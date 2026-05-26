@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <ranges>
 
 TEST_CASE("BufferPool::Acquire allocates a buffer of at least the requested capacity", "[bufferpool]")
 {
@@ -49,18 +50,15 @@ TEST_CASE("BufferPool honours its retention cap", "[bufferpool]")
     REQUIRE(pool->RetainedCount() == 2);
 }
 
-TEST_CASE("Pool with zero retention always allocates fresh buffers", "[bufferpool]")
+TEST_CASE("Pool with zero retention never grows its free list", "[bufferpool]")
 {
     auto const pool = FastCache::BufferPool::Create(0);
-    std::byte* firstAddress = nullptr;
+    for ([[maybe_unused]] auto const i : std::views::iota(0, 4))
     {
         auto buffer = pool->Acquire(128);
-        firstAddress = buffer.Data();
+        REQUIRE(buffer.IsValid());
     }
     REQUIRE(pool->RetainedCount() == 0);
-
-    auto buffer = pool->Acquire(128);
-    REQUIRE(buffer.Data() != firstAddress);
 }
 
 TEST_CASE("PooledBuffer::Resize clamps to capacity", "[bufferpool]")

@@ -19,5 +19,10 @@ target_link_libraries(FastCacheTest
         Catch2::Catch2
 )
 
+# When Catch2 is fetched via CPM, its extras/ directory (containing Catch.cmake
+# and catch_discover_tests) is not on CMAKE_MODULE_PATH by default. Add it.
+if(Catch2_SOURCE_DIR)
+    list(APPEND CMAKE_MODULE_PATH "${Catch2_SOURCE_DIR}/extras")
+endif()
 include(Catch)
 catch_discover_tests(FastCacheTest)

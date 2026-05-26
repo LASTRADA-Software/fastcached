@@ -4,8 +4,20 @@
 
 target_sources(FastCache
     PRIVATE
+        Async/TestReactor.cpp
+        Cache/CacheEngine.cpp
+        Cache/InMemoryLruStorage.cpp
+        Config/CliParser.cpp
         Core/Logger.cpp
         Core/BufferPool.cpp
+        Net/BlockingSocket.cpp
+        Net/InMemoryTransport.cpp
+        Net/Framing/LineReader.cpp
+        Protocol/MemcachedText.cpp
+        Protocol/ProtocolAutodetect.cpp
+        Server/BlockingServerLoop.cpp
+        Server/Connection.cpp
+        Server/Server.cpp
 )
 
 # Header-only files surfaced for IDE indexing.

@@ -44,16 +44,21 @@ include(ClangTidy)
 set(CPM_USE_LOCAL_PACKAGES ON CACHE BOOL "Prefer system-installed packages over CPM downloads")
 include(cmake/CPM.cmake)
 
+# yaml-cpp 0.8.0 declares cmake_minimum_required(VERSION 3.4) which CMake 4.x
+# refuses outright. Inject the policy-version compatibility shim so the fetch
+# configures on modern toolchains. This is scoped to yaml-cpp only.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 CPMAddPackage(
     NAME yaml-cpp
     GITHUB_REPOSITORY jbeder/yaml-cpp
-    VERSION 0.8.0
+    GIT_TAG 0.8.0
     OPTIONS
         "YAML_CPP_BUILD_TESTS OFF"
         "YAML_CPP_BUILD_TOOLS OFF"
         "YAML_BUILD_SHARED_LIBS OFF"
         "YAML_CPP_INSTALL OFF"
 )
+unset(CMAKE_POLICY_VERSION_MINIMUM CACHE)
 
 if(FASTCACHED_BUILD_TESTS)
     CPMAddPackage(
