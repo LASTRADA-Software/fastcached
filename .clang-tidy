@@ -1,3 +1,6 @@
+# cppcoreguidelines-pro-type-vararg is disabled: POSIX APIs we have to call
+# (open(), fcntl(), ioctl(), etc.) are declared variadic and there is no
+# non-variadic alternative. Suppressing per-call with NOLINT adds noise.
 ---
 Checks: >-
   -*,
@@ -36,6 +39,7 @@ Checks: >-
   -cppcoreguidelines-pro-type-cstyle-cast,
   -cppcoreguidelines-pro-type-reinterpret-cast,
   -cppcoreguidelines-pro-bounds-avoid-unchecked-container-access,
+  -cppcoreguidelines-pro-type-vararg,
   modernize-*,
   -modernize-avoid-bind,
   -modernize-avoid-c-arrays,
@@ -43,6 +47,7 @@ Checks: >-
   -modernize-use-trailing-return-type,
   performance-*,
   readability-*,
+  -readability-convert-member-functions-to-static,
   -readability-avoid-unconditional-preprocessor-if,
   -readability-braces-around-statements,
   -readability-else-after-return,
@@ -65,7 +70,7 @@ CheckOptions:
   - key:             readability-function-cognitive-complexity.IgnoreMacros
     value:           true
   - key:             bugprone-easily-swappable-parameters.MinimumLength
-    value:           '3'
+    value:           '4'
   - key:             cert-dcl16-c.NewSuffixes
     value:           'L;LL;LU;LLU'
   - key:             cert-oop54-cpp.WarnOnlyIfThisHasSuspiciousField
@@ -98,5 +103,7 @@ CheckOptions:
     value:           '1'
   - key:             readability-identifier-naming.FunctionCase
     value:           CamelCase
+  # await_ready et al. are coroutine customization points whose names are
+  # mandated by the C++ standard; they can't follow CamelCase.
   - key:             readability-identifier-naming.FunctionIgnoredRegexp
-    value:           '^(main|begin|end|push_back|pop_back|data|str|get|size|length|resize|empty|clear|value|c_str|capacity|to_string|string_view|assign|at|reserve|substr|sv)$'
+    value:           '^(main|begin|end|push_back|pop_back|data|str|get|size|length|resize|empty|clear|value|c_str|capacity|to_string|string_view|assign|at|reserve|substr|sv|await_ready|await_suspend|await_resume|initial_suspend|final_suspend|unhandled_exception|return_value|return_void|yield_value|get_return_object|get_return_object_on_allocation_failure|address|operator_new|operator_delete|from_promise)$'
