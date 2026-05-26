@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <span>
+#include <tuple>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -61,7 +62,7 @@ TEST_CASE("Add fails when the key already exists", "[cache]")
 {
     FastCache::InMemoryLruStorage storage;
     FastCache::ManualClock clock;
-    (void) storage.Set("k", MakeBytes("first"), 0, FastCache::TimePoint::max());
+    std::ignore = storage.Set("k", MakeBytes("first"), 0, FastCache::TimePoint::max());
     auto const result = storage.Add("k", MakeBytes("second"), 0, FastCache::TimePoint::max(), clock.Now());
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::StorageErrorCode::KeyExists);
@@ -101,7 +102,7 @@ TEST_CASE("Increment treats numeric values and saturates", "[cache]")
 {
     FastCache::InMemoryLruStorage storage;
     FastCache::ManualClock clock;
-    (void) storage.Set("counter", MakeBytes("10"), 0, FastCache::TimePoint::max());
+    std::ignore = storage.Set("counter", MakeBytes("10"), 0, FastCache::TimePoint::max());
 
     auto const up = storage.IncrementOrInitialize("counter", 5, clock.Now());
     REQUIRE(up.has_value());
@@ -117,7 +118,7 @@ TEST_CASE("TTL expiry hides entries past their deadline", "[cache]")
     FastCache::InMemoryLruStorage storage;
     FastCache::ManualClock clock;
     auto const expiry = clock.Now() + 100ms;
-    (void) storage.Set("k", MakeBytes("v"), 0, expiry);
+    std::ignore = storage.Set("k", MakeBytes("v"), 0, expiry);
 
     auto const before = storage.Get("k", clock.Now());
     REQUIRE(before->found);
@@ -131,12 +132,12 @@ TEST_CASE("LRU eviction kicks in when byte budget exceeded", "[cache]")
 {
     FastCache::InMemoryLruStorage storage { 4 }; // 4 bytes total
     FastCache::ManualClock clock;
-    (void) storage.Set("a", MakeBytes("xx"), 0, FastCache::TimePoint::max());
-    (void) storage.Set("b", MakeBytes("yy"), 0, FastCache::TimePoint::max());
+    std::ignore = storage.Set("a", MakeBytes("xx"), 0, FastCache::TimePoint::max());
+    std::ignore = storage.Set("b", MakeBytes("yy"), 0, FastCache::TimePoint::max());
     REQUIRE(storage.Snapshot().bytesUsed == 4);
 
     // Inserting one more byte should evict the LRU tail ("a").
-    (void) storage.Set("c", MakeBytes("z"), 0, FastCache::TimePoint::max());
+    std::ignore = storage.Set("c", MakeBytes("z"), 0, FastCache::TimePoint::max());
     auto const a = storage.Get("a", clock.Now());
     REQUIRE_FALSE(a->found);
     REQUIRE(storage.Snapshot().evictions == 1);
@@ -146,7 +147,7 @@ TEST_CASE("FlushWithGeneration hides existing entries immediately", "[cache]")
 {
     FastCache::InMemoryLruStorage storage;
     FastCache::ManualClock clock;
-    (void) storage.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
+    std::ignore = storage.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
 
     storage.FlushWithGeneration(clock.Now());
     auto const got = storage.Get("k", clock.Now());

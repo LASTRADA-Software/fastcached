@@ -2,6 +2,7 @@
 #include <FastCache/Cache/DiskStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Crc32c.hpp>
+#include <FastCache/Core/Owner.hpp>
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -152,6 +154,122 @@ std::expected<std::unique_ptr<DiskStorage>, StorageError> DiskStorage::Open(Opti
     return storage;
 }
 
+std::expected<void, StorageError> DiskStorage::ReplayBytes(std::span<std::byte const> raw, std::uintmax_t& goodPrefix)
+{
+    std::span<std::byte const> cursor { raw.data() + (raw.empty() ? 0 : HeaderSize),
+                                        raw.empty() ? 0 : raw.size() - HeaderSize };
+    goodPrefix = raw.empty() ? 0 : HeaderSize;
+
+    while (!cursor.empty())
+    {
+        std::uint32_t totalLen = 0;
+        std::uint32_t storedCrc = 0;
+        if (!ReadTrivial(cursor, totalLen) || !ReadTrivial(cursor, storedCrc))
+            break;
+        if (totalLen > cursor.size())
+            break;
+
+        auto const payload = cursor.first(totalLen);
+        cursor = cursor.subspan(totalLen);
+
+        if (Crc32c::Compute(payload) != storedCrc)
+            break;
+
+        if (!ApplyReplayedRecord(payload))
+            break;
+
+        goodPrefix += sizeof(std::uint32_t) + sizeof(std::uint32_t) + totalLen;
+    }
+    return {};
+}
+
+bool DiskStorage::ApplyReplayedRecord(std::span<std::byte const> payload)
+{
+    auto p = payload;
+    std::uint8_t typeByte = 0;
+    std::uint32_t flags = 0;
+    CasToken cas = 0;
+    std::int64_t expiryMicros = 0;
+    std::uint64_t generation = 0;
+    std::uint32_t keyLen = 0;
+    std::uint32_t valueLen = 0;
+
+    if (!ReadTrivial(p, typeByte) || !ReadTrivial(p, flags) || !ReadTrivial(p, cas) || !ReadTrivial(p, expiryMicros)
+        || !ReadTrivial(p, generation) || !ReadTrivial(p, keyLen) || !ReadTrivial(p, valueLen))
+        return false;
+
+    if (p.size() < std::size_t { keyLen } + valueLen)
+        return false;
+
+    auto const keyBytes = p.first(keyLen);
+    auto const valueBytes = p.subspan(keyLen, valueLen);
+    std::string keyStr;
+    keyStr.reserve(keyLen);
+    for (auto const b: keyBytes)
+        keyStr.push_back(static_cast<char>(b));
+
+    switch (static_cast<RecordType>(typeByte))
+    {
+        case RecordType::Set: {
+            std::vector<std::byte> valueVec { valueBytes.begin(), valueBytes.end() };
+            ApplySet(std::move(keyStr), std::move(valueVec), flags, MicrosToTimePoint(expiryMicros), cas);
+            _nextCas = std::max<CasToken>(_nextCas, cas + 1);
+            _liveGeneration = std::max<std::uint64_t>(_liveGeneration, generation);
+            return true;
+        }
+        case RecordType::Delete:
+            ApplyDelete(keyStr);
+            return true;
+        case RecordType::Flush:
+            ApplyFlush();
+            _liveGeneration = std::max<std::uint64_t>(_liveGeneration, generation);
+            return true;
+        default:
+            return false;
+    }
+}
+
+std::expected<void, StorageError> DiskStorage::ValidateLogHeader(std::vector<std::byte>& raw)
+{
+    if (raw.size() < HeaderSize)
+    {
+        // File too short — treat as empty, will rewrite header.
+        raw.clear();
+        return {};
+    }
+    if (std::memcmp(raw.data(), Magic.data(), Magic.size()) != 0)
+        return std::unexpected(MakeCorrupt("bad magic"));
+    std::uint32_t version = 0;
+    std::memcpy(&version, raw.data() + 4, sizeof(version));
+    if (version != FormatVersion)
+        return std::unexpected(MakeCorrupt(std::format("unsupported version {}", version)));
+    return {};
+}
+
+std::expected<std::vector<std::byte>, StorageError> DiskStorage::SlurpLogFile(std::filesystem::path const& path)
+{
+    gsl::owner<std::FILE*> fp { nullptr };
+    fp = std::fopen(path.string().c_str(), "rb");
+    if (!fp)
+        return std::unexpected(MakeIoError(errno, "fopen for replay"));
+
+    std::fseek(fp, 0, SEEK_END);
+    auto const len = std::ftell(fp);
+    std::fseek(fp, 0, SEEK_SET);
+    std::vector<std::byte> raw(static_cast<std::size_t>(len));
+    if (len > 0)
+    {
+        auto const got = std::fread(raw.data(), 1, raw.size(), fp);
+        if (got != raw.size())
+        {
+            std::fclose(fp);
+            return std::unexpected(MakeIoError(errno, "fread on replay"));
+        }
+    }
+    std::fclose(fp);
+    return raw;
+}
+
 std::expected<void, StorageError> DiskStorage::OpenAndReplay()
 {
     namespace fs = std::filesystem;
@@ -162,122 +280,21 @@ std::expected<void, StorageError> DiskStorage::OpenAndReplay()
 
     auto const exists = fs::exists(path, ec);
 
-    // Read existing log first (if any), then truncate at first corrupt
-    // record and reopen for append.
     std::vector<std::byte> raw;
     std::uintmax_t goodPrefix = 0;
 
     if (exists)
     {
-        auto* fp = std::fopen(path.string().c_str(), "rb");
-        if (!fp)
-            return std::unexpected(MakeIoError(errno, "fopen for replay"));
+        auto slurped = SlurpLogFile(path);
+        if (!slurped.has_value())
+            return std::unexpected(slurped.error());
+        raw = std::move(*slurped);
 
-        // Slurp the whole file. For sccache-style use the log is bounded
-        // by compaction; if it grows unbounded the user can compact.
-        std::fseek(fp, 0, SEEK_END);
-        auto const len = std::ftell(fp);
-        std::fseek(fp, 0, SEEK_SET);
-        raw.resize(static_cast<std::size_t>(len));
-        if (len > 0)
-        {
-            auto const got = std::fread(raw.data(), 1, raw.size(), fp);
-            if (got != raw.size())
-            {
-                std::fclose(fp);
-                return std::unexpected(MakeIoError(errno, "fread on replay"));
-            }
-        }
-        std::fclose(fp);
+        if (auto const r = ValidateLogHeader(raw); !r.has_value())
+            return std::unexpected(r.error());
 
-        // Validate header.
-        if (raw.size() < HeaderSize)
-        {
-            // File too short — treat as empty, will rewrite header.
-            raw.clear();
-        }
-        else
-        {
-            if (std::memcmp(raw.data(), Magic.data(), Magic.size()) != 0)
-                return std::unexpected(MakeCorrupt("bad magic"));
-            std::uint32_t version = 0;
-            std::memcpy(&version, raw.data() + 4, sizeof(version));
-            if (version != FormatVersion)
-                return std::unexpected(MakeCorrupt(std::format("unsupported version {}", version)));
-        }
-
-        // Replay records.
-        std::span<std::byte const> cursor { raw.data() + (raw.empty() ? 0 : HeaderSize),
-                                            raw.empty() ? 0 : raw.size() - HeaderSize };
-        goodPrefix = raw.empty() ? 0 : HeaderSize;
-
-        while (!cursor.empty())
-        {
-            std::uint32_t totalLen = 0;
-            std::uint32_t storedCrc = 0;
-            if (!ReadTrivial(cursor, totalLen))
-                break; // truncated header
-            if (!ReadTrivial(cursor, storedCrc))
-                break;
-
-            if (totalLen > cursor.size())
-                break; // truncated body
-
-            auto const payload = cursor.first(totalLen);
-            cursor = cursor.subspan(totalLen);
-
-            auto const actualCrc = Crc32c::Compute(payload);
-            if (actualCrc != storedCrc)
-                break; // first bad record — stop here, truncate below
-
-            // Parse payload.
-            auto p = payload;
-            std::uint8_t typeByte = 0;
-            std::uint32_t flags = 0;
-            CasToken cas = 0;
-            std::int64_t expiryMicros = 0;
-            std::uint64_t generation = 0;
-            std::uint32_t keyLen = 0;
-            std::uint32_t valueLen = 0;
-
-            if (!ReadTrivial(p, typeByte) || !ReadTrivial(p, flags) || !ReadTrivial(p, cas) || !ReadTrivial(p, expiryMicros)
-                || !ReadTrivial(p, generation) || !ReadTrivial(p, keyLen) || !ReadTrivial(p, valueLen))
-                break;
-
-            if (p.size() < std::size_t { keyLen } + valueLen)
-                break;
-
-            auto const keyBytes = p.first(keyLen);
-            auto const valueBytes = p.subspan(keyLen, valueLen);
-            std::string keyStr;
-            keyStr.reserve(keyLen);
-            for (auto const b: keyBytes)
-                keyStr.push_back(static_cast<char>(b));
-
-            switch (static_cast<RecordType>(typeByte))
-            {
-                case RecordType::Set: {
-                    std::vector<std::byte> valueVec { valueBytes.begin(), valueBytes.end() };
-                    ApplySet(std::move(keyStr), std::move(valueVec), flags, MicrosToTimePoint(expiryMicros), cas);
-                    _nextCas = std::max<CasToken>(_nextCas, cas + 1);
-                    _liveGeneration = std::max<std::uint64_t>(_liveGeneration, generation);
-                    break;
-                }
-                case RecordType::Delete:
-                    ApplyDelete(keyStr);
-                    break;
-                case RecordType::Flush:
-                    ApplyFlush();
-                    _liveGeneration = std::max<std::uint64_t>(_liveGeneration, generation);
-                    break;
-                default:
-                    break; // unknown record type — stop replay
-            }
-
-            // Advance the "good prefix" marker so corruption truncation
-            // happens at the right offset.
-            goodPrefix += sizeof(std::uint32_t) + sizeof(std::uint32_t) + totalLen;
-        }
+        if (auto const r = ReplayBytes(raw, goodPrefix); !r.has_value())
+            return std::unexpected(r.error());
     }
 
     // (Re)open in append mode, truncating to goodPrefix if needed.
@@ -595,11 +612,12 @@ std::expected<void, StorageError> DiskStorage::Delete(std::string_view key, Time
     return {};
 }
 
-void DiskStorage::FlushWithGeneration(TimePoint)
+void DiskStorage::FlushWithGeneration(TimePoint /*now*/)
 {
     ApplyFlush();
-    (void) AppendFlush(); // best-effort: a failed flush record only means
-                          // restart-after-crash won't bump the generation.
+    // best-effort: a failed flush record only means restart-after-crash
+    // won't bump the generation.
+    std::ignore = AppendFlush();
 }
 
 std::size_t DiskStorage::PurgeExpired(TimePoint now)
@@ -632,7 +650,7 @@ std::expected<std::size_t, StorageError> DiskStorage::Compact()
     namespace fs = std::filesystem;
     auto const newPath = _options.logPath.string() + ".new";
 
-    auto* newLog = std::fopen(newPath.c_str(), "wb+");
+    gsl::owner<std::FILE*> newLog = std::fopen(newPath.c_str(), "wb+");
     if (!newLog)
         return std::unexpected(MakeIoError(errno, "fopen .new"));
 

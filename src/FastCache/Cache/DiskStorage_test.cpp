@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace
@@ -75,7 +76,7 @@ TEST_CASE("DiskStorage: delete after reopen takes effect", "[diskstorage]")
     {
         auto storage = FastCache::DiskStorage::Open({ .logPath = path });
         REQUIRE(storage.has_value());
-        (void) (*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
+        std::ignore = (*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
         REQUIRE((*storage)->Delete("k", clock.Now()).has_value());
     }
     auto storage = FastCache::DiskStorage::Open({ .logPath = path });
@@ -92,8 +93,8 @@ TEST_CASE("DiskStorage: crash recovery truncates a torn final record", "[disksto
     {
         auto storage = FastCache::DiskStorage::Open({ .logPath = path });
         REQUIRE(storage.has_value());
-        (void) (*storage)->Set("good", MakeBytes("alive"), 0, FastCache::TimePoint::max());
-        (void) (*storage)->Set("alsogood", MakeBytes("also-alive"), 0, FastCache::TimePoint::max());
+        std::ignore = (*storage)->Set("good", MakeBytes("alive"), 0, FastCache::TimePoint::max());
+        std::ignore = (*storage)->Set("alsogood", MakeBytes("also-alive"), 0, FastCache::TimePoint::max());
     }
 
     // Corrupt the file by appending a bogus record header followed by
@@ -125,8 +126,8 @@ TEST_CASE("DiskStorage: Compact drops deleted/expired entries", "[diskstorage]")
 
     auto storage = FastCache::DiskStorage::Open({ .logPath = path });
     REQUIRE(storage.has_value());
-    (void) (*storage)->Set("keep", MakeBytes("yes"), 0, FastCache::TimePoint::max());
-    (void) (*storage)->Set("gone", MakeBytes("bye"), 0, FastCache::TimePoint::max());
+    std::ignore = (*storage)->Set("keep", MakeBytes("yes"), 0, FastCache::TimePoint::max());
+    std::ignore = (*storage)->Set("gone", MakeBytes("bye"), 0, FastCache::TimePoint::max());
     REQUIRE((*storage)->Delete("gone", clock.Now()).has_value());
 
     auto const sizeBefore = std::filesystem::file_size(path);
