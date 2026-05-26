@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Platform/IDaemonHost.hpp>
 
-#include <cstdio>
 #include <cstdlib>
+#include <format>
+#include <fstream>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <utility>
 
 #if !defined(_WIN32)
@@ -20,7 +22,7 @@ namespace FastCache
 
 #if defined(_WIN32)
 
-std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string /*pidfile*/)
+std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string const& /*pidfile*/)
 {
     return nullptr; // unsupported on Windows
 }
@@ -76,12 +78,8 @@ namespace
             // Write pidfile (best effort).
             if (!_pidfile.empty())
             {
-                auto* fp = std::fopen(_pidfile.c_str(), "w");
-                if (fp)
-                {
-                    std::fprintf(fp, "%d\n", ::getpid());
-                    std::fclose(fp);
-                }
+                if (std::ofstream out { _pidfile, std::ios::trunc }; out)
+                    out << std::format("{}\n", ::getpid());
             }
 
             if (!body)
@@ -95,9 +93,9 @@ namespace
 
 } // namespace
 
-std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string pidfile)
+std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string const& pidfile)
 {
-    return std::make_unique<PosixDaemonHost>(std::move(pidfile));
+    return std::make_unique<PosixDaemonHost>(pidfile);
 }
 
 #endif // !_WIN32

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <utility>
 
 #if defined(_WIN32)
@@ -16,7 +17,7 @@ namespace FastCache
 
 #if !defined(_WIN32)
 
-std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string /*serviceName*/)
+std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string const& /*serviceName*/)
 {
     return nullptr; // unsupported on non-Windows
 }
@@ -108,9 +109,9 @@ namespace
 
 } // namespace
 
-std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string serviceName)
+std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string const& serviceName)
 {
-    return std::make_unique<WindowsServiceHost>(std::move(serviceName));
+    return std::make_unique<WindowsServiceHost>(serviceName);
 }
 
 #endif // _WIN32

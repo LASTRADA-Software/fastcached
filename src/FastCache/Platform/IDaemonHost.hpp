@@ -58,12 +58,12 @@ class ForegroundHost final: public IDaemonHost
 /// supported (Windows).
 /// @param pidfile Path to pidfile (may be empty).
 /// @return Owning host or nullptr.
-[[nodiscard]] std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string pidfile);
+[[nodiscard]] std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string const& pidfile);
 
 /// Construct a Windows Service host registered with the SCM. Returns
 /// nullptr on non-Windows platforms.
 /// @param serviceName Service name as registered with SCM.
 /// @return Owning host or nullptr.
-[[nodiscard]] std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string serviceName);
+[[nodiscard]] std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string const& serviceName);
 
 } // namespace FastCache
