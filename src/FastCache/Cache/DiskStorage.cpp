@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/DiskStorage.hpp>
-
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Crc32c.hpp>
 
@@ -24,11 +23,11 @@
 
 #if defined(_WIN32)
     #include <io.h>
-    #define FASTCACHED_FSYNC(fd) _commit(fd)
+    #define FASTCACHED_FSYNC(fd)  _commit(fd)
     #define FASTCACHED_FILENO(fp) _fileno(fp)
 #else
     #include <unistd.h>
-    #define FASTCACHED_FSYNC(fd) ::fsync(fd)
+    #define FASTCACHED_FSYNC(fd)  ::fsync(fd)
     #define FASTCACHED_FILENO(fp) ::fileno(fp)
 #endif
 
@@ -65,14 +64,18 @@ namespace
     [[nodiscard]] StorageError MakeIoError(int code, std::string ctx)
     {
         return StorageError {
-            .code = StorageErrorCode::IoError, .systemCode = code, .context = std::move(ctx),
+            .code = StorageErrorCode::IoError,
+            .systemCode = code,
+            .context = std::move(ctx),
         };
     }
 
     [[nodiscard]] StorageError MakeCorrupt(std::string ctx)
     {
         return StorageError {
-            .code = StorageErrorCode::Corrupt, .systemCode = 0, .context = std::move(ctx),
+            .code = StorageErrorCode::Corrupt,
+            .systemCode = 0,
+            .context = std::move(ctx),
         };
     }
 
@@ -125,7 +128,10 @@ namespace
 
 } // namespace
 
-DiskStorage::DiskStorage(Options options) noexcept: _options { std::move(options) } {}
+DiskStorage::DiskStorage(Options options) noexcept:
+    _options { std::move(options) }
+{
+}
 
 DiskStorage::~DiskStorage()
 {
@@ -234,9 +240,8 @@ std::expected<void, StorageError> DiskStorage::OpenAndReplay()
             std::uint32_t keyLen = 0;
             std::uint32_t valueLen = 0;
 
-            if (!ReadTrivial(p, typeByte) || !ReadTrivial(p, flags) || !ReadTrivial(p, cas)
-                || !ReadTrivial(p, expiryMicros) || !ReadTrivial(p, generation) || !ReadTrivial(p, keyLen)
-                || !ReadTrivial(p, valueLen))
+            if (!ReadTrivial(p, typeByte) || !ReadTrivial(p, flags) || !ReadTrivial(p, cas) || !ReadTrivial(p, expiryMicros)
+                || !ReadTrivial(p, generation) || !ReadTrivial(p, keyLen) || !ReadTrivial(p, valueLen))
                 break;
 
             if (p.size() < std::size_t { keyLen } + valueLen)
@@ -246,25 +251,27 @@ std::expected<void, StorageError> DiskStorage::OpenAndReplay()
             auto const valueBytes = p.subspan(keyLen, valueLen);
             std::string keyStr;
             keyStr.reserve(keyLen);
-            for (auto const b : keyBytes)
+            for (auto const b: keyBytes)
                 keyStr.push_back(static_cast<char>(b));
 
             switch (static_cast<RecordType>(typeByte))
             {
-                case RecordType::Set:
-                {
+                case RecordType::Set: {
                     std::vector<std::byte> valueVec { valueBytes.begin(), valueBytes.end() };
                     ApplySet(std::move(keyStr), std::move(valueVec), flags, MicrosToTimePoint(expiryMicros), cas);
                     _nextCas = std::max<CasToken>(_nextCas, cas + 1);
                     _liveGeneration = std::max<std::uint64_t>(_liveGeneration, generation);
                     break;
                 }
-                case RecordType::Delete: ApplyDelete(keyStr); break;
+                case RecordType::Delete:
+                    ApplyDelete(keyStr);
+                    break;
                 case RecordType::Flush:
                     ApplyFlush();
                     _liveGeneration = std::max<std::uint64_t>(_liveGeneration, generation);
                     break;
-                default: break; // unknown record type — stop replay
+                default:
+                    break; // unknown record type — stop replay
             }
 
             // Advance the "good prefix" marker so corruption truncation
@@ -340,11 +347,8 @@ void DiskStorage::EvictToFit()
     }
 }
 
-CasToken DiskStorage::ApplySet(std::string key,
-                               std::vector<std::byte> value,
-                               std::uint32_t flags,
-                               TimePoint expiry,
-                               CasToken cas)
+CasToken DiskStorage::ApplySet(
+    std::string key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, CasToken cas)
 {
     auto const indexIt = _index.find(key);
     if (indexIt != _index.end())
@@ -389,8 +393,7 @@ void DiskStorage::ApplyFlush()
     ++_liveGeneration;
 }
 
-std::expected<void, StorageError>
-DiskStorage::AppendRecord(RecordType type, std::string_view key, CacheEntry const& entry)
+std::expected<void, StorageError> DiskStorage::AppendRecord(RecordType type, std::string_view key, CacheEntry const& entry)
 {
     std::vector<std::byte> payload;
     payload.reserve(RecordHeaderSize + key.size() + entry.value.size());
@@ -402,9 +405,9 @@ DiskStorage::AppendRecord(RecordType type, std::string_view key, CacheEntry cons
     PushLe<std::uint64_t>(payload, entry.generation);
     PushLe<std::uint32_t>(payload, static_cast<std::uint32_t>(key.size()));
     PushLe<std::uint32_t>(payload, static_cast<std::uint32_t>(entry.value.size()));
-    for (auto const c : key)
+    for (auto const c: key)
         payload.push_back(static_cast<std::byte>(c));
-    for (auto const b : entry.value)
+    for (auto const b: entry.value)
         payload.push_back(b);
 
     auto const totalLen = static_cast<std::uint32_t>(payload.size());
@@ -467,8 +470,10 @@ std::expected<GetResult, StorageError> DiskStorage::Get(std::string_view key, Ti
     return GetResult { .found = true, .entry = it->entry };
 }
 
-std::expected<CasToken, StorageError>
-DiskStorage::Set(std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry)
+std::expected<CasToken, StorageError> DiskStorage::Set(std::string_view key,
+                                                       std::vector<std::byte> value,
+                                                       std::uint32_t flags,
+                                                       TimePoint expiry)
 {
     ++_stats.cmdSet;
     auto const cas = _nextCas++;
@@ -480,47 +485,43 @@ DiskStorage::Set(std::string_view key, std::vector<std::byte> value, std::uint32
     return newCas;
 }
 
-std::expected<CasToken, StorageError> DiskStorage::Add(std::string_view key,
-                                                       std::vector<std::byte> value,
-                                                       std::uint32_t flags,
-                                                       TimePoint expiry,
-                                                       TimePoint now)
+std::expected<CasToken, StorageError> DiskStorage::Add(
+    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it != _lru.end())
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyExists });
+        return std::unexpected(StorageError { .code = StorageErrorCode::KeyExists, .systemCode = 0, .context = {} });
     return Set(key, std::move(value), flags, expiry);
 }
 
-std::expected<CasToken, StorageError> DiskStorage::Replace(std::string_view key,
-                                                           std::vector<std::byte> value,
-                                                           std::uint32_t flags,
-                                                           TimePoint expiry,
-                                                           TimePoint now)
+std::expected<CasToken, StorageError> DiskStorage::Replace(
+    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound });
+        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound, .systemCode = 0, .context = {} });
     return Set(key, std::move(value), flags, expiry);
 }
 
-std::expected<CasToken, StorageError>
-DiskStorage::Append(std::string_view key, std::span<std::byte const> suffix, TimePoint now)
+std::expected<CasToken, StorageError> DiskStorage::Append(std::string_view key,
+                                                          std::span<std::byte const> suffix,
+                                                          TimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound });
+        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound, .systemCode = 0, .context = {} });
     auto combined = it->entry.value;
     combined.insert(combined.end(), suffix.begin(), suffix.end());
     return Set(key, std::move(combined), it->entry.flags, it->entry.expiry);
 }
 
-std::expected<CasToken, StorageError>
-DiskStorage::Prepend(std::string_view key, std::span<std::byte const> prefix, TimePoint now)
+std::expected<CasToken, StorageError> DiskStorage::Prepend(std::string_view key,
+                                                           std::span<std::byte const> prefix,
+                                                           TimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound });
+        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound, .systemCode = 0, .context = {} });
     std::vector<std::byte> combined;
     combined.reserve(prefix.size() + it->entry.value.size());
     combined.insert(combined.end(), prefix.begin(), prefix.end());
@@ -537,29 +538,30 @@ std::expected<CasToken, StorageError> DiskStorage::CompareAndSwap(std::string_vi
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound });
+        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound, .systemCode = 0, .context = {} });
     if (it->entry.cas != expected)
-        return std::unexpected(StorageError { .code = StorageErrorCode::CasMismatch });
+        return std::unexpected(StorageError { .code = StorageErrorCode::CasMismatch, .systemCode = 0, .context = {} });
     return Set(key, std::move(value), flags, expiry);
 }
 
-std::expected<IStorage::IncrResult, StorageError>
-DiskStorage::IncrementOrInitialize(std::string_view key, std::int64_t delta, TimePoint now)
+std::expected<IStorage::IncrResult, StorageError> DiskStorage::IncrementOrInitialize(std::string_view key,
+                                                                                     std::int64_t delta,
+                                                                                     TimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound });
+        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound, .systemCode = 0, .context = {} });
 
     auto const& bytes = it->entry.value;
     std::string asText;
     asText.reserve(bytes.size());
-    for (auto const b : bytes)
+    for (auto const b: bytes)
         asText.push_back(static_cast<char>(b));
 
     std::uint64_t current = 0;
     auto const [_, ec] = std::from_chars(asText.data(), asText.data() + asText.size(), current);
     if (ec != std::errc {} || asText.empty())
-        return std::unexpected(StorageError { .code = StorageErrorCode::InvalidArgument });
+        return std::unexpected(StorageError { .code = StorageErrorCode::InvalidArgument, .systemCode = 0, .context = {} });
 
     std::uint64_t updated = current;
     if (delta >= 0)
@@ -572,7 +574,7 @@ DiskStorage::IncrementOrInitialize(std::string_view key, std::int64_t delta, Tim
     auto newText = std::to_string(updated);
     std::vector<std::byte> newValue;
     newValue.reserve(newText.size());
-    for (auto const c : newText)
+    for (auto const c: newText)
         newValue.push_back(static_cast<std::byte>(c));
 
     auto const setResult = Set(key, std::move(newValue), it->entry.flags, it->entry.expiry);
@@ -585,7 +587,7 @@ std::expected<void, StorageError> DiskStorage::Delete(std::string_view key, Time
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound });
+        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound, .systemCode = 0, .context = {} });
     ApplyDelete(key);
     auto const result = AppendDelete(key);
     if (!result.has_value())
@@ -646,7 +648,7 @@ std::expected<std::size_t, StorageError> DiskStorage::Compact()
 
     // Walk LRU and write a Set record for each live entry.
     std::size_t written = 0;
-    for (auto const& node : _lru)
+    for (auto const& node: _lru)
     {
         std::vector<std::byte> payload;
         payload.reserve(RecordHeaderSize + node.key.size() + node.entry.value.size());
@@ -657,9 +659,9 @@ std::expected<std::size_t, StorageError> DiskStorage::Compact()
         PushLe<std::uint64_t>(payload, node.entry.generation);
         PushLe<std::uint32_t>(payload, static_cast<std::uint32_t>(node.key.size()));
         PushLe<std::uint32_t>(payload, static_cast<std::uint32_t>(node.entry.value.size()));
-        for (auto const c : node.key)
+        for (auto const c: node.key)
             payload.push_back(static_cast<std::byte>(c));
-        for (auto const b : node.entry.value)
+        for (auto const b: node.entry.value)
             payload.push_back(b);
 
         auto const totalLen = static_cast<std::uint32_t>(payload.size());

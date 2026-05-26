@@ -4,6 +4,7 @@
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
+#include <cstdint>
 #include <expected>
 #include <span>
 #include <string>
@@ -13,11 +14,11 @@ namespace FastCache
 {
 
 /// Outcome categories returned by ParseCli.
-enum class CliOutcome : unsigned
+enum class CliOutcome : std::uint8_t
 {
-    Run,           ///< Parsing succeeded; proceed to run the daemon.
-    ShowHelp,      ///< --help / -h was seen.
-    ShowVersion,   ///< --version / -V was seen.
+    Run,         ///< Parsing succeeded; proceed to run the daemon.
+    ShowHelp,    ///< --help / -h was seen.
+    ShowVersion, ///< --version / -V was seen.
 };
 
 struct CliResult

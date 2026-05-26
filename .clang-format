@@ -74,6 +74,11 @@ IncludeCategories:
     Priority:  10
   - Regex:     '^<yaml-cpp/'
     Priority:  40
+  # winsock2.h must be #included BEFORE any other Windows header (notably
+  # mswsock.h, windows.h, ws2tcpip.h) because those depend on its types.
+  # Give it its own category so it always sorts ahead of the rest.
+  - Regex:     '^<winsock2\.h>'
+    Priority:  60
   - Regex:     '^<catch2/'
     Priority:  70
   - Regex:     '^<sys/'

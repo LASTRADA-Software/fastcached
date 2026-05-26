@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Server/ReactorServerLoop.hpp>
-
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
+#include <FastCache/Server/ReactorServerLoop.hpp>
 #include <FastCache/Server/Server.hpp>
 
 #include <atomic>
@@ -38,11 +37,8 @@ using PlatformListener = KqueueListener;
     #error "No reactor implementation for this platform"
 #endif
 
-int RunReactorServer(ReactorServerOptions options,
-                     CacheEngine& engine,
-                     ILogger& logger,
-                     IAdmissionControl* admission,
-                     IMetricsSink* metrics)
+int RunReactorServer(
+    ReactorServerOptions options, CacheEngine& engine, ILogger& logger, IAdmissionControl* admission, IMetricsSink* metrics)
 {
     SteadyClock clock;
     PlatformReactor reactor { clock };

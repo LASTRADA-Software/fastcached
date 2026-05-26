@@ -14,10 +14,10 @@ namespace FastCache
 /// Concept covering the integer types the memcached binary header and Redis
 /// length prefixes serialise as big-endian on the wire.
 template <typename T>
-concept WireInteger = std::same_as<T, std::uint8_t>   //
-    || std::same_as<T, std::uint16_t>                 //
-    || std::same_as<T, std::uint32_t>                 //
-    || std::same_as<T, std::uint64_t>;
+concept WireInteger = std::same_as<T, std::uint8_t>     //
+                      || std::same_as<T, std::uint16_t> //
+                      || std::same_as<T, std::uint32_t> //
+                      || std::same_as<T, std::uint64_t>;
 
 /// Convert a wire-integer value to big-endian (network byte order).
 /// @param value Host-order integer.

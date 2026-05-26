@@ -17,7 +17,9 @@ namespace
 
     [[nodiscard]] ConfigError MakeError(ConfigErrorCode code, std::string field, std::string context)
     {
-        return ConfigError { .code = code, .source = "argv", .line = 0, .field = std::move(field), .context = std::move(context) };
+        return ConfigError {
+            .code = code, .source = "argv", .line = 0, .field = std::move(field), .context = std::move(context)
+        };
     }
 
     [[nodiscard]] std::expected<std::uint16_t, ConfigError> ParsePort(std::string_view sv)
@@ -43,14 +45,142 @@ namespace
 
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv)
     {
-        if (sv == "trace") return LogLevel::Trace;
-        if (sv == "debug") return LogLevel::Debug;
-        if (sv == "info") return LogLevel::Info;
-        if (sv == "warn") return LogLevel::Warn;
-        if (sv == "error") return LogLevel::Error;
-        if (sv == "fatal") return LogLevel::Fatal;
-        return std::unexpected(
-            MakeError(ConfigErrorCode::OutOfRange, "log-level", std::format("unknown level: {}", sv)));
+        if (sv == "trace")
+            return LogLevel::Trace;
+        if (sv == "debug")
+            return LogLevel::Debug;
+        if (sv == "info")
+            return LogLevel::Info;
+        if (sv == "warn")
+            return LogLevel::Warn;
+        if (sv == "error")
+            return LogLevel::Error;
+        if (sv == "fatal")
+            return LogLevel::Fatal;
+        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, "log-level", std::format("unknown level: {}", sv)));
+    }
+
+    [[nodiscard]] bool FlagMatches(std::string_view arg, std::string_view name) noexcept
+    {
+        if (arg == name)
+            return true;
+        return arg.starts_with(std::string { name } + "=");
+    }
+
+    /// Pull the value out of `args[i]` for a `--flag=value` or `--flag value`
+    /// shape, advancing i past the value if it's a separate argv element.
+    [[nodiscard]] std::expected<std::string_view, ConfigError> TakeValue(std::span<char const* const> args,
+                                                                         std::size_t& i,
+                                                                         std::string_view flag)
+    {
+        auto const arg = std::string_view { args[i] };
+        if (auto const eq = arg.find('='); eq != std::string_view::npos)
+            return arg.substr(eq + 1);
+        if (i + 1 >= args.size())
+            return std::unexpected(MakeError(ConfigErrorCode::ParseError, std::string { flag }, "missing value"));
+        ++i;
+        return std::string_view { args[i] };
+    }
+
+    /// Per-arg dispatch outcome.
+    enum class ArgOutcome : std::uint8_t
+    {
+        Continue,    ///< Argument handled; loop continues.
+        ShowHelp,    ///< Caller should return CliOutcome::ShowHelp.
+        ShowVersion, ///< Caller should return CliOutcome::ShowVersion.
+        Unknown,     ///< Argument not recognised by any handler.
+    };
+
+    /// Apply a string-valued flag to a Config field if it matches. Returns
+    /// std::nullopt when the flag does not match (so the dispatcher can try
+    /// the next handler).
+    [[nodiscard]] std::expected<bool, ConfigError> ApplyStringFlag(std::span<char const* const> args,
+                                                                   std::size_t& i,
+                                                                   std::string_view flagName,
+                                                                   std::string& target)
+    {
+        if (!FlagMatches(std::string_view { args[i] }, flagName))
+            return false;
+        auto const value = TakeValue(args, i, flagName);
+        if (!value.has_value())
+            return std::unexpected(value.error());
+        target = std::string { *value };
+        return true;
+    }
+
+    /// Templated equivalent for typed (parsed) flags: --port, --max-memory,
+    /// --log-level.
+    template <typename Parser, typename Target>
+    [[nodiscard]] std::expected<bool, ConfigError> ApplyParsedFlag(
+        std::span<char const* const> args, std::size_t& i, std::string_view flagName, Parser parser, Target& target)
+    {
+        if (!FlagMatches(std::string_view { args[i] }, flagName))
+            return false;
+        auto const value = TakeValue(args, i, flagName);
+        if (!value.has_value())
+            return std::unexpected(value.error());
+        auto const parsed = parser(*value);
+        if (!parsed.has_value())
+            return std::unexpected(parsed.error());
+        target = *parsed;
+        return true;
+    }
+
+    /// Dispatch a single argument. Returns ArgOutcome on success or a
+    /// ConfigError if the argument matched a flag but parsing failed.
+    [[nodiscard]] std::expected<ArgOutcome, ConfigError> HandleOneArg(std::span<char const* const> args,
+                                                                      std::size_t& i,
+                                                                      Config& cfg)
+    {
+        std::string_view const arg { args[i] };
+        if (arg == "--help" || arg == "-h")
+            return ArgOutcome::ShowHelp;
+        if (arg == "--version" || arg == "-V")
+            return ArgOutcome::ShowVersion;
+        if (arg == "--daemon")
+        {
+            cfg.daemon = true;
+            return ArgOutcome::Continue;
+        }
+
+        // String-valued flags.
+        for (auto const& [name, target]: std::initializer_list<std::pair<std::string_view, std::string*>> {
+                 { "--config", &cfg.configPath },
+                 { "--bind", &cfg.bindAddress },
+                 { "--pidfile", &cfg.pidfile },
+                 { "--service-name", &cfg.serviceName },
+             })
+        {
+            auto const matched = ApplyStringFlag(args, i, name, *target);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
+
+        // Typed flags.
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--port", ParsePort, cfg.port);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--max-memory", ParseMaxMemory, cfg.maxMemoryBytes);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--log-level", ParseLogLevel, cfg.logLevel);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
+        return ArgOutcome::Unknown;
     }
 
 } // namespace
@@ -73,112 +203,25 @@ std::string_view CliUsage() noexcept
 std::expected<CliResult, ConfigError> ParseCli(std::span<char const* const> args)
 {
     CliResult outcome;
-    Config& cfg = outcome.config;
-
-    auto takeValue =
-        [&](std::string_view flag, std::size_t& index) -> std::expected<std::string_view, ConfigError> {
-        // Supports both `--flag=value` and `--flag value` shapes.
-        auto const arg = std::string_view { args[index] };
-        if (auto const eq = arg.find('='); eq != std::string_view::npos)
-            return arg.substr(eq + 1);
-        if (index + 1 >= args.size())
-            return std::unexpected(MakeError(
-                ConfigErrorCode::ParseError, std::string { flag }, "missing value"));
-        ++index;
-        return std::string_view { args[index] };
-    };
-
-    auto matchesFlag = [](std::string_view arg, std::string_view name) noexcept {
-        if (arg == name)
-            return true;
-        return arg.starts_with(std::string { name } + "=");
-    };
-
     for (std::size_t i = 0; i < args.size(); ++i)
     {
-        std::string_view const arg { args[i] };
-        if (arg == "--help" || arg == "-h")
+        auto const result = HandleOneArg(args, i, outcome.config);
+        if (!result.has_value())
+            return std::unexpected(result.error());
+        switch (*result)
         {
-            outcome.outcome = CliOutcome::ShowHelp;
-            return outcome;
+            case ArgOutcome::Continue:
+                continue;
+            case ArgOutcome::ShowHelp:
+                outcome.outcome = CliOutcome::ShowHelp;
+                return outcome;
+            case ArgOutcome::ShowVersion:
+                outcome.outcome = CliOutcome::ShowVersion;
+                return outcome;
+            case ArgOutcome::Unknown:
+                return std::unexpected(
+                    MakeError(ConfigErrorCode::UnknownKey, std::string { args[i] }, "unrecognised argument"));
         }
-        if (arg == "--version" || arg == "-V")
-        {
-            outcome.outcome = CliOutcome::ShowVersion;
-            return outcome;
-        }
-        if (matchesFlag(arg, "--config"))
-        {
-            auto const value = takeValue("--config", i);
-            if (!value.has_value())
-                return std::unexpected(value.error());
-            cfg.configPath = std::string { *value };
-            continue;
-        }
-        if (arg == "--daemon")
-        {
-            cfg.daemon = true;
-            continue;
-        }
-        if (matchesFlag(arg, "--pidfile"))
-        {
-            auto const value = takeValue("--pidfile", i);
-            if (!value.has_value())
-                return std::unexpected(value.error());
-            cfg.pidfile = std::string { *value };
-            continue;
-        }
-        if (matchesFlag(arg, "--service-name"))
-        {
-            auto const value = takeValue("--service-name", i);
-            if (!value.has_value())
-                return std::unexpected(value.error());
-            cfg.serviceName = std::string { *value };
-            continue;
-        }
-        if (matchesFlag(arg, "--bind"))
-        {
-            auto const value = takeValue("--bind", i);
-            if (!value.has_value())
-                return std::unexpected(value.error());
-            cfg.bindAddress = std::string { *value };
-            continue;
-        }
-        if (matchesFlag(arg, "--port"))
-        {
-            auto const value = takeValue("--port", i);
-            if (!value.has_value())
-                return std::unexpected(value.error());
-            auto const port = ParsePort(*value);
-            if (!port.has_value())
-                return std::unexpected(port.error());
-            cfg.port = *port;
-            continue;
-        }
-        if (matchesFlag(arg, "--max-memory"))
-        {
-            auto const value = takeValue("--max-memory", i);
-            if (!value.has_value())
-                return std::unexpected(value.error());
-            auto const mem = ParseMaxMemory(*value);
-            if (!mem.has_value())
-                return std::unexpected(mem.error());
-            cfg.maxMemoryBytes = *mem;
-            continue;
-        }
-        if (matchesFlag(arg, "--log-level"))
-        {
-            auto const value = takeValue("--log-level", i);
-            if (!value.has_value())
-                return std::unexpected(value.error());
-            auto const level = ParseLogLevel(*value);
-            if (!level.has_value())
-                return std::unexpected(level.error());
-            cfg.logLevel = *level;
-            continue;
-        }
-        return std::unexpected(
-            MakeError(ConfigErrorCode::UnknownKey, std::string { arg }, "unrecognised argument"));
     }
     return outcome;
 }

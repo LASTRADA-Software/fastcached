@@ -51,7 +51,10 @@ class ManualClock final: public IClock
   public:
     /// Construct with the given starting time.
     /// @param start Initial value returned by Now().
-    explicit ManualClock(TimePoint start = TimePoint {}) noexcept: _now { start } {}
+    explicit ManualClock(TimePoint start = TimePoint {}) noexcept:
+        _now { start }
+    {
+    }
 
     [[nodiscard]] TimePoint Now() const noexcept override
     {

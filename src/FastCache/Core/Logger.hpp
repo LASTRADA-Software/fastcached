@@ -2,6 +2,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <format>
 #include <mutex>
 #include <ostream>
@@ -14,7 +15,7 @@ namespace FastCache
 
 /// Severity level for log records. Numerically ordered low → high.
 /// Used both as a per-record tag and as a per-logger threshold filter.
-enum class LogLevel : unsigned
+enum class LogLevel : std::uint8_t
 {
     Trace = 0, ///< Per-byte / per-step traces. Very loud.
     Debug = 1, ///< Useful during development.
@@ -31,12 +32,18 @@ enum class LogLevel : unsigned
 {
     switch (level)
     {
-        case LogLevel::Trace: return "TRACE";
-        case LogLevel::Debug: return "DEBUG";
-        case LogLevel::Info:  return "INFO";
-        case LogLevel::Warn:  return "WARN";
-        case LogLevel::Error: return "ERROR";
-        case LogLevel::Fatal: return "FATAL";
+        case LogLevel::Trace:
+            return "TRACE";
+        case LogLevel::Debug:
+            return "DEBUG";
+        case LogLevel::Info:
+            return "INFO";
+        case LogLevel::Warn:
+            return "WARN";
+        case LogLevel::Error:
+            return "ERROR";
+        case LogLevel::Fatal:
+            return "FATAL";
     }
     return "?";
 }
@@ -93,7 +100,10 @@ class NullLogger final: public ILogger
 {
   public:
     void Log(LogLevel /*level*/, std::string_view /*message*/) override {}
-    [[nodiscard]] LogLevel MinLevel() const noexcept override { return LogLevel::Fatal; }
+    [[nodiscard]] LogLevel MinLevel() const noexcept override
+    {
+        return LogLevel::Fatal;
+    }
     void SetMinLevel(LogLevel /*level*/) noexcept override {}
 };
 

@@ -49,7 +49,9 @@ class TestReactor: public IReactor
     /// @return Number of pending timers.
     [[nodiscard]] std::size_t PendingTimers() const noexcept;
 
-  private:
+    /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
+    /// can name the type. The fields are not part of the public API
+    /// surface — treat as Detail.
     struct ScheduledEntry
     {
         TimePoint deadline;
@@ -57,6 +59,7 @@ class TestReactor: public IReactor
         std::coroutine_handle<> handle;
     };
 
+  private:
     void FireExpiredTimers();
 
     IClock& _clock;

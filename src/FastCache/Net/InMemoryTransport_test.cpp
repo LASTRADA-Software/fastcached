@@ -25,7 +25,7 @@ FastCache::Task<std::string> ReadAllAvailable(FastCache::ISocket& socket, std::s
         if (*result == 0)
             break;
         chunk.resize(*result);
-        for (auto const b : chunk)
+        for (auto const b: chunk)
             out.push_back(static_cast<char>(b));
     }
     co_return out;
@@ -80,11 +80,10 @@ TEST_CASE("InMemoryPipe respects the backpressure cap", "[net][inmemory]")
     REQUIRE(clientWroteOk);
 
     // Pipe is now full (4 buffered, cap=4). Next write should partial-fail.
-    auto const second = FastCache::SyncRun(
-        [](FastCache::ISocket& socket) -> FastCache::Task<bool> {
-            std::string_view const five = "EXTRA";
-            auto const result = co_await socket.Write(FastCache::AsBytes(five));
-            co_return !result.has_value();
-        }(*pair.client));
+    auto const second = FastCache::SyncRun([](FastCache::ISocket& socket) -> FastCache::Task<bool> {
+        std::string_view const five = "EXTRA";
+        auto const result = co_await socket.Write(FastCache::AsBytes(five));
+        co_return !result.has_value();
+    }(*pair.client));
     REQUIRE(second);
 }

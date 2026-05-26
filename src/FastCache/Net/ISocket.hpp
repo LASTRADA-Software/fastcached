@@ -27,13 +27,20 @@ class IoAwaitable
     /// Construct an awaitable in an already-completed state. Used when an
     /// implementation can satisfy the operation synchronously.
     /// @param result Eagerly-known result.
-    explicit IoAwaitable(IoResult result) noexcept: _result { result }, _ready { true } {}
+    explicit IoAwaitable(IoResult result) noexcept:
+        _result { result },
+        _ready { true }
+    {
+    }
 
     /// Construct an awaitable that will be completed asynchronously. The
     /// implementation arranges suspension in await_suspend.
     IoAwaitable() noexcept = default;
 
-    [[nodiscard]] bool await_ready() const noexcept { return _ready; }
+    [[nodiscard]] bool await_ready() const noexcept
+    {
+        return _ready;
+    }
 
     /// Suspend hook — backends override the parent ISocket method to wire
     /// the coroutine handle into their resume path. The default
@@ -46,7 +53,10 @@ class IoAwaitable
             _suspendCallback(this, handle);
     }
 
-    IoResult await_resume() noexcept { return _result; }
+    IoResult await_resume() noexcept
+    {
+        return _result;
+    }
 
     /// Called by the backend to publish the result and resume the suspended
     /// coroutine. Safe to call from any thread; the resume happens
@@ -71,7 +81,10 @@ class IoAwaitable
     }
 
     /// Backend-private state pointer (e.g., back-pointer to the socket).
-    [[nodiscard]] void* CallbackState() const noexcept { return _suspendCallbackState; }
+    [[nodiscard]] void* CallbackState() const noexcept
+    {
+        return _suspendCallbackState;
+    }
 
   private:
     IoResult _result { 0 };

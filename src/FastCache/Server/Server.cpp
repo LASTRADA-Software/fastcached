@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Server/Server.hpp>
-
 #include <FastCache/Server/Connection.hpp>
+#include <FastCache/Server/Server.hpp>
 
 #include <memory>
 #include <utility>
@@ -16,8 +15,7 @@ namespace
     /// ensures the Connection object is freed when the coroutine ends.
     /// Admission and metrics observers are passed by raw pointer (may be
     /// null) so Connection cleanup decrements the admission gate.
-    DetachedTask RunConnectionDetached(std::unique_ptr<Connection> connection,
-                                       IAdmissionControl* admission)
+    DetachedTask RunConnectionDetached(std::unique_ptr<Connection> connection, IAdmissionControl* admission)
     {
         co_await connection->Run();
         if (admission)
@@ -27,11 +25,8 @@ namespace
 
 } // namespace
 
-Server::Server(IListener& listener,
-               CacheEngine& engine,
-               ILogger& logger,
-               IAdmissionControl* admission,
-               IMetricsSink* metrics) noexcept:
+Server::Server(
+    IListener& listener, CacheEngine& engine, ILogger& logger, IAdmissionControl* admission, IMetricsSink* metrics) noexcept:
     _listener { listener },
     _engine { engine },
     _logger { logger },

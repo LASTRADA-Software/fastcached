@@ -59,7 +59,10 @@ class IocpReactor: public IReactor
     void Stop() noexcept override;
     void Submit(std::coroutine_handle<> handle) override;
     void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override;
-    [[nodiscard]] IClock& Clock() noexcept override { return _clock; }
+    [[nodiscard]] IClock& Clock() noexcept override
+    {
+        return _clock;
+    }
 
     /// Attach a SOCKET (or any HANDLE) to this reactor's IOCP. Required
     /// once per socket before any async I/O can complete on it.
@@ -70,9 +73,13 @@ class IocpReactor: public IReactor
 
     /// Native IOCP handle. Used by sockets/listener to validate they
     /// belong to the right reactor.
-    [[nodiscard]] void* NativeHandle() const noexcept { return _iocp; }
+    [[nodiscard]] void* NativeHandle() const noexcept
+    {
+        return _iocp;
+    }
 
-  private:
+    /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
+    /// can name the type. Treat as Detail.
     struct TimerEntry
     {
         TimePoint deadline;
@@ -80,6 +87,7 @@ class IocpReactor: public IReactor
         std::coroutine_handle<> handle;
     };
 
+  private:
     void FireExpiredTimers();
 
     IClock& _clock;

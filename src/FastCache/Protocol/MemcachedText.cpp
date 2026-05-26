@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Protocol/MemcachedText.hpp>
-
-#include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
+#include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
+#include <FastCache/Protocol/MemcachedText.hpp>
 
 #include <algorithm>
 #include <charconv>
@@ -156,19 +155,16 @@ namespace
             out.append(std::to_string(entry.cas));
         }
         out.append(Crlf);
-        for (auto const b : entry.value)
+        for (auto const b: entry.value)
             out.push_back(static_cast<char>(b));
         out.append(Crlf);
     }
 
-    Task<bool> HandleGet(ISocket& socket,
-                         CacheEngine& engine,
-                         std::span<std::string_view const> keys,
-                         bool includeCas)
+    Task<bool> HandleGet(ISocket& socket, CacheEngine& engine, std::span<std::string_view const> keys, bool includeCas)
     {
         std::string response;
         response.reserve(64 * keys.size());
-        for (auto const key : keys)
+        for (auto const key: keys)
         {
             auto const result = engine.Get(key);
             if (!result.has_value() || !result->found)
@@ -212,11 +208,7 @@ namespace
         else if (commandName == "prepend")
             result = engine.Prepend(parsed.key, std::span<std::byte const> { payload->data(), payload->size() });
         else if (commandName == "cas")
-            result = engine.CompareAndSwap(parsed.key,
-                                           parsed.cas,
-                                           std::move(*payload),
-                                           parsed.flags,
-                                           parsed.exptime);
+            result = engine.CompareAndSwap(parsed.key, parsed.cas, std::move(*payload), parsed.flags, parsed.exptime);
         else
             co_return co_await WriteError(socket, "ERROR");
 
@@ -255,10 +247,7 @@ namespace
         co_return co_await WriteLine(socket, "NOT_FOUND");
     }
 
-    Task<bool> HandleIncrDecr(ISocket& socket,
-                              CacheEngine& engine,
-                              std::span<std::string_view const> args,
-                              bool isIncr)
+    Task<bool> HandleIncrDecr(ISocket& socket, CacheEngine& engine, std::span<std::string_view const> args, bool isIncr)
     {
         if (args.size() < 2)
             co_return co_await WriteError(socket, "CLIENT_ERROR", "missing args");
@@ -278,8 +267,7 @@ namespace
             case StorageErrorCode::KeyNotFound:
                 co_return co_await WriteLine(socket, "NOT_FOUND");
             case StorageErrorCode::InvalidArgument:
-                co_return co_await WriteError(
-                    socket, "CLIENT_ERROR", "cannot increment or decrement non-numeric value");
+                co_return co_await WriteError(socket, "CLIENT_ERROR", "cannot increment or decrement non-numeric value");
             default:
                 co_return co_await WriteError(socket, "SERVER_ERROR", "storage failure");
         }
@@ -289,7 +277,7 @@ namespace
     {
         std::uint32_t delay = 0;
         bool noreply = false;
-        for (auto const& token : args)
+        for (auto const& token: args)
         {
             if (IsNoReply(token))
                 noreply = true;
@@ -367,8 +355,8 @@ Task<void> MemcachedTextHandler::Run(ISocket& socket, CacheEngine& engine, std::
             ok = co_await HandleGet(socket, engine, tail, /*includeCas*/ false);
         else if (command == "gets")
             ok = co_await HandleGet(socket, engine, tail, /*includeCas*/ true);
-        else if (command == "set" || command == "add" || command == "replace" || command == "append"
-                 || command == "prepend" || command == "cas")
+        else if (command == "set" || command == "add" || command == "replace" || command == "append" || command == "prepend"
+                 || command == "cas")
             ok = co_await HandleStorage(socket, engine, reader, command, tail);
         else if (command == "delete")
             ok = co_await HandleDelete(socket, engine, tail);

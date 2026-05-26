@@ -68,14 +68,22 @@ void InstallStopHandlers()
 FastCache::Config Merge(FastCache::Config fileCfg, FastCache::Config const& cliCfg)
 {
     FastCache::Config defaults;
-    if (cliCfg.bindAddress != defaults.bindAddress) fileCfg.bindAddress = cliCfg.bindAddress;
-    if (cliCfg.port != defaults.port) fileCfg.port = cliCfg.port;
-    if (cliCfg.maxMemoryBytes != defaults.maxMemoryBytes) fileCfg.maxMemoryBytes = cliCfg.maxMemoryBytes;
-    if (cliCfg.logLevel != defaults.logLevel) fileCfg.logLevel = cliCfg.logLevel;
-    if (!cliCfg.configPath.empty()) fileCfg.configPath = cliCfg.configPath;
-    if (cliCfg.daemon) fileCfg.daemon = true;
-    if (!cliCfg.pidfile.empty()) fileCfg.pidfile = cliCfg.pidfile;
-    if (cliCfg.serviceName != defaults.serviceName) fileCfg.serviceName = cliCfg.serviceName;
+    if (cliCfg.bindAddress != defaults.bindAddress)
+        fileCfg.bindAddress = cliCfg.bindAddress;
+    if (cliCfg.port != defaults.port)
+        fileCfg.port = cliCfg.port;
+    if (cliCfg.maxMemoryBytes != defaults.maxMemoryBytes)
+        fileCfg.maxMemoryBytes = cliCfg.maxMemoryBytes;
+    if (cliCfg.logLevel != defaults.logLevel)
+        fileCfg.logLevel = cliCfg.logLevel;
+    if (!cliCfg.configPath.empty())
+        fileCfg.configPath = cliCfg.configPath;
+    if (cliCfg.daemon)
+        fileCfg.daemon = true;
+    if (!cliCfg.pidfile.empty())
+        fileCfg.pidfile = cliCfg.pidfile;
+    if (cliCfg.serviceName != defaults.serviceName)
+        fileCfg.serviceName = cliCfg.serviceName;
     return fileCfg;
 }
 
@@ -101,8 +109,7 @@ int DaemonBody(FastCache::Config const& effective)
                 effective.bindAddress,
                 effective.port,
                 effective.maxMemoryBytes,
-                effective.configPath.empty() ? std::string_view { "<none>" }
-                                             : std::string_view { effective.configPath });
+                effective.configPath.empty() ? std::string_view { "<none>" } : std::string_view { effective.configPath });
 
     InstallStopHandlers();
     logger.Log(FastCache::LogLevel::Info, "ready, accepting connections");
@@ -117,9 +124,7 @@ int DaemonBody(FastCache::Config const& effective)
                 continue;
             auto const result = reloader.Reload();
             if (!result.has_value())
-                logger.Logf(FastCache::LogLevel::Error,
-                            "config reload failed: {}",
-                            result.error().ToString());
+                logger.Logf(FastCache::LogLevel::Error, "config reload failed: {}", result.error().ToString());
             else
                 logger.Log(FastCache::LogLevel::Info, "config reloaded");
         }

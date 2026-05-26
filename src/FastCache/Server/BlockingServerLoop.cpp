@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Server/BlockingServerLoop.hpp>
-
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Net/IListener.hpp>
+#include <FastCache/Server/BlockingServerLoop.hpp>
 #include <FastCache/Server/Connection.hpp>
 
 #include <atomic>
@@ -25,10 +24,7 @@ namespace
 
 } // namespace
 
-std::uint64_t RunBlockingServerLoop(IListener& listener,
-                                    CacheEngine& engine,
-                                    ILogger& logger,
-                                    std::atomic<bool>& shouldStop)
+std::uint64_t RunBlockingServerLoop(IListener& listener, CacheEngine& engine, ILogger& logger, std::atomic<bool>& shouldStop)
 {
     std::uint64_t accepted = 0;
     while (!shouldStop.load(std::memory_order_acquire))
@@ -36,9 +32,7 @@ std::uint64_t RunBlockingServerLoop(IListener& listener,
         auto result = SyncRun(AcceptOne(listener));
         if (!result.has_value())
         {
-            logger.Logf(LogLevel::Debug,
-                        "BlockingServerLoop: accept ended ({})",
-                        result.error().ToString());
+            logger.Logf(LogLevel::Debug, "BlockingServerLoop: accept ended ({})", result.error().ToString());
             break;
         }
 
@@ -57,7 +51,8 @@ std::uint64_t RunBlockingServerLoop(IListener& listener,
                     // bring the server down.
                 }
             },
-        }.detach();
+        }
+            .detach();
     }
     return accepted;
 }

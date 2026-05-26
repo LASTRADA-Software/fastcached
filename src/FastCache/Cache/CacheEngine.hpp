@@ -44,24 +44,26 @@ class CacheEngine
 
     [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key);
 
-    [[nodiscard]] std::expected<CasToken, StorageError>
-    Set(std::string_view key, std::vector<std::byte> value, std::uint32_t flags, std::uint32_t exptime);
+    [[nodiscard]] std::expected<CasToken, StorageError> Set(std::string_view key,
+                                                            std::vector<std::byte> value,
+                                                            std::uint32_t flags,
+                                                            std::uint32_t exptime);
 
-    [[nodiscard]] std::expected<CasToken, StorageError>
-    Add(std::string_view key, std::vector<std::byte> value, std::uint32_t flags, std::uint32_t exptime);
+    [[nodiscard]] std::expected<CasToken, StorageError> Add(std::string_view key,
+                                                            std::vector<std::byte> value,
+                                                            std::uint32_t flags,
+                                                            std::uint32_t exptime);
 
-    [[nodiscard]] std::expected<CasToken, StorageError>
-    Replace(std::string_view key, std::vector<std::byte> value, std::uint32_t flags, std::uint32_t exptime);
+    [[nodiscard]] std::expected<CasToken, StorageError> Replace(std::string_view key,
+                                                                std::vector<std::byte> value,
+                                                                std::uint32_t flags,
+                                                                std::uint32_t exptime);
 
     [[nodiscard]] std::expected<CasToken, StorageError> Append(std::string_view key, std::span<std::byte const> suffix);
     [[nodiscard]] std::expected<CasToken, StorageError> Prepend(std::string_view key, std::span<std::byte const> prefix);
 
-    [[nodiscard]] std::expected<CasToken, StorageError>
-    CompareAndSwap(std::string_view key,
-                   CasToken expected,
-                   std::vector<std::byte> value,
-                   std::uint32_t flags,
-                   std::uint32_t exptime);
+    [[nodiscard]] std::expected<CasToken, StorageError> CompareAndSwap(
+        std::string_view key, CasToken expected, std::vector<std::byte> value, std::uint32_t flags, std::uint32_t exptime);
 
     [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> Increment(std::string_view key, std::uint64_t delta);
     [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> Decrement(std::string_view key, std::uint64_t delta);
@@ -71,9 +73,15 @@ class CacheEngine
     /// Flush all entries; `delaySeconds == 0` is immediate.
     void FlushAll(std::uint32_t delaySeconds);
 
-    [[nodiscard]] StorageStats Snapshot() const noexcept { return _storage.Snapshot(); }
+    [[nodiscard]] StorageStats Snapshot() const noexcept
+    {
+        return _storage.Snapshot();
+    }
 
-    [[nodiscard]] IClock& Clock() noexcept { return _clock; }
+    [[nodiscard]] IClock& Clock() noexcept
+    {
+        return _clock;
+    }
 
   private:
     IStorage& _storage;

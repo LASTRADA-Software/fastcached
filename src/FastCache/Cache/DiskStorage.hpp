@@ -79,17 +79,11 @@ class DiskStorage final: public IStorage
                                                             std::uint32_t flags,
                                                             TimePoint expiry) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Add(std::string_view key,
-                                                            std::vector<std::byte> value,
-                                                            std::uint32_t flags,
-                                                            TimePoint expiry,
-                                                            TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Add(
+        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Replace(std::string_view key,
-                                                                std::vector<std::byte> value,
-                                                                std::uint32_t flags,
-                                                                TimePoint expiry,
-                                                                TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Replace(
+        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Append(std::string_view key,
                                                                std::span<std::byte const> suffix,
@@ -106,8 +100,9 @@ class DiskStorage final: public IStorage
                                                                        TimePoint expiry,
                                                                        TimePoint now) override;
 
-    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError>
-    IncrementOrInitialize(std::string_view key, std::int64_t delta, TimePoint now) override;
+    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(std::string_view key,
+                                                                                          std::int64_t delta,
+                                                                                          TimePoint now) override;
 
     [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key, TimePoint now) override;
 
@@ -126,10 +121,16 @@ class DiskStorage final: public IStorage
     void Resize(std::size_t newMaxBytes);
 
     /// @return Current durability mode.
-    [[nodiscard]] Durability DurabilityMode() const noexcept { return _options.durability; }
+    [[nodiscard]] Durability DurabilityMode() const noexcept
+    {
+        return _options.durability;
+    }
 
     /// Change durability at runtime (for SIGHUP reload).
-    void SetDurability(Durability mode) noexcept { _options.durability = mode; }
+    void SetDurability(Durability mode) noexcept
+    {
+        _options.durability = mode;
+    }
 
   private:
     /// On-disk record kinds.
@@ -170,8 +171,9 @@ class DiskStorage final: public IStorage
 
     /// Append a record to the open log file. Optionally syncs based on
     /// durability mode.
-    [[nodiscard]] std::expected<void, StorageError>
-    AppendRecord(RecordType type, std::string_view key, CacheEntry const& entry);
+    [[nodiscard]] std::expected<void, StorageError> AppendRecord(RecordType type,
+                                                                 std::string_view key,
+                                                                 CacheEntry const& entry);
 
     /// Append a tombstone for `key`.
     [[nodiscard]] std::expected<void, StorageError> AppendDelete(std::string_view key);

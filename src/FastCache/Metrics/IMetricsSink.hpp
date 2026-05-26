@@ -24,7 +24,7 @@ class IMetricsSink
     IMetricsSink& operator=(IMetricsSink&&) = delete;
     virtual ~IMetricsSink() = default;
 
-    enum class Counter : unsigned
+    enum class Counter : std::uint8_t
     {
         CmdGet = 0,
         CmdSet,
@@ -78,17 +78,28 @@ class AtomicMetricsSink final: public IMetricsSink
 {
     switch (counter)
     {
-        case IMetricsSink::Counter::CmdGet:                       return "cmd_get";
-        case IMetricsSink::Counter::CmdSet:                       return "cmd_set";
-        case IMetricsSink::Counter::CmdDelete:                    return "cmd_delete";
-        case IMetricsSink::Counter::GetHits:                      return "get_hits";
-        case IMetricsSink::Counter::GetMisses:                    return "get_misses";
-        case IMetricsSink::Counter::Evictions:                    return "evictions";
-        case IMetricsSink::Counter::ConnectionsTotal:             return "connections_total";
-        case IMetricsSink::Counter::ConnectionsAdmissionRejected: return "connections_rejected";
-        case IMetricsSink::Counter::BytesIn:                      return "bytes_in";
-        case IMetricsSink::Counter::BytesOut:                     return "bytes_out";
-        case IMetricsSink::Counter::Last:                         return "<last>";
+        case IMetricsSink::Counter::CmdGet:
+            return "cmd_get";
+        case IMetricsSink::Counter::CmdSet:
+            return "cmd_set";
+        case IMetricsSink::Counter::CmdDelete:
+            return "cmd_delete";
+        case IMetricsSink::Counter::GetHits:
+            return "get_hits";
+        case IMetricsSink::Counter::GetMisses:
+            return "get_misses";
+        case IMetricsSink::Counter::Evictions:
+            return "evictions";
+        case IMetricsSink::Counter::ConnectionsTotal:
+            return "connections_total";
+        case IMetricsSink::Counter::ConnectionsAdmissionRejected:
+            return "connections_rejected";
+        case IMetricsSink::Counter::BytesIn:
+            return "bytes_in";
+        case IMetricsSink::Counter::BytesOut:
+            return "bytes_out";
+        case IMetricsSink::Counter::Last:
+            return "<last>";
     }
     return "<unknown>";
 }

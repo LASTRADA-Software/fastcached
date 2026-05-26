@@ -36,7 +36,7 @@ namespace
 void Crc32c::Update(std::uint32_t& state, std::span<std::byte const> bytes) noexcept
 {
     auto crc = state;
-    for (auto const b : bytes)
+    for (auto const b: bytes)
         crc = (crc >> 8) ^ Table[(crc ^ std::to_integer<std::uint8_t>(b)) & 0xFFU];
     state = crc;
 }

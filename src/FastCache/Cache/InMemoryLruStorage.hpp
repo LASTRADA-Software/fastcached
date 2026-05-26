@@ -44,17 +44,11 @@ class InMemoryLruStorage final: public IStorage
                                                             std::uint32_t flags,
                                                             TimePoint expiry) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Add(std::string_view key,
-                                                            std::vector<std::byte> value,
-                                                            std::uint32_t flags,
-                                                            TimePoint expiry,
-                                                            TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Add(
+        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Replace(std::string_view key,
-                                                                std::vector<std::byte> value,
-                                                                std::uint32_t flags,
-                                                                TimePoint expiry,
-                                                                TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Replace(
+        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Append(std::string_view key,
                                                                std::span<std::byte const> suffix,
@@ -71,8 +65,9 @@ class InMemoryLruStorage final: public IStorage
                                                                        TimePoint expiry,
                                                                        TimePoint now) override;
 
-    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError>
-    IncrementOrInitialize(std::string_view key, std::int64_t delta, TimePoint now) override;
+    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(std::string_view key,
+                                                                                          std::int64_t delta,
+                                                                                          TimePoint now) override;
 
     [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key, TimePoint now) override;
 
@@ -106,10 +101,7 @@ class InMemoryLruStorage final: public IStorage
     /// Mutate the existing entry in-place; updates byte accounting and
     /// promotes the entry to the front of the LRU. Bumps CAS.
     /// @return New CAS token.
-    CasToken MutateExisting(Iterator it,
-                            std::vector<std::byte> value,
-                            std::uint32_t flags,
-                            TimePoint expiry);
+    CasToken MutateExisting(Iterator it, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry);
 
     /// Evict from the LRU tail until bytesUsed <= maxBytes.
     void EvictToFit();

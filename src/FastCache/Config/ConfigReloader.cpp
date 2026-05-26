@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/ConfigReloader.hpp>
-
 #include <FastCache/Config/YamlReader.hpp>
 
 #include <expected>
@@ -34,7 +33,11 @@ std::expected<void, ConfigError> ConfigReloader::Reload()
 {
     if (_configPath.empty())
         return std::unexpected(ConfigError {
-            .code = ConfigErrorCode::FileNotFound, .source = {}, .line = 0, .field = {}, .context = "no config path",
+            .code = ConfigErrorCode::FileNotFound,
+            .source = {},
+            .line = 0,
+            .field = {},
+            .context = "no config path",
         });
 
     auto reloaded = ReadYamlConfig(_configPath);
@@ -57,13 +60,12 @@ std::expected<void, ConfigError> ConfigReloader::Reload()
         observers = _subscribers;
     }
 
-    for (auto const& obs : observers)
+    for (auto const& obs: observers)
         obs(previous, next);
     return {};
 }
 
-std::expected<void, ConfigError>
-ConfigReloader::ValidateImmutable(Config const& previous, Config const& candidate)
+std::expected<void, ConfigError> ConfigReloader::ValidateImmutable(Config const& previous, Config const& candidate)
 {
     if (previous.bindAddress != candidate.bindAddress)
         return std::unexpected(ConfigError {

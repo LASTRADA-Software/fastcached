@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Protocol/ProtocolAutodetect.hpp>
-
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Errors/NetError.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Protocol/ProtocolAutodetect.hpp>
 
 #include <cstddef>
 #include <expected>
@@ -28,8 +27,10 @@ namespace
             case '+':
             case '-':
             case ':':
-            case '$': return ProtocolFlavor::RedisResp;
-            default:  return ProtocolFlavor::MemcachedText;
+            case '$':
+                return ProtocolFlavor::RedisResp;
+            default:
+                return ProtocolFlavor::MemcachedText;
         }
     }
 
@@ -43,7 +44,7 @@ Task<std::expected<AutodetectResult, NetError>> DetectProtocol(ISocket& socket)
         co_return std::unexpected(result.error());
 
     if (*result == 0)
-        co_return std::unexpected(NetError { .code = NetErrorCode::Eof });
+        co_return std::unexpected(NetError { .code = NetErrorCode::Eof, .systemCode = 0, .context = {} });
 
     AutodetectResult outcome;
     outcome.flavor = ClassifyFirstByte(peekBuffer[0]);

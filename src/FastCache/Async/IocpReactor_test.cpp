@@ -19,8 +19,14 @@ namespace
 struct YieldAwaitable
 {
     FastCache::IReactor& reactor;
-    [[nodiscard]] bool await_ready() const noexcept { return false; }
-    void await_suspend(std::coroutine_handle<> handle) const { reactor.Submit(handle); }
+    [[nodiscard]] bool await_ready() const noexcept
+    {
+        return false;
+    }
+    void await_suspend(std::coroutine_handle<> handle) const
+    {
+        reactor.Submit(handle);
+    }
     void await_resume() const noexcept {}
 };
 
@@ -29,8 +35,14 @@ struct SleepUntil
 {
     FastCache::IReactor& reactor;
     FastCache::TimePoint deadline;
-    [[nodiscard]] bool await_ready() const noexcept { return reactor.Clock().Now() >= deadline; }
-    void await_suspend(std::coroutine_handle<> handle) const { reactor.Schedule(deadline, handle); }
+    [[nodiscard]] bool await_ready() const noexcept
+    {
+        return reactor.Clock().Now() >= deadline;
+    }
+    void await_suspend(std::coroutine_handle<> handle) const
+    {
+        reactor.Schedule(deadline, handle);
+    }
     void await_resume() const noexcept {}
 };
 

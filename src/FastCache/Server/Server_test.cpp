@@ -24,8 +24,7 @@ FastCache::Task<std::string> ReadResponse(FastCache::ISocket& socket)
     while (true)
     {
         std::vector<std::byte> chunk(256);
-        auto const result =
-            co_await socket.Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const result = co_await socket.Read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!result.has_value() || *result == 0)
             break;
         for (std::size_t i = 0; i < *result; ++i)
@@ -93,7 +92,10 @@ namespace
 class AlwaysDenyAdmission final: public FastCache::IAdmissionControl
 {
   public:
-    [[nodiscard]] bool AllowAccept() noexcept override { return false; }
+    [[nodiscard]] bool AllowAccept() noexcept override
+    {
+        return false;
+    }
     void OnConnectionStarted() noexcept override {}
     void OnConnectionEnded() noexcept override {}
 };

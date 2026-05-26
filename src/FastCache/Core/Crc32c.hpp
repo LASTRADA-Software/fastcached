@@ -27,7 +27,10 @@ class Crc32c
     static void Update(std::uint32_t& state, std::span<std::byte const> bytes) noexcept;
 
     /// Finalise the streaming state into a usable CRC value.
-    [[nodiscard]] static std::uint32_t Finalise(std::uint32_t state) noexcept { return state ^ 0xFFFF'FFFFU; }
+    [[nodiscard]] static std::uint32_t Finalise(std::uint32_t state) noexcept
+    {
+        return state ^ 0xFFFF'FFFFU;
+    }
 };
 
 } // namespace FastCache

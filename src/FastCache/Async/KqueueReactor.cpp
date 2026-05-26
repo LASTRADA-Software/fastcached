@@ -3,6 +3,9 @@
 
 #if defined(__APPLE__)
 
+    #include <sys/event.h>
+    #include <sys/types.h>
+
     #include <algorithm>
     #include <chrono>
     #include <cstdint>
@@ -11,8 +14,6 @@
 
     #include <errno.h>
     #include <fcntl.h>
-    #include <sys/event.h>
-    #include <sys/types.h>
     #include <unistd.h>
 
 namespace FastCache
@@ -21,8 +22,7 @@ namespace FastCache
 namespace
 {
 
-    constexpr auto EntryGreater = [](KqueueReactor::TimerEntry const& a,
-                                     KqueueReactor::TimerEntry const& b) noexcept {
+    constexpr auto EntryGreater = [](KqueueReactor::TimerEntry const& a, KqueueReactor::TimerEntry const& b) noexcept {
         if (a.deadline != b.deadline)
             return a.deadline > b.deadline;
         return a.sequence > b.sequence;
@@ -32,8 +32,7 @@ namespace
     {
         if (nextDeadline <= now)
             return timespec { 0, 0 };
-        auto const nanos =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(nextDeadline - now).count();
+        auto const nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(nextDeadline - now).count();
         if (nanos < 0)
             return timespec { 0, 0 };
         constexpr std::int64_t NanosPerSecond = 1'000'000'000LL;
@@ -45,13 +44,14 @@ namespace
 
 } // namespace
 
-KqueueReactor::KqueueReactor(IClock& clock): _clock { clock }
+KqueueReactor::KqueueReactor(IClock& clock):
+    _clock { clock }
 {
     _kq = ::kqueue();
     if (::pipe(_wakePipe) == 0)
     {
         // Make both ends non-blocking + CLOEXEC.
-        for (auto fd : _wakePipe)
+        for (auto fd: _wakePipe)
         {
             auto const flags = ::fcntl(fd, F_GETFL, 0);
             if (flags >= 0)
@@ -126,7 +126,7 @@ void KqueueReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
         return;
     {
         std::lock_guard const lock { _timerMutex };
-        _timers.push_back(TimerEntry { deadline, _nextSequence++, handle });
+        _timers.push_back(TimerEntry { .deadline = deadline, .sequence = _nextSequence++, .handle = handle });
         std::ranges::push_heap(_timers, EntryGreater);
     }
     char one = 1;
@@ -153,7 +153,7 @@ void KqueueReactor::FireExpiredTimers()
             _timers.pop_back();
         }
     }
-    for (auto handle : due)
+    for (auto handle: due)
         if (handle && !handle.done())
             handle.resume();
 }

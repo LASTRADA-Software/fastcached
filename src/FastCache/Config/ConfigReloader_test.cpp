@@ -71,10 +71,9 @@ TEST_CASE("ConfigReloader::Reload rejects changes to immutable fields", "[config
                                 "bind: 127.0.0.1\n"
                                 "port: 11700\n"
                                 "max_memory: 1024\n");
-    FastCache::Config initial { .bindAddress = "127.0.0.1",
-                                .port = 11700,
-                                .maxMemoryBytes = 1024,
-                                .configPath = path.string() };
+    FastCache::Config initial {
+        .bindAddress = "127.0.0.1", .port = 11700, .maxMemoryBytes = 1024, .configPath = path.string()
+    };
     FastCache::ConfigReloader reloader { initial, path };
 
     // Try to change the port — should be rejected.

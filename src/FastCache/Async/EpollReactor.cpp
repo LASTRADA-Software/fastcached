@@ -3,14 +3,15 @@
 
 #if defined(__linux__)
 
+    #include <sys/epoll.h>
+    #include <sys/eventfd.h>
+
     #include <algorithm>
     #include <chrono>
     #include <cstdint>
     #include <ranges>
 
     #include <errno.h>
-    #include <sys/epoll.h>
-    #include <sys/eventfd.h>
     #include <unistd.h>
 
 namespace FastCache
@@ -20,8 +21,7 @@ namespace
 {
 
     /// Min-heap comparator: earlier deadline wins, FIFO on ties.
-    constexpr auto EntryGreater = [](EpollReactor::TimerEntry const& a,
-                                     EpollReactor::TimerEntry const& b) noexcept {
+    constexpr auto EntryGreater = [](EpollReactor::TimerEntry const& a, EpollReactor::TimerEntry const& b) noexcept {
         if (a.deadline != b.deadline)
             return a.deadline > b.deadline;
         return a.sequence > b.sequence;
@@ -33,8 +33,7 @@ namespace
             return -1; // infinite
         if (nextDeadline <= now)
             return 0;
-        auto const millis =
-            std::chrono::duration_cast<std::chrono::milliseconds>(nextDeadline - now).count();
+        auto const millis = std::chrono::duration_cast<std::chrono::milliseconds>(nextDeadline - now).count();
         if (millis < 0)
             return 0;
         if (millis > std::numeric_limits<int>::max())
@@ -44,7 +43,8 @@ namespace
 
 } // namespace
 
-EpollReactor::EpollReactor(IClock& clock): _clock { clock }
+EpollReactor::EpollReactor(IClock& clock):
+    _clock { clock }
 {
     _epollFd = ::epoll_create1(EPOLL_CLOEXEC);
     _wakeFd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -115,7 +115,7 @@ void EpollReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
         return;
     {
         std::lock_guard const lock { _timerMutex };
-        _timers.push_back(TimerEntry { deadline, _nextSequence++, handle });
+        _timers.push_back(TimerEntry { .deadline = deadline, .sequence = _nextSequence++, .handle = handle });
         std::ranges::push_heap(_timers, EntryGreater);
     }
     std::uint64_t one = 1;
@@ -142,7 +142,7 @@ void EpollReactor::FireExpiredTimers()
             _timers.pop_back();
         }
     }
-    for (auto handle : due)
+    for (auto handle: due)
         if (handle && !handle.done())
             handle.resume();
 }

@@ -29,9 +29,15 @@ class EpollSocket final: public ISocket
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
     void Close() noexcept override;
-    [[nodiscard]] bool IsClosed() const noexcept override { return _closed; }
+    [[nodiscard]] bool IsClosed() const noexcept override
+    {
+        return _closed;
+    }
 
-    [[nodiscard]] int Native() const noexcept { return _fd; }
+    [[nodiscard]] int Native() const noexcept
+    {
+        return _fd;
+    }
 
     /// Implementation detail; public so the .cpp dispatch bridge can reach it.
     struct Impl;
@@ -48,8 +54,10 @@ class EpollSocket final: public ISocket
 class EpollListener final: public IListener
 {
   public:
-    [[nodiscard]] static std::unique_ptr<EpollListener>
-    Bind(EpollReactor& reactor, std::string_view bindAddress, std::uint16_t port, int backlog = 64);
+    [[nodiscard]] static std::unique_ptr<EpollListener> Bind(EpollReactor& reactor,
+                                                             std::string_view bindAddress,
+                                                             std::uint16_t port,
+                                                             int backlog = 64);
 
     ~EpollListener() override;
 

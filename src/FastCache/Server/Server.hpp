@@ -42,7 +42,10 @@ class Server
     void Shutdown() noexcept;
 
     /// @return Number of connections accepted since construction.
-    [[nodiscard]] std::uint64_t AcceptedCount() const noexcept { return _accepted.load(std::memory_order_relaxed); }
+    [[nodiscard]] std::uint64_t AcceptedCount() const noexcept
+    {
+        return _accepted.load(std::memory_order_relaxed);
+    }
 
   private:
     IListener& _listener;

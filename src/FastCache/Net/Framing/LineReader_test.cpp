@@ -17,11 +17,10 @@ namespace
 void PushAndClose(FastCache::ISocket& socket, std::string_view data)
 {
     auto const bytes = FastCache::AsBytes(data);
-    auto const result = FastCache::SyncRun(
-        [](FastCache::ISocket& s, std::span<std::byte const> b) -> FastCache::Task<bool> {
-            auto const r = co_await s.Write(b);
-            co_return r.has_value();
-        }(socket, bytes));
+    auto const result = FastCache::SyncRun([](FastCache::ISocket& s, std::span<std::byte const> b) -> FastCache::Task<bool> {
+        auto const r = co_await s.Write(b);
+        co_return r.has_value();
+    }(socket, bytes));
     REQUIRE(result);
     socket.Close();
 }

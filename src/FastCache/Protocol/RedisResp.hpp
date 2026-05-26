@@ -27,8 +27,7 @@ class RedisRespHandler final: public IProtocolHandler
     /// Returned by INFO; mirrors the memcached `version` semantics.
     [[nodiscard]] static std::string_view ServerVersion() noexcept;
 
-    [[nodiscard]] Task<void>
-    Run(ISocket& socket, CacheEngine& engine, std::vector<std::byte> primingBytes) override;
+    [[nodiscard]] Task<void> Run(ISocket& socket, CacheEngine& engine, std::vector<std::byte> primingBytes) override;
 };
 
 } // namespace FastCache

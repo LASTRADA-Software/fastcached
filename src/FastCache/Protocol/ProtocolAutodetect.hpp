@@ -7,6 +7,7 @@
 #include <FastCache/Net/ISocket.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <span>
 #include <vector>
@@ -15,12 +16,12 @@ namespace FastCache
 {
 
 /// Identifier for the protocol that should drive a connection.
-enum class ProtocolFlavor : unsigned
+enum class ProtocolFlavor : std::uint8_t
 {
     Unknown = 0,
     MemcachedText,
     MemcachedBinary, ///< Not yet implemented; recognised but currently treated like MemcachedText.
-    RedisResp,        ///< Not yet implemented; recognised but currently treated like MemcachedText.
+    RedisResp,       ///< Not yet implemented; recognised but currently treated like MemcachedText.
 };
 
 /// Outcome of peeking the start of a stream: which protocol to dispatch to

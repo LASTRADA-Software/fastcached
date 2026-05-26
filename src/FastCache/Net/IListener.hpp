@@ -20,10 +20,17 @@ using AcceptResult = std::expected<std::unique_ptr<ISocket>, NetError>;
 class AcceptAwaitable
 {
   public:
-    explicit AcceptAwaitable(AcceptResult result) noexcept: _result { std::move(result) }, _ready { true } {}
+    explicit AcceptAwaitable(AcceptResult result) noexcept:
+        _result { std::move(result) },
+        _ready { true }
+    {
+    }
     AcceptAwaitable() noexcept = default;
 
-    [[nodiscard]] bool await_ready() const noexcept { return _ready; }
+    [[nodiscard]] bool await_ready() const noexcept
+    {
+        return _ready;
+    }
 
     void await_suspend(std::coroutine_handle<> handle) noexcept
     {
@@ -32,7 +39,10 @@ class AcceptAwaitable
             _suspendCallback(this, handle);
     }
 
-    AcceptResult await_resume() noexcept { return std::move(_result); }
+    AcceptResult await_resume() noexcept
+    {
+        return std::move(_result);
+    }
 
     void Complete(AcceptResult result) noexcept
     {
@@ -49,7 +59,10 @@ class AcceptAwaitable
         _suspendCallbackState = state;
     }
 
-    [[nodiscard]] void* CallbackState() const noexcept { return _suspendCallbackState; }
+    [[nodiscard]] void* CallbackState() const noexcept
+    {
+        return _suspendCallbackState;
+    }
 
   private:
     AcceptResult _result { std::unexpected(NetError {}) };

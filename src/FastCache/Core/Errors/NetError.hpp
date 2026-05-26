@@ -10,7 +10,7 @@ namespace FastCache
 
 /// Categories of network-layer errors surfaced through std::expected.
 /// Kept intentionally small — protocol-level failures use ProtocolError.
-enum class NetErrorCode : unsigned
+enum class NetErrorCode : std::uint8_t
 {
     Ok = 0,           ///< Sentinel — not used as an error, but useful for converting from int returns.
     Eof,              ///< Peer closed the connection cleanly.
@@ -53,19 +53,32 @@ struct NetError
 {
     switch (code)
     {
-        case NetErrorCode::Ok:               return "Ok";
-        case NetErrorCode::Eof:              return "Eof";
-        case NetErrorCode::Cancelled:        return "Cancelled";
-        case NetErrorCode::Timeout:          return "Timeout";
-        case NetErrorCode::WouldBlock:       return "WouldBlock";
-        case NetErrorCode::BadFileHandle:    return "BadFileHandle";
-        case NetErrorCode::AddressInUse:     return "AddressInUse";
-        case NetErrorCode::AddressNotAvail:  return "AddressNotAvail";
-        case NetErrorCode::ConnRefused:      return "ConnRefused";
-        case NetErrorCode::ConnReset:        return "ConnReset";
-        case NetErrorCode::HostUnreach:      return "HostUnreach";
-        case NetErrorCode::PermissionDenied: return "PermissionDenied";
-        case NetErrorCode::SystemError:      return "SystemError";
+        case NetErrorCode::Ok:
+            return "Ok";
+        case NetErrorCode::Eof:
+            return "Eof";
+        case NetErrorCode::Cancelled:
+            return "Cancelled";
+        case NetErrorCode::Timeout:
+            return "Timeout";
+        case NetErrorCode::WouldBlock:
+            return "WouldBlock";
+        case NetErrorCode::BadFileHandle:
+            return "BadFileHandle";
+        case NetErrorCode::AddressInUse:
+            return "AddressInUse";
+        case NetErrorCode::AddressNotAvail:
+            return "AddressNotAvail";
+        case NetErrorCode::ConnRefused:
+            return "ConnRefused";
+        case NetErrorCode::ConnReset:
+            return "ConnReset";
+        case NetErrorCode::HostUnreach:
+            return "HostUnreach";
+        case NetErrorCode::PermissionDenied:
+            return "PermissionDenied";
+        case NetErrorCode::SystemError:
+            return "SystemError";
     }
     return "Unknown";
 }

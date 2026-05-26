@@ -43,10 +43,16 @@ class InMemoryPipe
     std::size_t TryPull(std::span<std::byte> into) noexcept;
 
     /// @return true if the writing end has been closed.
-    [[nodiscard]] bool IsWriteClosed() const noexcept { return _writeClosed; }
+    [[nodiscard]] bool IsWriteClosed() const noexcept
+    {
+        return _writeClosed;
+    }
 
     /// @return Number of bytes currently buffered.
-    [[nodiscard]] std::size_t Buffered() const noexcept { return _buffer.size(); }
+    [[nodiscard]] std::size_t Buffered() const noexcept
+    {
+        return _buffer.size();
+    }
 
     /// Register a callback to be invoked when a Push or CloseWrite happens.
     /// Used by InMemorySocket::Read to wire its awaitable to the pipe's
@@ -80,7 +86,10 @@ class InMemorySocket: public ISocket
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
     void Close() noexcept override;
-    [[nodiscard]] bool IsClosed() const noexcept override { return _closed; }
+    [[nodiscard]] bool IsClosed() const noexcept override
+    {
+        return _closed;
+    }
 
     /// Half-close: signal EOF to the peer on the outbound pipe but leave
     /// the inbound (this socket's read side) open. Used by tests that need

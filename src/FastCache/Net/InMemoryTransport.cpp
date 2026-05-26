@@ -12,7 +12,10 @@ namespace FastCache
 
 // -- InMemoryPipe ----------------------------------------------------------
 
-InMemoryPipe::InMemoryPipe(std::size_t maxBytesInFlight) noexcept: _maxInFlight { maxBytesInFlight } {}
+InMemoryPipe::InMemoryPipe(std::size_t maxBytesInFlight) noexcept:
+    _maxInFlight { maxBytesInFlight }
+{
+}
 
 std::size_t InMemoryPipe::Push(std::span<std::byte const> bytes)
 {
@@ -26,7 +29,7 @@ std::size_t InMemoryPipe::Push(std::span<std::byte const> bytes)
         accepted = std::min(accepted, headroom);
     }
 
-    for (auto const b : bytes.first(accepted))
+    for (auto const b: bytes.first(accepted))
         _buffer.push_back(b);
 
     if (accepted > 0 && _progressCallback)
@@ -87,7 +90,8 @@ void InMemorySocket::ShutdownWrite() noexcept
 IoAwaitable InMemorySocket::Read(std::span<std::byte> buffer)
 {
     if (_closed)
-        return IoAwaitable { std::unexpected(NetError { .code = NetErrorCode::BadFileHandle }) };
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     // Synchronous fast path: bytes already buffered.
     if (_inbound->Buffered() > 0)
@@ -117,12 +121,13 @@ IoAwaitable InMemorySocket::Read(std::span<std::byte> buffer)
 IoAwaitable InMemorySocket::Write(std::span<std::byte const> buffer)
 {
     if (_closed)
-        return IoAwaitable { std::unexpected(NetError { .code = NetErrorCode::BadFileHandle }) };
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     auto const accepted = _outbound->Push(buffer);
     if (accepted < buffer.size())
-        return IoAwaitable { std::unexpected(NetError { .code = NetErrorCode::WouldBlock,
-                                                        .context = "InMemoryPipe backpressure" }) };
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::WouldBlock, .systemCode = 0, .context = "InMemoryPipe backpressure" }) };
     return IoAwaitable { IoResult { accepted } };
 }
 
@@ -181,7 +186,8 @@ AcceptAwaitable InMemoryListener::Accept()
     }
 
     if (_closed)
-        return AcceptAwaitable { std::unexpected(NetError { .code = NetErrorCode::Cancelled }) };
+        return AcceptAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }) };
 
     // No connection waiting — park until ConnectClient() or Close() fires.
     AcceptAwaitable awaitable;
@@ -195,7 +201,7 @@ void InMemoryListener::Close() noexcept
     if (_pendingAwaitable)
     {
         auto* const a = std::exchange(_pendingAwaitable, nullptr);
-        a->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled }));
+        a->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
     }
 }
 

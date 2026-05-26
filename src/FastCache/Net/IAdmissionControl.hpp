@@ -38,7 +38,10 @@ class CountingAdmissionControl final: public IAdmissionControl
 {
   public:
     /// @param maxConcurrent Connection cap (0 = unlimited).
-    explicit CountingAdmissionControl(std::size_t maxConcurrent = 0) noexcept: _max { maxConcurrent } {}
+    explicit CountingAdmissionControl(std::size_t maxConcurrent = 0) noexcept:
+        _max { maxConcurrent }
+    {
+    }
 
     [[nodiscard]] bool AllowAccept() noexcept override
     {
@@ -47,14 +50,26 @@ class CountingAdmissionControl final: public IAdmissionControl
         return _in.load(std::memory_order_acquire) < _max;
     }
 
-    void OnConnectionStarted() noexcept override { _in.fetch_add(1, std::memory_order_acq_rel); }
-    void OnConnectionEnded() noexcept override { _in.fetch_sub(1, std::memory_order_acq_rel); }
+    void OnConnectionStarted() noexcept override
+    {
+        _in.fetch_add(1, std::memory_order_acq_rel);
+    }
+    void OnConnectionEnded() noexcept override
+    {
+        _in.fetch_sub(1, std::memory_order_acq_rel);
+    }
 
     /// @return Current in-flight count.
-    [[nodiscard]] std::size_t InFlight() const noexcept { return _in.load(std::memory_order_acquire); }
+    [[nodiscard]] std::size_t InFlight() const noexcept
+    {
+        return _in.load(std::memory_order_acquire);
+    }
 
     /// Adjust the cap at runtime (e.g. from ConfigReloader).
-    void SetMax(std::size_t newMax) noexcept { _max = newMax; }
+    void SetMax(std::size_t newMax) noexcept
+    {
+        _max = newMax;
+    }
 
   private:
     std::size_t _max;

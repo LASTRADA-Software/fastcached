@@ -37,10 +37,16 @@ class IocpSocket final: public ISocket
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
     void Close() noexcept override;
-    [[nodiscard]] bool IsClosed() const noexcept override { return _closed; }
+    [[nodiscard]] bool IsClosed() const noexcept override
+    {
+        return _closed;
+    }
 
     /// @return Native SOCKET handle.
-    [[nodiscard]] std::uintptr_t Native() const noexcept { return _native; }
+    [[nodiscard]] std::uintptr_t Native() const noexcept
+    {
+        return _native;
+    }
 
     /// Implementation detail; declared in the public section so the
     /// suspend-callback bridge in IocpSocket.cpp can reach it.
@@ -61,8 +67,10 @@ class IocpListener final: public IListener
     /// Bind to host:port and start listening.
     /// @return Owning listener on success; one in an errored state on
     ///         failure (Accept() yields the bind error).
-    [[nodiscard]] static std::unique_ptr<IocpListener>
-    Bind(IocpReactor& reactor, std::string_view bindAddress, std::uint16_t port, int backlog = 64);
+    [[nodiscard]] static std::unique_ptr<IocpListener> Bind(IocpReactor& reactor,
+                                                            std::string_view bindAddress,
+                                                            std::uint16_t port,
+                                                            int backlog = 64);
 
     ~IocpListener() override;
 

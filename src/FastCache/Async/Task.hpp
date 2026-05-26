@@ -34,7 +34,10 @@ namespace Detail
 
         struct FinalAwaiter
         {
-            [[nodiscard]] bool await_ready() const noexcept { return false; }
+            [[nodiscard]] bool await_ready() const noexcept
+            {
+                return false;
+            }
 
             /// Symmetric transfer: resume the continuation directly so the
             /// caller's stack frame does not grow per `co_await`.
@@ -47,9 +50,18 @@ namespace Detail
             void await_resume() const noexcept {}
         };
 
-        [[nodiscard]] std::suspend_always initial_suspend() const noexcept { return {}; }
-        [[nodiscard]] FinalAwaiter final_suspend() const noexcept { return {}; }
-        void unhandled_exception() noexcept { exception = std::current_exception(); }
+        [[nodiscard]] std::suspend_always initial_suspend() const noexcept
+        {
+            return {};
+        }
+        [[nodiscard]] FinalAwaiter final_suspend() const noexcept
+        {
+            return {};
+        }
+        void unhandled_exception() noexcept
+        {
+            exception = std::current_exception();
+        }
     };
 
     template <typename T>
@@ -78,7 +90,10 @@ namespace Detail
     class TaskAwaiterBase
     {
       public:
-        explicit TaskAwaiterBase(std::coroutine_handle<TaskPromise<T>> handle) noexcept: _handle { handle } {}
+        explicit TaskAwaiterBase(std::coroutine_handle<TaskPromise<T>> handle) noexcept:
+            _handle { handle }
+        {
+        }
 
         [[nodiscard]] bool await_ready() const noexcept
         {
@@ -105,12 +120,18 @@ class Task
     using Handle = std::coroutine_handle<promise_type>;
 
     Task() noexcept = default;
-    explicit Task(Handle handle) noexcept: _handle { handle } {}
+    explicit Task(Handle handle) noexcept:
+        _handle { handle }
+    {
+    }
 
     Task(Task const&) = delete;
     Task& operator=(Task const&) = delete;
 
-    Task(Task&& other) noexcept: _handle { std::exchange(other._handle, {}) } {}
+    Task(Task&& other) noexcept:
+        _handle { std::exchange(other._handle, {}) }
+    {
+    }
 
     Task& operator=(Task&& other) noexcept
     {
@@ -131,14 +152,23 @@ class Task
 
     /// @return true if this task has run to completion (or has never started
     /// and is in the empty / moved-from state).
-    [[nodiscard]] bool IsReady() const noexcept { return !_handle || _handle.done(); }
+    [[nodiscard]] bool IsReady() const noexcept
+    {
+        return !_handle || _handle.done();
+    }
 
     /// Raw access to the underlying coroutine handle. Used by reactors to
     /// post the task onto their ready queue without going through co_await.
-    [[nodiscard]] Handle Native() const noexcept { return _handle; }
+    [[nodiscard]] Handle Native() const noexcept
+    {
+        return _handle;
+    }
 
     /// Release ownership of the handle — caller now owns destruction.
-    [[nodiscard]] Handle Release() noexcept { return std::exchange(_handle, {}); }
+    [[nodiscard]] Handle Release() noexcept
+    {
+        return std::exchange(_handle, {});
+    }
 
     /// Awaiter for `co_await task`. Owns the handle for the duration of the
     /// suspension — the rvalue Task that produced this Awaiter is left
@@ -148,7 +178,10 @@ class Task
     class Awaiter: public Detail::TaskAwaiterBase<T>
     {
       public:
-        explicit Awaiter(Handle handle) noexcept: Detail::TaskAwaiterBase<T> { handle } {}
+        explicit Awaiter(Handle handle) noexcept:
+            Detail::TaskAwaiterBase<T> { handle }
+        {
+        }
         Awaiter(Awaiter const&) = delete;
         Awaiter& operator=(Awaiter const&) = delete;
         Awaiter(Awaiter&& other) noexcept:
@@ -175,7 +208,10 @@ class Task
         Handle _owned { this->_handle };
     };
 
-    Awaiter operator co_await() && noexcept { return Awaiter { std::exchange(_handle, {}) }; }
+    Awaiter operator co_await() && noexcept
+    {
+        return Awaiter { std::exchange(_handle, {}) };
+    }
 
   private:
     Handle _handle {};
@@ -189,12 +225,18 @@ class Task<void>
     using Handle = std::coroutine_handle<promise_type>;
 
     Task() noexcept = default;
-    explicit Task(Handle handle) noexcept: _handle { handle } {}
+    explicit Task(Handle handle) noexcept:
+        _handle { handle }
+    {
+    }
 
     Task(Task const&) = delete;
     Task& operator=(Task const&) = delete;
 
-    Task(Task&& other) noexcept: _handle { std::exchange(other._handle, {}) } {}
+    Task(Task&& other) noexcept:
+        _handle { std::exchange(other._handle, {}) }
+    {
+    }
 
     Task& operator=(Task&& other) noexcept
     {
@@ -213,14 +255,26 @@ class Task<void>
             _handle.destroy();
     }
 
-    [[nodiscard]] bool IsReady() const noexcept { return !_handle || _handle.done(); }
-    [[nodiscard]] Handle Native() const noexcept { return _handle; }
-    [[nodiscard]] Handle Release() noexcept { return std::exchange(_handle, {}); }
+    [[nodiscard]] bool IsReady() const noexcept
+    {
+        return !_handle || _handle.done();
+    }
+    [[nodiscard]] Handle Native() const noexcept
+    {
+        return _handle;
+    }
+    [[nodiscard]] Handle Release() noexcept
+    {
+        return std::exchange(_handle, {});
+    }
 
     class Awaiter: public Detail::TaskAwaiterBase<void>
     {
       public:
-        explicit Awaiter(Handle handle) noexcept: Detail::TaskAwaiterBase<void> { handle } {}
+        explicit Awaiter(Handle handle) noexcept:
+            Detail::TaskAwaiterBase<void> { handle }
+        {
+        }
         Awaiter(Awaiter const&) = delete;
         Awaiter& operator=(Awaiter const&) = delete;
         Awaiter(Awaiter&& other) noexcept:
@@ -246,7 +300,10 @@ class Task<void>
         Handle _owned { this->_handle };
     };
 
-    Awaiter operator co_await() && noexcept { return Awaiter { std::exchange(_handle, {}) }; }
+    Awaiter operator co_await() && noexcept
+    {
+        return Awaiter { std::exchange(_handle, {}) };
+    }
 
   private:
     Handle _handle {};
@@ -281,11 +338,23 @@ struct DetachedTask
 {
     struct promise_type
     {
-        [[nodiscard]] DetachedTask get_return_object() noexcept { return {}; }
-        [[nodiscard]] std::suspend_never initial_suspend() const noexcept { return {}; }
-        [[nodiscard]] std::suspend_never final_suspend() const noexcept { return {}; }
+        [[nodiscard]] DetachedTask get_return_object() noexcept
+        {
+            return {};
+        }
+        [[nodiscard]] std::suspend_never initial_suspend() const noexcept
+        {
+            return {};
+        }
+        [[nodiscard]] std::suspend_never final_suspend() const noexcept
+        {
+            return {};
+        }
         void return_void() const noexcept {}
-        void unhandled_exception() const noexcept { std::terminate(); }
+        void unhandled_exception() const noexcept
+        {
+            std::terminate();
+        }
     };
 };
 

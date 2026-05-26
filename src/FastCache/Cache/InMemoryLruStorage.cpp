@@ -18,17 +18,17 @@ namespace
 
     [[nodiscard]] StorageError MakeKeyNotFound()
     {
-        return StorageError { .code = StorageErrorCode::KeyNotFound };
+        return StorageError { .code = StorageErrorCode::KeyNotFound, .systemCode = 0, .context = {} };
     }
 
     [[nodiscard]] StorageError MakeKeyExists()
     {
-        return StorageError { .code = StorageErrorCode::KeyExists };
+        return StorageError { .code = StorageErrorCode::KeyExists, .systemCode = 0, .context = {} };
     }
 
     [[nodiscard]] StorageError MakeCasMismatch()
     {
-        return StorageError { .code = StorageErrorCode::CasMismatch };
+        return StorageError { .code = StorageErrorCode::CasMismatch, .systemCode = 0, .context = {} };
     }
 
     [[nodiscard]] StorageError MakeInvalidArgument(std::string context)
@@ -48,7 +48,10 @@ namespace
 
 } // namespace
 
-InMemoryLruStorage::InMemoryLruStorage(std::size_t maxBytes) noexcept: _maxBytes { maxBytes } {}
+InMemoryLruStorage::InMemoryLruStorage(std::size_t maxBytes) noexcept:
+    _maxBytes { maxBytes }
+{
+}
 
 InMemoryLruStorage::Iterator InMemoryLruStorage::FindAlive(std::string_view key, TimePoint now)
 {
@@ -86,10 +89,7 @@ void InMemoryLruStorage::EvictToFit()
     }
 }
 
-CasToken InMemoryLruStorage::InsertNew(std::string key,
-                                       std::vector<std::byte> value,
-                                       std::uint32_t flags,
-                                       TimePoint expiry)
+CasToken InMemoryLruStorage::InsertNew(std::string key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry)
 {
     auto const cas = _nextCas++;
     auto const size = value.size();
@@ -110,10 +110,7 @@ CasToken InMemoryLruStorage::InsertNew(std::string key,
     return cas;
 }
 
-CasToken InMemoryLruStorage::MutateExisting(Iterator it,
-                                            std::vector<std::byte> value,
-                                            std::uint32_t flags,
-                                            TimePoint expiry)
+CasToken InMemoryLruStorage::MutateExisting(Iterator it, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry)
 {
     _bytesUsed -= it->entry.value.size();
     it->entry.value = std::move(value);
@@ -152,11 +149,8 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Set(std::string_view k
     return InsertNew(std::string { key }, std::move(value), flags, expiry);
 }
 
-std::expected<CasToken, StorageError> InMemoryLruStorage::Add(std::string_view key,
-                                                              std::vector<std::byte> value,
-                                                              std::uint32_t flags,
-                                                              TimePoint expiry,
-                                                              TimePoint now)
+std::expected<CasToken, StorageError> InMemoryLruStorage::Add(
+    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it != _lru.end())
@@ -164,11 +158,8 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Add(std::string_view k
     return InsertNew(std::string { key }, std::move(value), flags, expiry);
 }
 
-std::expected<CasToken, StorageError> InMemoryLruStorage::Replace(std::string_view key,
-                                                                  std::vector<std::byte> value,
-                                                                  std::uint32_t flags,
-                                                                  TimePoint expiry,
-                                                                  TimePoint now)
+std::expected<CasToken, StorageError> InMemoryLruStorage::Replace(
+    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
@@ -219,8 +210,9 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::CompareAndSwap(std::st
     return MutateExisting(it, std::move(value), flags, expiry);
 }
 
-std::expected<IStorage::IncrResult, StorageError>
-InMemoryLruStorage::IncrementOrInitialize(std::string_view key, std::int64_t delta, TimePoint now)
+std::expected<IStorage::IncrResult, StorageError> InMemoryLruStorage::IncrementOrInitialize(std::string_view key,
+                                                                                            std::int64_t delta,
+                                                                                            TimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
@@ -230,7 +222,7 @@ InMemoryLruStorage::IncrementOrInitialize(std::string_view key, std::int64_t del
     auto const& bytes = it->entry.value;
     std::string asText;
     asText.reserve(bytes.size());
-    for (auto const b : bytes)
+    for (auto const b: bytes)
         asText.push_back(static_cast<char>(b));
 
     std::uint64_t current = 0;
@@ -244,13 +236,13 @@ InMemoryLruStorage::IncrementOrInitialize(std::string_view key, std::int64_t del
     else
     {
         auto const absDelta = static_cast<std::uint64_t>(-(delta + 1)) + 1; // safe |INT64_MIN|
-        updated = current > absDelta ? current - absDelta : 0; // saturating
+        updated = current > absDelta ? current - absDelta : 0;              // saturating
     }
 
     auto newText = std::to_string(updated);
     std::vector<std::byte> newValue;
     newValue.reserve(newText.size());
-    for (auto const c : newText)
+    for (auto const c: newText)
         newValue.push_back(static_cast<std::byte>(c));
 
     auto const cas = MutateExisting(it, std::move(newValue), it->entry.flags, it->entry.expiry);

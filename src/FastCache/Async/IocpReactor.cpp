@@ -37,8 +37,7 @@ namespace
     {
         if (nextDeadline <= now)
             return 0;
-        auto const millis =
-            std::chrono::duration_cast<std::chrono::milliseconds>(nextDeadline - now).count();
+        auto const millis = std::chrono::duration_cast<std::chrono::milliseconds>(nextDeadline - now).count();
         if (millis < 0)
             return 0;
         if (millis > static_cast<std::int64_t>(INFINITE - 1))
@@ -48,7 +47,8 @@ namespace
 
 } // namespace
 
-IocpReactor::IocpReactor(IClock& clock): _clock { clock }
+IocpReactor::IocpReactor(IClock& clock):
+    _clock { clock }
 {
     _iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, /*threads*/ 1);
 }
@@ -85,7 +85,7 @@ void IocpReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
         return;
     {
         std::lock_guard const lock { _timerMutex };
-        _timers.push_back(TimerEntry { deadline, _nextSequence++, handle });
+        _timers.push_back(TimerEntry { .deadline = deadline, .sequence = _nextSequence++, .handle = handle });
         std::ranges::push_heap(_timers, EntryGreater);
     }
     // Nudge the reactor in case it's blocked waiting on a later deadline.
@@ -112,7 +112,7 @@ void IocpReactor::FireExpiredTimers()
             _timers.pop_back();
         }
     }
-    for (auto handle : due)
+    for (auto handle: due)
         if (handle && !handle.done())
             handle.resume();
 }
@@ -130,13 +130,10 @@ void IocpReactor::Run()
             nextDeadline = _timers.empty() ? TimePoint::max() : _timers.front().deadline;
         }
         auto const now = _clock.Now();
-        auto const timeout = nextDeadline == TimePoint::max()
-            ? INFINITE
-            : DeadlineToTimeout(nextDeadline, now);
+        auto const timeout = nextDeadline == TimePoint::max() ? INFINITE : DeadlineToTimeout(nextDeadline, now);
 
         ULONG removed = 0;
-        BOOL const ok = GetQueuedCompletionStatusEx(
-            static_cast<HANDLE>(_iocp), entries, Batch, &removed, timeout, FALSE);
+        BOOL const ok = GetQueuedCompletionStatusEx(static_cast<HANDLE>(_iocp), entries, Batch, &removed, timeout, FALSE);
 
         if (!ok)
         {

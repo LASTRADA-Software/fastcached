@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Protocol/RedisResp.hpp>
-
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
+#include <FastCache/Protocol/RedisResp.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -34,7 +33,7 @@ namespace
     [[nodiscard]] std::string Upper(std::string_view sv)
     {
         std::string out { sv };
-        for (auto& c : out)
+        for (auto& c: out)
             c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         return out;
     }
@@ -69,9 +68,18 @@ namespace
         co_return r.has_value();
     }
 
-    Task<bool> ReplyOk(ISocket& socket) { co_return co_await WriteAll(socket, "+OK\r\n"); }
-    Task<bool> ReplyPong(ISocket& socket) { co_return co_await WriteAll(socket, "+PONG\r\n"); }
-    Task<bool> ReplyNil(ISocket& socket) { co_return co_await WriteAll(socket, "$-1\r\n"); }
+    Task<bool> ReplyOk(ISocket& socket)
+    {
+        co_return co_await WriteAll(socket, "+OK\r\n");
+    }
+    Task<bool> ReplyPong(ISocket& socket)
+    {
+        co_return co_await WriteAll(socket, "+PONG\r\n");
+    }
+    Task<bool> ReplyNil(ISocket& socket)
+    {
+        co_return co_await WriteAll(socket, "$-1\r\n");
+    }
 
     Task<bool> ReplyInteger(ISocket& socket, std::int64_t value)
     {
@@ -209,8 +217,8 @@ namespace
                 std::uint64_t raw = 0;
                 if (!ParseUnsigned(std::string_view { tail[i + 1] }, raw))
                     return std::unexpected(std::string { "bad number for " } + tok);
-                opts.exptime = tok == "EX" ? static_cast<std::uint32_t>(raw)
-                                           : static_cast<std::uint32_t>((raw + 999) / 1000);
+                opts.exptime =
+                    tok == "EX" ? static_cast<std::uint32_t>(raw) : static_cast<std::uint32_t>((raw + 999) / 1000);
                 ++i;
             }
             else
@@ -226,9 +234,8 @@ namespace
         auto const result = engine.Get(args[0]);
         if (!result.has_value() || !result->found)
             co_return co_await ReplyNil(socket);
-        co_return co_await ReplyBulkString(socket,
-                                           std::span<std::byte const> { result->entry.value.data(),
-                                                                        result->entry.value.size() });
+        co_return co_await ReplyBulkString(
+            socket, std::span<std::byte const> { result->entry.value.data(), result->entry.value.size() });
     }
 
     Task<bool> HandleSet(ISocket& socket, CacheEngine& engine, std::span<std::string const> args)
@@ -244,7 +251,7 @@ namespace
 
         std::vector<std::byte> bytes;
         bytes.reserve(value.size());
-        for (auto const c : value)
+        for (auto const c: value)
             bytes.push_back(static_cast<std::byte>(c));
 
         std::expected<CasToken, StorageError> result { 0 };
@@ -257,8 +264,7 @@ namespace
 
         if (result.has_value())
             co_return co_await ReplyOk(socket);
-        if (result.error().code == StorageErrorCode::KeyExists
-            || result.error().code == StorageErrorCode::KeyNotFound)
+        if (result.error().code == StorageErrorCode::KeyExists || result.error().code == StorageErrorCode::KeyNotFound)
             co_return co_await ReplyNil(socket);
         co_return co_await ReplyError(socket, "storage failure");
     }
@@ -266,18 +272,16 @@ namespace
     Task<bool> HandleSetEx(ISocket& socket, CacheEngine& engine, std::span<std::string const> args, bool millis)
     {
         if (args.size() != 3)
-            co_return co_await ReplyError(socket,
-                                          millis ? "wrong number of arguments for 'psetex'"
-                                                 : "wrong number of arguments for 'setex'");
+            co_return co_await ReplyError(
+                socket, millis ? "wrong number of arguments for 'psetex'" : "wrong number of arguments for 'setex'");
         std::uint64_t raw = 0;
         if (!ParseUnsigned(std::string_view { args[1] }, raw))
             co_return co_await ReplyError(socket, "ttl must be a number");
-        auto const exptime = millis ? static_cast<std::uint32_t>((raw + 999) / 1000)
-                                    : static_cast<std::uint32_t>(raw);
+        auto const exptime = millis ? static_cast<std::uint32_t>((raw + 999) / 1000) : static_cast<std::uint32_t>(raw);
 
         std::vector<std::byte> bytes;
         bytes.reserve(args[2].size());
-        for (auto const c : args[2])
+        for (auto const c: args[2])
             bytes.push_back(static_cast<std::byte>(c));
         auto const result = engine.Set(args[0], std::move(bytes), 0, exptime);
         if (!result.has_value())
@@ -290,7 +294,7 @@ namespace
         if (args.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'del'");
         std::int64_t deleted = 0;
-        for (auto const& key : args)
+        for (auto const& key: args)
         {
             auto const result = engine.Delete(key);
             if (result.has_value())
@@ -304,7 +308,7 @@ namespace
         if (args.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'exists'");
         std::int64_t found = 0;
-        for (auto const& key : args)
+        for (auto const& key: args)
         {
             auto const result = engine.Get(key);
             if (result.has_value() && result->found)
@@ -330,16 +334,15 @@ namespace
     Task<bool> HandleInfo(ISocket& socket, CacheEngine& engine)
     {
         auto const stats = engine.Snapshot();
-        auto const body = std::format(
-            "# Server\r\nfastcached_version:{}\r\nredis_version:6.0.0-fastcached\r\n"
-            "# Memory\r\nused_memory:{}\r\nmaxmemory:{}\r\n"
-            "# Stats\r\ntotal_commands_processed:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\n",
-            RedisRespHandler::ServerVersion(),
-            stats.bytesUsed,
-            stats.bytesLimit,
-            stats.cmdGet + stats.cmdSet,
-            stats.getHits,
-            stats.getMisses);
+        auto const body = std::format("# Server\r\nfastcached_version:{}\r\nredis_version:6.0.0-fastcached\r\n"
+                                      "# Memory\r\nused_memory:{}\r\nmaxmemory:{}\r\n"
+                                      "# Stats\r\ntotal_commands_processed:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\n",
+                                      RedisRespHandler::ServerVersion(),
+                                      stats.bytesUsed,
+                                      stats.bytesLimit,
+                                      stats.cmdGet + stats.cmdSet,
+                                      stats.getHits,
+                                      stats.getMisses);
         co_return co_await ReplyBulkString(socket, body);
     }
 
@@ -356,12 +359,11 @@ namespace
         // The server banner is variable-length so the $-prefix length is
         // derived from the runtime banner.
         auto const banner = ServerVersionBanner;
-        auto const body = std::format(
-            "*6\r\n$6\r\nserver\r\n${}\r\n{}\r\n"
-            "$5\r\nproto\r\n:2\r\n"
-            "$2\r\nid\r\n:1\r\n",
-            banner.size(),
-            banner);
+        auto const body = std::format("*6\r\n$6\r\nserver\r\n${}\r\n{}\r\n"
+                                      "$5\r\nproto\r\n:2\r\n"
+                                      "$2\r\nid\r\n:1\r\n",
+                                      banner.size(),
+                                      banner);
         co_return co_await WriteAll(socket, body);
     }
 
@@ -387,18 +389,30 @@ namespace
         auto const name = Upper(cmd.args[0]);
         auto const tail = std::span<std::string const> { cmd.args.data() + 1, cmd.args.size() - 1 };
 
-        if (name == "GET") co_return co_await HandleGet(socket, engine, tail);
-        if (name == "SET") co_return co_await HandleSet(socket, engine, tail);
-        if (name == "SETEX") co_return co_await HandleSetEx(socket, engine, tail, /*millis*/ false);
-        if (name == "PSETEX") co_return co_await HandleSetEx(socket, engine, tail, /*millis*/ true);
-        if (name == "DEL" || name == "UNLINK") co_return co_await HandleDel(socket, engine, tail);
-        if (name == "EXISTS") co_return co_await HandleExists(socket, engine, tail);
-        if (name == "PING") co_return co_await HandlePing(socket, tail);
-        if (name == "ECHO") co_return co_await HandleEcho(socket, tail);
-        if (name == "INFO") co_return co_await HandleInfo(socket, engine);
-        if (name == "HELLO") co_return co_await HandleHello(socket, tail);
-        if (name == "COMMAND") co_return co_await HandleCommand(socket, tail);
-        if (name == "FLUSHDB" || name == "FLUSHALL") co_return co_await HandleFlush(socket, engine);
+        if (name == "GET")
+            co_return co_await HandleGet(socket, engine, tail);
+        if (name == "SET")
+            co_return co_await HandleSet(socket, engine, tail);
+        if (name == "SETEX")
+            co_return co_await HandleSetEx(socket, engine, tail, /*millis*/ false);
+        if (name == "PSETEX")
+            co_return co_await HandleSetEx(socket, engine, tail, /*millis*/ true);
+        if (name == "DEL" || name == "UNLINK")
+            co_return co_await HandleDel(socket, engine, tail);
+        if (name == "EXISTS")
+            co_return co_await HandleExists(socket, engine, tail);
+        if (name == "PING")
+            co_return co_await HandlePing(socket, tail);
+        if (name == "ECHO")
+            co_return co_await HandleEcho(socket, tail);
+        if (name == "INFO")
+            co_return co_await HandleInfo(socket, engine);
+        if (name == "HELLO")
+            co_return co_await HandleHello(socket, tail);
+        if (name == "COMMAND")
+            co_return co_await HandleCommand(socket, tail);
+        if (name == "FLUSHDB" || name == "FLUSHALL")
+            co_return co_await HandleFlush(socket, engine);
         if (name == "QUIT")
         {
             (void) co_await ReplyOk(socket);

@@ -7,6 +7,8 @@
     #include <FastCache/Core/Errors/NetError.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
 
+    #include <sys/socket.h>
+
     #include <cstddef>
     #include <cstdint>
     #include <cstring>
@@ -17,12 +19,12 @@
     #include <string_view>
     #include <utility>
 
-    #include <arpa/inet.h>
     #include <errno.h>
     #include <fcntl.h>
-    #include <netinet/in.h>
-    #include <sys/socket.h>
     #include <unistd.h>
+
+    #include <arpa/inet.h>
+    #include <netinet/in.h>
 
 namespace FastCache
 {
@@ -34,17 +36,27 @@ namespace
     {
         switch (code)
         {
-            case ECONNRESET:    return NetErrorCode::ConnReset;
-            case ECONNREFUSED:  return NetErrorCode::ConnRefused;
-            case EHOSTUNREACH:  return NetErrorCode::HostUnreach;
-            case EADDRINUSE:    return NetErrorCode::AddressInUse;
-            case EADDRNOTAVAIL: return NetErrorCode::AddressNotAvail;
-            case EACCES:        return NetErrorCode::PermissionDenied;
+            case ECONNRESET:
+                return NetErrorCode::ConnReset;
+            case ECONNREFUSED:
+                return NetErrorCode::ConnRefused;
+            case EHOSTUNREACH:
+                return NetErrorCode::HostUnreach;
+            case EADDRINUSE:
+                return NetErrorCode::AddressInUse;
+            case EADDRNOTAVAIL:
+                return NetErrorCode::AddressNotAvail;
+            case EACCES:
+                return NetErrorCode::PermissionDenied;
             case EBADF:
-            case ENOTSOCK:      return NetErrorCode::BadFileHandle;
-            case EINTR:         return NetErrorCode::Cancelled;
-            case EAGAIN:        return NetErrorCode::WouldBlock;
-            default:            return NetErrorCode::SystemError;
+            case ENOTSOCK:
+                return NetErrorCode::BadFileHandle;
+            case EINTR:
+                return NetErrorCode::Cancelled;
+            case EAGAIN:
+                return NetErrorCode::WouldBlock;
+            default:
+                return NetErrorCode::SystemError;
         }
     }
 
@@ -94,7 +106,8 @@ struct EpollSocket::Impl
         reactor.UpdateInterest(&handler, readOp.awaitable != nullptr, writeOp.awaitable != nullptr);
     }
 
-    Impl(EpollReactor& r, int fd): reactor { r }
+    Impl(EpollReactor& r, int fd):
+        reactor { r }
     {
         handler.fd = fd;
         handler.onReadable = &OnReadable;
@@ -107,8 +120,7 @@ namespace
 
     EpollSocket::Impl* ImplFromHandler(EpollFdHandler* base) noexcept
     {
-        return reinterpret_cast<EpollSocket::Impl*>(reinterpret_cast<char*>(base)
-            - offsetof(EpollSocket::Impl, handler));
+        return reinterpret_cast<EpollSocket::Impl*>(reinterpret_cast<char*>(base) - offsetof(EpollSocket::Impl, handler));
     }
 
 } // namespace
@@ -213,7 +225,8 @@ namespace
 IoAwaitable EpollSocket::Read(std::span<std::byte> buffer)
 {
     if (_closed)
-        return IoAwaitable { std::unexpected(NetError { .code = NetErrorCode::BadFileHandle }) };
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     // Fast path: try recv synchronously.
     auto const got = ::recv(_fd, buffer.data(), buffer.size(), 0);
@@ -234,7 +247,8 @@ IoAwaitable EpollSocket::Read(std::span<std::byte> buffer)
 IoAwaitable EpollSocket::Write(std::span<std::byte const> buffer)
 {
     if (_closed)
-        return IoAwaitable { std::unexpected(NetError { .code = NetErrorCode::BadFileHandle }) };
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     // Try send synchronously; cycle until EAGAIN or completion.
     auto remaining = buffer;
@@ -274,7 +288,8 @@ struct EpollListener::Impl
 
     static void OnReadable(EpollFdHandler* base);
 
-    Impl(EpollReactor& r): reactor { r }
+    Impl(EpollReactor& r):
+        reactor { r }
     {
         handler.onReadable = &OnReadable;
     }
@@ -286,7 +301,7 @@ namespace
     EpollListener::Impl* ListenerImplFromHandler(EpollFdHandler* base) noexcept
     {
         return reinterpret_cast<EpollListener::Impl*>(reinterpret_cast<char*>(base)
-            - offsetof(EpollListener::Impl, handler));
+                                                      - offsetof(EpollListener::Impl, handler));
     }
 
     void ListenerAwaitableSuspended(AcceptAwaitable* self, std::coroutine_handle<> /*handle*/)
@@ -325,8 +340,10 @@ void EpollListener::Impl::OnReadable(EpollFdHandler* base)
 EpollListener::EpollListener() noexcept = default;
 EpollListener::~EpollListener() = default;
 
-std::unique_ptr<EpollListener>
-EpollListener::Bind(EpollReactor& reactor, std::string_view bindAddress, std::uint16_t port, int backlog)
+std::unique_ptr<EpollListener> EpollListener::Bind(EpollReactor& reactor,
+                                                   std::string_view bindAddress,
+                                                   std::uint16_t port,
+                                                   int backlog)
 {
     Detail::EnsureNetworkInitialised();
 
@@ -399,15 +416,15 @@ void EpollListener::Close() noexcept
     {
         auto* awaitable = _impl->pending;
         _impl->pending = nullptr;
-        awaitable->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled }));
+        awaitable->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
     }
 }
 
 AcceptAwaitable EpollListener::Accept()
 {
     if (!IsBound())
-        return AcceptAwaitable { std::unexpected(NetError {
-            .code = NetErrorCode::BadFileHandle, .context = std::string { BindError() } }) };
+        return AcceptAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = std::string { BindError() } }) };
 
     // Fast path: try accept synchronously.
     sockaddr_in client {};

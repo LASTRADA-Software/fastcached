@@ -9,16 +9,16 @@ namespace FastCache
 {
 
 /// Categories of configuration errors (CLI parsing, YAML parsing, validation, reload).
-enum class ConfigErrorCode : unsigned
+enum class ConfigErrorCode : std::uint8_t
 {
-    Ok = 0,             ///< Sentinel.
-    FileNotFound,       ///< --config path does not exist or cannot be read.
-    ParseError,         ///< YAML/CLI input is syntactically invalid.
-    UnknownKey,         ///< YAML contains a key we do not recognise.
-    TypeMismatch,       ///< Field present but wrong type (e.g., string where int expected).
-    OutOfRange,         ///< Numeric value outside the valid range (e.g., port > 65535).
-    MissingRequired,    ///< Required field absent.
-    ImmutableChanged,   ///< Reload attempted to change a field that is fixed at startup.
+    Ok = 0,           ///< Sentinel.
+    FileNotFound,     ///< --config path does not exist or cannot be read.
+    ParseError,       ///< YAML/CLI input is syntactically invalid.
+    UnknownKey,       ///< YAML contains a key we do not recognise.
+    TypeMismatch,     ///< Field present but wrong type (e.g., string where int expected).
+    OutOfRange,       ///< Numeric value outside the valid range (e.g., port > 65535).
+    MissingRequired,  ///< Required field absent.
+    ImmutableChanged, ///< Reload attempted to change a field that is fixed at startup.
 };
 
 /// Structured config error. Carries file:line if the source supports it.
@@ -53,14 +53,22 @@ struct ConfigError
 {
     switch (code)
     {
-        case ConfigErrorCode::Ok:               return "Ok";
-        case ConfigErrorCode::FileNotFound:     return "FileNotFound";
-        case ConfigErrorCode::ParseError:       return "ParseError";
-        case ConfigErrorCode::UnknownKey:       return "UnknownKey";
-        case ConfigErrorCode::TypeMismatch:     return "TypeMismatch";
-        case ConfigErrorCode::OutOfRange:       return "OutOfRange";
-        case ConfigErrorCode::MissingRequired:  return "MissingRequired";
-        case ConfigErrorCode::ImmutableChanged: return "ImmutableChanged";
+        case ConfigErrorCode::Ok:
+            return "Ok";
+        case ConfigErrorCode::FileNotFound:
+            return "FileNotFound";
+        case ConfigErrorCode::ParseError:
+            return "ParseError";
+        case ConfigErrorCode::UnknownKey:
+            return "UnknownKey";
+        case ConfigErrorCode::TypeMismatch:
+            return "TypeMismatch";
+        case ConfigErrorCode::OutOfRange:
+            return "OutOfRange";
+        case ConfigErrorCode::MissingRequired:
+            return "MissingRequired";
+        case ConfigErrorCode::ImmutableChanged:
+            return "ImmutableChanged";
     }
     return "Unknown";
 }

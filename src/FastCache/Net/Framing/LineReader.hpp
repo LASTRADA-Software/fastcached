@@ -57,7 +57,10 @@ class ByteReader
     void PrimeWith(std::span<std::byte const> bytes);
 
     /// @return true if the underlying socket returned EOF and the buffer is drained.
-    [[nodiscard]] bool Eof() const noexcept { return _eof && _buffer.empty(); }
+    [[nodiscard]] bool Eof() const noexcept
+    {
+        return _eof && _buffer.empty();
+    }
 
     /// @return Read-only view over currently-buffered bytes.
     [[nodiscard]] std::span<std::byte const> Buffered() const noexcept

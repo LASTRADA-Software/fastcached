@@ -7,8 +7,8 @@
 #if defined(__linux__)
 
     #include <atomic>
-    #include <cstdint>
     #include <coroutine>
+    #include <cstdint>
     #include <deque>
     #include <mutex>
     #include <vector>
@@ -54,7 +54,10 @@ class EpollReactor: public IReactor
     void Stop() noexcept override;
     void Submit(std::coroutine_handle<> handle) override;
     void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override;
-    [[nodiscard]] IClock& Clock() noexcept override { return _clock; }
+    [[nodiscard]] IClock& Clock() noexcept override
+    {
+        return _clock;
+    }
 
     /// Register an EpollFdHandler with the reactor. Initial interest is
     /// none; the caller adjusts via UpdateInterest after registration.
@@ -72,7 +75,8 @@ class EpollReactor: public IReactor
     /// called.
     void Detach(EpollFdHandler* handler) noexcept;
 
-  private:
+    /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
+    /// can name the type. Treat as Detail.
     struct TimerEntry
     {
         TimePoint deadline;
@@ -80,6 +84,7 @@ class EpollReactor: public IReactor
         std::coroutine_handle<> handle;
     };
 
+  private:
     void FireExpiredTimers();
     void DrainPendingSubmits();
 

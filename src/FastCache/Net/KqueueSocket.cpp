@@ -7,6 +7,8 @@
     #include <FastCache/Core/Errors/NetError.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
 
+    #include <sys/socket.h>
+
     #include <cstddef>
     #include <cstdint>
     #include <cstring>
@@ -17,12 +19,12 @@
     #include <string_view>
     #include <utility>
 
-    #include <arpa/inet.h>
     #include <errno.h>
     #include <fcntl.h>
-    #include <netinet/in.h>
-    #include <sys/socket.h>
     #include <unistd.h>
+
+    #include <arpa/inet.h>
+    #include <netinet/in.h>
 
 namespace FastCache
 {
@@ -34,17 +36,27 @@ namespace
     {
         switch (code)
         {
-            case ECONNRESET:    return NetErrorCode::ConnReset;
-            case ECONNREFUSED:  return NetErrorCode::ConnRefused;
-            case EHOSTUNREACH:  return NetErrorCode::HostUnreach;
-            case EADDRINUSE:    return NetErrorCode::AddressInUse;
-            case EADDRNOTAVAIL: return NetErrorCode::AddressNotAvail;
-            case EACCES:        return NetErrorCode::PermissionDenied;
+            case ECONNRESET:
+                return NetErrorCode::ConnReset;
+            case ECONNREFUSED:
+                return NetErrorCode::ConnRefused;
+            case EHOSTUNREACH:
+                return NetErrorCode::HostUnreach;
+            case EADDRINUSE:
+                return NetErrorCode::AddressInUse;
+            case EADDRNOTAVAIL:
+                return NetErrorCode::AddressNotAvail;
+            case EACCES:
+                return NetErrorCode::PermissionDenied;
             case EBADF:
-            case ENOTSOCK:      return NetErrorCode::BadFileHandle;
-            case EINTR:         return NetErrorCode::Cancelled;
-            case EAGAIN:        return NetErrorCode::WouldBlock;
-            default:            return NetErrorCode::SystemError;
+            case ENOTSOCK:
+                return NetErrorCode::BadFileHandle;
+            case EINTR:
+                return NetErrorCode::Cancelled;
+            case EAGAIN:
+                return NetErrorCode::WouldBlock;
+            default:
+                return NetErrorCode::SystemError;
         }
     }
 
@@ -95,7 +107,8 @@ struct KqueueSocket::Impl
         reactor.UpdateInterest(&handler, readOp.awaitable != nullptr, writeOp.awaitable != nullptr);
     }
 
-    Impl(KqueueReactor& r, int fd): reactor { r }
+    Impl(KqueueReactor& r, int fd):
+        reactor { r }
     {
         handler.fd = fd;
         handler.onReadable = &OnReadable;
@@ -108,8 +121,7 @@ namespace
 
     KqueueSocket::Impl* ImplFromHandler(KqueueFdHandler* base) noexcept
     {
-        return reinterpret_cast<KqueueSocket::Impl*>(reinterpret_cast<char*>(base)
-            - offsetof(KqueueSocket::Impl, handler));
+        return reinterpret_cast<KqueueSocket::Impl*>(reinterpret_cast<char*>(base) - offsetof(KqueueSocket::Impl, handler));
     }
 
 } // namespace
@@ -150,8 +162,7 @@ void KqueueSocket::Impl::OnWritable(KqueueFdHandler* base)
             ::send(impl->handler.fd, impl->writeOp.writeRemaining.data(), impl->writeOp.writeRemaining.size(), 0);
         if (wrote > 0)
         {
-            impl->writeOp.writeRemaining =
-                impl->writeOp.writeRemaining.subspan(static_cast<std::size_t>(wrote));
+            impl->writeOp.writeRemaining = impl->writeOp.writeRemaining.subspan(static_cast<std::size_t>(wrote));
             continue;
         }
         if (wrote < 0 && (errno == EAGAIN || errno == EINTR))
@@ -213,7 +224,8 @@ namespace
 IoAwaitable KqueueSocket::Read(std::span<std::byte> buffer)
 {
     if (_closed)
-        return IoAwaitable { std::unexpected(NetError { .code = NetErrorCode::BadFileHandle }) };
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     auto const got = ::recv(_fd, buffer.data(), buffer.size(), 0);
     if (got >= 0)
@@ -232,7 +244,8 @@ IoAwaitable KqueueSocket::Read(std::span<std::byte> buffer)
 IoAwaitable KqueueSocket::Write(std::span<std::byte const> buffer)
 {
     if (_closed)
-        return IoAwaitable { std::unexpected(NetError { .code = NetErrorCode::BadFileHandle }) };
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     auto remaining = buffer;
     while (!remaining.empty())
@@ -270,7 +283,11 @@ struct KqueueListener::Impl
 
     static void OnReadable(KqueueFdHandler* base);
 
-    Impl(KqueueReactor& r): reactor { r } { handler.onReadable = &OnReadable; }
+    Impl(KqueueReactor& r):
+        reactor { r }
+    {
+        handler.onReadable = &OnReadable;
+    }
 };
 
 namespace
@@ -279,7 +296,7 @@ namespace
     KqueueListener::Impl* ListenerImplFromHandler(KqueueFdHandler* base) noexcept
     {
         return reinterpret_cast<KqueueListener::Impl*>(reinterpret_cast<char*>(base)
-            - offsetof(KqueueListener::Impl, handler));
+                                                       - offsetof(KqueueListener::Impl, handler));
     }
 
     void ListenerAwaitableSuspended(AcceptAwaitable* self, std::coroutine_handle<> /*handle*/)
@@ -319,8 +336,10 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
 KqueueListener::KqueueListener() noexcept = default;
 KqueueListener::~KqueueListener() = default;
 
-std::unique_ptr<KqueueListener>
-KqueueListener::Bind(KqueueReactor& reactor, std::string_view bindAddress, std::uint16_t port, int backlog)
+std::unique_ptr<KqueueListener> KqueueListener::Bind(KqueueReactor& reactor,
+                                                     std::string_view bindAddress,
+                                                     std::uint16_t port,
+                                                     int backlog)
 {
     Detail::EnsureNetworkInitialised();
 
@@ -385,15 +404,15 @@ void KqueueListener::Close() noexcept
     {
         auto* awaitable = _impl->pending;
         _impl->pending = nullptr;
-        awaitable->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled }));
+        awaitable->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
     }
 }
 
 AcceptAwaitable KqueueListener::Accept()
 {
     if (!IsBound())
-        return AcceptAwaitable { std::unexpected(NetError {
-            .code = NetErrorCode::BadFileHandle, .context = std::string { BindError() } }) };
+        return AcceptAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = std::string { BindError() } }) };
 
     sockaddr_in client {};
     socklen_t len = sizeof(client);

@@ -111,7 +111,10 @@ bool PooledBuffer::IsValid() const noexcept
 
 // -- BufferPool ------------------------------------------------------------
 
-BufferPool::BufferPool(std::size_t maxRetainedBuffers) noexcept: _maxRetained { maxRetainedBuffers } {}
+BufferPool::BufferPool(std::size_t maxRetainedBuffers) noexcept:
+    _maxRetained { maxRetainedBuffers }
+{
+}
 
 std::shared_ptr<BufferPool> BufferPool::Create(std::size_t maxRetainedBuffers)
 {
@@ -127,8 +130,8 @@ PooledBuffer BufferPool::Acquire(std::size_t minCapacity)
     bool found = false;
     {
         std::lock_guard const lock { _mutex };
-        auto const it = std::ranges::find_if(_free,
-                                             [requested](auto const& slot) noexcept { return slot.size() >= requested; });
+        auto const it =
+            std::ranges::find_if(_free, [requested](auto const& slot) noexcept { return slot.size() >= requested; });
         if (it != _free.end())
         {
             picked = std::move(*it);

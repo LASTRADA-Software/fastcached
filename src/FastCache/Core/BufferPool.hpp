@@ -106,7 +106,10 @@ class BufferPool: public std::enable_shared_from_this<BufferPool>
     [[nodiscard]] std::size_t RetainedCount() const noexcept;
 
     /// @return Maximum number of buffers that will be retained on return.
-    [[nodiscard]] std::size_t MaxRetained() const noexcept { return _maxRetained; }
+    [[nodiscard]] std::size_t MaxRetained() const noexcept
+    {
+        return _maxRetained;
+    }
 
   private:
     friend class PooledBuffer;

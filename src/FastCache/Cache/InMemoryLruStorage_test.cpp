@@ -17,7 +17,7 @@ std::vector<std::byte> MakeBytes(std::string_view text)
 {
     std::vector<std::byte> bytes;
     bytes.reserve(text.size());
-    for (auto const c : text)
+    for (auto const c: text)
         bytes.push_back(static_cast<std::byte>(c));
     return bytes;
 }
@@ -26,7 +26,7 @@ std::string Decode(std::span<std::byte const> bytes)
 {
     std::string out;
     out.reserve(bytes.size());
-    for (auto const b : bytes)
+    for (auto const b: bytes)
         out.push_back(static_cast<char>(b));
     return out;
 }
@@ -83,11 +83,13 @@ TEST_CASE("CompareAndSwap matches the CAS token", "[cache]")
     auto const setCas = storage.Set("k", MakeBytes("one"), 0, FastCache::TimePoint::max());
     REQUIRE(setCas.has_value());
 
-    auto const wrongResult = storage.CompareAndSwap("k", 9999, MakeBytes("two"), 0, FastCache::TimePoint::max(), clock.Now());
+    auto const wrongResult =
+        storage.CompareAndSwap("k", 9999, MakeBytes("two"), 0, FastCache::TimePoint::max(), clock.Now());
     REQUIRE_FALSE(wrongResult.has_value());
     REQUIRE(wrongResult.error().code == FastCache::StorageErrorCode::CasMismatch);
 
-    auto const rightResult = storage.CompareAndSwap("k", *setCas, MakeBytes("two"), 0, FastCache::TimePoint::max(), clock.Now());
+    auto const rightResult =
+        storage.CompareAndSwap("k", *setCas, MakeBytes("two"), 0, FastCache::TimePoint::max(), clock.Now());
     REQUIRE(rightResult.has_value());
 
     auto const got = storage.Get("k", clock.Now());

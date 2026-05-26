@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Platform/IDaemonHost.hpp>
-
 #include <FastCache/Platform/DaemonControls.hpp>
+#include <FastCache/Platform/IDaemonHost.hpp>
 
 #include <atomic>
 #include <memory>
@@ -40,8 +39,7 @@ namespace
         g_currentStatus.dwWin32ExitCode = NO_ERROR;
         g_currentStatus.dwWaitHint = waitHintMs;
         if (state == SERVICE_RUNNING)
-            g_currentStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
-                | SERVICE_ACCEPT_PARAMCHANGE;
+            g_currentStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PARAMCHANGE;
         else
             g_currentStatus.dwControlsAccepted = 0;
         if (g_serviceStatus)
@@ -60,8 +58,10 @@ namespace
             case SERVICE_CONTROL_PARAMCHANGE:
                 DaemonControls::Instance().RequestReload();
                 return NO_ERROR;
-            case SERVICE_CONTROL_INTERROGATE: return NO_ERROR;
-            default:                          return ERROR_CALL_NOT_IMPLEMENTED;
+            case SERVICE_CONTROL_INTERROGATE:
+                return NO_ERROR;
+            default:
+                return ERROR_CALL_NOT_IMPLEMENTED;
         }
     }
 
@@ -83,7 +83,10 @@ namespace
     class WindowsServiceHost final: public IDaemonHost
     {
       public:
-        explicit WindowsServiceHost(std::string name) noexcept: _name { std::move(name) } {}
+        explicit WindowsServiceHost(std::string name) noexcept:
+            _name { std::move(name) }
+        {
+        }
 
         int Run(Body body) override
         {

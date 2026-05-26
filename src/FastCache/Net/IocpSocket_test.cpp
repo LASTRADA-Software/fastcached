@@ -8,6 +8,8 @@
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/IocpSocket.hpp>
 
+    #include <winsock2.h>
+
     #include <catch2/catch_test_macros.hpp>
 
     #include <array>
@@ -21,7 +23,6 @@
     #include <thread>
     #include <vector>
 
-    #include <winsock2.h>
     #include <ws2tcpip.h>
 
 namespace

@@ -12,9 +12,7 @@ namespace
 {
 
     /// Min-heap comparator: earlier deadlines win, FIFO on ties.
-    constexpr auto EntryGreater = [](TestReactor::ScheduledEntry const& a,
-                                     TestReactor::ScheduledEntry const& b) noexcept
-    {
+    constexpr auto EntryGreater = [](TestReactor::ScheduledEntry const& a, TestReactor::ScheduledEntry const& b) noexcept {
         if (a.deadline != b.deadline)
             return a.deadline > b.deadline;
         return a.sequence > b.sequence;
@@ -22,7 +20,10 @@ namespace
 
 } // namespace
 
-TestReactor::TestReactor(IClock& clock) noexcept: _clock { clock } {}
+TestReactor::TestReactor(IClock& clock) noexcept:
+    _clock { clock }
+{
+}
 
 void TestReactor::Run()
 {
@@ -49,7 +50,7 @@ void TestReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
 {
     if (!handle)
         return;
-    _timers.push_back(ScheduledEntry { deadline, _nextSequence++, handle });
+    _timers.push_back(ScheduledEntry { .deadline = deadline, .sequence = _nextSequence++, .handle = handle });
     std::ranges::push_heap(_timers, EntryGreater);
 }
 

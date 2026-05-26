@@ -45,7 +45,10 @@ class KqueueReactor: public IReactor
     void Stop() noexcept override;
     void Submit(std::coroutine_handle<> handle) override;
     void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override;
-    [[nodiscard]] IClock& Clock() noexcept override { return _clock; }
+    [[nodiscard]] IClock& Clock() noexcept override
+    {
+        return _clock;
+    }
 
     /// Register an fd with the kqueue. Initial interest is none; use
     /// UpdateInterest to arm EVFILT_READ / EVFILT_WRITE.
@@ -58,7 +61,8 @@ class KqueueReactor: public IReactor
     /// Remove the fd from the kqueue.
     void Detach(KqueueFdHandler* handler) noexcept;
 
-  private:
+    /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
+    /// can name the type. Treat as Detail.
     struct TimerEntry
     {
         TimePoint deadline;
@@ -66,6 +70,7 @@ class KqueueReactor: public IReactor
         std::coroutine_handle<> handle;
     };
 
+  private:
     void FireExpiredTimers();
     void DrainPendingSubmits();
 

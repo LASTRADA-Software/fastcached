@@ -30,7 +30,7 @@ std::vector<std::byte> MakeBytes(std::string_view text)
 {
     std::vector<std::byte> bytes;
     bytes.reserve(text.size());
-    for (auto const c : text)
+    for (auto const c: text)
         bytes.push_back(static_cast<std::byte>(c));
     return bytes;
 }
@@ -39,7 +39,7 @@ std::string Decode(std::span<std::byte const> bytes)
 {
     std::string out;
     out.reserve(bytes.size());
-    for (auto const b : bytes)
+    for (auto const b: bytes)
         out.push_back(static_cast<char>(b));
     return out;
 }
@@ -163,12 +163,12 @@ TEST_CASE("DiskStorage: CAS round-trips across reopen", "[diskstorage]")
     REQUIRE(got->entry.cas == originalCas);
 
     // CAS mismatch should fire against the persisted token.
-    auto const bad = (*storage)->CompareAndSwap(
-        "k", originalCas + 99, MakeBytes("nope"), 0, FastCache::TimePoint::max(), clock.Now());
+    auto const bad =
+        (*storage)->CompareAndSwap("k", originalCas + 99, MakeBytes("nope"), 0, FastCache::TimePoint::max(), clock.Now());
     REQUIRE_FALSE(bad.has_value());
     REQUIRE(bad.error().code == FastCache::StorageErrorCode::CasMismatch);
 
-    auto const good = (*storage)->CompareAndSwap(
-        "k", originalCas, MakeBytes("new"), 0, FastCache::TimePoint::max(), clock.Now());
+    auto const good =
+        (*storage)->CompareAndSwap("k", originalCas, MakeBytes("new"), 0, FastCache::TimePoint::max(), clock.Now());
     REQUIRE(good.has_value());
 }

@@ -37,6 +37,5 @@ TEST_CASE("CRC32C detects single-bit changes", "[crc32c]")
 {
     std::string_view const a = "fastcached";
     std::string_view const b = "Fastcached";
-    REQUIRE(FastCache::Crc32c::Compute(FastCache::AsBytes(a))
-            != FastCache::Crc32c::Compute(FastCache::AsBytes(b)));
+    REQUIRE(FastCache::Crc32c::Compute(FastCache::AsBytes(a)) != FastCache::Crc32c::Compute(FastCache::AsBytes(b)));
 }

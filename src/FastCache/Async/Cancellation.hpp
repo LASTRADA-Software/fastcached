@@ -40,7 +40,10 @@ class CancellationToken
   private:
     friend class CancellationSource;
 
-    explicit CancellationToken(std::shared_ptr<Detail::CancellationState> state) noexcept: _state { std::move(state) } {}
+    explicit CancellationToken(std::shared_ptr<Detail::CancellationState> state) noexcept:
+        _state { std::move(state) }
+    {
+    }
 
     std::shared_ptr<Detail::CancellationState> _state;
 };
@@ -50,16 +53,28 @@ class CancellationToken
 class CancellationSource
 {
   public:
-    CancellationSource(): _state { std::make_shared<Detail::CancellationState>() } {}
+    CancellationSource():
+        _state { std::make_shared<Detail::CancellationState>() }
+    {
+    }
 
     /// @return A token that observes this source.
-    [[nodiscard]] CancellationToken Token() const noexcept { return CancellationToken { _state }; }
+    [[nodiscard]] CancellationToken Token() const noexcept
+    {
+        return CancellationToken { _state };
+    }
 
     /// @return true if Cancel() has already been called.
-    [[nodiscard]] bool IsCancelled() const noexcept { return _state->cancelled.load(std::memory_order_acquire); }
+    [[nodiscard]] bool IsCancelled() const noexcept
+    {
+        return _state->cancelled.load(std::memory_order_acquire);
+    }
 
     /// Request cancellation. Idempotent.
-    void Cancel() noexcept { _state->cancelled.store(true, std::memory_order_release); }
+    void Cancel() noexcept
+    {
+        _state->cancelled.store(true, std::memory_order_release);
+    }
 
   private:
     std::shared_ptr<Detail::CancellationState> _state;

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Net/BlockingSocket.hpp>
-
 #include <FastCache/Core/Errors/NetError.hpp>
+#include <FastCache/Net/BlockingSocket.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -16,14 +15,17 @@
 
 #if defined(_WIN32)
     #include <winsock2.h>
+
     #include <ws2tcpip.h>
 #else
-    #include <arpa/inet.h>
-    #include <errno.h>
-    #include <netinet/in.h>
-    #include <signal.h>
     #include <sys/socket.h>
+
+    #include <errno.h>
+    #include <signal.h>
     #include <unistd.h>
+
+    #include <arpa/inet.h>
+    #include <netinet/in.h>
 #endif
 
 namespace FastCache
@@ -39,26 +41,41 @@ namespace Detail
         std::atomic<bool> g_winsockInitialised { false };
         std::atomic<bool> g_winsockInitialising { false };
 
-        [[nodiscard]] int LastNetworkError() noexcept { return WSAGetLastError(); }
+        [[nodiscard]] int LastNetworkError() noexcept
+        {
+            return WSAGetLastError();
+        }
 
         [[nodiscard]] NetErrorCode TranslateError(int code) noexcept
         {
             switch (code)
             {
-                case WSAECONNRESET:    return NetErrorCode::ConnReset;
-                case WSAECONNREFUSED:  return NetErrorCode::ConnRefused;
-                case WSAEHOSTUNREACH:  return NetErrorCode::HostUnreach;
-                case WSAEADDRINUSE:    return NetErrorCode::AddressInUse;
-                case WSAEADDRNOTAVAIL: return NetErrorCode::AddressNotAvail;
-                case WSAEACCES:        return NetErrorCode::PermissionDenied;
+                case WSAECONNRESET:
+                    return NetErrorCode::ConnReset;
+                case WSAECONNREFUSED:
+                    return NetErrorCode::ConnRefused;
+                case WSAEHOSTUNREACH:
+                    return NetErrorCode::HostUnreach;
+                case WSAEADDRINUSE:
+                    return NetErrorCode::AddressInUse;
+                case WSAEADDRNOTAVAIL:
+                    return NetErrorCode::AddressNotAvail;
+                case WSAEACCES:
+                    return NetErrorCode::PermissionDenied;
                 case WSAEBADF:
-                case WSAENOTSOCK:      return NetErrorCode::BadFileHandle;
-                case WSAEINTR:         return NetErrorCode::Cancelled;
-                default:               return NetErrorCode::SystemError;
+                case WSAENOTSOCK:
+                    return NetErrorCode::BadFileHandle;
+                case WSAEINTR:
+                    return NetErrorCode::Cancelled;
+                default:
+                    return NetErrorCode::SystemError;
             }
         }
 
-        [[nodiscard]] int CloseNative(NativeSocket s) noexcept { return ::closesocket(static_cast<SOCKET>(s)); }
+        [[nodiscard]] int CloseNative(NativeSocket s) noexcept
+        {
+            return ::closesocket(static_cast<SOCKET>(s));
+        }
     } // namespace
 
     void EnsureNetworkInitialised()
@@ -85,26 +102,41 @@ namespace Detail
     {
         std::atomic<bool> g_posixInitialised { false };
 
-        [[nodiscard]] int LastNetworkError() noexcept { return errno; }
+        [[nodiscard]] int LastNetworkError() noexcept
+        {
+            return errno;
+        }
 
         [[nodiscard]] NetErrorCode TranslateError(int code) noexcept
         {
             switch (code)
             {
-                case ECONNRESET:    return NetErrorCode::ConnReset;
-                case ECONNREFUSED:  return NetErrorCode::ConnRefused;
-                case EHOSTUNREACH:  return NetErrorCode::HostUnreach;
-                case EADDRINUSE:    return NetErrorCode::AddressInUse;
-                case EADDRNOTAVAIL: return NetErrorCode::AddressNotAvail;
-                case EACCES:        return NetErrorCode::PermissionDenied;
+                case ECONNRESET:
+                    return NetErrorCode::ConnReset;
+                case ECONNREFUSED:
+                    return NetErrorCode::ConnRefused;
+                case EHOSTUNREACH:
+                    return NetErrorCode::HostUnreach;
+                case EADDRINUSE:
+                    return NetErrorCode::AddressInUse;
+                case EADDRNOTAVAIL:
+                    return NetErrorCode::AddressNotAvail;
+                case EACCES:
+                    return NetErrorCode::PermissionDenied;
                 case EBADF:
-                case ENOTSOCK:      return NetErrorCode::BadFileHandle;
-                case EINTR:         return NetErrorCode::Cancelled;
-                default:            return NetErrorCode::SystemError;
+                case ENOTSOCK:
+                    return NetErrorCode::BadFileHandle;
+                case EINTR:
+                    return NetErrorCode::Cancelled;
+                default:
+                    return NetErrorCode::SystemError;
             }
         }
 
-        [[nodiscard]] int CloseNative(NativeSocket s) noexcept { return ::close(s); }
+        [[nodiscard]] int CloseNative(NativeSocket s) noexcept
+        {
+            return ::close(s);
+        }
     } // namespace
 
     void EnsureNetworkInitialised()
@@ -136,7 +168,10 @@ namespace
 
 // -- BlockingSocket --------------------------------------------------------
 
-BlockingSocket::BlockingSocket(Detail::NativeSocket native) noexcept: _native { native } {}
+BlockingSocket::BlockingSocket(Detail::NativeSocket native) noexcept:
+    _native { native }
+{
+}
 
 BlockingSocket::~BlockingSocket()
 {
@@ -158,12 +193,11 @@ void BlockingSocket::Close() noexcept
 IoAwaitable BlockingSocket::Read(std::span<std::byte> buffer)
 {
     if (_closed)
-        return IoAwaitable { std::unexpected(NetError { .code = NetErrorCode::BadFileHandle }) };
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
-    auto const got = ::recv(static_cast<int>(_native),
-                            reinterpret_cast<char*>(buffer.data()),
-                            static_cast<int>(buffer.size()),
-                            0);
+    auto const got =
+        ::recv(static_cast<int>(_native), reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0);
     if (got < 0)
         return IoAwaitable { std::unexpected(MakeSystemError("recv")) };
     return IoAwaitable { IoResult { static_cast<std::size_t>(got) } };
@@ -172,7 +206,8 @@ IoAwaitable BlockingSocket::Read(std::span<std::byte> buffer)
 IoAwaitable BlockingSocket::Write(std::span<std::byte const> buffer)
 {
     if (_closed)
-        return IoAwaitable { std::unexpected(NetError { .code = NetErrorCode::BadFileHandle }) };
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     std::size_t written = 0;
     while (written < buffer.size())
@@ -190,8 +225,7 @@ IoAwaitable BlockingSocket::Write(std::span<std::byte const> buffer)
 
 // -- BlockingListener ------------------------------------------------------
 
-std::unique_ptr<BlockingListener>
-BlockingListener::Bind(std::string_view bindAddress, std::uint16_t port, int backlog)
+std::unique_ptr<BlockingListener> BlockingListener::Bind(std::string_view bindAddress, std::uint16_t port, int backlog)
 {
     Detail::EnsureNetworkInitialised();
 
@@ -206,11 +240,7 @@ BlockingListener::Bind(std::string_view bindAddress, std::uint16_t port, int bac
 
     // SO_REUSEADDR so restart-after-crash works on Linux.
     int reuse = 1;
-    ::setsockopt(sock,
-                 SOL_SOCKET,
-                 SO_REUSEADDR,
-                 reinterpret_cast<char const*>(&reuse),
-                 sizeof(reuse));
+    ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
 
     sockaddr_in addr {};
     addr.sin_family = AF_INET;
@@ -258,8 +288,8 @@ void BlockingListener::Close() noexcept
 AcceptAwaitable BlockingListener::Accept()
 {
     if (_native == Detail::InvalidSocket)
-        return AcceptAwaitable { std::unexpected(NetError {
-            .code = NetErrorCode::BadFileHandle, .context = _bindError }) };
+        return AcceptAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = _bindError }) };
 
     sockaddr_in client {};
 #if defined(_WIN32)
@@ -267,8 +297,7 @@ AcceptAwaitable BlockingListener::Accept()
 #else
     socklen_t addrLen = sizeof(client);
 #endif
-    auto const acceptedRaw =
-        ::accept(static_cast<int>(_native), reinterpret_cast<sockaddr*>(&client), &addrLen);
+    auto const acceptedRaw = ::accept(static_cast<int>(_native), reinterpret_cast<sockaddr*>(&client), &addrLen);
     if (acceptedRaw < 0 || acceptedRaw == static_cast<int>(Detail::InvalidSocket))
         return AcceptAwaitable { std::unexpected(MakeSystemError("accept")) };
 

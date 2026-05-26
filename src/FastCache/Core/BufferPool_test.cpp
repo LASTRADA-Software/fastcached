@@ -53,7 +53,7 @@ TEST_CASE("BufferPool honours its retention cap", "[bufferpool]")
 TEST_CASE("Pool with zero retention never grows its free list", "[bufferpool]")
 {
     auto const pool = FastCache::BufferPool::Create(0);
-    for ([[maybe_unused]] auto const i : std::views::iota(0, 4))
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 4))
     {
         auto buffer = pool->Acquire(128);
         REQUIRE(buffer.IsValid());

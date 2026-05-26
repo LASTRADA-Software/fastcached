@@ -7,6 +7,8 @@
     #include <FastCache/Core/Errors/NetError.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
 
+    #include <winsock2.h>
+
     #include <array>
     #include <cstddef>
     #include <cstdint>
@@ -17,9 +19,8 @@
     #include <string_view>
     #include <utility>
 
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
     #include <mswsock.h>
+    #include <ws2tcpip.h>
 
 namespace FastCache
 {
@@ -31,17 +32,26 @@ namespace
     {
         switch (code)
         {
-            case WSAECONNRESET:    return NetErrorCode::ConnReset;
-            case WSAECONNREFUSED:  return NetErrorCode::ConnRefused;
-            case WSAEHOSTUNREACH:  return NetErrorCode::HostUnreach;
-            case WSAEADDRINUSE:    return NetErrorCode::AddressInUse;
-            case WSAEADDRNOTAVAIL: return NetErrorCode::AddressNotAvail;
-            case WSAEACCES:        return NetErrorCode::PermissionDenied;
+            case WSAECONNRESET:
+                return NetErrorCode::ConnReset;
+            case WSAECONNREFUSED:
+                return NetErrorCode::ConnRefused;
+            case WSAEHOSTUNREACH:
+                return NetErrorCode::HostUnreach;
+            case WSAEADDRINUSE:
+                return NetErrorCode::AddressInUse;
+            case WSAEADDRNOTAVAIL:
+                return NetErrorCode::AddressNotAvail;
+            case WSAEACCES:
+                return NetErrorCode::PermissionDenied;
             case WSAEBADF:
-            case WSAENOTSOCK:      return NetErrorCode::BadFileHandle;
+            case WSAENOTSOCK:
+                return NetErrorCode::BadFileHandle;
             case WSAEINTR:
-            case ERROR_OPERATION_ABORTED: return NetErrorCode::Cancelled;
-            default:                      return NetErrorCode::SystemError;
+            case ERROR_OPERATION_ABORTED:
+                return NetErrorCode::Cancelled;
+            default:
+                return NetErrorCode::SystemError;
         }
     }
 
@@ -87,7 +97,9 @@ struct IocpSocket::Impl
             awaitable->Complete(std::unexpected(MakeWsaError(static_cast<int>(err), op->isWrite ? "WSASend" : "WSARecv")));
     }
 
-    Impl(IocpReactor& r, SOCKET s): reactor { r }, native { s }
+    Impl(IocpReactor& r, SOCKET s):
+        reactor { r },
+        native { s }
     {
         readOp.completion.dispatch = &Dispatch;
         writeOp.completion.dispatch = &Dispatch;
@@ -138,7 +150,8 @@ namespace
 IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
 {
     if (_closed)
-        return IoAwaitable { std::unexpected(NetError { .code = NetErrorCode::BadFileHandle }) };
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     auto& op = _impl->readOp;
     op.awaitable = nullptr; // populated by the suspend callback below
@@ -149,13 +162,8 @@ IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
     wsaBuf.len = static_cast<ULONG>(buffer.size());
     DWORD bytesReceived = 0;
     DWORD flags = 0;
-    auto const rc = WSARecv(_impl->native,
-                            &wsaBuf,
-                            1,
-                            &bytesReceived,
-                            &flags,
-                            reinterpret_cast<LPWSAOVERLAPPED>(&op.completion),
-                            nullptr);
+    auto const rc = WSARecv(
+        _impl->native, &wsaBuf, 1, &bytesReceived, &flags, reinterpret_cast<LPWSAOVERLAPPED>(&op.completion), nullptr);
     auto const lastErr = (rc == 0) ? 0 : WSAGetLastError();
     if (rc == 0 || lastErr == WSA_IO_PENDING)
     {
@@ -169,7 +177,8 @@ IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
 IoAwaitable IocpSocket::Write(std::span<std::byte const> buffer)
 {
     if (_closed)
-        return IoAwaitable { std::unexpected(NetError { .code = NetErrorCode::BadFileHandle }) };
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     auto& op = _impl->writeOp;
     op.awaitable = nullptr;
@@ -250,7 +259,10 @@ struct IocpListener::Impl
             awaitable->Complete(AcceptResult { std::move(sock) });
     }
 
-    Impl(IocpReactor& r): reactor { r } {}
+    Impl(IocpReactor& r):
+        reactor { r }
+    {
+    }
 
     ~Impl()
     {
@@ -264,8 +276,10 @@ struct IocpListener::Impl
 IocpListener::IocpListener() noexcept = default;
 IocpListener::~IocpListener() = default;
 
-std::unique_ptr<IocpListener>
-IocpListener::Bind(IocpReactor& reactor, std::string_view bindAddress, std::uint16_t port, int backlog)
+std::unique_ptr<IocpListener> IocpListener::Bind(IocpReactor& reactor,
+                                                 std::string_view bindAddress,
+                                                 std::uint16_t port,
+                                                 int backlog)
 {
     Detail::EnsureNetworkInitialised();
 
@@ -280,11 +294,7 @@ IocpListener::Bind(IocpReactor& reactor, std::string_view bindAddress, std::uint
     }
 
     int reuse = 1;
-    ::setsockopt(sock,
-                 SOL_SOCKET,
-                 SO_REUSEADDR,
-                 reinterpret_cast<char const*>(&reuse),
-                 sizeof(reuse));
+    ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
 
     sockaddr_in addr {};
     addr.sin_family = AF_INET;
@@ -378,8 +388,8 @@ namespace
 AcceptAwaitable IocpListener::Accept()
 {
     if (!IsBound())
-        return AcceptAwaitable { std::unexpected(NetError {
-            .code = NetErrorCode::BadFileHandle, .context = std::string { BindError() } }) };
+        return AcceptAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = std::string { BindError() } }) };
 
     auto& op = _impl->current;
     op.awaitable = nullptr;

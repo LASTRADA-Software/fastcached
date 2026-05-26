@@ -64,15 +64,15 @@ std::vector<std::byte> BuildBinaryFrame(std::uint8_t opcode,
     AppendBe16(frame, static_cast<std::uint16_t>(key.size()));
     frame.push_back(std::byte { static_cast<std::uint8_t>(extras.size()) });
     frame.push_back(std::byte { 0 }); // data type
-    AppendBe16(frame, 0);              // vbucket
+    AppendBe16(frame, 0);             // vbucket
     AppendBe32(frame, static_cast<std::uint32_t>(extras.size() + key.size() + value.size()));
     AppendBe32(frame, opaque);
     AppendBe64(frame, cas);
-    for (auto const b : extras)
+    for (auto const b: extras)
         frame.push_back(b);
-    for (auto const c : key)
+    for (auto const c: key)
         frame.push_back(static_cast<std::byte>(c));
-    for (auto const c : value)
+    for (auto const c: value)
         frame.push_back(static_cast<std::byte>(c));
     return frame;
 }
@@ -130,8 +130,7 @@ TEST_CASE("memcached-binary: SET then GET round-trips", "[protocol][binary]")
     REQUIRE(response.size() == 24 + 24 + 4 + 5);
 
     // Decode the SET response status.
-    auto const setStatus =
-        FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { response.data() + 6, 2 });
+    auto const setStatus = FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { response.data() + 6, 2 });
     REQUIRE(setStatus == 0);
     // Decode the GET response status + value.
     auto const getStatus =
@@ -149,8 +148,7 @@ TEST_CASE("memcached-binary: GET miss yields KeyNotFound", "[protocol][binary]")
     auto const req = BuildBinaryFrame(0x00, "absent", {}, {});
     auto const response = Exchange(fix, std::span<std::byte const> { req.data(), req.size() });
     REQUIRE(response.size() >= 24);
-    auto const status =
-        FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { response.data() + 6, 2 });
+    auto const status = FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { response.data() + 6, 2 });
     REQUIRE(status == 1); // Status::KeyNotFound
 }
 
@@ -160,8 +158,7 @@ TEST_CASE("memcached-binary: NoOp echoes opaque", "[protocol][binary]")
     auto const req = BuildBinaryFrame(/*opcode*/ 0x0a, {}, {}, {}, /*cas*/ 0, /*opaque*/ 0xDEADBEEFU);
     auto const response = Exchange(fix, std::span<std::byte const> { req.data(), req.size() });
     REQUIRE(response.size() == 24);
-    auto const opaque =
-        FastCache::ReadBigEndian<std::uint32_t>(std::span<std::byte const> { response.data() + 12, 4 });
+    auto const opaque = FastCache::ReadBigEndian<std::uint32_t>(std::span<std::byte const> { response.data() + 12, 4 });
     REQUIRE(opaque == 0xDEADBEEFU);
 }
 
@@ -171,7 +168,6 @@ TEST_CASE("memcached-binary: SASL replies AuthError so non-authing clients fail 
     auto const req = BuildBinaryFrame(/*opcode*/ 0x21, "PLAIN", {}, {});
     auto const response = Exchange(fix, std::span<std::byte const> { req.data(), req.size() });
     REQUIRE(response.size() >= 24);
-    auto const status =
-        FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { response.data() + 6, 2 });
+    auto const status = FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { response.data() + 6, 2 });
     REQUIRE(status == 0x20); // Status::AuthError
 }

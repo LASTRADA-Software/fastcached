@@ -59,19 +59,13 @@ class IStorage
 
     /// Store only if no value currently exists under `key`. Returns the new
     /// CAS token, or StorageError(KeyExists) if the key was present.
-    [[nodiscard]] virtual std::expected<CasToken, StorageError> Add(std::string_view key,
-                                                                    std::vector<std::byte> value,
-                                                                    std::uint32_t flags,
-                                                                    TimePoint expiry,
-                                                                    TimePoint now) = 0;
+    [[nodiscard]] virtual std::expected<CasToken, StorageError> Add(
+        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) = 0;
 
     /// Store only if a value currently exists under `key`. Returns the new
     /// CAS token, or StorageError(KeyNotFound).
-    [[nodiscard]] virtual std::expected<CasToken, StorageError> Replace(std::string_view key,
-                                                                        std::vector<std::byte> value,
-                                                                        std::uint32_t flags,
-                                                                        TimePoint expiry,
-                                                                        TimePoint now) = 0;
+    [[nodiscard]] virtual std::expected<CasToken, StorageError> Replace(
+        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) = 0;
 
     /// Append `suffix` to the existing value at `key`. Flags and expiry are
     /// preserved. CAS bumps.
@@ -101,8 +95,9 @@ class IStorage
         std::uint64_t value;
         CasToken cas;
     };
-    [[nodiscard]] virtual std::expected<IncrResult, StorageError>
-    IncrementOrInitialize(std::string_view key, std::int64_t delta, TimePoint now) = 0;
+    [[nodiscard]] virtual std::expected<IncrResult, StorageError> IncrementOrInitialize(std::string_view key,
+                                                                                        std::int64_t delta,
+                                                                                        TimePoint now) = 0;
 
     /// Delete the entry. Returns StorageError(KeyNotFound) if no entry exists.
     [[nodiscard]] virtual std::expected<void, StorageError> Delete(std::string_view key, TimePoint now) = 0;

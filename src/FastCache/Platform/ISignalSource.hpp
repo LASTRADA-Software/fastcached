@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cstdint>
+
 namespace FastCache
 {
 
 /// Logical events that the platform layer surfaces to the daemon. POSIX
 /// signals (SIGTERM/SIGINT/SIGHUP) and Windows SCM controls (Stop,
 /// PARAMCHANGE) both map onto these.
-enum class SignalEvent : unsigned
+enum class SignalEvent : std::uint8_t
 {
     Stop = 0,
     Reload = 1,
@@ -39,10 +41,19 @@ class ISignalSource
 class ScriptedSignalSource final: public ISignalSource
 {
   public:
-    void FireStop() noexcept { _stop = true; }
-    void FireReload() noexcept { _reload = true; }
+    void FireStop() noexcept
+    {
+        _stop = true;
+    }
+    void FireReload() noexcept
+    {
+        _reload = true;
+    }
 
-    [[nodiscard]] bool StopRequested() const noexcept override { return _stop; }
+    [[nodiscard]] bool StopRequested() const noexcept override
+    {
+        return _stop;
+    }
     [[nodiscard]] bool TakeReloadRequest() noexcept override
     {
         if (!_reload)

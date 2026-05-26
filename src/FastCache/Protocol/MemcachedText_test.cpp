@@ -42,8 +42,7 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket& socket)
     while (true)
     {
         std::vector<std::byte> chunk(256);
-        auto const result =
-            co_await socket.Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const result = co_await socket.Read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!result.has_value())
             break;
         if (*result == 0)

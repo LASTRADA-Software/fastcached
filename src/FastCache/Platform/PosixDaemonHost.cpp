@@ -8,9 +8,10 @@
 #include <utility>
 
 #if !defined(_WIN32)
-    #include <fcntl.h>
     #include <sys/stat.h>
     #include <sys/types.h>
+
+    #include <fcntl.h>
     #include <unistd.h>
 #endif
 
@@ -32,7 +33,10 @@ namespace
     class PosixDaemonHost final: public IDaemonHost
     {
       public:
-        explicit PosixDaemonHost(std::string pidfile) noexcept: _pidfile { std::move(pidfile) } {}
+        explicit PosixDaemonHost(std::string pidfile) noexcept:
+            _pidfile { std::move(pidfile) }
+        {
+        }
 
         int Run(Body body) override
         {

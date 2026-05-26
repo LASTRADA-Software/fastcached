@@ -40,7 +40,10 @@ class BlockingSocket final: public ISocket
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
     void Close() noexcept override;
-    [[nodiscard]] bool IsClosed() const noexcept override { return _closed; }
+    [[nodiscard]] bool IsClosed() const noexcept override
+    {
+        return _closed;
+    }
 
   private:
     Detail::NativeSocket _native;
@@ -59,8 +62,9 @@ class BlockingListener final: public IListener
     /// @param backlog ::listen backlog.
     /// @return A bound and listening listener, or one in an errored state
     ///         (Accept() will immediately yield the bind error).
-    [[nodiscard]] static std::unique_ptr<BlockingListener>
-    Bind(std::string_view bindAddress, std::uint16_t port, int backlog = 64);
+    [[nodiscard]] static std::unique_ptr<BlockingListener> Bind(std::string_view bindAddress,
+                                                                std::uint16_t port,
+                                                                int backlog = 64);
 
     ~BlockingListener() override;
 
@@ -68,10 +72,16 @@ class BlockingListener final: public IListener
     void Close() noexcept override;
 
     /// @return true if the listener bound and listens cleanly.
-    [[nodiscard]] bool IsBound() const noexcept { return _native != Detail::InvalidSocket; }
+    [[nodiscard]] bool IsBound() const noexcept
+    {
+        return _native != Detail::InvalidSocket;
+    }
 
     /// @return Error context recorded at Bind() time if binding failed.
-    [[nodiscard]] std::string_view BindError() const noexcept { return _bindError; }
+    [[nodiscard]] std::string_view BindError() const noexcept
+    {
+        return _bindError;
+    }
 
   private:
     BlockingListener() = default;

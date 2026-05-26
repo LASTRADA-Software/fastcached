@@ -38,7 +38,10 @@ void ConsoleLogger::SetMinLevel(LogLevel level) noexcept
 
 // -- CapturingLogger -------------------------------------------------------
 
-CapturingLogger::CapturingLogger(LogLevel initialMinLevel) noexcept: _minLevel { initialMinLevel } {}
+CapturingLogger::CapturingLogger(LogLevel initialMinLevel) noexcept:
+    _minLevel { initialMinLevel }
+{
+}
 
 void CapturingLogger::Log(LogLevel level, std::string_view message)
 {
@@ -46,7 +49,7 @@ void CapturingLogger::Log(LogLevel level, std::string_view message)
         return;
 
     std::lock_guard const lock { _mutex };
-    _records.push_back(Record { level, std::string { message } });
+    _records.push_back(Record { .level = level, .message = std::string { message } });
 }
 
 LogLevel CapturingLogger::MinLevel() const noexcept
