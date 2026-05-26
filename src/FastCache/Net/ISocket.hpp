@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <expected>
 #include <span>
+#include <utility>
 
 namespace FastCache
 {
@@ -28,7 +29,7 @@ class IoAwaitable
     /// implementation can satisfy the operation synchronously.
     /// @param result Eagerly-known result.
     explicit IoAwaitable(IoResult result) noexcept:
-        _result { result },
+        _result { std::move(result) },
         _ready { true }
     {
     }

@@ -35,6 +35,10 @@ class BlockingSocket final: public ISocket
 {
   public:
     explicit BlockingSocket(Detail::NativeSocket native) noexcept;
+    BlockingSocket(BlockingSocket const&) = delete;
+    BlockingSocket(BlockingSocket&&) = delete;
+    BlockingSocket& operator=(BlockingSocket const&) = delete;
+    BlockingSocket& operator=(BlockingSocket&&) = delete;
     ~BlockingSocket() override;
 
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
@@ -66,6 +70,10 @@ class BlockingListener final: public IListener
                                                                 std::uint16_t port,
                                                                 int backlog = 64);
 
+    BlockingListener(BlockingListener const&) = delete;
+    BlockingListener(BlockingListener&&) = delete;
+    BlockingListener& operator=(BlockingListener const&) = delete;
+    BlockingListener& operator=(BlockingListener&&) = delete;
     ~BlockingListener() override;
 
     [[nodiscard]] AcceptAwaitable Accept() override;

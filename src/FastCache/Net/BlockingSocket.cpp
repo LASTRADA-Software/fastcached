@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 
 #if defined(_WIN32)
     #include <winsock2.h>
@@ -20,8 +21,9 @@
 #else
     #include <sys/socket.h>
 
-    #include <errno.h>
-    #include <signal.h>
+    #include <cerrno>
+    #include <csignal>
+
     #include <unistd.h>
 
     #include <arpa/inet.h>
@@ -33,6 +35,15 @@ namespace FastCache
 
 namespace Detail
 {
+
+#if defined(_WIN32)
+    /// Type of the `len` argument to recv()/send() on this platform.
+    /// Windows uses `int`; POSIX uses `size_t`. Picked here so callers can
+    /// write the cast once and not trip [clang-diagnostic-sign-conversion].
+    using IoLen = int;
+#else
+    using IoLen = std::size_t;
+#endif
 
 #if defined(_WIN32)
 
@@ -185,7 +196,7 @@ void BlockingSocket::Close() noexcept
     _closed = true;
     if (_native != Detail::InvalidSocket)
     {
-        Detail::CloseNative(_native);
+        std::ignore = Detail::CloseNative(_native);
         _native = Detail::InvalidSocket;
     }
 }
@@ -196,8 +207,10 @@ IoAwaitable BlockingSocket::Read(std::span<std::byte> buffer)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
-    auto const got =
-        ::recv(static_cast<int>(_native), reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0);
+    auto const got = ::recv(static_cast<int>(_native),
+                            reinterpret_cast<char*>(buffer.data()),
+                            static_cast<Detail::IoLen>(buffer.size()),
+                            0);
     if (got < 0)
         return IoAwaitable { std::unexpected(MakeSystemError("recv")) };
     return IoAwaitable { IoResult { static_cast<std::size_t>(got) } };
@@ -214,7 +227,7 @@ IoAwaitable BlockingSocket::Write(std::span<std::byte const> buffer)
     {
         auto const n = ::send(static_cast<int>(_native),
                               reinterpret_cast<char const*>(buffer.data()) + written,
-                              static_cast<int>(buffer.size() - written),
+                              static_cast<Detail::IoLen>(buffer.size() - written),
                               0);
         if (n < 0)
             return IoAwaitable { std::unexpected(MakeSystemError("send")) };
@@ -249,21 +262,21 @@ std::unique_ptr<BlockingListener> BlockingListener::Bind(std::string_view bindAd
     if (::inet_pton(AF_INET, addrCopy.c_str(), &addr.sin_addr) != 1)
     {
         listener->_bindError = std::format("inet_pton({}) failed", addrCopy);
-        Detail::CloseNative(static_cast<Detail::NativeSocket>(sock));
+        std::ignore = Detail::CloseNative(static_cast<Detail::NativeSocket>(sock));
         return listener;
     }
 
     if (::bind(sock, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) != 0)
     {
         listener->_bindError = std::format("bind({}:{}) failed: {}", addrCopy, port, Detail::LastNetworkError());
-        Detail::CloseNative(static_cast<Detail::NativeSocket>(sock));
+        std::ignore = Detail::CloseNative(static_cast<Detail::NativeSocket>(sock));
         return listener;
     }
 
     if (::listen(sock, backlog) != 0)
     {
         listener->_bindError = std::format("listen() failed: {}", Detail::LastNetworkError());
-        Detail::CloseNative(static_cast<Detail::NativeSocket>(sock));
+        std::ignore = Detail::CloseNative(static_cast<Detail::NativeSocket>(sock));
         return listener;
     }
 
@@ -280,7 +293,7 @@ void BlockingListener::Close() noexcept
 {
     if (_native != Detail::InvalidSocket)
     {
-        Detail::CloseNative(_native);
+        std::ignore = Detail::CloseNative(_native);
         _native = Detail::InvalidSocket;
     }
 }

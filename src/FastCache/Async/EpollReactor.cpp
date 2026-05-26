@@ -11,7 +11,8 @@
     #include <cstdint>
     #include <ranges>
 
-    #include <errno.h>
+    #include <cerrno>
+
     #include <unistd.h>
 
 namespace FastCache
@@ -44,10 +45,10 @@ namespace
 } // namespace
 
 EpollReactor::EpollReactor(IClock& clock):
-    _clock { clock }
+    _clock { clock },
+    _epollFd { ::epoll_create1(EPOLL_CLOEXEC) },
+    _wakeFd { ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) }
 {
-    _epollFd = ::epoll_create1(EPOLL_CLOEXEC);
-    _wakeFd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (_epollFd >= 0 && _wakeFd >= 0)
     {
         epoll_event ev {};
@@ -65,7 +66,7 @@ EpollReactor::~EpollReactor()
         ::close(_epollFd);
 }
 
-bool EpollReactor::Attach(EpollFdHandler* handler) noexcept
+bool EpollReactor::Attach(EpollFdHandler* handler) const noexcept
 {
     if (!handler || handler->fd < 0 || _epollFd < 0)
         return false;
@@ -75,7 +76,7 @@ bool EpollReactor::Attach(EpollFdHandler* handler) noexcept
     return ::epoll_ctl(_epollFd, EPOLL_CTL_ADD, handler->fd, &ev) == 0;
 }
 
-bool EpollReactor::UpdateInterest(EpollFdHandler* handler, bool read, bool write) noexcept
+bool EpollReactor::UpdateInterest(EpollFdHandler* handler, bool read, bool write) const noexcept
 {
     if (!handler || handler->fd < 0 || _epollFd < 0)
         return false;
@@ -89,7 +90,7 @@ bool EpollReactor::UpdateInterest(EpollFdHandler* handler, bool read, bool write
     return ::epoll_ctl(_epollFd, EPOLL_CTL_MOD, handler->fd, &ev) == 0;
 }
 
-void EpollReactor::Detach(EpollFdHandler* handler) noexcept
+void EpollReactor::Detach(EpollFdHandler* handler) const noexcept
 {
     if (!handler || handler->fd < 0 || _epollFd < 0)
         return;
