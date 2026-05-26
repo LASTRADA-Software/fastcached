@@ -3,7 +3,7 @@ name: Build
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, "fix-ci"]
   pull_request:
     branches: [master, main]
 
@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [clang-debug, gcc-debug]
+        preset: [clang-debug, clang-release, gcc-debug, gcc-release]
     steps:
       - uses: actions/checkout@v4
 
@@ -63,7 +63,7 @@ jobs:
           sudo apt-get install -y ninja-build libyaml-cpp-dev
 
       - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
-        if: matrix.preset == 'clang-debug'
+        if: startsWith(matrix.preset, 'clang')
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
@@ -74,7 +74,7 @@ jobs:
           sudo ln -sf /usr/bin/clang-tidy-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang-tidy
 
       - name: "Install GCC ${{ env.GCC_VERSION }}"
-        if: matrix.preset == 'gcc-debug'
+        if: startsWith(matrix.preset, 'gcc')
         run: |
           sudo apt-get install -y gcc-${{ env.GCC_VERSION }} g++-${{ env.GCC_VERSION }}
           sudo ln -sf /usr/bin/gcc-${{ env.GCC_VERSION }} /usr/local/bin/gcc
@@ -170,7 +170,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [cl-debug, clangcl-debug]
+        preset: [cl-debug, cl-release, clangcl-debug, clangcl-release]
     steps:
       - uses: actions/checkout@v4
 
