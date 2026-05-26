@@ -52,51 +52,46 @@ namespace
         return ec == std::errc {} && ptr == sv.data() + sv.size();
     }
 
-    Task<bool> WriteAll(ISocket& socket, std::string_view payload)
+    Task<bool> WriteAll(ISocket* socket, std::string_view payload)
     {
         if (payload.empty())
             co_return true;
-        auto const r = co_await socket.Write(AsBytes(payload));
+        auto const r = co_await socket->Write(AsBytes(payload));
         co_return r.has_value();
     }
 
-    Task<bool> WriteAll(ISocket& socket, std::span<std::byte const> payload)
+    Task<bool> WriteAll(ISocket* socket, std::span<std::byte const> payload)
     {
         if (payload.empty())
             co_return true;
-        auto const r = co_await socket.Write(payload);
+        auto const r = co_await socket->Write(payload);
         co_return r.has_value();
     }
 
-    Task<bool> ReplyOk(ISocket& socket)
+    Task<bool> ReplyOk(ISocket* socket)
     {
         co_return co_await WriteAll(socket, "+OK\r\n");
     }
-    Task<bool> ReplyPong(ISocket& socket)
+    Task<bool> ReplyPong(ISocket* socket)
     {
         co_return co_await WriteAll(socket, "+PONG\r\n");
     }
-    Task<bool> ReplyNil(ISocket& socket)
+    Task<bool> ReplyNil(ISocket* socket)
     {
         co_return co_await WriteAll(socket, "$-1\r\n");
     }
 
-    Task<bool> ReplyInteger(ISocket& socket, std::int64_t value)
+    Task<bool> ReplyInteger(ISocket* socket, std::int64_t value)
     {
         co_return co_await WriteAll(socket, std::format(":{}\r\n", value));
     }
 
-    Task<bool> ReplySimpleString(ISocket& socket, std::string_view text)
-    {
-        co_return co_await WriteAll(socket, std::format("+{}\r\n", text));
-    }
-
-    Task<bool> ReplyError(ISocket& socket, std::string_view detail)
+    Task<bool> ReplyError(ISocket* socket, std::string_view detail)
     {
         co_return co_await WriteAll(socket, std::format("-ERR {}\r\n", detail));
     }
 
-    Task<bool> ReplyBulkString(ISocket& socket, std::span<std::byte const> bytes)
+    Task<bool> ReplyBulkString(ISocket* socket, std::span<std::byte const> bytes)
     {
         auto const header = std::format("${}\r\n", bytes.size());
         if (!co_await WriteAll(socket, header))
@@ -106,7 +101,7 @@ namespace
         co_return co_await WriteAll(socket, Crlf);
     }
 
-    Task<bool> ReplyBulkString(ISocket& socket, std::string_view text)
+    Task<bool> ReplyBulkString(ISocket* socket, std::string_view text)
     {
         co_return co_await ReplyBulkString(socket, AsBytes(text));
     }
@@ -121,10 +116,10 @@ namespace
 
     using ReadCommandResult = std::expected<ParsedCommand, ProtocolError>;
 
-    /// Read a `$<len>\r\n<bytes>\r\n` bulk string argument from the reader.
-    Task<std::expected<std::string, ProtocolError>> ReadBulkArg(ByteReader& reader)
+    /// Read a `$<len>\r\n<bytes>\r\n` bulk string argument from the reader->
+    Task<std::expected<std::string, ProtocolError>> ReadBulkArg(ByteReader* reader)
     {
-        auto const header = co_await reader.ReadLine();
+        auto const header = co_await reader->ReadLine();
         if (!header.has_value())
             co_return std::unexpected(header.error());
         auto const& line = *header;
@@ -136,19 +131,19 @@ namespace
             co_return std::unexpected(
                 ProtocolError { .code = ProtocolErrorCode::MalformedFrame, .context = "bad bulk length" });
 
-        auto const bytes = co_await reader.ReadExactly(static_cast<std::size_t>(len));
+        auto const bytes = co_await reader->ReadExactly(static_cast<std::size_t>(len));
         if (!bytes.has_value())
             co_return std::unexpected(bytes.error());
         // Trailing CRLF.
-        auto const crlf = co_await reader.ReadExactly(2);
+        auto const crlf = co_await reader->ReadExactly(2);
         if (!crlf.has_value())
             co_return std::unexpected(crlf.error());
         co_return std::string { reinterpret_cast<char const*>(bytes->data()), bytes->size() };
     }
 
-    Task<ReadCommandResult> ReadOneCommand(ByteReader& reader)
+    Task<ReadCommandResult> ReadOneCommand(ByteReader* reader)
     {
-        auto const first = co_await reader.ReadLine();
+        auto const first = co_await reader->ReadLine();
         if (!first.has_value())
             co_return std::unexpected(first.error());
         auto const& line = *first;
@@ -227,18 +222,18 @@ namespace
         return opts;
     }
 
-    Task<bool> HandleGet(ISocket& socket, CacheEngine& engine, std::span<std::string const> args)
+    Task<bool> HandleGet(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
     {
         if (args.size() != 1)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'get'");
-        auto const result = engine.Get(args[0]);
+        auto const result = engine->Get(args[0]);
         if (!result.has_value() || !result->found)
             co_return co_await ReplyNil(socket);
         co_return co_await ReplyBulkString(
             socket, std::span<std::byte const> { result->entry.value.data(), result->entry.value.size() });
     }
 
-    Task<bool> HandleSet(ISocket& socket, CacheEngine& engine, std::span<std::string const> args)
+    Task<bool> HandleSet(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
     {
         if (args.size() < 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'set'");
@@ -256,11 +251,11 @@ namespace
 
         std::expected<CasToken, StorageError> result { 0 };
         if (opts->nx)
-            result = engine.Add(key, std::move(bytes), 0, opts->exptime);
+            result = engine->Add(key, std::move(bytes), 0, opts->exptime);
         else if (opts->xx)
-            result = engine.Replace(key, std::move(bytes), 0, opts->exptime);
+            result = engine->Replace(key, std::move(bytes), 0, opts->exptime);
         else
-            result = engine.Set(key, std::move(bytes), 0, opts->exptime);
+            result = engine->Set(key, std::move(bytes), 0, opts->exptime);
 
         if (result.has_value())
             co_return co_await ReplyOk(socket);
@@ -269,7 +264,7 @@ namespace
         co_return co_await ReplyError(socket, "storage failure");
     }
 
-    Task<bool> HandleSetEx(ISocket& socket, CacheEngine& engine, std::span<std::string const> args, bool millis)
+    Task<bool> HandleSetEx(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, bool millis)
     {
         if (args.size() != 3)
             co_return co_await ReplyError(
@@ -283,57 +278,57 @@ namespace
         bytes.reserve(args[2].size());
         for (auto const c: args[2])
             bytes.push_back(static_cast<std::byte>(c));
-        auto const result = engine.Set(args[0], std::move(bytes), 0, exptime);
+        auto const result = engine->Set(args[0], std::move(bytes), 0, exptime);
         if (!result.has_value())
             co_return co_await ReplyError(socket, "storage failure");
         co_return co_await ReplyOk(socket);
     }
 
-    Task<bool> HandleDel(ISocket& socket, CacheEngine& engine, std::span<std::string const> args)
+    Task<bool> HandleDel(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
     {
         if (args.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'del'");
         std::int64_t deleted = 0;
         for (auto const& key: args)
         {
-            auto const result = engine.Delete(key);
+            auto const result = engine->Delete(key);
             if (result.has_value())
                 ++deleted;
         }
         co_return co_await ReplyInteger(socket, deleted);
     }
 
-    Task<bool> HandleExists(ISocket& socket, CacheEngine& engine, std::span<std::string const> args)
+    Task<bool> HandleExists(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
     {
         if (args.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'exists'");
         std::int64_t found = 0;
         for (auto const& key: args)
         {
-            auto const result = engine.Get(key);
+            auto const result = engine->Get(key);
             if (result.has_value() && result->found)
                 ++found;
         }
         co_return co_await ReplyInteger(socket, found);
     }
 
-    Task<bool> HandlePing(ISocket& socket, std::span<std::string const> args)
+    Task<bool> HandlePing(ISocket* socket, std::span<std::string const> args)
     {
         if (args.empty())
             co_return co_await ReplyPong(socket);
         co_return co_await ReplyBulkString(socket, args[0]);
     }
 
-    Task<bool> HandleEcho(ISocket& socket, std::span<std::string const> args)
+    Task<bool> HandleEcho(ISocket* socket, std::span<std::string const> args)
     {
         if (args.size() != 1)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'echo'");
         co_return co_await ReplyBulkString(socket, args[0]);
     }
 
-    Task<bool> HandleInfo(ISocket& socket, CacheEngine& engine)
+    Task<bool> HandleInfo(ISocket* socket, CacheEngine* engine)
     {
-        auto const stats = engine.Snapshot();
+        auto const stats = engine->Snapshot();
         auto const body = std::format("# Server\r\nfastcached_version:{}\r\nredis_version:6.0.0-fastcached\r\n"
                                       "# Memory\r\nused_memory:{}\r\nmaxmemory:{}\r\n"
                                       "# Stats\r\ntotal_commands_processed:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\n",
@@ -346,7 +341,7 @@ namespace
         co_return co_await ReplyBulkString(socket, body);
     }
 
-    Task<bool> HandleHello(ISocket& socket, std::span<std::string const> args)
+    Task<bool> HandleHello(ISocket* socket, std::span<std::string const> args)
     {
         // HELLO [<protover>] — we only support RESP2.
         if (!args.empty())
@@ -367,7 +362,7 @@ namespace
         co_return co_await WriteAll(socket, body);
     }
 
-    Task<bool> HandleCommand(ISocket& socket, std::span<std::string const> args)
+    Task<bool> HandleCommand(ISocket* socket, std::span<std::string const> args)
     {
         // Always reply with an empty array; sccache only uses COMMAND
         // DOCS/COUNT for sanity checks.
@@ -375,13 +370,13 @@ namespace
         co_return co_await WriteAll(socket, "*0\r\n");
     }
 
-    Task<bool> HandleFlush(ISocket& socket, CacheEngine& engine)
+    Task<bool> HandleFlush(ISocket* socket, CacheEngine* engine)
     {
-        engine.FlushAll(0);
+        engine->FlushAll(0);
         co_return co_await ReplyOk(socket);
     }
 
-    Task<bool> Dispatch(ISocket& socket, CacheEngine& engine, ParsedCommand const& cmd)
+    Task<bool> Dispatch(ISocket* socket, CacheEngine* engine, ParsedCommand cmd)
     {
         if (cmd.args.empty())
             co_return true;
@@ -416,7 +411,7 @@ namespace
         if (name == "QUIT")
         {
             (void) co_await ReplyOk(socket);
-            socket.Close();
+            socket->Close();
             co_return false; // signal session end
         }
         if (name == "AUTH")
@@ -431,19 +426,19 @@ std::string_view RedisRespHandler::ServerVersion() noexcept
     return ServerVersionBanner;
 }
 
-Task<void> RedisRespHandler::Run(ISocket& socket, CacheEngine& engine, std::vector<std::byte> primingBytes)
+Task<void> RedisRespHandler::Run(ISocket* socket, CacheEngine* engine, std::vector<std::byte> primingBytes)
 {
-    ByteReader reader { socket, MaxLineBytes, MaxPayloadBytes };
+    ByteReader reader { *socket, MaxLineBytes, MaxPayloadBytes };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
 
     while (true)
     {
-        auto cmd = co_await ReadOneCommand(reader);
+        auto cmd = co_await ReadOneCommand(&reader);
         if (!cmd.has_value())
             co_return; // truncated / malformed — drop connection
         if (cmd->args.empty())
             continue;
-        auto const keepGoing = co_await Dispatch(socket, engine, *cmd);
+        auto const keepGoing = co_await Dispatch(socket, engine, std::move(*cmd));
         if (!keepGoing)
             co_return;
     }

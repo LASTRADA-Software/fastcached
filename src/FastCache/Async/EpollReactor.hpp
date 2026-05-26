@@ -69,25 +69,25 @@ class EpollReactor: public IReactor
     /// none; the caller adjusts via UpdateInterest after registration.
     /// @param handler Stable address; lifetime owned by the caller.
     /// @return true on success.
-    [[nodiscard]] bool Attach(EpollFdHandler* handler) noexcept;
+    [[nodiscard]] bool Attach(EpollFdHandler* handler) const noexcept;
 
     /// Update the epoll interest mask on an attached fd. Pass `read=true`
     /// to register interest in EPOLLIN, `write=true` for EPOLLOUT.
     /// Setting both to false re-arms the handler with edge-triggered
     /// no-interest (used to mute an fd after one-shot completion).
-    [[nodiscard]] bool UpdateInterest(EpollFdHandler* handler, bool read, bool write) noexcept;
+    [[nodiscard]] bool UpdateInterest(EpollFdHandler* handler, bool read, bool write) const noexcept;
 
     /// Remove the fd from the epoll set. Safe even if Attach was never
     /// called.
-    void Detach(EpollFdHandler* handler) noexcept;
+    void Detach(EpollFdHandler* handler) const noexcept;
 
     /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
     /// can name the type. Treat as Detail.
     struct TimerEntry
     {
-        TimePoint deadline;
-        std::uint64_t sequence;
-        std::coroutine_handle<> handle;
+        TimePoint deadline {};
+        std::uint64_t sequence { 0 };
+        std::coroutine_handle<> handle {};
     };
 
   private:

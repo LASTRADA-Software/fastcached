@@ -20,7 +20,7 @@ Connection::Connection(std::unique_ptr<ISocket> socket, CacheEngine& engine, ILo
 
 Task<void> Connection::Run()
 {
-    auto detect = co_await DetectProtocol(*_socket);
+    auto detect = co_await DetectProtocol(_socket.get());
     if (!detect.has_value())
     {
         _logger.Logf(LogLevel::Debug, "Connection: autodetect failed: {}", detect.error().ToString());
@@ -32,17 +32,17 @@ Task<void> Connection::Run()
     {
         case ProtocolFlavor::MemcachedText: {
             MemcachedTextHandler handler;
-            co_await handler.Run(*_socket, _engine, std::move(detect->primer));
+            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer));
             break;
         }
         case ProtocolFlavor::MemcachedBinary: {
             MemcachedBinaryHandler handler;
-            co_await handler.Run(*_socket, _engine, std::move(detect->primer));
+            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer));
             break;
         }
         case ProtocolFlavor::RedisResp: {
             RedisRespHandler handler;
-            co_await handler.Run(*_socket, _engine, std::move(detect->primer));
+            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer));
             break;
         }
         case ProtocolFlavor::Unknown:

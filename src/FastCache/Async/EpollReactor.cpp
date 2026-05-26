@@ -7,11 +7,12 @@
     #include <sys/eventfd.h>
 
     #include <algorithm>
+    #include <cerrno>
     #include <chrono>
     #include <cstdint>
     #include <ranges>
+    #include <tuple>
 
-    #include <errno.h>
     #include <unistd.h>
 
 namespace FastCache
@@ -44,10 +45,10 @@ namespace
 } // namespace
 
 EpollReactor::EpollReactor(IClock& clock):
-    _clock { clock }
+    _clock { clock },
+    _epollFd { ::epoll_create1(EPOLL_CLOEXEC) },
+    _wakeFd { ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) }
 {
-    _epollFd = ::epoll_create1(EPOLL_CLOEXEC);
-    _wakeFd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (_epollFd >= 0 && _wakeFd >= 0)
     {
         epoll_event ev {};
@@ -65,7 +66,7 @@ EpollReactor::~EpollReactor()
         ::close(_epollFd);
 }
 
-bool EpollReactor::Attach(EpollFdHandler* handler) noexcept
+bool EpollReactor::Attach(EpollFdHandler* handler) const noexcept
 {
     if (!handler || handler->fd < 0 || _epollFd < 0)
         return false;
@@ -75,7 +76,7 @@ bool EpollReactor::Attach(EpollFdHandler* handler) noexcept
     return ::epoll_ctl(_epollFd, EPOLL_CTL_ADD, handler->fd, &ev) == 0;
 }
 
-bool EpollReactor::UpdateInterest(EpollFdHandler* handler, bool read, bool write) noexcept
+bool EpollReactor::UpdateInterest(EpollFdHandler* handler, bool read, bool write) const noexcept
 {
     if (!handler || handler->fd < 0 || _epollFd < 0)
         return false;
@@ -89,7 +90,7 @@ bool EpollReactor::UpdateInterest(EpollFdHandler* handler, bool read, bool write
     return ::epoll_ctl(_epollFd, EPOLL_CTL_MOD, handler->fd, &ev) == 0;
 }
 
-void EpollReactor::Detach(EpollFdHandler* handler) noexcept
+void EpollReactor::Detach(EpollFdHandler* handler) const noexcept
 {
     if (!handler || handler->fd < 0 || _epollFd < 0)
         return;
@@ -106,7 +107,7 @@ void EpollReactor::Submit(std::coroutine_handle<> handle)
         _pendingSubmits.push_back(handle);
     }
     std::uint64_t one = 1;
-    (void) ::write(_wakeFd, &one, sizeof(one));
+    std::ignore = ::write(_wakeFd, &one, sizeof(one));
 }
 
 void EpollReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
@@ -119,14 +120,14 @@ void EpollReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
         std::ranges::push_heap(_timers, EntryGreater);
     }
     std::uint64_t one = 1;
-    (void) ::write(_wakeFd, &one, sizeof(one));
+    std::ignore = ::write(_wakeFd, &one, sizeof(one));
 }
 
 void EpollReactor::Stop() noexcept
 {
     _stopped.store(true, std::memory_order_release);
     std::uint64_t one = 1;
-    (void) ::write(_wakeFd, &one, sizeof(one));
+    std::ignore = ::write(_wakeFd, &one, sizeof(one));
 }
 
 void EpollReactor::FireExpiredTimers()
@@ -192,7 +193,7 @@ void EpollReactor::Run()
             {
                 // Wake event — drain the eventfd counter and move on.
                 std::uint64_t buf {};
-                (void) ::read(_wakeFd, &buf, sizeof(buf));
+                std::ignore = ::read(_wakeFd, &buf, sizeof(buf));
                 continue;
             }
             auto* handler = static_cast<EpollFdHandler*>(ev.data.ptr);

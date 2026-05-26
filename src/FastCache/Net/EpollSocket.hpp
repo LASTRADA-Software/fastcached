@@ -24,6 +24,10 @@ class EpollSocket final: public ISocket
 {
   public:
     EpollSocket(EpollReactor& reactor, int fd) noexcept;
+    EpollSocket(EpollSocket const&) = delete;
+    EpollSocket(EpollSocket&&) = delete;
+    EpollSocket& operator=(EpollSocket const&) = delete;
+    EpollSocket& operator=(EpollSocket&&) = delete;
     ~EpollSocket() override;
 
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
@@ -59,6 +63,10 @@ class EpollListener final: public IListener
                                                              std::uint16_t port,
                                                              int backlog = 64);
 
+    EpollListener(EpollListener const&) = delete;
+    EpollListener(EpollListener&&) = delete;
+    EpollListener& operator=(EpollListener const&) = delete;
+    EpollListener& operator=(EpollListener&&) = delete;
     ~EpollListener() override;
 
     [[nodiscard]] AcceptAwaitable Accept() override;

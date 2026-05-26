@@ -14,15 +14,15 @@
 namespace
 {
 
-void PushAndClose(FastCache::ISocket& socket, std::string_view data)
+void PushAndClose(FastCache::ISocket* socket, std::string_view data)
 {
     auto const bytes = FastCache::AsBytes(data);
-    auto const result = FastCache::SyncRun([](FastCache::ISocket& s, std::span<std::byte const> b) -> FastCache::Task<bool> {
-        auto const r = co_await s.Write(b);
+    auto const result = FastCache::SyncRun([](FastCache::ISocket* s, std::span<std::byte const> b) -> FastCache::Task<bool> {
+        auto const r = co_await s->Write(b);
         co_return r.has_value();
     }(socket, bytes));
     REQUIRE(result);
-    socket.Close();
+    socket->Close();
 }
 
 } // namespace
@@ -30,7 +30,7 @@ void PushAndClose(FastCache::ISocket& socket, std::string_view data)
 TEST_CASE("ByteReader extracts a single line", "[net][linereader]")
 {
     auto pair = FastCache::InMemorySocketPair::Create();
-    PushAndClose(*pair.client, "hello\r\n");
+    PushAndClose(pair.client.get(), "hello\r\n");
 
     FastCache::ByteReader reader { *pair.server, /*maxLineBytes*/ 1024, /*maxPayloadBytes*/ 1024 };
     auto const line = FastCache::SyncRun(reader.ReadLine());
@@ -41,7 +41,7 @@ TEST_CASE("ByteReader extracts a single line", "[net][linereader]")
 TEST_CASE("ByteReader handles a payload that follows a line", "[net][linereader]")
 {
     auto pair = FastCache::InMemorySocketPair::Create();
-    PushAndClose(*pair.client, "set foo 0 0 5\r\nhello\r\n");
+    PushAndClose(pair.client.get(), "set foo 0 0 5\r\nhello\r\n");
 
     FastCache::ByteReader reader { *pair.server, 1024, 1024 };
     auto const line = FastCache::SyncRun(reader.ReadLine());
@@ -64,7 +64,7 @@ TEST_CASE("ByteReader rejects lines past the cap", "[net][linereader]")
     auto pair = FastCache::InMemorySocketPair::Create();
     std::string oversized(64, 'A');
     oversized += "\r\n";
-    PushAndClose(*pair.client, oversized);
+    PushAndClose(pair.client.get(), oversized);
 
     FastCache::ByteReader reader { *pair.server, /*maxLineBytes*/ 16, /*maxPayloadBytes*/ 1024 };
     auto const line = FastCache::SyncRun(reader.ReadLine());
@@ -86,7 +86,7 @@ TEST_CASE("ByteReader reports truncation on EOF before line", "[net][linereader]
 TEST_CASE("ByteReader rejects oversized payload requests", "[net][linereader]")
 {
     auto pair = FastCache::InMemorySocketPair::Create();
-    PushAndClose(*pair.client, "anything");
+    PushAndClose(pair.client.get(), "anything");
 
     FastCache::ByteReader reader { *pair.server, 1024, /*maxPayloadBytes*/ 4 };
     auto const body = FastCache::SyncRun(reader.ReadExactly(100));

@@ -28,7 +28,7 @@ namespace FastCache
 class MemcachedBinaryHandler final: public IProtocolHandler
 {
   public:
-    [[nodiscard]] Task<void> Run(ISocket& socket, CacheEngine& engine, std::vector<std::byte> primingBytes) override;
+    [[nodiscard]] Task<void> Run(ISocket* socket, CacheEngine* engine, std::vector<std::byte> primingBytes) override;
 };
 
 } // namespace FastCache

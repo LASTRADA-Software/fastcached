@@ -81,6 +81,10 @@ class InMemorySocket: public ISocket
     /// @param inbound Pipe this socket reads from (peer's outbound).
     /// @param outbound Pipe this socket writes into (peer's inbound).
     InMemorySocket(std::shared_ptr<InMemoryPipe> inbound, std::shared_ptr<InMemoryPipe> outbound) noexcept;
+    InMemorySocket(InMemorySocket const&) = delete;
+    InMemorySocket(InMemorySocket&&) = delete;
+    InMemorySocket& operator=(InMemorySocket const&) = delete;
+    InMemorySocket& operator=(InMemorySocket&&) = delete;
     ~InMemorySocket() override;
 
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
@@ -127,6 +131,10 @@ class InMemoryListener final: public IListener
 {
   public:
     InMemoryListener();
+    InMemoryListener(InMemoryListener const&) = delete;
+    InMemoryListener(InMemoryListener&&) = delete;
+    InMemoryListener& operator=(InMemoryListener const&) = delete;
+    InMemoryListener& operator=(InMemoryListener&&) = delete;
     ~InMemoryListener() override;
 
     [[nodiscard]] AcceptAwaitable Accept() override;

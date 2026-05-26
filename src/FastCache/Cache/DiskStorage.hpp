@@ -5,6 +5,7 @@
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
+#include <FastCache/Core/Owner.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -198,11 +199,26 @@ class DiskStorage final: public IStorage
     /// Apply a Flush record (bump live generation).
     void ApplyFlush();
 
+    /// Slurp the entire log file into memory.
+    [[nodiscard]] std::expected<std::vector<std::byte>, StorageError> SlurpLogFile(std::filesystem::path const& path);
+
+    /// Validate the magic+version header at the start of `raw`. Clears `raw` if
+    /// the file is shorter than the header (caller treats as empty/new).
+    [[nodiscard]] std::expected<void, StorageError> ValidateLogHeader(std::vector<std::byte>& raw);
+
+    /// Replay all records in `raw` from offset HeaderSize, updating goodPrefix
+    /// to the offset just past the last successfully-applied record.
+    [[nodiscard]] std::expected<void, StorageError> ReplayBytes(std::span<std::byte const> raw, std::uintmax_t& goodPrefix);
+
+    /// Decode a single record payload and apply its effect to in-memory state.
+    /// @return true on success; false on corrupt/unknown payload (caller stops replay).
+    [[nodiscard]] bool ApplyReplayedRecord(std::span<std::byte const> payload);
+
     Options _options;
 
     // Native log file handle; we use a C FILE* so we can fflush+fsync
-    // portably enough for MVP.
-    std::FILE* _log { nullptr };
+    // portably enough for MVP. gsl::owner<> marks ownership for clang-tidy.
+    gsl::owner<std::FILE*> _log { nullptr };
 
     std::size_t _bytesUsed { 0 };
     std::uint64_t _liveGeneration { 1 };

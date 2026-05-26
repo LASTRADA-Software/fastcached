@@ -9,6 +9,7 @@
 
     #include <sys/socket.h>
 
+    #include <cerrno>
     #include <cstddef>
     #include <cstdint>
     #include <cstring>
@@ -17,9 +18,9 @@
     #include <span>
     #include <string>
     #include <string_view>
+    #include <tuple>
     #include <utility>
 
-    #include <errno.h>
     #include <fcntl.h>
     #include <unistd.h>
 
@@ -103,7 +104,7 @@ struct EpollSocket::Impl
 
     void UpdateInterest()
     {
-        reactor.UpdateInterest(&handler, readOp.awaitable != nullptr, writeOp.awaitable != nullptr);
+        std::ignore = reactor.UpdateInterest(&handler, readOp.awaitable != nullptr, writeOp.awaitable != nullptr);
     }
 
     Impl(EpollReactor& r, int fd):
@@ -187,7 +188,7 @@ EpollSocket::EpollSocket(EpollReactor& reactor, int fd) noexcept:
     _fd { fd }
 {
     SetNonBlocking(fd);
-    reactor.Attach(&_impl->handler);
+    std::ignore = reactor.Attach(&_impl->handler);
 }
 
 EpollSocket::~EpollSocket()
@@ -241,7 +242,8 @@ IoAwaitable EpollSocket::Read(std::span<std::byte> buffer)
     _impl->readOp.readBuffer = buffer;
     IoAwaitable a;
     a.SetSuspendCallback(&EpollSocketAwaitableSuspended, &_impl->readOp);
-    _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ true, /*write*/ _impl->writeOp.awaitable != nullptr);
+    std::ignore =
+        _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ true, /*write*/ _impl->writeOp.awaitable != nullptr);
     return a;
 }
 
@@ -274,7 +276,8 @@ IoAwaitable EpollSocket::Write(std::span<std::byte const> buffer)
     _impl->writeOp.writeTotal = buffer.size();
     IoAwaitable a;
     a.SetSuspendCallback(&EpollSocketAwaitableSuspended, &_impl->writeOp);
-    _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ _impl->readOp.awaitable != nullptr, /*write*/ true);
+    std::ignore =
+        _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ _impl->readOp.awaitable != nullptr, /*write*/ true);
     return a;
 }
 
@@ -328,13 +331,13 @@ void EpollListener::Impl::OnReadable(EpollFdHandler* base)
             return;
         auto* awaitable = impl->pending;
         impl->pending = nullptr;
-        impl->reactor.UpdateInterest(&impl->handler, false, false);
+        std::ignore = impl->reactor.UpdateInterest(&impl->handler, false, false);
         awaitable->Complete(std::unexpected(MakePosixError(errno, "accept4")));
         return;
     }
     auto* awaitable = impl->pending;
     impl->pending = nullptr;
-    impl->reactor.UpdateInterest(&impl->handler, false, false);
+    std::ignore = impl->reactor.UpdateInterest(&impl->handler, false, false);
     awaitable->Complete(AcceptResult { std::make_unique<EpollSocket>(impl->reactor, fd) });
 }
 
@@ -439,7 +442,7 @@ AcceptAwaitable EpollListener::Accept()
     _impl->pending = nullptr;
     AcceptAwaitable a;
     a.SetSuspendCallback(&ListenerAwaitableSuspended, _impl.get());
-    _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ true, /*write*/ false);
+    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ true, /*write*/ false);
     return a;
 }
 

@@ -61,7 +61,7 @@ namespace
         SaslStep = 0x22,
     };
 
-    enum class Status : std::uint16_t
+    enum class Status : std::uint8_t
     {
         Ok = 0x00,
         KeyNotFound = 0x01,
@@ -104,7 +104,7 @@ namespace
         return true;
     }
 
-    Task<bool> WriteResponse(ISocket& socket,
+    Task<bool> WriteResponse(ISocket* socket,
                              Opcode opcode,
                              Status status,
                              std::uint32_t opaque,
@@ -125,40 +125,54 @@ namespace
         WriteBigEndian<std::uint32_t>(std::span<std::byte> { &hdr[12], 4 }, opaque);
         WriteBigEndian<std::uint64_t>(std::span<std::byte> { &hdr[16], 8 }, cas);
 
-        auto const r1 = co_await socket.Write(std::span<std::byte const> { hdr.data(), hdr.size() });
+        auto const r1 = co_await socket->Write(std::span<std::byte const> { hdr.data(), hdr.size() });
         if (!r1.has_value())
             co_return false;
         if (!extras.empty())
         {
-            auto const r = co_await socket.Write(extras);
+            auto const r = co_await socket->Write(extras);
             if (!r.has_value())
                 co_return false;
         }
         if (!key.empty())
         {
-            auto const r = co_await socket.Write(key);
+            auto const r = co_await socket->Write(key);
             if (!r.has_value())
                 co_return false;
         }
         if (!value.empty())
         {
-            auto const r = co_await socket.Write(value);
+            auto const r = co_await socket->Write(value);
             if (!r.has_value())
                 co_return false;
         }
         co_return true;
     }
 
-    Task<bool> ReplyError(ISocket& socket, Opcode opcode, Status status, std::uint32_t opaque)
+    [[nodiscard]] constexpr std::string_view ErrorMessage(Status status) noexcept
     {
-        std::string_view const msg = status == Status::KeyNotFound        ? "Not found"
-                                     : status == Status::KeyExists        ? "Data exists for key"
-                                     : status == Status::ItemNotStored    ? "Not stored"
-                                     : status == Status::IncrOnNonNumeric ? "Non-numeric server-side value"
-                                     : status == Status::InvalidArguments ? "Invalid arguments"
-                                     : status == Status::AuthError        ? "Auth failure"
-                                                                          : "Internal error";
-        co_return co_await WriteResponse(socket, opcode, status, opaque, 0, {}, {}, AsBytes(msg));
+        switch (status)
+        {
+            case Status::KeyNotFound:
+                return "Not found";
+            case Status::KeyExists:
+                return "Data exists for key";
+            case Status::ItemNotStored:
+                return "Not stored";
+            case Status::IncrOnNonNumeric:
+                return "Non-numeric server-side value";
+            case Status::InvalidArguments:
+                return "Invalid arguments";
+            case Status::AuthError:
+                return "Auth failure";
+            default:
+                return "Internal error";
+        }
+    }
+
+    Task<bool> ReplyError(ISocket* socket, Opcode opcode, Status status, std::uint32_t opaque)
+    {
+        co_return co_await WriteResponse(socket, opcode, status, opaque, 0, {}, {}, AsBytes(ErrorMessage(status)));
     }
 
     [[nodiscard]] Status MapStorageError(StorageErrorCode code) noexcept
@@ -182,10 +196,10 @@ namespace
         }
     }
 
-    Task<bool> HandleStorage(ISocket& socket,
-                             CacheEngine& engine,
+    Task<bool> HandleStorage(ISocket* socket,
+                             CacheEngine* engine,
                              Opcode opcode,
-                             RequestHeader const& header,
+                             RequestHeader header,
                              std::span<std::byte const> extras,
                              std::span<std::byte const> key,
                              std::span<std::byte const> value)
@@ -209,19 +223,19 @@ namespace
         switch (normalised)
         {
             case Opcode::Set:
-                result = engine.Set(keyStr, std::move(valVec), flags, exptime);
+                result = engine->Set(keyStr, std::move(valVec), flags, exptime);
                 break;
             case Opcode::Add:
-                result = engine.Add(keyStr, std::move(valVec), flags, exptime);
+                result = engine->Add(keyStr, std::move(valVec), flags, exptime);
                 break;
             case Opcode::Replace:
-                result = engine.Replace(keyStr, std::move(valVec), flags, exptime);
+                result = engine->Replace(keyStr, std::move(valVec), flags, exptime);
                 break;
             case Opcode::Append:
-                result = engine.Append(keyStr, value);
+                result = engine->Append(keyStr, value);
                 break;
             case Opcode::Prepend:
-                result = engine.Prepend(keyStr, value);
+                result = engine->Prepend(keyStr, value);
                 break;
             default:
                 break;
@@ -239,14 +253,14 @@ namespace
     }
 
     Task<bool> HandleGet(
-        ISocket& socket, CacheEngine& engine, Opcode opcode, RequestHeader const& header, std::span<std::byte const> key)
+        ISocket* socket, CacheEngine* engine, Opcode opcode, RequestHeader header, std::span<std::byte const> key)
     {
         std::string keyStr;
         keyStr.reserve(key.size());
         for (auto const b: key)
             keyStr.push_back(static_cast<char>(b));
 
-        auto const result = engine.Get(keyStr);
+        auto const result = engine->Get(keyStr);
         bool const includeKey = opcode == Opcode::GetK || opcode == Opcode::GetKQ;
         bool const quiet = opcode == Opcode::GetQ || opcode == Opcode::GetKQ;
 
@@ -272,14 +286,14 @@ namespace
     }
 
     Task<bool> HandleDelete(
-        ISocket& socket, CacheEngine& engine, Opcode opcode, RequestHeader const& header, std::span<std::byte const> key)
+        ISocket* socket, CacheEngine* engine, Opcode opcode, RequestHeader header, std::span<std::byte const> key)
     {
         std::string keyStr;
         keyStr.reserve(key.size());
         for (auto const b: key)
             keyStr.push_back(static_cast<char>(b));
 
-        auto const result = engine.Delete(keyStr);
+        auto const result = engine->Delete(keyStr);
         bool const quiet = opcode == Opcode::DeleteQ;
         if (!result.has_value())
         {
@@ -292,20 +306,20 @@ namespace
         co_return co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, 0, {}, {}, {});
     }
 
-    Task<bool> HandleVersion(ISocket& socket, RequestHeader const& header)
+    Task<bool> HandleVersion(ISocket* socket, RequestHeader header)
     {
         auto const ver = ServerVersionBanner;
         co_return co_await WriteResponse(socket, Opcode::Version, Status::Ok, header.opaque, 0, {}, {}, AsBytes(ver));
     }
 
-    Task<bool> HandleNoOp(ISocket& socket, RequestHeader const& header)
+    Task<bool> HandleNoOp(ISocket* socket, RequestHeader header)
     {
         co_return co_await WriteResponse(socket, Opcode::NoOp, Status::Ok, header.opaque, 0, {}, {}, {});
     }
 
-    Task<bool> HandleFlush(ISocket& socket, CacheEngine& engine, Opcode opcode, RequestHeader const& header)
+    Task<bool> HandleFlush(ISocket* socket, CacheEngine* engine, Opcode opcode, RequestHeader header)
     {
-        engine.FlushAll(0);
+        engine->FlushAll(0);
         if (opcode == Opcode::FlushQ)
             co_return true;
         co_return co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, 0, {}, {}, {});
@@ -313,10 +327,10 @@ namespace
 
 } // namespace
 
-Task<void> MemcachedBinaryHandler::Run(ISocket& socket, CacheEngine& engine, std::vector<std::byte> primingBytes)
+Task<void> MemcachedBinaryHandler::Run(ISocket* socket, CacheEngine* engine, std::vector<std::byte> primingBytes)
 {
     constexpr std::size_t MaxBodyBytes = 16 * 1024 * 1024;
-    ByteReader reader { socket, /*maxLineBytes*/ 1, /*maxPayloadBytes*/ MaxBodyBytes + HeaderSize };
+    ByteReader reader { *socket, /*maxLineBytes*/ 1, /*maxPayloadBytes*/ MaxBodyBytes + HeaderSize };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
 
     while (true)
@@ -372,10 +386,10 @@ Task<void> MemcachedBinaryHandler::Run(ISocket& socket, CacheEngine& engine, std
                 break;
             case Opcode::Quit:
                 (void) co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, 0, {}, {}, {});
-                socket.Close();
+                socket->Close();
                 co_return;
             case Opcode::QuitQ:
-                socket.Close();
+                socket->Close();
                 co_return;
             case Opcode::NoOp:
                 keepGoing = co_await HandleNoOp(socket, header);

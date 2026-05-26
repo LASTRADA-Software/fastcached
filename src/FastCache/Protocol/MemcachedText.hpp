@@ -34,7 +34,7 @@ class MemcachedTextHandler final: public IProtocolHandler
     /// @return Server version string emitted by the `version` command.
     [[nodiscard]] static std::string_view ServerVersion() noexcept;
 
-    [[nodiscard]] Task<void> Run(ISocket& socket, CacheEngine& engine, std::vector<std::byte> primingBytes) override;
+    [[nodiscard]] Task<void> Run(ISocket* socket, CacheEngine* engine, std::vector<std::byte> primingBytes) override;
 };
 
 } // namespace FastCache

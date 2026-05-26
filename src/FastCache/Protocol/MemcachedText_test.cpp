@@ -20,7 +20,7 @@ namespace
 
 /// Test fixture: an InMemorySocketPair, a CacheEngine over an
 /// InMemoryLruStorage, and a single MemcachedTextHandler driving the
-/// server-side socket. The client side is driven manually by tests.
+/// server-side socket-> The client side is driven manually by tests.
 struct TextFixture
 {
     FastCache::ManualClock clock;
@@ -30,19 +30,19 @@ struct TextFixture
     FastCache::MemcachedTextHandler handler;
 };
 
-FastCache::Task<bool> WriteString(FastCache::ISocket& socket, std::string_view payload)
+FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view payload)
 {
-    auto const result = co_await socket.Write(FastCache::AsBytes(payload));
+    auto const result = co_await socket->Write(FastCache::AsBytes(payload));
     co_return result.has_value();
 }
 
-FastCache::Task<std::string> ReadAvailable(FastCache::ISocket& socket)
+FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
 {
     std::string out;
     while (true)
     {
         std::vector<std::byte> chunk(256);
-        auto const result = co_await socket.Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!result.has_value())
             break;
         if (*result == 0)
@@ -61,16 +61,16 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket& socket)
 /// our request so the handler observes EOF and the task completes.
 std::string Exchange(TextFixture& fix, std::string_view request)
 {
-    REQUIRE(FastCache::SyncRun(WriteString(*fix.pair.client, request)));
+    REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), request)));
     // Half-close: server will see EOF after consuming `request`, but the
     // client's read side stays open so we can read the response back.
     fix.pair.client->ShutdownWrite();
 
-    FastCache::SyncRun(fix.handler.Run(*fix.pair.server, fix.engine, /*primingBytes*/ {}));
+    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primingBytes*/ {}));
     // The handler closed the server-side socket when its loop ended,
     // which closed the server→client pipe's write side. The client can now
     // read the buffered response and then observe EOF.
-    return FastCache::SyncRun(ReadAvailable(*fix.pair.client));
+    return FastCache::SyncRun(ReadAvailable(fix.pair.client.get()));
 }
 
 } // namespace

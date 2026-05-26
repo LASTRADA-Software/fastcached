@@ -66,23 +66,15 @@ namespace
         return token == "noreply";
     }
 
-    Task<bool> WriteAll(ISocket& socket, std::string_view payload)
+    Task<bool> WriteAll(ISocket* socket, std::string_view payload)
     {
         if (payload.empty())
             co_return true;
-        auto const result = co_await socket.Write(AsBytes(payload));
+        auto const result = co_await socket->Write(AsBytes(payload));
         co_return result.has_value();
     }
 
-    Task<bool> WriteAll(ISocket& socket, std::span<std::byte const> payload)
-    {
-        if (payload.empty())
-            co_return true;
-        auto const result = co_await socket.Write(payload);
-        co_return result.has_value();
-    }
-
-    Task<bool> WriteError(ISocket& socket, std::string_view code, std::string_view detail = {})
+    Task<bool> WriteError(ISocket* socket, std::string_view code, std::string_view detail = {})
     {
         std::string line { code };
         if (!detail.empty())
@@ -94,7 +86,7 @@ namespace
         co_return co_await WriteAll(socket, line);
     }
 
-    Task<bool> WriteLine(ISocket& socket, std::string_view text)
+    Task<bool> WriteLine(ISocket* socket, std::string_view text)
     {
         std::string line { text };
         line.append(Crlf);
@@ -160,13 +152,13 @@ namespace
         out.append(Crlf);
     }
 
-    Task<bool> HandleGet(ISocket& socket, CacheEngine& engine, std::span<std::string_view const> keys, bool includeCas)
+    Task<bool> HandleGet(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> keys, bool includeCas)
     {
         std::string response;
         response.reserve(64 * keys.size());
         for (auto const key: keys)
         {
-            auto const result = engine.Get(key);
+            auto const result = engine->Get(key);
             if (!result.has_value() || !result->found)
                 continue;
             AppendValueBlock(response, key, result->entry, includeCas);
@@ -175,9 +167,9 @@ namespace
         co_return co_await WriteAll(socket, response);
     }
 
-    Task<bool> HandleStorage(ISocket& socket,
-                             CacheEngine& engine,
-                             ByteReader& reader,
+    Task<bool> HandleStorage(ISocket* socket,
+                             CacheEngine* engine,
+                             ByteReader* reader,
                              std::string_view commandName,
                              std::span<std::string_view const> args)
     {
@@ -187,28 +179,28 @@ namespace
             co_return co_await WriteError(socket, "CLIENT_ERROR", "bad command line format");
 
         // Read the payload (bytes + trailing CRLF).
-        auto payload = co_await reader.ReadExactly(parsed.bytes);
+        auto payload = co_await reader->ReadExactly(parsed.bytes);
         if (!payload.has_value())
             co_return co_await WriteError(socket, "CLIENT_ERROR", "bad payload");
 
         // Consume the CRLF that follows the payload — memcached sends it.
-        auto const trailing = co_await reader.ReadExactly(2);
+        auto const trailing = co_await reader->ReadExactly(2);
         if (!trailing.has_value())
             co_return co_await WriteError(socket, "CLIENT_ERROR", "missing CRLF after payload");
 
         std::expected<CasToken, StorageError> result { 0 };
         if (commandName == "set")
-            result = engine.Set(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
+            result = engine->Set(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
         else if (commandName == "add")
-            result = engine.Add(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
+            result = engine->Add(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
         else if (commandName == "replace")
-            result = engine.Replace(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
+            result = engine->Replace(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
         else if (commandName == "append")
-            result = engine.Append(parsed.key, std::span<std::byte const> { payload->data(), payload->size() });
+            result = engine->Append(parsed.key, std::span<std::byte const> { payload->data(), payload->size() });
         else if (commandName == "prepend")
-            result = engine.Prepend(parsed.key, std::span<std::byte const> { payload->data(), payload->size() });
+            result = engine->Prepend(parsed.key, std::span<std::byte const> { payload->data(), payload->size() });
         else if (commandName == "cas")
-            result = engine.CompareAndSwap(parsed.key, parsed.cas, std::move(*payload), parsed.flags, parsed.exptime);
+            result = engine->CompareAndSwap(parsed.key, parsed.cas, std::move(*payload), parsed.flags, parsed.exptime);
         else
             co_return co_await WriteError(socket, "ERROR");
 
@@ -233,13 +225,13 @@ namespace
         }
     }
 
-    Task<bool> HandleDelete(ISocket& socket, CacheEngine& engine, std::span<std::string_view const> args)
+    Task<bool> HandleDelete(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
     {
         if (args.empty())
             co_return co_await WriteError(socket, "CLIENT_ERROR", "missing key");
 
         bool const noreply = args.size() > 1 && IsNoReply(args.back());
-        auto const result = engine.Delete(args[0]);
+        auto const result = engine->Delete(args[0]);
         if (noreply)
             co_return true;
         if (result.has_value())
@@ -247,7 +239,7 @@ namespace
         co_return co_await WriteLine(socket, "NOT_FOUND");
     }
 
-    Task<bool> HandleIncrDecr(ISocket& socket, CacheEngine& engine, std::span<std::string_view const> args, bool isIncr)
+    Task<bool> HandleIncrDecr(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args, bool isIncr)
     {
         if (args.size() < 2)
             co_return co_await WriteError(socket, "CLIENT_ERROR", "missing args");
@@ -257,7 +249,7 @@ namespace
             co_return co_await WriteError(socket, "CLIENT_ERROR", "delta not numeric");
 
         bool const noreply = args.size() > 2 && IsNoReply(args.back());
-        auto const result = isIncr ? engine.Increment(args[0], delta) : engine.Decrement(args[0], delta);
+        auto const result = isIncr ? engine->Increment(args[0], delta) : engine->Decrement(args[0], delta);
         if (noreply)
             co_return true;
         if (result.has_value())
@@ -273,7 +265,7 @@ namespace
         }
     }
 
-    Task<bool> HandleFlushAll(ISocket& socket, CacheEngine& engine, std::span<std::string_view const> args)
+    Task<bool> HandleFlushAll(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
     {
         std::uint32_t delay = 0;
         bool noreply = false;
@@ -284,15 +276,15 @@ namespace
             else if (!ParseUnsigned(token, delay))
                 co_return co_await WriteError(socket, "CLIENT_ERROR", "bad flush_all arg");
         }
-        engine.FlushAll(delay);
+        engine->FlushAll(delay);
         if (noreply)
             co_return true;
         co_return co_await WriteLine(socket, "OK");
     }
 
-    Task<bool> HandleStats(ISocket& socket, CacheEngine& engine)
+    Task<bool> HandleStats(ISocket* socket, CacheEngine* engine)
     {
-        auto const stats = engine.Snapshot();
+        auto const stats = engine->Snapshot();
         auto const lines = std::format("STAT version {}\r\n"
                                        "STAT curr_items {}\r\n"
                                        "STAT bytes {}\r\n"
@@ -322,9 +314,9 @@ std::string_view MemcachedTextHandler::ServerVersion() noexcept
     return ServerVersionBanner;
 }
 
-Task<void> MemcachedTextHandler::Run(ISocket& socket, CacheEngine& engine, std::vector<std::byte> primingBytes)
+Task<void> MemcachedTextHandler::Run(ISocket* socket, CacheEngine* engine, std::vector<std::byte> primingBytes)
 {
-    ByteReader reader { socket, MaxLineBytes, MaxPayloadBytes };
+    ByteReader reader { *socket, MaxLineBytes, MaxPayloadBytes };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
 
     while (true)
@@ -357,7 +349,7 @@ Task<void> MemcachedTextHandler::Run(ISocket& socket, CacheEngine& engine, std::
             ok = co_await HandleGet(socket, engine, tail, /*includeCas*/ true);
         else if (command == "set" || command == "add" || command == "replace" || command == "append" || command == "prepend"
                  || command == "cas")
-            ok = co_await HandleStorage(socket, engine, reader, command, tail);
+            ok = co_await HandleStorage(socket, engine, &reader, command, tail);
         else if (command == "delete")
             ok = co_await HandleDelete(socket, engine, tail);
         else if (command == "incr")
@@ -372,7 +364,7 @@ Task<void> MemcachedTextHandler::Run(ISocket& socket, CacheEngine& engine, std::
             ok = co_await WriteLine(socket, std::format("VERSION {}", ServerVersion()));
         else if (command == "quit")
         {
-            socket.Close();
+            socket->Close();
             co_return;
         }
         else

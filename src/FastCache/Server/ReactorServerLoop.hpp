@@ -33,7 +33,7 @@ struct ReactorServerOptions
 /// by `admission` (nullable; nullptr means unbounded).
 ///
 /// @return Process exit code (0 on clean shutdown).
-int RunReactorServer(ReactorServerOptions options,
+int RunReactorServer(ReactorServerOptions const& options,
                      CacheEngine& engine,
                      ILogger& logger,
                      IAdmissionControl* admission = nullptr,

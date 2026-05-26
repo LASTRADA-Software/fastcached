@@ -18,13 +18,13 @@
 namespace
 {
 
-FastCache::Task<std::string> ReadResponse(FastCache::ISocket& socket)
+FastCache::Task<std::string> ReadResponse(FastCache::ISocket* socket)
 {
     std::string out;
     while (true)
     {
         std::vector<std::byte> chunk(256);
-        auto const result = co_await socket.Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!result.has_value() || *result == 0)
             break;
         for (std::size_t i = 0; i < *result; ++i)
@@ -35,9 +35,9 @@ FastCache::Task<std::string> ReadResponse(FastCache::ISocket& socket)
     co_return out;
 }
 
-FastCache::Task<bool> Send(FastCache::ISocket& socket, std::string_view payload)
+FastCache::Task<bool> Send(FastCache::ISocket* socket, std::string_view payload)
 {
-    auto const r = co_await socket.Write(FastCache::AsBytes(payload));
+    auto const r = co_await socket->Write(FastCache::AsBytes(payload));
     co_return r.has_value();
 }
 
@@ -55,7 +55,7 @@ TEST_CASE("Server accepts and serves a memcached-text client end-to-end", "[serv
     // Stage a client BEFORE running the server so Accept resolves
     // synchronously on the first iteration.
     auto client = listener.ConnectClient();
-    REQUIRE(FastCache::SyncRun(Send(*client, "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
+    REQUIRE(FastCache::SyncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
     client->ShutdownWrite();
 
     // Close the listener — pre-queued connections drain before Accept
@@ -63,7 +63,7 @@ TEST_CASE("Server accepts and serves a memcached-text client end-to-end", "[serv
     listener.Close();
     FastCache::SyncRun(server.Run());
 
-    auto const response = FastCache::SyncRun(ReadResponse(*client));
+    auto const response = FastCache::SyncRun(ReadResponse(client.get()));
     REQUIRE(response == "STORED\r\nVALUE foo 0 5\r\nhello\r\nEND\r\n");
     REQUIRE(server.AcceptedCount() == 1);
 }

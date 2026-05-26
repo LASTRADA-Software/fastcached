@@ -77,22 +77,22 @@ std::vector<std::byte> BuildBinaryFrame(std::uint8_t opcode,
     return frame;
 }
 
-FastCache::Task<bool> Write(FastCache::ISocket& s, std::span<std::byte const> bytes)
+FastCache::Task<bool> Write(FastCache::ISocket* s, std::span<std::byte const> bytes)
 {
-    auto const r = co_await s.Write(bytes);
+    auto const r = co_await s->Write(bytes);
     co_return r.has_value();
 }
 
-FastCache::Task<std::vector<std::byte>> Drain(FastCache::ISocket& s)
+FastCache::Task<std::vector<std::byte>> Drain(FastCache::ISocket* s)
 {
     std::vector<std::byte> out;
     while (true)
     {
         std::vector<std::byte> chunk(512);
-        auto const r = co_await s.Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const r = co_await s->Read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!r.has_value() || *r == 0)
             break;
-        out.insert(out.end(), chunk.begin(), chunk.begin() + *r);
+        out.insert(out.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*r));
         if (*r < chunk.size())
             break;
     }
@@ -101,10 +101,10 @@ FastCache::Task<std::vector<std::byte>> Drain(FastCache::ISocket& s)
 
 std::vector<std::byte> Exchange(BinaryFixture& fix, std::span<std::byte const> request)
 {
-    REQUIRE(FastCache::SyncRun(Write(*fix.pair.client, request)));
+    REQUIRE(FastCache::SyncRun(Write(fix.pair.client.get(), request)));
     fix.pair.client->ShutdownWrite();
-    FastCache::SyncRun(fix.handler.Run(*fix.pair.server, fix.engine, /*primer*/ {}));
-    return FastCache::SyncRun(Drain(*fix.pair.client));
+    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}));
+    return FastCache::SyncRun(Drain(fix.pair.client.get()));
 }
 
 } // namespace

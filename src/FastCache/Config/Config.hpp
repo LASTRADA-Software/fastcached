@@ -29,13 +29,13 @@ struct Config
 
     /// Path of the YAML config file (if any) that produced this Config.
     /// Used by ConfigReloader on SIGHUP. Empty means no file-backed config.
-    std::string configPath;
+    std::string configPath {};
 
     /// If true, daemonize (POSIX) or self-register as a Windows service.
     bool daemon { false };
 
     /// Optional pidfile path (POSIX daemon mode only).
-    std::string pidfile;
+    std::string pidfile {};
 
     /// Windows service name; defaults to FastCached.
     std::string serviceName { "FastCached" };

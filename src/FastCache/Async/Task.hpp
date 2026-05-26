@@ -107,6 +107,16 @@ namespace Detail
         }
 
       protected:
+        [[nodiscard]] std::coroutine_handle<TaskPromise<T>> Coroutine() const noexcept
+        {
+            return _handle;
+        }
+        void SetCoroutine(std::coroutine_handle<TaskPromise<T>> handle) noexcept
+        {
+            _handle = handle;
+        }
+
+      private:
         std::coroutine_handle<TaskPromise<T>> _handle;
     };
 
@@ -187,7 +197,7 @@ class Task
         Awaiter(Awaiter&& other) noexcept:
             Detail::TaskAwaiterBase<T> { std::exchange(other._owned, Handle {}) }
         {
-            this->_handle = _owned;
+            this->SetCoroutine(_owned);
         }
         Awaiter& operator=(Awaiter&&) = delete;
         ~Awaiter()
@@ -198,14 +208,14 @@ class Task
 
         T await_resume()
         {
-            auto& promise = this->_handle.promise();
+            auto& promise = this->Coroutine().promise();
             if (promise.exception)
                 std::rethrow_exception(promise.exception);
             return std::move(std::get<1>(promise.result));
         }
 
       private:
-        Handle _owned { this->_handle };
+        Handle _owned { this->Coroutine() };
     };
 
     Awaiter operator co_await() && noexcept
@@ -280,7 +290,7 @@ class Task<void>
         Awaiter(Awaiter&& other) noexcept:
             Detail::TaskAwaiterBase<void> { std::exchange(other._owned, Handle {}) }
         {
-            this->_handle = _owned;
+            this->SetCoroutine(_owned);
         }
         Awaiter& operator=(Awaiter&&) = delete;
         ~Awaiter()
@@ -291,13 +301,13 @@ class Task<void>
 
         void await_resume()
         {
-            auto& promise = this->_handle.promise();
+            auto& promise = this->Coroutine().promise();
             if (promise.exception)
                 std::rethrow_exception(promise.exception);
         }
 
       private:
-        Handle _owned { this->_handle };
+        Handle _owned { this->Coroutine() };
     };
 
     Awaiter operator co_await() && noexcept
@@ -366,7 +376,7 @@ struct DetachedTask
 /// @param task Task to drive; must not be empty.
 /// @return The task's result (or rethrows its exception).
 template <typename T>
-T SyncRun(Task<T>&& task)
+T SyncRun(Task<T> task)
 {
     auto handle = task.Native();
     handle.resume();

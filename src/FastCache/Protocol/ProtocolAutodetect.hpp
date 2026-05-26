@@ -42,6 +42,6 @@ struct AutodetectResult
 /// On EOF before any byte arrives, returns NetErrorCode::Eof.
 /// @param socket Source socket; bytes peeked are returned in the primer.
 /// @return Task resolving to the detected flavor + primer bytes.
-[[nodiscard]] Task<std::expected<AutodetectResult, NetError>> DetectProtocol(ISocket& socket);
+[[nodiscard]] Task<std::expected<AutodetectResult, NetError>> DetectProtocol(ISocket* socket);
 
 } // namespace FastCache
