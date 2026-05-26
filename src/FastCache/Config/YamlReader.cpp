@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/YamlReader.hpp>
+#include <FastCache/Platform/HostMemory.hpp>
 
 #include <yaml-cpp/yaml.h>
 
@@ -72,11 +74,14 @@ namespace
     [[nodiscard]] std::expected<void, ConfigError> ApplyEntry(
         Config& cfg, std::string const& key, YAML::Node const& valueNode, std::filesystem::path const& path, unsigned line)
     {
+        /// `bind`: interface address to listen on. Free-form string; left to
+        /// the OS resolver. Examples: "127.0.0.1", "0.0.0.0", "::".
         if (key == "bind")
         {
             cfg.bindAddress = valueNode.as<std::string>();
             return {};
         }
+        /// `port`: TCP listen port. Integer in 1..65535.
         if (key == "port")
         {
             auto const raw = valueNode.as<int>();
@@ -85,14 +90,26 @@ namespace
             cfg.port = static_cast<std::uint16_t>(raw);
             return {};
         }
+        /// `max_memory`: in-memory cache byte budget. Integer with optional
+        /// unit suffix k/K=1024, m/M=1024², g/G=1024³ (1024-based). Plain
+        /// integer means bytes. A trailing "%" sets the budget to that
+        /// percentage of the host's total RAM (e.g., 50%). 0 disables
+        /// eviction.
         if (key == "max_memory")
         {
-            auto const raw = valueNode.as<long long>();
-            if (raw < 0)
-                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, path, "max_memory", "must be >= 0", line));
-            cfg.maxMemoryBytes = static_cast<std::size_t>(raw);
+            auto const raw = valueNode.as<std::string>();
+            auto parsed = ParseByteSize(raw, "max_memory", QueryHostTotalMemoryBytes());
+            if (!parsed.has_value())
+            {
+                auto err = std::move(parsed).error();
+                err.source = path.string();
+                err.line = line;
+                return std::unexpected(std::move(err));
+            }
+            cfg.maxMemoryBytes = *parsed;
             return {};
         }
+        /// `log_level`: verbosity. One of trace|debug|info|warn|error|fatal.
         if (key == "log_level")
         {
             auto const level = ParseLogLevel(valueNode.as<std::string>(), path, line);

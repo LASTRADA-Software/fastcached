@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
+#include <FastCache/Platform/HostMemory.hpp>
 
 #include <charconv>
 #include <expected>
@@ -35,12 +37,10 @@ namespace
 
     [[nodiscard]] std::expected<std::size_t, ConfigError> ParseMaxMemory(std::string_view sv)
     {
-        std::uint64_t raw = 0;
-        auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), raw);
-        if (ec != std::errc {} || ptr != sv.data() + sv.size())
-            return std::unexpected(
-                MakeError(ConfigErrorCode::TypeMismatch, "max-memory", std::format("not a number: {}", sv)));
-        return static_cast<std::size_t>(raw);
+        return ParseByteSize(sv, "max-memory", QueryHostTotalMemoryBytes()).transform_error([](ConfigError err) {
+            err.source = "argv";
+            return err;
+        });
     }
 
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv)
@@ -191,13 +191,34 @@ std::string_view CliUsage() noexcept
            "  --config=<path>        YAML config file; CLI flags override file values\n"
            "  --bind=<addr>          bind address (default 127.0.0.1)\n"
            "  --port=<num>           TCP port (default 11211)\n"
-           "  --max-memory=<bytes>   in-memory storage byte budget (default 64 MiB)\n"
+           "  --max-memory=<size>    in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)\n"
            "  --log-level=<level>    trace|debug|info|warn|error|fatal (default info)\n"
            "  --daemon               daemonize (POSIX) / register as Windows service\n"
            "  --pidfile=<path>       POSIX daemon mode only\n"
            "  --service-name=<name>  Windows service name (default FastCached)\n"
            "  --help, -h             show this help and exit\n"
-           "  --version, -V          show version and exit\n";
+           "  --version, -V          show version and exit\n"
+           "\n"
+#if defined(_WIN32)
+           "Use with sccache (memcached protocol, PowerShell):\n"
+           "  Start-Process fastcached -ArgumentList '--port=11211'\n"
+           "  $env:SCCACHE_MEMCACHED = 'tcp://127.0.0.1:11211'\n"
+           "  sccache <compiler> /c hello.cpp /Fo:hello.obj\n"
+           "\n"
+           "Use with sccache (Redis protocol, PowerShell):\n"
+           "  $env:SCCACHE_REDIS = 'redis://127.0.0.1:11211'\n"
+#else
+           "Use with sccache (memcached protocol):\n"
+           "  fastcached --port=11211 &\n"
+           "  export SCCACHE_MEMCACHED=tcp://127.0.0.1:11211\n"
+           "  sccache <compiler> -c hello.c -o hello.o\n"
+           "\n"
+           "Use with sccache (Redis protocol):\n"
+           "  export SCCACHE_REDIS=redis://127.0.0.1:11211\n"
+#endif
+           "\n"
+           "sccache <= 0.7 speaks memcached text; >= 0.8 speaks memcached binary;\n"
+           "either works because fastcached auto-detects the wire format.\n";
 }
 
 std::expected<CliResult, ConfigError> ParseCli(std::span<char const* const> args)

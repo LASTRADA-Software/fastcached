@@ -22,6 +22,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Project-wide options
 
 option(FASTCACHED_BUILD_TESTS "Build unit tests" ON)
+option(USE_SCCACHE "Use sccache as the compiler launcher when the binary is on PATH" ON)
+
+# ----------------------------------------------------------------------------
+# Compiler caching (sccache). Loaded before any compiler invocation so that
+# CPM-fetched dependencies also get cached. cache.cmake silently no-ops when
+# sccache is not installed or USE_SCCACHE=OFF.
+
+include(cache)
 
 # Default install/runtime/library output directories.
 if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
