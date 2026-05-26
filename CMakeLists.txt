@@ -32,14 +32,12 @@ if(NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
 endif()
 
 # ----------------------------------------------------------------------------
-# Toolchain helpers (warning levels, sanitizers, clang-tidy).
-
-include(PedanticCompiler)
-include(Sanitizers)
-include(ClangTidy)
-
-# ----------------------------------------------------------------------------
 # Dependencies via CPM (tries find_package first).
+#
+# Fetched BEFORE the pedantic/sanitizer/clang-tidy includes so the global
+# add_compile_options() / CMAKE_CXX_CLANG_TIDY they install only apply to our
+# own targets (defined later in this directory), not to third-party code where
+# -Werror -Wconversion is not our problem to fix.
 
 set(CPM_USE_LOCAL_PACKAGES ON CACHE BOOL "Prefer system-installed packages over CPM downloads")
 include(cmake/CPM.cmake)
@@ -67,6 +65,13 @@ if(FASTCACHED_BUILD_TESTS)
         VERSION 3.6.0
     )
 endif()
+
+# ----------------------------------------------------------------------------
+# Toolchain helpers (warning levels, sanitizers, clang-tidy).
+
+include(PedanticCompiler)
+include(Sanitizers)
+include(ClangTidy)
 
 # ----------------------------------------------------------------------------
 # Library target: all FastCache code lives here (so both the executable and
