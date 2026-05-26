@@ -110,6 +110,7 @@ struct EpollSocket::Impl
         reactor { r }
     {
         handler.fd = fd;
+        handler.owner = this;
         handler.onReadable = &OnReadable;
         handler.onWritable = &OnWritable;
     }
@@ -120,7 +121,7 @@ namespace
 
     EpollSocket::Impl* ImplFromHandler(EpollFdHandler* base) noexcept
     {
-        return reinterpret_cast<EpollSocket::Impl*>(reinterpret_cast<char*>(base) - offsetof(EpollSocket::Impl, handler));
+        return static_cast<EpollSocket::Impl*>(base->owner);
     }
 
 } // namespace
@@ -291,6 +292,7 @@ struct EpollListener::Impl
     Impl(EpollReactor& r):
         reactor { r }
     {
+        handler.owner = this;
         handler.onReadable = &OnReadable;
     }
 };
@@ -300,8 +302,7 @@ namespace
 
     EpollListener::Impl* ListenerImplFromHandler(EpollFdHandler* base) noexcept
     {
-        return reinterpret_cast<EpollListener::Impl*>(reinterpret_cast<char*>(base)
-                                                      - offsetof(EpollListener::Impl, handler));
+        return static_cast<EpollListener::Impl*>(base->owner);
     }
 
     void ListenerAwaitableSuspended(AcceptAwaitable* self, std::coroutine_handle<> /*handle*/)

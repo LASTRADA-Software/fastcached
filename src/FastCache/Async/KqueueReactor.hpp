@@ -19,9 +19,14 @@ namespace FastCache
 /// Per-fd handler analogous to EpollFdHandler. kqueue dispatches readiness
 /// events to the registered EV_FILTER_{READ,WRITE} via the data.ptr / udata
 /// field, and the handler's callbacks perform the actual recv/send.
+///
+/// Carries an explicit `owner` back-pointer so callbacks can recover their
+/// enclosing struct without `offsetof` (UB on non-standard-layout types —
+/// KqueueSocket::Impl is non-standard-layout because it holds a reference).
 struct KqueueFdHandler
 {
     int fd { -1 };
+    void* owner { nullptr };
     void (*onReadable)(KqueueFdHandler* self) { nullptr };
     void (*onWritable)(KqueueFdHandler* self) { nullptr };
 };

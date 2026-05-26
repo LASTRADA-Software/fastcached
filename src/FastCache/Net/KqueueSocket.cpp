@@ -111,6 +111,7 @@ struct KqueueSocket::Impl
         reactor { r }
     {
         handler.fd = fd;
+        handler.owner = this;
         handler.onReadable = &OnReadable;
         handler.onWritable = &OnWritable;
     }
@@ -121,7 +122,7 @@ namespace
 
     KqueueSocket::Impl* ImplFromHandler(KqueueFdHandler* base) noexcept
     {
-        return reinterpret_cast<KqueueSocket::Impl*>(reinterpret_cast<char*>(base) - offsetof(KqueueSocket::Impl, handler));
+        return static_cast<KqueueSocket::Impl*>(base->owner);
     }
 
 } // namespace
@@ -286,6 +287,7 @@ struct KqueueListener::Impl
     Impl(KqueueReactor& r):
         reactor { r }
     {
+        handler.owner = this;
         handler.onReadable = &OnReadable;
     }
 };
@@ -295,8 +297,7 @@ namespace
 
     KqueueListener::Impl* ListenerImplFromHandler(KqueueFdHandler* base) noexcept
     {
-        return reinterpret_cast<KqueueListener::Impl*>(reinterpret_cast<char*>(base)
-                                                       - offsetof(KqueueListener::Impl, handler));
+        return static_cast<KqueueListener::Impl*>(base->owner);
     }
 
     void ListenerAwaitableSuspended(AcceptAwaitable* self, std::coroutine_handle<> /*handle*/)

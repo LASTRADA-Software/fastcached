@@ -20,11 +20,17 @@ namespace FastCache
 /// embed one of these and set the callbacks; the reactor dispatches
 /// readiness events to them via the stored function pointers.
 ///
+/// The handler carries an explicit `owner` back-pointer so the callbacks
+/// can recover their enclosing struct without `offsetof` (which is UB on
+/// non-standard-layout types — and EpollSocket::Impl is non-standard-
+/// layout because it holds an EpollReactor reference).
+///
 /// Lifetime: the handler must outlive its registration. Sockets clear
 /// the registration via EpollReactor::Detach() before destruction.
 struct EpollFdHandler
 {
     int fd { -1 };
+    void* owner { nullptr };
     void (*onReadable)(EpollFdHandler* self) { nullptr };
     void (*onWritable)(EpollFdHandler* self) { nullptr };
 };
