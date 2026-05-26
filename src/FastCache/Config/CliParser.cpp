@@ -199,6 +199,15 @@ std::string_view CliUsage() noexcept
            "  --help, -h             show this help and exit\n"
            "  --version, -V          show version and exit\n"
            "\n"
+#if defined(_WIN32)
+           "Use with sccache (memcached protocol, PowerShell):\n"
+           "  Start-Process fastcached -ArgumentList '--port=11211'\n"
+           "  $env:SCCACHE_MEMCACHED = 'tcp://127.0.0.1:11211'\n"
+           "  sccache <compiler> /c hello.cpp /Fo:hello.obj\n"
+           "\n"
+           "Use with sccache (Redis protocol, PowerShell):\n"
+           "  $env:SCCACHE_REDIS = 'redis://127.0.0.1:11211'\n"
+#else
            "Use with sccache (memcached protocol):\n"
            "  fastcached --port=11211 &\n"
            "  export SCCACHE_MEMCACHED=tcp://127.0.0.1:11211\n"
@@ -206,6 +215,7 @@ std::string_view CliUsage() noexcept
            "\n"
            "Use with sccache (Redis protocol):\n"
            "  export SCCACHE_REDIS=redis://127.0.0.1:11211\n"
+#endif
            "\n"
            "sccache <= 0.7 speaks memcached text; >= 0.8 speaks memcached binary;\n"
            "either works because fastcached auto-detects the wire format.\n";
