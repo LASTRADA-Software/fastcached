@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Minimal probe workflow used to verify the GitHub Actions integration
+# accepts new workflows at all. Safe to delete once CI is healthy.
+name: CI Probe
+
+on:
+  push:
+    branches: [fix-ci]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  probe:
+    name: "Probe"
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Probe workflow ran on $(date -u)"
