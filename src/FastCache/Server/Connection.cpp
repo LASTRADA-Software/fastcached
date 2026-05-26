@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Server/Connection.hpp>
 
+#include <FastCache/Protocol/MemcachedBinary.hpp>
 #include <FastCache/Protocol/MemcachedText.hpp>
 #include <FastCache/Protocol/ProtocolAutodetect.hpp>
+#include <FastCache/Protocol/RedisResp.hpp>
 
 #include <memory>
 #include <utility>
@@ -30,10 +32,20 @@ Task<void> Connection::Run()
     switch (detect->flavor)
     {
         case ProtocolFlavor::MemcachedText:
-        case ProtocolFlavor::MemcachedBinary: // binary not yet implemented; treat as text for now
-        case ProtocolFlavor::RedisResp:       // RESP not yet implemented; treat as text for now
         {
             MemcachedTextHandler handler;
+            co_await handler.Run(*_socket, _engine, std::move(detect->primer));
+            break;
+        }
+        case ProtocolFlavor::MemcachedBinary:
+        {
+            MemcachedBinaryHandler handler;
+            co_await handler.Run(*_socket, _engine, std::move(detect->primer));
+            break;
+        }
+        case ProtocolFlavor::RedisResp:
+        {
+            RedisRespHandler handler;
             co_await handler.Run(*_socket, _engine, std::move(detect->primer));
             break;
         }

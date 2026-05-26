@@ -58,10 +58,14 @@ namespace
 std::string_view CliUsage() noexcept
 {
     return "usage: fastcached [options]\n"
+           "  --config=<path>        YAML config file; CLI flags override file values\n"
            "  --bind=<addr>          bind address (default 127.0.0.1)\n"
            "  --port=<num>           TCP port (default 11211)\n"
            "  --max-memory=<bytes>   in-memory storage byte budget (default 64 MiB)\n"
            "  --log-level=<level>    trace|debug|info|warn|error|fatal (default info)\n"
+           "  --daemon               daemonize (POSIX) / register as Windows service\n"
+           "  --pidfile=<path>       POSIX daemon mode only\n"
+           "  --service-name=<name>  Windows service name (default FastCached)\n"
            "  --help, -h             show this help and exit\n"
            "  --version, -V          show version and exit\n";
 }
@@ -102,6 +106,35 @@ std::expected<CliResult, ConfigError> ParseCli(std::span<char const* const> args
         {
             outcome.outcome = CliOutcome::ShowVersion;
             return outcome;
+        }
+        if (matchesFlag(arg, "--config"))
+        {
+            auto const value = takeValue("--config", i);
+            if (!value.has_value())
+                return std::unexpected(value.error());
+            cfg.configPath = std::string { *value };
+            continue;
+        }
+        if (arg == "--daemon")
+        {
+            cfg.daemon = true;
+            continue;
+        }
+        if (matchesFlag(arg, "--pidfile"))
+        {
+            auto const value = takeValue("--pidfile", i);
+            if (!value.has_value())
+                return std::unexpected(value.error());
+            cfg.pidfile = std::string { *value };
+            continue;
+        }
+        if (matchesFlag(arg, "--service-name"))
+        {
+            auto const value = takeValue("--service-name", i);
+            if (!value.has_value())
+                return std::unexpected(value.error());
+            cfg.serviceName = std::string { *value };
+            continue;
         }
         if (matchesFlag(arg, "--bind"))
         {

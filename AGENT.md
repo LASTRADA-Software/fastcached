@@ -2,21 +2,63 @@
 
 ## Project Architecture
 
-...
+A layered C++23 server. Each layer reaches its collaborators through a
+narrow interface so the whole thing is testable end-to-end against an
+in-memory transport.
+
+```
+src/FastCache/
+  Core/         Errors taxonomy, Clock, Logger, BufferPool, Bytes, Endian, Crc32c
+  Async/        Task<T>, DetachedTask, Cancellation, IReactor + TestReactor
+  Net/          ISocket, IListener, IoAwaitable, IAdmissionControl,
+                BlockingSocket (Winsock + POSIX),
+                InMemoryTransport (paired pipes + InMemoryListener),
+                Framing/ByteReader (line and length-prefixed)
+  Cache/        IStorage atomic primitives, CacheEntry, CacheEngine,
+                InMemoryLruStorage, DiskStorage (append-only log + CRC32C)
+  Protocol/     IProtocolHandler, ProtocolAutodetect, MemcachedText,
+                MemcachedBinary, RedisResp (RESP2)
+  Server/       Connection (per-client coroutine), Server, BlockingServerLoop
+                (production thread-per-connection driver of the same handlers)
+  Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
+                ISignalSource, DaemonControls (process-wide stop/reload flags)
+  Config/       Config, CliParser, YamlReader (yaml-cpp), ConfigReloader
+  Metrics/      IMetricsSink + AtomicMetricsSink
+```
+
+Production flow: `main()` -> CLI -> optional YAML -> `ConfigReloader` ->
+`CacheEngine` over `InMemoryLruStorage` -> `BlockingListener` ->
+`RunBlockingServerLoop` (one `std::jthread` per connection driving the
+coroutine handler via `SyncRun`).
 
 ## Design Patterns & Principles
 
-### Error handling: `std::expected<T, SqlError>`
-Prefer `std::expected<T, SqlError>` for fallible API surface. Chain monadically with `and_then`, `or_else`, `transform`, `transform_error` rather than nested `if`s. Reserve exceptions for programmer errors (precondition violation, misuse).
+### Error handling: `std::expected<T, E>`
+Prefer `std::expected<T, E>` for fallible API surface. The error taxonomy
+is split: `NetError`, `ProtocolError`, `StorageError`, `ConfigError`.
+Chain monadically with `and_then`, `or_else`, `transform`,
+`transform_error` rather than nested `if`s. Reserve exceptions for
+programmer errors (precondition violation, contract misuse).
 
 ### Dependency injection
-Tests must obtain a connection via DI (dependency injection) with a mocked client connection.
+Anything that touches I/O, time, randomness, or the filesystem is reached
+through an interface: `IClock`, `IReactor`, `ISocket`/`IListener`,
+`IStorage`, `ILogger`, `IDaemonHost`, `ISignalSource`,
+`IAdmissionControl`, `IMetricsSink`. Tests substitute deterministic fakes
+(`ManualClock`, `TestReactor`, `InMemoryTransport`, `NullLogger`,
+`CapturingLogger`, `ScriptedSignalSource`).
 
 ### Data-driven design
-...
+No magic literals scattered across the code: the CLI flag table is data,
+the storage-record layout is documented in one place, the per-DBMS / per-
+protocol dispatch lives in one switch each.
 
 ### RAII for resource handles
-...
+Sockets, listeners, log files, coroutine handles — every resource is
+owned by an RAII wrapper. `PooledBuffer` returns to its `BufferPool` on
+destruction; `Task<T>`'s `Awaiter` takes ownership of the coroutine
+handle on construction so the temporary `Task` cannot tear the coroutine
+down across a suspend point.
 
 ## C++ Coding Guidelines (self-contained — no external `cpp.md` required)
 

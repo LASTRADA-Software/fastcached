@@ -2,53 +2,148 @@
 //
 // fastcached — Fast Cache Daemon entry point.
 //
-// MVP wiring: CLI -> Config -> CacheEngine over InMemoryLruStorage ->
-// BlockingListener -> RunBlockingServerLoop. Foreground mode only —
-// daemon / Windows service / SIGHUP reload come in subsequent passes.
+// Wiring: CLI -> optional YAML file -> ConfigReloader -> CacheEngine over
+// InMemoryLruStorage -> BlockingListener -> RunBlockingServerLoop, hosted
+// by the requested IDaemonHost (foreground / POSIX daemon / Windows
+// service). SIGINT/SIGTERM and SCM stop trigger graceful shutdown;
+// SIGHUP and SCM PARAMCHANGE trigger config reload.
 
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
+#include <FastCache/Config/ConfigReloader.hpp>
+#include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Platform/DaemonControls.hpp>
+#include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Server/BlockingServerLoop.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 #include <print>
 #include <span>
 #include <string_view>
+#include <thread>
 
 namespace
 {
 
 constexpr std::string_view kProgramVersion = "0.0.1";
 
-/// Process-wide stop flag. Set by the SIGINT/SIGTERM handler (POSIX) or by
-/// SetConsoleCtrlHandler (Windows). The accept loop polls it between
-/// accepts; the OS additionally interrupts the blocking accept() via
-/// closesocket()/close() from the same path.
-std::atomic<bool> g_shouldStop { false };
 FastCache::BlockingListener* g_activeListener { nullptr };
 
 extern "C" void HandleStopSignal(int /*signum*/)
 {
-    g_shouldStop.store(true, std::memory_order_release);
-    // Unblock the accept() syscall by closing the listening socket.
+    FastCache::DaemonControls::Instance().RequestStop();
     if (auto* const listener = g_activeListener)
         listener->Close();
 }
+
+#if !defined(_WIN32)
+extern "C" void HandleReloadSignal(int /*signum*/)
+{
+    FastCache::DaemonControls::Instance().RequestReload();
+}
+#endif
 
 void InstallStopHandlers()
 {
     std::signal(SIGINT, &HandleStopSignal);
     std::signal(SIGTERM, &HandleStopSignal);
+#if !defined(_WIN32)
+    std::signal(SIGHUP, &HandleReloadSignal);
+#endif
+}
+
+/// Merge: CLI flags override YAML for any value explicitly changed from
+/// the default. Same simple heuristic the MVP shipped with.
+FastCache::Config Merge(FastCache::Config fileCfg, FastCache::Config const& cliCfg)
+{
+    FastCache::Config defaults;
+    if (cliCfg.bindAddress != defaults.bindAddress) fileCfg.bindAddress = cliCfg.bindAddress;
+    if (cliCfg.port != defaults.port) fileCfg.port = cliCfg.port;
+    if (cliCfg.maxMemoryBytes != defaults.maxMemoryBytes) fileCfg.maxMemoryBytes = cliCfg.maxMemoryBytes;
+    if (cliCfg.logLevel != defaults.logLevel) fileCfg.logLevel = cliCfg.logLevel;
+    if (!cliCfg.configPath.empty()) fileCfg.configPath = cliCfg.configPath;
+    if (cliCfg.daemon) fileCfg.daemon = true;
+    if (!cliCfg.pidfile.empty()) fileCfg.pidfile = cliCfg.pidfile;
+    if (cliCfg.serviceName != defaults.serviceName) fileCfg.serviceName = cliCfg.serviceName;
+    return fileCfg;
+}
+
+/// Daemon body: holds the actual server lifecycle. Runs under whatever
+/// IDaemonHost was selected (Foreground / Posix double-fork / Windows
+/// service).
+int DaemonBody(FastCache::Config const& effective)
+{
+    FastCache::ConsoleLogger logger { std::cerr, effective.logLevel };
+    FastCache::ConfigReloader reloader { effective, effective.configPath };
+    FastCache::SteadyClock clock;
+    FastCache::InMemoryLruStorage storage { effective.maxMemoryBytes };
+    FastCache::CacheEngine engine { storage, clock };
+
+    reloader.Subscribe([&logger, &storage](auto const& /*prev*/, auto const& next) {
+        logger.SetMinLevel(next->logLevel);
+        storage.Resize(next->maxMemoryBytes);
+    });
+
+    logger.Logf(FastCache::LogLevel::Info,
+                "fastcached {} starting; bind={}:{} max-memory={} bytes config={}",
+                kProgramVersion,
+                effective.bindAddress,
+                effective.port,
+                effective.maxMemoryBytes,
+                effective.configPath.empty() ? std::string_view { "<none>" }
+                                             : std::string_view { effective.configPath });
+
+    auto listener = FastCache::BlockingListener::Bind(effective.bindAddress, effective.port);
+    if (!listener || !listener->IsBound())
+    {
+        logger.Logf(FastCache::LogLevel::Error,
+                    "fastcached: cannot bind: {}",
+                    listener ? listener->BindError() : std::string_view { "null listener" });
+        return EXIT_FAILURE;
+    }
+
+    g_activeListener = listener.get();
+    InstallStopHandlers();
+    logger.Log(FastCache::LogLevel::Info, "ready, accepting connections");
+
+    std::atomic<bool> reloaderQuit { false };
+    std::jthread reloaderThread { [&reloader, &logger, &reloaderQuit] {
+        auto& controls = FastCache::DaemonControls::Instance();
+        while (!reloaderQuit.load(std::memory_order_acquire))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds { 250 });
+            if (!controls.TakeReloadRequest())
+                continue;
+            auto const result = reloader.Reload();
+            if (!result.has_value())
+                logger.Logf(FastCache::LogLevel::Error,
+                            "config reload failed: {}",
+                            result.error().ToString());
+            else
+                logger.Log(FastCache::LogLevel::Info, "config reloaded");
+        }
+    } };
+
+    auto const served = FastCache::RunBlockingServerLoop(
+        *listener, engine, logger, FastCache::DaemonControls::Instance().StopFlag());
+
+    reloaderQuit.store(true, std::memory_order_release);
+    logger.Logf(FastCache::LogLevel::Info, "shutting down; served {} connection(s)", served);
+    g_activeListener = nullptr;
+    return EXIT_SUCCESS;
 }
 
 } // namespace
@@ -77,36 +172,34 @@ int main(int argc, char const* const* argv)
             break;
     }
 
-    auto const& cfg = parsed->config;
-
-    FastCache::ConsoleLogger logger { std::cerr, cfg.logLevel };
-    logger.Logf(FastCache::LogLevel::Info,
-                "fastcached {} starting; bind={}:{} max-memory={} bytes",
-                kProgramVersion,
-                cfg.bindAddress,
-                cfg.port,
-                cfg.maxMemoryBytes);
-
-    FastCache::SteadyClock clock;
-    FastCache::InMemoryLruStorage storage { cfg.maxMemoryBytes };
-    FastCache::CacheEngine engine { storage, clock };
-
-    auto listener = FastCache::BlockingListener::Bind(cfg.bindAddress, cfg.port);
-    if (!listener || !listener->IsBound())
+    FastCache::Config effective;
+    if (!parsed->config.configPath.empty())
     {
-        logger.Logf(FastCache::LogLevel::Error,
-                    "fastcached: cannot bind: {}",
-                    listener ? listener->BindError() : std::string_view { "null listener" });
-        return EXIT_FAILURE;
+        auto loaded = FastCache::ReadYamlConfig(parsed->config.configPath);
+        if (!loaded.has_value())
+        {
+            std::println(std::cerr, "fastcached: {}", loaded.error().ToString());
+            return EXIT_FAILURE;
+        }
+        effective = Merge(std::move(*loaded), parsed->config);
+        effective.configPath = parsed->config.configPath;
+    }
+    else
+    {
+        effective = parsed->config;
     }
 
-    g_activeListener = listener.get();
-    InstallStopHandlers();
-    logger.Log(FastCache::LogLevel::Info, "ready, accepting connections");
+    std::unique_ptr<FastCache::IDaemonHost> host;
+    if (effective.daemon)
+    {
+#if defined(_WIN32)
+        host = FastCache::MakeWindowsServiceHost(effective.serviceName);
+#else
+        host = FastCache::MakePosixDaemonHost(effective.pidfile);
+#endif
+    }
+    if (!host)
+        host = std::make_unique<FastCache::ForegroundHost>();
 
-    auto const served = FastCache::RunBlockingServerLoop(*listener, engine, logger, g_shouldStop);
-
-    logger.Logf(FastCache::LogLevel::Info, "shutting down; served {} connection(s)", served);
-    g_activeListener = nullptr;
-    return EXIT_SUCCESS;
+    return host->Run([&effective] { return DaemonBody(effective); });
 }

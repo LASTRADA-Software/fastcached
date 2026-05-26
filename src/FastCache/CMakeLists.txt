@@ -6,15 +6,24 @@ target_sources(FastCache
     PRIVATE
         Async/TestReactor.cpp
         Cache/CacheEngine.cpp
+        Cache/DiskStorage.cpp
         Cache/InMemoryLruStorage.cpp
         Config/CliParser.cpp
+        Config/ConfigReloader.cpp
+        Config/YamlReader.cpp
+        Core/Crc32c.cpp
         Core/Logger.cpp
         Core/BufferPool.cpp
         Net/BlockingSocket.cpp
+        Platform/DaemonControls.cpp
+        Platform/PosixDaemonHost.cpp
+        Platform/WindowsServiceHost.cpp
         Net/InMemoryTransport.cpp
         Net/Framing/LineReader.cpp
+        Protocol/MemcachedBinary.cpp
         Protocol/MemcachedText.cpp
         Protocol/ProtocolAutodetect.cpp
+        Protocol/RedisResp.cpp
         Server/BlockingServerLoop.cpp
         Server/Connection.cpp
         Server/Server.cpp
