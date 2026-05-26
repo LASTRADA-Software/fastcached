@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Catch2 entry point for the FastCacheTest binary. We provide a custom main
+// (rather than linking Catch2WithMain) so future work can register CLI flags
+// for connecting tests to non-default test seams (test-env paths, etc.).
+
+#define CATCH_CONFIG_RUNNER
+#include <catch2/catch_session.hpp>
+
+int main(int argc, char* argv[])
+{
+    Catch::Session session;
+    auto const cliReturn = session.applyCommandLine(argc, argv);
+    if (cliReturn != 0)
+        return cliReturn;
+    return session.run();
+}

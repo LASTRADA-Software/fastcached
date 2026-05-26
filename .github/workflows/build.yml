@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CTEST_OUTPUT_ON_FAILURE: 1
+  CLANG_TOOLS_VERSION: "20"
+  GCC_VERSION: "14"
+  CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/CPM
+
+jobs:
+  check-clang-format:
+    name: "Check C++ style"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Install clang-format"
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
+          sudo apt-get install -y clang-format-${{ env.CLANG_TOOLS_VERSION }}
+      - name: "Run clang-format"
+        run: |
+          git ls-files '*.h' '*.hpp' '*.cpp' \
+            | xargs clang-format-${{ env.CLANG_TOOLS_VERSION }} --dry-run --Werror --style=file
+
+  linux:
+    name: "Linux-${{ matrix.preset }}"
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [clang-debug, gcc-debug]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Cache CPM packages"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-${{ runner.os }}-${{ matrix.preset }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}-
+
+      - name: "ccache"
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-${{ matrix.preset }}
+          max-size: 256M
+
+      - name: "Install build tools"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libyaml-cpp-dev
+
+      - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
+        if: matrix.preset == 'clang-debug'
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
+          sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} clang-tidy-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
+          sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
+          sudo ln -sf /usr/bin/clang-tidy-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang-tidy
+
+      - name: "Install GCC ${{ env.GCC_VERSION }}"
+        if: matrix.preset == 'gcc-debug'
+        run: |
+          sudo apt-get install -y gcc-${{ env.GCC_VERSION }} g++-${{ env.GCC_VERSION }}
+          sudo ln -sf /usr/bin/gcc-${{ env.GCC_VERSION }} /usr/local/bin/gcc
+          sudo ln -sf /usr/bin/g++-${{ env.GCC_VERSION }} /usr/local/bin/g++
+
+      - name: "Configure"
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: "Build"
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: "Test"
+        run: ctest --preset ${{ matrix.preset }}
+
+  windows:
+    name: "Windows-${{ matrix.preset }}"
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [cl-debug, clangcl-debug]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Cache CPM packages"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-${{ runner.os }}-${{ matrix.preset }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}-
+
+      - name: "sccache"
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: "Install ninja"
+        run: choco install ninja --no-progress
+
+      - name: "Setup MSVC dev environment"
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: "Configure"
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: "Build"
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: "Test"
+        run: ctest --preset ${{ matrix.preset }}

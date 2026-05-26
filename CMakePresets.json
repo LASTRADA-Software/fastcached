@@ -1,0 +1,157 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "PEDANTIC_COMPILER": "ON"
+            }
+        },
+
+        {
+            "name": "clang-debug",
+            "displayName": "Clang Debug (PEDANTIC + ASan + UBSan + clang-tidy)",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "PEDANTIC_COMPILER_WERROR": "ON",
+                "ENABLE_SANITIZER_ADDRESS": "ON",
+                "ENABLE_SANITIZER_UNDEFINED": "ON",
+                "ENABLE_TIDY": "ON"
+            },
+            "condition": {
+                "type": "notEquals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+
+        {
+            "name": "gcc-debug",
+            "displayName": "GCC Debug (PEDANTIC)",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "gcc",
+                "CMAKE_CXX_COMPILER": "g++",
+                "PEDANTIC_COMPILER_WERROR": "ON"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            }
+        },
+
+        {
+            "name": "clang-coverage",
+            "displayName": "Clang Coverage (LCOV/llvm-cov)",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "ENABLE_COVERAGE": "ON"
+            },
+            "condition": {
+                "type": "notEquals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+
+        {
+            "name": "clang-asan-ubsan",
+            "displayName": "Clang ASan + UBSan (no clang-tidy)",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "ENABLE_SANITIZER_ADDRESS": "ON",
+                "ENABLE_SANITIZER_UNDEFINED": "ON"
+            },
+            "condition": {
+                "type": "notEquals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+
+        {
+            "name": "clang-tsan",
+            "displayName": "Clang ThreadSanitizer",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "ENABLE_SANITIZER_THREAD": "ON"
+            },
+            "condition": {
+                "type": "notEquals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+
+        {
+            "name": "cl-debug",
+            "displayName": "MSVC Debug",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "cl",
+                "CMAKE_CXX_COMPILER": "cl",
+                "PEDANTIC_COMPILER_WERROR": "ON"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+
+        {
+            "name": "clangcl-debug",
+            "displayName": "clang-cl Debug",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "clang-cl",
+                "CMAKE_CXX_COMPILER": "clang-cl",
+                "PEDANTIC_COMPILER_WERROR": "ON"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "clang-debug",      "configurePreset": "clang-debug" },
+        { "name": "gcc-debug",        "configurePreset": "gcc-debug" },
+        { "name": "clang-coverage",   "configurePreset": "clang-coverage" },
+        { "name": "clang-asan-ubsan", "configurePreset": "clang-asan-ubsan" },
+        { "name": "clang-tsan",       "configurePreset": "clang-tsan" },
+        { "name": "cl-debug",         "configurePreset": "cl-debug" },
+        { "name": "clangcl-debug",    "configurePreset": "clangcl-debug" }
+    ],
+    "testPresets": [
+        { "name": "clang-debug",      "configurePreset": "clang-debug",      "output": { "outputOnFailure": true } },
+        { "name": "gcc-debug",        "configurePreset": "gcc-debug",        "output": { "outputOnFailure": true } },
+        { "name": "clang-coverage",   "configurePreset": "clang-coverage",   "output": { "outputOnFailure": true } },
+        { "name": "clang-asan-ubsan", "configurePreset": "clang-asan-ubsan", "output": { "outputOnFailure": true } },
+        { "name": "clang-tsan",       "configurePreset": "clang-tsan",       "output": { "outputOnFailure": true } },
+        { "name": "cl-debug",         "configurePreset": "cl-debug",         "output": { "outputOnFailure": true } },
+        { "name": "clangcl-debug",    "configurePreset": "clangcl-debug",    "output": { "outputOnFailure": true } }
+    ]
+}
