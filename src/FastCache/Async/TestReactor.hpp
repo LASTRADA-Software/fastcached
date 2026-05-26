@@ -54,9 +54,9 @@ class TestReactor: public IReactor
     /// surface — treat as Detail.
     struct ScheduledEntry
     {
-        TimePoint deadline;
-        std::uint64_t sequence; ///< Tie-breaker so equal deadlines fire FIFO.
-        std::coroutine_handle<> handle;
+        TimePoint deadline {};
+        std::uint64_t sequence { 0 }; ///< Tie-breaker so equal deadlines fire FIFO.
+        std::coroutine_handle<> handle {};
     };
 
   private:
