@@ -16,10 +16,17 @@ namespace FastCache
 /// ConfigError(OutOfRange). Missing file is ConfigError(FileNotFound).
 ///
 /// Recognised top-level keys (all optional):
-///   bind:          string         (e.g. "127.0.0.1")
-///   port:          int            (1..65535)
-///   max_memory:    int            (bytes, >= 0; 0 disables eviction)
-///   log_level:     string         (trace|debug|info|warn|error|fatal)
+///
+///   bind:        string   interface to bind on (e.g. "127.0.0.1", "0.0.0.0").
+///
+///   port:        int      TCP listen port; 1..65535.
+///
+///   max_memory:  size     in-memory cache budget. Integer with optional unit
+///                         suffix: k/K = 1024, m/M = 1024², g/G = 1024³
+///                         (1024-based). Plain integer means bytes. 0 disables
+///                         eviction. Examples: 67108864, 64m, 1g.
+///
+///   log_level:   string   one of: trace | debug | info | warn | error | fatal.
 ///
 /// CLI flags later override these values via the caller.
 /// @param path Filesystem path of the YAML file.

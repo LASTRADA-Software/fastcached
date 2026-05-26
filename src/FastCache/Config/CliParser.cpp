@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
 
 #include <charconv>
@@ -35,12 +36,10 @@ namespace
 
     [[nodiscard]] std::expected<std::size_t, ConfigError> ParseMaxMemory(std::string_view sv)
     {
-        std::uint64_t raw = 0;
-        auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), raw);
-        if (ec != std::errc {} || ptr != sv.data() + sv.size())
-            return std::unexpected(
-                MakeError(ConfigErrorCode::TypeMismatch, "max-memory", std::format("not a number: {}", sv)));
-        return static_cast<std::size_t>(raw);
+        return ParseByteSize(sv, "max-memory").transform_error([](ConfigError err) {
+            err.source = "argv";
+            return err;
+        });
     }
 
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv)
@@ -191,7 +190,7 @@ std::string_view CliUsage() noexcept
            "  --config=<path>        YAML config file; CLI flags override file values\n"
            "  --bind=<addr>          bind address (default 127.0.0.1)\n"
            "  --port=<num>           TCP port (default 11211)\n"
-           "  --max-memory=<bytes>   in-memory storage byte budget (default 64 MiB)\n"
+           "  --max-memory=<size>    in-memory budget; suffix k/m/g = KiB/MiB/GiB (default 64 MiB)\n"
            "  --log-level=<level>    trace|debug|info|warn|error|fatal (default info)\n"
            "  --daemon               daemonize (POSIX) / register as Windows service\n"
            "  --pidfile=<path>       POSIX daemon mode only\n"

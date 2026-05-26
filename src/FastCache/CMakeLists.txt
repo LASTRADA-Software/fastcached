@@ -11,6 +11,7 @@ target_sources(FastCache
         Cache/CacheEngine.cpp
         Cache/DiskStorage.cpp
         Cache/InMemoryLruStorage.cpp
+        Config/ByteSize.cpp
         Config/CliParser.cpp
         Config/ConfigReloader.cpp
         Config/YamlReader.cpp

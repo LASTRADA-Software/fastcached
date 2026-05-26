@@ -31,7 +31,8 @@ struct CliResult
 /// Recognised flags:
 ///   --bind <addr>            (default 127.0.0.1)
 ///   --port <num>             (default 11211)
-///   --max-memory <bytes>     (default 67108864 = 64 MiB; accepts plain integer)
+///   --max-memory <size>      (default 64 MiB; integer with optional unit suffix
+///                             k/K=1024, m/M=1024², g/G=1024³; plain int = bytes)
 ///   --log-level <level>      (trace|debug|info|warn|error|fatal; default info)
 ///   --help, -h               print usage and exit
 ///   --version, -V            print version and exit

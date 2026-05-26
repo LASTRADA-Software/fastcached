@@ -70,3 +70,28 @@ TEST_CASE("YamlReader: empty file produces defaults", "[config][yaml]")
     REQUIRE(cfg->bindAddress == "127.0.0.1");
     REQUIRE(cfg->port == 11211);
 }
+
+TEST_CASE("YamlReader: max_memory accepts kibibyte suffix", "[config][yaml]")
+{
+    auto const path = WriteTempYaml("mem-k", "max_memory: 4k\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE(cfg.has_value());
+    REQUIRE(cfg->maxMemoryBytes == 4u * 1024u);
+}
+
+TEST_CASE("YamlReader: max_memory accepts mebibyte suffix", "[config][yaml]")
+{
+    auto const path = WriteTempYaml("mem-m", "max_memory: 256m\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE(cfg.has_value());
+    REQUIRE(cfg->maxMemoryBytes == 256u * 1024u * 1024u);
+}
+
+TEST_CASE("YamlReader: max_memory rejects unknown suffix", "[config][yaml]")
+{
+    auto const path = WriteTempYaml("mem-bad", "max_memory: 5x\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE_FALSE(cfg.has_value());
+    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::TypeMismatch);
+    REQUIRE(cfg.error().field == "max_memory");
+}
