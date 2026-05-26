@@ -4,7 +4,9 @@
 
 target_sources(FastCache
     PRIVATE
+        Async/EpollReactor.cpp
         Async/IocpReactor.cpp
+        Async/KqueueReactor.cpp
         Async/TestReactor.cpp
         Cache/CacheEngine.cpp
         Cache/DiskStorage.cpp
@@ -16,7 +18,9 @@ target_sources(FastCache
         Core/Logger.cpp
         Core/BufferPool.cpp
         Net/BlockingSocket.cpp
+        Net/EpollSocket.cpp
         Net/IocpSocket.cpp
+        Net/KqueueSocket.cpp
         Platform/DaemonControls.cpp
         Platform/PosixDaemonHost.cpp
         Platform/WindowsServiceHost.cpp
@@ -28,6 +32,7 @@ target_sources(FastCache
         Protocol/RedisResp.cpp
         Server/BlockingServerLoop.cpp
         Server/Connection.cpp
+        Server/ReactorServerLoop.cpp
         Server/Server.cpp
 )
 

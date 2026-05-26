@@ -22,8 +22,8 @@ namespace
 
     /// Completion-key sentinels distinguishing internal vs. socket
     /// completions on a single IOCP port.
-    constexpr ULONG_PTR kKeyResumeCoroutine = 1;
-    constexpr ULONG_PTR kKeyStop = 2;
+    constexpr ULONG_PTR KeyResumeCoroutine = 1;
+    constexpr ULONG_PTR KeyStop = 2;
     // Socket completions use the IocpSocket pointer as the key.
 
     /// Min-heap comparator: earlier deadlines win; FIFO on ties.
@@ -76,7 +76,7 @@ void IocpReactor::Submit(std::coroutine_handle<> handle)
     if (!handle || !_iocp)
         return;
     PostQueuedCompletionStatus(
-        static_cast<HANDLE>(_iocp), 0, kKeyResumeCoroutine, reinterpret_cast<LPOVERLAPPED>(handle.address()));
+        static_cast<HANDLE>(_iocp), 0, KeyResumeCoroutine, reinterpret_cast<LPOVERLAPPED>(handle.address()));
 }
 
 void IocpReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
@@ -89,14 +89,14 @@ void IocpReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
         std::ranges::push_heap(_timers, EntryGreater);
     }
     // Nudge the reactor in case it's blocked waiting on a later deadline.
-    PostQueuedCompletionStatus(static_cast<HANDLE>(_iocp), 0, kKeyResumeCoroutine, nullptr);
+    PostQueuedCompletionStatus(static_cast<HANDLE>(_iocp), 0, KeyResumeCoroutine, nullptr);
 }
 
 void IocpReactor::Stop() noexcept
 {
     _stopped.store(true, std::memory_order_release);
     if (_iocp)
-        PostQueuedCompletionStatus(static_cast<HANDLE>(_iocp), 0, kKeyStop, nullptr);
+        PostQueuedCompletionStatus(static_cast<HANDLE>(_iocp), 0, KeyStop, nullptr);
 }
 
 void IocpReactor::FireExpiredTimers()
@@ -119,8 +119,8 @@ void IocpReactor::FireExpiredTimers()
 
 void IocpReactor::Run()
 {
-    constexpr ULONG kBatch = 32;
-    OVERLAPPED_ENTRY entries[kBatch];
+    constexpr ULONG Batch = 32;
+    OVERLAPPED_ENTRY entries[Batch];
 
     while (!_stopped.load(std::memory_order_acquire))
     {
@@ -136,7 +136,7 @@ void IocpReactor::Run()
 
         ULONG removed = 0;
         BOOL const ok = GetQueuedCompletionStatusEx(
-            static_cast<HANDLE>(_iocp), entries, kBatch, &removed, timeout, FALSE);
+            static_cast<HANDLE>(_iocp), entries, Batch, &removed, timeout, FALSE);
 
         if (!ok)
         {
@@ -154,9 +154,9 @@ void IocpReactor::Run()
         for (ULONG i = 0; i < removed; ++i)
         {
             auto const& entry = entries[i];
-            if (entry.lpCompletionKey == kKeyStop)
+            if (entry.lpCompletionKey == KeyStop)
                 return;
-            if (entry.lpCompletionKey == kKeyResumeCoroutine)
+            if (entry.lpCompletionKey == KeyResumeCoroutine)
             {
                 if (entry.lpOverlapped == nullptr)
                     continue; // pure wake-up, no work

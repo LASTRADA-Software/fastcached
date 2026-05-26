@@ -89,6 +89,81 @@ jobs:
       - name: "Test"
         run: ctest --preset ${{ matrix.preset }}
 
+      - name: "Upload Linux binary for the sccache smoke job"
+        if: matrix.preset == 'clang-debug'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastcached-linux
+          path: out/build/clang-debug/target/fastcached
+          retention-days: 1
+
+  sccache-smoke:
+    name: "sccache smoke (memcached + Redis)"
+    runs-on: ubuntu-24.04
+    needs: linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Download fastcached binary"
+        uses: actions/download-artifact@v4
+        with:
+          name: fastcached-linux
+          path: bin
+      - name: "Make fastcached executable"
+        run: chmod +x bin/fastcached
+      - name: "Install sccache + a C++ compiler"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sccache g++-14
+      - name: "Write a one-file C++ source to compile"
+        run: |
+          mkdir -p smoke
+          cat > smoke/hello.cpp <<'EOF'
+          #include <string>
+          int main() { return std::string{"hi"}.size(); }
+          EOF
+      - name: "Smoke: memcached text protocol"
+        run: |
+          set -e
+          ./bin/fastcached --port=11611 --log-level=info &
+          server=$!
+          sleep 1
+          export SCCACHE_MEMCACHED=tcp://127.0.0.1:11611
+          export SCCACHE_NO_DAEMON=0
+          sccache --stop-server || true
+          sccache --start-server
+          sccache --zero-stats
+          # First compile: cache miss.
+          sccache g++-14 -std=c++23 -c smoke/hello.cpp -o /tmp/hello.o
+          rm -f /tmp/hello.o
+          # Second compile: cache hit.
+          sccache g++-14 -std=c++23 -c smoke/hello.cpp -o /tmp/hello.o
+          stats=$(sccache --show-stats)
+          echo "$stats"
+          echo "$stats" | grep -E "Cache hits[[:space:]]+[1-9]" >/dev/null || { echo "no cache hit"; exit 1; }
+          sccache --stop-server || true
+          kill $server || true
+          wait $server 2>/dev/null || true
+      - name: "Smoke: Redis RESP2 protocol"
+        run: |
+          set -e
+          ./bin/fastcached --port=11612 --log-level=info &
+          server=$!
+          sleep 1
+          unset SCCACHE_MEMCACHED
+          export SCCACHE_REDIS=redis://127.0.0.1:11612
+          sccache --stop-server || true
+          sccache --start-server
+          sccache --zero-stats
+          sccache g++-14 -std=c++23 -c smoke/hello.cpp -o /tmp/hello.o
+          rm -f /tmp/hello.o
+          sccache g++-14 -std=c++23 -c smoke/hello.cpp -o /tmp/hello.o
+          stats=$(sccache --show-stats)
+          echo "$stats"
+          echo "$stats" | grep -E "Cache hits[[:space:]]+[1-9]" >/dev/null || { echo "no cache hit"; exit 1; }
+          sccache --stop-server || true
+          kill $server || true
+          wait $server 2>/dev/null || true
+
   windows:
     name: "Windows-${{ matrix.preset }}"
     runs-on: windows-2025

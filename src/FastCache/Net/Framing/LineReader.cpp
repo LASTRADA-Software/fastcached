@@ -13,8 +13,8 @@ namespace FastCache
 namespace
 {
 
-    constexpr std::byte kCr { 0x0d };
-    constexpr std::byte kLf { 0x0a };
+    constexpr std::byte CarriageReturn { 0x0d };
+    constexpr std::byte LineFeed { 0x0a };
 
     [[nodiscard]] ProtocolError MakeTruncated(std::string context)
     {
@@ -52,7 +52,7 @@ std::expected<std::string, ProtocolError> ByteReader::TryExtractLine()
 
     for (std::size_t i = 0; i + 1 < _buffer.size(); ++i)
     {
-        if (_buffer[i] == kCr && _buffer[i + 1] == kLf)
+        if (_buffer[i] == CarriageReturn && _buffer[i + 1] == LineFeed)
         {
             if (i > _maxLineBytes)
                 return std::unexpected(MakeLineTooLong());

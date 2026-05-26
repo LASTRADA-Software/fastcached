@@ -5,6 +5,7 @@
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 
 #include <algorithm>
@@ -25,9 +26,9 @@ namespace FastCache
 namespace
 {
 
-    constexpr std::size_t kMaxLineBytes = 4096;
-    constexpr std::size_t kMaxPayloadBytes = 16 * 1024 * 1024; // 16 MiB
-    constexpr std::string_view kCrlf = "\r\n";
+    constexpr std::size_t MaxLineBytes = 4096;
+    constexpr std::size_t MaxPayloadBytes = 16 * 1024 * 1024; // 16 MiB
+    constexpr std::string_view Crlf = "\r\n";
 
     /// Split a line on whitespace into at most maxParts tokens.
     [[nodiscard]] std::vector<std::string_view> Tokenize(std::string_view line, std::size_t maxParts = 16)
@@ -90,14 +91,14 @@ namespace
             line.push_back(' ');
             line.append(detail);
         }
-        line.append(kCrlf);
+        line.append(Crlf);
         co_return co_await WriteAll(socket, line);
     }
 
     Task<bool> WriteLine(ISocket& socket, std::string_view text)
     {
         std::string line { text };
-        line.append(kCrlf);
+        line.append(Crlf);
         co_return co_await WriteAll(socket, line);
     }
 
@@ -154,10 +155,10 @@ namespace
             out.push_back(' ');
             out.append(std::to_string(entry.cas));
         }
-        out.append(kCrlf);
+        out.append(Crlf);
         for (auto const b : entry.value)
             out.push_back(static_cast<char>(b));
-        out.append(kCrlf);
+        out.append(Crlf);
     }
 
     Task<bool> HandleGet(ISocket& socket,
@@ -330,12 +331,12 @@ namespace
 
 std::string_view MemcachedTextHandler::ServerVersion() noexcept
 {
-    return "fastcached-0.0.1";
+    return ServerVersionBanner;
 }
 
 Task<void> MemcachedTextHandler::Run(ISocket& socket, CacheEngine& engine, std::vector<std::byte> primingBytes)
 {
-    ByteReader reader { socket, kMaxLineBytes, kMaxPayloadBytes };
+    ByteReader reader { socket, MaxLineBytes, MaxPayloadBytes };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
 
     while (true)

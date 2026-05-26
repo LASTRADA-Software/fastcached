@@ -14,7 +14,7 @@ namespace FastCache
 // Default minimum capacity when caller passes 0. Sized to comfortably hold a
 // memcached text line or a Redis RESP small array without an immediate
 // reallocation. Not a hard limit — Acquire() honours minCapacity.
-constexpr std::size_t kDefaultBufferCapacity = 4096;
+constexpr std::size_t DefaultBufferCapacity = 4096;
 
 // -- PooledBuffer ----------------------------------------------------------
 
@@ -121,7 +121,7 @@ std::shared_ptr<BufferPool> BufferPool::Create(std::size_t maxRetainedBuffers)
 
 PooledBuffer BufferPool::Acquire(std::size_t minCapacity)
 {
-    auto const requested = minCapacity == 0 ? kDefaultBufferCapacity : minCapacity;
+    auto const requested = minCapacity == 0 ? DefaultBufferCapacity : minCapacity;
 
     std::vector<std::byte> picked;
     bool found = false;

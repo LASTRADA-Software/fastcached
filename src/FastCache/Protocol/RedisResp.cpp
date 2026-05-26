@@ -5,6 +5,7 @@
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 
 #include <algorithm>
@@ -26,9 +27,9 @@ namespace FastCache
 namespace
 {
 
-    constexpr std::size_t kMaxLineBytes = 65536;
-    constexpr std::size_t kMaxPayloadBytes = 64 * 1024 * 1024;
-    constexpr std::string_view kCrlf = "\r\n";
+    constexpr std::size_t MaxLineBytes = 65536;
+    constexpr std::size_t MaxPayloadBytes = 64 * 1024 * 1024;
+    constexpr std::string_view Crlf = "\r\n";
 
     [[nodiscard]] std::string Upper(std::string_view sv)
     {
@@ -94,7 +95,7 @@ namespace
             co_return false;
         if (!co_await WriteAll(socket, bytes))
             co_return false;
-        co_return co_await WriteAll(socket, kCrlf);
+        co_return co_await WriteAll(socket, Crlf);
     }
 
     Task<bool> ReplyBulkString(ISocket& socket, std::string_view text)
@@ -352,11 +353,15 @@ namespace
                 co_return co_await WriteAll(socket, "-NOPROTO sorry, RESP3 not supported\r\n");
         }
         // Minimal RESP2 HELLO reply — an array of key/value pairs.
+        // The server banner is variable-length so the $-prefix length is
+        // derived from the runtime banner.
+        auto const banner = ServerVersionBanner;
         auto const body = std::format(
-            "*6\r\n$6\r\nserver\r\n$13\r\n{}\r\n"
+            "*6\r\n$6\r\nserver\r\n${}\r\n{}\r\n"
             "$5\r\nproto\r\n:2\r\n"
             "$2\r\nid\r\n:1\r\n",
-            "fastcached-0");
+            banner.size(),
+            banner);
         co_return co_await WriteAll(socket, body);
     }
 
@@ -409,12 +414,12 @@ namespace
 
 std::string_view RedisRespHandler::ServerVersion() noexcept
 {
-    return "fastcached-0.0.1";
+    return ServerVersionBanner;
 }
 
 Task<void> RedisRespHandler::Run(ISocket& socket, CacheEngine& engine, std::vector<std::byte> primingBytes)
 {
-    ByteReader reader { socket, kMaxLineBytes, kMaxPayloadBytes };
+    ByteReader reader { socket, MaxLineBytes, MaxPayloadBytes };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
 
     while (true)

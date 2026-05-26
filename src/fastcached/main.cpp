@@ -16,10 +16,12 @@
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Server/BlockingServerLoop.hpp>
+#include <FastCache/Server/ReactorServerLoop.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -38,15 +40,11 @@
 namespace
 {
 
-constexpr std::string_view kProgramVersion = "0.0.1";
-
-FastCache::BlockingListener* g_activeListener { nullptr };
+constexpr std::string_view ProgramVersion = FastCache::VersionString;
 
 extern "C" void HandleStopSignal(int /*signum*/)
 {
     FastCache::DaemonControls::Instance().RequestStop();
-    if (auto* const listener = g_activeListener)
-        listener->Close();
 }
 
 #if !defined(_WIN32)
@@ -99,23 +97,13 @@ int DaemonBody(FastCache::Config const& effective)
 
     logger.Logf(FastCache::LogLevel::Info,
                 "fastcached {} starting; bind={}:{} max-memory={} bytes config={}",
-                kProgramVersion,
+                ProgramVersion,
                 effective.bindAddress,
                 effective.port,
                 effective.maxMemoryBytes,
                 effective.configPath.empty() ? std::string_view { "<none>" }
                                              : std::string_view { effective.configPath });
 
-    auto listener = FastCache::BlockingListener::Bind(effective.bindAddress, effective.port);
-    if (!listener || !listener->IsBound())
-    {
-        logger.Logf(FastCache::LogLevel::Error,
-                    "fastcached: cannot bind: {}",
-                    listener ? listener->BindError() : std::string_view { "null listener" });
-        return EXIT_FAILURE;
-    }
-
-    g_activeListener = listener.get();
     InstallStopHandlers();
     logger.Log(FastCache::LogLevel::Info, "ready, accepting connections");
 
@@ -137,13 +125,13 @@ int DaemonBody(FastCache::Config const& effective)
         }
     } };
 
-    auto const served = FastCache::RunBlockingServerLoop(
-        *listener, engine, logger, FastCache::DaemonControls::Instance().StopFlag());
+    FastCache::ReactorServerOptions serverOpts;
+    serverOpts.bindAddress = effective.bindAddress;
+    serverOpts.port = effective.port;
+    auto const exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
 
     reloaderQuit.store(true, std::memory_order_release);
-    logger.Logf(FastCache::LogLevel::Info, "shutting down; served {} connection(s)", served);
-    g_activeListener = nullptr;
-    return EXIT_SUCCESS;
+    return exitCode;
 }
 
 } // namespace
@@ -163,7 +151,7 @@ int main(int argc, char const* const* argv)
     switch (parsed->outcome)
     {
         case FastCache::CliOutcome::ShowVersion:
-            std::println("fastcached {}", kProgramVersion);
+            std::println("fastcached {}", ProgramVersion);
             return EXIT_SUCCESS;
         case FastCache::CliOutcome::ShowHelp:
             std::print("{}", FastCache::CliUsage());

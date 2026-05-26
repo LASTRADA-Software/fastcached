@@ -201,7 +201,7 @@ IoAwaitable IocpSocket::Write(std::span<std::byte const> buffer)
 namespace
 {
 
-    constexpr std::size_t kAcceptAddrSize = sizeof(sockaddr_in) + 16;
+    constexpr std::size_t AcceptAddrSize = sizeof(sockaddr_in) + 16;
 
 } // namespace
 
@@ -219,7 +219,7 @@ struct IocpListener::Impl
         IocpCompletion completion;
         AcceptAwaitable* awaitable { nullptr };
         SOCKET acceptSock { INVALID_SOCKET };
-        std::array<std::byte, kAcceptAddrSize * 2> addrBuf {};
+        std::array<std::byte, AcceptAddrSize * 2> addrBuf {};
         IocpReactor* reactor { nullptr };
     };
 
@@ -394,8 +394,8 @@ AcceptAwaitable IocpListener::Accept()
                                       op.acceptSock,
                                       op.addrBuf.data(),
                                       0,
-                                      static_cast<DWORD>(kAcceptAddrSize),
-                                      static_cast<DWORD>(kAcceptAddrSize),
+                                      static_cast<DWORD>(AcceptAddrSize),
+                                      static_cast<DWORD>(AcceptAddrSize),
                                       &bytesReceived,
                                       reinterpret_cast<LPWSAOVERLAPPED>(&op.completion));
     auto const lastErr = ok ? 0 : WSAGetLastError();

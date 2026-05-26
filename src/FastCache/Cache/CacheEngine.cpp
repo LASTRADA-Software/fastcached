@@ -14,7 +14,7 @@ namespace
 
     /// memcached's threshold: any exptime above 30 days is interpreted as a
     /// UNIX timestamp.
-    constexpr std::uint32_t kExptimeAbsoluteThreshold = 60u * 60u * 24u * 30u;
+    constexpr std::uint32_t ExptimeAbsoluteThreshold = 60u * 60u * 24u * 30u;
 
 } // namespace
 
@@ -26,7 +26,7 @@ TimePoint CacheEngine::ExpiryFromExptime(std::uint32_t exptime) const noexcept
         return TimePoint::max();
 
     auto const now = _clock.Now();
-    if (exptime <= kExptimeAbsoluteThreshold)
+    if (exptime <= ExptimeAbsoluteThreshold)
         return now + std::chrono::seconds { exptime };
 
     // Absolute UNIX timestamp. We approximate "now in unix seconds" by

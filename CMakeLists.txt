@@ -73,9 +73,21 @@ endif()
 # the test binary link it).
 
 add_library(FastCache STATIC)
-target_include_directories(FastCache PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(FastCache PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
+)
 target_compile_features(FastCache PUBLIC cxx_std_23)
 target_link_libraries(FastCache PUBLIC yaml-cpp::yaml-cpp)
+
+# Substitute the version triple/string into Core/Version.hpp at configure
+# time. The generated header lives under the build dir so it never gets
+# checked in.
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/FastCache/Core/Version.hpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/FastCache/Core/Version.hpp"
+    @ONLY
+)
 
 if(WIN32)
     target_link_libraries(FastCache PUBLIC ws2_32)

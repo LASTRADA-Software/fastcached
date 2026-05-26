@@ -84,3 +84,68 @@ TEST_CASE("Server::Shutdown closes the listener", "[server]")
 
     REQUIRE(server.AcceptedCount() == 0);
 }
+
+namespace
+{
+
+/// Admission policy that always refuses (used to test the rejection path
+/// without needing to keep a long-running connection in flight).
+class AlwaysDenyAdmission final: public FastCache::IAdmissionControl
+{
+  public:
+    [[nodiscard]] bool AllowAccept() noexcept override { return false; }
+    void OnConnectionStarted() noexcept override {}
+    void OnConnectionEnded() noexcept override {}
+};
+
+} // namespace
+
+TEST_CASE("Server rejects connections when admission denies", "[server][admission]")
+{
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::NullLogger logger;
+    FastCache::InMemoryListener listener;
+    AlwaysDenyAdmission admission;
+    FastCache::AtomicMetricsSink metrics;
+    FastCache::Server server { listener, engine, logger, &admission, &metrics };
+
+    auto c1 = listener.ConnectClient();
+    auto c2 = listener.ConnectClient();
+    c1->ShutdownWrite();
+    c2->ShutdownWrite();
+
+    listener.Close();
+    FastCache::SyncRun(server.Run());
+
+    // Both incoming connections were refused; AcceptedCount only counts
+    // admitted connections.
+    REQUIRE(server.AcceptedCount() == 0);
+    REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsTotal) == 0);
+    REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsAdmissionRejected) == 2);
+}
+
+TEST_CASE("Server admits + tracks ConnectionsTotal", "[server][admission]")
+{
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::NullLogger logger;
+    FastCache::InMemoryListener listener;
+    FastCache::CountingAdmissionControl admission { /*maxConcurrent*/ 4 };
+    FastCache::AtomicMetricsSink metrics;
+    FastCache::Server server { listener, engine, logger, &admission, &metrics };
+
+    auto c1 = listener.ConnectClient();
+    auto c2 = listener.ConnectClient();
+    c1->ShutdownWrite();
+    c2->ShutdownWrite();
+
+    listener.Close();
+    FastCache::SyncRun(server.Run());
+
+    REQUIRE(server.AcceptedCount() == 2);
+    REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsTotal) == 2);
+    REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsAdmissionRejected) == 0);
+}

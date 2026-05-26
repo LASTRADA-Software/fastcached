@@ -17,10 +17,10 @@ namespace Detail
 
 #if defined(_WIN32)
     using NativeSocket = std::uintptr_t; // SOCKET on Windows
-    constexpr NativeSocket kInvalidSocket = static_cast<NativeSocket>(~0ull);
+    constexpr NativeSocket InvalidSocket = static_cast<NativeSocket>(~0ull);
 #else
     using NativeSocket = int;
-    constexpr NativeSocket kInvalidSocket = -1;
+    constexpr NativeSocket InvalidSocket = -1;
 #endif
 
     /// One-time Winsock startup / Linux SIGPIPE setup. Idempotent.
@@ -68,7 +68,7 @@ class BlockingListener final: public IListener
     void Close() noexcept override;
 
     /// @return true if the listener bound and listens cleanly.
-    [[nodiscard]] bool IsBound() const noexcept { return _native != Detail::kInvalidSocket; }
+    [[nodiscard]] bool IsBound() const noexcept { return _native != Detail::InvalidSocket; }
 
     /// @return Error context recorded at Bind() time if binding failed.
     [[nodiscard]] std::string_view BindError() const noexcept { return _bindError; }
@@ -76,7 +76,7 @@ class BlockingListener final: public IListener
   private:
     BlockingListener() = default;
 
-    Detail::NativeSocket _native { Detail::kInvalidSocket };
+    Detail::NativeSocket _native { Detail::InvalidSocket };
     std::string _bindError;
 };
 

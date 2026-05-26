@@ -14,7 +14,7 @@ class Crc32c
 {
   public:
     /// Initial seed; what an "empty" CRC32C looks like.
-    static constexpr std::uint32_t kSeed = 0xFFFF'FFFFU;
+    static constexpr std::uint32_t Seed = 0xFFFF'FFFFU;
 
     /// One-shot computation over a byte span.
     /// @param bytes Input bytes.
@@ -22,7 +22,7 @@ class Crc32c
     [[nodiscard]] static std::uint32_t Compute(std::span<std::byte const> bytes) noexcept;
 
     /// Streaming API: feed multiple buffers, finalise once.
-    /// @param state In/out CRC state (seed with kSeed for the first call).
+    /// @param state In/out CRC state (seed with Seed for the first call).
     /// @param bytes Input bytes.
     static void Update(std::uint32_t& state, std::span<std::byte const> bytes) noexcept;
 

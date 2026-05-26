@@ -148,10 +148,10 @@ void BlockingSocket::Close() noexcept
     if (_closed)
         return;
     _closed = true;
-    if (_native != Detail::kInvalidSocket)
+    if (_native != Detail::InvalidSocket)
     {
         Detail::CloseNative(_native);
-        _native = Detail::kInvalidSocket;
+        _native = Detail::InvalidSocket;
     }
 }
 
@@ -198,7 +198,7 @@ BlockingListener::Bind(std::string_view bindAddress, std::uint16_t port, int bac
     std::unique_ptr<BlockingListener> listener { new BlockingListener {} };
 
     auto const sock = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0 || sock == static_cast<int>(Detail::kInvalidSocket))
+    if (sock < 0 || sock == static_cast<int>(Detail::InvalidSocket))
     {
         listener->_bindError = std::format("socket() failed: {}", Detail::LastNetworkError());
         return listener;
@@ -248,16 +248,16 @@ BlockingListener::~BlockingListener()
 
 void BlockingListener::Close() noexcept
 {
-    if (_native != Detail::kInvalidSocket)
+    if (_native != Detail::InvalidSocket)
     {
         Detail::CloseNative(_native);
-        _native = Detail::kInvalidSocket;
+        _native = Detail::InvalidSocket;
     }
 }
 
 AcceptAwaitable BlockingListener::Accept()
 {
-    if (_native == Detail::kInvalidSocket)
+    if (_native == Detail::InvalidSocket)
         return AcceptAwaitable { std::unexpected(NetError {
             .code = NetErrorCode::BadFileHandle, .context = _bindError }) };
 
@@ -269,7 +269,7 @@ AcceptAwaitable BlockingListener::Accept()
 #endif
     auto const acceptedRaw =
         ::accept(static_cast<int>(_native), reinterpret_cast<sockaddr*>(&client), &addrLen);
-    if (acceptedRaw < 0 || acceptedRaw == static_cast<int>(Detail::kInvalidSocket))
+    if (acceptedRaw < 0 || acceptedRaw == static_cast<int>(Detail::InvalidSocket))
         return AcceptAwaitable { std::unexpected(MakeSystemError("accept")) };
 
     return AcceptAwaitable { AcceptResult {

@@ -5,6 +5,7 @@
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 
 #include <array>
@@ -23,9 +24,9 @@ namespace FastCache
 namespace
 {
 
-    constexpr std::byte kRequestMagic { 0x80 };
-    constexpr std::byte kResponseMagic { 0x81 };
-    constexpr std::size_t kHeaderSize = 24;
+    constexpr std::byte RequestMagic { 0x80 };
+    constexpr std::byte ResponseMagic { 0x81 };
+    constexpr std::size_t HeaderSize = 24;
 
     enum class Opcode : std::uint8_t
     {
@@ -90,7 +91,7 @@ namespace
 
     [[nodiscard]] bool ParseHeader(std::span<std::byte const> bytes, RequestHeader& out)
     {
-        if (bytes.size() < kHeaderSize)
+        if (bytes.size() < HeaderSize)
             return false;
         out.magic = std::to_integer<std::uint8_t>(bytes[0]);
         out.opcode = std::to_integer<std::uint8_t>(bytes[1]);
@@ -113,8 +114,8 @@ namespace
                              std::span<std::byte const> key,
                              std::span<std::byte const> value)
     {
-        std::array<std::byte, kHeaderSize> hdr {};
-        hdr[0] = kResponseMagic;
+        std::array<std::byte, HeaderSize> hdr {};
+        hdr[0] = ResponseMagic;
         hdr[1] = std::byte { static_cast<std::uint8_t>(opcode) };
         WriteBigEndian<std::uint16_t>(std::span<std::byte> { &hdr[2], 2 }, static_cast<std::uint16_t>(key.size()));
         hdr[4] = std::byte { static_cast<std::uint8_t>(extras.size()) };
@@ -283,7 +284,7 @@ namespace
 
     Task<bool> HandleVersion(ISocket& socket, RequestHeader const& header)
     {
-        std::string_view const ver = "fastcached-0.0.1";
+        auto const ver = ServerVersionBanner;
         co_return co_await WriteResponse(
             socket, Opcode::Version, Status::Ok, header.opaque, 0, {}, {}, AsBytes(ver));
     }
@@ -306,22 +307,22 @@ namespace
 Task<void>
 MemcachedBinaryHandler::Run(ISocket& socket, CacheEngine& engine, std::vector<std::byte> primingBytes)
 {
-    constexpr std::size_t kMaxBodyBytes = 16 * 1024 * 1024;
-    ByteReader reader { socket, /*maxLineBytes*/ 1, /*maxPayloadBytes*/ kMaxBodyBytes + kHeaderSize };
+    constexpr std::size_t MaxBodyBytes = 16 * 1024 * 1024;
+    ByteReader reader { socket, /*maxLineBytes*/ 1, /*maxPayloadBytes*/ MaxBodyBytes + HeaderSize };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
 
     while (true)
     {
-        auto const headerBytes = co_await reader.ReadExactly(kHeaderSize);
+        auto const headerBytes = co_await reader.ReadExactly(HeaderSize);
         if (!headerBytes.has_value())
             co_return;
 
         RequestHeader header {};
         if (!ParseHeader(std::span<std::byte const> { headerBytes->data(), headerBytes->size() }, header))
             co_return;
-        if (header.magic != static_cast<std::uint8_t>(kRequestMagic))
+        if (header.magic != static_cast<std::uint8_t>(RequestMagic))
             co_return; // protocol error — drop the connection
-        if (header.totalBodyLen > kMaxBodyBytes)
+        if (header.totalBodyLen > MaxBodyBytes)
             co_return;
 
         auto const body = co_await reader.ReadExactly(header.totalBodyLen);

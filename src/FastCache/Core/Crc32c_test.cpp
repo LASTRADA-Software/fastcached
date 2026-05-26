@@ -25,7 +25,7 @@ TEST_CASE("CRC32C streaming equals one-shot", "[crc32c]")
     auto const sv = std::string_view { "the quick brown fox jumps over the lazy dog" };
     auto const oneShot = FastCache::Crc32c::Compute(FastCache::AsBytes(sv));
 
-    auto state = FastCache::Crc32c::kSeed;
+    auto state = FastCache::Crc32c::Seed;
     auto const first = FastCache::AsBytes(sv.substr(0, 16));
     auto const second = FastCache::AsBytes(sv.substr(16));
     FastCache::Crc32c::Update(state, first);

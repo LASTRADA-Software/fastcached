@@ -80,7 +80,8 @@ TEST_CASE("memcached-text version yields VERSION line", "[protocol][text]")
 {
     TextFixture fix;
     auto const response = Exchange(fix, "version\r\n");
-    REQUIRE(response == "VERSION fastcached-0.0.1\r\n");
+    REQUIRE(response.starts_with("VERSION fastcached-"));
+    REQUIRE(response.ends_with("\r\n"));
 }
 
 TEST_CASE("memcached-text set then get", "[protocol][text]")

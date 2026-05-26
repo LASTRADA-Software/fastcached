@@ -15,11 +15,11 @@ namespace FastCache
 namespace
 {
 
-    constexpr std::byte kBinaryMagic { 0x80 };
+    constexpr std::byte BinaryMagic { 0x80 };
 
     [[nodiscard]] ProtocolFlavor ClassifyFirstByte(std::byte b) noexcept
     {
-        if (b == kBinaryMagic)
+        if (b == BinaryMagic)
             return ProtocolFlavor::MemcachedBinary;
         auto const c = static_cast<char>(b);
         switch (c)

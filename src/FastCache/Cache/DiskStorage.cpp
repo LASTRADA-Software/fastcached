@@ -38,15 +38,15 @@ namespace FastCache
 namespace
 {
 
-    constexpr std::array<char, 4> kMagic = { 'F', 'C', 'A', 'S' };
-    constexpr std::uint32_t kFormatVersion = 1;
+    constexpr std::array<char, 4> Magic = { 'F', 'C', 'A', 'S' };
+    constexpr std::uint32_t FormatVersion = 1;
 
     /// File header: magic + version + reserved padding.
     /// Layout (16 bytes total):
     ///   bytes 0..3:  'F' 'C' 'A' 'S'
     ///   bytes 4..7:  format version (u32 little-endian)
     ///   bytes 8..15: reserved (zero)
-    constexpr std::size_t kHeaderSize = 16;
+    constexpr std::size_t HeaderSize = 16;
 
     /// Per-record on-disk layout (little-endian):
     ///   u32 total_len     (size in bytes of payload+crc, not counting these 4 bytes)
@@ -60,7 +60,7 @@ namespace
     ///   u32 value_len
     ///   key (key_len bytes)
     ///   value (value_len bytes)
-    constexpr std::size_t kRecordHeaderSize = 1 + 4 + 8 + 8 + 8 + 4 + 4;
+    constexpr std::size_t RecordHeaderSize = 1 + 4 + 8 + 8 + 8 + 4 + 4;
 
     [[nodiscard]] StorageError MakeIoError(int code, std::string ctx)
     {
@@ -185,25 +185,25 @@ std::expected<void, StorageError> DiskStorage::OpenAndReplay()
         std::fclose(fp);
 
         // Validate header.
-        if (raw.size() < kHeaderSize)
+        if (raw.size() < HeaderSize)
         {
             // File too short — treat as empty, will rewrite header.
             raw.clear();
         }
         else
         {
-            if (std::memcmp(raw.data(), kMagic.data(), kMagic.size()) != 0)
+            if (std::memcmp(raw.data(), Magic.data(), Magic.size()) != 0)
                 return std::unexpected(MakeCorrupt("bad magic"));
             std::uint32_t version = 0;
             std::memcpy(&version, raw.data() + 4, sizeof(version));
-            if (version != kFormatVersion)
+            if (version != FormatVersion)
                 return std::unexpected(MakeCorrupt(std::format("unsupported version {}", version)));
         }
 
         // Replay records.
-        std::span<std::byte const> cursor { raw.data() + (raw.empty() ? 0 : kHeaderSize),
-                                            raw.empty() ? 0 : raw.size() - kHeaderSize };
-        goodPrefix = raw.empty() ? 0 : kHeaderSize;
+        std::span<std::byte const> cursor { raw.data() + (raw.empty() ? 0 : HeaderSize),
+                                            raw.empty() ? 0 : raw.size() - HeaderSize };
+        goodPrefix = raw.empty() ? 0 : HeaderSize;
 
         while (!cursor.empty())
         {
@@ -289,9 +289,9 @@ std::expected<void, StorageError> DiskStorage::OpenAndReplay()
     if (!exists || goodPrefix == 0)
     {
         // Write header.
-        std::array<std::byte, kHeaderSize> hdr {};
-        std::memcpy(hdr.data(), kMagic.data(), kMagic.size());
-        std::memcpy(hdr.data() + 4, &kFormatVersion, sizeof(kFormatVersion));
+        std::array<std::byte, HeaderSize> hdr {};
+        std::memcpy(hdr.data(), Magic.data(), Magic.size());
+        std::memcpy(hdr.data() + 4, &FormatVersion, sizeof(FormatVersion));
         if (std::fwrite(hdr.data(), 1, hdr.size(), _log) != hdr.size())
             return std::unexpected(MakeIoError(errno, "fwrite header"));
         std::fflush(_log);
@@ -393,7 +393,7 @@ std::expected<void, StorageError>
 DiskStorage::AppendRecord(RecordType type, std::string_view key, CacheEntry const& entry)
 {
     std::vector<std::byte> payload;
-    payload.reserve(kRecordHeaderSize + key.size() + entry.value.size());
+    payload.reserve(RecordHeaderSize + key.size() + entry.value.size());
 
     PushLe<std::uint8_t>(payload, static_cast<std::uint8_t>(type));
     PushLe<std::uint32_t>(payload, entry.flags);
@@ -635,9 +635,9 @@ std::expected<std::size_t, StorageError> DiskStorage::Compact()
         return std::unexpected(MakeIoError(errno, "fopen .new"));
 
     // Header.
-    std::array<std::byte, kHeaderSize> hdr {};
-    std::memcpy(hdr.data(), kMagic.data(), kMagic.size());
-    std::memcpy(hdr.data() + 4, &kFormatVersion, sizeof(kFormatVersion));
+    std::array<std::byte, HeaderSize> hdr {};
+    std::memcpy(hdr.data(), Magic.data(), Magic.size());
+    std::memcpy(hdr.data() + 4, &FormatVersion, sizeof(FormatVersion));
     if (std::fwrite(hdr.data(), 1, hdr.size(), newLog) != hdr.size())
     {
         std::fclose(newLog);
@@ -649,7 +649,7 @@ std::expected<std::size_t, StorageError> DiskStorage::Compact()
     for (auto const& node : _lru)
     {
         std::vector<std::byte> payload;
-        payload.reserve(kRecordHeaderSize + node.key.size() + node.entry.value.size());
+        payload.reserve(RecordHeaderSize + node.key.size() + node.entry.value.size());
         PushLe<std::uint8_t>(payload, static_cast<std::uint8_t>(RecordType::Set));
         PushLe<std::uint32_t>(payload, node.entry.flags);
         PushLe<std::uint64_t>(payload, node.entry.cas);
