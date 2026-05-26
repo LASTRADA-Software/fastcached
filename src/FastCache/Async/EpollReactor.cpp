@@ -7,11 +7,11 @@
     #include <sys/eventfd.h>
 
     #include <algorithm>
+    #include <cerrno>
     #include <chrono>
     #include <cstdint>
     #include <ranges>
-
-    #include <cerrno>
+    #include <tuple>
 
     #include <unistd.h>
 
@@ -107,7 +107,7 @@ void EpollReactor::Submit(std::coroutine_handle<> handle)
         _pendingSubmits.push_back(handle);
     }
     std::uint64_t one = 1;
-    (void) ::write(_wakeFd, &one, sizeof(one));
+    std::ignore = ::write(_wakeFd, &one, sizeof(one));
 }
 
 void EpollReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
@@ -120,14 +120,14 @@ void EpollReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
         std::ranges::push_heap(_timers, EntryGreater);
     }
     std::uint64_t one = 1;
-    (void) ::write(_wakeFd, &one, sizeof(one));
+    std::ignore = ::write(_wakeFd, &one, sizeof(one));
 }
 
 void EpollReactor::Stop() noexcept
 {
     _stopped.store(true, std::memory_order_release);
     std::uint64_t one = 1;
-    (void) ::write(_wakeFd, &one, sizeof(one));
+    std::ignore = ::write(_wakeFd, &one, sizeof(one));
 }
 
 void EpollReactor::FireExpiredTimers()
@@ -193,7 +193,7 @@ void EpollReactor::Run()
             {
                 // Wake event — drain the eventfd counter and move on.
                 std::uint64_t buf {};
-                (void) ::read(_wakeFd, &buf, sizeof(buf));
+                std::ignore = ::read(_wakeFd, &buf, sizeof(buf));
                 continue;
             }
             auto* handler = static_cast<EpollFdHandler*>(ev.data.ptr);

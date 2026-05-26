@@ -37,8 +37,11 @@ using PlatformListener = KqueueListener;
     #error "No reactor implementation for this platform"
 #endif
 
-int RunReactorServer(
-    ReactorServerOptions const& options, CacheEngine& engine, ILogger& logger, IAdmissionControl* admission, IMetricsSink* metrics)
+int RunReactorServer(ReactorServerOptions const& options,
+                     CacheEngine& engine,
+                     ILogger& logger,
+                     IAdmissionControl* admission,
+                     IMetricsSink* metrics)
 {
     SteadyClock clock;
     PlatformReactor reactor { clock };

@@ -207,10 +207,8 @@ IoAwaitable BlockingSocket::Read(std::span<std::byte> buffer)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
-    auto const got = ::recv(static_cast<int>(_native),
-                            reinterpret_cast<char*>(buffer.data()),
-                            static_cast<Detail::IoLen>(buffer.size()),
-                            0);
+    auto const got = ::recv(
+        static_cast<int>(_native), reinterpret_cast<char*>(buffer.data()), static_cast<Detail::IoLen>(buffer.size()), 0);
     if (got < 0)
         return IoAwaitable { std::unexpected(MakeSystemError("recv")) };
     return IoAwaitable { IoResult { static_cast<std::size_t>(got) } };

@@ -153,13 +153,20 @@ namespace
     {
         switch (status)
         {
-            case Status::KeyNotFound: return "Not found";
-            case Status::KeyExists: return "Data exists for key";
-            case Status::ItemNotStored: return "Not stored";
-            case Status::IncrOnNonNumeric: return "Non-numeric server-side value";
-            case Status::InvalidArguments: return "Invalid arguments";
-            case Status::AuthError: return "Auth failure";
-            default: return "Internal error";
+            case Status::KeyNotFound:
+                return "Not found";
+            case Status::KeyExists:
+                return "Data exists for key";
+            case Status::ItemNotStored:
+                return "Not stored";
+            case Status::IncrOnNonNumeric:
+                return "Non-numeric server-side value";
+            case Status::InvalidArguments:
+                return "Invalid arguments";
+            case Status::AuthError:
+                return "Auth failure";
+            default:
+                return "Internal error";
         }
     }
 

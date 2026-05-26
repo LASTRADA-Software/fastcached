@@ -59,7 +59,7 @@ namespace
                 std::exit(EXIT_SUCCESS);
 
             ::umask(0);
-            (void) ::chdir("/");
+            std::ignore = ::chdir("/");
 
             // Redirect stdio to /dev/null.
             ::close(STDIN_FILENO);

@@ -9,6 +9,7 @@
 
     #include <sys/socket.h>
 
+    #include <cerrno>
     #include <cstddef>
     #include <cstdint>
     #include <cstring>
@@ -19,8 +20,6 @@
     #include <string_view>
     #include <tuple>
     #include <utility>
-
-    #include <cerrno>
 
     #include <fcntl.h>
     #include <unistd.h>
@@ -243,7 +242,8 @@ IoAwaitable EpollSocket::Read(std::span<std::byte> buffer)
     _impl->readOp.readBuffer = buffer;
     IoAwaitable a;
     a.SetSuspendCallback(&EpollSocketAwaitableSuspended, &_impl->readOp);
-    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ true, /*write*/ _impl->writeOp.awaitable != nullptr);
+    std::ignore =
+        _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ true, /*write*/ _impl->writeOp.awaitable != nullptr);
     return a;
 }
 
@@ -276,7 +276,8 @@ IoAwaitable EpollSocket::Write(std::span<std::byte const> buffer)
     _impl->writeOp.writeTotal = buffer.size();
     IoAwaitable a;
     a.SetSuspendCallback(&EpollSocketAwaitableSuspended, &_impl->writeOp);
-    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ _impl->readOp.awaitable != nullptr, /*write*/ true);
+    std::ignore =
+        _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ _impl->readOp.awaitable != nullptr, /*write*/ true);
     return a;
 }
 

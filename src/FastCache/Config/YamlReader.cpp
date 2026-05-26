@@ -52,60 +52,57 @@ namespace
 namespace
 {
 
-[[nodiscard]] std::expected<YAML::Node, ConfigError> LoadRoot(std::filesystem::path const& path)
-{
-    try
+    [[nodiscard]] std::expected<YAML::Node, ConfigError> LoadRoot(std::filesystem::path const& path)
     {
-        return YAML::LoadFile(path.string());
+        try
+        {
+            return YAML::LoadFile(path.string());
+        }
+        catch (YAML::ParserException const& e)
+        {
+            return std::unexpected(
+                MakeError(ConfigErrorCode::ParseError, path, {}, e.msg, static_cast<unsigned>(e.mark.line + 1)));
+        }
+        catch (YAML::Exception const& e)
+        {
+            return std::unexpected(MakeError(ConfigErrorCode::ParseError, path, {}, e.what()));
+        }
     }
-    catch (YAML::ParserException const& e)
-    {
-        return std::unexpected(
-            MakeError(ConfigErrorCode::ParseError, path, {}, e.msg, static_cast<unsigned>(e.mark.line + 1)));
-    }
-    catch (YAML::Exception const& e)
-    {
-        return std::unexpected(MakeError(ConfigErrorCode::ParseError, path, {}, e.what()));
-    }
-}
 
-[[nodiscard]] std::expected<void, ConfigError> ApplyEntry(Config& cfg,
-                                                          std::string const& key,
-                                                          YAML::Node const& valueNode,
-                                                          std::filesystem::path const& path,
-                                                          unsigned line)
-{
-    if (key == "bind")
+    [[nodiscard]] std::expected<void, ConfigError> ApplyEntry(
+        Config& cfg, std::string const& key, YAML::Node const& valueNode, std::filesystem::path const& path, unsigned line)
     {
-        cfg.bindAddress = valueNode.as<std::string>();
-        return {};
+        if (key == "bind")
+        {
+            cfg.bindAddress = valueNode.as<std::string>();
+            return {};
+        }
+        if (key == "port")
+        {
+            auto const raw = valueNode.as<int>();
+            if (raw <= 0 || raw > 65535)
+                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, path, "port", "must be in 1..65535", line));
+            cfg.port = static_cast<std::uint16_t>(raw);
+            return {};
+        }
+        if (key == "max_memory")
+        {
+            auto const raw = valueNode.as<long long>();
+            if (raw < 0)
+                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, path, "max_memory", "must be >= 0", line));
+            cfg.maxMemoryBytes = static_cast<std::size_t>(raw);
+            return {};
+        }
+        if (key == "log_level")
+        {
+            auto const level = ParseLogLevel(valueNode.as<std::string>(), path, line);
+            if (!level.has_value())
+                return std::unexpected(level.error());
+            cfg.logLevel = *level;
+            return {};
+        }
+        return std::unexpected(MakeError(ConfigErrorCode::UnknownKey, path, key, "unrecognised key", line));
     }
-    if (key == "port")
-    {
-        auto const raw = valueNode.as<int>();
-        if (raw <= 0 || raw > 65535)
-            return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, path, "port", "must be in 1..65535", line));
-        cfg.port = static_cast<std::uint16_t>(raw);
-        return {};
-    }
-    if (key == "max_memory")
-    {
-        auto const raw = valueNode.as<long long>();
-        if (raw < 0)
-            return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, path, "max_memory", "must be >= 0", line));
-        cfg.maxMemoryBytes = static_cast<std::size_t>(raw);
-        return {};
-    }
-    if (key == "log_level")
-    {
-        auto const level = ParseLogLevel(valueNode.as<std::string>(), path, line);
-        if (!level.has_value())
-            return std::unexpected(level.error());
-        cfg.logLevel = *level;
-        return {};
-    }
-    return std::unexpected(MakeError(ConfigErrorCode::UnknownKey, path, key, "unrecognised key", line));
-}
 
 } // namespace
 
