@@ -4,6 +4,7 @@
 
 target_sources(FastCache
     PRIVATE
+        Async/IocpReactor.cpp
         Async/TestReactor.cpp
         Cache/CacheEngine.cpp
         Cache/DiskStorage.cpp
@@ -15,6 +16,7 @@ target_sources(FastCache
         Core/Logger.cpp
         Core/BufferPool.cpp
         Net/BlockingSocket.cpp
+        Net/IocpSocket.cpp
         Platform/DaemonControls.cpp
         Platform/PosixDaemonHost.cpp
         Platform/WindowsServiceHost.cpp
