@@ -97,8 +97,16 @@ jobs:
           path: out/build/clang-debug/target/fastcached
           retention-days: 1
 
-  sccache-smoke:
-    name: "sccache smoke (memcached + Redis)"
+  # Smoke tests live in three sibling jobs so the PR status check tells you
+  # *which* protocol broke without opening the log. They share the same
+  # fastcached binary artifact and the same compile-twice / expect-cache-hit
+  # assertion. The only deltas are which sccache version is installed (apt
+  # = 0.7.7 = OpenDAL 0.44 = memcached TEXT wire; mozilla-actions's prebuilt
+  # = >=0.8 = OpenDAL >=0.45 = memcached BINARY wire) and which SCCACHE_*
+  # env var points sccache at fastcached.
+
+  sccache-smoke-memcached-text:
+    name: "sccache smoke (memcached text)"
     runs-on: ubuntu-24.04
     needs: linux
     steps:
@@ -121,14 +129,15 @@ jobs:
           #include <string>
           int main() { return std::string{"hi"}.size(); }
           EOF
-      - name: "Smoke: memcached text protocol"
+      - name: "Smoke"
+        env:
+          SCCACHE_MEMCACHED: tcp://127.0.0.1:11611
+          SCCACHE_NO_DAEMON: "0"
         run: |
           set -e
           ./bin/fastcached --port=11611 --log-level=info &
           server=$!
           sleep 1
-          export SCCACHE_MEMCACHED=tcp://127.0.0.1:11611
-          export SCCACHE_NO_DAEMON=0
           sccache --stop-server || true
           sccache --start-server
           sccache --zero-stats
@@ -143,14 +152,91 @@ jobs:
           sccache --stop-server || true
           kill $server || true
           wait $server 2>/dev/null || true
-      - name: "Smoke: Redis RESP2 protocol"
+
+  sccache-smoke-memcached-binary:
+    name: "sccache smoke (memcached binary)"
+    runs-on: ubuntu-24.04
+    needs: linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Download fastcached binary"
+        uses: actions/download-artifact@v4
+        with:
+          name: fastcached-linux
+          path: bin
+      - name: "Make fastcached executable"
+        run: chmod +x bin/fastcached
+      - name: "Install C++ compiler + libyaml-cpp runtime"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 libyaml-cpp0.8
+      # mozilla-actions/sccache-action ships sccache >= 0.8, which uses
+      # OpenDAL >= 0.45 and speaks the memcached BINARY protocol; the apt
+      # sccache (0.7.7) on noble still speaks text.
+      - name: "Install sccache (binary protocol via OpenDAL >= 0.45)"
+        uses: mozilla-actions/sccache-action@v0.0.6
+      - name: "Write a one-file C++ source to compile"
+        run: |
+          mkdir -p smoke
+          cat > smoke/hello.cpp <<'EOF'
+          #include <string>
+          int main() { return std::string{"hi"}.size(); }
+          EOF
+      - name: "Smoke"
+        env:
+          SCCACHE_MEMCACHED: tcp://127.0.0.1:11611
+          SCCACHE_NO_DAEMON: "0"
         run: |
           set -e
-          ./bin/fastcached --port=11612 --log-level=info &
+          ./bin/fastcached --port=11611 --log-level=info &
           server=$!
           sleep 1
-          unset SCCACHE_MEMCACHED
-          export SCCACHE_REDIS=redis://127.0.0.1:11612
+          sccache --stop-server || true
+          sccache --start-server
+          sccache --zero-stats
+          sccache g++-14 -std=c++23 -c smoke/hello.cpp -o /tmp/hello.o
+          rm -f /tmp/hello.o
+          sccache g++-14 -std=c++23 -c smoke/hello.cpp -o /tmp/hello.o
+          stats=$(sccache --show-stats)
+          echo "$stats"
+          echo "$stats" | grep -E "Cache hits[[:space:]]+[1-9]" >/dev/null || { echo "no cache hit"; exit 1; }
+          sccache --stop-server || true
+          kill $server || true
+          wait $server 2>/dev/null || true
+
+  sccache-smoke-redis:
+    name: "sccache smoke (redis RESP2)"
+    runs-on: ubuntu-24.04
+    needs: linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Download fastcached binary"
+        uses: actions/download-artifact@v4
+        with:
+          name: fastcached-linux
+          path: bin
+      - name: "Make fastcached executable"
+        run: chmod +x bin/fastcached
+      - name: "Install sccache + a C++ compiler"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sccache g++-14
+      - name: "Write a one-file C++ source to compile"
+        run: |
+          mkdir -p smoke
+          cat > smoke/hello.cpp <<'EOF'
+          #include <string>
+          int main() { return std::string{"hi"}.size(); }
+          EOF
+      - name: "Smoke"
+        env:
+          SCCACHE_REDIS: redis://127.0.0.1:11611
+          SCCACHE_NO_DAEMON: "0"
+        run: |
+          set -e
+          ./bin/fastcached --port=11611 --log-level=info &
+          server=$!
+          sleep 1
           sccache --stop-server || true
           sccache --start-server
           sccache --zero-stats
