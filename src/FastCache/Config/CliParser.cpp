@@ -197,7 +197,18 @@ std::string_view CliUsage() noexcept
            "  --pidfile=<path>       POSIX daemon mode only\n"
            "  --service-name=<name>  Windows service name (default FastCached)\n"
            "  --help, -h             show this help and exit\n"
-           "  --version, -V          show version and exit\n";
+           "  --version, -V          show version and exit\n"
+           "\n"
+           "Use with sccache (memcached protocol):\n"
+           "  fastcached --port=11211 &\n"
+           "  export SCCACHE_MEMCACHED=tcp://127.0.0.1:11211\n"
+           "  sccache <compiler> -c hello.c -o hello.o\n"
+           "\n"
+           "Use with sccache (Redis protocol):\n"
+           "  export SCCACHE_REDIS=redis://127.0.0.1:11211\n"
+           "\n"
+           "sccache <= 0.7 speaks memcached text; >= 0.8 speaks memcached binary;\n"
+           "either works because fastcached auto-detects the wire format.\n";
 }
 
 std::expected<CliResult, ConfigError> ParseCli(std::span<char const* const> args)
