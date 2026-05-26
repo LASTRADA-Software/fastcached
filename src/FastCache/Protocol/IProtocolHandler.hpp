@@ -34,7 +34,7 @@ class IProtocolHandler
     /// @param primingBytes Bytes that were peeked during protocol
     ///        autodetection and must be replayed before any socket read.
     /// @return Task that completes when the session ends.
-    [[nodiscard]] virtual Task<void> Run(ISocket& socket, CacheEngine& engine, std::vector<std::byte> primingBytes) = 0;
+    [[nodiscard]] virtual Task<void> Run(ISocket* socket, CacheEngine* engine, std::vector<std::byte> primingBytes) = 0;
 };
 
 } // namespace FastCache

@@ -36,10 +36,10 @@ namespace
 
 } // namespace
 
-Task<std::expected<AutodetectResult, NetError>> DetectProtocol(ISocket& socket)
+Task<std::expected<AutodetectResult, NetError>> DetectProtocol(ISocket* socket)
 {
     std::byte peekBuffer[1] {};
-    auto const result = co_await socket.Read(std::span<std::byte> { peekBuffer, 1 });
+    auto const result = co_await socket->Read(std::span<std::byte> { peekBuffer, 1 });
     if (!result.has_value())
         co_return std::unexpected(result.error());
 

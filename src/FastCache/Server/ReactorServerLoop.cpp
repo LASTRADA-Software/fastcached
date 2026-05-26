@@ -38,7 +38,7 @@ using PlatformListener = KqueueListener;
 #endif
 
 int RunReactorServer(
-    ReactorServerOptions options, CacheEngine& engine, ILogger& logger, IAdmissionControl* admission, IMetricsSink* metrics)
+    ReactorServerOptions const& options, CacheEngine& engine, ILogger& logger, IAdmissionControl* admission, IMetricsSink* metrics)
 {
     SteadyClock clock;
     PlatformReactor reactor { clock };
@@ -57,11 +57,11 @@ int RunReactorServer(
     // Fire the accept loop as a detached coroutine. DetachedTask's
     // initial_suspend=suspend_never starts the body inline; the first
     // co_await suspends on the listener and the reactor takes over.
-    auto runAccept = [](Server& s) -> DetachedTask {
-        co_await s.Run();
+    auto runAccept = [](Server* s) -> DetachedTask {
+        co_await s->Run();
         co_return;
     };
-    runAccept(server);
+    runAccept(&server);
 
     // Watchdog: poll DaemonControls for the stop request from a sidecar
     // thread. When set, shutdown the server (closes the listener) and
