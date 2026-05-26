@@ -50,14 +50,40 @@ namespace
 
 } // namespace
 
-std::expected<std::size_t, ConfigError> ParseByteSize(std::string_view sv, std::string_view field)
+std::expected<std::size_t, ConfigError> ParseByteSize(std::string_view sv,
+                                                      std::string_view field,
+                                                      std::size_t hostTotalBytes)
 {
     if (sv.empty())
         return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, field, "empty value"));
 
+    auto const tail = sv.back();
+
+    // Percentage of host total memory.
+    if (tail == '%')
+    {
+        auto const digits = sv.substr(0, sv.size() - 1);
+        if (digits.empty())
+            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, field, "percent without digits"));
+
+        auto pct = std::uint64_t { 0 };
+        auto const [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), pct);
+        if (ec != std::errc {} || ptr != digits.data() + digits.size())
+            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, field, std::format("not a number: {}", sv)));
+
+        if (pct > 100)
+            return std::unexpected(
+                MakeError(ConfigErrorCode::OutOfRange, field, std::format("percentage out of range 0..100: {}", sv)));
+
+        if (hostTotalBytes == 0)
+            return std::unexpected(
+                MakeError(ConfigErrorCode::TypeMismatch, field, "percent-of-host requested but host memory is unknown"));
+
+        return static_cast<std::size_t>((static_cast<std::uint64_t>(hostTotalBytes) * pct) / 100U);
+    }
+
     auto multiplier = std::uint64_t { 1 };
     auto digits = sv;
-    auto const tail = sv.back();
     if (tail < '0' || tail > '9')
     {
         multiplier = SuffixMultiplier(tail);

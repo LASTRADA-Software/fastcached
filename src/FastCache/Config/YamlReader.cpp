@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/YamlReader.hpp>
+#include <FastCache/Platform/HostMemory.hpp>
 
 #include <yaml-cpp/yaml.h>
 
@@ -91,11 +92,13 @@ namespace
         }
         /// `max_memory`: in-memory cache byte budget. Integer with optional
         /// unit suffix k/K=1024, m/M=1024², g/G=1024³ (1024-based). Plain
-        /// integer means bytes. 0 disables eviction.
+        /// integer means bytes. A trailing "%" sets the budget to that
+        /// percentage of the host's total RAM (e.g., 50%). 0 disables
+        /// eviction.
         if (key == "max_memory")
         {
             auto const raw = valueNode.as<std::string>();
-            auto parsed = ParseByteSize(raw, "max_memory");
+            auto parsed = ParseByteSize(raw, "max_memory", QueryHostTotalMemoryBytes());
             if (!parsed.has_value())
             {
                 auto err = std::move(parsed).error();

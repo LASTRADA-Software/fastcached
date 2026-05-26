@@ -23,6 +23,7 @@ target_sources(FastCache
         Net/IocpSocket.cpp
         Net/KqueueSocket.cpp
         Platform/DaemonControls.cpp
+        Platform/HostMemory.cpp
         Platform/PosixDaemonHost.cpp
         Platform/WindowsServiceHost.cpp
         Net/InMemoryTransport.cpp

@@ -76,7 +76,7 @@ TEST_CASE("YamlReader: max_memory accepts kibibyte suffix", "[config][yaml]")
     auto const path = WriteTempYaml("mem-k", "max_memory: 4k\n");
     auto const cfg = FastCache::ReadYamlConfig(path);
     REQUIRE(cfg.has_value());
-    REQUIRE(cfg->maxMemoryBytes == 4u * 1024u);
+    REQUIRE(cfg->maxMemoryBytes == 4U * 1024U);
 }
 
 TEST_CASE("YamlReader: max_memory accepts mebibyte suffix", "[config][yaml]")
@@ -84,7 +84,7 @@ TEST_CASE("YamlReader: max_memory accepts mebibyte suffix", "[config][yaml]")
     auto const path = WriteTempYaml("mem-m", "max_memory: 256m\n");
     auto const cfg = FastCache::ReadYamlConfig(path);
     REQUIRE(cfg.has_value());
-    REQUIRE(cfg->maxMemoryBytes == 256u * 1024u * 1024u);
+    REQUIRE(cfg->maxMemoryBytes == 256U * 1024U * 1024U);
 }
 
 TEST_CASE("YamlReader: max_memory rejects unknown suffix", "[config][yaml]")

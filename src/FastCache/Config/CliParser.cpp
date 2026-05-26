@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
+#include <FastCache/Platform/HostMemory.hpp>
 
 #include <charconv>
 #include <expected>
@@ -36,7 +37,7 @@ namespace
 
     [[nodiscard]] std::expected<std::size_t, ConfigError> ParseMaxMemory(std::string_view sv)
     {
-        return ParseByteSize(sv, "max-memory").transform_error([](ConfigError err) {
+        return ParseByteSize(sv, "max-memory", QueryHostTotalMemoryBytes()).transform_error([](ConfigError err) {
             err.source = "argv";
             return err;
         });
@@ -190,7 +191,7 @@ std::string_view CliUsage() noexcept
            "  --config=<path>        YAML config file; CLI flags override file values\n"
            "  --bind=<addr>          bind address (default 127.0.0.1)\n"
            "  --port=<num>           TCP port (default 11211)\n"
-           "  --max-memory=<size>    in-memory budget; suffix k/m/g = KiB/MiB/GiB (default 64 MiB)\n"
+           "  --max-memory=<size>    in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)\n"
            "  --log-level=<level>    trace|debug|info|warn|error|fatal (default info)\n"
            "  --daemon               daemonize (POSIX) / register as Windows service\n"
            "  --pidfile=<path>       POSIX daemon mode only\n"

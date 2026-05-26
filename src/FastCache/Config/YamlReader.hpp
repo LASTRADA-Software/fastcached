@@ -23,8 +23,10 @@ namespace FastCache
 ///
 ///   max_memory:  size     in-memory cache budget. Integer with optional unit
 ///                         suffix: k/K = 1024, m/M = 1024², g/G = 1024³
-///                         (1024-based). Plain integer means bytes. 0 disables
-///                         eviction. Examples: 67108864, 64m, 1g.
+///                         (1024-based). Plain integer means bytes. A trailing
+///                         "%" sets the budget to that percentage of host total
+///                         RAM (e.g., 50%). 0 disables eviction.
+///                         Examples: 67108864, 64m, 1g, 50%.
 ///
 ///   log_level:   string   one of: trace | debug | info | warn | error | fatal.
 ///

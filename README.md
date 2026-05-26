@@ -84,7 +84,7 @@ usage: fastcached [options]
   --config=<path>        YAML config file; CLI flags override file values
   --bind=<addr>          bind address (default 127.0.0.1)
   --port=<num>           TCP port (default 11211)
-  --max-memory=<size>    in-memory budget; suffix k/m/g = KiB/MiB/GiB (default 64 MiB)
+  --max-memory=<size>    in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)
   --log-level=<level>    trace|debug|info|warn|error|fatal (default info)
   --daemon               daemonize (POSIX) / register as Windows service
   --pidfile=<path>       POSIX daemon mode only
@@ -93,8 +93,10 @@ usage: fastcached [options]
   --version, -V          show version and exit
 ```
 
-`--max-memory` takes an integer with an optional 1024-based unit suffix:
-`64m` is 64 × 1024² = 67108864 bytes. A plain integer is interpreted as bytes.
+`--max-memory` takes an integer with an optional unit suffix:
+`64m` is 64 × 1024² = 67108864 bytes; a plain integer is interpreted as bytes;
+a trailing `%` (e.g. `50%`) sets the budget to that fraction of the host's
+total RAM, queried at startup.
 
 ## YAML config (optional)
 
@@ -103,8 +105,9 @@ usage: fastcached [options]
 bind: 0.0.0.0
 # TCP port (1..65535); 11611 mirrors the value used in CI
 port: 11611
-# in-memory budget; suffix k/K/m/M/g/G = KiB/MiB/GiB (1024-based)
-max_memory: 256m
+# in-memory budget; k/K/m/M/g/G = KiB/MiB/GiB (1024-based),
+# or "N%" to use N percent of the host's total RAM
+max_memory: 50%
 # one of: trace | debug | info | warn | error | fatal
 log_level: debug
 ```
