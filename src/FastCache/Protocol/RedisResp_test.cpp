@@ -27,19 +27,19 @@ struct RespFixture
     FastCache::RedisRespHandler handler;
 };
 
-FastCache::Task<bool> WriteString(FastCache::ISocket& s, std::string_view payload)
+FastCache::Task<bool> WriteString(FastCache::ISocket* s, std::string_view payload)
 {
-    auto const r = co_await s.Write(FastCache::AsBytes(payload));
+    auto const r = co_await s->Write(FastCache::AsBytes(payload));
     co_return r.has_value();
 }
 
-FastCache::Task<std::string> DrainResponse(FastCache::ISocket& s)
+FastCache::Task<std::string> DrainResponse(FastCache::ISocket* s)
 {
     std::string out;
     while (true)
     {
         std::vector<std::byte> chunk(512);
-        auto const r = co_await s.Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const r = co_await s->Read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!r.has_value() || *r == 0)
             break;
         for (std::size_t i = 0; i < *r; ++i)
@@ -52,10 +52,10 @@ FastCache::Task<std::string> DrainResponse(FastCache::ISocket& s)
 
 std::string Exchange(RespFixture& fix, std::string_view request)
 {
-    REQUIRE(FastCache::SyncRun(WriteString(*fix.pair.client, request)));
+    REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), request)));
     fix.pair.client->ShutdownWrite();
-    FastCache::SyncRun(fix.handler.Run(*fix.pair.server, fix.engine, /*primer*/ {}));
-    return FastCache::SyncRun(DrainResponse(*fix.pair.client));
+    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}));
+    return FastCache::SyncRun(DrainResponse(fix.pair.client.get()));
 }
 
 } // namespace

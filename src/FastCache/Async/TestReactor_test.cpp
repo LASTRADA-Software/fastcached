@@ -16,7 +16,7 @@ namespace
 /// Awaitable that yields control back to the reactor's ready queue.
 struct YieldAwaitable
 {
-    FastCache::IReactor& reactor;
+    FastCache::IReactor* reactor { nullptr };
 
     [[nodiscard]] bool await_ready() const noexcept
     {
@@ -24,7 +24,7 @@ struct YieldAwaitable
     }
     void await_suspend(std::coroutine_handle<> handle) const
     {
-        reactor.Submit(handle);
+        reactor->Submit(handle);
     }
     void await_resume() const noexcept {}
 };
@@ -32,21 +32,21 @@ struct YieldAwaitable
 /// Awaitable that resumes when the reactor's clock reaches the given deadline.
 struct SleepAwaitable
 {
-    FastCache::IReactor& reactor;
-    FastCache::TimePoint deadline;
+    FastCache::IReactor* reactor { nullptr };
+    FastCache::TimePoint deadline {};
 
     [[nodiscard]] bool await_ready() const noexcept
     {
-        return reactor.Clock().Now() >= deadline;
+        return reactor->Clock().Now() >= deadline;
     }
     void await_suspend(std::coroutine_handle<> handle) const
     {
-        reactor.Schedule(deadline, handle);
+        reactor->Schedule(deadline, handle);
     }
     void await_resume() const noexcept {}
 };
 
-FastCache::Task<void> CountYields(FastCache::IReactor& reactor, int* counter, int times)
+FastCache::Task<void> CountYields(FastCache::IReactor* reactor, int* counter, int times)
 {
     for (auto i = 0; i < times; ++i)
     {
@@ -56,9 +56,9 @@ FastCache::Task<void> CountYields(FastCache::IReactor& reactor, int* counter, in
     co_return;
 }
 
-FastCache::Task<void> WaitUntil(FastCache::IReactor& reactor, FastCache::TimePoint deadline, bool* fired)
+FastCache::Task<void> WaitUntil(FastCache::IReactor* reactor, FastCache::TimePoint deadline, bool* fired)
 {
-    co_await SleepAwaitable { reactor, deadline };
+    co_await SleepAwaitable { .reactor = reactor, .deadline = deadline };
     *fired = true;
     co_return;
 }
@@ -71,7 +71,7 @@ TEST_CASE("TestReactor::Submit resumes a single coroutine and drains", "[reactor
     FastCache::TestReactor reactor { clock };
 
     int counter = 0;
-    auto task = CountYields(reactor, &counter, 3);
+    auto task = CountYields(&reactor, &counter, 3);
     reactor.Submit(task.Native());
     reactor.Run();
 
@@ -87,8 +87,8 @@ TEST_CASE("TestReactor processes multiple coroutines in FIFO order", "[reactor]"
 
     int c1 = 0;
     int c2 = 0;
-    auto t1 = CountYields(reactor, &c1, 2);
-    auto t2 = CountYields(reactor, &c2, 2);
+    auto t1 = CountYields(&reactor, &c1, 2);
+    auto t2 = CountYields(&reactor, &c2, 2);
     reactor.Submit(t1.Native());
     reactor.Submit(t2.Native());
     reactor.Run();
@@ -103,7 +103,7 @@ TEST_CASE("TestReactor::Schedule fires a timer when the clock advances", "[react
     FastCache::TestReactor reactor { clock };
 
     bool fired = false;
-    auto task = WaitUntil(reactor, clock.Now() + 100ms, &fired);
+    auto task = WaitUntil(&reactor, clock.Now() + 100ms, &fired);
     reactor.Submit(task.Native());
 
     reactor.Run();
@@ -131,10 +131,10 @@ TEST_CASE("TestReactor fires timers in deadline order with FIFO tiebreak", "[rea
     bool firedSame2 = false;
 
     auto const start = clock.Now();
-    auto early = WaitUntil(reactor, start + 10ms, &firedEarly);
-    auto late = WaitUntil(reactor, start + 50ms, &firedLate);
-    auto same1 = WaitUntil(reactor, start + 25ms, &firedSame1);
-    auto same2 = WaitUntil(reactor, start + 25ms, &firedSame2);
+    auto early = WaitUntil(&reactor, start + 10ms, &firedEarly);
+    auto late = WaitUntil(&reactor, start + 50ms, &firedLate);
+    auto same1 = WaitUntil(&reactor, start + 25ms, &firedSame1);
+    auto same2 = WaitUntil(&reactor, start + 25ms, &firedSame2);
 
     reactor.Submit(early.Native());
     reactor.Submit(late.Native());
@@ -156,7 +156,7 @@ TEST_CASE("TestReactor::Stop short-circuits the loop", "[reactor]")
     FastCache::TestReactor reactor { clock };
 
     int counter = 0;
-    auto task = CountYields(reactor, &counter, 10);
+    auto task = CountYields(&reactor, &counter, 10);
     reactor.Submit(task.Native());
     reactor.Stop();
     reactor.Run();
