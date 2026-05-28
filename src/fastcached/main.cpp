@@ -11,6 +11,7 @@
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Cache/ShardedStorage.hpp>
 #include <FastCache/Cache/TracingStorage.hpp>
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
@@ -24,6 +25,7 @@
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Server/BlockingServerLoop.hpp>
+#include <FastCache/Server/PooledServerLoop.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 
 #include <atomic>
@@ -93,7 +95,24 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::Config const& cliC
         fileCfg.storageDurability = cliCfg.storageDurability;
     if (cliCfg.storageMaxValueBytes != defaults.storageMaxValueBytes)
         fileCfg.storageMaxValueBytes = cliCfg.storageMaxValueBytes;
+    if (cliCfg.threadingModel != defaults.threadingModel)
+        fileCfg.threadingModel = cliCfg.threadingModel;
+    if (cliCfg.workerThreads != defaults.workerThreads)
+        fileCfg.workerThreads = cliCfg.workerThreads;
+    if (cliCfg.storageShards != defaults.storageShards)
+        fileCfg.storageShards = cliCfg.storageShards;
     return fileCfg;
+}
+
+/// Pick a default shard count when the user left it at 0 (auto):
+/// min(16, hardware_concurrency), floor of 1.
+[[nodiscard]] std::size_t ResolveShardCount(std::size_t requested) noexcept
+{
+    if (requested != 0)
+        return requested;
+    auto const hw = std::thread::hardware_concurrency();
+    auto const cap = std::min<unsigned>(hw == 0 ? 1u : hw, 16u);
+    return static_cast<std::size_t>(cap);
 }
 
 /// Translate the user-facing StorageDurability into the page-store enum.
@@ -120,35 +139,106 @@ int DaemonBody(FastCache::Config const& effective)
     FastCache::ConfigReloader reloader { effective, effective.configPath };
     FastCache::SteadyClock clock;
 
-    // ----- storage factory: pick the backend per --storage. -----
-    std::unique_ptr<FastCache::IStorage> backend;
-    FastCache::InMemoryLruStorage* memBackend = nullptr;
-    FastCache::CowTreeStorage* diskBackend = nullptr;
+    // ----- storage factory ---------------------------------------------------
+    //
+    // Possible shapes:
+    //   - In-memory, single shard: one InMemoryLruStorage holds everything.
+    //   - In-memory, N shards: N InMemoryLruStorage wrapped in a ShardedStorage.
+    //   - Persistent, single shard: one CowTreeStorage at effective.storagePath
+    //     (the file). Matches PR #10's contract.
+    //   - Persistent, N shards: N CowTreeStorage instances at
+    //     <storagePath>/shard-NN.cow inside the directory.
+    //
+    // The shard count is `--storage-shards` (0 = auto).
 
-    if (effective.storagePath.empty())
+    auto const shardCount = ResolveShardCount(effective.storageShards);
+    auto const usingPersistent = !effective.storagePath.empty();
+    auto const useSharding = shardCount > 1;
+
+    std::unique_ptr<FastCache::IStorage> backend;
+    FastCache::InMemoryLruStorage* singleMemBackend = nullptr;
+    FastCache::CowTreeStorage* singleDiskBackend = nullptr;
+    FastCache::ShardedStorage* shardedBackend = nullptr;
+
+    if (!useSharding)
     {
-        auto mem = std::make_unique<FastCache::InMemoryLruStorage>(effective.maxMemoryBytes);
-        memBackend = mem.get();
-        backend = std::move(mem);
+        // Single shard — preserves the pre-sharding behaviour.
+        if (!usingPersistent)
+        {
+            auto mem = std::make_unique<FastCache::InMemoryLruStorage>(effective.maxMemoryBytes);
+            singleMemBackend = mem.get();
+            backend = std::move(mem);
+        }
+        else
+        {
+            FastCache::CowTreeStorage::Options opts;
+            opts.path = effective.storagePath;
+            opts.maxBytes = effective.maxMemoryBytes;
+            opts.durability = ToPageStoreDurability(effective.storageDurability);
+            opts.maxValueBytes = effective.storageMaxValueBytes;
+            auto opened = FastCache::CowTreeStorage::Open(opts);
+            if (!opened.has_value())
+            {
+                logger.Logf(FastCache::LogLevel::Fatal,
+                            "failed to open storage '{}': {}",
+                            effective.storagePath,
+                            opened.error().ToString());
+                return EXIT_FAILURE;
+            }
+            singleDiskBackend = opened->get();
+            backend = std::move(*opened);
+        }
     }
     else
     {
-        FastCache::CowTreeStorage::Options opts;
-        opts.path = effective.storagePath;
-        opts.maxBytes = effective.maxMemoryBytes;
-        opts.durability = ToPageStoreDurability(effective.storageDurability);
-        opts.maxValueBytes = effective.storageMaxValueBytes;
-        auto opened = FastCache::CowTreeStorage::Open(opts);
-        if (!opened.has_value())
+        // Sharded — split the memory budget evenly across shards.
+        auto const perShardBytes = effective.maxMemoryBytes / shardCount;
+        std::vector<std::unique_ptr<FastCache::IStorage>> shards;
+        shards.reserve(shardCount);
+
+        if (!usingPersistent)
         {
-            logger.Logf(FastCache::LogLevel::Fatal,
-                        "failed to open storage '{}': {}",
-                        effective.storagePath,
-                        opened.error().ToString());
-            return EXIT_FAILURE;
+            for (std::size_t i = 0; i < shardCount; ++i)
+                shards.emplace_back(std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes));
         }
-        diskBackend = opened->get();
-        backend = std::move(*opened);
+        else
+        {
+            // Treat the path as a directory; create it if missing.
+            std::filesystem::path const dir { effective.storagePath };
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (ec)
+            {
+                logger.Logf(FastCache::LogLevel::Fatal,
+                            "failed to create storage directory '{}': {}",
+                            effective.storagePath,
+                            ec.message());
+                return EXIT_FAILURE;
+            }
+
+            for (std::size_t i = 0; i < shardCount; ++i)
+            {
+                FastCache::CowTreeStorage::Options opts;
+                opts.path = dir / std::format("shard-{:02d}.cow", i);
+                opts.maxBytes = perShardBytes;
+                opts.durability = ToPageStoreDurability(effective.storageDurability);
+                opts.maxValueBytes = effective.storageMaxValueBytes;
+                auto opened = FastCache::CowTreeStorage::Open(opts);
+                if (!opened.has_value())
+                {
+                    logger.Logf(FastCache::LogLevel::Fatal,
+                                "failed to open shard '{}': {}",
+                                opts.path.string(),
+                                opened.error().ToString());
+                    return EXIT_FAILURE;
+                }
+                shards.push_back(std::move(*opened));
+            }
+        }
+
+        auto sharded = std::make_unique<FastCache::ShardedStorage>(std::move(shards));
+        shardedBackend = sharded.get();
+        backend = std::move(sharded);
     }
 
     // Optionally wrap in TracingStorage when trace logging is requested.
@@ -162,13 +252,16 @@ int DaemonBody(FastCache::Config const& effective)
 
     FastCache::CacheEngine engine { *storagePtr, clock };
 
-    reloader.Subscribe([&logger, memBackend, diskBackend](auto const& /*prev*/, auto const& next) {
-        logger.SetMinLevel(next->logLevel);
-        if (memBackend != nullptr)
-            memBackend->Resize(next->maxMemoryBytes);
-        if (diskBackend != nullptr)
-            diskBackend->Resize(next->maxMemoryBytes);
-    });
+    reloader.Subscribe(
+        [&logger, singleMemBackend, singleDiskBackend, shardedBackend](auto const& /*prev*/, auto const& next) {
+            logger.SetMinLevel(next->logLevel);
+            if (singleMemBackend != nullptr)
+                singleMemBackend->Resize(next->maxMemoryBytes);
+            if (singleDiskBackend != nullptr)
+                singleDiskBackend->Resize(next->maxMemoryBytes);
+            if (shardedBackend != nullptr)
+                shardedBackend->ResizeTotal(next->maxMemoryBytes);
+        });
 
     auto const durabilityName = [&] {
         switch (effective.storageDurability)
@@ -182,8 +275,12 @@ int DaemonBody(FastCache::Config const& effective)
         }
         return std::string_view { "?" };
     }();
+    auto const threadingName = (effective.threadingModel == FastCache::ThreadingModel::Threaded)
+                                   ? std::string_view { "threaded" }
+                                   : std::string_view { "reactor" };
     logger.Logf(FastCache::LogLevel::Info,
-                "fastcached {} starting; bind={}:{} max-memory={} config={} storage={} durability={} max-value={}",
+                "fastcached {} starting; bind={}:{} max-memory={} config={} storage={} "
+                "durability={} max-value={} threading={} shards={}",
                 ProgramVersion,
                 effective.bindAddress,
                 effective.port,
@@ -192,7 +289,9 @@ int DaemonBody(FastCache::Config const& effective)
                 effective.storagePath.empty() ? std::string_view { "<in-memory>" }
                                               : std::string_view { effective.storagePath },
                 durabilityName,
-                FastCache::FormatByteSize(effective.storageMaxValueBytes));
+                FastCache::FormatByteSize(effective.storageMaxValueBytes),
+                threadingName,
+                shardCount);
 
     InstallStopHandlers();
     logger.Log(FastCache::LogLevel::Info, "ready, accepting connections");
@@ -213,10 +312,48 @@ int DaemonBody(FastCache::Config const& effective)
         }
     } };
 
-    FastCache::ReactorServerOptions serverOpts;
-    serverOpts.bindAddress = effective.bindAddress;
-    serverOpts.port = effective.port;
-    auto const exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
+    int exitCode = EXIT_SUCCESS;
+    if (effective.threadingModel == FastCache::ThreadingModel::Reactor)
+    {
+        FastCache::ReactorServerOptions serverOpts;
+        serverOpts.bindAddress = effective.bindAddress;
+        serverOpts.port = effective.port;
+        exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
+    }
+    else
+    {
+        // Threaded mode: BlockingListener + pooled accept loop.
+        auto listener = FastCache::BlockingListener::Bind(effective.bindAddress, effective.port);
+        if (!listener || !listener->IsBound())
+        {
+            logger.Logf(FastCache::LogLevel::Fatal,
+                        "cannot bind: {}",
+                        listener ? listener->BindError() : std::string_view { "null listener" });
+            reloaderQuit.store(true, std::memory_order_release);
+            return EXIT_FAILURE;
+        }
+
+        // Watchdog: poll DaemonControls for stop; close the listener so the
+        // accept loop exits.
+        std::atomic<bool> watchdogQuit { false };
+        std::jthread watchdog { [&] {
+            auto& controls = FastCache::DaemonControls::Instance();
+            while (!watchdogQuit.load(std::memory_order_acquire))
+            {
+                if (controls.StopRequested())
+                {
+                    listener->Close();
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds { 100 });
+            }
+        } };
+
+        std::atomic<bool> stop { false };
+        auto const accepted = FastCache::RunPooledServerLoop(*listener, engine, logger, stop, effective.workerThreads);
+        watchdogQuit.store(true, std::memory_order_release);
+        logger.Logf(FastCache::LogLevel::Info, "served {} connection(s)", accepted);
+    }
 
     reloaderQuit.store(true, std::memory_order_release);
     return exitCode;
