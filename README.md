@@ -14,7 +14,8 @@ not been benchmarked against them and has not been used in production.
 
 All layers are wired and the daemon runs. The codebase covers an event-driven
 reactor (IOCP / epoll / kqueue) with a blocking fallback, an LRU in-memory
-storage with an append-only disk log option, CLI + YAML config with SIGHUP
+storage, an optional copy-on-write persistent backend (the sibling
+[`CowTree`](src/CowTree/README.md) library), CLI + YAML config with SIGHUP
 reload, and a POSIX-daemon / Windows-service host. CI builds on Linux (clang +
 gcc), macOS, and Windows (MSVC + clang-cl), and three separate jobs spin up
 the daemon and assert sccache gets a cache hit using each wire protocol.
@@ -86,6 +87,8 @@ usage: fastcached [options]
   --port=<num>           TCP port (default 11211)
   --max-memory=<size>    in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)
   --log-level=<level>    trace|debug|info|warn|error|fatal (default info)
+  --storage=<path>       persist cache to a CoW-tree file (default: in-memory only)
+  --storage-durability=<mode>  fsync|batched|none for --storage (default batched)
   --daemon               daemonize (POSIX) / register as Windows service
   --pidfile=<path>       POSIX daemon mode only
   --service-name=<name>  Windows service name (default FastCached)
@@ -98,6 +101,46 @@ usage: fastcached [options]
 a trailing `%` (e.g. `50%`) sets the budget to that fraction of the host's
 total RAM, queried at startup.
 
+`--storage=<path>` switches the cache from in-memory-only to a copy-on-write
+B+tree backed by `<path>`. Every commit is crash-consistent (the file always
+matches either the previous or the new transaction; a kill -9 at any instant
+leaves no half-written state), and reopening the file picks up the previous
+state. `--storage-durability` trades durability for throughput: `fsync`
+flushes on every commit, `batched` flushes at commit boundaries only (the
+default), `none` relies on the OS page cache.
+
+### Run with 30% of host RAM and a persistent cache file
+
+```sh
+# Linux / macOS — persist to ~/.cache/fastcached/cache.cow,
+# budget = 30% of total host RAM, fsync-on-commit durability.
+mkdir -p ~/.cache/fastcached
+fastcached \
+    --port=11211 \
+    --max-memory=30% \
+    --storage=$HOME/.cache/fastcached/cache.cow \
+    --storage-durability=fsync &
+
+export SCCACHE_MEMCACHED=tcp://127.0.0.1:11211
+sccache g++ -std=c++23 -c hello.cpp -o hello.o
+```
+
+```powershell
+# Windows (PowerShell) — same idea, %LOCALAPPDATA% for the cache directory.
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\fastcached" | Out-Null
+Start-Process fastcached -ArgumentList `
+    '--port=11211', `
+    '--max-memory=30%', `
+    "--storage=$env:LOCALAPPDATA\fastcached\cache.cow", `
+    '--storage-durability=batched'
+
+$env:SCCACHE_MEMCACHED = 'tcp://127.0.0.1:11211'
+```
+
+The first run writes entries to disk; stop the daemon (Ctrl-C, kill, or a
+power loss) and start it again with the same flags and the cache picks back
+up from where it left off — no warm-up.
+
 ## YAML config (optional)
 
 ```yaml
@@ -107,9 +150,13 @@ bind: 0.0.0.0
 port: 11611
 # in-memory budget; k/K/m/M/g/G = KiB/MiB/GiB (1024-based),
 # or "N%" to use N percent of the host's total RAM
-max_memory: 50%
+max_memory: 30%
 # one of: trace | debug | info | warn | error | fatal
 log_level: debug
+# optional: path to a CoW-tree file. Comment out for an in-memory cache.
+storage_path: /var/lib/fastcached/cache.cow
+# optional: fsync | batched | none (default: batched)
+storage_durability: batched
 ```
 
 CLI flags override YAML values. On POSIX, `SIGHUP` triggers a re-read of the
@@ -145,6 +192,8 @@ GitHub.
 ```
 src/FastCache/        library code, organised by layer (Core, Async, Net,
                       Cache, Protocol, Server, Platform, Config, Metrics)
+src/CowTree/          standalone copy-on-write B+tree library (no dependency
+                      on FastCache; can be lifted into other projects)
 src/fastcached/       the daemon executable's main()
 src/tests/            Catch2 entry point; *_test.cpp files live next to sources
 cmake/                build helpers (PedanticCompiler, Sanitizers, CPM, ...)
