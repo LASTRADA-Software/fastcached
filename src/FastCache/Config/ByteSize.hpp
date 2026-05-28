@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <expected>
+#include <string>
 #include <string_view>
 
 namespace FastCache
@@ -35,5 +36,17 @@ namespace FastCache
 [[nodiscard]] std::expected<std::size_t, ConfigError> ParseByteSize(std::string_view sv,
                                                                     std::string_view field,
                                                                     std::size_t hostTotalBytes = 0);
+
+/// Format a byte count as a short human-readable string.
+///
+/// The largest unit (`G`, `M`, `K`) for which the byte count is an exact
+/// integer multiple is chosen; otherwise the raw byte count with a `B`
+/// suffix is returned. Examples: `8G`, `64M`, `4096B`, `0B`.
+///
+/// 1024-based units, mirroring `ParseByteSize`.
+///
+/// @param bytes Byte count to format.
+/// @return Short human-readable string (e.g. `"30M"`, `"4096B"`).
+[[nodiscard]] std::string FormatByteSize(std::size_t bytes);
 
 } // namespace FastCache
