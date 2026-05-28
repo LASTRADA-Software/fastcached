@@ -188,11 +188,11 @@ auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
     auto cursor = live.freeRoot;
     while (cursor)
     {
-        auto const idx = static_cast<std::uint64_t>(cursor.value);
-        if (idx == 0 || idx > _totalDataPages)
+        auto const pageIndex = cursor.value;
+        if (pageIndex == 0 || pageIndex > _totalDataPages)
             return std::unexpected(CowTreeError::Corrupt);
-        _live.erase(idx);
-        _freeList.push_back(idx);
+        _live.erase(pageIndex);
+        _freeList.push_back(pageIndex);
 
         // Chase the chain.
         std::array<std::byte, 8> buf {};

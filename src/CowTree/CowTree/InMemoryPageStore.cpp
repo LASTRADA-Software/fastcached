@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <expected>
 #include <ranges>
+#include <tuple>
 #include <utility>
 
 #include <CowTree/InMemoryPageStore.hpp>
@@ -28,7 +29,7 @@ InMemoryPageStore::InMemoryPageStore(std::size_t pageSize) noexcept:
     for (auto& m: _meta)
     {
         m.assign(_pageSize, std::byte { 0 });
-        (void) EncodeMeta(BytesSpan { m.data(), m.size() }, blank);
+        std::ignore = EncodeMeta(BytesSpan { m.data(), m.size() }, blank);
     }
 }
 

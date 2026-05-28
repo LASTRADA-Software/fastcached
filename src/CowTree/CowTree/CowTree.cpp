@@ -243,7 +243,7 @@ auto CowTree::Open() -> std::expected<void, CowTreeError>
 
 ReadTxn CowTree::BeginRead() const noexcept
 {
-    return ReadTxn { const_cast<IPageStore*>(&_store), _liveRoot, _liveTxn };
+    return ReadTxn { &_store, _liveRoot, _liveTxn };
 }
 
 WriteTxn CowTree::BeginWrite()
@@ -263,7 +263,7 @@ std::size_t CowTree::PageSize() const noexcept
 
 auto CowTree::Lookup(PageId root, BytesView key) const -> std::expected<std::optional<std::vector<std::byte>>, CowTreeError>
 {
-    ReadTxn r { const_cast<IPageStore*>(&_store), root, _liveTxn };
+    ReadTxn r { &_store, root, _liveTxn };
     return r.Get(key);
 }
 
@@ -316,7 +316,7 @@ auto CowTree::WriteLeaf(WriteTxn& txn, std::span<std::pair<std::vector<std::byte
         auto id = buildOne(entries);
         if (!id.has_value())
             return std::unexpected(id.error());
-        return PutResult { *id, std::nullopt, false };
+        return PutResult { .left = *id, .split = std::nullopt, .inserted = false };
     }
 
     // Split point: walk forward, accumulating until adding the next entry would
@@ -390,7 +390,7 @@ auto CowTree::WriteInternal(WriteTxn& txn,
         auto id = buildOne(firstChild, entries);
         if (!id.has_value())
             return std::unexpected(id.error());
-        return PutResult { *id, std::nullopt, false };
+        return PutResult { .left = *id, .split = std::nullopt, .inserted = false };
     }
 
     // Split: walk forward; one entry "moves up" as the separator.

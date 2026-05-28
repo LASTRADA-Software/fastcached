@@ -24,11 +24,6 @@ CowTree::BytesView B(std::string_view s) noexcept
     return CowTree::AsBytes(s);
 }
 
-std::string S(CowTree::BytesView v) noexcept
-{
-    return std::string(CowTree::AsStringView(v));
-}
-
 std::string Decode(std::vector<std::byte> const& v) noexcept
 {
     return std::string(CowTree::AsStringView(CowTree::BytesView { v.data(), v.size() }));

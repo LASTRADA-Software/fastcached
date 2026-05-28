@@ -63,21 +63,6 @@ void RequireBaseline(CowTree::CowTree& tree)
     REQUIRE_FALSE(c->has_value());
 }
 
-// Check that the tree shows the post-commit state: a→apple, b→banana, c→cherry.
-void RequirePostCommit(CowTree::CowTree& tree)
-{
-    auto r = tree.BeginRead();
-    auto a = r.Get(B("a"));
-    REQUIRE(a.has_value());
-    REQUIRE(a->has_value());
-    REQUIRE(Decode(**a) == "apple");
-
-    auto c = r.Get(B("c"));
-    REQUIRE(c.has_value());
-    REQUIRE(c->has_value());
-    REQUIRE(Decode(**c) == "cherry");
-}
-
 } // namespace
 
 TEST_CASE("Failure during data Write leaves the previous txn intact", "[crash]")
