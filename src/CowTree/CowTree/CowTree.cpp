@@ -321,31 +321,31 @@ auto CowTree::WriteLeaf(WriteTxn& txn, std::span<std::pair<std::vector<std::byte
 
     // Split point: walk forward, accumulating until adding the next entry would
     // overflow. Guarantee both halves are non-empty.
-    std::size_t splitIdx = 0;
+    std::size_t splitIndex = 0;
     std::size_t leftBytes = 0;
     for (std::size_t i = 0; i < entries.size(); ++i)
     {
         auto const need = LeafEntryBytes(entries[i].first.size(), entries[i].second.size());
         if (leftBytes + need > capacity && i > 0)
         {
-            splitIdx = i;
+            splitIndex = i;
             break;
         }
         leftBytes += need;
-        splitIdx = i + 1;
+        splitIndex = i + 1;
     }
-    if (splitIdx == 0 || splitIdx >= entries.size())
+    if (splitIndex == 0 || splitIndex >= entries.size())
         return std::unexpected(CowTreeError::ValueTooLarge);
 
-    auto leftId = buildOne(entries.subspan(0, splitIdx));
+    auto leftId = buildOne(entries.subspan(0, splitIndex));
     if (!leftId.has_value())
         return std::unexpected(leftId.error());
-    auto rightId = buildOne(entries.subspan(splitIdx));
+    auto rightId = buildOne(entries.subspan(splitIndex));
     if (!rightId.has_value())
         return std::unexpected(rightId.error());
 
     // Separator: the first key on the right half (B+tree leaf split).
-    auto sepKey = entries[splitIdx].first;
+    auto sepKey = entries[splitIndex].first;
     PutResult res;
     res.left = *leftId;
     res.split = std::make_pair(std::move(sepKey), *rightId);
@@ -394,31 +394,31 @@ auto CowTree::WriteInternal(WriteTxn& txn,
     }
 
     // Split: walk forward; one entry "moves up" as the separator.
-    std::size_t splitIdx = 0;
+    std::size_t splitIndex = 0;
     std::size_t leftBytes = 0;
     for (std::size_t i = 0; i < entries.size(); ++i)
     {
         auto const need = InternalEntryBytes(entries[i].first.size());
         if (leftBytes + need > capacity && i > 0)
         {
-            splitIdx = i;
+            splitIndex = i;
             break;
         }
         leftBytes += need;
-        splitIdx = i + 1;
+        splitIndex = i + 1;
     }
-    if (splitIdx == 0 || splitIdx >= entries.size())
+    if (splitIndex == 0 || splitIndex >= entries.size())
         return std::unexpected(CowTreeError::ValueTooLarge);
 
-    auto leftId = buildOne(firstChild, entries.subspan(0, splitIdx));
+    auto leftId = buildOne(firstChild, entries.subspan(0, splitIndex));
     if (!leftId.has_value())
         return std::unexpected(leftId.error());
 
-    // The separator that goes up to the parent is entries[splitIdx].first,
+    // The separator that goes up to the parent is entries[splitIndex].first,
     // and its child becomes the rightmost-firstChild of the new right page.
-    auto sepKey = entries[splitIdx].first;
-    auto rightFirstChild = entries[splitIdx].second;
-    auto rightSlice = entries.subspan(splitIdx + 1);
+    auto sepKey = entries[splitIndex].first;
+    auto rightFirstChild = entries[splitIndex].second;
+    auto rightSlice = entries.subspan(splitIndex + 1);
 
     auto rightId = buildOne(rightFirstChild, rightSlice);
     if (!rightId.has_value())
@@ -516,16 +516,16 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
     // Choose the child whose subtree should contain `key`.
     // Convention: firstChildSnapshot contains keys < existingOwned[0].key
     //             existingOwned[i].second contains keys in [existingOwned[i].first, existingOwned[i+1].first)
-    // childIdx == std::nullopt means "use firstChildSnapshot".
-    std::optional<std::size_t> childIdx;
+    // childIndex == std::nullopt means "use firstChildSnapshot".
+    std::optional<std::size_t> childIndex;
     for (std::size_t i = 0; i < existingOwned.size(); ++i)
     {
         if (CompareBytes(View(existingOwned[i].first), key) <= 0)
-            childIdx = i;
+            childIndex = i;
         else
             break;
     }
-    PageId childPage = childIdx.has_value() ? existingOwned[*childIdx].second : firstChildSnapshot;
+    PageId childPage = childIndex.has_value() ? existingOwned[*childIndex].second : firstChildSnapshot;
 
     auto sub = PutRec(txn, childPage, key, value);
     if (!sub.has_value())
@@ -538,13 +538,13 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
     entries.reserve(existingOwned.size() + 1);
 
     PageId newFirstChild = firstChildSnapshot;
-    if (!childIdx.has_value())
+    if (!childIndex.has_value())
         newFirstChild = sub->left;
 
     for (std::size_t i = 0; i < existingOwned.size(); ++i)
     {
         PageId childPtr = existingOwned[i].second;
-        if (childIdx.has_value() && i == *childIdx)
+        if (childIndex.has_value() && i == *childIndex)
             childPtr = sub->left;
         entries.emplace_back(std::move(existingOwned[i].first), childPtr);
     }
@@ -553,7 +553,7 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
     // after the modified slot. The right page covers keys >= separator.
     if (sub->split.has_value())
     {
-        std::size_t const insertAt = childIdx.has_value() ? (*childIdx + 1) : 0;
+        std::size_t const insertAt = childIndex.has_value() ? (*childIndex + 1) : 0;
         entries.insert(entries.begin() + static_cast<std::ptrdiff_t>(insertAt),
                        std::make_pair(std::move(sub->split->first), sub->split->second));
     }
@@ -632,16 +632,16 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key) -> std::expect
     for (auto const& e: *existingViews)
         existingOwned.emplace_back(CopyBytes(e.key), e.child);
 
-    // childIdx == std::nullopt means "use firstChildSnapshot".
-    std::optional<std::size_t> childIdx;
+    // childIndex == std::nullopt means "use firstChildSnapshot".
+    std::optional<std::size_t> childIndex;
     for (std::size_t i = 0; i < existingOwned.size(); ++i)
     {
         if (CompareBytes(View(existingOwned[i].first), key) <= 0)
-            childIdx = i;
+            childIndex = i;
         else
             break;
     }
-    PageId childPage = childIdx.has_value() ? existingOwned[*childIdx].second : firstChildSnapshot;
+    PageId childPage = childIndex.has_value() ? existingOwned[*childIndex].second : firstChildSnapshot;
 
     auto sub = EraseRec(txn, childPage, key);
     if (!sub.has_value())
@@ -661,7 +661,7 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key) -> std::expect
     {
         // Child collapsed. Remove the entry that pointed to it; the
         // child to its right (if any) absorbs the range.
-        if (!childIdx.has_value())
+        if (!childIndex.has_value())
         {
             // firstChild was removed. Promote the next entry's child as
             // the new firstChild and drop that entry.
@@ -673,10 +673,10 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key) -> std::expect
         }
         else
         {
-            // Drop existingOwned[*childIdx].
+            // Drop existingOwned[*childIndex].
             for (std::size_t i = 0; i < existingOwned.size(); ++i)
             {
-                if (i == *childIdx)
+                if (i == *childIndex)
                     continue;
                 entries.emplace_back(std::move(existingOwned[i].first), existingOwned[i].second);
             }
@@ -685,12 +685,12 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key) -> std::expect
     else
     {
         // Rebuild with updated child pointer.
-        if (!childIdx.has_value())
+        if (!childIndex.has_value())
             newFirstChild = sub->left;
         for (std::size_t i = 0; i < existingOwned.size(); ++i)
         {
             PageId childPtr = existingOwned[i].second;
-            if (childIdx.has_value() && i == *childIdx)
+            if (childIndex.has_value() && i == *childIndex)
                 childPtr = sub->left;
             entries.emplace_back(std::move(existingOwned[i].first), childPtr);
         }
