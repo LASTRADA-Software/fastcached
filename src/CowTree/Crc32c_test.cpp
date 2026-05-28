@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <CowTree/Bytes.hpp>
-#include <CowTree/Crc32c.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+
+#include <CowTree/Bytes.hpp>
+#include <CowTree/Crc32c.hpp>
 
 namespace
 {

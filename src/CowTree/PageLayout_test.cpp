@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <CowTree/Bytes.hpp>
-#include <CowTree/Errors.hpp>
-#include <CowTree/PageId.hpp>
-#include <CowTree/PageLayout.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
 #include <string_view>
 #include <vector>
+
+#include <CowTree/Bytes.hpp>
+#include <CowTree/Errors.hpp>
+#include <CowTree/PageId.hpp>
+#include <CowTree/PageLayout.hpp>
 
 namespace
 {
@@ -39,8 +39,7 @@ TEST_CASE("Leaf page round-trip preserves entries in order", "[pagelayout]")
         { Bytes("cherry"), Bytes("dark-red") },
     };
     std::vector<std::byte> page(4096, std::byte { 0 });
-    REQUIRE(CowTree::EncodeLeafPage({ page.data(), page.size() },
-                                     { entries.data(), entries.size() }).has_value());
+    REQUIRE(CowTree::EncodeLeafPage({ page.data(), page.size() }, { entries.data(), entries.size() }).has_value());
 
     auto header = CowTree::DecodePageHeader({ page.data(), page.size() });
     REQUIRE(header.has_value());
@@ -65,8 +64,7 @@ TEST_CASE("Leaf page rejects oversized payload", "[pagelayout]")
         { Bytes("k3"), CowTree::BytesView { big.data(), big.size() } },
     };
     std::vector<std::byte> page(4096, std::byte { 0 });
-    auto r = CowTree::EncodeLeafPage({ page.data(), page.size() },
-                                      { entries.data(), entries.size() });
+    auto r = CowTree::EncodeLeafPage({ page.data(), page.size() }, { entries.data(), entries.size() });
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error() == CowTree::CowTreeError::ValueTooLarge);
 }
@@ -78,9 +76,9 @@ TEST_CASE("Internal page encodes firstChild + entries", "[pagelayout]")
         { Bytes("m"), CowTree::PageId { 3 } },
     };
     std::vector<std::byte> page(4096, std::byte { 0 });
-    REQUIRE(CowTree::EncodeInternalPage({ page.data(), page.size() },
-                                         CowTree::PageId { 1 },
-                                         { entries.data(), entries.size() }).has_value());
+    REQUIRE(
+        CowTree::EncodeInternalPage({ page.data(), page.size() }, CowTree::PageId { 1 }, { entries.data(), entries.size() })
+            .has_value());
 
     auto header = CowTree::DecodePageHeader({ page.data(), page.size() });
     REQUIRE(header.has_value());

@@ -6,9 +6,6 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 
-#include <CowTree/CowTree.hpp>
-#include <CowTree/FilePageStore.hpp>
-
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -21,6 +18,9 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include <CowTree/CowTree.hpp>
+#include <CowTree/FilePageStore.hpp>
 
 namespace FastCache
 {
@@ -57,9 +57,7 @@ class CowTreeStorage final: public IStorage
         std::size_t maxBytes { 0 };
 
         /// Durability mode for the page store.
-        CowTree::FilePageStore::Durability durability {
-            CowTree::FilePageStore::Durability::Batched
-        };
+        CowTree::FilePageStore::Durability durability { CowTree::FilePageStore::Durability::Batched };
 
         /// Page size for newly created files. Ignored when the file
         /// already exists (its on-disk page size wins). When zero,

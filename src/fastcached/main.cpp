@@ -189,7 +189,8 @@ int DaemonBody(FastCache::Config const& effective)
                 effective.port,
                 FastCache::FormatByteSize(effective.maxMemoryBytes),
                 effective.configPath.empty() ? std::string_view { "<none>" } : std::string_view { effective.configPath },
-                effective.storagePath.empty() ? std::string_view { "<in-memory>" } : std::string_view { effective.storagePath },
+                effective.storagePath.empty() ? std::string_view { "<in-memory>" }
+                                              : std::string_view { effective.storagePath },
                 durabilityName,
                 FastCache::FormatByteSize(effective.storageMaxValueBytes));
 

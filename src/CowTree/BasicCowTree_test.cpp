@@ -1,9 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <CowTree/Bytes.hpp>
-#include <CowTree/CowTree.hpp>
-#include <CowTree/Errors.hpp>
-#include <CowTree/InMemoryPageStore.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -15,6 +10,11 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <CowTree/Bytes.hpp>
+#include <CowTree/CowTree.hpp>
+#include <CowTree/Errors.hpp>
+#include <CowTree/InMemoryPageStore.hpp>
 
 namespace
 {

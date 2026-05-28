@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <CowTree/Bytes.hpp>
-#include <CowTree/Errors.hpp>
-#include <CowTree/IPageStore.hpp>
-#include <CowTree/Meta.hpp>
-#include <CowTree/PageId.hpp>
-
 #include <array>
 #include <cstddef>
 #include <expected>
 #include <unordered_set>
 #include <vector>
+
+#include <CowTree/Bytes.hpp>
+#include <CowTree/Errors.hpp>
+#include <CowTree/IPageStore.hpp>
+#include <CowTree/Meta.hpp>
+#include <CowTree/PageId.hpp>
 
 namespace CowTree
 {
@@ -82,26 +82,19 @@ class InMemoryPageStore final: public IPageStore
 
     // IPageStore -----------------------------------------------------
 
-    [[nodiscard]] auto Read(PageId id) const
-        -> std::expected<BytesView, CowTreeError> override;
+    [[nodiscard]] auto Read(PageId id) const -> std::expected<BytesView, CowTreeError> override;
 
-    [[nodiscard]] auto Allocate()
-        -> std::expected<PageId, CowTreeError> override;
+    [[nodiscard]] auto Allocate() -> std::expected<PageId, CowTreeError> override;
 
-    [[nodiscard]] auto Write(PageId id, BytesView data)
-        -> std::expected<void, CowTreeError> override;
+    [[nodiscard]] auto Write(PageId id, BytesView data) -> std::expected<void, CowTreeError> override;
 
-    [[nodiscard]] auto Free(PageId id)
-        -> std::expected<void, CowTreeError> override;
+    [[nodiscard]] auto Free(PageId id) -> std::expected<void, CowTreeError> override;
 
-    [[nodiscard]] auto SyncData()
-        -> std::expected<void, CowTreeError> override;
+    [[nodiscard]] auto SyncData() -> std::expected<void, CowTreeError> override;
 
-    [[nodiscard]] auto ReadMeta(MetaSlot slot) const
-        -> std::expected<Meta, CowTreeError> override;
+    [[nodiscard]] auto ReadMeta(MetaSlot slot) const -> std::expected<Meta, CowTreeError> override;
 
-    [[nodiscard]] auto WriteMeta(MetaSlot slot, Meta const& meta)
-        -> std::expected<void, CowTreeError> override;
+    [[nodiscard]] auto WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError> override;
 
     [[nodiscard]] auto PageSize() const noexcept -> std::size_t override;
 

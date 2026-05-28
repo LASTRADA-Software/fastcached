@@ -41,8 +41,7 @@ struct TempFile
     TempFile()
     {
         std::mt19937_64 rng { std::random_device {}() };
-        path = std::filesystem::temp_directory_path()
-             / ("cowstorage-test-" + std::to_string(rng()) + ".cow");
+        path = std::filesystem::temp_directory_path() / ("cowstorage-test-" + std::to_string(rng()) + ".cow");
         std::filesystem::remove(path);
     }
     ~TempFile()

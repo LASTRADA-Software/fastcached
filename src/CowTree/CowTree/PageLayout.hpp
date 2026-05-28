@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <CowTree/Bytes.hpp>
-#include <CowTree/Errors.hpp>
-#include <CowTree/PageId.hpp>
-
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
 #include <vector>
+
+#include <CowTree/Bytes.hpp>
+#include <CowTree/Errors.hpp>
+#include <CowTree/PageId.hpp>
 
 namespace CowTree
 {
@@ -81,11 +81,11 @@ struct InternalEntry
 /// @param header  Decoded header (entryCount).
 /// @return Vector of LeafEntry views into `page`. Lifetime tied to `page`.
 [[nodiscard]] std::expected<std::vector<LeafEntry>, CowTreeError> DecodeLeafEntries(BytesView page,
-                                                                                     PageHeader const& header) noexcept;
+                                                                                    PageHeader const& header) noexcept;
 
 /// Iterate the entries of an internal page in stored order.
-[[nodiscard]] std::expected<std::vector<InternalEntry>, CowTreeError> DecodeInternalEntries(BytesView page,
-                                                                                             PageHeader const& header) noexcept;
+[[nodiscard]] std::expected<std::vector<InternalEntry>, CowTreeError> DecodeInternalEntries(
+    BytesView page, PageHeader const& header) noexcept;
 
 /// Compute the on-page byte cost of a leaf entry (header bytes + key + value).
 [[nodiscard]] constexpr std::size_t LeafEntryBytes(std::size_t keyLen, std::size_t valueLen) noexcept
@@ -107,8 +107,8 @@ struct InternalEntry
 
 /// Write a fresh internal page from a leftmost child + vector of entries.
 [[nodiscard]] std::expected<void, CowTreeError> EncodeInternalPage(BytesSpan page,
-                                                                    PageId firstChild,
-                                                                    std::span<InternalEntry const> entries) noexcept;
+                                                                   PageId firstChild,
+                                                                   std::span<InternalEntry const> entries) noexcept;
 
 /// Effective payload area (bytes available for entries after the header).
 [[nodiscard]] constexpr std::size_t PagePayloadCapacity(std::size_t pageSize) noexcept

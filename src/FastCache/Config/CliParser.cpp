@@ -59,8 +59,8 @@ namespace
             return StorageDurability::Batched;
         if (sv == "none")
             return StorageDurability::None;
-        return std::unexpected(MakeError(
-            ConfigErrorCode::OutOfRange, "storage-durability", std::format("unknown durability mode: {}", sv)));
+        return std::unexpected(
+            MakeError(ConfigErrorCode::OutOfRange, "storage-durability", std::format("unknown durability mode: {}", sv)));
     }
 
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv)

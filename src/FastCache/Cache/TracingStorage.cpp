@@ -112,8 +112,8 @@ std::expected<CasToken, StorageError> TracingStorage::Replace(
 }
 
 std::expected<CasToken, StorageError> TracingStorage::Append(std::string_view key,
-                                                              std::span<std::byte const> suffix,
-                                                              TimePoint now)
+                                                             std::span<std::byte const> suffix,
+                                                             TimePoint now)
 {
     return TraceCall(
         "APPEND",
@@ -127,8 +127,8 @@ std::expected<CasToken, StorageError> TracingStorage::Append(std::string_view ke
 }
 
 std::expected<CasToken, StorageError> TracingStorage::Prepend(std::string_view key,
-                                                               std::span<std::byte const> prefix,
-                                                               TimePoint now)
+                                                              std::span<std::byte const> prefix,
+                                                              TimePoint now)
 {
     return TraceCall(
         "PREPEND",
@@ -142,11 +142,11 @@ std::expected<CasToken, StorageError> TracingStorage::Prepend(std::string_view k
 }
 
 std::expected<CasToken, StorageError> TracingStorage::CompareAndSwap(std::string_view key,
-                                                                      CasToken expected,
-                                                                      std::vector<std::byte> value,
-                                                                      std::uint32_t flags,
-                                                                      TimePoint expiry,
-                                                                      TimePoint now)
+                                                                     CasToken expected,
+                                                                     std::vector<std::byte> value,
+                                                                     std::uint32_t flags,
+                                                                     TimePoint expiry,
+                                                                     TimePoint now)
 {
     return TraceCall(
         "CAS",
@@ -160,8 +160,8 @@ std::expected<CasToken, StorageError> TracingStorage::CompareAndSwap(std::string
 }
 
 std::expected<IStorage::IncrResult, StorageError> TracingStorage::IncrementOrInitialize(std::string_view key,
-                                                                                         std::int64_t delta,
-                                                                                         TimePoint now)
+                                                                                        std::int64_t delta,
+                                                                                        TimePoint now)
 {
     return TraceCall(
         delta >= 0 ? "INCR" : "DECR",

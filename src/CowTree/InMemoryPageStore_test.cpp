@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <catch2/catch_test_macros.hpp>
+
+#include <cstddef>
+#include <vector>
+
 #include <CowTree/Bytes.hpp>
 #include <CowTree/Errors.hpp>
 #include <CowTree/InMemoryPageStore.hpp>
 #include <CowTree/Meta.hpp>
 #include <CowTree/PageId.hpp>
-
-#include <catch2/catch_test_macros.hpp>
-
-#include <cstddef>
-#include <vector>
 
 namespace
 {

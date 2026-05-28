@@ -30,8 +30,8 @@ namespace
     }
 
     [[nodiscard]] std::expected<StorageDurability, ConfigError> ParseStorageDurability(std::string_view sv,
-                                                                                        std::filesystem::path const& path,
-                                                                                        unsigned line)
+                                                                                       std::filesystem::path const& path,
+                                                                                       unsigned line)
     {
         if (sv == "fsync")
             return StorageDurability::Fsync;
@@ -40,10 +40,10 @@ namespace
         if (sv == "none")
             return StorageDurability::None;
         return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
-                                          path,
-                                          "storage_durability",
-                                          std::string { "unknown durability mode: " } + std::string { sv },
-                                          line));
+                                         path,
+                                         "storage_durability",
+                                         std::string { "unknown durability mode: " } + std::string { sv },
+                                         line));
     }
 
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv,

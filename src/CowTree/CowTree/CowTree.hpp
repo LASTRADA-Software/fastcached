@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <CowTree/Bytes.hpp>
-#include <CowTree/Errors.hpp>
-#include <CowTree/IPageStore.hpp>
-#include <CowTree/Meta.hpp>
-#include <CowTree/PageId.hpp>
-
 #include <cstddef>
 #include <expected>
 #include <functional>
@@ -14,6 +8,12 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <CowTree/Bytes.hpp>
+#include <CowTree/Errors.hpp>
+#include <CowTree/IPageStore.hpp>
+#include <CowTree/Meta.hpp>
+#include <CowTree/PageId.hpp>
 
 namespace CowTree
 {
@@ -38,18 +38,26 @@ class ReadTxn
     /// @param key Lookup key.
     /// @return The value bytes (owned copy) when present, std::nullopt on
     ///         miss; CowTreeError on I/O or corruption.
-    [[nodiscard]] auto Get(BytesView key) const
-        -> std::expected<std::optional<std::vector<std::byte>>, CowTreeError>;
+    [[nodiscard]] auto Get(BytesView key) const -> std::expected<std::optional<std::vector<std::byte>>, CowTreeError>;
 
     /// @return The txnId of the snapshot this transaction observes.
-    [[nodiscard]] TxnId Snapshot() const noexcept { return _txnId; }
+    [[nodiscard]] TxnId Snapshot() const noexcept
+    {
+        return _txnId;
+    }
 
     /// @return The root page id of the snapshot (PageId::None() if the
     ///         tree was empty when this transaction began).
-    [[nodiscard]] PageId Root() const noexcept { return _root; }
+    [[nodiscard]] PageId Root() const noexcept
+    {
+        return _root;
+    }
 
     /// @return True if the transaction holds a valid snapshot.
-    [[nodiscard]] explicit operator bool() const noexcept { return _store != nullptr; }
+    [[nodiscard]] explicit operator bool() const noexcept
+    {
+        return _store != nullptr;
+    }
 
   private:
     friend class CowTree;
@@ -89,26 +97,26 @@ class WriteTxn
     /// @param value New value bytes.
     /// @return CowTreeError::ValueTooLarge if a single key+value pair
     ///         exceeds the per-page payload limit.
-    [[nodiscard]] auto Put(BytesView key, BytesView value)
-        -> std::expected<void, CowTreeError>;
+    [[nodiscard]] auto Put(BytesView key, BytesView value) -> std::expected<void, CowTreeError>;
 
     /// Remove `key`.
     /// @return true if a key was removed, false if it was already absent.
-    [[nodiscard]] auto Erase(BytesView key)
-        -> std::expected<bool, CowTreeError>;
+    [[nodiscard]] auto Erase(BytesView key) -> std::expected<bool, CowTreeError>;
 
     /// Atomically commit this transaction: data-sync new pages, write
     /// the meta page that names the new root.
     /// @return The committed txnId on success.
-    [[nodiscard]] auto Commit()
-        -> std::expected<TxnId, CowTreeError>;
+    [[nodiscard]] auto Commit() -> std::expected<TxnId, CowTreeError>;
 
     /// Discard the in-flight transaction. The live root is unchanged
     /// and the freshly allocated pages are returned to the free list.
     void Abort() noexcept;
 
     /// @return True iff the transaction is still pending (no commit/abort yet).
-    [[nodiscard]] explicit operator bool() const noexcept { return _tree != nullptr; }
+    [[nodiscard]] explicit operator bool() const noexcept
+    {
+        return _tree != nullptr;
+    }
 
   private:
     friend class CowTree;
@@ -181,7 +189,10 @@ class CowTree
 
     /// Alias for BeginRead — emphasises that the captured root is a
     /// snapshot pinned at this moment.
-    [[nodiscard]] ReadTxn Snapshot() const noexcept { return BeginRead(); }
+    [[nodiscard]] ReadTxn Snapshot() const noexcept
+    {
+        return BeginRead();
+    }
 
     /// Begin a write transaction. There must be no other live write
     /// transaction (single-writer contract).
@@ -228,16 +239,13 @@ class CowTree
         bool erased { false };
     };
 
-    [[nodiscard]] auto EraseRec(WriteTxn& txn, PageId node, BytesView key)
-        -> std::expected<EraseResult, CowTreeError>;
+    [[nodiscard]] auto EraseRec(WriteTxn& txn, PageId node, BytesView key) -> std::expected<EraseResult, CowTreeError>;
 
     /// Allocate a new page and remember it for rollback on abort.
-    [[nodiscard]] auto AllocateForTxn(WriteTxn& txn)
-        -> std::expected<PageId, CowTreeError>;
+    [[nodiscard]] auto AllocateForTxn(WriteTxn& txn) -> std::expected<PageId, CowTreeError>;
 
     /// Commit the pending transaction (called from WriteTxn::Commit).
-    [[nodiscard]] auto CommitTxn(WriteTxn& txn)
-        -> std::expected<TxnId, CowTreeError>;
+    [[nodiscard]] auto CommitTxn(WriteTxn& txn) -> std::expected<TxnId, CowTreeError>;
 
     /// Abort the pending transaction (called from WriteTxn::Abort /
     /// destructor).
@@ -245,7 +253,8 @@ class CowTree
 
     /// Build a fresh leaf page from the given entries; returns the new
     /// page id (or a split if the entries didn't fit).
-    [[nodiscard]] auto WriteLeaf(WriteTxn& txn, std::span<std::pair<std::vector<std::byte>, std::vector<std::byte>> const> entries)
+    [[nodiscard]] auto WriteLeaf(WriteTxn& txn,
+                                 std::span<std::pair<std::vector<std::byte>, std::vector<std::byte>> const> entries)
         -> std::expected<PutResult, CowTreeError>;
 
     /// Build a fresh internal page from the given children + separators.

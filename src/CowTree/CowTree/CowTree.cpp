@@ -1,7 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <CowTree/CowTree.hpp>
-#include <CowTree/PageLayout.hpp>
-
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
@@ -10,8 +7,12 @@
 #include <ranges>
 #include <span>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
+
+#include <CowTree/CowTree.hpp>
+#include <CowTree/PageLayout.hpp>
 
 namespace CowTree
 {
@@ -54,8 +55,7 @@ namespace
 // ReadTxn
 // ============================================================================
 
-auto ReadTxn::Get(BytesView key) const
-    -> std::expected<std::optional<std::vector<std::byte>>, CowTreeError>
+auto ReadTxn::Get(BytesView key) const -> std::expected<std::optional<std::vector<std::byte>>, CowTreeError>
 {
     if (_store == nullptr)
         return std::unexpected(CowTreeError::NotOpen);
@@ -149,8 +149,7 @@ WriteTxn::~WriteTxn()
     Abort();
 }
 
-auto WriteTxn::Put(BytesView key, BytesView value)
-    -> std::expected<void, CowTreeError>
+auto WriteTxn::Put(BytesView key, BytesView value) -> std::expected<void, CowTreeError>
 {
     if (_tree == nullptr)
         return std::unexpected(CowTreeError::NotOpen);
@@ -177,8 +176,7 @@ auto WriteTxn::Put(BytesView key, BytesView value)
     return {};
 }
 
-auto WriteTxn::Erase(BytesView key)
-    -> std::expected<bool, CowTreeError>
+auto WriteTxn::Erase(BytesView key) -> std::expected<bool, CowTreeError>
 {
     if (_tree == nullptr)
         return std::unexpected(CowTreeError::NotOpen);
@@ -263,15 +261,13 @@ std::size_t CowTree::PageSize() const noexcept
     return _store.PageSize();
 }
 
-auto CowTree::Lookup(PageId root, BytesView key) const
-    -> std::expected<std::optional<std::vector<std::byte>>, CowTreeError>
+auto CowTree::Lookup(PageId root, BytesView key) const -> std::expected<std::optional<std::vector<std::byte>>, CowTreeError>
 {
     ReadTxn r { const_cast<IPageStore*>(&_store), root, _liveTxn };
     return r.Get(key);
 }
 
-auto CowTree::AllocateForTxn(WriteTxn& txn)
-    -> std::expected<PageId, CowTreeError>
+auto CowTree::AllocateForTxn(WriteTxn& txn) -> std::expected<PageId, CowTreeError>
 {
     auto id = _store.Allocate();
     if (!id.has_value())
@@ -280,8 +276,7 @@ auto CowTree::AllocateForTxn(WriteTxn& txn)
     return *id;
 }
 
-auto CowTree::WriteLeaf(WriteTxn& txn,
-                        std::span<std::pair<std::vector<std::byte>, std::vector<std::byte>> const> entries)
+auto CowTree::WriteLeaf(WriteTxn& txn, std::span<std::pair<std::vector<std::byte>, std::vector<std::byte>> const> entries)
     -> std::expected<PutResult, CowTreeError>
 {
     // Build a leaf page from `entries`. If the entries don't fit, split
@@ -298,16 +293,16 @@ auto CowTree::WriteLeaf(WriteTxn& txn,
         auto idResult = AllocateForTxn(txn);
         if (!idResult.has_value())
             return std::unexpected(idResult.error());
-        auto bufResult = _store.Read(*idResult);
-        // The buffer returned by Read may share lifetime constraints; we
-        // build into a local vector instead.
+        // Build the page contents in a local buffer; we'll Write() it
+        // into the store below. Avoids any lifetime issues with the
+        // store's internal read buffer.
         std::vector<std::byte> buf(pageSize, std::byte { 0 });
         std::vector<LeafEntry> leafEntries;
         leafEntries.reserve(slice.size());
         for (auto const& [k, v]: slice)
             leafEntries.push_back({ View(k), View(v) });
         auto encoded = EncodeLeafPage(BytesSpan { buf.data(), buf.size() },
-                                       std::span<LeafEntry const> { leafEntries.data(), leafEntries.size() });
+                                      std::span<LeafEntry const> { leafEntries.data(), leafEntries.size() });
         if (!encoded.has_value())
             return std::unexpected(encoded.error());
         auto wrote = _store.Write(*idResult, BytesView { buf.data(), buf.size() });
@@ -369,9 +364,9 @@ auto CowTree::WriteInternal(WriteTxn& txn,
     for (auto const& [k, _]: entries)
         totalBytes += InternalEntryBytes(k.size());
 
-    auto buildOne = [&](PageId leftmost,
-                        std::span<std::pair<std::vector<std::byte>, PageId> const> slice)
-        -> std::expected<PageId, CowTreeError> {
+    auto buildOne =
+        [&](PageId leftmost,
+            std::span<std::pair<std::vector<std::byte>, PageId> const> slice) -> std::expected<PageId, CowTreeError> {
         auto idResult = AllocateForTxn(txn);
         if (!idResult.has_value())
             return std::unexpected(idResult.error());
@@ -380,9 +375,8 @@ auto CowTree::WriteInternal(WriteTxn& txn,
         ies.reserve(slice.size());
         for (auto const& [k, c]: slice)
             ies.push_back({ View(k), c });
-        auto encoded = EncodeInternalPage(BytesSpan { buf.data(), buf.size() },
-                                           leftmost,
-                                           std::span<InternalEntry const> { ies.data(), ies.size() });
+        auto encoded = EncodeInternalPage(
+            BytesSpan { buf.data(), buf.size() }, leftmost, std::span<InternalEntry const> { ies.data(), ies.size() });
         if (!encoded.has_value())
             return std::unexpected(encoded.error());
         auto wrote = _store.Write(*idResult, BytesView { buf.data(), buf.size() });
@@ -436,8 +430,7 @@ auto CowTree::WriteInternal(WriteTxn& txn,
     return res;
 }
 
-auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
-    -> std::expected<PutResult, CowTreeError>
+auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value) -> std::expected<PutResult, CowTreeError>
 {
     if (LeafEntryBytes(key.size(), value.size()) > PagePayloadCapacity(_store.PageSize()))
         return std::unexpected(CowTreeError::ValueTooLarge);
@@ -523,7 +516,8 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
     // Choose the child whose subtree should contain `key`.
     // Convention: firstChildSnapshot contains keys < existingOwned[0].key
     //             existingOwned[i].second contains keys in [existingOwned[i].first, existingOwned[i+1].first)
-    std::size_t childIdx = static_cast<std::size_t>(-1); // -1 means firstChild
+    // childIdx == std::nullopt means "use firstChildSnapshot".
+    std::optional<std::size_t> childIdx;
     for (std::size_t i = 0; i < existingOwned.size(); ++i)
     {
         if (CompareBytes(View(existingOwned[i].first), key) <= 0)
@@ -531,9 +525,7 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
         else
             break;
     }
-    PageId childPage = (childIdx == static_cast<std::size_t>(-1))
-                           ? firstChildSnapshot
-                           : existingOwned[childIdx].second;
+    PageId childPage = childIdx.has_value() ? existingOwned[*childIdx].second : firstChildSnapshot;
 
     auto sub = PutRec(txn, childPage, key, value);
     if (!sub.has_value())
@@ -546,13 +538,13 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
     entries.reserve(existingOwned.size() + 1);
 
     PageId newFirstChild = firstChildSnapshot;
-    if (childIdx == static_cast<std::size_t>(-1))
+    if (!childIdx.has_value())
         newFirstChild = sub->left;
 
     for (std::size_t i = 0; i < existingOwned.size(); ++i)
     {
         PageId childPtr = existingOwned[i].second;
-        if (i == childIdx)
+        if (childIdx.has_value() && i == *childIdx)
             childPtr = sub->left;
         entries.emplace_back(std::move(existingOwned[i].first), childPtr);
     }
@@ -561,7 +553,7 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
     // after the modified slot. The right page covers keys >= separator.
     if (sub->split.has_value())
     {
-        std::size_t insertAt = (childIdx == static_cast<std::size_t>(-1)) ? 0 : childIdx + 1;
+        std::size_t const insertAt = childIdx.has_value() ? (*childIdx + 1) : 0;
         entries.insert(entries.begin() + static_cast<std::ptrdiff_t>(insertAt),
                        std::make_pair(std::move(sub->split->first), sub->split->second));
     }
@@ -573,11 +565,10 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
     return built;
 }
 
-auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key)
-    -> std::expected<EraseResult, CowTreeError>
+auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key) -> std::expected<EraseResult, CowTreeError>
 {
     if (!node)
-        return EraseResult { PageId::None(), false };
+        return EraseResult { .left = PageId::None(), .erased = false };
 
     auto page = _store.Read(node);
     if (!page.has_value())
@@ -605,7 +596,7 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key)
             entries.emplace_back(CopyBytes(e.key), CopyBytes(e.value));
         }
         if (!erased)
-            return EraseResult { node, false };
+            return EraseResult { .left = node, .erased = false };
 
         // Retire the old leaf.
         txn._freedPages.push_back(node);
@@ -613,7 +604,7 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key)
         if (entries.empty())
         {
             // Leaf becomes empty. Return None — parent collapses this child.
-            return EraseResult { PageId::None(), true };
+            return EraseResult { .left = PageId::None(), .erased = true };
         }
 
         auto leaf = WriteLeaf(txn, std::span { entries.data(), entries.size() });
@@ -625,7 +616,7 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key)
             // as an error since the parent path here can't absorb a split.
             return std::unexpected(CowTreeError::Corrupt);
         }
-        return EraseResult { leaf->left, true };
+        return EraseResult { .left = leaf->left, .erased = true };
     }
 
     // Internal: descend. Copy entries to owned bytes BEFORE recursing,
@@ -641,7 +632,8 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key)
     for (auto const& e: *existingViews)
         existingOwned.emplace_back(CopyBytes(e.key), e.child);
 
-    std::size_t childIdx = static_cast<std::size_t>(-1);
+    // childIdx == std::nullopt means "use firstChildSnapshot".
+    std::optional<std::size_t> childIdx;
     for (std::size_t i = 0; i < existingOwned.size(); ++i)
     {
         if (CompareBytes(View(existingOwned[i].first), key) <= 0)
@@ -649,16 +641,14 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key)
         else
             break;
     }
-    PageId childPage = (childIdx == static_cast<std::size_t>(-1))
-                           ? firstChildSnapshot
-                           : existingOwned[childIdx].second;
+    PageId childPage = childIdx.has_value() ? existingOwned[*childIdx].second : firstChildSnapshot;
 
     auto sub = EraseRec(txn, childPage, key);
     if (!sub.has_value())
         return std::unexpected(sub.error());
 
     if (!sub->erased)
-        return EraseResult { node, false };
+        return EraseResult { .left = node, .erased = false };
 
     // Retire old internal page.
     txn._freedPages.push_back(node);
@@ -671,22 +661,22 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key)
     {
         // Child collapsed. Remove the entry that pointed to it; the
         // child to its right (if any) absorbs the range.
-        if (childIdx == static_cast<std::size_t>(-1))
+        if (!childIdx.has_value())
         {
             // firstChild was removed. Promote the next entry's child as
             // the new firstChild and drop that entry.
             if (existingOwned.empty())
-                return EraseResult { PageId::None(), true };
+                return EraseResult { .left = PageId::None(), .erased = true };
             newFirstChild = existingOwned[0].second;
             for (std::size_t i = 1; i < existingOwned.size(); ++i)
                 entries.emplace_back(std::move(existingOwned[i].first), existingOwned[i].second);
         }
         else
         {
-            // Drop existingOwned[childIdx].
+            // Drop existingOwned[*childIdx].
             for (std::size_t i = 0; i < existingOwned.size(); ++i)
             {
-                if (i == childIdx)
+                if (i == *childIdx)
                     continue;
                 entries.emplace_back(std::move(existingOwned[i].first), existingOwned[i].second);
             }
@@ -695,12 +685,12 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key)
     else
     {
         // Rebuild with updated child pointer.
-        if (childIdx == static_cast<std::size_t>(-1))
+        if (!childIdx.has_value())
             newFirstChild = sub->left;
         for (std::size_t i = 0; i < existingOwned.size(); ++i)
         {
             PageId childPtr = existingOwned[i].second;
-            if (i == childIdx)
+            if (childIdx.has_value() && i == *childIdx)
                 childPtr = sub->left;
             entries.emplace_back(std::move(existingOwned[i].first), childPtr);
         }
@@ -709,18 +699,17 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key)
     // If this internal page now has no entries AND we still have a firstChild,
     // collapse the level: return the firstChild directly.
     if (entries.empty())
-        return EraseResult { newFirstChild, true };
+        return EraseResult { .left = newFirstChild, .erased = true };
 
     auto built = WriteInternal(txn, newFirstChild, std::span { entries.data(), entries.size() });
     if (!built.has_value())
         return std::unexpected(built.error());
     if (built->split.has_value())
         return std::unexpected(CowTreeError::Corrupt);
-    return EraseResult { built->left, true };
+    return EraseResult { .left = built->left, .erased = true };
 }
 
-auto CowTree::CommitTxn(WriteTxn& txn)
-    -> std::expected<TxnId, CowTreeError>
+auto CowTree::CommitTxn(WriteTxn& txn) -> std::expected<TxnId, CowTreeError>
 {
     // 1. Sync data pages.
     if (auto const r = _store.SyncData(); !r.has_value())
@@ -741,7 +730,7 @@ auto CowTree::CommitTxn(WriteTxn& txn)
 
     // 3. Freed pages can now be reused.
     for (auto const fp: txn._freedPages)
-        (void) _store.Free(fp);
+        std::ignore = _store.Free(fp);
 
     _liveRoot = next.root;
     _liveTxn = next.txnId;
@@ -758,7 +747,7 @@ void CowTree::AbortTxn(WriteTxn& txn) noexcept
 {
     // Return new pages to the store; freed pages remain live in the tree.
     for (auto const np: txn._newPages)
-        (void) _store.Free(np);
+        std::ignore = _store.Free(np);
     txn._newPages.clear();
     txn._freedPages.clear();
 }

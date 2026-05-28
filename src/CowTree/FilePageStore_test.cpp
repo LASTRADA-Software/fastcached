@@ -1,8 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <CowTree/Bytes.hpp>
-#include <CowTree/CowTree.hpp>
-#include <CowTree/FilePageStore.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
@@ -10,6 +6,10 @@
 #include <random>
 #include <string>
 #include <vector>
+
+#include <CowTree/Bytes.hpp>
+#include <CowTree/CowTree.hpp>
+#include <CowTree/FilePageStore.hpp>
 
 namespace
 {
@@ -32,8 +32,7 @@ struct TempFile
     TempFile()
     {
         std::mt19937_64 rng { std::random_device {}() };
-        path = std::filesystem::temp_directory_path()
-             / ("cowtree-test-" + std::to_string(rng()) + ".cow");
+        path = std::filesystem::temp_directory_path() / ("cowtree-test-" + std::to_string(rng()) + ".cow");
         std::filesystem::remove(path);
     }
     ~TempFile()

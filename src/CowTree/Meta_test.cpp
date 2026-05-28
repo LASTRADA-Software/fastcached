@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <CowTree/Bytes.hpp>
-#include <CowTree/Errors.hpp>
-#include <CowTree/Meta.hpp>
-#include <CowTree/PageId.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+
+#include <CowTree/Bytes.hpp>
+#include <CowTree/Errors.hpp>
+#include <CowTree/Meta.hpp>
+#include <CowTree/PageId.hpp>
 
 TEST_CASE("Meta encode/decode round-trip", "[meta]")
 {
@@ -80,6 +80,5 @@ TEST_CASE("Meta decode rejects wrong magic", "[meta]")
     auto dec = CowTree::DecodeMeta({ page.data(), page.size() });
     REQUIRE_FALSE(dec.has_value());
     // Either the CRC or the magic check fires, both are valid failure modes.
-    REQUIRE((dec.error() == CowTree::CowTreeError::Corrupt
-             || dec.error() == CowTree::CowTreeError::InvalidArg));
+    REQUIRE((dec.error() == CowTree::CowTreeError::Corrupt || dec.error() == CowTree::CowTreeError::InvalidArg));
 }

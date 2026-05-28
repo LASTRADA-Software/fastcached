@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <CowTree/Bytes.hpp>
-#include <CowTree/Errors.hpp>
-#include <CowTree/IPageStore.hpp>
-#include <CowTree/Meta.hpp>
-#include <CowTree/PageId.hpp>
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +10,12 @@
 #include <mutex>
 #include <unordered_set>
 #include <vector>
+
+#include <CowTree/Bytes.hpp>
+#include <CowTree/Errors.hpp>
+#include <CowTree/IPageStore.hpp>
+#include <CowTree/Meta.hpp>
+#include <CowTree/PageId.hpp>
 
 namespace CowTree
 {
@@ -61,8 +61,7 @@ class FilePageStore final: public IPageStore
     /// size.
     /// @param options Open parameters.
     /// @return Owning FilePageStore on success.
-    [[nodiscard]] static auto Open(Options options)
-        -> std::expected<std::unique_ptr<FilePageStore>, CowTreeError>;
+    [[nodiscard]] static auto Open(Options options) -> std::expected<std::unique_ptr<FilePageStore>, CowTreeError>;
 
     FilePageStore(FilePageStore const&) = delete;
     FilePageStore(FilePageStore&&) = delete;
@@ -72,26 +71,19 @@ class FilePageStore final: public IPageStore
 
     // IPageStore -----------------------------------------------------
 
-    [[nodiscard]] auto Read(PageId id) const
-        -> std::expected<BytesView, CowTreeError> override;
+    [[nodiscard]] auto Read(PageId id) const -> std::expected<BytesView, CowTreeError> override;
 
-    [[nodiscard]] auto Allocate()
-        -> std::expected<PageId, CowTreeError> override;
+    [[nodiscard]] auto Allocate() -> std::expected<PageId, CowTreeError> override;
 
-    [[nodiscard]] auto Write(PageId id, BytesView data)
-        -> std::expected<void, CowTreeError> override;
+    [[nodiscard]] auto Write(PageId id, BytesView data) -> std::expected<void, CowTreeError> override;
 
-    [[nodiscard]] auto Free(PageId id)
-        -> std::expected<void, CowTreeError> override;
+    [[nodiscard]] auto Free(PageId id) -> std::expected<void, CowTreeError> override;
 
-    [[nodiscard]] auto SyncData()
-        -> std::expected<void, CowTreeError> override;
+    [[nodiscard]] auto SyncData() -> std::expected<void, CowTreeError> override;
 
-    [[nodiscard]] auto ReadMeta(MetaSlot slot) const
-        -> std::expected<Meta, CowTreeError> override;
+    [[nodiscard]] auto ReadMeta(MetaSlot slot) const -> std::expected<Meta, CowTreeError> override;
 
-    [[nodiscard]] auto WriteMeta(MetaSlot slot, Meta const& meta)
-        -> std::expected<void, CowTreeError> override;
+    [[nodiscard]] auto WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError> override;
 
     [[nodiscard]] auto PageSize() const noexcept -> std::size_t override;
 
@@ -115,27 +107,22 @@ class FilePageStore final: public IPageStore
     [[nodiscard]] std::uint64_t MetaSlotOffset(MetaSlot slot) const noexcept;
 
     /// Read `data.size()` bytes from `offset` into `data`.
-    [[nodiscard]] auto ReadAt(std::uint64_t offset, BytesSpan data) const
-        -> std::expected<void, CowTreeError>;
+    [[nodiscard]] auto ReadAt(std::uint64_t offset, BytesSpan data) const -> std::expected<void, CowTreeError>;
 
     /// Write `data.size()` bytes from `data` to `offset`.
-    [[nodiscard]] auto WriteAt(std::uint64_t offset, BytesView data)
-        -> std::expected<void, CowTreeError>;
+    [[nodiscard]] auto WriteAt(std::uint64_t offset, BytesView data) const -> std::expected<void, CowTreeError>;
 
     /// Fsync the backing file according to durability mode.
-    [[nodiscard]] auto Fsync()
-        -> std::expected<void, CowTreeError>;
+    [[nodiscard]] auto Fsync() -> std::expected<void, CowTreeError>;
 
     /// Initialise a brand-new file (write two blank meta pages, size
     /// the file to 2*pageSize).
-    [[nodiscard]] auto BootstrapNewFile()
-        -> std::expected<void, CowTreeError>;
+    [[nodiscard]] auto BootstrapNewFile() -> std::expected<void, CowTreeError>;
 
     /// Recover state from an existing file: pick the live meta page,
     /// scan for the highest allocated data page, populate the in-memory
     /// free list by chasing `freeRoot`.
-    [[nodiscard]] auto RecoverExistingFile()
-        -> std::expected<void, CowTreeError>;
+    [[nodiscard]] auto RecoverExistingFile() -> std::expected<void, CowTreeError>;
 
     Options _options;
 #if defined(_WIN32)

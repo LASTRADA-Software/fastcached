@@ -1,7 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <CowTree/FilePageStore.hpp>
-#include <CowTree/Meta.hpp>
-
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
@@ -15,12 +12,16 @@
 #include <utility>
 #include <vector>
 
+#include <CowTree/FilePageStore.hpp>
+#include <CowTree/Meta.hpp>
+
 #if defined(_WIN32)
     #include <windows.h>
 #else
-    #include <fcntl.h>
     #include <sys/stat.h>
     #include <sys/types.h>
+
+    #include <fcntl.h>
     #include <unistd.h>
 #endif
 
@@ -68,8 +69,7 @@ FilePageStore::~FilePageStore()
 #endif
 }
 
-auto FilePageStore::Open(Options options)
-    -> std::expected<std::unique_ptr<FilePageStore>, CowTreeError>
+auto FilePageStore::Open(Options options) -> std::expected<std::unique_ptr<FilePageStore>, CowTreeError>
 {
     if (!IsValidPageSize(options.pageSize))
         return std::unexpected(CowTreeError::InvalidArg);
@@ -80,13 +80,8 @@ auto FilePageStore::Open(Options options)
 
 #if defined(_WIN32)
     auto const path = store->_options.path.native();
-    auto* handle = ::CreateFileW(path.c_str(),
-                                 GENERIC_READ | GENERIC_WRITE,
-                                 FILE_SHARE_READ,
-                                 nullptr,
-                                 OPEN_ALWAYS,
-                                 FILE_ATTRIBUTE_NORMAL,
-                                 nullptr);
+    auto* handle = ::CreateFileW(
+        path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE)
         return std::unexpected(CowTreeError::IoError);
     store->_handle = handle;
@@ -113,8 +108,7 @@ auto FilePageStore::Open(Options options)
     return store;
 }
 
-auto FilePageStore::BootstrapNewFile()
-    -> std::expected<void, CowTreeError>
+auto FilePageStore::BootstrapNewFile() -> std::expected<void, CowTreeError>
 {
     std::vector<std::byte> blank(_pageSize, std::byte { 0 });
     // Write two blank meta pages so the file is the canonical 2*PageSize.
@@ -143,8 +137,7 @@ auto FilePageStore::BootstrapNewFile()
     return {};
 }
 
-auto FilePageStore::RecoverExistingFile()
-    -> std::expected<void, CowTreeError>
+auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
 {
     auto const metaA = ReadMeta(MetaSlot::A);
     auto const metaB = ReadMeta(MetaSlot::B);
@@ -174,12 +167,12 @@ auto FilePageStore::RecoverExistingFile()
         return std::unexpected(CowTreeError::IoError);
     auto const fileSize = static_cast<std::uint64_t>(size.QuadPart);
 #else
-    struct stat st;
+    struct stat st {};
     if (::fstat(_fd, &st) != 0)
         return std::unexpected(CowTreeError::IoError);
     auto const fileSize = static_cast<std::uint64_t>(st.st_size);
 #endif
-    auto const dataBytes = fileSize >= 2 * _pageSize ? (fileSize - 2 * _pageSize) : 0;
+    auto const dataBytes = fileSize >= (2 * _pageSize) ? (fileSize - (2 * _pageSize)) : 0;
     _totalDataPages = static_cast<std::size_t>(dataBytes / _pageSize);
 
     // Mark every data page index live by default; consult the on-disk
@@ -222,8 +215,7 @@ std::uint64_t FilePageStore::MetaSlotOffset(MetaSlot slot) const noexcept
     return static_cast<std::uint64_t>(slot) * static_cast<std::uint64_t>(_pageSize);
 }
 
-auto FilePageStore::ReadAt(std::uint64_t offset, BytesSpan data) const
-    -> std::expected<void, CowTreeError>
+auto FilePageStore::ReadAt(std::uint64_t offset, BytesSpan data) const -> std::expected<void, CowTreeError>
 {
 #if defined(_WIN32)
     OVERLAPPED ov {};
@@ -254,8 +246,7 @@ auto FilePageStore::ReadAt(std::uint64_t offset, BytesSpan data) const
 #endif
 }
 
-auto FilePageStore::WriteAt(std::uint64_t offset, BytesView data)
-    -> std::expected<void, CowTreeError>
+auto FilePageStore::WriteAt(std::uint64_t offset, BytesView data) const -> std::expected<void, CowTreeError>
 {
 #if defined(_WIN32)
     OVERLAPPED ov {};
@@ -284,8 +275,7 @@ auto FilePageStore::WriteAt(std::uint64_t offset, BytesView data)
 #endif
 }
 
-auto FilePageStore::Fsync()
-    -> std::expected<void, CowTreeError>
+auto FilePageStore::Fsync() -> std::expected<void, CowTreeError>
 {
     ++_fsyncCount;
 #if defined(_WIN32)
@@ -298,8 +288,7 @@ auto FilePageStore::Fsync()
     return {};
 }
 
-auto FilePageStore::Read(PageId id) const
-    -> std::expected<BytesView, CowTreeError>
+auto FilePageStore::Read(PageId id) const -> std::expected<BytesView, CowTreeError>
 {
     if (!id || id.value > _totalDataPages)
         return std::unexpected(CowTreeError::OutOfRange);
@@ -309,16 +298,14 @@ auto FilePageStore::Read(PageId id) const
     std::lock_guard const lock { _ioMutex };
     if (_readBufferPageIdx != id.value)
     {
-        if (auto const r = ReadAt(DataPageOffset(id), BytesSpan { _readBuffer.data(), _readBuffer.size() });
-            !r.has_value())
+        if (auto const r = ReadAt(DataPageOffset(id), BytesSpan { _readBuffer.data(), _readBuffer.size() }); !r.has_value())
             return std::unexpected(r.error());
         _readBufferPageIdx = id.value;
     }
     return BytesView { _readBuffer.data(), _readBuffer.size() };
 }
 
-auto FilePageStore::Allocate()
-    -> std::expected<PageId, CowTreeError>
+auto FilePageStore::Allocate() -> std::expected<PageId, CowTreeError>
 {
     std::lock_guard const lock { _ioMutex };
     if (!_freeList.empty())
@@ -339,14 +326,12 @@ auto FilePageStore::Allocate()
     // Extend the file with zeros so a subsequent Read before Write does
     // not race against a sparse-file allocation pattern.
     std::vector<std::byte> blank(_pageSize, std::byte { 0 });
-    if (auto const r = WriteAt(DataPageOffset(PageId { newIdx }), BytesView { blank.data(), blank.size() });
-        !r.has_value())
+    if (auto const r = WriteAt(DataPageOffset(PageId { newIdx }), BytesView { blank.data(), blank.size() }); !r.has_value())
         return std::unexpected(r.error());
     return PageId { newIdx };
 }
 
-auto FilePageStore::Write(PageId id, BytesView data)
-    -> std::expected<void, CowTreeError>
+auto FilePageStore::Write(PageId id, BytesView data) -> std::expected<void, CowTreeError>
 {
     if (!id || id.value > _totalDataPages)
         return std::unexpected(CowTreeError::OutOfRange);
@@ -366,8 +351,7 @@ auto FilePageStore::Write(PageId id, BytesView data)
     return {};
 }
 
-auto FilePageStore::Free(PageId id)
-    -> std::expected<void, CowTreeError>
+auto FilePageStore::Free(PageId id) -> std::expected<void, CowTreeError>
 {
     if (!id || id.value > _totalDataPages)
         return std::unexpected(CowTreeError::OutOfRange);
@@ -381,8 +365,7 @@ auto FilePageStore::Free(PageId id)
     return {};
 }
 
-auto FilePageStore::SyncData()
-    -> std::expected<void, CowTreeError>
+auto FilePageStore::SyncData() -> std::expected<void, CowTreeError>
 {
     if (_options.durability == Durability::None)
         return {};
@@ -390,8 +373,7 @@ auto FilePageStore::SyncData()
     return Fsync();
 }
 
-auto FilePageStore::ReadMeta(MetaSlot slot) const
-    -> std::expected<Meta, CowTreeError>
+auto FilePageStore::ReadMeta(MetaSlot slot) const -> std::expected<Meta, CowTreeError>
 {
     std::vector<std::byte> buf(_pageSize, std::byte { 0 });
     if (auto const r = ReadAt(MetaSlotOffset(slot), BytesSpan { buf.data(), buf.size() }); !r.has_value())
@@ -399,8 +381,7 @@ auto FilePageStore::ReadMeta(MetaSlot slot) const
     return DecodeMeta(BytesView { buf.data(), buf.size() });
 }
 
-auto FilePageStore::WriteMeta(MetaSlot slot, Meta const& meta)
-    -> std::expected<void, CowTreeError>
+auto FilePageStore::WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError>
 {
     std::vector<std::byte> buf(_pageSize, std::byte { 0 });
     auto effective = meta;

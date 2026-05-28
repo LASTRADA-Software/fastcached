@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <CowTree/Crc32c.hpp>
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
+
+#include <CowTree/Crc32c.hpp>
 
 namespace CowTree
 {

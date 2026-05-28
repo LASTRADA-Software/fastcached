@@ -9,16 +9,16 @@
 // WriteMeta call, then constructing a *new* CowTree over the same store
 // (simulating a process restart) and verifying its visible state.
 
-#include <CowTree/Bytes.hpp>
-#include <CowTree/CowTree.hpp>
-#include <CowTree/InMemoryPageStore.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <CowTree/Bytes.hpp>
+#include <CowTree/CowTree.hpp>
+#include <CowTree/InMemoryPageStore.hpp>
 
 namespace
 {

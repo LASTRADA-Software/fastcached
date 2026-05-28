@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <CowTree/InMemoryPageStore.hpp>
-#include <CowTree/Meta.hpp>
-
 #include <algorithm>
 #include <cstddef>
 #include <expected>
 #include <ranges>
 #include <utility>
+
+#include <CowTree/InMemoryPageStore.hpp>
+#include <CowTree/Meta.hpp>
 
 namespace CowTree
 {
@@ -59,8 +59,7 @@ std::size_t InMemoryPageStore::SyncDataCount() const noexcept
     return _syncDataCount;
 }
 
-auto InMemoryPageStore::Read(PageId id) const
-    -> std::expected<BytesView, CowTreeError>
+auto InMemoryPageStore::Read(PageId id) const -> std::expected<BytesView, CowTreeError>
 {
     if (!id)
         return std::unexpected(CowTreeError::OutOfRange);
@@ -73,8 +72,7 @@ auto InMemoryPageStore::Read(PageId id) const
     return BytesView { page.data(), page.size() };
 }
 
-auto InMemoryPageStore::Allocate()
-    -> std::expected<PageId, CowTreeError>
+auto InMemoryPageStore::Allocate() -> std::expected<PageId, CowTreeError>
 {
     std::size_t idx = 0;
     if (!_freeList.empty())
@@ -91,8 +89,7 @@ auto InMemoryPageStore::Allocate()
     return PageOf(idx);
 }
 
-auto InMemoryPageStore::Write(PageId id, BytesView data)
-    -> std::expected<void, CowTreeError>
+auto InMemoryPageStore::Write(PageId id, BytesView data) -> std::expected<void, CowTreeError>
 {
     ++_writeCount;
     if (_plan.failNthWrite != 0 && _writeCount == _plan.failNthWrite)
@@ -113,8 +110,7 @@ auto InMemoryPageStore::Write(PageId id, BytesView data)
     return {};
 }
 
-auto InMemoryPageStore::Free(PageId id)
-    -> std::expected<void, CowTreeError>
+auto InMemoryPageStore::Free(PageId id) -> std::expected<void, CowTreeError>
 {
     if (!id)
         return std::unexpected(CowTreeError::OutOfRange);
@@ -130,8 +126,7 @@ auto InMemoryPageStore::Free(PageId id)
     return {};
 }
 
-auto InMemoryPageStore::SyncData()
-    -> std::expected<void, CowTreeError>
+auto InMemoryPageStore::SyncData() -> std::expected<void, CowTreeError>
 {
     ++_syncDataCount;
     if (_plan.failNthSyncData != 0 && _syncDataCount == _plan.failNthSyncData)
@@ -142,15 +137,13 @@ auto InMemoryPageStore::SyncData()
     return {};
 }
 
-auto InMemoryPageStore::ReadMeta(MetaSlot slot) const
-    -> std::expected<Meta, CowTreeError>
+auto InMemoryPageStore::ReadMeta(MetaSlot slot) const -> std::expected<Meta, CowTreeError>
 {
     auto const& raw = _meta[static_cast<std::size_t>(slot)];
     return DecodeMeta(BytesView { raw.data(), raw.size() });
 }
 
-auto InMemoryPageStore::WriteMeta(MetaSlot slot, Meta const& meta)
-    -> std::expected<void, CowTreeError>
+auto InMemoryPageStore::WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError>
 {
     ++_writeMetaCount;
     auto& raw = _meta[static_cast<std::size_t>(slot)];

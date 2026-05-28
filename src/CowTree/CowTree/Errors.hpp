@@ -17,18 +17,18 @@ namespace CowTree
 /// callers who need the original cause.
 enum class CowTreeError : std::uint8_t
 {
-    Ok = 0,         ///< Sentinel, never returned in an unexpected().
-    NotFound,       ///< Key absent / page id never allocated.
-    IoError,        ///< Underlying file or store I/O failed.
-    Corrupt,        ///< CRC or layout invariant violation on read.
-    CorruptMetas,   ///< Both meta pages failed CRC; tree is unrecoverable.
-    OutOfRange,     ///< Page id, slot index, or value-size argument out of range.
-    NotOpen,        ///< Operation requires Open() to have been called first.
-    AlreadyOpen,    ///< Open() called twice.
-    InvalidArg,     ///< Caller passed a malformed argument (e.g. wrong page-size buffer).
-    ValueTooLarge,  ///< Single key+value pair does not fit in a page.
-    InjectedFault,  ///< Test-only: a failure was injected by the page-store fault harness.
-    Unsupported,    ///< Operation not supported by this implementation.
+    Ok = 0,        ///< Sentinel, never returned in an unexpected().
+    NotFound,      ///< Key absent / page id never allocated.
+    IoError,       ///< Underlying file or store I/O failed.
+    Corrupt,       ///< CRC or layout invariant violation on read.
+    CorruptMetas,  ///< Both meta pages failed CRC; tree is unrecoverable.
+    OutOfRange,    ///< Page id, slot index, or value-size argument out of range.
+    NotOpen,       ///< Operation requires Open() to have been called first.
+    AlreadyOpen,   ///< Open() called twice.
+    InvalidArg,    ///< Caller passed a malformed argument (e.g. wrong page-size buffer).
+    ValueTooLarge, ///< Single key+value pair does not fit in a page.
+    InjectedFault, ///< Test-only: a failure was injected by the page-store fault harness.
+    Unsupported,   ///< Operation not supported by this implementation.
 };
 
 /// Stable name for a CowTreeError, suitable for diagnostic logging.

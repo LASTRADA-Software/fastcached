@@ -1,7 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <CowTree/Crc32c.hpp>
-#include <CowTree/PageLayout.hpp>
-
 #include <algorithm>
 #include <bit>
 #include <cstddef>
@@ -9,6 +6,9 @@
 #include <cstring>
 #include <expected>
 #include <ranges>
+
+#include <CowTree/Crc32c.hpp>
+#include <CowTree/PageLayout.hpp>
 
 namespace CowTree
 {

@@ -2,11 +2,6 @@
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
 
-#include <CowTree/Bytes.hpp>
-#include <CowTree/CowTree.hpp>
-#include <CowTree/Errors.hpp>
-#include <CowTree/FilePageStore.hpp>
-
 #include <algorithm>
 #include <bit>
 #include <charconv>
@@ -20,11 +15,26 @@
 #include <utility>
 #include <vector>
 
+#include <CowTree/Bytes.hpp>
+#include <CowTree/CowTree.hpp>
+#include <CowTree/Errors.hpp>
+#include <CowTree/FilePageStore.hpp>
+
 namespace FastCache
 {
 
 namespace
 {
+
+    /// Build a StorageError with just a code (and an optional context).
+    /// Spelled out as a helper because gcc -Wmissing-field-initializers
+    /// rejects designated initialisers that omit fields, and writing
+    /// `{ .code = X, .systemCode = 0, .context = {} }` at every call
+    /// site is noisy.
+    [[nodiscard]] StorageError MakeError(StorageErrorCode code, std::string context = {}) noexcept
+    {
+        return StorageError { .code = code, .systemCode = 0, .context = std::move(context) };
+    }
 
     /// Map CowTreeError into FastCache::StorageError.
     [[nodiscard]] StorageError TranslateError(CowTree::CowTreeError e, std::string context = {})
@@ -106,21 +116,16 @@ namespace
         return CowTree::BytesView { reinterpret_cast<std::byte const*>(sv.data()), sv.size() };
     }
 
-    [[nodiscard]] CowTree::BytesView ValueView(std::span<std::byte const> v) noexcept
-    {
-        return CowTree::BytesView { v.data(), v.size() };
-    }
-
     /// Compute a power-of-two page size large enough to hold a single
     /// entry of `maxValueBytes` plus the 32-byte CowTreeStorage entry
     /// header, an upper-bound key (1 KiB), and CowTree per-entry +
     /// page-header overhead. Floor of `DefaultPageSize`.
     [[nodiscard]] std::size_t DerivePageSize(std::size_t maxValueBytes) noexcept
     {
-        constexpr std::size_t EntryHeader = 32;       ///< CowTreeStorage's encoded entry header.
-        constexpr std::size_t LeafEntryOverhead = 6;  ///< u16 keyLen + u32 valueLen.
-        constexpr std::size_t PageHeader = 16;        ///< CowTree page header.
-        constexpr std::size_t KeyBudget = 1024;       ///< typical max sccache key.
+        constexpr std::size_t EntryHeader = 32;      ///< CowTreeStorage's encoded entry header.
+        constexpr std::size_t LeafEntryOverhead = 6; ///< u16 keyLen + u32 valueLen.
+        constexpr std::size_t PageHeader = 16;       ///< CowTree page header.
+        constexpr std::size_t KeyBudget = 1024;      ///< typical max sccache key.
         auto const needed = maxValueBytes + EntryHeader + KeyBudget + LeafEntryOverhead + PageHeader;
 
         std::size_t pageSize = CowTree::DefaultPageSize;
@@ -132,12 +137,12 @@ namespace
     [[nodiscard]] std::expected<std::uint64_t, StorageError> ParseUnsigned(std::span<std::byte const> bytes)
     {
         if (bytes.empty())
-            return std::unexpected(StorageError { .code = StorageErrorCode::InvalidArgument });
+            return std::unexpected(MakeError(StorageErrorCode::InvalidArgument));
         std::string_view const sv { reinterpret_cast<char const*>(bytes.data()), bytes.size() };
         std::uint64_t value = 0;
         auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value);
         if (ec != std::errc {} || ptr != sv.data() + sv.size())
-            return std::unexpected(StorageError { .code = StorageErrorCode::InvalidArgument });
+            return std::unexpected(MakeError(StorageErrorCode::InvalidArgument));
         return value;
     }
 
@@ -156,8 +161,8 @@ std::expected<std::unique_ptr<CowTreeStorage>, StorageError> CowTreeStorage::Ope
 
     CowTree::FilePageStore::Options pageOpts;
     pageOpts.path = self->_options.path;
-    pageOpts.pageSize = self->_options.pageSize != 0 ? self->_options.pageSize
-                                                     : DerivePageSize(self->_options.maxValueBytes);
+    pageOpts.pageSize =
+        self->_options.pageSize != 0 ? self->_options.pageSize : DerivePageSize(self->_options.maxValueBytes);
     pageOpts.durability = self->_options.durability;
 
     auto store = CowTree::FilePageStore::Open(pageOpts);
@@ -197,20 +202,20 @@ std::expected<CacheEntry, StorageError> CowTreeStorage::Decode(CowTree::BytesVie
     auto cursor = raw;
     CacheEntry e;
     if (!ReadLe<std::uint32_t>(cursor, e.flags))
-        return std::unexpected(StorageError { .code = StorageErrorCode::Corrupt });
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
     if (!ReadLe<std::uint64_t>(cursor, e.cas))
-        return std::unexpected(StorageError { .code = StorageErrorCode::Corrupt });
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
     std::int64_t expiryUs = 0;
     if (!ReadLe<std::int64_t>(cursor, expiryUs))
-        return std::unexpected(StorageError { .code = StorageErrorCode::Corrupt });
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
     e.expiry = MicrosToTimePoint(expiryUs);
     if (!ReadLe<std::uint64_t>(cursor, e.generation))
-        return std::unexpected(StorageError { .code = StorageErrorCode::Corrupt });
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
     std::uint32_t valueLen = 0;
     if (!ReadLe<std::uint32_t>(cursor, valueLen))
-        return std::unexpected(StorageError { .code = StorageErrorCode::Corrupt });
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
     if (cursor.size() < valueLen)
-        return std::unexpected(StorageError { .code = StorageErrorCode::Corrupt });
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
     e.value.assign(cursor.begin(), cursor.begin() + valueLen);
     return e;
 }
@@ -233,7 +238,7 @@ std::expected<void, StorageError> CowTreeStorage::Replay()
 std::expected<std::optional<CowTreeStorage::LoadedEntry>, StorageError> CowTreeStorage::LoadEntry(std::string_view key) const
 {
     if (_tree == nullptr)
-        return std::unexpected(StorageError { .code = StorageErrorCode::IoError, .context = "not open" });
+        return std::unexpected(MakeError(StorageErrorCode::IoError, "not open"));
     auto reader = _tree->BeginRead();
     auto got = reader.Get(KeyView(key));
     if (!got.has_value())
@@ -345,7 +350,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Set(std::string_view key,
 {
     ++_stats.cmdSet;
     if (value.size() > _options.maxValueBytes)
-        return std::unexpected(StorageError { .code = StorageErrorCode::ValueTooLarge });
+        return std::unexpected(MakeError(StorageErrorCode::ValueTooLarge));
     CacheEntry e;
     e.value = std::move(value);
     e.flags = flags;
@@ -367,7 +372,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Add(
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
     if (loaded->has_value() && (*loaded)->entry.expiry > now && (*loaded)->entry.generation >= _liveGeneration)
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyExists });
+        return std::unexpected(MakeError(StorageErrorCode::KeyExists));
     return Set(key, std::move(value), flags, expiry);
 }
 
@@ -378,22 +383,22 @@ std::expected<CasToken, StorageError> CowTreeStorage::Replace(
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
     if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound });
+        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     return Set(key, std::move(value), flags, expiry);
 }
 
 std::expected<CasToken, StorageError> CowTreeStorage::Append(std::string_view key,
-                                                              std::span<std::byte const> suffix,
-                                                              TimePoint now)
+                                                             std::span<std::byte const> suffix,
+                                                             TimePoint now)
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
     if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound });
+        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     auto& entry = (*loaded)->entry;
     if (entry.value.size() + suffix.size() > _options.maxValueBytes)
-        return std::unexpected(StorageError { .code = StorageErrorCode::ValueTooLarge });
+        return std::unexpected(MakeError(StorageErrorCode::ValueTooLarge));
     entry.value.insert(entry.value.end(), suffix.begin(), suffix.end());
     entry.cas = _nextCas++;
     if (auto const r = StoreEntry(key, entry); !r.has_value())
@@ -404,17 +409,17 @@ std::expected<CasToken, StorageError> CowTreeStorage::Append(std::string_view ke
 }
 
 std::expected<CasToken, StorageError> CowTreeStorage::Prepend(std::string_view key,
-                                                               std::span<std::byte const> prefix,
-                                                               TimePoint now)
+                                                              std::span<std::byte const> prefix,
+                                                              TimePoint now)
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
     if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound });
+        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     auto& entry = (*loaded)->entry;
     if (entry.value.size() + prefix.size() > _options.maxValueBytes)
-        return std::unexpected(StorageError { .code = StorageErrorCode::ValueTooLarge });
+        return std::unexpected(MakeError(StorageErrorCode::ValueTooLarge));
     std::vector<std::byte> merged;
     merged.reserve(prefix.size() + entry.value.size());
     merged.insert(merged.end(), prefix.begin(), prefix.end());
@@ -429,25 +434,25 @@ std::expected<CasToken, StorageError> CowTreeStorage::Prepend(std::string_view k
 }
 
 std::expected<CasToken, StorageError> CowTreeStorage::CompareAndSwap(std::string_view key,
-                                                                      CasToken expected,
-                                                                      std::vector<std::byte> value,
-                                                                      std::uint32_t flags,
-                                                                      TimePoint expiry,
-                                                                      TimePoint now)
+                                                                     CasToken expected,
+                                                                     std::vector<std::byte> value,
+                                                                     std::uint32_t flags,
+                                                                     TimePoint expiry,
+                                                                     TimePoint now)
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
     if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound });
+        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     if ((*loaded)->entry.cas != expected)
-        return std::unexpected(StorageError { .code = StorageErrorCode::CasMismatch });
+        return std::unexpected(MakeError(StorageErrorCode::CasMismatch));
     return Set(key, std::move(value), flags, expiry);
 }
 
 std::expected<IStorage::IncrResult, StorageError> CowTreeStorage::IncrementOrInitialize(std::string_view key,
-                                                                                          std::int64_t delta,
-                                                                                          TimePoint now)
+                                                                                        std::int64_t delta,
+                                                                                        TimePoint now)
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
@@ -457,7 +462,8 @@ std::expected<IStorage::IncrResult, StorageError> CowTreeStorage::IncrementOrIni
     if (loaded->has_value() && (*loaded)->entry.expiry > now && (*loaded)->entry.generation >= _liveGeneration)
     {
         exists = true;
-        auto parsed = ParseUnsigned(std::span<std::byte const> { (*loaded)->entry.value.data(), (*loaded)->entry.value.size() });
+        auto parsed =
+            ParseUnsigned(std::span<std::byte const> { (*loaded)->entry.value.data(), (*loaded)->entry.value.size() });
         if (!parsed.has_value())
             return std::unexpected(parsed.error());
         current = *parsed;
@@ -493,7 +499,7 @@ std::expected<void, StorageError> CowTreeStorage::Delete(std::string_view key, T
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
     if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
-        return std::unexpected(StorageError { .code = StorageErrorCode::KeyNotFound });
+        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     if (auto const r = EraseEntry(key); !r.has_value())
         return std::unexpected(r.error());
     EraseFromLru(key);

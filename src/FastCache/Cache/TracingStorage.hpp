@@ -88,10 +88,7 @@ class TracingStorage final: public IStorage
     /// a log line `storage: <verb> key=<key> result=<fmt(result)> took=<us>us`.
     /// Returns whatever `op` returned unchanged.
     template <class Op, class OutcomeFmt>
-    auto TraceCall(std::string_view verb,
-                   std::string_view key,
-                   Op&& op,
-                   OutcomeFmt&& fmt) -> decltype(op())
+    auto TraceCall(std::string_view verb, std::string_view key, Op&& op, OutcomeFmt&& fmt) -> decltype(op())
     {
         bool const traceOn = _logger.MinLevel() <= LogLevel::Trace;
         auto const startedAt = _clock.Now();
