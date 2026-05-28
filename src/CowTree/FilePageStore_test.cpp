@@ -42,6 +42,8 @@ struct TempFile
     }
     TempFile(TempFile const&) = delete;
     TempFile& operator=(TempFile const&) = delete;
+    TempFile(TempFile&&) = delete;
+    TempFile& operator=(TempFile&&) = delete;
 };
 
 } // namespace
@@ -55,7 +57,7 @@ TEST_CASE("FilePageStore opens a fresh file and reports the page size", "[filest
 
     auto store = CowTree::FilePageStore::Open(opts);
     REQUIRE(store.has_value());
-    REQUIRE((*store)->PageSize() == 4096u);
+    REQUIRE((*store)->PageSize() == 4096U);
 }
 
 TEST_CASE("Allocated page survives close + reopen", "[filestore][persist]")
@@ -86,7 +88,7 @@ TEST_CASE("Allocated page survives close + reopen", "[filestore][persist]")
         auto got = r.Get(B("persist"));
         REQUIRE(got.has_value());
         REQUIRE(got->has_value());
-        REQUIRE(Decode(**got) == "yes");
+        REQUIRE(Decode(got->value()) == "yes");
     }
 }
 

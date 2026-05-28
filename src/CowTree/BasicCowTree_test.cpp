@@ -72,7 +72,7 @@ TEST_CASE("Put then Get returns the value", "[cowtree]")
     auto got = reader.Get(B("foo"));
     REQUIRE(got.has_value());
     REQUIRE(got->has_value());
-    REQUIRE(Decode(**got) == "bar");
+    REQUIRE(Decode(got->value()) == "bar");
 }
 
 TEST_CASE("Overwriting an existing key replaces the value", "[cowtree]")
@@ -86,7 +86,7 @@ TEST_CASE("Overwriting an existing key replaces the value", "[cowtree]")
 
     auto reader = tree.BeginRead();
     auto got = reader.Get(B("k"));
-    REQUIRE(Decode(**got) == "v2");
+    REQUIRE(Decode(got->value()) == "v2");
 }
 
 TEST_CASE("Erase removes a key and reports whether it was present", "[cowtree]")
@@ -126,7 +126,7 @@ TEST_CASE("Many keys span multiple pages and remain accessible", "[cowtree]")
         auto got = reader.Get(B(k));
         REQUIRE(got.has_value());
         REQUIRE(got->has_value());
-        REQUIRE(Decode(**got) == std::format("val-{:04d}", i));
+        REQUIRE(Decode(got->value()) == std::format("val-{:04d}", i));
     }
 }
 
@@ -166,7 +166,7 @@ TEST_CASE("Random workload tracks std::map oracle", "[cowtree][fuzz]")
                 auto got = reader.Get(B(k));
                 REQUIRE(got.has_value());
                 REQUIRE(got->has_value());
-                REQUIRE(Decode(**got) == v);
+                REQUIRE(Decode(got->value()) == v);
             }
         }
     }
@@ -178,7 +178,7 @@ TEST_CASE("Random workload tracks std::map oracle", "[cowtree][fuzz]")
         auto got = reader.Get(B(k));
         REQUIRE(got.has_value());
         REQUIRE(got->has_value());
-        REQUIRE(Decode(**got) == v);
+        REQUIRE(Decode(got->value()) == v);
     }
 }
 
@@ -197,7 +197,7 @@ TEST_CASE("Reopening the tree finds the last committed root", "[cowtree]")
     auto got = reader.Get(B("k"));
     REQUIRE(got.has_value());
     REQUIRE(got->has_value());
-    REQUIRE(Decode(**got) == "v");
+    REQUIRE(Decode(got->value()) == "v");
 }
 
 TEST_CASE("Abort discards in-flight changes", "[cowtree]")
@@ -218,5 +218,5 @@ TEST_CASE("Abort discards in-flight changes", "[cowtree]")
     auto got = reader.Get(B("k"));
     REQUIRE(got.has_value());
     REQUIRE(got->has_value());
-    REQUIRE(Decode(**got) == "committed");
+    REQUIRE(Decode(got->value()) == "committed");
 }

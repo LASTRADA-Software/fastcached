@@ -51,12 +51,12 @@ void RequireBaseline(CowTree::CowTree& tree)
     auto a = r.Get(B("a"));
     REQUIRE(a.has_value());
     REQUIRE(a->has_value());
-    REQUIRE(Decode(**a) == "apple");
+    REQUIRE(Decode(a->value()) == "apple");
 
     auto b = r.Get(B("b"));
     REQUIRE(b.has_value());
     REQUIRE(b->has_value());
-    REQUIRE(Decode(**b) == "banana");
+    REQUIRE(Decode(b->value()) == "banana");
 
     auto c = r.Get(B("c"));
     REQUIRE(c.has_value());

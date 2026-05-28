@@ -22,19 +22,19 @@ CowTree::BytesView AsBytes(std::string_view sv) noexcept
 TEST_CASE("Crc32c known vector for empty input", "[crc32c]")
 {
     auto const crc = CowTree::Crc32c::Compute(AsBytes(""));
-    REQUIRE(crc == 0u);
+    REQUIRE(crc == 0U);
 }
 
 TEST_CASE("Crc32c known vector for ASCII 'a'", "[crc32c]")
 {
     auto const crc = CowTree::Crc32c::Compute(AsBytes("a"));
-    REQUIRE(crc == 0xC1D04330u);
+    REQUIRE(crc == 0xC1D04330U);
 }
 
 TEST_CASE("Crc32c known vector for '123456789'", "[crc32c]")
 {
     auto const crc = CowTree::Crc32c::Compute(AsBytes("123456789"));
-    REQUIRE(crc == 0xE3069283u);
+    REQUIRE(crc == 0xE3069283U);
 }
 
 TEST_CASE("Crc32c streaming matches one-shot", "[crc32c]")
@@ -61,7 +61,7 @@ TEST_CASE("Crc32c detects single-byte flips", "[crc32c]")
     for (std::size_t i = 0; i < buf.size(); ++i)
     {
         auto copy = buf;
-        copy[i] = std::byte { static_cast<std::uint8_t>(static_cast<std::uint8_t>(copy[i]) ^ 0xFFu) };
+        copy[i] = std::byte { static_cast<std::uint8_t>(static_cast<std::uint8_t>(copy[i]) ^ 0xFFU) };
         auto const flipped = CowTree::Crc32c::Compute({ copy.data(), copy.size() });
         REQUIRE(flipped != base);
     }

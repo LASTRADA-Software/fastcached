@@ -23,7 +23,7 @@ std::vector<std::byte> MakePage(std::size_t size, std::byte fill)
 TEST_CASE("InMemoryPageStore reports configured page size", "[pagestore]")
 {
     CowTree::InMemoryPageStore store { 4096 };
-    REQUIRE(store.PageSize() == 4096u);
+    REQUIRE(store.PageSize() == 4096U);
 }
 
 TEST_CASE("Allocate yields unique, non-zero PageIds", "[pagestore]")
@@ -92,9 +92,9 @@ TEST_CASE("ReadMeta on a fresh store returns a blank, valid meta", "[pagestore][
     CowTree::InMemoryPageStore store;
     auto meta = store.ReadMeta(CowTree::MetaSlot::A);
     REQUIRE(meta.has_value());
-    REQUIRE(meta->txnId == 0u);
-    REQUIRE(meta->root.value == 0u);
-    REQUIRE(meta->itemCount == 0u);
+    REQUIRE(meta->txnId == 0U);
+    REQUIRE(meta->root.value == 0U);
+    REQUIRE(meta->itemCount == 0U);
 }
 
 TEST_CASE("WriteMeta+ReadMeta round-trip", "[pagestore][meta]")
@@ -108,8 +108,8 @@ TEST_CASE("WriteMeta+ReadMeta round-trip", "[pagestore][meta]")
 
     auto loaded = store.ReadMeta(CowTree::MetaSlot::B);
     REQUIRE(loaded.has_value());
-    REQUIRE(loaded->txnId == 17u);
-    REQUIRE(loaded->root.value == 3u);
+    REQUIRE(loaded->txnId == 17U);
+    REQUIRE(loaded->root.value == 3U);
 }
 
 TEST_CASE("FailNthWrite injects exactly once", "[pagestore][fault]")
@@ -155,7 +155,7 @@ TEST_CASE("TornOnNthWriteMeta zeroes the slot, then fails", "[pagestore][fault]"
     auto a = store.ReadMeta(CowTree::MetaSlot::A);
     auto b = store.ReadMeta(CowTree::MetaSlot::B);
     REQUIRE(a.has_value());
-    REQUIRE(a->txnId == 1u);
+    REQUIRE(a->txnId == 1U);
     REQUIRE_FALSE(b.has_value());
 }
 
