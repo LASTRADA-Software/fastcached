@@ -9,8 +9,10 @@ target_sources(FastCache
         Async/KqueueReactor.cpp
         Async/TestReactor.cpp
         Cache/CacheEngine.cpp
+        Cache/CowTreeStorage.cpp
         Cache/DiskStorage.cpp
         Cache/InMemoryLruStorage.cpp
+        Cache/TracingStorage.cpp
         Config/ByteSize.cpp
         Config/CliParser.cpp
         Config/ConfigReloader.cpp
