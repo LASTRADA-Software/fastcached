@@ -51,6 +51,38 @@ namespace
         });
     }
 
+    [[nodiscard]] std::expected<std::size_t, ConfigError> ParsePositiveInt(std::string_view sv, std::string_view field)
+    {
+        if (sv.empty())
+            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, std::string { field }, "empty value"));
+        std::size_t value = 0;
+        auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value);
+        if (ec != std::errc {} || ptr != sv.data() + sv.size())
+            return std::unexpected(
+                MakeError(ConfigErrorCode::TypeMismatch, std::string { field }, std::format("not a number: {}", sv)));
+        return value;
+    }
+
+    [[nodiscard]] std::expected<std::size_t, ConfigError> ParseThreads(std::string_view sv)
+    {
+        return ParsePositiveInt(sv, "threads");
+    }
+
+    [[nodiscard]] std::expected<std::size_t, ConfigError> ParseStorageShards(std::string_view sv)
+    {
+        return ParsePositiveInt(sv, "storage-shards");
+    }
+
+    [[nodiscard]] std::expected<ThreadingModel, ConfigError> ParseThreadingModel(std::string_view sv)
+    {
+        if (sv == "threaded")
+            return ThreadingModel::Threaded;
+        if (sv == "reactor")
+            return ThreadingModel::Reactor;
+        return std::unexpected(MakeError(
+            ConfigErrorCode::OutOfRange, "threading-model", std::format("unknown model (expect threaded|reactor): {}", sv)));
+    }
+
     [[nodiscard]] std::expected<StorageDurability, ConfigError> ParseStorageDurability(std::string_view sv)
     {
         if (sv == "fsync")
@@ -217,6 +249,28 @@ namespace
             if (*matched)
                 return ArgOutcome::Continue;
         }
+        {
+            auto const matched =
+                ApplyParsedFlag(args, i, "--threading-model", ParseThreadingModel, cfg.threadingModel);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--threads", ParseThreads, cfg.workerThreads);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--storage-shards", ParseStorageShards, cfg.storageShards);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
         return ArgOutcome::Unknown;
     }
 
@@ -233,6 +287,10 @@ std::string_view CliUsage() noexcept
            "  --storage=<path>       persist cache to a CoW-tree file (default: in-memory only)\n"
            "  --storage-durability=<mode>  fsync|batched|none for --storage (default batched)\n"
            "  --storage-max-value=<size>   per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)\n"
+           "  --threading-model=<mode>     threaded|reactor (default threaded)\n"
+           "  --threads=<N>                worker thread count for threaded mode (default: hardware_concurrency)\n"
+           "  --storage-shards=<N>         shard storage into N partitions for write parallelism\n"
+           "                                   when N>1 and --storage is set, --storage must be a directory\n"
            "  --daemon               daemonize (POSIX) / register as Windows service\n"
            "  --pidfile=<path>       POSIX daemon mode only\n"
            "  --service-name=<name>  Windows service name (default FastCached)\n"

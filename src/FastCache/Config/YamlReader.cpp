@@ -168,6 +168,42 @@ namespace
             cfg.storageMaxValueBytes = *parsed;
             return {};
         }
+        /// `threading_model`: threaded | reactor.
+        if (key == "threading_model")
+        {
+            auto const raw = valueNode.as<std::string>();
+            if (raw == "threaded")
+                cfg.threadingModel = ThreadingModel::Threaded;
+            else if (raw == "reactor")
+                cfg.threadingModel = ThreadingModel::Reactor;
+            else
+                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+                                                  path,
+                                                  "threading_model",
+                                                  std::string { "unknown model (expect threaded|reactor): " } + raw,
+                                                  line));
+            return {};
+        }
+        /// `threads`: positive integer worker count for threaded mode.
+        if (key == "threads")
+        {
+            auto const raw = valueNode.as<int>();
+            if (raw < 0)
+                return std::unexpected(
+                    MakeError(ConfigErrorCode::OutOfRange, path, "threads", "must be >= 0", line));
+            cfg.workerThreads = static_cast<std::size_t>(raw);
+            return {};
+        }
+        /// `storage_shards`: positive integer shard count.
+        if (key == "storage_shards")
+        {
+            auto const raw = valueNode.as<int>();
+            if (raw < 0)
+                return std::unexpected(
+                    MakeError(ConfigErrorCode::OutOfRange, path, "storage_shards", "must be >= 0", line));
+            cfg.storageShards = static_cast<std::size_t>(raw);
+            return {};
+        }
         return std::unexpected(MakeError(ConfigErrorCode::UnknownKey, path, key, "unrecognised key", line));
     }
 

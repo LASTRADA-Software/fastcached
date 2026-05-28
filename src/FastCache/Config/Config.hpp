@@ -20,6 +20,23 @@ enum class StorageDurability : std::uint8_t
     None = 2,    ///< OS page cache only; no fsync.
 };
 
+/// Server threading model. Controls how concurrent client connections
+/// are served.
+enum class ThreadingModel : std::uint8_t
+{
+    /// Thread-pool-backed accept loop (fixed-size pool created at
+    /// startup). One accept thread feeds a bounded queue; N workers
+    /// drive Connection coroutines to completion. Default — required
+    /// for parallel sccache builds and other multi-client workloads.
+    Threaded = 0,
+
+    /// Single-threaded reactor (IOCP / epoll / kqueue). All
+    /// connections multiplexed on one thread. Useful for testing,
+    /// low-resource deployments, and single-client workloads where
+    /// CPU parallelism is not needed.
+    Reactor = 1,
+};
+
 /// All runtime configuration. POD-like value type; built once from CLI
 /// arguments (and later, from a YAML config file). For SIGHUP reload, the
 /// daemon keeps a shared_ptr<const Config> and atomically swaps.
@@ -65,6 +82,20 @@ struct Config
     /// objects. Set/Add/Replace/Append/Prepend that would exceed this
     /// return StorageErrorCode::ValueTooLarge.
     std::size_t storageMaxValueBytes { 1 * 1024 * 1024 };
+
+    /// Server threading model. See ThreadingModel docs.
+    ThreadingModel threadingModel { ThreadingModel::Threaded };
+
+    /// Worker thread count for Threaded mode. 0 means "use
+    /// std::thread::hardware_concurrency()". Ignored for Reactor mode.
+    std::size_t workerThreads { 0 };
+
+    /// Number of storage shards. 1 means "do not shard" (preserves
+    /// PR #10 single-file storage behaviour). When >1 and `storagePath`
+    /// is set, the path is treated as a directory containing
+    /// `shard-NN.cow` files. 0 means "auto" — defaults to a sensible
+    /// value at runtime (min(16, hardware_concurrency)).
+    std::size_t storageShards { 0 };
 };
 
 } // namespace FastCache
