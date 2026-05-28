@@ -10,6 +10,16 @@
 namespace FastCache
 {
 
+/// Durability policy for the persistent storage backend. Decoupled from
+/// the storage subsystem so the Config layer does not depend on Cache
+/// internals; main.cpp translates this into the backend's enum.
+enum class StorageDurability : std::uint8_t
+{
+    Fsync = 0,   ///< fsync after every write. Slowest, safest.
+    Batched = 1, ///< Buffer writes, fsync at commit boundaries (default).
+    None = 2,    ///< OS page cache only; no fsync.
+};
+
 /// All runtime configuration. POD-like value type; built once from CLI
 /// arguments (and later, from a YAML config file). For SIGHUP reload, the
 /// daemon keeps a shared_ptr<const Config> and atomically swaps.
@@ -39,6 +49,22 @@ struct Config
 
     /// Windows service name; defaults to FastCached.
     std::string serviceName { "FastCached" };
+
+    /// Optional path to a persistent storage file. When set, the
+    /// daemon uses a CoW-tree storage backed by this file; when empty,
+    /// the cache is in-memory only.
+    std::string storagePath {};
+
+    /// Durability mode for the persistent backend (ignored when
+    /// storagePath is empty).
+    StorageDurability storageDurability { StorageDurability::Batched };
+
+    /// Maximum size of a single cache value in bytes (only enforced
+    /// when `storagePath` is set). Defaults to 1 MiB which fits
+    /// typical sccache compile-cache values; raise it to allow larger
+    /// objects. Set/Add/Replace/Append/Prepend that would exceed this
+    /// return StorageErrorCode::ValueTooLarge.
+    std::size_t storageMaxValueBytes { 1 * 1024 * 1024 };
 };
 
 } // namespace FastCache

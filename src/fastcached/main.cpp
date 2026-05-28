@@ -9,7 +9,10 @@
 // SIGHUP and SCM PARAMCHANGE trigger config reload.
 
 #include <FastCache/Cache/CacheEngine.hpp>
+#include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Cache/TracingStorage.hpp>
+#include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
@@ -84,7 +87,28 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::Config const& cliC
         fileCfg.pidfile = cliCfg.pidfile;
     if (cliCfg.serviceName != defaults.serviceName)
         fileCfg.serviceName = cliCfg.serviceName;
+    if (!cliCfg.storagePath.empty())
+        fileCfg.storagePath = cliCfg.storagePath;
+    if (cliCfg.storageDurability != defaults.storageDurability)
+        fileCfg.storageDurability = cliCfg.storageDurability;
+    if (cliCfg.storageMaxValueBytes != defaults.storageMaxValueBytes)
+        fileCfg.storageMaxValueBytes = cliCfg.storageMaxValueBytes;
     return fileCfg;
+}
+
+/// Translate the user-facing StorageDurability into the page-store enum.
+CowTree::FilePageStore::Durability ToPageStoreDurability(FastCache::StorageDurability d) noexcept
+{
+    switch (d)
+    {
+        case FastCache::StorageDurability::Fsync:
+            return CowTree::FilePageStore::Durability::Fsync;
+        case FastCache::StorageDurability::Batched:
+            return CowTree::FilePageStore::Durability::Batched;
+        case FastCache::StorageDurability::None:
+            return CowTree::FilePageStore::Durability::None;
+    }
+    return CowTree::FilePageStore::Durability::Batched;
 }
 
 /// Daemon body: holds the actual server lifecycle. Runs under whatever
@@ -95,21 +119,79 @@ int DaemonBody(FastCache::Config const& effective)
     FastCache::ConsoleLogger logger { std::cerr, effective.logLevel };
     FastCache::ConfigReloader reloader { effective, effective.configPath };
     FastCache::SteadyClock clock;
-    FastCache::InMemoryLruStorage storage { effective.maxMemoryBytes };
-    FastCache::CacheEngine engine { storage, clock };
 
-    reloader.Subscribe([&logger, &storage](auto const& /*prev*/, auto const& next) {
+    // ----- storage factory: pick the backend per --storage. -----
+    std::unique_ptr<FastCache::IStorage> backend;
+    FastCache::InMemoryLruStorage* memBackend = nullptr;
+    FastCache::CowTreeStorage* diskBackend = nullptr;
+
+    if (effective.storagePath.empty())
+    {
+        auto mem = std::make_unique<FastCache::InMemoryLruStorage>(effective.maxMemoryBytes);
+        memBackend = mem.get();
+        backend = std::move(mem);
+    }
+    else
+    {
+        FastCache::CowTreeStorage::Options opts;
+        opts.path = effective.storagePath;
+        opts.maxBytes = effective.maxMemoryBytes;
+        opts.durability = ToPageStoreDurability(effective.storageDurability);
+        opts.maxValueBytes = effective.storageMaxValueBytes;
+        auto opened = FastCache::CowTreeStorage::Open(opts);
+        if (!opened.has_value())
+        {
+            logger.Logf(FastCache::LogLevel::Fatal,
+                        "failed to open storage '{}': {}",
+                        effective.storagePath,
+                        opened.error().ToString());
+            return EXIT_FAILURE;
+        }
+        diskBackend = opened->get();
+        backend = std::move(*opened);
+    }
+
+    // Optionally wrap in TracingStorage when trace logging is requested.
+    std::unique_ptr<FastCache::TracingStorage> tracer;
+    FastCache::IStorage* storagePtr = backend.get();
+    if (effective.logLevel <= FastCache::LogLevel::Trace)
+    {
+        tracer = std::make_unique<FastCache::TracingStorage>(*backend, logger, clock);
+        storagePtr = tracer.get();
+    }
+
+    FastCache::CacheEngine engine { *storagePtr, clock };
+
+    reloader.Subscribe([&logger, memBackend, diskBackend](auto const& /*prev*/, auto const& next) {
         logger.SetMinLevel(next->logLevel);
-        storage.Resize(next->maxMemoryBytes);
+        if (memBackend != nullptr)
+            memBackend->Resize(next->maxMemoryBytes);
+        if (diskBackend != nullptr)
+            diskBackend->Resize(next->maxMemoryBytes);
     });
 
+    auto const durabilityName = [&] {
+        switch (effective.storageDurability)
+        {
+            case FastCache::StorageDurability::Fsync:
+                return std::string_view { "fsync" };
+            case FastCache::StorageDurability::Batched:
+                return std::string_view { "batched" };
+            case FastCache::StorageDurability::None:
+                return std::string_view { "none" };
+        }
+        return std::string_view { "?" };
+    }();
     logger.Logf(FastCache::LogLevel::Info,
-                "fastcached {} starting; bind={}:{} max-memory={} bytes config={}",
+                "fastcached {} starting; bind={}:{} max-memory={} config={} storage={} durability={} max-value={}",
                 ProgramVersion,
                 effective.bindAddress,
                 effective.port,
-                effective.maxMemoryBytes,
-                effective.configPath.empty() ? std::string_view { "<none>" } : std::string_view { effective.configPath });
+                FastCache::FormatByteSize(effective.maxMemoryBytes),
+                effective.configPath.empty() ? std::string_view { "<none>" } : std::string_view { effective.configPath },
+                effective.storagePath.empty() ? std::string_view { "<in-memory>" } : std::string_view { effective.storagePath },
+                durabilityName,
+                FastCache::FormatByteSize(effective.storageMaxValueBytes));
 
     InstallStopHandlers();
     logger.Log(FastCache::LogLevel::Info, "ready, accepting connections");

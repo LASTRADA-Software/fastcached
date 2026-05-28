@@ -29,6 +29,23 @@ namespace
         };
     }
 
+    [[nodiscard]] std::expected<StorageDurability, ConfigError> ParseStorageDurability(std::string_view sv,
+                                                                                        std::filesystem::path const& path,
+                                                                                        unsigned line)
+    {
+        if (sv == "fsync")
+            return StorageDurability::Fsync;
+        if (sv == "batched")
+            return StorageDurability::Batched;
+        if (sv == "none")
+            return StorageDurability::None;
+        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+                                          path,
+                                          "storage_durability",
+                                          std::string { "unknown durability mode: " } + std::string { sv },
+                                          line));
+    }
+
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv,
                                                                      std::filesystem::path const& path,
                                                                      unsigned line)
@@ -116,6 +133,39 @@ namespace
             if (!level.has_value())
                 return std::unexpected(level.error());
             cfg.logLevel = *level;
+            return {};
+        }
+        /// `storage_path`: filesystem path of the CoW-tree backing file.
+        if (key == "storage_path")
+        {
+            cfg.storagePath = valueNode.as<std::string>();
+            return {};
+        }
+        /// `storage_durability`: fsync|batched|none.
+        if (key == "storage_durability")
+        {
+            auto const d = ParseStorageDurability(valueNode.as<std::string>(), path, line);
+            if (!d.has_value())
+                return std::unexpected(d.error());
+            cfg.storageDurability = *d;
+            return {};
+        }
+        /// `storage_max_value`: per-value byte cap for the persistent
+        /// backend. Same byte-size grammar as `max_memory` but without
+        /// the `%` form (host-RAM-relative makes no sense for a value
+        /// size).
+        if (key == "storage_max_value")
+        {
+            auto const raw = valueNode.as<std::string>();
+            auto parsed = ParseByteSize(raw, "storage_max_value");
+            if (!parsed.has_value())
+            {
+                auto err = std::move(parsed).error();
+                err.source = path.string();
+                err.line = line;
+                return std::unexpected(std::move(err));
+            }
+            cfg.storageMaxValueBytes = *parsed;
             return {};
         }
         return std::unexpected(MakeError(ConfigErrorCode::UnknownKey, path, key, "unrecognised key", line));

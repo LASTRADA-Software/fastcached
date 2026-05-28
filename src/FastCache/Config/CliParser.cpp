@@ -43,6 +43,26 @@ namespace
         });
     }
 
+    [[nodiscard]] std::expected<std::size_t, ConfigError> ParseStorageMaxValue(std::string_view sv)
+    {
+        return ParseByteSize(sv, "storage-max-value").transform_error([](ConfigError err) {
+            err.source = "argv";
+            return err;
+        });
+    }
+
+    [[nodiscard]] std::expected<StorageDurability, ConfigError> ParseStorageDurability(std::string_view sv)
+    {
+        if (sv == "fsync")
+            return StorageDurability::Fsync;
+        if (sv == "batched")
+            return StorageDurability::Batched;
+        if (sv == "none")
+            return StorageDurability::None;
+        return std::unexpected(MakeError(
+            ConfigErrorCode::OutOfRange, "storage-durability", std::format("unknown durability mode: {}", sv)));
+    }
+
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv)
     {
         if (sv == "trace")
@@ -149,6 +169,7 @@ namespace
                  { "--bind", &cfg.bindAddress },
                  { "--pidfile", &cfg.pidfile },
                  { "--service-name", &cfg.serviceName },
+                 { "--storage", &cfg.storagePath },
              })
         {
             auto const matched = ApplyStringFlag(args, i, name, *target);
@@ -180,6 +201,22 @@ namespace
             if (*matched)
                 return ArgOutcome::Continue;
         }
+        {
+            auto const matched =
+                ApplyParsedFlag(args, i, "--storage-durability", ParseStorageDurability, cfg.storageDurability);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
+        {
+            auto const matched =
+                ApplyParsedFlag(args, i, "--storage-max-value", ParseStorageMaxValue, cfg.storageMaxValueBytes);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
         return ArgOutcome::Unknown;
     }
 
@@ -193,6 +230,9 @@ std::string_view CliUsage() noexcept
            "  --port=<num>           TCP port (default 11211)\n"
            "  --max-memory=<size>    in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)\n"
            "  --log-level=<level>    trace|debug|info|warn|error|fatal (default info)\n"
+           "  --storage=<path>       persist cache to a CoW-tree file (default: in-memory only)\n"
+           "  --storage-durability=<mode>  fsync|batched|none for --storage (default batched)\n"
+           "  --storage-max-value=<size>   per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)\n"
            "  --daemon               daemonize (POSIX) / register as Windows service\n"
            "  --pidfile=<path>       POSIX daemon mode only\n"
            "  --service-name=<name>  Windows service name (default FastCached)\n"
