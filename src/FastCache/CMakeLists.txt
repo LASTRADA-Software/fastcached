@@ -12,6 +12,7 @@ target_sources(FastCache
         Cache/CowTreeStorage.cpp
         Cache/DiskStorage.cpp
         Cache/InMemoryLruStorage.cpp
+        Cache/ShardedStorage.cpp
         Cache/TracingStorage.cpp
         Config/ByteSize.cpp
         Config/CliParser.cpp
