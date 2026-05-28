@@ -42,24 +42,33 @@ enum class ThreadingModel : std::uint8_t
 /// daemon keeps a shared_ptr<const Config> and atomically swaps.
 struct Config
 {
-    /// Bind address, IPv4 string. Default 127.0.0.1.
-    std::string bindAddress { "127.0.0.1" };
-
-    /// TCP port. memcached default is 11211; fastcached's MVP follows.
-    std::uint16_t port { 11211 };
-
     /// In-memory storage byte budget. 0 = unbounded (testing/dev only).
     std::size_t maxMemoryBytes { 64 * 1024 * 1024 };
 
-    /// Log threshold.
-    LogLevel logLevel { LogLevel::Info };
+    /// Maximum size of a single cache value in bytes (only enforced
+    /// when `storagePath` is set). Defaults to 1 MiB which fits
+    /// typical sccache compile-cache values; raise it to allow larger
+    /// objects. Set/Add/Replace/Append/Prepend that would exceed this
+    /// return StorageErrorCode::ValueTooLarge.
+    std::size_t storageMaxValueBytes { 1 * 1024 * 1024 };
+
+    /// Worker thread count for Threaded mode. 0 means "use
+    /// std::thread::hardware_concurrency()". Ignored for Reactor mode.
+    std::size_t workerThreads { 0 };
+
+    /// Number of storage shards. 1 means "do not shard" (preserves
+    /// PR #10 single-file storage behaviour). When >1 and `storagePath`
+    /// is set, the path is treated as a directory containing
+    /// `shard-NN.cow` files. 0 means "auto" — defaults to a sensible
+    /// value at runtime (min(16, hardware_concurrency)).
+    std::size_t storageShards { 0 };
+
+    /// Bind address, IPv4 string. Default 127.0.0.1.
+    std::string bindAddress { "127.0.0.1" };
 
     /// Path of the YAML config file (if any) that produced this Config.
     /// Used by ConfigReloader on SIGHUP. Empty means no file-backed config.
     std::string configPath {};
-
-    /// If true, daemonize (POSIX) or self-register as a Windows service.
-    bool daemon { false };
 
     /// Optional pidfile path (POSIX daemon mode only).
     std::string pidfile {};
@@ -72,30 +81,21 @@ struct Config
     /// the cache is in-memory only.
     std::string storagePath {};
 
+    /// TCP port. memcached default is 11211; fastcached's MVP follows.
+    std::uint16_t port { 11211 };
+
+    /// Log threshold.
+    LogLevel logLevel { LogLevel::Info };
+
+    /// If true, daemonize (POSIX) or self-register as a Windows service.
+    bool daemon { false };
+
     /// Durability mode for the persistent backend (ignored when
     /// storagePath is empty).
     StorageDurability storageDurability { StorageDurability::Batched };
 
-    /// Maximum size of a single cache value in bytes (only enforced
-    /// when `storagePath` is set). Defaults to 1 MiB which fits
-    /// typical sccache compile-cache values; raise it to allow larger
-    /// objects. Set/Add/Replace/Append/Prepend that would exceed this
-    /// return StorageErrorCode::ValueTooLarge.
-    std::size_t storageMaxValueBytes { 1 * 1024 * 1024 };
-
     /// Server threading model. See ThreadingModel docs.
     ThreadingModel threadingModel { ThreadingModel::Threaded };
-
-    /// Worker thread count for Threaded mode. 0 means "use
-    /// std::thread::hardware_concurrency()". Ignored for Reactor mode.
-    std::size_t workerThreads { 0 };
-
-    /// Number of storage shards. 1 means "do not shard" (preserves
-    /// PR #10 single-file storage behaviour). When >1 and `storagePath`
-    /// is set, the path is treated as a directory containing
-    /// `shard-NN.cow` files. 0 means "auto" — defaults to a sensible
-    /// value at runtime (min(16, hardware_concurrency)).
-    std::size_t storageShards { 0 };
 };
 
 } // namespace FastCache

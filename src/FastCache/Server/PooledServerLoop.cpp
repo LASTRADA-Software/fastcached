@@ -161,11 +161,8 @@ namespace
 
 } // namespace
 
-std::uint64_t RunPooledServerLoop(IListener& listener,
-                                  CacheEngine& engine,
-                                  ILogger& logger,
-                                  std::atomic<bool>& shouldStop,
-                                  std::size_t poolSize)
+std::uint64_t RunPooledServerLoop(
+    IListener& listener, CacheEngine& engine, ILogger& logger, std::atomic<bool>& shouldStop, std::size_t poolSize)
 {
     auto const resolvedSize = ResolvedPoolSize(poolSize);
     WorkerPool pool { resolvedSize, engine, logger };

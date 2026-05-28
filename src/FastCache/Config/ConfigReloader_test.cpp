@@ -24,7 +24,7 @@ std::filesystem::path WriteYaml(std::string_view stem, std::string_view content)
 
 TEST_CASE("ConfigReloader: Current() returns the initial snapshot", "[config][reload]")
 {
-    FastCache::Config initial { .bindAddress = "127.0.0.1", .port = 11500, .maxMemoryBytes = 1024 };
+    FastCache::Config initial { .maxMemoryBytes = 1024, .bindAddress = "127.0.0.1", .port = 11500 };
     FastCache::ConfigReloader reloader { initial, {} };
     auto const snapshot = reloader.Current();
     REQUIRE(snapshot->bindAddress == "127.0.0.1");
@@ -38,11 +38,11 @@ TEST_CASE("ConfigReloader::Reload picks up reloadable changes", "[config][reload
                                 "port: 11600\n"
                                 "max_memory: 1024\n"
                                 "log_level: info\n");
-    FastCache::Config initial { .bindAddress = "127.0.0.1",
+    FastCache::Config initial { .maxMemoryBytes = 1024,
+                                .bindAddress = "127.0.0.1",
+                                .configPath = path.string(),
                                 .port = 11600,
-                                .maxMemoryBytes = 1024,
-                                .logLevel = FastCache::LogLevel::Info,
-                                .configPath = path.string() };
+                                .logLevel = FastCache::LogLevel::Info };
     FastCache::ConfigReloader reloader { initial, path };
 
     bool fired = false;
@@ -72,7 +72,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to immutable fields", "[config
                                 "port: 11700\n"
                                 "max_memory: 1024\n");
     FastCache::Config initial {
-        .bindAddress = "127.0.0.1", .port = 11700, .maxMemoryBytes = 1024, .configPath = path.string()
+        .maxMemoryBytes = 1024, .bindAddress = "127.0.0.1", .configPath = path.string(), .port = 11700
     };
     FastCache::ConfigReloader reloader { initial, path };
 

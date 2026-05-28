@@ -178,10 +178,10 @@ namespace
                 cfg.threadingModel = ThreadingModel::Reactor;
             else
                 return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
-                                                  path,
-                                                  "threading_model",
-                                                  std::string { "unknown model (expect threaded|reactor): " } + raw,
-                                                  line));
+                                                 path,
+                                                 "threading_model",
+                                                 std::string { "unknown model (expect threaded|reactor): " } + raw,
+                                                 line));
             return {};
         }
         /// `threads`: positive integer worker count for threaded mode.
@@ -189,8 +189,7 @@ namespace
         {
             auto const raw = valueNode.as<int>();
             if (raw < 0)
-                return std::unexpected(
-                    MakeError(ConfigErrorCode::OutOfRange, path, "threads", "must be >= 0", line));
+                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, path, "threads", "must be >= 0", line));
             cfg.workerThreads = static_cast<std::size_t>(raw);
             return {};
         }
@@ -199,8 +198,7 @@ namespace
         {
             auto const raw = valueNode.as<int>();
             if (raw < 0)
-                return std::unexpected(
-                    MakeError(ConfigErrorCode::OutOfRange, path, "storage_shards", "must be >= 0", line));
+                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, path, "storage_shards", "must be >= 0", line));
             cfg.storageShards = static_cast<std::size_t>(raw);
             return {};
         }

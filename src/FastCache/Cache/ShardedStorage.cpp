@@ -66,8 +66,8 @@ std::expected<CasToken, StorageError> ShardedStorage::Replace(
 }
 
 std::expected<CasToken, StorageError> ShardedStorage::Append(std::string_view key,
-                                                              std::span<std::byte const> suffix,
-                                                              TimePoint now)
+                                                             std::span<std::byte const> suffix,
+                                                             TimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
@@ -75,8 +75,8 @@ std::expected<CasToken, StorageError> ShardedStorage::Append(std::string_view ke
 }
 
 std::expected<CasToken, StorageError> ShardedStorage::Prepend(std::string_view key,
-                                                               std::span<std::byte const> prefix,
-                                                               TimePoint now)
+                                                              std::span<std::byte const> prefix,
+                                                              TimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
@@ -84,11 +84,11 @@ std::expected<CasToken, StorageError> ShardedStorage::Prepend(std::string_view k
 }
 
 std::expected<CasToken, StorageError> ShardedStorage::CompareAndSwap(std::string_view key,
-                                                                      CasToken expected,
-                                                                      std::vector<std::byte> value,
-                                                                      std::uint32_t flags,
-                                                                      TimePoint expiry,
-                                                                      TimePoint now)
+                                                                     CasToken expected,
+                                                                     std::vector<std::byte> value,
+                                                                     std::uint32_t flags,
+                                                                     TimePoint expiry,
+                                                                     TimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
@@ -96,8 +96,8 @@ std::expected<CasToken, StorageError> ShardedStorage::CompareAndSwap(std::string
 }
 
 std::expected<IStorage::IncrResult, StorageError> ShardedStorage::IncrementOrInitialize(std::string_view key,
-                                                                                         std::int64_t delta,
-                                                                                         TimePoint now)
+                                                                                        std::int64_t delta,
+                                                                                        TimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };

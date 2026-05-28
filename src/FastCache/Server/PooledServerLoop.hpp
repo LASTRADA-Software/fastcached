@@ -37,10 +37,7 @@ namespace FastCache
 ///                    zero is replaced by `std::thread::hardware_concurrency()`
 ///                    (with a floor of 1 if hardware_concurrency returns 0).
 /// @return Number of connections accepted before exit.
-std::uint64_t RunPooledServerLoop(IListener& listener,
-                                  CacheEngine& engine,
-                                  ILogger& logger,
-                                  std::atomic<bool>& shouldStop,
-                                  std::size_t poolSize);
+std::uint64_t RunPooledServerLoop(
+    IListener& listener, CacheEngine& engine, ILogger& logger, std::atomic<bool>& shouldStop, std::size_t poolSize);
 
 } // namespace FastCache

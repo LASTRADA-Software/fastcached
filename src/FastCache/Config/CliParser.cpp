@@ -250,8 +250,7 @@ namespace
                 return ArgOutcome::Continue;
         }
         {
-            auto const matched =
-                ApplyParsedFlag(args, i, "--threading-model", ParseThreadingModel, cfg.threadingModel);
+            auto const matched = ApplyParsedFlag(args, i, "--threading-model", ParseThreadingModel, cfg.threadingModel);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)

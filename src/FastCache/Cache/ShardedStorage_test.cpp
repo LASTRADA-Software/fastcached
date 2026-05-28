@@ -77,7 +77,7 @@ class ParkableStorage final: public FastCache::IStorage
     }
 
     std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view /*key*/,
-                                                                      FastCache::TimePoint /*now*/) override
+                                                                     FastCache::TimePoint /*now*/) override
     {
         ++readInFlight;
         std::unique_lock lock { _mu };
@@ -87,9 +87,9 @@ class ParkableStorage final: public FastCache::IStorage
     }
 
     std::expected<FastCache::CasToken, FastCache::StorageError> Set(std::string_view /*key*/,
-                                                                      std::vector<std::byte> /*value*/,
-                                                                      std::uint32_t /*flags*/,
-                                                                      FastCache::TimePoint /*expiry*/) override
+                                                                    std::vector<std::byte> /*value*/,
+                                                                    std::uint32_t /*flags*/,
+                                                                    FastCache::TimePoint /*expiry*/) override
     {
         ++writeInFlight;
         std::unique_lock lock { _mu };
@@ -99,46 +99,39 @@ class ParkableStorage final: public FastCache::IStorage
     }
 
     // Minimal stubs for the rest of the interface; not used by these tests.
-    std::expected<FastCache::CasToken, FastCache::StorageError> Add(std::string_view,
-                                                                     std::vector<std::byte>,
-                                                                     std::uint32_t,
-                                                                     FastCache::TimePoint,
-                                                                     FastCache::TimePoint) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> Add(
+        std::string_view, std::vector<std::byte>, std::uint32_t, FastCache::TimePoint, FastCache::TimePoint) override
     {
         return FastCache::CasToken { 0 };
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> Replace(std::string_view,
-                                                                         std::vector<std::byte>,
-                                                                         std::uint32_t,
-                                                                         FastCache::TimePoint,
-                                                                         FastCache::TimePoint) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> Replace(
+        std::string_view, std::vector<std::byte>, std::uint32_t, FastCache::TimePoint, FastCache::TimePoint) override
     {
         return FastCache::CasToken { 0 };
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Append(std::string_view,
+                                                                       std::span<std::byte const>,
+                                                                       FastCache::TimePoint) override
+    {
+        return FastCache::CasToken { 0 };
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view,
                                                                         std::span<std::byte const>,
                                                                         FastCache::TimePoint) override
     {
         return FastCache::CasToken { 0 };
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view,
-                                                                         std::span<std::byte const>,
-                                                                         FastCache::TimePoint) override
-    {
-        return FastCache::CasToken { 0 };
-    }
     std::expected<FastCache::CasToken, FastCache::StorageError> CompareAndSwap(std::string_view,
-                                                                                FastCache::CasToken,
-                                                                                std::vector<std::byte>,
-                                                                                std::uint32_t,
-                                                                                FastCache::TimePoint,
-                                                                                FastCache::TimePoint) override
+                                                                               FastCache::CasToken,
+                                                                               std::vector<std::byte>,
+                                                                               std::uint32_t,
+                                                                               FastCache::TimePoint,
+                                                                               FastCache::TimePoint) override
     {
         return FastCache::CasToken { 0 };
     }
-    std::expected<FastCache::IStorage::IncrResult, FastCache::StorageError> IncrementOrInitialize(std::string_view,
-                                                                                                    std::int64_t,
-                                                                                                    FastCache::TimePoint) override
+    std::expected<FastCache::IStorage::IncrResult, FastCache::StorageError> IncrementOrInitialize(
+        std::string_view, std::int64_t, FastCache::TimePoint) override
     {
         return FastCache::IStorage::IncrResult { 0, 0 };
     }
@@ -251,14 +244,18 @@ TEST_CASE("Concurrent readers on the same shard do not block each other", "[shar
     FastCache::ManualClock clock;
 
     // First reader: parks inside Get while holding the shared lock.
-    std::thread reader1 { [&] { (void) storage.Get("any-key", clock.Now()); } };
+    std::thread reader1 { [&] {
+        (void) storage.Get("any-key", clock.Now());
+    } };
 
     // Wait until reader1 is actually parked inside the stub.
     REQUIRE(WaitFor([&] { return park->readInFlight.load() == 1; }));
 
     // Second reader on the same shard: must NOT block. It should
     // immediately acquire the shared lock and reach the stub.
-    std::thread reader2 { [&] { (void) storage.Get("another-key", clock.Now()); } };
+    std::thread reader2 { [&] {
+        (void) storage.Get("another-key", clock.Now());
+    } };
     REQUIRE(WaitFor([&] { return park->readInFlight.load() == 2; }));
 
     // Release both.
@@ -295,7 +292,9 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     }
 
     // Writer parks inside Set on shard 0, holding the exclusive lock.
-    std::thread writer { [&] { (void) storage.Set(keyShard0, MakeBytes("v"), 0, FastCache::TimePoint::max()); } };
+    std::thread writer { [&] {
+        (void) storage.Set(keyShard0, MakeBytes("v"), 0, FastCache::TimePoint::max());
+    } };
     REQUIRE(WaitFor([&] { return park0->writeInFlight.load() == 1; }));
 
     // A reader on the same shard MUST block — until the writer releases,
@@ -314,7 +313,9 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     // A reader on a DIFFERENT shard must proceed immediately — it should
     // reach the inner stub (where parkGet=true holds it) without being
     // blocked by the unrelated writer on shard 0.
-    std::thread otherShardReader { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
+    std::thread otherShardReader { [&] {
+        (void) storage.Get(keyShard1, clock.Now());
+    } };
     REQUIRE(WaitFor([&] { return park1->readInFlight.load() == 1; }));
 
     // Release the writer; the same-shard reader can then proceed too.
