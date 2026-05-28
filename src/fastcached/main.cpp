@@ -111,7 +111,7 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::Config const& cliC
     if (requested != 0)
         return requested;
     auto const hw = std::thread::hardware_concurrency();
-    auto const cap = std::min<unsigned>(hw == 0 ? 1u : hw, 16u);
+    auto const cap = std::min<unsigned>(hw == 0 ? 1U : hw, 16U);
     return static_cast<std::size_t>(cap);
 }
 

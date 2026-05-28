@@ -12,6 +12,7 @@
 #include <expected>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -284,7 +285,7 @@ void CowTreeStorage::TouchOrInsert(std::string_view key, std::size_t valueSize)
         _lru.splice(_lru.begin(), _lru, it->second);
         return;
     }
-    _lru.push_front(LruNode { std::string { key }, valueSize });
+    _lru.push_front(LruNode { .key = std::string { key }, .bytes = valueSize });
     _index[std::string { key }] = _lru.begin();
     _bytesUsed += valueSize;
 }
@@ -310,7 +311,7 @@ void CowTreeStorage::EvictToFit()
         _bytesUsed -= victim->bytes;
         _index.erase(victim->key);
         _lru.erase(victim);
-        (void) EraseEntry(keyCopy);
+        std::ignore = EraseEntry(keyCopy);
         ++_stats.evictions;
     }
 }
@@ -324,16 +325,16 @@ std::expected<GetResult, StorageError> CowTreeStorage::Get(std::string_view key,
     if (!loaded->has_value())
     {
         ++_stats.getMisses;
-        return GetResult { false, {} };
+        return GetResult { .found = false, .entry = {} };
     }
     auto& entry = (*loaded)->entry;
     if (entry.expiry <= now || entry.generation < _liveGeneration)
     {
         // Expired or flushed.
-        (void) EraseEntry(key);
+        std::ignore = EraseEntry(key);
         EraseFromLru(key);
         ++_stats.getMisses;
-        return GetResult { false, {} };
+        return GetResult { .found = false, .entry = {} };
     }
     TouchOrInsert(key, entry.value.size());
     ++_stats.getHits;
@@ -477,7 +478,7 @@ std::expected<IStorage::IncrResult, StorageError> CowTreeStorage::IncrementOrIni
     else
     {
         auto const sub = static_cast<std::uint64_t>(-delta);
-        next = (sub >= current) ? 0u : (current - sub);
+        next = (sub >= current) ? 0U : (current - sub);
     }
     auto const s = std::to_string(next);
     std::vector<std::byte> bytes;
@@ -486,11 +487,11 @@ std::expected<IStorage::IncrResult, StorageError> CowTreeStorage::IncrementOrIni
         bytes.push_back(static_cast<std::byte>(c));
 
     auto const expiryToUse = exists ? (*loaded)->entry.expiry : TimePoint::max();
-    auto const flagsToUse = exists ? (*loaded)->entry.flags : 0u;
+    auto const flagsToUse = exists ? (*loaded)->entry.flags : 0U;
     auto cas = Set(key, std::move(bytes), flagsToUse, expiryToUse);
     if (!cas.has_value())
         return std::unexpected(cas.error());
-    return IStorage::IncrResult { next, *cas };
+    return IStorage::IncrResult { .value = next, .cas = *cas };
 }
 
 std::expected<void, StorageError> CowTreeStorage::Delete(std::string_view key, TimePoint now)
