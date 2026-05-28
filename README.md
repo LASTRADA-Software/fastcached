@@ -12,13 +12,14 @@ not been benchmarked against them and has not been used in production.
 
 ## Status
 
-All layers are wired and the daemon runs. The codebase covers an event-driven
-reactor (IOCP / epoll / kqueue) with a blocking fallback, an LRU in-memory
-storage, an optional copy-on-write persistent backend (the sibling
-[`CowTree`](src/CowTree/README.md) library), CLI + YAML config with SIGHUP
-reload, and a POSIX-daemon / Windows-service host. CI builds on Linux (clang +
-gcc), macOS, and Windows (MSVC + clang-cl), and three separate jobs spin up
-the daemon and assert sccache gets a cache hit using each wire protocol.
+All layers are wired and the daemon runs. The codebase covers a thread-pool-
+backed server (default) and a single-threaded reactor (IOCP / epoll / kqueue)
+opt-in, an LRU in-memory storage, an optional copy-on-write persistent
+backend (the sibling [`CowTree`](src/CowTree/README.md) library), key-hash
+sharding for parallel writes, CLI + YAML config with SIGHUP reload, and a
+POSIX-daemon / Windows-service host. CI builds on Linux (clang + gcc), macOS,
+and Windows (MSVC + clang-cl), and three separate jobs spin up the daemon and
+assert sccache gets a cache hit using each wire protocol.
 
 Protocol coverage is intentionally a subset:
 
@@ -89,6 +90,11 @@ usage: fastcached [options]
   --log-level=<level>    trace|debug|info|warn|error|fatal (default info)
   --storage=<path>       persist cache to a CoW-tree file (default: in-memory only)
   --storage-durability=<mode>  fsync|batched|none for --storage (default batched)
+  --storage-max-value=<size>   per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)
+  --threading-model=<mode>     threaded|reactor (default threaded)
+  --threads=<N>                worker thread count for threaded mode (default: hardware_concurrency)
+  --storage-shards=<N>         shard storage into N partitions for write parallelism
+                                   when N>1 and --storage is set, --storage must be a directory
   --daemon               daemonize (POSIX) / register as Windows service
   --pidfile=<path>       POSIX daemon mode only
   --service-name=<name>  Windows service name (default FastCached)
@@ -141,6 +147,39 @@ The first run writes entries to disk; stop the daemon (Ctrl-C, kill, or a
 power loss) and start it again with the same flags and the cache picks back
 up from where it left off — no warm-up.
 
+### Concurrency: thread pool + sharded storage
+
+By default `fastcached` serves connections on a **thread pool** sized to
+`hardware_concurrency()` (override with `--threads=N`). One accept thread
+feeds a bounded queue; pool workers loop popping connections and driving
+each protocol coroutine to completion. Workers are created once at startup
+and reused — no per-connection thread spawn, which matters on builds where
+sccache opens hundreds of connections.
+
+Storage is **sharded by key hash** when `--storage-shards>1`. Each shard
+has its own `std::shared_mutex`: any number of `Get`s on the same shard
+run in parallel (shared lock); writes take an exclusive lock that only
+blocks operations on *that* shard, never across shards. For sccache's
+read-heavy, well-hashed key space this scales reads linearly across cores.
+
+```sh
+# Pool + sharded persistent storage (--storage is treated as a directory
+# whenever --storage-shards > 1):
+./fastcached \
+    --port=11211 \
+    --max-memory=30% \
+    --storage=$HOME/.cache/fastcached \
+    --storage-shards=16 \
+    --threads=16
+
+# Fall back to single-threaded reactor if you need it for comparison:
+./fastcached --threading-model=reactor --port=11211 &
+```
+
+`--storage` is interpreted as a regular file when `--storage-shards=1` (the
+single-file mode introduced in the previous release) and as a directory
+holding `shard-NN.cow` files when `--storage-shards>1`.
+
 ## YAML config (optional)
 
 ```yaml
@@ -153,10 +192,17 @@ port: 11611
 max_memory: 30%
 # one of: trace | debug | info | warn | error | fatal
 log_level: debug
-# optional: path to a CoW-tree file. Comment out for an in-memory cache.
-storage_path: /var/lib/fastcached/cache.cow
+# optional: path to a CoW-tree file (single-shard) or directory (sharded).
+storage_path: /var/lib/fastcached/cache
 # optional: fsync | batched | none (default: batched)
 storage_durability: batched
+# optional: shard storage across N partitions for parallel writes (0 = auto,
+# 1 = single file/instance, N>1 = directory with shard-NN.cow files)
+storage_shards: 16
+# optional: threaded (default) | reactor
+threading_model: threaded
+# optional: worker thread count for threaded mode (0 = hardware_concurrency)
+threads: 0
 ```
 
 CLI flags override YAML values. On POSIX, `SIGHUP` triggers a re-read of the
