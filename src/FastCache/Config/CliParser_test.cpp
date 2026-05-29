@@ -120,6 +120,61 @@ TEST_CASE("CliParser: --execution-model=auto records the explicit-set flag", "[c
     REQUIRE(result->executionModelExplicit);
 }
 
+TEST_CASE("CliParser: --threads=0 records the explicit-set flag (regression for Merge default-collision)",
+          "[config][cli][regression]")
+{
+    // Regression for finding #14 — `--threads=0` happens to equal the
+    // field's default, and the old Merge gated on value comparison.
+    // The fix tracks "user typed this flag" per-flag so YAML's
+    // `threads: 8` cannot shadow an explicit `--threads=0` (auto).
+    auto const args = std::array<char const*, 1> { "--threads=0" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.workerThreads == 0u);
+    REQUIRE(result->workerThreadsExplicit);
+}
+
+TEST_CASE("CliParser: --storage-shards=0 records the explicit-set flag",
+          "[config][cli][regression]")
+{
+    auto const args = std::array<char const*, 1> { "--storage-shards=0" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.storageShards == 0u);
+    REQUIRE(result->storageShardsExplicit);
+}
+
+TEST_CASE("CliParser: --storage-durability=batched records the explicit-set flag",
+          "[config][cli][regression]")
+{
+    // batched is the field's default; absent an explicit-tracker the
+    // Merge step couldn't distinguish "user typed batched" from "flag
+    // absent", so a YAML override of `none` would silently win.
+    auto const args = std::array<char const*, 1> { "--storage-durability=batched" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.storageDurability == FastCache::StorageDurability::Batched);
+    REQUIRE(result->storageDurabilityExplicit);
+}
+
+TEST_CASE("CliParser: omitting all flags leaves every explicit-tracker false",
+          "[config][cli][regression]")
+{
+    auto const args = std::array<char const*, 0> {};
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE_FALSE(result->bindAddressExplicit);
+    REQUIRE_FALSE(result->portExplicit);
+    REQUIRE_FALSE(result->maxMemoryBytesExplicit);
+    REQUIRE_FALSE(result->logLevelExplicit);
+    REQUIRE_FALSE(result->storagePathExplicit);
+    REQUIRE_FALSE(result->storageDurabilityExplicit);
+    REQUIRE_FALSE(result->storageMaxValueBytesExplicit);
+    REQUIRE_FALSE(result->executionModelExplicit);
+    REQUIRE_FALSE(result->workerThreadsExplicit);
+    REQUIRE_FALSE(result->storageShardsExplicit);
+}
+
 TEST_CASE("CliParser: --execution-model parses each mode", "[config][cli][execution-model]")
 {
     for (auto const& [text, mode]: std::initializer_list<std::pair<char const*, FastCache::ExecutionModel>> {
