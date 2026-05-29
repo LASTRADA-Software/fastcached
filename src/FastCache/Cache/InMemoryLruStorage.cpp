@@ -302,4 +302,38 @@ void InMemoryLruStorage::Resize(std::size_t newMaxBytes)
     EvictToFit();
 }
 
+void InMemoryLruStorage::InsertVerbatim(std::string_view key, CacheEntry entry)
+{
+    // Bypass the CAS / generation machinery and store the entry as the
+    // caller supplied it. The whole point is to mirror a lower-tier
+    // entry without rewriting its identity.
+    auto const indexIt = _index.find(key);
+    if (indexIt != _index.end())
+    {
+        auto const nodeIt = indexIt->second;
+        _bytesUsed -= nodeIt->entry.value.size();
+        nodeIt->entry = std::move(entry);
+        _bytesUsed += nodeIt->entry.value.size();
+        _lru.splice(_lru.begin(), _lru, nodeIt);
+        EvictToFit();
+        return;
+    }
+    Node node;
+    node.key = std::string { key };
+    node.entry = std::move(entry);
+    auto const size = node.entry.value.size();
+    _lru.push_front(std::move(node));
+    _index.emplace(_lru.front().key, _lru.begin());
+    _bytesUsed += size;
+    EvictToFit();
+}
+
+void InMemoryLruStorage::EraseIfPresent(std::string_view key)
+{
+    auto const indexIt = _index.find(key);
+    if (indexIt == _index.end())
+        return;
+    EraseAt(indexIt->second);
+}
+
 } // namespace FastCache
