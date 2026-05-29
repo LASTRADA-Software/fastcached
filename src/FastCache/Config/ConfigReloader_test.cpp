@@ -125,8 +125,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to storage_path (regression fo
     REQUIRE(reloader.Current()->storagePath == "/tmp/a.cow");
 }
 
-TEST_CASE("ConfigReloader::Reload rejects changes to storage_durability",
-          "[config][reload][regression]")
+TEST_CASE("ConfigReloader::Reload rejects changes to storage_durability", "[config][reload][regression]")
 {
     auto const path = WriteYaml("storage-durability-immutable",
                                 "bind: 127.0.0.1\n"

@@ -132,8 +132,7 @@ TEST_CASE("LayeredStorage read-through populates L1 on an L1 miss", "[layered][r
     REQUIRE(l1Direct->entry.cas == *directCas);
 }
 
-TEST_CASE("LayeredStorage CompareAndSwap survives L1 eviction (CAS coherency)",
-          "[layered][cas]")
+TEST_CASE("LayeredStorage CompareAndSwap survives L1 eviction (CAS coherency)", "[layered][cas]")
 {
     // L1 budget is 8 bytes — small enough to force eviction after the
     // first Set. We then verify that a subsequent CAS against the cas
@@ -147,8 +146,8 @@ TEST_CASE("LayeredStorage CompareAndSwap survives L1 eviction (CAS coherency)",
 
     // Insert other entries to evict "key" from L1.
     for (int i = 0; i < 10; ++i)
-        REQUIRE(storage->Set(std::format("filler-{}", i), MakeBytes("XXXXXXXX"), 0, FastCache::TimePoint::max())
-                    .has_value());
+        REQUIRE(
+            storage->Set(std::format("filler-{}", i), MakeBytes("XXXXXXXX"), 0, FastCache::TimePoint::max()).has_value());
 
     // L1 should no longer hold "key" (the small budget evicted it).
     auto l1Probe = storage->L1().Get("key", clock.Now());
@@ -162,8 +161,7 @@ TEST_CASE("LayeredStorage CompareAndSwap survives L1 eviction (CAS coherency)",
     REQUIRE(refetched->found);
     REQUIRE(refetched->entry.cas == *cas);
 
-    auto casResult = storage->CompareAndSwap("key", *cas, MakeBytes("post"), 0,
-                                              FastCache::TimePoint::max(), clock.Now());
+    auto casResult = storage->CompareAndSwap("key", *cas, MakeBytes("post"), 0, FastCache::TimePoint::max(), clock.Now());
     REQUIRE(casResult.has_value());
 }
 
@@ -191,8 +189,7 @@ TEST_CASE("LayeredStorage Append routes through L2 and mirrors to L1", "[layered
     REQUIRE(storage->Set("k", MakeBytes("hello"), 0, FastCache::TimePoint::max()).has_value());
 
     auto const suffix = MakeBytes(" world");
-    auto const cas =
-        storage->Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, clock.Now());
+    auto const cas = storage->Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, clock.Now());
     REQUIRE(cas.has_value());
 
     // Both tiers must reflect the appended value with the new CAS.
@@ -229,8 +226,7 @@ TEST_CASE("LayeredStorage IncrementOrInitialize routes through L2", "[layered][c
     REQUIRE(Decode(l2->entry.value) == "15");
 }
 
-TEST_CASE("LayeredStorage FlushWithGeneration hides entries in both tiers",
-          "[layered][flush]")
+TEST_CASE("LayeredStorage FlushWithGeneration hides entries in both tiers", "[layered][flush]")
 {
     auto storage = MakeLayered();
     FastCache::ManualClock clock;
@@ -251,8 +247,7 @@ TEST_CASE("LayeredStorage FlushWithGeneration hides entries in both tiers",
     REQUIRE_FALSE(l2->found);
 }
 
-TEST_CASE("LayeredStorage PurgeExpired returns the L2 (canonical) count",
-          "[layered][purge]")
+TEST_CASE("LayeredStorage PurgeExpired returns the L2 (canonical) count", "[layered][purge]")
 {
     auto storage = MakeLayered();
     FastCache::ManualClock clock;
@@ -261,8 +256,7 @@ TEST_CASE("LayeredStorage PurgeExpired returns the L2 (canonical) count",
     for (int i = 0; i < 5; ++i)
         REQUIRE(storage->Set(std::format("expire-{}", i), MakeBytes("v"), 0, shortExpiry).has_value());
     for (int i = 0; i < 3; ++i)
-        REQUIRE(storage->Set(std::format("keep-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max())
-                    .has_value());
+        REQUIRE(storage->Set(std::format("keep-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     clock.Advance(10ms);
     auto const purged = storage->PurgeExpired(clock.Now());
@@ -277,8 +271,7 @@ TEST_CASE("LayeredStorage PurgeExpired returns the L2 (canonical) count",
     }
 }
 
-TEST_CASE("L1 eviction never loses data; L2 still serves every key",
-          "[layered][eviction]")
+TEST_CASE("L1 eviction never loses data; L2 still serves every key", "[layered][eviction]")
 {
     auto storage = MakeLayered(64); // tiny L1 budget so only a few entries fit
     FastCache::ManualClock clock;
@@ -287,9 +280,7 @@ TEST_CASE("L1 eviction never loses data; L2 still serves every key",
     for (int i = 0; i < N; ++i)
     {
         auto const key = std::format("k-{:02d}", i);
-        REQUIRE(
-            storage->Set(key, MakeBytes(std::format("payload-{:02d}", i)), 0, FastCache::TimePoint::max())
-                .has_value());
+        REQUIRE(storage->Set(key, MakeBytes(std::format("payload-{:02d}", i)), 0, FastCache::TimePoint::max()).has_value());
     }
 
     // Every key must still be retrievable (L1 evicted older entries
@@ -303,8 +294,7 @@ TEST_CASE("L1 eviction never loses data; L2 still serves every key",
     }
 }
 
-TEST_CASE("LayeredStorage Snapshot tracks LayeredStorage-level stats",
-          "[layered][stats]")
+TEST_CASE("LayeredStorage Snapshot tracks LayeredStorage-level stats", "[layered][stats]")
 {
     auto storage = MakeLayered();
     FastCache::ManualClock clock;
@@ -366,10 +356,9 @@ TEST_CASE("Sharded composition: ShardedStorage of LayeredStorage(InMem, CowTree)
         FastCache::ManualClock clock;
         for (int i = 0; i < 100; ++i)
         {
-            REQUIRE(storage
-                        ->Set(std::format("key-{}", i), MakeBytes(std::format("value-{}", i)), 0,
-                              FastCache::TimePoint::max())
-                        .has_value());
+            REQUIRE(
+                storage->Set(std::format("key-{}", i), MakeBytes(std::format("value-{}", i)), 0, FastCache::TimePoint::max())
+                    .has_value());
         }
     }
 
@@ -394,17 +383,14 @@ TEST_CASE("Sharded composition: ShardedStorage of LayeredStorage(InMem, CowTree)
     }
 }
 
-TEST_CASE("LayeredStorage::Resize tunes only the L1 budget",
-          "[layered][resize]")
+TEST_CASE("LayeredStorage::Resize tunes only the L1 budget", "[layered][resize]")
 {
     auto storage = MakeLayered(1024);
 
     constexpr int N = 50;
     for (int i = 0; i < N; ++i)
     {
-        REQUIRE(
-            storage->Set(std::format("k-{:02d}", i), MakeBytes("XXXXXXXX"), 0, FastCache::TimePoint::max())
-                .has_value());
+        REQUIRE(storage->Set(std::format("k-{:02d}", i), MakeBytes("XXXXXXXX"), 0, FastCache::TimePoint::max()).has_value());
     }
     auto const before = storage->L1().Snapshot();
     REQUIRE(before.bytesUsed <= 1024u);
@@ -424,8 +410,7 @@ TEST_CASE("LayeredStorage::Resize tunes only the L1 budget",
     }
 }
 
-TEST_CASE("LayeredStorage Add fails when present in L2 (canonical), even if L1 evicted",
-          "[layered][add]")
+TEST_CASE("LayeredStorage Add fails when present in L2 (canonical), even if L1 evicted", "[layered][add]")
 {
     auto storage = MakeLayered(8); // tiny L1
     FastCache::ManualClock clock;
@@ -434,9 +419,7 @@ TEST_CASE("LayeredStorage Add fails when present in L2 (canonical), even if L1 e
 
     // Push out L1 with other writes.
     for (int i = 0; i < 5; ++i)
-        REQUIRE(
-            storage->Set(std::format("filler-{}", i), MakeBytes("XXXX"), 0, FastCache::TimePoint::max())
-                .has_value());
+        REQUIRE(storage->Set(std::format("filler-{}", i), MakeBytes("XXXX"), 0, FastCache::TimePoint::max()).has_value());
 
     // L1 may have evicted "k", but L2 still has it — Add must fail.
     auto r = storage->Add("k", MakeBytes("second"), 0, FastCache::TimePoint::max(), clock.Now());
@@ -444,8 +427,7 @@ TEST_CASE("LayeredStorage Add fails when present in L2 (canonical), even if L1 e
     REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyExists);
 }
 
-TEST_CASE("LayeredStorage Replace fails when absent from both tiers",
-          "[layered][replace]")
+TEST_CASE("LayeredStorage Replace fails when absent from both tiers", "[layered][replace]")
 {
     auto storage = MakeLayered();
     FastCache::ManualClock clock;

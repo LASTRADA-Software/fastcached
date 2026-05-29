@@ -253,9 +253,9 @@ TEST_CASE("Concurrent same-shard Gets serialise (correctness over read paralleli
     } };
     REQUIRE(WaitFor([&] { return park->readInFlight.load() == 1; }));
 
-    // Second reader on the same shard: must block on the exclusive
-    // lock. We confirm by spawning it and waiting briefly to be sure
-    // it does *not* reach the stub.
+    // Second reader on the same shard: must block on the unique lock
+    // and therefore not reach the stub while reader1 is still parked
+    // inside Get. We confirm with a brief grace window.
     std::thread reader2 { [&] {
         (void) storage.Get("another-key", clock.Now());
     } };
@@ -263,19 +263,12 @@ TEST_CASE("Concurrent same-shard Gets serialise (correctness over read paralleli
     std::this_thread::sleep_for(50ms);
     REQUIRE(park->readInFlight.load() == 1);
 
-    // Release reader1; reader2 should now acquire and reach the stub.
-    park->parkGet = true; // keep parking so reader2 also parks
-    park->Release();      // wakes reader1; parkGet is now false so reader1 falls through
-    // ParkableStorage::Release flips parkGet to false unconditionally,
-    // so reader1 falls through immediately. Re-park for reader2:
-    {
-        // After reader1 finishes, parkGet may be false; check by
-        // waiting for reader2 to reach the stub at least once.
-        REQUIRE(WaitFor([&] { return park->readInFlight.load() >= 1; }));
-    }
+    // Release unblocks reader1 (which then exits Get) and reader2 can
+    // now acquire. Both must complete cleanly.
     park->Release();
     reader1.join();
     reader2.join();
+    REQUIRE(park->readInFlight.load() == 0);
 }
 
 TEST_CASE("Cross-shard Gets run in parallel (sharding preserves read parallelism)", "[sharded][concurrency]")

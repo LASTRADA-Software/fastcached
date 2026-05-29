@@ -12,8 +12,7 @@
 namespace FastCache
 {
 
-LayeredStorage::LayeredStorage(std::unique_ptr<InMemoryLruStorage> l1Cache,
-                               std::unique_ptr<IStorage> l2Backing) noexcept:
+LayeredStorage::LayeredStorage(std::unique_ptr<InMemoryLruStorage> l1Cache, std::unique_ptr<IStorage> l2Backing) noexcept:
     _l1 { std::move(l1Cache) },
     _l2 { std::move(l2Backing) }
 {

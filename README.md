@@ -118,6 +118,15 @@ state. `--storage-durability` trades durability for throughput: `fsync`
 flushes on every commit, `batched` flushes at commit boundaries only (the
 default), `none` relies on the OS page cache.
 
+With persistent storage enabled, every shard is composed as
+`LayeredStorage(InMemoryLruStorage, CowTreeStorage)`. Reads first consult
+the in-memory LRU cache (L1) and only fall through to the on-disk B+tree
+(L2) on a miss; the L2 result is then mirrored into L1 with **L2's CAS
+preserved**, so subsequent CAS / Get calls return the same token whether
+they were served from RAM or disk. Writes pass through L2 first (canonical
+CAS) and then mirror into L1. `--max-memory` is the L1 byte budget; the
+on-disk file grows independently as needed by the workload.
+
 ### Run with 30% of host RAM and a persistent cache file
 
 ```sh

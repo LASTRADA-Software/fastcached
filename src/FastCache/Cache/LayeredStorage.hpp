@@ -42,7 +42,8 @@ namespace FastCache
 /// | `Delete`         | L2.Delete; always drop from L1 (best effort). |
 /// | `FlushWithGeneration` | Forward to both (each maintains its own gen). |
 /// | `PurgeExpired`   | Forward to both; return L2's count (canonical). |
-/// | `Snapshot`       | itemCount/bytesUsed/bytesLimit from L2; LayeredStorage tracks its own cmdGet/cmdSet/getHits/getMisses. |
+/// | `Snapshot`       | itemCount/bytesUsed/bytesLimit from L2; LayeredStorage tracks its own
+/// cmdGet/cmdSet/getHits/getMisses. |
 ///
 /// ## Concurrency
 ///
@@ -58,8 +59,7 @@ class LayeredStorage final: public IStorage
     /// (L2). Ownership of both is taken.
     /// @param l1Cache In-memory cache; may be configured with its own byte budget.
     /// @param l2Backing Canonical lower-tier storage (typically a `CowTreeStorage`).
-    explicit LayeredStorage(std::unique_ptr<InMemoryLruStorage> l1Cache,
-                            std::unique_ptr<IStorage> l2Backing) noexcept;
+    explicit LayeredStorage(std::unique_ptr<InMemoryLruStorage> l1Cache, std::unique_ptr<IStorage> l2Backing) noexcept;
 
     LayeredStorage(LayeredStorage const&) = delete;
     LayeredStorage(LayeredStorage&&) = delete;

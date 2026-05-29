@@ -134,8 +134,7 @@ TEST_CASE("CliParser: --threads=0 records the explicit-set flag (regression for 
     REQUIRE(result->workerThreadsExplicit);
 }
 
-TEST_CASE("CliParser: --storage-shards=0 records the explicit-set flag",
-          "[config][cli][regression]")
+TEST_CASE("CliParser: --storage-shards=0 records the explicit-set flag", "[config][cli][regression]")
 {
     auto const args = std::array<char const*, 1> { "--storage-shards=0" };
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
@@ -144,8 +143,7 @@ TEST_CASE("CliParser: --storage-shards=0 records the explicit-set flag",
     REQUIRE(result->storageShardsExplicit);
 }
 
-TEST_CASE("CliParser: --storage-durability=batched records the explicit-set flag",
-          "[config][cli][regression]")
+TEST_CASE("CliParser: --storage-durability=batched records the explicit-set flag", "[config][cli][regression]")
 {
     // batched is the field's default; absent an explicit-tracker the
     // Merge step couldn't distinguish "user typed batched" from "flag
@@ -157,8 +155,7 @@ TEST_CASE("CliParser: --storage-durability=batched records the explicit-set flag
     REQUIRE(result->storageDurabilityExplicit);
 }
 
-TEST_CASE("CliParser: omitting all flags leaves every explicit-tracker false",
-          "[config][cli][regression]")
+TEST_CASE("CliParser: omitting all flags leaves every explicit-tracker false", "[config][cli][regression]")
 {
     auto const args = std::array<char const*, 0> {};
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });

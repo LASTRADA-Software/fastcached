@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Cache/LayeredStorage.hpp>
 #include <FastCache/Cache/ShardedStorage.hpp>
 
 #include <cstddef>
@@ -170,6 +171,8 @@ void ShardedStorage::ResizeTotal(std::size_t newTotalBytes)
         std::unique_lock const lock { shard->mu };
         if (auto* mem = dynamic_cast<InMemoryLruStorage*>(shard->storage.get()); mem != nullptr)
             mem->Resize(perShard);
+        else if (auto* layered = dynamic_cast<LayeredStorage*>(shard->storage.get()); layered != nullptr)
+            layered->Resize(perShard);
         else if (auto* disk = dynamic_cast<CowTreeStorage*>(shard->storage.get()); disk != nullptr)
             disk->Resize(perShard);
     }
