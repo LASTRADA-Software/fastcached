@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +10,7 @@
 #include <memory>
 #include <ranges>
 #include <span>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -185,22 +187,35 @@ auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
     // page id, with the rest holding additional free ids. For the MVP
     // we treat freeRoot itself as a leaf-pointer to a singly-linked
     // chain of free pages (one id per page).
+    //
+    // A visited set + iteration cap guards against a corrupted or
+    // adversarial file whose `next` link forms a cycle — without the
+    // guard Open() loops forever and the in-memory _freeList grows
+    // without bound.
+    std::unordered_set<std::uint64_t> visited;
+    visited.reserve(_totalDataPages);
     auto cursor = live.freeRoot;
     while (cursor)
     {
         auto const pageIndex = cursor.value;
         if (pageIndex == 0 || pageIndex > _totalDataPages)
             return std::unexpected(CowTreeError::Corrupt);
+        if (!visited.insert(pageIndex).second)
+            return std::unexpected(CowTreeError::Corrupt);
         _live.erase(pageIndex);
         _freeList.push_back(pageIndex);
 
-        // Chase the chain.
+        // Chase the chain. Use the little-endian decode path that
+        // every other on-disk field uses; a raw memcpy here would
+        // disagree on a big-endian host.
         std::array<std::byte, 8> buf {};
         if (auto const r = ReadAt(DataPageOffset(cursor), BytesSpan { buf.data(), buf.size() }); !r.has_value())
             return std::unexpected(r.error());
-        std::uint64_t next = 0;
-        std::memcpy(&next, buf.data(), sizeof(next));
-        cursor = PageId { next };
+        std::uint64_t nextRaw = 0;
+        std::memcpy(&nextRaw, buf.data(), sizeof(nextRaw));
+        if constexpr (std::endian::native != std::endian::little)
+            nextRaw = std::byteswap(nextRaw);
+        cursor = PageId { nextRaw };
     }
     return {};
 }

@@ -157,6 +157,9 @@ std::expected<void, CowTreeError> EncodeLeafPage(BytesSpan page, std::span<LeafE
 {
     std::ranges::fill(page, std::byte { 0 });
 
+    if (entries.size() > MaxEntriesPerPage)
+        return std::unexpected(CowTreeError::ValueTooLarge);
+
     // Compute total byte cost; reject if it overflows the page.
     std::size_t needed = 0;
     for (auto const& e: entries)
@@ -191,6 +194,9 @@ std::expected<void, CowTreeError> EncodeInternalPage(BytesSpan page,
                                                      std::span<InternalEntry const> entries) noexcept
 {
     std::ranges::fill(page, std::byte { 0 });
+
+    if (entries.size() > MaxEntriesPerPage)
+        return std::unexpected(CowTreeError::ValueTooLarge);
 
     std::size_t needed = 0;
     for (auto const& e: entries)

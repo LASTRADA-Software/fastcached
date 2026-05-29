@@ -28,15 +28,22 @@ namespace CowTree
 /// ```
 inline constexpr std::size_t PageHeaderSize = 16;
 
-/// Maximum length of a single key in bytes. Absolute ceiling; the
-/// practical limit is set by the page size of the backing store (one
-/// key+value must fit in one page).
-inline constexpr std::size_t MaxKeyLength = 64 * 1024;
+/// Maximum length of a single key in bytes. Bounded by the on-disk
+/// uint16_t length field — sizes equal to or above this are rejected at
+/// encode time. The practical limit is set by the page size of the
+/// backing store (one key+value must fit in one page).
+inline constexpr std::size_t MaxKeyLength = static_cast<std::size_t>(0xFFFFU);
 
 /// Maximum length of a single value in bytes. Absolute ceiling; the
 /// practical limit is set by the page size of the backing store (one
 /// key+value must fit in one page).
 inline constexpr std::size_t MaxValueLength = 64 * 1024 * 1024;
+
+/// Maximum number of entries on a single page. Bounded by the on-disk
+/// uint16_t entryCount field. EncodeLeafPage / EncodeInternalPage reject
+/// payloads above this even when their byte cost would fit, because the
+/// header cannot record the count.
+inline constexpr std::size_t MaxEntriesPerPage = static_cast<std::size_t>(0xFFFFU);
 
 /// Header view over the raw bytes of a page. The actual entries follow
 /// the header, packed sequentially.
