@@ -168,19 +168,22 @@ namespace
             cfg.storageMaxValueBytes = *parsed;
             return {};
         }
-        /// `threading_model`: threaded | reactor.
-        if (key == "threading_model")
+        /// `execution_model`: auto | threaded | reactor. `auto` picks
+        /// reactor for in-memory and threaded for CoW on-disk storage.
+        if (key == "execution_model")
         {
             auto const raw = valueNode.as<std::string>();
-            if (raw == "threaded")
-                cfg.threadingModel = ThreadingModel::Threaded;
+            if (raw == "auto")
+                cfg.executionModel = ExecutionModel::Auto;
+            else if (raw == "threaded")
+                cfg.executionModel = ExecutionModel::Threaded;
             else if (raw == "reactor")
-                cfg.threadingModel = ThreadingModel::Reactor;
+                cfg.executionModel = ExecutionModel::Reactor;
             else
                 return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
                                                  path,
-                                                 "threading_model",
-                                                 std::string { "unknown model (expect threaded|reactor): " } + raw,
+                                                 "execution_model",
+                                                 std::string { "unknown model (expect auto|threaded|reactor): " } + raw,
                                                  line));
             return {};
         }

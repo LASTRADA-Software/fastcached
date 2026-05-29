@@ -73,14 +73,17 @@ namespace
         return ParsePositiveInt(sv, "storage-shards");
     }
 
-    [[nodiscard]] std::expected<ThreadingModel, ConfigError> ParseThreadingModel(std::string_view sv)
+    [[nodiscard]] std::expected<ExecutionModel, ConfigError> ParseExecutionModel(std::string_view sv)
     {
+        if (sv == "auto")
+            return ExecutionModel::Auto;
         if (sv == "threaded")
-            return ThreadingModel::Threaded;
+            return ExecutionModel::Threaded;
         if (sv == "reactor")
-            return ThreadingModel::Reactor;
-        return std::unexpected(MakeError(
-            ConfigErrorCode::OutOfRange, "threading-model", std::format("unknown model (expect threaded|reactor): {}", sv)));
+            return ExecutionModel::Reactor;
+        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+                                         "execution-model",
+                                         std::format("unknown model (expect auto|threaded|reactor): {}", sv)));
     }
 
     [[nodiscard]] std::expected<StorageDurability, ConfigError> ParseStorageDurability(std::string_view sv)
@@ -182,8 +185,9 @@ namespace
     /// ConfigError if the argument matched a flag but parsing failed.
     [[nodiscard]] std::expected<ArgOutcome, ConfigError> HandleOneArg(std::span<char const* const> args,
                                                                       std::size_t& i,
-                                                                      Config& cfg)
+                                                                      CliResult& result)
     {
+        auto& cfg = result.config;
         std::string_view const arg { args[i] };
         if (arg == "--help" || arg == "-h")
             return ArgOutcome::ShowHelp;
@@ -250,11 +254,14 @@ namespace
                 return ArgOutcome::Continue;
         }
         {
-            auto const matched = ApplyParsedFlag(args, i, "--threading-model", ParseThreadingModel, cfg.threadingModel);
+            auto const matched = ApplyParsedFlag(args, i, "--execution-model", ParseExecutionModel, cfg.executionModel);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.executionModelExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         {
             auto const matched = ApplyParsedFlag(args, i, "--threads", ParseThreads, cfg.workerThreads);
@@ -286,7 +293,8 @@ std::string_view CliUsage() noexcept
            "  --storage=<path>       persist cache to a CoW-tree file (default: in-memory only)\n"
            "  --storage-durability=<mode>  fsync|batched|none for --storage (default batched)\n"
            "  --storage-max-value=<size>   per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)\n"
-           "  --threading-model=<mode>     threaded|reactor (default threaded)\n"
+           "  --execution-model=<mode>     auto|threaded|reactor (default auto)\n"
+           "                                   auto: reactor for in-memory, threaded for --storage on disk\n"
            "  --threads=<N>                worker thread count for threaded mode (default: hardware_concurrency)\n"
            "  --storage-shards=<N>         shard storage into N partitions for write parallelism\n"
            "                                   when N>1 and --storage is set, --storage must be a directory\n"
@@ -323,7 +331,7 @@ std::expected<CliResult, ConfigError> ParseCli(std::span<char const* const> args
     CliResult outcome;
     for (std::size_t i = 0; i < args.size(); ++i)
     {
-        auto const result = HandleOneArg(args, i, outcome.config);
+        auto const result = HandleOneArg(args, i, outcome);
         if (!result.has_value())
             return std::unexpected(result.error());
         switch (*result)

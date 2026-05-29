@@ -69,9 +69,14 @@ void InstallStopHandlers()
 }
 
 /// Merge: CLI flags override YAML for any value explicitly changed from
-/// the default. Same simple heuristic the MVP shipped with.
-FastCache::Config Merge(FastCache::Config fileCfg, FastCache::Config const& cliCfg)
+/// the default. Same simple heuristic the MVP shipped with. The full
+/// CliResult is passed (not just the Config) so flags whose default is
+/// itself a meaningful user-visible value — like `--execution-model=auto`
+/// — can override a non-default YAML value when the user typed them
+/// explicitly.
+FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& cli)
 {
+    auto const& cliCfg = cli.config;
     FastCache::Config defaults;
     if (cliCfg.bindAddress != defaults.bindAddress)
         fileCfg.bindAddress = cliCfg.bindAddress;
@@ -95,8 +100,8 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::Config const& cliC
         fileCfg.storageDurability = cliCfg.storageDurability;
     if (cliCfg.storageMaxValueBytes != defaults.storageMaxValueBytes)
         fileCfg.storageMaxValueBytes = cliCfg.storageMaxValueBytes;
-    if (cliCfg.threadingModel != defaults.threadingModel)
-        fileCfg.threadingModel = cliCfg.threadingModel;
+    if (cli.executionModelExplicit)
+        fileCfg.executionModel = cliCfg.executionModel;
     if (cliCfg.workerThreads != defaults.workerThreads)
         fileCfg.workerThreads = cliCfg.workerThreads;
     if (cliCfg.storageShards != defaults.storageShards)
@@ -113,6 +118,19 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::Config const& cliC
     auto const hw = std::thread::hardware_concurrency();
     auto const cap = std::min<unsigned>(hw == 0 ? 1U : hw, 16U);
     return static_cast<std::size_t>(cap);
+}
+
+/// Resolve `ExecutionModel::Auto` to a concrete model based on the
+/// active storage backend: reactor when the cache is in-memory (no
+/// disk I/O to overlap with), threaded when CoW on-disk storage is
+/// configured (per-shard locks and page-store fsyncs benefit from
+/// parallel workers). Pass-through for an explicit Threaded/Reactor.
+[[nodiscard]] FastCache::ExecutionModel ResolveExecutionModel(FastCache::ExecutionModel requested,
+                                                              bool usingPersistentStorage) noexcept
+{
+    if (requested != FastCache::ExecutionModel::Auto)
+        return requested;
+    return usingPersistentStorage ? FastCache::ExecutionModel::Threaded : FastCache::ExecutionModel::Reactor;
 }
 
 /// Translate the user-facing StorageDurability into the page-store enum.
@@ -275,12 +293,19 @@ int DaemonBody(FastCache::Config const& effective)
         }
         return std::string_view { "?" };
     }();
-    auto const threadingName = (effective.threadingModel == FastCache::ThreadingModel::Threaded)
+    auto const resolvedExecutionModel = ResolveExecutionModel(effective.executionModel, usingPersistent);
+    auto const executionName = (resolvedExecutionModel == FastCache::ExecutionModel::Threaded)
                                    ? std::string_view { "threaded" }
                                    : std::string_view { "reactor" };
+    // Only annotate the resolved model with "(auto)" when it was actually
+    // resolved from Auto — there's nothing to disambiguate when the user
+    // typed --execution-model=threaded.
+    auto const executionAnnotation = (effective.executionModel == FastCache::ExecutionModel::Auto)
+                                         ? std::string_view { " (auto)" }
+                                         : std::string_view {};
     logger.Logf(FastCache::LogLevel::Info,
                 "fastcached {} starting; bind={}:{} max-memory={} config={} storage={} "
-                "durability={} max-value={} threading={} shards={}",
+                "durability={} max-value={} execution={}{} shards={}",
                 ProgramVersion,
                 effective.bindAddress,
                 effective.port,
@@ -290,7 +315,8 @@ int DaemonBody(FastCache::Config const& effective)
                                               : std::string_view { effective.storagePath },
                 durabilityName,
                 FastCache::FormatByteSize(effective.storageMaxValueBytes),
-                threadingName,
+                executionName,
+                executionAnnotation,
                 shardCount);
 
     InstallStopHandlers();
@@ -313,7 +339,7 @@ int DaemonBody(FastCache::Config const& effective)
     } };
 
     int exitCode = EXIT_SUCCESS;
-    if (effective.threadingModel == FastCache::ThreadingModel::Reactor)
+    if (resolvedExecutionModel == FastCache::ExecutionModel::Reactor)
     {
         FastCache::ReactorServerOptions serverOpts;
         serverOpts.bindAddress = effective.bindAddress;
@@ -394,7 +420,7 @@ int main(int argc, char const* const* argv)
             std::println(std::cerr, "fastcached: {}", loaded.error().ToString());
             return EXIT_FAILURE;
         }
-        effective = Merge(std::move(*loaded), parsed->config);
+        effective = Merge(std::move(*loaded), *parsed);
         effective.configPath = parsed->config.configPath;
     }
     else

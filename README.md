@@ -91,7 +91,8 @@ usage: fastcached [options]
   --storage=<path>       persist cache to a CoW-tree file (default: in-memory only)
   --storage-durability=<mode>  fsync|batched|none for --storage (default batched)
   --storage-max-value=<size>   per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)
-  --threading-model=<mode>     threaded|reactor (default threaded)
+  --execution-model=<mode>     auto|threaded|reactor (default auto)
+                                   auto: reactor for in-memory, threaded for --storage on disk
   --threads=<N>                worker thread count for threaded mode (default: hardware_concurrency)
   --storage-shards=<N>         shard storage into N partitions for write parallelism
                                    when N>1 and --storage is set, --storage must be a directory
@@ -149,8 +150,14 @@ up from where it left off — no warm-up.
 
 ### Concurrency: thread pool + sharded storage
 
-By default `fastcached` serves connections on a **thread pool** sized to
-`hardware_concurrency()` (override with `--threads=N`). One accept thread
+`--execution-model` defaults to `auto`, which picks **reactor** for the
+in-memory cache (single thread is plenty when every operation is a hash
+lookup) and **threaded** when `--storage=<path>` is set (disk I/O and
+per-shard locks benefit from parallel workers). Pass `--execution-model=threaded`
+or `=reactor` to force a choice.
+
+In threaded mode `fastcached` serves connections on a **thread pool** sized
+to `hardware_concurrency()` (override with `--threads=N`). One accept thread
 feeds a bounded queue; pool workers loop popping connections and driving
 each protocol coroutine to completion. Workers are created once at startup
 and reused — no per-connection thread spawn, which matters on builds where
@@ -173,7 +180,7 @@ read-heavy, well-hashed key space this scales reads linearly across cores.
     --threads=16
 
 # Fall back to single-threaded reactor if you need it for comparison:
-./fastcached --threading-model=reactor --port=11211 &
+./fastcached --execution-model=reactor --port=11211 &
 ```
 
 `--storage` is interpreted as a regular file when `--storage-shards=1` (the
@@ -199,8 +206,9 @@ storage_durability: batched
 # optional: shard storage across N partitions for parallel writes (0 = auto,
 # 1 = single file/instance, N>1 = directory with shard-NN.cow files)
 storage_shards: 16
-# optional: threaded (default) | reactor
-threading_model: threaded
+# optional: auto (default) | threaded | reactor
+# auto picks reactor for in-memory storage, threaded for CoW on-disk storage
+execution_model: auto
 # optional: worker thread count for threaded mode (0 = hardware_concurrency)
 threads: 0
 ```

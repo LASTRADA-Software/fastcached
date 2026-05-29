@@ -25,6 +25,12 @@ struct CliResult
 {
     CliOutcome outcome { CliOutcome::Run };
     Config config {};
+
+    /// True iff `--execution-model` appeared on the CLI. Lets the Merge
+    /// step distinguish "user explicitly asked for the default (`auto`)"
+    /// from "user did not pass the flag", so an explicit `auto` on the
+    /// CLI can override a non-auto value in the YAML config.
+    bool executionModelExplicit { false };
 };
 
 /// Parse `argv[1..argc-1]` into a Config. Returns ConfigError on bad input.

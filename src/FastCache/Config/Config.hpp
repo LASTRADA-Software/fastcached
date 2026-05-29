@@ -20,21 +20,28 @@ enum class StorageDurability : std::uint8_t
     None = 2,    ///< OS page cache only; no fsync.
 };
 
-/// Server threading model. Controls how concurrent client connections
+/// Server execution model. Controls how concurrent client connections
 /// are served.
-enum class ThreadingModel : std::uint8_t
+enum class ExecutionModel : std::uint8_t
 {
+    /// Pick the best model for the configured storage backend: reactor
+    /// for in-memory (single-threaded suffices — operations are
+    /// non-blocking and CPU-bound on hash lookups), threaded for CoW
+    /// on-disk storage (disk I/O and page-store writes benefit from
+    /// per-shard parallelism). The default.
+    Auto = 0,
+
     /// Thread-pool-backed accept loop (fixed-size pool created at
     /// startup). One accept thread feeds a bounded queue; N workers
-    /// drive Connection coroutines to completion. Default — required
-    /// for parallel sccache builds and other multi-client workloads.
-    Threaded = 0,
+    /// drive Connection coroutines to completion. Required for
+    /// parallel sccache builds and other multi-client workloads.
+    Threaded = 1,
 
     /// Single-threaded reactor (IOCP / epoll / kqueue). All
     /// connections multiplexed on one thread. Useful for testing,
     /// low-resource deployments, and single-client workloads where
     /// CPU parallelism is not needed.
-    Reactor = 1,
+    Reactor = 2,
 };
 
 /// All runtime configuration. POD-like value type; built once from CLI
@@ -53,7 +60,8 @@ struct Config
     std::size_t storageMaxValueBytes { 1 * 1024 * 1024 };
 
     /// Worker thread count for Threaded mode. 0 means "use
-    /// std::thread::hardware_concurrency()". Ignored for Reactor mode.
+    /// std::thread::hardware_concurrency()". Ignored when the
+    /// resolved execution model is Reactor.
     std::size_t workerThreads { 0 };
 
     /// Number of storage shards. 1 means "do not shard" (preserves
@@ -94,8 +102,8 @@ struct Config
     /// storagePath is empty).
     StorageDurability storageDurability { StorageDurability::Batched };
 
-    /// Server threading model. See ThreadingModel docs.
-    ThreadingModel threadingModel { ThreadingModel::Threaded };
+    /// Server execution model. See ExecutionModel docs.
+    ExecutionModel executionModel { ExecutionModel::Auto };
 };
 
 } // namespace FastCache
