@@ -95,7 +95,9 @@ usage: fastcached [options]
                                    auto: reactor for in-memory, threaded for --storage on disk
   --threads=<N>                worker thread count for threaded mode (default: hardware_concurrency)
   --storage-shards=<N>         shard storage into N partitions for write parallelism
-                                   when N>1 and --storage is set, --storage must be a directory
+                                   default 1 (single-file mode) when --storage names a regular
+                                   file or does not yet exist; min(16, hardware_concurrency)
+                                   otherwise. With N>1 and --storage set, --storage is a directory
   --daemon               daemonize (POSIX) / register as Windows service
   --pidfile=<path>       POSIX daemon mode only
   --service-name=<name>  Windows service name (default FastCached)
@@ -183,9 +185,23 @@ read-heavy, well-hashed key space this scales reads linearly across cores.
 ./fastcached --execution-model=reactor --port=11211 &
 ```
 
-`--storage` is interpreted as a regular file when `--storage-shards=1` (the
-single-file mode introduced in the previous release) and as a directory
-holding `shard-NN.cow` files when `--storage-shards>1`.
+`--storage` is interpreted as a regular file when `--storage-shards=1`
+(single-file mode) and as a directory holding `shard-NN.cow` files when
+`--storage-shards>1`. When `--storage-shards` is omitted (its default),
+fastcached infers the mode from the path: a regular file or non-existent
+path → single-file mode (1 shard); an existing directory → multi-shard
+fan-out using `min(16, hardware_concurrency)` shards. This keeps the
+documented `--storage=path.cow` invocation single-file regardless of the
+host's core count.
+
+In threaded execution mode, single-shard storage is still wrapped in a
+`ShardedStorage` decorator (with one shard) so the per-shard mutex
+serialises worker threads against the unprotected backend.
+
+`--storage-durability=none` skips `fsync` entirely. The OS page cache may
+reorder writes against the meta page across a power loss, so crash
+consistency is **not** guaranteed in this mode — use it only when you can
+tolerate losing the cache on an unclean shutdown.
 
 ## YAML config (optional)
 

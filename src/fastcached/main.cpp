@@ -68,23 +68,22 @@ void InstallStopHandlers()
 #endif
 }
 
-/// Merge: CLI flags override YAML for any value explicitly changed from
-/// the default. Same simple heuristic the MVP shipped with. The full
-/// CliResult is passed (not just the Config) so flags whose default is
-/// itself a meaningful user-visible value — like `--execution-model=auto`
-/// — can override a non-default YAML value when the user typed them
-/// explicitly.
+/// Merge CLI flags into the YAML-loaded Config. A CLI value overrides
+/// the file value when the corresponding flag was explicitly passed —
+/// driven by the per-flag "explicit" booleans on `CliResult`, not by
+/// value comparison against the default. The latter would silently
+/// drop `--threads=0` / `--storage-shards=0` / `--storage-durability=batched`
+/// / any other typed value that matches the field's default.
 FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& cli)
 {
     auto const& cliCfg = cli.config;
-    FastCache::Config defaults;
-    if (cliCfg.bindAddress != defaults.bindAddress)
+    if (cli.bindAddressExplicit)
         fileCfg.bindAddress = cliCfg.bindAddress;
-    if (cliCfg.port != defaults.port)
+    if (cli.portExplicit)
         fileCfg.port = cliCfg.port;
-    if (cliCfg.maxMemoryBytes != defaults.maxMemoryBytes)
+    if (cli.maxMemoryBytesExplicit)
         fileCfg.maxMemoryBytes = cliCfg.maxMemoryBytes;
-    if (cliCfg.logLevel != defaults.logLevel)
+    if (cli.logLevelExplicit)
         fileCfg.logLevel = cliCfg.logLevel;
     if (!cliCfg.configPath.empty())
         fileCfg.configPath = cliCfg.configPath;
@@ -92,32 +91,55 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         fileCfg.daemon = true;
     if (!cliCfg.pidfile.empty())
         fileCfg.pidfile = cliCfg.pidfile;
-    if (cliCfg.serviceName != defaults.serviceName)
+    if (cliCfg.serviceName != FastCache::Config {}.serviceName)
         fileCfg.serviceName = cliCfg.serviceName;
-    if (!cliCfg.storagePath.empty())
+    if (cli.storagePathExplicit)
         fileCfg.storagePath = cliCfg.storagePath;
-    if (cliCfg.storageDurability != defaults.storageDurability)
+    if (cli.storageDurabilityExplicit)
         fileCfg.storageDurability = cliCfg.storageDurability;
-    if (cliCfg.storageMaxValueBytes != defaults.storageMaxValueBytes)
+    if (cli.storageMaxValueBytesExplicit)
         fileCfg.storageMaxValueBytes = cliCfg.storageMaxValueBytes;
     if (cli.executionModelExplicit)
         fileCfg.executionModel = cliCfg.executionModel;
-    if (cliCfg.workerThreads != defaults.workerThreads)
+    if (cli.workerThreadsExplicit)
         fileCfg.workerThreads = cliCfg.workerThreads;
-    if (cliCfg.storageShards != defaults.storageShards)
+    if (cli.storageShardsExplicit)
         fileCfg.storageShards = cliCfg.storageShards;
     return fileCfg;
 }
 
 /// Pick a default shard count when the user left it at 0 (auto):
 /// min(16, hardware_concurrency), floor of 1.
-[[nodiscard]] std::size_t ResolveShardCount(std::size_t requested) noexcept
+[[nodiscard]] std::size_t AutoShardCount() noexcept
 {
-    if (requested != 0)
-        return requested;
     auto const hw = std::thread::hardware_concurrency();
     auto const cap = std::min<unsigned>(hw == 0 ? 1U : hw, 16U);
     return static_cast<std::size_t>(cap);
+}
+
+/// Resolve the effective shard count.
+///
+/// - User-specified non-zero: honored verbatim.
+/// - Auto (0) for in-memory: fan out (`AutoShardCount`) so threaded mode
+///   gets parallelism without the user opting in.
+/// - Auto (0) for persistent: defaults to **single-file mode** (1
+///   shard). The README documents `--storage=<path>` as a single file;
+///   inferring a multi-shard directory from `hardware_concurrency` would
+///   silently `mkdir` over the user's intended file. If the path
+///   already exists as a directory, treat that as the user explicitly
+///   opting into fan-out and pick `AutoShardCount`.
+[[nodiscard]] std::size_t ResolvePhysicalShards(std::size_t requested,
+                                                bool usingPersistent,
+                                                std::filesystem::path const& storagePath) noexcept
+{
+    if (requested != 0)
+        return requested;
+    if (!usingPersistent)
+        return AutoShardCount();
+    std::error_code ec;
+    if (std::filesystem::is_directory(storagePath, ec))
+        return AutoShardCount();
+    return 1;
 }
 
 /// Resolve `ExecutionModel::Auto` to a concrete model based on the
@@ -159,104 +181,110 @@ int DaemonBody(FastCache::Config const& effective)
 
     // ----- storage factory ---------------------------------------------------
     //
-    // Possible shapes:
+    // Possible physical shapes:
     //   - In-memory, single shard: one InMemoryLruStorage holds everything.
-    //   - In-memory, N shards: N InMemoryLruStorage wrapped in a ShardedStorage.
-    //   - Persistent, single shard: one CowTreeStorage at effective.storagePath
-    //     (the file). Matches PR #10's contract.
+    //   - In-memory, N shards: N InMemoryLruStorage instances.
+    //   - Persistent, single shard: one CowTreeStorage at the path.
     //   - Persistent, N shards: N CowTreeStorage instances at
     //     <storagePath>/shard-NN.cow inside the directory.
     //
-    // The shard count is `--storage-shards` (0 = auto).
+    // Concurrency wrapping (orthogonal to physical fan-out):
+    //   - Threaded execution: always wrap in ShardedStorage (even at
+    //     shards==1) so workers serialise via the per-shard mutex.
+    //     Without this, single-shard CowTreeStorage / InMemoryLruStorage
+    //     race on _index/_lru/_bytesUsed under the thread pool.
+    //   - Reactor execution: single-shard backends run unwrapped; the
+    //     reactor is single-threaded so no wrapper is needed.
 
-    auto const shardCount = ResolveShardCount(effective.storageShards);
     auto const usingPersistent = !effective.storagePath.empty();
-    auto const useSharding = shardCount > 1;
+    auto const resolvedExecutionModel = ResolveExecutionModel(effective.executionModel, usingPersistent);
+    auto const physicalShards = ResolvePhysicalShards(effective.storageShards, usingPersistent, effective.storagePath);
+    auto const useShardingWrapper =
+        physicalShards > 1 || resolvedExecutionModel == FastCache::ExecutionModel::Threaded;
 
     std::unique_ptr<FastCache::IStorage> backend;
     FastCache::InMemoryLruStorage* singleMemBackend = nullptr;
     FastCache::CowTreeStorage* singleDiskBackend = nullptr;
     FastCache::ShardedStorage* shardedBackend = nullptr;
 
-    if (!useSharding)
+    // 1. Build the physical inner storage(s).
+    std::vector<std::unique_ptr<FastCache::IStorage>> inners;
+    inners.reserve(physicalShards);
+
+    auto const perShardBytes = physicalShards > 0 ? effective.maxMemoryBytes / physicalShards : effective.maxMemoryBytes;
+
+    if (!usingPersistent)
     {
-        // Single shard — preserves the pre-sharding behaviour.
-        if (!usingPersistent)
+        for (std::size_t i = 0; i < physicalShards; ++i)
+            inners.emplace_back(std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes));
+    }
+    else if (physicalShards == 1)
+    {
+        // Single-file mode. The README's documented invocation.
+        FastCache::CowTreeStorage::Options opts;
+        opts.path = effective.storagePath;
+        opts.maxBytes = effective.maxMemoryBytes;
+        opts.durability = ToPageStoreDurability(effective.storageDurability);
+        opts.maxValueBytes = effective.storageMaxValueBytes;
+        auto opened = FastCache::CowTreeStorage::Open(opts);
+        if (!opened.has_value())
         {
-            auto mem = std::make_unique<FastCache::InMemoryLruStorage>(effective.maxMemoryBytes);
-            singleMemBackend = mem.get();
-            backend = std::move(mem);
+            logger.Logf(FastCache::LogLevel::Fatal,
+                        "failed to open storage '{}': {}",
+                        effective.storagePath,
+                        opened.error().ToString());
+            return EXIT_FAILURE;
         }
-        else
+        inners.push_back(std::move(*opened));
+    }
+    else
+    {
+        // Multi-shard persistent: storagePath is a directory of shard-NN.cow files.
+        std::filesystem::path const dir { effective.storagePath };
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec)
+        {
+            logger.Logf(FastCache::LogLevel::Fatal,
+                        "failed to create storage directory '{}': {}",
+                        effective.storagePath,
+                        ec.message());
+            return EXIT_FAILURE;
+        }
+        for (std::size_t i = 0; i < physicalShards; ++i)
         {
             FastCache::CowTreeStorage::Options opts;
-            opts.path = effective.storagePath;
-            opts.maxBytes = effective.maxMemoryBytes;
+            opts.path = dir / std::format("shard-{:02d}.cow", i);
+            opts.maxBytes = perShardBytes;
             opts.durability = ToPageStoreDurability(effective.storageDurability);
             opts.maxValueBytes = effective.storageMaxValueBytes;
             auto opened = FastCache::CowTreeStorage::Open(opts);
             if (!opened.has_value())
             {
                 logger.Logf(FastCache::LogLevel::Fatal,
-                            "failed to open storage '{}': {}",
-                            effective.storagePath,
+                            "failed to open shard '{}': {}",
+                            opts.path.string(),
                             opened.error().ToString());
                 return EXIT_FAILURE;
             }
-            singleDiskBackend = opened->get();
-            backend = std::move(*opened);
+            inners.push_back(std::move(*opened));
         }
+    }
+
+    // 2. Either wrap in ShardedStorage or hand out the single inner.
+    if (useShardingWrapper)
+    {
+        auto sharded = std::make_unique<FastCache::ShardedStorage>(std::move(inners));
+        shardedBackend = sharded.get();
+        backend = std::move(sharded);
     }
     else
     {
-        // Sharded — split the memory budget evenly across shards.
-        auto const perShardBytes = effective.maxMemoryBytes / shardCount;
-        std::vector<std::unique_ptr<FastCache::IStorage>> shards;
-        shards.reserve(shardCount);
-
         if (!usingPersistent)
-        {
-            for (std::size_t i = 0; i < shardCount; ++i)
-                shards.emplace_back(std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes));
-        }
+            singleMemBackend = static_cast<FastCache::InMemoryLruStorage*>(inners.front().get());
         else
-        {
-            // Treat the path as a directory; create it if missing.
-            std::filesystem::path const dir { effective.storagePath };
-            std::error_code ec;
-            std::filesystem::create_directories(dir, ec);
-            if (ec)
-            {
-                logger.Logf(FastCache::LogLevel::Fatal,
-                            "failed to create storage directory '{}': {}",
-                            effective.storagePath,
-                            ec.message());
-                return EXIT_FAILURE;
-            }
-
-            for (std::size_t i = 0; i < shardCount; ++i)
-            {
-                FastCache::CowTreeStorage::Options opts;
-                opts.path = dir / std::format("shard-{:02d}.cow", i);
-                opts.maxBytes = perShardBytes;
-                opts.durability = ToPageStoreDurability(effective.storageDurability);
-                opts.maxValueBytes = effective.storageMaxValueBytes;
-                auto opened = FastCache::CowTreeStorage::Open(opts);
-                if (!opened.has_value())
-                {
-                    logger.Logf(FastCache::LogLevel::Fatal,
-                                "failed to open shard '{}': {}",
-                                opts.path.string(),
-                                opened.error().ToString());
-                    return EXIT_FAILURE;
-                }
-                shards.push_back(std::move(*opened));
-            }
-        }
-
-        auto sharded = std::make_unique<FastCache::ShardedStorage>(std::move(shards));
-        shardedBackend = sharded.get();
-        backend = std::move(sharded);
+            singleDiskBackend = static_cast<FastCache::CowTreeStorage*>(inners.front().get());
+        backend = std::move(inners.front());
     }
 
     // Optionally wrap in TracingStorage when trace logging is requested.
@@ -293,7 +321,6 @@ int DaemonBody(FastCache::Config const& effective)
         }
         return std::string_view { "?" };
     }();
-    auto const resolvedExecutionModel = ResolveExecutionModel(effective.executionModel, usingPersistent);
     auto const executionName = (resolvedExecutionModel == FastCache::ExecutionModel::Threaded)
                                    ? std::string_view { "threaded" }
                                    : std::string_view { "reactor" };
@@ -303,9 +330,11 @@ int DaemonBody(FastCache::Config const& effective)
     auto const executionAnnotation = (effective.executionModel == FastCache::ExecutionModel::Auto)
                                          ? std::string_view { " (auto)" }
                                          : std::string_view {};
+    auto const shardingMode =
+        useShardingWrapper ? std::string_view { "" } : std::string_view { " (unwrapped)" };
     logger.Logf(FastCache::LogLevel::Info,
                 "fastcached {} starting; bind={}:{} max-memory={} config={} storage={} "
-                "durability={} max-value={} execution={}{} shards={}",
+                "durability={} max-value={} execution={}{} shards={}{}",
                 ProgramVersion,
                 effective.bindAddress,
                 effective.port,
@@ -317,7 +346,8 @@ int DaemonBody(FastCache::Config const& effective)
                 FastCache::FormatByteSize(effective.storageMaxValueBytes),
                 executionName,
                 executionAnnotation,
-                shardCount);
+                physicalShards,
+                shardingMode);
 
     InstallStopHandlers();
     logger.Log(FastCache::LogLevel::Info, "ready, accepting connections");
