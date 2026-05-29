@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 
 namespace FastCache
@@ -199,20 +200,26 @@ namespace
             return ArgOutcome::Continue;
         }
 
-        // String-valued flags.
-        for (auto const& [name, target]: std::initializer_list<std::pair<std::string_view, std::string*>> {
-                 { "--config", &cfg.configPath },
-                 { "--bind", &cfg.bindAddress },
-                 { "--pidfile", &cfg.pidfile },
-                 { "--service-name", &cfg.serviceName },
-                 { "--storage", &cfg.storagePath },
+        // String-valued flags. Each match flips an "explicit" bool so
+        // Merge can override YAML even when the typed value happens to
+        // equal the field's default.
+        for (auto const& [name, target, seenPtr]: std::initializer_list<std::tuple<std::string_view, std::string*, bool*>> {
+                 { "--config", &cfg.configPath, nullptr },
+                 { "--bind", &cfg.bindAddress, &result.bindAddressExplicit },
+                 { "--pidfile", &cfg.pidfile, nullptr },
+                 { "--service-name", &cfg.serviceName, nullptr },
+                 { "--storage", &cfg.storagePath, &result.storagePathExplicit },
              })
         {
             auto const matched = ApplyStringFlag(args, i, name, *target);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                if (seenPtr != nullptr)
+                    *seenPtr = true;
                 return ArgOutcome::Continue;
+            }
         }
 
         // Typed flags.
@@ -221,21 +228,30 @@ namespace
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.portExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         {
             auto const matched = ApplyParsedFlag(args, i, "--max-memory", ParseMaxMemory, cfg.maxMemoryBytes);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.maxMemoryBytesExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         {
             auto const matched = ApplyParsedFlag(args, i, "--log-level", ParseLogLevel, cfg.logLevel);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.logLevelExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         {
             auto const matched =
@@ -243,7 +259,10 @@ namespace
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.storageDurabilityExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         {
             auto const matched =
@@ -251,7 +270,10 @@ namespace
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.storageMaxValueBytesExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         {
             auto const matched = ApplyParsedFlag(args, i, "--execution-model", ParseExecutionModel, cfg.executionModel);
@@ -268,14 +290,20 @@ namespace
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.workerThreadsExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         {
             auto const matched = ApplyParsedFlag(args, i, "--storage-shards", ParseStorageShards, cfg.storageShards);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.storageShardsExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         return ArgOutcome::Unknown;
     }
@@ -297,6 +325,8 @@ std::string_view CliUsage() noexcept
            "                                   auto: reactor for in-memory, threaded for --storage on disk\n"
            "  --threads=<N>                worker thread count for threaded mode (default: hardware_concurrency)\n"
            "  --storage-shards=<N>         shard storage into N partitions for write parallelism\n"
+           "                                   default: 1 (single-file mode) when --storage names a regular file,\n"
+           "                                   min(16, hardware_concurrency) otherwise;\n"
            "                                   when N>1 and --storage is set, --storage must be a directory\n"
            "  --daemon               daemonize (POSIX) / register as Windows service\n"
            "  --pidfile=<path>       POSIX daemon mode only\n"

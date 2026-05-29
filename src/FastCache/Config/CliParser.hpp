@@ -26,11 +26,23 @@ struct CliResult
     CliOutcome outcome { CliOutcome::Run };
     Config config {};
 
-    /// True iff `--execution-model` appeared on the CLI. Lets the Merge
-    /// step distinguish "user explicitly asked for the default (`auto`)"
-    /// from "user did not pass the flag", so an explicit `auto` on the
-    /// CLI can override a non-auto value in the YAML config.
+    /// Per-flag "user typed this on the CLI" trackers. Without these,
+    /// a user-typed value that happens to equal the field's default
+    /// (`--threads=0`, `--storage-shards=0`, `--storage-durability=batched`,
+    /// `--storage-max-value=1m`, ...) would be indistinguishable from
+    /// "flag not given" in the Merge step, so the YAML value would
+    /// silently win. Each handler in `ParseCli` sets the matching
+    /// bool when the flag appears in argv.
+    bool bindAddressExplicit { false };
+    bool portExplicit { false };
+    bool maxMemoryBytesExplicit { false };
+    bool logLevelExplicit { false };
+    bool storagePathExplicit { false };
+    bool storageDurabilityExplicit { false };
+    bool storageMaxValueBytesExplicit { false };
     bool executionModelExplicit { false };
+    bool workerThreadsExplicit { false };
+    bool storageShardsExplicit { false };
 };
 
 /// Parse `argv[1..argc-1]` into a Config. Returns ConfigError on bad input.
