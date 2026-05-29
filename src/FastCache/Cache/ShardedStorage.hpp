@@ -22,18 +22,18 @@ namespace FastCache
 /// IStorage that fans every call across N inner shards by `std::hash(key)`.
 ///
 /// Each shard is itself an IStorage and is owned by this object. A
-/// `std::shared_mutex` per shard provides reader/writer separation:
+/// `std::shared_mutex` per shard provides per-shard serialisation:
 ///
-/// - Read operations (`Get`, `Snapshot`, `PurgeExpired`) take a *shared*
-///   lock on the relevant shard. Any number of threads may read the same
-///   shard simultaneously without blocking each other.
-/// - Mutation operations (`Set`, `Add`, `Replace`, `Append`, `Prepend`,
-///   `CompareAndSwap`, `IncrementOrInitialize`, `Delete`,
-///   `FlushWithGeneration`) take an *exclusive* lock and serialise with
-///   other writers and concurrent readers on the same shard.
-/// - A write to shard N never blocks any operation on a different shard,
+/// - Every call into a shard's storage takes an *exclusive* lock on the
+///   relevant shard. The wrapped backends (InMemoryLruStorage,
+///   CowTreeStorage) mutate state on `Get` and `Snapshot` too (LRU
+///   ordering, stats counters, mutable `_stats` member), so a shared
+///   lock would race concurrent same-shard operations.
+/// - A call to shard N never blocks any operation on a different shard,
 ///   so distinct keys distributed across shards run in parallel on up to
-///   `shards.size()` cores at once.
+///   `shards.size()` cores at once. The shared_mutex type is retained
+///   in case a future split of Get into Lookup + deferred-promote
+///   recovers read parallelism on a single shard.
 ///
 /// Sharding is purely by key, which the cache engine maps to a single
 /// shard for each operation. Operations that cross shards by definition

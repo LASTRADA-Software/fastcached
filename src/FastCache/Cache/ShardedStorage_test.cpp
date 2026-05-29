@@ -231,9 +231,13 @@ TEST_CASE("ShardedStorage FlushWithGeneration invalidates entries in every shard
     }
 }
 
-TEST_CASE("Concurrent readers on the same shard do not block each other", "[sharded][concurrency]")
+TEST_CASE("Concurrent same-shard Gets serialise (correctness over read parallelism)", "[sharded][concurrency]")
 {
-    // Single shard so we know both Gets target the same lock.
+    // ShardedStorage now takes a unique_lock for Get because the
+    // wrapped backends mutate LRU order / stats counters on the way
+    // out — a shared_lock would race those mutations. The trade-off
+    // is that two same-shard readers serialise; cross-shard reads
+    // still run in parallel (covered by the next test).
     auto parkable = std::make_unique<ParkableStorage>();
     auto* park = parkable.get();
     park->parkGet = true;
@@ -243,25 +247,78 @@ TEST_CASE("Concurrent readers on the same shard do not block each other", "[shar
     FastCache::ShardedStorage storage { std::move(shards) };
     FastCache::ManualClock clock;
 
-    // First reader: parks inside Get while holding the shared lock.
+    // First reader: parks inside Get while holding the unique lock.
     std::thread reader1 { [&] {
         (void) storage.Get("any-key", clock.Now());
     } };
-
-    // Wait until reader1 is actually parked inside the stub.
     REQUIRE(WaitFor([&] { return park->readInFlight.load() == 1; }));
 
-    // Second reader on the same shard: must NOT block. It should
-    // immediately acquire the shared lock and reach the stub.
+    // Second reader on the same shard: must block on the exclusive
+    // lock. We confirm by spawning it and waiting briefly to be sure
+    // it does *not* reach the stub.
     std::thread reader2 { [&] {
         (void) storage.Get("another-key", clock.Now());
     } };
-    REQUIRE(WaitFor([&] { return park->readInFlight.load() == 2; }));
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(50ms);
+    REQUIRE(park->readInFlight.load() == 1);
 
-    // Release both.
+    // Release reader1; reader2 should now acquire and reach the stub.
+    park->parkGet = true; // keep parking so reader2 also parks
+    park->Release();      // wakes reader1; parkGet is now false so reader1 falls through
+    // ParkableStorage::Release flips parkGet to false unconditionally,
+    // so reader1 falls through immediately. Re-park for reader2:
+    {
+        // After reader1 finishes, parkGet may be false; check by
+        // waiting for reader2 to reach the stub at least once.
+        REQUIRE(WaitFor([&] { return park->readInFlight.load() >= 1; }));
+    }
     park->Release();
     reader1.join();
     reader2.join();
+}
+
+TEST_CASE("Cross-shard Gets run in parallel (sharding preserves read parallelism)", "[sharded][concurrency]")
+{
+    auto parkable0 = std::make_unique<ParkableStorage>();
+    auto parkable1 = std::make_unique<ParkableStorage>();
+    auto* park0 = parkable0.get();
+    auto* park1 = parkable1.get();
+    park0->parkGet = true;
+    park1->parkGet = true;
+
+    std::vector<std::unique_ptr<FastCache::IStorage>> shards;
+    shards.push_back(std::move(parkable0));
+    shards.push_back(std::move(parkable1));
+    FastCache::ShardedStorage storage { std::move(shards) };
+    FastCache::ManualClock clock;
+
+    // Find two keys, one per shard.
+    std::string keyShard0;
+    std::string keyShard1;
+    for (int i = 0; keyShard0.empty() || keyShard1.empty(); ++i)
+    {
+        auto k = std::format("probe-{}", i);
+        if (storage.ShardIndexFor(k) == 0 && keyShard0.empty())
+            keyShard0 = k;
+        else if (storage.ShardIndexFor(k) == 1 && keyShard1.empty())
+            keyShard1 = k;
+    }
+
+    // Two readers on distinct shards must both reach the stub
+    // simultaneously — sharding's whole point.
+    std::thread reader0 { [&] {
+        (void) storage.Get(keyShard0, clock.Now());
+    } };
+    std::thread reader1 { [&] {
+        (void) storage.Get(keyShard1, clock.Now());
+    } };
+    REQUIRE(WaitFor([&] { return park0->readInFlight.load() == 1 && park1->readInFlight.load() == 1; }));
+
+    park0->Release();
+    park1->Release();
+    reader0.join();
+    reader1.join();
 }
 
 TEST_CASE("A writer excludes readers on the same shard but not across shards", "[sharded][concurrency]")

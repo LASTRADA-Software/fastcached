@@ -34,8 +34,13 @@ std::size_t ShardedStorage::ShardIndexFor(std::string_view key) const noexcept
 
 std::expected<GetResult, StorageError> ShardedStorage::Get(std::string_view key, TimePoint now)
 {
+    // Get is *not* a pure read on the wrapped storage: both InMemory
+    // and CowTree backends mutate LRU order and stats counters on the
+    // way out. Taking a unique_lock here is the minimum-surface fix
+    // for the data race; splitting Get into Lookup + deferred-promote
+    // is the longer-term path to recover read parallelism.
     auto& shard = *_shards[ShardIndexFor(key)];
-    std::shared_lock const lock { shard.mu };
+    std::unique_lock const lock { shard.mu };
     return shard.storage->Get(key, now);
 }
 
@@ -135,10 +140,15 @@ std::size_t ShardedStorage::PurgeExpired(TimePoint now)
 
 StorageStats ShardedStorage::Snapshot() const noexcept
 {
+    // CowTreeStorage::Snapshot writes its `mutable _stats` member, so
+    // a shared_lock here would race two concurrent Snapshot calls and
+    // race a concurrent Get's bump of cmdGet/getHits/getMisses on the
+    // same shard. unique_lock serialises Snapshot per shard; cross-
+    // shard parallelism still holds.
     StorageStats aggregate;
     for (auto const& shard: _shards)
     {
-        std::shared_lock const lock { shard->mu };
+        std::unique_lock const lock { shard->mu };
         auto const s = shard->storage->Snapshot();
         aggregate.itemCount += s.itemCount;
         aggregate.bytesUsed += s.bytesUsed;
