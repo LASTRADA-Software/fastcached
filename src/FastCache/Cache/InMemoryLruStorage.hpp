@@ -80,6 +80,19 @@ class InMemoryLruStorage final: public IStorage
     /// SIGHUP. Triggers eviction until under the new budget.
     void Resize(std::size_t newMaxBytes);
 
+    /// Insert / overwrite an entry verbatim, preserving its `cas`, `flags`,
+    /// `expiry`, and `generation` exactly as supplied — no fresh CAS token
+    /// is issued. Used by `LayeredStorage` to mirror an entry observed in a
+    /// lower tier (canonical CAS) into the in-memory cache. Promotes to the
+    /// LRU front, updates `_bytesUsed`, and triggers eviction-to-fit.
+    /// @param key   Insertion key.
+    /// @param entry Source-of-truth CacheEntry to store as-is.
+    void InsertVerbatim(std::string_view key, CacheEntry entry);
+
+    /// Drop the entry under `key` if present. No error if absent. Used by
+    /// `LayeredStorage` to keep the L1 mirror in sync with an L2 delete.
+    void EraseIfPresent(std::string_view key);
+
   private:
     struct Node
     {

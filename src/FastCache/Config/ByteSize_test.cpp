@@ -114,3 +114,24 @@ TEST_CASE("ParseByteSize: bare '%' is TypeMismatch", "[config][bytesize]")
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
 }
+
+TEST_CASE("FormatByteSize: zero bytes is 0B", "[config][bytesize]")
+{
+    REQUIRE(FastCache::FormatByteSize(0) == "0B");
+}
+
+TEST_CASE("FormatByteSize: clean multiples scale up to KB/MB/GB", "[config][bytesize]")
+{
+    REQUIRE(FastCache::FormatByteSize(1024) == "1K");
+    REQUIRE(FastCache::FormatByteSize(4 * 1024) == "4K");
+    REQUIRE(FastCache::FormatByteSize(1024 * 1024) == "1M");
+    REQUIRE(FastCache::FormatByteSize(64 * 1024 * 1024) == "64M");
+    REQUIRE(FastCache::FormatByteSize(2ULL * 1024 * 1024 * 1024) == "2G");
+}
+
+TEST_CASE("FormatByteSize: non-clean values fall back to bytes", "[config][bytesize]")
+{
+    REQUIRE(FastCache::FormatByteSize(1) == "1B");
+    REQUIRE(FastCache::FormatByteSize(1025) == "1025B");
+    REQUIRE(FastCache::FormatByteSize(1024 * 1024 + 1) == "1048577B");
+}

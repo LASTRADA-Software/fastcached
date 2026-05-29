@@ -9,8 +9,11 @@ target_sources(FastCache
         Async/KqueueReactor.cpp
         Async/TestReactor.cpp
         Cache/CacheEngine.cpp
-        Cache/DiskStorage.cpp
+        Cache/CowTreeStorage.cpp
         Cache/InMemoryLruStorage.cpp
+        Cache/LayeredStorage.cpp
+        Cache/ShardedStorage.cpp
+        Cache/TracingStorage.cpp
         Config/ByteSize.cpp
         Config/CliParser.cpp
         Config/ConfigReloader.cpp
@@ -34,6 +37,7 @@ target_sources(FastCache
         Protocol/RedisResp.cpp
         Server/BlockingServerLoop.cpp
         Server/Connection.cpp
+        Server/PooledServerLoop.cpp
         Server/ReactorServerLoop.cpp
         Server/Server.cpp
 )

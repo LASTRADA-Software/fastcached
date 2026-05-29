@@ -111,4 +111,19 @@ std::expected<std::size_t, ConfigError> ParseByteSize(std::string_view sv,
     return static_cast<std::size_t>(product);
 }
 
+std::string FormatByteSize(std::size_t bytes)
+{
+    constexpr std::size_t KiB = 1024;
+    constexpr std::size_t MiB = 1024 * KiB;
+    constexpr std::size_t GiB = 1024 * MiB;
+
+    if (bytes >= GiB && bytes % GiB == 0)
+        return std::format("{}G", bytes / GiB);
+    if (bytes >= MiB && bytes % MiB == 0)
+        return std::format("{}M", bytes / MiB);
+    if (bytes >= KiB && bytes % KiB == 0)
+        return std::format("{}K", bytes / KiB);
+    return std::format("{}B", bytes);
+}
+
 } // namespace FastCache

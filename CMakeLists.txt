@@ -82,6 +82,20 @@ include(Sanitizers)
 include(ClangTidy)
 
 # ----------------------------------------------------------------------------
+# Test wiring is enabled early so all subdirectories (CowTree, FastCache,
+# src/tests) can register their CTest test executables via
+# catch_discover_tests().
+
+if(FASTCACHED_BUILD_TESTS)
+    enable_testing()
+endif()
+
+# ----------------------------------------------------------------------------
+# Sibling libraries (no dependency on FastCache).
+
+add_subdirectory(src/CowTree)
+
+# ----------------------------------------------------------------------------
 # Library target: all FastCache code lives here (so both the executable and
 # the test binary link it).
 
@@ -92,6 +106,7 @@ target_include_directories(FastCache PUBLIC
 )
 target_compile_features(FastCache PUBLIC cxx_std_23)
 target_link_libraries(FastCache PUBLIC yaml-cpp::yaml-cpp)
+target_link_libraries(FastCache PUBLIC CowTree)
 
 # Substitute the version triple/string into Core/Version.hpp at configure
 # time. The generated header lives under the build dir so it never gets
@@ -123,6 +138,5 @@ target_link_libraries(fastcached PRIVATE FastCache)
 # Tests.
 
 if(FASTCACHED_BUILD_TESTS)
-    enable_testing()
     add_subdirectory(src/tests)
 endif()
