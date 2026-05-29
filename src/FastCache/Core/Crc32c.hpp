@@ -9,7 +9,7 @@ namespace FastCache
 {
 
 /// CRC-32C (Castagnoli polynomial 0x1EDC6F41), bit-reflected, table-based.
-/// Used by DiskStorage to detect torn writes during crash recovery.
+/// Page-level integrity check used by the persistent storage stack.
 class Crc32c
 {
   public:

@@ -10,8 +10,8 @@ target_sources(FastCache
         Async/TestReactor.cpp
         Cache/CacheEngine.cpp
         Cache/CowTreeStorage.cpp
-        Cache/DiskStorage.cpp
         Cache/InMemoryLruStorage.cpp
+        Cache/LayeredStorage.cpp
         Cache/ShardedStorage.cpp
         Cache/TracingStorage.cpp
         Config/ByteSize.cpp
