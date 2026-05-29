@@ -304,15 +304,29 @@ void CowTreeStorage::EvictToFit()
 {
     if (_options.maxBytes == 0)
         return;
-    while (_bytesUsed > _options.maxBytes && !_lru.empty())
+    // Track remaining attempts so a stuck disk (e.g. ENOSPC on every
+    // commit) walks the LRU once and bails rather than spinning. Better
+    // to leave the soft cap violated than to mutate the in-memory mirror
+    // out of sync with the tree on disk.
+    auto remainingAttempts = _lru.size();
+    while (_bytesUsed > _options.maxBytes && !_lru.empty() && remainingAttempts != 0)
     {
         auto victim = std::prev(_lru.end());
-        auto keyCopy = victim->key;
+        auto const keyCopy = victim->key;
+        if (auto const r = EraseEntry(keyCopy); !r.has_value())
+        {
+            // Disk delete failed; rotate the stuck victim out of the
+            // tail so the next iteration tries a different key. Once
+            // every entry has rotated through unsuccessfully we bail.
+            _lru.splice(_lru.begin(), _lru, victim);
+            --remainingAttempts;
+            continue;
+        }
         _bytesUsed -= victim->bytes;
-        _index.erase(victim->key);
+        _index.erase(keyCopy);
         _lru.erase(victim);
-        std::ignore = EraseEntry(keyCopy);
         ++_stats.evictions;
+        remainingAttempts = _lru.size();
     }
 }
 
@@ -330,9 +344,12 @@ std::expected<GetResult, StorageError> CowTreeStorage::Get(std::string_view key,
     auto& entry = (*loaded)->entry;
     if (entry.expiry <= now || entry.generation < _liveGeneration)
     {
-        // Expired or flushed.
-        std::ignore = EraseEntry(key);
-        EraseFromLru(key);
+        // Expired or flushed. Treat as a miss; do NOT mutate the tree
+        // from a read path — under ShardedStorage::Get the caller
+        // holds only a shared_lock, so opening a write transaction
+        // would violate CowTree's single-writer contract and race
+        // concurrent expired-Gets on the same shard. Defer the on-
+        // disk cleanup to PurgeExpired (writer-locked).
         ++_stats.getMisses;
         return GetResult { .found = false, .entry = {} };
     }
@@ -477,7 +494,10 @@ std::expected<IStorage::IncrResult, StorageError> CowTreeStorage::IncrementOrIni
     }
     else
     {
-        auto const sub = static_cast<std::uint64_t>(-delta);
+        // Negating INT64_MIN as a signed int is UB; compute |delta|
+        // via the two-step idiom that the in-memory backend already
+        // uses (see InMemoryLruStorage.cpp). Saturating subtract.
+        auto const sub = static_cast<std::uint64_t>(-(delta + 1)) + 1;
         next = (sub >= current) ? 0U : (current - sub);
     }
     auto const s = std::to_string(next);
@@ -499,8 +519,19 @@ std::expected<void, StorageError> CowTreeStorage::Delete(std::string_view key, T
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
-    if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
+    if (!loaded->has_value())
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
+    auto const& entry = (*loaded)->entry;
+    if (entry.expiry <= now || entry.generation < _liveGeneration)
+    {
+        // The on-disk record is stale (expired or older than the
+        // current flush generation); still clean it up so a subsequent
+        // restart doesn't replay the dead bytes. Caller's view is the
+        // same as if the key was absent — KeyNotFound.
+        std::ignore = EraseEntry(key);
+        EraseFromLru(key);
+        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
+    }
     if (auto const r = EraseEntry(key); !r.has_value())
         return std::unexpected(r.error());
     EraseFromLru(key);
@@ -513,10 +544,46 @@ void CowTreeStorage::FlushWithGeneration(TimePoint effectiveAt)
     _flushEffectiveAt = effectiveAt;
 }
 
-std::size_t CowTreeStorage::PurgeExpired(TimePoint /*now*/)
+std::size_t CowTreeStorage::PurgeExpired(TimePoint now)
 {
-    // No-op for v1; expired entries are purged on Get/Delete/Replace path.
-    return 0;
+    // Walk the LRU mirror, collect keys whose stored entry is expired
+    // or stale-generation, then erase them on disk + drop them from
+    // the mirror. Two-phase to avoid iterator invalidation by
+    // EraseFromLru. Bound to keys present in the mirror — entries on
+    // disk that the LRU does not know about (post-restart, with Replay
+    // a no-op) are reachable only via Get, which the reader-side fix
+    // now leaves alone.
+    std::vector<std::string> victims;
+    victims.reserve(_lru.size());
+    for (auto const& node: _lru)
+    {
+        auto loaded = LoadEntry(node.key);
+        if (!loaded.has_value())
+            continue;
+        if (!loaded->has_value())
+        {
+            // Disk and mirror out of sync — drop the orphan from the
+            // mirror; nothing to erase on disk.
+            victims.push_back(node.key);
+            continue;
+        }
+        auto const& entry = (*loaded)->entry;
+        if (entry.expiry <= now || entry.generation < _liveGeneration)
+            victims.push_back(node.key);
+    }
+    std::size_t purged = 0;
+    for (auto const& key: victims)
+    {
+        auto loaded = LoadEntry(key);
+        if (loaded.has_value() && loaded->has_value())
+        {
+            if (auto const r = EraseEntry(key); !r.has_value())
+                continue;
+        }
+        EraseFromLru(key);
+        ++purged;
+    }
+    return purged;
 }
 
 StorageStats CowTreeStorage::Snapshot() const noexcept
