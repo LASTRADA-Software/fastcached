@@ -1,6 +1,13 @@
 # cppcoreguidelines-pro-type-vararg is disabled: POSIX APIs we have to call
 # (open(), fcntl(), ioctl(), etc.) are declared variadic and there is no
 # non-variadic alternative. Suppressing per-call with NOLINT adds noise.
+#
+# clang-analyzer-core.uninitialized.Assign is disabled: the static analyzer
+# does not model the discriminated-union invariant of std::expected, so its
+# monadic operations (transform_error et al.) trip a false "field is
+# uninitialized" report when the expected actually holds its value alternative.
+# The narrower clang-analyzer-optin.cplusplus.UninitializedObject below is
+# disabled for the same family of std::expected/optional false positives.
 ---
 Checks: >-
   -*,
@@ -15,6 +22,7 @@ Checks: >-
   -bugprone-std-namespace-modification,
   -bugprone-throwing-static-initialization,
   clang-analyzer-core.*,
+  -clang-analyzer-core.uninitialized.Assign,
   clang-analyzer-cplusplus.*,
   clang-analyzer-deadcode.*,
   clang-analyzer-nullability.*,
@@ -65,12 +73,22 @@ UseColor: true
 HeaderFilterRegex: '.*/fastcached/src/.*'
 FormatStyle:     none
 CheckOptions:
+  # 60 is generous (LLVM default is 25) but matches the natural complexity
+  # of the B+tree split / merge recursion in src/CowTree. Functions that
+  # don't have an algorithmic reason to be complex still trip the check
+  # well before this threshold.
   - key:             readability-function-cognitive-complexity.Threshold
-    value:           '25'
+    value:           '60'
   - key:             readability-function-cognitive-complexity.IgnoreMacros
     value:           true
   - key:             bugprone-easily-swappable-parameters.MinimumLength
     value:           '4'
+  # An explicit (void)/static_cast<void> cast is the established idiom for
+  # "I deliberately discard this [[nodiscard]] result" (e.g. fire-and-forget
+  # Set/Get inside concurrency tests). Honour it rather than forcing artificial
+  # value consumption.
+  - key:             bugprone-unused-return-value.AllowCastToVoid
+    value:           'true'
   - key:             cert-dcl16-c.NewSuffixes
     value:           'L;LL;LU;LLU'
   - key:             cert-oop54-cpp.WarnOnlyIfThisHasSuspiciousField

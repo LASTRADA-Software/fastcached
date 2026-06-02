@@ -17,7 +17,7 @@ namespace Detail
 
 #if defined(_WIN32)
     using NativeSocket = std::uintptr_t; // SOCKET on Windows
-    constexpr NativeSocket InvalidSocket = static_cast<NativeSocket>(~0ull);
+    constexpr NativeSocket InvalidSocket = static_cast<NativeSocket>(~0ULL);
 #else
     using NativeSocket = int;
     constexpr NativeSocket InvalidSocket = -1;

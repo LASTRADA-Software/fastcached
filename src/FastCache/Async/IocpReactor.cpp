@@ -84,7 +84,7 @@ void IocpReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
     if (!handle)
         return;
     {
-        std::lock_guard const lock { _timerMutex };
+        std::scoped_lock const lock { _timerMutex };
         _timers.push_back(TimerEntry { .deadline = deadline, .sequence = _nextSequence++, .handle = handle });
         std::ranges::push_heap(_timers, EntryGreater);
     }
@@ -104,7 +104,7 @@ void IocpReactor::FireExpiredTimers()
     auto const now = _clock.Now();
     std::vector<std::coroutine_handle<>> due;
     {
-        std::lock_guard const lock { _timerMutex };
+        std::scoped_lock const lock { _timerMutex };
         while (!_timers.empty() && _timers.front().deadline <= now)
         {
             std::ranges::pop_heap(_timers, EntryGreater);
@@ -126,7 +126,7 @@ void IocpReactor::Run()
     {
         TimePoint nextDeadline;
         {
-            std::lock_guard const lock { _timerMutex };
+            std::scoped_lock const lock { _timerMutex };
             nextDeadline = _timers.empty() ? TimePoint::max() : _timers.front().deadline;
         }
         auto const now = _clock.Now();
