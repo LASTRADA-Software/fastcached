@@ -5,38 +5,39 @@
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
-#include <FastCache/Core/StringHash.hpp>
+#include <FastCache/Core/Logger.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
-#include <functional>
-#include <list>
+#include <format>
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace FastCache
 {
 
-/// In-memory LRU storage. Single-threaded by contract — a reactor instance
-/// owns one storage and is the only thread that touches it. CAS and
-/// generation logic live here so the cache engine never has to re-derive
-/// them.
+/// IStorage decorator that emits one Trace log line per call describing
+/// the verb, key, outcome, and latency.
 ///
-/// Byte budget: bytesUsed = sum of value.size() across live entries. When
-/// an insert/replace would push bytesUsed above maxBytes, the LRU tail is
-/// evicted until under budget. The key string and per-entry overhead are
-/// not counted — the budget is approximate.
-class InMemoryLruStorage final: public IStorage
+/// All calls are forwarded to an inner IStorage; this class adds no
+/// semantic behavior of its own. When the logger's `MinLevel()` is
+/// above Trace, the only overhead is one atomic load per call plus the
+/// (already cheap) clock read. The boilerplate that would otherwise
+/// have to be copy-pasted across all eleven IStorage methods is
+/// confined to a single templated `TraceCall` helper.
+class TracingStorage final: public IStorage
 {
   public:
-    /// Construct with the given byte budget. `maxBytes == 0` disables
-    /// eviction entirely (useful for unit tests).
-    /// @param maxBytes Soft cap on total value bytes.
-    explicit InMemoryLruStorage(std::size_t maxBytes = 0) noexcept;
+    /// Construct over an inner storage, logger, and clock.
+    /// @param inner  Backing storage; non-owning reference, must outlive *this.
+    /// @param logger Sink for trace lines.
+    /// @param clock  Source for the latency anchor (injected for tests).
+    TracingStorage(IStorage& inner, ILogger& logger, IClock& clock) noexcept;
 
     [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key, TimePoint now) override;
 
@@ -74,52 +75,37 @@ class InMemoryLruStorage final: public IStorage
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;
-
+    void Resize(std::size_t newMaxBytes) override;
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
 
-    /// Reconfigure the byte budget at runtime. Used by ConfigReloader on
-    /// SIGHUP. Triggers eviction until under the new budget.
-    void Resize(std::size_t newMaxBytes) override;
-
   private:
-    struct Node
+    IStorage& _inner;
+    ILogger& _logger;
+    IClock& _clock;
+
+    /// Single point of truth for the trace-line shape.
+    ///
+    /// Invokes `op`, then (when trace is on) computes latency and emits
+    /// a log line `storage: <verb> key=<key> result=<fmt(result)> took=<us>us`.
+    /// Returns whatever `op` returned unchanged.
+    template <class Op, class OutcomeFmt>
+    auto TraceCall(std::string_view verb, std::string_view key, Op&& op, OutcomeFmt&& fmt) -> decltype(op())
     {
-        std::string key;
-        CacheEntry entry;
-    };
-
-    using LruList = std::list<Node>;
-    using Iterator = LruList::iterator;
-
-    /// Return iterator to the (non-expired, current-generation) entry, or
-    /// end() on miss. Mutates the LRU on hits (moves to front).
-    Iterator FindAlive(std::string_view key, TimePoint now);
-
-    /// Insert a new entry; evicts as needed to stay under the byte budget.
-    /// @return CAS token of the inserted entry.
-    CasToken InsertNew(std::string key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry);
-
-    /// Mutate the existing entry in-place; updates byte accounting and
-    /// promotes the entry to the front of the LRU. Bumps CAS.
-    /// @return New CAS token.
-    CasToken MutateExisting(Iterator it, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry);
-
-    /// Evict from the LRU tail until bytesUsed <= maxBytes.
-    void EvictToFit();
-
-    /// Erase the entry pointed at by `it`. Updates accounting and stats.
-    void EraseAt(Iterator it);
-
-    std::size_t _maxBytes;
-    std::size_t _bytesUsed { 0 };
-    std::uint64_t _liveGeneration { 1 };
-    TimePoint _flushEffectiveAt { TimePoint::min() };
-    CasToken _nextCas { 1 };
-
-    LruList _lru;
-    std::unordered_map<std::string, Iterator, TransparentStringHash, std::equal_to<>> _index;
-
-    mutable StorageStats _stats;
+        bool const traceOn = _logger.MinLevel() <= LogLevel::Trace;
+        auto const startedAt = _clock.Now();
+        auto result = std::forward<Op>(op)();
+        if (traceOn)
+        {
+            auto const took = _clock.Now() - startedAt;
+            _logger.Logf(LogLevel::Trace,
+                         "storage: {} key={} result={} took={}us",
+                         verb,
+                         key,
+                         std::forward<OutcomeFmt>(fmt)(result),
+                         std::chrono::duration_cast<std::chrono::microseconds>(took).count());
+        }
+        return result;
+    }
 };
 
 } // namespace FastCache

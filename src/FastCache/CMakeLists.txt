@@ -9,8 +9,9 @@ target_sources(FastCache
         Async/KqueueReactor.cpp
         Async/TestReactor.cpp
         Cache/CacheEngine.cpp
-        Cache/DiskStorage.cpp
+        Cache/CowTreeStorage.cpp
         Cache/InMemoryLruStorage.cpp
+        Cache/TracingStorage.cpp
         Config/ByteSize.cpp
         Config/CliParser.cpp
         Config/ConfigReloader.cpp
@@ -51,6 +52,7 @@ target_sources(FastCache
             Core/Errors/ConfigError.hpp
             Core/Bytes.hpp
             Core/Endian.hpp
+            Core/StringHash.hpp
             Core/Clock.hpp
             Core/Logger.hpp
             Core/BufferPool.hpp

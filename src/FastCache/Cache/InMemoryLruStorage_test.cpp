@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Cache/StorageTestUtils.hpp>
 #include <FastCache/Core/Clock.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -10,29 +11,8 @@
 #include <vector>
 
 using namespace std::chrono_literals;
-
-namespace
-{
-
-std::vector<std::byte> MakeBytes(std::string_view text)
-{
-    std::vector<std::byte> bytes;
-    bytes.reserve(text.size());
-    for (auto const c: text)
-        bytes.push_back(static_cast<std::byte>(c));
-    return bytes;
-}
-
-std::string Decode(std::span<std::byte const> bytes)
-{
-    std::string out;
-    out.reserve(bytes.size());
-    for (auto const b: bytes)
-        out.push_back(static_cast<char>(b));
-    return out;
-}
-
-} // namespace
+using FastCache::Testing::Decode;
+using FastCache::Testing::MakeBytes;
 
 TEST_CASE("InMemoryLruStorage Get miss returns found=false", "[cache]")
 {
