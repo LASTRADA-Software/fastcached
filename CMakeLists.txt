@@ -17,6 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_COLOR_DIAGNOSTICS ON)
 
 # ----------------------------------------------------------------------------
 # Project-wide options
@@ -72,6 +73,20 @@ if(FASTCACHED_BUILD_TESTS)
         GITHUB_REPOSITORY catchorg/Catch2
         VERSION 3.6.0
     )
+
+    # Locate the directory shipping Catch.cmake (providing catch_discover_tests)
+    # and put it on CMAKE_MODULE_PATH so every test subdirectory can simply
+    # include(Catch). Catch2 reaches us by one of two routes:
+    #   * CPM source build  -> helpers live in ${Catch2_SOURCE_DIR}/extras
+    #   * system find_package -> helpers live next to Catch2Config.cmake,
+    #                            i.e. in ${Catch2_DIR}
+    # CPM_USE_LOCAL_PACKAGES makes the latter the default whenever a system
+    # Catch2 is installed, so both routes must be handled.
+    if(Catch2_SOURCE_DIR)
+        list(APPEND CMAKE_MODULE_PATH "${Catch2_SOURCE_DIR}/extras")
+    elseif(Catch2_DIR)
+        list(APPEND CMAKE_MODULE_PATH "${Catch2_DIR}")
+    endif()
 endif()
 
 # ----------------------------------------------------------------------------
@@ -80,6 +95,20 @@ endif()
 include(PedanticCompiler)
 include(Sanitizers)
 include(ClangTidy)
+
+# ----------------------------------------------------------------------------
+# Test wiring is enabled early so all subdirectories (CowTree, FastCache,
+# src/tests) can register their CTest test executables via
+# catch_discover_tests().
+
+if(FASTCACHED_BUILD_TESTS)
+    enable_testing()
+endif()
+
+# ----------------------------------------------------------------------------
+# Sibling libraries (no dependency on FastCache).
+
+add_subdirectory(src/CowTree)
 
 # ----------------------------------------------------------------------------
 # Library target: all FastCache code lives here (so both the executable and
@@ -92,6 +121,7 @@ target_include_directories(FastCache PUBLIC
 )
 target_compile_features(FastCache PUBLIC cxx_std_23)
 target_link_libraries(FastCache PUBLIC yaml-cpp::yaml-cpp)
+target_link_libraries(FastCache PUBLIC CowTree)
 
 # Substitute the version triple/string into Core/Version.hpp at configure
 # time. The generated header lives under the build dir so it never gets
@@ -123,6 +153,5 @@ target_link_libraries(fastcached PRIVATE FastCache)
 # Tests.
 
 if(FASTCACHED_BUILD_TESTS)
-    enable_testing()
     add_subdirectory(src/tests)
 endif()
