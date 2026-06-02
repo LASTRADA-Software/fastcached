@@ -73,6 +73,42 @@ TEST_CASE("InMemorySocketPair surfaces EOF when one side closes", "[net][inmemor
     REQUIRE(result);
 }
 
+TEST_CASE("A Read with no buffered bytes parks and completes on a later peer Write", "[net][inmemory]")
+{
+    // Exercises the asynchronous park path: Read() finds the pipe empty,
+    // suspends, and is later woken by the peer's Write via OnInboundProgress.
+    // The awaitable that gets parked must be the one living in the awaiting
+    // coroutine's frame (registered from await_suspend), not the local inside
+    // Read() — otherwise _pendingRead dangles and the read never completes.
+    auto pair = FastCache::InMemorySocketPair::Create();
+
+    std::vector<std::byte> chunk(5);
+    auto reader = [](FastCache::ISocket* socket, std::span<std::byte> buffer) -> FastCache::Task<std::size_t> {
+        auto const r = co_await socket->Read(buffer);
+        REQUIRE(r.has_value());
+        co_return *r;
+    }(pair.server.get(), std::span<std::byte> { chunk.data(), chunk.size() });
+
+    // Drive the reader until it parks inside Read(). Nothing is buffered yet,
+    // so it must suspend rather than complete.
+    auto handle = reader.Native();
+    handle.resume();
+    REQUIRE_FALSE(reader.IsReady());
+
+    // The peer writes: this pushes into the pipe and fires the inbound
+    // progress callback, which must resume the parked reader to completion.
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "hello")));
+
+    REQUIRE(reader.IsReady());
+    auto const got = std::get<1>(handle.promise().result);
+    REQUIRE(got == 5);
+
+    std::string out;
+    for (auto const b: chunk)
+        out.push_back(static_cast<char>(b));
+    REQUIRE(out == "hello");
+}
+
 TEST_CASE("InMemoryPipe respects the backpressure cap", "[net][inmemory]")
 {
     auto pair = FastCache::InMemorySocketPair::Create(4);
