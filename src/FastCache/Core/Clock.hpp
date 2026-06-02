@@ -58,7 +58,7 @@ class ManualClock final: public IClock
 
     [[nodiscard]] TimePoint Now() const noexcept override
     {
-        std::lock_guard const lock { _mutex };
+        std::scoped_lock const lock { _mutex };
         return _now;
     }
 
@@ -66,7 +66,7 @@ class ManualClock final: public IClock
     /// @param delta Non-negative duration to advance the clock by.
     void Advance(Duration delta) noexcept
     {
-        std::lock_guard const lock { _mutex };
+        std::scoped_lock const lock { _mutex };
         _now += delta;
     }
 
@@ -74,7 +74,7 @@ class ManualClock final: public IClock
     /// @param when New value Now() will return.
     void SetNow(TimePoint when) noexcept
     {
-        std::lock_guard const lock { _mutex };
+        std::scoped_lock const lock { _mutex };
         _now = when;
     }
 

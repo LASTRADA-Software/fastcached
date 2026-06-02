@@ -104,17 +104,14 @@ IoAwaitable InMemorySocket::Read(std::span<std::byte> buffer)
     if (_inbound->IsWriteClosed())
         return IoAwaitable { IoResult { 0 } };
 
-    // Park: install a callback so a future Push wakes us up.
-    IoAwaitable awaitable;
-    _pendingRead = &awaitable;
+    // Park: install a callback so a future Push wakes us up. The awaitable
+    // must be registered from inside await_suspend — at that point `self` is
+    // the awaitable living in the awaiting coroutine's frame, not this local
+    // (which is moved out on return and then destroyed). Recording &awaitable
+    // here would leave _pendingRead dangling and _handle unset.
     _pendingReadBuffer = buffer;
-    awaitable.SetSuspendCallback(
-        [](IoAwaitable* /*self*/, std::coroutine_handle<> /*handle*/) {
-            // The pipe's progress callback is what actually completes the
-            // awaitable; await_suspend just needs to record the handle on
-            // the awaitable itself, which the base class already did.
-        },
-        this);
+    IoAwaitable awaitable;
+    awaitable.SetSuspendCallback(&InMemorySocket::OnReadSuspended, this);
     return awaitable;
 }
 
@@ -129,6 +126,12 @@ IoAwaitable InMemorySocket::Write(std::span<std::byte const> buffer)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::WouldBlock, .systemCode = 0, .context = "InMemoryPipe backpressure" }) };
     return IoAwaitable { IoResult { accepted } };
+}
+
+void InMemorySocket::OnReadSuspended(IoAwaitable* awaitable, std::coroutine_handle<> /*handle*/) noexcept
+{
+    auto* const self = static_cast<InMemorySocket*>(awaitable->CallbackState());
+    self->_pendingRead = awaitable;
 }
 
 void InMemorySocket::OnInboundProgress(void* state) noexcept

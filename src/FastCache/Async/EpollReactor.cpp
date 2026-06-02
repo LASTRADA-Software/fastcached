@@ -103,7 +103,7 @@ void EpollReactor::Submit(std::coroutine_handle<> handle)
     if (!handle)
         return;
     {
-        std::lock_guard const lock { _submitMutex };
+        std::scoped_lock const lock { _submitMutex };
         _pendingSubmits.push_back(handle);
     }
     std::uint64_t one = 1;
@@ -115,7 +115,7 @@ void EpollReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
     if (!handle)
         return;
     {
-        std::lock_guard const lock { _timerMutex };
+        std::scoped_lock const lock { _timerMutex };
         _timers.push_back(TimerEntry { .deadline = deadline, .sequence = _nextSequence++, .handle = handle });
         std::ranges::push_heap(_timers, EntryGreater);
     }
@@ -135,7 +135,7 @@ void EpollReactor::FireExpiredTimers()
     auto const now = _clock.Now();
     std::vector<std::coroutine_handle<>> due;
     {
-        std::lock_guard const lock { _timerMutex };
+        std::scoped_lock const lock { _timerMutex };
         while (!_timers.empty() && _timers.front().deadline <= now)
         {
             std::ranges::pop_heap(_timers, EntryGreater);
@@ -152,7 +152,7 @@ void EpollReactor::DrainPendingSubmits()
 {
     std::deque<std::coroutine_handle<>> drained;
     {
-        std::lock_guard const lock { _submitMutex };
+        std::scoped_lock const lock { _submitMutex };
         drained.swap(_pendingSubmits);
     }
     while (!drained.empty())
@@ -173,7 +173,7 @@ void EpollReactor::Run()
     {
         TimePoint nextDeadline;
         {
-            std::lock_guard const lock { _timerMutex };
+            std::scoped_lock const lock { _timerMutex };
             nextDeadline = _timers.empty() ? TimePoint::max() : _timers.front().deadline;
         }
         auto const timeout = DeadlineToMs(nextDeadline, _clock.Now());

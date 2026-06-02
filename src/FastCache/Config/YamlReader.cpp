@@ -29,6 +29,23 @@ namespace
         };
     }
 
+    [[nodiscard]] std::expected<StorageDurability, ConfigError> ParseStorageDurability(std::string_view sv,
+                                                                                       std::filesystem::path const& path,
+                                                                                       unsigned line)
+    {
+        if (sv == "fsync")
+            return StorageDurability::Fsync;
+        if (sv == "batched")
+            return StorageDurability::Batched;
+        if (sv == "none")
+            return StorageDurability::None;
+        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+                                         path,
+                                         "storage_durability",
+                                         std::string { "unknown durability mode: " } + std::string { sv },
+                                         line));
+    }
+
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv,
                                                                      std::filesystem::path const& path,
                                                                      unsigned line)
@@ -116,6 +133,76 @@ namespace
             if (!level.has_value())
                 return std::unexpected(level.error());
             cfg.logLevel = *level;
+            return {};
+        }
+        /// `storage_path`: filesystem path of the CoW-tree backing file.
+        if (key == "storage_path")
+        {
+            cfg.storagePath = valueNode.as<std::string>();
+            return {};
+        }
+        /// `storage_durability`: fsync|batched|none.
+        if (key == "storage_durability")
+        {
+            auto const d = ParseStorageDurability(valueNode.as<std::string>(), path, line);
+            if (!d.has_value())
+                return std::unexpected(d.error());
+            cfg.storageDurability = *d;
+            return {};
+        }
+        /// `storage_max_value`: per-value byte cap for the persistent
+        /// backend. Same byte-size grammar as `max_memory` but without
+        /// the `%` form (host-RAM-relative makes no sense for a value
+        /// size).
+        if (key == "storage_max_value")
+        {
+            auto const raw = valueNode.as<std::string>();
+            auto parsed = ParseByteSize(raw, "storage_max_value");
+            if (!parsed.has_value())
+            {
+                auto err = std::move(parsed).error();
+                err.source = path.string();
+                err.line = line;
+                return std::unexpected(std::move(err));
+            }
+            cfg.storageMaxValueBytes = *parsed;
+            return {};
+        }
+        /// `execution_model`: auto | threaded | reactor. `auto` picks
+        /// reactor for in-memory and threaded for CoW on-disk storage.
+        if (key == "execution_model")
+        {
+            auto const raw = valueNode.as<std::string>();
+            if (raw == "auto")
+                cfg.executionModel = ExecutionModel::Auto;
+            else if (raw == "threaded")
+                cfg.executionModel = ExecutionModel::Threaded;
+            else if (raw == "reactor")
+                cfg.executionModel = ExecutionModel::Reactor;
+            else
+                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+                                                 path,
+                                                 "execution_model",
+                                                 std::string { "unknown model (expect auto|threaded|reactor): " } + raw,
+                                                 line));
+            return {};
+        }
+        /// `threads`: positive integer worker count for threaded mode.
+        if (key == "threads")
+        {
+            auto const raw = valueNode.as<int>();
+            if (raw < 0)
+                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, path, "threads", "must be >= 0", line));
+            cfg.workerThreads = static_cast<std::size_t>(raw);
+            return {};
+        }
+        /// `storage_shards`: positive integer shard count.
+        if (key == "storage_shards")
+        {
+            auto const raw = valueNode.as<int>();
+            if (raw < 0)
+                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, path, "storage_shards", "must be >= 0", line));
+            cfg.storageShards = static_cast<std::size_t>(raw);
             return {};
         }
         return std::unexpected(MakeError(ConfigErrorCode::UnknownKey, path, key, "unrecognised key", line));

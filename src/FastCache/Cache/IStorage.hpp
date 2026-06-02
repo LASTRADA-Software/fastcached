@@ -111,6 +111,13 @@ class IStorage
     /// Purge any entries whose expiry has passed. Returns the number purged.
     virtual std::size_t PurgeExpired(TimePoint now) = 0;
 
+    /// Reconfigure the byte budget at runtime (e.g. on SIGHUP reload).
+    /// Budget-owning backends evict to fit; forwarding decorators pass it
+    /// on; composite backends split it across their inner storages.
+    /// @param newMaxBytes New byte budget. Composite backends split or
+    ///        forward this across their inner storages.
+    virtual void Resize(std::size_t newMaxBytes) = 0;
+
     /// @return Current storage statistics.
     [[nodiscard]] virtual StorageStats Snapshot() const noexcept = 0;
 };

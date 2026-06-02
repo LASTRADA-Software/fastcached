@@ -22,7 +22,7 @@ void ConsoleLogger::Log(LogLevel level, std::string_view message)
         return;
 
     auto const line = std::format("[{}] {}\n", ToStringView(level), message);
-    std::lock_guard const lock { _writeMutex };
+    std::scoped_lock const lock { _writeMutex };
     _sink.write(line.data(), static_cast<std::streamsize>(line.size()));
 }
 
@@ -48,7 +48,7 @@ void CapturingLogger::Log(LogLevel level, std::string_view message)
     if (level < _minLevel.load(std::memory_order_relaxed))
         return;
 
-    std::lock_guard const lock { _mutex };
+    std::scoped_lock const lock { _mutex };
     _records.push_back(Record { .level = level, .message = std::string { message } });
 }
 
@@ -64,13 +64,13 @@ void CapturingLogger::SetMinLevel(LogLevel level) noexcept
 
 std::vector<CapturingLogger::Record> CapturingLogger::Snapshot() const
 {
-    std::lock_guard const lock { _mutex };
+    std::scoped_lock const lock { _mutex };
     return _records;
 }
 
 void CapturingLogger::Clear()
 {
-    std::lock_guard const lock { _mutex };
+    std::scoped_lock const lock { _mutex };
     _records.clear();
 }
 

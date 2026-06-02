@@ -24,7 +24,7 @@ std::filesystem::path WriteYaml(std::string_view stem, std::string_view content)
 
 TEST_CASE("ConfigReloader: Current() returns the initial snapshot", "[config][reload]")
 {
-    FastCache::Config initial { .bindAddress = "127.0.0.1", .port = 11500, .maxMemoryBytes = 1024 };
+    FastCache::Config initial { .maxMemoryBytes = 1024, .bindAddress = "127.0.0.1", .port = 11500 };
     FastCache::ConfigReloader reloader { initial, {} };
     auto const snapshot = reloader.Current();
     REQUIRE(snapshot->bindAddress == "127.0.0.1");
@@ -38,11 +38,11 @@ TEST_CASE("ConfigReloader::Reload picks up reloadable changes", "[config][reload
                                 "port: 11600\n"
                                 "max_memory: 1024\n"
                                 "log_level: info\n");
-    FastCache::Config initial { .bindAddress = "127.0.0.1",
+    FastCache::Config initial { .maxMemoryBytes = 1024,
+                                .bindAddress = "127.0.0.1",
+                                .configPath = path.string(),
                                 .port = 11600,
-                                .maxMemoryBytes = 1024,
-                                .logLevel = FastCache::LogLevel::Info,
-                                .configPath = path.string() };
+                                .logLevel = FastCache::LogLevel::Info };
     FastCache::ConfigReloader reloader { initial, path };
 
     bool fired = false;
@@ -72,7 +72,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to immutable fields", "[config
                                 "port: 11700\n"
                                 "max_memory: 1024\n");
     FastCache::Config initial {
-        .bindAddress = "127.0.0.1", .port = 11700, .maxMemoryBytes = 1024, .configPath = path.string()
+        .maxMemoryBytes = 1024, .bindAddress = "127.0.0.1", .configPath = path.string(), .port = 11700
     };
     FastCache::ConfigReloader reloader { initial, path };
 
@@ -88,6 +88,68 @@ TEST_CASE("ConfigReloader::Reload rejects changes to immutable fields", "[config
     REQUIRE(result.error().field == "port");
     // Live snapshot unchanged.
     REQUIRE(reloader.Current()->port == 11700);
+}
+
+TEST_CASE("ConfigReloader::Reload rejects changes to storage_path (regression for ValidateImmutable gap)",
+          "[config][reload][regression]")
+{
+    // Regression for finding #13 — pre-fix, ValidateImmutable only
+    // checked bindAddress and port. Changing storage_path, shards,
+    // durability, execution_model, threads, or storage_max_value via
+    // SIGHUP silently swapped Config but left the running backend on
+    // the old settings.
+    auto const path = WriteYaml("storage-path-immutable",
+                                "bind: 127.0.0.1\n"
+                                "port: 11710\n"
+                                "max_memory: 1024\n"
+                                "storage_path: /tmp/a.cow\n");
+    FastCache::Config initial {
+        .maxMemoryBytes = 1024,
+        .bindAddress = "127.0.0.1",
+        .configPath = path.string(),
+        .storagePath = "/tmp/a.cow",
+        .port = 11710,
+    };
+    FastCache::ConfigReloader reloader { initial, path };
+
+    {
+        std::ofstream out { path, std::ios::trunc };
+        out << "bind: 127.0.0.1\nport: 11710\nmax_memory: 1024\nstorage_path: /tmp/b.cow\n";
+    }
+
+    auto const result = reloader.Reload();
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::ImmutableChanged);
+    REQUIRE(result.error().field == "storage");
+    // Live snapshot still names a.cow.
+    REQUIRE(reloader.Current()->storagePath == "/tmp/a.cow");
+}
+
+TEST_CASE("ConfigReloader::Reload rejects changes to storage_durability", "[config][reload][regression]")
+{
+    auto const path = WriteYaml("storage-durability-immutable",
+                                "bind: 127.0.0.1\n"
+                                "port: 11720\n"
+                                "max_memory: 1024\n"
+                                "storage_durability: fsync\n");
+    FastCache::Config initial {
+        .maxMemoryBytes = 1024,
+        .bindAddress = "127.0.0.1",
+        .configPath = path.string(),
+        .port = 11720,
+        .storageDurability = FastCache::StorageDurability::Fsync,
+    };
+    FastCache::ConfigReloader reloader { initial, path };
+
+    {
+        std::ofstream out { path, std::ios::trunc };
+        out << "bind: 127.0.0.1\nport: 11720\nmax_memory: 1024\nstorage_durability: batched\n";
+    }
+
+    auto const result = reloader.Reload();
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::ImmutableChanged);
+    REQUIRE(result.error().field == "storage-durability");
 }
 
 TEST_CASE("ConfigReloader: Reload with no config path returns FileNotFound", "[config][reload]")

@@ -5,6 +5,7 @@
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
+#include <FastCache/Core/StringHash.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -78,7 +79,20 @@ class InMemoryLruStorage final: public IStorage
 
     /// Reconfigure the byte budget at runtime. Used by ConfigReloader on
     /// SIGHUP. Triggers eviction until under the new budget.
-    void Resize(std::size_t newMaxBytes);
+    void Resize(std::size_t newMaxBytes) override;
+
+    /// Insert / overwrite an entry verbatim, preserving its `cas`, `flags`,
+    /// `expiry`, and `generation` exactly as supplied — no fresh CAS token
+    /// is issued. Used by `LayeredStorage` to mirror an entry observed in a
+    /// lower tier (canonical CAS) into the in-memory cache. Promotes to the
+    /// LRU front, updates `_bytesUsed`, and triggers eviction-to-fit.
+    /// @param key   Insertion key.
+    /// @param entry Source-of-truth CacheEntry to store as-is.
+    void InsertVerbatim(std::string_view key, CacheEntry entry);
+
+    /// Drop the entry under `key` if present. No error if absent. Used by
+    /// `LayeredStorage` to keep the L1 mirror in sync with an L2 delete.
+    void EraseIfPresent(std::string_view key);
 
   private:
     struct Node
@@ -114,25 +128,6 @@ class InMemoryLruStorage final: public IStorage
     std::uint64_t _liveGeneration { 1 };
     TimePoint _flushEffectiveAt { TimePoint::min() };
     CasToken _nextCas { 1 };
-
-    /// Transparent hasher so the map can be looked up by string_view without
-    /// constructing a temporary std::string.
-    struct TransparentStringHash
-    {
-        using is_transparent = void;
-        [[nodiscard]] std::size_t operator()(std::string_view sv) const noexcept
-        {
-            return std::hash<std::string_view> {}(sv);
-        }
-        [[nodiscard]] std::size_t operator()(std::string const& s) const noexcept
-        {
-            return std::hash<std::string_view> {}(std::string_view { s });
-        }
-        [[nodiscard]] std::size_t operator()(char const* s) const noexcept
-        {
-            return std::hash<std::string_view> {}(std::string_view { s });
-        }
-    };
 
     LruList _lru;
     std::unordered_map<std::string, Iterator, TransparentStringHash, std::equal_to<>> _index;

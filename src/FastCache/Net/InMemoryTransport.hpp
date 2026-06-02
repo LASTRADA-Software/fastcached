@@ -104,6 +104,15 @@ class InMemorySocket: public ISocket
   private:
     static void OnInboundProgress(void* state) noexcept;
 
+    /// await_suspend hook for a parked Read. Records `awaitable` (which lives
+    /// in the awaiting coroutine's frame, so its address is stable) as the
+    /// socket's pending read, to be completed by OnInboundProgress.
+    /// The owning socket is recovered from the awaitable's callback state.
+    /// @param awaitable The awaitable being suspended (callback `self`).
+    /// @param handle The suspending coroutine's handle (already recorded by the
+    /// awaitable's await_suspend; unused here).
+    static void OnReadSuspended(IoAwaitable* awaitable, std::coroutine_handle<> handle) noexcept;
+
     std::shared_ptr<InMemoryPipe> _inbound;
     std::shared_ptr<InMemoryPipe> _outbound;
     IoAwaitable* _pendingRead { nullptr };

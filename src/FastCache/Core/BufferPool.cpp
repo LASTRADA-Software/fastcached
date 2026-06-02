@@ -129,7 +129,7 @@ PooledBuffer BufferPool::Acquire(std::size_t minCapacity)
     std::vector<std::byte> picked;
     bool found = false;
     {
-        std::lock_guard const lock { _mutex };
+        std::scoped_lock const lock { _mutex };
         auto const it =
             std::ranges::find_if(_free, [requested](auto const& slot) noexcept { return slot.size() >= requested; });
         if (it != _free.end())
@@ -148,7 +148,7 @@ PooledBuffer BufferPool::Acquire(std::size_t minCapacity)
 
 std::size_t BufferPool::RetainedCount() const noexcept
 {
-    std::lock_guard const lock { _mutex };
+    std::scoped_lock const lock { _mutex };
     return _free.size();
 }
 
@@ -157,7 +157,7 @@ void BufferPool::Return(std::vector<std::byte> storage) noexcept
     if (storage.empty() || _maxRetained == 0)
         return;
 
-    std::lock_guard const lock { _mutex };
+    std::scoped_lock const lock { _mutex };
     if (_free.size() >= _maxRetained)
         return;
     _free.push_back(std::move(storage));

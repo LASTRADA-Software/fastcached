@@ -95,3 +95,42 @@ TEST_CASE("YamlReader: max_memory rejects unknown suffix", "[config][yaml]")
     REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::TypeMismatch);
     REQUIRE(cfg.error().field == "max_memory");
 }
+
+TEST_CASE("YamlReader: execution_model parses each mode", "[config][yaml][execution-model]")
+{
+    {
+        auto const path = WriteTempYaml("exec-auto", "execution_model: auto\n");
+        auto const cfg = FastCache::ReadYamlConfig(path);
+        REQUIRE(cfg.has_value());
+        REQUIRE(cfg->executionModel == FastCache::ExecutionModel::Auto);
+    }
+    {
+        auto const path = WriteTempYaml("exec-threaded", "execution_model: threaded\n");
+        auto const cfg = FastCache::ReadYamlConfig(path);
+        REQUIRE(cfg.has_value());
+        REQUIRE(cfg->executionModel == FastCache::ExecutionModel::Threaded);
+    }
+    {
+        auto const path = WriteTempYaml("exec-reactor", "execution_model: reactor\n");
+        auto const cfg = FastCache::ReadYamlConfig(path);
+        REQUIRE(cfg.has_value());
+        REQUIRE(cfg->executionModel == FastCache::ExecutionModel::Reactor);
+    }
+}
+
+TEST_CASE("YamlReader: execution_model rejects unknown values", "[config][yaml][execution-model]")
+{
+    auto const path = WriteTempYaml("exec-bad", "execution_model: fiber\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE_FALSE(cfg.has_value());
+    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::OutOfRange);
+    REQUIRE(cfg.error().field == "execution_model");
+}
+
+TEST_CASE("YamlReader: threading_model is no longer accepted", "[config][yaml][execution-model]")
+{
+    auto const path = WriteTempYaml("legacy", "threading_model: threaded\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE_FALSE(cfg.has_value());
+    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::UnknownKey);
+}
