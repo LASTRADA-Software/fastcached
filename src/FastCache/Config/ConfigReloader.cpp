@@ -19,13 +19,13 @@ ConfigReloader::ConfigReloader(Config initial, std::filesystem::path configPath)
 
 ConfigReloader::Snapshot ConfigReloader::Current() const noexcept
 {
-    std::lock_guard const lock { _swapMutex };
+    std::scoped_lock const lock { _swapMutex };
     return _current;
 }
 
 void ConfigReloader::Subscribe(Subscriber subscriber)
 {
-    std::lock_guard const lock { _swapMutex };
+    std::scoped_lock const lock { _swapMutex };
     _subscribers.push_back(std::move(subscriber));
 }
 
@@ -48,7 +48,7 @@ std::expected<void, ConfigError> ConfigReloader::Reload()
     Snapshot next;
     std::vector<Subscriber> observers;
     {
-        std::lock_guard const lock { _swapMutex };
+        std::scoped_lock const lock { _swapMutex };
         previous = _current;
 
         auto const validation = ValidateImmutable(*previous, *reloaded);
@@ -67,22 +67,36 @@ std::expected<void, ConfigError> ConfigReloader::Reload()
 
 std::expected<void, ConfigError> ConfigReloader::ValidateImmutable(Config const& previous, Config const& candidate)
 {
+    // Fields enforced as immutable: the live wiring (listener address,
+    // backend type, shard layout, execution model, durability mode,
+    // value-size cap) is baked into objects constructed at startup. A
+    // SIGHUP that swaps Config but leaves the backend untouched would
+    // otherwise silently disagree with `reloader.Current()`.
+    auto const reject = [](std::string field, std::string context) {
+        return std::unexpected(ConfigError {
+            .code = ConfigErrorCode::ImmutableChanged,
+            .source = {},
+            .line = 0,
+            .field = std::move(field),
+            .context = std::move(context),
+        });
+    };
     if (previous.bindAddress != candidate.bindAddress)
-        return std::unexpected(ConfigError {
-            .code = ConfigErrorCode::ImmutableChanged,
-            .source = {},
-            .line = 0,
-            .field = "bind",
-            .context = "cannot change bind address at runtime",
-        });
+        return reject("bind", "cannot change bind address at runtime");
     if (previous.port != candidate.port)
-        return std::unexpected(ConfigError {
-            .code = ConfigErrorCode::ImmutableChanged,
-            .source = {},
-            .line = 0,
-            .field = "port",
-            .context = "cannot change port at runtime",
-        });
+        return reject("port", "cannot change port at runtime");
+    if (previous.storagePath != candidate.storagePath)
+        return reject("storage", "cannot change storage path at runtime");
+    if (previous.storageShards != candidate.storageShards)
+        return reject("storage-shards", "cannot change shard count at runtime");
+    if (previous.storageDurability != candidate.storageDurability)
+        return reject("storage-durability", "cannot change durability mode at runtime");
+    if (previous.storageMaxValueBytes != candidate.storageMaxValueBytes)
+        return reject("storage-max-value", "cannot change value-size cap at runtime");
+    if (previous.executionModel != candidate.executionModel)
+        return reject("execution-model", "cannot change execution model at runtime");
+    if (previous.workerThreads != candidate.workerThreads)
+        return reject("threads", "cannot change worker-thread count at runtime");
     return {};
 }
 
