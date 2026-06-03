@@ -62,6 +62,11 @@ InMemoryLruStorage::Iterator InMemoryLruStorage::FindAlive(std::string_view key,
     auto const nodeIt = indexIt->second;
     if (!IsAlive(nodeIt->entry, _liveGeneration, now))
     {
+        // Lazy reclaim during lookup. Attribute a never-fetched expiry to
+        // the expired_unfetched counter (generation flushes are not
+        // "expiry" and are excluded).
+        if (nodeIt->entry.expiry <= now && !nodeIt->entry.fetched)
+            ++_stats.expiredUnfetched;
         EraseAt(nodeIt);
         return _lru.end();
     }
@@ -84,7 +89,10 @@ void InMemoryLruStorage::EvictToFit()
         return;
     while (_bytesUsed > _maxBytes && !_lru.empty())
     {
-        EraseAt(std::prev(_lru.end()));
+        auto const victim = std::prev(_lru.end());
+        if (!victim->entry.fetched)
+            ++_stats.evictedUnfetched;
+        EraseAt(victim);
         ++_stats.evictions;
     }
 }
@@ -118,6 +126,9 @@ CasToken InMemoryLruStorage::MutateExisting(Iterator it, std::vector<std::byte> 
     it->entry.expiry = expiry;
     it->entry.generation = _liveGeneration;
     it->entry.cas = _nextCas++;
+    // A value-rewriting mutation produces a fresh item nobody has read yet.
+    it->entry.stale = false;
+    it->entry.fetched = false;
     _bytesUsed += it->entry.value.size();
     _lru.splice(_lru.begin(), _lru, it);
     EvictToFit();
@@ -134,7 +145,13 @@ std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view 
         return GetResult { .found = false, .entry = {} };
     }
     ++_stats.getHits;
-    return GetResult { .found = true, .entry = it->entry };
+    // Snapshot the entry as it was *before* this read so the meta `l` flag
+    // reports seconds since the PREVIOUS access; then advance the stored
+    // lastAccess and mark it fetched for the next reader.
+    GetResult result { .found = true, .entry = it->entry };
+    it->entry.lastAccess = now;
+    it->entry.fetched = true;
+    return result;
 }
 
 std::expected<CasToken, StorageError> InMemoryLruStorage::Set(std::string_view key,
@@ -169,11 +186,14 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Replace(
 
 std::expected<CasToken, StorageError> InMemoryLruStorage::Append(std::string_view key,
                                                                  std::span<std::byte const> suffix,
+                                                                 CasToken expected,
                                                                  TimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
         return std::unexpected(MakeKeyNotFound());
+    if (expected != 0 && it->entry.cas != expected)
+        return std::unexpected(MakeCasMismatch());
 
     auto combined = it->entry.value;
     combined.insert(combined.end(), suffix.begin(), suffix.end());
@@ -182,11 +202,14 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Append(std::string_vie
 
 std::expected<CasToken, StorageError> InMemoryLruStorage::Prepend(std::string_view key,
                                                                   std::span<std::byte const> prefix,
+                                                                  CasToken expected,
                                                                   TimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
         return std::unexpected(MakeKeyNotFound());
+    if (expected != 0 && it->entry.cas != expected)
+        return std::unexpected(MakeCasMismatch());
 
     std::vector<std::byte> combined;
     combined.reserve(prefix.size() + it->entry.value.size());
@@ -204,21 +227,36 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::CompareAndSwap(std::st
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
+    {
+        ++_stats.casMisses;
         return std::unexpected(MakeKeyNotFound());
+    }
     if (it->entry.cas != expected)
+    {
+        ++_stats.casBadval;
         return std::unexpected(MakeCasMismatch());
+    }
+    ++_stats.casHits;
     return MutateExisting(it, std::move(value), flags, expiry);
 }
 
 std::expected<IStorage::IncrResult, StorageError> InMemoryLruStorage::IncrementOrInitialize(std::string_view key,
-                                                                                            std::int64_t delta,
+                                                                                            std::uint64_t magnitude,
+                                                                                            bool decrement,
                                                                                             TimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
+    {
+        if (decrement)
+            ++_stats.decrMisses;
+        else
+            ++_stats.incrMisses;
         return std::unexpected(MakeKeyNotFound());
+    }
 
-    // Decode the existing value as ASCII unsigned 64-bit.
+    // Decode the existing value as ASCII unsigned 64-bit *before* booking a
+    // hit: a non-numeric value is a client error, not a successful incr/decr.
     auto const& bytes = it->entry.value;
     std::string asText;
     asText.reserve(bytes.size());
@@ -230,14 +268,19 @@ std::expected<IStorage::IncrResult, StorageError> InMemoryLruStorage::IncrementO
     if (ec != std::errc {} || asText.empty())
         return std::unexpected(MakeInvalidArgument("existing value is not numeric"));
 
-    std::uint64_t updated = current;
-    if (delta >= 0)
-        updated += static_cast<std::uint64_t>(delta);
+    if (decrement)
+        ++_stats.decrHits;
     else
-    {
-        auto const absDelta = static_cast<std::uint64_t>(-(delta + 1)) + 1; // safe |INT64_MIN|
-        updated = current > absDelta ? current - absDelta : 0;              // saturating
-    }
+        ++_stats.incrHits;
+
+    // memcached: increment wraps modulo 2^64 (natural for uint64), decrement
+    // saturates at 0. `magnitude` is the full unsigned amount, so deltas in
+    // [2^63, 2^64) are honoured rather than aliasing to the wrong direction.
+    std::uint64_t const updated = [&]() -> std::uint64_t {
+        if (!decrement)
+            return current + magnitude;
+        return magnitude >= current ? 0U : current - magnitude;
+    }();
 
     auto newText = std::to_string(updated);
     std::vector<std::byte> newValue;
@@ -253,9 +296,57 @@ std::expected<void, StorageError> InMemoryLruStorage::Delete(std::string_view ke
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
+    {
+        ++_stats.deleteMisses;
         return std::unexpected(MakeKeyNotFound());
+    }
     EraseAt(it);
+    ++_stats.deleteHits;
     return {};
+}
+
+std::expected<CasToken, StorageError> InMemoryLruStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
+{
+    ++_stats.cmdTouch;
+    auto const it = FindAlive(key, now);
+    if (it == _lru.end())
+    {
+        ++_stats.touchMisses;
+        return std::unexpected(MakeKeyNotFound());
+    }
+    it->entry.expiry = newExpiry;
+    it->entry.cas = _nextCas++;
+    it->entry.lastAccess = now;
+    ++_stats.touchHits;
+    return it->entry.cas;
+}
+
+std::expected<GetResult, StorageError> InMemoryLruStorage::Peek(std::string_view key, TimePoint now)
+{
+    // Non-mutating: no LRU promotion, no lastAccess/fetched update, no
+    // stats. Expired / flushed entries read as a miss but are left in
+    // place for the writer-locked PurgeExpired to reclaim.
+    auto const indexIt = _index.find(key);
+    if (indexIt == _index.end())
+        return GetResult { .found = false, .entry = {} };
+    auto const& entry = indexIt->second->entry;
+    if (!IsAlive(entry, _liveGeneration, now))
+        return GetResult { .found = false, .entry = {} };
+    return GetResult { .found = true, .entry = entry };
+}
+
+std::expected<CasToken, StorageError> InMemoryLruStorage::MarkStale(std::string_view key,
+                                                                    std::optional<TimePoint> newExpiry,
+                                                                    TimePoint now)
+{
+    auto const it = FindAlive(key, now);
+    if (it == _lru.end())
+        return std::unexpected(MakeKeyNotFound());
+    it->entry.stale = true;
+    if (newExpiry.has_value())
+        it->entry.expiry = *newExpiry;
+    it->entry.cas = _nextCas++;
+    return it->entry.cas;
 }
 
 void InMemoryLruStorage::FlushWithGeneration(TimePoint effectiveAt)
@@ -269,6 +360,7 @@ void InMemoryLruStorage::FlushWithGeneration(TimePoint effectiveAt)
     // engine can schedule the bump on the reactor instead.
     static_cast<void>(effectiveAt);
     ++_liveGeneration;
+    ++_stats.cmdFlush;
 }
 
 std::size_t InMemoryLruStorage::PurgeExpired(TimePoint now)
@@ -280,6 +372,8 @@ std::size_t InMemoryLruStorage::PurgeExpired(TimePoint now)
         auto const next = std::next(it);
         if (!IsAlive(it->entry, _liveGeneration, now))
         {
+            if (it->entry.expiry <= now && !it->entry.fetched)
+                ++_stats.expiredUnfetched;
             EraseAt(it);
             ++purged;
         }

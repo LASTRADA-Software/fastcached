@@ -153,7 +153,7 @@ TEST_CASE("LayeredStorage Append routes through L2 and mirrors to L1", "[layered
     REQUIRE(storage->Set("k", MakeBytes("hello"), 0, FastCache::TimePoint::max()).has_value());
 
     auto const suffix = MakeBytes(" world");
-    auto const cas = storage->Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, clock.Now());
+    auto const cas = storage->Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, 0, clock.Now());
     REQUIRE(cas.has_value());
 
     // Both tiers must reflect the appended value with the new CAS.
@@ -179,7 +179,7 @@ TEST_CASE("LayeredStorage IncrementOrInitialize routes through L2", "[layered][c
     // so this test does not depend on the more permissive
     // CowTreeStorage initialise-on-missing behaviour.
     REQUIRE(storage->Set("counter", MakeBytes("10"), 0, FastCache::TimePoint::max()).has_value());
-    auto next = storage->IncrementOrInitialize("counter", 5, clock.Now());
+    auto next = storage->IncrementOrInitialize("counter", 5, /*decrement=*/false, clock.Now());
     REQUIRE(next.has_value());
     REQUIRE(next->value == 15U);
 
@@ -188,6 +188,45 @@ TEST_CASE("LayeredStorage IncrementOrInitialize routes through L2", "[layered][c
     REQUIRE(l2.has_value());
     REQUIRE(l2->found);
     REQUIRE(Decode(l2->entry.value) == "15");
+}
+
+TEST_CASE("LayeredStorage GetAndTouch refreshes TTL and reads through both tiers", "[layered][gat]")
+{
+    auto storage = MakeLayered();
+    FastCache::ManualClock clock;
+    REQUIRE(storage->Set("k", MakeBytes("v"), 0, clock.Now() + 1s).has_value());
+
+    auto const newExpiry = clock.Now() + 60s;
+    auto const gat = storage->GetAndTouch("k", newExpiry, clock.Now());
+    REQUIRE(gat.has_value());
+    REQUIRE(gat->found);
+    REQUIRE(Decode(gat->entry.value) == "v");
+    REQUIRE(gat->entry.expiry == newExpiry);
+    // The canonical tier reflects the refreshed expiry.
+    REQUIRE(storage->L2().Get("k", clock.Now())->entry.expiry == newExpiry);
+
+    auto const miss = storage->GetAndTouch("absent", newExpiry, clock.Now());
+    REQUIRE_FALSE(miss.has_value());
+    REQUIRE(miss.error().code == FastCache::StorageErrorCode::KeyNotFound);
+}
+
+TEST_CASE("LayeredStorage CompareAndDelete checks CAS and drops both tiers", "[layered][cad]")
+{
+    auto storage = MakeLayered();
+    FastCache::ManualClock clock;
+    auto const setCas = storage->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
+    REQUIRE(setCas.has_value());
+
+    // Wrong CAS -> mismatch, entry survives.
+    auto const wrong = storage->CompareAndDelete("k", *setCas + 1, clock.Now());
+    REQUIRE_FALSE(wrong.has_value());
+    REQUIRE(wrong.error().code == FastCache::StorageErrorCode::CasMismatch);
+    REQUIRE(storage->Get("k", clock.Now())->found);
+
+    // Right CAS -> deleted from both tiers.
+    REQUIRE(storage->CompareAndDelete("k", *setCas, clock.Now()).has_value());
+    REQUIRE_FALSE(storage->Get("k", clock.Now())->found);
+    REQUIRE_FALSE(storage->L2().Get("k", clock.Now())->found);
 }
 
 TEST_CASE("LayeredStorage FlushWithGeneration hides entries in both tiers", "[layered][flush]")
@@ -396,6 +435,83 @@ TEST_CASE("LayeredStorage Replace fails when absent from both tiers", "[layered]
     auto storage = MakeLayered();
     FastCache::ManualClock clock;
     auto r = storage->Replace("missing", MakeBytes("nope"), 0, FastCache::TimePoint::max(), clock.Now());
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
+}
+
+TEST_CASE("LayeredStorage Touch routes through L2 and mirrors into L1", "[layered][touch]")
+{
+    auto storage = MakeLayered();
+    FastCache::ManualClock clock;
+
+    auto const setCas = storage->Set("k", MakeBytes("v"), 0, clock.Now() + 1s);
+    REQUIRE(setCas.has_value());
+
+    auto const newExpiry = clock.Now() + 60s;
+    auto const touched = storage->Touch("k", newExpiry, clock.Now());
+    REQUIRE(touched.has_value());
+    REQUIRE(*touched != *setCas);
+
+    // Both L1 and L2 must reflect the bumped CAS + new expiry.
+    auto const l1Got = storage->L1().Get("k", clock.Now());
+    REQUIRE(l1Got.has_value());
+    REQUIRE(l1Got->found);
+    REQUIRE(l1Got->entry.cas == *touched);
+    REQUIRE(l1Got->entry.expiry == newExpiry);
+
+    auto const l2Got = storage->L2().Get("k", clock.Now());
+    REQUIRE(l2Got.has_value());
+    REQUIRE(l2Got->found);
+    REQUIRE(l2Got->entry.cas == *touched);
+    REQUIRE(l2Got->entry.expiry == newExpiry);
+}
+
+TEST_CASE("LayeredStorage Touch miss does not corrupt L1", "[layered][touch]")
+{
+    auto storage = MakeLayered();
+    FastCache::ManualClock clock;
+    auto const r = storage->Touch("nope", FastCache::TimePoint::max(), clock.Now());
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
+}
+
+TEST_CASE("LayeredStorage write-through preserves lastAccess in the L1 mirror", "[layered][lastaccess][regression]")
+{
+    // Regression: the mirror refresh used Get(now=min()), and Get stamps
+    // lastAccess=now — so every write-through clobbered the field to
+    // TimePoint::min(), defeating the meta `l` flag. The refresh now uses
+    // a non-mutating Peek, so the touch's lastAccess survives.
+    auto storage = MakeLayered();
+    FastCache::ManualClock clock;
+    clock.Advance(100s);
+    auto const t = clock.Now();
+
+    REQUIRE(storage->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(storage->Touch("k", FastCache::TimePoint::max(), t).has_value());
+
+    auto const l1 = storage->L1().Peek("k", t);
+    REQUIRE(l1.has_value());
+    REQUIRE(l1->found);
+    REQUIRE(l1->entry.lastAccess == t); // not TimePoint::min()
+    auto const l2 = storage->L2().Peek("k", t);
+    REQUIRE(l2->found);
+    REQUIRE(l2->entry.lastAccess == t);
+}
+
+TEST_CASE("LayeredStorage over a CowTree L2 returns KeyNotFound on an incr miss", "[layered][cowtree][incr][regression]")
+{
+    // The production shape: InMemoryLru L1 + CowTree L2. The incr/decr
+    // contract must be "miss = KeyNotFound" so the protocol layer's
+    // vivify branch (initial value / TTL) runs instead of CowTree silently
+    // creating the key with the wrong value.
+    FastCache::Testing::TempFile tmp;
+    auto l2 = FastCache::CowTreeStorage::Open(FastCache::CowTreeStorage::Options { .path = tmp.path });
+    REQUIRE(l2.has_value());
+    auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(0);
+    FastCache::LayeredStorage storage { std::move(l1), std::move(*l2) };
+    FastCache::ManualClock clock;
+
+    auto const r = storage.IncrementOrInitialize("counter", 5, /*decrement=*/false, clock.Now());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }

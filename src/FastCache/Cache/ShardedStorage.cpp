@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <utility>
@@ -70,20 +71,22 @@ std::expected<CasToken, StorageError> ShardedStorage::Replace(
 
 std::expected<CasToken, StorageError> ShardedStorage::Append(std::string_view key,
                                                              std::span<std::byte const> suffix,
+                                                             CasToken expected,
                                                              TimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
-    return shard.storage->Append(key, suffix, now);
+    return shard.storage->Append(key, suffix, expected, now);
 }
 
 std::expected<CasToken, StorageError> ShardedStorage::Prepend(std::string_view key,
                                                               std::span<std::byte const> prefix,
+                                                              CasToken expected,
                                                               TimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
-    return shard.storage->Prepend(key, prefix, now);
+    return shard.storage->Prepend(key, prefix, expected, now);
 }
 
 std::expected<CasToken, StorageError> ShardedStorage::CompareAndSwap(std::string_view key,
@@ -99,18 +102,71 @@ std::expected<CasToken, StorageError> ShardedStorage::CompareAndSwap(std::string
 }
 
 std::expected<IStorage::IncrResult, StorageError> ShardedStorage::IncrementOrInitialize(std::string_view key,
-                                                                                        std::int64_t delta,
+                                                                                        std::uint64_t magnitude,
+                                                                                        bool decrement,
                                                                                         TimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
-    return shard.storage->IncrementOrInitialize(key, delta, now);
+    return shard.storage->IncrementOrInitialize(key, magnitude, decrement, now);
 }
 
 std::expected<void, StorageError> ShardedStorage::Delete(std::string_view key, TimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
+    return shard.storage->Delete(key, now);
+}
+
+std::expected<CasToken, StorageError> ShardedStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
+{
+    auto& shard = *_shards[ShardIndexFor(key)];
+    std::unique_lock const lock { shard.mu };
+    return shard.storage->Touch(key, newExpiry, now);
+}
+
+std::expected<GetResult, StorageError> ShardedStorage::Peek(std::string_view key, TimePoint now)
+{
+    auto& shard = *_shards[ShardIndexFor(key)];
+    std::unique_lock const lock { shard.mu };
+    return shard.storage->Peek(key, now);
+}
+
+std::expected<CasToken, StorageError> ShardedStorage::MarkStale(std::string_view key,
+                                                                std::optional<TimePoint> newExpiry,
+                                                                TimePoint now)
+{
+    auto& shard = *_shards[ShardIndexFor(key)];
+    std::unique_lock const lock { shard.mu };
+    return shard.storage->MarkStale(key, newExpiry, now);
+}
+
+std::expected<GetResult, StorageError> ShardedStorage::GetAndTouch(std::string_view key, TimePoint newExpiry, TimePoint now)
+{
+    // Hold the shard lock across both inner calls so the touch and the
+    // read form a single atomic critical section — no concurrent writer
+    // can mutate or delete the key between them.
+    auto& shard = *_shards[ShardIndexFor(key)];
+    std::unique_lock const lock { shard.mu };
+    auto const touched = shard.storage->Touch(key, newExpiry, now);
+    if (!touched.has_value())
+        return std::unexpected(touched.error());
+    return shard.storage->Get(key, now);
+}
+
+std::expected<void, StorageError> ShardedStorage::CompareAndDelete(std::string_view key, CasToken expected, TimePoint now)
+{
+    // Compare and delete under one shard-lock acquisition so a concurrent
+    // writer cannot replace the value between the CAS check and the erase.
+    auto& shard = *_shards[ShardIndexFor(key)];
+    std::unique_lock const lock { shard.mu };
+    auto const got = shard.storage->Peek(key, now);
+    if (!got.has_value())
+        return std::unexpected(got.error());
+    if (!got->found)
+        return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
+    if (got->entry.cas != expected)
+        return std::unexpected(MakeStorageError(StorageErrorCode::CasMismatch));
     return shard.storage->Delete(key, now);
 }
 
@@ -152,10 +208,25 @@ StorageStats ShardedStorage::Snapshot() const noexcept
         aggregate.bytesUsed += s.bytesUsed;
         aggregate.bytesLimit += s.bytesLimit;
         aggregate.evictions += s.evictions;
-        aggregate.getHits += s.getHits;
-        aggregate.getMisses += s.getMisses;
         aggregate.cmdGet += s.cmdGet;
         aggregate.cmdSet += s.cmdSet;
+        aggregate.cmdTouch += s.cmdTouch;
+        aggregate.cmdFlush += s.cmdFlush;
+        aggregate.getHits += s.getHits;
+        aggregate.getMisses += s.getMisses;
+        aggregate.deleteHits += s.deleteHits;
+        aggregate.deleteMisses += s.deleteMisses;
+        aggregate.incrHits += s.incrHits;
+        aggregate.incrMisses += s.incrMisses;
+        aggregate.decrHits += s.decrHits;
+        aggregate.decrMisses += s.decrMisses;
+        aggregate.touchHits += s.touchHits;
+        aggregate.touchMisses += s.touchMisses;
+        aggregate.casHits += s.casHits;
+        aggregate.casMisses += s.casMisses;
+        aggregate.casBadval += s.casBadval;
+        aggregate.evictedUnfetched += s.evictedUnfetched;
+        aggregate.expiredUnfetched += s.expiredUnfetched;
     }
     return aggregate;
 }

@@ -82,10 +82,12 @@ class LayeredStorage final: public IStorage
 
     [[nodiscard]] std::expected<CasToken, StorageError> Append(std::string_view key,
                                                                std::span<std::byte const> suffix,
+                                                               CasToken expected,
                                                                TimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Prepend(std::string_view key,
                                                                 std::span<std::byte const> prefix,
+                                                                CasToken expected,
                                                                 TimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> CompareAndSwap(std::string_view key,
@@ -96,10 +98,34 @@ class LayeredStorage final: public IStorage
                                                                        TimePoint now) override;
 
     [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(std::string_view key,
-                                                                                          std::int64_t delta,
+                                                                                          std::uint64_t magnitude,
+                                                                                          bool decrement,
                                                                                           TimePoint now) override;
 
     [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key, TimePoint now) override;
+
+    [[nodiscard]] std::expected<CasToken, StorageError> Touch(std::string_view key,
+                                                              TimePoint newExpiry,
+                                                              TimePoint now) override;
+
+    [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
+
+    [[nodiscard]] std::expected<CasToken, StorageError> MarkStale(std::string_view key,
+                                                                  std::optional<TimePoint> newExpiry,
+                                                                  TimePoint now) override;
+
+    // Explicit compound-op overrides (rather than the IStorage defaults) so
+    // the two-tier get-and-touch / compare-and-delete behaviour is spelled
+    // out and directly unit-tested. The single-critical-section guarantee is
+    // the enclosing ShardedStorage's per-shard lock; on the unwrapped reactor
+    // there is no concurrent writer to exclude.
+    [[nodiscard]] std::expected<GetResult, StorageError> GetAndTouch(std::string_view key,
+                                                                     TimePoint newExpiry,
+                                                                     TimePoint now) override;
+
+    [[nodiscard]] std::expected<void, StorageError> CompareAndDelete(std::string_view key,
+                                                                     CasToken expected,
+                                                                     TimePoint now) override;
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;

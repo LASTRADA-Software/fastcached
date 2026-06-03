@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 
 #if defined(_WIN32)
     #include <winsock2.h>
@@ -243,7 +244,10 @@ std::unique_ptr<BlockingListener> BlockingListener::Bind(std::string_view bindAd
     std::unique_ptr<BlockingListener> listener { new BlockingListener {} };
 
     auto const sock = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0 || sock == static_cast<int>(Detail::InvalidSocket))
+    // `InvalidSocket` is the platform sentinel (INVALID_SOCKET on Windows, -1
+    // on POSIX), so a direct compare detects failure on both without the
+    // signed/unsigned mismatch a `< 0` check against an unsigned SOCKET hits.
+    if (sock == static_cast<std::remove_const_t<decltype(sock)>>(Detail::InvalidSocket))
     {
         listener->_bindError = std::format("socket() failed: {}", Detail::LastNetworkError());
         return listener;
@@ -309,7 +313,7 @@ AcceptAwaitable BlockingListener::Accept()
     socklen_t addrLen = sizeof(client);
 #endif
     auto const acceptedRaw = ::accept(static_cast<int>(_native), reinterpret_cast<sockaddr*>(&client), &addrLen);
-    if (acceptedRaw < 0 || acceptedRaw == static_cast<int>(Detail::InvalidSocket))
+    if (acceptedRaw == static_cast<std::remove_const_t<decltype(acceptedRaw)>>(Detail::InvalidSocket))
         return AcceptAwaitable { std::unexpected(MakeSystemError("accept")) };
 
     return AcceptAwaitable { AcceptResult {

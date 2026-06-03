@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <utility>
 
@@ -51,6 +52,11 @@ std::expected<GetResult, StorageError> CacheEngine::Get(std::string_view key)
     return _storage.Get(key, _clock.Now());
 }
 
+std::expected<GetResult, StorageError> CacheEngine::Peek(std::string_view key)
+{
+    return _storage.Peek(key, _clock.Now());
+}
+
 std::expected<CasToken, StorageError> CacheEngine::Set(std::string_view key,
                                                        std::vector<std::byte> value,
                                                        std::uint32_t flags,
@@ -75,14 +81,18 @@ std::expected<CasToken, StorageError> CacheEngine::Replace(std::string_view key,
     return _storage.Replace(key, std::move(value), flags, ExpiryFromExptime(exptime), _clock.Now());
 }
 
-std::expected<CasToken, StorageError> CacheEngine::Append(std::string_view key, std::span<std::byte const> suffix)
+std::expected<CasToken, StorageError> CacheEngine::Append(std::string_view key,
+                                                          std::span<std::byte const> suffix,
+                                                          CasToken expected)
 {
-    return _storage.Append(key, suffix, _clock.Now());
+    return _storage.Append(key, suffix, expected, _clock.Now());
 }
 
-std::expected<CasToken, StorageError> CacheEngine::Prepend(std::string_view key, std::span<std::byte const> prefix)
+std::expected<CasToken, StorageError> CacheEngine::Prepend(std::string_view key,
+                                                           std::span<std::byte const> prefix,
+                                                           CasToken expected)
 {
-    return _storage.Prepend(key, prefix, _clock.Now());
+    return _storage.Prepend(key, prefix, expected, _clock.Now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::CompareAndSwap(
@@ -93,18 +103,44 @@ std::expected<CasToken, StorageError> CacheEngine::CompareAndSwap(
 
 std::expected<IStorage::IncrResult, StorageError> CacheEngine::Increment(std::string_view key, std::uint64_t delta)
 {
-    return _storage.IncrementOrInitialize(key, static_cast<std::int64_t>(delta), _clock.Now());
+    // The full uint64 delta is forwarded verbatim — memcached increments wrap
+    // modulo 2^64, and a signed cast would alias deltas >= 2^63 to decrements.
+    return _storage.IncrementOrInitialize(key, delta, /*decrement=*/false, _clock.Now());
 }
 
 std::expected<IStorage::IncrResult, StorageError> CacheEngine::Decrement(std::string_view key, std::uint64_t delta)
 {
-    auto const signedDelta = -static_cast<std::int64_t>(delta);
-    return _storage.IncrementOrInitialize(key, signedDelta, _clock.Now());
+    // Pass the magnitude + direction rather than a negated signed delta:
+    // negating INT64_MIN (delta == 2^63) would be signed-overflow UB.
+    return _storage.IncrementOrInitialize(key, delta, /*decrement=*/true, _clock.Now());
 }
 
 std::expected<void, StorageError> CacheEngine::Delete(std::string_view key)
 {
     return _storage.Delete(key, _clock.Now());
+}
+
+std::expected<CasToken, StorageError> CacheEngine::Touch(std::string_view key, std::uint32_t exptime)
+{
+    return _storage.Touch(key, ExpiryFromExptime(exptime), _clock.Now());
+}
+
+std::expected<GetResult, StorageError> CacheEngine::GetAndTouch(std::string_view key, std::uint32_t exptime)
+{
+    return _storage.GetAndTouch(key, ExpiryFromExptime(exptime), _clock.Now());
+}
+
+std::expected<void, StorageError> CacheEngine::CompareAndDelete(std::string_view key, CasToken expected)
+{
+    return _storage.CompareAndDelete(key, expected, _clock.Now());
+}
+
+std::expected<CasToken, StorageError> CacheEngine::MarkStale(std::string_view key, std::optional<std::uint32_t> newExptime)
+{
+    std::optional<TimePoint> newExpiry;
+    if (newExptime.has_value())
+        newExpiry = ExpiryFromExptime(*newExptime);
+    return _storage.MarkStale(key, newExpiry, _clock.Now());
 }
 
 void CacheEngine::FlushAll(std::uint32_t delaySeconds)

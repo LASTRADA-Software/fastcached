@@ -5,10 +5,11 @@
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
+#include <FastCache/Protocol/MemcachedMeta.hpp>
+#include <FastCache/Protocol/MemcachedShared.hpp>
 #include <FastCache/Protocol/MemcachedText.hpp>
 
 #include <algorithm>
-#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -27,14 +28,16 @@ namespace
 
     constexpr std::size_t MaxLineBytes = 4096;
     constexpr std::size_t MaxPayloadBytes = 16 * 1024 * 1024; // 16 MiB
-    constexpr std::string_view Crlf = "\r\n";
 
-    /// Split a line on whitespace into at most maxParts tokens.
-    [[nodiscard]] std::vector<std::string_view> Tokenize(std::string_view line, std::size_t maxParts = 16)
+    /// Split a line on whitespace into tokens. `maxParts == 0` (the default)
+    /// imposes no limit: the line length is already bounded by ByteReader's
+    /// MaxLineBytes, so a multi-key `get`/`gets`/`gat`/`gats` keeps every key
+    /// instead of silently dropping those past a fixed cap.
+    [[nodiscard]] std::vector<std::string_view> Tokenize(std::string_view line, std::size_t maxParts = 0)
     {
         std::vector<std::string_view> out;
         std::size_t i = 0;
-        while (i < line.size() && out.size() < maxParts)
+        while (i < line.size() && (maxParts == 0 || out.size() < maxParts))
         {
             while (i < line.size() && (line[i] == ' ' || line[i] == '\t'))
                 ++i;
@@ -48,13 +51,6 @@ namespace
         return out;
     }
 
-    template <typename T>
-    [[nodiscard]] bool ParseUnsigned(std::string_view sv, T& out) noexcept
-    {
-        auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), out);
-        return ec == std::errc {} && ptr == sv.data() + sv.size();
-    }
-
     [[nodiscard]] bool ParseCasToken(std::string_view sv, CasToken& out) noexcept
     {
         return ParseUnsigned(sv, out);
@@ -64,14 +60,6 @@ namespace
     [[nodiscard]] bool IsNoReply(std::string_view token) noexcept
     {
         return token == "noreply";
-    }
-
-    Task<bool> WriteAll(ISocket* socket, std::string_view payload)
-    {
-        if (payload.empty())
-            co_return true;
-        auto const result = co_await socket->Write(AsBytes(payload));
-        co_return result.has_value();
     }
 
     Task<bool> WriteError(ISocket* socket, std::string_view code, std::string_view detail = {})
@@ -282,29 +270,223 @@ namespace
         co_return co_await WriteLine(socket, "OK");
     }
 
-    Task<bool> HandleStats(ISocket* socket, CacheEngine* engine)
+    /// Append a single `<prefix><name> <value>\r\n` stat line.
+    /// @param out    Destination buffer.
+    /// @param prefix Line prefix, e.g. "STAT " or "STAT items:1:".
+    /// @param name   Stat name appended directly after the prefix.
+    /// @param value  Stat value, rendered verbatim.
+    void AppendStatLine(std::string& out, std::string_view prefix, std::string_view name, std::string_view value)
+    {
+        out.append(prefix);
+        out.append(name);
+        out.push_back(' ');
+        out.append(value);
+        out.append(Crlf);
+    }
+
+    /// Append a stat line whose value is an unsigned integer.
+    /// @param out    Destination buffer.
+    /// @param prefix Line prefix, e.g. "STAT " or "STAT items:1:".
+    /// @param name   Stat name appended directly after the prefix.
+    /// @param value  Stat value, rendered as decimal text.
+    void AppendStatLine(std::string& out, std::string_view prefix, std::string_view name, std::uint64_t value)
+    {
+        AppendStatLine(out, prefix, name, std::to_string(value));
+    }
+
+    /// Render the default `stats` snapshot. Includes the full counter set
+    /// added in the storage-stats expansion.
+    void AppendDefaultStats(std::string& out, StorageStats const& stats)
+    {
+        auto const append = [&](std::string_view name, std::uint64_t value) {
+            AppendStatLine(out, "STAT ", name, value);
+        };
+        out.append("STAT version ");
+        out.append(MemcachedTextHandler::ServerVersion());
+        out.append(Crlf);
+        append("curr_items", stats.itemCount);
+        append("bytes", stats.bytesUsed);
+        append("limit_maxbytes", stats.bytesLimit);
+        append("evictions", stats.evictions);
+        append("cmd_get", stats.cmdGet);
+        append("cmd_set", stats.cmdSet);
+        append("cmd_touch", stats.cmdTouch);
+        append("cmd_flush", stats.cmdFlush);
+        append("get_hits", stats.getHits);
+        append("get_misses", stats.getMisses);
+        append("delete_hits", stats.deleteHits);
+        append("delete_misses", stats.deleteMisses);
+        append("incr_hits", stats.incrHits);
+        append("incr_misses", stats.incrMisses);
+        append("decr_hits", stats.decrHits);
+        append("decr_misses", stats.decrMisses);
+        append("touch_hits", stats.touchHits);
+        append("touch_misses", stats.touchMisses);
+        append("cas_hits", stats.casHits);
+        append("cas_misses", stats.casMisses);
+        append("cas_badval", stats.casBadval);
+        append("evicted_unfetched", stats.evictedUnfetched);
+        append("expired_unfetched", stats.expiredUnfetched);
+    }
+
+    /// Synthetic `stats settings` — render the engine's effective
+    /// configuration. fastcached does not yet thread a `Config` object
+    /// into the text handler, so this returns only the settings the
+    /// engine itself can derive. A future pass will inject Config and
+    /// add port / bind address / max_item_size / etc.
+    void AppendSettings(std::string& out, StorageStats const& stats)
+    {
+        auto const append = [&](std::string_view name, std::string_view value) {
+            AppendStatLine(out, "STAT ", name, value);
+        };
+        append("maxbytes", std::to_string(stats.bytesLimit));
+        append("evictions", "on");
+        append("cas_enabled", "yes");
+        append("flush_enabled", "yes");
+        append("verbosity", "0");
+    }
+
+    /// Synthetic `stats items` — fastcached does not have slab classes,
+    /// so one synthetic class (id 1) represents the entire LRU.
+    void AppendItems(std::string& out, StorageStats const& stats)
+    {
+        auto const append = [&](std::string_view name, std::uint64_t value) {
+            AppendStatLine(out, "STAT items:1:", name, value);
+        };
+        append("number", stats.itemCount);
+        append("evicted", stats.evictions);
+        append("evicted_unfetched", stats.evictedUnfetched);
+        append("expired_unfetched", stats.expiredUnfetched);
+    }
+
+    /// Synthetic `stats slabs` — one virtual slab class covers everything.
+    void AppendSlabs(std::string& out, StorageStats const& stats)
+    {
+        auto const append = [&](std::string_view name, std::uint64_t value) {
+            AppendStatLine(out, "STAT 1:", name, value);
+        };
+        append("chunk_size", 1024);
+        append("used_chunks", stats.itemCount);
+        append("free_chunks", 0);
+        append("get_hits", stats.getHits);
+        append("cmd_set", stats.cmdSet);
+        out.append("STAT active_slabs 1\r\n");
+        out.append("STAT total_malloced ");
+        out.append(std::to_string(stats.bytesUsed));
+        out.append(Crlf);
+    }
+
+    Task<bool> HandleStats(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
     {
         auto const stats = engine->Snapshot();
-        auto const lines = std::format("STAT version {}\r\n"
-                                       "STAT curr_items {}\r\n"
-                                       "STAT bytes {}\r\n"
-                                       "STAT limit_maxbytes {}\r\n"
-                                       "STAT evictions {}\r\n"
-                                       "STAT cmd_get {}\r\n"
-                                       "STAT cmd_set {}\r\n"
-                                       "STAT get_hits {}\r\n"
-                                       "STAT get_misses {}\r\n"
-                                       "END\r\n",
-                                       MemcachedTextHandler::ServerVersion(),
-                                       stats.itemCount,
-                                       stats.bytesUsed,
-                                       stats.bytesLimit,
-                                       stats.evictions,
-                                       stats.cmdGet,
-                                       stats.cmdSet,
-                                       stats.getHits,
-                                       stats.getMisses);
-        co_return co_await WriteAll(socket, lines);
+        std::string out;
+        out.reserve(512);
+
+        std::string_view const sub = args.empty() ? std::string_view {} : args[0];
+        if (sub.empty())
+            AppendDefaultStats(out, stats);
+        else if (sub == "settings")
+            AppendSettings(out, stats);
+        else if (sub == "items")
+            AppendItems(out, stats);
+        else if (sub == "slabs")
+            AppendSlabs(out, stats);
+        else if (sub == "sizes")
+        {
+            // Without per-entry size tracking we can only report a single
+            // bucket. memcached uses 32-byte powers-of-two; we approximate
+            // with one row at the median bucket. Clients that depend on
+            // this for capacity planning should switch to mgdump.
+            auto const avg = stats.itemCount == 0 ? std::size_t { 0 } : stats.bytesUsed / stats.itemCount;
+            out.append("STAT ");
+            out.append(std::to_string(avg));
+            out.push_back(' ');
+            out.append(std::to_string(stats.itemCount));
+            out.append(Crlf);
+        }
+        else if (sub == "conns")
+        {
+            // Without a connection registry we cannot enumerate active
+            // connections. Return an empty result rather than ERROR so
+            // capability probes succeed.
+        }
+        else if (sub == "reset")
+        {
+            // Counter reset is not yet exposed by IStorage — return RESET
+            // to acknowledge the command without lying about state.
+            co_return co_await WriteLine(socket, "RESET");
+        }
+        else
+        {
+            co_return co_await WriteError(socket, "CLIENT_ERROR", "unsupported stats sub-command");
+        }
+        out.append("END\r\n");
+        co_return co_await WriteAll(socket, out);
+    }
+
+    /// `touch <key> <exptime> [noreply]`.
+    Task<bool> HandleTouch(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
+    {
+        if (args.size() < 2)
+            co_return co_await WriteError(socket, "CLIENT_ERROR", "missing args");
+        std::uint32_t exptime = 0;
+        if (!ParseUnsigned(args[1], exptime))
+            co_return co_await WriteError(socket, "CLIENT_ERROR", "bad exptime");
+        bool const noreply = args.size() > 2 && IsNoReply(args.back());
+
+        auto const r = engine->Touch(args[0], exptime);
+        if (noreply)
+            co_return true;
+        if (r.has_value())
+            co_return co_await WriteLine(socket, "TOUCHED");
+        co_return co_await WriteLine(socket, "NOT_FOUND");
+    }
+
+    /// `gat <exptime> <key>...` and `gats <exptime> <key>...`.
+    Task<bool> HandleGat(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args, bool includeCas)
+    {
+        if (args.size() < 2)
+            co_return co_await WriteError(socket, "CLIENT_ERROR", "missing args");
+        std::uint32_t exptime = 0;
+        if (!ParseUnsigned(args[0], exptime))
+            co_return co_await WriteError(socket, "CLIENT_ERROR", "bad exptime");
+
+        std::string response;
+        response.reserve(64 * args.size());
+        for (std::size_t i = 1; i < args.size(); ++i)
+        {
+            auto const& key = args[i];
+            // Refresh expiry and read the value back atomically. Composing
+            // a separate Touch + Get would let a concurrent writer delete
+            // or mutate the entry in between, crediting touch_hits for a
+            // value the response never returns. On a miss, skip the key.
+            auto const r = engine->GetAndTouch(key, exptime);
+            if (!r.has_value() || !r->found)
+                continue;
+            AppendValueBlock(response, key, r->entry, includeCas);
+        }
+        response.append("END\r\n");
+        co_return co_await WriteAll(socket, response);
+    }
+
+    /// `cache_memlimit <megabytes> [noreply]`.
+    Task<bool> HandleCacheMemlimit(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
+    {
+        if (args.empty())
+            co_return co_await WriteError(socket, "CLIENT_ERROR", "missing megabytes argument");
+        std::uint64_t megabytes = 0;
+        if (!ParseUnsigned(args[0], megabytes))
+            co_return co_await WriteError(socket, "CLIENT_ERROR", "bad megabytes argument");
+        bool const noreply = args.size() > 1 && IsNoReply(args.back());
+        // Guard the MB->bytes conversion: an absurd argument must not wrap
+        // size_t to a tiny budget (mass eviction) or zero (= unlimited).
+        constexpr std::uint64_t BytesPerMegabyte = 1024U * 1024U;
+        if (megabytes > SIZE_MAX / BytesPerMegabyte)
+            co_return co_await WriteError(socket, "CLIENT_ERROR", "megabytes argument too large");
+        engine->Resize(static_cast<std::size_t>(megabytes * BytesPerMegabyte));
+        if (noreply)
+            co_return true;
+        co_return co_await WriteLine(socket, "OK");
     }
 
 } // namespace
@@ -359,9 +541,28 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket, CacheEngine* engine, std::
         else if (command == "flush_all")
             ok = co_await HandleFlushAll(socket, engine, tail);
         else if (command == "stats")
-            ok = co_await HandleStats(socket, engine);
+            ok = co_await HandleStats(socket, engine, tail);
         else if (command == "version")
             ok = co_await WriteLine(socket, std::format("VERSION {}", ServerVersion()));
+        else if (command == "touch")
+            ok = co_await HandleTouch(socket, engine, tail);
+        else if (command == "gat")
+            ok = co_await HandleGat(socket, engine, tail, /*includeCas*/ false);
+        else if (command == "gats")
+            ok = co_await HandleGat(socket, engine, tail, /*includeCas*/ true);
+        else if (command == "cache_memlimit")
+            ok = co_await HandleCacheMemlimit(socket, engine, tail);
+        else if (command == "verbosity")
+            // Accepted as a no-op — fastcached logs via ILogger.
+            ok = co_await WriteLine(socket, "OK");
+        else if (command == "slabs" || command == "lru" || command == "lru_crawler")
+            // Synthetic stub — fastcached does not implement slab allocation
+            // or a separate LRU crawler; capability probes get OK rather
+            // than ERROR. See docs for the non-applicable rationale.
+            ok = co_await WriteLine(socket, "OK");
+        else if (command == "mg" || command == "ms" || command == "md" || command == "ma" || command == "me"
+                 || command == "mn")
+            ok = co_await MemcachedMeta::Dispatch(socket, engine, &reader, command, tail);
         else if (command == "quit")
         {
             socket->Close();

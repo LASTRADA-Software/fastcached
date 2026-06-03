@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <span>
 #include <string_view>
+#include <vector>
 
 namespace FastCache
 {
@@ -28,6 +29,21 @@ using BytesSpan = std::span<std::byte>;
 [[nodiscard]] constexpr std::string_view AsStringView(BytesView bv) noexcept
 {
     return std::string_view { reinterpret_cast<char const*>(bv.data()), bv.size() };
+}
+
+/// Copy a string's bytes into an owning byte vector. Handy when a numeric
+/// or text value must be handed to a storage API that takes ownership of a
+/// `std::vector<std::byte>` (e.g. an arithmetic auto-vivify writing back the
+/// stringified initial value).
+/// @param sv Source text.
+/// @return Newly allocated vector holding the same bytes.
+[[nodiscard]] inline std::vector<std::byte> BytesFromString(std::string_view sv)
+{
+    std::vector<std::byte> out;
+    out.reserve(sv.size());
+    for (auto const c: sv)
+        out.push_back(static_cast<std::byte>(c));
+    return out;
 }
 
 } // namespace FastCache

@@ -144,3 +144,23 @@ TEST_CASE("TracingStorage emits DELETED / NOT_FOUND for Delete", "[tracing]")
     REQUIRE(ContainsSubstr(records[0].message, "result=DELETED"));
     REQUIRE(ContainsSubstr(records[1].message, "result=NOT_FOUND"));
 }
+
+TEST_CASE("TracingStorage forwards Touch and emits TOUCHED / NOT_FOUND", "[tracing][touch]")
+{
+    FastCache::InMemoryLruStorage inner;
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::ManualClock clock;
+    REQUIRE(inner.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+
+    FastCache::TracingStorage tracer { inner, logger, clock };
+    auto const touched = tracer.Touch("k", FastCache::TimePoint::max(), clock.Now());
+    REQUIRE(touched.has_value());
+    auto const missed = tracer.Touch("nope", FastCache::TimePoint::max(), clock.Now());
+    REQUIRE_FALSE(missed.has_value());
+
+    auto records = logger.Snapshot();
+    REQUIRE(records.size() == 2);
+    REQUIRE(ContainsSubstr(records[0].message, "storage: TOUCH"));
+    REQUIRE(ContainsSubstr(records[0].message, "result=TOUCHED"));
+    REQUIRE(ContainsSubstr(records[1].message, "result=NOT_FOUND"));
+}

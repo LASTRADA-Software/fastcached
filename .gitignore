@@ -1,6 +1,7 @@
 out/
 build/
 _build/
+site/
 .cache/
 .vs/
 .vscode/

@@ -113,12 +113,13 @@ std::expected<CasToken, StorageError> TracingStorage::Replace(
 
 std::expected<CasToken, StorageError> TracingStorage::Append(std::string_view key,
                                                              std::span<std::byte const> suffix,
+                                                             CasToken expected,
                                                              TimePoint now)
 {
     return TraceCall(
         "APPEND",
         key,
-        [&] { return _inner.Append(key, suffix, now); },
+        [&] { return _inner.Append(key, suffix, expected, now); },
         [](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
                 return std::string { ErrorOutcome(r.error()) };
@@ -128,12 +129,13 @@ std::expected<CasToken, StorageError> TracingStorage::Append(std::string_view ke
 
 std::expected<CasToken, StorageError> TracingStorage::Prepend(std::string_view key,
                                                               std::span<std::byte const> prefix,
+                                                              CasToken expected,
                                                               TimePoint now)
 {
     return TraceCall(
         "PREPEND",
         key,
-        [&] { return _inner.Prepend(key, prefix, now); },
+        [&] { return _inner.Prepend(key, prefix, expected, now); },
         [](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
                 return std::string { ErrorOutcome(r.error()) };
@@ -160,13 +162,14 @@ std::expected<CasToken, StorageError> TracingStorage::CompareAndSwap(std::string
 }
 
 std::expected<IStorage::IncrResult, StorageError> TracingStorage::IncrementOrInitialize(std::string_view key,
-                                                                                        std::int64_t delta,
+                                                                                        std::uint64_t magnitude,
+                                                                                        bool decrement,
                                                                                         TimePoint now)
 {
     return TraceCall(
-        delta >= 0 ? "INCR" : "DECR",
+        decrement ? "DECR" : "INCR",
         key,
-        [&] { return _inner.IncrementOrInitialize(key, delta, now); },
+        [&] { return _inner.IncrementOrInitialize(key, magnitude, decrement, now); },
         [](std::expected<IStorage::IncrResult, StorageError> const& r) -> std::string {
             if (!r.has_value())
                 return std::string { ErrorOutcome(r.error()) };
@@ -180,6 +183,77 @@ std::expected<void, StorageError> TracingStorage::Delete(std::string_view key, T
         "DELETE",
         key,
         [&] { return _inner.Delete(key, now); },
+        [](std::expected<void, StorageError> const& r) -> std::string {
+            if (!r.has_value())
+                return std::string { ErrorOutcome(r.error()) };
+            return "DELETED";
+        });
+}
+
+std::expected<CasToken, StorageError> TracingStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
+{
+    return TraceCall(
+        "TOUCH",
+        key,
+        [&] { return _inner.Touch(key, newExpiry, now); },
+        [](std::expected<CasToken, StorageError> const& r) -> std::string {
+            if (!r.has_value())
+                return std::string { ErrorOutcome(r.error()) };
+            return "TOUCHED";
+        });
+}
+
+std::expected<GetResult, StorageError> TracingStorage::Peek(std::string_view key, TimePoint now)
+{
+    return TraceCall(
+        "PEEK",
+        key,
+        [&] { return _inner.Peek(key, now); },
+        [](std::expected<GetResult, StorageError> const& r) -> std::string {
+            if (!r.has_value())
+                return std::string { ErrorOutcome(r.error()) };
+            if (r->found)
+                return std::format("HIT bytes={}", r->entry.value.size());
+            return "MISS";
+        });
+}
+
+std::expected<CasToken, StorageError> TracingStorage::MarkStale(std::string_view key,
+                                                                std::optional<TimePoint> newExpiry,
+                                                                TimePoint now)
+{
+    return TraceCall(
+        "MARK_STALE",
+        key,
+        [&] { return _inner.MarkStale(key, newExpiry, now); },
+        [](std::expected<CasToken, StorageError> const& r) -> std::string {
+            if (!r.has_value())
+                return std::string { ErrorOutcome(r.error()) };
+            return "STALE";
+        });
+}
+
+std::expected<GetResult, StorageError> TracingStorage::GetAndTouch(std::string_view key, TimePoint newExpiry, TimePoint now)
+{
+    return TraceCall(
+        "GAT",
+        key,
+        [&] { return _inner.GetAndTouch(key, newExpiry, now); },
+        [](std::expected<GetResult, StorageError> const& r) -> std::string {
+            if (!r.has_value())
+                return std::string { ErrorOutcome(r.error()) };
+            if (r->found)
+                return std::format("HIT bytes={}", r->entry.value.size());
+            return "MISS";
+        });
+}
+
+std::expected<void, StorageError> TracingStorage::CompareAndDelete(std::string_view key, CasToken expected, TimePoint now)
+{
+    return TraceCall(
+        "CAD",
+        key,
+        [&] { return _inner.CompareAndDelete(key, expected, now); },
         [](std::expected<void, StorageError> const& r) -> std::string {
             if (!r.has_value())
                 return std::string { ErrorOutcome(r.error()) };
