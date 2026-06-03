@@ -107,6 +107,42 @@ std::vector<std::byte> Exchange(BinaryFixture& fix, std::span<std::byte const> r
     return FastCache::SyncRun(Drain(fix.pair.client.get()));
 }
 
+/// One decoded binary response packet.
+struct BinaryRecord
+{
+    std::uint8_t opcode { 0 };
+    std::uint16_t status { 0 };
+    std::uint64_t cas { 0 };
+    std::string value;
+};
+
+/// Walk a concatenated binary response stream into individual packets,
+/// using each header's totalBodyLen so variable-length error bodies don't
+/// throw off the offsets.
+std::vector<BinaryRecord> ParseRecords(std::vector<std::byte> const& resp)
+{
+    std::vector<BinaryRecord> out;
+    std::size_t off = 0;
+    while (off + 24 <= resp.size())
+    {
+        BinaryRecord rec;
+        rec.opcode = std::to_integer<std::uint8_t>(resp[off + 1]);
+        auto const keyLen = FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { resp.data() + off + 2, 2 });
+        auto const extrasLen = std::to_integer<std::uint8_t>(resp[off + 4]);
+        rec.status = FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { resp.data() + off + 6, 2 });
+        auto const bodyLen =
+            FastCache::ReadBigEndian<std::uint32_t>(std::span<std::byte const> { resp.data() + off + 8, 4 });
+        rec.cas = FastCache::ReadBigEndian<std::uint64_t>(std::span<std::byte const> { resp.data() + off + 16, 8 });
+        std::size_t const valueStart = off + 24 + extrasLen + keyLen;
+        std::size_t const valueLen = bodyLen - extrasLen - keyLen;
+        for (std::size_t i = valueStart; i < valueStart + valueLen && i < resp.size(); ++i)
+            rec.value.push_back(static_cast<char>(resp[i]));
+        out.push_back(std::move(rec));
+        off += 24 + bodyLen;
+    }
+    return out;
+}
+
 } // namespace
 
 TEST_CASE("memcached-binary: SET then GET round-trips", "[protocol][binary]")
@@ -378,14 +414,16 @@ TEST_CASE("memcached-binary: Verbosity (0x1b) is a no-op that returns Ok", "[pro
     REQUIRE(status == 0);
 }
 
-TEST_CASE("memcached-binary: quiet IncrementQ on miss with exptime=0xffffffff suppresses the error response",
+TEST_CASE("memcached-binary: quiet IncrementQ on miss with exptime=0xffffffff emits the error response",
           "[protocol][binary][quiet]")
 {
     BinaryFixture fix;
-    // Issue IncrementQ (quiet) on a missing key with the "don't create"
-    // sentinel exptime — the quiet semantics suppress the KeyNotFound
-    // response. We confirm by pipelining a NoOp afterwards: only the
-    // NoOp's reply (24 bytes) should come back.
+    // IncrementQ is a quiet *mutation*. Per the memcached binary spec,
+    // "quiet mutations only return responses on failure" — success is
+    // suppressed but "errors should not be allowed to go unnoticed". So a
+    // miss under the "don't create" sentinel (0xffffffff) is a failure and
+    // must emit a KeyNotFound packet. We pipeline a NoOp afterwards and
+    // expect TWO replies: the IncrementQ error, then the NoOp.
     std::array<std::byte, 20> extras {};
     FastCache::WriteBigEndian<std::uint64_t>(std::span<std::byte> { extras.data(), 8 }, 1U);
     FastCache::WriteBigEndian<std::uint64_t>(std::span<std::byte> { extras.data() + 8, 8 }, 0U);
@@ -395,54 +433,14 @@ TEST_CASE("memcached-binary: quiet IncrementQ on miss with exptime=0xffffffff su
     auto noop = BuildBinaryFrame(/*opcode*/ 0x0a, {}, {}, {}, /*cas*/ 0, /*opaque*/ 0x12345678U);
     frame.insert(frame.end(), noop.begin(), noop.end());
 
-    auto const response = Exchange(fix, std::span<std::byte const> { frame.data(), frame.size() });
-    // Exactly one 24-byte header — the NoOp reply.
-    REQUIRE(response.size() == 24);
-    REQUIRE(std::to_integer<std::uint8_t>(response[1]) == 0x0a);
-    auto const opaque = FastCache::ReadBigEndian<std::uint32_t>(std::span<std::byte const> { response.data() + 12, 4 });
-    REQUIRE(opaque == 0x12345678U);
+    auto const records = ParseRecords(Exchange(fix, std::span<std::byte const> { frame.data(), frame.size() }));
+    // IncrementQ error reply (opcode 0x15, status KeyNotFound=0x0001) + NoOp.
+    REQUIRE(records.size() == 2);
+    REQUIRE(records[0].opcode == 0x15);
+    REQUIRE(records[0].status == 0x0001);
+    REQUIRE(records[1].opcode == 0x0a);
+    REQUIRE(records[1].status == 0x0000);
 }
-
-namespace
-{
-
-/// One decoded binary response packet.
-struct BinaryRecord
-{
-    std::uint8_t opcode { 0 };
-    std::uint16_t status { 0 };
-    std::uint64_t cas { 0 };
-    std::string value;
-};
-
-/// Walk a concatenated binary response stream into individual packets,
-/// using each header's totalBodyLen so variable-length error bodies don't
-/// throw off the offsets.
-std::vector<BinaryRecord> ParseRecords(std::vector<std::byte> const& resp)
-{
-    std::vector<BinaryRecord> out;
-    std::size_t off = 0;
-    while (off + 24 <= resp.size())
-    {
-        BinaryRecord rec;
-        rec.opcode = std::to_integer<std::uint8_t>(resp[off + 1]);
-        auto const keyLen = FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { resp.data() + off + 2, 2 });
-        auto const extrasLen = std::to_integer<std::uint8_t>(resp[off + 4]);
-        rec.status = FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { resp.data() + off + 6, 2 });
-        auto const bodyLen =
-            FastCache::ReadBigEndian<std::uint32_t>(std::span<std::byte const> { resp.data() + off + 8, 4 });
-        rec.cas = FastCache::ReadBigEndian<std::uint64_t>(std::span<std::byte const> { resp.data() + off + 16, 8 });
-        std::size_t const valueStart = off + 24 + extrasLen + keyLen;
-        std::size_t const valueLen = bodyLen - extrasLen - keyLen;
-        for (std::size_t i = valueStart; i < valueStart + valueLen && i < resp.size(); ++i)
-            rec.value.push_back(static_cast<char>(resp[i]));
-        out.push_back(std::move(rec));
-        off += 24 + bodyLen;
-    }
-    return out;
-}
-
-} // namespace
 
 TEST_CASE("memcached-binary: AppendQ (0x19) and PrependQ (0x1a) actually mutate the stored value",
           "[protocol][binary][append][regression]")
@@ -470,6 +468,92 @@ TEST_CASE("memcached-binary: AppendQ (0x19) and PrependQ (0x1a) actually mutate 
     REQUIRE(records[1].opcode == 0x00);
     REQUIRE(records[1].status == 0);
     REQUIRE(records[1].value == "ABC");
+}
+
+TEST_CASE("memcached-binary: quiet AddQ (0x12) on an existing key emits KeyExists", "[protocol][binary][quiet]")
+{
+    // Quiet mutation: success is suppressed, but a failure (the key already
+    // exists, so Add is rejected) must still emit an error packet.
+    BinaryFixture fix;
+    std::array<std::byte, 8> extras {}; // flags + exptime.
+
+    auto frame = BuildBinaryFrame(/*Set*/ 0x01, "k", std::span<std::byte const> { extras.data(), 8 }, "v");
+    auto const addQ = BuildBinaryFrame(/*AddQ*/ 0x12, "k", std::span<std::byte const> { extras.data(), 8 }, "w");
+    frame.insert(frame.end(), addQ.begin(), addQ.end());
+
+    auto const records = ParseRecords(Exchange(fix, std::span<std::byte const> { frame.data(), frame.size() }));
+    // SET success reply + AddQ error reply (success would have been silent).
+    REQUIRE(records.size() == 2);
+    REQUIRE(records[0].opcode == 0x01);
+    REQUIRE(records[0].status == 0x0000);
+    REQUIRE(records[1].opcode == 0x12);
+    REQUIRE(records[1].status == 0x0002); // KeyExists
+}
+
+TEST_CASE("memcached-binary: quiet ReplaceQ (0x13) on a missing key emits KeyNotFound", "[protocol][binary][quiet]")
+{
+    // Quiet mutation on a miss is a failure → error packet, not silence.
+    BinaryFixture fix;
+    std::array<std::byte, 8> extras {};
+    auto const frame = BuildBinaryFrame(/*ReplaceQ*/ 0x13, "absent", std::span<std::byte const> { extras.data(), 8 }, "v");
+
+    auto const records = ParseRecords(Exchange(fix, std::span<std::byte const> { frame.data(), frame.size() }));
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0].opcode == 0x13);
+    REQUIRE(records[0].status == 0x0001); // KeyNotFound
+}
+
+TEST_CASE("memcached-binary: quiet IncrementQ (0x15) on a non-numeric value emits IncrOnNonNumeric",
+          "[protocol][binary][quiet][arith]")
+{
+    // Quiet arithmetic on a non-numeric existing value is a failure → the
+    // error packet must surface even though IncrementQ is quiet on success.
+    BinaryFixture fix;
+    std::array<std::byte, 8> setExtras {};
+    auto frame = BuildBinaryFrame(/*Set*/ 0x01, "k", std::span<std::byte const> { setExtras.data(), 8 }, "notnum");
+
+    std::array<std::byte, 20> arithExtras {};
+    FastCache::WriteBigEndian<std::uint64_t>(std::span<std::byte> { arithExtras.data(), 8 }, 1U);
+    FastCache::WriteBigEndian<std::uint64_t>(std::span<std::byte> { arithExtras.data() + 8, 8 }, 0U);
+    FastCache::WriteBigEndian<std::uint32_t>(std::span<std::byte> { arithExtras.data() + 16, 4 }, 0U);
+    auto const incrQ = BuildBinaryFrame(/*IncrementQ*/ 0x15, "k", std::span<std::byte const> { arithExtras.data(), 20 }, {});
+    frame.insert(frame.end(), incrQ.begin(), incrQ.end());
+
+    auto const records = ParseRecords(Exchange(fix, std::span<std::byte const> { frame.data(), frame.size() }));
+    REQUIRE(records.size() == 2);
+    REQUIRE(records[0].opcode == 0x01);
+    REQUIRE(records[0].status == 0x0000);
+    REQUIRE(records[1].opcode == 0x15);
+    REQUIRE(records[1].status == 0x0006); // IncrOnNonNumeric
+}
+
+TEST_CASE("memcached-binary: quiet DeleteQ (0x14) on a missing key emits KeyNotFound", "[protocol][binary][quiet]")
+{
+    // DeleteQ is a quiet mutation: a miss is a failure and must be reported.
+    BinaryFixture fix;
+    auto const frame = BuildBinaryFrame(/*DeleteQ*/ 0x14, "absent", {}, {});
+
+    auto const records = ParseRecords(Exchange(fix, std::span<std::byte const> { frame.data(), frame.size() }));
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0].opcode == 0x14);
+    REQUIRE(records[0].status == 0x0001); // KeyNotFound
+}
+
+TEST_CASE("memcached-binary: quiet GatQ (0x1e) is mum on a cache miss", "[protocol][binary][quiet][gat]")
+{
+    // GAT is a quiet *read*: like GetQ it stays silent on a cache miss. We
+    // pipeline a NoOp and expect only the NoOp reply to come back.
+    BinaryFixture fix;
+    std::array<std::byte, 4> extras {};
+    FastCache::WriteBigEndian<std::uint32_t>(std::span<std::byte> { extras.data(), 4 }, 0U);
+    auto frame = BuildBinaryFrame(/*GatQ*/ 0x1e, "absent", std::span<std::byte const> { extras.data(), 4 }, {});
+
+    auto const noop = BuildBinaryFrame(/*NoOp*/ 0x0a, {}, {}, {}, /*cas*/ 0, /*opaque*/ 0x0badcafeU);
+    frame.insert(frame.end(), noop.begin(), noop.end());
+
+    auto const records = ParseRecords(Exchange(fix, std::span<std::byte const> { frame.data(), frame.size() }));
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0].opcode == 0x0a); // only the NoOp — GatQ miss suppressed
 }
 
 TEST_CASE("memcached-binary: Set with a non-zero header CAS is a conditional store", "[protocol][binary][cas][regression]")

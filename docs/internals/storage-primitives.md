@@ -14,12 +14,24 @@ public:
     virtual std::expected<CasToken, StorageError> Set(string_view key, vector<byte> value, uint32_t flags, TimePoint expiry) = 0;
     virtual std::expected<CasToken, StorageError> Add(string_view key, vector<byte> value, uint32_t flags, TimePoint expiry, TimePoint now) = 0;
     virtual std::expected<CasToken, StorageError> Replace(string_view key, vector<byte> value, uint32_t flags, TimePoint expiry, TimePoint now) = 0;
-    virtual std::expected<CasToken, StorageError> Append(string_view key, span<byte const> suffix, TimePoint now) = 0;
-    virtual std::expected<CasToken, StorageError> Prepend(string_view key, span<byte const> prefix, TimePoint now) = 0;
+    virtual std::expected<CasToken, StorageError> Append(string_view key, span<byte const> suffix, CasToken expected, TimePoint now) = 0;
+    virtual std::expected<CasToken, StorageError> Prepend(string_view key, span<byte const> prefix, CasToken expected, TimePoint now) = 0;
     virtual std::expected<CasToken, StorageError> CompareAndSwap(string_view key, CasToken expected, vector<byte> value, uint32_t flags, TimePoint expiry, TimePoint now) = 0;
-    virtual std::expected<IncrResult, StorageError> IncrementOrInitialize(string_view key, int64_t delta, TimePoint now) = 0;
+    // magnitude is unsigned; `decrement` picks the direction (a signed delta
+    // could not represent magnitudes >= 2^63).
+    virtual std::expected<IncrResult, StorageError> IncrementOrInitialize(string_view key, uint64_t magnitude, bool decrement, TimePoint now) = 0;
     virtual std::expected<void, StorageError> Delete(string_view key, TimePoint now) = 0;
     virtual std::expected<CasToken, StorageError> Touch(string_view key, TimePoint newExpiry, TimePoint now) = 0;
+
+    // Non-mutating read: like Get but does not touch lastAccess, LRU position, or hit/miss stats.
+    virtual std::expected<GetResult, StorageError> Peek(string_view key, TimePoint now) = 0;
+    // Mark the entry stale (meta `md I` / `ms I`) without removing it; optionally refresh expiry.
+    virtual std::expected<CasToken, StorageError> MarkStale(string_view key, optional<TimePoint> newExpiry, TimePoint now) = 0;
+    // Atomic get-and-touch (memcached gat); defaults to Touch + Get, lock-owning backends override.
+    virtual std::expected<GetResult, StorageError> GetAndTouch(string_view key, TimePoint newExpiry, TimePoint now);
+    // Atomic delete-if-CAS-matches (meta `md C(token)`); defaults to Peek + Delete.
+    virtual std::expected<void, StorageError> CompareAndDelete(string_view key, CasToken expected, TimePoint now);
+
     virtual void FlushWithGeneration(TimePoint effectiveAt) = 0;
     virtual std::size_t PurgeExpired(TimePoint now) = 0;
     virtual void Resize(std::size_t newMaxBytes) = 0;
@@ -52,7 +64,10 @@ operation mapping across all four protocols, see
 | Compare-and-swap             | `CompareAndSwap` |
 | Increment / decrement        | `IncrementOrInitialize` |
 | Delete                       | `Delete` |
+| Compare-and-delete (meta `md C`) | `CompareAndDelete` |
 | Refresh TTL                  | `Touch` |
+| Get-and-touch (`gat` / `gats`)   | `GetAndTouch` |
+| Mark stale (meta `md I` / `ms I`) | `MarkStale` |
 | Drop all entries             | `FlushWithGeneration` |
 | Rebudget                     | `Resize` |
 | Snapshot stats               | `Snapshot` |
@@ -70,6 +85,7 @@ Each stored value has the metadata recorded in `CacheEntry`:
 | `generation`  | For `flush_all` — entries older than the storage's live generation are invisible |
 | `lastAccess`  | Updated on every successful `Get`; surfaced via meta `l` flag |
 | `stale`       | Set by meta `md I` / `ms I`; surfaced via meta `X` response flag |
+| `fetched`     | Set once the entry has been returned by a successful `Get`. Drives the `evicted_unfetched` / `expired_unfetched` stats (entries discarded before any client read them). Reset on insertion and on every value-rewriting mutation. |
 
 ## StorageStats
 

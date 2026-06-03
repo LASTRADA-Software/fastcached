@@ -14,8 +14,7 @@ clients speak.
 ## exptime semantics
 
 The `exptime` field on `set`, `add`, `replace`, `cas`, `touch`, `gat`,
-`gats`, `cache_memlimit`, and meta `T` flag follows the standard
-memcached rules:
+`gats`, and the meta `T` flag follows the standard memcached rules:
 
 | Value             | Meaning |
 |-------------------|---------|

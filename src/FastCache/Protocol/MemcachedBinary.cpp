@@ -313,12 +313,11 @@ namespace
                 break;
         }
 
+        // Per the memcached binary spec, quiet mutations suppress only the
+        // success reply — "errors should not be allowed to go unnoticed", so
+        // a failure still emits an error packet even for the quiet opcode.
         if (!result.has_value())
-        {
-            if (isQuiet)
-                co_return true;
             co_return co_await ReplyError(socket, opcode, MapStorageError(result.error().code), header.opaque);
-        }
         if (isQuiet)
             co_return true;
         co_return co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, *result, {}, {}, {});
@@ -357,12 +356,11 @@ namespace
     {
         auto const result = engine->Delete(AsStringView(key));
         bool const quiet = opcode == Opcode::DeleteQ;
+        // DeleteQ is a quiet mutation: it suppresses only the success reply.
+        // A miss (KeyNotFound) is a failure and must still emit an error
+        // packet per the memcached binary spec.
         if (!result.has_value())
-        {
-            if (quiet)
-                co_return true;
             co_return co_await ReplyError(socket, opcode, Status::KeyNotFound, header.opaque);
-        }
         if (quiet)
             co_return true;
         co_return co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, 0, {}, {}, {});
@@ -416,16 +414,21 @@ namespace
         // single atomic step so no concurrent writer can slip between the
         // touch and the read.
         auto const got = engine->GetAndTouch(keyView, exptime);
-        if (!got.has_value() || !got->found)
+        // GAT is a quiet *read*: like GetQ it is "mum on cache miss", so a
+        // miss is suppressed for the quiet variant. A miss surfaces here as
+        // either KeyNotFound (the touch step found nothing) or a value with
+        // found == false. Any *other* storage error is a genuine failure and
+        // must always surface — quiet silences the miss, not real failures.
+        bool const isMiss =
+            (!got.has_value() && got.error().code == StorageErrorCode::KeyNotFound) || (got.has_value() && !got->found);
+        if (isMiss)
         {
             if (isQuiet)
                 co_return true;
-            co_return co_await ReplyError(
-                socket,
-                opcode,
-                MapStorageError(got.has_value() ? StorageErrorCode::KeyNotFound : got.error().code),
-                header.opaque);
+            co_return co_await ReplyError(socket, opcode, Status::KeyNotFound, header.opaque);
         }
+        if (!got.has_value())
+            co_return co_await ReplyError(socket, opcode, MapStorageError(got.error().code), header.opaque);
         auto const& entry = got->entry;
         std::array<std::byte, 4> outExtras {};
         WriteBigEndian<std::uint32_t>(outExtras, entry.flags);
@@ -463,30 +466,23 @@ namespace
         // Try the existing key first.
         auto result = isIncr ? engine->Increment(keyView, delta) : engine->Decrement(keyView, delta);
 
+        // IncrementQ / DecrementQ are quiet mutations: per the memcached
+        // binary spec they suppress only the success reply, so every failure
+        // below still emits an error packet even for the quiet variant.
         if (!result.has_value() && result.error().code == StorageErrorCode::KeyNotFound)
         {
             // Spec: expiration of 0xffffffff means "do NOT create on miss".
             if (expiration == 0xFFFFFFFFU)
-            {
-                if (isQuiet)
-                    co_return true;
                 co_return co_await ReplyError(socket, opcode, Status::KeyNotFound, header.opaque);
-            }
             // Auto-vivify with the initial value and the given expiration.
             auto const set = engine->Set(keyView, BytesFromString(std::to_string(initial)), 0, expiration);
             if (!set.has_value())
-            {
-                if (isQuiet)
-                    co_return true;
                 co_return co_await ReplyError(socket, opcode, MapStorageError(set.error().code), header.opaque);
-            }
             result = IStorage::IncrResult { .value = initial, .cas = *set };
         }
         else if (!result.has_value())
         {
             // Non-numeric existing value or other error.
-            if (isQuiet)
-                co_return true;
             auto const code = result.error().code;
             auto const status = code == StorageErrorCode::InvalidArgument ? Status::IncrOnNonNumeric : MapStorageError(code);
             co_return co_await ReplyError(socket, opcode, status, header.opaque);
