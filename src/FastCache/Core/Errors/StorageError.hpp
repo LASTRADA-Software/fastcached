@@ -39,6 +39,16 @@ struct StorageError
     }
 };
 
+/// Build a `StorageError` carrying only a code (no system code or context).
+/// Centralizes the full field initialization in one place so call sites stay
+/// terse without tripping `-Wmissing-designated-field-initializers`.
+/// @param code The storage error category.
+/// @return A `StorageError` with `code` set and the remaining fields defaulted.
+[[nodiscard]] inline StorageError MakeStorageError(StorageErrorCode code) noexcept
+{
+    return StorageError { .code = code, .systemCode = 0, .context = {} };
+}
+
 [[nodiscard]] constexpr std::string_view ToStringView(StorageErrorCode code) noexcept
 {
     switch (code)

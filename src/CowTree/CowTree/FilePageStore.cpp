@@ -33,13 +33,6 @@ namespace CowTree
 namespace
 {
 
-#if defined(_WIN32)
-    [[nodiscard]] int WinErrnoFromLastError() noexcept
-    {
-        return static_cast<int>(GetLastError());
-    }
-#endif
-
     /// True iff the page size is one we will accept.
     [[nodiscard]] bool IsValidPageSize(std::size_t size) noexcept
     {

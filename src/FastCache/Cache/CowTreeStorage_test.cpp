@@ -13,6 +13,7 @@
 #include <format>
 #include <fstream>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
@@ -469,8 +470,10 @@ TEST_CASE("Append + Prepend round-trip and persist", "[cowstorage][roundtrip]")
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
         REQUIRE(storage.Set("k", MakeBytes("middle"), 0, FastCache::TimePoint::max()).has_value());
-        REQUIRE(storage.Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, clock.Now()).has_value());
-        REQUIRE(storage.Prepend("k", std::span<std::byte const> { prefix.data(), prefix.size() }, clock.Now()).has_value());
+        REQUIRE(
+            storage.Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, 0, clock.Now()).has_value());
+        REQUIRE(
+            storage.Prepend("k", std::span<std::byte const> { prefix.data(), prefix.size() }, 0, clock.Now()).has_value());
         auto got = storage.Get("k", clock.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
@@ -500,7 +503,7 @@ TEST_CASE("Append exceeding maxValueBytes returns ValueTooLarge and leaves value
     REQUIRE((*storage)->Set("k", MakeBytes("0123456789ABCDE"), 0, FastCache::TimePoint::max()).has_value());
     auto const overflow = MakeBytes("XX");
     auto const result =
-        (*storage)->Append("k", std::span<std::byte const> { overflow.data(), overflow.size() }, clock.Now());
+        (*storage)->Append("k", std::span<std::byte const> { overflow.data(), overflow.size() }, 0, clock.Now());
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::StorageErrorCode::ValueTooLarge);
 
@@ -557,17 +560,22 @@ TEST_CASE("CompareAndSwap mismatch leaves entry untouched", "[cowstorage][cas]")
     REQUIRE(got->entry.cas == *setCas);
 }
 
-TEST_CASE("IncrementOrInitialize creates and increments; survives reopen", "[cowstorage][incr][roundtrip]")
+TEST_CASE("IncrementOrInitialize returns KeyNotFound on a miss; increments an existing key", "[cowstorage][incr][roundtrip]")
 {
     TempFile tmp;
     FastCache::ManualClock clock;
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        auto a = storage.IncrementOrInitialize("counter", 10, clock.Now());
-        REQUIRE(a.has_value());
-        REQUIRE(a->value == 10U);
+        // Contract: a missing key is a miss, NOT an auto-create. The
+        // protocol layer owns the "initialize" semantics (binary
+        // initial/expiration, meta J/N) and re-issues a Set on KeyNotFound.
+        auto miss = storage.IncrementOrInitialize("counter", 10, /*decrement=*/false, clock.Now());
+        REQUIRE_FALSE(miss.has_value());
+        REQUIRE(miss.error().code == FastCache::StorageErrorCode::KeyNotFound);
 
-        auto b = storage.IncrementOrInitialize("counter", 5, clock.Now());
+        // Seed the key, then increment the existing value.
+        REQUIRE(storage.Set("counter", MakeBytes("10"), 0, FastCache::TimePoint::max()).has_value());
+        auto b = storage.IncrementOrInitialize("counter", 5, /*decrement=*/false, clock.Now());
         REQUIRE(b.has_value());
         REQUIRE(b->value == 15U);
     });
@@ -587,27 +595,121 @@ TEST_CASE("IncrementOrInitialize floors at 0 on saturating decrement", "[cowstor
     REQUIRE(storage.has_value());
     FastCache::ManualClock clock;
 
-    REQUIRE((*storage)->IncrementOrInitialize("k", 5, clock.Now()).has_value());
-    auto r = (*storage)->IncrementOrInitialize("k", -10, clock.Now());
+    REQUIRE((*storage)->Set("k", MakeBytes("5"), 0, FastCache::TimePoint::max()).has_value());
+    auto r = (*storage)->IncrementOrInitialize("k", 10, /*decrement=*/true, clock.Now());
     REQUIRE(r.has_value());
     REQUIRE(r->value == 0U);
 }
 
-TEST_CASE("IncrementOrInitialize DECR with INT64_MIN does not invoke UB and floors at 0", "[cowstorage][incr][regression]")
+TEST_CASE("IncrementOrInitialize handles full-uint64 magnitudes without signed-overflow UB",
+          "[cowstorage][incr][regression]")
 {
-    // Regression for finding #10 — negating INT64_MIN as a signed int
-    // is UB. ASan/UBSan would abort. The fix uses the
-    // `static_cast<uint64_t>(-(delta + 1)) + 1` idiom.
+    // The magnitude is a full std::uint64_t, so a decrement by 2^63 saturates
+    // cleanly at 0 and an increment by 2^63 adds — magnitudes the old signed
+    // delta could not carry (decr by 2^63 was negation-of-INT64_MIN UB; incr
+    // by 2^63 aliased to a decrement). UBSan would abort on a regression.
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts { .path = tmp.path };
+    auto storage = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(storage.has_value());
+    FastCache::ManualClock clock;
+    constexpr std::uint64_t Huge = 1ULL << 63;
+
+    REQUIRE((*storage)->Set("k", MakeBytes("0"), 0, FastCache::TimePoint::max()).has_value());
+    auto const up = (*storage)->IncrementOrInitialize("k", Huge, /*decrement=*/false, clock.Now());
+    REQUIRE(up.has_value());
+    REQUIRE(up->value == Huge); // 0 + 2^63, not aliased to a decrement
+
+    auto const down = (*storage)->IncrementOrInitialize("k", Huge, /*decrement=*/true, clock.Now());
+    REQUIRE(down.has_value());
+    REQUIRE(down->value == 0U); // 2^63 - 2^63
+}
+
+TEST_CASE("CowTreeStorage Touch preserves the fetched bit (a touch is not a read)", "[cowstorage][stats][unfetched]")
+{
+    // Regression: Touch used the default AccessKind::Write, clearing `fetched`
+    // and diverging from InMemoryLruStorage. A previously-read entry that is
+    // later purged must NOT be counted expired_unfetched.
     TempFile tmp;
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
     FastCache::ManualClock clock;
 
-    REQUIRE((*storage)->IncrementOrInitialize("k", 0, clock.Now()).has_value());
-    auto r = (*storage)->IncrementOrInitialize("k", std::numeric_limits<std::int64_t>::min(), clock.Now());
-    REQUIRE(r.has_value());
-    REQUIRE(r->value == 0U);
+    REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, clock.Now() + 1s).has_value());
+    REQUIRE((*storage)->Get("k", clock.Now())->found);                          // fetched = true
+    REQUIRE((*storage)->Touch("k", clock.Now() + 1s, clock.Now()).has_value()); // must keep fetched
+
+    clock.Advance(2s);
+    REQUIRE((*storage)->PurgeExpired(clock.Now()) == 1U);
+    REQUIRE((*storage)->Snapshot().expiredUnfetched == 0U);
+}
+
+TEST_CASE("CowTreeStorage MarkStale preserves the fetched bit", "[cowstorage][stats][unfetched]")
+{
+    // MarkStale shares TouchOrInsert(AccessKind::Preserve) with Touch, so a
+    // previously-read entry that is later purged must not be counted unfetched.
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts { .path = tmp.path };
+    auto storage = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(storage.has_value());
+    FastCache::ManualClock clock;
+
+    REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, clock.Now() + 1s).has_value());
+    REQUIRE((*storage)->Get("k", clock.Now())->found);                          // fetched = true
+    REQUIRE((*storage)->MarkStale("k", std::nullopt, clock.Now()).has_value()); // must keep fetched
+
+    clock.Advance(2s);
+    REQUIRE((*storage)->PurgeExpired(clock.Now()) == 1U);
+    REQUIRE((*storage)->Snapshot().expiredUnfetched == 0U);
+}
+
+TEST_CASE("CowTreeStorage GetAndTouch refreshes the expiry and returns the entry", "[cowstorage][gat]")
+{
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts { .path = tmp.path };
+    auto storage = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(storage.has_value());
+    FastCache::ManualClock clock;
+
+    REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, clock.Now() + 1s).has_value());
+    auto const newExpiry = clock.Now() + 60s;
+    auto const gat = (*storage)->GetAndTouch("k", newExpiry, clock.Now());
+    REQUIRE(gat.has_value());
+    REQUIRE(gat->found);
+    REQUIRE(Decode(gat->entry.value) == "v");
+    REQUIRE(gat->entry.expiry == newExpiry);
+
+    auto const miss = (*storage)->GetAndTouch("absent", newExpiry, clock.Now());
+    REQUIRE_FALSE(miss.has_value());
+    REQUIRE(miss.error().code == FastCache::StorageErrorCode::KeyNotFound);
+}
+
+TEST_CASE("CowTreeStorage CompareAndDelete honours the CAS precondition", "[cowstorage][cad]")
+{
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts { .path = tmp.path };
+    auto storage = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(storage.has_value());
+    FastCache::ManualClock clock;
+
+    auto const setCas = (*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
+    REQUIRE(setCas.has_value());
+
+    // Wrong CAS -> mismatch, entry survives.
+    auto const wrong = (*storage)->CompareAndDelete("k", *setCas + 1, clock.Now());
+    REQUIRE_FALSE(wrong.has_value());
+    REQUIRE(wrong.error().code == FastCache::StorageErrorCode::CasMismatch);
+    REQUIRE((*storage)->Get("k", clock.Now())->found);
+
+    // Right CAS -> deleted.
+    REQUIRE((*storage)->CompareAndDelete("k", *setCas, clock.Now()).has_value());
+    REQUIRE_FALSE((*storage)->Get("k", clock.Now())->found);
+
+    // Absent key -> KeyNotFound.
+    auto const absent = (*storage)->CompareAndDelete("absent", 1, clock.Now());
+    REQUIRE_FALSE(absent.has_value());
+    REQUIRE(absent.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
 
 // ============================================================================
@@ -938,4 +1040,112 @@ TEST_CASE("Set above maxValueBytes returns ValueTooLarge", "[cowstorage][boundar
     auto const r = (*storage)->Set("k", too_big, 0, FastCache::TimePoint::max());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::ValueTooLarge);
+}
+
+TEST_CASE("Touch refreshes expiry and bumps CAS, persists across reopen", "[cowstorage][touch]")
+{
+    TempFile tmp;
+    FastCache::ManualClock clock;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+
+    auto firstCas = FastCache::CasToken { 0 };
+    auto extendedExpiry = clock.Now() + 60s;
+    {
+        auto storage = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(storage.has_value());
+
+        auto const setCas = (*storage)->Set("k", MakeBytes("payload"), 0xBEEF, clock.Now() + 1s);
+        REQUIRE(setCas.has_value());
+        firstCas = *setCas;
+
+        auto const touched = (*storage)->Touch("k", extendedExpiry, clock.Now());
+        REQUIRE(touched.has_value());
+        REQUIRE(*touched != firstCas);
+
+        auto const stats = (*storage)->Snapshot();
+        REQUIRE(stats.touchHits == 1U);
+        REQUIRE(stats.cmdTouch == 1U);
+    }
+    // Reopen: the touch should have persisted (extended expiry + new CAS).
+    auto reopened = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(reopened.has_value());
+    auto const got = (*reopened)->Get("k", clock.Now() + 30s);
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
+    REQUIRE(Decode(got->entry.value) == "payload");
+    REQUIRE(got->entry.flags == 0xBEEF);
+    REQUIRE(got->entry.expiry == extendedExpiry);
+}
+
+TEST_CASE("Touch on absent key returns KeyNotFound + bumps touchMisses", "[cowstorage][touch]")
+{
+    TempFile tmp;
+    FastCache::ManualClock clock;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+
+    auto storage = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(storage.has_value());
+
+    auto const r = (*storage)->Touch("nope", FastCache::TimePoint::max(), clock.Now());
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
+    REQUIRE((*storage)->Snapshot().touchMisses == 1U);
+}
+
+TEST_CASE("CowTree v2 trailer round-trips lastAccess and stale across reopen", "[cowstorage][v2]")
+{
+    TempFile tmp;
+    FastCache::ManualClock clock;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+    clock.Advance(7s);
+    auto const t = clock.Now();
+
+    {
+        auto storage = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(storage.has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        // Touch persists lastAccess; MarkStale persists the stale flag.
+        // (A read no longer writes — see the "no write on read" test — so
+        // we exercise the trailer via the write paths that legitimately
+        // own those fields.)
+        REQUIRE((*storage)->Touch("k", FastCache::TimePoint::max(), t).has_value());
+        REQUIRE((*storage)->MarkStale("k", std::nullopt, t).has_value());
+    }
+
+    auto reopened = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(reopened.has_value());
+    // Peek so the read itself does not advance lastAccess in the copy.
+    auto const got = (*reopened)->Peek("k", t);
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
+    REQUIRE(got->entry.lastAccess == t); // round-tripped through the v2 trailer
+    REQUIRE(got->entry.stale);           // stale flag round-tripped too
+}
+
+TEST_CASE("CowTreeStorage Get does not persist lastAccess (no write on a read path)", "[cowstorage][get][regression]")
+{
+    // Regression: Get used to open a full write transaction on every hit to
+    // persist lastAccess — crippling read-heavy workloads. The returned
+    // copy still carries a fresh lastAccess, but nothing is written back, so
+    // the persisted value (set by Set, which never reads) stays the unset
+    // sentinel across a reopen.
+    TempFile tmp;
+    FastCache::ManualClock clock;
+    clock.Advance(100s);
+    WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
+        REQUIRE(storage.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        auto const got = storage.Get("k", clock.Now());
+        REQUIRE(got.has_value());
+        REQUIRE(got->found);
+        REQUIRE(got->entry.lastAccess == clock.Now()); // fresh in the returned copy
+    });
+    WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
+        auto const peeked = storage.Peek("k", clock.Now());
+        REQUIRE(peeked.has_value());
+        REQUIRE(peeked->found);
+        REQUIRE(peeked->entry.lastAccess == FastCache::TimePoint::min()); // never written by the read
+    });
 }

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -45,8 +46,11 @@ std::expected<CasToken, StorageError> LayeredStorage::MirrorL2WriteResult(std::s
 {
     // After an L2 write succeeded with the given CAS, fetch the
     // freshly-stored entry from L2 so the L1 mirror gets every field
-    // (flags, expiry, generation) verbatim. L2 is the canonical source.
-    auto fetched = _l2->Get(key, now);
+    // (flags, expiry, generation, lastAccess, stale) verbatim. Use Peek,
+    // not Get: this is internal write-through bookkeeping, not a client
+    // read, so it must not stamp lastAccess (Get would overwrite it to the
+    // sentinel `now` passed here) or inflate hit stats. L2 is canonical.
+    auto fetched = _l2->Peek(key, now);
     if (!fetched.has_value())
         return std::unexpected(fetched.error());
     if (fetched->found)
@@ -117,10 +121,11 @@ std::expected<CasToken, StorageError> LayeredStorage::Replace(
 
 std::expected<CasToken, StorageError> LayeredStorage::Append(std::string_view key,
                                                              std::span<std::byte const> suffix,
+                                                             CasToken expected,
                                                              TimePoint now)
 {
     ++_stats.cmdSet;
-    auto const cas = _l2->Append(key, suffix, now);
+    auto const cas = _l2->Append(key, suffix, expected, now);
     if (!cas.has_value())
         return std::unexpected(cas.error());
     return MirrorL2WriteResult(key, *cas, TimePoint::min());
@@ -128,10 +133,11 @@ std::expected<CasToken, StorageError> LayeredStorage::Append(std::string_view ke
 
 std::expected<CasToken, StorageError> LayeredStorage::Prepend(std::string_view key,
                                                               std::span<std::byte const> prefix,
+                                                              CasToken expected,
                                                               TimePoint now)
 {
     ++_stats.cmdSet;
-    auto const cas = _l2->Prepend(key, prefix, now);
+    auto const cas = _l2->Prepend(key, prefix, expected, now);
     if (!cas.has_value())
         return std::unexpected(cas.error());
     return MirrorL2WriteResult(key, *cas, TimePoint::min());
@@ -152,11 +158,12 @@ std::expected<CasToken, StorageError> LayeredStorage::CompareAndSwap(std::string
 }
 
 std::expected<IStorage::IncrResult, StorageError> LayeredStorage::IncrementOrInitialize(std::string_view key,
-                                                                                        std::int64_t delta,
+                                                                                        std::uint64_t magnitude,
+                                                                                        bool decrement,
                                                                                         TimePoint now)
 {
     ++_stats.cmdSet;
-    auto const r = _l2->IncrementOrInitialize(key, delta, now);
+    auto const r = _l2->IncrementOrInitialize(key, magnitude, decrement, now);
     if (!r.has_value())
         return std::unexpected(r.error());
     // Refresh L1 with the new entry — IncrementOrInitialize mutates
@@ -175,6 +182,68 @@ std::expected<void, StorageError> LayeredStorage::Delete(std::string_view key, T
     // existence check because we don't care whether L1 had it.
     DropFromL1(key);
     return r;
+}
+
+std::expected<CasToken, StorageError> LayeredStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
+{
+    auto const cas = _l2->Touch(key, newExpiry, now);
+    if (!cas.has_value())
+    {
+        // Keep L1 consistent on miss: the entry's identity changed only
+        // if it existed in L2, so on miss we leave L1 alone — a later
+        // Get will either find or miss it consistently with L2.
+        return std::unexpected(cas.error());
+    }
+    // Re-fetch from L2 so the L1 mirror picks up the new expiry/CAS.
+    return MirrorL2WriteResult(key, *cas, TimePoint::min());
+}
+
+std::expected<GetResult, StorageError> LayeredStorage::Peek(std::string_view key, TimePoint now)
+{
+    // Non-mutating across both tiers: L1 first, fall through to L2. No
+    // mirror is populated (a Peek must leave observable state untouched).
+    auto l1 = _l1->Peek(key, now);
+    if (!l1.has_value())
+        return std::unexpected(l1.error());
+    if (l1->found)
+        return *l1;
+    return _l2->Peek(key, now);
+}
+
+std::expected<CasToken, StorageError> LayeredStorage::MarkStale(std::string_view key,
+                                                                std::optional<TimePoint> newExpiry,
+                                                                TimePoint now)
+{
+    auto const cas = _l2->MarkStale(key, newExpiry, now);
+    if (!cas.has_value())
+        return std::unexpected(cas.error());
+    return MirrorL2WriteResult(key, *cas, TimePoint::min());
+}
+
+std::expected<GetResult, StorageError> LayeredStorage::GetAndTouch(std::string_view key, TimePoint newExpiry, TimePoint now)
+{
+    // Refresh the expiry (write-through to L2, mirror into L1) then read the
+    // refreshed entry back through the tier. The atomicity boundary is the
+    // enclosing ShardedStorage's per-shard lock; on the unwrapped reactor
+    // there is no concurrent writer to interleave between the touch and read.
+    auto const touched = Touch(key, newExpiry, now);
+    if (!touched.has_value())
+        return std::unexpected(touched.error());
+    return Get(key, now);
+}
+
+std::expected<void, StorageError> LayeredStorage::CompareAndDelete(std::string_view key, CasToken expected, TimePoint now)
+{
+    // Peek falls through to L2, so the CAS compare sees the canonical entry
+    // even when it was evicted from the L1 mirror.
+    auto const peeked = Peek(key, now);
+    if (!peeked.has_value())
+        return std::unexpected(peeked.error());
+    if (!peeked->found)
+        return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
+    if (peeked->entry.cas != expected)
+        return std::unexpected(MakeStorageError(StorageErrorCode::CasMismatch));
+    return Delete(key, now);
 }
 
 void LayeredStorage::FlushWithGeneration(TimePoint effectiveAt)

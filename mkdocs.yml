@@ -1,0 +1,150 @@
+# fastcached — MkDocs site configuration.
+#
+# Build:   pip install -r docs/requirements.txt && mkdocs build --strict
+# Preview: mkdocs serve
+#
+# The strict flag fails on any broken link, missing nav entry, or
+# unresolved snippet — keeping the docs in lockstep with the code is
+# enforced mechanically by scripts/check-docs.py in CI.
+
+site_name: fastcached
+site_description: A memcached- and Redis-compatible cache daemon
+site_author: fastcached contributors
+copyright: Apache-2.0 licensed. Memcached and Redis are registered trademarks of their respective owners.
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - navigation.indexes
+    - content.code.copy
+    - content.tabs.link
+    - search.suggest
+    - search.share
+    - search.highlight
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: docs/snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Getting started:
+    - Install: getting-started/install.md
+    - Quickstart: getting-started/quickstart.md
+  - Protocols:
+    - Overview: protocols/overview.md
+    - Coverage matrix: protocols/coverage-matrix.md
+    - Compatibility with upstream: protocols/compatibility-with-upstream.md
+    - Autodetection: protocols/autodetect.md
+    - memcached (text): protocols/memcached-text.md
+    - memcached (binary): protocols/memcached-binary.md
+    - memcached (meta): protocols/memcached-meta.md
+    - Meta flags reference: protocols/meta-flags-reference.md
+    - Binary opcodes: protocols/binary-opcodes.md
+    - Binary status codes: protocols/status-codes.md
+    - Redis RESP2: protocols/redis-resp.md
+  - Commands:
+    - Index: commands/index.md
+    - memcached storage:
+      - set: commands/memcached/storage/set.md
+      - add: commands/memcached/storage/add.md
+      - replace: commands/memcached/storage/replace.md
+      - append: commands/memcached/storage/append.md
+      - prepend: commands/memcached/storage/prepend.md
+      - cas: commands/memcached/storage/cas.md
+    - memcached retrieval:
+      - get: commands/memcached/retrieval/get.md
+      - gets: commands/memcached/retrieval/gets.md
+      - gat: commands/memcached/retrieval/gat.md
+      - gats: commands/memcached/retrieval/gats.md
+    - memcached deletion:
+      - delete: commands/memcached/deletion/delete.md
+    - memcached arithmetic:
+      - incr: commands/memcached/arithmetic/incr.md
+      - decr: commands/memcached/arithmetic/decr.md
+    - memcached lifetime:
+      - touch: commands/memcached/lifetime/touch.md
+    - memcached meta:
+      - mg: commands/memcached/meta/mg.md
+      - ms: commands/memcached/meta/ms.md
+      - md: commands/memcached/meta/md.md
+      - ma: commands/memcached/meta/ma.md
+      - me: commands/memcached/meta/me.md
+      - mn: commands/memcached/meta/mn.md
+    - memcached admin:
+      - stats: commands/memcached/admin/stats.md
+      - flush_all: commands/memcached/admin/flush_all.md
+      - cache_memlimit: commands/memcached/admin/cache_memlimit.md
+      - verbosity: commands/memcached/admin/verbosity.md
+      - version: commands/memcached/admin/version.md
+      - quit: commands/memcached/admin/quit.md
+    - memcached slabs (stubs):
+      - slabs: commands/memcached/slabs/slabs.md
+      - lru: commands/memcached/slabs/lru.md
+      - lru_crawler: commands/memcached/slabs/lru_crawler.md
+    - Redis string:
+      - GET: commands/redis/string/get.md
+      - SET: commands/redis/string/set.md
+      - SETEX: commands/redis/string/setex.md
+      - PSETEX: commands/redis/string/psetex.md
+    - Redis keys:
+      - DEL: commands/redis/keys/del.md
+      - UNLINK: commands/redis/keys/unlink.md
+      - EXISTS: commands/redis/keys/exists.md
+    - Redis connection:
+      - PING: commands/redis/connection/ping.md
+      - ECHO: commands/redis/connection/echo.md
+      - HELLO: commands/redis/connection/hello.md
+      - AUTH: commands/redis/connection/auth.md
+      - QUIT: commands/redis/connection/quit.md
+    - Redis server:
+      - INFO: commands/redis/server/info.md
+      - COMMAND: commands/redis/server/command.md
+      - FLUSHDB: commands/redis/server/flushdb.md
+      - FLUSHALL: commands/redis/server/flushall.md
+    - Unsupported Redis commands: commands/redis/unsupported.md
+  - Operations:
+    - Known limitations: operations/known-limitations.md
+  - Internals:
+    - Architecture: internals/architecture.md
+    - Storage primitives: internals/storage-primitives.md
+  - About:
+    - License: about/license.md

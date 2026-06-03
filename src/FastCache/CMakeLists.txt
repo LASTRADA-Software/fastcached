@@ -32,6 +32,7 @@ target_sources(FastCache
         Net/InMemoryTransport.cpp
         Net/Framing/LineReader.cpp
         Protocol/MemcachedBinary.cpp
+        Protocol/MemcachedMeta.cpp
         Protocol/MemcachedText.cpp
         Protocol/ProtocolAutodetect.cpp
         Protocol/RedisResp.cpp

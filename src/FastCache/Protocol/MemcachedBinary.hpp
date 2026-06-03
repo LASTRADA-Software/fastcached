@@ -13,18 +13,20 @@
 namespace FastCache
 {
 
-/// memcached binary protocol handler. Implements the subset that real
-/// memcached clients need:
+/// memcached binary protocol handler. Implements the full opcode set
+/// listed in the official memcached protocol-binary spec:
 ///   Get(0x00), Set(0x01), Add(0x02), Replace(0x03), Delete(0x04),
 ///   Increment(0x05), Decrement(0x06), Quit(0x07), Flush(0x08),
 ///   GetQ(0x09), NoOp(0x0a), Version(0x0b), GetK(0x0c), GetKQ(0x0d),
 ///   Append(0x0e), Prepend(0x0f), Stat(0x10), SetQ(0x11), AddQ(0x12),
 ///   ReplaceQ(0x13), DeleteQ(0x14), IncrementQ(0x15), DecrementQ(0x16),
-///   QuitQ(0x17), FlushQ(0x18), AppendQ(0x19), PrependQ(0x1a)
+///   QuitQ(0x17), FlushQ(0x18), AppendQ(0x19), PrependQ(0x1a),
+///   Verbosity(0x1b), Touch(0x1c), GAT(0x1d), GATQ(0x1e),
+///   GATK(0x23), GATKQ(0x24).
 ///
 /// SASL opcodes (0x20 List, 0x21 Auth, 0x22 Step) are recognised but
 /// replied to with auth_error so non-authing clients fail fast rather
-/// than hang.
+/// than hang. fastcached does not implement SASL authentication.
 class MemcachedBinaryHandler final: public IProtocolHandler
 {
   public:

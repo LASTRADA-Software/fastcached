@@ -56,9 +56,15 @@ namespace
         FlushQ = 0x18,
         AppendQ = 0x19,
         PrependQ = 0x1a,
+        Verbosity = 0x1b,
+        Touch = 0x1c,
+        Gat = 0x1d,
+        GatQ = 0x1e,
         SaslList = 0x20,
         SaslAuth = 0x21,
         SaslStep = 0x22,
+        GatK = 0x23,
+        GatKQ = 0x24,
     };
 
     enum class Status : std::uint8_t
@@ -73,6 +79,10 @@ namespace
         AuthError = 0x20,
         UnknownCommand = 0x81,
         OutOfMemory = 0x82,
+        NotSupported = 0x83,
+        InternalError = 0x84,
+        Busy = 0x85,
+        TemporaryFailure = 0x86,
     };
 
     struct RequestHeader
@@ -165,6 +175,18 @@ namespace
                 return "Invalid arguments";
             case Status::AuthError:
                 return "Auth failure";
+            case Status::NotSupported:
+                return "Not supported";
+            case Status::Busy:
+                return "Busy";
+            case Status::TemporaryFailure:
+                return "Temporary failure";
+            case Status::ValueTooLarge:
+                return "Value too large";
+            case Status::OutOfMemory:
+                return "Out of memory";
+            case Status::UnknownCommand:
+                return "Unknown command";
             default:
                 return "Internal error";
         }
@@ -210,34 +232,84 @@ namespace
         auto const exptime = ReadBigEndian<std::uint32_t>(extras.subspan(4));
 
         std::vector<std::byte> valVec { value.begin(), value.end() };
-        std::string keyStr;
-        keyStr.reserve(key.size());
-        for (auto const b: key)
-            keyStr.push_back(static_cast<char>(b));
+        auto const keyView = AsStringView(key);
 
         std::expected<CasToken, StorageError> result { 0 };
-        bool const isQuiet = opcode == Opcode::SetQ || opcode == Opcode::AddQ || opcode == Opcode::ReplaceQ
-                             || opcode == Opcode::AppendQ || opcode == Opcode::PrependQ;
-        auto const normalised =
-            isQuiet ? static_cast<Opcode>(static_cast<std::uint8_t>(opcode) & ~std::uint8_t { 0x10 }) : opcode;
-        switch (normalised)
+
+        enum class StorageVerb : std::uint8_t
         {
-            case Opcode::Set:
-                result = engine->Set(keyStr, std::move(valVec), flags, exptime);
+            Set,
+            Add,
+            Replace,
+            Append,
+            Prepend
+        };
+
+        /// One row per storage opcode mapping it to its base verb and quiet
+        /// bit. An explicit table (rather than the historical `opcode & ~0x10`
+        /// normalisation) is required because Append/Prepend's quiet variants
+        /// are 0x19/0x1a, not base (0x0e/0x0f) + 0x10 — the bit-clear produced
+        /// GetQ/NoOp and the storage silently no-op'd.
+        struct StorageOpcode
+        {
+            Opcode opcode;
+            StorageVerb verb;
+            bool quiet;
+        };
+        static constexpr std::array<StorageOpcode, 10> StorageOpcodes { {
+            { .opcode = Opcode::Set, .verb = StorageVerb::Set, .quiet = false },
+            { .opcode = Opcode::SetQ, .verb = StorageVerb::Set, .quiet = true },
+            { .opcode = Opcode::Add, .verb = StorageVerb::Add, .quiet = false },
+            { .opcode = Opcode::AddQ, .verb = StorageVerb::Add, .quiet = true },
+            { .opcode = Opcode::Replace, .verb = StorageVerb::Replace, .quiet = false },
+            { .opcode = Opcode::ReplaceQ, .verb = StorageVerb::Replace, .quiet = true },
+            { .opcode = Opcode::Append, .verb = StorageVerb::Append, .quiet = false },
+            { .opcode = Opcode::AppendQ, .verb = StorageVerb::Append, .quiet = true },
+            { .opcode = Opcode::Prepend, .verb = StorageVerb::Prepend, .quiet = false },
+            { .opcode = Opcode::PrependQ, .verb = StorageVerb::Prepend, .quiet = true },
+        } };
+        // Resolve to a raw pointer (or nullptr). std::ranges::find over a
+        // std::array yields a wrapped iterator on MSVC but a raw pointer on
+        // libc++; binding either to a named auto makes clang-tidy's
+        // readability-qualified-auto and MSVC's type deduction disagree. A
+        // range-based scan into an explicit pointer is portable across both.
+        StorageOpcode const* descriptor = nullptr;
+        for (StorageOpcode const& candidate: StorageOpcodes)
+        {
+            if (candidate.opcode == opcode)
+            {
+                descriptor = &candidate;
                 break;
-            case Opcode::Add:
-                result = engine->Add(keyStr, std::move(valVec), flags, exptime);
+            }
+        }
+        StorageVerb const verb = descriptor != nullptr ? descriptor->verb : StorageVerb::Set;
+        bool const isQuiet = descriptor != nullptr && descriptor->quiet;
+
+        // A non-zero header CAS turns Set/Replace into a conditional store
+        // (the spec's compare-and-swap): store only if the current CAS
+        // matches, else KeyExists (mapped from CasMismatch). A zero CAS is
+        // an unconditional store.
+        bool const casConditional = header.cas != 0;
+        switch (verb)
+        {
+            case StorageVerb::Set:
+                result = casConditional ? engine->CompareAndSwap(keyView, header.cas, std::move(valVec), flags, exptime)
+                                        : engine->Set(keyView, std::move(valVec), flags, exptime);
                 break;
-            case Opcode::Replace:
-                result = engine->Replace(keyStr, std::move(valVec), flags, exptime);
+            case StorageVerb::Add:
+                // Add requires the key to be absent; a CAS token is
+                // meaningless here, so it is ignored per memcached.
+                result = engine->Add(keyView, std::move(valVec), flags, exptime);
                 break;
-            case Opcode::Append:
-                result = engine->Append(keyStr, value);
+            case StorageVerb::Replace:
+                result = casConditional ? engine->CompareAndSwap(keyView, header.cas, std::move(valVec), flags, exptime)
+                                        : engine->Replace(keyView, std::move(valVec), flags, exptime);
                 break;
-            case Opcode::Prepend:
-                result = engine->Prepend(keyStr, value);
+            case StorageVerb::Append:
+                result = engine->Append(keyView, value);
                 break;
-            default:
+            case StorageVerb::Prepend:
+                result = engine->Prepend(keyView, value);
                 break;
         }
 
@@ -255,12 +327,7 @@ namespace
     Task<bool> HandleGet(
         ISocket* socket, CacheEngine* engine, Opcode opcode, RequestHeader header, std::span<std::byte const> key)
     {
-        std::string keyStr;
-        keyStr.reserve(key.size());
-        for (auto const b: key)
-            keyStr.push_back(static_cast<char>(b));
-
-        auto const result = engine->Get(keyStr);
+        auto const result = engine->Get(AsStringView(key));
         bool const includeKey = opcode == Opcode::GetK || opcode == Opcode::GetKQ;
         bool const quiet = opcode == Opcode::GetQ || opcode == Opcode::GetKQ;
 
@@ -288,12 +355,7 @@ namespace
     Task<bool> HandleDelete(
         ISocket* socket, CacheEngine* engine, Opcode opcode, RequestHeader header, std::span<std::byte const> key)
     {
-        std::string keyStr;
-        keyStr.reserve(key.size());
-        for (auto const b: key)
-            keyStr.push_back(static_cast<char>(b));
-
-        auto const result = engine->Delete(keyStr);
+        auto const result = engine->Delete(AsStringView(key));
         bool const quiet = opcode == Opcode::DeleteQ;
         if (!result.has_value())
         {
@@ -323,6 +385,183 @@ namespace
         if (opcode == Opcode::FlushQ)
             co_return true;
         co_return co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, 0, {}, {}, {});
+    }
+
+    /// memcached binary `touch` and `gat` / `gat*` family. The shared
+    /// branch (touch vs gat) is captured by `withValue`.
+    Task<bool> HandleTouchFamily(ISocket* socket,
+                                 CacheEngine* engine,
+                                 Opcode opcode,
+                                 RequestHeader header,
+                                 std::span<std::byte const> extras,
+                                 std::span<std::byte const> key)
+    {
+        if (extras.size() < 4)
+            co_return co_await ReplyError(socket, opcode, Status::InvalidArguments, header.opaque);
+        auto const exptime = ReadBigEndian<std::uint32_t>(extras);
+        bool const isTouch = opcode == Opcode::Touch;
+        bool const includeKey = opcode == Opcode::GatK || opcode == Opcode::GatKQ;
+        bool const isQuiet = opcode == Opcode::GatQ || opcode == Opcode::GatKQ;
+        auto const keyView = AsStringView(key);
+
+        if (isTouch)
+        {
+            auto const touched = engine->Touch(keyView, exptime);
+            if (!touched.has_value())
+                co_return co_await ReplyError(socket, opcode, MapStorageError(touched.error().code), header.opaque);
+            co_return co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, *touched, {}, {}, {});
+        }
+
+        // GAT family: refresh the expiry and read the value back in a
+        // single atomic step so no concurrent writer can slip between the
+        // touch and the read.
+        auto const got = engine->GetAndTouch(keyView, exptime);
+        if (!got.has_value() || !got->found)
+        {
+            if (isQuiet)
+                co_return true;
+            co_return co_await ReplyError(
+                socket,
+                opcode,
+                MapStorageError(got.has_value() ? StorageErrorCode::KeyNotFound : got.error().code),
+                header.opaque);
+        }
+        auto const& entry = got->entry;
+        std::array<std::byte, 4> outExtras {};
+        WriteBigEndian<std::uint32_t>(outExtras, entry.flags);
+        std::span<std::byte const> const keyOut = includeKey ? key : std::span<std::byte const> {};
+        co_return co_await WriteResponse(socket,
+                                         opcode,
+                                         Status::Ok,
+                                         header.opaque,
+                                         entry.cas,
+                                         std::span<std::byte const> { outExtras.data(), outExtras.size() },
+                                         keyOut,
+                                         std::span<std::byte const> { entry.value.data(), entry.value.size() });
+    }
+
+    /// memcached binary increment / decrement, including auto-vivify on
+    /// miss when expiration != 0xffffffff (the spec's sentinel for "fail
+    /// rather than create").
+    Task<bool> HandleArithmetic(ISocket* socket,
+                                CacheEngine* engine,
+                                Opcode opcode,
+                                RequestHeader header,
+                                std::span<std::byte const> extras,
+                                std::span<std::byte const> key)
+    {
+        if (extras.size() < 20)
+            co_return co_await ReplyError(socket, opcode, Status::InvalidArguments, header.opaque);
+        auto const delta = ReadBigEndian<std::uint64_t>(extras);
+        auto const initial = ReadBigEndian<std::uint64_t>(extras.subspan(8));
+        auto const expiration = ReadBigEndian<std::uint32_t>(extras.subspan(16));
+
+        bool const isQuiet = opcode == Opcode::IncrementQ || opcode == Opcode::DecrementQ;
+        bool const isIncr = opcode == Opcode::Increment || opcode == Opcode::IncrementQ;
+        auto const keyView = AsStringView(key);
+
+        // Try the existing key first.
+        auto result = isIncr ? engine->Increment(keyView, delta) : engine->Decrement(keyView, delta);
+
+        if (!result.has_value() && result.error().code == StorageErrorCode::KeyNotFound)
+        {
+            // Spec: expiration of 0xffffffff means "do NOT create on miss".
+            if (expiration == 0xFFFFFFFFU)
+            {
+                if (isQuiet)
+                    co_return true;
+                co_return co_await ReplyError(socket, opcode, Status::KeyNotFound, header.opaque);
+            }
+            // Auto-vivify with the initial value and the given expiration.
+            auto const set = engine->Set(keyView, BytesFromString(std::to_string(initial)), 0, expiration);
+            if (!set.has_value())
+            {
+                if (isQuiet)
+                    co_return true;
+                co_return co_await ReplyError(socket, opcode, MapStorageError(set.error().code), header.opaque);
+            }
+            result = IStorage::IncrResult { .value = initial, .cas = *set };
+        }
+        else if (!result.has_value())
+        {
+            // Non-numeric existing value or other error.
+            if (isQuiet)
+                co_return true;
+            auto const code = result.error().code;
+            auto const status = code == StorageErrorCode::InvalidArgument ? Status::IncrOnNonNumeric : MapStorageError(code);
+            co_return co_await ReplyError(socket, opcode, status, header.opaque);
+        }
+
+        if (isQuiet)
+            co_return true;
+
+        // Response: 8-byte big-endian new value.
+        std::array<std::byte, 8> outValue {};
+        WriteBigEndian<std::uint64_t>(outValue, result->value);
+        co_return co_await WriteResponse(socket,
+                                         opcode,
+                                         Status::Ok,
+                                         header.opaque,
+                                         result->cas,
+                                         {},
+                                         {},
+                                         std::span<std::byte const> { outValue.data(), outValue.size() });
+    }
+
+    /// Render one `STAT key value` packet for the binary Stat command.
+    Task<bool> WriteStatLine(ISocket* socket, std::uint32_t opaque, std::string_view name, std::string value)
+    {
+        co_return co_await WriteResponse(socket, Opcode::Stat, Status::Ok, opaque, 0, {}, AsBytes(name), AsBytes(value));
+    }
+
+    Task<bool> HandleStat(ISocket* socket, CacheEngine* engine, RequestHeader header, std::span<std::byte const> key)
+    {
+        auto const stats = engine->Snapshot();
+        auto const subkey = AsStringView(key);
+        // Only the empty sub-key is exhaustive; other sub-keys (settings,
+        // items, ...) get a minimal shape today and are filled out by the
+        // text-protocol stats expansion. For binary clients that probe
+        // capabilities, returning *some* data is better than UnknownCommand.
+        // A plain forwarding lambda (not itself a coroutine): the `std::string`
+        // value is moved into `WriteStatLine`'s frame, so nothing dangles and
+        // the coroutine-capturing-lambda lint does not apply.
+        auto const emit = [&](std::string_view name, std::uint64_t v) {
+            return WriteStatLine(socket, header.opaque, name, std::to_string(v));
+        };
+
+        if (subkey.empty() || subkey == "default")
+        {
+            std::array<std::pair<std::string_view, std::uint64_t>, 23> const table { {
+                { "curr_items", stats.itemCount },
+                { "bytes", stats.bytesUsed },
+                { "limit_maxbytes", stats.bytesLimit },
+                { "evictions", stats.evictions },
+                { "cmd_get", stats.cmdGet },
+                { "cmd_set", stats.cmdSet },
+                { "cmd_touch", stats.cmdTouch },
+                { "cmd_flush", stats.cmdFlush },
+                { "get_hits", stats.getHits },
+                { "get_misses", stats.getMisses },
+                { "delete_hits", stats.deleteHits },
+                { "delete_misses", stats.deleteMisses },
+                { "touch_hits", stats.touchHits },
+                { "touch_misses", stats.touchMisses },
+                { "cas_hits", stats.casHits },
+                { "cas_misses", stats.casMisses },
+                { "cas_badval", stats.casBadval },
+                { "incr_hits", stats.incrHits },
+                { "incr_misses", stats.incrMisses },
+                { "decr_hits", stats.decrHits },
+                { "decr_misses", stats.decrMisses },
+                { "evicted_unfetched", stats.evictedUnfetched },
+                { "expired_unfetched", stats.expiredUnfetched },
+            } };
+            for (auto const& [name, value]: table)
+                if (!co_await emit(name, value))
+                    co_return false;
+        }
+        // Empty-key terminator packet — spec-required end-of-stats marker.
+        co_return co_await WriteResponse(socket, Opcode::Stat, Status::Ok, header.opaque, 0, {}, {}, {});
     }
 
 } // namespace
@@ -400,6 +639,28 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket, CacheEngine* engine, std
             case Opcode::Flush:
             case Opcode::FlushQ:
                 keepGoing = co_await HandleFlush(socket, engine, opcode, header);
+                break;
+            case Opcode::Touch:
+            case Opcode::Gat:
+            case Opcode::GatQ:
+            case Opcode::GatK:
+            case Opcode::GatKQ:
+                keepGoing = co_await HandleTouchFamily(socket, engine, opcode, header, extras, key);
+                break;
+            case Opcode::Increment:
+            case Opcode::IncrementQ:
+            case Opcode::Decrement:
+            case Opcode::DecrementQ:
+                keepGoing = co_await HandleArithmetic(socket, engine, opcode, header, extras, key);
+                break;
+            case Opcode::Stat:
+                keepGoing = co_await HandleStat(socket, engine, header, key);
+                break;
+            case Opcode::Verbosity:
+                // Accepted as a no-op — fastcached logs via ILogger, not via
+                // the verbosity dial. Reply Ok so capability-probing clients
+                // continue rather than abort.
+                keepGoing = co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, 0, {}, {}, {});
                 break;
             case Opcode::SaslList:
             case Opcode::SaslAuth:

@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
@@ -109,12 +110,14 @@ class ParkableStorage final: public FastCache::IStorage
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Append(std::string_view /*key*/,
                                                                        std::span<std::byte const> /*suffix*/,
+                                                                       FastCache::CasToken /*expected*/,
                                                                        FastCache::TimePoint /*now*/) override
     {
         return FastCache::CasToken { 0 };
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view /*key*/,
                                                                         std::span<std::byte const> /*prefix*/,
+                                                                        FastCache::CasToken /*expected*/,
                                                                         FastCache::TimePoint /*now*/) override
     {
         return FastCache::CasToken { 0 };
@@ -129,13 +132,30 @@ class ParkableStorage final: public FastCache::IStorage
         return FastCache::CasToken { 0 };
     }
     std::expected<FastCache::IStorage::IncrResult, FastCache::StorageError> IncrementOrInitialize(
-        std::string_view /*key*/, std::int64_t /*delta*/, FastCache::TimePoint /*now*/) override
+        std::string_view /*key*/, std::uint64_t /*magnitude*/, bool /*decrement*/, FastCache::TimePoint /*now*/) override
     {
         return FastCache::IStorage::IncrResult { .value = 0, .cas = FastCache::CasToken { 0 } };
     }
     std::expected<void, FastCache::StorageError> Delete(std::string_view /*key*/, FastCache::TimePoint /*now*/) override
     {
         return {};
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Touch(std::string_view /*key*/,
+                                                                      FastCache::TimePoint /*newExpiry*/,
+                                                                      FastCache::TimePoint /*now*/) override
+    {
+        return FastCache::CasToken { 0 };
+    }
+    std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view /*key*/,
+                                                                      FastCache::TimePoint /*now*/) override
+    {
+        return FastCache::GetResult { .found = false, .entry = {} };
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(std::string_view /*key*/,
+                                                                          std::optional<FastCache::TimePoint> /*newExpiry*/,
+                                                                          FastCache::TimePoint /*now*/) override
+    {
+        return FastCache::CasToken { 0 };
     }
     void FlushWithGeneration(FastCache::TimePoint /*effectiveAt*/) override {}
     void Resize(std::size_t /*newMaxBytes*/) override {}
@@ -183,6 +203,34 @@ TEST_CASE("ShardedStorage round-trips Set + Get through the right shard", "[shar
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(Decode(got->entry.value) == "bar");
+}
+
+TEST_CASE("ShardedStorage Touch routes to the owning shard", "[sharded][touch]")
+{
+    using namespace std::chrono_literals;
+    auto storage = MakeSharded(4);
+    FastCache::ManualClock clock;
+
+    auto const setCas = storage->Set("hello", MakeBytes("v"), 0, clock.Now() + 1s);
+    REQUIRE(setCas.has_value());
+
+    auto const touched = storage->Touch("hello", clock.Now() + 60s, clock.Now());
+    REQUIRE(touched.has_value());
+    REQUIRE(*touched != *setCas);
+
+    auto const got = storage->Get("hello", clock.Now() + 30s);
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
+    REQUIRE(got->entry.cas == *touched);
+}
+
+TEST_CASE("ShardedStorage Touch on absent key returns KeyNotFound", "[sharded][touch]")
+{
+    auto storage = MakeSharded(4);
+    FastCache::ManualClock clock;
+    auto const r = storage->Touch("nope", FastCache::TimePoint::max(), clock.Now());
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
 
 TEST_CASE("ShardedStorage hashes keys deterministically to one of N shards", "[sharded]")
@@ -481,4 +529,50 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
         REQUIRE(got->found);
         REQUIRE(Decode(got->entry.value) == std::format("final-{}", i));
     }
+}
+
+TEST_CASE("ShardedStorage GetAndTouch refreshes expiry and returns the post-touch entry", "[sharded][gat]")
+{
+    using namespace std::chrono_literals;
+    auto storage = MakeSharded(4);
+    FastCache::ManualClock clock;
+
+    auto const setCas = storage->Set("k", MakeBytes("v"), 0, clock.Now() + 1s);
+    REQUIRE(setCas.has_value());
+
+    auto const gat = storage->GetAndTouch("k", clock.Now() + 60s, clock.Now());
+    REQUIRE(gat.has_value());
+    REQUIRE(gat->found);
+    REQUIRE(Decode(gat->entry.value) == "v");
+    REQUIRE(gat->entry.cas != *setCas);              // touch bumped CAS
+    REQUIRE(gat->entry.expiry == clock.Now() + 60s); // and refreshed expiry
+
+    // Miss propagates KeyNotFound.
+    auto const miss = storage->GetAndTouch("absent", clock.Now() + 60s, clock.Now());
+    REQUIRE_FALSE(miss.has_value());
+    REQUIRE(miss.error().code == FastCache::StorageErrorCode::KeyNotFound);
+}
+
+TEST_CASE("ShardedStorage CompareAndDelete removes only on a CAS match", "[sharded][cas]")
+{
+    auto storage = MakeSharded(4);
+    FastCache::ManualClock clock;
+
+    auto const setCas = storage->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
+    REQUIRE(setCas.has_value());
+
+    // Wrong CAS: rejected, entry survives.
+    auto const mismatch = storage->CompareAndDelete("k", *setCas + 1, clock.Now());
+    REQUIRE_FALSE(mismatch.has_value());
+    REQUIRE(mismatch.error().code == FastCache::StorageErrorCode::CasMismatch);
+    REQUIRE(storage->Get("k", clock.Now())->found);
+
+    // Right CAS: deleted.
+    REQUIRE(storage->CompareAndDelete("k", *setCas, clock.Now()).has_value());
+    REQUIRE_FALSE(storage->Get("k", clock.Now())->found);
+
+    // Absent key: KeyNotFound.
+    auto const absent = storage->CompareAndDelete("nope", 1, clock.Now());
+    REQUIRE_FALSE(absent.has_value());
+    REQUIRE(absent.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }

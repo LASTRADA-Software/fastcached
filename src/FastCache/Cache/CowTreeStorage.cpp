@@ -185,7 +185,7 @@ std::expected<std::unique_ptr<CowTreeStorage>, StorageError> CowTreeStorage::Ope
 std::vector<std::byte> CowTreeStorage::Encode(CacheEntry const& entry)
 {
     std::vector<std::byte> out;
-    out.reserve(4 + 8 + 8 + 8 + 4 + entry.value.size());
+    out.reserve(4 + 8 + 8 + 8 + 4 + entry.value.size() + 8 + 1);
     AppendLe<std::uint32_t>(out, entry.flags);
     AppendLe<std::uint64_t>(out, entry.cas);
     AppendLe<std::int64_t>(out, TimePointToMicros(entry.expiry));
@@ -195,6 +195,9 @@ std::vector<std::byte> CowTreeStorage::Encode(CacheEntry const& entry)
     out.resize(offset + entry.value.size());
     if (!entry.value.empty())
         std::memcpy(out.data() + offset, entry.value.data(), entry.value.size());
+    // v2 trailer (always written on new entries; absent in legacy files).
+    AppendLe<std::int64_t>(out, TimePointToMicros(entry.lastAccess));
+    AppendLe<std::uint8_t>(out, entry.stale ? std::uint8_t { 1 } : std::uint8_t { 0 });
     return out;
 }
 
@@ -218,6 +221,16 @@ std::expected<CacheEntry, StorageError> CowTreeStorage::Decode(CowTree::BytesVie
     if (cursor.size() < valueLen)
         return std::unexpected(MakeError(StorageErrorCode::Corrupt));
     e.value.assign(cursor.begin(), cursor.begin() + valueLen);
+    cursor = cursor.subspan(valueLen);
+    // v2 trailer: present in entries written by this version, absent in
+    // legacy files. Both fields are optional and default to "unread, not
+    // stale" when missing.
+    std::int64_t lastAccessUs = 0;
+    if (ReadLe<std::int64_t>(cursor, lastAccessUs))
+        e.lastAccess = MicrosToTimePoint(lastAccessUs);
+    std::uint8_t staleByte = 0;
+    if (ReadLe<std::uint8_t>(cursor, staleByte))
+        e.stale = staleByte != 0;
     return e;
 }
 
@@ -274,18 +287,32 @@ std::expected<void, StorageError> CowTreeStorage::EraseEntry(std::string_view ke
     return {};
 }
 
-void CowTreeStorage::TouchOrInsert(std::string_view key, std::size_t valueSize)
+void CowTreeStorage::TouchOrInsert(std::string_view key, std::size_t valueSize, AccessKind access)
 {
     auto it = _index.find(key);
     if (it != _index.end())
     {
+        // A read records the access, a value-rewriting Write clears the bit
+        // (the new value is unread), and a TTL-only Preserve (Touch /
+        // MarkStale) leaves the existing bit alone — matching
+        // InMemoryLruStorage, where Touch never disturbs `fetched`.
+        bool const fetched = [&] {
+            if (access == AccessKind::Read)
+                return true;
+            if (access == AccessKind::Write)
+                return false;
+            return it->second->fetched;
+        }();
         _bytesUsed -= it->second->bytes;
         it->second->bytes = valueSize;
+        it->second->fetched = fetched;
         _bytesUsed += valueSize;
         _lru.splice(_lru.begin(), _lru, it->second);
         return;
     }
-    _lru.push_front(LruNode { .key = std::string { key }, .bytes = valueSize });
+    // A brand-new mirror node has never been read; only an explicit Read
+    // marks it fetched.
+    _lru.push_front(LruNode { .key = std::string { key }, .bytes = valueSize, .fetched = access == AccessKind::Read });
     _index.emplace(_lru.front().key, _lru.begin());
     _bytesUsed += valueSize;
 }
@@ -322,6 +349,8 @@ void CowTreeStorage::EvictToFit()
             --remainingAttempts;
             continue;
         }
+        if (!victim->fetched)
+            ++_stats.evictedUnfetched;
         _bytesUsed -= victim->bytes;
         _index.erase(keyCopy);
         _lru.erase(victim);
@@ -353,12 +382,111 @@ std::expected<GetResult, StorageError> CowTreeStorage::Get(std::string_view key,
         ++_stats.getMisses;
         return GetResult { .found = false, .entry = {} };
     }
-    TouchOrInsert(key, entry.value.size());
+    entry.lastAccess = now;
+    TouchOrInsert(key, entry.value.size(), AccessKind::Read);
     ++_stats.getHits;
+    // Deliberately do NOT persist the lastAccess advance here: a read must
+    // not open a write transaction (CoW page churn + log growth on every
+    // hit would cripple read-heavy workloads, and under ShardedStorage the
+    // single-writer contract must hold). The returned copy carries the
+    // fresh lastAccess for the caller; the on-disk value only advances on
+    // the next genuine write (Set / Touch / MarkStale / ...).
     GetResult result;
     result.found = true;
     result.entry = std::move(entry);
     return result;
+}
+
+std::expected<CasToken, StorageError> CowTreeStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
+{
+    ++_stats.cmdTouch;
+    auto loaded = LoadEntry(key);
+    if (!loaded.has_value())
+    {
+        ++_stats.touchMisses;
+        return std::unexpected(loaded.error());
+    }
+    if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
+    {
+        ++_stats.touchMisses;
+        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
+    }
+    auto& entry = (*loaded)->entry;
+    // A touch refreshes TTL/CAS/lastAccess but rewrites no value bytes, so the
+    // LRU `fetched` bit is preserved (AccessKind::Preserve) rather than
+    // cleared — matching InMemoryLruStorage::Touch, which leaves it alone.
+    entry.expiry = newExpiry;
+    entry.cas = _nextCas++;
+    entry.lastAccess = now;
+    if (auto const r = StoreEntry(key, entry); !r.has_value())
+        return std::unexpected(r.error());
+    TouchOrInsert(key, entry.value.size(), AccessKind::Preserve);
+    ++_stats.touchHits;
+    return entry.cas;
+}
+
+std::expected<GetResult, StorageError> CowTreeStorage::Peek(std::string_view key, TimePoint now)
+{
+    // Non-mutating: no LRU promotion, no lastAccess advance, no stats, and
+    // crucially no write transaction. Expired / flushed entries read as a
+    // miss but are left for the writer-locked PurgeExpired to reclaim.
+    auto loaded = LoadEntry(key);
+    if (!loaded.has_value())
+        return std::unexpected(loaded.error());
+    if (!loaded->has_value())
+        return GetResult { .found = false, .entry = {} };
+    auto& entry = (*loaded)->entry;
+    if (entry.expiry <= now || entry.generation < _liveGeneration)
+        return GetResult { .found = false, .entry = {} };
+    GetResult result;
+    result.found = true;
+    result.entry = std::move(entry);
+    return result;
+}
+
+std::expected<CasToken, StorageError> CowTreeStorage::MarkStale(std::string_view key,
+                                                                std::optional<TimePoint> newExpiry,
+                                                                TimePoint now)
+{
+    auto loaded = LoadEntry(key);
+    if (!loaded.has_value())
+        return std::unexpected(loaded.error());
+    if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
+        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
+    auto& entry = (*loaded)->entry;
+    entry.stale = true;
+    if (newExpiry.has_value())
+        entry.expiry = *newExpiry;
+    entry.cas = _nextCas++;
+    if (auto const r = StoreEntry(key, entry); !r.has_value())
+        return std::unexpected(r.error());
+    // Marking stale rewrites no value bytes, so keep the `fetched` bit.
+    TouchOrInsert(key, entry.value.size(), AccessKind::Preserve);
+    return entry.cas;
+}
+
+std::expected<GetResult, StorageError> CowTreeStorage::GetAndTouch(std::string_view key, TimePoint newExpiry, TimePoint now)
+{
+    // Refresh the expiry, then read the refreshed entry back. The atomicity
+    // boundary is the enclosing ShardedStorage's per-shard lock (this tier
+    // never owns a lock); on the unwrapped single-threaded reactor there is
+    // no concurrent writer to interleave between the touch and the read.
+    auto const touched = Touch(key, newExpiry, now);
+    if (!touched.has_value())
+        return std::unexpected(touched.error());
+    return Get(key, now);
+}
+
+std::expected<void, StorageError> CowTreeStorage::CompareAndDelete(std::string_view key, CasToken expected, TimePoint now)
+{
+    auto const peeked = Peek(key, now);
+    if (!peeked.has_value())
+        return std::unexpected(peeked.error());
+    if (!peeked->found)
+        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
+    if (peeked->entry.cas != expected)
+        return std::unexpected(MakeError(StorageErrorCode::CasMismatch));
+    return Delete(key, now);
 }
 
 std::expected<CasToken, StorageError> CowTreeStorage::Set(std::string_view key,
@@ -407,6 +535,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Replace(
 
 std::expected<CasToken, StorageError> CowTreeStorage::Append(std::string_view key,
                                                              std::span<std::byte const> suffix,
+                                                             CasToken expected,
                                                              TimePoint now)
 {
     auto loaded = LoadEntry(key);
@@ -415,10 +544,15 @@ std::expected<CasToken, StorageError> CowTreeStorage::Append(std::string_view ke
     if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     auto& entry = (*loaded)->entry;
+    if (expected != 0 && entry.cas != expected)
+        return std::unexpected(MakeError(StorageErrorCode::CasMismatch));
     if (entry.value.size() + suffix.size() > _options.maxValueBytes)
         return std::unexpected(MakeError(StorageErrorCode::ValueTooLarge));
     entry.value.insert(entry.value.end(), suffix.begin(), suffix.end());
     entry.cas = _nextCas++;
+    // A value-rewriting mutation produces a fresh item nobody has read yet
+    // (mirrors InMemoryLruStorage::MutateExisting and the CacheEntry contract).
+    entry.stale = false;
     if (auto const r = StoreEntry(key, entry); !r.has_value())
         return std::unexpected(r.error());
     TouchOrInsert(key, entry.value.size());
@@ -428,6 +562,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Append(std::string_view ke
 
 std::expected<CasToken, StorageError> CowTreeStorage::Prepend(std::string_view key,
                                                               std::span<std::byte const> prefix,
+                                                              CasToken expected,
                                                               TimePoint now)
 {
     auto loaded = LoadEntry(key);
@@ -436,6 +571,8 @@ std::expected<CasToken, StorageError> CowTreeStorage::Prepend(std::string_view k
     if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     auto& entry = (*loaded)->entry;
+    if (expected != 0 && entry.cas != expected)
+        return std::unexpected(MakeError(StorageErrorCode::CasMismatch));
     if (entry.value.size() + prefix.size() > _options.maxValueBytes)
         return std::unexpected(MakeError(StorageErrorCode::ValueTooLarge));
     std::vector<std::byte> merged;
@@ -444,6 +581,9 @@ std::expected<CasToken, StorageError> CowTreeStorage::Prepend(std::string_view k
     merged.insert(merged.end(), entry.value.begin(), entry.value.end());
     entry.value = std::move(merged);
     entry.cas = _nextCas++;
+    // A value-rewriting mutation produces a fresh item nobody has read yet
+    // (mirrors InMemoryLruStorage::MutateExisting and the CacheEntry contract).
+    entry.stale = false;
     if (auto const r = StoreEntry(key, entry); !r.has_value())
         return std::unexpected(r.error());
     TouchOrInsert(key, entry.value.size());
@@ -460,57 +600,88 @@ std::expected<CasToken, StorageError> CowTreeStorage::CompareAndSwap(std::string
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
+    {
+        ++_stats.casMisses;
         return std::unexpected(loaded.error());
+    }
     if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
+    {
+        ++_stats.casMisses;
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
+    }
     if ((*loaded)->entry.cas != expected)
+    {
+        ++_stats.casBadval;
         return std::unexpected(MakeError(StorageErrorCode::CasMismatch));
+    }
+    ++_stats.casHits;
     return Set(key, std::move(value), flags, expiry);
 }
 
 std::expected<IStorage::IncrResult, StorageError> CowTreeStorage::IncrementOrInitialize(std::string_view key,
-                                                                                        std::int64_t delta,
+                                                                                        std::uint64_t magnitude,
+                                                                                        bool decrement,
                                                                                         TimePoint now)
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
-        return std::unexpected(loaded.error());
-    std::uint64_t current = 0;
-    bool exists = false;
-    if (loaded->has_value() && (*loaded)->entry.expiry > now && (*loaded)->entry.generation >= _liveGeneration)
     {
-        exists = true;
-        auto parsed =
-            ParseUnsigned(std::span<std::byte const> { (*loaded)->entry.value.data(), (*loaded)->entry.value.size() });
+        if (decrement)
+            ++_stats.decrMisses;
+        else
+            ++_stats.incrMisses;
+        return std::unexpected(loaded.error());
+    }
+    // Miss = KeyNotFound, matching InMemoryLruStorage. The "initialize"
+    // half of the name is the protocol layer's job: it owns the spec
+    // semantics (binary `initial`/`expiration`, meta `J`/`N`) and re-issues
+    // a Set on KeyNotFound. Auto-vivifying here with current=0 would ignore
+    // those flags and silently bypass the binary "do not create" sentinel.
+    if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
+    {
+        if (decrement)
+            ++_stats.decrMisses;
+        else
+            ++_stats.incrMisses;
+        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
+    }
+
+    auto& existing = (*loaded)->entry;
+    std::uint64_t current = 0;
+    {
+        auto parsed = ParseUnsigned(std::span<std::byte const> { existing.value.data(), existing.value.size() });
         if (!parsed.has_value())
             return std::unexpected(parsed.error());
         current = *parsed;
     }
 
-    std::uint64_t next = 0;
-    if (delta >= 0)
-    {
-        next = current + static_cast<std::uint64_t>(delta);
-    }
-    else
-    {
-        // Negating INT64_MIN as a signed int is UB; compute |delta|
-        // via the two-step idiom that the in-memory backend already
-        // uses (see InMemoryLruStorage.cpp). Saturating subtract.
-        auto const sub = static_cast<std::uint64_t>(-(delta + 1)) + 1;
-        next = (sub >= current) ? 0U : (current - sub);
-    }
+    // memcached: increment wraps modulo 2^64 (natural for uint64), decrement
+    // saturates at 0. The full unsigned `magnitude` is honoured, so deltas in
+    // [2^63, 2^64) add/subtract correctly instead of aliasing direction.
+    std::uint64_t const next = [&]() -> std::uint64_t {
+        if (!decrement)
+            return current + magnitude;
+        return magnitude >= current ? 0U : current - magnitude;
+    }();
     auto const s = std::to_string(next);
     std::vector<std::byte> bytes;
     bytes.reserve(s.size());
     for (auto const c: s)
         bytes.push_back(static_cast<std::byte>(c));
 
-    auto const expiryToUse = exists ? (*loaded)->entry.expiry : TimePoint::max();
-    auto const flagsToUse = exists ? (*loaded)->entry.flags : 0U;
-    auto cas = Set(key, std::move(bytes), flagsToUse, expiryToUse);
+    auto cas = Set(key, std::move(bytes), existing.flags, existing.expiry);
     if (!cas.has_value())
+    {
+        if (decrement)
+            ++_stats.decrMisses;
+        else
+            ++_stats.incrMisses;
         return std::unexpected(cas.error());
+    }
+    if (decrement)
+        ++_stats.decrHits;
+    else
+        ++_stats.incrHits;
     return IStorage::IncrResult { .value = next, .cas = *cas };
 }
 
@@ -518,9 +689,15 @@ std::expected<void, StorageError> CowTreeStorage::Delete(std::string_view key, T
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
+    {
+        ++_stats.deleteMisses;
         return std::unexpected(loaded.error());
+    }
     if (!loaded->has_value())
+    {
+        ++_stats.deleteMisses;
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
+    }
     auto const& entry = (*loaded)->entry;
     if (entry.expiry <= now || entry.generation < _liveGeneration)
     {
@@ -530,11 +707,13 @@ std::expected<void, StorageError> CowTreeStorage::Delete(std::string_view key, T
         // same as if the key was absent — KeyNotFound.
         std::ignore = EraseEntry(key);
         EraseFromLru(key);
+        ++_stats.deleteMisses;
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     }
     if (auto const r = EraseEntry(key); !r.has_value())
         return std::unexpected(r.error());
     EraseFromLru(key);
+    ++_stats.deleteHits;
     return {};
 }
 
@@ -542,6 +721,7 @@ void CowTreeStorage::FlushWithGeneration(TimePoint effectiveAt)
 {
     ++_liveGeneration;
     _flushEffectiveAt = effectiveAt;
+    ++_stats.cmdFlush;
 }
 
 std::size_t CowTreeStorage::PurgeExpired(TimePoint now)
@@ -568,8 +748,16 @@ std::size_t CowTreeStorage::PurgeExpired(TimePoint now)
             continue;
         }
         auto const& entry = (*loaded)->entry;
-        if (entry.expiry <= now || entry.generation < _liveGeneration)
+        if (entry.expiry <= now)
+        {
+            if (!node.fetched)
+                ++_stats.expiredUnfetched;
             victims.push_back(node.key);
+        }
+        else if (entry.generation < _liveGeneration)
+        {
+            victims.push_back(node.key);
+        }
     }
     std::size_t purged = 0;
     for (auto const& key: victims)

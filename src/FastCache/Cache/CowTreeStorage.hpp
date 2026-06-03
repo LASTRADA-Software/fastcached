@@ -14,6 +14,7 @@
 #include <functional>
 #include <list>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -45,7 +46,13 @@ namespace FastCache
 /// u64 generation
 /// u32 value_len
 /// [value bytes]
+/// // --- v2 trailer (optional; absent in legacy files) ---
+/// i64 lastAccess_us        (INT64_MIN = never accessed)
+/// u8  stale                (0 = live, 1 = stale)
 /// ```
+/// Older entries (without the v2 trailer) are decoded with `lastAccess`
+/// defaulted to `TimePoint::min()` and `stale = false`, so on-disk
+/// upgrades are seamless.
 class CowTreeStorage final: public IStorage
 {
   public:
@@ -99,10 +106,12 @@ class CowTreeStorage final: public IStorage
 
     [[nodiscard]] std::expected<CasToken, StorageError> Append(std::string_view key,
                                                                std::span<std::byte const> suffix,
+                                                               CasToken expected,
                                                                TimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Prepend(std::string_view key,
                                                                 std::span<std::byte const> prefix,
+                                                                CasToken expected,
                                                                 TimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> CompareAndSwap(std::string_view key,
@@ -113,10 +122,35 @@ class CowTreeStorage final: public IStorage
                                                                        TimePoint now) override;
 
     [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(std::string_view key,
-                                                                                          std::int64_t delta,
+                                                                                          std::uint64_t magnitude,
+                                                                                          bool decrement,
                                                                                           TimePoint now) override;
 
     [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key, TimePoint now) override;
+
+    [[nodiscard]] std::expected<CasToken, StorageError> Touch(std::string_view key,
+                                                              TimePoint newExpiry,
+                                                              TimePoint now) override;
+
+    [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
+
+    [[nodiscard]] std::expected<CasToken, StorageError> MarkStale(std::string_view key,
+                                                                  std::optional<TimePoint> newExpiry,
+                                                                  TimePoint now) override;
+
+    // Explicit compound-op overrides (rather than the IStorage defaults) so
+    // the get-and-touch / compare-and-delete behaviour of the persistent
+    // tier is spelled out and directly unit-tested. The single-critical-
+    // section guarantee is provided by the enclosing ShardedStorage's
+    // per-shard lock (this tier is never the lock owner); on the unwrapped
+    // single-threaded reactor there is no concurrent writer to exclude.
+    [[nodiscard]] std::expected<GetResult, StorageError> GetAndTouch(std::string_view key,
+                                                                     TimePoint newExpiry,
+                                                                     TimePoint now) override;
+
+    [[nodiscard]] std::expected<void, StorageError> CompareAndDelete(std::string_view key,
+                                                                     CasToken expected,
+                                                                     TimePoint now) override;
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;
@@ -152,8 +186,23 @@ class CowTreeStorage final: public IStorage
     /// Replay the tree into the LRU mirror at Open.
     [[nodiscard]] std::expected<void, StorageError> Replay();
 
+    /// Why `TouchOrInsert` is being called, which decides how the LRU
+    /// mirror's `fetched` bit is set.
+    enum class AccessKind : std::uint8_t
+    {
+        Write,    ///< Value-rewriting mutation: the entry counts as unread.
+        Read,     ///< Client read (`Get`): record that a client has read it.
+        Preserve, ///< TTL-only change (`Touch`/`MarkStale`): keep `fetched` as-is.
+    };
+
     /// Promote the key to the front of the LRU (or insert it).
-    void TouchOrInsert(std::string_view key, std::size_t valueSize);
+    /// @param key       Entry key.
+    /// @param valueSize New byte size to account for the entry.
+    /// @param access    `AccessKind::Read` sets the `fetched` bit so the LRU
+    ///                  mirror records a client access; `AccessKind::Write`
+    ///                  (the default) clears it, since a value-rewriting
+    ///                  mutation produces an entry nobody has read yet.
+    void TouchOrInsert(std::string_view key, std::size_t valueSize, AccessKind access = AccessKind::Write);
 
     /// Drop the entry from the LRU mirror.
     void EraseFromLru(std::string_view key);
@@ -169,6 +218,11 @@ class CowTreeStorage final: public IStorage
     {
         std::string key;
         std::size_t bytes { 0 };
+        /// True once a client has read this key since it was last written.
+        /// In-memory only (not persisted): drives the evicted_unfetched /
+        /// expired_unfetched counters and resets on restart along with the
+        /// rest of the LRU mirror.
+        bool fetched { false };
     };
     using LruList = std::list<LruNode>;
     using Iterator = LruList::iterator;
