@@ -12,6 +12,8 @@ project(fastcached
     LANGUAGES CXX
 )
 
+include(GNUInstallDirs)
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -148,6 +150,22 @@ add_subdirectory(src/FastCache)
 
 add_executable(fastcached src/fastcached/main.cpp)
 target_link_libraries(fastcached PRIVATE FastCache)
+
+# ----------------------------------------------------------------------------
+# Installation. Lays out the daemon binary and project docs under the standard
+# GNUInstallDirs prefix (bin/ + share/doc/fastcached/). The FastCache/CowTree
+# static libraries and headers are intentionally not installed: they PUBLIC-link
+# an un-installed CPM yaml-cpp, so exporting a consumable SDK is out of scope.
+
+install(TARGETS fastcached
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+)
+
+install(FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+        "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
+    DESTINATION "${CMAKE_INSTALL_DOCDIR}"
+)
 
 # ----------------------------------------------------------------------------
 # Tests.
