@@ -284,3 +284,10 @@ jobs:
 
       - name: "Test"
         run: ctest --preset ${{ matrix.preset }}
+
+      - name: "Upload fastcached.exe"
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastcached-windows-${{ matrix.preset }}
+          path: out/build/${{ matrix.preset }}/target/fastcached.exe
+          if-no-files-found: error
