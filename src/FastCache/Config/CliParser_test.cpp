@@ -4,10 +4,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cstddef>
 #include <initializer_list>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 TEST_CASE("CliParser: --max-memory accepts plain bytes", "[config][cli]")
 {
@@ -202,4 +205,123 @@ TEST_CASE("CliParser: --help text mentions execution-model with auto", "[config]
     REQUIRE(usage.find("--execution-model") != std::string::npos);
     REQUIRE(usage.find("auto|threaded|reactor") != std::string::npos);
     REQUIRE(usage.find("--threading-model") == std::string::npos);
+}
+
+namespace
+{
+/// Split `text` into '\n'-separated lines (the trailing segment is kept).
+[[nodiscard]] std::vector<std::string_view> SplitLines(std::string_view text)
+{
+    std::vector<std::string_view> lines;
+    while (true)
+    {
+        auto const newline = text.find('\n');
+        if (newline == std::string_view::npos)
+        {
+            lines.push_back(text);
+            return lines;
+        }
+        lines.push_back(text.substr(0, newline));
+        text.remove_prefix(newline + 1);
+    }
+}
+
+/// Column (0-based) at which the description text begins on an option line:
+/// the first non-space character following the run of 2+ gap spaces after
+/// the flag. Internal single spaces inside a flag (e.g. "--help, -h") do not
+/// count as the gap.
+[[nodiscard]] std::size_t DescriptionColumn(std::string_view line)
+{
+    auto i = std::size_t { 2 }; // past the leading "  " indent
+    while (i + 1 < line.size() && !(line[i] == ' ' && line[i + 1] == ' '))
+        ++i;
+    while (i < line.size() && line[i] == ' ')
+        ++i;
+    return i;
+}
+
+/// Remove ANSI SGR escape sequences ("\x1b[...m") from `text`.
+[[nodiscard]] std::string StripAnsi(std::string_view text)
+{
+    std::string out;
+    auto i = std::size_t { 0 };
+    while (i < text.size())
+    {
+        if (text[i] == '\x1b')
+        {
+            while (i < text.size() && text[i] != 'm')
+                ++i;
+            if (i < text.size())
+                ++i; // consume the terminating 'm'
+        }
+        else
+        {
+            out += text[i];
+            ++i;
+        }
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("CliParser: --help option descriptions share one aligned column", "[config][cli][help]")
+{
+    auto const usage = FastCache::CliUsage();
+    auto expectedColumn = std::size_t { 0 };
+    auto optionLines = std::size_t { 0 };
+
+    for (auto const line: SplitLines(usage))
+    {
+        if (!line.starts_with("  --"))
+            continue;
+        auto const column = DescriptionColumn(line);
+        if (optionLines == 0)
+            expectedColumn = column;
+        else
+            REQUIRE(column == expectedColumn);
+        ++optionLines;
+    }
+
+    // Every documented flag must have lined up against the same column.
+    REQUIRE(optionLines >= 14);
+    REQUIRE(expectedColumn > 0);
+}
+
+TEST_CASE("CliParser: --help wraps continuation lines to the description column", "[config][cli][help]")
+{
+    auto const usage = FastCache::CliUsage();
+    auto const lines = SplitLines(usage);
+
+    // Find the --execution-model flag line and its continuation ("auto: ...").
+    auto flagColumn = std::size_t { 0 };
+    auto continuationColumn = std::size_t { 0 };
+    for (auto const line: lines)
+    {
+        if (line.starts_with("  --execution-model"))
+            flagColumn = DescriptionColumn(line);
+        else if (line.find("auto: reactor for in-memory") != std::string_view::npos)
+            continuationColumn = line.find_first_not_of(' ');
+    }
+
+    REQUIRE(flagColumn > 0);
+    REQUIRE(continuationColumn == flagColumn);
+}
+
+TEST_CASE("CliParser: plain --help carries no ANSI escapes", "[config][cli][help][color]")
+{
+    auto const usage = FastCache::CliUsage(FastCache::UsageColor::Plain);
+    REQUIRE(usage.find('\x1b') == std::string::npos);
+}
+
+TEST_CASE("CliParser: colorized --help adds ANSI escapes but identical text", "[config][cli][help][color]")
+{
+    auto const plain = FastCache::CliUsage(FastCache::UsageColor::Plain);
+    auto const colored = FastCache::CliUsage(FastCache::UsageColor::Colored);
+
+    // Color escapes are present...
+    REQUIRE(colored.find("\x1b[") != std::string::npos);
+    REQUIRE(colored.size() > plain.size());
+    // ...and stripping them recovers exactly the plain layout (so color never
+    // disturbs alignment).
+    REQUIRE(StripAnsi(colored) == plain);
 }

@@ -25,6 +25,7 @@
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
+#include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Server/BlockingServerLoop.hpp>
 #include <FastCache/Server/PooledServerLoop.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
@@ -452,7 +453,9 @@ int main(int argc, char const* const* argv)
             std::println("fastcached {}", ProgramVersion);
             return EXIT_SUCCESS;
         case FastCache::CliOutcome::ShowHelp:
-            std::print("{}", FastCache::CliUsage());
+            std::print("{}",
+                       FastCache::CliUsage(FastCache::StdoutSupportsColor() ? FastCache::UsageColor::Colored
+                                                                            : FastCache::UsageColor::Plain));
             return EXIT_SUCCESS;
         case FastCache::CliOutcome::Run:
             break;
