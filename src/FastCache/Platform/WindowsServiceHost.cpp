@@ -33,6 +33,9 @@ namespace
     SERVICE_STATUS g_currentStatus {};
     IDaemonHost::Body g_body;
     std::atomic<int> g_exitCode { 0 };
+    /// Service name the SCM dispatcher was started with; used by ServiceMain so
+    /// a custom --service-name matches what was registered at install time.
+    std::string g_serviceName { "FastCached" };
 
     void ReportStatus(DWORD state, DWORD waitHintMs = 0)
     {
@@ -68,7 +71,7 @@ namespace
 
     void WINAPI ServiceMain(DWORD /*argc*/, LPSTR* /*argv*/)
     {
-        g_serviceStatus = RegisterServiceCtrlHandlerExA("FastCached", &ServiceCtrlHandlerEx, nullptr);
+        g_serviceStatus = RegisterServiceCtrlHandlerExA(g_serviceName.c_str(), &ServiceCtrlHandlerEx, nullptr);
         if (!g_serviceStatus)
             return;
         g_currentStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
@@ -92,6 +95,7 @@ namespace
         int Run(Body body) override
         {
             g_body = std::move(body);
+            g_serviceName = _name;
             // SERVICE_TABLE_ENTRYA takes a mutable char*; the SCM does not
             // modify the name but the API signature requires non-const.
             SERVICE_TABLE_ENTRYA table[] = {

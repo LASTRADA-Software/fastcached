@@ -16,9 +16,11 @@ namespace FastCache
 /// Outcome categories returned by ParseCli.
 enum class CliOutcome : std::uint8_t
 {
-    Run,         ///< Parsing succeeded; proceed to run the daemon.
-    ShowHelp,    ///< --help / -h was seen.
-    ShowVersion, ///< --version / -V was seen.
+    Run,              ///< Parsing succeeded; proceed to run the daemon.
+    ShowHelp,         ///< --help / -h was seen.
+    ShowVersion,      ///< --version / -V was seen.
+    InstallService,   ///< --install-service was seen; register a Windows service.
+    UninstallService, ///< --uninstall-service was seen; remove the Windows service.
 };
 
 struct CliResult

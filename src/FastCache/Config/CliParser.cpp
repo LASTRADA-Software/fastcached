@@ -204,6 +204,19 @@ namespace
             cfg.daemon = true;
             return ArgOutcome::Continue;
         }
+        // Service-control requests record the desired outcome but keep parsing:
+        // the remaining flags (--service-name, --port, --storage, ...) are
+        // captured into the config that gets baked into the service command line.
+        if (arg == "--install-service")
+        {
+            result.outcome = CliOutcome::InstallService;
+            return ArgOutcome::Continue;
+        }
+        if (arg == "--uninstall-service")
+        {
+            result.outcome = CliOutcome::UninstallService;
+            return ArgOutcome::Continue;
+        }
 
         // String-valued flags. Each match flips an "explicit" bool so
         // Merge can override YAML even when the typed value happens to
@@ -344,28 +357,36 @@ namespace
     /// The option table — single source of truth for both the help text and its
     /// alignment. Add a row here and it lines up automatically.
     constexpr auto UsageOptions = std::to_array<UsageOption>({
-        { "--config=<path>", "YAML config file; CLI flags override file values" },
-        { "--bind=<addr>", "bind address (default 127.0.0.1)" },
-        { "--port=<num>", "TCP port (default 11211)" },
-        { "--max-memory=<size>", "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)" },
-        { "--log-level=<level>", "trace|debug|info|warn|error|fatal (default info)" },
-        { "--storage=<path>", "persist cache to a CoW-tree file (default: in-memory only)" },
-        { "--storage-durability=<mode>", "fsync|batched|none for --storage (default batched)" },
-        { "--storage-max-value=<size>", "per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)" },
-        { "--execution-model=<mode>",
-          "auto|threaded|reactor (default auto)\n"
-          "auto: reactor for in-memory, threaded for --storage on disk" },
-        { "--threads=<N>", "worker thread count for threaded mode (default: hardware_concurrency)" },
-        { "--storage-shards=<N>",
-          "shard storage into N partitions for write parallelism\n"
-          "default: 1 (single-file mode) when --storage names a regular file,\n"
-          "min(16, hardware_concurrency) otherwise;\n"
-          "when N>1 and --storage is set, --storage must be a directory" },
-        { "--daemon", "daemonize (POSIX) / register as Windows service" },
-        { "--pidfile=<path>", "POSIX daemon mode only" },
-        { "--service-name=<name>", "Windows service name (default FastCached)" },
-        { "--help, -h", "show this help and exit" },
-        { "--version, -V", "show version and exit" },
+        { .flag = "--config=<path>", .description = "YAML config file; CLI flags override file values" },
+        { .flag = "--bind=<addr>", .description = "bind address (default 127.0.0.1)" },
+        { .flag = "--port=<num>", .description = "TCP port (default 11211)" },
+        { .flag = "--max-memory=<size>",
+          .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)" },
+        { .flag = "--log-level=<level>", .description = "trace|debug|info|warn|error|fatal (default info)" },
+        { .flag = "--storage=<path>", .description = "persist cache to a CoW-tree file (default: in-memory only)" },
+        { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },
+        { .flag = "--storage-max-value=<size>",
+          .description = "per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)" },
+        { .flag = "--execution-model=<mode>",
+          .description = "auto|threaded|reactor (default auto)\n"
+                         "auto: reactor for in-memory, threaded for --storage on disk" },
+        { .flag = "--threads=<N>", .description = "worker thread count for threaded mode (default: hardware_concurrency)" },
+        { .flag = "--storage-shards=<N>",
+          .description = "shard storage into N partitions for write parallelism\n"
+                         "default: 1 (single-file mode) when --storage names a regular file,\n"
+                         "min(16, hardware_concurrency) otherwise;\n"
+                         "when N>1 and --storage is set, --storage must be a directory" },
+        { .flag = "--daemon",
+          .description = "daemonize (POSIX) / run under the Windows SCM (used by the installed service)" },
+        { .flag = "--install-service",
+          .description = "register fastcached as an auto-start Windows service (Windows only;\n"
+                         "needs an elevated prompt; other flags are baked into the service)" },
+        { .flag = "--uninstall-service",
+          .description = "remove the fastcached Windows service (Windows only; needs elevation)" },
+        { .flag = "--pidfile=<path>", .description = "POSIX daemon mode only" },
+        { .flag = "--service-name=<name>", .description = "Windows service name (default FastCached)" },
+        { .flag = "--help, -h", .description = "show this help and exit" },
+        { .flag = "--version, -V", .description = "show version and exit" },
     });
 
     /// A worked example block printed below the option table.
@@ -378,17 +399,18 @@ namespace
     /// Platform-specific sccache usage snippets (PowerShell vs POSIX shell).
     constexpr auto UsageExamples = std::to_array<UsageExample>({
 #if defined(_WIN32)
-        { "Use with sccache (memcached protocol, PowerShell):",
-          "  Start-Process fastcached -ArgumentList '--port=11211'\n"
-          "  $env:SCCACHE_MEMCACHED = 'tcp://127.0.0.1:11211'\n"
-          "  sccache <compiler> /c hello.cpp /Fo:hello.obj" },
-        { "Use with sccache (Redis protocol, PowerShell):", "  $env:SCCACHE_REDIS = 'redis://127.0.0.1:11211'" },
+        { .title = "Use with sccache (memcached protocol, PowerShell):",
+          .body = "  Start-Process fastcached -ArgumentList '--port=11211'\n"
+                  "  $env:SCCACHE_MEMCACHED = 'tcp://127.0.0.1:11211'\n"
+                  "  sccache <compiler> /c hello.cpp /Fo:hello.obj" },
+        { .title = "Use with sccache (Redis protocol, PowerShell):",
+          .body = "  $env:SCCACHE_REDIS = 'redis://127.0.0.1:11211'" },
 #else
-        { "Use with sccache (memcached protocol):",
-          "  fastcached --port=11211 &\n"
-          "  export SCCACHE_MEMCACHED=tcp://127.0.0.1:11211\n"
-          "  sccache <compiler> -c hello.c -o hello.o" },
-        { "Use with sccache (Redis protocol):", "  export SCCACHE_REDIS=redis://127.0.0.1:11211" },
+        { .title = "Use with sccache (memcached protocol):",
+          .body = "  fastcached --port=11211 &\n"
+                  "  export SCCACHE_MEMCACHED=tcp://127.0.0.1:11211\n"
+                  "  sccache <compiler> -c hello.c -o hello.o" },
+        { .title = "Use with sccache (Redis protocol):", .body = "  export SCCACHE_REDIS=redis://127.0.0.1:11211" },
 #endif
     });
 

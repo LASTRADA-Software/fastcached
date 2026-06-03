@@ -28,6 +28,7 @@ target_sources(FastCache
         Platform/DaemonControls.cpp
         Platform/HostMemory.cpp
         Platform/PosixDaemonHost.cpp
+        Platform/ServiceControl.cpp
         Platform/Terminal.cpp
         Platform/WindowsServiceHost.cpp
         Net/InMemoryTransport.cpp

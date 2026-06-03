@@ -325,3 +325,23 @@ TEST_CASE("CliParser: colorized --help adds ANSI escapes but identical text", "[
     // disturbs alignment).
     REQUIRE(StripAnsi(colored) == plain);
 }
+
+TEST_CASE("CliParser: --install-service selects the install outcome and keeps parsing flags", "[config][cli][service]")
+{
+    auto const args = std::array<char const*, 3> { "--install-service", "--port=6000", "--service-name=Foo" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->outcome == FastCache::CliOutcome::InstallService);
+    // Flags after --install-service still land in the config that gets baked
+    // into the service command line.
+    REQUIRE(result->config.port == 6000U);
+    REQUIRE(result->config.serviceName == "Foo");
+}
+
+TEST_CASE("CliParser: --uninstall-service selects the uninstall outcome", "[config][cli][service]")
+{
+    auto const args = std::array<char const*, 1> { "--uninstall-service" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->outcome == FastCache::CliOutcome::UninstallService);
+}

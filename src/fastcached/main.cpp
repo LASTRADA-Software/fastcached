@@ -25,6 +25,7 @@
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
+#include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Server/BlockingServerLoop.hpp>
 #include <FastCache/Server/PooledServerLoop.hpp>
@@ -458,6 +459,10 @@ int main(int argc, char const* const* argv)
                                                                             : FastCache::UsageColor::Plain));
             return EXIT_SUCCESS;
         case FastCache::CliOutcome::Run:
+        case FastCache::CliOutcome::InstallService:
+        case FastCache::CliOutcome::UninstallService:
+            // Run and the service-control requests all need the effective
+            // config assembled below; they branch apart afterwards.
             break;
     }
 
@@ -476,6 +481,22 @@ int main(int argc, char const* const* argv)
     else
     {
         effective = parsed->config;
+    }
+
+    // Service-control requests act on the SCM and exit; they never run the
+    // daemon body. The effective config is reused so every flag passed
+    // alongside --install-service is baked into the service command line.
+    if (parsed->outcome == FastCache::CliOutcome::InstallService
+        || parsed->outcome == FastCache::CliOutcome::UninstallService)
+    {
+        auto const result = parsed->outcome == FastCache::CliOutcome::InstallService
+                                ? FastCache::InstallWindowsService(effective)
+                                : FastCache::UninstallWindowsService(effective);
+        if (result.exitCode == 0)
+            std::println("fastcached: {}", result.message);
+        else
+            std::println(std::cerr, "fastcached: {}", result.message);
+        return result.exitCode;
     }
 
     std::unique_ptr<FastCache::IDaemonHost> host;
