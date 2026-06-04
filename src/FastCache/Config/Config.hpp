@@ -52,12 +52,14 @@ struct Config
     /// In-memory storage byte budget. 0 = unbounded (testing/dev only).
     std::size_t maxMemoryBytes { 64 * 1024 * 1024 };
 
-    /// Maximum size of a single cache value in bytes (only enforced
-    /// when `storagePath` is set). Defaults to 1 MiB which fits
-    /// typical sccache compile-cache values; raise it to allow larger
-    /// objects. Set/Add/Replace/Append/Prepend that would exceed this
-    /// return StorageErrorCode::ValueTooLarge.
-    std::size_t storageMaxValueBytes { 1 * 1024 * 1024 };
+    /// Maximum size of a single cache value in bytes, enforced by every
+    /// storage backend (in-memory LRU and on-disk COW tree). Defaults to
+    /// 16 MiB, matching the protocol payload cap (`MaxPayloadBytes`), so
+    /// the default imposes no extra limit beyond what the wire layer
+    /// already rejects; lower it to enforce a stricter per-value cap.
+    /// Set/Add/Replace/CompareAndSwap/Append/Prepend that would exceed
+    /// this return StorageErrorCode::ValueTooLarge.
+    std::size_t storageMaxValueBytes { 16 * 1024 * 1024 };
 
     /// Worker thread count for Threaded mode. 0 means "use
     /// std::thread::hardware_concurrency()". Ignored when the

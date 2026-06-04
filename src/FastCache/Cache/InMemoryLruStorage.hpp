@@ -34,10 +34,16 @@ namespace FastCache
 class InMemoryLruStorage final: public IStorage
 {
   public:
-    /// Construct with the given byte budget. `maxBytes == 0` disables
-    /// eviction entirely (useful for unit tests).
+    /// Construct with the given byte budget and per-value size cap.
+    /// `maxBytes == 0` disables eviction entirely; `maxValueBytes == 0`
+    /// disables the per-value limit. Both default to 0 (useful for unit
+    /// tests).
     /// @param maxBytes Soft cap on total value bytes.
-    explicit InMemoryLruStorage(std::size_t maxBytes = 0) noexcept;
+    /// @param maxValueBytes Hard cap on a single value's size in bytes; a
+    ///                      Set/Add/Replace/CompareAndSwap/Append/Prepend
+    ///                      that would exceed it returns
+    ///                      StorageErrorCode::ValueTooLarge.
+    explicit InMemoryLruStorage(std::size_t maxBytes = 0, std::size_t maxValueBytes = 0) noexcept;
 
     [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key, TimePoint now) override;
 
@@ -137,7 +143,17 @@ class InMemoryLruStorage final: public IStorage
     /// Erase the entry pointed at by `it`. Updates accounting and stats.
     void EraseAt(Iterator it);
 
+    /// True if a value of `size` bytes exceeds the configured per-value
+    /// cap. Always false when the cap is disabled (`_maxValueBytes == 0`).
+    /// @param size Candidate value size in bytes.
+    /// @return Whether the value is too large to store.
+    [[nodiscard]] bool ExceedsValueLimit(std::size_t size) const noexcept
+    {
+        return _maxValueBytes != 0 && size > _maxValueBytes;
+    }
+
     std::size_t _maxBytes;
+    std::size_t _maxValueBytes;
     std::size_t _bytesUsed { 0 };
     std::uint64_t _liveGeneration { 1 };
     TimePoint _flushEffectiveAt { TimePoint::min() };

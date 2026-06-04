@@ -195,7 +195,7 @@ struct StorageBackendBundle
     auto opened = FastCache::CowTreeStorage::Open(opts);
     if (!opened.has_value())
         return std::unexpected(opened.error().ToString());
-    auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes);
+    auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes, effective.storageMaxValueBytes);
     return std::make_unique<FastCache::LayeredStorage>(std::move(l1), std::move(*opened));
 }
 
@@ -211,7 +211,8 @@ struct StorageBackendBundle
     if (!usingPersistent)
     {
         for (std::size_t i = 0; i < physicalShards; ++i)
-            inners.emplace_back(std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes));
+            inners.emplace_back(
+                std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes, effective.storageMaxValueBytes));
         return inners;
     }
 
@@ -276,7 +277,8 @@ struct StorageBackendBundle
     // Unwrapped single-shard reactor path.
     if (!usingPersistent)
     {
-        bundle.backend = std::make_unique<FastCache::InMemoryLruStorage>(effective.maxMemoryBytes);
+        bundle.backend =
+            std::make_unique<FastCache::InMemoryLruStorage>(effective.maxMemoryBytes, effective.storageMaxValueBytes);
         return bundle;
     }
 

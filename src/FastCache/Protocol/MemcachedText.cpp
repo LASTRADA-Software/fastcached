@@ -208,6 +208,8 @@ namespace
                 co_return co_await WriteLine(socket, "NOT_STORED");
             case StorageErrorCode::CasMismatch:
                 co_return co_await WriteLine(socket, "EXISTS");
+            case StorageErrorCode::ValueTooLarge:
+                co_return co_await WriteError(socket, "SERVER_ERROR", "object too large for cache");
             default:
                 co_return co_await WriteError(socket, "SERVER_ERROR", "storage failure");
         }
