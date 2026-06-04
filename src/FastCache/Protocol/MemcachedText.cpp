@@ -3,6 +3,7 @@
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
+#include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/MemcachedMeta.hpp>
@@ -144,12 +145,17 @@ namespace
     {
         std::string response;
         response.reserve(64 * keys.size());
-        for (auto const key: keys)
         {
-            auto const result = engine->Get(key);
-            if (!result.has_value() || !result->found)
-                continue;
-            AppendValueBlock(response, key, result->entry, includeCas);
+            // Synchronous lookup loop — scoped so the zone ends before the
+            // co_await below (a zone must never straddle a suspension point).
+            FC_ZONE_SCOPED_N("memcached.HandleGet.lookup");
+            for (auto const key: keys)
+            {
+                auto const result = engine->Get(key);
+                if (!result.has_value() || !result->found)
+                    continue;
+                AppendValueBlock(response, key, result->entry, includeCas);
+            }
         }
         response.append("END\r\n");
         co_return co_await WriteAll(socket, response);
@@ -177,19 +183,27 @@ namespace
             co_return co_await WriteError(socket, "CLIENT_ERROR", "missing CRLF after payload");
 
         std::expected<CasToken, StorageError> result { 0 };
-        if (commandName == "set")
-            result = engine->Set(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
-        else if (commandName == "add")
-            result = engine->Add(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
-        else if (commandName == "replace")
-            result = engine->Replace(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
-        else if (commandName == "append")
-            result = engine->Append(parsed.key, std::span<std::byte const> { payload->data(), payload->size() });
-        else if (commandName == "prepend")
-            result = engine->Prepend(parsed.key, std::span<std::byte const> { payload->data(), payload->size() });
-        else if (commandName == "cas")
-            result = engine->CompareAndSwap(parsed.key, parsed.cas, std::move(*payload), parsed.flags, parsed.exptime);
-        else
+        bool unknownCommand = false;
+        {
+            // Synchronous storage dispatch — scoped so the zone closes before
+            // any co_await below (a zone must not straddle a suspension point).
+            FC_ZONE_SCOPED_N("memcached.HandleStorage.dispatch");
+            if (commandName == "set")
+                result = engine->Set(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
+            else if (commandName == "add")
+                result = engine->Add(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
+            else if (commandName == "replace")
+                result = engine->Replace(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
+            else if (commandName == "append")
+                result = engine->Append(parsed.key, std::span<std::byte const> { payload->data(), payload->size() });
+            else if (commandName == "prepend")
+                result = engine->Prepend(parsed.key, std::span<std::byte const> { payload->data(), payload->size() });
+            else if (commandName == "cas")
+                result = engine->CompareAndSwap(parsed.key, parsed.cas, std::move(*payload), parsed.flags, parsed.exptime);
+            else
+                unknownCommand = true;
+        }
+        if (unknownCommand)
             co_return co_await WriteError(socket, "ERROR");
 
         if (parsed.noreply)
@@ -221,7 +235,10 @@ namespace
             co_return co_await WriteError(socket, "CLIENT_ERROR", "missing key");
 
         bool const noreply = args.size() > 1 && IsNoReply(args.back());
-        auto const result = engine->Delete(args[0]);
+        auto const result = [&] {
+            FC_ZONE_SCOPED_N("memcached.HandleDelete.dispatch");
+            return engine->Delete(args[0]);
+        }();
         if (noreply)
             co_return true;
         if (result.has_value())
@@ -239,7 +256,10 @@ namespace
             co_return co_await WriteError(socket, "CLIENT_ERROR", "delta not numeric");
 
         bool const noreply = args.size() > 2 && IsNoReply(args.back());
-        auto const result = isIncr ? engine->Increment(args[0], delta) : engine->Decrement(args[0], delta);
+        auto const result = [&] {
+            FC_ZONE_SCOPED_N("memcached.HandleIncrDecr.dispatch");
+            return isIncr ? engine->Increment(args[0], delta) : engine->Decrement(args[0], delta);
+        }();
         if (noreply)
             co_return true;
         if (result.has_value())
@@ -575,6 +595,11 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket, CacheEngine* engine, std::
 
         if (!ok)
             co_return;
+
+        // One command fully handled and its response written — mark the frame
+        // so the Tracy viewer renders per-request timing. FrameMark is a
+        // stackless timeline event, so it is safe inside this coroutine.
+        FC_FRAME_MARK;
     }
 }
 

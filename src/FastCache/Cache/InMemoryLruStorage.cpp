@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Core/Profiling.hpp>
 
 #include <algorithm>
 #include <charconv>
@@ -86,6 +87,7 @@ void InMemoryLruStorage::EraseAt(Iterator it)
 
 void InMemoryLruStorage::EvictToFit()
 {
+    FC_ZONE_SCOPED_N("LruStorage::EvictToFit");
     if (_maxBytes == 0)
         return;
     while (_bytesUsed > _maxBytes && !_lru.empty())
@@ -96,10 +98,14 @@ void InMemoryLruStorage::EvictToFit()
         EraseAt(victim);
         ++_stats.evictions;
     }
+    // Memory-pressure timeline so the Tracy viewer shows how close the cache
+    // runs to its byte cap over the course of a workload.
+    FC_PLOT("lru.bytesUsed", static_cast<std::int64_t>(_bytesUsed));
 }
 
 CasToken InMemoryLruStorage::InsertNew(std::string key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry)
 {
+    FC_ZONE_SCOPED_N("LruStorage::InsertNew");
     auto const cas = _nextCas++;
     auto const size = value.size();
 
@@ -121,6 +127,7 @@ CasToken InMemoryLruStorage::InsertNew(std::string key, std::vector<std::byte> v
 
 CasToken InMemoryLruStorage::MutateExisting(Iterator it, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry)
 {
+    FC_ZONE_SCOPED_N("LruStorage::MutateExisting");
     _bytesUsed -= it->entry.value.size();
     it->entry.value = std::move(value);
     it->entry.flags = flags;
@@ -138,6 +145,7 @@ CasToken InMemoryLruStorage::MutateExisting(Iterator it, std::vector<std::byte> 
 
 std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view key, TimePoint now)
 {
+    FC_ZONE_SCOPED_N("LruStorage::Get");
     ++_stats.cmdGet;
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
@@ -160,6 +168,7 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Set(std::string_view k
                                                               std::uint32_t flags,
                                                               TimePoint expiry)
 {
+    FC_ZONE_SCOPED_N("LruStorage::Set");
     ++_stats.cmdSet;
     if (ExceedsValueLimit(value.size()))
         return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));

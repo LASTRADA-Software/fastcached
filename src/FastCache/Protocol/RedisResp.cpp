@@ -3,6 +3,7 @@
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
+#include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
@@ -443,6 +444,9 @@ Task<void> RedisRespHandler::Run(ISocket* socket, CacheEngine* engine, std::vect
         auto const keepGoing = co_await Dispatch(socket, engine, std::move(*cmd));
         if (!keepGoing)
             co_return;
+
+        // One command handled and replied — mark the request frame.
+        FC_FRAME_MARK;
     }
 }
 

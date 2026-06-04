@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Server/Connection.hpp>
 #include <FastCache/Server/PooledServerLoop.hpp>
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -85,8 +87,15 @@ namespace
     };
 
     /// Worker body: pop sockets and drive them to completion.
-    void WorkerLoop(WorkQueue& queue, CacheEngine& engine, ILogger& logger)
+    /// @param queue Shared work queue this worker drains.
+    /// @param engine Cache engine the connection handlers operate on.
+    /// @param logger Logger for connection-level diagnostics.
+    /// @param workerIndex Zero-based index used only to name the Tracy thread.
+    void WorkerLoop(WorkQueue& queue, CacheEngine& engine, ILogger& logger, [[maybe_unused]] std::size_t workerIndex)
     {
+        // Name the OS thread in the Tracy timeline (no-op when Tracy is off, in
+        // which case the std::format argument is discarded unevaluated).
+        FC_THREAD_NAME(std::format("fc-worker-{}", workerIndex).c_str());
         while (true)
         {
             auto socket = queue.Pop();
@@ -119,7 +128,7 @@ namespace
         {
             _threads.reserve(poolSize);
             for (std::size_t i = 0; i < poolSize; ++i)
-                _threads.emplace_back(WorkerLoop, std::ref(_queue), std::ref(engine), std::ref(logger));
+                _threads.emplace_back(WorkerLoop, std::ref(_queue), std::ref(engine), std::ref(logger), i);
         }
 
         ~WorkerPool()

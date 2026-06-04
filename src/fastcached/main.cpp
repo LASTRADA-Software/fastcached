@@ -21,6 +21,7 @@
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
@@ -440,6 +441,7 @@ int DaemonBody(FastCache::Config const& effective)
 
 int main(int argc, char const* const* argv)
 {
+    FC_THREAD_NAME("fastcached-main");
     std::span<char const* const> const args { argv + 1, argc > 0 ? static_cast<std::size_t>(argc - 1) : 0 };
 
     auto const parsed = FastCache::ParseCli(args);

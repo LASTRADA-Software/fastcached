@@ -3,6 +3,7 @@
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
+#include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/MemcachedBinary.hpp>
@@ -669,6 +670,9 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket, CacheEngine* engine, std
         }
         if (!keepGoing)
             co_return;
+
+        // One binary command handled and replied — mark the request frame.
+        FC_FRAME_MARK;
     }
 }
 
