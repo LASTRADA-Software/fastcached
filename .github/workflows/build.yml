@@ -122,36 +122,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y sccache g++-14
-      - name: "Write a one-file C++ source to compile"
-        run: |
-          mkdir -p smoke
-          cat > smoke/hello.cpp <<'EOF'
-          #include <string>
-          int main() { return std::string{"hi"}.size(); }
-          EOF
       - name: "Smoke"
-        env:
-          SCCACHE_MEMCACHED: tcp://127.0.0.1:11611
-          SCCACHE_NO_DAEMON: "0"
-        run: |
-          set -e
-          ./bin/fastcached --port=11611 --log-level=info &
-          server=$!
-          sleep 1
-          sccache --stop-server || true
-          sccache --start-server
-          sccache --zero-stats
-          # First compile: cache miss.
-          sccache g++-14 -std=c++23 -c smoke/hello.cpp -o /tmp/hello.o
-          rm -f /tmp/hello.o
-          # Second compile: cache hit.
-          sccache g++-14 -std=c++23 -c smoke/hello.cpp -o /tmp/hello.o
-          stats=$(sccache --show-stats)
-          echo "$stats"
-          echo "$stats" | grep -E "Cache hits[[:space:]]+[1-9]" >/dev/null || { echo "no cache hit"; exit 1; }
-          sccache --stop-server || true
-          kill $server || true
-          wait $server 2>/dev/null || true
+        run: bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached --protocol memcached --port 11611 --compiler g++-14
 
   sccache-smoke-memcached-binary:
     name: "sccache smoke (memcached binary)"
@@ -175,34 +147,8 @@ jobs:
       # sccache (0.7.7) on noble still speaks text.
       - name: "Install sccache (binary protocol via OpenDAL >= 0.45)"
         uses: mozilla-actions/sccache-action@v0.0.6
-      - name: "Write a one-file C++ source to compile"
-        run: |
-          mkdir -p smoke
-          cat > smoke/hello.cpp <<'EOF'
-          #include <string>
-          int main() { return std::string{"hi"}.size(); }
-          EOF
       - name: "Smoke"
-        env:
-          SCCACHE_MEMCACHED: tcp://127.0.0.1:11611
-          SCCACHE_NO_DAEMON: "0"
-        run: |
-          set -e
-          ./bin/fastcached --port=11611 --log-level=info &
-          server=$!
-          sleep 1
-          sccache --stop-server || true
-          sccache --start-server
-          sccache --zero-stats
-          sccache g++-14 -std=c++23 -c smoke/hello.cpp -o /tmp/hello.o
-          rm -f /tmp/hello.o
-          sccache g++-14 -std=c++23 -c smoke/hello.cpp -o /tmp/hello.o
-          stats=$(sccache --show-stats)
-          echo "$stats"
-          echo "$stats" | grep -E "Cache hits[[:space:]]+[1-9]" >/dev/null || { echo "no cache hit"; exit 1; }
-          sccache --stop-server || true
-          kill $server || true
-          wait $server 2>/dev/null || true
+        run: bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached --protocol memcached --port 11611 --compiler g++-14
 
   sccache-smoke-redis:
     name: "sccache smoke (redis RESP2)"
@@ -221,34 +167,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y sccache g++-14
-      - name: "Write a one-file C++ source to compile"
-        run: |
-          mkdir -p smoke
-          cat > smoke/hello.cpp <<'EOF'
-          #include <string>
-          int main() { return std::string{"hi"}.size(); }
-          EOF
       - name: "Smoke"
-        env:
-          SCCACHE_REDIS: redis://127.0.0.1:11611
-          SCCACHE_NO_DAEMON: "0"
-        run: |
-          set -e
-          ./bin/fastcached --port=11611 --log-level=info &
-          server=$!
-          sleep 1
-          sccache --stop-server || true
-          sccache --start-server
-          sccache --zero-stats
-          sccache g++-14 -std=c++23 -c smoke/hello.cpp -o /tmp/hello.o
-          rm -f /tmp/hello.o
-          sccache g++-14 -std=c++23 -c smoke/hello.cpp -o /tmp/hello.o
-          stats=$(sccache --show-stats)
-          echo "$stats"
-          echo "$stats" | grep -E "Cache hits[[:space:]]+[1-9]" >/dev/null || { echo "no cache hit"; exit 1; }
-          sccache --stop-server || true
-          kill $server || true
-          wait $server 2>/dev/null || true
+        run: bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached --protocol redis --port 11611 --compiler g++-14
 
   windows:
     name: "Windows-${{ matrix.preset }}"
@@ -284,3 +204,10 @@ jobs:
 
       - name: "Test"
         run: ctest --preset ${{ matrix.preset }}
+
+      - name: "Upload fastcached.exe"
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastcached-windows-${{ matrix.preset }}
+          path: out/build/${{ matrix.preset }}/target/fastcached.exe
+          if-no-files-found: error

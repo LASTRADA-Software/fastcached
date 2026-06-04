@@ -25,6 +25,8 @@
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
+#include <FastCache/Platform/ServiceControl.hpp>
+#include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Server/BlockingServerLoop.hpp>
 #include <FastCache/Server/PooledServerLoop.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
@@ -193,7 +195,7 @@ struct StorageBackendBundle
     auto opened = FastCache::CowTreeStorage::Open(opts);
     if (!opened.has_value())
         return std::unexpected(opened.error().ToString());
-    auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes);
+    auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes, effective.storageMaxValueBytes);
     return std::make_unique<FastCache::LayeredStorage>(std::move(l1), std::move(*opened));
 }
 
@@ -209,7 +211,8 @@ struct StorageBackendBundle
     if (!usingPersistent)
     {
         for (std::size_t i = 0; i < physicalShards; ++i)
-            inners.emplace_back(std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes));
+            inners.emplace_back(
+                std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes, effective.storageMaxValueBytes));
         return inners;
     }
 
@@ -274,7 +277,8 @@ struct StorageBackendBundle
     // Unwrapped single-shard reactor path.
     if (!usingPersistent)
     {
-        bundle.backend = std::make_unique<FastCache::InMemoryLruStorage>(effective.maxMemoryBytes);
+        bundle.backend =
+            std::make_unique<FastCache::InMemoryLruStorage>(effective.maxMemoryBytes, effective.storageMaxValueBytes);
         return bundle;
     }
 
@@ -452,9 +456,15 @@ int main(int argc, char const* const* argv)
             std::println("fastcached {}", ProgramVersion);
             return EXIT_SUCCESS;
         case FastCache::CliOutcome::ShowHelp:
-            std::print("{}", FastCache::CliUsage());
+            std::print("{}",
+                       FastCache::CliUsage(FastCache::StdoutSupportsColor() ? FastCache::UsageColor::Colored
+                                                                            : FastCache::UsageColor::Plain));
             return EXIT_SUCCESS;
         case FastCache::CliOutcome::Run:
+        case FastCache::CliOutcome::InstallService:
+        case FastCache::CliOutcome::UninstallService:
+            // Run and the service-control requests all need the effective
+            // config assembled below; they branch apart afterwards.
             break;
     }
 
@@ -473,6 +483,22 @@ int main(int argc, char const* const* argv)
     else
     {
         effective = parsed->config;
+    }
+
+    // Service-control requests act on the SCM and exit; they never run the
+    // daemon body. The effective config is reused so every flag passed
+    // alongside --install-service is baked into the service command line.
+    if (parsed->outcome == FastCache::CliOutcome::InstallService
+        || parsed->outcome == FastCache::CliOutcome::UninstallService)
+    {
+        auto const result = parsed->outcome == FastCache::CliOutcome::InstallService
+                                ? FastCache::InstallWindowsService(effective)
+                                : FastCache::UninstallWindowsService(effective);
+        if (result.exitCode == 0)
+            std::println("fastcached: {}", result.message);
+        else
+            std::println(std::cerr, "fastcached: {}", result.message);
+        return result.exitCode;
     }
 
     std::unique_ptr<FastCache::IDaemonHost> host;

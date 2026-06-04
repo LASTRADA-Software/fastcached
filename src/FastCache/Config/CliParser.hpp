@@ -16,9 +16,11 @@ namespace FastCache
 /// Outcome categories returned by ParseCli.
 enum class CliOutcome : std::uint8_t
 {
-    Run,         ///< Parsing succeeded; proceed to run the daemon.
-    ShowHelp,    ///< --help / -h was seen.
-    ShowVersion, ///< --version / -V was seen.
+    Run,              ///< Parsing succeeded; proceed to run the daemon.
+    ShowHelp,         ///< --help / -h was seen.
+    ShowVersion,      ///< --version / -V was seen.
+    InstallService,   ///< --install-service was seen; register a Windows service.
+    UninstallService, ///< --uninstall-service was seen; remove the Windows service.
 };
 
 struct CliResult
@@ -60,7 +62,19 @@ struct CliResult
 /// @return Parsed CliResult on success; ConfigError on failure.
 [[nodiscard]] std::expected<CliResult, ConfigError> ParseCli(std::span<char const* const> args);
 
-/// @return Usage text (multi-line). Used by main when --help is requested.
-[[nodiscard]] std::string_view CliUsage() noexcept;
+/// Whether CliUsage should colorize its output.
+enum class UsageColor : std::uint8_t
+{
+    Plain,   ///< Plain text — for files, pipes, NO_COLOR, and tests.
+    Colored, ///< ANSI SGR color escapes — for interactive terminals.
+};
+
+/// Render the multi-line usage/help text with column-aligned option
+/// descriptions. Used by main when --help is requested.
+/// @param color UsageColor::Colored to emit ANSI SGR escapes for headings and
+///              option flags (appropriate only for interactive terminals, see
+///              StdoutSupportsColor); UsageColor::Plain for plain text.
+/// @return Fully formatted usage text.
+[[nodiscard]] std::string CliUsage(UsageColor color = UsageColor::Plain);
 
 } // namespace FastCache

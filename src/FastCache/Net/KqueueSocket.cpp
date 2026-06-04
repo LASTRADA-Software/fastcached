@@ -6,6 +6,7 @@
     #include <FastCache/Async/KqueueReactor.hpp>
     #include <FastCache/Core/Errors/NetError.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
+    #include <FastCache/Net/SocketAddress.hpp>
 
     #include <sys/socket.h>
 
@@ -314,7 +315,7 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
     if (!impl->pending)
         return;
 
-    sockaddr_in client {};
+    sockaddr_storage client {};
     socklen_t len = sizeof(client);
     auto const fd = ::accept(impl->handler.fd, reinterpret_cast<sockaddr*>(&client), &len);
     if (fd < 0)
@@ -337,49 +338,24 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
 KqueueListener::KqueueListener() noexcept = default;
 KqueueListener::~KqueueListener() = default;
 
-std::unique_ptr<KqueueListener> KqueueListener::Bind(KqueueReactor& reactor,
-                                                     std::string_view bindAddress,
-                                                     std::uint16_t port,
-                                                     int backlog)
+std::unique_ptr<KqueueListener> KqueueListener::Bind(
+    KqueueReactor& reactor, std::string_view bindAddress, std::uint16_t port, int backlog, IAddressResolver& resolver)
 {
-    Detail::EnsureNetworkInitialised();
-
     std::unique_ptr<KqueueListener> listener { new KqueueListener {} };
     listener->_impl = std::make_unique<Impl>(reactor);
 
-    auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0)
+    // Shared resolve + create + bind + listen. macOS has no SOCK_NONBLOCK
+    // socket-type flag, so the listening socket is switched to non-blocking
+    // afterwards (matching how accepted sockets are handled).
+    auto bound = Detail::BindAndListen(resolver, bindAddress, port, backlog, /*extraTypeFlags*/ 0);
+    if (!bound.has_value())
     {
-        listener->_impl->bindError = "socket() failed";
+        listener->_impl->bindError = std::move(bound).error();
         return listener;
     }
+
+    auto const fd = static_cast<int>(bound->socket);
     SetNonBlocking(fd);
-
-    int reuse = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    std::string const addrCopy { bindAddress };
-    if (::inet_pton(AF_INET, addrCopy.c_str(), &addr.sin_addr) != 1)
-    {
-        listener->_impl->bindError = "inet_pton failed";
-        ::close(fd);
-        return listener;
-    }
-    if (::bind(fd, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) != 0)
-    {
-        listener->_impl->bindError = "bind failed";
-        ::close(fd);
-        return listener;
-    }
-    if (::listen(fd, backlog) != 0)
-    {
-        listener->_impl->bindError = "listen failed";
-        ::close(fd);
-        return listener;
-    }
     listener->_impl->handler.fd = fd;
     return listener;
 }
@@ -415,7 +391,7 @@ AcceptAwaitable KqueueListener::Accept()
         return AcceptAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = std::string { BindError() } }) };
 
-    sockaddr_in client {};
+    sockaddr_storage client {};
     socklen_t len = sizeof(client);
     auto const fd = ::accept(_impl->handler.fd, reinterpret_cast<sockaddr*>(&client), &len);
     if (fd >= 0)

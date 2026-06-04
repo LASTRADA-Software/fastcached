@@ -515,3 +515,29 @@ TEST_CASE("LayeredStorage over a CowTree L2 returns KeyNotFound on an incr miss"
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
+
+TEST_CASE("LayeredStorage over a CowTree L2 rejects an oversized Set without polluting either tier",
+          "[layered][cowtree][max-value]")
+{
+    // Production shape: InMemoryLru L1 + CowTree L2 with a per-value cap.
+    // Writes go to L2 first, so the cap is enforced canonically there; the
+    // failure must propagate and leave neither tier holding the key.
+    FastCache::Testing::TempFile tmp;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+    opts.maxValueBytes = 16;
+    auto l2 = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(l2.has_value());
+    auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(0, 16);
+    FastCache::LayeredStorage storage { std::move(l1), std::move(*l2) };
+    FastCache::ManualClock clock;
+
+    auto const oversized = MakeBytes(std::string(17, 'x'));
+    auto const r = storage.Set("big", oversized, 0, FastCache::TimePoint::max());
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(r.error().code == FastCache::StorageErrorCode::ValueTooLarge);
+
+    // Neither tier was populated by the rejected write.
+    REQUIRE_FALSE(storage.L1().Get("big", clock.Now())->found);
+    REQUIRE_FALSE(storage.L2().Get("big", clock.Now())->found);
+}

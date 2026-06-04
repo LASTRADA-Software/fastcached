@@ -25,9 +25,12 @@ target_sources(FastCache
         Net/EpollSocket.cpp
         Net/IocpSocket.cpp
         Net/KqueueSocket.cpp
+        Net/SocketAddress.cpp
         Platform/DaemonControls.cpp
         Platform/HostMemory.cpp
         Platform/PosixDaemonHost.cpp
+        Platform/ServiceControl.cpp
+        Platform/Terminal.cpp
         Platform/WindowsServiceHost.cpp
         Net/InMemoryTransport.cpp
         Net/Framing/LineReader.cpp

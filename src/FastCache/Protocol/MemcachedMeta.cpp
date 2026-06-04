@@ -83,6 +83,8 @@ namespace
                 return "NF";
             case StorageErrorCode::CasMismatch:
                 return "EX";
+            case StorageErrorCode::ValueTooLarge:
+                return "SERVER_ERROR object too large for cache";
             default:
                 return "SERVER_ERROR storage failure";
         }

@@ -6,6 +6,7 @@
     #include <FastCache/Async/EpollReactor.hpp>
     #include <FastCache/Core/Errors/NetError.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
+    #include <FastCache/Net/SocketAddress.hpp>
 
     #include <sys/socket.h>
 
@@ -322,7 +323,7 @@ void EpollListener::Impl::OnReadable(EpollFdHandler* base)
     if (!impl->pending)
         return;
 
-    sockaddr_in client {};
+    sockaddr_storage client {};
     socklen_t len = sizeof(client);
     auto const fd = ::accept4(impl->handler.fd, reinterpret_cast<sockaddr*>(&client), &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd < 0)
@@ -344,49 +345,22 @@ void EpollListener::Impl::OnReadable(EpollFdHandler* base)
 EpollListener::EpollListener() noexcept = default;
 EpollListener::~EpollListener() = default;
 
-std::unique_ptr<EpollListener> EpollListener::Bind(EpollReactor& reactor,
-                                                   std::string_view bindAddress,
-                                                   std::uint16_t port,
-                                                   int backlog)
+std::unique_ptr<EpollListener> EpollListener::Bind(
+    EpollReactor& reactor, std::string_view bindAddress, std::uint16_t port, int backlog, IAddressResolver& resolver)
 {
-    Detail::EnsureNetworkInitialised();
-
     std::unique_ptr<EpollListener> listener { new EpollListener {} };
     listener->_impl = std::make_unique<Impl>(reactor);
 
-    auto fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0)
+    // Shared resolve + create + bind + listen; epoll wants the accept socket
+    // (and thus the listener) non-blocking and close-on-exec.
+    auto bound = Detail::BindAndListen(resolver, bindAddress, port, backlog, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (!bound.has_value())
     {
-        listener->_impl->bindError = "socket() failed";
+        listener->_impl->bindError = std::move(bound).error();
         return listener;
     }
 
-    int reuse = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    std::string const addrCopy { bindAddress };
-    if (::inet_pton(AF_INET, addrCopy.c_str(), &addr.sin_addr) != 1)
-    {
-        listener->_impl->bindError = "inet_pton failed";
-        ::close(fd);
-        return listener;
-    }
-    if (::bind(fd, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) != 0)
-    {
-        listener->_impl->bindError = "bind failed";
-        ::close(fd);
-        return listener;
-    }
-    if (::listen(fd, backlog) != 0)
-    {
-        listener->_impl->bindError = "listen failed";
-        ::close(fd);
-        return listener;
-    }
-
+    auto const fd = static_cast<int>(bound->socket);
     listener->_impl->handler.fd = fd;
     if (!reactor.Attach(&listener->_impl->handler))
     {
@@ -431,7 +405,7 @@ AcceptAwaitable EpollListener::Accept()
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = std::string { BindError() } }) };
 
     // Fast path: try accept synchronously.
-    sockaddr_in client {};
+    sockaddr_storage client {};
     socklen_t len = sizeof(client);
     auto const fd = ::accept4(_impl->handler.fd, reinterpret_cast<sockaddr*>(&client), &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd >= 0)

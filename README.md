@@ -98,7 +98,10 @@ usage: fastcached [options]
                                    default 1 (single-file mode) when --storage names a regular
                                    file or does not yet exist; min(16, hardware_concurrency)
                                    otherwise. With N>1 and --storage set, --storage is a directory
-  --daemon               daemonize (POSIX) / register as Windows service
+  --daemon               daemonize (POSIX) / run under the Windows SCM (used by the installed service)
+  --install-service      register fastcached as an auto-start Windows service (Windows only;
+                             needs an elevated prompt; other flags are baked into the service)
+  --uninstall-service    remove the fastcached Windows service (Windows only; needs elevation)
   --pidfile=<path>       POSIX daemon mode only
   --service-name=<name>  Windows service name (default FastCached)
   --help, -h             show this help and exit
@@ -240,6 +243,34 @@ threads: 0
 
 CLI flags override YAML values. On POSIX, `SIGHUP` triggers a re-read of the
 file; on Windows, the service control manager's `PARAMCHANGE` does the same.
+
+## Running as a Windows service
+
+`--install-service` registers fastcached with the Windows Service Control
+Manager. It must be run from an **elevated** (Administrator) prompt — creating a
+service is a privileged operation. Every other flag you pass alongside it is
+baked into the service's launch command line, so the service starts with exactly
+that configuration on every boot:
+
+```powershell
+# From an elevated PowerShell. Paths are made absolute automatically, because a
+# service runs from C:\Windows\System32, not the install directory.
+fastcached.exe --install-service --port=11211 --storage=C:\fastcached\cache.cow --threads=8
+
+# The service is registered as auto-start (runs on every boot) but left stopped.
+# Start it now for this session:
+sc start FastCached
+
+# Inspect it:
+Get-Service FastCached
+
+# Remove it (also elevated):
+fastcached.exe --uninstall-service
+```
+
+Use `--service-name=<name>` to register (or remove) the service under a custom
+name when running more than one instance. `--daemon` is the in-service runtime
+hook the SCM invokes for you — you do not normally run it by hand.
 
 ## Building
 

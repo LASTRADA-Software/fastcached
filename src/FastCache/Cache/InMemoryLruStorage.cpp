@@ -48,8 +48,9 @@ namespace
 
 } // namespace
 
-InMemoryLruStorage::InMemoryLruStorage(std::size_t maxBytes) noexcept:
-    _maxBytes { maxBytes }
+InMemoryLruStorage::InMemoryLruStorage(std::size_t maxBytes, std::size_t maxValueBytes) noexcept:
+    _maxBytes { maxBytes },
+    _maxValueBytes { maxValueBytes }
 {
 }
 
@@ -160,6 +161,8 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Set(std::string_view k
                                                               TimePoint expiry)
 {
     ++_stats.cmdSet;
+    if (ExceedsValueLimit(value.size()))
+        return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
     auto const indexIt = _index.find(key);
     if (indexIt != _index.end())
         return MutateExisting(indexIt->second, std::move(value), flags, expiry);
@@ -169,6 +172,8 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Set(std::string_view k
 std::expected<CasToken, StorageError> InMemoryLruStorage::Add(
     std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
 {
+    if (ExceedsValueLimit(value.size()))
+        return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
     auto const it = FindAlive(key, now);
     if (it != _lru.end())
         return std::unexpected(MakeKeyExists());
@@ -178,6 +183,8 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Add(
 std::expected<CasToken, StorageError> InMemoryLruStorage::Replace(
     std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
 {
+    if (ExceedsValueLimit(value.size()))
+        return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
         return std::unexpected(MakeKeyNotFound());
@@ -194,6 +201,8 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Append(std::string_vie
         return std::unexpected(MakeKeyNotFound());
     if (expected != 0 && it->entry.cas != expected)
         return std::unexpected(MakeCasMismatch());
+    if (ExceedsValueLimit(it->entry.value.size() + suffix.size()))
+        return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
 
     auto combined = it->entry.value;
     combined.insert(combined.end(), suffix.begin(), suffix.end());
@@ -210,6 +219,8 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Prepend(std::string_vi
         return std::unexpected(MakeKeyNotFound());
     if (expected != 0 && it->entry.cas != expected)
         return std::unexpected(MakeCasMismatch());
+    if (ExceedsValueLimit(it->entry.value.size() + prefix.size()))
+        return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
 
     std::vector<std::byte> combined;
     combined.reserve(prefix.size() + it->entry.value.size());
@@ -236,6 +247,8 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::CompareAndSwap(std::st
         ++_stats.casBadval;
         return std::unexpected(MakeCasMismatch());
     }
+    if (ExceedsValueLimit(value.size()))
+        return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
     ++_stats.casHits;
     return MutateExisting(it, std::move(value), flags, expiry);
 }

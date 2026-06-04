@@ -24,3 +24,45 @@ target_link_libraries(FastCacheTest
 # system find_package.
 include(Catch)
 catch_discover_tests(FastCacheTest)
+
+# ---------------------------------------------------------------------------
+# sccache smoke tests. Registered only when an sccache binary is present
+# (SCCACHE is the find_program result from cmake/cache.cmake). Each test starts
+# the freshly-built fastcached, points sccache at it over one wire protocol,
+# and asserts a cache hit — the same compile-twice check the CI smoke jobs run,
+# via the same scripts/sccache-smoke driver.
+#
+# They start a real server and invoke the real compiler, so they are slow and
+# environment-dependent: the "smoke" label lets you select (ctest -L smoke) or
+# skip (ctest -LE smoke) them, and a missing runtime prerequisite exits 77 to
+# report as skipped rather than failed.
+
+if(SCCACHE)
+    set(FASTCACHED_SMOKE_PORT "11611" CACHE STRING "TCP port the sccache smoke tests bind fastcached to")
+
+    if(WIN32)
+        set(_smoke_driver pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/sccache-smoke.ps1")
+    else()
+        set(_smoke_driver bash "${CMAKE_SOURCE_DIR}/scripts/sccache-smoke.sh")
+    endif()
+
+    foreach(_proto IN ITEMS memcached redis)
+        add_test(
+            NAME "sccache-smoke-${_proto}"
+            COMMAND ${_smoke_driver}
+                --fastcached "$<TARGET_FILE:fastcached>"
+                --protocol ${_proto}
+                --port ${FASTCACHED_SMOKE_PORT}
+                --compiler "${CMAKE_CXX_COMPILER}"
+        )
+        # Both tests bind the same port and drive one shared sccache server, so
+        # they must not run concurrently with each other.
+        set_tests_properties("sccache-smoke-${_proto}" PROPERTIES
+            LABELS "smoke"
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE
+        )
+    endforeach()
+else()
+    message(STATUS "sccache not found — skipping sccache smoke tests")
+endif()

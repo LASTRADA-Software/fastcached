@@ -6,6 +6,7 @@
     #include <FastCache/Async/IocpReactor.hpp>
     #include <FastCache/Net/IListener.hpp>
     #include <FastCache/Net/ISocket.hpp>
+    #include <FastCache/Net/SocketAddress.hpp>
 
     #include <cstddef>
     #include <cstdint>
@@ -70,7 +71,8 @@ class IocpListener final: public IListener
     [[nodiscard]] static std::unique_ptr<IocpListener> Bind(IocpReactor& reactor,
                                                             std::string_view bindAddress,
                                                             std::uint16_t port,
-                                                            int backlog = 64);
+                                                            int backlog = 64,
+                                                            IAddressResolver& resolver = DefaultAddressResolver());
 
     ~IocpListener() override;
 

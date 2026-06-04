@@ -24,6 +24,12 @@ namespace
 /// server-side socket-> The client side is driven manually by tests.
 struct TextFixture
 {
+    /// @param maxValueBytes Per-value storage cap (0 = unlimited, the default).
+    explicit TextFixture(std::size_t maxValueBytes = 0):
+        storage { 0, maxValueBytes }
+    {
+    }
+
     FastCache::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
@@ -89,6 +95,16 @@ TEST_CASE("memcached-text set then get", "[protocol][text]")
     TextFixture fix;
     auto const response = Exchange(fix, "set foo 0 0 5\r\nhello\r\nget foo\r\n");
     REQUIRE(response == "STORED\r\nVALUE foo 0 5\r\nhello\r\nEND\r\n");
+}
+
+TEST_CASE("memcached-text set over the value cap yields SERVER_ERROR object too large", "[protocol][text][max-value]")
+{
+    TextFixture fix { /*maxValueBytes=*/8 };
+    // One request, three commands: a value within the cap stores; one over it
+    // is rejected with the stock memcached wording (framing stays aligned —
+    // the oversized payload is still consumed); the prior value is intact.
+    auto const response = Exchange(fix, "set k 0 0 8\r\nABCDEFGH\r\nset big 0 0 9\r\nABCDEFGHI\r\nget k\r\n");
+    REQUIRE(response == "STORED\r\nSERVER_ERROR object too large for cache\r\nVALUE k 0 8\r\nABCDEFGH\r\nEND\r\n");
 }
 
 TEST_CASE("memcached-text get miss yields END only", "[protocol][text]")

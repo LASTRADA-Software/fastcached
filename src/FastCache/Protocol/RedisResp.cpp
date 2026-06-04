@@ -261,6 +261,8 @@ namespace
             co_return co_await ReplyOk(socket);
         if (result.error().code == StorageErrorCode::KeyExists || result.error().code == StorageErrorCode::KeyNotFound)
             co_return co_await ReplyNil(socket);
+        if (result.error().code == StorageErrorCode::ValueTooLarge)
+            co_return co_await ReplyError(socket, "value too large");
         co_return co_await ReplyError(socket, "storage failure");
     }
 

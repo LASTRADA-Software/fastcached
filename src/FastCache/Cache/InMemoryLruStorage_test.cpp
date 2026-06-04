@@ -386,6 +386,72 @@ TEST_CASE("Decrement by 2^63 saturates to zero without signed-overflow UB", "[ca
     REQUIRE(r->value == 0);
 }
 
+TEST_CASE("Set/Add/Replace/CAS at the value cap roundtrip; one byte over returns ValueTooLarge",
+          "[cache][max-value][boundary]")
+{
+    // maxBytes == 0 -> no eviction so the byte budget never masks the
+    // per-value check; maxValueBytes == 16 is the per-value cap.
+    FastCache::InMemoryLruStorage storage { 0, 16 };
+    FastCache::ManualClock clock;
+
+    auto const fits = MakeBytes(std::string(16, 'x'));
+    auto const oversized = MakeBytes(std::string(17, 'x'));
+
+    REQUIRE(storage.Set("k", fits, 0, FastCache::TimePoint::max()).has_value());
+
+    auto const setOver = storage.Set("over", oversized, 0, FastCache::TimePoint::max());
+    REQUIRE_FALSE(setOver.has_value());
+    REQUIRE(setOver.error().code == FastCache::StorageErrorCode::ValueTooLarge);
+
+    auto const addOver = storage.Add("over", oversized, 0, FastCache::TimePoint::max(), clock.Now());
+    REQUIRE_FALSE(addOver.has_value());
+    REQUIRE(addOver.error().code == FastCache::StorageErrorCode::ValueTooLarge);
+
+    auto const replaceOver = storage.Replace("k", oversized, 0, FastCache::TimePoint::max(), clock.Now());
+    REQUIRE_FALSE(replaceOver.has_value());
+    REQUIRE(replaceOver.error().code == FastCache::StorageErrorCode::ValueTooLarge);
+
+    auto const setCas = storage.Set("k", fits, 0, FastCache::TimePoint::max());
+    REQUIRE(setCas.has_value());
+    auto const casOver = storage.CompareAndSwap("k", *setCas, oversized, 0, FastCache::TimePoint::max(), clock.Now());
+    REQUIRE_FALSE(casOver.has_value());
+    REQUIRE(casOver.error().code == FastCache::StorageErrorCode::ValueTooLarge);
+
+    // The oversized rejections never mutated the stored value.
+    auto const got = storage.Get("k", clock.Now());
+    REQUIRE(got->found);
+    REQUIRE(got->entry.value == fits);
+}
+
+TEST_CASE("Append/Prepend that push the combined value over the cap return ValueTooLarge", "[cache][max-value][boundary]")
+{
+    FastCache::InMemoryLruStorage storage { 0, 8 };
+    FastCache::ManualClock clock;
+    REQUIRE(storage.Set("k", MakeBytes("12345"), 0, FastCache::TimePoint::max()).has_value()); // 5 bytes, fits
+
+    auto const suffix = MakeBytes("six!"); // 5 + 4 = 9 > 8
+    auto const appended = storage.Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, 0, clock.Now());
+    REQUIRE_FALSE(appended.has_value());
+    REQUIRE(appended.error().code == FastCache::StorageErrorCode::ValueTooLarge);
+
+    auto const prefix = MakeBytes("pre!"); // 5 + 4 = 9 > 8
+    auto const prepended = storage.Prepend("k", std::span<std::byte const> { prefix.data(), prefix.size() }, 0, clock.Now());
+    REQUIRE_FALSE(prepended.has_value());
+    REQUIRE(prepended.error().code == FastCache::StorageErrorCode::ValueTooLarge);
+
+    // A growth that still fits the cap succeeds (5 + 3 = 8 == cap).
+    auto const fitting = MakeBytes("678");
+    REQUIRE(storage.Append("k", std::span<std::byte const> { fitting.data(), fitting.size() }, 0, clock.Now()).has_value());
+    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.value) == "12345678");
+}
+
+TEST_CASE("maxValueBytes == 0 disables the per-value cap entirely", "[cache][max-value]")
+{
+    FastCache::InMemoryLruStorage storage { 0, 0 };        // no budget cap, no value cap
+    auto const big = MakeBytes(std::string(1 << 20, 'x')); // 1 MiB
+    REQUIRE(storage.Set("k", big, 0, FastCache::TimePoint::max()).has_value());
+}
+
 TEST_CASE("Decrement by zero is booked under decr stats, not incr", "[cache][decr][stats]")
 {
     FastCache::InMemoryLruStorage storage;
