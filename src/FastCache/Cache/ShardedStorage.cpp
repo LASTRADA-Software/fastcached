@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/ShardedStorage.hpp>
+#include <FastCache/Core/Profiling.hpp>
 
 #include <cstddef>
 #include <functional>
@@ -38,6 +39,7 @@ std::expected<GetResult, StorageError> ShardedStorage::Get(std::string_view key,
     // way out. Taking a unique_lock here is the minimum-surface fix
     // for the data race; splitting Get into Lookup + deferred-promote
     // is the longer-term path to recover read parallelism.
+    FC_ZONE_SCOPED_N("ShardedStorage::Get");
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
     return shard.storage->Get(key, now);
@@ -48,6 +50,7 @@ std::expected<CasToken, StorageError> ShardedStorage::Set(std::string_view key,
                                                           std::uint32_t flags,
                                                           TimePoint expiry)
 {
+    FC_ZONE_SCOPED_N("ShardedStorage::Set");
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
     return shard.storage->Set(key, std::move(value), flags, expiry);

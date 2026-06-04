@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 
 #include <algorithm>
@@ -47,6 +48,7 @@ ByteReader::ByteReader(ISocket& socket,
 
 std::expected<std::string, ProtocolError> ByteReader::TryExtractLine()
 {
+    FC_ZONE_SCOPED_N("LineReader.TryExtractLine");
     if (_buffer.size() < 2)
         return std::unexpected(ProtocolError { .code = ProtocolErrorCode::MalformedFrame, .context = "no CRLF yet" });
 

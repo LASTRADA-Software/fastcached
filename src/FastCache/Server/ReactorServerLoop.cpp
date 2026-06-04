@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 #include <FastCache/Server/Server.hpp>
@@ -43,6 +44,9 @@ int RunReactorServer(ReactorServerOptions const& options,
                      IAdmissionControl* admission,
                      IMetricsSink* metrics)
 {
+    // The reactor runs to completion on this thread (reactor.Run() below), so
+    // every coroutine zone in the single-threaded model lands on this row.
+    FC_THREAD_NAME("fc-reactor");
     SteadyClock clock;
     PlatformReactor reactor { clock };
 

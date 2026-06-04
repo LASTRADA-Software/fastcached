@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
+#include <FastCache/Core/Profiling.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -329,6 +330,7 @@ void CowTreeStorage::EraseFromLru(std::string_view key)
 
 void CowTreeStorage::EvictToFit()
 {
+    FC_ZONE_SCOPED_N("CowTreeStorage::EvictToFit");
     if (_options.maxBytes == 0)
         return;
     // Track remaining attempts so a stuck disk (e.g. ENOSPC on every
@@ -361,6 +363,7 @@ void CowTreeStorage::EvictToFit()
 
 std::expected<GetResult, StorageError> CowTreeStorage::Get(std::string_view key, TimePoint now)
 {
+    FC_ZONE_SCOPED_N("CowTreeStorage::Get");
     ++_stats.cmdGet;
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
@@ -494,6 +497,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Set(std::string_view key,
                                                           std::uint32_t flags,
                                                           TimePoint expiry)
 {
+    FC_ZONE_SCOPED_N("CowTreeStorage::Set");
     ++_stats.cmdSet;
     if (value.size() > _options.maxValueBytes)
         return std::unexpected(MakeError(StorageErrorCode::ValueTooLarge));
