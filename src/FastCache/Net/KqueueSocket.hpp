@@ -6,6 +6,7 @@
     #include <FastCache/Async/KqueueReactor.hpp>
     #include <FastCache/Net/IListener.hpp>
     #include <FastCache/Net/ISocket.hpp>
+    #include <FastCache/Net/SocketAddress.hpp>
 
     #include <cstddef>
     #include <cstdint>
@@ -53,7 +54,8 @@ class KqueueListener final: public IListener
     [[nodiscard]] static std::unique_ptr<KqueueListener> Bind(KqueueReactor& reactor,
                                                               std::string_view bindAddress,
                                                               std::uint16_t port,
-                                                              int backlog = 64);
+                                                              int backlog = 64,
+                                                              IAddressResolver& resolver = DefaultAddressResolver());
 
     ~KqueueListener() override;
 

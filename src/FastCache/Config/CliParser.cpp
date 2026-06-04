@@ -47,6 +47,22 @@ namespace
         return static_cast<std::uint16_t>(raw);
     }
 
+    /// Validate a bind address syntactically only. The authoritative check —
+    /// "does this resolve to a bindable IPv4/IPv6 address?" — happens at bind
+    /// time via getaddrinfo, so a hostname like "localhost" is accepted here
+    /// and either resolves at bind or surfaces a clean fatal bind error. We
+    /// only reject input that can never be a host: empty, or containing
+    /// whitespace / control characters.
+    [[nodiscard]] std::expected<std::string, ConfigError> ParseBindAddress(std::string_view sv)
+    {
+        if (sv.empty())
+            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, "bind", "empty bind address"));
+        if (std::ranges::any_of(sv, [](char c) { return c == ' ' || c == '\t' || static_cast<unsigned char>(c) < 0x20; }))
+            return std::unexpected(
+                MakeError(ConfigErrorCode::TypeMismatch, "bind", std::format("invalid characters in bind address: {}", sv)));
+        return std::string { sv };
+    }
+
     [[nodiscard]] std::expected<std::size_t, ConfigError> ParseMaxMemory(std::string_view sv)
     {
         return ParseByteSize(sv, "max-memory", QueryHostTotalMemoryBytes()).transform_error(WithArgvSource);
@@ -223,7 +239,6 @@ namespace
         // equal the field's default.
         for (auto const& [name, target, seenPtr]: std::initializer_list<std::tuple<std::string_view, std::string*, bool*>> {
                  { "--config", &cfg.configPath, nullptr },
-                 { "--bind", &cfg.bindAddress, &result.bindAddressExplicit },
                  { "--pidfile", &cfg.pidfile, nullptr },
                  { "--service-name", &cfg.serviceName, nullptr },
                  { "--storage", &cfg.storagePath, &result.storagePathExplicit },
@@ -241,6 +256,16 @@ namespace
         }
 
         // Typed flags.
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--bind", ParseBindAddress, cfg.bindAddress);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.bindAddressExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
         {
             auto const matched = ApplyParsedFlag(args, i, "--port", ParsePort, cfg.port);
             if (!matched.has_value())
@@ -358,7 +383,7 @@ namespace
     /// alignment. Add a row here and it lines up automatically.
     constexpr auto UsageOptions = std::to_array<UsageOption>({
         { .flag = "--config=<path>", .description = "YAML config file; CLI flags override file values" },
-        { .flag = "--bind=<addr>", .description = "bind address (default 127.0.0.1)" },
+        { .flag = "--bind=<addr>", .description = "bind address: IPv4/IPv6 literal or hostname (default 127.0.0.1)" },
         { .flag = "--port=<num>", .description = "TCP port (default 11211)" },
         { .flag = "--max-memory=<size>",
           .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)" },

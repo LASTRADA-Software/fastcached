@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/Errors/NetError.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/SocketAddress.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -237,52 +238,21 @@ IoAwaitable BlockingSocket::Write(std::span<std::byte const> buffer)
 
 // -- BlockingListener ------------------------------------------------------
 
-std::unique_ptr<BlockingListener> BlockingListener::Bind(std::string_view bindAddress, std::uint16_t port, int backlog)
+std::unique_ptr<BlockingListener> BlockingListener::Bind(std::string_view bindAddress,
+                                                         std::uint16_t port,
+                                                         int backlog,
+                                                         IAddressResolver& resolver)
 {
-    Detail::EnsureNetworkInitialised();
-
     std::unique_ptr<BlockingListener> listener { new BlockingListener {} };
 
-    auto const sock = ::socket(AF_INET, SOCK_STREAM, 0);
-    // `InvalidSocket` is the platform sentinel (INVALID_SOCKET on Windows, -1
-    // on POSIX), so a direct compare detects failure on both without the
-    // signed/unsigned mismatch a `< 0` check against an unsigned SOCKET hits.
-    if (sock == static_cast<std::remove_const_t<decltype(sock)>>(Detail::InvalidSocket))
-    {
-        listener->_bindError = std::format("socket() failed: {}", Detail::LastNetworkError());
-        return listener;
-    }
-
-    // SO_REUSEADDR so restart-after-crash works on Linux.
-    int reuse = 1;
-    ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
-
-    sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    std::string const addrCopy { bindAddress };
-    if (::inet_pton(AF_INET, addrCopy.c_str(), &addr.sin_addr) != 1)
-    {
-        listener->_bindError = std::format("inet_pton({}) failed", addrCopy);
-        std::ignore = Detail::CloseNative(static_cast<Detail::NativeSocket>(sock));
-        return listener;
-    }
-
-    if (::bind(sock, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) != 0)
-    {
-        listener->_bindError = std::format("bind({}:{}) failed: {}", addrCopy, port, Detail::LastNetworkError());
-        std::ignore = Detail::CloseNative(static_cast<Detail::NativeSocket>(sock));
-        return listener;
-    }
-
-    if (::listen(sock, backlog) != 0)
-    {
-        listener->_bindError = std::format("listen() failed: {}", Detail::LastNetworkError());
-        std::ignore = Detail::CloseNative(static_cast<Detail::NativeSocket>(sock));
-        return listener;
-    }
-
-    listener->_native = static_cast<Detail::NativeSocket>(sock);
+    // Resolve (IPv4/IPv6 literal or hostname) + create + bind + listen, all in
+    // the shared routine. On success store the listening socket; on failure
+    // record the diagnostic for Accept() to surface as a NetError.
+    auto bound = Detail::BindAndListen(resolver, bindAddress, port, backlog, /*extraTypeFlags*/ 0);
+    if (bound.has_value())
+        listener->_native = bound->socket;
+    else
+        listener->_bindError = std::move(bound).error();
     return listener;
 }
 
@@ -306,7 +276,9 @@ AcceptAwaitable BlockingListener::Accept()
         return AcceptAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = _bindError }) };
 
-    sockaddr_in client {};
+    // sockaddr_storage holds either an IPv4 or IPv6 peer address without
+    // truncation, since the listener may be bound to either family.
+    sockaddr_storage client {};
 #if defined(_WIN32)
     int addrLen = sizeof(client);
 #else

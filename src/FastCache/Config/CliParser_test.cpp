@@ -175,6 +175,54 @@ TEST_CASE("CliParser: omitting all flags leaves every explicit-tracker false", "
     REQUIRE_FALSE(result->storageShardsExplicit);
 }
 
+TEST_CASE("CliParser: --bind sets the address and records the explicit-set flag", "[config][cli][bind]")
+{
+    auto const args = std::array<char const*, 1> { "--bind=192.168.1.5" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.bindAddress == "192.168.1.5");
+    REQUIRE(result->bindAddressExplicit);
+}
+
+TEST_CASE("CliParser: --bind accepts IPv6 literals and hostnames verbatim (resolved at bind time)", "[config][cli][bind]")
+{
+    SECTION("IPv6 literal via =")
+    {
+        auto const args = std::array<char const*, 1> { "--bind=::1" };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(result.has_value());
+        REQUIRE(result->config.bindAddress == "::1");
+    }
+    SECTION("hostname via separate argv element")
+    {
+        auto const args = std::array<char const*, 2> { "--bind", "localhost" };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(result.has_value());
+        REQUIRE(result->config.bindAddress == "localhost");
+        REQUIRE(result->bindAddressExplicit);
+    }
+}
+
+TEST_CASE("CliParser: --bind rejects syntactically invalid addresses", "[config][cli][bind]")
+{
+    SECTION("empty value")
+    {
+        auto const args = std::array<char const*, 1> { "--bind=" };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
+        REQUIRE(result.error().field == "bind");
+    }
+    SECTION("embedded whitespace")
+    {
+        auto const args = std::array<char const*, 1> { "--bind=host with spaces" };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
+        REQUIRE(result.error().field == "bind");
+    }
+}
+
 TEST_CASE("CliParser: --execution-model parses each mode", "[config][cli][execution-model]")
 {
     for (auto const& [text, mode]: std::initializer_list<std::pair<char const*, FastCache::ExecutionModel>> {

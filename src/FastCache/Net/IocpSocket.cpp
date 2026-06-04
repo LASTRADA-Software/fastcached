@@ -6,6 +6,7 @@
     #include <FastCache/Async/IocpReactor.hpp>
     #include <FastCache/Core/Errors/NetError.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
+    #include <FastCache/Net/SocketAddress.hpp>
 
     #include <winsock2.h>
 
@@ -210,7 +211,9 @@ IoAwaitable IocpSocket::Write(std::span<std::byte const> buffer)
 namespace
 {
 
-    constexpr std::size_t AcceptAddrSize = sizeof(sockaddr_in) + 16;
+    // AcceptEx requires a per-address buffer of at least sizeof(sockaddr) + 16.
+    // Use sockaddr_storage so an IPv6 peer/local address is never truncated.
+    constexpr std::size_t AcceptAddrSize = sizeof(sockaddr_storage) + 16;
 
 } // namespace
 
@@ -219,6 +222,7 @@ struct IocpListener::Impl
     IocpReactor& reactor;
     SOCKET listenSock { INVALID_SOCKET };
     LPFN_ACCEPTEX acceptExFn { nullptr };
+    int family { AF_INET }; ///< Address family of the bound socket (for accept sockets).
     std::string bindError;
 
     /// Pending AcceptEx state. Only one Accept is in flight at a time
@@ -276,48 +280,21 @@ struct IocpListener::Impl
 IocpListener::IocpListener() noexcept = default;
 IocpListener::~IocpListener() = default;
 
-std::unique_ptr<IocpListener> IocpListener::Bind(IocpReactor& reactor,
-                                                 std::string_view bindAddress,
-                                                 std::uint16_t port,
-                                                 int backlog)
+std::unique_ptr<IocpListener> IocpListener::Bind(
+    IocpReactor& reactor, std::string_view bindAddress, std::uint16_t port, int backlog, IAddressResolver& resolver)
 {
-    Detail::EnsureNetworkInitialised();
-
     std::unique_ptr<IocpListener> listener { new IocpListener {} };
     listener->_impl = std::make_unique<Impl>(reactor);
 
-    auto sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET)
+    // Shared resolve + create + bind + listen (IPv4/IPv6 literal or hostname).
+    auto bound = Detail::BindAndListen(resolver, bindAddress, port, backlog, /*extraTypeFlags*/ 0);
+    if (!bound.has_value())
     {
-        listener->_impl->bindError = "socket() failed";
+        listener->_impl->bindError = std::move(bound).error();
         return listener;
     }
-
-    int reuse = 1;
-    ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
-
-    sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    std::string const addrCopy { bindAddress };
-    if (::inet_pton(AF_INET, addrCopy.c_str(), &addr.sin_addr) != 1)
-    {
-        listener->_impl->bindError = "inet_pton failed";
-        ::closesocket(sock);
-        return listener;
-    }
-    if (::bind(sock, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) != 0)
-    {
-        listener->_impl->bindError = "bind failed";
-        ::closesocket(sock);
-        return listener;
-    }
-    if (::listen(sock, backlog) != 0)
-    {
-        listener->_impl->bindError = "listen failed";
-        ::closesocket(sock);
-        return listener;
-    }
+    auto const sock = static_cast<SOCKET>(bound->socket);
+    listener->_impl->family = bound->family;
 
     // Fetch the AcceptEx fn pointer via WSAIoctl.
     GUID guidAcceptEx = WSAID_ACCEPTEX;
@@ -395,7 +372,7 @@ AcceptAwaitable IocpListener::Accept()
     op.awaitable = nullptr;
     op.completion.overlapped = OVERLAPPED {};
 
-    op.acceptSock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    op.acceptSock = ::socket(_impl->family, SOCK_STREAM, IPPROTO_TCP);
     if (op.acceptSock == INVALID_SOCKET)
         return AcceptAwaitable { std::unexpected(MakeWsaError(WSAGetLastError(), "socket(accept)")) };
 

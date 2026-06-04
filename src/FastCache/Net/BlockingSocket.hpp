@@ -12,6 +12,12 @@
 namespace FastCache
 {
 
+// Forward declarations for the bind-time resolver DI seam (defined in
+// SocketAddress.hpp, which includes this header — so only a forward
+// declaration is possible here).
+class IAddressResolver;
+[[nodiscard]] IAddressResolver& DefaultAddressResolver() noexcept;
+
 namespace Detail
 {
 
@@ -64,11 +70,14 @@ class BlockingListener final: public IListener
     /// @param bindAddress IPv4/IPv6 host or "0.0.0.0".
     /// @param port TCP port number.
     /// @param backlog ::listen backlog.
+    /// @param resolver Resolver for the bind host (DI seam over getaddrinfo);
+    ///        defaults to the process-wide system resolver.
     /// @return A bound and listening listener, or one in an errored state
     ///         (Accept() will immediately yield the bind error).
     [[nodiscard]] static std::unique_ptr<BlockingListener> Bind(std::string_view bindAddress,
                                                                 std::uint16_t port,
-                                                                int backlog = 64);
+                                                                int backlog = 64,
+                                                                IAddressResolver& resolver = DefaultAddressResolver());
 
     BlockingListener(BlockingListener const&) = delete;
     BlockingListener(BlockingListener&&) = delete;
