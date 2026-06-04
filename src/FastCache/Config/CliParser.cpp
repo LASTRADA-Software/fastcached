@@ -383,7 +383,8 @@ namespace
     /// alignment. Add a row here and it lines up automatically.
     constexpr auto UsageOptions = std::to_array<UsageOption>({
         { .flag = "--config=<path>", .description = "YAML config file; CLI flags override file values" },
-        { .flag = "--bind=<addr>", .description = "bind address: IPv4/IPv6 literal or hostname (default 127.0.0.1)" },
+        { .flag = "--bind=<addr>",
+          .description = "bind address: IPv4/IPv6 literal or hostname; '::' is dual-stack (default 127.0.0.1)" },
         { .flag = "--port=<num>", .description = "TCP port (default 11211)" },
         { .flag = "--max-memory=<size>",
           .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)" },

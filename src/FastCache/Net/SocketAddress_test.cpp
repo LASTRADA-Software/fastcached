@@ -55,6 +55,23 @@ FastCache::ResolvedEndpoint MakeV4Endpoint(char const* ip, std::uint16_t port)
     return endpoint;
 }
 
+/// Build an IPv6 ResolvedEndpoint for `ip`:`port` (e.g. the "::" wildcard),
+/// mirroring what the system resolver hands to BindAndListen for an IPv6 bind.
+FastCache::ResolvedEndpoint MakeV6Endpoint(char const* ip, std::uint16_t port)
+{
+    sockaddr_in6 sa {};
+    sa.sin6_family = AF_INET6;
+    sa.sin6_port = htons(port);
+    ::inet_pton(AF_INET6, ip, &sa.sin6_addr);
+
+    FastCache::ResolvedEndpoint endpoint;
+    std::memcpy(endpoint.storage.data(), &sa, sizeof(sa));
+    endpoint.length = sizeof(sa);
+    endpoint.family = AF_INET6;
+    endpoint.protocol = IPPROTO_TCP;
+    return endpoint;
+}
+
 /// Resolver fake that replays a fixed candidate list (or a fixed error),
 /// ignoring host/port — the DI seam that makes BindAndListen testable without
 /// touching the network.
@@ -183,4 +200,30 @@ TEST_CASE("BindAndListen reports failure when no candidate is bindable", "[net][
     FakeAddressResolver resolver { std::vector { MakeV4Endpoint("192.0.2.1", 0) } };
     auto const bound = FastCache::Detail::BindAndListen(resolver, "192.0.2.1", 0, /*backlog*/ 16, /*extraTypeFlags*/ 0);
     REQUIRE_FALSE(bound.has_value());
+}
+
+TEST_CASE("BindAndListen forces dual-stack (IPV6_V6ONLY=0) on an IPv6 wildcard bind", "[net][bind][dual-stack]")
+{
+    FakeAddressResolver resolver { std::vector { MakeV6Endpoint("::", 0) } };
+    auto bound = FastCache::Detail::BindAndListen(resolver, "::", 0, /*backlog*/ 16, /*extraTypeFlags*/ 0);
+    if (!bound.has_value())
+    {
+        // No usable IPv6 stack in this environment — nothing to assert.
+        SUCCEED("IPv6 unavailable; skipping dual-stack assertion");
+        return;
+    }
+    REQUIRE(bound->family == AF_INET6);
+
+    int v6only = 1;
+#if defined(_WIN32)
+    int len = sizeof(v6only);
+    auto const rc =
+        ::getsockopt(static_cast<SOCKET>(bound->socket), IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<char*>(&v6only), &len);
+#else
+    socklen_t len = sizeof(v6only);
+    auto const rc = ::getsockopt(static_cast<int>(bound->socket), IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &len);
+#endif
+    REQUIRE(rc == 0);
+    REQUIRE(v6only == 0); // dual-stack: the "::" socket also accepts IPv4 clients
+    CloseRaw(bound->socket);
 }

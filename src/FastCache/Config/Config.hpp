@@ -73,7 +73,9 @@ struct Config
     /// value at runtime (min(16, hardware_concurrency)).
     std::size_t storageShards { 0 };
 
-    /// Bind address, IPv4 string. Default 127.0.0.1.
+    /// Bind address: IPv4/IPv6 literal or hostname. Default 127.0.0.1
+    /// (IPv4 loopback). An IPv6 wildcard (`::`) binds dual-stack and
+    /// serves both IPv4 and IPv6 on every platform.
     std::string bindAddress { "127.0.0.1" };
 
     /// Path of the YAML config file (if any) that produced this Config.

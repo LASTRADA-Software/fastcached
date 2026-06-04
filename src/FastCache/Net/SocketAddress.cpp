@@ -153,8 +153,18 @@ namespace Detail
             // SO_REUSEADDR so restart-after-crash rebinds without TIME_WAIT delay.
             int reuse = 1;
             ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
-            // IPV6_V6ONLY is left at the OS default: "::" is v6-only on Linux and
-            // dual-stack elsewhere; "0.0.0.0" stays v4. Not forced either way.
+
+            // Force dual-stack on IPv6 sockets so a "::" wildcard accepts IPv4
+            // clients too. The OS default is v6-only on Windows and Linux, which
+            // makes "--bind=::" silently unreachable over IPv4 — surprising for a
+            // cache addressed as 127.0.0.1. Best-effort: a failure leaves the OS
+            // default and bind still proceeds. No effect on AF_INET sockets or on
+            // a specific IPv6 literal such as "::1".
+            if (endpoint.family == AF_INET6)
+            {
+                int v6only = 0;
+                ::setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<char const*>(&v6only), sizeof(v6only));
+            }
 
             if (::bind(
                     sock, reinterpret_cast<sockaddr const*>(endpoint.storage.data()), static_cast<AddrLen>(endpoint.length))
