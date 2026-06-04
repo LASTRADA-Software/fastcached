@@ -27,6 +27,14 @@ set(CMAKE_COLOR_DIAGNOSTICS ON)
 option(FASTCACHED_BUILD_TESTS "Build unit tests" ON)
 option(USE_SCCACHE "Use sccache as the compiler launcher when the binary is on PATH" ON)
 
+# Tracy profiler. TRACY_ENABLE is Tracy's own gate; reusing the name means the
+# fetched client library actually emits instrumentation rather than its no-op
+# stub. Our code keys off the separate FC_TRACY_ENABLED compile definition
+# (set below) so Core/Profiling.hpp stays decoupled from Tracy's macro surface
+# and pulls in no Tracy header when the profiler is off.
+option(TRACY_ENABLE "Enable Tracy profiler instrumentation (fetches & links the Tracy client)" OFF)
+option(TRACY_ON_DEMAND "Tracy: only collect data while a profiler is connected" ON)
+
 # ----------------------------------------------------------------------------
 # Compiler caching (sccache). Loaded before any compiler invocation so that
 # CPM-fetched dependencies also get cached. cache.cmake silently no-ops when
@@ -91,6 +99,23 @@ if(FASTCACHED_BUILD_TESTS)
     endif()
 endif()
 
+# Tracy is third-party, so (like yaml-cpp/Catch2) it is fetched BEFORE the
+# pedantic/clang-tidy includes below — the global -Werror and clang-tidy hooks
+# must not apply to its sources. We forward TRACY_ENABLE/TRACY_ON_DEMAND so the
+# client emits instrumentation; TRACY_ON_DEMAND keeps a long-running daemon from
+# buffering events (and growing memory) until a profiler actually connects.
+if(TRACY_ENABLE)
+    CPMAddPackage(
+        NAME tracy
+        GITHUB_REPOSITORY wolfpld/tracy
+        GIT_TAG v0.11.1
+        OPTIONS
+            "TRACY_ENABLE ON"
+            "TRACY_ON_DEMAND ${TRACY_ON_DEMAND}"
+            "TRACY_STATIC ON"
+    )
+endif()
+
 # ----------------------------------------------------------------------------
 # Toolchain helpers (warning levels, sanitizers, clang-tidy).
 
@@ -124,6 +149,16 @@ target_include_directories(FastCache PUBLIC
 target_compile_features(FastCache PUBLIC cxx_std_23)
 target_link_libraries(FastCache PUBLIC yaml-cpp::yaml-cpp)
 target_link_libraries(FastCache PUBLIC CowTree)
+
+# Tracy is linked PUBLIC so FC_TRACY_ENABLED and the Tracy include dirs
+# propagate transitively to the fastcached executable (thread naming in
+# main.cpp) and to the FastCacheTest binary (so Profiling_test sees the same
+# mode). When TRACY_ENABLE is OFF nothing is linked or defined and every
+# Core/Profiling.hpp macro compiles to (void)0 — a strictly zero-cost build.
+if(TRACY_ENABLE)
+    target_link_libraries(FastCache PUBLIC Tracy::TracyClient)
+    target_compile_definitions(FastCache PUBLIC FC_TRACY_ENABLED=1)
+endif()
 
 # Substitute the version triple/string into Core/Version.hpp at configure
 # time. The generated header lives under the build dir so it never gets

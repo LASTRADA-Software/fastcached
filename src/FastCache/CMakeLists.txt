@@ -63,4 +63,5 @@ target_sources(FastCache
             Core/Clock.hpp
             Core/Logger.hpp
             Core/BufferPool.hpp
+            Core/Profiling.hpp
 )

@@ -51,6 +51,25 @@
         },
 
         {
+            "name": "clang-tracy",
+            "displayName": "Clang RelWithDebInfo + Tracy profiler (TRACY_ENABLE)",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "PEDANTIC_COMPILER_WERROR": "OFF",
+                "TRACY_ENABLE": "ON",
+                "TRACY_ON_DEMAND": "ON"
+            },
+            "condition": {
+                "type": "notEquals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+
+        {
             "name": "gcc-debug",
             "displayName": "GCC Debug (PEDANTIC)",
             "inherits": "base",
@@ -207,6 +226,7 @@
     "buildPresets": [
         { "name": "clang-debug",      "configurePreset": "clang-debug" },
         { "name": "clang-release",    "configurePreset": "clang-release" },
+        { "name": "clang-tracy",      "configurePreset": "clang-tracy" },
         { "name": "gcc-debug",        "configurePreset": "gcc-debug" },
         { "name": "gcc-release",      "configurePreset": "gcc-release" },
         { "name": "clang-coverage",   "configurePreset": "clang-coverage" },
@@ -220,6 +240,7 @@
     "testPresets": [
         { "name": "clang-debug",      "configurePreset": "clang-debug",      "output": { "outputOnFailure": true } },
         { "name": "clang-release",    "configurePreset": "clang-release",    "output": { "outputOnFailure": true } },
+        { "name": "clang-tracy",      "configurePreset": "clang-tracy",      "output": { "outputOnFailure": true } },
         { "name": "gcc-debug",        "configurePreset": "gcc-debug",        "output": { "outputOnFailure": true } },
         { "name": "gcc-release",      "configurePreset": "gcc-release",      "output": { "outputOnFailure": true } },
         { "name": "clang-coverage",   "configurePreset": "clang-coverage",   "output": { "outputOnFailure": true } },
