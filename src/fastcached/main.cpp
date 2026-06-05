@@ -125,17 +125,18 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
     return static_cast<std::size_t>(cap);
 }
 
-/// Resolve the effective shard count.
+/// Resolve the effective shard count. Sharding fans writes across independent
+/// CoW files so the multi-core reactors write in parallel.
 ///
 /// - User-specified non-zero: honored verbatim.
-/// - Auto (0) for in-memory: fan out (`AutoShardCount`) so threaded mode
-///   gets parallelism without the user opting in.
-/// - Auto (0) for persistent: defaults to **single-file mode** (1
-///   shard). The README documents `--storage=<path>` as a single file;
-///   inferring a multi-shard directory from `hardware_concurrency` would
-///   silently `mkdir` over the user's intended file. If the path
-///   already exists as a directory, treat that as the user explicitly
-///   opting into fan-out and pick `AutoShardCount`.
+/// - Auto (0) for in-memory: fan out (`AutoShardCount`).
+/// - Auto (0) for persistent: fan out **by default** so disk writes
+///   parallelise, EXCEPT for paths that name a single file — an existing
+///   regular file, or a not-yet-existing path with a file extension (e.g.
+///   `cache.cow`) — which stay single-file for backward compatibility (the
+///   path is used as one file, never `mkdir`-ed over). An existing directory
+///   or a not-yet-existing extension-less path (a cache directory) fans out
+///   into `shard-NN.cow` files.
 [[nodiscard]] std::size_t ResolvePhysicalShards(std::size_t requested,
                                                 bool usingPersistent,
                                                 std::filesystem::path const& storagePath) noexcept
@@ -146,8 +147,12 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         return AutoShardCount();
     std::error_code ec;
     if (std::filesystem::is_directory(storagePath, ec))
-        return AutoShardCount();
-    return 1;
+        return AutoShardCount(); // existing directory of shards
+    if (std::filesystem::exists(storagePath, ec))
+        return 1; // existing regular file — keep single-file (compat)
+    if (storagePath.has_extension())
+        return 1;            // a new file-looking path (e.g. cache.cow) — single file
+    return AutoShardCount(); // a new cache directory — fan out
 }
 
 /// Resolve `ExecutionModel::Auto` to a concrete model. Both the in-memory

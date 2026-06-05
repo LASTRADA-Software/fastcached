@@ -325,7 +325,9 @@ class Daemon:
             f"--storage-max-value={max_value}",
         ]
         if self._scenario.storage == "disk":
-            storage_path = self._storage_dir / "store.cow"
+            # Extension-less path => a shard directory (shard-by-default), so
+            # the multi-core reactors write to independent CoW files in parallel.
+            storage_path = self._storage_dir / "store"
             argv.append(f"--storage={storage_path}")
             argv.append(f"--storage-durability={self._scenario.durability}")
         return argv
