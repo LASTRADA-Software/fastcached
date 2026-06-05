@@ -136,28 +136,17 @@ namespace
         WriteBigEndian<std::uint32_t>(std::span<std::byte> { &hdr[12], 4 }, opaque);
         WriteBigEndian<std::uint64_t>(std::span<std::byte> { &hdr[16], 8 }, cas);
 
-        auto const r1 = co_await socket->Write(std::span<std::byte const> { hdr.data(), hdr.size() });
-        if (!r1.has_value())
-            co_return false;
-        if (!extras.empty())
-        {
-            auto const r = co_await socket->Write(extras);
-            if (!r.has_value())
-                co_return false;
-        }
-        if (!key.empty())
-        {
-            auto const r = co_await socket->Write(key);
-            if (!r.has_value())
-                co_return false;
-        }
-        if (!value.empty())
-        {
-            auto const r = co_await socket->Write(value);
-            if (!r.has_value())
-                co_return false;
-        }
-        co_return true;
+        // Coalesce header + extras + key + value into one buffer and a single
+        // write. The request/response hot path is syscall-bound, so one send()
+        // per reply beats up to four.
+        std::vector<std::byte> out;
+        out.reserve(hdr.size() + extras.size() + key.size() + value.size());
+        out.insert(out.end(), hdr.begin(), hdr.end());
+        out.insert(out.end(), extras.begin(), extras.end());
+        out.insert(out.end(), key.begin(), key.end());
+        out.insert(out.end(), value.begin(), value.end());
+        auto const written = co_await socket->Write(std::span<std::byte const> { out.data(), out.size() });
+        co_return written.has_value();
     }
 
     [[nodiscard]] constexpr std::string_view ErrorMessage(Status status) noexcept

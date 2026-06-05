@@ -94,12 +94,18 @@ namespace
 
     Task<bool> ReplyBulkString(ISocket* socket, std::span<std::byte const> bytes)
     {
+        // Coalesce `$<len>\r\n<bytes>\r\n` into one buffer and a single write:
+        // the request/response hot path (e.g. GET) is dominated by syscall
+        // count, so one send() per reply beats three.
         auto const header = std::format("${}\r\n", bytes.size());
-        if (!co_await WriteAll(socket, header))
-            co_return false;
-        if (!co_await WriteAll(socket, bytes))
-            co_return false;
-        co_return co_await WriteAll(socket, Crlf);
+        std::vector<std::byte> out;
+        out.reserve(header.size() + bytes.size() + 2);
+        auto const headerBytes = AsBytes(header);
+        out.insert(out.end(), headerBytes.begin(), headerBytes.end());
+        out.insert(out.end(), bytes.begin(), bytes.end());
+        auto const crlf = AsBytes(Crlf);
+        out.insert(out.end(), crlf.begin(), crlf.end());
+        co_return co_await WriteAll(socket, std::span<std::byte const> { out.data(), out.size() });
     }
 
     Task<bool> ReplyBulkString(ISocket* socket, std::string_view text)
