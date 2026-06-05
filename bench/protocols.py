@@ -128,6 +128,10 @@ class MemcachedTextClient:
         self._conn.send(b"version\r\n")
         return self._conn.read_line().startswith(b"VERSION")
 
+    def flush(self) -> bool:
+        self._conn.send(b"flush_all\r\n")
+        return self._conn.read_line() == b"OK"
+
     def close(self) -> None:
         self._conn.close()
 
@@ -181,6 +185,10 @@ class RedisRespClient:
         self._conn.send(self._encode(b"PING"))
         return self._read_reply() == b"PONG"
 
+    def flush(self) -> bool:
+        self._conn.send(self._encode(b"FLUSHALL"))
+        return self._read_reply() == b"OK"
+
     def close(self) -> None:
         self._conn.close()
 
@@ -194,6 +202,7 @@ class MemcachedBinaryClient:
     _OP_SET = 0x01
     _OP_DELETE = 0x04
     _OP_INCREMENT = 0x05
+    _OP_FLUSH = 0x08
     _OP_VERSION = 0x0B
     _STATUS_OK = 0x00
     _STATUS_KEY_NOT_FOUND = 0x01
@@ -246,6 +255,11 @@ class MemcachedBinaryClient:
 
     def ping(self) -> bool:
         self._send(self._OP_VERSION)
+        status, _, _ = self._recv()
+        return status == self._STATUS_OK
+
+    def flush(self) -> bool:
+        self._send(self._OP_FLUSH)
         status, _, _ = self._recv()
         return status == self._STATUS_OK
 

@@ -187,6 +187,52 @@ def print_comparison_table(comparisons) -> None:
     print()
 
 
+def print_multitarget_table(target_names: list[str], rows: list) -> None:
+    """Print fastcached vs real servers: ops/s per target + fastcached speedup."""
+    import report
+
+    color = supports_color()
+    headers = ["Scenario", *[f"{t} ops/s" for t in target_names], "fc vs best"]
+    table: list[list[str]] = []
+    plain: list[list[str]] = []
+    for name, by_target in rows:
+        cells = [name]
+        plains = [name]
+        for target in target_names:
+            result = by_target.get(target)
+            text = f"{result.throughput_ops_per_sec:,.0f}" if result is not None else "-"
+            cells.append(text)
+            plains.append(text)
+        speedup = report.fastcached_speedup(by_target)
+        if speedup is None:
+            cells.append("-")
+            plains.append("-")
+        else:
+            text = f"{speedup:.2f}x"
+            plains.append(text)
+            cells.append(_colorize(text, GREEN if speedup >= 1.0 else RED, color))
+        table.append(cells)
+        plain.append(plains)
+
+    widths = [len(h) for h in headers]
+    for prow in plain:
+        for i, cell in enumerate(prow):
+            widths[i] = max(widths[i], len(cell))
+
+    def render(cells: list[str], prow: list[str]) -> str:
+        out = []
+        for i, cell in enumerate(cells):
+            pad = widths[i] - len(prow[i])
+            out.append(("{}" + " " * pad).format(cell) if i == 0 else (" " * pad + cell))
+        return "  ".join(out)
+
+    print(_colorize(render(headers, headers), BOLD, color))
+    print(_colorize("-" * (sum(widths) + 2 * len(widths)), DIM, color))
+    for cells, prow in zip(table, plain):
+        print(render(cells, prow))
+    print()
+
+
 def print_highlights(lines: list[str]) -> None:
     color = supports_color()
     print(_colorize("Highlights", BOLD, color))

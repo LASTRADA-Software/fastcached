@@ -28,7 +28,28 @@ python bench/fastcached_bench.py --no-build \
 
 # Charts (PNG + inline Sixel where supported):
 python -m pip install -r bench/requirements-plots.txt
+
+# Head-to-head against the REAL servers (the actual goal):
+python bench/fastcached_bench.py --no-build --candidate-binary <fastcached> \
+    --vs redis,memcached
 ```
+
+## Comparing against real redis / memcached (`--vs`)
+
+`--vs redis,memcached` runs the candidate fastcached and each available real
+server over the same scenarios and reports throughput per target plus
+`fastcached vs best` (>1× means fastcached wins). Real servers are in-memory, so
+only the memory scenarios run against them; disk scenarios stay fastcached-only.
+
+Baseline discovery (optional; each is skipped with a notice if absent):
+- **redis**: a native `redis-server` on `PATH` (or `--redis-server <path>`),
+  started with persistence disabled.
+- **memcached**: `memcached:latest` via Docker (`docker run --rm -p ...`).
+
+Each server runs on its own high port (some low ports are blocked). Note that
+Docker's port-forwarding on Windows/macOS adds latency, which penalizes the
+dockerized memcached relative to a native build — the native redis comparison is
+the fairer bar on those platforms.
 
 Run it from an environment where `cmake --build --preset <preset>` already works
 for your OS — a *Developer PowerShell for VS* on Windows, or a shell with the

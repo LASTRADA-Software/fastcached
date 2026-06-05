@@ -378,6 +378,46 @@ def _prepopulate(scenario: Scenario, host: str, port: int, op_timeout: float) ->
         client.close()
 
 
+def _flush(scenario: Scenario, host: str, port: int, op_timeout: float) -> None:
+    """Drop all keys — used to reset a long-lived (real) server between scenarios."""
+    client = protocols.make_client(scenario.protocol, host, port, op_timeout)
+    try:
+        client.flush()
+    finally:
+        client.close()
+
+
+def measure_running_server(
+    executor: concurrent.futures.ProcessPoolExecutor,
+    pool_size: int,
+    scenario: Scenario,
+    host: str,
+    port: int,
+    reps: int,
+    warmup: int,
+    seed: int,
+    op_timeout: float,
+    flush_first: bool = False,
+) -> ScenarioResult:
+    """Measure a scenario against an ALREADY-RUNNING server at host:port.
+
+    Used both by the fastcached path (fresh daemon, ``flush_first=False``) and by
+    the real-server baselines (a shared long-lived server, ``flush_first=True``
+    to reset state between scenarios).
+    """
+    if flush_first:
+        _flush(scenario, host, port, op_timeout)
+    if scenario.prepopulate:
+        _prepopulate(scenario, host, port, op_timeout)
+    for _ in range(warmup):
+        _measure(executor, pool_size, scenario, host, port, seed, op_timeout)
+    measured = [
+        _measure(executor, pool_size, scenario, host, port, seed + rep, op_timeout)
+        for rep in range(reps)
+    ]
+    return _aggregate(scenario, measured)
+
+
 def run_scenario(
     executor: concurrent.futures.ProcessPoolExecutor,
     pool_size: int,
@@ -391,18 +431,12 @@ def run_scenario(
     seed: int,
     op_timeout: float,
 ) -> ScenarioResult:
-    """Start a daemon, run warmup + measured reps, and return aggregated metrics."""
+    """Start a fastcached daemon, run warmup + measured reps, return aggregated metrics."""
     daemon = Daemon(binary, scenario, host, port, storage_dir)
     daemon.start()
     try:
-        if scenario.prepopulate:
-            _prepopulate(scenario, host, port, op_timeout)
-        for _ in range(warmup):
-            _measure(executor, pool_size, scenario, host, port, seed, op_timeout)
-        measured = [
-            _measure(executor, pool_size, scenario, host, port, seed + rep, op_timeout)
-            for rep in range(reps)
-        ]
+        return measure_running_server(
+            executor, pool_size, scenario, host, port, reps, warmup, seed, op_timeout, flush_first=False
+        )
     finally:
         daemon.stop()
-    return _aggregate(scenario, measured)

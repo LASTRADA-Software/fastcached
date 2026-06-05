@@ -84,6 +84,62 @@ def write_json(path: Path, env: dict, comparisons: list[Comparison]) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+# --- Multi-target (fastcached vs real redis/memcached) ------------------------
+
+def fastcached_speedup(by_target: dict) -> float | None:
+    """fastcached throughput / best competitor throughput (>1 means fastcached wins)."""
+    fc = by_target.get("fastcached")
+    others = [r.throughput_ops_per_sec for name, r in by_target.items()
+              if name != "fastcached" and r is not None]
+    if fc is None or not others:
+        return None
+    best_other = max(others)
+    return fc.throughput_ops_per_sec / best_other if best_other > 0 else None
+
+
+def write_multitarget_json(path: Path, env: dict, target_names: list[str], rows: list) -> None:
+    """rows: list of (scenario_name, by_target dict[name -> ScenarioResult])."""
+    payload = {
+        "environment": env,
+        "targets": target_names,
+        "scenarios": [
+            {
+                "name": name,
+                "fastcached_speedup_vs_best": fastcached_speedup(by_target),
+                "targets": {t: (r.as_dict() if r is not None else None) for t, r in by_target.items()},
+            }
+            for name, by_target in rows
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def write_multitarget_markdown(path: Path, env: dict, target_names: list[str], rows: list, png_files: list) -> None:
+    lines: list[str] = ["# fastcached vs real redis / memcached\n", "## Environment\n",
+                        "| Field | Value |", "| --- | --- |"]
+    for key in ("timestamp", "host", "os", "cpu", "cores", "python", "preset", "profile", "reps", "candidate_ref"):
+        if key in env:
+            lines.append(f"| {key} | {env[key]} |")
+    lines.append("")
+    if png_files:
+        lines.append("## Charts\n")
+        lines += [f"![{p.stem}]({p.name})\n" for p in png_files]
+    lines.append("## Throughput (ops/sec, median of reps; higher is better)\n")
+    header = "| Scenario | " + " | ".join(target_names) + " | fastcached vs best |"
+    lines.append(header)
+    lines.append("| --- | " + " | ".join("---:" for _ in target_names) + " | ---: |")
+    for name, by_target in rows:
+        cells = []
+        for target in target_names:
+            result = by_target.get(target)
+            cells.append(f"{result.throughput_ops_per_sec:,.0f}" if result is not None else "—")
+        speedup = fastcached_speedup(by_target)
+        speedup_text = f"{speedup:.2f}x" if speedup is not None else "—"
+        lines.append(f"| {name} | " + " | ".join(cells) + f" | {speedup_text} |")
+    lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def _format_delta(value: float | None, improvement_is_negative: bool) -> str:
     if value is None:
         return "n/a"

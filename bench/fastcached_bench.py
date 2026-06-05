@@ -34,8 +34,9 @@ from pathlib import Path
 
 import plots
 import report
+import servers
 import termviz
-from runner import ScenarioResult, run_scenario
+from runner import ScenarioResult, measure_running_server, run_scenario
 from workloads import scenarios_for
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -155,6 +156,78 @@ def run_suite(
     return results
 
 
+def run_multitarget(
+    fastcached_binary: Path,
+    vs_names: list[str],
+    profile: str,
+    storage_root: Path,
+    base_port: int,
+    reps: int,
+    warmup: int,
+    seed: int,
+    op_timeout: float,
+    redis_server: str | None,
+) -> tuple[list[str], list]:
+    """Run scenarios against fastcached and each available real server.
+
+    Real servers (in-memory only) run the memory scenarios for the protocols
+    they speak; fastcached runs everything. Returns (target_names, rows) where
+    each row is (scenario_name, {target_name: ScenarioResult}).
+    """
+    pool_size = os.cpu_count() or 1
+    # Start the requested real servers on distinct high ports (some low ports
+    # are blocked); skip any whose dependency is missing.
+    started: list = []
+    port_offset = 100
+    for name in vs_names:
+        server = servers.build_baseline(name, HOST, base_port + port_offset, redis_server)
+        port_offset += 100
+        if server is None:
+            print(f"  (baseline '{name}' unavailable — skipping)")
+            continue
+        print(f"  starting baseline '{name}' on port {server.port} ...")
+        try:
+            server.start()
+            started.append(server)
+        except Exception as error:  # noqa: BLE001 - report and continue
+            print(f"  ! baseline '{name}' failed to start: {error}", file=sys.stderr)
+
+    target_names = ["fastcached", *[s.name for s in started]]
+    scenarios = scenarios_for(profile)
+    rows: list = []
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=pool_size) as executor:
+            for index, scenario in enumerate(scenarios):
+                print(f"  ({index + 1}/{len(scenarios)}) {scenario.name}", flush=True)
+                by_target: dict = {}
+                storage_dir = storage_root / f"fc-{index}"
+                try:
+                    by_target["fastcached"] = run_scenario(
+                        executor, pool_size, fastcached_binary, scenario, HOST, base_port + index,
+                        storage_dir, reps, warmup, seed, op_timeout,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    print(f"      ! fastcached scenario failed: {error}", file=sys.stderr)
+                finally:
+                    shutil.rmtree(storage_dir, ignore_errors=True)
+                # Real servers are in-memory only: skip disk scenarios.
+                if scenario.storage == "memory":
+                    for server in started:
+                        if scenario.protocol in server.protocols:
+                            try:
+                                by_target[server.name] = measure_running_server(
+                                    executor, pool_size, scenario, server.host, server.port,
+                                    reps, warmup, seed, op_timeout, flush_first=True,
+                                )
+                            except Exception as error:  # noqa: BLE001
+                                print(f"      ! {server.name} scenario failed: {error}", file=sys.stderr)
+                rows.append((scenario.name, by_target))
+    finally:
+        for server in started:
+            server.stop()
+    return target_names, rows
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark fastcached: base vs candidate.")
     parser.add_argument("--base", default="master", help="base git ref (default: master)")
@@ -171,6 +244,8 @@ def main() -> int:
     parser.add_argument("--no-build", action="store_true", help="skip building; use --base-binary/--candidate-binary")
     parser.add_argument("--base-binary", help="prebuilt base binary (with --no-build)")
     parser.add_argument("--candidate-binary", help="prebuilt candidate binary (with --no-build)")
+    parser.add_argument("--vs", default="", help="comma list of real baselines to compare against: redis,memcached")
+    parser.add_argument("--redis-server", help="path to redis-server (else discovered on PATH)")
     args = parser.parse_args()
 
     # Never let a non-UTF-8 stdout (e.g. a redirected cp1252 console on Windows)
@@ -180,24 +255,53 @@ def main() -> int:
     except (AttributeError, ValueError):
         pass
 
-    # Resolve binaries (build or provided).
+    # Resolve binaries (build or provided). --vs only needs the candidate.
     if args.no_build:
-        if not (args.base_binary and args.candidate_binary):
-            parser.error("--no-build requires --base-binary and --candidate-binary")
-        base_binary = Path(args.base_binary)
+        if not args.candidate_binary:
+            parser.error("--no-build requires --candidate-binary")
+        if not args.vs and not args.base_binary:
+            parser.error("--no-build (base-vs-candidate) requires --base-binary")
+        base_binary = Path(args.base_binary) if args.base_binary else None
         candidate_binary = Path(args.candidate_binary)
         base_sha = candidate_sha = "provided"
     else:
-        print("Building base and candidate ...")
-        base_binary = build_ref(args.base, args.preset)
         candidate_binary = build_ref(args.candidate, args.preset)
-        base_sha = git_sha(args.base)
         candidate_sha = git_sha(args.candidate)
+        if args.vs:
+            base_binary, base_sha = None, ""
+        else:
+            print("Building base ...")
+            base_binary = build_ref(args.base, args.preset)
+            base_sha = git_sha(args.base)
 
     pool_size = os.cpu_count() or 1
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.out) / timestamp
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # --vs mode: compare the candidate fastcached against real redis/memcached.
+    if args.vs:
+        vs_names = [name.strip() for name in args.vs.split(",") if name.strip()]
+        env = gather_env(args, base_sha, candidate_sha)
+        with tempfile.TemporaryDirectory(prefix="fastcached-bench-storage-") as storage_root_str:
+            target_names, rows = run_multitarget(
+                candidate_binary, vs_names, args.profile, Path(storage_root_str),
+                args.port, args.reps, args.warmup, args.seed, args.op_timeout, args.redis_server,
+            )
+        chart_objects = [] if args.charts == "none" else plots.render_multitarget(target_names, rows, out_dir)
+        png_files = [chart.path for chart in chart_objects]
+        report.write_multitarget_json(out_dir / "summary.json", env, target_names, rows)
+        report.write_multitarget_markdown(out_dir / "report.md", env, target_names, rows, png_files)
+        print()
+        termviz.print_environment(env)
+        termviz.print_multitarget_table(target_names, rows)
+        if chart_objects and termviz.detect_sixel(args.charts):
+            termviz.render_charts_to_terminal(chart_objects)
+        elif png_files:
+            print(f"Charts written to {out_dir}.")
+        print(f"\nReport:  {out_dir / 'report.md'}")
+        print(f"Summary: {out_dir / 'summary.json'}")
+        return 0
 
     with tempfile.TemporaryDirectory(prefix="fastcached-bench-storage-") as storage_root_str:
         storage_root = Path(storage_root_str)

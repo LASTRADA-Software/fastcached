@@ -78,6 +78,41 @@ def _line_vs_connections(plt, comparisons, storage, op_mix, metric, ylabel, titl
     return fig
 
 
+def render_multitarget(target_names: list[str], rows: list, out_dir: Path) -> list[Chart]:
+    """Grouped bar chart of throughput per scenario across targets (fastcached vs real)."""
+    if not available() or not rows:
+        return []
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Only chart scenarios that have a real competitor (i.e. more than fastcached).
+    charted = [(name, bt) for name, bt in rows if sum(1 for r in bt.values() if r is not None) > 1]
+    if not charted:
+        return []
+
+    labels = [name for name, _ in charted]
+    indices = np.arange(len(labels))
+    width = 0.8 / max(1, len(target_names))
+    fig, axis = plt.subplots(figsize=(max(8, len(labels) * 0.5), 5))
+    for offset, target in enumerate(target_names):
+        values = [
+            (by_target[target].throughput_ops_per_sec if by_target.get(target) is not None else 0)
+            for _, by_target in charted
+        ]
+        axis.bar(indices + offset * width, values, width, label=target)
+    axis.set_xticks(indices + width * (len(target_names) - 1) / 2)
+    axis.set_xticklabels(labels, fontsize=6, rotation=40, ha="right")
+    axis.set_ylabel("ops/sec")
+    axis.set_title("Throughput: fastcached vs real redis/memcached")
+    axis.legend()
+    chart = _figure_to_chart(fig, "fastcached vs real", out_dir / "vs_real_throughput.png")
+    plt.close(fig)
+    return [chart]
+
+
 def render_all(comparisons: list[Comparison], out_dir: Path) -> list[Chart]:
     """Render the comparison charts that make sense for this data set."""
     if not available() or not comparisons:
