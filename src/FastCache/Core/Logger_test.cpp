@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <regex>
 #include <sstream>
 #include <string>
 
@@ -64,6 +65,18 @@ TEST_CASE("CapturingLogger Clear removes all records", "[logger]")
     logger.Log(FastCache::LogLevel::Info, "two");
     logger.Clear();
     REQUIRE(logger.Snapshot().empty());
+}
+
+TEST_CASE("ConsoleLogger prefixes lines with ISO 8601 UTC timestamp when enabled", "[logger]")
+{
+    std::ostringstream sink;
+    FastCache::ConsoleLogger logger { sink, FastCache::LogLevel::Trace, /*timestamps=*/true };
+
+    logger.Log(FastCache::LogLevel::Info, "hello");
+
+    auto const output = sink.str();
+    static std::regex const pattern { R"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z \[INFO\] hello\n)" };
+    REQUIRE(std::regex_match(output, pattern));
 }
 
 TEST_CASE("ILogger::Logf only formats when the level passes the filter", "[logger]")

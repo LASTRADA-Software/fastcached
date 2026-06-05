@@ -109,6 +109,8 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         fileCfg.workerThreads = cliCfg.workerThreads;
     if (cli.storageShardsExplicit)
         fileCfg.storageShards = cliCfg.storageShards;
+    if (cliCfg.logTimestamps)
+        fileCfg.logTimestamps = true;
     return fileCfg;
 }
 
@@ -329,7 +331,7 @@ int RunThreadedServer(FastCache::Config const& effective, FastCache::CacheEngine
 /// service).
 int DaemonBody(FastCache::Config const& effective)
 {
-    FastCache::ConsoleLogger logger { std::cerr, effective.logLevel };
+    FastCache::ConsoleLogger logger { std::cerr, effective.logLevel, effective.logTimestamps };
     FastCache::ConfigReloader reloader { effective, effective.configPath };
     FastCache::SteadyClock clock;
 

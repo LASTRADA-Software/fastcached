@@ -2,6 +2,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <format>
 #include <mutex>
@@ -108,18 +109,20 @@ class NullLogger final: public ILogger
 };
 
 /// Synchronous logger that writes to a std::ostream (typically std::cerr).
-/// Thread-safe via a mutex around the stream write. Format:
+/// Thread-safe via a mutex around the stream write. Format without timestamps:
 ///   "[LEVEL] message\n"
-/// Timestamps and ANSI colours are intentionally omitted at this layer — the
-/// daemon can wrap this logger to add timestamps without making the sink
-/// itself more complex.
+/// With timestamps enabled:
+///   "2026-06-05T14:23:01.123456Z [LEVEL] message\n"
 class ConsoleLogger final: public ILogger
 {
   public:
     /// Construct over a stream reference whose lifetime exceeds this logger.
     /// @param sink Output stream (e.g., std::cerr).
     /// @param initialMinLevel Initial filter threshold.
-    explicit ConsoleLogger(std::ostream& sink, LogLevel initialMinLevel = LogLevel::Info) noexcept;
+    /// @param timestamps When true, prefix each line with an ISO 8601 UTC timestamp.
+    explicit ConsoleLogger(std::ostream& sink,
+                           LogLevel initialMinLevel = LogLevel::Info,
+                           bool timestamps = false) noexcept;
 
     void Log(LogLevel level, std::string_view message) override;
     [[nodiscard]] LogLevel MinLevel() const noexcept override;
@@ -129,6 +132,7 @@ class ConsoleLogger final: public ILogger
     std::ostream& _sink;
     std::atomic<LogLevel> _minLevel;
     std::mutex _writeMutex;
+    bool _timestamps;
 };
 
 /// Capturing logger that stores every emitted record in memory. Designed for

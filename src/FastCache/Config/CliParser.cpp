@@ -220,6 +220,11 @@ namespace
             cfg.daemon = true;
             return ArgOutcome::Continue;
         }
+        if (arg == "--log-timestamps")
+        {
+            cfg.logTimestamps = true;
+            return ArgOutcome::Continue;
+        }
         // Service-control requests record the desired outcome but keep parsing:
         // the remaining flags (--service-name, --port, --storage, ...) are
         // captured into the config that gets baked into the service command line.
@@ -389,6 +394,7 @@ namespace
         { .flag = "--max-memory=<size>",
           .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)" },
         { .flag = "--log-level=<level>", .description = "trace|debug|info|warn|error|fatal (default info)" },
+        { .flag = "--log-timestamps", .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)" },
         { .flag = "--storage=<path>", .description = "persist cache to a CoW-tree file (default: in-memory only)" },
         { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },
         { .flag = "--storage-max-value=<size>",

@@ -135,6 +135,12 @@ namespace
             cfg.logLevel = *level;
             return {};
         }
+        /// `log_timestamps`: prefix log lines with ISO 8601 UTC timestamps.
+        if (key == "log_timestamps")
+        {
+            cfg.logTimestamps = valueNode.as<bool>();
+            return {};
+        }
         /// `storage_path`: filesystem path of the CoW-tree backing file.
         if (key == "storage_path")
         {

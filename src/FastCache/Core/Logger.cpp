@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/Logger.hpp>
 
+#include <chrono>
 #include <format>
 #include <ostream>
 #include <string>
@@ -10,9 +11,10 @@ namespace FastCache
 
 // -- ConsoleLogger ---------------------------------------------------------
 
-ConsoleLogger::ConsoleLogger(std::ostream& sink, LogLevel initialMinLevel) noexcept:
+ConsoleLogger::ConsoleLogger(std::ostream& sink, LogLevel initialMinLevel, bool timestamps) noexcept:
     _sink { sink },
-    _minLevel { initialMinLevel }
+    _minLevel { initialMinLevel },
+    _timestamps { timestamps }
 {
 }
 
@@ -21,7 +23,16 @@ void ConsoleLogger::Log(LogLevel level, std::string_view message)
     if (level < _minLevel.load(std::memory_order_relaxed))
         return;
 
-    auto const line = std::format("[{}] {}\n", ToStringView(level), message);
+    std::string line;
+    if (_timestamps)
+    {
+        auto const now = std::chrono::floor<std::chrono::microseconds>(std::chrono::system_clock::now());
+        line = std::format("{:%FT%T}Z [{}] {}\n", now, ToStringView(level), message);
+    }
+    else
+    {
+        line = std::format("[{}] {}\n", ToStringView(level), message);
+    }
     std::scoped_lock const lock { _writeMutex };
     _sink.write(line.data(), static_cast<std::streamsize>(line.size()));
 }

@@ -99,6 +99,9 @@ struct Config
     /// Log threshold.
     LogLevel logLevel { LogLevel::Info };
 
+    /// When true, each ConsoleLogger line is prefixed with an ISO 8601 UTC timestamp.
+    bool logTimestamps { false };
+
     /// If true, daemonize (POSIX) or self-register as a Windows service.
     bool daemon { false };
 
