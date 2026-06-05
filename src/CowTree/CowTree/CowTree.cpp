@@ -711,9 +711,19 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key) -> std::expect
 
 auto CowTree::CommitTxn(WriteTxn& txn) -> std::expected<TxnId, CowTreeError>
 {
-    // 1. Sync data pages.
-    if (auto const r = _store.SyncData(); !r.has_value())
-        return std::unexpected(r.error());
+    // 1. Flush new data pages so they are durable *before* the meta slot
+    //    that references them. This ordering barrier is load-bearing for
+    //    crash safety: data pages carry no read-time checksum, and the
+    //    alternating-slot meta only guards against a torn meta — not a torn
+    //    data page — so a durable new meta pointing at not-yet-durable data
+    //    would silently corrupt. When the transaction allocated no new pages
+    //    (a delete or a no-op-structural change), there is nothing to order
+    //    ahead of the meta, so we skip this fsync entirely.
+    if (!txn._newPages.empty())
+    {
+        if (auto const r = _store.SyncData(); !r.has_value())
+            return std::unexpected(r.error());
+    }
 
     // 2. Write the new meta page (alternating slot).
     Meta next;
