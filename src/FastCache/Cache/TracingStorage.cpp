@@ -76,7 +76,11 @@ std::expected<CasToken, StorageError> TracingStorage::Set(std::string_view key,
         [&]() mutable { return _inner.Set(key, std::move(value), flags, expiry); },
         [bytes](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
+            {
+                if (r.error().code == StorageErrorCode::ValueTooLarge)
+                    return std::format("VALUE_TOO_LARGE bytes={}", bytes);
                 return std::string { ErrorOutcome(r.error()) };
+            }
             return std::format("STORED bytes={}", bytes);
         });
 }
@@ -91,7 +95,11 @@ std::expected<CasToken, StorageError> TracingStorage::Add(
         [&]() mutable { return _inner.Add(key, std::move(value), flags, expiry, now); },
         [bytes](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
+            {
+                if (r.error().code == StorageErrorCode::ValueTooLarge)
+                    return std::format("VALUE_TOO_LARGE bytes={}", bytes);
                 return std::string { ErrorOutcome(r.error()) };
+            }
             return std::format("STORED bytes={}", bytes);
         });
 }
@@ -106,7 +114,11 @@ std::expected<CasToken, StorageError> TracingStorage::Replace(
         [&]() mutable { return _inner.Replace(key, std::move(value), flags, expiry, now); },
         [bytes](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
+            {
+                if (r.error().code == StorageErrorCode::ValueTooLarge)
+                    return std::format("VALUE_TOO_LARGE bytes={}", bytes);
                 return std::string { ErrorOutcome(r.error()) };
+            }
             return std::format("STORED bytes={}", bytes);
         });
 }
@@ -116,13 +128,18 @@ std::expected<CasToken, StorageError> TracingStorage::Append(std::string_view ke
                                                              CasToken expected,
                                                              TimePoint now)
 {
+    auto const bytes = suffix.size();
     return TraceCall(
         "APPEND",
         key,
         [&] { return _inner.Append(key, suffix, expected, now); },
-        [](std::expected<CasToken, StorageError> const& r) -> std::string {
+        [bytes](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
+            {
+                if (r.error().code == StorageErrorCode::ValueTooLarge)
+                    return std::format("VALUE_TOO_LARGE bytes={}", bytes);
                 return std::string { ErrorOutcome(r.error()) };
+            }
             return "STORED";
         });
 }
@@ -132,13 +149,18 @@ std::expected<CasToken, StorageError> TracingStorage::Prepend(std::string_view k
                                                               CasToken expected,
                                                               TimePoint now)
 {
+    auto const bytes = prefix.size();
     return TraceCall(
         "PREPEND",
         key,
         [&] { return _inner.Prepend(key, prefix, expected, now); },
-        [](std::expected<CasToken, StorageError> const& r) -> std::string {
+        [bytes](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
+            {
+                if (r.error().code == StorageErrorCode::ValueTooLarge)
+                    return std::format("VALUE_TOO_LARGE bytes={}", bytes);
                 return std::string { ErrorOutcome(r.error()) };
+            }
             return "STORED";
         });
 }
@@ -150,13 +172,18 @@ std::expected<CasToken, StorageError> TracingStorage::CompareAndSwap(std::string
                                                                      TimePoint expiry,
                                                                      TimePoint now)
 {
+    auto const bytes = value.size();
     return TraceCall(
         "CAS",
         key,
         [&]() mutable { return _inner.CompareAndSwap(key, expected, std::move(value), flags, expiry, now); },
-        [](std::expected<CasToken, StorageError> const& r) -> std::string {
+        [bytes](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
+            {
+                if (r.error().code == StorageErrorCode::ValueTooLarge)
+                    return std::format("VALUE_TOO_LARGE bytes={}", bytes);
                 return std::string { ErrorOutcome(r.error()) };
+            }
             return "STORED";
         });
 }
