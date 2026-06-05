@@ -10,3 +10,5 @@ site/
 CMakeUserPresets.json
 *.user
 compile_commands.json
+bench/results/
+__pycache__/

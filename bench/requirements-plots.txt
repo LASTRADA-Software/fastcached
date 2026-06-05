@@ -1,0 +1,7 @@
+# Optional extra for chart rendering (PNG files + inline Sixel charts).
+# The benchmark suite runs and produces terminal tables + Markdown/JSON reports
+# WITHOUT this; installing it only adds the images.
+#
+#   python -m pip install -r bench/requirements-plots.txt
+#
+matplotlib>=3.7
