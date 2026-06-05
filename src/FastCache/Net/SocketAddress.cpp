@@ -148,8 +148,12 @@ IAddressResolver& DefaultAddressResolver() noexcept
 namespace Detail
 {
 
-    std::expected<BoundListener, std::string> BindAndListen(
-        IAddressResolver& resolver, std::string_view host, std::uint16_t port, int backlog, int extraTypeFlags)
+    std::expected<BoundListener, std::string> BindAndListen(IAddressResolver& resolver,
+                                                            std::string_view host,
+                                                            std::uint16_t port,
+                                                            int backlog,
+                                                            int extraTypeFlags,
+                                                            ReusePort reusePort)
     {
         EnsureNetworkInitialised();
 
@@ -172,6 +176,20 @@ namespace Detail
             // SO_REUSEADDR so restart-after-crash rebinds without TIME_WAIT delay.
             int reuse = 1;
             ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
+
+            // SO_REUSEPORT lets N reactor threads each bind a listener on the
+            // same port; the kernel then load-balances new connections across
+            // them. POSIX only; absent on Windows.
+#if defined(SO_REUSEPORT)
+            if (reusePort == ReusePort::Yes)
+            {
+                int reusePortValue = 1;
+                ::setsockopt(
+                    sock, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<char const*>(&reusePortValue), sizeof(reusePortValue));
+            }
+#else
+            static_cast<void>(reusePort);
+#endif
 
             // Force dual-stack on IPv6 sockets so a "::" wildcard accepts IPv4
             // clients too. The OS default is v6-only on Windows and Linux, which

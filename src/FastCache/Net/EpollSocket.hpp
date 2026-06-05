@@ -63,7 +63,8 @@ class EpollListener final: public IListener
                                                              std::string_view bindAddress,
                                                              std::uint16_t port,
                                                              int backlog = 511,
-                                                             IAddressResolver& resolver = DefaultAddressResolver());
+                                                             IAddressResolver& resolver = DefaultAddressResolver(),
+                                                             ReusePort reusePort = ReusePort::No);
 
     EpollListener(EpollListener const&) = delete;
     EpollListener(EpollListener&&) = delete;

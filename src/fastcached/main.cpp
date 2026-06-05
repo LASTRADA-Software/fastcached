@@ -345,16 +345,32 @@ int DaemonBody(FastCache::Config const& effective)
 
     auto const usingPersistent = !effective.storagePath.empty();
     auto const resolvedExecutionModel = ResolveExecutionModel(effective.executionModel, usingPersistent);
-    auto const physicalShards = ResolvePhysicalShards(effective.storageShards, usingPersistent, effective.storagePath);
+
+    // Reactor model scales across cores by running N independent
+    // single-threaded reactors (one per worker thread; default: hardware
+    // concurrency). The legacy threaded pool sizes itself from workerThreads
+    // instead, so reactorCount is 1 there.
+    auto const hardwareThreads = std::max(1U, std::thread::hardware_concurrency());
+    auto const reactorCount = [&]() -> unsigned {
+        if (resolvedExecutionModel != FastCache::ExecutionModel::Reactor)
+            return 1U; // the legacy threaded pool sizes itself from workerThreads
+        return effective.workerThreads != 0 ? static_cast<unsigned>(effective.workerThreads) : hardwareThreads;
+    }();
+
+    auto physicalShards = ResolvePhysicalShards(effective.storageShards, usingPersistent, effective.storagePath);
+    // Several reactor threads share one storage, so keep at least as many
+    // in-memory shards as reactors to hold per-shard lock contention down.
+    if (!usingPersistent && reactorCount > 1)
+        physicalShards = std::max<std::size_t>(physicalShards, reactorCount);
+
     // Wrap the backend in a ShardedStorage (its per-shard mutex serialises
     // access) whenever more than one thread can reach it: the legacy threaded
-    // pool, an explicit multi-shard layout, or the persistent backend on the
-    // reactor — where the multi-threaded Windows IOCP loop may drive several
-    // connections into storage at once, and a lone CowTreeStorage is not
-    // internally thread-safe. The in-memory single-shard reactor stays
-    // unwrapped: one thread owns it, so the wrapper would be pure overhead.
-    auto const useShardingWrapper =
-        physicalShards > 1 || resolvedExecutionModel == FastCache::ExecutionModel::Threaded || usingPersistent;
+    // pool, an explicit multi-shard layout, the persistent backend, or the
+    // reactor running on more than one thread. A lone reactor over in-memory
+    // storage stays unwrapped — one thread owns it, so the wrapper would be
+    // pure overhead.
+    auto const useShardingWrapper = physicalShards > 1 || resolvedExecutionModel == FastCache::ExecutionModel::Threaded
+                                    || usingPersistent || reactorCount > 1;
 
     auto bundle = BuildStorageBackend(effective, usingPersistent, useShardingWrapper, physicalShards);
     if (!bundle.has_value())
@@ -448,10 +464,10 @@ int DaemonBody(FastCache::Config const& effective)
         serverOpts.bindAddress = effective.bindAddress;
         serverOpts.port = effective.port;
         serverOpts.listenBacklog = effective.listenBacklog;
-        // The reactor multiplexes every connection on one thread — no
-        // connection-concurrency ceiling, and no cross-thread coroutine
-        // migration. (Scaling across cores via independent reactors is a
-        // follow-up.)
+        // One reactor per core (each single-threaded, connections pinned). One
+        // reactor = today's single-loop behaviour; N reactors scale across
+        // cores without any cross-thread coroutine migration.
+        serverOpts.reactorThreads = reactorCount;
         exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
     }
     else

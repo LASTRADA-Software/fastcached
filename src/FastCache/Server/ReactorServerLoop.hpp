@@ -23,13 +23,12 @@ struct ReactorServerOptions
     std::size_t maxConnections { 0 }; ///< 0 = unlimited.
     int listenBacklog { 511 };        ///< ::listen() backlog depth.
 
-    /// Number of threads draining the reactor. 1 keeps strict single-threaded
-    /// semantics (the in-memory fast path, where the unwrapped storage is not
-    /// thread-safe). >1 is honoured only on platforms whose reactor is
-    /// multi-thread safe (Windows IOCP today); elsewhere the loop runs
-    /// single-threaded regardless. With >1 threads every IStorage the
-    /// connections reach must be thread-safe (the disk backend is wrapped in a
-    /// ShardedStorage by the caller).
+    /// Number of independent reactors to run, each single-threaded with its
+    /// own connections (no coroutine migration). 1 is the classic single-loop
+    /// server. >1 scales across cores: on Windows a single acceptor hands
+    /// sockets round-robin to N IOCP reactors; on POSIX N listeners share the
+    /// port via SO_REUSEPORT. With >1, the storage every connection reaches
+    /// must be thread-safe (the caller wraps it in a ShardedStorage).
     unsigned reactorThreads { 1 };
 };
 

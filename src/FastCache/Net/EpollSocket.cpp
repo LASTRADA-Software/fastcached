@@ -346,15 +346,19 @@ void EpollListener::Impl::OnReadable(EpollFdHandler* base)
 EpollListener::EpollListener() noexcept = default;
 EpollListener::~EpollListener() = default;
 
-std::unique_ptr<EpollListener> EpollListener::Bind(
-    EpollReactor& reactor, std::string_view bindAddress, std::uint16_t port, int backlog, IAddressResolver& resolver)
+std::unique_ptr<EpollListener> EpollListener::Bind(EpollReactor& reactor,
+                                                   std::string_view bindAddress,
+                                                   std::uint16_t port,
+                                                   int backlog,
+                                                   IAddressResolver& resolver,
+                                                   ReusePort reusePort)
 {
     std::unique_ptr<EpollListener> listener { new EpollListener {} };
     listener->_impl = std::make_unique<Impl>(reactor);
 
     // Shared resolve + create + bind + listen; epoll wants the accept socket
     // (and thus the listener) non-blocking and close-on-exec.
-    auto bound = Detail::BindAndListen(resolver, bindAddress, port, backlog, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    auto bound = Detail::BindAndListen(resolver, bindAddress, port, backlog, SOCK_NONBLOCK | SOCK_CLOEXEC, reusePort);
     if (!bound.has_value())
     {
         listener->_impl->bindError = std::move(bound).error();

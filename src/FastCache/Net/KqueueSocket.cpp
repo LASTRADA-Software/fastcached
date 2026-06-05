@@ -339,8 +339,12 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
 KqueueListener::KqueueListener() noexcept = default;
 KqueueListener::~KqueueListener() = default;
 
-std::unique_ptr<KqueueListener> KqueueListener::Bind(
-    KqueueReactor& reactor, std::string_view bindAddress, std::uint16_t port, int backlog, IAddressResolver& resolver)
+std::unique_ptr<KqueueListener> KqueueListener::Bind(KqueueReactor& reactor,
+                                                     std::string_view bindAddress,
+                                                     std::uint16_t port,
+                                                     int backlog,
+                                                     IAddressResolver& resolver,
+                                                     ReusePort reusePort)
 {
     std::unique_ptr<KqueueListener> listener { new KqueueListener {} };
     listener->_impl = std::make_unique<Impl>(reactor);
@@ -348,7 +352,7 @@ std::unique_ptr<KqueueListener> KqueueListener::Bind(
     // Shared resolve + create + bind + listen. macOS has no SOCK_NONBLOCK
     // socket-type flag, so the listening socket is switched to non-blocking
     // afterwards (matching how accepted sockets are handled).
-    auto bound = Detail::BindAndListen(resolver, bindAddress, port, backlog, /*extraTypeFlags*/ 0);
+    auto bound = Detail::BindAndListen(resolver, bindAddress, port, backlog, /*extraTypeFlags*/ 0, reusePort);
     if (!bound.has_value())
     {
         listener->_impl->bindError = std::move(bound).error();

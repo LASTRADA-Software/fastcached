@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/Errors/NetError.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Net/ISocket.hpp>
 
 #include <cstddef>
+#include <expected>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -40,6 +42,21 @@ namespace Detail
     /// a failure is ignored and leaves the OS default in place.
     /// @param socket The connected stream-socket handle to tune.
     void ApplyHotSocketOptions(NativeSocket socket) noexcept;
+
+    /// Accept one connection from a listening socket and return its raw native
+    /// handle (with TCP_NODELAY applied, and non-blocking on POSIX). Used by
+    /// the multi-reactor server loop: a single acceptor accepts here, then
+    /// hands the raw handle to one reactor which wraps it. The handle is NOT
+    /// associated with any reactor yet.
+    /// @param listenSocket A bound, listening socket.
+    /// @return The accepted socket handle, or a NetError (Cancelled-like when
+    ///         the listening socket was closed to unblock the accept).
+    [[nodiscard]] std::expected<NativeSocket, NetError> AcceptRaw(NativeSocket listenSocket) noexcept;
+
+    /// Close a raw native socket handle — e.g. the listening socket, to unblock
+    /// a thread parked in AcceptRaw().
+    /// @param socket The handle to close.
+    void CloseNativeSocket(NativeSocket socket) noexcept;
 
 } // namespace Detail
 
