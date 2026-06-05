@@ -72,6 +72,41 @@ TEST_CASE("RESP: PING with payload echoes back as bulk", "[protocol][resp]")
     REQUIRE(Exchange(fix, "*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n") == "$5\r\nhello\r\n");
 }
 
+TEST_CASE("RESP: SELECT accepts any database index with +OK", "[protocol][resp]")
+{
+    RespFixture fix;
+    REQUIRE(Exchange(fix, "*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n") == "+OK\r\n");
+}
+
+TEST_CASE("RESP: CLIENT SETNAME/SETINFO acknowledged, ID/GETNAME answered", "[protocol][resp]")
+{
+    {
+        RespFixture fix;
+        REQUIRE(Exchange(fix, "*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$2\r\nhi\r\n") == "+OK\r\n");
+    }
+    {
+        RespFixture fix;
+        REQUIRE(Exchange(fix, "*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n") == ":1\r\n");
+    }
+    {
+        RespFixture fix;
+        REQUIRE(Exchange(fix, "*2\r\n$6\r\nCLIENT\r\n$7\r\nGETNAME\r\n") == "$0\r\n\r\n");
+    }
+}
+
+TEST_CASE("RESP: CONFIG GET echoes requested params with a synthetic value", "[protocol][resp]")
+{
+    RespFixture fix;
+    REQUIRE(Exchange(fix, "*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$9\r\nmaxmemory\r\n")
+            == "*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n");
+}
+
+TEST_CASE("RESP: CONFIG SET is accepted as a no-op", "[protocol][resp]")
+{
+    RespFixture fix;
+    REQUIRE(Exchange(fix, "*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n") == "+OK\r\n");
+}
+
 TEST_CASE("RESP: SET then GET round-trip via the array form", "[protocol][resp]")
 {
     RespFixture fix;

@@ -379,6 +379,51 @@ namespace
         co_return co_await ReplyOk(socket);
     }
 
+    Task<bool> HandleSelect(ISocket* socket, std::span<std::string const> args)
+    {
+        // fastcached exposes a single logical keyspace. The redis client
+        // crate issues `SELECT <index>` whenever the connection URL names a
+        // database; accept any index rather than erroring (which aborts the
+        // client's connection setup and surfaces as a startup timeout).
+        static_cast<void>(args);
+        co_return co_await ReplyOk(socket);
+    }
+
+    Task<bool> HandleClient(ISocket* socket, std::span<std::string const> args)
+    {
+        // Client libraries send CLIENT SETNAME / SETINFO / ID / GETNAME during
+        // connection setup. We hold no per-client state, so acknowledge each
+        // benignly instead of returning an error that would abort the
+        // library's handshake.
+        auto const sub = args.empty() ? std::string {} : Upper(args[0]);
+        if (sub == "GETNAME")
+            co_return co_await ReplyBulkString(socket, std::string_view {});
+        if (sub == "ID")
+            co_return co_await ReplyInteger(socket, 1);
+        co_return co_await ReplyOk(socket);
+    }
+
+    Task<bool> HandleConfig(ISocket* socket, std::span<std::string const> args)
+    {
+        // CONFIG GET <param>... — redis clients probe parameters such as
+        // `maxmemory` / `save` on connect. We expose no runtime tunables, so
+        // every requested parameter reports "0"; replying with the requested
+        // name/value pairs keeps the client crate's map parsing satisfied.
+        // CONFIG SET / RESETSTAT / REWRITE are accepted as no-ops.
+        auto const sub = args.empty() ? std::string {} : Upper(args[0]);
+        if (sub == "GET" && args.size() > 1)
+        {
+            auto const params = std::span<std::string const> { args.data() + 1, args.size() - 1 };
+            std::string body = std::format("*{}\r\n", params.size() * 2);
+            for (auto const& name: params)
+                body += std::format("${}\r\n{}\r\n$1\r\n0\r\n", name.size(), name);
+            co_return co_await WriteAll(socket, body);
+        }
+        if (sub == "GET")
+            co_return co_await WriteAll(socket, "*0\r\n");
+        co_return co_await ReplyOk(socket);
+    }
+
     Task<bool> Dispatch(ISocket* socket, CacheEngine* engine, ParsedCommand cmd)
     {
         if (cmd.args.empty())
@@ -411,6 +456,12 @@ namespace
             co_return co_await HandleCommand(socket, tail);
         if (name == "FLUSHDB" || name == "FLUSHALL")
             co_return co_await HandleFlush(socket, engine);
+        if (name == "SELECT")
+            co_return co_await HandleSelect(socket, tail);
+        if (name == "CLIENT")
+            co_return co_await HandleClient(socket, tail);
+        if (name == "CONFIG")
+            co_return co_await HandleConfig(socket, tail);
         if (name == "QUIT")
         {
             (void) co_await ReplyOk(socket);
