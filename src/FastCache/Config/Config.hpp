@@ -96,6 +96,14 @@ struct Config
     /// TCP port. memcached default is 11211; fastcached's MVP follows.
     std::uint16_t port { 11211 };
 
+    /// ::listen() backlog — the depth of the kernel's queue of accepted-
+    /// but-not-yet-handed-off connections. Bursts of parallel clients (a
+    /// `make -jN` driving sccache opens many sockets at once) overflow a
+    /// small backlog and get ECONNREFUSED / timeouts at the OS layer before
+    /// the daemon ever sees them. Defaults to 511 (the value redis uses);
+    /// the kernel silently clamps to its own SOMAXCONN ceiling.
+    int listenBacklog { 511 };
+
     /// Log threshold.
     LogLevel logLevel { LogLevel::Info };
 

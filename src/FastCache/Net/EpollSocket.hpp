@@ -62,7 +62,7 @@ class EpollListener final: public IListener
     [[nodiscard]] static std::unique_ptr<EpollListener> Bind(EpollReactor& reactor,
                                                              std::string_view bindAddress,
                                                              std::uint16_t port,
-                                                             int backlog = 64,
+                                                             int backlog = 511,
                                                              IAddressResolver& resolver = DefaultAddressResolver());
 
     EpollListener(EpollListener const&) = delete;

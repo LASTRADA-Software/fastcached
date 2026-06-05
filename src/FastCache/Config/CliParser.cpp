@@ -95,6 +95,18 @@ namespace
         return ParsePositiveInt(sv, "storage-shards");
     }
 
+    [[nodiscard]] std::expected<int, ConfigError> ParseListenBacklog(std::string_view sv)
+    {
+        // The kernel clamps to its own SOMAXCONN ceiling, so we only guard
+        // against absurd or non-positive input; 1..65535 is plenty of headroom.
+        return ParsePositiveInt(sv, "listen-backlog").and_then([](std::size_t value) -> std::expected<int, ConfigError> {
+            if (value == 0 || value > 65535)
+                return std::unexpected(MakeError(
+                    ConfigErrorCode::OutOfRange, "listen-backlog", std::format("out of range (1..65535): {}", value)));
+            return static_cast<int>(value);
+        });
+    }
+
     [[nodiscard]] std::expected<ExecutionModel, ConfigError> ParseExecutionModel(std::string_view sv)
     {
         if (sv == "auto")
@@ -353,6 +365,16 @@ namespace
                 return ArgOutcome::Continue;
             }
         }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--listen-backlog", ParseListenBacklog, cfg.listenBacklog);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.listenBacklogExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
         return ArgOutcome::Unknown;
     }
 
@@ -401,8 +423,11 @@ namespace
           .description = "per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)" },
         { .flag = "--execution-model=<mode>",
           .description = "auto|threaded|reactor (default auto)\n"
-                         "auto: reactor for in-memory, threaded for --storage on disk" },
+                         "auto: the reactor for both in-memory and --storage on disk;\n"
+                         "threaded selects the legacy per-connection worker pool" },
         { .flag = "--threads=<N>", .description = "worker thread count for threaded mode (default: hardware_concurrency)" },
+        { .flag = "--listen-backlog=<N>",
+          .description = "::listen() backlog depth (default 511; clamped to the kernel's SOMAXCONN)" },
         { .flag = "--storage-shards=<N>",
           .description = "shard storage into N partitions for write parallelism\n"
                          "default: 1 (single-file mode) when --storage names a regular file,\n"

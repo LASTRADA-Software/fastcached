@@ -211,6 +211,16 @@ namespace
             cfg.storageShards = static_cast<std::size_t>(raw);
             return {};
         }
+        /// `listen_backlog`: ::listen() backlog depth (1..65535).
+        if (key == "listen_backlog")
+        {
+            auto const raw = valueNode.as<int>();
+            if (raw < 1 || raw > 65535)
+                return std::unexpected(
+                    MakeError(ConfigErrorCode::OutOfRange, path, "listen_backlog", "must be in 1..65535", line));
+            cfg.listenBacklog = raw;
+            return {};
+        }
         return std::unexpected(MakeError(ConfigErrorCode::UnknownKey, path, key, "unrecognised key", line));
     }
 

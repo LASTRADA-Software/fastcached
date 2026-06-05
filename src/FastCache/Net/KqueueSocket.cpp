@@ -329,6 +329,7 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
         return;
     }
     SetNonBlocking(fd);
+    Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(fd));
     auto* awaitable = impl->pending;
     impl->pending = nullptr;
     impl->reactor.UpdateInterest(&impl->handler, false, false);

@@ -146,6 +146,24 @@ TEST_CASE("CliParser: --storage-shards=0 records the explicit-set flag", "[confi
     REQUIRE(result->storageShardsExplicit);
 }
 
+TEST_CASE("CliParser: --listen-backlog sets the value and records the explicit-set flag", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--listen-backlog=1024" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.listenBacklog == 1024);
+    REQUIRE(result->listenBacklogExplicit);
+}
+
+TEST_CASE("CliParser: --listen-backlog rejects out-of-range values", "[config][cli]")
+{
+    auto const zero = std::array<char const*, 1> { "--listen-backlog=0" };
+    REQUIRE_FALSE(FastCache::ParseCli(std::span<char const* const> { zero }).has_value());
+
+    auto const tooBig = std::array<char const*, 1> { "--listen-backlog=70000" };
+    REQUIRE_FALSE(FastCache::ParseCli(std::span<char const* const> { tooBig }).has_value());
+}
+
 TEST_CASE("CliParser: --storage-durability=batched records the explicit-set flag", "[config][cli][regression]")
 {
     // batched is the field's default; absent an explicit-tracker the
@@ -173,6 +191,7 @@ TEST_CASE("CliParser: omitting all flags leaves every explicit-tracker false", "
     REQUIRE_FALSE(result->executionModelExplicit);
     REQUIRE_FALSE(result->workerThreadsExplicit);
     REQUIRE_FALSE(result->storageShardsExplicit);
+    REQUIRE_FALSE(result->listenBacklogExplicit);
 }
 
 TEST_CASE("CliParser: --bind sets the address and records the explicit-set flag", "[config][cli][bind]")
@@ -347,7 +366,7 @@ TEST_CASE("CliParser: --help wraps continuation lines to the description column"
     {
         if (line.starts_with("  --execution-model"))
             flagColumn = DescriptionColumn(line);
-        else if (line.find("auto: reactor for in-memory") != std::string_view::npos)
+        else if (line.find("auto: the reactor for both in-memory") != std::string_view::npos)
             continuationColumn = line.find_first_not_of(' ');
     }
 

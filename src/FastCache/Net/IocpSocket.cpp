@@ -257,6 +257,7 @@ struct IocpListener::Impl
         }
 
         // Hand the accepted SOCKET off into an IocpSocket wrapping it.
+        Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(op->acceptSock));
         auto sock = std::make_unique<IocpSocket>(*op->reactor, static_cast<std::uintptr_t>(op->acceptSock));
         op->acceptSock = INVALID_SOCKET;
         if (awaitable)

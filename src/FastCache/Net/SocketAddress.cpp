@@ -23,6 +23,7 @@
     #include <unistd.h>
 
     #include <netinet/in.h>
+    #include <netinet/tcp.h>
 #endif
 
 namespace FastCache
@@ -78,6 +79,24 @@ namespace
     }
 #endif
 } // namespace
+
+namespace Detail
+{
+
+    void ApplyHotSocketOptions(NativeSocket socket) noexcept
+    {
+        // TCP_NODELAY disables Nagle's algorithm so a small reply isn't held
+        // back waiting for the peer's ACK of a previous segment. Best-effort.
+        int const one = 1;
+#if defined(_WIN32)
+        ::setsockopt(
+            static_cast<SOCKET>(socket), IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char const*>(&one), sizeof(one));
+#else
+        ::setsockopt(static_cast<int>(socket), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#endif
+    }
+
+} // namespace Detail
 
 std::expected<std::vector<ResolvedEndpoint>, std::string> SystemAddressResolver::Resolve(std::string_view host,
                                                                                          std::uint16_t port)

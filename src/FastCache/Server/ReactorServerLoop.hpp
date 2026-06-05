@@ -21,6 +21,16 @@ struct ReactorServerOptions
     std::string bindAddress { "127.0.0.1" };
     std::uint16_t port { 11211 };
     std::size_t maxConnections { 0 }; ///< 0 = unlimited.
+    int listenBacklog { 511 };        ///< ::listen() backlog depth.
+
+    /// Number of threads draining the reactor. 1 keeps strict single-threaded
+    /// semantics (the in-memory fast path, where the unwrapped storage is not
+    /// thread-safe). >1 is honoured only on platforms whose reactor is
+    /// multi-thread safe (Windows IOCP today); elsewhere the loop runs
+    /// single-threaded regardless. With >1 threads every IStorage the
+    /// connections reach must be thread-safe (the disk backend is wrapped in a
+    /// ShardedStorage by the caller).
+    unsigned reactorThreads { 1 };
 };
 
 /// Run the reactor-driven server loop using the platform's native

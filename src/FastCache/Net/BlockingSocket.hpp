@@ -32,6 +32,15 @@ namespace Detail
     /// One-time Winsock startup / Linux SIGPIPE setup. Idempotent.
     void EnsureNetworkInitialised();
 
+    /// Apply latency-critical socket options to a freshly accepted or
+    /// connected stream socket. Currently sets TCP_NODELAY so that small
+    /// request/response writes are not delayed by Nagle's algorithm — which,
+    /// combined with delayed ACK, can add tens (Linux) to hundreds (Windows)
+    /// of milliseconds per round trip on the request hot path. Best-effort:
+    /// a failure is ignored and leaves the OS default in place.
+    /// @param socket The connected stream-socket handle to tune.
+    void ApplyHotSocketOptions(NativeSocket socket) noexcept;
+
 } // namespace Detail
 
 /// Blocking-IO ISocket implementation. Reads/Writes call the OS socket
@@ -76,7 +85,7 @@ class BlockingListener final: public IListener
     ///         (Accept() will immediately yield the bind error).
     [[nodiscard]] static std::unique_ptr<BlockingListener> Bind(std::string_view bindAddress,
                                                                 std::uint16_t port,
-                                                                int backlog = 64,
+                                                                int backlog = 511,
                                                                 IAddressResolver& resolver = DefaultAddressResolver());
 
     BlockingListener(BlockingListener const&) = delete;

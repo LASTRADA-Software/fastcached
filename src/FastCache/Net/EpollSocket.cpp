@@ -336,6 +336,7 @@ void EpollListener::Impl::OnReadable(EpollFdHandler* base)
         awaitable->Complete(std::unexpected(MakePosixError(errno, "accept4")));
         return;
     }
+    Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(fd));
     auto* awaitable = impl->pending;
     impl->pending = nullptr;
     std::ignore = impl->reactor.UpdateInterest(&impl->handler, false, false);

@@ -291,6 +291,7 @@ AcceptAwaitable BlockingListener::Accept()
     if (acceptedRaw == static_cast<std::remove_const_t<decltype(acceptedRaw)>>(Detail::InvalidSocket))
         return AcceptAwaitable { std::unexpected(MakeSystemError("accept")) };
 
+    Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(acceptedRaw));
     return AcceptAwaitable { AcceptResult {
         std::make_unique<BlockingSocket>(static_cast<Detail::NativeSocket>(acceptedRaw)) } };
 }

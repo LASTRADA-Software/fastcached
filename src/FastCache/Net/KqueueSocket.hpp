@@ -54,7 +54,7 @@ class KqueueListener final: public IListener
     [[nodiscard]] static std::unique_ptr<KqueueListener> Bind(KqueueReactor& reactor,
                                                               std::string_view bindAddress,
                                                               std::uint16_t port,
-                                                              int backlog = 64,
+                                                              int backlog = 511,
                                                               IAddressResolver& resolver = DefaultAddressResolver());
 
     ~KqueueListener() override;

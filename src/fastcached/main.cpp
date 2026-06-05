@@ -109,6 +109,8 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         fileCfg.workerThreads = cliCfg.workerThreads;
     if (cli.storageShardsExplicit)
         fileCfg.storageShards = cliCfg.storageShards;
+    if (cli.listenBacklogExplicit)
+        fileCfg.listenBacklog = cliCfg.listenBacklog;
     if (cliCfg.logTimestamps)
         fileCfg.logTimestamps = true;
     return fileCfg;
@@ -148,17 +150,22 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
     return 1;
 }
 
-/// Resolve `ExecutionModel::Auto` to a concrete model based on the
-/// active storage backend: reactor when the cache is in-memory (no
-/// disk I/O to overlap with), threaded when CoW on-disk storage is
-/// configured (per-shard locks and page-store fsyncs benefit from
-/// parallel workers). Pass-through for an explicit Threaded/Reactor.
+/// Resolve `ExecutionModel::Auto` to a concrete model. Both the in-memory
+/// and the on-disk backend now run on the reactor: one event loop
+/// multiplexes every connection, so the number of concurrent clients is
+/// bounded by memory rather than by a worker count. (The legacy thread pool
+/// pinned one worker per keep-alive session, so once open connections
+/// exceeded the pool size — common under a parallel sccache build — the
+/// surplus connections were accepted but never served and the client timed
+/// out.) On Windows the reactor is additionally drained by several threads,
+/// so a blocking page-store fsync overlaps with serving other connections.
+/// `--execution-model=threaded` still selects the legacy pool explicitly.
 [[nodiscard]] FastCache::ExecutionModel ResolveExecutionModel(FastCache::ExecutionModel requested,
-                                                              bool usingPersistentStorage) noexcept
+                                                              bool /*usingPersistentStorage*/) noexcept
 {
     if (requested != FastCache::ExecutionModel::Auto)
         return requested;
-    return usingPersistentStorage ? FastCache::ExecutionModel::Threaded : FastCache::ExecutionModel::Reactor;
+    return FastCache::ExecutionModel::Reactor;
 }
 
 /// Translate the user-facing StorageDurability into the page-store enum.
@@ -296,7 +303,7 @@ struct StorageBackendBundle
 /// when DaemonControls reports a stop request.
 int RunThreadedServer(FastCache::Config const& effective, FastCache::CacheEngine& engine, FastCache::ConsoleLogger& logger)
 {
-    auto listener = FastCache::BlockingListener::Bind(effective.bindAddress, effective.port);
+    auto listener = FastCache::BlockingListener::Bind(effective.bindAddress, effective.port, effective.listenBacklog);
     if (!listener || !listener->IsBound())
     {
         logger.Logf(FastCache::LogLevel::Fatal,
@@ -304,6 +311,7 @@ int RunThreadedServer(FastCache::Config const& effective, FastCache::CacheEngine
                     listener ? listener->BindError() : std::string_view { "null listener" });
         return EXIT_FAILURE;
     }
+    logger.Log(FastCache::LogLevel::Info, "ready, accepting connections");
 
     std::atomic<bool> watchdogQuit { false };
     std::jthread watchdog { [&] {
@@ -338,7 +346,15 @@ int DaemonBody(FastCache::Config const& effective)
     auto const usingPersistent = !effective.storagePath.empty();
     auto const resolvedExecutionModel = ResolveExecutionModel(effective.executionModel, usingPersistent);
     auto const physicalShards = ResolvePhysicalShards(effective.storageShards, usingPersistent, effective.storagePath);
-    auto const useShardingWrapper = physicalShards > 1 || resolvedExecutionModel == FastCache::ExecutionModel::Threaded;
+    // Wrap the backend in a ShardedStorage (its per-shard mutex serialises
+    // access) whenever more than one thread can reach it: the legacy threaded
+    // pool, an explicit multi-shard layout, or the persistent backend on the
+    // reactor — where the multi-threaded Windows IOCP loop may drive several
+    // connections into storage at once, and a lone CowTreeStorage is not
+    // internally thread-safe. The in-memory single-shard reactor stays
+    // unwrapped: one thread owns it, so the wrapper would be pure overhead.
+    auto const useShardingWrapper =
+        physicalShards > 1 || resolvedExecutionModel == FastCache::ExecutionModel::Threaded || usingPersistent;
 
     auto bundle = BuildStorageBackend(effective, usingPersistent, useShardingWrapper, physicalShards);
     if (!bundle.has_value())
@@ -404,7 +420,10 @@ int DaemonBody(FastCache::Config const& effective)
                 shardingMode);
 
     InstallStopHandlers();
-    logger.Log(FastCache::LogLevel::Info, "ready, accepting connections");
+    // The "ready, accepting connections" line is emitted by the server loop
+    // itself, only once its listener is actually bound and listening — see
+    // RunReactorServer / RunThreadedServer. Logging it here (before bind)
+    // would race a client that connects on the strength of the message.
 
     std::atomic<bool> reloaderQuit { false };
     std::jthread reloaderThread { [&reloader, &logger, &reloaderQuit] {
@@ -428,6 +447,16 @@ int DaemonBody(FastCache::Config const& effective)
         FastCache::ReactorServerOptions serverOpts;
         serverOpts.bindAddress = effective.bindAddress;
         serverOpts.port = effective.port;
+        serverOpts.listenBacklog = effective.listenBacklog;
+        // In-memory storage owns a single, lock-free LRU that exactly one
+        // thread may touch, so it stays single-threaded. The persistent
+        // backend is wrapped in a ShardedStorage above and benefits from
+        // several reactor threads overlapping page-store fsyncs (honoured on
+        // Windows IOCP; clamped to 1 elsewhere by RunReactorServer).
+        auto const hardwareThreads = std::max(1U, std::thread::hardware_concurrency());
+        auto const persistentThreads =
+            effective.workerThreads != 0 ? static_cast<unsigned>(effective.workerThreads) : hardwareThreads;
+        serverOpts.reactorThreads = usingPersistent ? persistentThreads : 1U;
         exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
     }
     else

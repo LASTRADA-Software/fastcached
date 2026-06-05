@@ -27,9 +27,16 @@ src/FastCache/
 ```
 
 Production flow: `main()` -> CLI -> optional YAML -> `ConfigReloader` ->
-`CacheEngine` over `InMemoryLruStorage` -> `BlockingListener` ->
-`RunBlockingServerLoop` (one `std::jthread` per connection driving the
-coroutine handler via `SyncRun`).
+`CacheEngine` over `InMemoryLruStorage` (or a `ShardedStorage` of
+`CowTreeStorage` when `--storage` is set) -> platform `IListener` ->
+`RunReactorServer`. The reactor (IOCP / epoll / kqueue) multiplexes every
+connection on its event loop, so the number of concurrent clients is bounded
+by memory, not by a worker count. On Windows the persistent backend drives
+the IOCP reactor from several threads (sized by `--threads`) so a blocking
+page-store `fsync` overlaps with serving other connections; the disk backend
+is therefore always wrapped in a `ShardedStorage` for thread safety. The
+legacy thread-per-connection pool (`RunPooledServerLoop`) and blocking driver
+remain reachable via `--execution-model=threaded`.
 
 ## Design Patterns & Principles
 

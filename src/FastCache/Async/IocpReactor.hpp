@@ -30,11 +30,17 @@ struct IocpCompletion
 
 /// Windows IOCP-based reactor.
 ///
-/// One reactor instance, one I/O completion port, one worker thread (the
-/// thread that calls Run()). Coroutines posted via Submit() are resumed on
-/// that thread. Sockets attach themselves to the reactor's IOCP via
-/// AttachHandle so their WSARecv/WSASend completions arrive on the same
-/// thread.
+/// One reactor instance and one I/O completion port, drained by one *or
+/// more* worker threads — every thread that calls Run() pulls completions
+/// from the same port. A single connection coroutine only ever has one
+/// outstanding operation at a time (it awaits reads/writes sequentially and
+/// the protocol handlers schedule no concurrent timers), so a given
+/// coroutine is only ever resumed by the one thread that dequeues its
+/// completion — two threads never resume the same coroutine concurrently.
+/// Running N threads lets a blocking storage call (an fsync on the disk
+/// backend) occupy one thread while the others keep accepting and serving;
+/// it also means any IStorage reachable from a connection must be
+/// thread-safe (the server wraps the disk backend in a ShardedStorage).
 ///
 /// Submit/Schedule are safe to call from any thread; both go through
 /// PostQueuedCompletionStatus.
@@ -47,7 +53,13 @@ class IocpReactor: public IReactor
 {
   public:
     /// Construct over an IClock; the clock drives all deadline checks.
-    explicit IocpReactor(IClock& clock);
+    /// @param clock Time provider used for all deadline checks.
+    /// @param concurrency Maximum number of threads the completion port lets
+    ///        run concurrently. 0 means "one per logical processor" (the IOCP
+    ///        default). 1 preserves strict single-threaded semantics for tests
+    ///        and the in-memory server. Must be paired with the same number of
+    ///        threads calling Run().
+    explicit IocpReactor(IClock& clock, unsigned concurrency = 1);
     ~IocpReactor() override;
 
     IocpReactor(IocpReactor const&) = delete;
