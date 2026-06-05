@@ -141,6 +141,22 @@ class FilePageStore final: public IPageStore
     /// on-disk free-list chain on Open and updated on Free/Allocate.
     std::vector<std::uint64_t> _freeList;
 
+    /// Group-commit (Batched durability): pages freed since the last flush.
+    /// They are NOT reusable yet — reusing a page before its freeing is
+    /// durable would let a crash-rollback (to the last flush) read a page that
+    /// a later in-batch write overwrote. On flush they graduate to `_freeList`.
+    std::vector<std::uint64_t> _pendingFree;
+
+    /// Commits (meta writes) since the last Batched flush; drives the
+    /// flush-every-N-commits boundary.
+    std::size_t _commitsSinceFlush { 0 };
+
+    /// Flush the accumulated Batched writes after this many commits.
+    static constexpr std::size_t BatchedFlushInterval = 64;
+
+    /// fsync + graduate pending frees. Caller must hold `_ioMutex`.
+    [[nodiscard]] auto FlushBatchLocked() -> std::expected<void, CowTreeError>;
+
     /// Cached page buffer to satisfy the IPageStore lifetime contract on
     /// Read() — a returned BytesView must remain valid until the next
     /// mutating call. Mutable because Read is `const` from the consumer's

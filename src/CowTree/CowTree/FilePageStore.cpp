@@ -49,6 +49,13 @@ FilePageStore::FilePageStore(Options options) noexcept:
 
 FilePageStore::~FilePageStore()
 {
+    // Graceful shutdown: make any buffered group-commit writes durable so a
+    // clean stop never loses data (only a hard crash drops the last batch).
+    if (_options.durability == Durability::Batched && _commitsSinceFlush > 0)
+    {
+        std::scoped_lock const lock { _ioMutex };
+        std::ignore = FlushBatchLocked();
+    }
 #if defined(_WIN32)
     if (_handle != nullptr)
     {
@@ -367,15 +374,33 @@ auto FilePageStore::Free(PageId id) -> std::expected<void, CowTreeError>
     if (!_live.contains(id.value))
         return std::unexpected(CowTreeError::OutOfRange);
     _live.erase(id.value);
-    _freeList.push_back(id.value);
+    // Batched group-commit defers reuse until the freeing is durable (see
+    // _pendingFree); other modes recycle immediately.
+    if (_options.durability == Durability::Batched)
+        _pendingFree.push_back(id.value);
+    else
+        _freeList.push_back(id.value);
     if (_readBufferPageIdx == id.value)
         _readBufferPageIdx = 0;
     return {};
 }
 
+auto FilePageStore::FlushBatchLocked() -> std::expected<void, CowTreeError>
+{
+    if (auto const r = Fsync(); !r.has_value())
+        return std::unexpected(r.error());
+    // The freeing is now durable, so freed pages may be recycled.
+    _freeList.insert(_freeList.end(), _pendingFree.begin(), _pendingFree.end());
+    _pendingFree.clear();
+    _commitsSinceFlush = 0;
+    return {};
+}
+
 auto FilePageStore::SyncData() -> std::expected<void, CowTreeError>
 {
-    if (_options.durability == Durability::None)
+    // Only strict Fsync mode flushes data per commit. Batched defers the flush
+    // to a group-commit boundary (see WriteMeta); None never flushes.
+    if (_options.durability != Durability::Fsync)
         return {};
     std::scoped_lock const lock { _ioMutex };
     return Fsync();
@@ -399,10 +424,15 @@ auto FilePageStore::WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<
     std::scoped_lock const lock { _ioMutex };
     if (auto const r = WriteAt(MetaSlotOffset(slot), BytesView { buf.data(), buf.size() }); !r.has_value())
         return std::unexpected(r.error());
-    if (_options.durability != Durability::None)
+    if (_options.durability == Durability::Fsync)
+        return Fsync(); // strict: every commit is durable
+    if (_options.durability == Durability::Batched)
     {
-        if (auto const r = Fsync(); !r.has_value())
-            return std::unexpected(r.error());
+        // Group commit: flush only every BatchedFlushInterval commits. A hard
+        // crash loses at most that many recent writes; the pending-free list
+        // ensures the rolled-back tree is never corrupted.
+        if (++_commitsSinceFlush >= BatchedFlushInterval)
+            return FlushBatchLocked();
     }
     return {};
 }

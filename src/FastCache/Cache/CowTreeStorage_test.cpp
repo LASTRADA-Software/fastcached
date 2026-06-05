@@ -15,6 +15,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -1160,12 +1161,15 @@ namespace
 {
 /// Options with a small fixed page so values above ~1 KiB exercise the
 /// overflow chain, and a generous value cap so multi-page values are allowed.
-FastCache::CowTreeStorage::Options OverflowOptions(std::filesystem::path const& path)
+FastCache::CowTreeStorage::Options OverflowOptions(
+    std::filesystem::path const& path,
+    CowTree::FilePageStore::Durability durability = CowTree::FilePageStore::Durability::Batched)
 {
     FastCache::CowTreeStorage::Options opts;
     opts.path = path;
     opts.pageSize = 4096;                 // InlineValueLimit() = 1024
     opts.maxValueBytes = 4 * 1024 * 1024; // allow multi-page values
+    opts.durability = durability;
     return opts;
 }
 } // namespace
@@ -1201,14 +1205,16 @@ TEST_CASE("Overflow chains round-trip across many sizes and survive reopen", "[c
 TEST_CASE("Overwriting a large value reclaims the old overflow chain", "[cowstorage][overflow]")
 {
     TempFile tmp;
-    auto storage = FastCache::CowTreeStorage::Open(OverflowOptions(tmp.path));
+    // Fsync durability frees pages immediately (Batched defers reuse to the
+    // group-commit flush boundary), so reuse is observable within this session.
+    auto storage = FastCache::CowTreeStorage::Open(OverflowOptions(tmp.path, CowTree::FilePageStore::Durability::Fsync));
     REQUIRE(storage.has_value());
 
     REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 1), 0, FastCache::TimePoint::max()).has_value());
     auto const afterFirst = std::filesystem::file_size(tmp.path);
 
-    for (int i = 0; i < 12; ++i)
-        REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 100 + i), 0, FastCache::TimePoint::max()).has_value());
+    for (auto const i: std::views::iota(0U, 12U))
+        REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 100U + i), 0, FastCache::TimePoint::max()).has_value());
     auto const afterMany = std::filesystem::file_size(tmp.path);
 
     // Each overwrite frees the previous chain, so the file reuses pages instead
@@ -1224,16 +1230,18 @@ TEST_CASE("Overwriting a large value reclaims the old overflow chain", "[cowstor
 TEST_CASE("Deleting a large value frees its overflow chain for reuse", "[cowstorage][overflow]")
 {
     TempFile tmp;
-    auto storage = FastCache::CowTreeStorage::Open(OverflowOptions(tmp.path));
+    // Fsync durability frees pages immediately so reuse is observable in-session
+    // (Batched would defer the freed-chain reuse to the group-commit boundary).
+    auto storage = FastCache::CowTreeStorage::Open(OverflowOptions(tmp.path, CowTree::FilePageStore::Durability::Fsync));
     REQUIRE(storage.has_value());
     FastCache::ManualClock clock;
 
     REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 5), 0, FastCache::TimePoint::max()).has_value());
     auto const afterFirst = std::filesystem::file_size(tmp.path);
-    for (int i = 0; i < 8; ++i)
+    for (auto const i: std::views::iota(0U, 8U))
     {
         REQUIRE((*storage)->Delete("k", clock.Now()).has_value());
-        REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 200 + i), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 200U + i), 0, FastCache::TimePoint::max()).has_value());
     }
     REQUIRE(std::filesystem::file_size(tmp.path) < afterFirst * 3);
 
