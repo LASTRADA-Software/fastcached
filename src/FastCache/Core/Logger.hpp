@@ -120,9 +120,7 @@ class ConsoleLogger final: public ILogger
     /// @param sink Output stream (e.g., std::cerr).
     /// @param initialMinLevel Initial filter threshold.
     /// @param timestamps When true, prefix each line with an ISO 8601 UTC timestamp.
-    explicit ConsoleLogger(std::ostream& sink,
-                           LogLevel initialMinLevel = LogLevel::Info,
-                           bool timestamps = false) noexcept;
+    explicit ConsoleLogger(std::ostream& sink, LogLevel initialMinLevel = LogLevel::Info, bool timestamps = false) noexcept;
 
     void Log(LogLevel level, std::string_view message) override;
     [[nodiscard]] LogLevel MinLevel() const noexcept override;
