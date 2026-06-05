@@ -21,6 +21,8 @@
 #include <thread>
 #include <vector>
 
+#include <CowTree/InMemoryPageStore.hpp>
+
 using namespace std::chrono_literals;
 using FastCache::Testing::Decode;
 using FastCache::Testing::MakeBytes;
@@ -1148,4 +1150,161 @@ TEST_CASE("CowTreeStorage Get does not persist lastAccess (no write on a read pa
         REQUIRE(peeked->found);
         REQUIRE(peeked->entry.lastAccess == FastCache::TimePoint::min()); // never written by the read
     });
+}
+
+// ============================================================================
+// Overflow pages (values larger than the inline limit spill to a page chain)
+// ============================================================================
+
+namespace
+{
+/// Options with a small fixed page so values above ~1 KiB exercise the
+/// overflow chain, and a generous value cap so multi-page values are allowed.
+FastCache::CowTreeStorage::Options OverflowOptions(std::filesystem::path const& path)
+{
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = path;
+    opts.pageSize = 4096;                 // InlineValueLimit() = 1024
+    opts.maxValueBytes = 4 * 1024 * 1024; // allow multi-page values
+    return opts;
+}
+} // namespace
+
+TEST_CASE("Overflow chains round-trip across many sizes and survive reopen", "[cowstorage][overflow]")
+{
+    TempFile tmp;
+    std::vector<std::size_t> const sizes { 0, 1, 1024, 1025, 4079, 4080, 4081, 8192, 65536, 262144, 1024 * 1024 };
+
+    {
+        auto storage = FastCache::CowTreeStorage::Open(OverflowOptions(tmp.path));
+        REQUIRE(storage.has_value());
+        for (auto const size: sizes)
+        {
+            auto const value = RandomBytes(size, 0xA000ULL + size);
+            REQUIRE((*storage)->Set(std::format("k{}", size), value, 0, FastCache::TimePoint::max()).has_value());
+        }
+    }
+
+    auto reopened = FastCache::CowTreeStorage::Open(OverflowOptions(tmp.path));
+    REQUIRE(reopened.has_value());
+    FastCache::ManualClock clock;
+    for (auto const size: sizes)
+    {
+        auto const value = RandomBytes(size, 0xA000ULL + size);
+        auto const got = (*reopened)->Get(std::format("k{}", size), clock.Now());
+        REQUIRE(got.has_value());
+        REQUIRE(got->found);
+        REQUIRE(got->entry.value == value); // exact bytewise round-trip via the chain
+    }
+}
+
+TEST_CASE("Overwriting a large value reclaims the old overflow chain", "[cowstorage][overflow]")
+{
+    TempFile tmp;
+    auto storage = FastCache::CowTreeStorage::Open(OverflowOptions(tmp.path));
+    REQUIRE(storage.has_value());
+
+    REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 1), 0, FastCache::TimePoint::max()).has_value());
+    auto const afterFirst = std::filesystem::file_size(tmp.path);
+
+    for (int i = 0; i < 12; ++i)
+        REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 100 + i), 0, FastCache::TimePoint::max()).has_value());
+    auto const afterMany = std::filesystem::file_size(tmp.path);
+
+    // Each overwrite frees the previous chain, so the file reuses pages instead
+    // of growing ~12x. (A leak would push this well past 3x.)
+    REQUIRE(afterMany < afterFirst * 3);
+
+    auto const got = (*storage)->Get("k", FastCache::ManualClock {}.Now());
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
+    REQUIRE(got->entry.value == RandomBytes(256 * 1024, 111)); // last write wins
+}
+
+TEST_CASE("Deleting a large value frees its overflow chain for reuse", "[cowstorage][overflow]")
+{
+    TempFile tmp;
+    auto storage = FastCache::CowTreeStorage::Open(OverflowOptions(tmp.path));
+    REQUIRE(storage.has_value());
+    FastCache::ManualClock clock;
+
+    REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 5), 0, FastCache::TimePoint::max()).has_value());
+    auto const afterFirst = std::filesystem::file_size(tmp.path);
+    for (int i = 0; i < 8; ++i)
+    {
+        REQUIRE((*storage)->Delete("k", clock.Now()).has_value());
+        REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 200 + i), 0, FastCache::TimePoint::max()).has_value());
+    }
+    REQUIRE(std::filesystem::file_size(tmp.path) < afterFirst * 3);
+
+    REQUIRE((*storage)->Delete("k", clock.Now()).has_value());
+    auto const got = (*storage)->Get("k", clock.Now());
+    REQUIRE(got.has_value());
+    REQUIRE_FALSE(got->found);
+}
+
+TEST_CASE("Crash during overflow-chain write leaves the previous value intact", "[cowstorage][overflow][crash]")
+{
+    CowTree::InMemoryPageStore store; // default 4 KiB page -> 1 KiB inline limit
+    FastCache::CowTreeStorage::Options opts;
+    opts.maxValueBytes = 1024 * 1024;
+
+    {
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("initial"), 0, FastCache::TimePoint::max()).has_value());
+    }
+
+    {
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        CowTree::InMemoryPageStore::FaultPlan plan;
+        plan.failNthWrite = 1; // fail the first overflow-chunk write
+        store.SetFaultPlan(plan);
+        store.ResetCounters();
+        auto const r = (*storage)->Set("k", RandomBytes(50000, 9), 0, FastCache::TimePoint::max());
+        REQUIRE_FALSE(r.has_value());
+    }
+
+    store.SetFaultPlan({});
+    store.ResetCounters();
+    auto reopened = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE(reopened.has_value());
+    auto const got = (*reopened)->Get("k", FastCache::ManualClock {}.Now());
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
+    REQUIRE(Decode(got->entry.value) == "initial"); // rolled back, never a hybrid
+}
+
+TEST_CASE("Crash during overflow SyncData leaves the previous value intact", "[cowstorage][overflow][crash]")
+{
+    CowTree::InMemoryPageStore store;
+    FastCache::CowTreeStorage::Options opts;
+    opts.maxValueBytes = 1024 * 1024;
+
+    {
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("initial"), 0, FastCache::TimePoint::max()).has_value());
+    }
+
+    {
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        CowTree::InMemoryPageStore::FaultPlan plan;
+        plan.failNthSyncData = 1; // fail the durability barrier before the meta flip
+        store.SetFaultPlan(plan);
+        store.ResetCounters();
+        auto const r = (*storage)->Set("k", RandomBytes(50000, 11), 0, FastCache::TimePoint::max());
+        REQUIRE_FALSE(r.has_value());
+    }
+
+    store.SetFaultPlan({});
+    store.ResetCounters();
+    auto reopened = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE(reopened.has_value());
+    auto const got = (*reopened)->Get("k", FastCache::ManualClock {}.Now());
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
+    REQUIRE(Decode(got->entry.value) == "initial");
 }
