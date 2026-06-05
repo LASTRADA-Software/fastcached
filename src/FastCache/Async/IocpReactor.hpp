@@ -30,17 +30,14 @@ struct IocpCompletion
 
 /// Windows IOCP-based reactor.
 ///
-/// One reactor instance and one I/O completion port, drained by one *or
-/// more* worker threads — every thread that calls Run() pulls completions
-/// from the same port. A single connection coroutine only ever has one
-/// outstanding operation at a time (it awaits reads/writes sequentially and
-/// the protocol handlers schedule no concurrent timers), so a given
-/// coroutine is only ever resumed by the one thread that dequeues its
-/// completion — two threads never resume the same coroutine concurrently.
-/// Running N threads lets a blocking storage call (an fsync on the disk
-/// backend) occupy one thread while the others keep accepting and serving;
-/// it also means any IStorage reachable from a connection must be
-/// thread-safe (the server wraps the disk backend in a ShardedStorage).
+/// One reactor instance, one I/O completion port, ONE worker thread (the
+/// thread that calls Run()). Coroutines posted via Submit() are resumed on
+/// that thread; a connection's socket is associated with this reactor's port,
+/// so all its completions are dequeued by this one thread and its coroutine is
+/// never resumed concurrently. Scaling across cores is done by running several
+/// independent reactors (one per thread), each owning its own connections —
+/// NOT by draining one port from many threads (that migrates a coroutine
+/// across threads and is unsafe).
 ///
 /// Submit/Schedule are safe to call from any thread; both go through
 /// PostQueuedCompletionStatus.
@@ -54,12 +51,7 @@ class IocpReactor: public IReactor
   public:
     /// Construct over an IClock; the clock drives all deadline checks.
     /// @param clock Time provider used for all deadline checks.
-    /// @param concurrency Maximum number of threads the completion port lets
-    ///        run concurrently. 0 means "one per logical processor" (the IOCP
-    ///        default). 1 preserves strict single-threaded semantics for tests
-    ///        and the in-memory server. Must be paired with the same number of
-    ///        threads calling Run().
-    explicit IocpReactor(IClock& clock, unsigned concurrency = 1);
+    explicit IocpReactor(IClock& clock);
     ~IocpReactor() override;
 
     IocpReactor(IocpReactor const&) = delete;

@@ -448,15 +448,10 @@ int DaemonBody(FastCache::Config const& effective)
         serverOpts.bindAddress = effective.bindAddress;
         serverOpts.port = effective.port;
         serverOpts.listenBacklog = effective.listenBacklog;
-        // In-memory storage owns a single, lock-free LRU that exactly one
-        // thread may touch, so it stays single-threaded. The persistent
-        // backend is wrapped in a ShardedStorage above and benefits from
-        // several reactor threads overlapping page-store fsyncs (honoured on
-        // Windows IOCP; clamped to 1 elsewhere by RunReactorServer).
-        auto const hardwareThreads = std::max(1U, std::thread::hardware_concurrency());
-        auto const persistentThreads =
-            effective.workerThreads != 0 ? static_cast<unsigned>(effective.workerThreads) : hardwareThreads;
-        serverOpts.reactorThreads = usingPersistent ? persistentThreads : 1U;
+        // The reactor multiplexes every connection on one thread — no
+        // connection-concurrency ceiling, and no cross-thread coroutine
+        // migration. (Scaling across cores via independent reactors is a
+        // follow-up.)
         exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
     }
     else

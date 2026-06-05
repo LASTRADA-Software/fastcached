@@ -11,7 +11,6 @@
     #include <chrono>
     #include <coroutine>
     #include <thread>
-    #include <vector>
 
 namespace
 {
@@ -90,39 +89,6 @@ TEST_CASE("IocpReactor::Submit resumes a coroutine on the reactor thread", "[rea
 
     reactor.Run();
     REQUIRE(counter.load(std::memory_order_relaxed) == 3);
-}
-
-TEST_CASE("IocpReactor drains from several threads and one Stop() joins them all", "[reactor][iocp]")
-{
-    // Regression for the connection-concurrency ceiling: the persistent
-    // server now drains the reactor from a pool of threads. This proves the
-    // pool model works — N threads pull from one port concurrently — and that
-    // a single Stop() chains a wake-up through every thread (a missing chain
-    // would hang join() below and the test would deadlock).
-    constexpr unsigned ThreadCount = 4;
-    constexpr int WorkerCount = 8;
-    constexpr int YieldsPerWorker = 50;
-
-    FastCache::SteadyClock clock;
-    FastCache::IocpReactor reactor { clock, ThreadCount };
-
-    std::atomic<int> counter { 0 };
-    for (auto i = 0; i < WorkerCount; ++i)
-        Worker(reactor, counter, YieldsPerWorker);
-
-    std::jthread stopper { [&reactor, &counter] {
-        while (counter.load(std::memory_order_relaxed) < WorkerCount * YieldsPerWorker)
-            std::this_thread::sleep_for(std::chrono::milliseconds { 1 });
-        reactor.Stop();
-    } };
-
-    std::vector<std::jthread> threads;
-    for (auto i = 1U; i < ThreadCount; ++i)
-        threads.emplace_back([&reactor] { reactor.Run(); });
-    reactor.Run();   // this thread is the fourth drainer
-    threads.clear(); // joins; deadlocks if Stop() failed to wake every thread
-
-    REQUIRE(counter.load(std::memory_order_relaxed) == WorkerCount * YieldsPerWorker);
 }
 
 TEST_CASE("IocpReactor::Schedule fires a timer", "[reactor][iocp]")

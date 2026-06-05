@@ -47,14 +47,12 @@ namespace
 
 } // namespace
 
-IocpReactor::IocpReactor(IClock& clock, unsigned concurrency):
+IocpReactor::IocpReactor(IClock& clock):
     _clock { clock }
 {
-    // NumberOfConcurrentThreads: 0 lets the OS allow one runnable thread per
-    // logical processor; a non-zero value caps it. We pass the requested
-    // concurrency straight through so the number of Run() threads and the
-    // port's concurrency stay in lock-step.
-    _iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, concurrency);
+    // One worker thread per reactor instance — scaling is by running several
+    // independent reactors, not by draining one port from many threads.
+    _iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, /*threads*/ 1);
 }
 
 IocpReactor::~IocpReactor()
@@ -156,14 +154,7 @@ void IocpReactor::Run()
         {
             auto const& entry = entries[i];
             if (entry.lpCompletionKey == KeyStop)
-            {
-                // Re-post so the next Run() thread also wakes and exits. One
-                // Stop() therefore drains every worker thread: each exiting
-                // thread hands the baton to the next. The final surplus
-                // KeyStop is harmlessly discarded when the port is closed.
-                PostQueuedCompletionStatus(static_cast<HANDLE>(_iocp), 0, KeyStop, nullptr);
                 return;
-            }
             if (entry.lpCompletionKey == KeyResumeCoroutine)
             {
                 if (entry.lpOverlapped == nullptr)
