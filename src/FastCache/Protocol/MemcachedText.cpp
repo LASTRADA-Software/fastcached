@@ -11,6 +11,8 @@
 #include <FastCache/Protocol/MemcachedText.hpp>
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -122,26 +124,45 @@ namespace
         return true;
     }
 
-    /// Format the `VALUE <key> <flags> <bytes>[ <cas>]\r\n` *header line* for a
-    /// get/gets response. The value bytes themselves are appended separately as
-    /// their own gather segment (zero-copy), so this emits only the small line.
-    /// @return The formatted header line.
-    [[nodiscard]] std::string FormatValueHeader(std::string_view key, CacheEntry const& entry, bool includeCas)
+    /// Upper bound on a `VALUE` header line: "VALUE " + key (memcached caps
+    /// keys at 250) + three space-separated unsigned decimals (flags up to
+    /// 10 digits, size up to 20, cas up to 20) + spaces + CRLF, with slack.
+    constexpr std::size_t ValueHeaderCap = 250 + 96;
+
+    /// Format the `VALUE <key> <flags> <bytes>[ <cas>]\r\n` *header line* into a
+    /// caller-owned fixed buffer (no heap allocation), returning a view of the
+    /// written bytes. The value bytes themselves are a separate zero-copy
+    /// gather segment, so this emits only the small line. The buffer must
+    /// outlive the returned view (e.g. it lives in the coroutine frame across
+    /// the write).
+    /// @param out Destination buffer, at least ValueHeaderCap bytes.
+    /// @return View over the formatted header within @p out.
+    [[nodiscard]] std::string_view FormatValueHeader(std::span<char> out,
+                                                     std::string_view key,
+                                                     CacheEntry const& entry,
+                                                     bool includeCas)
     {
-        std::string out;
-        out.append("VALUE ");
-        out.append(key);
-        out.push_back(' ');
-        out.append(std::to_string(entry.flags));
-        out.push_back(' ');
-        out.append(std::to_string(entry.ValueSize()));
+        auto* p = out.data();
+        auto const append = [&p](std::string_view sv) {
+            p = std::ranges::copy(sv, p).out;
+        };
+        auto const appendUint = [&p](std::uint64_t v) {
+            auto const r = std::to_chars(p, p + 20, v);
+            p = r.ptr;
+        };
+        append("VALUE ");
+        append(key);
+        *p++ = ' ';
+        appendUint(entry.flags);
+        *p++ = ' ';
+        appendUint(entry.ValueSize());
         if (includeCas)
         {
-            out.push_back(' ');
-            out.append(std::to_string(entry.cas));
+            *p++ = ' ';
+            appendUint(entry.cas);
         }
-        out.append(Crlf);
-        return out;
+        append(Crlf);
+        return std::string_view { out.data(), static_cast<std::size_t>(p - out.data()) };
     }
 
     /// Retained backing for a gathered get/gets/gat reply: the per-hit header
@@ -176,6 +197,30 @@ namespace
 
     Task<bool> HandleGet(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> keys, bool includeCas)
     {
+        // Fast path for the overwhelmingly common single-key `get`: assemble
+        // the reply with frame-local state and no heap allocation beyond the
+        // one header string — no GatherState shared_ptr, no hits/segments
+        // vectors. The header string and the GetResult live in this coroutine
+        // frame (alive across the suspended write); the value's reference-
+        // counted handle is the write's keep-alive.
+        if (keys.size() == 1)
+        {
+            auto result = engine->Get(keys[0]);
+            if (!result.has_value() || !result->found)
+                co_return co_await WriteAll(socket, "END\r\n");
+            // Header formatted into a frame-local buffer (no heap allocation);
+            // it lives across the suspended write since it's in this frame.
+            std::array<char, ValueHeaderCap> headerBuf {};
+            auto const header = FormatValueHeader(headerBuf, keys[0], result->entry, includeCas);
+            std::array<std::span<std::byte const>, 4> const segments {
+                AsBytes(header),
+                result->entry.ValueBytes(),
+                AsBytes(Crlf),
+                AsBytes(std::string_view { "END\r\n" }),
+            };
+            co_return co_await WriteAllVectored(socket, segments, result->entry.value.AsKeepAlive());
+        }
+
         auto state = std::make_shared<GatherState>();
         {
             // Synchronous lookup loop — scoped so the zone ends before the
@@ -188,7 +233,8 @@ namespace
                 auto result = engine->Get(key);
                 if (!result.has_value() || !result->found)
                     continue;
-                state->headers.push_back(FormatValueHeader(key, result->entry, includeCas));
+                std::array<char, ValueHeaderCap> headerBuf {};
+                state->headers.emplace_back(FormatValueHeader(headerBuf, key, result->entry, includeCas));
                 state->hits.push_back(std::move(*result));
             }
         }
@@ -520,7 +566,8 @@ namespace
             auto r = engine->GetAndTouch(key, exptime);
             if (!r.has_value() || !r->found)
                 continue;
-            state->headers.push_back(FormatValueHeader(key, r->entry, includeCas));
+            std::array<char, ValueHeaderCap> headerBuf {};
+            state->headers.emplace_back(FormatValueHeader(headerBuf, key, r->entry, includeCas));
             state->hits.push_back(std::move(*r));
         }
         co_return co_await WriteGatheredValues(socket, std::move(state));
