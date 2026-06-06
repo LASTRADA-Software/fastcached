@@ -6,9 +6,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -22,6 +24,7 @@
 #include <thread>
 #include <vector>
 
+#include <CowTree/Crc32c.hpp>
 #include <CowTree/InMemoryPageStore.hpp>
 
 using namespace std::chrono_literals;
@@ -43,6 +46,40 @@ std::vector<std::byte> RandomBytes(std::size_t size, std::uint64_t seed)
     for (std::size_t i = 0; i < size; ++i)
         out.push_back(static_cast<std::byte>(static_cast<std::uint8_t>(rng() & 0xFFU)));
     return out;
+}
+
+/// Read a little-endian u32 from `bytes` at `offset` (host-endian aware).
+std::uint32_t LoadLeU32(std::span<std::byte const> bytes, std::size_t offset)
+{
+    std::uint32_t value = 0;
+    std::memcpy(&value, bytes.data() + offset, sizeof(value));
+    if constexpr (std::endian::native != std::endian::little)
+        value = std::byteswap(value);
+    return value;
+}
+
+/// Store a little-endian u64 into `bytes` at `offset` (host-endian aware).
+void StoreLeU64(std::vector<std::byte>& bytes, std::size_t offset, std::uint64_t value)
+{
+    if constexpr (std::endian::native != std::endian::little)
+        value = std::byteswap(value);
+    std::memcpy(bytes.data() + offset, &value, sizeof(value));
+}
+
+/// True iff `page` parses as a valid overflow page under the on-disk layout
+/// `[u32 crc][u64 next][u32 chunkLen][chunk]`, CRC over `[4 .. 16 + chunkLen)`.
+/// Lets a test pick overflow pages out of a store without touching internals.
+constexpr std::size_t OverflowHeader = 16;
+bool LooksLikeOverflowPage(std::span<std::byte const> page, std::size_t pageSize)
+{
+    if (page.size() < OverflowHeader)
+        return false;
+    auto const crc = LoadLeU32(page, 0);
+    auto const chunkLen = LoadLeU32(page, 12);
+    if (chunkLen > pageSize - OverflowHeader)
+        return false;
+    auto const region = std::span<std::byte const> { page.data() + 4, (OverflowHeader - 4) + chunkLen };
+    return CowTree::Crc32c::Compute(region) == crc;
 }
 
 /// Open + drop helper: returns the result of a callable that takes a
@@ -1315,4 +1352,104 @@ TEST_CASE("Crash during overflow SyncData leaves the previous value intact", "[c
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(Decode(got->entry.value) == "initial");
+}
+
+TEST_CASE("Reclaiming a corrupted overflow chain never frees another key's pages", "[cowstorage][overflow][crash]")
+{
+    // Regression for the FreeChain cross-key-corruption finding: FreeChain must
+    // validate each overflow page's CRC before trusting its `next` link. Here we
+    // point target's chain links at a victim page and break their CRC; if the
+    // reclaim path followed the corrupt link it would free the victim's pages,
+    // which a later allocation would overwrite.
+    CowTree::InMemoryPageStore store { 4096 };
+    FastCache::CowTreeStorage::Options opts;
+    opts.maxValueBytes = 1024 * 1024;
+    opts.durability = CowTree::FilePageStore::Durability::Fsync; // free pages reusable immediately
+
+    auto const victimBytes = RandomBytes(50000, 0x5151ULL);
+    auto const targetBytes = RandomBytes(50000, 0x7272ULL);
+
+    auto liveOverflowPages = [&](std::uint64_t maxScan) {
+        std::vector<std::uint64_t> ids;
+        for (std::uint64_t i = 1; i <= maxScan; ++i)
+        {
+            auto const view = store.Read(CowTree::PageId { i });
+            if (view.has_value() && LooksLikeOverflowPage(*view, store.PageSize()))
+                ids.push_back(i);
+        }
+        return ids;
+    };
+
+    auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE(storage.has_value());
+
+    REQUIRE((*storage)->Set("victim", victimBytes, 0, FastCache::TimePoint::max()).has_value());
+    auto const victimPages = liveOverflowPages(2048);
+    REQUIRE_FALSE(victimPages.empty());
+    auto const victimPage = victimPages.front();
+
+    REQUIRE((*storage)->Set("target", targetBytes, 0, FastCache::TimePoint::max()).has_value());
+    std::vector<std::uint64_t> targetPages;
+    for (auto const id: liveOverflowPages(2048))
+        if (std::ranges::find(victimPages, id) == victimPages.end())
+            targetPages.push_back(id);
+    REQUIRE_FALSE(targetPages.empty());
+
+    // Point every target overflow page's `next` at a victim page. Because the
+    // CRC now covers `next`, this also breaks each page's checksum.
+    for (auto const id: targetPages)
+    {
+        auto const view = store.Read(CowTree::PageId { id });
+        REQUIRE(view.has_value());
+        std::vector<std::byte> page(view->begin(), view->end());
+        StoreLeU64(page, sizeof(std::uint32_t), victimPage); // next := a victim page id
+        REQUIRE(store.Write(CowTree::PageId { id }, CowTree::BytesView { page.data(), page.size() }).has_value());
+    }
+
+    // Overwrite target with a tiny inline value: this reclaims the (now corrupt)
+    // overflow chain. The CRC guard must stop the walk at the first bad page.
+    REQUIRE((*storage)->Set("target", MakeBytes("small"), 0, FastCache::TimePoint::max()).has_value());
+    // Churn allocations so a wrongly-freed victim page would be reused + clobbered.
+    for (auto const i: std::views::iota(0U, 8U))
+        REQUIRE((*storage)
+                    ->Set(std::format("filler-{}", i), RandomBytes(50000, 900U + i), 0, FastCache::TimePoint::max())
+                    .has_value());
+
+    // The victim's bytes survive intact: its pages were never freed.
+    auto const got = (*storage)->Get("victim", FastCache::ManualClock {}.Now());
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
+    REQUIRE(got->entry.value == victimBytes);
+}
+
+TEST_CASE("Touch on a large value reuses the overflow chain without an O(value) rewrite", "[cowstorage][overflow][touch]")
+{
+    CowTree::InMemoryPageStore store { 4096 }; // inline limit 1024
+    FastCache::CowTreeStorage::Options opts;
+    opts.maxValueBytes = 1024 * 1024;
+    opts.durability = CowTree::FilePageStore::Durability::Fsync;
+
+    auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE(storage.has_value());
+    FastCache::ManualClock clock;
+
+    auto const big = RandomBytes(50000, 0xABCDULL); // ~13 overflow pages at 4 KiB
+    REQUIRE((*storage)->Set("k", big, 0, clock.Now() + 1s).has_value());
+
+    auto const writesBefore = store.WriteCount();
+    auto const newExpiry = clock.Now() + 3600s;
+    auto const touched = (*storage)->Touch("k", newExpiry, clock.Now());
+    REQUIRE(touched.has_value());
+    auto const writesByTouch = store.WriteCount() - writesBefore;
+
+    // Reusing the chain rewrites only the small descriptor leaf; a chain rewrite
+    // would write the whole ~13-page chain. Guard well below that.
+    REQUIRE(writesByTouch < 8);
+
+    // The value is intact and the expiry was refreshed without touching the chain.
+    auto const got = (*storage)->Get("k", clock.Now() + 1800s);
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
+    REQUIRE(got->entry.value == big);
+    REQUIRE(got->entry.expiry == newExpiry);
 }

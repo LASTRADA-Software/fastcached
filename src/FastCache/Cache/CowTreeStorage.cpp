@@ -327,16 +327,24 @@ std::expected<CowTree::PageId, StorageError> CowTreeStorage::WriteOverflowChain(
         auto const chunk = value.subspan(offset, chunkLen);
         std::uint64_t const next = (i + 1 < pageCount) ? ids[i + 1].value : 0;
 
-        std::vector<std::byte> header;
-        header.reserve(OverflowPageHeaderSize);
-        AppendLe<std::uint64_t>(header, next);
-        AppendLe<std::uint32_t>(header, static_cast<std::uint32_t>(chunkLen));
-        AppendLe<std::uint32_t>(header, CowTree::Crc32c::Compute(chunk));
-
+        // Page layout: [u32 crc32c][u64 next][u32 chunkLen][chunk]. The CRC
+        // covers everything after itself (next + chunkLen + chunk), so a torn
+        // write to the chain LINK — not only the payload — is caught on read.
         std::vector<std::byte> page(pageSize, std::byte { 0 });
-        std::memcpy(page.data(), header.data(), header.size());
+        std::vector<std::byte> link;
+        link.reserve(OverflowPageHeaderSize - sizeof(std::uint32_t));
+        AppendLe<std::uint64_t>(link, next);
+        AppendLe<std::uint32_t>(link, static_cast<std::uint32_t>(chunkLen));
+        std::memcpy(page.data() + sizeof(std::uint32_t), link.data(), link.size());
         if (!chunk.empty())
             std::memcpy(page.data() + OverflowPageHeaderSize, chunk.data(), chunkLen);
+
+        auto const crcRegion = std::span<std::byte const> { page.data() + sizeof(std::uint32_t),
+                                                            (OverflowPageHeaderSize - sizeof(std::uint32_t)) + chunkLen };
+        std::vector<std::byte> crcBytes;
+        AppendLe<std::uint32_t>(crcBytes, CowTree::Crc32c::Compute(crcRegion));
+        std::memcpy(page.data(), crcBytes.data(), crcBytes.size());
+
         if (auto const r = _store->Write(ids[i], CowTree::BytesView { page.data(), page.size() }); !r.has_value())
         {
             rollback();
@@ -346,11 +354,45 @@ std::expected<CowTree::PageId, StorageError> CowTreeStorage::WriteOverflowChain(
     return ids.front();
 }
 
+std::expected<CowTreeStorage::OverflowPage, StorageError> CowTreeStorage::ReadOverflowPage(CowTree::PageId id) const
+{
+    auto const payloadPerPage = _store->PageSize() - OverflowPageHeaderSize;
+    auto view = _store->Read(id);
+    if (!view.has_value())
+        return std::unexpected(TranslateError(view.error(), "overflow Read"));
+    // The view aliases the store's reusable read buffer; copy it out before the
+    // next Read invalidates it.
+    OverflowPage page;
+    page.bytes.assign(view->begin(), view->end());
+    if (page.bytes.size() < OverflowPageHeaderSize)
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+    CowTree::BytesView headerView { page.bytes.data(), OverflowPageHeaderSize };
+    std::uint32_t crc = 0;
+    std::ignore = ReadLe<std::uint32_t>(headerView, crc);
+    std::ignore = ReadLe<std::uint64_t>(headerView, page.next);
+    std::ignore = ReadLe<std::uint32_t>(headerView, page.chunkLen);
+    if (page.chunkLen > payloadPerPage || OverflowPageHeaderSize + page.chunkLen > page.bytes.size())
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+    // The CRC covers next + chunkLen + chunk (everything after the CRC field),
+    // so a torn write to the chain link is caught here, not just a torn payload.
+    auto const crcRegion = std::span<std::byte const> { page.bytes.data() + sizeof(std::uint32_t),
+                                                        (OverflowPageHeaderSize - sizeof(std::uint32_t)) + page.chunkLen };
+    if (CowTree::Crc32c::Compute(crcRegion) != crc)
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+    return page;
+}
+
 std::expected<std::vector<std::byte>, StorageError> CowTreeStorage::ReadOverflowChain(CowTree::PageId root,
                                                                                       std::uint64_t totalLen) const
 {
-    auto const pageSize = _store->PageSize();
-    auto const payloadPerPage = pageSize - OverflowPageHeaderSize;
+    // Defence in depth: a wild `totalLen` (e.g. a CRC-consistent-but-wrong
+    // descriptor from a future encoder bug or format skew) must not drive an
+    // unbounded reserve that throws std::length_error/std::bad_alloc — on the
+    // reactor's DetachedTask path an escaped exception terminates the daemon.
+    if (totalLen > _options.maxValueBytes)
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+
+    auto const payloadPerPage = _store->PageSize() - OverflowPageHeaderSize;
     std::vector<std::byte> out;
     out.reserve(static_cast<std::size_t>(totalLen));
 
@@ -360,28 +402,13 @@ std::expected<std::vector<std::byte>, StorageError> CowTreeStorage::ReadOverflow
     while (cursor && visited < maxPages)
     {
         ++visited;
-        auto view = _store->Read(cursor);
-        if (!view.has_value())
-            return std::unexpected(TranslateError(view.error(), "overflow Read"));
-        // The view aliases the store's reusable read buffer; copy header fields
-        // and the chunk out before the next Read invalidates it.
-        std::vector<std::byte> page(view->begin(), view->end());
-        if (page.size() < OverflowPageHeaderSize)
-            return std::unexpected(MakeError(StorageErrorCode::Corrupt));
-        CowTree::BytesView headerView { page.data(), OverflowPageHeaderSize };
-        std::uint64_t next = 0;
-        std::uint32_t chunkLen = 0;
-        std::uint32_t crc = 0;
-        std::ignore = ReadLe<std::uint64_t>(headerView, next);
-        std::ignore = ReadLe<std::uint32_t>(headerView, chunkLen);
-        std::ignore = ReadLe<std::uint32_t>(headerView, crc);
-        if (chunkLen > payloadPerPage || OverflowPageHeaderSize + chunkLen > page.size())
-            return std::unexpected(MakeError(StorageErrorCode::Corrupt));
-        auto const chunk = std::span<std::byte const> { page.data() + OverflowPageHeaderSize, chunkLen };
-        if (CowTree::Crc32c::Compute(chunk) != crc)
-            return std::unexpected(MakeError(StorageErrorCode::Corrupt));
-        out.insert(out.end(), chunk.begin(), chunk.end());
-        cursor = CowTree::PageId { next };
+        auto page = ReadOverflowPage(cursor);
+        if (!page.has_value())
+            return std::unexpected(page.error());
+        out.insert(out.end(),
+                   page->bytes.begin() + static_cast<std::ptrdiff_t>(OverflowPageHeaderSize),
+                   page->bytes.begin() + static_cast<std::ptrdiff_t>(OverflowPageHeaderSize + page->chunkLen));
+        cursor = CowTree::PageId { page->next };
     }
     if (out.size() != totalLen)
         return std::unexpected(MakeError(StorageErrorCode::Corrupt));
@@ -399,16 +426,16 @@ void CowTreeStorage::FreeChain(CowTree::PageId root)
     while (cursor && visited < cap)
     {
         ++visited;
-        auto view = _store->Read(cursor);
-        if (!view.has_value())
+        // Validate the page (CRC + bounds) BEFORE trusting its `next` link.
+        // A torn/corrupt overflow page must never steer Free() into a page that
+        // belongs to a different live key — that page would be handed to a later
+        // Allocate and overwritten, corrupting the other value. On a validation
+        // failure we stop: a damaged chain leaks its own tail at worst, which is
+        // strictly safer than freeing foreign pages.
+        auto page = ReadOverflowPage(cursor);
+        if (!page.has_value())
             return;
-        std::uint64_t next = 0;
-        if (view->size() >= sizeof(next))
-        {
-            std::vector<std::byte> header(view->begin(), view->begin() + sizeof(next));
-            CowTree::BytesView headerView { header.data(), header.size() };
-            std::ignore = ReadLe<std::uint64_t>(headerView, next);
-        }
+        auto const next = page->next;
         std::ignore = _store->Free(cursor);
         cursor = CowTree::PageId { next };
     }
@@ -476,12 +503,6 @@ std::expected<std::optional<CowTreeStorage::LoadedEntry>, StorageError> CowTreeS
 
 std::expected<void, StorageError> CowTreeStorage::StoreEntry(std::string_view key, CacheEntry const& entry)
 {
-    // Capture any existing overflow chain so it can be reclaimed AFTER the new
-    // value commits (CoW correctness: never free the old data first).
-    auto oldRef = ReadStoredRef(key);
-    if (!oldRef.has_value())
-        return std::unexpected(oldRef.error());
-
     std::vector<std::byte> encoded;
     CowTree::PageId newChain = CowTree::PageId::None();
     if (entry.value.size() > InlineValueLimit())
@@ -504,11 +525,14 @@ std::expected<void, StorageError> CowTreeStorage::StoreEntry(std::string_view ke
     }
 
     auto txn = _tree->BeginWrite();
-    if (auto const r = txn.Put(KeyView(key), CowTree::BytesView { encoded.data(), encoded.size() }); !r.has_value())
+    // Put returns the displaced record (if the key already existed), so we learn
+    // the previous overflow chain to reclaim WITHOUT a separate read transaction.
+    auto put = txn.Put(KeyView(key), CowTree::BytesView { encoded.data(), encoded.size() });
+    if (!put.has_value())
     {
         if (newChain)
             FreeChain(newChain);
-        return std::unexpected(TranslateError(r.error()));
+        return std::unexpected(TranslateError(put.error()));
     }
     if (auto const r = txn.Commit(); !r.has_value())
     {
@@ -516,10 +540,16 @@ std::expected<void, StorageError> CowTreeStorage::StoreEntry(std::string_view ke
             FreeChain(newChain);
         return std::unexpected(TranslateError(r.error()));
     }
-    // Committed: the new value is durable, so the old chain (if any) is now
-    // unreferenced and can be reclaimed.
-    if (oldRef->has_value() && (*oldRef)->overflow)
-        FreeChain((*oldRef)->root);
+    // Committed: the new value is durable, so an old overflow chain named by the
+    // displaced record (if any) is now unreferenced and can be reclaimed. (CoW
+    // correctness: never free the old data before the new value is durable.)
+    if (put->has_value())
+    {
+        auto const& oldRecord = **put;
+        if (auto const oldParsed = ParseRecord(CowTree::BytesView { oldRecord.data(), oldRecord.size() });
+            oldParsed.has_value() && oldParsed->overflow)
+            FreeChain(oldParsed->root);
+    }
     return {};
 }
 
@@ -652,32 +682,78 @@ std::expected<GetResult, StorageError> CowTreeStorage::Get(std::string_view key,
     return result;
 }
 
+std::expected<CasToken, StorageError> CowTreeStorage::UpdateRecordMetadata(std::string_view key,
+                                                                           TimePoint now,
+                                                                           std::function<void(CacheEntry&)> const& mutate)
+{
+    if (_tree == nullptr)
+        return std::unexpected(MakeError(StorageErrorCode::IoError, "not open"));
+    auto reader = _tree->BeginRead();
+    auto got = reader.Get(KeyView(key));
+    if (!got.has_value())
+        return std::unexpected(TranslateError(got.error()));
+    if (!got->has_value())
+        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
+    auto parsed = ParseRecord(CowTree::BytesView { (*got)->data(), (*got)->size() });
+    if (!parsed.has_value())
+        return std::unexpected(parsed.error());
+    auto& entry = parsed->entry;
+    if (entry.expiry <= now || entry.generation < _liveGeneration)
+        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
+
+    // Re-encode ONLY the leaf record. For an overflow value we keep the existing
+    // chain (same root + totalLen) and rewrite just the descriptor; for an inline
+    // value we copy its bytes out of the current record and re-encode inline.
+    // Either way the value bytes are never re-read or re-written.
+    std::size_t valueSize = 0;
+    std::vector<std::byte> encoded;
+    if (parsed->overflow)
+    {
+        valueSize = static_cast<std::size_t>(parsed->totalLen);
+        mutate(entry);
+        entry.cas = _nextCas++;
+        encoded = EncodeOverflowDescriptor(entry, parsed->root, parsed->totalLen);
+    }
+    else
+    {
+        auto const& raw = **got;
+        entry.value.assign(raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset),
+                           raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset + parsed->inlineLen));
+        valueSize = entry.value.size();
+        mutate(entry);
+        entry.cas = _nextCas++;
+        encoded = EncodeInline(entry);
+    }
+
+    auto txn = _tree->BeginWrite();
+    // The displaced descriptor names the SAME overflow chain we are reusing, so
+    // we deliberately ignore Put's returned old record — freeing that chain would
+    // discard the live value. (Inline records reference no chain.)
+    auto put = txn.Put(KeyView(key), CowTree::BytesView { encoded.data(), encoded.size() });
+    if (!put.has_value())
+        return std::unexpected(TranslateError(put.error()));
+    if (auto const r = txn.Commit(); !r.has_value())
+        return std::unexpected(TranslateError(r.error()));
+    // Metadata-only change: preserve the LRU `fetched` bit (matching
+    // InMemoryLruStorage::Touch / MarkStale).
+    TouchOrInsert(key, valueSize, AccessKind::Preserve);
+    return entry.cas;
+}
+
 std::expected<CasToken, StorageError> CowTreeStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
 {
     ++_stats.cmdTouch;
-    auto loaded = LoadEntry(key);
-    if (!loaded.has_value())
+    auto const cas = UpdateRecordMetadata(key, now, [&](CacheEntry& entry) {
+        entry.expiry = newExpiry;
+        entry.lastAccess = now;
+    });
+    if (!cas.has_value())
     {
         ++_stats.touchMisses;
-        return std::unexpected(loaded.error());
+        return std::unexpected(cas.error());
     }
-    if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
-    {
-        ++_stats.touchMisses;
-        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
-    }
-    auto& entry = (*loaded)->entry;
-    // A touch refreshes TTL/CAS/lastAccess but rewrites no value bytes, so the
-    // LRU `fetched` bit is preserved (AccessKind::Preserve) rather than
-    // cleared — matching InMemoryLruStorage::Touch, which leaves it alone.
-    entry.expiry = newExpiry;
-    entry.cas = _nextCas++;
-    entry.lastAccess = now;
-    if (auto const r = StoreEntry(key, entry); !r.has_value())
-        return std::unexpected(r.error());
-    TouchOrInsert(key, entry.value.size(), AccessKind::Preserve);
     ++_stats.touchHits;
-    return entry.cas;
+    return *cas;
 }
 
 std::expected<GetResult, StorageError> CowTreeStorage::Peek(std::string_view key, TimePoint now)
@@ -703,21 +779,13 @@ std::expected<CasToken, StorageError> CowTreeStorage::MarkStale(std::string_view
                                                                 std::optional<TimePoint> newExpiry,
                                                                 TimePoint now)
 {
-    auto loaded = LoadEntry(key);
-    if (!loaded.has_value())
-        return std::unexpected(loaded.error());
-    if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
-        return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
-    auto& entry = (*loaded)->entry;
-    entry.stale = true;
-    if (newExpiry.has_value())
-        entry.expiry = *newExpiry;
-    entry.cas = _nextCas++;
-    if (auto const r = StoreEntry(key, entry); !r.has_value())
-        return std::unexpected(r.error());
-    // Marking stale rewrites no value bytes, so keep the `fetched` bit.
-    TouchOrInsert(key, entry.value.size(), AccessKind::Preserve);
-    return entry.cas;
+    // Marking stale rewrites no value bytes — reuse any overflow chain in place
+    // and rewrite only the descriptor (preserving the LRU `fetched` bit).
+    return UpdateRecordMetadata(key, now, [&](CacheEntry& entry) {
+        entry.stale = true;
+        if (newExpiry.has_value())
+            entry.expiry = *newExpiry;
+    });
 }
 
 std::expected<GetResult, StorageError> CowTreeStorage::GetAndTouch(std::string_view key, TimePoint newExpiry, TimePoint now)

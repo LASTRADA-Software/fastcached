@@ -95,9 +95,13 @@ class WriteTxn
     /// Insert or replace `key` with `value`.
     /// @param key   Insertion key.
     /// @param value New value bytes.
-    /// @return CowTreeError::ValueTooLarge if a single key+value pair
-    ///         exceeds the per-page payload limit.
-    [[nodiscard]] auto Put(BytesView key, BytesView value) -> std::expected<void, CowTreeError>;
+    /// @return The previous value bytes when `key` already existed (letting the
+    ///         caller reclaim any out-of-line backing the old record named
+    ///         without a separate read transaction), or `std::nullopt` when the
+    ///         key was newly inserted; CowTreeError::ValueTooLarge if a single
+    ///         key+value pair exceeds the per-page payload limit.
+    [[nodiscard]] auto Put(BytesView key, BytesView value)
+        -> std::expected<std::optional<std::vector<std::byte>>, CowTreeError>;
 
     /// Remove `key`.
     /// @return true if a key was removed, false if it was already absent.
@@ -225,7 +229,8 @@ class CowTree
     {
         PageId left;
         std::optional<std::pair<std::vector<std::byte>, PageId>> split;
-        bool inserted { false }; ///< True when the key was new (vs. replaced).
+        bool inserted { false };                        ///< True when the key was new (vs. replaced).
+        std::optional<std::vector<std::byte>> replaced; ///< Previous value bytes when the key was replaced.
     };
 
     [[nodiscard]] auto PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)

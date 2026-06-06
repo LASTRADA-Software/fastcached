@@ -56,10 +56,12 @@ namespace FastCache
 /// -- inline:   u32 value_len ; [value bytes]
 /// -- overflow: u64 total_len ; u64 root_page_id
 /// ```
-/// Each overflow page is `[u64 next_page_id][u32 chunk_len][u32 crc32c][chunk]`
-/// (next == 0 marks the last page; the per-page CRC closes the torn-write gap,
-/// since data pages otherwise carry no read-time checksum). v3 breaks the older
-/// on-disk format (acceptable pre-release).
+/// Each overflow page is `[u32 crc32c][u64 next_page_id][u32 chunk_len][chunk]`
+/// (next == 0 marks the last page). The CRC is computed over everything that
+/// follows it — the `next` link, `chunk_len`, and the chunk — so a torn write
+/// to the chain linkage (not just the payload) is detected on read; data pages
+/// otherwise carry no read-time checksum. v3 breaks the older on-disk format
+/// (acceptable pre-release).
 class CowTreeStorage final: public IStorage
 {
   public:
@@ -204,6 +206,18 @@ class CowTreeStorage final: public IStorage
     /// Erase the entry from the tree.
     [[nodiscard]] std::expected<void, StorageError> EraseEntry(std::string_view key);
 
+    /// Apply a metadata-only mutation (TTL / stale / lastAccess) to the stored
+    /// record for `key`, rewriting ONLY the leaf record and REUSING any existing
+    /// overflow chain in place — no chain materialisation and no chain rewrite,
+    /// so a touch of a large value is O(record), not O(value). CAS is bumped.
+    /// @param key    Entry key.
+    /// @param now    Current clock value (drives the existence/expiry check).
+    /// @param mutate Callback adjusting the parsed entry's metadata in place.
+    /// @return The new CAS token, or KeyNotFound if absent/expired/flushed.
+    [[nodiscard]] std::expected<CasToken, StorageError> UpdateRecordMetadata(std::string_view key,
+                                                                             TimePoint now,
+                                                                             std::function<void(CacheEntry&)> const& mutate);
+
     /// A leaf record parsed into its header plus either inline value bounds or
     /// an overflow descriptor (the value itself is materialised separately).
     struct ParsedRecord
@@ -223,6 +237,22 @@ class CowTreeStorage final: public IStorage
         bool overflow { false };
         CowTree::PageId root { CowTree::PageId::None() };
     };
+
+    /// One validated overflow page: a copy of its bytes (the store's read
+    /// buffer is reused on the next Read), the `next` link, and the chunk
+    /// length. Returned only after the per-page CRC and bounds have passed.
+    struct OverflowPage
+    {
+        std::vector<std::byte> bytes;
+        std::uint64_t next { 0 };
+        std::uint32_t chunkLen { 0 };
+    };
+
+    /// Read overflow page `id`, copy it out, and validate its header bounds and
+    /// chunk CRC. Returns Corrupt if the page is malformed. Both the read path
+    /// and the reclaim path go through this so neither ever trusts a `next`
+    /// link from an unverified page.
+    [[nodiscard]] std::expected<OverflowPage, StorageError> ReadOverflowPage(CowTree::PageId id) const;
 
     /// Encode an entry whose value is stored inline in the leaf.
     [[nodiscard]] static std::vector<std::byte> EncodeInline(CacheEntry const& entry);
