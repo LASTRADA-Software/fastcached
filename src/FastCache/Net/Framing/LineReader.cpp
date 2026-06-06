@@ -71,8 +71,14 @@ std::expected<std::string, ProtocolError> ByteReader::TryExtractLine()
 
 Task<std::expected<std::size_t, ProtocolError>> ByteReader::PullChunk()
 {
-    std::vector<std::byte> chunk(_readChunkBytes);
-    auto const result = co_await _socket.Read(std::span<std::byte> { chunk.data(), chunk.size() });
+    // Reuse a persistent scratch buffer across reads. Sizing it with resize()
+    // only grows the allocation once (and the one-time zero-fill is irrelevant
+    // — we overwrite exactly `got` bytes from the socket and copy only those);
+    // a fresh `std::vector<std::byte>(_readChunkBytes)` per call would malloc +
+    // zero-fill + free on every request, which dominated the get hot path.
+    if (_scratch.size() < _readChunkBytes)
+        _scratch.resize(_readChunkBytes);
+    auto const result = co_await _socket.Read(std::span<std::byte> { _scratch.data(), _readChunkBytes });
     if (!result.has_value())
         co_return std::unexpected(MakeTruncated("socket read failed"));
 
@@ -82,8 +88,7 @@ Task<std::expected<std::size_t, ProtocolError>> ByteReader::PullChunk()
         _eof = true;
         co_return std::size_t { 0 };
     }
-    chunk.resize(got);
-    _buffer.insert(_buffer.end(), chunk.begin(), chunk.end());
+    _buffer.insert(_buffer.end(), _scratch.begin(), _scratch.begin() + static_cast<std::ptrdiff_t>(got));
     co_return got;
 }
 
