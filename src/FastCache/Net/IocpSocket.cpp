@@ -113,7 +113,10 @@ IocpSocket::IocpSocket(IocpReactor& reactor, std::uintptr_t native) noexcept:
     _impl { std::make_unique<Impl>(reactor, static_cast<SOCKET>(native)) },
     _native { native }
 {
-    reactor.AttachHandle(reinterpret_cast<void*>(static_cast<std::uintptr_t>(_impl->native)));
+    // Record whether the IOCP association succeeded. If it didn't, no
+    // completion will ever be dequeued for this socket; callers must check
+    // IsAttached() and abandon the connection instead of awaiting forever.
+    _attached = reactor.AttachHandle(reinterpret_cast<void*>(static_cast<std::uintptr_t>(_impl->native)));
 }
 
 IocpSocket::~IocpSocket()

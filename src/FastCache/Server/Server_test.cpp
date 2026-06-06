@@ -11,6 +11,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <new>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -41,6 +45,101 @@ FastCache::Task<bool> Send(FastCache::ISocket* socket, std::string_view payload)
     co_return r.has_value();
 }
 
+/// IStorage stub whose Get throws. Used to prove the connection driver's
+/// exception firewall drops a single connection rather than letting the throw
+/// reach DetachedTask::unhandled_exception (std::terminate) and abort the whole
+/// server. Only Get is exercised by the test; the rest return a benign miss.
+class ThrowOnGetStorage final: public FastCache::IStorage
+{
+    static auto Miss()
+    {
+        return std::unexpected(FastCache::MakeStorageError(FastCache::StorageErrorCode::KeyNotFound));
+    }
+
+  public:
+    std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view, FastCache::TimePoint) override
+    {
+        throw std::bad_alloc {};
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Set(std::string_view,
+                                                                    std::vector<std::byte>,
+                                                                    std::uint32_t,
+                                                                    FastCache::TimePoint) override
+    {
+        return FastCache::CasToken { 1 };
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Add(
+        std::string_view, std::vector<std::byte>, std::uint32_t, FastCache::TimePoint, FastCache::TimePoint) override
+    {
+        return Miss();
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Replace(
+        std::string_view, std::vector<std::byte>, std::uint32_t, FastCache::TimePoint, FastCache::TimePoint) override
+    {
+        return Miss();
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Append(std::string_view,
+                                                                       std::span<std::byte const>,
+                                                                       FastCache::CasToken,
+                                                                       FastCache::TimePoint) override
+    {
+        return Miss();
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view,
+                                                                        std::span<std::byte const>,
+                                                                        FastCache::CasToken,
+                                                                        FastCache::TimePoint) override
+    {
+        return Miss();
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> CompareAndSwap(std::string_view,
+                                                                               FastCache::CasToken,
+                                                                               std::vector<std::byte>,
+                                                                               std::uint32_t,
+                                                                               FastCache::TimePoint,
+                                                                               FastCache::TimePoint) override
+    {
+        return Miss();
+    }
+    std::expected<IncrResult, FastCache::StorageError> IncrementOrInitialize(std::string_view,
+                                                                             std::uint64_t,
+                                                                             bool,
+                                                                             FastCache::TimePoint) override
+    {
+        return std::unexpected(FastCache::MakeStorageError(FastCache::StorageErrorCode::KeyNotFound));
+    }
+    std::expected<void, FastCache::StorageError> Delete(std::string_view, FastCache::TimePoint) override
+    {
+        return std::unexpected(FastCache::MakeStorageError(FastCache::StorageErrorCode::KeyNotFound));
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Touch(std::string_view,
+                                                                      FastCache::TimePoint,
+                                                                      FastCache::TimePoint) override
+    {
+        return Miss();
+    }
+    std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view, FastCache::TimePoint) override
+    {
+        return FastCache::GetResult {};
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(std::string_view,
+                                                                          std::optional<FastCache::TimePoint>,
+                                                                          FastCache::TimePoint) override
+    {
+        return Miss();
+    }
+    void FlushWithGeneration(FastCache::TimePoint) override {}
+    std::size_t PurgeExpired(FastCache::TimePoint) override
+    {
+        return 0;
+    }
+    void Resize(std::size_t) override {}
+    [[nodiscard]] FastCache::StorageStats Snapshot() const noexcept override
+    {
+        return {};
+    }
+};
+
 } // namespace
 
 TEST_CASE("Server accepts and serves a memcached-text client end-to-end", "[server]")
@@ -65,6 +164,28 @@ TEST_CASE("Server accepts and serves a memcached-text client end-to-end", "[serv
 
     auto const response = FastCache::SyncRun(ReadResponse(client.get()));
     REQUIRE(response == "STORED\r\nVALUE foo 0 5\r\nhello\r\nEND\r\n");
+    REQUIRE(server.AcceptedCount() == 1);
+}
+
+TEST_CASE("Server drops a connection whose handler throws instead of terminating", "[server][regression]")
+{
+    FastCache::ManualClock clock;
+    ThrowOnGetStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::NullLogger logger;
+    FastCache::InMemoryListener listener;
+    FastCache::Server server { listener, engine, logger };
+
+    auto client = listener.ConnectClient();
+    REQUIRE(FastCache::SyncRun(Send(client.get(), "get foo\r\n")));
+    client->ShutdownWrite();
+    listener.Close();
+
+    // The Get throws std::bad_alloc. Without the firewall in RunConnectionDetached
+    // the throw would reach DetachedTask::unhandled_exception -> std::terminate and
+    // abort this test process. With it, the one connection is dropped and Run()
+    // returns normally — the server survives a handler exception.
+    FastCache::SyncRun(server.Run());
     REQUIRE(server.AcceptedCount() == 1);
 }
 

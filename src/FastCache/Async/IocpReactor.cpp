@@ -150,11 +150,20 @@ void IocpReactor::Run()
             return;
         }
 
+        bool stopRequested = false;
         for (ULONG i = 0; i < removed; ++i)
         {
             auto const& entry = entries[i];
             if (entry.lpCompletionKey == KeyStop)
-                return;
+            {
+                // Don't bail out mid-batch: finish processing the entries already
+                // dequeued alongside this stop, so a coroutine handed off to this
+                // reactor concurrently with shutdown still gets resumed (and takes
+                // ownership of its socket) instead of being abandoned. Exit after
+                // draining the current batch.
+                stopRequested = true;
+                continue;
+            }
             if (entry.lpCompletionKey == KeyResumeCoroutine)
             {
                 if (entry.lpOverlapped == nullptr)
@@ -174,6 +183,9 @@ void IocpReactor::Run()
                 completion->dispatch(completion, entry.dwNumberOfBytesTransferred, err);
             }
         }
+
+        if (stopRequested)
+            return;
 
         FireExpiredTimers();
     }

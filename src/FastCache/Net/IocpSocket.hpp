@@ -49,6 +49,15 @@ class IocpSocket final: public ISocket
         return _native;
     }
 
+    /// @return True if the socket was successfully associated with the
+    ///         reactor's completion port in the constructor. When false, no
+    ///         I/O completion will ever be dequeued for this socket, so the
+    ///         caller must abandon the connection rather than await on it.
+    [[nodiscard]] bool IsAttached() const noexcept
+    {
+        return _attached;
+    }
+
     /// Implementation detail; declared in the public section so the
     /// suspend-callback bridge in IocpSocket.cpp can reach it.
     struct Impl;
@@ -57,6 +66,7 @@ class IocpSocket final: public ISocket
     std::unique_ptr<Impl> _impl;
     std::uintptr_t _native;
     bool _closed { false };
+    bool _attached { false };
 };
 
 /// IOCP-backed IListener using AcceptEx. Accept() submits AcceptEx with a

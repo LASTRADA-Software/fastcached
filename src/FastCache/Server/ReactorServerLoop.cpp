@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <format>
 #include <memory>
 #include <thread>
@@ -123,9 +124,33 @@ namespace
         IocpReactor& reactor, Detail::NativeSocket raw, CacheEngine& engine, ILogger& logger, IAdmissionControl* admission)
     {
         co_await ResumeOn { reactor };
-        auto socket = std::make_unique<IocpSocket>(reactor, static_cast<std::uintptr_t>(raw));
-        Connection connection { std::move(socket), engine, logger };
-        co_await connection.Run();
+        // Firewall: this is a DetachedTask (unhandled_exception -> std::terminate),
+        // so a handler exception must drop only this connection, not the daemon.
+        try
+        {
+            auto socket = std::make_unique<IocpSocket>(reactor, static_cast<std::uintptr_t>(raw));
+            if (!socket->IsAttached())
+            {
+                // CreateIoCompletionPort failed for this socket: no completion
+                // will ever be dequeued, so awaiting would hang the connection
+                // and leak its admission slot. Drop it now; the unique_ptr's
+                // destructor closes the socket.
+                logger.Logf(LogLevel::Error, "handed-off connection: IOCP association failed; dropping");
+            }
+            else
+            {
+                Connection connection { std::move(socket), engine, logger };
+                co_await connection.Run();
+            }
+        }
+        catch (std::exception const& e)
+        {
+            logger.Logf(LogLevel::Error, "connection dropped on exception: {}", e.what());
+        }
+        catch (...)
+        {
+            logger.Logf(LogLevel::Error, "connection dropped on unknown exception");
+        }
         if (admission)
             admission->OnConnectionEnded();
         co_return;
@@ -200,7 +225,6 @@ namespace
         threads.reserve(reactorCount - 1);
         for (auto i = 1U; i < reactorCount; ++i)
             threads.emplace_back([&reactors, i] {
-                static_cast<void>(i);
                 FC_THREAD_NAME(std::format("fc-reactor-{}", i).c_str());
                 reactors[i]->Run();
             });
