@@ -88,11 +88,30 @@ namespace Detail
         // TCP_NODELAY disables Nagle's algorithm so a small reply isn't held
         // back waiting for the peer's ACK of a previous segment. Best-effort.
         int const one = 1;
+        // Enlarge the socket send/receive buffers. A large value reply (e.g.
+        // 64 KiB) overflows the default ~16-200 KiB send buffer, so the value
+        // drains over several sendmsg calls with an EPOLLOUT re-arm between
+        // each — extra syscalls that cap large-value throughput. A 1 MiB buffer
+        // lets a typical large reply land in a single sendmsg. The kernel
+        // clamps to its own max (net.core.wmem_max), so this is an upper hint.
+        int const socketBufferBytes = 1 << 20; // 1 MiB
 #if defined(_WIN32)
         ::setsockopt(
             static_cast<SOCKET>(socket), IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char const*>(&one), sizeof(one));
+        ::setsockopt(static_cast<SOCKET>(socket),
+                     SOL_SOCKET,
+                     SO_SNDBUF,
+                     reinterpret_cast<char const*>(&socketBufferBytes),
+                     sizeof(socketBufferBytes));
+        ::setsockopt(static_cast<SOCKET>(socket),
+                     SOL_SOCKET,
+                     SO_RCVBUF,
+                     reinterpret_cast<char const*>(&socketBufferBytes),
+                     sizeof(socketBufferBytes));
 #else
         ::setsockopt(static_cast<int>(socket), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        ::setsockopt(static_cast<int>(socket), SOL_SOCKET, SO_SNDBUF, &socketBufferBytes, sizeof(socketBufferBytes));
+        ::setsockopt(static_cast<int>(socket), SOL_SOCKET, SO_RCVBUF, &socketBufferBytes, sizeof(socketBufferBytes));
 #endif
     }
 
