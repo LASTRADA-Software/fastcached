@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <memory>
 #include <ranges>
 #include <span>
 #include <string>
@@ -121,9 +122,13 @@ namespace
         return true;
     }
 
-    /// Encode a single `VALUE` block for a get/gets response.
-    void AppendValueBlock(std::string& out, std::string_view key, CacheEntry const& entry, bool includeCas)
+    /// Format the `VALUE <key> <flags> <bytes>[ <cas>]\r\n` *header line* for a
+    /// get/gets response. The value bytes themselves are appended separately as
+    /// their own gather segment (zero-copy), so this emits only the small line.
+    /// @return The formatted header line.
+    [[nodiscard]] std::string FormatValueHeader(std::string_view key, CacheEntry const& entry, bool includeCas)
     {
+        std::string out;
         out.append("VALUE ");
         out.append(key);
         out.push_back(' ');
@@ -136,29 +141,58 @@ namespace
             out.append(std::to_string(entry.cas));
         }
         out.append(Crlf);
-        for (auto const b: entry.ValueBytes())
-            out.push_back(static_cast<char>(b));
-        out.append(Crlf);
+        return out;
+    }
+
+    /// Retained backing for a gathered get/gets/gat reply: the per-hit header
+    /// lines and the GetResults that own the values' reference-counted buffers.
+    /// Held alive (via a shared_ptr keep-alive) for the whole write so the
+    /// zero-copy value segments stay valid, even across a suspension.
+    struct GatherState
+    {
+        std::vector<GetResult> hits;
+        std::vector<std::string> headers;
+    };
+
+    /// Send a gathered `VALUE` reply: for each hit, three segments
+    /// [header][value][CRLF] with the value pointing directly at the cached
+    /// payload (no copy), then a trailing `END\r\n`.
+    /// @param socket Destination socket.
+    /// @param state  Collected hits + formatted headers (moved in; kept alive).
+    /// @return True if the full reply was written.
+    Task<bool> WriteGatheredValues(ISocket* socket, std::shared_ptr<GatherState> state)
+    {
+        std::vector<std::span<std::byte const>> segments;
+        segments.reserve((state->hits.size() * 3) + 1);
+        for (std::size_t i = 0; i < state->hits.size(); ++i)
+        {
+            segments.push_back(AsBytes(state->headers[i]));
+            segments.push_back(state->hits[i].entry.ValueBytes());
+            segments.push_back(AsBytes(Crlf));
+        }
+        segments.push_back(AsBytes(std::string_view { "END\r\n" }));
+        co_return co_await WriteAllVectored(socket, segments, std::move(state));
     }
 
     Task<bool> HandleGet(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> keys, bool includeCas)
     {
-        std::string response;
-        response.reserve(64 * keys.size());
+        auto state = std::make_shared<GatherState>();
         {
             // Synchronous lookup loop — scoped so the zone ends before the
             // co_await below (a zone must never straddle a suspension point).
             FC_ZONE_SCOPED_N("memcached.HandleGet.lookup");
+            state->hits.reserve(keys.size());
+            state->headers.reserve(keys.size());
             for (auto const key: keys)
             {
-                auto const result = engine->Get(key);
+                auto result = engine->Get(key);
                 if (!result.has_value() || !result->found)
                     continue;
-                AppendValueBlock(response, key, result->entry, includeCas);
+                state->headers.push_back(FormatValueHeader(key, result->entry, includeCas));
+                state->hits.push_back(std::move(*result));
             }
         }
-        response.append("END\r\n");
-        co_return co_await WriteAll(socket, response);
+        co_return co_await WriteGatheredValues(socket, std::move(state));
     }
 
     Task<bool> HandleStorage(ISocket* socket,
@@ -473,8 +507,9 @@ namespace
         if (!ParseUnsigned(args[0], exptime))
             co_return co_await WriteError(socket, "CLIENT_ERROR", "bad exptime");
 
-        std::string response;
-        response.reserve(64 * args.size());
+        auto state = std::make_shared<GatherState>();
+        state->hits.reserve(args.size());
+        state->headers.reserve(args.size());
         for (std::size_t i = 1; i < args.size(); ++i)
         {
             auto const& key = args[i];
@@ -482,13 +517,13 @@ namespace
             // a separate Touch + Get would let a concurrent writer delete
             // or mutate the entry in between, crediting touch_hits for a
             // value the response never returns. On a miss, skip the key.
-            auto const r = engine->GetAndTouch(key, exptime);
+            auto r = engine->GetAndTouch(key, exptime);
             if (!r.has_value() || !r->found)
                 continue;
-            AppendValueBlock(response, key, r->entry, includeCas);
+            state->headers.push_back(FormatValueHeader(key, r->entry, includeCas));
+            state->hits.push_back(std::move(*r));
         }
-        response.append("END\r\n");
-        co_return co_await WriteAll(socket, response);
+        co_return co_await WriteGatheredValues(socket, std::move(state));
     }
 
     /// `cache_memlimit <megabytes> [noreply]`.

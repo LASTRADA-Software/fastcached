@@ -272,7 +272,7 @@ IoAwaitable BlockingSocket::Write(std::span<std::byte const> buffer)
 }
 
 IoAwaitable BlockingSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                          std::shared_ptr<void> /*keepAlive*/)
+                                          std::shared_ptr<void const> /*keepAlive*/)
 {
     FC_ZONE_SCOPED_N("socket.writev");
     if (_closed)

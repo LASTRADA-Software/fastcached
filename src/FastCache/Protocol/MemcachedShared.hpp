@@ -6,6 +6,9 @@
 #include <FastCache/Net/ISocket.hpp>
 
 #include <charconv>
+#include <cstddef>
+#include <memory>
+#include <span>
 #include <string_view>
 #include <system_error>
 
@@ -38,6 +41,28 @@ inline Task<bool> WriteAll(ISocket* socket, std::string_view payload)
         co_return true;
     auto const result = co_await socket->Write(AsBytes(payload));
     co_return result.has_value();
+}
+
+/// Gather-write an ordered set of byte segments as one logical reply, pinning
+/// the payload owner alive across a write that may suspend. Verifies the full
+/// byte count was transferred (not merely that the call succeeded), so a short
+/// write surfaces as a failure rather than a silently truncated response.
+/// @param socket   Destination socket.
+/// @param segments Ordered, non-owning views to gather, in send order.
+/// @param keepAlive Optional owner pinning the segments' backing storage for
+///        the operation's lifetime (e.g. the GetResult holding the value).
+/// @return True if every byte of every segment was written.
+inline Task<bool> WriteAllVectored(ISocket* socket,
+                                   std::span<std::span<std::byte const> const> segments,
+                                   std::shared_ptr<void const> keepAlive = {})
+{
+    std::size_t expected = 0;
+    for (auto const seg: segments)
+        expected += seg.size();
+    if (expected == 0)
+        co_return true;
+    auto const result = co_await socket->WriteVectored(segments, std::move(keepAlive));
+    co_return result.has_value() && *result == expected;
 }
 
 } // namespace FastCache

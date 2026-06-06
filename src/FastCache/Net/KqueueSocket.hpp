@@ -29,7 +29,7 @@ class KqueueSocket final: public ISocket
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
     [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                            std::shared_ptr<void> keepAlive = {}) override;
+                                            std::shared_ptr<void const> keepAlive = {}) override;
     void Close() noexcept override;
     [[nodiscard]] bool IsClosed() const noexcept override
     {

@@ -87,7 +87,7 @@ struct IocpSocket::Impl
         // is dequeued. Both are released by the next Read/Write/WriteVectored
         // that reuses this op, or at socket teardown.
         std::vector<WSABUF> writeBufs {};
-        std::shared_ptr<void> writeKeepAlive {};
+        std::shared_ptr<void const> writeKeepAlive {};
     };
 
     Op readOp;
@@ -217,7 +217,8 @@ IoAwaitable IocpSocket::Write(std::span<std::byte const> buffer)
     return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSASend")) };
 }
 
-IoAwaitable IocpSocket::WriteVectored(std::span<std::span<std::byte const> const> segments, std::shared_ptr<void> keepAlive)
+IoAwaitable IocpSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                      std::shared_ptr<void const> keepAlive)
 {
     if (_closed)
         return IoAwaitable { std::unexpected(

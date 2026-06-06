@@ -198,7 +198,7 @@ struct EpollSocket::Impl
         // Owner pinning the segments' backing bytes for the op's lifetime
         // (e.g. the GetResult holding the reference-counted value). Released
         // when the op completes.
-        std::shared_ptr<void> writeKeepAlive {};
+        std::shared_ptr<void const> writeKeepAlive {};
 
         /// @return True once every vectored segment has been fully sent.
         [[nodiscard]] bool VectoredDone() const noexcept
@@ -429,7 +429,8 @@ IoAwaitable EpollSocket::Write(std::span<std::byte const> buffer)
     return a;
 }
 
-IoAwaitable EpollSocket::WriteVectored(std::span<std::span<std::byte const> const> segments, std::shared_ptr<void> keepAlive)
+IoAwaitable EpollSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                       std::shared_ptr<void const> keepAlive)
 {
     if (_closed)
         return IoAwaitable { std::unexpected(

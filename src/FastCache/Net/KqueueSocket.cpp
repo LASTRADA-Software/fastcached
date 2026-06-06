@@ -183,7 +183,7 @@ struct KqueueSocket::Impl
         std::vector<std::span<std::byte const>> writeSegments {};
         std::size_t writeSegIndex { 0 };
         std::size_t writeSegOffset { 0 };
-        std::shared_ptr<void> writeKeepAlive {};
+        std::shared_ptr<void const> writeKeepAlive {};
 
         void ClearVectored() noexcept
         {
@@ -400,7 +400,7 @@ IoAwaitable KqueueSocket::Write(std::span<std::byte const> buffer)
 }
 
 IoAwaitable KqueueSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                        std::shared_ptr<void> keepAlive)
+                                        std::shared_ptr<void const> keepAlive)
 {
     if (_closed)
         return IoAwaitable { std::unexpected(

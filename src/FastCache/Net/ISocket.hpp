@@ -139,14 +139,14 @@ class ISocket
     /// long, pass it as `keepAlive`: the implementation stores the handle
     /// alongside the in-flight operation, so the bytes outlive the suspend
     /// even if the caller's `GetResult` goes out of scope. `keepAlive` is
-    /// type-erased (`shared_ptr<void>`) so any owner shape works.
+    /// type-erased (`shared_ptr<void const>`) so any owner shape works.
     ///
     /// @param segments Ordered, non-owning views to gather, in send order.
     /// @param keepAlive Optional owner pinning the segments' backing storage
     ///        for the operation's lifetime.
     /// @return Awaitable resolving to IoResult (total bytes written).
     [[nodiscard]] virtual IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                                    std::shared_ptr<void> keepAlive = {}) = 0;
+                                                    std::shared_ptr<void const> keepAlive = {}) = 0;
 
     /// Close the socket. Idempotent; subsequent Read/Write resolves with
     /// NetErrorCode::BadFileHandle.

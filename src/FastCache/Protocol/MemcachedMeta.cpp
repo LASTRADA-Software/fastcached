@@ -6,10 +6,12 @@
 #include <FastCache/Protocol/MemcachedMeta.hpp>
 #include <FastCache/Protocol/MemcachedShared.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -566,8 +568,16 @@ namespace
         line.append(Crlf);
         if (f.wantValue)
         {
-            line.append(AsStringView(entry.ValueBytes()));
-            line.append(Crlf);
+            // Gather [VA-line][value][CRLF]: the value segment points at the
+            // cached payload (no copy), kept alive across the write by the
+            // entry's reference-counted handle. `line` lives in this frame
+            // (suspended, not destroyed, across the co_await).
+            std::array<std::span<std::byte const>, 3> const segments {
+                AsBytes(std::string_view { line }),
+                entry.ValueBytes(),
+                AsBytes(Crlf),
+            };
+            co_return co_await WriteAllVectored(socket, segments, got->entry.value);
         }
         co_return co_await WriteAll(socket, line);
     }

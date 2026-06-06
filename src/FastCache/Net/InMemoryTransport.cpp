@@ -129,7 +129,7 @@ IoAwaitable InMemorySocket::Write(std::span<std::byte const> buffer)
 }
 
 IoAwaitable InMemorySocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                          std::shared_ptr<void> /*keepAlive*/)
+                                          std::shared_ptr<void const> /*keepAlive*/)
 {
     if (_closed)
         return IoAwaitable { std::unexpected(

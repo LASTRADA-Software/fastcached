@@ -97,6 +97,42 @@ TEST_CASE("memcached-text set then get", "[protocol][text]")
     REQUIRE(response == "STORED\r\nVALUE foo 0 5\r\nhello\r\nEND\r\n");
 }
 
+TEST_CASE("memcached-text get round-trips a large (64 KiB) value via the gather path", "[protocol][text][large]")
+{
+    // Exercises the zero-copy scatter/gather GET response: the value segment
+    // points directly at the cached payload. A 64 KiB value is the size where
+    // the previous copy-into-one-buffer path lost to memcached, so this guards
+    // both correctness and the no-copy reply assembly.
+    TextFixture fix;
+    constexpr std::size_t kSize = 64U * 1024U;
+    std::string value(kSize, '\0');
+    for (std::size_t i = 0; i < kSize; ++i)
+        value[i] = static_cast<char>('A' + (i % 26));
+
+    auto const request = std::format("set big 0 0 {}\r\n{}\r\nget big\r\n", kSize, value);
+    auto const response = Exchange(fix, request);
+
+    auto const expected = std::format("STORED\r\nVALUE big 0 {}\r\n{}\r\nEND\r\n", kSize, value);
+    REQUIRE(response == expected);
+}
+
+TEST_CASE("memcached-text multi-key get gathers every value block in order", "[protocol][text][large]")
+{
+    // The multi-key path emits per-hit [header][value][CRLF] segments; verify
+    // ordering and framing hold when several keys (incl. a large value) are
+    // requested in one command.
+    TextFixture fix;
+    std::string const big(4096, 'Z');
+    auto const request =
+        std::format("set a 0 0 1\r\nx\r\nset b 0 0 {}\r\n{}\r\nset c 0 0 1\r\ny\r\nget a b c\r\n", big.size(), big);
+    auto const response = Exchange(fix, request);
+    auto const expected =
+        std::format("STORED\r\nSTORED\r\nSTORED\r\nVALUE a 0 1\r\nx\r\nVALUE b 0 {}\r\n{}\r\nVALUE c 0 1\r\ny\r\nEND\r\n",
+                    big.size(),
+                    big);
+    REQUIRE(response == expected);
+}
+
 TEST_CASE("memcached-text set over the value cap yields SERVER_ERROR object too large", "[protocol][text][max-value]")
 {
     TextFixture fix { /*maxValueBytes=*/8 };

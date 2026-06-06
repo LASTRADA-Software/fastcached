@@ -42,6 +42,40 @@ TEST_CASE("InMemoryLruStorage Set + Get round-trips", "[cache]")
     REQUIRE(got->entry.cas == *cas);
 }
 
+TEST_CASE("InMemoryLruStorage a held GET value survives a concurrent overwrite (copy-on-write)", "[cache]")
+{
+    // Models the zero-copy GET lifetime invariant: a reader holds the value's
+    // reference-counted handle (as a suspended socket write would) while a
+    // writer overwrites the same key. Because mutation rebinds to a fresh
+    // buffer rather than editing in place, the reader's bytes must stay intact.
+    FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
+
+    REQUIRE(storage.Set("k", MakeBytes("original"), 0, FastCache::TimePoint::max()).has_value());
+
+    auto reader = storage.Get("k", clock.Now());
+    REQUIRE(reader.has_value());
+    REQUIRE(reader->found);
+    auto const heldHandle = reader->entry.value; // shared_ptr to the original buffer
+    auto const heldView = reader->entry.ValueBytes();
+    REQUIRE(Decode(heldView) == "original");
+
+    // Writer replaces the value (and a second write to force the old node out
+    // of any internal reuse). The reader's handle keeps the old buffer alive.
+    REQUIRE(storage.Set("k", MakeBytes("rewritten-and-longer"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(storage.Set("k", MakeBytes("third"), 0, FastCache::TimePoint::max()).has_value());
+
+    // The bytes the reader is still "streaming" are unchanged and valid.
+    REQUIRE(Decode(heldView) == "original");
+    REQUIRE(heldHandle != nullptr);
+    REQUIRE(Decode(std::span<std::byte const> { heldHandle->data(), heldHandle->size() }) == "original");
+
+    // A fresh GET observes the latest value.
+    auto const latest = storage.Get("k", clock.Now());
+    REQUIRE(latest.has_value());
+    REQUIRE(Decode(latest->entry.ValueBytes()) == "third");
+}
+
 TEST_CASE("Add fails when the key already exists", "[cache]")
 {
     FastCache::InMemoryLruStorage storage;

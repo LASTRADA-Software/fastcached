@@ -9,12 +9,14 @@
 #include <FastCache/Protocol/RedisResp.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -61,12 +63,23 @@ namespace
         co_return r.has_value();
     }
 
-    Task<bool> WriteAll(ISocket* socket, std::span<std::byte const> payload)
+    /// Gather-write ordered segments as one reply, pinning the payload owner
+    /// across a possibly-suspending write and verifying the full byte count.
+    /// @param socket    Destination socket.
+    /// @param segments  Ordered, non-owning views to gather.
+    /// @param keepAlive Optional owner pinning the segments' backing storage.
+    /// @return True if every byte was written.
+    Task<bool> WriteAllVectored(ISocket* socket,
+                                std::span<std::span<std::byte const> const> segments,
+                                std::shared_ptr<void const> keepAlive = {})
     {
-        if (payload.empty())
+        std::size_t expected = 0;
+        for (auto const seg: segments)
+            expected += seg.size();
+        if (expected == 0)
             co_return true;
-        auto const r = co_await socket->Write(payload);
-        co_return r.has_value();
+        auto const r = co_await socket->WriteVectored(segments, std::move(keepAlive));
+        co_return r.has_value() && *r == expected;
     }
 
     Task<bool> ReplyOk(ISocket* socket)
@@ -92,20 +105,21 @@ namespace
         co_return co_await WriteAll(socket, std::format("-ERR {}\r\n", detail));
     }
 
-    Task<bool> ReplyBulkString(ISocket* socket, std::span<std::byte const> bytes)
+    Task<bool> ReplyBulkString(ISocket* socket, std::span<std::byte const> bytes, std::shared_ptr<void const> keepAlive = {})
     {
-        // Coalesce `$<len>\r\n<bytes>\r\n` into one buffer and a single write:
-        // the request/response hot path (e.g. GET) is dominated by syscall
-        // count, so one send() per reply beats three.
+        // Gather `$<len>\r\n` + bytes + `\r\n` into one scattered write: the
+        // value segment points directly at the cached payload (no copy), and
+        // `keepAlive` keeps that payload alive across a write that may suspend.
+        // `header` lives in this coroutine frame (suspended, not destroyed,
+        // across the co_await), so its address is stable. The hot path (GET) is
+        // syscall-bound, so one sendmsg per reply beats three send()s.
         auto const header = std::format("${}\r\n", bytes.size());
-        std::vector<std::byte> out;
-        out.reserve(header.size() + bytes.size() + 2);
-        auto const headerBytes = AsBytes(header);
-        out.insert(out.end(), headerBytes.begin(), headerBytes.end());
-        out.insert(out.end(), bytes.begin(), bytes.end());
-        auto const crlf = AsBytes(Crlf);
-        out.insert(out.end(), crlf.begin(), crlf.end());
-        co_return co_await WriteAll(socket, std::span<std::byte const> { out.data(), out.size() });
+        std::array<std::span<std::byte const>, 3> const segments {
+            AsBytes(header),
+            bytes,
+            AsBytes(Crlf),
+        };
+        co_return co_await WriteAllVectored(socket, segments, std::move(keepAlive));
     }
 
     Task<bool> ReplyBulkString(ISocket* socket, std::string_view text)
@@ -236,7 +250,7 @@ namespace
         auto const result = engine->Get(args[0]);
         if (!result.has_value() || !result->found)
             co_return co_await ReplyNil(socket);
-        co_return co_await ReplyBulkString(socket, result->entry.ValueBytes());
+        co_return co_await ReplyBulkString(socket, result->entry.ValueBytes(), result->entry.value);
     }
 
     Task<bool> HandleSet(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
