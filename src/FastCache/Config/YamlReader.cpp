@@ -209,6 +209,22 @@ namespace
                                                  line));
             return {};
         }
+        /// `cpu_affinity`: none | per-core reactor thread pinning.
+        if (key == "cpu_affinity")
+        {
+            auto const raw = valueNode.as<std::string>();
+            if (raw == "none")
+                cfg.cpuAffinity = CpuAffinity::None;
+            else if (raw == "per-core")
+                cfg.cpuAffinity = CpuAffinity::PerCore;
+            else
+                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+                                                 path,
+                                                 "cpu_affinity",
+                                                 std::string { "unknown mode (expect none|per-core): " } + raw,
+                                                 line));
+            return {};
+        }
         /// `threads`: positive integer worker count for threaded mode.
         if (key == "threads")
         {

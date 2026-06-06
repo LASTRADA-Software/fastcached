@@ -142,6 +142,16 @@ namespace
             ConfigErrorCode::OutOfRange, "lru-mode", std::format("unknown mode (expect approximate|strict): {}", sv)));
     }
 
+    [[nodiscard]] std::expected<CpuAffinity, ConfigError> ParseCpuAffinity(std::string_view sv)
+    {
+        if (sv == "none")
+            return CpuAffinity::None;
+        if (sv == "per-core")
+            return CpuAffinity::PerCore;
+        return std::unexpected(MakeError(
+            ConfigErrorCode::OutOfRange, "cpu-affinity", std::format("unknown mode (expect none|per-core): {}", sv)));
+    }
+
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv)
     {
         if (sv == "trace")
@@ -364,6 +374,13 @@ namespace
                 return ArgOutcome::Continue;
         }
         {
+            auto const matched = ApplyParsedFlag(args, i, "--cpu-affinity", ParseCpuAffinity, cfg.cpuAffinity);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
+        {
             auto const matched = ApplyParsedFlag(args, i, "--threads", ParseThreads, cfg.workerThreads);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
@@ -447,6 +464,9 @@ namespace
           .description = "approximate|strict in-memory LRU recency (default approximate)\n"
                          "approximate: same-shard reads run concurrently (faster);\n"
                          "strict: exact LRU order, reads serialise per shard" },
+        { .flag = "--cpu-affinity=<mode>",
+          .description = "none|per-core reactor thread pinning (default per-core)\n"
+                         "per-core: pin each reactor to its own core (multi-reactor only)" },
         { .flag = "--threads=<N>",
           .description = "server parallelism: the number of pinned reactors (default reactor model)\n"
                          "or the worker-pool size (--execution-model=threaded); default hardware_concurrency" },

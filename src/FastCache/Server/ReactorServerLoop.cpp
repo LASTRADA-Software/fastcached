@@ -4,6 +4,7 @@
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Net/SocketAddress.hpp>
+#include <FastCache/Platform/CpuAffinity.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Server/Connection.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
@@ -287,7 +288,15 @@ namespace
                 reactor->Stop();
         });
 
+        auto const onlineCpus = OnlineCpuCount();
         auto runReactor = [&](unsigned index) {
+            // Pin this reactor to its own core (best-effort) so its connections
+            // and storage shards stay cache-resident on one core.
+            if (options.pinReactorsToCpu && onlineCpus > 0)
+            {
+                if (!PinCallingThreadToCpu(index % onlineCpus))
+                    logger.Logf(LogLevel::Warn, "reactor {}: CPU affinity not applied", index);
+            }
             auto runAccept = [](Server* s) -> DetachedTask {
                 co_await s->Run();
                 co_return;

@@ -30,6 +30,12 @@ struct ReactorServerOptions
     /// port via SO_REUSEPORT. With >1, the storage every connection reaches
     /// must be thread-safe (the caller wraps it in a ShardedStorage).
     unsigned reactorThreads { 1 };
+
+    /// Pin each reactor thread to a distinct CPU core (reactor *i* → core
+    /// *i % online_cpus*). Keeps a worker's hot state resident in one core's
+    /// caches instead of migrating across cores. Best-effort: ignored when the
+    /// platform doesn't support pinning. Only meaningful with reactorThreads>1.
+    bool pinReactorsToCpu { false };
 };
 
 /// Run the reactor-driven server loop using the platform's native

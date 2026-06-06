@@ -482,6 +482,9 @@ int DaemonBody(FastCache::Config const& effective)
         // reactor = today's single-loop behaviour; N reactors scale across
         // cores without any cross-thread coroutine migration.
         serverOpts.reactorThreads = reactorCount;
+        // Pin reactors to cores when asked (PerCore) and there's more than one;
+        // a lone reactor gains nothing from pinning.
+        serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
         exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
     }
     else

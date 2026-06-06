@@ -124,6 +124,32 @@ TEST_CASE("CliParser: --lru-mode rejects unknown values", "[config][cli]")
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
 }
 
+TEST_CASE("CliParser: --cpu-affinity parses each policy and defaults to per-core", "[config][cli]")
+{
+    auto const def = FastCache::ParseCli(std::span<char const* const> {});
+    REQUIRE(def.has_value());
+    REQUIRE(def->config.cpuAffinity == FastCache::CpuAffinity::PerCore);
+
+    for (auto const& [text, mode]: std::initializer_list<std::pair<char const*, FastCache::CpuAffinity>> {
+             { "--cpu-affinity=none", FastCache::CpuAffinity::None },
+             { "--cpu-affinity=per-core", FastCache::CpuAffinity::PerCore },
+         })
+    {
+        auto const args = std::array<char const*, 1> { text };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(result.has_value());
+        REQUIRE(result->config.cpuAffinity == mode);
+    }
+}
+
+TEST_CASE("CliParser: --cpu-affinity rejects unknown values", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--cpu-affinity=numa" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
+}
+
 TEST_CASE("CliParser: --storage-max-value parses byte-size suffixes", "[config][cli][storage]")
 {
     {

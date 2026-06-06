@@ -44,6 +44,16 @@ enum class ExecutionModel : std::uint8_t
     Reactor = 2,
 };
 
+/// CPU-affinity policy for the reactor worker threads.
+enum class CpuAffinity : std::uint8_t
+{
+    /// Let the OS scheduler place reactor threads (default for a lone reactor).
+    None = 0,
+    /// Pin each reactor thread to its own core (default with >1 reactor): keeps
+    /// per-worker state cache-resident and avoids cross-core migration churn.
+    PerCore = 1,
+};
+
 /// In-memory LRU recency policy. Decoupled from the Cache layer (like
 /// StorageDurability); main.cpp translates this into the backend's `LruMode`.
 enum class LruRecency : std::uint8_t
@@ -135,6 +145,11 @@ struct Config
     /// throughput by letting same-shard reads run concurrently; Strict gives
     /// exact LRU order at the cost of serialising reads per shard.
     LruRecency lruRecency { LruRecency::Approximate };
+
+    /// CPU-affinity policy for reactor threads. PerCore (default) pins each
+    /// reactor to its own core when running more than one; with a single
+    /// reactor it is a no-op regardless. None lets the scheduler place threads.
+    CpuAffinity cpuAffinity { CpuAffinity::PerCore };
 };
 
 } // namespace FastCache

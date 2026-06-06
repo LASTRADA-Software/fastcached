@@ -26,6 +26,7 @@ target_sources(FastCache
         Net/IocpSocket.cpp
         Net/KqueueSocket.cpp
         Net/SocketAddress.cpp
+        Platform/CpuAffinity.cpp
         Platform/DaemonControls.cpp
         Platform/HostMemory.cpp
         Platform/PosixDaemonHost.cpp
