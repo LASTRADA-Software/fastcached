@@ -84,7 +84,7 @@ namespace
     /// Per-`sendmsg` iovec batch cap. `IOV_MAX` is the kernel limit (1024 on
     /// Linux); a single GET reply needs only a handful, but a multi-key `get`
     /// can exceed it, so the send loop batches and re-issues.
-    constexpr std::size_t kMaxIov = 64;
+    constexpr std::size_t MaxIovBatch = 64;
 
     /// Outcome of pushing a vectored-write cursor forward with `sendmsg`.
     enum class SendProgress : std::uint8_t
@@ -96,7 +96,7 @@ namespace
 
     /// Send as much of the segments from the cursor `[segIndex, segOffset]`
     /// onward as the kernel accepts, advancing the cursor in place. Coalesces
-    /// up to `kMaxIov` segments per `sendmsg` and loops until the kernel
+    /// up to `MaxIovBatch` segments per `sendmsg` and loops until the kernel
     /// blocks, errors, or all bytes are gone.
     /// @param fd Socket file descriptor.
     /// @param segments Ordered payload segments.
@@ -112,9 +112,9 @@ namespace
     {
         while (segIndex < segments.size())
         {
-            std::array<iovec, kMaxIov> iov {};
+            std::array<iovec, MaxIovBatch> iov {};
             std::size_t count = 0;
-            for (auto i = segIndex; i < segments.size() && count < kMaxIov; ++i)
+            for (auto i = segIndex; i < segments.size() && count < MaxIovBatch; ++i)
             {
                 auto const seg = segments[i];
                 auto const skip = (i == segIndex) ? segOffset : std::size_t { 0 };

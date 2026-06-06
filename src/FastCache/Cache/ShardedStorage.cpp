@@ -59,8 +59,8 @@ std::expected<GetResult, StorageError> ShardedStorage::Get(std::string_view key,
     // before the exclusive one is taken (std::shared_mutex has no upgrade).
     if (result.has_value() && result->found)
     {
-        constexpr unsigned kPromoteEveryN = 16;
-        if (shard.readSampler.fetch_add(1, std::memory_order_relaxed) % kPromoteEveryN == 0)
+        constexpr unsigned PromoteEveryNthRead = 16;
+        if (shard.readSampler.fetch_add(1, std::memory_order_relaxed) % PromoteEveryNthRead == 0)
         {
             std::unique_lock const lock { shard.mu };
             shard.storage->PromoteOnRead(key, now);

@@ -193,6 +193,22 @@ namespace
                                                  line));
             return {};
         }
+        /// `lru_mode`: approximate | strict in-memory LRU recency policy.
+        if (key == "lru_mode")
+        {
+            auto const raw = valueNode.as<std::string>();
+            if (raw == "approximate")
+                cfg.lruRecency = LruRecency::Approximate;
+            else if (raw == "strict")
+                cfg.lruRecency = LruRecency::Strict;
+            else
+                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+                                                 path,
+                                                 "lru_mode",
+                                                 std::string { "unknown mode (expect approximate|strict): " } + raw,
+                                                 line));
+            return {};
+        }
         /// `threads`: positive integer worker count for threaded mode.
         if (key == "threads")
         {

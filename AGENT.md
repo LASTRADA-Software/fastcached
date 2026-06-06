@@ -85,6 +85,7 @@ down across a suspend point.
 - **`auto` type deduction** for readability; **structured bindings** for tuple-like returns.
 - **`clang-format` after every change** — use the project `.clang-format`.
 - **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT` — address the underlying issue. The `clang-debug` preset enables `clang-tidy` automatically.
+- **No `k`-prefix on identifiers.** Do not use the Google-style `kFoo` prefix for constants, enumerators, or any other symbol — it violates the project `.clang-tidy` naming convention. Use `Foo` (PascalCase) for constants/enumerators and `foo`/`fooBar` for locals and members instead.
 - **All changes covered by unit tests.** Aim to **increase** coverage with every PR.
 - **No raw owning pointers.** Use `std::unique_ptr` / `std::shared_ptr` for ownership; RAII for resources.
 - **No new third-party dependencies** without strong justification.

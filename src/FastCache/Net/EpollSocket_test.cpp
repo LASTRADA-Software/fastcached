@@ -160,13 +160,13 @@ TEST_CASE("EpollSocket::WriteVectored streams a large value across partial write
     int const smallRcv = 8192;
     ::setsockopt(pair.peerSide, SOL_SOCKET, SO_RCVBUF, &smallRcv, sizeof(smallRcv));
 
-    constexpr std::size_t kValueBytes = 4U * 1024U * 1024U; // 4 MiB
-    std::vector<std::byte> value(kValueBytes);
-    for (std::size_t i = 0; i < kValueBytes; ++i)
+    constexpr std::size_t ValueByteCount = 4U * 1024U * 1024U; // 4 MiB
+    std::vector<std::byte> value(ValueByteCount);
+    for (std::size_t i = 0; i < ValueByteCount; ++i)
         value[i] = static_cast<std::byte>(i & 0xFF);
     std::string_view const header = "HDR:";
     std::string_view const trailer = ":END";
-    auto const total = header.size() + kValueBytes + trailer.size();
+    auto const total = header.size() + ValueByteCount + trailer.size();
 
     FastCache::SteadyClock clock;
     FastCache::EpollReactor reactor { clock };
@@ -187,10 +187,11 @@ TEST_CASE("EpollSocket::WriteVectored streams a large value across partial write
     REQUIRE(received.size() == total);
     std::string const head { reinterpret_cast<char const*>(received.data()), header.size() };
     REQUIRE(head == "HDR:");
-    std::string const tail { reinterpret_cast<char const*>(received.data()) + header.size() + kValueBytes, trailer.size() };
+    std::string const tail { reinterpret_cast<char const*>(received.data()) + header.size() + ValueByteCount,
+                             trailer.size() };
     REQUIRE(tail == ":END");
     bool intact = true;
-    for (std::size_t i = 0; i < kValueBytes && intact; ++i)
+    for (std::size_t i = 0; i < ValueByteCount && intact; ++i)
         intact = received[header.size() + i] == static_cast<std::byte>(i & 0xFF);
     REQUIRE(intact);
 }

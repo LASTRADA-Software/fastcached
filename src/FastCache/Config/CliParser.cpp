@@ -132,6 +132,16 @@ namespace
             MakeError(ConfigErrorCode::OutOfRange, "storage-durability", std::format("unknown durability mode: {}", sv)));
     }
 
+    [[nodiscard]] std::expected<LruRecency, ConfigError> ParseLruRecency(std::string_view sv)
+    {
+        if (sv == "approximate")
+            return LruRecency::Approximate;
+        if (sv == "strict")
+            return LruRecency::Strict;
+        return std::unexpected(MakeError(
+            ConfigErrorCode::OutOfRange, "lru-mode", std::format("unknown mode (expect approximate|strict): {}", sv)));
+    }
+
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv)
     {
         if (sv == "trace")
@@ -347,6 +357,13 @@ namespace
             }
         }
         {
+            auto const matched = ApplyParsedFlag(args, i, "--lru-mode", ParseLruRecency, cfg.lruRecency);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
+        {
             auto const matched = ApplyParsedFlag(args, i, "--threads", ParseThreads, cfg.workerThreads);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
@@ -426,6 +443,10 @@ namespace
           .description = "auto|threaded|reactor (default auto)\n"
                          "auto: the reactor for both in-memory and --storage on disk;\n"
                          "threaded selects the legacy per-connection worker pool" },
+        { .flag = "--lru-mode=<mode>",
+          .description = "approximate|strict in-memory LRU recency (default approximate)\n"
+                         "approximate: same-shard reads run concurrently (faster);\n"
+                         "strict: exact LRU order, reads serialise per shard" },
         { .flag = "--threads=<N>",
           .description = "server parallelism: the number of pinned reactors (default reactor model)\n"
                          "or the worker-pool size (--execution-model=threaded); default hardware_concurrency" },

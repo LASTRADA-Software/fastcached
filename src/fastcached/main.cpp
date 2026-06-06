@@ -188,6 +188,14 @@ CowTree::FilePageStore::Durability ToPageStoreDurability(FastCache::StorageDurab
     return CowTree::FilePageStore::Durability::Batched;
 }
 
+/// Translate the config-layer LRU recency policy into the cache backend's enum.
+/// @param r Config recency policy.
+/// @return The corresponding InMemoryLruStorage mode.
+[[nodiscard]] FastCache::LruMode ToLruMode(FastCache::LruRecency r) noexcept
+{
+    return r == FastCache::LruRecency::Strict ? FastCache::LruMode::Strict : FastCache::LruMode::Approximate;
+}
+
 /// Holds the assembled storage chain. The reload subscriber resizes it
 /// through the virtual `IStorage::Resize`, so no typed observer pointers
 /// are needed.
@@ -210,7 +218,8 @@ struct StorageBackendBundle
     auto opened = FastCache::CowTreeStorage::Open(opts);
     if (!opened.has_value())
         return std::unexpected(opened.error().ToString());
-    auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes, effective.storageMaxValueBytes);
+    auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(
+        perShardBytes, effective.storageMaxValueBytes, ToLruMode(effective.lruRecency));
     return std::make_unique<FastCache::LayeredStorage>(std::move(l1), std::move(*opened));
 }
 
@@ -226,8 +235,8 @@ struct StorageBackendBundle
     if (!usingPersistent)
     {
         for (std::size_t i = 0; i < physicalShards; ++i)
-            inners.emplace_back(
-                std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes, effective.storageMaxValueBytes));
+            inners.emplace_back(std::make_unique<FastCache::InMemoryLruStorage>(
+                perShardBytes, effective.storageMaxValueBytes, ToLruMode(effective.lruRecency)));
         return inners;
     }
 
@@ -292,8 +301,8 @@ struct StorageBackendBundle
     // Unwrapped single-shard reactor path.
     if (!usingPersistent)
     {
-        bundle.backend =
-            std::make_unique<FastCache::InMemoryLruStorage>(effective.maxMemoryBytes, effective.storageMaxValueBytes);
+        bundle.backend = std::make_unique<FastCache::InMemoryLruStorage>(
+            effective.maxMemoryBytes, effective.storageMaxValueBytes, ToLruMode(effective.lruRecency));
         return bundle;
     }
 

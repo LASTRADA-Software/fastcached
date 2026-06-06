@@ -104,15 +104,15 @@ TEST_CASE("memcached-text get round-trips a large (64 KiB) value via the gather 
     // the previous copy-into-one-buffer path lost to memcached, so this guards
     // both correctness and the no-copy reply assembly.
     TextFixture fix;
-    constexpr std::size_t kSize = 64U * 1024U;
-    std::string value(kSize, '\0');
-    for (std::size_t i = 0; i < kSize; ++i)
+    constexpr std::size_t Size = 64U * 1024U;
+    std::string value(Size, '\0');
+    for (std::size_t i = 0; i < Size; ++i)
         value[i] = static_cast<char>('A' + (i % 26));
 
-    auto const request = std::format("set big 0 0 {}\r\n{}\r\nget big\r\n", kSize, value);
+    auto const request = std::format("set big 0 0 {}\r\n{}\r\nget big\r\n", Size, value);
     auto const response = Exchange(fix, request);
 
-    auto const expected = std::format("STORED\r\nVALUE big 0 {}\r\n{}\r\nEND\r\n", kSize, value);
+    auto const expected = std::format("STORED\r\nVALUE big 0 {}\r\n{}\r\nEND\r\n", Size, value);
     REQUIRE(response == expected);
 }
 

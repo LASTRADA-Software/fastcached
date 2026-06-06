@@ -97,6 +97,33 @@ TEST_CASE("CliParser: --storage-durability rejects unknown values", "[config][cl
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
 }
 
+TEST_CASE("CliParser: --lru-mode parses each policy and defaults to approximate", "[config][cli]")
+{
+    // Default (flag absent) is Approximate.
+    auto const def = FastCache::ParseCli(std::span<char const* const> {});
+    REQUIRE(def.has_value());
+    REQUIRE(def->config.lruRecency == FastCache::LruRecency::Approximate);
+
+    for (auto const& [text, mode]: std::initializer_list<std::pair<char const*, FastCache::LruRecency>> {
+             { "--lru-mode=approximate", FastCache::LruRecency::Approximate },
+             { "--lru-mode=strict", FastCache::LruRecency::Strict },
+         })
+    {
+        auto const args = std::array<char const*, 1> { text };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(result.has_value());
+        REQUIRE(result->config.lruRecency == mode);
+    }
+}
+
+TEST_CASE("CliParser: --lru-mode rejects unknown values", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--lru-mode=sloppy" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
+}
+
 TEST_CASE("CliParser: --storage-max-value parses byte-size suffixes", "[config][cli][storage]")
 {
     {

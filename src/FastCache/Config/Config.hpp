@@ -44,6 +44,17 @@ enum class ExecutionModel : std::uint8_t
     Reactor = 2,
 };
 
+/// In-memory LRU recency policy. Decoupled from the Cache layer (like
+/// StorageDurability); main.cpp translates this into the backend's `LruMode`.
+enum class LruRecency : std::uint8_t
+{
+    /// Sampled/deferred promotion: reads run concurrently under a shared lock
+    /// and eviction stays approximately-LRU. Favours read throughput. Default.
+    Approximate = 0,
+    /// Promote on every read for exact LRU order; reads on one shard serialise.
+    Strict = 1,
+};
+
 /// All runtime configuration. POD-like value type; built once from CLI
 /// arguments (and later, from a YAML config file). For SIGHUP reload, the
 /// daemon keeps a shared_ptr<const Config> and atomically swaps.
@@ -119,6 +130,11 @@ struct Config
 
     /// Server execution model. See ExecutionModel docs.
     ExecutionModel executionModel { ExecutionModel::Auto };
+
+    /// In-memory LRU recency policy. Approximate (default) favours read
+    /// throughput by letting same-shard reads run concurrently; Strict gives
+    /// exact LRU order at the cost of serialising reads per shard.
+    LruRecency lruRecency { LruRecency::Approximate };
 };
 
 } // namespace FastCache

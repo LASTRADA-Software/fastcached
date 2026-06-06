@@ -398,32 +398,32 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
 
     // A handful of keys, each with a fixed set of legal values, so a reader can
     // verify any value it sees is a complete, valid one written by some thread.
-    constexpr int kKeys = 8;
+    constexpr int KeyCount = 8;
     auto keyOf = [](int k) {
         return "key-" + std::to_string(k);
     };
     auto valueOf = [](int k, int v) {
         return "k" + std::to_string(k) + "-v" + std::to_string(v);
     };
-    constexpr int kValuesPerKey = 4;
-    for (int k = 0; k < kKeys; ++k)
+    constexpr int ValuesPerKey = 4;
+    for (int k = 0; k < KeyCount; ++k)
         REQUIRE(storage->Set(keyOf(k), MakeBytes(valueOf(k, 0)), 0, FastCache::TimePoint::max()).has_value());
 
-    constexpr int kThreads = 8;
-    constexpr int kOpsPerThread = 5000;
+    constexpr int ThreadCount = 8;
+    constexpr int OpsPerThread = 5000;
     std::atomic<bool> torn { false };
     std::vector<std::thread> threads;
-    threads.reserve(kThreads);
-    for (int t = 0; t < kThreads; ++t)
+    threads.reserve(ThreadCount);
+    for (int t = 0; t < ThreadCount; ++t)
     {
         threads.emplace_back([&, t] {
             std::mt19937 rng { static_cast<std::uint32_t>(0x9E37 + t) };
-            for (int i = 0; i < kOpsPerThread; ++i)
+            for (int i = 0; i < OpsPerThread; ++i)
             {
-                int const k = static_cast<int>(rng() % kKeys);
+                int const k = static_cast<int>(rng() % KeyCount);
                 if ((rng() & 1U) != 0U)
                 {
-                    int const v = static_cast<int>(rng() % kValuesPerKey);
+                    int const v = static_cast<int>(rng() % ValuesPerKey);
                     (void) storage->Set(keyOf(k), MakeBytes(valueOf(k, v)), 0, FastCache::TimePoint::max());
                 }
                 else
@@ -433,7 +433,7 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
                     {
                         auto const text = Decode(got->entry.ValueBytes());
                         bool legal = false;
-                        for (int v = 0; v < kValuesPerKey; ++v)
+                        for (int v = 0; v < ValuesPerKey; ++v)
                             legal = legal || text == valueOf(k, v);
                         if (!legal)
                             torn.store(true);
@@ -447,7 +447,7 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
 
     REQUIRE_FALSE(torn.load());
     // Every key still resolves to a legal value after the storm.
-    for (int k = 0; k < kKeys; ++k)
+    for (int k = 0; k < KeyCount; ++k)
     {
         auto const got = storage->Get(keyOf(k), clock.Now());
         REQUIRE(got.has_value());

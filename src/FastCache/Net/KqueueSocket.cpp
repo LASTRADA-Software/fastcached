@@ -84,7 +84,7 @@ namespace
     }
 
     /// Per-`sendmsg` iovec batch cap (see EpollSocket for the rationale).
-    constexpr std::size_t kMaxIov = 64;
+    constexpr std::size_t MaxIovBatch = 64;
 
     /// Outcome of pushing a vectored-write cursor forward with `sendmsg`.
     enum class SendProgress : std::uint8_t
@@ -111,9 +111,9 @@ namespace
     {
         while (segIndex < segments.size())
         {
-            std::array<iovec, kMaxIov> iov {};
+            std::array<iovec, MaxIovBatch> iov {};
             std::size_t count = 0;
-            for (auto i = segIndex; i < segments.size() && count < kMaxIov; ++i)
+            for (auto i = segIndex; i < segments.size() && count < MaxIovBatch; ++i)
             {
                 auto const seg = segments[i];
                 auto const skip = (i == segIndex) ? segOffset : std::size_t { 0 };
