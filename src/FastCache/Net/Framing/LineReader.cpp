@@ -2,8 +2,8 @@
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 
-#include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <format>
 #include <string>
 #include <utility>
@@ -46,23 +46,35 @@ ByteReader::ByteReader(ISocket& socket,
 {
 }
 
+void ByteReader::Compact()
+{
+    if (_consumed == 0)
+        return;
+    auto const remaining = Available();
+    if (remaining != 0)
+        std::memmove(_buffer.data(), _buffer.data() + _consumed, remaining);
+    _buffer.resize(remaining);
+    _consumed = 0;
+}
+
 std::expected<std::string, ProtocolError> ByteReader::TryExtractLine()
 {
     FC_ZONE_SCOPED_N("LineReader.TryExtractLine");
-    if (_buffer.size() < 2)
+    auto const* const base = _buffer.data() + _consumed;
+    auto const avail = Available();
+    if (avail < 2)
         return std::unexpected(ProtocolError { .code = ProtocolErrorCode::MalformedFrame, .context = "no CRLF yet" });
 
-    for (std::size_t i = 0; i + 1 < _buffer.size(); ++i)
+    for (std::size_t i = 0; i + 1 < avail; ++i)
     {
-        if (_buffer[i] == CarriageReturn && _buffer[i + 1] == LineFeed)
+        if (base[i] == CarriageReturn && base[i + 1] == LineFeed)
         {
             if (i > _maxLineBytes)
                 return std::unexpected(MakeLineTooLong());
-            std::string line;
-            line.reserve(i);
-            for (std::size_t j = 0; j < i; ++j)
-                line.push_back(static_cast<char>(_buffer[j]));
-            _buffer.erase(_buffer.begin(), _buffer.begin() + static_cast<std::ptrdiff_t>(i + 2));
+            // Bulk-copy the line bytes (no per-byte loop), then consume the
+            // line + its CRLF by advancing the read cursor (no buffer memmove).
+            std::string line { reinterpret_cast<char const*>(base), i };
+            _consumed += i + 2;
             return line;
         }
     }
@@ -76,6 +88,9 @@ Task<std::expected<std::size_t, ProtocolError>> ByteReader::PullChunk()
     // — we overwrite exactly `got` bytes from the socket and copy only those);
     // a fresh `std::vector<std::byte>(_readChunkBytes)` per call would malloc +
     // zero-fill + free on every request, which dominated the get hot path.
+    // Drop already-consumed bytes before growing the buffer, so a long-lived
+    // connection's buffer stays bounded by the in-flight (unconsumed) data.
+    Compact();
     if (_scratch.size() < _readChunkBytes)
         _scratch.resize(_readChunkBytes);
     auto const result = co_await _socket.Read(std::span<std::byte> { _scratch.data(), _readChunkBytes });
@@ -99,7 +114,7 @@ Task<ByteReader::LineResult> ByteReader::ReadLine()
 
     while (true)
     {
-        if (_buffer.size() > _maxLineBytes)
+        if (Available() > _maxLineBytes)
             co_return std::unexpected(MakeLineTooLong());
 
         auto const pulled = co_await PullChunk();
@@ -108,7 +123,7 @@ Task<ByteReader::LineResult> ByteReader::ReadLine()
 
         if (*pulled == 0)
         {
-            if (_buffer.empty())
+            if (Available() == 0)
                 co_return std::unexpected(MakeTruncated("clean EOF before line"));
             co_return std::unexpected(MakeTruncated("EOF mid-line"));
         }
@@ -116,7 +131,7 @@ Task<ByteReader::LineResult> ByteReader::ReadLine()
         if (auto extracted = TryExtractLine(); extracted.has_value())
             co_return std::move(*extracted);
 
-        if (_buffer.size() > _maxLineBytes)
+        if (Available() > _maxLineBytes)
             co_return std::unexpected(MakeLineTooLong());
     }
 }
@@ -125,6 +140,9 @@ void ByteReader::PrimeWith(std::span<std::byte const> bytes)
 {
     if (bytes.empty())
         return;
+    // Drop the consumed prefix first so "insert at front" prepends ahead of
+    // only the unconsumed data (and the cursor stays at 0).
+    Compact();
     _buffer.insert(_buffer.begin(), bytes.begin(), bytes.end());
 }
 
@@ -133,7 +151,7 @@ Task<ByteReader::BytesResult> ByteReader::ReadExactly(std::size_t count)
     if (count > _maxPayloadBytes)
         co_return std::unexpected(MakePayloadTooLarge(count, _maxPayloadBytes));
 
-    while (_buffer.size() < count)
+    while (Available() < count)
     {
         auto const pulled = co_await PullChunk();
         if (!pulled.has_value())
@@ -142,10 +160,9 @@ Task<ByteReader::BytesResult> ByteReader::ReadExactly(std::size_t count)
             co_return std::unexpected(MakeTruncated("EOF before payload satisfied"));
     }
 
-    std::vector<std::byte> out;
-    out.reserve(count);
-    out.insert(out.end(), _buffer.begin(), _buffer.begin() + static_cast<std::ptrdiff_t>(count));
-    _buffer.erase(_buffer.begin(), _buffer.begin() + static_cast<std::ptrdiff_t>(count));
+    auto const* const base = _buffer.data() + _consumed;
+    std::vector<std::byte> out { base, base + count };
+    _consumed += count; // consume via the cursor; no buffer memmove
     co_return out;
 }
 
