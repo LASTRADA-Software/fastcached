@@ -417,6 +417,9 @@ auto FilePageStore::FlushBatchLocked() -> std::expected<void, CowTreeError>
         _commitsSinceFlush = 0;
         return {};
     }
+    // Copy the buffered meta out under the has_value() guard, before the Fsync
+    // and the reset() below (so the access is provably checked and never dangles).
+    auto const pending = *_pendingMeta;
 
     // Crash-safe group commit, in strict order:
     //   1. fsync the buffered DATA pages so they are durable before any meta
@@ -429,7 +432,7 @@ auto FilePageStore::FlushBatchLocked() -> std::expected<void, CowTreeError>
     if (auto const r = Fsync(); !r.has_value())
         return std::unexpected(r.error());
     auto const target = (_lastDurableSlot == MetaSlot::A) ? MetaSlot::B : MetaSlot::A;
-    if (auto const r = WriteSlotLocked(target, *_pendingMeta); !r.has_value())
+    if (auto const r = WriteSlotLocked(target, pending); !r.has_value())
         return std::unexpected(r.error());
     if (auto const r = Fsync(); !r.has_value())
         return std::unexpected(r.error());

@@ -229,8 +229,8 @@ class CowTree
     {
         PageId left;
         std::optional<std::pair<std::vector<std::byte>, PageId>> split;
-        bool inserted { false };                        ///< True when the key was new (vs. replaced).
-        std::optional<std::vector<std::byte>> replaced; ///< Previous value bytes when the key was replaced.
+        bool inserted { false };                           ///< True when the key was new (vs. replaced).
+        std::optional<std::vector<std::byte>> replaced {}; ///< Previous value bytes when the key was replaced.
     };
 
     [[nodiscard]] auto PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)

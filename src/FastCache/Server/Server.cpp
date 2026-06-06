@@ -23,7 +23,7 @@ namespace
     /// value) would take down the entire daemon and every other connection.
     /// We instead log it and drop only this connection. The legacy threaded
     /// driver (PooledServerLoop) already has the equivalent guard.
-    DetachedTask RunConnectionDetached(std::unique_ptr<Connection> connection, ILogger& logger, IAdmissionControl* admission)
+    DetachedTask RunConnectionDetached(std::unique_ptr<Connection> connection, ILogger* logger, IAdmissionControl* admission)
     {
         try
         {
@@ -31,11 +31,11 @@ namespace
         }
         catch (std::exception const& e)
         {
-            logger.Logf(LogLevel::Error, "connection dropped on exception: {}", e.what());
+            logger->Logf(LogLevel::Error, "connection dropped on exception: {}", e.what());
         }
         catch (...)
         {
-            logger.Logf(LogLevel::Error, "connection dropped on unknown exception");
+            logger->Logf(LogLevel::Error, "connection dropped on unknown exception");
         }
         if (admission)
             admission->OnConnectionEnded();
@@ -83,7 +83,7 @@ Task<void> Server::Run()
             _metrics->Increment(IMetricsSink::Counter::ConnectionsTotal);
 
         auto connection = std::make_unique<Connection>(std::move(*accepted), _engine, _logger);
-        RunConnectionDetached(std::move(connection), _logger, _admission);
+        RunConnectionDetached(std::move(connection), &_logger, _admission);
     }
     co_return;
 }

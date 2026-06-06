@@ -45,99 +45,111 @@ FastCache::Task<bool> Send(FastCache::ISocket* socket, std::string_view payload)
     co_return r.has_value();
 }
 
-/// IStorage stub whose Get throws. Used to prove the connection driver's
+/// IStorage decorator whose Get throws. Used to prove the connection driver's
 /// exception firewall drops a single connection rather than letting the throw
 /// reach DetachedTask::unhandled_exception (std::terminate) and abort the whole
-/// server. Only Get is exercised by the test; the rest return a benign miss.
+/// server. Every other method forwards to a real in-memory storage.
 class ThrowOnGetStorage final: public FastCache::IStorage
 {
-    static auto Miss()
-    {
-        return std::unexpected(FastCache::MakeStorageError(FastCache::StorageErrorCode::KeyNotFound));
-    }
-
   public:
-    std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view, FastCache::TimePoint) override
+    std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view /*key*/,
+                                                                     FastCache::TimePoint /*now*/) override
     {
         throw std::bad_alloc {};
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> Set(std::string_view,
-                                                                    std::vector<std::byte>,
-                                                                    std::uint32_t,
-                                                                    FastCache::TimePoint) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> Set(std::string_view key,
+                                                                    std::vector<std::byte> value,
+                                                                    std::uint32_t flags,
+                                                                    FastCache::TimePoint expiry) override
     {
-        return FastCache::CasToken { 1 };
+        return _inner.Set(key, std::move(value), flags, expiry);
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> Add(
-        std::string_view, std::vector<std::byte>, std::uint32_t, FastCache::TimePoint, FastCache::TimePoint) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> Add(std::string_view key,
+                                                                    std::vector<std::byte> value,
+                                                                    std::uint32_t flags,
+                                                                    FastCache::TimePoint expiry,
+                                                                    FastCache::TimePoint now) override
     {
-        return Miss();
+        return _inner.Add(key, std::move(value), flags, expiry, now);
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> Replace(
-        std::string_view, std::vector<std::byte>, std::uint32_t, FastCache::TimePoint, FastCache::TimePoint) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> Replace(std::string_view key,
+                                                                        std::vector<std::byte> value,
+                                                                        std::uint32_t flags,
+                                                                        FastCache::TimePoint expiry,
+                                                                        FastCache::TimePoint now) override
     {
-        return Miss();
+        return _inner.Replace(key, std::move(value), flags, expiry, now);
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> Append(std::string_view,
-                                                                       std::span<std::byte const>,
-                                                                       FastCache::CasToken,
-                                                                       FastCache::TimePoint) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> Append(std::string_view key,
+                                                                       std::span<std::byte const> suffix,
+                                                                       FastCache::CasToken expected,
+                                                                       FastCache::TimePoint now) override
     {
-        return Miss();
+        return _inner.Append(key, suffix, expected, now);
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view,
-                                                                        std::span<std::byte const>,
-                                                                        FastCache::CasToken,
-                                                                        FastCache::TimePoint) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view key,
+                                                                        std::span<std::byte const> prefix,
+                                                                        FastCache::CasToken expected,
+                                                                        FastCache::TimePoint now) override
     {
-        return Miss();
+        return _inner.Prepend(key, prefix, expected, now);
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> CompareAndSwap(std::string_view,
-                                                                               FastCache::CasToken,
-                                                                               std::vector<std::byte>,
-                                                                               std::uint32_t,
-                                                                               FastCache::TimePoint,
-                                                                               FastCache::TimePoint) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> CompareAndSwap(std::string_view key,
+                                                                               FastCache::CasToken expected,
+                                                                               std::vector<std::byte> value,
+                                                                               std::uint32_t flags,
+                                                                               FastCache::TimePoint expiry,
+                                                                               FastCache::TimePoint now) override
     {
-        return Miss();
+        return _inner.CompareAndSwap(key, expected, std::move(value), flags, expiry, now);
     }
-    std::expected<IncrResult, FastCache::StorageError> IncrementOrInitialize(std::string_view,
-                                                                             std::uint64_t,
-                                                                             bool,
-                                                                             FastCache::TimePoint) override
+    std::expected<IncrResult, FastCache::StorageError> IncrementOrInitialize(std::string_view key,
+                                                                             std::uint64_t magnitude,
+                                                                             bool decrement,
+                                                                             FastCache::TimePoint now) override
     {
-        return std::unexpected(FastCache::MakeStorageError(FastCache::StorageErrorCode::KeyNotFound));
+        return _inner.IncrementOrInitialize(key, magnitude, decrement, now);
     }
-    std::expected<void, FastCache::StorageError> Delete(std::string_view, FastCache::TimePoint) override
+    std::expected<void, FastCache::StorageError> Delete(std::string_view key, FastCache::TimePoint now) override
     {
-        return std::unexpected(FastCache::MakeStorageError(FastCache::StorageErrorCode::KeyNotFound));
+        return _inner.Delete(key, now);
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> Touch(std::string_view,
-                                                                      FastCache::TimePoint,
-                                                                      FastCache::TimePoint) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> Touch(std::string_view key,
+                                                                      FastCache::TimePoint newExpiry,
+                                                                      FastCache::TimePoint now) override
     {
-        return Miss();
+        return _inner.Touch(key, newExpiry, now);
     }
-    std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view, FastCache::TimePoint) override
+    std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view key,
+                                                                      FastCache::TimePoint now) override
     {
-        return FastCache::GetResult {};
+        return _inner.Peek(key, now);
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(std::string_view,
-                                                                          std::optional<FastCache::TimePoint>,
-                                                                          FastCache::TimePoint) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(std::string_view key,
+                                                                          std::optional<FastCache::TimePoint> newExpiry,
+                                                                          FastCache::TimePoint now) override
     {
-        return Miss();
+        return _inner.MarkStale(key, newExpiry, now);
     }
-    void FlushWithGeneration(FastCache::TimePoint) override {}
-    std::size_t PurgeExpired(FastCache::TimePoint) override
+    void FlushWithGeneration(FastCache::TimePoint effectiveAt) override
     {
-        return 0;
+        _inner.FlushWithGeneration(effectiveAt);
     }
-    void Resize(std::size_t) override {}
+    std::size_t PurgeExpired(FastCache::TimePoint now) override
+    {
+        return _inner.PurgeExpired(now);
+    }
+    void Resize(std::size_t newMaxBytes) override
+    {
+        _inner.Resize(newMaxBytes);
+    }
     [[nodiscard]] FastCache::StorageStats Snapshot() const noexcept override
     {
-        return {};
+        return _inner.Snapshot();
     }
+
+  private:
+    FastCache::InMemoryLruStorage _inner;
 };
 
 } // namespace
