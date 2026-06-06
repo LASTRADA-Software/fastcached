@@ -33,13 +33,19 @@ namespace
     constexpr std::size_t MaxLineBytes = 4096;
     constexpr std::size_t MaxPayloadBytes = 16 * 1024 * 1024; // 16 MiB
 
-    /// Split a line on whitespace into tokens. `maxParts == 0` (the default)
-    /// imposes no limit: the line length is already bounded by ByteReader's
-    /// MaxLineBytes, so a multi-key `get`/`gets`/`gat`/`gats` keeps every key
-    /// instead of silently dropping those past a fixed cap.
-    [[nodiscard]] std::vector<std::string_view> Tokenize(std::string_view line, std::size_t maxParts = 0)
+    /// Split a line on whitespace into `out` (cleared first). `maxParts == 0`
+    /// (the default) imposes no limit: the line length is already bounded by
+    /// ByteReader's MaxLineBytes, so a multi-key `get`/`gets`/`gat`/`gats`
+    /// keeps every key instead of silently dropping those past a fixed cap.
+    /// Filling a caller-owned vector (cleared, capacity reused) avoids a heap
+    /// allocation on every command — the per-request tokenization was one of
+    /// the last per-GET allocations on the text hot path.
+    /// @param line Source line.
+    /// @param out  Destination token list (cleared, then appended to).
+    /// @param maxParts Cap on token count (0 = unlimited).
+    void Tokenize(std::string_view line, std::vector<std::string_view>& out, std::size_t maxParts = 0)
     {
-        std::vector<std::string_view> out;
+        out.clear();
         std::size_t i = 0;
         while (i < line.size() && (maxParts == 0 || out.size() < maxParts))
         {
@@ -52,7 +58,6 @@ namespace
                 ++i;
             out.emplace_back(line.data() + start, i - start);
         }
-        return out;
     }
 
     [[nodiscard]] bool ParseCasToken(std::string_view sv, CasToken& out) noexcept
@@ -605,6 +610,10 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket, CacheEngine* engine, std::
     ByteReader reader { *socket, MaxLineBytes, MaxPayloadBytes };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
 
+    // Reused across commands: cleared each iteration, so its capacity persists
+    // and the common path tokenizes without a per-command heap allocation.
+    std::vector<std::string_view> parts;
+
     while (true)
     {
         auto const lineResult = co_await reader.ReadLine();
@@ -618,7 +627,7 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket, CacheEngine* engine, std::
         if (line.empty())
             continue;
 
-        auto const parts = Tokenize(line);
+        Tokenize(line, parts);
         if (parts.empty())
         {
             (void) co_await WriteError(socket, "ERROR");
