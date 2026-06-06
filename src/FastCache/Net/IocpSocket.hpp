@@ -37,6 +37,8 @@ class IocpSocket final: public ISocket
 
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
+    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                            std::shared_ptr<void> keepAlive = {}) override;
     void Close() noexcept override;
     [[nodiscard]] bool IsClosed() const noexcept override
     {

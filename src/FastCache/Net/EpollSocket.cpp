@@ -9,7 +9,9 @@
     #include <FastCache/Net/SocketAddress.hpp>
 
     #include <sys/socket.h>
+    #include <sys/uio.h>
 
+    #include <array>
     #include <cerrno>
     #include <cstddef>
     #include <cstdint>
@@ -21,6 +23,7 @@
     #include <string_view>
     #include <tuple>
     #include <utility>
+    #include <vector>
 
     #include <fcntl.h>
     #include <unistd.h>
@@ -78,6 +81,95 @@ namespace
             ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
 
+    /// Per-`sendmsg` iovec batch cap. `IOV_MAX` is the kernel limit (1024 on
+    /// Linux); a single GET reply needs only a handful, but a multi-key `get`
+    /// can exceed it, so the send loop batches and re-issues.
+    constexpr std::size_t kMaxIov = 64;
+
+    /// Outcome of pushing a vectored-write cursor forward with `sendmsg`.
+    enum class SendProgress : std::uint8_t
+    {
+        Completed,  ///< Every segment fully sent.
+        WouldBlock, ///< Kernel buffer full (EAGAIN); arm EPOLLOUT and retry.
+        Error,      ///< Fatal send error; `errno` carries the cause.
+    };
+
+    /// Send as much of the segments from the cursor `[segIndex, segOffset]`
+    /// onward as the kernel accepts, advancing the cursor in place. Coalesces
+    /// up to `kMaxIov` segments per `sendmsg` and loops until the kernel
+    /// blocks, errors, or all bytes are gone.
+    /// @param fd Socket file descriptor.
+    /// @param segments Ordered payload segments.
+    /// @param segIndex In/out: index of the first unsent segment.
+    /// @param segOffset In/out: bytes already sent from `segments[segIndex]`.
+    /// @param sentTotal In/out: running count of bytes sent across the op.
+    /// @return Whether the cursor reached the end, would block, or errored.
+    [[nodiscard]] SendProgress SendFromCursor(int fd,
+                                              std::span<std::span<std::byte const> const> segments,
+                                              std::size_t& segIndex,
+                                              std::size_t& segOffset,
+                                              std::size_t& sentTotal) noexcept
+    {
+        while (segIndex < segments.size())
+        {
+            std::array<iovec, kMaxIov> iov {};
+            std::size_t count = 0;
+            for (auto i = segIndex; i < segments.size() && count < kMaxIov; ++i)
+            {
+                auto const seg = segments[i];
+                auto const skip = (i == segIndex) ? segOffset : std::size_t { 0 };
+                // A zero-length segment carries no bytes; skip it so it never
+                // occupies an iovec slot (and is stepped over by the advance
+                // loop below once the batch is sent).
+                if (seg.size() <= skip)
+                    continue;
+                iov[count].iov_base = const_cast<std::byte*>(seg.data() + skip);
+                iov[count].iov_len = seg.size() - skip;
+                ++count;
+            }
+            if (count == 0)
+            {
+                // Only empty/exhausted segments remained in this window; step
+                // the cursor past them and continue (or finish).
+                segIndex = segments.size();
+                segOffset = 0;
+                break;
+            }
+
+            msghdr msg {};
+            msg.msg_iov = iov.data();
+            msg.msg_iovlen = count;
+            auto const wrote = ::sendmsg(fd, &msg, MSG_NOSIGNAL);
+            if (wrote < 0)
+            {
+                if (errno == EAGAIN || errno == EINTR)
+                    return SendProgress::WouldBlock;
+                return SendProgress::Error;
+            }
+
+            sentTotal += static_cast<std::size_t>(wrote);
+            // Advance the cursor by `wrote` bytes across the segment list.
+            auto advance = static_cast<std::size_t>(wrote);
+            while (advance > 0 && segIndex < segments.size())
+            {
+                auto const seg = segments[segIndex];
+                auto const avail = seg.size() - segOffset;
+                if (advance < avail)
+                {
+                    segOffset += advance;
+                    advance = 0;
+                }
+                else
+                {
+                    advance -= avail;
+                    ++segIndex;
+                    segOffset = 0;
+                }
+            }
+        }
+        return segIndex >= segments.size() ? SendProgress::Completed : SendProgress::WouldBlock;
+    }
+
 } // namespace
 
 // -- EpollSocket ------------------------------------------------------------
@@ -92,9 +184,37 @@ struct EpollSocket::Impl
         IoAwaitable* awaitable { nullptr };
         // For Read: a writable view we fill in-place.
         std::span<std::byte> readBuffer {};
-        // For Write: bytes still to send.
+        // For a scalar Write: bytes still to send.
         std::span<std::byte const> writeRemaining {};
         std::size_t writeTotal { 0 };
+
+        // For a vectored Write (WriteVectored): an owned copy of the segment
+        // list (so the caller's `segments` span need not outlive the call),
+        // plus a cursor into it. The cursor names the first not-yet-fully-sent
+        // segment and the byte offset already consumed within it.
+        std::vector<std::span<std::byte const>> writeSegments {};
+        std::size_t writeSegIndex { 0 };
+        std::size_t writeSegOffset { 0 };
+        // Owner pinning the segments' backing bytes for the op's lifetime
+        // (e.g. the GetResult holding the reference-counted value). Released
+        // when the op completes.
+        std::shared_ptr<void> writeKeepAlive {};
+
+        /// @return True once every vectored segment has been fully sent.
+        [[nodiscard]] bool VectoredDone() const noexcept
+        {
+            return writeSegIndex >= writeSegments.size();
+        }
+
+        /// Reset all write state after a vectored op completes or fails.
+        void ClearVectored() noexcept
+        {
+            writeSegments.clear();
+            writeSegIndex = 0;
+            writeSegOffset = 0;
+            writeKeepAlive.reset();
+            writeTotal = 0;
+        }
     };
 
     Op readOp;
@@ -160,6 +280,33 @@ void EpollSocket::Impl::OnWritable(EpollFdHandler* base)
         return;
 
     auto* awaitable = impl->writeOp.awaitable;
+
+    // Vectored write in flight: drive the cursor with sendmsg.
+    if (!impl->writeOp.writeSegments.empty())
+    {
+        auto const progress = SendFromCursor(impl->handler.fd,
+                                             impl->writeOp.writeSegments,
+                                             impl->writeOp.writeSegIndex,
+                                             impl->writeOp.writeSegOffset,
+                                             impl->writeOp.writeTotal);
+        if (progress == SendProgress::WouldBlock)
+            return; // wait for the next writable event
+        if (progress == SendProgress::Error)
+        {
+            impl->writeOp.awaitable = nullptr;
+            impl->writeOp.ClearVectored();
+            impl->UpdateInterest();
+            awaitable->Complete(std::unexpected(MakePosixError(errno, "sendmsg")));
+            return;
+        }
+        auto const total = impl->writeOp.writeTotal;
+        impl->writeOp.awaitable = nullptr;
+        impl->writeOp.ClearVectored();
+        impl->UpdateInterest();
+        awaitable->Complete(IoResult { total });
+        return;
+    }
+
     while (!impl->writeOp.writeRemaining.empty())
     {
         auto const wrote =
@@ -275,6 +422,40 @@ IoAwaitable EpollSocket::Write(std::span<std::byte const> buffer)
     _impl->writeOp.awaitable = nullptr;
     _impl->writeOp.writeRemaining = remaining;
     _impl->writeOp.writeTotal = buffer.size();
+    IoAwaitable a;
+    a.SetSuspendCallback(&EpollSocketAwaitableSuspended, &_impl->writeOp);
+    std::ignore =
+        _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ _impl->readOp.awaitable != nullptr, /*write*/ true);
+    return a;
+}
+
+IoAwaitable EpollSocket::WriteVectored(std::span<std::span<std::byte const> const> segments, std::shared_ptr<void> keepAlive)
+{
+    if (_closed)
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    // Own a copy of the segment list so the caller's `segments` span need not
+    // outlive this call; the owned vector lives in writeOp until completion.
+    std::vector<std::span<std::byte const>> owned { segments.begin(), segments.end() };
+    std::size_t segIndex = 0;
+    std::size_t segOffset = 0;
+    std::size_t sent = 0;
+
+    // Fast path: try to drain synchronously without parking.
+    auto const progress = SendFromCursor(_fd, owned, segIndex, segOffset, sent);
+    if (progress == SendProgress::Error)
+        return IoAwaitable { std::unexpected(MakePosixError(errno, "sendmsg")) };
+    if (progress == SendProgress::Completed)
+        return IoAwaitable { IoResult { sent } };
+
+    // Park: stash the cursor + keep-alive and arm EPOLLOUT.
+    _impl->writeOp.awaitable = nullptr;
+    _impl->writeOp.writeSegments = std::move(owned);
+    _impl->writeOp.writeSegIndex = segIndex;
+    _impl->writeOp.writeSegOffset = segOffset;
+    _impl->writeOp.writeTotal = sent;
+    _impl->writeOp.writeKeepAlive = std::move(keepAlive);
     IoAwaitable a;
     a.SetSuspendCallback(&EpollSocketAwaitableSuspended, &_impl->writeOp);
     std::ignore =

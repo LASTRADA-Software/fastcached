@@ -128,6 +128,29 @@ IoAwaitable InMemorySocket::Write(std::span<std::byte const> buffer)
     return IoAwaitable { IoResult { accepted } };
 }
 
+IoAwaitable InMemorySocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                          std::shared_ptr<void> /*keepAlive*/)
+{
+    if (_closed)
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    // Push each segment in order so the peer observes the exact same byte
+    // stream a single contiguous Write would have produced. The keep-alive is
+    // unnecessary here: Push copies the bytes into the pipe synchronously, so
+    // nothing outlives this call.
+    std::size_t total = 0;
+    for (auto const seg: segments)
+    {
+        auto const accepted = _outbound->Push(seg);
+        total += accepted;
+        if (accepted < seg.size())
+            return IoAwaitable { std::unexpected(
+                NetError { .code = NetErrorCode::WouldBlock, .systemCode = 0, .context = "InMemoryPipe backpressure" }) };
+    }
+    return IoAwaitable { IoResult { total } };
+}
+
 void InMemorySocket::OnReadSuspended(IoAwaitable* awaitable, std::coroutine_handle<> /*handle*/) noexcept
 {
     auto* const self = static_cast<InMemorySocket*>(awaitable->CallbackState());

@@ -19,6 +19,7 @@
     #include <string>
     #include <string_view>
     #include <utility>
+    #include <vector>
 
     #include <mswsock.h>
     #include <ws2tcpip.h>
@@ -80,6 +81,13 @@ struct IocpSocket::Impl
         IocpCompletion completion;
         IoAwaitable* awaitable { nullptr };
         bool isWrite { false };
+        // Vectored-write backing storage that must outlive the overlapped
+        // completion: WSASend consumes the WSABUF array asynchronously, and
+        // the payload bytes are referenced (not copied) until the completion
+        // is dequeued. Both are released by the next Read/Write/WriteVectored
+        // that reuses this op, or at socket teardown.
+        std::vector<WSABUF> writeBufs {};
+        std::shared_ptr<void> writeKeepAlive {};
     };
 
     Op readOp;
@@ -206,6 +214,59 @@ IoAwaitable IocpSocket::Write(std::span<std::byte const> buffer)
         a.SetSuspendCallback(&SocketAwaitableSuspended, &op);
         return a;
     }
+    return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSASend")) };
+}
+
+IoAwaitable IocpSocket::WriteVectored(std::span<std::span<std::byte const> const> segments, std::shared_ptr<void> keepAlive)
+{
+    if (_closed)
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    auto& op = _impl->writeOp;
+    op.awaitable = nullptr;
+    op.completion.overlapped = OVERLAPPED {};
+
+    // Build the WSABUF array from the non-empty segments. Both this array and
+    // the referenced bytes must outlive the async completion, so the array
+    // lives in `op.writeBufs` and the payload owner in `op.writeKeepAlive`.
+    op.writeBufs.clear();
+    op.writeBufs.reserve(segments.size());
+    for (auto const seg: segments)
+    {
+        if (seg.empty())
+            continue;
+        WSABUF buf;
+        buf.buf = const_cast<CHAR*>(reinterpret_cast<CHAR const*>(seg.data()));
+        buf.len = static_cast<ULONG>(seg.size());
+        op.writeBufs.push_back(buf);
+    }
+    op.writeKeepAlive = std::move(keepAlive);
+
+    if (op.writeBufs.empty())
+    {
+        // Nothing to send; complete synchronously with zero bytes.
+        op.writeKeepAlive.reset();
+        return IoAwaitable { IoResult { 0 } };
+    }
+
+    DWORD bytesSent = 0;
+    auto const rc = WSASend(_impl->native,
+                            op.writeBufs.data(),
+                            static_cast<DWORD>(op.writeBufs.size()),
+                            &bytesSent,
+                            /*flags*/ 0,
+                            reinterpret_cast<LPWSAOVERLAPPED>(&op.completion),
+                            nullptr);
+    auto const lastErr = (rc == 0) ? 0 : WSAGetLastError();
+    if (rc == 0 || lastErr == WSA_IO_PENDING)
+    {
+        IoAwaitable a;
+        a.SetSuspendCallback(&SocketAwaitableSuspended, &op);
+        return a;
+    }
+    op.writeBufs.clear();
+    op.writeKeepAlive.reset();
     return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSASend")) };
 }
 

@@ -271,6 +271,38 @@ IoAwaitable BlockingSocket::Write(std::span<std::byte const> buffer)
     return IoAwaitable { IoResult { written } };
 }
 
+IoAwaitable BlockingSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                          std::shared_ptr<void> /*keepAlive*/)
+{
+    FC_ZONE_SCOPED_N("socket.writev");
+    if (_closed)
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    // A blocking socket sends everything before returning, so no keep-alive is
+    // needed: the segments outlive the call by construction. Send each segment
+    // fully, in order. (A scatter `writev`/`WSASend` is a possible refinement,
+    // but the threaded driver is the legacy path; the reactor's EpollSocket
+    // carries the zero-copy fast path.)
+    std::size_t total = 0;
+    for (auto const seg: segments)
+    {
+        std::size_t written = 0;
+        while (written < seg.size())
+        {
+            auto const n = ::send(static_cast<int>(_native),
+                                  reinterpret_cast<char const*>(seg.data()) + written,
+                                  static_cast<Detail::IoLen>(seg.size() - written),
+                                  0);
+            if (n < 0)
+                return IoAwaitable { std::unexpected(MakeSystemError("send")) };
+            written += static_cast<std::size_t>(n);
+        }
+        total += written;
+    }
+    return IoAwaitable { IoResult { total } };
+}
+
 // -- BlockingListener ------------------------------------------------------
 
 std::unique_ptr<BlockingListener> BlockingListener::Bind(std::string_view bindAddress,
