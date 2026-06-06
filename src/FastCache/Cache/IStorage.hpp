@@ -17,6 +17,21 @@
 namespace FastCache
 {
 
+/// LRU recency policy for the in-memory backend.
+///
+/// `Strict` promotes an entry to most-recently-used on **every** read, giving
+/// exact LRU order — but a read then mutates shared state, so reads on one
+/// shard must serialise behind an exclusive lock. `Approximate` skips the
+/// per-read promotion on the (lock-free, shared-locked) read path and instead
+/// promotes a sampled fraction of reads under a brief exclusive lock; reads run
+/// concurrently and eviction stays "good enough" (memcached-style). Approximate
+/// is the default — it favours read throughput, the common case for a cache.
+enum class LruMode : std::uint8_t
+{
+    Approximate, ///< Sampled/deferred promotion; concurrent reads (default).
+    Strict,      ///< Promote on every read; reads serialise per shard.
+};
+
 /// Storage statistics surfaced by the `stats` command.
 ///
 /// All counters are monotonic from process start unless the operator
@@ -242,6 +257,34 @@ class IStorage
 
     /// @return Current storage statistics.
     [[nodiscard]] virtual StorageStats Snapshot() const noexcept = 0;
+
+    /// Whether this backend's `Get` is safe to call concurrently under a
+    /// *shared* (reader) lock — i.e. a read performs no structural mutation of
+    /// shared state and uses atomic/last-writer-wins updates for any counters
+    /// it touches. A `ShardedStorage` wrapping such a backend takes a shared
+    /// lock on `Get`, recovering read parallelism on a single shard; backends
+    /// that mutate on read (LRU splice, page touch) return false and are served
+    /// under an exclusive lock as before. Defaults to false (conservative).
+    /// @return True if concurrent shared-locked `Get` calls are race-free.
+    [[nodiscard]] virtual bool SupportsSharedRead() const noexcept
+    {
+        return false;
+    }
+
+    /// Best-effort LRU promotion + access-time advance for a key just read
+    /// under a shared lock. Called by a lock-owning decorator (ShardedStorage)
+    /// on a *sampled* fraction of reads, holding an **exclusive** lock — so it
+    /// may safely splice the LRU and advance `lastAccess`/`fetched`, which the
+    /// shared `Get` deliberately skips. A no-op miss is fine if the key was
+    /// evicted in the meantime. The default does nothing (backends that
+    /// promote on `Get` itself need no deferred promotion).
+    /// @param key Key to promote.
+    /// @param now Current clock value (for the access-time advance).
+    virtual void PromoteOnRead(std::string_view key, TimePoint now)
+    {
+        static_cast<void>(key);
+        static_cast<void>(now);
+    }
 };
 
 } // namespace FastCache

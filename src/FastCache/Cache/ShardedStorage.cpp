@@ -34,15 +34,39 @@ std::size_t ShardedStorage::ShardIndexFor(std::string_view key) const noexcept
 
 std::expected<GetResult, StorageError> ShardedStorage::Get(std::string_view key, TimePoint now)
 {
-    // Get is *not* a pure read on the wrapped storage: both InMemory
-    // and CowTree backends mutate LRU order and stats counters on the
-    // way out. Taking a unique_lock here is the minimum-surface fix
-    // for the data race; splitting Get into Lookup + deferred-promote
-    // is the longer-term path to recover read parallelism.
     FC_ZONE_SCOPED_N("ShardedStorage::Get");
     auto& shard = *_shards[ShardIndexFor(key)];
-    std::unique_lock const lock { shard.mu };
-    return shard.storage->Get(key, now);
+
+    // Backends whose Get mutates shared state on read (Strict-mode LRU splice,
+    // CowTree page touch) need an exclusive lock. Backends that report
+    // SupportsSharedRead() perform a race-free read under a shared lock, so
+    // concurrent same-shard reads run in parallel — the multi-connection win.
+    if (!shard.storage->SupportsSharedRead())
+    {
+        std::unique_lock const lock { shard.mu };
+        return shard.storage->Get(key, now);
+    }
+
+    auto result = [&] {
+        std::shared_lock const lock { shard.mu };
+        return shard.storage->Get(key, now);
+    }();
+
+    // Sampled, deferred LRU promotion: on a fraction of hits, take a brief
+    // exclusive lock to splice the entry to MRU and advance its access time —
+    // the work the shared read skipped. Most reads pay nothing; the LRU stays
+    // approximately correct (memcached-style). The shared lock is released
+    // before the exclusive one is taken (std::shared_mutex has no upgrade).
+    if (result.has_value() && result->found)
+    {
+        constexpr unsigned kPromoteEveryN = 16;
+        if (shard.readSampler.fetch_add(1, std::memory_order_relaxed) % kPromoteEveryN == 0)
+        {
+            std::unique_lock const lock { shard.mu };
+            shard.storage->PromoteOnRead(key, now);
+        }
+    }
+    return result;
 }
 
 std::expected<CasToken, StorageError> ShardedStorage::Set(std::string_view key,

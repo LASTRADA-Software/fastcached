@@ -49,9 +49,10 @@ namespace
 
 } // namespace
 
-InMemoryLruStorage::InMemoryLruStorage(std::size_t maxBytes, std::size_t maxValueBytes) noexcept:
+InMemoryLruStorage::InMemoryLruStorage(std::size_t maxBytes, std::size_t maxValueBytes, LruMode lruMode) noexcept:
     _maxBytes { maxBytes },
-    _maxValueBytes { maxValueBytes }
+    _maxValueBytes { maxValueBytes },
+    _lruMode { lruMode }
 {
 }
 
@@ -76,6 +77,17 @@ InMemoryLruStorage::Iterator InMemoryLruStorage::FindAlive(std::string_view key,
     // Move to front (most recently used).
     _lru.splice(_lru.begin(), _lru, nodeIt);
     return nodeIt;
+}
+
+CacheEntry const* InMemoryLruStorage::FindAliveReadOnly(std::string_view key, TimePoint now) const
+{
+    auto const indexIt = _index.find(key);
+    if (indexIt == _index.end())
+        return nullptr;
+    auto const& entry = indexIt->second->entry;
+    if (!IsAlive(entry, _liveGeneration, now))
+        return nullptr; // leave the expired node in place for PurgeExpired
+    return &entry;
 }
 
 void InMemoryLruStorage::EraseAt(Iterator it)
@@ -154,6 +166,28 @@ CasToken InMemoryLruStorage::MutateExisting(Iterator it,
 std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view key, TimePoint now)
 {
     FC_ZONE_SCOPED_N("LruStorage::Get");
+
+    if (_lruMode == LruMode::Approximate)
+    {
+        // Shared-read-safe path: ShardedStorage calls this under a *shared*
+        // lock, so it must not mutate `_lru`/`_index` or write the node.
+        // Counters are atomic; promotion + lastAccess/fetched advance are
+        // deferred to the sampled, exclusively-locked PromoteOnRead.
+        _readCmdGet.fetch_add(1, std::memory_order_relaxed);
+        auto const* entry = FindAliveReadOnly(key, now);
+        if (entry == nullptr)
+        {
+            _readGetMisses.fetch_add(1, std::memory_order_relaxed);
+            return GetResult { .found = false, .entry = {} };
+        }
+        _readGetHits.fetch_add(1, std::memory_order_relaxed);
+        // Copy the entry (cheap: the value is a refcounted handle). The
+        // returned lastAccess reflects the value *before* this read, matching
+        // the meta `l` semantics; the stored advance happens in PromoteOnRead.
+        return GetResult { .found = true, .entry = *entry };
+    }
+
+    // Strict path: promote on every read; the caller holds an exclusive lock.
     ++_stats.cmdGet;
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
@@ -169,6 +203,23 @@ std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view 
     it->entry.lastAccess = now;
     it->entry.fetched = true;
     return result;
+}
+
+void InMemoryLruStorage::PromoteOnRead(std::string_view key, TimePoint now)
+{
+    // Called under an exclusive lock on a sampled fraction of Approximate-mode
+    // reads. Promote the entry to most-recently-used and advance its access
+    // bookkeeping — the work the shared `Get` deliberately skipped. A miss
+    // (evicted/expired since the read) is a harmless no-op.
+    auto const indexIt = _index.find(key);
+    if (indexIt == _index.end())
+        return;
+    auto const it = indexIt->second;
+    if (!IsAlive(it->entry, _liveGeneration, now))
+        return;
+    _lru.splice(_lru.begin(), _lru, it);
+    it->entry.lastAccess = now;
+    it->entry.fetched = true;
 }
 
 std::expected<CasToken, StorageError> InMemoryLruStorage::Set(std::string_view key,
@@ -421,7 +472,15 @@ StorageStats InMemoryLruStorage::Snapshot() const noexcept
     _stats.itemCount = _lru.size();
     _stats.bytesUsed = _bytesUsed;
     _stats.bytesLimit = _maxBytes;
-    return _stats;
+    // Fold in the atomic read-path counters (Approximate mode bumps these
+    // instead of the plain `_stats` members). Snapshot runs under the shard's
+    // exclusive lock, so the structure reads are stable; the atomics are read
+    // relaxed.
+    auto stats = _stats;
+    stats.cmdGet += _readCmdGet.load(std::memory_order_relaxed);
+    stats.getHits += _readGetHits.load(std::memory_order_relaxed);
+    stats.getMisses += _readGetMisses.load(std::memory_order_relaxed);
+    return stats;
 }
 
 void InMemoryLruStorage::Resize(std::size_t newMaxBytes)

@@ -6,6 +6,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -136,6 +137,9 @@ class ShardedStorage final: public IStorage
     {
         std::unique_ptr<IStorage> storage;
         mutable std::shared_mutex mu;
+        /// Per-shard read counter driving sampled LRU promotion: every Nth
+        /// shared-locked read triggers a brief exclusive-locked PromoteOnRead.
+        std::atomic<unsigned> readSampler { 0 };
     };
 
     std::vector<std::unique_ptr<Shard>> _shards;

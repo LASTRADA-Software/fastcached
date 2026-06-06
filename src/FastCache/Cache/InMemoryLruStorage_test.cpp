@@ -244,8 +244,9 @@ TEST_CASE("Get reports the previous lastAccess and advances the stored one", "[c
 {
     // The returned entry carries the access *before* this read so the meta
     // `l` flag reports seconds since the prior access (never a constant 0),
-    // while the stored lastAccess advances for the next reader.
-    FastCache::InMemoryLruStorage storage;
+    // while the stored lastAccess advances for the next reader. This advance-
+    // on-read behaviour is the Strict policy; Approximate defers it.
+    FastCache::InMemoryLruStorage storage { 0, 0, FastCache::LruMode::Strict };
     FastCache::ManualClock clock;
     std::ignore = storage.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
 
@@ -321,8 +322,9 @@ TEST_CASE("CAS hits, misses, and badval are counted distinctly", "[cache][stats]
 TEST_CASE("InMemoryLruStorage counts evicted_unfetched only for never-read victims", "[cache][stats][unfetched]")
 {
     // Budget fits exactly one 100-byte value, so each insert evicts the
-    // prior one.
-    FastCache::InMemoryLruStorage storage { 150 };
+    // prior one. Strict mode so a read marks the entry fetched (Approximate
+    // defers that, which would change the unfetched accounting under test).
+    FastCache::InMemoryLruStorage storage { 150, 0, FastCache::LruMode::Strict };
     FastCache::ManualClock clock;
     auto const big = MakeBytes(std::string(100, 'x'));
 
@@ -338,7 +340,9 @@ TEST_CASE("InMemoryLruStorage counts evicted_unfetched only for never-read victi
 
 TEST_CASE("InMemoryLruStorage counts expired_unfetched only for never-read victims", "[cache][stats][unfetched]")
 {
-    FastCache::InMemoryLruStorage storage;
+    // Strict mode: a read marks the entry fetched and lazy read-time expiry is
+    // accounted on Get. Approximate defers both to PurgeExpired / promotion.
+    FastCache::InMemoryLruStorage storage { 0, 0, FastCache::LruMode::Strict };
     FastCache::ManualClock clock;
     auto const expiry = clock.Now() + 1s;
     REQUIRE(storage.Set("k1", MakeBytes("a"), 0, expiry).has_value());

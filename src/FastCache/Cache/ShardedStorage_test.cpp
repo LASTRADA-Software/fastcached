@@ -42,7 +42,7 @@ std::unique_ptr<FastCache::ShardedStorage> MakeSharded(std::size_t shardCount)
 /// Test-only IStorage stub whose Get blocks on a condition variable until
 /// the test releases it. Used to prove that two readers can hold the
 /// shared lock concurrently and that a writer excludes readers.
-class ParkableStorage final: public FastCache::IStorage
+class ParkableStorage: public FastCache::IStorage
 {
   public:
     /// Calls in flight on Get() / Set() right now.
@@ -166,6 +166,18 @@ class ParkableStorage final: public FastCache::IStorage
     [[nodiscard]] FastCache::StorageStats Snapshot() const noexcept override
     {
         return {};
+    }
+};
+
+/// A ParkableStorage that advertises shared-read support, so ShardedStorage
+/// serves its Get under a *shared* lock — letting concurrent same-shard reads
+/// proceed in parallel. Used to prove the read-parallelism path.
+class SharedReadParkableStorage final: public ParkableStorage
+{
+  public:
+    [[nodiscard]] bool SupportsSharedRead() const noexcept override
+    {
+        return true;
     }
 };
 
@@ -301,13 +313,13 @@ TEST_CASE("ShardedStorage FlushWithGeneration invalidates entries in every shard
     }
 }
 
-TEST_CASE("Concurrent same-shard Gets serialise (correctness over read parallelism)", "[sharded][concurrency]")
+TEST_CASE("Concurrent same-shard Gets serialise for a non-shared-read backend", "[sharded][concurrency]")
 {
-    // ShardedStorage now takes a unique_lock for Get because the
-    // wrapped backends mutate LRU order / stats counters on the way
-    // out — a shared_lock would race those mutations. The trade-off
-    // is that two same-shard readers serialise; cross-shard reads
-    // still run in parallel (covered by the next test).
+    // A backend that reports SupportsSharedRead() == false (the default,
+    // e.g. a mutate-on-read backend) is served under a unique_lock, so two
+    // same-shard readers serialise. ParkableStorage does not override
+    // SupportsSharedRead, so it takes this exclusive path. Backends that DO
+    // support shared reads run concurrently (next test).
     auto parkable = std::make_unique<ParkableStorage>();
     auto* park = parkable.get();
     park->parkGet = true;
@@ -318,13 +330,17 @@ TEST_CASE("Concurrent same-shard Gets serialise (correctness over read paralleli
     FastCache::ManualClock clock;
 
     // First reader: parks inside Get while holding the unique lock.
-    std::thread reader1 { [&] { (void) storage.Get("any-key", clock.Now()); } };
+    std::thread reader1 { [&] {
+        (void) storage.Get("any-key", clock.Now());
+    } };
     REQUIRE(WaitFor([&] { return park->readInFlight.load() == 1; }));
 
     // Second reader on the same shard: must block on the unique lock
     // and therefore not reach the stub while reader1 is still parked
     // inside Get. We confirm with a brief grace window.
-    std::thread reader2 { [&] { (void) storage.Get("another-key", clock.Now()); } };
+    std::thread reader2 { [&] {
+        (void) storage.Get("another-key", clock.Now());
+    } };
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(50ms);
     REQUIRE(park->readInFlight.load() == 1);
@@ -335,6 +351,108 @@ TEST_CASE("Concurrent same-shard Gets serialise (correctness over read paralleli
     reader1.join();
     reader2.join();
     REQUIRE(park->readInFlight.load() == 0);
+}
+
+TEST_CASE("Concurrent same-shard Gets run in parallel for a shared-read backend", "[sharded][concurrency]")
+{
+    // The read-parallelism win: a backend that supports shared reads is served
+    // under a shared_lock, so two readers on the SAME shard are inside Get at
+    // once (readInFlight reaches 2), unlike the exclusive-lock backend above.
+    auto parkable = std::make_unique<SharedReadParkableStorage>();
+    auto* park = parkable.get();
+    park->parkGet = true;
+
+    std::vector<std::unique_ptr<FastCache::IStorage>> shards;
+    shards.push_back(std::move(parkable));
+    FastCache::ShardedStorage storage { std::move(shards) };
+    FastCache::ManualClock clock;
+
+    std::thread reader1 { [&] {
+        (void) storage.Get("key-a", clock.Now());
+    } };
+    std::thread reader2 { [&] {
+        (void) storage.Get("key-b", clock.Now());
+    } };
+
+    // Both readers must reach the stub concurrently while parked — proving the
+    // shared lock admits them simultaneously.
+    REQUIRE(WaitFor([&] { return park->readInFlight.load() == 2; }));
+
+    park->Release();
+    reader1.join();
+    reader2.join();
+    REQUIRE(park->readInFlight.load() == 0);
+}
+
+TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[sharded][concurrency][stress]")
+{
+    // The real test of the shared-read path: many threads read and write the
+    // SAME small key set on a ShardedStorage<InMemoryLruStorage> (Approximate
+    // mode). Readers run under a shared lock and touch atomic stats + copy the
+    // refcounted value handle; writers rebind values (copy-on-write) and the
+    // sampled promotion splices under a brief exclusive lock. Run under the
+    // clang-tsan preset, this surfaces any data race; correctness-wise every
+    // observed value must be one a writer actually stored (never torn).
+    auto storage = MakeSharded(4);
+    FastCache::SteadyClock clock;
+
+    // A handful of keys, each with a fixed set of legal values, so a reader can
+    // verify any value it sees is a complete, valid one written by some thread.
+    constexpr int kKeys = 8;
+    auto keyOf = [](int k) {
+        return "key-" + std::to_string(k);
+    };
+    auto valueOf = [](int k, int v) {
+        return "k" + std::to_string(k) + "-v" + std::to_string(v);
+    };
+    constexpr int kValuesPerKey = 4;
+    for (int k = 0; k < kKeys; ++k)
+        REQUIRE(storage->Set(keyOf(k), MakeBytes(valueOf(k, 0)), 0, FastCache::TimePoint::max()).has_value());
+
+    constexpr int kThreads = 8;
+    constexpr int kOpsPerThread = 5000;
+    std::atomic<bool> torn { false };
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t)
+    {
+        threads.emplace_back([&, t] {
+            std::mt19937 rng { static_cast<std::uint32_t>(0x9E37 + t) };
+            for (int i = 0; i < kOpsPerThread; ++i)
+            {
+                int const k = static_cast<int>(rng() % kKeys);
+                if ((rng() & 1U) != 0U)
+                {
+                    int const v = static_cast<int>(rng() % kValuesPerKey);
+                    (void) storage->Set(keyOf(k), MakeBytes(valueOf(k, v)), 0, FastCache::TimePoint::max());
+                }
+                else
+                {
+                    auto const got = storage->Get(keyOf(k), clock.Now());
+                    if (got.has_value() && got->found)
+                    {
+                        auto const text = Decode(got->entry.ValueBytes());
+                        bool legal = false;
+                        for (int v = 0; v < kValuesPerKey; ++v)
+                            legal = legal || text == valueOf(k, v);
+                        if (!legal)
+                            torn.store(true);
+                    }
+                }
+            }
+        });
+    }
+    for (auto& th: threads)
+        th.join();
+
+    REQUIRE_FALSE(torn.load());
+    // Every key still resolves to a legal value after the storm.
+    for (int k = 0; k < kKeys; ++k)
+    {
+        auto const got = storage->Get(keyOf(k), clock.Now());
+        REQUIRE(got.has_value());
+        REQUIRE(got->found);
+    }
 }
 
 TEST_CASE("Cross-shard Gets run in parallel (sharding preserves read parallelism)", "[sharded][concurrency]")
@@ -366,8 +484,12 @@ TEST_CASE("Cross-shard Gets run in parallel (sharding preserves read parallelism
 
     // Two readers on distinct shards must both reach the stub
     // simultaneously — sharding's whole point.
-    std::thread reader0 { [&] { (void) storage.Get(keyShard0, clock.Now()); } };
-    std::thread reader1 { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
+    std::thread reader0 { [&] {
+        (void) storage.Get(keyShard0, clock.Now());
+    } };
+    std::thread reader1 { [&] {
+        (void) storage.Get(keyShard1, clock.Now());
+    } };
     REQUIRE(WaitFor([&] { return park0->readInFlight.load() == 1 && park1->readInFlight.load() == 1; }));
 
     park0->Release();
@@ -404,7 +526,9 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     }
 
     // Writer parks inside Set on shard 0, holding the exclusive lock.
-    std::thread writer { [&] { (void) storage.Set(keyShard0, MakeBytes("v"), 0, FastCache::TimePoint::max()); } };
+    std::thread writer { [&] {
+        (void) storage.Set(keyShard0, MakeBytes("v"), 0, FastCache::TimePoint::max());
+    } };
     REQUIRE(WaitFor([&] { return park0->writeInFlight.load() == 1; }));
 
     // A reader on the same shard MUST block — until the writer releases,
@@ -423,7 +547,9 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     // A reader on a DIFFERENT shard must proceed immediately — it should
     // reach the inner stub (where parkGet=true holds it) without being
     // blocked by the unrelated writer on shard 0.
-    std::thread otherShardReader { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
+    std::thread otherShardReader { [&] {
+        (void) storage.Get(keyShard1, clock.Now());
+    } };
     REQUIRE(WaitFor([&] { return park1->readInFlight.load() == 1; }));
 
     // Release the writer; the same-shard reader can then proceed too.

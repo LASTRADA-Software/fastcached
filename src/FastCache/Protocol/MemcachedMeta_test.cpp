@@ -418,9 +418,12 @@ TEST_CASE("meta mg with u does not count a get hit (no-bump)", "[protocol][meta]
 TEST_CASE("meta mg l reports seconds since the previous read (regression)", "[protocol][meta][mg][last-access][regression]")
 {
     // engine->Get used to stamp lastAccess before `l` was computed, so `l`
-    // was always 0. Drive two reads 10s apart on the same engine.
+    // was always 0. Drive two reads 10s apart on the same engine. Strict mode
+    // so the stored lastAccess advances on every read (the Approximate policy
+    // defers that and would report l0 here); the since-previous-read semantics
+    // are what this regression guards.
     FastCache::ManualClock clock;
-    FastCache::InMemoryLruStorage storage;
+    FastCache::InMemoryLruStorage storage { 0, 0, FastCache::LruMode::Strict };
     FastCache::CacheEngine engine { storage, clock };
     FastCache::MemcachedTextHandler handler;
 
