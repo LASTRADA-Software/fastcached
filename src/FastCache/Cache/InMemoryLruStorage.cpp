@@ -103,7 +103,10 @@ void InMemoryLruStorage::EvictToFit()
     FC_PLOT("lru.bytesUsed", static_cast<std::int64_t>(_bytesUsed));
 }
 
-CasToken InMemoryLruStorage::InsertNew(std::string key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry)
+CasToken InMemoryLruStorage::InsertNew(std::string key,
+                                       std::span<std::byte const> value,
+                                       std::uint32_t flags,
+                                       TimePoint expiry)
 {
     FC_ZONE_SCOPED_N("LruStorage::InsertNew");
     auto const cas = _nextCas++;
@@ -111,7 +114,7 @@ CasToken InMemoryLruStorage::InsertNew(std::string key, std::vector<std::byte> v
 
     Node node;
     node.key = std::move(key);
-    node.entry.value = MakeSharedValue(std::move(value));
+    node.entry.value = MakeSharedValue(value);
     node.entry.flags = flags;
     node.entry.cas = cas;
     node.entry.expiry = expiry;
@@ -125,13 +128,16 @@ CasToken InMemoryLruStorage::InsertNew(std::string key, std::vector<std::byte> v
     return cas;
 }
 
-CasToken InMemoryLruStorage::MutateExisting(Iterator it, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry)
+CasToken InMemoryLruStorage::MutateExisting(Iterator it,
+                                            std::span<std::byte const> value,
+                                            std::uint32_t flags,
+                                            TimePoint expiry)
 {
     FC_ZONE_SCOPED_N("LruStorage::MutateExisting");
     _bytesUsed -= it->entry.ValueSize();
     // Rebind to a fresh immutable buffer (copy-on-write): any reader still
     // holding the previous SharedValue keeps a valid, unchanged payload.
-    it->entry.value = MakeSharedValue(std::move(value));
+    it->entry.value = MakeSharedValue(value);
     it->entry.flags = flags;
     it->entry.expiry = expiry;
     it->entry.generation = _liveGeneration;

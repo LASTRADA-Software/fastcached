@@ -56,7 +56,7 @@ TEST_CASE("InMemoryLruStorage a held GET value survives a concurrent overwrite (
     auto reader = storage.Get("k", clock.Now());
     REQUIRE(reader.has_value());
     REQUIRE(reader->found);
-    auto const heldHandle = reader->entry.value; // shared_ptr to the original buffer
+    auto const heldHandle = reader->entry.value; // refcounted handle to the original buffer
     auto const heldView = reader->entry.ValueBytes();
     REQUIRE(Decode(heldView) == "original");
 
@@ -67,8 +67,8 @@ TEST_CASE("InMemoryLruStorage a held GET value survives a concurrent overwrite (
 
     // The bytes the reader is still "streaming" are unchanged and valid.
     REQUIRE(Decode(heldView) == "original");
-    REQUIRE(heldHandle != nullptr);
-    REQUIRE(Decode(std::span<std::byte const> { heldHandle->data(), heldHandle->size() }) == "original");
+    REQUIRE(static_cast<bool>(heldHandle));
+    REQUIRE(Decode(heldHandle.Bytes()) == "original");
 
     // A fresh GET observes the latest value.
     auto const latest = storage.Get("k", clock.Now());

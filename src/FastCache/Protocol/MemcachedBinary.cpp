@@ -348,7 +348,7 @@ namespace
                                          std::span<std::byte const> { extras.data(), extras.size() },
                                          keyOut,
                                          entry.ValueBytes(),
-                                         entry.value);
+                                         entry.value.AsKeepAlive());
     }
 
     Task<bool> HandleDelete(
@@ -441,7 +441,7 @@ namespace
                                          std::span<std::byte const> { outExtras.data(), outExtras.size() },
                                          keyOut,
                                          entry.ValueBytes(),
-                                         entry.value);
+                                         entry.value.AsKeepAlive());
     }
 
     /// memcached binary increment / decrement, including auto-vivify on

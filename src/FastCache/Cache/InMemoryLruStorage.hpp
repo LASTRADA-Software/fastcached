@@ -129,13 +129,15 @@ class InMemoryLruStorage final: public IStorage
     Iterator FindAlive(std::string_view key, TimePoint now);
 
     /// Insert a new entry; evicts as needed to stay under the byte budget.
+    /// The value bytes are copied into a fresh immutable buffer.
     /// @return CAS token of the inserted entry.
-    CasToken InsertNew(std::string key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry);
+    CasToken InsertNew(std::string key, std::span<std::byte const> value, std::uint32_t flags, TimePoint expiry);
 
     /// Mutate the existing entry in-place; updates byte accounting and
-    /// promotes the entry to the front of the LRU. Bumps CAS.
+    /// promotes the entry to the front of the LRU. Bumps CAS. The value bytes
+    /// are copied into a fresh immutable buffer (copy-on-write).
     /// @return New CAS token.
-    CasToken MutateExisting(Iterator it, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry);
+    CasToken MutateExisting(Iterator it, std::span<std::byte const> value, std::uint32_t flags, TimePoint expiry);
 
     /// Evict from the LRU tail until bytesUsed <= maxBytes.
     void EvictToFit();

@@ -495,7 +495,7 @@ std::expected<std::optional<CowTreeStorage::LoadedEntry>, StorageError> CowTreeS
         // overflow chain into a fresh heap buffer, so wrapping it in a
         // SharedValue is correct (it outlives any read lock) — it simply
         // yields no copy-elimination benefit, unlike the in-memory backend.
-        entry.value = MakeSharedValue(std::move(*value));
+        entry.value = MakeSharedValue(*value);
     }
     else
     {
@@ -830,7 +830,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Set(std::string_view key,
     if (value.size() > _options.maxValueBytes)
         return std::unexpected(MakeError(StorageErrorCode::ValueTooLarge));
     CacheEntry e;
-    e.value = MakeSharedValue(std::move(value));
+    e.value = MakeSharedValue(value);
     e.flags = flags;
     e.cas = _nextCas++;
     e.expiry = expiry;
@@ -885,7 +885,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Append(std::string_view ke
     combined.reserve(existing.size() + suffix.size());
     combined.insert(combined.end(), existing.begin(), existing.end());
     combined.insert(combined.end(), suffix.begin(), suffix.end());
-    entry.value = MakeSharedValue(std::move(combined));
+    entry.value = MakeSharedValue(combined);
     entry.cas = _nextCas++;
     // A value-rewriting mutation produces a fresh item nobody has read yet
     // (mirrors InMemoryLruStorage::MutateExisting and the CacheEntry contract).
@@ -917,7 +917,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Prepend(std::string_view k
     merged.reserve(prefix.size() + existing.size());
     merged.insert(merged.end(), prefix.begin(), prefix.end());
     merged.insert(merged.end(), existing.begin(), existing.end());
-    entry.value = MakeSharedValue(std::move(merged));
+    entry.value = MakeSharedValue(merged);
     entry.cas = _nextCas++;
     // A value-rewriting mutation produces a fresh item nobody has read yet
     // (mirrors InMemoryLruStorage::MutateExisting and the CacheEntry contract).

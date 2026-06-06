@@ -577,7 +577,7 @@ namespace
                 entry.ValueBytes(),
                 AsBytes(Crlf),
             };
-            co_return co_await WriteAllVectored(socket, segments, got->entry.value);
+            co_return co_await WriteAllVectored(socket, segments, got->entry.value.AsKeepAlive());
         }
         co_return co_await WriteAll(socket, line);
     }
