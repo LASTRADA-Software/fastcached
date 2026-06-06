@@ -202,7 +202,7 @@ TEST_CASE("ShardedStorage round-trips Set + Get through the right shard", "[shar
     auto const got = storage->Get("foo", clock.Now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(Decode(got->entry.value) == "bar");
+    REQUIRE(Decode(got->entry.ValueBytes()) == "bar");
 }
 
 TEST_CASE("ShardedStorage Touch routes to the owning shard", "[sharded][touch]")
@@ -318,17 +318,13 @@ TEST_CASE("Concurrent same-shard Gets serialise (correctness over read paralleli
     FastCache::ManualClock clock;
 
     // First reader: parks inside Get while holding the unique lock.
-    std::thread reader1 { [&] {
-        (void) storage.Get("any-key", clock.Now());
-    } };
+    std::thread reader1 { [&] { (void) storage.Get("any-key", clock.Now()); } };
     REQUIRE(WaitFor([&] { return park->readInFlight.load() == 1; }));
 
     // Second reader on the same shard: must block on the unique lock
     // and therefore not reach the stub while reader1 is still parked
     // inside Get. We confirm with a brief grace window.
-    std::thread reader2 { [&] {
-        (void) storage.Get("another-key", clock.Now());
-    } };
+    std::thread reader2 { [&] { (void) storage.Get("another-key", clock.Now()); } };
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(50ms);
     REQUIRE(park->readInFlight.load() == 1);
@@ -370,12 +366,8 @@ TEST_CASE("Cross-shard Gets run in parallel (sharding preserves read parallelism
 
     // Two readers on distinct shards must both reach the stub
     // simultaneously — sharding's whole point.
-    std::thread reader0 { [&] {
-        (void) storage.Get(keyShard0, clock.Now());
-    } };
-    std::thread reader1 { [&] {
-        (void) storage.Get(keyShard1, clock.Now());
-    } };
+    std::thread reader0 { [&] { (void) storage.Get(keyShard0, clock.Now()); } };
+    std::thread reader1 { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
     REQUIRE(WaitFor([&] { return park0->readInFlight.load() == 1 && park1->readInFlight.load() == 1; }));
 
     park0->Release();
@@ -412,9 +404,7 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     }
 
     // Writer parks inside Set on shard 0, holding the exclusive lock.
-    std::thread writer { [&] {
-        (void) storage.Set(keyShard0, MakeBytes("v"), 0, FastCache::TimePoint::max());
-    } };
+    std::thread writer { [&] { (void) storage.Set(keyShard0, MakeBytes("v"), 0, FastCache::TimePoint::max()); } };
     REQUIRE(WaitFor([&] { return park0->writeInFlight.load() == 1; }));
 
     // A reader on the same shard MUST block — until the writer releases,
@@ -433,9 +423,7 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     // A reader on a DIFFERENT shard must proceed immediately — it should
     // reach the inner stub (where parkGet=true holds it) without being
     // blocked by the unrelated writer on shard 0.
-    std::thread otherShardReader { [&] {
-        (void) storage.Get(keyShard1, clock.Now());
-    } };
+    std::thread otherShardReader { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
     REQUIRE(WaitFor([&] { return park1->readInFlight.load() == 1; }));
 
     // Release the writer; the same-shard reader can then proceed too.
@@ -527,7 +515,7 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
         auto const got = storage->Get(key, clock.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(Decode(got->entry.value) == std::format("final-{}", i));
+        REQUIRE(Decode(got->entry.ValueBytes()) == std::format("final-{}", i));
     }
 }
 
@@ -543,7 +531,7 @@ TEST_CASE("ShardedStorage GetAndTouch refreshes expiry and returns the post-touc
     auto const gat = storage->GetAndTouch("k", clock.Now() + 60s, clock.Now());
     REQUIRE(gat.has_value());
     REQUIRE(gat->found);
-    REQUIRE(Decode(gat->entry.value) == "v");
+    REQUIRE(Decode(gat->entry.ValueBytes()) == "v");
     REQUIRE(gat->entry.cas != *setCas);              // touch bumped CAS
     REQUIRE(gat->entry.expiry == clock.Now() + 60s); // and refreshed expiry
 

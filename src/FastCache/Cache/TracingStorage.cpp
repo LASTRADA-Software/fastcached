@@ -73,7 +73,7 @@ std::expected<GetResult, StorageError> TracingStorage::Get(std::string_view key,
             if (!r.has_value())
                 return std::string { ErrorOutcome(r.error()) };
             if (r->found)
-                return std::format("HIT bytes={}", r->entry.value.size());
+                return std::format("HIT bytes={}", r->entry.ValueSize());
             return "MISS";
         });
 }
@@ -230,7 +230,7 @@ std::expected<GetResult, StorageError> TracingStorage::Peek(std::string_view key
             if (!r.has_value())
                 return std::string { ErrorOutcome(r.error()) };
             if (r->found)
-                return std::format("HIT bytes={}", r->entry.value.size());
+                return std::format("HIT bytes={}", r->entry.ValueSize());
             return "MISS";
         });
 }
@@ -260,7 +260,7 @@ std::expected<GetResult, StorageError> TracingStorage::GetAndTouch(std::string_v
             if (!r.has_value())
                 return std::string { ErrorOutcome(r.error()) };
             if (r->found)
-                return std::format("HIT bytes={}", r->entry.value.size());
+                return std::format("HIT bytes={}", r->entry.ValueSize());
             return "MISS";
         });
 }

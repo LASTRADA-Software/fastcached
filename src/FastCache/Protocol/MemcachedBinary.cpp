@@ -338,7 +338,7 @@ namespace
                                          entry.cas,
                                          std::span<std::byte const> { extras.data(), extras.size() },
                                          keyOut,
-                                         std::span<std::byte const> { entry.value.data(), entry.value.size() });
+                                         entry.ValueBytes());
     }
 
     Task<bool> HandleDelete(
@@ -430,7 +430,7 @@ namespace
                                          entry.cas,
                                          std::span<std::byte const> { outExtras.data(), outExtras.size() },
                                          keyOut,
-                                         std::span<std::byte const> { entry.value.data(), entry.value.size() });
+                                         entry.ValueBytes());
     }
 
     /// memcached binary increment / decrement, including auto-vivify on

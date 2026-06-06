@@ -129,14 +129,14 @@ namespace
         out.push_back(' ');
         out.append(std::to_string(entry.flags));
         out.push_back(' ');
-        out.append(std::to_string(entry.value.size()));
+        out.append(std::to_string(entry.ValueSize()));
         if (includeCas)
         {
             out.push_back(' ');
             out.append(std::to_string(entry.cas));
         }
         out.append(Crlf);
-        for (auto const b: entry.value)
+        for (auto const b: entry.ValueBytes())
             out.push_back(static_cast<char>(b));
         out.append(Crlf);
     }

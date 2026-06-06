@@ -236,8 +236,7 @@ namespace
         auto const result = engine->Get(args[0]);
         if (!result.has_value() || !result->found)
             co_return co_await ReplyNil(socket);
-        co_return co_await ReplyBulkString(
-            socket, std::span<std::byte const> { result->entry.value.data(), result->entry.value.size() });
+        co_return co_await ReplyBulkString(socket, result->entry.ValueBytes());
     }
 
     Task<bool> HandleSet(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)

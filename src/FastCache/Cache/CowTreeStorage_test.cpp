@@ -31,6 +31,7 @@ using namespace std::chrono_literals;
 using FastCache::Testing::Decode;
 using FastCache::Testing::MakeBytes;
 using FastCache::Testing::TempFile;
+using FastCache::Testing::ValueOf;
 
 namespace
 {
@@ -118,7 +119,7 @@ TEST_CASE("CowTreeStorage Set + Get round-trips", "[cowstorage]")
     auto got = (*storage)->Get("k", clock.Now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(Decode(got->entry.value) == "hello");
+    REQUIRE(Decode(got->entry.ValueBytes()) == "hello");
     REQUIRE(got->entry.flags == 7U);
     REQUIRE(got->entry.cas == *cas);
 }
@@ -136,7 +137,7 @@ TEST_CASE("CowTreeStorage entries survive close + reopen", "[cowstorage][persist
         auto got = storage.Get("k", clock.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(Decode(got->entry.value) == "persisted");
+        REQUIRE(Decode(got->entry.ValueBytes()) == "persisted");
     });
 }
 
@@ -152,14 +153,14 @@ TEST_CASE("Empty value roundtrips, including across reopen", "[cowstorage][round
         auto got = storage.Get("empty", FastCache::ManualClock {}.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(got->entry.value.empty());
+        REQUIRE(ValueOf(got->entry).empty());
     });
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
         auto got = storage.Get("empty", FastCache::ManualClock {}.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(got->entry.value.empty());
+        REQUIRE(ValueOf(got->entry).empty());
     });
 }
 
@@ -187,8 +188,8 @@ TEST_CASE("Every single byte 0x00..0xFF roundtrips across reopen", "[cowstorage]
             auto got = storage.Get(key, clock.Now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
-            REQUIRE(got->entry.value.size() == 1U);
-            REQUIRE(static_cast<std::uint8_t>(got->entry.value[0]) == static_cast<std::uint8_t>(b));
+            REQUIRE(got->entry.ValueSize() == 1U);
+            REQUIRE(static_cast<std::uint8_t>(ValueOf(got->entry)[0]) == static_cast<std::uint8_t>(b));
         }
     });
 }
@@ -209,7 +210,7 @@ TEST_CASE("All-byte-values blob roundtrips across reopen", "[cowstorage][roundtr
         auto got = storage.Get("blob", FastCache::ManualClock {}.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(got->entry.value == blob);
+        REQUIRE(ValueOf(got->entry) == blob);
     });
 }
 
@@ -229,12 +230,12 @@ TEST_CASE("1 KiB / 64 KiB random binary roundtrips across reopen", "[cowstorage]
         auto a = storage.Get("small", clock.Now());
         REQUIRE(a.has_value());
         REQUIRE(a->found);
-        REQUIRE(a->entry.value == small);
+        REQUIRE(ValueOf(a->entry) == small);
 
         auto b = storage.Get("medium", clock.Now());
         REQUIRE(b.has_value());
         REQUIRE(b->found);
-        REQUIRE(b->entry.value == medium);
+        REQUIRE(ValueOf(b->entry) == medium);
     });
 }
 
@@ -259,7 +260,7 @@ TEST_CASE("Value exactly at maxValueBytes roundtrips; one over returns ValueTooL
     auto got = (*storage)->Get("fits", FastCache::ManualClock {}.Now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(got->entry.value == fits);
+    REQUIRE(ValueOf(got->entry) == fits);
 }
 
 TEST_CASE("Keys with embedded NULs and non-ASCII bytes roundtrip", "[cowstorage][roundtrip]")
@@ -280,17 +281,17 @@ TEST_CASE("Keys with embedded NULs and non-ASCII bytes roundtrip", "[cowstorage]
         auto a = storage.Get(keyA, clock.Now());
         REQUIRE(a.has_value());
         REQUIRE(a->found);
-        REQUIRE(Decode(a->entry.value) == "A");
+        REQUIRE(Decode(a->entry.ValueBytes()) == "A");
 
         auto b = storage.Get(keyB, clock.Now());
         REQUIRE(b.has_value());
         REQUIRE(b->found);
-        REQUIRE(Decode(b->entry.value) == "B");
+        REQUIRE(Decode(b->entry.ValueBytes()) == "B");
 
         auto c = storage.Get(keyC, clock.Now());
         REQUIRE(c.has_value());
         REQUIRE(c->found);
-        REQUIRE(Decode(c->entry.value) == "C");
+        REQUIRE(Decode(c->entry.ValueBytes()) == "C");
     });
 }
 
@@ -394,7 +395,7 @@ TEST_CASE("Many small entries fit and read back across reopen", "[cowstorage][sh
             auto got = storage.Get(std::format("key-{:05d}", i), clock.Now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
-            REQUIRE(Decode(got->entry.value) == std::format("value-{:05d}", i));
+            REQUIRE(Decode(got->entry.ValueBytes()) == std::format("value-{:05d}", i));
         }
     });
 }
@@ -417,7 +418,7 @@ TEST_CASE("Sort-key prefixes do not leak across entries", "[cowstorage][shape]")
             auto got = storage.Get(k, clock.Now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
-            REQUIRE(Decode(got->entry.value) == v);
+            REQUIRE(Decode(got->entry.ValueBytes()) == v);
         }
     });
 }
@@ -434,7 +435,7 @@ TEST_CASE("Update replaces in place; only the latest value persists", "[cowstora
         auto got = storage.Get("k", FastCache::ManualClock {}.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(Decode(got->entry.value) == "v3");
+        REQUIRE(Decode(got->entry.ValueBytes()) == "v3");
     });
 }
 
@@ -451,7 +452,7 @@ TEST_CASE("Delete + reinsert with different value persists the new value", "[cow
         auto got = storage.Get("k", clock.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(Decode(got->entry.value) == "new");
+        REQUIRE(Decode(got->entry.ValueBytes()) == "new");
     });
 }
 
@@ -497,7 +498,7 @@ TEST_CASE("Replace overwrites and persists across reopen", "[cowstorage][roundtr
         auto got = storage.Get("k", clock.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(Decode(got->entry.value) == "v2");
+        REQUIRE(Decode(got->entry.ValueBytes()) == "v2");
     });
 }
 
@@ -517,14 +518,14 @@ TEST_CASE("Append + Prepend round-trip and persist", "[cowstorage][roundtrip]")
         auto got = storage.Get("k", clock.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(Decode(got->entry.value) == "start middle end");
+        REQUIRE(Decode(got->entry.ValueBytes()) == "start middle end");
     });
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
         auto got = storage.Get("k", clock.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(Decode(got->entry.value) == "start middle end");
+        REQUIRE(Decode(got->entry.ValueBytes()) == "start middle end");
     });
 }
 
@@ -550,7 +551,7 @@ TEST_CASE("Append exceeding maxValueBytes returns ValueTooLarge and leaves value
     auto got = (*storage)->Get("k", clock.Now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(Decode(got->entry.value) == "0123456789ABCDE");
+    REQUIRE(Decode(got->entry.ValueBytes()) == "0123456789ABCDE");
 }
 
 TEST_CASE("CompareAndSwap success path persists across reopen", "[cowstorage][cas][roundtrip]")
@@ -574,7 +575,7 @@ TEST_CASE("CompareAndSwap success path persists across reopen", "[cowstorage][ca
         auto got = storage.Get("k", clock.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(Decode(got->entry.value) == "two");
+        REQUIRE(Decode(got->entry.ValueBytes()) == "two");
     });
 }
 
@@ -595,7 +596,7 @@ TEST_CASE("CompareAndSwap mismatch leaves entry untouched", "[cowstorage][cas]")
     auto got = (*storage)->Get("k", clock.Now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(Decode(got->entry.value) == "one");
+    REQUIRE(Decode(got->entry.ValueBytes()) == "one");
     REQUIRE(got->entry.flags == 7U);
     REQUIRE(got->entry.cas == *setCas);
 }
@@ -623,7 +624,7 @@ TEST_CASE("IncrementOrInitialize returns KeyNotFound on a miss; increments an ex
         auto got = storage.Get("counter", clock.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(Decode(got->entry.value) == "15");
+        REQUIRE(Decode(got->entry.ValueBytes()) == "15");
     });
 }
 
@@ -717,7 +718,7 @@ TEST_CASE("CowTreeStorage GetAndTouch refreshes the expiry and returns the entry
     auto const gat = (*storage)->GetAndTouch("k", newExpiry, clock.Now());
     REQUIRE(gat.has_value());
     REQUIRE(gat->found);
-    REQUIRE(Decode(gat->entry.value) == "v");
+    REQUIRE(Decode(gat->entry.ValueBytes()) == "v");
     REQUIRE(gat->entry.expiry == newExpiry);
 
     auto const miss = (*storage)->GetAndTouch("absent", newExpiry, clock.Now());
@@ -971,7 +972,7 @@ TEST_CASE("Three Open/Close cycles preserve every entry", "[cowstorage][persist]
                 auto got = storage.Get(std::format("k-{:04d}", i), clock.Now());
                 REQUIRE(got.has_value());
                 REQUIRE(got->found);
-                REQUIRE(Decode(got->entry.value) == std::format("v-{:04d}", i));
+                REQUIRE(Decode(got->entry.ValueBytes()) == std::format("v-{:04d}", i));
             }
         });
     };
@@ -1006,14 +1007,14 @@ TEST_CASE("Mixed Set/Update/Delete script replays identically across a mid-scrip
             auto got = storage.Get(std::format("k-{}", i), clock.Now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
-            REQUIRE(Decode(got->entry.value) == std::format("v1-{}", i));
+            REQUIRE(Decode(got->entry.ValueBytes()) == std::format("v1-{}", i));
         }
         for (int i = 10; i < 15; ++i)
         {
             auto got = storage.Get(std::format("k-{}", i), clock.Now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
-            REQUIRE(Decode(got->entry.value) == std::format("v0-{}", i));
+            REQUIRE(Decode(got->entry.ValueBytes()) == std::format("v0-{}", i));
         }
         for (int i = 15; i < 20; ++i)
         {
@@ -1113,7 +1114,7 @@ TEST_CASE("Touch refreshes expiry and bumps CAS, persists across reopen", "[cows
     auto const got = (*reopened)->Get("k", clock.Now() + 30s);
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(Decode(got->entry.value) == "payload");
+    REQUIRE(Decode(got->entry.ValueBytes()) == "payload");
     REQUIRE(got->entry.flags == 0xBEEF);
     REQUIRE(got->entry.expiry == extendedExpiry);
 }
@@ -1235,7 +1236,7 @@ TEST_CASE("Overflow chains round-trip across many sizes and survive reopen", "[c
         auto const got = (*reopened)->Get(std::format("k{}", size), clock.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(got->entry.value == value); // exact bytewise round-trip via the chain
+        REQUIRE(ValueOf(got->entry) == value); // exact bytewise round-trip via the chain
     }
 }
 
@@ -1261,7 +1262,7 @@ TEST_CASE("Overwriting a large value reclaims the old overflow chain", "[cowstor
     auto const got = (*storage)->Get("k", FastCache::ManualClock {}.Now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(got->entry.value == RandomBytes(256 * 1024, 111)); // last write wins
+    REQUIRE(ValueOf(got->entry) == RandomBytes(256 * 1024, 111)); // last write wins
 }
 
 TEST_CASE("Deleting a large value frees its overflow chain for reuse", "[cowstorage][overflow]")
@@ -1318,7 +1319,7 @@ TEST_CASE("Crash during overflow-chain write leaves the previous value intact", 
     auto const got = (*reopened)->Get("k", FastCache::ManualClock {}.Now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(Decode(got->entry.value) == "initial"); // rolled back, never a hybrid
+    REQUIRE(Decode(got->entry.ValueBytes()) == "initial"); // rolled back, never a hybrid
 }
 
 TEST_CASE("Crash during overflow SyncData leaves the previous value intact", "[cowstorage][overflow][crash]")
@@ -1351,7 +1352,7 @@ TEST_CASE("Crash during overflow SyncData leaves the previous value intact", "[c
     auto const got = (*reopened)->Get("k", FastCache::ManualClock {}.Now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(Decode(got->entry.value) == "initial");
+    REQUIRE(Decode(got->entry.ValueBytes()) == "initial");
 }
 
 TEST_CASE("Reclaiming a corrupted overflow chain never frees another key's pages", "[cowstorage][overflow][crash]")
@@ -1419,7 +1420,7 @@ TEST_CASE("Reclaiming a corrupted overflow chain never frees another key's pages
     auto const got = (*storage)->Get("victim", FastCache::ManualClock {}.Now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(got->entry.value == victimBytes);
+    REQUIRE(ValueOf(got->entry) == victimBytes);
 }
 
 TEST_CASE("Touch on a large value reuses the overflow chain without an O(value) rewrite", "[cowstorage][overflow][touch]")
@@ -1450,6 +1451,6 @@ TEST_CASE("Touch on a large value reuses the overflow chain without an O(value) 
     auto const got = (*storage)->Get("k", clock.Now() + 1800s);
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(got->entry.value == big);
+    REQUIRE(ValueOf(got->entry) == big);
     REQUIRE(got->entry.expiry == newExpiry);
 }

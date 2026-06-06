@@ -541,7 +541,7 @@ namespace
         if (f.wantValue)
         {
             line.append("VA ");
-            line.append(std::to_string(entry.value.size()));
+            line.append(std::to_string(entry.ValueSize()));
         }
         else
         {
@@ -554,7 +554,7 @@ namespace
         rf.emitFlags = f.wantFlags;
         rf.flags = entry.flags;
         rf.emitSize = f.wantSize;
-        rf.size = entry.value.size();
+        rf.size = entry.ValueSize();
         rf.emitTtl = f.wantTtl;
         rf.ttlSeconds = TtlSecondsFromExpiry(entry.expiry, now);
         rf.emitHit = f.wantHit;
@@ -566,7 +566,7 @@ namespace
         line.append(Crlf);
         if (f.wantValue)
         {
-            line.append(AsStringView(entry.value));
+            line.append(AsStringView(entry.ValueBytes()));
             line.append(Crlf);
         }
         co_return co_await WriteAll(socket, line);
@@ -667,7 +667,7 @@ namespace
                 // they differ for append/prepend (concatenation) and
                 // mark-stale (the payload is discarded). Peek is non-mutating.
                 auto const stored = engine->Peek(key);
-                rf.size = stored.has_value() && stored->found ? stored->entry.value.size() : datalen;
+                rf.size = stored.has_value() && stored->found ? stored->entry.ValueSize() : datalen;
             }
         }
         AppendResponseFlags(line, rf);
@@ -812,7 +812,7 @@ namespace
                                 TtlSecondsFromExpiry(entry.expiry, now),
                                 LastAccessSeconds(entry.lastAccess, now),
                                 entry.cas,
-                                entry.value.size());
+                                entry.ValueSize());
         co_return co_await WriteAll(socket, line);
     }
 

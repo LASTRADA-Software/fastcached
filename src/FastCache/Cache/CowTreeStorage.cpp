@@ -217,14 +217,15 @@ namespace
 
 std::vector<std::byte> CowTreeStorage::EncodeInline(CacheEntry const& entry)
 {
+    auto const bytes = entry.ValueBytes();
     std::vector<std::byte> out;
-    out.reserve(1 + 4 + 8 + 8 + 8 + 8 + 1 + 4 + entry.value.size());
+    out.reserve(1 + 4 + 8 + 8 + 8 + 8 + 1 + 4 + bytes.size());
     AppendCommonHeader(out, RecordKindInline, entry);
-    AppendLe<std::uint32_t>(out, static_cast<std::uint32_t>(entry.value.size()));
+    AppendLe<std::uint32_t>(out, static_cast<std::uint32_t>(bytes.size()));
     auto const offset = out.size();
-    out.resize(offset + entry.value.size());
-    if (!entry.value.empty())
-        std::memcpy(out.data() + offset, entry.value.data(), entry.value.size());
+    out.resize(offset + bytes.size());
+    if (!bytes.empty())
+        std::memcpy(out.data() + offset, bytes.data(), bytes.size());
     return out;
 }
 
@@ -490,24 +491,30 @@ std::expected<std::optional<CowTreeStorage::LoadedEntry>, StorageError> CowTreeS
         auto value = ReadOverflowChain(parsed->root, parsed->totalLen);
         if (!value.has_value())
             return std::unexpected(value.error());
-        entry.value = std::move(*value);
+        // Disk-backend fallback: the value was just materialized from the
+        // overflow chain into a fresh heap buffer, so wrapping it in a
+        // SharedValue is correct (it outlives any read lock) — it simply
+        // yields no copy-elimination benefit, unlike the in-memory backend.
+        entry.value = MakeSharedValue(std::move(*value));
     }
     else
     {
         auto const& raw = **got;
-        entry.value.assign(raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset),
-                           raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset + parsed->inlineLen));
+        entry.value = MakeSharedValue(
+            std::vector<std::byte> { raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset),
+                                     raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset + parsed->inlineLen) });
     }
     return LoadedEntry { std::move(entry) };
 }
 
 std::expected<void, StorageError> CowTreeStorage::StoreEntry(std::string_view key, CacheEntry const& entry)
 {
+    auto const bytes = entry.ValueBytes();
     std::vector<std::byte> encoded;
     CowTree::PageId newChain = CowTree::PageId::None();
-    if (entry.value.size() > InlineValueLimit())
+    if (bytes.size() > InlineValueLimit())
     {
-        auto chain = WriteOverflowChain(std::span<std::byte const> { entry.value.data(), entry.value.size() });
+        auto chain = WriteOverflowChain(bytes);
         if (!chain.has_value())
             return std::unexpected(chain.error());
         newChain = *chain;
@@ -517,7 +524,7 @@ std::expected<void, StorageError> CowTreeStorage::StoreEntry(std::string_view ke
             FreeChain(newChain);
             return std::unexpected(TranslateError(r.error(), "overflow SyncData"));
         }
-        encoded = EncodeOverflowDescriptor(entry, newChain, static_cast<std::uint64_t>(entry.value.size()));
+        encoded = EncodeOverflowDescriptor(entry, newChain, static_cast<std::uint64_t>(bytes.size()));
     }
     else
     {
@@ -668,7 +675,7 @@ std::expected<GetResult, StorageError> CowTreeStorage::Get(std::string_view key,
         return GetResult { .found = false, .entry = {} };
     }
     entry.lastAccess = now;
-    TouchOrInsert(key, entry.value.size(), AccessKind::Read);
+    TouchOrInsert(key, entry.ValueSize(), AccessKind::Read);
     ++_stats.getHits;
     // Deliberately do NOT persist the lastAccess advance here: a read must
     // not open a write transaction (CoW page churn + log growth on every
@@ -717,9 +724,10 @@ std::expected<CasToken, StorageError> CowTreeStorage::UpdateRecordMetadata(std::
     else
     {
         auto const& raw = **got;
-        entry.value.assign(raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset),
-                           raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset + parsed->inlineLen));
-        valueSize = entry.value.size();
+        entry.value = MakeSharedValue(
+            std::vector<std::byte> { raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset),
+                                     raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset + parsed->inlineLen) });
+        valueSize = entry.ValueSize();
         mutate(entry);
         entry.cas = _nextCas++;
         encoded = EncodeInline(entry);
@@ -822,7 +830,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Set(std::string_view key,
     if (value.size() > _options.maxValueBytes)
         return std::unexpected(MakeError(StorageErrorCode::ValueTooLarge));
     CacheEntry e;
-    e.value = std::move(value);
+    e.value = MakeSharedValue(std::move(value));
     e.flags = flags;
     e.cas = _nextCas++;
     e.expiry = expiry;
@@ -830,7 +838,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Set(std::string_view key,
 
     if (auto const r = StoreEntry(key, e); !r.has_value())
         return std::unexpected(r.error());
-    TouchOrInsert(key, e.value.size());
+    TouchOrInsert(key, e.ValueSize());
     EvictToFit();
     return e.cas;
 }
@@ -870,16 +878,21 @@ std::expected<CasToken, StorageError> CowTreeStorage::Append(std::string_view ke
     auto& entry = (*loaded)->entry;
     if (expected != 0 && entry.cas != expected)
         return std::unexpected(MakeError(StorageErrorCode::CasMismatch));
-    if (entry.value.size() + suffix.size() > _options.maxValueBytes)
+    auto const existing = entry.ValueBytes();
+    if (existing.size() + suffix.size() > _options.maxValueBytes)
         return std::unexpected(MakeError(StorageErrorCode::ValueTooLarge));
-    entry.value.insert(entry.value.end(), suffix.begin(), suffix.end());
+    std::vector<std::byte> combined;
+    combined.reserve(existing.size() + suffix.size());
+    combined.insert(combined.end(), existing.begin(), existing.end());
+    combined.insert(combined.end(), suffix.begin(), suffix.end());
+    entry.value = MakeSharedValue(std::move(combined));
     entry.cas = _nextCas++;
     // A value-rewriting mutation produces a fresh item nobody has read yet
     // (mirrors InMemoryLruStorage::MutateExisting and the CacheEntry contract).
     entry.stale = false;
     if (auto const r = StoreEntry(key, entry); !r.has_value())
         return std::unexpected(r.error());
-    TouchOrInsert(key, entry.value.size());
+    TouchOrInsert(key, entry.ValueSize());
     EvictToFit();
     return entry.cas;
 }
@@ -897,20 +910,21 @@ std::expected<CasToken, StorageError> CowTreeStorage::Prepend(std::string_view k
     auto& entry = (*loaded)->entry;
     if (expected != 0 && entry.cas != expected)
         return std::unexpected(MakeError(StorageErrorCode::CasMismatch));
-    if (entry.value.size() + prefix.size() > _options.maxValueBytes)
+    auto const existing = entry.ValueBytes();
+    if (existing.size() + prefix.size() > _options.maxValueBytes)
         return std::unexpected(MakeError(StorageErrorCode::ValueTooLarge));
     std::vector<std::byte> merged;
-    merged.reserve(prefix.size() + entry.value.size());
+    merged.reserve(prefix.size() + existing.size());
     merged.insert(merged.end(), prefix.begin(), prefix.end());
-    merged.insert(merged.end(), entry.value.begin(), entry.value.end());
-    entry.value = std::move(merged);
+    merged.insert(merged.end(), existing.begin(), existing.end());
+    entry.value = MakeSharedValue(std::move(merged));
     entry.cas = _nextCas++;
     // A value-rewriting mutation produces a fresh item nobody has read yet
     // (mirrors InMemoryLruStorage::MutateExisting and the CacheEntry contract).
     entry.stale = false;
     if (auto const r = StoreEntry(key, entry); !r.has_value())
         return std::unexpected(r.error());
-    TouchOrInsert(key, entry.value.size());
+    TouchOrInsert(key, entry.ValueSize());
     EvictToFit();
     return entry.cas;
 }
@@ -973,7 +987,7 @@ std::expected<IStorage::IncrResult, StorageError> CowTreeStorage::IncrementOrIni
     auto& existing = (*loaded)->entry;
     std::uint64_t current = 0;
     {
-        auto parsed = ParseUnsigned(std::span<std::byte const> { existing.value.data(), existing.value.size() });
+        auto parsed = ParseUnsigned(existing.ValueBytes());
         if (!parsed.has_value())
             return std::unexpected(parsed.error());
         current = *parsed;
