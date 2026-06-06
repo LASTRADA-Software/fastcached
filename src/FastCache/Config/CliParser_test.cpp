@@ -46,6 +46,26 @@ TEST_CASE("CliParser: --max-memory rejects unknown suffix", "[config][cli]")
     REQUIRE(result.error().field == "max-memory");
 }
 
+TEST_CASE("CliParser: --log-timestamps sets the value and the explicit-override flag", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--log-timestamps" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.logTimestamps);
+    // The explicit flag is what lets a CLI --log-timestamps override the YAML
+    // value in BOTH directions (the merge in main.cpp), unlike the old one-way OR.
+    REQUIRE(result->logTimestampsExplicit);
+}
+
+TEST_CASE("CliParser: --log-timestamps absent leaves the explicit-override flag clear", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--port=11211" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE_FALSE(result->logTimestampsExplicit);
+    REQUIRE_FALSE(result->config.logTimestamps);
+}
+
 TEST_CASE("CliParser: --storage parses into Config::storagePath", "[config][cli][storage]")
 {
     auto const args = std::array<char const*, 1> { "--storage=/var/lib/fastcached/cache.cow" };

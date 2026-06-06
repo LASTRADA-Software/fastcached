@@ -111,8 +111,8 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         fileCfg.storageShards = cliCfg.storageShards;
     if (cli.listenBacklogExplicit)
         fileCfg.listenBacklog = cliCfg.listenBacklog;
-    if (cliCfg.logTimestamps)
-        fileCfg.logTimestamps = true;
+    if (cli.logTimestampsExplicit)
+        fileCfg.logTimestamps = cliCfg.logTimestamps;
     return fileCfg;
 }
 

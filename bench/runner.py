@@ -311,10 +311,10 @@ class Daemon:
         self._ready = threading.Event()
 
     def _argv(self) -> list[str]:
-        # The CoW page size is derived from --storage-max-value, and every
-        # write shuffles whole pages, so an oversized cap makes disk writes
-        # pay for megabyte pages (the default 16 MiB cap => ~200 ms/write).
-        # Size the cap just above the scenario's value so the page is small.
+        # --storage-max-value is the per-value byte cap; size it just above the
+        # scenario's value so writes are accepted. (The CoW page size is now a
+        # fixed small value and larger values spill to overflow pages, so this
+        # cap no longer drives page size.)
         max_value = max(self._scenario.value_bytes + 8192, 16384)
         argv = [
             str(self._binary),

@@ -235,6 +235,7 @@ namespace
         if (arg == "--log-timestamps")
         {
             cfg.logTimestamps = true;
+            result.logTimestampsExplicit = true;
             return ArgOutcome::Continue;
         }
         // Service-control requests record the desired outcome but keep parsing:
@@ -425,7 +426,9 @@ namespace
           .description = "auto|threaded|reactor (default auto)\n"
                          "auto: the reactor for both in-memory and --storage on disk;\n"
                          "threaded selects the legacy per-connection worker pool" },
-        { .flag = "--threads=<N>", .description = "worker thread count for threaded mode (default: hardware_concurrency)" },
+        { .flag = "--threads=<N>",
+          .description = "server parallelism: the number of pinned reactors (default reactor model)\n"
+                         "or the worker-pool size (--execution-model=threaded); default hardware_concurrency" },
         { .flag = "--listen-backlog=<N>",
           .description = "::listen() backlog depth (default 511; clamped to the kernel's SOMAXCONN)" },
         { .flag = "--storage-shards=<N>",
