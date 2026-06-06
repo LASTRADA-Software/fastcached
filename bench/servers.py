@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real redis / memcached baselines for head-to-head benchmarking.
 
-These wrap a real ``redis-server`` (native binary) and ``memcached`` (Docker
-image) so the suite can chart fastcached against the actual competitors. Both
-are optional: if the binary / Docker image is unavailable, discovery returns
-None and the caller skips that baseline.
+These wrap a real ``redis-server`` and a real ``memcached`` (both native
+binaries) so the suite can chart fastcached against the actual competitors.
+Both are optional: if the binary is unavailable, discovery returns None and the
+caller skips that baseline.
 
-On the Windows dev box: ``redis-server.exe`` is installed natively; memcached
-runs via ``docker run memcached:latest``. Custom high ports are used throughout
-(some low ports are blocked).
+Running both competitors natively — rather than memcached in Docker — keeps the
+comparison fair, since Docker's userland port-forwarding adds latency that would
+penalise the dockerized server. Custom high ports are used throughout (some low
+ports are blocked).
 """
 
 from __future__ import annotations
@@ -87,35 +88,42 @@ class RedisServer(RealServer):
 
 
 class MemcachedServer(RealServer):
-    """``memcached:latest`` run as a Docker container (host port -> 11211)."""
+    """A native ``memcached`` binary run as a subprocess.
+
+    Running the native binary (rather than a Docker container) keeps the
+    comparison fair: Docker's userland port-forwarding adds latency that would
+    penalise memcached relative to the natively-run fastcached and redis.
+    """
 
     protocols = frozenset({"memcached-text", "memcached-binary"})
 
-    def __init__(self, host: str, port: int, image: str = "memcached:latest") -> None:
+    def __init__(self, binary: str, host: str, port: int) -> None:
         self.name = "memcached"
+        self._binary = binary
         self.host = host
         self.port = port
-        self._image = image
-        self._container = f"fcbench-memcached-{port}"
+        self._process: subprocess.Popen | None = None
 
     def start(self) -> None:
-        # Remove any stale container from a previous aborted run, then start.
-        subprocess.run(["docker", "rm", "-f", self._container],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        result = subprocess.run(
-            ["docker", "run", "--rm", "-d", "--name", self._container,
-             "-p", f"{self.port}:11211", self._image],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        # -l binds the listen address, -p the TCP port. Defaults (64 MiB, etc.)
+        # match a stock cache; no persistence to configure (memcached is RAM-only).
+        self._process = subprocess.Popen(
+            [self._binary, "-l", self.host, "-p", str(self.port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"docker run memcached failed: {result.stderr.strip()}")
         if not _wait_port(self.host, self.port, READY_TIMEOUT_SECONDS):
             self.stop()
-            raise RuntimeError(f"memcached container did not become ready on port {self.port}")
+            raise RuntimeError(f"memcached did not become ready on port {self.port}")
 
     def stop(self) -> None:
-        subprocess.run(["docker", "stop", self._container],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if self._process is not None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+            self._process = None
 
 
 def discover_redis(redis_server: str | None = None) -> str | None:
@@ -131,13 +139,9 @@ def discover_redis(redis_server: str | None = None) -> str | None:
     return None
 
 
-def docker_available(image: str = "memcached:latest") -> bool:
-    """True if docker is on PATH and the memcached image is present."""
-    if shutil.which("docker") is None:
-        return False
-    result = subprocess.run(["docker", "image", "inspect", image],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    return result.returncode == 0
+def discover_memcached() -> str | None:
+    """Locate a native ``memcached`` binary on PATH, or None if unavailable."""
+    return shutil.which("memcached")
 
 
 def build_baseline(name: str, host: str, port: int, redis_server: str | None) -> RealServer | None:
@@ -146,5 +150,6 @@ def build_baseline(name: str, host: str, port: int, redis_server: str | None) ->
         binary = discover_redis(redis_server)
         return RedisServer(binary, host, port) if binary else None
     if name == "memcached":
-        return MemcachedServer(host, port) if docker_available() else None
+        binary = discover_memcached()
+        return MemcachedServer(binary, host, port) if binary else None
     raise ValueError(f"unknown baseline {name!r}")
