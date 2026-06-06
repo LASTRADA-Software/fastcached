@@ -51,7 +51,8 @@ FilePageStore::~FilePageStore()
 {
     // Graceful shutdown: make any buffered group-commit writes durable so a
     // clean stop never loses data (only a hard crash drops the last batch).
-    if (_options.durability == Durability::Batched && _commitsSinceFlush > 0)
+    // A simulated crash (test seam) skips this and leaves the window unflushed.
+    if (!_crashedForTest && _options.durability == Durability::Batched && _commitsSinceFlush > 0)
     {
         std::scoped_lock const lock { _ioMutex };
         std::ignore = FlushBatchLocked();
@@ -136,6 +137,9 @@ auto FilePageStore::BootstrapNewFile() -> std::expected<void, CowTreeError>
 
     if (auto const r = Fsync(); !r.has_value())
         return std::unexpected(r.error());
+    // Both slots hold the blank txnId 0; treat A as the durable one so the
+    // first Batched flush writes to B (preserving the alternating invariant).
+    _lastDurableSlot = MetaSlot::A;
     return {};
 }
 
@@ -146,13 +150,33 @@ auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
     if (!metaA.has_value() && !metaB.has_value())
         return std::unexpected(CowTreeError::CorruptMetas);
 
+    // Pick the live meta AND remember which slot it came from, so the next
+    // Batched flush writes to the *other* slot and never overwrites the
+    // currently-durable one.
     Meta live;
     if (metaA.has_value() && metaB.has_value())
-        live = (metaA->txnId >= metaB->txnId) ? *metaA : *metaB;
+    {
+        if (metaA->txnId >= metaB->txnId)
+        {
+            live = *metaA;
+            _lastDurableSlot = MetaSlot::A;
+        }
+        else
+        {
+            live = *metaB;
+            _lastDurableSlot = MetaSlot::B;
+        }
+    }
     else if (metaA.has_value())
+    {
         live = *metaA;
+        _lastDurableSlot = MetaSlot::A;
+    }
     else
+    {
         live = *metaB;
+        _lastDurableSlot = MetaSlot::B;
+    }
 
     if (live.pageSize != _pageSize)
     {
@@ -387,8 +411,31 @@ auto FilePageStore::Free(PageId id) -> std::expected<void, CowTreeError>
 
 auto FilePageStore::FlushBatchLocked() -> std::expected<void, CowTreeError>
 {
+    // Nothing committed since the last flush: nothing to make durable.
+    if (!_pendingMeta.has_value())
+    {
+        _commitsSinceFlush = 0;
+        return {};
+    }
+
+    // Crash-safe group commit, in strict order:
+    //   1. fsync the buffered DATA pages so they are durable before any meta
+    //      references them (data pages carry no read-time checksum);
+    //   2. write the meta to the slot that does NOT hold the last durable meta,
+    //      so a torn write here can never destroy the recoverable copy;
+    //   3. fsync the META.
+    // A crash between (1) and (3) simply leaves the previous durable slot intact
+    // and loses only this unflushed window — never a corrupt/unopenable store.
     if (auto const r = Fsync(); !r.has_value())
         return std::unexpected(r.error());
+    auto const target = (_lastDurableSlot == MetaSlot::A) ? MetaSlot::B : MetaSlot::A;
+    if (auto const r = WriteSlotLocked(target, *_pendingMeta); !r.has_value())
+        return std::unexpected(r.error());
+    if (auto const r = Fsync(); !r.has_value())
+        return std::unexpected(r.error());
+
+    _lastDurableSlot = target;
+    _pendingMeta.reset();
     // The freeing is now durable, so freed pages may be recycled.
     _freeList.insert(_freeList.end(), _pendingFree.begin(), _pendingFree.end());
     _pendingFree.clear();
@@ -398,8 +445,9 @@ auto FilePageStore::FlushBatchLocked() -> std::expected<void, CowTreeError>
 
 auto FilePageStore::SyncData() -> std::expected<void, CowTreeError>
 {
-    // Only strict Fsync mode flushes data per commit. Batched defers the flush
-    // to a group-commit boundary (see WriteMeta); None never flushes.
+    // Only strict Fsync mode flushes data per commit. Batched defers the data
+    // fsync to the group-commit boundary in FlushBatchLocked, which fsyncs data
+    // *before* writing the meta that references it; None never flushes.
     if (_options.durability != Durability::Fsync)
         return {};
     std::scoped_lock const lock { _ioMutex };
@@ -414,26 +462,44 @@ auto FilePageStore::ReadMeta(MetaSlot slot) const -> std::expected<Meta, CowTree
     return DecodeMeta(BytesView { buf.data(), buf.size() });
 }
 
-auto FilePageStore::WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError>
+auto FilePageStore::WriteSlotLocked(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError>
 {
     std::vector<std::byte> buf(_pageSize, std::byte { 0 });
     auto effective = meta;
     effective.pageSize = static_cast<std::uint32_t>(_pageSize);
     if (auto const r = EncodeMeta(BytesSpan { buf.data(), buf.size() }, effective); !r.has_value())
         return std::unexpected(r.error());
+    return WriteAt(MetaSlotOffset(slot), BytesView { buf.data(), buf.size() });
+}
+
+auto FilePageStore::WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError>
+{
     std::scoped_lock const lock { _ioMutex };
-    if (auto const r = WriteAt(MetaSlotOffset(slot), BytesView { buf.data(), buf.size() }); !r.has_value())
+
+    if (_options.durability == Durability::Batched)
+    {
+        // Group commit: buffer the latest meta in memory and make it durable
+        // only at a flush boundary. We deliberately do NOT write the slot on
+        // every commit. Overwriting a slot in place without an fsync (the old
+        // behaviour) let the OS write back a partial page at any time, so a hard
+        // crash inside the unflushed window could leave BOTH alternating slots
+        // torn and the store unopenable. Deferring the write — and flushing it
+        // to the slot that does not hold the last durable meta (see
+        // FlushBatchLocked) — guarantees one durable, self-consistent meta is
+        // always on disk. The caller-chosen `slot` is recomputed at flush time.
+        _pendingMeta = meta;
+        if (++_commitsSinceFlush >= BatchedFlushInterval)
+            return FlushBatchLocked();
+        return {};
+    }
+
+    // Fsync / None: write the caller's alternating slot immediately. In Fsync
+    // mode every commit is fsynced and the other slot still holds the prior
+    // durable meta, so a torn write never loses both. None never fsyncs.
+    if (auto const r = WriteSlotLocked(slot, meta); !r.has_value())
         return std::unexpected(r.error());
     if (_options.durability == Durability::Fsync)
         return Fsync(); // strict: every commit is durable
-    if (_options.durability == Durability::Batched)
-    {
-        // Group commit: flush only every BatchedFlushInterval commits. A hard
-        // crash loses at most that many recent writes; the pending-free list
-        // ensures the rolled-back tree is never corrupted.
-        if (++_commitsSinceFlush >= BatchedFlushInterval)
-            return FlushBatchLocked();
-    }
     return {};
 }
 
@@ -455,6 +521,27 @@ std::size_t FilePageStore::TotalDataPages() const noexcept
 std::size_t FilePageStore::FsyncCallCount() const noexcept
 {
     return _fsyncCount;
+}
+
+void FilePageStore::SimulateCrashForTest() noexcept
+{
+    // Drop the OS handle WITHOUT flushing: any buffered (unflushed)
+    // group-commit window is discarded, exactly as on power loss. The flag
+    // stops the destructor from flushing or re-closing the handle.
+    _crashedForTest = true;
+#if defined(_WIN32)
+    if (_handle != nullptr)
+    {
+        ::CloseHandle(_handle);
+        _handle = nullptr;
+    }
+#else
+    if (_fd >= 0)
+    {
+        ::close(_fd);
+        _fd = -1;
+    }
+#endif
 }
 
 } // namespace CowTree

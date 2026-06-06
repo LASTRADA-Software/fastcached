@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_set>
 #include <vector>
 
@@ -97,6 +98,13 @@ class FilePageStore final: public IPageStore
     /// Test helper: how many `fsync`/equivalent calls have been issued.
     [[nodiscard]] std::size_t FsyncCallCount() const noexcept;
 
+    /// Test helper: simulate a hard crash. Drops the OS handle WITHOUT
+    /// flushing any buffered group-commit batch and suppresses the
+    /// destructor's graceful flush, so the unflushed window is discarded
+    /// exactly as it would be on power loss. The object must not be used
+    /// afterwards except to be destroyed.
+    void SimulateCrashForTest() noexcept;
+
   private:
     explicit FilePageStore(Options options) noexcept;
 
@@ -114,6 +122,13 @@ class FilePageStore final: public IPageStore
 
     /// Fsync the backing file according to durability mode.
     [[nodiscard]] auto Fsync() -> std::expected<void, CowTreeError>;
+
+    /// Encode `meta` (forcing the on-disk page size) and write it to `slot`.
+    /// Does NOT fsync. Caller must hold `_ioMutex`.
+    /// @param slot Destination meta slot.
+    /// @param meta Meta record to encode and persist.
+    /// @return Empty on success; the underlying I/O error otherwise.
+    [[nodiscard]] auto WriteSlotLocked(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError>;
 
     /// Initialise a brand-new file (write two blank meta pages, size
     /// the file to 2*pageSize).
@@ -151,6 +166,19 @@ class FilePageStore final: public IPageStore
     /// flush-every-N-commits boundary.
     std::size_t _commitsSinceFlush { 0 };
 
+    /// Group-commit (Batched): the most recent committed meta, buffered in
+    /// memory and written to disk only at a flush boundary. `std::nullopt`
+    /// when no commit is pending since the last flush. Deferring the on-disk
+    /// write is what keeps a hard crash from ever observing a torn, in-place
+    /// overwrite of the last durable meta slot.
+    std::optional<Meta> _pendingMeta;
+
+    /// Slot currently holding the most recent fully-fsynced ("durable") meta.
+    /// The next Batched flush always writes to the *other* slot, so a torn
+    /// flush can never destroy the last durable meta. Initialised on
+    /// Bootstrap/Recover and advanced by `FlushBatchLocked`.
+    MetaSlot _lastDurableSlot { MetaSlot::A };
+
     /// Flush the accumulated Batched writes after this many commits.
     static constexpr std::size_t BatchedFlushInterval = 64;
 
@@ -165,6 +193,11 @@ class FilePageStore final: public IPageStore
     mutable std::uint64_t _readBufferPageIdx { 0 };
 
     std::size_t _fsyncCount { 0 };
+
+    /// Set by `SimulateCrashForTest` so the destructor skips its graceful
+    /// flush (and avoids touching the already-closed handle).
+    bool _crashedForTest { false };
+
     mutable std::mutex _ioMutex;
 };
 

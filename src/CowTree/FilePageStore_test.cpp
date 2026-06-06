@@ -228,3 +228,111 @@ TEST_CASE("Durability=Batched flushes buffered writes on graceful close", "[file
     REQUIRE(got->has_value());
     REQUIRE(Decode((*got).value_or(std::vector<std::byte> {})) == "value");
 }
+
+TEST_CASE("Durability=Batched defers meta-slot writes until the flush boundary", "[filestore][durability][batched]")
+{
+    TempFile tmp;
+    CowTree::FilePageStore::Options opts;
+    opts.path = tmp.path;
+    opts.pageSize = 4096;
+    opts.durability = CowTree::FilePageStore::Durability::Batched;
+
+    auto store = CowTree::FilePageStore::Open(opts);
+    REQUIRE(store.has_value());
+    CowTree::CowTree tree { **store };
+    REQUIRE(tree.Open().has_value());
+
+    for (int i = 0; i < 10; ++i) // fewer than the flush interval
+    {
+        auto const key = "k" + std::to_string(i);
+        auto txn = tree.BeginWrite();
+        REQUIRE(txn.Put(B(key), B("v")).has_value());
+        REQUIRE(txn.Commit().has_value());
+    }
+
+    // Crash-safety invariant: intermediate commits never overwrite a meta slot
+    // in place, so both slots still hold the bootstrap txnId 0. (The old code
+    // pwrote a fresh, un-fsynced txnId to an alternating slot on every commit,
+    // so a torn write inside the window could leave NO recoverable slot.)
+    auto const a = (*store)->ReadMeta(CowTree::MetaSlot::A);
+    auto const b = (*store)->ReadMeta(CowTree::MetaSlot::B);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    REQUIRE(a->txnId == 0U);
+    REQUIRE(b->txnId == 0U);
+}
+
+TEST_CASE("Durability=Batched: a crash inside the unflushed window reopens consistent",
+          "[filestore][durability][batched][crash]")
+{
+    TempFile tmp;
+    CowTree::FilePageStore::Options opts;
+    opts.path = tmp.path;
+    opts.pageSize = 4096;
+    opts.durability = CowTree::FilePageStore::Durability::Batched;
+
+    {
+        auto store = CowTree::FilePageStore::Open(opts);
+        REQUIRE(store.has_value());
+        CowTree::CowTree tree { **store };
+        REQUIRE(tree.Open().has_value());
+        for (int i = 0; i < 10; ++i) // < flush interval -> nothing durable yet
+        {
+            auto const key = "k" + std::to_string(i);
+            auto txn = tree.BeginWrite();
+            REQUIRE(txn.Put(B(key), B("v")).has_value());
+            REQUIRE(txn.Commit().has_value());
+        }
+        (*store)->SimulateCrashForTest(); // hard crash: no flush
+    }
+
+    // Reopen MUST succeed (never CorruptMetas) and show the last durable state
+    // -- here the empty bootstrap. The window is cleanly lost, not half-applied.
+    auto store = CowTree::FilePageStore::Open(opts);
+    REQUIRE(store.has_value());
+    CowTree::CowTree tree { **store };
+    REQUIRE(tree.Open().has_value());
+    auto r = tree.BeginRead();
+    auto got = r.Get(B("k0"));
+    REQUIRE(got.has_value()); // a clean miss, not an error / corruption
+    REQUIRE_FALSE(got->has_value());
+}
+
+TEST_CASE("Durability=Batched: commits flushed before a crash survive it", "[filestore][durability][batched][crash]")
+{
+    TempFile tmp;
+    CowTree::FilePageStore::Options opts;
+    opts.path = tmp.path;
+    opts.pageSize = 4096;
+    opts.durability = CowTree::FilePageStore::Durability::Batched;
+
+    {
+        auto store = CowTree::FilePageStore::Open(opts);
+        REQUIRE(store.has_value());
+        CowTree::CowTree tree { **store };
+        REQUIRE(tree.Open().has_value());
+        for (int i = 0; i < 80; ++i) // > flush interval (64): the first window is made durable
+        {
+            auto const key = "k" + std::to_string(i);
+            auto txn = tree.BeginWrite();
+            REQUIRE(txn.Put(B(key), B("v")).has_value());
+            REQUIRE(txn.Commit().has_value());
+        }
+        (*store)->SimulateCrashForTest();
+    }
+
+    auto store = CowTree::FilePageStore::Open(opts);
+    REQUIRE(store.has_value());
+    CowTree::CowTree tree { **store };
+    REQUIRE(tree.Open().has_value());
+    auto r = tree.BeginRead();
+    // A key from the flushed first window survives the crash...
+    auto early = r.Get(B("k0"));
+    REQUIRE(early.has_value());
+    REQUIRE(early->has_value());
+    REQUIRE(Decode((*early).value_or(std::vector<std::byte> {})) == "v");
+    // ...while a key written only in the unflushed tail is cleanly lost.
+    auto tail = r.Get(B("k79"));
+    REQUIRE(tail.has_value());
+    REQUIRE_FALSE(tail->has_value());
+}
