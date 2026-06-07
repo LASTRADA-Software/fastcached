@@ -15,7 +15,8 @@ namespace
 
 std::vector<std::byte> MakePage(std::size_t size, std::byte fill)
 {
-    return std::vector<std::byte>(size, fill);
+    std::vector<std::byte> page(size, fill);
+    return page;
 }
 
 } // namespace

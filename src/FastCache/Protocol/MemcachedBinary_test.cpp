@@ -397,9 +397,9 @@ TEST_CASE("memcached-binary: Stat (0x10) includes the unfetched counters (regres
     for (auto const b: response)
         text.push_back(static_cast<char>(b));
 
-    REQUIRE(text.find("evicted_unfetched") != std::string::npos);
-    REQUIRE(text.find("expired_unfetched") != std::string::npos);
-    REQUIRE(text.find("cmd_get") != std::string::npos); // a pre-existing counter is still present
+    REQUIRE(text.contains("evicted_unfetched"));
+    REQUIRE(text.contains("expired_unfetched"));
+    REQUIRE(text.contains("cmd_get")); // a pre-existing counter is still present
 }
 
 TEST_CASE("memcached-binary: Verbosity (0x1b) is a no-op that returns Ok", "[protocol][binary]")

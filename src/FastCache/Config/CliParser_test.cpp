@@ -342,9 +342,9 @@ TEST_CASE("CliParser: --execution-model rejects unknown values", "[config][cli][
 TEST_CASE("CliParser: --help text mentions execution-model with auto", "[config][cli][execution-model]")
 {
     auto const usage = std::string { FastCache::CliUsage() };
-    REQUIRE(usage.find("--execution-model") != std::string::npos);
-    REQUIRE(usage.find("auto|threaded|reactor") != std::string::npos);
-    REQUIRE(usage.find("--threading-model") == std::string::npos);
+    REQUIRE(usage.contains("--execution-model"));
+    REQUIRE(usage.contains("auto|threaded|reactor"));
+    REQUIRE(!usage.contains("--threading-model"));
 }
 
 namespace
@@ -439,7 +439,7 @@ TEST_CASE("CliParser: --help wraps continuation lines to the description column"
     {
         if (line.starts_with("  --execution-model"))
             flagColumn = DescriptionColumn(line);
-        else if (line.find("auto: the reactor for both in-memory") != std::string_view::npos)
+        else if (line.contains("auto: the reactor for both in-memory"))
             continuationColumn = line.find_first_not_of(' ');
     }
 
@@ -450,7 +450,7 @@ TEST_CASE("CliParser: --help wraps continuation lines to the description column"
 TEST_CASE("CliParser: plain --help carries no ANSI escapes", "[config][cli][help][color]")
 {
     auto const usage = FastCache::CliUsage(FastCache::UsageColor::Plain);
-    REQUIRE(usage.find('\x1b') == std::string::npos);
+    REQUIRE(!usage.contains('\x1b'));
 }
 
 TEST_CASE("CliParser: colorized --help adds ANSI escapes but identical text", "[config][cli][help][color]")
@@ -459,7 +459,7 @@ TEST_CASE("CliParser: colorized --help adds ANSI escapes but identical text", "[
     auto const colored = FastCache::CliUsage(FastCache::UsageColor::Colored);
 
     // Color escapes are present...
-    REQUIRE(colored.find("\x1b[") != std::string::npos);
+    REQUIRE(colored.contains("\x1b["));
     REQUIRE(colored.size() > plain.size());
     // ...and stripping them recovers exactly the plain layout (so color never
     // disturbs alignment).
