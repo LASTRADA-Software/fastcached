@@ -56,17 +56,57 @@ Chain monadically with `and_then`, `or_else`, `transform`,
 programmer errors (precondition violation, contract misuse).
 
 ### Dependency injection
-Anything that touches I/O, time, randomness, or the filesystem is reached
-through an interface: `IClock`, `IReactor`, `ISocket`/`IListener`,
+**This is a load-bearing principle, not a nice-to-have.** Anything that
+touches I/O, time, randomness, the filesystem, the network, or any other
+ambient/global resource is reached through an interface — never through a
+concrete type, a singleton, or a free function with hidden state. The
+existing seams are `IClock`, `IReactor`, `ISocket`/`IListener`,
 `IStorage`, `ILogger`, `IDaemonHost`, `ISignalSource`,
-`IAdmissionControl`, `IMetricsSink`. Tests substitute deterministic fakes
+`IAdmissionControl`, `IMetricsSink`. Collaborators are passed in (usually
+by reference or `unique_ptr` at construction), so every layer can be
+exercised in isolation: tests substitute deterministic fakes
 (`ManualClock`, `TestReactor`, `InMemoryTransport`, `NullLogger`,
-`CapturingLogger`, `ScriptedSignalSource`).
+`CapturingLogger`, `ScriptedSignalSource`) and the whole server runs
+end-to-end without a real socket or a real clock.
+
+When you add a component that does I/O or depends on the environment,
+**define the interface first and inject it** — do not reach for the
+concrete type directly. If you find yourself wanting a global, a `static`
+mutable, or a direct `::time()`/`::read()`/`new ConcreteThing` call in
+business logic, that is the signal to introduce (or reuse) a seam instead.
+Deviate from this only with a *strong, explicitly stated* reason (e.g. a
+genuinely pure leaf computation with no environment coupling); the default
+answer is "inject it".
 
 ### Data-driven design
-No magic literals scattered across the code: the CLI flag table is data,
-the storage-record layout is documented in one place, the per-DBMS / per-
-protocol dispatch lives in one switch each.
+**Behaviour is described by data; code interprets that data.** This is
+equally load-bearing and goes well beyond "no magic numbers". The aim is
+that adding a flag, a protocol verb, a storage backend, or an error code
+is a matter of *adding a row to a table*, not editing logic scattered
+across the codebase. Concretely:
+
+- **One source of truth per concept.** The CLI flag table is data; the
+  storage-record layout is documented and derived in one place; the
+  per-DBMS / per-protocol dispatch lives in a single switch each. There is
+  exactly one place to change when the concept changes.
+- **No naive, hand-rolled repetition.** If two branches differ only by a
+  value, lift the value into a descriptor/table and write the logic once.
+  Copy-pasted blocks that diverge only in constants, names, or types are a
+  defect — replace them with a data table the code iterates over, or a
+  small generic helper.
+- **Built for extension.** Prefer designs where the next case
+  (flag, verb, backend, metric, signal) is a new table entry or a new
+  interface implementation, not a new `if`/`else` arm threaded through
+  existing functions. Open for extension, closed for invasive modification.
+- **Tables over conditionals.** A `switch`/`if` ladder that mirrors a fixed
+  set of named things is usually a table in disguise; express it as data
+  (a descriptor array, a lookup map, a dispatch table) and drive it with a
+  range-based loop or `std::ranges` pipeline.
+
+As with DI, **adhere to this unless there is a very strong, explicitly
+justified reason not to.** When in doubt, ask: "if a sixth case showed up
+tomorrow, how many places would I edit?" If the answer is more than one,
+the design is not data-driven enough yet.
 
 ### RAII for resource handles
 Sockets, listeners, log files, coroutine handles — every resource is
@@ -78,8 +118,8 @@ down across a suspend point.
 ## C++ Coding Guidelines (self-contained — no external `cpp.md` required)
 
 ### Baseline (general C++23)
-- **Data-driven design** — avoid hard-coded magic values; prefer tables/descriptors.
-- **Dependency injection** — decouple components and improve testability.
+- **Data-driven design (non-negotiable)** — describe behaviour as data and let code interpret it. No hard-coded magic values; no copy-pasted branches that differ only by a constant/name/type; new cases should be a new table row or descriptor, not a new hand-written `if`. Prefer tables/descriptors and `std::ranges` over conditional ladders. See the "Data-driven design" principle above; deviate only with a strong, stated reason.
+- **Dependency injection (non-negotiable)** — reach every I/O / time / randomness / filesystem / environment dependency through an injected interface, never a singleton, global, or direct concrete call. Define the seam first, then inject it. See the "Dependency injection" principle above; deviate only with a strong, stated reason.
 - **Doxygen** on every new public function (params, return), class, struct, and member:
   ```cpp
   /// Short description.
