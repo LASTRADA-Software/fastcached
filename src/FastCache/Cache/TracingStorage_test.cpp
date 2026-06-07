@@ -18,7 +18,7 @@ namespace
 
 bool ContainsSubstr(std::string const& s, std::string_view needle) noexcept
 {
-    return s.find(needle) != std::string::npos;
+    return s.contains(needle);
 }
 
 } // namespace

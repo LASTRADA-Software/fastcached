@@ -12,6 +12,7 @@
     #include <sys/uio.h>
 
     #include <array>
+    #include <cerrno>
     #include <cstddef>
     #include <cstdint>
     #include <cstring>
@@ -24,7 +25,6 @@
     #include <utility>
     #include <vector>
 
-    #include <errno.h>
     #include <fcntl.h>
     #include <unistd.h>
 

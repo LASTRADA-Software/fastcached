@@ -86,8 +86,8 @@ TEST_CASE("PooledServerLoop serves N pre-staged connections to completion", "[po
     for (int i = 0; i < 10; ++i)
     {
         auto const response = FastCache::SyncRun(ReadAll(clients[static_cast<std::size_t>(i)].get()));
-        REQUIRE(response.find("STORED") != std::string::npos);
-        REQUIRE(response.find("VALUE k" + std::to_string(i)) != std::string::npos);
+        REQUIRE(response.contains("STORED"));
+        REQUIRE(response.contains("VALUE k" + std::to_string(i)));
     }
 }
 
@@ -125,5 +125,5 @@ TEST_CASE("PooledServerLoop with poolSize=0 resolves to hardware_concurrency", "
     REQUIRE(accepted == 1U);
 
     auto const response = FastCache::SyncRun(ReadAll(client.get()));
-    REQUIRE(response.find("STORED") != std::string::npos);
+    REQUIRE(response.contains("STORED"));
 }

@@ -136,9 +136,7 @@ TEST_CASE("EpollSocket::WriteVectored round-trips a small gathered reply", "[net
 
     std::string_view const value = "hello";
     DriveVectoredWrite(&reactor, pair.reactorSide, "VALUE k 0 5\r\n", FastCache::AsBytes(value), "\r\n", &reported);
-    std::jthread reactorThread { [&reactor] {
-        reactor.Run();
-    } };
+    std::jthread reactorThread { [&reactor] { reactor.Run(); } };
 
     auto const received = RecvExactly(pair.peerSide, 20);
     reactorThread.join();
@@ -174,9 +172,7 @@ TEST_CASE("EpollSocket::WriteVectored streams a large value across partial write
 
     DriveVectoredWrite(
         &reactor, pair.reactorSide, header, std::span<std::byte const> { value.data(), value.size() }, trailer, &reported);
-    std::jthread reactorThread { [&reactor] {
-        reactor.Run();
-    } };
+    std::jthread reactorThread { [&reactor] { reactor.Run(); } };
 
     // Drain on the test thread; the small SO_RCVBUF means the writer can only
     // make progress as we read, guaranteeing the partial-write path is hit.

@@ -358,7 +358,7 @@ auto FilePageStore::Allocate() -> std::expected<PageId, CowTreeError>
             _readBufferPageIdx = 0;
         return PageId { idx };
     }
-    auto const newIdx = static_cast<std::uint64_t>(_totalDataPages + 1);
+    auto const newIdx = static_cast<std::uint64_t>(_totalDataPages) + 1;
     _totalDataPages = static_cast<std::size_t>(newIdx);
     _live.insert(newIdx);
 

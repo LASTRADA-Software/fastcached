@@ -88,17 +88,17 @@ TEST_CASE("meta mg with c and k echos cas and key", "[protocol][meta][mg]")
     MetaFixture fix;
     auto const r = Exchange(fix, "set k 0 0 1\r\nA\r\nmg k c k\r\n");
     // CAS == 1 after a fresh set; mg without v emits HD.
-    REQUIRE(r.find("HD") != std::string::npos);
-    REQUIRE(r.find(" c1") != std::string::npos);
-    REQUIRE(r.find(" kk") != std::string::npos);
+    REQUIRE(r.contains("HD"));
+    REQUIRE(r.contains(" c1"));
+    REQUIRE(r.contains(" kk"));
 }
 
 TEST_CASE("meta mg with s and f reports size and flags", "[protocol][meta][mg]")
 {
     MetaFixture fix;
     auto const r = Exchange(fix, "set k 42 0 3\r\nfoo\r\nmg k s f\r\n");
-    REQUIRE(r.find(" s3") != std::string::npos);
-    REQUIRE(r.find(" f42") != std::string::npos);
+    REQUIRE(r.contains(" s3"));
+    REQUIRE(r.contains(" f42"));
 }
 
 TEST_CASE("meta mg with T refreshes TTL", "[protocol][meta][mg][touch]")
@@ -106,7 +106,7 @@ TEST_CASE("meta mg with T refreshes TTL", "[protocol][meta][mg][touch]")
     MetaFixture fix;
     auto const r = Exchange(fix, "set k 0 1 1\r\nA\r\nmg k T120 v\r\n");
     // The mg should still hit (touch happens, then return), value=A.
-    REQUIRE(r.find("VA 1\r\nA\r\n") != std::string::npos);
+    REQUIRE(r.contains("VA 1\r\nA\r\n"));
 }
 
 TEST_CASE("meta mg with N auto-vivifies on miss", "[protocol][meta][mg][vivify]")
@@ -114,7 +114,7 @@ TEST_CASE("meta mg with N auto-vivifies on miss", "[protocol][meta][mg][vivify]"
     MetaFixture fix;
     auto const r = Exchange(fix, "mg fresh N60 v\r\n");
     // Auto-vivified empty value; the response should be VA 0 with no body.
-    REQUIRE(r.find("VA 0\r\n") != std::string::npos);
+    REQUIRE(r.contains("VA 0\r\n"));
 }
 
 TEST_CASE("meta mg with q on miss emits nothing -- verified via piped mn", "[protocol][meta][mg][quiet]")
@@ -128,7 +128,7 @@ TEST_CASE("meta mg with O echoes the opaque token", "[protocol][meta][mg][opaque
 {
     MetaFixture fix;
     auto const r = Exchange(fix, "set k 0 0 1\r\nA\r\nmg k Oabc123\r\n");
-    REQUIRE(r.find(" Oabc123") != std::string::npos);
+    REQUIRE(r.contains(" Oabc123"));
 }
 
 TEST_CASE("meta ms stores a value via S mode (default)", "[protocol][meta][ms]")
@@ -164,8 +164,8 @@ TEST_CASE("meta ms with T sets a TTL", "[protocol][meta][ms]")
 {
     MetaFixture fix;
     auto const r = Exchange(fix, "ms k 1 T60\r\nA\r\nmg k v t\r\n");
-    REQUIRE(r.find("VA 1") != std::string::npos);
-    REQUIRE(r.find(" t") != std::string::npos);
+    REQUIRE(r.contains("VA 1"));
+    REQUIRE(r.contains(" t"));
 }
 
 TEST_CASE("meta md deletes the key and returns HD", "[protocol][meta][md]")
@@ -193,21 +193,21 @@ TEST_CASE("meta ma increments by default delta of 1", "[protocol][meta][ma]")
 {
     MetaFixture fix;
     auto const r = Exchange(fix, "set c 0 0 2\r\n10\r\nma c v\r\n");
-    REQUIRE(r.find("VA 2\r\n11\r\n") != std::string::npos);
+    REQUIRE(r.contains("VA 2\r\n11\r\n"));
 }
 
 TEST_CASE("meta ma D mode decrements", "[protocol][meta][ma]")
 {
     MetaFixture fix;
     auto const r = Exchange(fix, "set c 0 0 2\r\n10\r\nma c M=D D3 v\r\n");
-    REQUIRE(r.find("VA 1\r\n7\r\n") != std::string::npos);
+    REQUIRE(r.contains("VA 1\r\n7\r\n"));
 }
 
 TEST_CASE("meta ma N+J auto-vivifies", "[protocol][meta][ma][vivify]")
 {
     MetaFixture fix;
     auto const r = Exchange(fix, "ma c N60 J42 v\r\n");
-    REQUIRE(r.find("VA 2\r\n42\r\n") != std::string::npos);
+    REQUIRE(r.contains("VA 2\r\n42\r\n"));
 }
 
 TEST_CASE("meta ma without v returns just HD on success", "[protocol][meta][ma]")
@@ -222,8 +222,8 @@ TEST_CASE("meta me dumps entry metadata", "[protocol][meta][me]")
     MetaFixture fix;
     auto const r = Exchange(fix, "set k 0 0 3\r\nfoo\r\nme k\r\n");
     REQUIRE(r.starts_with("STORED\r\nME k "));
-    REQUIRE(r.find("size=3") != std::string::npos);
-    REQUIRE(r.find("cas=") != std::string::npos);
+    REQUIRE(r.contains("size=3"));
+    REQUIRE(r.contains("cas="));
 }
 
 TEST_CASE("meta me on miss returns EN", "[protocol][meta][me]")
@@ -244,8 +244,8 @@ TEST_CASE("meta mg pipelining with mn as a sync barrier", "[protocol][meta][mn]"
 {
     MetaFixture fix;
     auto const r = Exchange(fix, "ms k 1\r\nA\r\nms k 1\r\nB\r\nms k 1\r\nC\r\nmn\r\nmg k v\r\n");
-    REQUIRE(r.find("MN\r\n") != std::string::npos);
-    REQUIRE(r.find("VA 1\r\nC\r\n") != std::string::npos);
+    REQUIRE(r.contains("MN\r\n"));
+    REQUIRE(r.contains("VA 1\r\nC\r\n"));
 }
 
 TEST_CASE("meta mg with c and T returns the POST-touch CAS and TTL", "[protocol][meta][mg][touch][regression]")
@@ -256,10 +256,10 @@ TEST_CASE("meta mg with c and T returns the POST-touch CAS and TTL", "[protocol]
     // command just applied.
     MetaFixture fix;
     auto const r = Exchange(fix, "set k 0 30 1\r\nA\r\nmg k c t T120\r\n");
-    REQUIRE(r.find("HD") != std::string::npos);
-    REQUIRE(r.find(" c2") != std::string::npos);   // CAS bumped by the touch (set=1 -> touch=2)
-    REQUIRE(r.find(" c1") == std::string::npos);   // never the pre-touch CAS
-    REQUIRE(r.find(" t120") != std::string::npos); // the refreshed TTL, not the original 30
+    REQUIRE(r.contains("HD"));
+    REQUIRE(r.contains(" c2"));   // CAS bumped by the touch (set=1 -> touch=2)
+    REQUIRE(!r.contains(" c1"));  // never the pre-touch CAS
+    REQUIRE(r.contains(" t120")); // the refreshed TTL, not the original 30
 }
 
 TEST_CASE("meta md C compare-and-delete: mismatch keeps the entry, match removes it", "[protocol][meta][md][cas]")
@@ -276,33 +276,33 @@ TEST_CASE("meta md I marks the entry stale instead of removing it", "[protocol][
     MetaFixture fix;
     auto const r = Exchange(fix, "set k 0 0 1\r\nA\r\nmd k I\r\nmg k v\r\n");
     // HD acks the mark; the entry survives and a reader sees the X flag.
-    REQUIRE(r.find("HD\r\n") != std::string::npos);
-    REQUIRE(r.find("VA 1 X\r\nA\r\n") != std::string::npos);
+    REQUIRE(r.contains("HD\r\n"));
+    REQUIRE(r.contains("VA 1 X\r\nA\r\n"));
 }
 
 TEST_CASE("meta md I T marks stale and refreshes the TTL", "[protocol][meta][md][stale][touch]")
 {
     MetaFixture fix;
     auto const r = Exchange(fix, "set k 0 5 1\r\nA\r\nmd k I T120\r\nmg k t v\r\n");
-    REQUIRE(r.find(" t120") != std::string::npos); // TTL refreshed by the I+T combo
-    REQUIRE(r.find(" X") != std::string::npos);    // and marked stale
+    REQUIRE(r.contains(" t120")); // TTL refreshed by the I+T combo
+    REQUIRE(r.contains(" X"));    // and marked stale
 }
 
 TEST_CASE("meta ms I marks stale instead of storing the supplied payload", "[protocol][meta][ms][stale]")
 {
     MetaFixture fix;
     auto const r = Exchange(fix, "set k 0 0 1\r\nA\r\nms k 1 I\r\nB\r\nmg k v\r\n");
-    REQUIRE(r.find("HD\r\n") != std::string::npos);
+    REQUIRE(r.contains("HD\r\n"));
     // Value is unchanged (still A, not the ignored B) and now stale.
-    REQUIRE(r.find("VA 1 X\r\nA\r\n") != std::string::npos);
+    REQUIRE(r.contains("VA 1 X\r\nA\r\n"));
 }
 
 TEST_CASE("meta ms N auto-vivifies an append-mode miss", "[protocol][meta][ms][vivify]")
 {
     MetaFixture fix;
     auto const r = Exchange(fix, "ms fresh 3 M=A N60\r\nabc\r\nmg fresh v\r\n");
-    REQUIRE(r.find("HD\r\n") != std::string::npos);
-    REQUIRE(r.find("VA 3\r\nabc\r\n") != std::string::npos);
+    REQUIRE(r.contains("HD\r\n"));
+    REQUIRE(r.contains("VA 3\r\nabc\r\n"));
 }
 
 TEST_CASE("meta ma with T reports the post-touch CAS (regression)", "[protocol][meta][ma][touch][regression]")
@@ -401,8 +401,8 @@ TEST_CASE("meta mg with T counts a single get hit, not two (regression)", "[prot
     // copying the value twice; now it issues one GetAndTouch.
     MetaFixture fix;
     auto const r = Exchange(fix, "set k 0 0 1\r\nA\r\nmg k v T60\r\nstats\r\n");
-    REQUIRE(r.find("VA 1\r\nA\r\n") != std::string::npos);
-    REQUIRE(r.find("STAT get_hits 1\r\n") != std::string::npos);
+    REQUIRE(r.contains("VA 1\r\nA\r\n"));
+    REQUIRE(r.contains("STAT get_hits 1\r\n"));
 }
 
 TEST_CASE("meta mg with u does not count a get hit (no-bump)", "[protocol][meta][mg][nobump][regression]")
@@ -412,7 +412,7 @@ TEST_CASE("meta mg with u does not count a get hit (no-bump)", "[protocol][meta]
     // InMemoryLruStorage's pre-access-lastAccess test.)
     MetaFixture fix;
     auto const r = Exchange(fix, "set k 0 0 1\r\nA\r\nmg k u\r\nstats\r\n");
-    REQUIRE(r.find("STAT get_hits 0\r\n") != std::string::npos);
+    REQUIRE(r.contains("STAT get_hits 0\r\n"));
 }
 
 TEST_CASE("meta mg l reports seconds since the previous read (regression)", "[protocol][meta][mg][last-access][regression]")
@@ -438,7 +438,7 @@ TEST_CASE("meta mg l reports seconds since the previous read (regression)", "[pr
     std::ignore = runOnce("set k 0 0 1\r\nA\r\nmg k\r\n"); // first read stamps lastAccess at T0
     clock.Advance(std::chrono::seconds { 10 });
     auto const r = runOnce("mg k l\r\n"); // read at T0+10 -> l10, not l0
-    REQUIRE(r.find(" l10") != std::string::npos);
+    REQUIRE(r.contains(" l10"));
 }
 
 TEST_CASE("meta ma with t does not pollute get hits (regression)", "[protocol][meta][ma][stats][regression]")
@@ -447,7 +447,7 @@ TEST_CASE("meta ma with t does not pollute get hits (regression)", "[protocol][m
     // stamping lastAccess on the counter; it must use a non-mutating Peek.
     MetaFixture fix;
     auto const r = Exchange(fix, "set c 0 30 2\r\n10\r\nma c t v\r\nstats\r\n");
-    REQUIRE(r.find("STAT get_hits 0\r\n") != std::string::npos);
+    REQUIRE(r.contains("STAT get_hits 0\r\n"));
 }
 
 TEST_CASE("meta mg opaque token starting with '=' round-trips verbatim (regression)",
@@ -457,5 +457,5 @@ TEST_CASE("meta mg opaque token starting with '=' round-trips verbatim (regressi
     // only for the M mode flag, leaving an opaque `O=abc` intact.
     MetaFixture fix;
     auto const r = Exchange(fix, "set k 0 0 1\r\nA\r\nmg k O=abc\r\n");
-    REQUIRE(r.find(" O=abc") != std::string::npos);
+    REQUIRE(r.contains(" O=abc"));
 }

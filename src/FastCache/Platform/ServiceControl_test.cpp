@@ -32,24 +32,24 @@ TEST_CASE("ServiceControl: non-default scalar flags are baked in", "[platform][s
     cfg.maxMemoryBytes = 128U * 1024U * 1024U;
     cfg.storageShards = 4;
     auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
-    REQUIRE(cmd.find("--port=6000") != std::string::npos);
-    REQUIRE(cmd.find("--bind=0.0.0.0") != std::string::npos);
-    REQUIRE(cmd.find("--threads=8") != std::string::npos);
-    REQUIRE(cmd.find("--max-memory=134217728") != std::string::npos);
-    REQUIRE(cmd.find("--storage-shards=4") != std::string::npos);
+    REQUIRE(cmd.contains("--port=6000"));
+    REQUIRE(cmd.contains("--bind=0.0.0.0"));
+    REQUIRE(cmd.contains("--threads=8"));
+    REQUIRE(cmd.contains("--max-memory=134217728"));
+    REQUIRE(cmd.contains("--storage-shards=4"));
 }
 
 TEST_CASE("ServiceControl: flags left at their default are omitted", "[platform][service]")
 {
     FastCache::Config const cfg {};
     auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
-    REQUIRE(cmd.find("--port=") == std::string::npos);
-    REQUIRE(cmd.find("--bind=") == std::string::npos);
-    REQUIRE(cmd.find("--max-memory=") == std::string::npos);
-    REQUIRE(cmd.find("--threads=") == std::string::npos);
-    REQUIRE(cmd.find("--log-level=") == std::string::npos);
-    REQUIRE(cmd.find("--execution-model=") == std::string::npos);
-    REQUIRE(cmd.find("--storage=") == std::string::npos);
+    REQUIRE(!cmd.contains("--port="));
+    REQUIRE(!cmd.contains("--bind="));
+    REQUIRE(!cmd.contains("--max-memory="));
+    REQUIRE(!cmd.contains("--threads="));
+    REQUIRE(!cmd.contains("--log-level="));
+    REQUIRE(!cmd.contains("--execution-model="));
+    REQUIRE(!cmd.contains("--storage="));
 }
 
 TEST_CASE("ServiceControl: enum flags use their CLI spellings", "[platform][service]")
@@ -59,9 +59,9 @@ TEST_CASE("ServiceControl: enum flags use their CLI spellings", "[platform][serv
     cfg.storageDurability = FastCache::StorageDurability::Fsync;
     cfg.executionModel = FastCache::ExecutionModel::Threaded;
     auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
-    REQUIRE(cmd.find("--log-level=debug") != std::string::npos);
-    REQUIRE(cmd.find("--storage-durability=fsync") != std::string::npos);
-    REQUIRE(cmd.find("--execution-model=threaded") != std::string::npos);
+    REQUIRE(cmd.contains("--log-level=debug"));
+    REQUIRE(cmd.contains("--storage-durability=fsync"));
+    REQUIRE(cmd.contains("--execution-model=threaded"));
 }
 
 TEST_CASE("ServiceControl: the service name is always emitted, quoted when it has spaces", "[platform][service]")
@@ -69,7 +69,7 @@ TEST_CASE("ServiceControl: the service name is always emitted, quoted when it ha
     FastCache::Config cfg {};
     cfg.serviceName = "My Cache";
     auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
-    REQUIRE(cmd.find("--service-name=\"My Cache\"") != std::string::npos);
+    REQUIRE(cmd.contains("--service-name=\"My Cache\""));
 }
 
 TEST_CASE("ServiceControl: a relative storage path is absolutized", "[platform][service]")
@@ -79,10 +79,10 @@ TEST_CASE("ServiceControl: a relative storage path is absolutized", "[platform][
     auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
 
     auto const expected = std::filesystem::absolute("relative/cache.cow").string();
-    REQUIRE(cmd.find(expected) != std::string::npos);
+    REQUIRE(cmd.contains(expected));
     // The bare relative path must not survive — a service's working directory is
     // not the install directory, so it would resolve to the wrong location.
-    REQUIRE(cmd.find("--storage=relative/cache.cow") == std::string::npos);
+    REQUIRE(!cmd.contains("--storage=relative/cache.cow"));
 }
 
 TEST_CASE("ServiceControl: install/uninstall are unsupported off Windows", "[platform][service]")

@@ -71,7 +71,7 @@ namespace
     /// pass through unchanged for a stable, readable command line.
     [[nodiscard]] std::string MaybeQuote(std::string_view value)
     {
-        if (value.find(' ') != std::string_view::npos)
+        if (value.contains(' '))
             return std::format("\"{}\"", value);
         return std::string { value };
     }

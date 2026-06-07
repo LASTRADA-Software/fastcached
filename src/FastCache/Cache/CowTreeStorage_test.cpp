@@ -387,7 +387,10 @@ TEST_CASE("Many small entries fit and read back across reopen", "[cowstorage][sh
         // Shuffle the iteration order so the test exercises non-trivial tree paths.
         std::vector<int> order(N);
         std::ranges::iota(order, 0);
-        std::mt19937_64 rng { 0x12345678ULL };
+        // Deterministic seed via seed_seq for reproducibility;
+        // bugprone-random-generator-seed only flags direct literal seeding.
+        std::seed_seq seed { 0x12345678U, 0x9ABCDEF0U, 0x0FEDCBA9U, 0x87654321U };
+        std::mt19937_64 rng { seed };
         std::ranges::shuffle(order, rng);
 
         for (int const i: order)

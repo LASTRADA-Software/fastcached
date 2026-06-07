@@ -273,7 +273,7 @@ TEST_CASE("memcached-text gat returns every key in a large multi-key request (re
 
     auto const response = Exchange(fix, req);
     for (int i = 0; i < 20; ++i)
-        REQUIRE(response.find(std::format("VALUE k{} 0 1", i)) != std::string::npos);
+        REQUIRE(response.contains(std::format("VALUE k{} 0 1", i)));
 }
 
 TEST_CASE("memcached-text cache_memlimit reconfigures the storage budget", "[protocol][text][admin]")
@@ -292,7 +292,7 @@ TEST_CASE("memcached-text cache_memlimit rejects an overflowing argument (regres
     TextFixture fix;
     auto const before = fix.storage.Snapshot().bytesLimit;
     auto const response = Exchange(fix, "cache_memlimit 18446744073709551615\r\n"); // 2^64-1 MB
-    REQUIRE(response.find("CLIENT_ERROR") != std::string::npos);
+    REQUIRE(response.contains("CLIENT_ERROR"));
     REQUIRE(fix.storage.Snapshot().bytesLimit == before); // budget left unchanged
 }
 
@@ -309,21 +309,21 @@ TEST_CASE("memcached-text stats settings returns STAT lines", "[protocol][text][
     auto const response = Exchange(fix, "stats settings\r\n");
     REQUIRE(response.starts_with("STAT maxbytes "));
     REQUIRE(response.ends_with("END\r\n"));
-    REQUIRE(response.find("STAT cas_enabled yes") != std::string::npos);
+    REQUIRE(response.contains("STAT cas_enabled yes"));
 }
 
 TEST_CASE("memcached-text stats items reports the synthetic LRU class", "[protocol][text][stats]")
 {
     TextFixture fix;
     auto const response = Exchange(fix, "set k 0 0 1\r\nx\r\nstats items\r\n");
-    REQUIRE(response.find("STAT items:1:number 1") != std::string::npos);
+    REQUIRE(response.contains("STAT items:1:number 1"));
 }
 
 TEST_CASE("memcached-text stats slabs reports a single synthetic class", "[protocol][text][stats]")
 {
     TextFixture fix;
     auto const response = Exchange(fix, "stats slabs\r\n");
-    REQUIRE(response.find("STAT active_slabs 1") != std::string::npos);
+    REQUIRE(response.contains("STAT active_slabs 1"));
     REQUIRE(response.ends_with("END\r\n"));
 }
 
@@ -331,7 +331,7 @@ TEST_CASE("memcached-text stats sizes emits a single approximate bucket", "[prot
 {
     TextFixture fix;
     auto const response = Exchange(fix, "set k 0 0 4\r\nXXXX\r\nstats sizes\r\n");
-    REQUIRE(response.find("STAT 4 1\r\n") != std::string::npos);
+    REQUIRE(response.contains("STAT 4 1\r\n"));
 }
 
 TEST_CASE("memcached-text stats reset is acknowledged", "[protocol][text][stats]")
@@ -345,9 +345,9 @@ TEST_CASE("memcached-text stats includes the new touch / cas / incr counters", "
 {
     TextFixture fix;
     auto const response = Exchange(fix, "set k 0 0 1\r\nx\r\ntouch k 60\r\nstats\r\n");
-    REQUIRE(response.find("STAT touch_hits 1") != std::string::npos);
-    REQUIRE(response.find("STAT cmd_touch 1") != std::string::npos);
-    REQUIRE(response.find("STAT cas_hits ") != std::string::npos);
+    REQUIRE(response.contains("STAT touch_hits 1"));
+    REQUIRE(response.contains("STAT cmd_touch 1"));
+    REQUIRE(response.contains("STAT cas_hits "));
 }
 
 TEST_CASE("memcached-text slabs/lru/lru_crawler stubs reply OK", "[protocol][text][stubs]")

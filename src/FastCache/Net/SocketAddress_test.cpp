@@ -160,7 +160,7 @@ TEST_CASE("SystemAddressResolver rejects an unresolvable name", "[net][resolver]
     // ".invalid" is a reserved TLD (RFC 6761) guaranteed never to resolve.
     auto const resolved = resolver.Resolve("fastcached.invalid", 11211);
     REQUIRE_FALSE(resolved.has_value());
-    REQUIRE(resolved.error().find("fastcached.invalid") != std::string::npos);
+    REQUIRE(resolved.error().contains("fastcached.invalid"));
 }
 
 TEST_CASE("BindAndListen binds the first resolved candidate", "[net][bind]")
@@ -192,7 +192,7 @@ TEST_CASE("BindAndListen propagates a resolver error", "[net][bind]")
     FakeAddressResolver resolver { std::string { "cannot resolve 'banana': no usable address" } };
     auto const bound = FastCache::Detail::BindAndListen(resolver, "banana", 11211, /*backlog*/ 16, /*extraTypeFlags*/ 0);
     REQUIRE_FALSE(bound.has_value());
-    REQUIRE(bound.error().find("banana") != std::string::npos);
+    REQUIRE(bound.error().contains("banana"));
 }
 
 TEST_CASE("BindAndListen reports failure when no candidate is bindable", "[net][bind]")

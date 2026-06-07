@@ -26,6 +26,11 @@ class KqueueSocket final: public ISocket
     KqueueSocket(KqueueReactor& reactor, int fd) noexcept;
     ~KqueueSocket() override;
 
+    KqueueSocket(KqueueSocket const&) = delete;
+    KqueueSocket& operator=(KqueueSocket const&) = delete;
+    KqueueSocket(KqueueSocket&&) = delete;
+    KqueueSocket& operator=(KqueueSocket&&) = delete;
+
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
     [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
@@ -61,6 +66,11 @@ class KqueueListener final: public IListener
                                                               ReusePort reusePort = ReusePort::No);
 
     ~KqueueListener() override;
+
+    KqueueListener(KqueueListener const&) = delete;
+    KqueueListener& operator=(KqueueListener const&) = delete;
+    KqueueListener(KqueueListener&&) = delete;
+    KqueueListener& operator=(KqueueListener&&) = delete;
 
     [[nodiscard]] AcceptAwaitable Accept() override;
     void Close() noexcept override;
