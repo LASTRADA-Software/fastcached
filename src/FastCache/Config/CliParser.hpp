@@ -46,6 +46,8 @@ struct CliResult
     bool storageShardsExplicit { false };
     bool listenBacklogExplicit { false };
     bool logTimestampsExplicit { false };
+    bool requirePassExplicit { false };
+    bool authUsernameExplicit { false };
 };
 
 /// Parse `argv[1..argc-1]` into a Config. Returns ConfigError on bad input.

@@ -443,13 +443,47 @@ namespace
         co_return co_await ReplyOk(socket);
     }
 
-    Task<bool> Dispatch(ISocket* socket, CacheEngine* engine, ParsedCommand cmd)
+    /// Commands a client may issue before authenticating when a credential is
+    /// required: AUTH itself and QUIT. Everything else replies `-NOAUTH` until
+    /// AUTH succeeds. HELLO is intentionally NOT here: our HandleHello does not
+    /// parse the optional `HELLO <ver> AUTH <user> <pass>` clause, so allowing
+    /// bare HELLO pre-auth would only leak the version banner while leaving the
+    /// connection unauthenticated. Gating it makes HELLO reply `-NOAUTH` until a
+    /// separate AUTH succeeds, matching password-protected redis.
+    [[nodiscard]] bool IsPreAuthAllowed(std::string_view name) noexcept
+    {
+        return name == "AUTH" || name == "QUIT";
+    }
+
+    Task<bool> Dispatch(ISocket* socket, CacheEngine* engine, ParsedCommand cmd, SessionContext session, bool* authenticated)
     {
         if (cmd.args.empty())
             co_return true;
 
         auto const name = Upper(cmd.args[0]);
         auto const tail = std::span<std::string const> { cmd.args.data() + 1, cmd.args.size() - 1 };
+
+        auto const* const auth = session.auth;
+        bool const authEnabled = auth != nullptr && auth->Enabled();
+        if (authEnabled && !*authenticated && !IsPreAuthAllowed(name))
+            co_return co_await WriteAll(socket, "-NOAUTH Authentication required.\r\n");
+
+        if (name == "AUTH")
+        {
+            if (!authEnabled)
+                co_return co_await ReplyError(socket, "Client sent AUTH, but no password is set");
+            bool ok = false;
+            if (tail.size() == 1)
+                ok = auth->Verify(tail[0]);
+            else if (tail.size() == 2)
+                ok = auth->Verify(tail[0], tail[1]);
+            else
+                co_return co_await ReplyError(socket, "wrong number of arguments for 'auth' command");
+            if (!ok)
+                co_return co_await WriteAll(socket, "-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+            *authenticated = true;
+            co_return co_await ReplyOk(socket);
+        }
 
         if (name == "GET")
             co_return co_await HandleGet(socket, engine, tail);
@@ -487,8 +521,6 @@ namespace
             socket->Close();
             co_return false; // signal session end
         }
-        if (name == "AUTH")
-            co_return co_await ReplyError(socket, "Client sent AUTH, but no password is set");
         co_return co_await ReplyError(socket, std::format("unknown command '{}'", name));
     }
 
@@ -499,10 +531,16 @@ std::string_view RedisRespHandler::ServerVersion() noexcept
     return ServerVersionBanner;
 }
 
-Task<void> RedisRespHandler::Run(ISocket* socket, CacheEngine* engine, std::vector<std::byte> primingBytes)
+Task<void> RedisRespHandler::Run(ISocket* socket,
+                                 CacheEngine* engine,
+                                 std::vector<std::byte> primingBytes,
+                                 SessionContext session)
 {
     ByteReader reader { *socket, MaxLineBytes, MaxPayloadBytes };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
+
+    // Authenticated up-front unless a credential is required; AUTH flips this.
+    bool authenticated = !(session.auth != nullptr && session.auth->Enabled());
 
     while (true)
     {
@@ -511,7 +549,7 @@ Task<void> RedisRespHandler::Run(ISocket* socket, CacheEngine* engine, std::vect
             co_return; // truncated / malformed — drop connection
         if (cmd->args.empty())
             continue;
-        auto const keepGoing = co_await Dispatch(socket, engine, std::move(*cmd));
+        auto const keepGoing = co_await Dispatch(socket, engine, std::move(*cmd), session, &authenticated);
         if (!keepGoing)
             co_return;
 

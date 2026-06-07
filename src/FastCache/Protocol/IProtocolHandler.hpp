@@ -4,6 +4,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Protocol/SessionContext.hpp>
 
 #include <cstddef>
 #include <span>
@@ -33,8 +34,15 @@ class IProtocolHandler
     /// @param engine Cache engine shared between connections.
     /// @param primingBytes Bytes that were peeked during protocol
     ///        autodetection and must be replayed before any socket read.
+    /// @param session Per-server session context (authentication policy and
+    ///        other optional collaborators). Passed by value — it is a cheap
+    ///        pointer-sized bundle, and a by-value coroutine parameter is safe
+    ///        across suspension (a reference parameter would not be).
     /// @return Task that completes when the session ends.
-    [[nodiscard]] virtual Task<void> Run(ISocket* socket, CacheEngine* engine, std::vector<std::byte> primingBytes) = 0;
+    [[nodiscard]] virtual Task<void> Run(ISocket* socket,
+                                         CacheEngine* engine,
+                                         std::vector<std::byte> primingBytes,
+                                         SessionContext session) = 0;
 };
 
 } // namespace FastCache

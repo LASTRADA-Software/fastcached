@@ -94,7 +94,7 @@ namespace
         }
         logger.Log(LogLevel::Info, "ready, accepting connections");
 
-        Server server { *listener, engine, logger, admission, metrics };
+        Server server { *listener, engine, logger, admission, metrics, options.session };
         auto runAccept = [](Server* s) -> DetachedTask {
             co_await s->Run();
             co_return;
@@ -120,8 +120,12 @@ namespace
     /// reschedules onto `reactor` (so the socket is created and all its I/O
     /// completions land on that one thread — no coroutine migration), then
     /// wraps the raw handle and runs the protocol session.
-    DetachedTask RunHandedOffConnection(
-        IocpReactor& reactor, Detail::NativeSocket raw, CacheEngine& engine, ILogger& logger, IAdmissionControl* admission)
+    DetachedTask RunHandedOffConnection(IocpReactor& reactor,
+                                        Detail::NativeSocket raw,
+                                        CacheEngine& engine,
+                                        ILogger& logger,
+                                        IAdmissionControl* admission,
+                                        SessionContext session)
     {
         co_await ResumeOn { reactor };
         // Firewall: this is a DetachedTask (unhandled_exception -> std::terminate),
@@ -139,7 +143,7 @@ namespace
             }
             else
             {
-                Connection connection { std::move(socket), engine, logger };
+                Connection connection { std::move(socket), engine, logger, session };
                 co_await connection.Run();
             }
         }
@@ -205,7 +209,7 @@ namespace
                     metrics->Increment(IMetricsSink::Counter::ConnectionsTotal);
                 auto& reactor = *reactors[next % reactorCount];
                 ++next;
-                RunHandedOffConnection(reactor, *raw, engine, logger, admission);
+                RunHandedOffConnection(reactor, *raw, engine, logger, admission, options.session);
             }
         } };
 
@@ -271,7 +275,7 @@ namespace
                 return EXIT_FAILURE;
             }
             listeners.push_back(std::move(listener));
-            servers.push_back(std::make_unique<Server>(*listeners[i], engine, logger, admission, metrics));
+            servers.push_back(std::make_unique<Server>(*listeners[i], engine, logger, admission, metrics, options.session));
         }
         logger.Logf(LogLevel::Info, "ready, accepting connections ({} reactors)", reactorCount);
 

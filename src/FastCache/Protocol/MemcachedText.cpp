@@ -605,10 +605,19 @@ std::string_view MemcachedTextHandler::ServerVersion() noexcept
     return ServerVersionBanner;
 }
 
-Task<void> MemcachedTextHandler::Run(ISocket* socket, CacheEngine* engine, std::vector<std::byte> primingBytes)
+Task<void> MemcachedTextHandler::Run(ISocket* socket,
+                                     CacheEngine* engine,
+                                     std::vector<std::byte> primingBytes,
+                                     SessionContext session)
 {
     ByteReader reader { *socket, MaxLineBytes, MaxPayloadBytes };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
+
+    // The memcached text protocol has no authentication handshake, so when a
+    // credential is required there is no way to satisfy it over this protocol:
+    // every command except `version`/`quit` is refused. Clients that need auth
+    // must use the binary (SASL) or RESP (AUTH) protocols.
+    bool const authRequired = session.auth != nullptr && session.auth->Enabled();
 
     // Reused across commands: cleared each iteration, so its capacity persists
     // and the common path tokenizes without a per-command heap allocation.
@@ -636,6 +645,19 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket, CacheEngine* engine, std::
 
         auto const command = parts[0];
         auto const tail = std::span<std::string_view const> { parts.data() + 1, parts.size() - 1 };
+
+        if (authRequired && command != "version" && command != "quit")
+        {
+            // The text protocol has no auth handshake, so this command can never
+            // be satisfied. Reply once, then end the session rather than
+            // `continue`: a refused storage command (`set <k> <f> <e> <bytes>`)
+            // still has its data block sitting unread in the stream, and
+            // continuing would parse those value bytes as the next command —
+            // desyncing the parser and emitting a spurious second error. Clients
+            // that need auth must use the binary (SASL) or RESP (AUTH) protocol.
+            (void) co_await WriteError(socket, "CLIENT_ERROR", "authentication required");
+            co_return;
+        }
 
         bool ok = true;
         if (command == "get")

@@ -19,7 +19,10 @@ namespace FastCache
 ///   PING, ECHO, INFO, COMMAND, HELLO, QUIT, FLUSHDB, FLUSHALL
 ///
 /// RESP3 is not supported — `HELLO 3` replies `-NOPROTO`.
-/// AUTH replies with an error since no auth backend is wired in.
+/// AUTH authenticates against the session's AuthPolicy when one is configured;
+/// with no policy it replies the redis "no password is set" error. When a
+/// policy is configured, every data command before a successful AUTH replies
+/// `-NOAUTH`.
 /// Unknown commands reply `-ERR unknown command`.
 class RedisRespHandler final: public IProtocolHandler
 {
@@ -27,7 +30,10 @@ class RedisRespHandler final: public IProtocolHandler
     /// Returned by INFO; mirrors the memcached `version` semantics.
     [[nodiscard]] static std::string_view ServerVersion() noexcept;
 
-    [[nodiscard]] Task<void> Run(ISocket* socket, CacheEngine* engine, std::vector<std::byte> primingBytes) override;
+    [[nodiscard]] Task<void> Run(ISocket* socket,
+                                 CacheEngine* engine,
+                                 std::vector<std::byte> primingBytes,
+                                 SessionContext session) override;
 };
 
 } // namespace FastCache

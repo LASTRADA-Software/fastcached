@@ -7,6 +7,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IAdmissionControl.hpp>
 #include <FastCache/Net/IListener.hpp>
+#include <FastCache/Protocol/SessionContext.hpp>
 
 #include <atomic>
 #include <exception>
@@ -50,11 +51,14 @@ class Server
   public:
     /// Construct over the given collaborators; all references must outlive
     /// the server. Admission/metrics may be null.
+    /// @param session Per-server session context (auth policy etc.) forwarded
+    ///        to every connection. Copied by value; defaults to no auth.
     Server(IListener& listener,
            CacheEngine& engine,
            ILogger& logger,
            IAdmissionControl* admission = nullptr,
-           IMetricsSink* metrics = nullptr) noexcept;
+           IMetricsSink* metrics = nullptr,
+           SessionContext session = {}) noexcept;
 
     /// Run the accept loop until Shutdown() is called or the listener closes.
     /// @return Task that resolves when the accept loop exits.
@@ -77,6 +81,7 @@ class Server
     ILogger& _logger;
     IAdmissionControl* _admission;
     IMetricsSink* _metrics;
+    SessionContext _session;
     std::atomic<std::uint64_t> _accepted { 0 };
     std::atomic<bool> _shuttingDown { false };
 };

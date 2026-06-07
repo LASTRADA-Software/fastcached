@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
+#include <FastCache/Protocol/SessionContext.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -50,11 +52,11 @@ FastCache::Task<std::string> DrainResponse(FastCache::ISocket* s)
     co_return out;
 }
 
-std::string Exchange(RespFixture& fix, std::string_view request)
+std::string Exchange(RespFixture& fix, std::string_view request, FastCache::SessionContext session = {})
 {
     REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), request)));
     fix.pair.client->ShutdownWrite();
-    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}));
+    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, session));
     return FastCache::SyncRun(DrainResponse(fix.pair.client.get()));
 }
 
@@ -187,4 +189,62 @@ TEST_CASE("RESP: FLUSHDB wipes all entries", "[protocol][resp]")
                               "*1\r\n$7\r\nFLUSHDB\r\n"
                               "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
     REQUIRE(out == "+OK\r\n+OK\r\n$-1\r\n");
+}
+
+TEST_CASE("RESP: AUTH with no password set yields -ERR", "[protocol][resp][auth]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*2\r\n$4\r\nAUTH\r\n$1\r\nx\r\n");
+    REQUIRE(out.starts_with("-ERR Client sent AUTH"));
+}
+
+TEST_CASE("RESP: data command before AUTH yields -NOAUTH when auth is required", "[protocol][resp][auth]")
+{
+    FastCache::AuthPolicy const policy { "default", "s3cr3t" };
+    FastCache::SessionContext const session { .auth = &policy };
+    RespFixture fix;
+    auto const out = Exchange(fix, "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", session);
+    REQUIRE(out.starts_with("-NOAUTH"));
+}
+
+TEST_CASE("RESP: PING before AUTH is also gated", "[protocol][resp][auth]")
+{
+    FastCache::AuthPolicy const policy { "default", "s3cr3t" };
+    FastCache::SessionContext const session { .auth = &policy };
+    RespFixture fix;
+    REQUIRE(Exchange(fix, "PING\r\n", session).starts_with("-NOAUTH"));
+}
+
+TEST_CASE("RESP: AUTH with wrong password yields -WRONGPASS", "[protocol][resp][auth]")
+{
+    FastCache::AuthPolicy const policy { "default", "s3cr3t" };
+    FastCache::SessionContext const session { .auth = &policy };
+    RespFixture fix;
+    auto const out = Exchange(fix, "*2\r\n$4\r\nAUTH\r\n$5\r\nwrong\r\n", session);
+    REQUIRE(out.starts_with("-WRONGPASS"));
+}
+
+TEST_CASE("RESP: correct AUTH unlocks subsequent commands", "[protocol][resp][auth]")
+{
+    FastCache::AuthPolicy const policy { "default", "s3cr3t" };
+    FastCache::SessionContext const session { .auth = &policy };
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*2\r\n$4\r\nAUTH\r\n$6\r\ns3cr3t\r\n"
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+                              session);
+    REQUIRE(out == "+OK\r\n+OK\r\n$1\r\nv\r\n");
+}
+
+TEST_CASE("RESP: AUTH accepts the username/password form", "[protocol][resp][auth]")
+{
+    FastCache::AuthPolicy const policy { "alice", "s3cr3t" };
+    FastCache::SessionContext const session { .auth = &policy };
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$4\r\nAUTH\r\n$5\r\nalice\r\n$6\r\ns3cr3t\r\n"
+                              "*2\r\n$3\r\nGET\r\n$3\r\nmis\r\n",
+                              session);
+    REQUIRE(out == "+OK\r\n$-1\r\n");
 }

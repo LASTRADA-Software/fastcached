@@ -8,6 +8,7 @@ target_sources(FastCache
         Async/IocpReactor.cpp
         Async/KqueueReactor.cpp
         Async/TestReactor.cpp
+        Auth/AuthPolicy.cpp
         Cache/CacheEngine.cpp
         Cache/CowTreeStorage.cpp
         Cache/InMemoryLruStorage.cpp

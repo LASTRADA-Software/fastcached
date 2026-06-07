@@ -38,13 +38,18 @@ namespace
 
 } // namespace
 
-Server::Server(
-    IListener& listener, CacheEngine& engine, ILogger& logger, IAdmissionControl* admission, IMetricsSink* metrics) noexcept:
+Server::Server(IListener& listener,
+               CacheEngine& engine,
+               ILogger& logger,
+               IAdmissionControl* admission,
+               IMetricsSink* metrics,
+               SessionContext session) noexcept:
     _listener { listener },
     _engine { engine },
     _logger { logger },
     _admission { admission },
-    _metrics { metrics }
+    _metrics { metrics },
+    _session { session }
 {
 }
 
@@ -76,7 +81,7 @@ Task<void> Server::Run()
         if (_metrics)
             _metrics->Increment(IMetricsSink::Counter::ConnectionsTotal);
 
-        auto connection = std::make_unique<Connection>(std::move(*accepted), _engine, _logger);
+        auto connection = std::make_unique<Connection>(std::move(*accepted), _engine, _logger, _session);
         RunConnectionDetached(std::move(connection), &_logger, _admission);
     }
     co_return;

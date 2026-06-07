@@ -147,6 +147,20 @@ namespace
             cfg.storagePath = valueNode.as<std::string>();
             return {};
         }
+        /// `requirepass`: shared authentication secret (redis-style). Empty or
+        /// absent = auth disabled.
+        if (key == "requirepass")
+        {
+            cfg.requirePass = valueNode.as<std::string>();
+            return {};
+        }
+        /// `auth_username`: username for the AUTH <user> <pass> / SASL PLAIN
+        /// form. Defaults to "default".
+        if (key == "auth_username")
+        {
+            cfg.authUsername = valueNode.as<std::string>();
+            return {};
+        }
         /// `storage_durability`: fsync|batched|none.
         if (key == "storage_durability")
         {

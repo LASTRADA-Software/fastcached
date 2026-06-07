@@ -267,6 +267,8 @@ namespace
                  { "--pidfile", &cfg.pidfile, nullptr },
                  { "--service-name", &cfg.serviceName, nullptr },
                  { "--storage", &cfg.storagePath, &result.storagePathExplicit },
+                 { "--requirepass", &cfg.requirePass, &result.requirePassExplicit },
+                 { "--auth-username", &cfg.authUsername, &result.authUsernameExplicit },
              })
         {
             auto const matched = ApplyStringFlag(args, i, name, *target);
@@ -428,6 +430,11 @@ namespace
         { .flag = "--max-memory=<size>",
           .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)" },
         { .flag = "--log-level=<level>", .description = "trace|debug|info|warn|error|fatal (default info)" },
+        { .flag = "--requirepass=<secret>",
+          .description = "require clients to authenticate with this shared secret (default: no auth)\n"
+                         "redis: AUTH; memcached binary: SASL PLAIN; memcached text has no auth" },
+        { .flag = "--auth-username=<name>",
+          .description = "username for the AUTH <user> <pass> / SASL PLAIN form (default 'default')" },
         { .flag = "--log-timestamps", .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)" },
         { .flag = "--storage=<path>", .description = "persist cache to a CoW-tree file (default: in-memory only)" },
         { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },

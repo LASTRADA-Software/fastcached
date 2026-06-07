@@ -11,10 +11,14 @@
 namespace FastCache
 {
 
-Connection::Connection(std::unique_ptr<ISocket> socket, CacheEngine& engine, ILogger& logger) noexcept:
+Connection::Connection(std::unique_ptr<ISocket> socket,
+                       CacheEngine& engine,
+                       ILogger& logger,
+                       SessionContext session) noexcept:
     _socket { std::move(socket) },
     _engine { engine },
-    _logger { logger }
+    _logger { logger },
+    _session { session }
 {
 }
 
@@ -32,17 +36,17 @@ Task<void> Connection::Run()
     {
         case ProtocolFlavor::MemcachedText: {
             MemcachedTextHandler handler;
-            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer));
+            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer), _session);
             break;
         }
         case ProtocolFlavor::MemcachedBinary: {
             MemcachedBinaryHandler handler;
-            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer));
+            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer), _session);
             break;
         }
         case ProtocolFlavor::RedisResp: {
             RedisRespHandler handler;
-            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer));
+            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer), _session);
             break;
         }
         case ProtocolFlavor::Unknown:

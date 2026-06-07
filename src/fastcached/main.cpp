@@ -8,6 +8,7 @@
 // SIGINT/SIGTERM and SCM stop trigger graceful shutdown;
 // SIGHUP and SCM PARAMCHANGE trigger config reload.
 
+#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
@@ -38,6 +39,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <print>
 #include <span>
 #include <string_view>
@@ -108,6 +110,10 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         fileCfg.listenBacklog = cliCfg.listenBacklog;
     if (cli.logTimestampsExplicit)
         fileCfg.logTimestamps = cliCfg.logTimestamps;
+    if (cli.requirePassExplicit)
+        fileCfg.requirePass = cliCfg.requirePass;
+    if (cli.authUsernameExplicit)
+        fileCfg.authUsername = cliCfg.authUsername;
     return fileCfg;
 }
 
@@ -358,10 +364,16 @@ int DaemonBody(FastCache::Config const& effective)
         }
         return std::string_view { "?" };
     }();
+    // Authentication policy: built once, shared read-only across connections.
+    // Never log the secret itself — only whether auth is on.
+    std::optional<FastCache::AuthPolicy> authPolicy;
+    if (!effective.requirePass.empty())
+        authPolicy.emplace(effective.authUsername, effective.requirePass);
+
     auto const shardingMode = useShardingWrapper ? std::string_view { "" } : std::string_view { " (unwrapped)" };
     logger.Logf(FastCache::LogLevel::Info,
                 "fastcached {} starting; bind={}:{} max-memory={} config={} storage={} "
-                "durability={} max-value={} reactors={} shards={}{}",
+                "durability={} max-value={} reactors={} shards={}{} auth={}",
                 ProgramVersion,
                 effective.bindAddress,
                 effective.port,
@@ -373,7 +385,8 @@ int DaemonBody(FastCache::Config const& effective)
                 FastCache::FormatByteSize(effective.storageMaxValueBytes),
                 reactorCount,
                 physicalShards,
-                shardingMode);
+                shardingMode,
+                authPolicy ? std::string_view { "on" } : std::string_view { "off" });
 
     InstallStopHandlers();
     // The "ready, accepting connections" line is emitted by the server loop
@@ -408,6 +421,7 @@ int DaemonBody(FastCache::Config const& effective)
     // Pin reactors to cores when asked (PerCore) and there's more than one;
     // a lone reactor gains nothing from pinning.
     serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
+    serverOpts.session.auth = authPolicy ? &*authPolicy : nullptr;
     int const exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
 
     reloaderQuit.store(true, std::memory_order_release);

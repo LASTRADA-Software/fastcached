@@ -5,6 +5,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IAdmissionControl.hpp>
+#include <FastCache/Protocol/SessionContext.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -36,6 +37,11 @@ struct ReactorServerOptions
     /// caches instead of migrating across cores. Best-effort: ignored when the
     /// platform doesn't support pinning. Only meaningful with reactorThreads>1.
     bool pinReactorsToCpu { false };
+
+    /// Per-server session context forwarded to every connection (auth policy
+    /// and other optional collaborators). Default-constructed = auth disabled.
+    /// The referenced objects must outlive the server run.
+    SessionContext session {};
 };
 
 /// Run the reactor-driven server loop using the platform's native

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
@@ -7,6 +8,7 @@
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/MemcachedBinary.hpp>
+#include <FastCache/Protocol/SessionContext.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -99,11 +101,13 @@ FastCache::Task<std::vector<std::byte>> Drain(FastCache::ISocket* s)
     co_return out;
 }
 
-std::vector<std::byte> Exchange(BinaryFixture& fix, std::span<std::byte const> request)
+std::vector<std::byte> Exchange(BinaryFixture& fix,
+                                std::span<std::byte const> request,
+                                FastCache::SessionContext session = {})
 {
     REQUIRE(FastCache::SyncRun(Write(fix.pair.client.get(), request)));
     fix.pair.client->ShutdownWrite();
-    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}));
+    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, session));
     return FastCache::SyncRun(Drain(fix.pair.client.get()));
 }
 
@@ -206,6 +210,82 @@ TEST_CASE("memcached-binary: SASL replies AuthError so non-authing clients fail 
     REQUIRE(response.size() >= 24);
     auto const status = FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { response.data() + 6, 2 });
     REQUIRE(status == 0x20); // Status::AuthError
+}
+
+namespace
+{
+/// Build a SASL PLAIN initial-response value: authzid \0 authcid \0 passwd.
+[[nodiscard]] std::string PlainPayload(std::string_view user, std::string_view pass)
+{
+    std::string out;
+    out.push_back('\0'); // empty authzid
+    out.append(user);
+    out.push_back('\0');
+    out.append(pass);
+    return out;
+}
+} // namespace
+
+TEST_CASE("memcached-binary: SaslList advertises PLAIN when auth is enabled", "[protocol][binary][auth]")
+{
+    FastCache::AuthPolicy const policy { "default", "s3cr3t" };
+    FastCache::SharedAuthSource authSource { std::make_shared<FastCache::AuthPolicy const>(policy) };
+    FastCache::SessionContext const session { .authSource = &authSource };
+    BinaryFixture fix;
+    auto const req = BuildBinaryFrame(/*opcode*/ 0x20, {}, {}, {});
+    auto const response = Exchange(fix, std::span<std::byte const> { req.data(), req.size() }, session);
+    auto const records = ParseRecords(response);
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0].status == 0x00);
+    REQUIRE(records[0].value == "PLAIN");
+}
+
+TEST_CASE("memcached-binary: SASL PLAIN with correct credentials unlocks data commands", "[protocol][binary][auth]")
+{
+    FastCache::AuthPolicy const policy { "default", "s3cr3t" };
+    FastCache::SharedAuthSource authSource { std::make_shared<FastCache::AuthPolicy const>(policy) };
+    FastCache::SessionContext const session { .authSource = &authSource };
+    BinaryFixture fix;
+
+    auto const plain = PlainPayload("default", "s3cr3t");
+    auto frame = BuildBinaryFrame(/*opcode*/ 0x21, "PLAIN", {}, plain);
+
+    std::array<std::byte, 8> setExtras {};
+    auto setReq = BuildBinaryFrame(0x01, "k", std::span<std::byte const> { setExtras.data(), 8 }, "v");
+    frame.insert(frame.end(), setReq.begin(), setReq.end());
+
+    auto const response = Exchange(fix, std::span<std::byte const> { frame.data(), frame.size() }, session);
+    auto const records = ParseRecords(response);
+    REQUIRE(records.size() == 2);
+    REQUIRE(records[0].status == 0x00); // SASL auth ok
+    REQUIRE(records[1].status == 0x00); // SET ok after auth
+}
+
+TEST_CASE("memcached-binary: SASL PLAIN with wrong password yields AuthError", "[protocol][binary][auth]")
+{
+    FastCache::AuthPolicy const policy { "default", "s3cr3t" };
+    FastCache::SharedAuthSource authSource { std::make_shared<FastCache::AuthPolicy const>(policy) };
+    FastCache::SessionContext const session { .authSource = &authSource };
+    BinaryFixture fix;
+    auto const plain = PlainPayload("default", "wrong");
+    auto const req = BuildBinaryFrame(0x21, "PLAIN", {}, plain);
+    auto const response = Exchange(fix, std::span<std::byte const> { req.data(), req.size() }, session);
+    auto const records = ParseRecords(response);
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0].status == 0x20); // Status::AuthError
+}
+
+TEST_CASE("memcached-binary: data command before SASL auth yields AuthError", "[protocol][binary][auth]")
+{
+    FastCache::AuthPolicy const policy { "default", "s3cr3t" };
+    FastCache::SharedAuthSource authSource { std::make_shared<FastCache::AuthPolicy const>(policy) };
+    FastCache::SessionContext const session { .authSource = &authSource };
+    BinaryFixture fix;
+    auto const req = BuildBinaryFrame(0x00, "k", {}, {}); // GET before auth
+    auto const response = Exchange(fix, std::span<std::byte const> { req.data(), req.size() }, session);
+    auto const records = ParseRecords(response);
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0].status == 0x20); // Status::AuthError
 }
 
 TEST_CASE("memcached-binary: Touch (0x1c) refreshes expiry and returns Ok", "[protocol][binary][touch]")

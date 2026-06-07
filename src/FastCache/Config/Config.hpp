@@ -87,6 +87,26 @@ struct Config
     /// Windows service name; defaults to FastCached.
     std::string serviceName { "FastCached" };
 
+    /// Shared authentication secret (redis `requirepass` style). Empty (the
+    /// default) means authentication is disabled and every client is served
+    /// without a credential check. When set, clients must authenticate before
+    /// any data command: redis via `AUTH`, the memcached binary protocol via
+    /// SASL PLAIN. The memcached text protocol has no auth handshake, so it
+    /// then rejects data commands.
+    std::string requirePass {};
+
+    /// Expected username for the two-argument auth form (redis
+    /// `AUTH <user> <pass>` and SASL PLAIN authcid). Defaults to "default",
+    /// mirroring redis's default ACL user. Only consulted when `requirePass`
+    /// is non-empty.
+    ///
+    /// Note: the one-argument redis form `AUTH <pass>` authenticates the default
+    /// user against `requirePass` alone and does NOT enforce this username
+    /// (standard redis semantics). The username only constrains the two-argument
+    /// `AUTH <user> <pass>` form and SASL PLAIN, where the supplied authcid must
+    /// match it.
+    std::string authUsername { "default" };
+
     /// Optional path to a persistent storage file. When set, the
     /// daemon uses a CoW-tree storage backed by this file; when empty,
     /// the cache is in-memory only.
