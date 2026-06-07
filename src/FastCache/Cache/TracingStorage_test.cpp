@@ -145,6 +145,97 @@ TEST_CASE("TracingStorage emits DELETED / NOT_FOUND for Delete", "[tracing]")
     REQUIRE(ContainsSubstr(records[1].message, "result=NOT_FOUND"));
 }
 
+TEST_CASE("TracingStorage emits VALUE_TOO_LARGE with bytes for Set", "[tracing]")
+{
+    FastCache::InMemoryLruStorage inner { 0, 4 };
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::ManualClock clock;
+
+    FastCache::TracingStorage tracer { inner, logger, clock };
+    auto const r = tracer.Set("k", MakeBytes("hello"), 0, FastCache::TimePoint::max());
+    REQUIRE_FALSE(r.has_value());
+
+    auto records = logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(ContainsSubstr(records[0].message, "storage: SET"));
+    REQUIRE(ContainsSubstr(records[0].message, "result=VALUE_TOO_LARGE bytes=5"));
+}
+
+TEST_CASE("TracingStorage emits VALUE_TOO_LARGE with bytes for Add", "[tracing]")
+{
+    FastCache::InMemoryLruStorage inner { 0, 4 };
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::ManualClock clock;
+
+    FastCache::TracingStorage tracer { inner, logger, clock };
+    auto const r = tracer.Add("k", MakeBytes("hello"), 0, FastCache::TimePoint::max(), clock.Now());
+    REQUIRE_FALSE(r.has_value());
+
+    auto records = logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(ContainsSubstr(records[0].message, "storage: ADD"));
+    REQUIRE(ContainsSubstr(records[0].message, "result=VALUE_TOO_LARGE bytes=5"));
+}
+
+TEST_CASE("TracingStorage emits VALUE_TOO_LARGE with bytes for CAS", "[tracing]")
+{
+    FastCache::InMemoryLruStorage inner { 0, 4 };
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::ManualClock clock;
+
+    REQUIRE(inner.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    auto const casToken = inner.Get("k", clock.Now())->entry.cas;
+
+    FastCache::TracingStorage tracer { inner, logger, clock };
+    auto const r = tracer.CompareAndSwap("k", casToken, MakeBytes("hello"), 0, FastCache::TimePoint::max(), clock.Now());
+    REQUIRE_FALSE(r.has_value());
+
+    auto records = logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(ContainsSubstr(records[0].message, "storage: CAS"));
+    REQUIRE(ContainsSubstr(records[0].message, "result=VALUE_TOO_LARGE bytes=5"));
+}
+
+TEST_CASE("TracingStorage emits VALUE_TOO_LARGE with bytes for Append", "[tracing]")
+{
+    FastCache::InMemoryLruStorage inner { 0, 4 };
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::ManualClock clock;
+
+    REQUIRE(inner.Set("k", MakeBytes("ab"), 0, FastCache::TimePoint::max()).has_value());
+    auto const casToken = inner.Get("k", clock.Now())->entry.cas;
+
+    FastCache::TracingStorage tracer { inner, logger, clock };
+    auto const suffix = MakeBytes("cde");
+    auto const r = tracer.Append("k", suffix, casToken, clock.Now());
+    REQUIRE_FALSE(r.has_value());
+
+    auto records = logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(ContainsSubstr(records[0].message, "storage: APPEND"));
+    REQUIRE(ContainsSubstr(records[0].message, "result=VALUE_TOO_LARGE bytes=3"));
+}
+
+TEST_CASE("TracingStorage emits VALUE_TOO_LARGE with bytes for Prepend", "[tracing]")
+{
+    FastCache::InMemoryLruStorage inner { 0, 4 };
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::ManualClock clock;
+
+    REQUIRE(inner.Set("k", MakeBytes("ab"), 0, FastCache::TimePoint::max()).has_value());
+    auto const casToken = inner.Get("k", clock.Now())->entry.cas;
+
+    FastCache::TracingStorage tracer { inner, logger, clock };
+    auto const prefix = MakeBytes("cde");
+    auto const r = tracer.Prepend("k", prefix, casToken, clock.Now());
+    REQUIRE_FALSE(r.has_value());
+
+    auto records = logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(ContainsSubstr(records[0].message, "storage: PREPEND"));
+    REQUIRE(ContainsSubstr(records[0].message, "result=VALUE_TOO_LARGE bytes=3"));
+}
+
 TEST_CASE("TracingStorage forwards Touch and emits TOUCHED / NOT_FOUND", "[tracing][touch]")
 {
     FastCache::InMemoryLruStorage inner;

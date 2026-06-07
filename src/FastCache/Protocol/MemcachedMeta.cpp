@@ -6,10 +6,12 @@
 #include <FastCache/Protocol/MemcachedMeta.hpp>
 #include <FastCache/Protocol/MemcachedShared.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -541,7 +543,7 @@ namespace
         if (f.wantValue)
         {
             line.append("VA ");
-            line.append(std::to_string(entry.value.size()));
+            line.append(std::to_string(entry.ValueSize()));
         }
         else
         {
@@ -554,7 +556,7 @@ namespace
         rf.emitFlags = f.wantFlags;
         rf.flags = entry.flags;
         rf.emitSize = f.wantSize;
-        rf.size = entry.value.size();
+        rf.size = entry.ValueSize();
         rf.emitTtl = f.wantTtl;
         rf.ttlSeconds = TtlSecondsFromExpiry(entry.expiry, now);
         rf.emitHit = f.wantHit;
@@ -566,8 +568,16 @@ namespace
         line.append(Crlf);
         if (f.wantValue)
         {
-            line.append(AsStringView(entry.value));
-            line.append(Crlf);
+            // Gather [VA-line][value][CRLF]: the value segment points at the
+            // cached payload (no copy), kept alive across the write by the
+            // entry's reference-counted handle. `line` lives in this frame
+            // (suspended, not destroyed, across the co_await).
+            std::array<std::span<std::byte const>, 3> const segments {
+                AsBytes(std::string_view { line }),
+                entry.ValueBytes(),
+                AsBytes(Crlf),
+            };
+            co_return co_await WriteAllVectored(socket, segments, got->entry.value.AsKeepAlive());
         }
         co_return co_await WriteAll(socket, line);
     }
@@ -667,7 +677,7 @@ namespace
                 // they differ for append/prepend (concatenation) and
                 // mark-stale (the payload is discarded). Peek is non-mutating.
                 auto const stored = engine->Peek(key);
-                rf.size = stored.has_value() && stored->found ? stored->entry.value.size() : datalen;
+                rf.size = stored.has_value() && stored->found ? stored->entry.ValueSize() : datalen;
             }
         }
         AppendResponseFlags(line, rf);
@@ -812,7 +822,7 @@ namespace
                                 TtlSecondsFromExpiry(entry.expiry, now),
                                 LastAccessSeconds(entry.lastAccess, now),
                                 entry.cas,
-                                entry.value.size());
+                                entry.ValueSize());
         co_return co_await WriteAll(socket, line);
     }
 

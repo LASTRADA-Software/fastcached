@@ -16,6 +16,7 @@
 using namespace std::chrono_literals;
 using FastCache::Testing::Decode;
 using FastCache::Testing::MakeBytes;
+using FastCache::Testing::ValueOf;
 
 TEST_CASE("InMemoryLruStorage Get miss returns found=false", "[cache]")
 {
@@ -37,8 +38,42 @@ TEST_CASE("InMemoryLruStorage Set + Get round-trips", "[cache]")
     auto const got = storage.Get("k", clock.Now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(Decode(got->entry.value) == "v");
+    REQUIRE(Decode(got->entry.ValueBytes()) == "v");
     REQUIRE(got->entry.cas == *cas);
+}
+
+TEST_CASE("InMemoryLruStorage a held GET value survives a concurrent overwrite (copy-on-write)", "[cache]")
+{
+    // Models the zero-copy GET lifetime invariant: a reader holds the value's
+    // reference-counted handle (as a suspended socket write would) while a
+    // writer overwrites the same key. Because mutation rebinds to a fresh
+    // buffer rather than editing in place, the reader's bytes must stay intact.
+    FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
+
+    REQUIRE(storage.Set("k", MakeBytes("original"), 0, FastCache::TimePoint::max()).has_value());
+
+    auto reader = storage.Get("k", clock.Now());
+    REQUIRE(reader.has_value());
+    REQUIRE(reader->found);
+    auto const heldHandle = reader->entry.value; // refcounted handle to the original buffer
+    auto const heldView = reader->entry.ValueBytes();
+    REQUIRE(Decode(heldView) == "original");
+
+    // Writer replaces the value (and a second write to force the old node out
+    // of any internal reuse). The reader's handle keeps the old buffer alive.
+    REQUIRE(storage.Set("k", MakeBytes("rewritten-and-longer"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(storage.Set("k", MakeBytes("third"), 0, FastCache::TimePoint::max()).has_value());
+
+    // The bytes the reader is still "streaming" are unchanged and valid.
+    REQUIRE(Decode(heldView) == "original");
+    REQUIRE(static_cast<bool>(heldHandle));
+    REQUIRE(Decode(heldHandle.Bytes()) == "original");
+
+    // A fresh GET observes the latest value.
+    auto const latest = storage.Get("k", clock.Now());
+    REQUIRE(latest.has_value());
+    REQUIRE(Decode(latest->entry.ValueBytes()) == "third");
 }
 
 TEST_CASE("Add fails when the key already exists", "[cache]")
@@ -78,7 +113,7 @@ TEST_CASE("CompareAndSwap matches the CAS token", "[cache]")
 
     auto const got = storage.Get("k", clock.Now());
     REQUIRE(got->found);
-    REQUIRE(Decode(got->entry.value) == "two");
+    REQUIRE(Decode(got->entry.ValueBytes()) == "two");
 }
 
 TEST_CASE("Increment treats numeric values and saturates", "[cache]")
@@ -150,7 +185,7 @@ TEST_CASE("Append concatenates and bumps CAS", "[cache]")
     REQUIRE(*appendCas != *setCas);
 
     auto const got = storage.Get("k", clock.Now());
-    REQUIRE(Decode(got->entry.value) == "foobar");
+    REQUIRE(Decode(got->entry.ValueBytes()) == "foobar");
 }
 
 TEST_CASE("Touch on miss returns KeyNotFound and bumps touchMisses", "[cache][touch]")
@@ -181,7 +216,7 @@ TEST_CASE("Touch on hit refreshes expiry without rewriting the value, bumps CAS"
     auto const got = storage.Get("k", clock.Now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(Decode(got->entry.value) == "payload");
+    REQUIRE(Decode(got->entry.ValueBytes()) == "payload");
     REQUIRE(got->entry.flags == 0xCAFE);
     REQUIRE(got->entry.expiry == newExpiry);
     REQUIRE(got->entry.cas == *touchCas);
@@ -209,8 +244,9 @@ TEST_CASE("Get reports the previous lastAccess and advances the stored one", "[c
 {
     // The returned entry carries the access *before* this read so the meta
     // `l` flag reports seconds since the prior access (never a constant 0),
-    // while the stored lastAccess advances for the next reader.
-    FastCache::InMemoryLruStorage storage;
+    // while the stored lastAccess advances for the next reader. This advance-
+    // on-read behaviour is the Strict policy; Approximate defers it.
+    FastCache::InMemoryLruStorage storage { 0, 0, FastCache::LruMode::Strict };
     FastCache::ManualClock clock;
     std::ignore = storage.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
 
@@ -286,8 +322,9 @@ TEST_CASE("CAS hits, misses, and badval are counted distinctly", "[cache][stats]
 TEST_CASE("InMemoryLruStorage counts evicted_unfetched only for never-read victims", "[cache][stats][unfetched]")
 {
     // Budget fits exactly one 100-byte value, so each insert evicts the
-    // prior one.
-    FastCache::InMemoryLruStorage storage { 150 };
+    // prior one. Strict mode so a read marks the entry fetched (Approximate
+    // defers that, which would change the unfetched accounting under test).
+    FastCache::InMemoryLruStorage storage { 150, 0, FastCache::LruMode::Strict };
     FastCache::ManualClock clock;
     auto const big = MakeBytes(std::string(100, 'x'));
 
@@ -303,7 +340,9 @@ TEST_CASE("InMemoryLruStorage counts evicted_unfetched only for never-read victi
 
 TEST_CASE("InMemoryLruStorage counts expired_unfetched only for never-read victims", "[cache][stats][unfetched]")
 {
-    FastCache::InMemoryLruStorage storage;
+    // Strict mode: a read marks the entry fetched and lazy read-time expiry is
+    // accounted on Get. Approximate defers both to PurgeExpired / promotion.
+    FastCache::InMemoryLruStorage storage { 0, 0, FastCache::LruMode::Strict };
     FastCache::ManualClock clock;
     auto const expiry = clock.Now() + 1s;
     REQUIRE(storage.Set("k1", MakeBytes("a"), 0, expiry).has_value());
@@ -327,7 +366,7 @@ TEST_CASE("InMemoryLruStorage Peek is non-mutating", "[cache][peek]")
     auto const peeked = storage.Peek("k", clock.Now());
     REQUIRE(peeked.has_value());
     REQUIRE(peeked->found);
-    REQUIRE(Decode(peeked->entry.value) == "v");
+    REQUIRE(Decode(peeked->entry.ValueBytes()) == "v");
 
     // Peek must not register a get hit, and must not mark the entry fetched
     // (so a later eviction still counts it unfetched).
@@ -420,7 +459,7 @@ TEST_CASE("Set/Add/Replace/CAS at the value cap roundtrip; one byte over returns
     // The oversized rejections never mutated the stored value.
     auto const got = storage.Get("k", clock.Now());
     REQUIRE(got->found);
-    REQUIRE(got->entry.value == fits);
+    REQUIRE(ValueOf(got->entry) == fits);
 }
 
 TEST_CASE("Append/Prepend that push the combined value over the cap return ValueTooLarge", "[cache][max-value][boundary]")
@@ -442,7 +481,7 @@ TEST_CASE("Append/Prepend that push the combined value over the cap return Value
     // A growth that still fits the cap succeeds (5 + 3 = 8 == cap).
     auto const fitting = MakeBytes("678");
     REQUIRE(storage.Append("k", std::span<std::byte const> { fitting.data(), fitting.size() }, 0, clock.Now()).has_value());
-    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.value) == "12345678");
+    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.ValueBytes()) == "12345678");
 }
 
 TEST_CASE("maxValueBytes == 0 disables the per-value cap entirely", "[cache][max-value]")
@@ -498,17 +537,17 @@ TEST_CASE("Append honours an optional CAS precondition", "[cache][append][cas]")
     auto const wrong = storage.Append("k", span, *setCas + 999, clock.Now());
     REQUIRE_FALSE(wrong.has_value());
     REQUIRE(wrong.error().code == FastCache::StorageErrorCode::CasMismatch);
-    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.value) == "foo");
+    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.ValueBytes()) == "foo");
 
     // Right CAS -> appends.
     auto const right = storage.Append("k", span, *setCas, clock.Now());
     REQUIRE(right.has_value());
-    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.value) == "foobar");
+    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.ValueBytes()) == "foobar");
 
     // expected == 0 means unconditional.
     auto const baz = MakeBytes("baz");
     REQUIRE(storage.Append("k", std::span<std::byte const> { baz.data(), baz.size() }, 0, clock.Now()).has_value());
-    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.value) == "foobarbaz");
+    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.ValueBytes()) == "foobarbaz");
 }
 
 TEST_CASE("Prepend honours an optional CAS precondition", "[cache][prepend][cas]")
@@ -525,10 +564,10 @@ TEST_CASE("Prepend honours an optional CAS precondition", "[cache][prepend][cas]
     auto const wrong = storage.Prepend("k", span, *setCas + 7, clock.Now());
     REQUIRE_FALSE(wrong.has_value());
     REQUIRE(wrong.error().code == FastCache::StorageErrorCode::CasMismatch);
-    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.value) == "bar");
+    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.ValueBytes()) == "bar");
 
     // Right CAS -> prepends.
     auto const right = storage.Prepend("k", span, *setCas, clock.Now());
     REQUIRE(right.has_value());
-    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.value) == "foobar");
+    REQUIRE(Decode(storage.Get("k", clock.Now())->entry.ValueBytes()) == "foobar");
 }

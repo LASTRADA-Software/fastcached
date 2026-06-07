@@ -9,7 +9,9 @@
     #include <FastCache/Net/SocketAddress.hpp>
 
     #include <sys/socket.h>
+    #include <sys/uio.h>
 
+    #include <array>
     #include <cstddef>
     #include <cstdint>
     #include <cstring>
@@ -19,6 +21,7 @@
     #include <string>
     #include <string_view>
     #include <utility>
+    #include <vector>
 
     #include <errno.h>
     #include <fcntl.h>
@@ -80,6 +83,86 @@ namespace
             ::fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC);
     }
 
+    /// Per-`sendmsg` iovec batch cap (see EpollSocket for the rationale).
+    constexpr std::size_t MaxIovBatch = 64;
+
+    /// Outcome of pushing a vectored-write cursor forward with `sendmsg`.
+    enum class SendProgress : std::uint8_t
+    {
+        Completed,
+        WouldBlock,
+        Error,
+    };
+
+    /// Send segments from cursor `[segIndex, segOffset]` onward, advancing the
+    /// cursor in place. macOS lacks `MSG_NOSIGNAL`; SIGPIPE is suppressed via
+    /// the `SO_NOSIGPIPE` option applied at accept, so the flags stay 0.
+    /// @param fd Socket file descriptor.
+    /// @param segments Ordered payload segments.
+    /// @param segIndex In/out: index of the first unsent segment.
+    /// @param segOffset In/out: bytes already sent from `segments[segIndex]`.
+    /// @param sentTotal In/out: running count of bytes sent across the op.
+    /// @return Whether the cursor reached the end, would block, or errored.
+    [[nodiscard]] SendProgress SendFromCursor(int fd,
+                                              std::span<std::span<std::byte const> const> segments,
+                                              std::size_t& segIndex,
+                                              std::size_t& segOffset,
+                                              std::size_t& sentTotal) noexcept
+    {
+        while (segIndex < segments.size())
+        {
+            std::array<iovec, MaxIovBatch> iov {};
+            std::size_t count = 0;
+            for (auto i = segIndex; i < segments.size() && count < MaxIovBatch; ++i)
+            {
+                auto const seg = segments[i];
+                auto const skip = (i == segIndex) ? segOffset : std::size_t { 0 };
+                if (seg.size() <= skip)
+                    continue;
+                iov[count].iov_base = const_cast<std::byte*>(seg.data() + skip);
+                iov[count].iov_len = seg.size() - skip;
+                ++count;
+            }
+            if (count == 0)
+            {
+                segIndex = segments.size();
+                segOffset = 0;
+                break;
+            }
+
+            msghdr msg {};
+            msg.msg_iov = iov.data();
+            msg.msg_iovlen = static_cast<int>(count);
+            auto const wrote = ::sendmsg(fd, &msg, 0);
+            if (wrote < 0)
+            {
+                if (errno == EAGAIN || errno == EINTR)
+                    return SendProgress::WouldBlock;
+                return SendProgress::Error;
+            }
+
+            sentTotal += static_cast<std::size_t>(wrote);
+            auto advance = static_cast<std::size_t>(wrote);
+            while (advance > 0 && segIndex < segments.size())
+            {
+                auto const seg = segments[segIndex];
+                auto const avail = seg.size() - segOffset;
+                if (advance < avail)
+                {
+                    segOffset += advance;
+                    advance = 0;
+                }
+                else
+                {
+                    advance -= avail;
+                    ++segIndex;
+                    segOffset = 0;
+                }
+            }
+        }
+        return segIndex >= segments.size() ? SendProgress::Completed : SendProgress::WouldBlock;
+    }
+
 } // namespace
 
 // -- KqueueSocket -----------------------------------------------------------
@@ -95,6 +178,21 @@ struct KqueueSocket::Impl
         std::span<std::byte> readBuffer {};
         std::span<std::byte const> writeRemaining {};
         std::size_t writeTotal { 0 };
+
+        // Vectored-write state (see EpollSocket::Impl::Op for the contract).
+        std::vector<std::span<std::byte const>> writeSegments {};
+        std::size_t writeSegIndex { 0 };
+        std::size_t writeSegOffset { 0 };
+        std::shared_ptr<void const> writeKeepAlive {};
+
+        void ClearVectored() noexcept
+        {
+            writeSegments.clear();
+            writeSegIndex = 0;
+            writeSegOffset = 0;
+            writeKeepAlive.reset();
+            writeTotal = 0;
+        }
     };
 
     Op readOp;
@@ -158,6 +256,33 @@ void KqueueSocket::Impl::OnWritable(KqueueFdHandler* base)
     if (!impl->writeOp.awaitable)
         return;
     auto* awaitable = impl->writeOp.awaitable;
+
+    // Vectored write in flight: drive the cursor with sendmsg.
+    if (!impl->writeOp.writeSegments.empty())
+    {
+        auto const progress = SendFromCursor(impl->handler.fd,
+                                             impl->writeOp.writeSegments,
+                                             impl->writeOp.writeSegIndex,
+                                             impl->writeOp.writeSegOffset,
+                                             impl->writeOp.writeTotal);
+        if (progress == SendProgress::WouldBlock)
+            return;
+        if (progress == SendProgress::Error)
+        {
+            impl->writeOp.awaitable = nullptr;
+            impl->writeOp.ClearVectored();
+            impl->UpdateInterest();
+            awaitable->Complete(std::unexpected(MakePosixError(errno, "sendmsg")));
+            return;
+        }
+        auto const total = impl->writeOp.writeTotal;
+        impl->writeOp.awaitable = nullptr;
+        impl->writeOp.ClearVectored();
+        impl->UpdateInterest();
+        awaitable->Complete(IoResult { total });
+        return;
+    }
+
     while (!impl->writeOp.writeRemaining.empty())
     {
         auto const wrote =
@@ -274,6 +399,36 @@ IoAwaitable KqueueSocket::Write(std::span<std::byte const> buffer)
     return a;
 }
 
+IoAwaitable KqueueSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                        std::shared_ptr<void const> keepAlive)
+{
+    if (_closed)
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    std::vector<std::span<std::byte const>> owned { segments.begin(), segments.end() };
+    std::size_t segIndex = 0;
+    std::size_t segOffset = 0;
+    std::size_t sent = 0;
+
+    auto const progress = SendFromCursor(_fd, owned, segIndex, segOffset, sent);
+    if (progress == SendProgress::Error)
+        return IoAwaitable { std::unexpected(MakePosixError(errno, "sendmsg")) };
+    if (progress == SendProgress::Completed)
+        return IoAwaitable { IoResult { sent } };
+
+    _impl->writeOp.awaitable = nullptr;
+    _impl->writeOp.writeSegments = std::move(owned);
+    _impl->writeOp.writeSegIndex = segIndex;
+    _impl->writeOp.writeSegOffset = segOffset;
+    _impl->writeOp.writeTotal = sent;
+    _impl->writeOp.writeKeepAlive = std::move(keepAlive);
+    IoAwaitable a;
+    a.SetSuspendCallback(&KqueueSocketAwaitableSuspended, &_impl->writeOp);
+    _impl->reactor.UpdateInterest(&_impl->handler, _impl->readOp.awaitable != nullptr, true);
+    return a;
+}
+
 // -- KqueueListener ---------------------------------------------------------
 
 struct KqueueListener::Impl
@@ -329,6 +484,7 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
         return;
     }
     SetNonBlocking(fd);
+    Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(fd));
     auto* awaitable = impl->pending;
     impl->pending = nullptr;
     impl->reactor.UpdateInterest(&impl->handler, false, false);
@@ -338,8 +494,12 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
 KqueueListener::KqueueListener() noexcept = default;
 KqueueListener::~KqueueListener() = default;
 
-std::unique_ptr<KqueueListener> KqueueListener::Bind(
-    KqueueReactor& reactor, std::string_view bindAddress, std::uint16_t port, int backlog, IAddressResolver& resolver)
+std::unique_ptr<KqueueListener> KqueueListener::Bind(KqueueReactor& reactor,
+                                                     std::string_view bindAddress,
+                                                     std::uint16_t port,
+                                                     int backlog,
+                                                     IAddressResolver& resolver,
+                                                     ReusePort reusePort)
 {
     std::unique_ptr<KqueueListener> listener { new KqueueListener {} };
     listener->_impl = std::make_unique<Impl>(reactor);
@@ -347,7 +507,7 @@ std::unique_ptr<KqueueListener> KqueueListener::Bind(
     // Shared resolve + create + bind + listen. macOS has no SOCK_NONBLOCK
     // socket-type flag, so the listening socket is switched to non-blocking
     // afterwards (matching how accepted sockets are handled).
-    auto bound = Detail::BindAndListen(resolver, bindAddress, port, backlog, /*extraTypeFlags*/ 0);
+    auto bound = Detail::BindAndListen(resolver, bindAddress, port, backlog, /*extraTypeFlags*/ 0, reusePort);
     if (!bound.has_value())
     {
         listener->_impl->bindError = std::move(bound).error();

@@ -135,6 +135,12 @@ namespace
             cfg.logLevel = *level;
             return {};
         }
+        /// `log_timestamps`: prefix log lines with ISO 8601 UTC timestamps.
+        if (key == "log_timestamps")
+        {
+            cfg.logTimestamps = valueNode.as<bool>();
+            return {};
+        }
         /// `storage_path`: filesystem path of the CoW-tree backing file.
         if (key == "storage_path")
         {
@@ -187,6 +193,38 @@ namespace
                                                  line));
             return {};
         }
+        /// `lru_mode`: approximate | strict in-memory LRU recency policy.
+        if (key == "lru_mode")
+        {
+            auto const raw = valueNode.as<std::string>();
+            if (raw == "approximate")
+                cfg.lruRecency = LruRecency::Approximate;
+            else if (raw == "strict")
+                cfg.lruRecency = LruRecency::Strict;
+            else
+                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+                                                 path,
+                                                 "lru_mode",
+                                                 std::string { "unknown mode (expect approximate|strict): " } + raw,
+                                                 line));
+            return {};
+        }
+        /// `cpu_affinity`: none | per-core reactor thread pinning.
+        if (key == "cpu_affinity")
+        {
+            auto const raw = valueNode.as<std::string>();
+            if (raw == "none")
+                cfg.cpuAffinity = CpuAffinity::None;
+            else if (raw == "per-core")
+                cfg.cpuAffinity = CpuAffinity::PerCore;
+            else
+                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+                                                 path,
+                                                 "cpu_affinity",
+                                                 std::string { "unknown mode (expect none|per-core): " } + raw,
+                                                 line));
+            return {};
+        }
         /// `threads`: positive integer worker count for threaded mode.
         if (key == "threads")
         {
@@ -203,6 +241,16 @@ namespace
             if (raw < 0)
                 return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, path, "storage_shards", "must be >= 0", line));
             cfg.storageShards = static_cast<std::size_t>(raw);
+            return {};
+        }
+        /// `listen_backlog`: ::listen() backlog depth (1..65535).
+        if (key == "listen_backlog")
+        {
+            auto const raw = valueNode.as<int>();
+            if (raw < 1 || raw > 65535)
+                return std::unexpected(
+                    MakeError(ConfigErrorCode::OutOfRange, path, "listen_backlog", "must be in 1..65535", line));
+            cfg.listenBacklog = raw;
             return {};
         }
         return std::unexpected(MakeError(ConfigErrorCode::UnknownKey, path, key, "unrecognised key", line));

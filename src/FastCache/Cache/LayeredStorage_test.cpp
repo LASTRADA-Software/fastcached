@@ -49,7 +49,7 @@ TEST_CASE("LayeredStorage Set + Get write-through roundtrip", "[layered]")
     auto got = storage->Get("k", clock.Now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(Decode(got->entry.value) == "v");
+    REQUIRE(Decode(got->entry.ValueBytes()) == "v");
     REQUIRE(got->entry.flags == 42U);
     REQUIRE(got->entry.cas == *cas);
 }
@@ -160,13 +160,13 @@ TEST_CASE("LayeredStorage Append routes through L2 and mirrors to L1", "[layered
     auto l1 = storage->L1().Get("k", clock.Now());
     REQUIRE(l1.has_value());
     REQUIRE(l1->found);
-    REQUIRE(Decode(l1->entry.value) == "hello world");
+    REQUIRE(Decode(l1->entry.ValueBytes()) == "hello world");
     REQUIRE(l1->entry.cas == *cas);
 
     auto l2 = storage->L2().Get("k", clock.Now());
     REQUIRE(l2.has_value());
     REQUIRE(l2->found);
-    REQUIRE(Decode(l2->entry.value) == "hello world");
+    REQUIRE(Decode(l2->entry.ValueBytes()) == "hello world");
     REQUIRE(l2->entry.cas == *cas);
 }
 
@@ -187,7 +187,7 @@ TEST_CASE("LayeredStorage IncrementOrInitialize routes through L2", "[layered][c
     auto l2 = storage->L2().Get("counter", clock.Now());
     REQUIRE(l2.has_value());
     REQUIRE(l2->found);
-    REQUIRE(Decode(l2->entry.value) == "15");
+    REQUIRE(Decode(l2->entry.ValueBytes()) == "15");
 }
 
 TEST_CASE("LayeredStorage GetAndTouch refreshes TTL and reads through both tiers", "[layered][gat]")
@@ -200,7 +200,7 @@ TEST_CASE("LayeredStorage GetAndTouch refreshes TTL and reads through both tiers
     auto const gat = storage->GetAndTouch("k", newExpiry, clock.Now());
     REQUIRE(gat.has_value());
     REQUIRE(gat->found);
-    REQUIRE(Decode(gat->entry.value) == "v");
+    REQUIRE(Decode(gat->entry.ValueBytes()) == "v");
     REQUIRE(gat->entry.expiry == newExpiry);
     // The canonical tier reflects the refreshed expiry.
     REQUIRE(storage->L2().Get("k", clock.Now())->entry.expiry == newExpiry);
@@ -293,7 +293,7 @@ TEST_CASE("L1 eviction never loses data; L2 still serves every key", "[layered][
         auto got = storage->Get(std::format("k-{:02d}", i), clock.Now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(Decode(got->entry.value) == std::format("payload-{:02d}", i));
+        REQUIRE(Decode(got->entry.ValueBytes()) == std::format("payload-{:02d}", i));
     }
 }
 
@@ -374,7 +374,7 @@ TEST_CASE("Sharded composition: ShardedStorage of LayeredStorage(InMem, CowTree)
             auto got = storage->Get(std::format("key-{}", i), clock.Now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
-            REQUIRE(Decode(got->entry.value) == std::format("value-{}", i));
+            REQUIRE(Decode(got->entry.ValueBytes()) == std::format("value-{}", i));
         }
     }
 

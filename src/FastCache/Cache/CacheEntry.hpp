@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Cache/SharedValue.hpp>
 #include <FastCache/Core/Clock.hpp>
 
+#include <cstddef>
 #include <cstdint>
-#include <vector>
+#include <span>
 
 namespace FastCache
 {
@@ -17,8 +19,10 @@ using CasToken = std::uint64_t;
 /// A cached value with its associated metadata.
 struct CacheEntry
 {
-    /// Opaque payload bytes.
-    std::vector<std::byte> value;
+    /// Opaque payload bytes, reference-counted and immutable (see SharedValue).
+    /// May be null for a "no value" entry (e.g. the placeholder in a miss
+    /// `GetResult`); use ValueBytes()/ValueSize() for null-safe access.
+    SharedValue value;
 
     /// memcached "flags" word — opaque to the server, returned verbatim on get.
     std::uint32_t flags { 0 };
@@ -52,6 +56,20 @@ struct CacheEntry
     /// (entries discarded before any client ever read them). Reset to
     /// `false` on insertion and on every value-rewriting mutation.
     bool fetched { false };
+
+    /// Read-only view of the payload bytes.
+    /// @return A span over the value, or an empty span when no value is set.
+    [[nodiscard]] std::span<std::byte const> ValueBytes() const noexcept
+    {
+        return value.Bytes();
+    }
+
+    /// Payload size in bytes.
+    /// @return The value's byte count, or 0 when no value is set.
+    [[nodiscard]] std::size_t ValueSize() const noexcept
+    {
+        return value.size();
+    }
 };
 
 /// Result of a get-style operation that needs to distinguish "miss" from

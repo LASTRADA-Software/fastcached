@@ -7,6 +7,7 @@
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/StringHash.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -43,9 +44,25 @@ class InMemoryLruStorage final: public IStorage
     ///                      Set/Add/Replace/CompareAndSwap/Append/Prepend
     ///                      that would exceed it returns
     ///                      StorageErrorCode::ValueTooLarge.
-    explicit InMemoryLruStorage(std::size_t maxBytes = 0, std::size_t maxValueBytes = 0) noexcept;
+    /// @param lruMode Recency policy. `Approximate` (default) makes `Get`
+    ///                shared-read-safe (no promotion on the read path); `Strict`
+    ///                promotes on every read and is served under an exclusive
+    ///                lock by `ShardedStorage`.
+    explicit InMemoryLruStorage(std::size_t maxBytes = 0,
+                                std::size_t maxValueBytes = 0,
+                                LruMode lruMode = LruMode::Approximate) noexcept;
 
     [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key, TimePoint now) override;
+
+    /// In `Approximate` mode a shared-locked `Get` performs no structural
+    /// mutation, so concurrent reads on one shard are race-free.
+    /// @return True in Approximate mode, false in Strict mode.
+    [[nodiscard]] bool SupportsSharedRead() const noexcept override
+    {
+        return _lruMode == LruMode::Approximate;
+    }
+
+    void PromoteOnRead(std::string_view key, TimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Set(std::string_view key,
                                                             std::vector<std::byte> value,
@@ -128,14 +145,26 @@ class InMemoryLruStorage final: public IStorage
     /// end() on miss. Mutates the LRU on hits (moves to front).
     Iterator FindAlive(std::string_view key, TimePoint now);
 
+    /// Read-only lookup for the shared (Approximate) read path: locates a live
+    /// entry **without** mutating `_lru`/`_index` (no splice, no lazy erase) and
+    /// without writing the node, so concurrent shared-locked callers don't race.
+    /// Returns nullptr on miss or expiry (expired entries are reclaimed later by
+    /// the writer-locked PurgeExpired / a subsequent write).
+    /// @param key Lookup key.
+    /// @param now Current clock value.
+    /// @return Pointer to the live entry, or nullptr.
+    [[nodiscard]] CacheEntry const* FindAliveReadOnly(std::string_view key, TimePoint now) const;
+
     /// Insert a new entry; evicts as needed to stay under the byte budget.
+    /// The value bytes are copied into a fresh immutable buffer.
     /// @return CAS token of the inserted entry.
-    CasToken InsertNew(std::string key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry);
+    CasToken InsertNew(std::string key, std::span<std::byte const> value, std::uint32_t flags, TimePoint expiry);
 
     /// Mutate the existing entry in-place; updates byte accounting and
-    /// promotes the entry to the front of the LRU. Bumps CAS.
+    /// promotes the entry to the front of the LRU. Bumps CAS. The value bytes
+    /// are copied into a fresh immutable buffer (copy-on-write).
     /// @return New CAS token.
-    CasToken MutateExisting(Iterator it, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry);
+    CasToken MutateExisting(Iterator it, std::span<std::byte const> value, std::uint32_t flags, TimePoint expiry);
 
     /// Evict from the LRU tail until bytesUsed <= maxBytes.
     void EvictToFit();
@@ -154,6 +183,7 @@ class InMemoryLruStorage final: public IStorage
 
     std::size_t _maxBytes;
     std::size_t _maxValueBytes;
+    LruMode _lruMode;
     std::size_t _bytesUsed { 0 };
     std::uint64_t _liveGeneration { 1 };
     TimePoint _flushEffectiveAt { TimePoint::min() };
@@ -163,6 +193,14 @@ class InMemoryLruStorage final: public IStorage
     std::unordered_map<std::string, Iterator, TransparentStringHash, std::equal_to<>> _index;
 
     mutable StorageStats _stats;
+
+    /// Read-path counters bumped by the shared-locked `Get` (`cmd_get`,
+    /// `get_hits`, `get_misses`). Atomic so concurrent reads on one shard don't
+    /// race; folded into `_stats` (relaxed) by `Snapshot`. Kept separate from
+    /// `_stats` because `StorageStats` is a plain, copyable value type.
+    mutable std::atomic<std::uint64_t> _readCmdGet { 0 };
+    mutable std::atomic<std::uint64_t> _readGetHits { 0 };
+    mutable std::atomic<std::uint64_t> _readGetMisses { 0 };
 };
 
 } // namespace FastCache

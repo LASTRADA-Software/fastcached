@@ -27,9 +27,16 @@ src/FastCache/
 ```
 
 Production flow: `main()` -> CLI -> optional YAML -> `ConfigReloader` ->
-`CacheEngine` over `InMemoryLruStorage` -> `BlockingListener` ->
-`RunBlockingServerLoop` (one `std::jthread` per connection driving the
-coroutine handler via `SyncRun`).
+`CacheEngine` over `InMemoryLruStorage` (or a `ShardedStorage` of
+`CowTreeStorage` when `--storage` is set) -> platform `IListener` ->
+`RunReactorServer`. The reactor (IOCP / epoll / kqueue) multiplexes every
+connection on its event loop, so the number of concurrent clients is bounded
+by memory, not by a worker count. On Windows the persistent backend drives
+the IOCP reactor from several threads (sized by `--threads`) so a blocking
+page-store `fsync` overlaps with serving other connections; the disk backend
+is therefore always wrapped in a `ShardedStorage` for thread safety. The
+legacy thread-per-connection pool (`RunPooledServerLoop`) and blocking driver
+remain reachable via `--execution-model=threaded`.
 
 ## Design Patterns & Principles
 
@@ -78,6 +85,7 @@ down across a suspend point.
 - **`auto` type deduction** for readability; **structured bindings** for tuple-like returns.
 - **`clang-format` after every change** — use the project `.clang-format`.
 - **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT` — address the underlying issue. The `clang-debug` preset enables `clang-tidy` automatically.
+- **No `k`-prefix on identifiers.** Do not use the Google-style `kFoo` prefix for constants, enumerators, or any other symbol — it violates the project `.clang-tidy` naming convention. Use `Foo` (PascalCase) for constants/enumerators and `foo`/`fooBar` for locals and members instead.
 - **All changes covered by unit tests.** Aim to **increase** coverage with every PR.
 - **No raw owning pointers.** Use `std::unique_ptr` / `std::shared_ptr` for ownership; RAII for resources.
 - **No new third-party dependencies** without strong justification.

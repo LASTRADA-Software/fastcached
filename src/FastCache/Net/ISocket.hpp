@@ -6,6 +6,7 @@
 #include <coroutine>
 #include <cstddef>
 #include <expected>
+#include <memory>
 #include <span>
 #include <utility>
 
@@ -122,6 +123,30 @@ class ISocket
     /// @param buffer Source span; must outlive the awaitable.
     /// @return Awaitable resolving to IoResult.
     [[nodiscard]] virtual IoAwaitable Write(std::span<std::byte const> buffer) = 0;
+
+    /// Gather-write: send every segment in order as one logical write, using
+    /// a single scattered syscall (`sendmsg`/`WSASend`) where the platform
+    /// allows. Avoids copying large payloads into one contiguous buffer — the
+    /// canonical use is a GET reply assembled as `[header][value][trailer]`
+    /// where `value` points directly into the cached, reference-counted
+    /// payload. Resolves only once *all* bytes are sent (total == the sum of
+    /// segment sizes), or a NetError on failure.
+    ///
+    /// Lifetime contract: every segment's bytes, **and** the `segments` span
+    /// itself, must remain valid and at a stable address until the awaitable
+    /// resumes — the write may suspend on backpressure and resume on a later
+    /// reactor frame. To anchor a reference-counted payload for exactly that
+    /// long, pass it as `keepAlive`: the implementation stores the handle
+    /// alongside the in-flight operation, so the bytes outlive the suspend
+    /// even if the caller's `GetResult` goes out of scope. `keepAlive` is
+    /// type-erased (`shared_ptr<void const>`) so any owner shape works.
+    ///
+    /// @param segments Ordered, non-owning views to gather, in send order.
+    /// @param keepAlive Optional owner pinning the segments' backing storage
+    ///        for the operation's lifetime.
+    /// @return Awaitable resolving to IoResult (total bytes written).
+    [[nodiscard]] virtual IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                                    std::shared_ptr<void const> keepAlive = {}) = 0;
 
     /// Close the socket. Idempotent; subsequent Read/Write resolves with
     /// NetErrorCode::BadFileHandle.

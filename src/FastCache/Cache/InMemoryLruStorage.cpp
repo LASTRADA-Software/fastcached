@@ -49,9 +49,10 @@ namespace
 
 } // namespace
 
-InMemoryLruStorage::InMemoryLruStorage(std::size_t maxBytes, std::size_t maxValueBytes) noexcept:
+InMemoryLruStorage::InMemoryLruStorage(std::size_t maxBytes, std::size_t maxValueBytes, LruMode lruMode) noexcept:
     _maxBytes { maxBytes },
-    _maxValueBytes { maxValueBytes }
+    _maxValueBytes { maxValueBytes },
+    _lruMode { lruMode }
 {
 }
 
@@ -78,9 +79,20 @@ InMemoryLruStorage::Iterator InMemoryLruStorage::FindAlive(std::string_view key,
     return nodeIt;
 }
 
+CacheEntry const* InMemoryLruStorage::FindAliveReadOnly(std::string_view key, TimePoint now) const
+{
+    auto const indexIt = _index.find(key);
+    if (indexIt == _index.end())
+        return nullptr;
+    auto const& entry = indexIt->second->entry;
+    if (!IsAlive(entry, _liveGeneration, now))
+        return nullptr; // leave the expired node in place for PurgeExpired
+    return &entry;
+}
+
 void InMemoryLruStorage::EraseAt(Iterator it)
 {
-    _bytesUsed -= it->entry.value.size();
+    _bytesUsed -= it->entry.ValueSize();
     _index.erase(it->key);
     _lru.erase(it);
 }
@@ -103,7 +115,10 @@ void InMemoryLruStorage::EvictToFit()
     FC_PLOT("lru.bytesUsed", static_cast<std::int64_t>(_bytesUsed));
 }
 
-CasToken InMemoryLruStorage::InsertNew(std::string key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry)
+CasToken InMemoryLruStorage::InsertNew(std::string key,
+                                       std::span<std::byte const> value,
+                                       std::uint32_t flags,
+                                       TimePoint expiry)
 {
     FC_ZONE_SCOPED_N("LruStorage::InsertNew");
     auto const cas = _nextCas++;
@@ -111,7 +126,7 @@ CasToken InMemoryLruStorage::InsertNew(std::string key, std::vector<std::byte> v
 
     Node node;
     node.key = std::move(key);
-    node.entry.value = std::move(value);
+    node.entry.value = MakeSharedValue(value);
     node.entry.flags = flags;
     node.entry.cas = cas;
     node.entry.expiry = expiry;
@@ -125,11 +140,16 @@ CasToken InMemoryLruStorage::InsertNew(std::string key, std::vector<std::byte> v
     return cas;
 }
 
-CasToken InMemoryLruStorage::MutateExisting(Iterator it, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry)
+CasToken InMemoryLruStorage::MutateExisting(Iterator it,
+                                            std::span<std::byte const> value,
+                                            std::uint32_t flags,
+                                            TimePoint expiry)
 {
     FC_ZONE_SCOPED_N("LruStorage::MutateExisting");
-    _bytesUsed -= it->entry.value.size();
-    it->entry.value = std::move(value);
+    _bytesUsed -= it->entry.ValueSize();
+    // Rebind to a fresh immutable buffer (copy-on-write): any reader still
+    // holding the previous SharedValue keeps a valid, unchanged payload.
+    it->entry.value = MakeSharedValue(value);
     it->entry.flags = flags;
     it->entry.expiry = expiry;
     it->entry.generation = _liveGeneration;
@@ -137,7 +157,7 @@ CasToken InMemoryLruStorage::MutateExisting(Iterator it, std::vector<std::byte> 
     // A value-rewriting mutation produces a fresh item nobody has read yet.
     it->entry.stale = false;
     it->entry.fetched = false;
-    _bytesUsed += it->entry.value.size();
+    _bytesUsed += it->entry.ValueSize();
     _lru.splice(_lru.begin(), _lru, it);
     EvictToFit();
     return it->entry.cas;
@@ -146,6 +166,28 @@ CasToken InMemoryLruStorage::MutateExisting(Iterator it, std::vector<std::byte> 
 std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view key, TimePoint now)
 {
     FC_ZONE_SCOPED_N("LruStorage::Get");
+
+    if (_lruMode == LruMode::Approximate)
+    {
+        // Shared-read-safe path: ShardedStorage calls this under a *shared*
+        // lock, so it must not mutate `_lru`/`_index` or write the node.
+        // Counters are atomic; promotion + lastAccess/fetched advance are
+        // deferred to the sampled, exclusively-locked PromoteOnRead.
+        _readCmdGet.fetch_add(1, std::memory_order_relaxed);
+        auto const* entry = FindAliveReadOnly(key, now);
+        if (entry == nullptr)
+        {
+            _readGetMisses.fetch_add(1, std::memory_order_relaxed);
+            return GetResult { .found = false, .entry = {} };
+        }
+        _readGetHits.fetch_add(1, std::memory_order_relaxed);
+        // Copy the entry (cheap: the value is a refcounted handle). The
+        // returned lastAccess reflects the value *before* this read, matching
+        // the meta `l` semantics; the stored advance happens in PromoteOnRead.
+        return GetResult { .found = true, .entry = *entry };
+    }
+
+    // Strict path: promote on every read; the caller holds an exclusive lock.
     ++_stats.cmdGet;
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
@@ -161,6 +203,23 @@ std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view 
     it->entry.lastAccess = now;
     it->entry.fetched = true;
     return result;
+}
+
+void InMemoryLruStorage::PromoteOnRead(std::string_view key, TimePoint now)
+{
+    // Called under an exclusive lock on a sampled fraction of Approximate-mode
+    // reads. Promote the entry to most-recently-used and advance its access
+    // bookkeeping — the work the shared `Get` deliberately skipped. A miss
+    // (evicted/expired since the read) is a harmless no-op.
+    auto const indexIt = _index.find(key);
+    if (indexIt == _index.end())
+        return;
+    auto const it = indexIt->second;
+    if (!IsAlive(it->entry, _liveGeneration, now))
+        return;
+    _lru.splice(_lru.begin(), _lru, it);
+    it->entry.lastAccess = now;
+    it->entry.fetched = true;
 }
 
 std::expected<CasToken, StorageError> InMemoryLruStorage::Set(std::string_view key,
@@ -210,10 +269,13 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Append(std::string_vie
         return std::unexpected(MakeKeyNotFound());
     if (expected != 0 && it->entry.cas != expected)
         return std::unexpected(MakeCasMismatch());
-    if (ExceedsValueLimit(it->entry.value.size() + suffix.size()))
+    if (ExceedsValueLimit(it->entry.ValueSize() + suffix.size()))
         return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
 
-    auto combined = it->entry.value;
+    auto const existing = it->entry.ValueBytes();
+    std::vector<std::byte> combined;
+    combined.reserve(existing.size() + suffix.size());
+    combined.insert(combined.end(), existing.begin(), existing.end());
     combined.insert(combined.end(), suffix.begin(), suffix.end());
     return MutateExisting(it, std::move(combined), it->entry.flags, it->entry.expiry);
 }
@@ -228,13 +290,14 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Prepend(std::string_vi
         return std::unexpected(MakeKeyNotFound());
     if (expected != 0 && it->entry.cas != expected)
         return std::unexpected(MakeCasMismatch());
-    if (ExceedsValueLimit(it->entry.value.size() + prefix.size()))
+    if (ExceedsValueLimit(it->entry.ValueSize() + prefix.size()))
         return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
 
+    auto const existing = it->entry.ValueBytes();
     std::vector<std::byte> combined;
-    combined.reserve(prefix.size() + it->entry.value.size());
+    combined.reserve(prefix.size() + existing.size());
     combined.insert(combined.end(), prefix.begin(), prefix.end());
-    combined.insert(combined.end(), it->entry.value.begin(), it->entry.value.end());
+    combined.insert(combined.end(), existing.begin(), existing.end());
     return MutateExisting(it, std::move(combined), it->entry.flags, it->entry.expiry);
 }
 
@@ -279,7 +342,7 @@ std::expected<IStorage::IncrResult, StorageError> InMemoryLruStorage::IncrementO
 
     // Decode the existing value as ASCII unsigned 64-bit *before* booking a
     // hit: a non-numeric value is a client error, not a successful incr/decr.
-    auto const& bytes = it->entry.value;
+    auto const bytes = it->entry.ValueBytes();
     std::string asText;
     asText.reserve(bytes.size());
     for (auto const b: bytes)
@@ -409,7 +472,15 @@ StorageStats InMemoryLruStorage::Snapshot() const noexcept
     _stats.itemCount = _lru.size();
     _stats.bytesUsed = _bytesUsed;
     _stats.bytesLimit = _maxBytes;
-    return _stats;
+    // Fold in the atomic read-path counters (Approximate mode bumps these
+    // instead of the plain `_stats` members). Snapshot runs under the shard's
+    // exclusive lock, so the structure reads are stable; the atomics are read
+    // relaxed.
+    auto stats = _stats;
+    stats.cmdGet += _readCmdGet.load(std::memory_order_relaxed);
+    stats.getHits += _readGetHits.load(std::memory_order_relaxed);
+    stats.getMisses += _readGetMisses.load(std::memory_order_relaxed);
+    return stats;
 }
 
 void InMemoryLruStorage::Resize(std::size_t newMaxBytes)
@@ -427,9 +498,9 @@ void InMemoryLruStorage::InsertVerbatim(std::string_view key, CacheEntry entry)
     if (indexIt != _index.end())
     {
         auto const nodeIt = indexIt->second;
-        _bytesUsed -= nodeIt->entry.value.size();
+        _bytesUsed -= nodeIt->entry.ValueSize();
         nodeIt->entry = std::move(entry);
-        _bytesUsed += nodeIt->entry.value.size();
+        _bytesUsed += nodeIt->entry.ValueSize();
         _lru.splice(_lru.begin(), _lru, nodeIt);
         EvictToFit();
         return;
@@ -437,7 +508,7 @@ void InMemoryLruStorage::InsertVerbatim(std::string_view key, CacheEntry entry)
     Node node;
     node.key = std::string { key };
     node.entry = std::move(entry);
-    auto const size = node.entry.value.size();
+    auto const size = node.entry.ValueSize();
     _lru.push_front(std::move(node));
     _index.emplace(_lru.front().key, _lru.begin());
     _bytesUsed += size;

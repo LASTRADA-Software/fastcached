@@ -109,6 +109,10 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         fileCfg.workerThreads = cliCfg.workerThreads;
     if (cli.storageShardsExplicit)
         fileCfg.storageShards = cliCfg.storageShards;
+    if (cli.listenBacklogExplicit)
+        fileCfg.listenBacklog = cliCfg.listenBacklog;
+    if (cli.logTimestampsExplicit)
+        fileCfg.logTimestamps = cliCfg.logTimestamps;
     return fileCfg;
 }
 
@@ -121,17 +125,18 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
     return static_cast<std::size_t>(cap);
 }
 
-/// Resolve the effective shard count.
+/// Resolve the effective shard count. Sharding fans writes across independent
+/// CoW files so the multi-core reactors write in parallel.
 ///
 /// - User-specified non-zero: honored verbatim.
-/// - Auto (0) for in-memory: fan out (`AutoShardCount`) so threaded mode
-///   gets parallelism without the user opting in.
-/// - Auto (0) for persistent: defaults to **single-file mode** (1
-///   shard). The README documents `--storage=<path>` as a single file;
-///   inferring a multi-shard directory from `hardware_concurrency` would
-///   silently `mkdir` over the user's intended file. If the path
-///   already exists as a directory, treat that as the user explicitly
-///   opting into fan-out and pick `AutoShardCount`.
+/// - Auto (0) for in-memory: fan out (`AutoShardCount`).
+/// - Auto (0) for persistent: fan out **by default** so disk writes
+///   parallelise, EXCEPT for paths that name a single file — an existing
+///   regular file, or a not-yet-existing path with a file extension (e.g.
+///   `cache.cow`) — which stay single-file for backward compatibility (the
+///   path is used as one file, never `mkdir`-ed over). An existing directory
+///   or a not-yet-existing extension-less path (a cache directory) fans out
+///   into `shard-NN.cow` files.
 [[nodiscard]] std::size_t ResolvePhysicalShards(std::size_t requested,
                                                 bool usingPersistent,
                                                 std::filesystem::path const& storagePath) noexcept
@@ -142,21 +147,30 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         return AutoShardCount();
     std::error_code ec;
     if (std::filesystem::is_directory(storagePath, ec))
-        return AutoShardCount();
-    return 1;
+        return AutoShardCount(); // existing directory of shards
+    if (std::filesystem::exists(storagePath, ec))
+        return 1; // existing regular file — keep single-file (compat)
+    if (storagePath.has_extension())
+        return 1;            // a new file-looking path (e.g. cache.cow) — single file
+    return AutoShardCount(); // a new cache directory — fan out
 }
 
-/// Resolve `ExecutionModel::Auto` to a concrete model based on the
-/// active storage backend: reactor when the cache is in-memory (no
-/// disk I/O to overlap with), threaded when CoW on-disk storage is
-/// configured (per-shard locks and page-store fsyncs benefit from
-/// parallel workers). Pass-through for an explicit Threaded/Reactor.
+/// Resolve `ExecutionModel::Auto` to a concrete model. Both the in-memory
+/// and the on-disk backend now run on the reactor: one event loop
+/// multiplexes every connection, so the number of concurrent clients is
+/// bounded by memory rather than by a worker count. (The legacy thread pool
+/// pinned one worker per keep-alive session, so once open connections
+/// exceeded the pool size — common under a parallel sccache build — the
+/// surplus connections were accepted but never served and the client timed
+/// out.) On Windows the reactor is additionally drained by several threads,
+/// so a blocking page-store fsync overlaps with serving other connections.
+/// `--execution-model=threaded` still selects the legacy pool explicitly.
 [[nodiscard]] FastCache::ExecutionModel ResolveExecutionModel(FastCache::ExecutionModel requested,
-                                                              bool usingPersistentStorage) noexcept
+                                                              bool /*usingPersistentStorage*/) noexcept
 {
     if (requested != FastCache::ExecutionModel::Auto)
         return requested;
-    return usingPersistentStorage ? FastCache::ExecutionModel::Threaded : FastCache::ExecutionModel::Reactor;
+    return FastCache::ExecutionModel::Reactor;
 }
 
 /// Translate the user-facing StorageDurability into the page-store enum.
@@ -172,6 +186,14 @@ CowTree::FilePageStore::Durability ToPageStoreDurability(FastCache::StorageDurab
             return CowTree::FilePageStore::Durability::None;
     }
     return CowTree::FilePageStore::Durability::Batched;
+}
+
+/// Translate the config-layer LRU recency policy into the cache backend's enum.
+/// @param r Config recency policy.
+/// @return The corresponding InMemoryLruStorage mode.
+[[nodiscard]] FastCache::LruMode ToLruMode(FastCache::LruRecency r) noexcept
+{
+    return r == FastCache::LruRecency::Strict ? FastCache::LruMode::Strict : FastCache::LruMode::Approximate;
 }
 
 /// Holds the assembled storage chain. The reload subscriber resizes it
@@ -196,7 +218,8 @@ struct StorageBackendBundle
     auto opened = FastCache::CowTreeStorage::Open(opts);
     if (!opened.has_value())
         return std::unexpected(opened.error().ToString());
-    auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes, effective.storageMaxValueBytes);
+    auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(
+        perShardBytes, effective.storageMaxValueBytes, ToLruMode(effective.lruRecency));
     return std::make_unique<FastCache::LayeredStorage>(std::move(l1), std::move(*opened));
 }
 
@@ -212,8 +235,8 @@ struct StorageBackendBundle
     if (!usingPersistent)
     {
         for (std::size_t i = 0; i < physicalShards; ++i)
-            inners.emplace_back(
-                std::make_unique<FastCache::InMemoryLruStorage>(perShardBytes, effective.storageMaxValueBytes));
+            inners.emplace_back(std::make_unique<FastCache::InMemoryLruStorage>(
+                perShardBytes, effective.storageMaxValueBytes, ToLruMode(effective.lruRecency)));
         return inners;
     }
 
@@ -278,8 +301,8 @@ struct StorageBackendBundle
     // Unwrapped single-shard reactor path.
     if (!usingPersistent)
     {
-        bundle.backend =
-            std::make_unique<FastCache::InMemoryLruStorage>(effective.maxMemoryBytes, effective.storageMaxValueBytes);
+        bundle.backend = std::make_unique<FastCache::InMemoryLruStorage>(
+            effective.maxMemoryBytes, effective.storageMaxValueBytes, ToLruMode(effective.lruRecency));
         return bundle;
     }
 
@@ -294,7 +317,7 @@ struct StorageBackendBundle
 /// when DaemonControls reports a stop request.
 int RunThreadedServer(FastCache::Config const& effective, FastCache::CacheEngine& engine, FastCache::ConsoleLogger& logger)
 {
-    auto listener = FastCache::BlockingListener::Bind(effective.bindAddress, effective.port);
+    auto listener = FastCache::BlockingListener::Bind(effective.bindAddress, effective.port, effective.listenBacklog);
     if (!listener || !listener->IsBound())
     {
         logger.Logf(FastCache::LogLevel::Fatal,
@@ -302,6 +325,7 @@ int RunThreadedServer(FastCache::Config const& effective, FastCache::CacheEngine
                     listener ? listener->BindError() : std::string_view { "null listener" });
         return EXIT_FAILURE;
     }
+    logger.Log(FastCache::LogLevel::Info, "ready, accepting connections");
 
     std::atomic<bool> watchdogQuit { false };
     std::jthread watchdog { [&] {
@@ -329,14 +353,38 @@ int RunThreadedServer(FastCache::Config const& effective, FastCache::CacheEngine
 /// service).
 int DaemonBody(FastCache::Config const& effective)
 {
-    FastCache::ConsoleLogger logger { std::cerr, effective.logLevel };
+    FastCache::ConsoleLogger logger { std::cerr, effective.logLevel, effective.logTimestamps };
     FastCache::ConfigReloader reloader { effective, effective.configPath };
     FastCache::SteadyClock clock;
 
     auto const usingPersistent = !effective.storagePath.empty();
     auto const resolvedExecutionModel = ResolveExecutionModel(effective.executionModel, usingPersistent);
-    auto const physicalShards = ResolvePhysicalShards(effective.storageShards, usingPersistent, effective.storagePath);
-    auto const useShardingWrapper = physicalShards > 1 || resolvedExecutionModel == FastCache::ExecutionModel::Threaded;
+
+    // Reactor model scales across cores by running N independent
+    // single-threaded reactors (one per worker thread; default: hardware
+    // concurrency). The legacy threaded pool sizes itself from workerThreads
+    // instead, so reactorCount is 1 there.
+    auto const hardwareThreads = std::max(1U, std::thread::hardware_concurrency());
+    auto const reactorCount = [&]() -> unsigned {
+        if (resolvedExecutionModel != FastCache::ExecutionModel::Reactor)
+            return 1U; // the legacy threaded pool sizes itself from workerThreads
+        return effective.workerThreads != 0 ? static_cast<unsigned>(effective.workerThreads) : hardwareThreads;
+    }();
+
+    auto physicalShards = ResolvePhysicalShards(effective.storageShards, usingPersistent, effective.storagePath);
+    // Several reactor threads share one storage, so keep at least as many
+    // in-memory shards as reactors to hold per-shard lock contention down.
+    if (!usingPersistent && reactorCount > 1)
+        physicalShards = std::max<std::size_t>(physicalShards, reactorCount);
+
+    // Wrap the backend in a ShardedStorage (its per-shard mutex serialises
+    // access) whenever more than one thread can reach it: the legacy threaded
+    // pool, an explicit multi-shard layout, the persistent backend, or the
+    // reactor running on more than one thread. A lone reactor over in-memory
+    // storage stays unwrapped — one thread owns it, so the wrapper would be
+    // pure overhead.
+    auto const useShardingWrapper = physicalShards > 1 || resolvedExecutionModel == FastCache::ExecutionModel::Threaded
+                                    || usingPersistent || reactorCount > 1;
 
     auto bundle = BuildStorageBackend(effective, usingPersistent, useShardingWrapper, physicalShards);
     if (!bundle.has_value())
@@ -402,7 +450,10 @@ int DaemonBody(FastCache::Config const& effective)
                 shardingMode);
 
     InstallStopHandlers();
-    logger.Log(FastCache::LogLevel::Info, "ready, accepting connections");
+    // The "ready, accepting connections" line is emitted by the server loop
+    // itself, only once its listener is actually bound and listening — see
+    // RunReactorServer / RunThreadedServer. Logging it here (before bind)
+    // would race a client that connects on the strength of the message.
 
     std::atomic<bool> reloaderQuit { false };
     std::jthread reloaderThread { [&reloader, &logger, &reloaderQuit] {
@@ -426,6 +477,14 @@ int DaemonBody(FastCache::Config const& effective)
         FastCache::ReactorServerOptions serverOpts;
         serverOpts.bindAddress = effective.bindAddress;
         serverOpts.port = effective.port;
+        serverOpts.listenBacklog = effective.listenBacklog;
+        // One reactor per core (each single-threaded, connections pinned). One
+        // reactor = today's single-loop behaviour; N reactors scale across
+        // cores without any cross-thread coroutine migration.
+        serverOpts.reactorThreads = reactorCount;
+        // Pin reactors to cores when asked (PerCore) and there's more than one;
+        // a lone reactor gains nothing from pinning.
+        serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
         exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
     }
     else

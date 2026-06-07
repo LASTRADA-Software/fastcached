@@ -10,3 +10,10 @@ site/
 CMakeUserPresets.json
 *.user
 compile_commands.json
+bench/results/
+__pycache__/
+
+# Profiling artifacts
+callgrind.out.*
+perf.data*
+*.tracy

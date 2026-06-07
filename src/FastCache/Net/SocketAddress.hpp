@@ -92,10 +92,18 @@ namespace Detail
     /// @param backlog ::listen backlog.
     /// @param extraTypeFlags Flags OR'd into SOCK_STREAM at socket() creation
     ///        (e.g. SOCK_NONBLOCK | SOCK_CLOEXEC on Linux); 0 when unused.
+    /// @param reusePort When ReusePort::Yes, set SO_REUSEPORT so several
+    ///        listeners can bind the same port and the kernel load-balances new
+    ///        connections across them (POSIX only — one listener per reactor
+    ///        thread). No effect on platforms without SO_REUSEPORT (e.g. Windows).
     /// @return The bound, listening socket and its family, or an error message
     ///         describing why every candidate failed.
-    [[nodiscard]] std::expected<BoundListener, std::string> BindAndListen(
-        IAddressResolver& resolver, std::string_view host, std::uint16_t port, int backlog, int extraTypeFlags);
+    [[nodiscard]] std::expected<BoundListener, std::string> BindAndListen(IAddressResolver& resolver,
+                                                                          std::string_view host,
+                                                                          std::uint16_t port,
+                                                                          int backlog,
+                                                                          int extraTypeFlags,
+                                                                          ReusePort reusePort = ReusePort::No);
 
 } // namespace Detail
 

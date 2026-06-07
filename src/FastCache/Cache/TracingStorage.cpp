@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/TracingStorage.hpp>
 
+#include <cstddef>
 #include <format>
 #include <string>
 #include <utility>
@@ -40,6 +41,19 @@ namespace
         }
     }
 
+    /// Format a failed mutation's outcome for the trace log. VALUE_TOO_LARGE is
+    /// the one error whose rejected byte count is worth recording, so it carries
+    /// `bytes=`; every other code maps through ErrorOutcome.
+    /// @param err   The storage error returned by the mutation.
+    /// @param bytes The value/delta size the caller attempted to store.
+    /// @return The wire-shaped outcome string for the trace log.
+    [[nodiscard]] std::string FormatErrorOutcome(StorageError const& err, std::size_t bytes)
+    {
+        if (err.code == StorageErrorCode::ValueTooLarge)
+            return std::format("VALUE_TOO_LARGE bytes={}", bytes);
+        return std::string { ErrorOutcome(err) };
+    }
+
 } // namespace
 
 TracingStorage::TracingStorage(IStorage& inner, ILogger& logger, IClock& clock) noexcept:
@@ -59,7 +73,7 @@ std::expected<GetResult, StorageError> TracingStorage::Get(std::string_view key,
             if (!r.has_value())
                 return std::string { ErrorOutcome(r.error()) };
             if (r->found)
-                return std::format("HIT bytes={}", r->entry.value.size());
+                return std::format("HIT bytes={}", r->entry.ValueSize());
             return "MISS";
         });
 }
@@ -76,7 +90,7 @@ std::expected<CasToken, StorageError> TracingStorage::Set(std::string_view key,
         [&]() mutable { return _inner.Set(key, std::move(value), flags, expiry); },
         [bytes](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
-                return std::string { ErrorOutcome(r.error()) };
+                return FormatErrorOutcome(r.error(), bytes);
             return std::format("STORED bytes={}", bytes);
         });
 }
@@ -91,7 +105,7 @@ std::expected<CasToken, StorageError> TracingStorage::Add(
         [&]() mutable { return _inner.Add(key, std::move(value), flags, expiry, now); },
         [bytes](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
-                return std::string { ErrorOutcome(r.error()) };
+                return FormatErrorOutcome(r.error(), bytes);
             return std::format("STORED bytes={}", bytes);
         });
 }
@@ -106,7 +120,7 @@ std::expected<CasToken, StorageError> TracingStorage::Replace(
         [&]() mutable { return _inner.Replace(key, std::move(value), flags, expiry, now); },
         [bytes](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
-                return std::string { ErrorOutcome(r.error()) };
+                return FormatErrorOutcome(r.error(), bytes);
             return std::format("STORED bytes={}", bytes);
         });
 }
@@ -116,13 +130,14 @@ std::expected<CasToken, StorageError> TracingStorage::Append(std::string_view ke
                                                              CasToken expected,
                                                              TimePoint now)
 {
+    auto const bytes = suffix.size();
     return TraceCall(
         "APPEND",
         key,
         [&] { return _inner.Append(key, suffix, expected, now); },
-        [](std::expected<CasToken, StorageError> const& r) -> std::string {
+        [bytes](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
-                return std::string { ErrorOutcome(r.error()) };
+                return FormatErrorOutcome(r.error(), bytes);
             return "STORED";
         });
 }
@@ -132,13 +147,14 @@ std::expected<CasToken, StorageError> TracingStorage::Prepend(std::string_view k
                                                               CasToken expected,
                                                               TimePoint now)
 {
+    auto const bytes = prefix.size();
     return TraceCall(
         "PREPEND",
         key,
         [&] { return _inner.Prepend(key, prefix, expected, now); },
-        [](std::expected<CasToken, StorageError> const& r) -> std::string {
+        [bytes](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
-                return std::string { ErrorOutcome(r.error()) };
+                return FormatErrorOutcome(r.error(), bytes);
             return "STORED";
         });
 }
@@ -150,13 +166,14 @@ std::expected<CasToken, StorageError> TracingStorage::CompareAndSwap(std::string
                                                                      TimePoint expiry,
                                                                      TimePoint now)
 {
+    auto const bytes = value.size();
     return TraceCall(
         "CAS",
         key,
         [&]() mutable { return _inner.CompareAndSwap(key, expected, std::move(value), flags, expiry, now); },
-        [](std::expected<CasToken, StorageError> const& r) -> std::string {
+        [bytes](std::expected<CasToken, StorageError> const& r) -> std::string {
             if (!r.has_value())
-                return std::string { ErrorOutcome(r.error()) };
+                return FormatErrorOutcome(r.error(), bytes);
             return "STORED";
         });
 }
@@ -213,7 +230,7 @@ std::expected<GetResult, StorageError> TracingStorage::Peek(std::string_view key
             if (!r.has_value())
                 return std::string { ErrorOutcome(r.error()) };
             if (r->found)
-                return std::format("HIT bytes={}", r->entry.value.size());
+                return std::format("HIT bytes={}", r->entry.ValueSize());
             return "MISS";
         });
 }
@@ -243,7 +260,7 @@ std::expected<GetResult, StorageError> TracingStorage::GetAndTouch(std::string_v
             if (!r.has_value())
                 return std::string { ErrorOutcome(r.error()) };
             if (r->found)
-                return std::format("HIT bytes={}", r->entry.value.size());
+                return std::format("HIT bytes={}", r->entry.ValueSize());
             return "MISS";
         });
 }

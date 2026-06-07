@@ -67,7 +67,19 @@ server_pid=$!
 sleep 1
 
 sccache --stop-server >/dev/null 2>&1 || true
-sccache --start-server
+# Starting the server is where sccache validates that the requested backend is
+# compiled in. A binary built without the chosen feature (e.g. no redis support)
+# fails here with "Cache type not supported with current feature configuration".
+# That is a missing runtime prerequisite, not a fastcached fault, so map it to a
+# skip rather than a hard failure.
+if ! start_err="$(sccache --start-server 2>&1)"; then
+    echo "$start_err" >&2
+    if echo "$start_err" | grep -qi "feature configuration"; then
+        echo "sccache lacks ${protocol} backend support; skipping"
+        exit "$SKIP"
+    fi
+    exit 1
+fi
 sccache --zero-stats >/dev/null
 
 # First compile: cache miss (populates the cache via fastcached).

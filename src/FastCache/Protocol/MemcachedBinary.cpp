@@ -7,11 +7,13 @@
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/MemcachedBinary.hpp>
+#include <FastCache/Protocol/MemcachedShared.hpp>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -122,7 +124,8 @@ namespace
                              std::uint64_t cas,
                              std::span<std::byte const> extras,
                              std::span<std::byte const> key,
-                             std::span<std::byte const> value)
+                             std::span<std::byte const> value,
+                             std::shared_ptr<void const> keepAlive = {})
     {
         std::array<std::byte, HeaderSize> hdr {};
         hdr[0] = ResponseMagic;
@@ -136,28 +139,21 @@ namespace
         WriteBigEndian<std::uint32_t>(std::span<std::byte> { &hdr[12], 4 }, opaque);
         WriteBigEndian<std::uint64_t>(std::span<std::byte> { &hdr[16], 8 }, cas);
 
-        auto const r1 = co_await socket->Write(std::span<std::byte const> { hdr.data(), hdr.size() });
-        if (!r1.has_value())
-            co_return false;
-        if (!extras.empty())
-        {
-            auto const r = co_await socket->Write(extras);
-            if (!r.has_value())
-                co_return false;
-        }
-        if (!key.empty())
-        {
-            auto const r = co_await socket->Write(key);
-            if (!r.has_value())
-                co_return false;
-        }
-        if (!value.empty())
-        {
-            auto const r = co_await socket->Write(value);
-            if (!r.has_value())
-                co_return false;
-        }
-        co_return true;
+        // Gather header + extras + key + value into a single scattered write:
+        // the value segment points directly at the cached, reference-counted
+        // payload (no copy), and `keepAlive` keeps that payload alive across a
+        // write that may suspend. `hdr` lives in this coroutine frame, which is
+        // suspended (not destroyed) across the co_await, so its address is
+        // stable for the duration of the write. Empty segments are skipped by
+        // the socket layer. The hot path is syscall-bound, so one sendmsg per
+        // reply beats up to four send()s — and now without the copy.
+        std::array<std::span<std::byte const>, 4> const segments {
+            std::span<std::byte const> { hdr.data(), hdr.size() },
+            extras,
+            key,
+            value,
+        };
+        co_return co_await WriteAllVectored(socket, segments, std::move(keepAlive));
     }
 
     [[nodiscard]] constexpr std::string_view ErrorMessage(Status status) noexcept
@@ -342,6 +338,8 @@ namespace
         std::array<std::byte, 4> extras {};
         WriteBigEndian<std::uint32_t>(extras, entry.flags);
         std::span<std::byte const> const keyOut = includeKey ? key : std::span<std::byte const> {};
+        // Hand the value's reference-counted buffer to the write as keep-alive
+        // so the zero-copy value segment stays valid across a suspended write.
         co_return co_await WriteResponse(socket,
                                          opcode,
                                          Status::Ok,
@@ -349,7 +347,8 @@ namespace
                                          entry.cas,
                                          std::span<std::byte const> { extras.data(), extras.size() },
                                          keyOut,
-                                         std::span<std::byte const> { entry.value.data(), entry.value.size() });
+                                         entry.ValueBytes(),
+                                         entry.value.AsKeepAlive());
     }
 
     Task<bool> HandleDelete(
@@ -441,7 +440,8 @@ namespace
                                          entry.cas,
                                          std::span<std::byte const> { outExtras.data(), outExtras.size() },
                                          keyOut,
-                                         std::span<std::byte const> { entry.value.data(), entry.value.size() });
+                                         entry.ValueBytes(),
+                                         entry.value.AsKeepAlive());
     }
 
     /// memcached binary increment / decrement, including auto-vivify on

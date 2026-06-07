@@ -59,29 +59,51 @@ class ByteReader
     /// @return true if the underlying socket returned EOF and the buffer is drained.
     [[nodiscard]] bool Eof() const noexcept
     {
-        return _eof && _buffer.empty();
+        return _eof && _buffer.size() == _consumed;
     }
 
-    /// @return Read-only view over currently-buffered bytes.
+    /// @return Read-only view over currently-buffered (unconsumed) bytes.
     [[nodiscard]] std::span<std::byte const> Buffered() const noexcept
     {
-        return std::span<std::byte const> { _buffer.data(), _buffer.size() };
+        return std::span<std::byte const> { _buffer.data() + _consumed, _buffer.size() - _consumed };
     }
 
   private:
-    /// Try to extract a CRLF-delimited line from _buffer. On success the
-    /// line bytes and the CRLF are removed from _buffer.
+    /// Try to extract a CRLF-delimited line from the unconsumed region of
+    /// _buffer. On success the line bytes and the CRLF are consumed (the read
+    /// cursor advances; no bytes are moved).
     [[nodiscard]] std::expected<std::string, ProtocolError> TryExtractLine();
 
     /// Pull one chunk from the socket into _buffer; sets _eof on EOF.
     /// @return Task resolving to bytes pulled, or ProtocolError on socket failure.
     [[nodiscard]] Task<std::expected<std::size_t, ProtocolError>> PullChunk();
 
+    /// @return Count of unconsumed bytes available in _buffer.
+    [[nodiscard]] std::size_t Available() const noexcept
+    {
+        return _buffer.size() - _consumed;
+    }
+
+    /// Drop the consumed prefix: if the read cursor has advanced, move the
+    /// unconsumed tail to the front and reset the cursor. Called before a
+    /// socket read so the buffer doesn't grow unboundedly, and amortised so
+    /// the common "consume a whole line, buffer now empty" case is O(1).
+    void Compact();
+
     ISocket& _socket;
     std::size_t _maxLineBytes;
     std::size_t _maxPayloadBytes;
     std::size_t _readChunkBytes;
     std::vector<std::byte> _buffer;
+    /// Read cursor: index of the first unconsumed byte in _buffer. Consuming a
+    /// line or payload advances this instead of erasing from the front, so a
+    /// request does not memmove the buffer tail on every command.
+    std::size_t _consumed { 0 };
+    /// Reusable per-read scratch buffer. Allocated once (lazily, to chunk
+    /// size) and reused for every PullChunk, so the request hot path does not
+    /// allocate + zero-fill a fresh chunk on each socket read — that churn was
+    /// ~40% of instructions on a tight get loop.
+    std::vector<std::byte> _scratch;
     bool _eof { false };
 };
 

@@ -46,6 +46,26 @@ TEST_CASE("CliParser: --max-memory rejects unknown suffix", "[config][cli]")
     REQUIRE(result.error().field == "max-memory");
 }
 
+TEST_CASE("CliParser: --log-timestamps sets the value and the explicit-override flag", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--log-timestamps" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.logTimestamps);
+    // The explicit flag is what lets a CLI --log-timestamps override the YAML
+    // value in BOTH directions (the merge in main.cpp), unlike the old one-way OR.
+    REQUIRE(result->logTimestampsExplicit);
+}
+
+TEST_CASE("CliParser: --log-timestamps absent leaves the explicit-override flag clear", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--port=11211" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE_FALSE(result->logTimestampsExplicit);
+    REQUIRE_FALSE(result->config.logTimestamps);
+}
+
 TEST_CASE("CliParser: --storage parses into Config::storagePath", "[config][cli][storage]")
 {
     auto const args = std::array<char const*, 1> { "--storage=/var/lib/fastcached/cache.cow" };
@@ -72,6 +92,59 @@ TEST_CASE("CliParser: --storage-durability parses each mode", "[config][cli][sto
 TEST_CASE("CliParser: --storage-durability rejects unknown values", "[config][cli][storage]")
 {
     auto const args = std::array<char const*, 1> { "--storage-durability=maybe" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
+}
+
+TEST_CASE("CliParser: --lru-mode parses each policy and defaults to approximate", "[config][cli]")
+{
+    // Default (flag absent) is Approximate.
+    auto const def = FastCache::ParseCli(std::span<char const* const> {});
+    REQUIRE(def.has_value());
+    REQUIRE(def->config.lruRecency == FastCache::LruRecency::Approximate);
+
+    for (auto const& [text, mode]: std::initializer_list<std::pair<char const*, FastCache::LruRecency>> {
+             { "--lru-mode=approximate", FastCache::LruRecency::Approximate },
+             { "--lru-mode=strict", FastCache::LruRecency::Strict },
+         })
+    {
+        auto const args = std::array<char const*, 1> { text };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(result.has_value());
+        REQUIRE(result->config.lruRecency == mode);
+    }
+}
+
+TEST_CASE("CliParser: --lru-mode rejects unknown values", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--lru-mode=sloppy" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
+}
+
+TEST_CASE("CliParser: --cpu-affinity parses each policy and defaults to per-core", "[config][cli]")
+{
+    auto const def = FastCache::ParseCli(std::span<char const* const> {});
+    REQUIRE(def.has_value());
+    REQUIRE(def->config.cpuAffinity == FastCache::CpuAffinity::PerCore);
+
+    for (auto const& [text, mode]: std::initializer_list<std::pair<char const*, FastCache::CpuAffinity>> {
+             { "--cpu-affinity=none", FastCache::CpuAffinity::None },
+             { "--cpu-affinity=per-core", FastCache::CpuAffinity::PerCore },
+         })
+    {
+        auto const args = std::array<char const*, 1> { text };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(result.has_value());
+        REQUIRE(result->config.cpuAffinity == mode);
+    }
+}
+
+TEST_CASE("CliParser: --cpu-affinity rejects unknown values", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--cpu-affinity=numa" };
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
@@ -146,6 +219,24 @@ TEST_CASE("CliParser: --storage-shards=0 records the explicit-set flag", "[confi
     REQUIRE(result->storageShardsExplicit);
 }
 
+TEST_CASE("CliParser: --listen-backlog sets the value and records the explicit-set flag", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--listen-backlog=1024" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.listenBacklog == 1024);
+    REQUIRE(result->listenBacklogExplicit);
+}
+
+TEST_CASE("CliParser: --listen-backlog rejects out-of-range values", "[config][cli]")
+{
+    auto const zero = std::array<char const*, 1> { "--listen-backlog=0" };
+    REQUIRE_FALSE(FastCache::ParseCli(std::span<char const* const> { zero }).has_value());
+
+    auto const tooBig = std::array<char const*, 1> { "--listen-backlog=70000" };
+    REQUIRE_FALSE(FastCache::ParseCli(std::span<char const* const> { tooBig }).has_value());
+}
+
 TEST_CASE("CliParser: --storage-durability=batched records the explicit-set flag", "[config][cli][regression]")
 {
     // batched is the field's default; absent an explicit-tracker the
@@ -173,6 +264,7 @@ TEST_CASE("CliParser: omitting all flags leaves every explicit-tracker false", "
     REQUIRE_FALSE(result->executionModelExplicit);
     REQUIRE_FALSE(result->workerThreadsExplicit);
     REQUIRE_FALSE(result->storageShardsExplicit);
+    REQUIRE_FALSE(result->listenBacklogExplicit);
 }
 
 TEST_CASE("CliParser: --bind sets the address and records the explicit-set flag", "[config][cli][bind]")
@@ -347,7 +439,7 @@ TEST_CASE("CliParser: --help wraps continuation lines to the description column"
     {
         if (line.starts_with("  --execution-model"))
             flagColumn = DescriptionColumn(line);
-        else if (line.find("auto: reactor for in-memory") != std::string_view::npos)
+        else if (line.find("auto: the reactor for both in-memory") != std::string_view::npos)
             continuationColumn = line.find_first_not_of(' ');
     }
 

@@ -30,11 +30,14 @@ struct IocpCompletion
 
 /// Windows IOCP-based reactor.
 ///
-/// One reactor instance, one I/O completion port, one worker thread (the
+/// One reactor instance, one I/O completion port, ONE worker thread (the
 /// thread that calls Run()). Coroutines posted via Submit() are resumed on
-/// that thread. Sockets attach themselves to the reactor's IOCP via
-/// AttachHandle so their WSARecv/WSASend completions arrive on the same
-/// thread.
+/// that thread; a connection's socket is associated with this reactor's port,
+/// so all its completions are dequeued by this one thread and its coroutine is
+/// never resumed concurrently. Scaling across cores is done by running several
+/// independent reactors (one per thread), each owning its own connections —
+/// NOT by draining one port from many threads (that migrates a coroutine
+/// across threads and is unsafe).
 ///
 /// Submit/Schedule are safe to call from any thread; both go through
 /// PostQueuedCompletionStatus.
@@ -47,6 +50,7 @@ class IocpReactor: public IReactor
 {
   public:
     /// Construct over an IClock; the clock drives all deadline checks.
+    /// @param clock Time provider used for all deadline checks.
     explicit IocpReactor(IClock& clock);
     ~IocpReactor() override;
 

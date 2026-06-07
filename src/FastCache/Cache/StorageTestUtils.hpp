@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Cache/CacheEntry.hpp>
+
 #include <cstddef>
 #include <filesystem>
 #include <random>
@@ -25,6 +27,18 @@ namespace FastCache::Testing
     for (auto const c: text)
         bytes.push_back(static_cast<std::byte>(c));
     return bytes;
+}
+
+/// Copy a cache entry's (reference-counted, immutable) payload into an owning
+/// byte vector, so tests can use the full `std::vector` interface (`==`,
+/// `.empty()`, `.size()`, `operator[]`) against the value regardless of how
+/// storage represents it internally.
+/// @param entry Entry whose payload to materialize.
+/// @return A vector holding a copy of the entry's value bytes.
+[[nodiscard]] inline std::vector<std::byte> ValueOf(CacheEntry const& entry)
+{
+    auto const bytes = entry.ValueBytes();
+    return std::vector<std::byte> { bytes.begin(), bytes.end() };
 }
 
 /// Convert a byte span back to a string for value comparisons.

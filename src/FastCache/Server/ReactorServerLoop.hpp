@@ -21,6 +21,21 @@ struct ReactorServerOptions
     std::string bindAddress { "127.0.0.1" };
     std::uint16_t port { 11211 };
     std::size_t maxConnections { 0 }; ///< 0 = unlimited.
+    int listenBacklog { 511 };        ///< ::listen() backlog depth.
+
+    /// Number of independent reactors to run, each single-threaded with its
+    /// own connections (no coroutine migration). 1 is the classic single-loop
+    /// server. >1 scales across cores: on Windows a single acceptor hands
+    /// sockets round-robin to N IOCP reactors; on POSIX N listeners share the
+    /// port via SO_REUSEPORT. With >1, the storage every connection reaches
+    /// must be thread-safe (the caller wraps it in a ShardedStorage).
+    unsigned reactorThreads { 1 };
+
+    /// Pin each reactor thread to a distinct CPU core (reactor *i* → core
+    /// *i % online_cpus*). Keeps a worker's hot state resident in one core's
+    /// caches instead of migrating across cores. Best-effort: ignored when the
+    /// platform doesn't support pinning. Only meaningful with reactorThreads>1.
+    bool pinReactorsToCpu { false };
 };
 
 /// Run the reactor-driven server loop using the platform's native

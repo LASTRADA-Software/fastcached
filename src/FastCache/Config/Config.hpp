@@ -44,6 +44,27 @@ enum class ExecutionModel : std::uint8_t
     Reactor = 2,
 };
 
+/// CPU-affinity policy for the reactor worker threads.
+enum class CpuAffinity : std::uint8_t
+{
+    /// Let the OS scheduler place reactor threads (default for a lone reactor).
+    None = 0,
+    /// Pin each reactor thread to its own core (default with >1 reactor): keeps
+    /// per-worker state cache-resident and avoids cross-core migration churn.
+    PerCore = 1,
+};
+
+/// In-memory LRU recency policy. Decoupled from the Cache layer (like
+/// StorageDurability); main.cpp translates this into the backend's `LruMode`.
+enum class LruRecency : std::uint8_t
+{
+    /// Sampled/deferred promotion: reads run concurrently under a shared lock
+    /// and eviction stays approximately-LRU. Favours read throughput. Default.
+    Approximate = 0,
+    /// Promote on every read for exact LRU order; reads on one shard serialise.
+    Strict = 1,
+};
+
 /// All runtime configuration. POD-like value type; built once from CLI
 /// arguments (and later, from a YAML config file). For SIGHUP reload, the
 /// daemon keeps a shared_ptr<const Config> and atomically swaps.
@@ -96,8 +117,19 @@ struct Config
     /// TCP port. memcached default is 11211; fastcached's MVP follows.
     std::uint16_t port { 11211 };
 
+    /// ::listen() backlog — the depth of the kernel's queue of accepted-
+    /// but-not-yet-handed-off connections. Bursts of parallel clients (a
+    /// `make -jN` driving sccache opens many sockets at once) overflow a
+    /// small backlog and get ECONNREFUSED / timeouts at the OS layer before
+    /// the daemon ever sees them. Defaults to 511 (the value redis uses);
+    /// the kernel silently clamps to its own SOMAXCONN ceiling.
+    int listenBacklog { 511 };
+
     /// Log threshold.
     LogLevel logLevel { LogLevel::Info };
+
+    /// When true, each ConsoleLogger line is prefixed with an ISO 8601 UTC timestamp.
+    bool logTimestamps { false };
 
     /// If true, daemonize (POSIX) or self-register as a Windows service.
     bool daemon { false };
@@ -108,6 +140,16 @@ struct Config
 
     /// Server execution model. See ExecutionModel docs.
     ExecutionModel executionModel { ExecutionModel::Auto };
+
+    /// In-memory LRU recency policy. Approximate (default) favours read
+    /// throughput by letting same-shard reads run concurrently; Strict gives
+    /// exact LRU order at the cost of serialising reads per shard.
+    LruRecency lruRecency { LruRecency::Approximate };
+
+    /// CPU-affinity policy for reactor threads. PerCore (default) pins each
+    /// reactor to its own core when running more than one; with a single
+    /// reactor it is a no-op regardless. None lets the scheduler place threads.
+    CpuAffinity cpuAffinity { CpuAffinity::PerCore };
 };
 
 } // namespace FastCache

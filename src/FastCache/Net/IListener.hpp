@@ -11,6 +11,16 @@
 namespace FastCache
 {
 
+/// Whether a listener sets SO_REUSEPORT so several listeners can share one
+/// port and have the kernel load-balance connections across them (one listener
+/// per reactor thread). A strong enum rather than a bare bool so call sites
+/// read `ReusePort::Yes` instead of an opaque `true`.
+enum class ReusePort : bool
+{
+    No = false,
+    Yes = true,
+};
+
 /// Result of an asynchronous accept: either a newly-connected ISocket or an
 /// error (typically Cancelled on shutdown or a transient OS condition).
 using AcceptResult = std::expected<std::unique_ptr<ISocket>, NetError>;

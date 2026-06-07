@@ -28,6 +28,8 @@ class KqueueSocket final: public ISocket
 
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
+    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                            std::shared_ptr<void const> keepAlive = {}) override;
     void Close() noexcept override;
     [[nodiscard]] bool IsClosed() const noexcept override
     {
@@ -54,8 +56,9 @@ class KqueueListener final: public IListener
     [[nodiscard]] static std::unique_ptr<KqueueListener> Bind(KqueueReactor& reactor,
                                                               std::string_view bindAddress,
                                                               std::uint16_t port,
-                                                              int backlog = 64,
-                                                              IAddressResolver& resolver = DefaultAddressResolver());
+                                                              int backlog = 511,
+                                                              IAddressResolver& resolver = DefaultAddressResolver(),
+                                                              ReusePort reusePort = ReusePort::No);
 
     ~KqueueListener() override;
 

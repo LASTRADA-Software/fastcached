@@ -23,6 +23,7 @@
 
 #include <CowTree/CowTree.hpp>
 #include <CowTree/FilePageStore.hpp>
+#include <CowTree/IPageStore.hpp>
 
 namespace FastCache
 {
@@ -38,21 +39,29 @@ namespace FastCache
 /// passthrough); the encoded entry carries every field needed to
 /// reconstruct the in-memory shadow.
 ///
-/// Encoding (little-endian on disk):
+/// The page size is a small fixed value (`DefaultStoragePageSize`), decoupled
+/// from `maxValueBytes` — so a tiny write never shuffles a multi-megabyte page.
+/// A value larger than `PageSize()/4` is stored out-of-line as a chain of
+/// overflow pages; the leaf then holds only a small descriptor.
+///
+/// Leaf-record encoding (little-endian on disk; format v3):
 /// ```
+/// u8  kind                 (0 = inline, 1 = overflow)
 /// u32 flags
 /// u64 cas
 /// i64 expiry_us            (steady-clock microseconds; INT64_MAX = never)
 /// u64 generation
-/// u32 value_len
-/// [value bytes]
-/// // --- v2 trailer (optional; absent in legacy files) ---
 /// i64 lastAccess_us        (INT64_MIN = never accessed)
 /// u8  stale                (0 = live, 1 = stale)
+/// -- inline:   u32 value_len ; [value bytes]
+/// -- overflow: u64 total_len ; u64 root_page_id
 /// ```
-/// Older entries (without the v2 trailer) are decoded with `lastAccess`
-/// defaulted to `TimePoint::min()` and `stale = false`, so on-disk
-/// upgrades are seamless.
+/// Each overflow page is `[u32 crc32c][u64 next_page_id][u32 chunk_len][chunk]`
+/// (next == 0 marks the last page). The CRC is computed over everything that
+/// follows it — the `next` link, `chunk_len`, and the chunk — so a torn write
+/// to the chain linkage (not just the payload) is detected on read; data pages
+/// otherwise carry no read-time checksum. v3 breaks the older on-disk format
+/// (acceptable pre-release).
 class CowTreeStorage final: public IStorage
 {
   public:
@@ -84,6 +93,22 @@ class CowTreeStorage final: public IStorage
     /// Open or create the storage. Replays existing entries into the
     /// in-memory LRU mirror.
     [[nodiscard]] static std::expected<std::unique_ptr<CowTreeStorage>, StorageError> Open(Options options);
+
+    /// Test seam: open over an injected page store (e.g. an InMemoryPageStore
+    /// with fault injection) instead of a FilePageStore on disk. Used by the
+    /// crash-consistency tests.
+    /// @param options Storage options (path/durability ignored; the store is supplied).
+    /// @param store   The page store to drive (ownership transferred).
+    [[nodiscard]] static std::expected<std::unique_ptr<CowTreeStorage>, StorageError> OpenWithStore(
+        Options options, std::unique_ptr<CowTree::IPageStore> store);
+
+    /// Test seam: open over a BORROWED page store the caller owns and outlives
+    /// this object — so a test can reopen a fresh CowTreeStorage over the same
+    /// (in-memory) store to simulate a restart after an injected fault.
+    /// @param options Storage options (path/durability ignored).
+    /// @param store   Borrowed page store; must outlive the returned object.
+    [[nodiscard]] static std::expected<std::unique_ptr<CowTreeStorage>, StorageError> OpenBorrowing(
+        Options options, CowTree::IPageStore& store);
 
     CowTreeStorage(CowTreeStorage const&) = delete;
     CowTreeStorage(CowTreeStorage&&) = delete;
@@ -162,6 +187,10 @@ class CowTreeStorage final: public IStorage
   private:
     explicit CowTreeStorage(Options options) noexcept;
 
+    /// Build the tree over `_store`, replay, and set stats. Shared by the
+    /// owning and borrowing Open paths.
+    [[nodiscard]] std::expected<void, StorageError> Initialize();
+
     /// Result of a tree lookup with the encoded entry materialised.
     struct LoadedEntry
     {
@@ -177,11 +206,82 @@ class CowTreeStorage final: public IStorage
     /// Erase the entry from the tree.
     [[nodiscard]] std::expected<void, StorageError> EraseEntry(std::string_view key);
 
-    /// Encode a CacheEntry into a flat byte string for tree storage.
-    [[nodiscard]] static std::vector<std::byte> Encode(CacheEntry const& entry);
+    /// Apply a metadata-only mutation (TTL / stale / lastAccess) to the stored
+    /// record for `key`, rewriting ONLY the leaf record and REUSING any existing
+    /// overflow chain in place — no chain materialisation and no chain rewrite,
+    /// so a touch of a large value is O(record), not O(value). CAS is bumped.
+    /// @param key    Entry key.
+    /// @param now    Current clock value (drives the existence/expiry check).
+    /// @param mutate Callback adjusting the parsed entry's metadata in place.
+    /// @return The new CAS token, or KeyNotFound if absent/expired/flushed.
+    [[nodiscard]] std::expected<CasToken, StorageError> UpdateRecordMetadata(std::string_view key,
+                                                                             TimePoint now,
+                                                                             std::function<void(CacheEntry&)> const& mutate);
 
-    /// Decode a tree value back into a CacheEntry.
-    [[nodiscard]] static std::expected<CacheEntry, StorageError> Decode(CowTree::BytesView raw);
+    /// A leaf record parsed into its header plus either inline value bounds or
+    /// an overflow descriptor (the value itself is materialised separately).
+    struct ParsedRecord
+    {
+        CacheEntry entry;                                 ///< All fields except `value`.
+        bool overflow { false };                          ///< True when the value is out-of-line.
+        std::uint32_t inlineLen { 0 };                    ///< Inline value length (inline records).
+        std::size_t inlineOffset { 0 };                   ///< Offset of the inline value in `raw`.
+        std::uint64_t totalLen { 0 };                     ///< Full value length (overflow records).
+        CowTree::PageId root { CowTree::PageId::None() }; ///< Overflow chain head.
+    };
+
+    /// A lightweight reference to a stored value's out-of-line backing, used to
+    /// reclaim the old chain after an overwrite/erase.
+    struct StoredRef
+    {
+        bool overflow { false };
+        CowTree::PageId root { CowTree::PageId::None() };
+    };
+
+    /// One validated overflow page: a copy of its bytes (the store's read
+    /// buffer is reused on the next Read), the `next` link, and the chunk
+    /// length. Returned only after the per-page CRC and bounds have passed.
+    struct OverflowPage
+    {
+        std::vector<std::byte> bytes;
+        std::uint64_t next { 0 };
+        std::uint32_t chunkLen { 0 };
+    };
+
+    /// Read overflow page `id`, copy it out, and validate its header bounds and
+    /// chunk CRC. Returns Corrupt if the page is malformed. Both the read path
+    /// and the reclaim path go through this so neither ever trusts a `next`
+    /// link from an unverified page.
+    [[nodiscard]] std::expected<OverflowPage, StorageError> ReadOverflowPage(CowTree::PageId id) const;
+
+    /// Encode an entry whose value is stored inline in the leaf.
+    [[nodiscard]] static std::vector<std::byte> EncodeInline(CacheEntry const& entry);
+
+    /// Encode an entry whose value lives in an overflow chain; the leaf holds
+    /// only the descriptor (total length + chain head).
+    [[nodiscard]] static std::vector<std::byte> EncodeOverflowDescriptor(CacheEntry const& entry,
+                                                                         CowTree::PageId root,
+                                                                         std::uint64_t totalLen);
+
+    /// Parse a leaf record's header (everything but the materialised value).
+    [[nodiscard]] static std::expected<ParsedRecord, StorageError> ParseRecord(CowTree::BytesView raw);
+
+    /// Write `value` as a chain of overflow pages; returns the chain head.
+    [[nodiscard]] std::expected<CowTree::PageId, StorageError> WriteOverflowChain(std::span<std::byte const> value);
+
+    /// Read back an overflow chain into a contiguous buffer (verifying CRCs).
+    [[nodiscard]] std::expected<std::vector<std::byte>, StorageError> ReadOverflowChain(CowTree::PageId root,
+                                                                                        std::uint64_t totalLen) const;
+
+    /// Free every page of an overflow chain (best effort; in-memory free list).
+    void FreeChain(CowTree::PageId root);
+
+    /// Read just the stored descriptor for `key` (no value materialisation), so
+    /// an overwrite/erase can reclaim a pre-existing overflow chain.
+    [[nodiscard]] std::expected<std::optional<StoredRef>, StorageError> ReadStoredRef(std::string_view key) const;
+
+    /// Value-size boundary at/below which a value is stored inline in the leaf.
+    [[nodiscard]] std::size_t InlineValueLimit() const noexcept;
 
     /// Replay the tree into the LRU mirror at Open.
     [[nodiscard]] std::expected<void, StorageError> Replay();
@@ -211,7 +311,11 @@ class CowTreeStorage final: public IStorage
     void EvictToFit();
 
     Options _options;
-    std::unique_ptr<CowTree::FilePageStore> _store;
+    /// Holds the page store when this object owns it (FilePageStore in
+    /// production, or an injected store); null when the store is borrowed.
+    std::unique_ptr<CowTree::IPageStore> _ownedStore;
+    /// The active page store — points at `_ownedStore` or a borrowed store.
+    CowTree::IPageStore* _store { nullptr };
     std::unique_ptr<CowTree::CowTree> _tree;
 
     struct LruNode

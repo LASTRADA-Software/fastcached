@@ -23,6 +23,7 @@
     #include <unistd.h>
 
     #include <netinet/in.h>
+    #include <netinet/tcp.h>
 #endif
 
 namespace FastCache
@@ -79,6 +80,43 @@ namespace
 #endif
 } // namespace
 
+namespace Detail
+{
+
+    void ApplyHotSocketOptions(NativeSocket socket) noexcept
+    {
+        // TCP_NODELAY disables Nagle's algorithm so a small reply isn't held
+        // back waiting for the peer's ACK of a previous segment. Best-effort.
+        int const one = 1;
+        // Enlarge the socket send/receive buffers. A large value reply (e.g.
+        // 64 KiB) overflows the default ~16-200 KiB send buffer, so the value
+        // drains over several sendmsg calls with an EPOLLOUT re-arm between
+        // each — extra syscalls that cap large-value throughput. A 1 MiB buffer
+        // lets a typical large reply land in a single sendmsg. The kernel
+        // clamps to its own max (net.core.wmem_max), so this is an upper hint.
+        int const socketBufferBytes = 1 << 20; // 1 MiB
+#if defined(_WIN32)
+        ::setsockopt(
+            static_cast<SOCKET>(socket), IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char const*>(&one), sizeof(one));
+        ::setsockopt(static_cast<SOCKET>(socket),
+                     SOL_SOCKET,
+                     SO_SNDBUF,
+                     reinterpret_cast<char const*>(&socketBufferBytes),
+                     sizeof(socketBufferBytes));
+        ::setsockopt(static_cast<SOCKET>(socket),
+                     SOL_SOCKET,
+                     SO_RCVBUF,
+                     reinterpret_cast<char const*>(&socketBufferBytes),
+                     sizeof(socketBufferBytes));
+#else
+        ::setsockopt(static_cast<int>(socket), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        ::setsockopt(static_cast<int>(socket), SOL_SOCKET, SO_SNDBUF, &socketBufferBytes, sizeof(socketBufferBytes));
+        ::setsockopt(static_cast<int>(socket), SOL_SOCKET, SO_RCVBUF, &socketBufferBytes, sizeof(socketBufferBytes));
+#endif
+    }
+
+} // namespace Detail
+
 std::expected<std::vector<ResolvedEndpoint>, std::string> SystemAddressResolver::Resolve(std::string_view host,
                                                                                          std::uint16_t port)
 {
@@ -129,8 +167,12 @@ IAddressResolver& DefaultAddressResolver() noexcept
 namespace Detail
 {
 
-    std::expected<BoundListener, std::string> BindAndListen(
-        IAddressResolver& resolver, std::string_view host, std::uint16_t port, int backlog, int extraTypeFlags)
+    std::expected<BoundListener, std::string> BindAndListen(IAddressResolver& resolver,
+                                                            std::string_view host,
+                                                            std::uint16_t port,
+                                                            int backlog,
+                                                            int extraTypeFlags,
+                                                            ReusePort reusePort)
     {
         EnsureNetworkInitialised();
 
@@ -153,6 +195,20 @@ namespace Detail
             // SO_REUSEADDR so restart-after-crash rebinds without TIME_WAIT delay.
             int reuse = 1;
             ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
+
+            // SO_REUSEPORT lets N reactor threads each bind a listener on the
+            // same port; the kernel then load-balances new connections across
+            // them. POSIX only; absent on Windows.
+#if defined(SO_REUSEPORT)
+            if (reusePort == ReusePort::Yes)
+            {
+                int reusePortValue = 1;
+                ::setsockopt(
+                    sock, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<char const*>(&reusePortValue), sizeof(reusePortValue));
+            }
+#else
+            static_cast<void>(reusePort);
+#endif
 
             // Force dual-stack on IPv6 sockets so a "::" wildcard accepts IPv4
             // clients too. The OS default is v6-only on Windows and Linux, which

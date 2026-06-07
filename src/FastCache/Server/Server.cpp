@@ -2,6 +2,7 @@
 #include <FastCache/Server/Connection.hpp>
 #include <FastCache/Server/Server.hpp>
 
+#include <exception>
 #include <memory>
 #include <utility>
 
@@ -15,9 +16,27 @@ namespace
     /// ensures the Connection object is freed when the coroutine ends.
     /// Admission and metrics observers are passed by raw pointer (may be
     /// null) so Connection cleanup decrements the admission gate.
-    DetachedTask RunConnectionDetached(std::unique_ptr<Connection> connection, IAdmissionControl* admission)
+    ///
+    /// The body is wrapped in a catch-all firewall: this coroutine is a
+    /// DetachedTask, whose `unhandled_exception` calls std::terminate, so an
+    /// exception escaping a handler (e.g. std::bad_alloc while serving a large
+    /// value) would take down the entire daemon and every other connection.
+    /// We instead log it and drop only this connection. The legacy threaded
+    /// driver (PooledServerLoop) already has the equivalent guard.
+    DetachedTask RunConnectionDetached(std::unique_ptr<Connection> connection, ILogger* logger, IAdmissionControl* admission)
     {
-        co_await connection->Run();
+        try
+        {
+            co_await connection->Run();
+        }
+        catch (std::exception const& e)
+        {
+            logger->Logf(LogLevel::Error, "connection dropped on exception: {}", e.what());
+        }
+        catch (...)
+        {
+            logger->Logf(LogLevel::Error, "connection dropped on unknown exception");
+        }
         if (admission)
             admission->OnConnectionEnded();
         co_return;
@@ -64,7 +83,7 @@ Task<void> Server::Run()
             _metrics->Increment(IMetricsSink::Counter::ConnectionsTotal);
 
         auto connection = std::make_unique<Connection>(std::move(*accepted), _engine, _logger);
-        RunConnectionDetached(std::move(connection), _admission);
+        RunConnectionDetached(std::move(connection), &_logger, _admission);
     }
     co_return;
 }

@@ -45,6 +45,8 @@ struct CliResult
     bool executionModelExplicit { false };
     bool workerThreadsExplicit { false };
     bool storageShardsExplicit { false };
+    bool listenBacklogExplicit { false };
+    bool logTimestampsExplicit { false };
 };
 
 /// Parse `argv[1..argc-1]` into a Config. Returns ConfigError on bad input.

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/Errors/NetError.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Net/ISocket.hpp>
 
 #include <cstddef>
+#include <expected>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -32,6 +34,30 @@ namespace Detail
     /// One-time Winsock startup / Linux SIGPIPE setup. Idempotent.
     void EnsureNetworkInitialised();
 
+    /// Apply latency-critical socket options to a freshly accepted or
+    /// connected stream socket. Currently sets TCP_NODELAY so that small
+    /// request/response writes are not delayed by Nagle's algorithm — which,
+    /// combined with delayed ACK, can add tens (Linux) to hundreds (Windows)
+    /// of milliseconds per round trip on the request hot path. Best-effort:
+    /// a failure is ignored and leaves the OS default in place.
+    /// @param socket The connected stream-socket handle to tune.
+    void ApplyHotSocketOptions(NativeSocket socket) noexcept;
+
+    /// Accept one connection from a listening socket and return its raw native
+    /// handle (with TCP_NODELAY applied, and non-blocking on POSIX). Used by
+    /// the multi-reactor server loop: a single acceptor accepts here, then
+    /// hands the raw handle to one reactor which wraps it. The handle is NOT
+    /// associated with any reactor yet.
+    /// @param listenSocket A bound, listening socket.
+    /// @return The accepted socket handle, or a NetError (Cancelled-like when
+    ///         the listening socket was closed to unblock the accept).
+    [[nodiscard]] std::expected<NativeSocket, NetError> AcceptRaw(NativeSocket listenSocket) noexcept;
+
+    /// Close a raw native socket handle — e.g. the listening socket, to unblock
+    /// a thread parked in AcceptRaw().
+    /// @param socket The handle to close.
+    void CloseNativeSocket(NativeSocket socket) noexcept;
+
 } // namespace Detail
 
 /// Blocking-IO ISocket implementation. Reads/Writes call the OS socket
@@ -49,6 +75,8 @@ class BlockingSocket final: public ISocket
 
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
+    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                            std::shared_ptr<void const> keepAlive = {}) override;
     void Close() noexcept override;
     [[nodiscard]] bool IsClosed() const noexcept override
     {
@@ -76,7 +104,7 @@ class BlockingListener final: public IListener
     ///         (Accept() will immediately yield the bind error).
     [[nodiscard]] static std::unique_ptr<BlockingListener> Bind(std::string_view bindAddress,
                                                                 std::uint16_t port,
-                                                                int backlog = 64,
+                                                                int backlog = 511,
                                                                 IAddressResolver& resolver = DefaultAddressResolver());
 
     BlockingListener(BlockingListener const&) = delete;

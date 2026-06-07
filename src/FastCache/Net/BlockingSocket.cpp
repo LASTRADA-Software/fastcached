@@ -27,6 +27,7 @@
     #include <cerrno>
     #include <csignal>
 
+    #include <fcntl.h>
     #include <unistd.h>
 
     #include <arpa/inet.h>
@@ -180,6 +181,37 @@ namespace
     }
 } // namespace
 
+namespace Detail
+{
+
+    std::expected<NativeSocket, NetError> AcceptRaw(NativeSocket listenSocket) noexcept
+    {
+#if defined(_WIN32)
+        auto const accepted = ::accept(static_cast<SOCKET>(listenSocket), nullptr, nullptr);
+        if (accepted == INVALID_SOCKET)
+            return std::unexpected(MakeSystemError("accept"));
+        ApplyHotSocketOptions(static_cast<NativeSocket>(accepted));
+        return static_cast<NativeSocket>(accepted);
+#else
+        auto const accepted = ::accept(listenSocket, nullptr, nullptr);
+        if (accepted < 0)
+            return std::unexpected(MakeSystemError("accept"));
+        ApplyHotSocketOptions(static_cast<NativeSocket>(accepted));
+        // epoll/kqueue reactors require non-blocking sockets.
+        auto const flags = ::fcntl(accepted, F_GETFL, 0);
+        if (flags >= 0)
+            std::ignore = ::fcntl(accepted, F_SETFL, flags | O_NONBLOCK);
+        return static_cast<NativeSocket>(accepted);
+#endif
+    }
+
+    void CloseNativeSocket(NativeSocket socket) noexcept
+    {
+        std::ignore = CloseNative(socket);
+    }
+
+} // namespace Detail
+
 // -- BlockingSocket --------------------------------------------------------
 
 BlockingSocket::BlockingSocket(Detail::NativeSocket native) noexcept:
@@ -239,6 +271,38 @@ IoAwaitable BlockingSocket::Write(std::span<std::byte const> buffer)
     return IoAwaitable { IoResult { written } };
 }
 
+IoAwaitable BlockingSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                          std::shared_ptr<void const> /*keepAlive*/)
+{
+    FC_ZONE_SCOPED_N("socket.writev");
+    if (_closed)
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    // A blocking socket sends everything before returning, so no keep-alive is
+    // needed: the segments outlive the call by construction. Send each segment
+    // fully, in order. (A scatter `writev`/`WSASend` is a possible refinement,
+    // but the threaded driver is the legacy path; the reactor's EpollSocket
+    // carries the zero-copy fast path.)
+    std::size_t total = 0;
+    for (auto const seg: segments)
+    {
+        std::size_t written = 0;
+        while (written < seg.size())
+        {
+            auto const n = ::send(static_cast<int>(_native),
+                                  reinterpret_cast<char const*>(seg.data()) + written,
+                                  static_cast<Detail::IoLen>(seg.size() - written),
+                                  0);
+            if (n < 0)
+                return IoAwaitable { std::unexpected(MakeSystemError("send")) };
+            written += static_cast<std::size_t>(n);
+        }
+        total += written;
+    }
+    return IoAwaitable { IoResult { total } };
+}
+
 // -- BlockingListener ------------------------------------------------------
 
 std::unique_ptr<BlockingListener> BlockingListener::Bind(std::string_view bindAddress,
@@ -291,6 +355,7 @@ AcceptAwaitable BlockingListener::Accept()
     if (acceptedRaw == static_cast<std::remove_const_t<decltype(acceptedRaw)>>(Detail::InvalidSocket))
         return AcceptAwaitable { std::unexpected(MakeSystemError("accept")) };
 
+    Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(acceptedRaw));
     return AcceptAwaitable { AcceptResult {
         std::make_unique<BlockingSocket>(static_cast<Detail::NativeSocket>(acceptedRaw)) } };
 }

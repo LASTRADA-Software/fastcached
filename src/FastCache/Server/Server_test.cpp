@@ -11,6 +11,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <new>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -41,6 +45,113 @@ FastCache::Task<bool> Send(FastCache::ISocket* socket, std::string_view payload)
     co_return r.has_value();
 }
 
+/// IStorage decorator whose Get throws. Used to prove the connection driver's
+/// exception firewall drops a single connection rather than letting the throw
+/// reach DetachedTask::unhandled_exception (std::terminate) and abort the whole
+/// server. Every other method forwards to a real in-memory storage.
+class ThrowOnGetStorage final: public FastCache::IStorage
+{
+  public:
+    std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view /*key*/,
+                                                                     FastCache::TimePoint /*now*/) override
+    {
+        throw std::bad_alloc {};
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Set(std::string_view key,
+                                                                    std::vector<std::byte> value,
+                                                                    std::uint32_t flags,
+                                                                    FastCache::TimePoint expiry) override
+    {
+        return _inner.Set(key, std::move(value), flags, expiry);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Add(std::string_view key,
+                                                                    std::vector<std::byte> value,
+                                                                    std::uint32_t flags,
+                                                                    FastCache::TimePoint expiry,
+                                                                    FastCache::TimePoint now) override
+    {
+        return _inner.Add(key, std::move(value), flags, expiry, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Replace(std::string_view key,
+                                                                        std::vector<std::byte> value,
+                                                                        std::uint32_t flags,
+                                                                        FastCache::TimePoint expiry,
+                                                                        FastCache::TimePoint now) override
+    {
+        return _inner.Replace(key, std::move(value), flags, expiry, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Append(std::string_view key,
+                                                                       std::span<std::byte const> suffix,
+                                                                       FastCache::CasToken expected,
+                                                                       FastCache::TimePoint now) override
+    {
+        return _inner.Append(key, suffix, expected, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view key,
+                                                                        std::span<std::byte const> prefix,
+                                                                        FastCache::CasToken expected,
+                                                                        FastCache::TimePoint now) override
+    {
+        return _inner.Prepend(key, prefix, expected, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> CompareAndSwap(std::string_view key,
+                                                                               FastCache::CasToken expected,
+                                                                               std::vector<std::byte> value,
+                                                                               std::uint32_t flags,
+                                                                               FastCache::TimePoint expiry,
+                                                                               FastCache::TimePoint now) override
+    {
+        return _inner.CompareAndSwap(key, expected, std::move(value), flags, expiry, now);
+    }
+    std::expected<IncrResult, FastCache::StorageError> IncrementOrInitialize(std::string_view key,
+                                                                             std::uint64_t magnitude,
+                                                                             bool decrement,
+                                                                             FastCache::TimePoint now) override
+    {
+        return _inner.IncrementOrInitialize(key, magnitude, decrement, now);
+    }
+    std::expected<void, FastCache::StorageError> Delete(std::string_view key, FastCache::TimePoint now) override
+    {
+        return _inner.Delete(key, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Touch(std::string_view key,
+                                                                      FastCache::TimePoint newExpiry,
+                                                                      FastCache::TimePoint now) override
+    {
+        return _inner.Touch(key, newExpiry, now);
+    }
+    std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view key,
+                                                                      FastCache::TimePoint now) override
+    {
+        return _inner.Peek(key, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(std::string_view key,
+                                                                          std::optional<FastCache::TimePoint> newExpiry,
+                                                                          FastCache::TimePoint now) override
+    {
+        return _inner.MarkStale(key, newExpiry, now);
+    }
+    void FlushWithGeneration(FastCache::TimePoint effectiveAt) override
+    {
+        _inner.FlushWithGeneration(effectiveAt);
+    }
+    std::size_t PurgeExpired(FastCache::TimePoint now) override
+    {
+        return _inner.PurgeExpired(now);
+    }
+    void Resize(std::size_t newMaxBytes) override
+    {
+        _inner.Resize(newMaxBytes);
+    }
+    [[nodiscard]] FastCache::StorageStats Snapshot() const noexcept override
+    {
+        return _inner.Snapshot();
+    }
+
+  private:
+    FastCache::InMemoryLruStorage _inner;
+};
+
 } // namespace
 
 TEST_CASE("Server accepts and serves a memcached-text client end-to-end", "[server]")
@@ -65,6 +176,28 @@ TEST_CASE("Server accepts and serves a memcached-text client end-to-end", "[serv
 
     auto const response = FastCache::SyncRun(ReadResponse(client.get()));
     REQUIRE(response == "STORED\r\nVALUE foo 0 5\r\nhello\r\nEND\r\n");
+    REQUIRE(server.AcceptedCount() == 1);
+}
+
+TEST_CASE("Server drops a connection whose handler throws instead of terminating", "[server][regression]")
+{
+    FastCache::ManualClock clock;
+    ThrowOnGetStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::NullLogger logger;
+    FastCache::InMemoryListener listener;
+    FastCache::Server server { listener, engine, logger };
+
+    auto client = listener.ConnectClient();
+    REQUIRE(FastCache::SyncRun(Send(client.get(), "get foo\r\n")));
+    client->ShutdownWrite();
+    listener.Close();
+
+    // The Get throws std::bad_alloc. Without the firewall in RunConnectionDetached
+    // the throw would reach DetachedTask::unhandled_exception -> std::terminate and
+    // abort this test process. With it, the one connection is dropped and Run()
+    // returns normally — the server survives a handler exception.
+    FastCache::SyncRun(server.Run());
     REQUIRE(server.AcceptedCount() == 1);
 }
 

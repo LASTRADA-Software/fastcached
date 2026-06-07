@@ -149,7 +149,7 @@ WriteTxn::~WriteTxn()
     Abort();
 }
 
-auto WriteTxn::Put(BytesView key, BytesView value) -> std::expected<void, CowTreeError>
+auto WriteTxn::Put(BytesView key, BytesView value) -> std::expected<std::optional<std::vector<std::byte>>, CowTreeError>
 {
     if (_tree == nullptr)
         return std::unexpected(CowTreeError::NotOpen);
@@ -173,7 +173,9 @@ auto WriteTxn::Put(BytesView key, BytesView value) -> std::expected<void, CowTre
     }
     if (result->inserted)
         ++_itemDelta;
-    return {};
+    // The displaced value (nullopt on a fresh insert) lets the caller reclaim
+    // any out-of-line backing the old record named, no extra read required.
+    return std::move(result->replaced);
 }
 
 auto WriteTxn::Erase(BytesView key) -> std::expected<bool, CowTreeError>
@@ -464,11 +466,16 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
         entries.reserve(existing->size() + 1);
         bool replaced = false;
         bool inserted = false;
+        std::optional<std::vector<std::byte>> replacedValue;
         for (auto const& e: *existing)
         {
             auto const cmp = CompareBytes(e.key, key);
             if (!replaced && !inserted && cmp == 0)
             {
+                // Capture the old value before it is overwritten so the caller
+                // can reclaim any out-of-line backing it referenced — saves a
+                // separate read transaction on every replace.
+                replacedValue = CopyBytes(e.value);
                 entries.emplace_back(CopyBytes(key), CopyBytes(value));
                 replaced = true;
             }
@@ -496,6 +503,7 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
         if (!leaf.has_value())
             return std::unexpected(leaf.error());
         leaf->inserted = inserted;
+        leaf->replaced = std::move(replacedValue);
         return leaf;
     }
 
@@ -562,6 +570,7 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
     if (!built.has_value())
         return std::unexpected(built.error());
     built->inserted = sub->inserted;
+    built->replaced = std::move(sub->replaced);
     return built;
 }
 
@@ -711,11 +720,25 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key) -> std::expect
 
 auto CowTree::CommitTxn(WriteTxn& txn) -> std::expected<TxnId, CowTreeError>
 {
-    // 1. Sync data pages.
-    if (auto const r = _store.SyncData(); !r.has_value())
-        return std::unexpected(r.error());
+    // 1. Flush new data pages so they are durable *before* the meta slot
+    //    that references them. This ordering barrier is load-bearing for
+    //    crash safety: data pages carry no read-time checksum, and the
+    //    alternating-slot meta only guards against a torn meta — not a torn
+    //    data page — so a durable new meta pointing at not-yet-durable data
+    //    would silently corrupt. When the transaction allocated no new pages
+    //    (a delete or a no-op-structural change), there is nothing to order
+    //    ahead of the meta, so we skip this fsync entirely. In Batched mode
+    //    SyncData is a deliberate no-op here; FilePageStore performs the
+    //    equivalent data-before-meta fsync at its group-commit boundary.
+    if (!txn._newPages.empty())
+    {
+        if (auto const r = _store.SyncData(); !r.has_value())
+            return std::unexpected(r.error());
+    }
 
-    // 2. Write the new meta page (alternating slot).
+    // 2. Write the new meta page. The slot here is the alternating choice for
+    //    Fsync/None; in Batched mode FilePageStore overrides it to the
+    //    non-durable slot when it actually flushes (see FilePageStore::WriteMeta).
     Meta next;
     next.pageSize = static_cast<std::uint32_t>(_store.PageSize());
     next.txnId = txn._newTxnId;

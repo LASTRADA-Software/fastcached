@@ -95,6 +95,18 @@ namespace
         return ParsePositiveInt(sv, "storage-shards");
     }
 
+    [[nodiscard]] std::expected<int, ConfigError> ParseListenBacklog(std::string_view sv)
+    {
+        // The kernel clamps to its own SOMAXCONN ceiling, so we only guard
+        // against absurd or non-positive input; 1..65535 is plenty of headroom.
+        return ParsePositiveInt(sv, "listen-backlog").and_then([](std::size_t value) -> std::expected<int, ConfigError> {
+            if (value == 0 || value > 65535)
+                return std::unexpected(MakeError(
+                    ConfigErrorCode::OutOfRange, "listen-backlog", std::format("out of range (1..65535): {}", value)));
+            return static_cast<int>(value);
+        });
+    }
+
     [[nodiscard]] std::expected<ExecutionModel, ConfigError> ParseExecutionModel(std::string_view sv)
     {
         if (sv == "auto")
@@ -118,6 +130,26 @@ namespace
             return StorageDurability::None;
         return std::unexpected(
             MakeError(ConfigErrorCode::OutOfRange, "storage-durability", std::format("unknown durability mode: {}", sv)));
+    }
+
+    [[nodiscard]] std::expected<LruRecency, ConfigError> ParseLruRecency(std::string_view sv)
+    {
+        if (sv == "approximate")
+            return LruRecency::Approximate;
+        if (sv == "strict")
+            return LruRecency::Strict;
+        return std::unexpected(MakeError(
+            ConfigErrorCode::OutOfRange, "lru-mode", std::format("unknown mode (expect approximate|strict): {}", sv)));
+    }
+
+    [[nodiscard]] std::expected<CpuAffinity, ConfigError> ParseCpuAffinity(std::string_view sv)
+    {
+        if (sv == "none")
+            return CpuAffinity::None;
+        if (sv == "per-core")
+            return CpuAffinity::PerCore;
+        return std::unexpected(MakeError(
+            ConfigErrorCode::OutOfRange, "cpu-affinity", std::format("unknown mode (expect none|per-core): {}", sv)));
     }
 
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv)
@@ -218,6 +250,12 @@ namespace
         if (arg == "--daemon")
         {
             cfg.daemon = true;
+            return ArgOutcome::Continue;
+        }
+        if (arg == "--log-timestamps")
+        {
+            cfg.logTimestamps = true;
+            result.logTimestampsExplicit = true;
             return ArgOutcome::Continue;
         }
         // Service-control requests record the desired outcome but keep parsing:
@@ -329,6 +367,20 @@ namespace
             }
         }
         {
+            auto const matched = ApplyParsedFlag(args, i, "--lru-mode", ParseLruRecency, cfg.lruRecency);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--cpu-affinity", ParseCpuAffinity, cfg.cpuAffinity);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
+        {
             auto const matched = ApplyParsedFlag(args, i, "--threads", ParseThreads, cfg.workerThreads);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
@@ -345,6 +397,16 @@ namespace
             if (*matched)
             {
                 result.storageShardsExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--listen-backlog", ParseListenBacklog, cfg.listenBacklog);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.listenBacklogExplicit = true;
                 return ArgOutcome::Continue;
             }
         }
@@ -389,14 +451,27 @@ namespace
         { .flag = "--max-memory=<size>",
           .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)" },
         { .flag = "--log-level=<level>", .description = "trace|debug|info|warn|error|fatal (default info)" },
+        { .flag = "--log-timestamps", .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)" },
         { .flag = "--storage=<path>", .description = "persist cache to a CoW-tree file (default: in-memory only)" },
         { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },
         { .flag = "--storage-max-value=<size>",
           .description = "per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)" },
         { .flag = "--execution-model=<mode>",
           .description = "auto|threaded|reactor (default auto)\n"
-                         "auto: reactor for in-memory, threaded for --storage on disk" },
-        { .flag = "--threads=<N>", .description = "worker thread count for threaded mode (default: hardware_concurrency)" },
+                         "auto: the reactor for both in-memory and --storage on disk;\n"
+                         "threaded selects the legacy per-connection worker pool" },
+        { .flag = "--lru-mode=<mode>",
+          .description = "approximate|strict in-memory LRU recency (default approximate)\n"
+                         "approximate: same-shard reads run concurrently (faster);\n"
+                         "strict: exact LRU order, reads serialise per shard" },
+        { .flag = "--cpu-affinity=<mode>",
+          .description = "none|per-core reactor thread pinning (default per-core)\n"
+                         "per-core: pin each reactor to its own core (multi-reactor only)" },
+        { .flag = "--threads=<N>",
+          .description = "server parallelism: the number of pinned reactors (default reactor model)\n"
+                         "or the worker-pool size (--execution-model=threaded); default hardware_concurrency" },
+        { .flag = "--listen-backlog=<N>",
+          .description = "::listen() backlog depth (default 511; clamped to the kernel's SOMAXCONN)" },
         { .flag = "--storage-shards=<N>",
           .description = "shard storage into N partitions for write parallelism\n"
                          "default: 1 (single-file mode) when --storage names a regular file,\n"

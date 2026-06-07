@@ -65,6 +65,40 @@ void RequireBaseline(CowTree::CowTree& tree)
 
 } // namespace
 
+TEST_CASE("Commit fsyncs data only when the transaction wrote new pages", "[commit][fsync]")
+{
+    CowTree::InMemoryPageStore store;
+
+    CowTree::CowTree tree { store };
+    REQUIRE(tree.Open().has_value());
+
+    // A real write allocates pages, so the commit must fsync the data ahead
+    // of the meta slot that references it — durability is preserved.
+    {
+        auto const before = store.SyncDataCount();
+        auto txn = tree.BeginWrite();
+        REQUIRE(txn.Put(B("k"), B("v")).has_value());
+        REQUIRE(txn.Commit().has_value());
+        REQUIRE(store.SyncDataCount() == before + 1);
+    }
+
+    // A transaction that allocates no new pages has nothing to order ahead of
+    // the meta, so the data fsync is elided rather than paid for nothing.
+    {
+        auto const before = store.SyncDataCount();
+        auto txn = tree.BeginWrite();
+        REQUIRE(txn.Commit().has_value());
+        REQUIRE(store.SyncDataCount() == before);
+    }
+
+    // The earlier write is still durable and readable after the empty commit.
+    auto reader = tree.BeginRead();
+    auto v = reader.Get(B("k"));
+    REQUIRE(v.has_value());
+    REQUIRE(v->has_value());
+    REQUIRE(Decode((*v).value_or(std::vector<std::byte> {})) == "v");
+}
+
 TEST_CASE("Failure during data Write leaves the previous txn intact", "[crash]")
 {
     CowTree::InMemoryPageStore store;

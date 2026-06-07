@@ -9,12 +9,14 @@
 #include <FastCache/Protocol/RedisResp.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -61,12 +63,23 @@ namespace
         co_return r.has_value();
     }
 
-    Task<bool> WriteAll(ISocket* socket, std::span<std::byte const> payload)
+    /// Gather-write ordered segments as one reply, pinning the payload owner
+    /// across a possibly-suspending write and verifying the full byte count.
+    /// @param socket    Destination socket.
+    /// @param segments  Ordered, non-owning views to gather.
+    /// @param keepAlive Optional owner pinning the segments' backing storage.
+    /// @return True if every byte was written.
+    Task<bool> WriteAllVectored(ISocket* socket,
+                                std::span<std::span<std::byte const> const> segments,
+                                std::shared_ptr<void const> keepAlive = {})
     {
-        if (payload.empty())
+        std::size_t expected = 0;
+        for (auto const seg: segments)
+            expected += seg.size();
+        if (expected == 0)
             co_return true;
-        auto const r = co_await socket->Write(payload);
-        co_return r.has_value();
+        auto const r = co_await socket->WriteVectored(segments, std::move(keepAlive));
+        co_return r.has_value() && *r == expected;
     }
 
     Task<bool> ReplyOk(ISocket* socket)
@@ -92,14 +105,21 @@ namespace
         co_return co_await WriteAll(socket, std::format("-ERR {}\r\n", detail));
     }
 
-    Task<bool> ReplyBulkString(ISocket* socket, std::span<std::byte const> bytes)
+    Task<bool> ReplyBulkString(ISocket* socket, std::span<std::byte const> bytes, std::shared_ptr<void const> keepAlive = {})
     {
+        // Gather `$<len>\r\n` + bytes + `\r\n` into one scattered write: the
+        // value segment points directly at the cached payload (no copy), and
+        // `keepAlive` keeps that payload alive across a write that may suspend.
+        // `header` lives in this coroutine frame (suspended, not destroyed,
+        // across the co_await), so its address is stable. The hot path (GET) is
+        // syscall-bound, so one sendmsg per reply beats three send()s.
         auto const header = std::format("${}\r\n", bytes.size());
-        if (!co_await WriteAll(socket, header))
-            co_return false;
-        if (!co_await WriteAll(socket, bytes))
-            co_return false;
-        co_return co_await WriteAll(socket, Crlf);
+        std::array<std::span<std::byte const>, 3> const segments {
+            AsBytes(header),
+            bytes,
+            AsBytes(Crlf),
+        };
+        co_return co_await WriteAllVectored(socket, segments, std::move(keepAlive));
     }
 
     Task<bool> ReplyBulkString(ISocket* socket, std::string_view text)
@@ -230,8 +250,7 @@ namespace
         auto const result = engine->Get(args[0]);
         if (!result.has_value() || !result->found)
             co_return co_await ReplyNil(socket);
-        co_return co_await ReplyBulkString(
-            socket, std::span<std::byte const> { result->entry.value.data(), result->entry.value.size() });
+        co_return co_await ReplyBulkString(socket, result->entry.ValueBytes(), result->entry.value.AsKeepAlive());
     }
 
     Task<bool> HandleSet(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
@@ -379,6 +398,51 @@ namespace
         co_return co_await ReplyOk(socket);
     }
 
+    Task<bool> HandleSelect(ISocket* socket, std::span<std::string const> args)
+    {
+        // fastcached exposes a single logical keyspace. The redis client
+        // crate issues `SELECT <index>` whenever the connection URL names a
+        // database; accept any index rather than erroring (which aborts the
+        // client's connection setup and surfaces as a startup timeout).
+        static_cast<void>(args);
+        co_return co_await ReplyOk(socket);
+    }
+
+    Task<bool> HandleClient(ISocket* socket, std::span<std::string const> args)
+    {
+        // Client libraries send CLIENT SETNAME / SETINFO / ID / GETNAME during
+        // connection setup. We hold no per-client state, so acknowledge each
+        // benignly instead of returning an error that would abort the
+        // library's handshake.
+        auto const sub = args.empty() ? std::string {} : Upper(args[0]);
+        if (sub == "GETNAME")
+            co_return co_await ReplyBulkString(socket, std::string_view {});
+        if (sub == "ID")
+            co_return co_await ReplyInteger(socket, 1);
+        co_return co_await ReplyOk(socket);
+    }
+
+    Task<bool> HandleConfig(ISocket* socket, std::span<std::string const> args)
+    {
+        // CONFIG GET <param>... — redis clients probe parameters such as
+        // `maxmemory` / `save` on connect. We expose no runtime tunables, so
+        // every requested parameter reports "0"; replying with the requested
+        // name/value pairs keeps the client crate's map parsing satisfied.
+        // CONFIG SET / RESETSTAT / REWRITE are accepted as no-ops.
+        auto const sub = args.empty() ? std::string {} : Upper(args[0]);
+        if (sub == "GET" && args.size() > 1)
+        {
+            auto const params = std::span<std::string const> { args.data() + 1, args.size() - 1 };
+            std::string body = std::format("*{}\r\n", params.size() * 2);
+            for (auto const& name: params)
+                body += std::format("${}\r\n{}\r\n$1\r\n0\r\n", name.size(), name);
+            co_return co_await WriteAll(socket, body);
+        }
+        if (sub == "GET")
+            co_return co_await WriteAll(socket, "*0\r\n");
+        co_return co_await ReplyOk(socket);
+    }
+
     Task<bool> Dispatch(ISocket* socket, CacheEngine* engine, ParsedCommand cmd)
     {
         if (cmd.args.empty())
@@ -411,6 +475,12 @@ namespace
             co_return co_await HandleCommand(socket, tail);
         if (name == "FLUSHDB" || name == "FLUSHALL")
             co_return co_await HandleFlush(socket, engine);
+        if (name == "SELECT")
+            co_return co_await HandleSelect(socket, tail);
+        if (name == "CLIENT")
+            co_return co_await HandleClient(socket, tail);
+        if (name == "CONFIG")
+            co_return co_await HandleConfig(socket, tail);
         if (name == "QUIT")
         {
             (void) co_await ReplyOk(socket);
