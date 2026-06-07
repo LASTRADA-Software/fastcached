@@ -27,6 +27,13 @@ set(CMAKE_COLOR_DIAGNOSTICS ON)
 option(FASTCACHED_BUILD_TESTS "Build unit tests" ON)
 option(USE_SCCACHE "Use sccache as the compiler launcher when the binary is on PATH" ON)
 
+# TLS is opt-in and off by default so the standard build stays dependency-free
+# (mirroring TRACY_ENABLE). When on, the build links OpenSSL and our code keys
+# off the FC_TLS_ENABLED compile definition; when off, no OpenSSL header is
+# included and the TLS sources are not compiled. On Windows the OpenSSL package
+# is pulled in via the vcpkg manifest's "tls" feature (see vcpkg.json).
+option(FASTCACHED_ENABLE_TLS "Enable TLS support (requires OpenSSL)" OFF)
+
 # Tracy profiler. TRACY_ENABLE is Tracy's own gate; reusing the name means the
 # fetched client library actually emits instrumentation rather than its no-op
 # stub. Our code keys off the separate FC_TRACY_ENABLED compile definition
@@ -114,6 +121,14 @@ if(TRACY_ENABLE)
             "TRACY_ON_DEMAND ${TRACY_ON_DEMAND}"
             "TRACY_STATIC ON"
     )
+endif()
+
+# OpenSSL for the optional TLS support. Located before the pedantic/clang-tidy
+# includes so its imported targets carry no -Werror expectations of ours. The
+# REQUIRED here means a misconfigured TLS build fails fast at configure time
+# rather than at link time.
+if(FASTCACHED_ENABLE_TLS)
+    find_package(OpenSSL REQUIRED)
 endif()
 
 # ----------------------------------------------------------------------------

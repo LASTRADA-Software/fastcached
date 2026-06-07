@@ -52,8 +52,12 @@ place.
 - No live event subscription (`watch`). Observability is via the `stats`
   snapshot and, when `--metrics` is set, a Prometheus `/metrics` endpoint
   (plus a `/healthz` liveness probe) served on a dedicated HTTP port.
-- No built-in TLS termination. Run behind a TLS-terminating proxy
-  if encryption-in-transit is required.
+- TLS termination is opt-in and only present in builds compiled with
+  `-DFASTCACHED_ENABLE_TLS=ON` (links OpenSSL). Enable at runtime with
+  `--tls --tls-cert <pem> --tls-key <pem>`. The default build links no
+  OpenSSL and `--tls` then exits with a clear error; run behind a
+  TLS-terminating proxy in that case. Client-certificate (mutual TLS)
+  authentication is not yet implemented.
 
 See also [Compatibility with upstream](../protocols/compatibility-with-upstream.md)
 for a per-protocol completeness scorecard.

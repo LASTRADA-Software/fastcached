@@ -251,6 +251,12 @@ namespace
             result.metricsEnabledExplicit = true;
             return ArgOutcome::Continue;
         }
+        if (arg == "--tls")
+        {
+            cfg.tlsEnabled = true;
+            result.tlsEnabledExplicit = true;
+            return ArgOutcome::Continue;
+        }
         // Service-control requests record the desired outcome but keep parsing:
         // the remaining flags (--service-name, --port, --storage, ...) are
         // captured into the config that gets baked into the service command line.
@@ -276,6 +282,8 @@ namespace
                  { "--requirepass", &cfg.requirePass, &result.requirePassExplicit },
                  { "--auth-username", &cfg.authUsername, &result.authUsernameExplicit },
                  { "--metrics-bind", &cfg.metricsBindAddress, &result.metricsBindAddressExplicit },
+                 { "--tls-cert", &cfg.tlsCertPath, &result.tlsCertPathExplicit },
+                 { "--tls-key", &cfg.tlsKeyPath, &result.tlsKeyPathExplicit },
              })
         {
             auto const matched = ApplyStringFlag(args, i, name, *target);
@@ -456,6 +464,11 @@ namespace
           .description = "serve Prometheus /metrics and /healthz on a dedicated HTTP port (default off)" },
         { .flag = "--metrics-bind=<addr>", .description = "bind address for the metrics endpoint (default 127.0.0.1)" },
         { .flag = "--metrics-port=<num>", .description = "TCP port for the metrics endpoint (default 9259)" },
+        { .flag = "--tls",
+          .description = "terminate TLS on the cache port (default off; needs a build with OpenSSL\n"
+                         "and both --tls-cert and --tls-key)" },
+        { .flag = "--tls-cert=<path>", .description = "PEM certificate (chain) file for --tls" },
+        { .flag = "--tls-key=<path>", .description = "PEM private key file for --tls" },
         { .flag = "--log-timestamps", .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)" },
         { .flag = "--storage=<path>", .description = "persist cache to a CoW-tree file (default: in-memory only)" },
         { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },

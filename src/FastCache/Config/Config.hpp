@@ -128,6 +128,17 @@ struct Config
     /// `/healthz` liveness probe). Off by default.
     bool metricsEnabled { false };
 
+    /// Whether to terminate TLS on the cache port. Off by default. Requires a
+    /// build with `FASTCACHED_ENABLE_TLS=ON` and both `tlsCertPath`/`tlsKeyPath`
+    /// set; the daemon fails fast at startup otherwise.
+    bool tlsEnabled { false };
+
+    /// PEM certificate (chain) file for TLS. Only used when `tlsEnabled`.
+    std::string tlsCertPath {};
+
+    /// PEM private key file for TLS. Only used when `tlsEnabled`.
+    std::string tlsKeyPath {};
+
     /// ::listen() backlog — the depth of the kernel's queue of accepted-
     /// but-not-yet-handed-off connections. Bursts of parallel clients (a
     /// `make -jN` driving sccache opens many sockets at once) overflow a

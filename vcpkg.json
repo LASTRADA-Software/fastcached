@@ -1,0 +1,16 @@
+{
+  "name": "fastcached",
+  "version-string": "0.0.0",
+  "description": "Fast cache daemon (memcached + Redis RESP wire protocols).",
+  "homepage": "https://github.com/LASTRADA-Software/fastcached",
+  "dependencies": [],
+  "features": {
+    "tls": {
+      "description": "TLS support via OpenSSL (FASTCACHED_ENABLE_TLS).",
+      "dependencies": [
+        "openssl"
+      ]
+    }
+  },
+  "builtin-baseline": "10ceb139a610ebf3c6aa49cdc4a4b7f3db5d3f2b"
+}

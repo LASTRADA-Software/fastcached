@@ -51,6 +51,9 @@ struct CliResult
     bool metricsEnabledExplicit { false };
     bool metricsBindAddressExplicit { false };
     bool metricsPortExplicit { false };
+    bool tlsEnabledExplicit { false };
+    bool tlsCertPathExplicit { false };
+    bool tlsKeyPathExplicit { false };
 };
 
 /// Parse `argv[1..argc-1]` into a Config. Returns ConfigError on bad input.

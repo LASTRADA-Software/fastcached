@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Net/TlsWrap.hpp>
 #include <FastCache/Server/Connection.hpp>
 #include <FastCache/Server/Server.hpp>
 
@@ -43,13 +44,15 @@ Server::Server(IListener& listener,
                ILogger& logger,
                IAdmissionControl* admission,
                IMetricsSink* metrics,
-               SessionContext session) noexcept:
+               SessionContext session,
+               TlsContext* tls) noexcept:
     _listener { listener },
     _engine { engine },
     _logger { logger },
     _admission { admission },
     _metrics { metrics },
-    _session { session }
+    _session { session },
+    _tls { tls }
 {
 }
 
@@ -81,7 +84,7 @@ Task<void> Server::Run()
         if (_metrics)
             _metrics->Increment(IMetricsSink::Counter::ConnectionsTotal);
 
-        auto connection = std::make_unique<Connection>(std::move(*accepted), _engine, _logger, _session);
+        auto connection = std::make_unique<Connection>(WrapTls(std::move(*accepted), _tls), _engine, _logger, _session);
         RunConnectionDetached(std::move(connection), &_logger, _admission);
     }
     co_return;

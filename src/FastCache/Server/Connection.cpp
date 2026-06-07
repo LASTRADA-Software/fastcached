@@ -24,6 +24,16 @@ Connection::Connection(std::unique_ptr<ISocket> socket,
 
 Task<void> Connection::Run()
 {
+    // Drive any transport handshake (TLS) before reading application bytes.
+    // No-op for plaintext sockets; runs on this per-connection coroutine so a
+    // slow or stalled handshake never blocks the accept loop.
+    if (auto const handshake = co_await _socket->HandshakeIfNeeded(); !handshake.has_value())
+    {
+        _logger.Logf(LogLevel::Debug, "Connection: handshake failed: {}", handshake.error().ToString());
+        _socket->Close();
+        co_return;
+    }
+
     auto detect = co_await DetectProtocol(_socket.get());
     if (!detect.has_value())
     {

@@ -32,6 +32,8 @@
     #include <FastCache/Net/KqueueSocket.hpp>
 #endif
 
+#include <FastCache/Net/TlsWrap.hpp>
+
 namespace FastCache
 {
 
@@ -94,7 +96,7 @@ namespace
         }
         logger.Log(LogLevel::Info, "ready, accepting connections");
 
-        Server server { *listener, engine, logger, admission, metrics, options.session };
+        Server server { *listener, engine, logger, admission, metrics, options.session, options.tlsContext };
         auto runAccept = [](Server* s) -> DetachedTask {
             co_await s->Run();
             co_return;
@@ -125,7 +127,8 @@ namespace
                                         CacheEngine& engine,
                                         ILogger& logger,
                                         IAdmissionControl* admission,
-                                        SessionContext session)
+                                        SessionContext session,
+                                        [[maybe_unused]] TlsContext* tls)
     {
         co_await ResumeOn { reactor };
         // Firewall: this is a DetachedTask (unhandled_exception -> std::terminate),
@@ -143,7 +146,7 @@ namespace
             }
             else
             {
-                Connection connection { std::move(socket), engine, logger, session };
+                Connection connection { WrapTls(std::move(socket), tls), engine, logger, session };
                 co_await connection.Run();
             }
         }
@@ -209,7 +212,7 @@ namespace
                     metrics->Increment(IMetricsSink::Counter::ConnectionsTotal);
                 auto& reactor = *reactors[next % reactorCount];
                 ++next;
-                RunHandedOffConnection(reactor, *raw, engine, logger, admission, options.session);
+                RunHandedOffConnection(reactor, *raw, engine, logger, admission, options.session, options.tlsContext);
             }
         } };
 
@@ -275,7 +278,8 @@ namespace
                 return EXIT_FAILURE;
             }
             listeners.push_back(std::move(listener));
-            servers.push_back(std::make_unique<Server>(*listeners[i], engine, logger, admission, metrics, options.session));
+            servers.push_back(std::make_unique<Server>(
+                *listeners[i], engine, logger, admission, metrics, options.session, options.tlsContext));
         }
         logger.Logf(LogLevel::Info, "ready, accepting connections ({} reactors)", reactorCount);
 

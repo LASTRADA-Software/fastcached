@@ -184,6 +184,24 @@ namespace
             cfg.metricsPort = static_cast<std::uint16_t>(raw);
             return {};
         }
+        /// `tls`: terminate TLS on the cache port (needs an OpenSSL build).
+        if (key == "tls")
+        {
+            cfg.tlsEnabled = valueNode.as<bool>();
+            return {};
+        }
+        /// `tls_cert`: PEM certificate (chain) file for TLS.
+        if (key == "tls_cert")
+        {
+            cfg.tlsCertPath = valueNode.as<std::string>();
+            return {};
+        }
+        /// `tls_key`: PEM private key file for TLS.
+        if (key == "tls_key")
+        {
+            cfg.tlsKeyPath = valueNode.as<std::string>();
+            return {};
+        }
         /// `storage_durability`: fsync|batched|none.
         if (key == "storage_durability")
         {

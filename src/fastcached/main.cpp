@@ -32,6 +32,9 @@
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
+#if defined(FC_TLS_ENABLED)
+    #include <FastCache/Net/TlsContext.hpp>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -123,6 +126,12 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         fileCfg.metricsBindAddress = cliCfg.metricsBindAddress;
     if (cli.metricsPortExplicit)
         fileCfg.metricsPort = cliCfg.metricsPort;
+    if (cli.tlsEnabledExplicit)
+        fileCfg.tlsEnabled = cliCfg.tlsEnabled;
+    if (cli.tlsCertPathExplicit)
+        fileCfg.tlsCertPath = cliCfg.tlsCertPath;
+    if (cli.tlsKeyPathExplicit)
+        fileCfg.tlsKeyPath = cliCfg.tlsKeyPath;
     return fileCfg;
 }
 
@@ -387,10 +396,38 @@ int DaemonBody(FastCache::Config const& effective)
     if (!effective.requirePass.empty())
         authPolicy.emplace(effective.authUsername, effective.requirePass);
 
+    // TLS context: built once and shared read-only across connections. Fails
+    // fast on a missing build feature or unreadable cert/key.
+#if defined(FC_TLS_ENABLED)
+    std::unique_ptr<FastCache::TlsContext> tlsContext;
+#endif
+    if (effective.tlsEnabled)
+    {
+#if defined(FC_TLS_ENABLED)
+        if (effective.tlsCertPath.empty() || effective.tlsKeyPath.empty())
+        {
+            logger.Log(FastCache::LogLevel::Fatal, "fastcached: --tls requires both --tls-cert and --tls-key");
+            return EXIT_FAILURE;
+        }
+        auto created = FastCache::TlsContext::Create(effective.tlsCertPath, effective.tlsKeyPath);
+        if (!created.has_value())
+        {
+            logger.Logf(FastCache::LogLevel::Fatal, "fastcached: TLS init failed: {}", created.error().ToString());
+            return EXIT_FAILURE;
+        }
+        tlsContext = std::move(*created);
+#else
+        logger.Log(FastCache::LogLevel::Fatal,
+                   "fastcached: --tls requested but this build has no TLS support "
+                   "(rebuild with -DFASTCACHED_ENABLE_TLS=ON)");
+        return EXIT_FAILURE;
+#endif
+    }
+
     auto const shardingMode = useShardingWrapper ? std::string_view { "" } : std::string_view { " (unwrapped)" };
     logger.Logf(FastCache::LogLevel::Info,
                 "fastcached {} starting; bind={}:{} max-memory={} config={} storage={} "
-                "durability={} max-value={} reactors={} shards={}{} auth={}",
+                "durability={} max-value={} reactors={} shards={}{} auth={} tls={}",
                 ProgramVersion,
                 effective.bindAddress,
                 effective.port,
@@ -403,7 +440,8 @@ int DaemonBody(FastCache::Config const& effective)
                 reactorCount,
                 physicalShards,
                 shardingMode,
-                authPolicy ? std::string_view { "on" } : std::string_view { "off" });
+                authPolicy ? std::string_view { "on" } : std::string_view { "off" },
+                effective.tlsEnabled ? std::string_view { "on" } : std::string_view { "off" });
 
     InstallStopHandlers();
     // The "ready, accepting connections" line is emitted by the server loop
@@ -439,6 +477,9 @@ int DaemonBody(FastCache::Config const& effective)
     // a lone reactor gains nothing from pinning.
     serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
     serverOpts.session.auth = authPolicy ? &*authPolicy : nullptr;
+#if defined(FC_TLS_ENABLED)
+    serverOpts.tlsContext = tlsContext.get(); // null unless --tls is active
+#endif
 
     // Optional admin HTTP endpoint (/metrics, /healthz) on its own port and
     // thread. A blocking listener is plenty for scrape-rate traffic; SetTimeouts
