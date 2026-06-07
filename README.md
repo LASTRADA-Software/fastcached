@@ -16,11 +16,10 @@ cares about it benchmarks faster than native redis and memcached (see
 
 ## Status
 
-All layers are wired and the daemon runs. By default it serves connections on
-a **reactor** (IOCP / epoll / kqueue) — one event loop multiplexes every
+All layers are wired and the daemon runs. It serves connections on a
+**reactor** (IOCP / epoll / kqueue) — one event loop multiplexes every
 connection, optionally fanned out across several pinned reactor threads — so
 the number of concurrent clients is bounded by memory, not by a worker count.
-A legacy thread-pool driver remains reachable via `--execution-model=threaded`.
 On top of that the codebase covers an LRU in-memory storage, an optional
 copy-on-write persistent backend (the sibling
 [`CowTree`](src/CowTree/README.md) library) layered behind the LRU as an L2,
@@ -138,17 +137,14 @@ usage: fastcached [options]
   --storage=<path>       persist cache to a CoW-tree file (default: in-memory only)
   --storage-durability=<mode>  fsync|batched|none for --storage (default batched)
   --storage-max-value=<size>   per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)
-  --execution-model=<mode>     auto|threaded|reactor (default auto)
-                                   auto: the reactor for both in-memory and --storage on disk;
-                                   threaded selects the legacy per-connection worker pool
   --lru-mode=<mode>            approximate|strict in-memory LRU recency (default approximate)
                                    approximate: same-shard reads run concurrently (faster)
                                    strict: exact LRU order, reads serialise per shard
   --cpu-affinity=<mode>        none|per-core reactor thread pinning (default per-core;
                                    pins each reactor to its own core when running >1 reactor)
-  --threads=<N>                server parallelism: number of pinned reactors (reactor model)
-                                   or worker-pool size (--execution-model=threaded);
-                                   default hardware_concurrency
+  --threads=<N>                number of independent pinned reactors to run
+                                   (default hardware_concurrency); this is the server's
+                                   across-core parallelism
   --listen-backlog=<N>         ::listen() backlog depth (default 511; clamped to SOMAXCONN)
   --storage-shards=<N>         shard storage into N partitions for write parallelism
                                    default 1 (single-file mode) when --storage names a regular
@@ -220,17 +216,14 @@ up from where it left off — no warm-up.
 
 ### Concurrency: reactor + sharded storage
 
-`--execution-model` defaults to `auto`, which now resolves to the **reactor**
-for both the in-memory cache and on-disk `--storage`. One event loop
-multiplexes every connection, so concurrent clients are bounded by memory
-rather than a worker count — the older thread pool pinned one worker per
-keep-alive session, so a parallel sccache build could open more connections
-than the pool had workers and the surplus would be accepted but never served.
-`--threads=N` runs N independent pinned reactors (default
-`hardware_concurrency()`); on Windows the reactor is additionally drained by
-several threads so a blocking page-store `fsync` overlaps with serving other
-connections. Pass `--execution-model=threaded` to fall back to the legacy
-per-connection worker pool, or `=reactor` to force the reactor explicitly.
+fastcached serves connections on a **reactor** — one event loop (IOCP / epoll
+/ kqueue) multiplexes every connection, so concurrent clients are bounded by
+memory rather than a worker count. `--threads=N` runs N independent reactors
+(default `hardware_concurrency()`), each a single-threaded loop pinned to its
+own core, with every connection pinned to one reactor for its lifetime — so
+the server scales across cores without any cross-thread coroutine migration.
+On Windows the reactor is additionally drained by several threads so a
+blocking page-store `fsync` overlaps with serving other connections.
 
 Storage is **sharded by key hash** when `--storage-shards>1`. Each shard
 has its own `std::shared_mutex`: any number of `Get`s on the same shard
@@ -247,9 +240,6 @@ read-heavy, well-hashed key space this scales reads linearly across cores.
     --storage=$HOME/.cache/fastcached \
     --storage-shards=16 \
     --threads=16
-
-# Fall back to the legacy thread-pool driver if you need it for comparison:
-./fastcached --execution-model=threaded --port=11211 &
 ```
 
 `--storage` is interpreted as a regular file when `--storage-shards=1`
@@ -261,9 +251,9 @@ fan-out using `min(16, hardware_concurrency)` shards. This keeps the
 documented `--storage=path.cow` invocation single-file regardless of the
 host's core count.
 
-In threaded execution mode, single-shard storage is still wrapped in a
-`ShardedStorage` decorator (with one shard) so the per-shard mutex
-serialises worker threads against the unprotected backend.
+When more than one reactor can reach the backend, single-shard storage is
+still wrapped in a `ShardedStorage` decorator (with one shard) so the
+per-shard mutex serialises the reactors against the unprotected backend.
 
 `--storage-durability=none` skips `fsync` entirely. The OS page cache may
 reorder writes against the meta page across a power loss, so crash
@@ -293,12 +283,8 @@ storage_max_value: 1m
 # optional: shard storage across N partitions for parallel writes (0 = auto,
 # 1 = single file/instance, N>1 = directory with shard-NN.cow files)
 storage_shards: 16
-# optional: auto (default) | threaded | reactor
-# auto resolves to the reactor for both in-memory and on-disk storage;
-# threaded selects the legacy per-connection worker pool
-execution_model: auto
-# optional: server parallelism — pinned reactor count (reactor model) or
-# worker-pool size (threaded model); 0 = hardware_concurrency
+# optional: number of independent pinned reactors to run (across-core
+# parallelism); 0 = hardware_concurrency
 threads: 0
 # optional: approximate (default) | strict in-memory LRU recency
 lru_mode: approximate

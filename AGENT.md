@@ -25,8 +25,7 @@ src/FastCache/
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
                 RedisResp (RESP2)
   Server/       Connection (per-client coroutine), Server,
-                ReactorServerLoop (default production driver),
-                PooledServerLoop / BlockingServerLoop (legacy threaded driver)
+                ReactorServerLoop (the server driver)
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
                 ISignalSource, DaemonControls (process-wide stop/reload flags),
                 CpuAffinity, HostMemory, ServiceControl, Terminal
@@ -37,18 +36,15 @@ src/FastCache/
 Production flow: `main()` -> CLI -> optional YAML -> `ConfigReloader` ->
 `CacheEngine` over `InMemoryLruStorage` (or, when `--storage` is set, a
 `ShardedStorage` of `LayeredStorage(InMemoryLruStorage, CowTreeStorage)` —
-an in-memory L1 over the on-disk B+tree L2) -> platform `IListener` ->
-`RunReactorServer`. The reactor (IOCP / epoll / kqueue) is the default for
-both the in-memory and the on-disk backend (`ResolveExecutionModel` maps
-`Auto` to `Reactor`); it multiplexes every connection on its event loop, so
-the number of concurrent clients is bounded by memory, not by a worker count.
-`--threads` runs that many independent pinned reactors. On Windows the
-persistent backend additionally drains the IOCP reactor from several threads
-so a blocking page-store `fsync` overlaps with serving other connections;
-the disk backend is therefore always wrapped in a `ShardedStorage` for thread
-safety. The legacy thread-per-connection pool (`RunThreadedServer` ->
-`RunPooledServerLoop`) and the blocking driver remain reachable only via
-`--execution-model=threaded`.
+an in-memory L1 over the on-disk B+tree L2) -> `RunReactorServer`. The
+reactor (IOCP / epoll / kqueue) multiplexes every connection on its event
+loop, so the number of concurrent clients is bounded by memory, not by a
+worker count. `--threads` runs that many independent single-threaded
+reactors, each pinned to a core, with every connection pinned to one reactor
+for its lifetime. On Windows the persistent backend additionally drains the
+IOCP reactor from several threads so a blocking page-store `fsync` overlaps
+with serving other connections; the disk backend is therefore always wrapped
+in a `ShardedStorage` for thread safety.
 
 ## Design Patterns & Principles
 

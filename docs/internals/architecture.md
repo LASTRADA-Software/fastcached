@@ -24,8 +24,7 @@ src/FastCache/
   Protocol/     IProtocolHandler, ProtocolAutodetect, MemcachedText,
                 MemcachedMeta, MemcachedBinary, RedisResp (RESP2)
   Server/       Connection (per-client coroutine), Server,
-                ReactorServerLoop (default production driver),
-                PooledServerLoop / BlockingServerLoop (legacy threaded driver)
+                ReactorServerLoop (the server driver)
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
                 ISignalSource, DaemonControls (process-wide stop/reload flags),
                 CpuAffinity, HostMemory, ServiceControl, Terminal
