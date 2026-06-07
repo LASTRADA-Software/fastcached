@@ -413,11 +413,6 @@ int DaemonBody(FastCache::Config const& effective)
     // the connection counters; command/capacity stats come from the engine.
     FastCache::AtomicMetricsSink metrics;
 
-    reloader.Subscribe([&logger, backendPtr](auto const& /*prev*/, auto const& next) {
-        logger.SetMinLevel(next->logLevel);
-        backendPtr->Resize(next->maxMemoryBytes);
-    });
-
     auto const durabilityName = [&] {
         switch (effective.storageDurability)
         {
@@ -431,10 +426,26 @@ int DaemonBody(FastCache::Config const& effective)
         return std::string_view { "?" };
     }();
     // Authentication policy: built once, shared read-only across connections.
-    // Never log the secret itself — only whether auth is on.
-    std::optional<FastCache::AuthPolicy> authPolicy;
-    if (!effective.requirePass.empty())
-        authPolicy.emplace(effective.authUsername, effective.requirePass);
+    // Never log the secret itself — only whether auth is on. Wrapped in a
+    // SharedAuthSource so a SIGHUP-driven reload can swap in a freshly-built
+    // policy without restarting connections; in-flight verifies finish on the
+    // policy they captured.
+    auto const makePolicy = [](FastCache::Config const& c) -> std::shared_ptr<FastCache::AuthPolicy const> {
+        if (c.requirePass.empty())
+            return {};
+        return std::make_shared<FastCache::AuthPolicy const>(c.authUsername, c.requirePass);
+    };
+    FastCache::SharedAuthSource authSource { makePolicy(effective) };
+
+    reloader.Subscribe([&logger, backendPtr, &authSource, &makePolicy](auto const& /*prev*/, auto const& next) {
+        logger.SetMinLevel(next->logLevel);
+        backendPtr->Resize(next->maxMemoryBytes);
+        // Rotate the shared secret: building a fresh AuthPolicy and atomically
+        // swapping it in lets a SIGHUP'd operator update requirepass without
+        // restarting the daemon. In-flight verifies finish against the policy
+        // they captured (kept alive by the returned shared_ptr).
+        authSource.Store(makePolicy(*next));
+    });
 
     // TLS context: built once and shared read-only across connections. Fails
     // fast on a missing build feature or unreadable cert/key.
@@ -480,7 +491,7 @@ int DaemonBody(FastCache::Config const& effective)
                 reactorCount,
                 physicalShards,
                 shardingMode,
-                authPolicy ? std::string_view { "on" } : std::string_view { "off" },
+                authSource.Current() ? std::string_view { "on" } : std::string_view { "off" },
                 effective.tlsEnabled ? std::string_view { "on" } : std::string_view { "off" });
 
     InstallStopHandlers();
@@ -516,7 +527,11 @@ int DaemonBody(FastCache::Config const& effective)
     // Pin reactors to cores when asked (PerCore) and there's more than one;
     // a lone reactor gains nothing from pinning.
     serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
-    serverOpts.session.auth = authPolicy ? &*authPolicy : nullptr;
+    serverOpts.session.authSource = &authSource;
+    // Publish/subscribe registry: one instance shared read-mostly across every
+    // connection (RESP PUBLISH/SUBSCRIBE). Lives for the whole server run.
+    FastCache::PubSubRegistry pubsub;
+    serverOpts.session.pubsub = &pubsub;
 #if defined(FC_TLS_ENABLED)
     serverOpts.tlsContext = tlsContext.get(); // null unless --tls is active
 #endif

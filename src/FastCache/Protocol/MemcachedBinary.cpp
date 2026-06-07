@@ -596,7 +596,8 @@ namespace
                           SessionContext session,
                           bool* authenticated)
     {
-        bool const authEnabled = session.auth != nullptr && session.auth->Enabled();
+        auto const auth = session.CurrentAuth();
+        bool const authEnabled = auth != nullptr && auth->Enabled();
         if (!authEnabled)
             co_return co_await ReplyError(socket, opcode, Status::AuthError, header.opaque);
 
@@ -628,7 +629,7 @@ namespace
         // (the redis one-argument AUTH semantics), so a minimal PLAIN client that
         // sends `\0\0<pass>` is not locked out. A non-empty authcid must match the
         // configured username.
-        bool const ok = authcid.empty() ? session.auth->Verify(passwd) : session.auth->Verify(authcid, passwd);
+        bool const ok = authcid.empty() ? auth->Verify(passwd) : auth->Verify(authcid, passwd);
         if (!ok)
             co_return co_await ReplyError(socket, opcode, Status::AuthError, header.opaque);
 
@@ -648,9 +649,10 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket,
     ByteReader reader { *socket, /*maxLineBytes*/ 1, /*maxPayloadBytes*/ MaxBodyBytes + HeaderSize };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
 
-    bool const authEnabled = session.auth != nullptr && session.auth->Enabled();
-    // Authenticated up-front unless a credential is required; SASL flips this.
-    bool authenticated = !authEnabled;
+    // Authenticated up-front unless a credential is required at session start;
+    // SASL flips this. Re-evaluated against the live auth source on every
+    // command so SIGHUP reload of requirepass is honoured immediately.
+    bool authenticated = !(session.CurrentAuth() != nullptr && session.CurrentAuth()->Enabled());
 
     while (true)
     {
@@ -666,6 +668,28 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket,
         if (header.totalBodyLen > MaxBodyBytes)
             co_return;
 
+        auto const opcode = static_cast<Opcode>(header.opcode);
+        auto const authNow = session.CurrentAuth();
+        bool const authEnabled = authNow != nullptr && authNow->Enabled();
+        if (!authEnabled)
+            authenticated = true; // Reload turned auth off; no further gate.
+
+        // Gate data commands until authenticated when a credential is required.
+        // This MUST happen before the body is buffered: an unauthenticated
+        // attacker can otherwise pipeline requests with totalBodyLen close to
+        // the per-frame cap (16 MiB) and force the server to allocate that
+        // much memory per request before being told to authenticate. We drain
+        // the body without buffering it, then reply AuthError.
+        if (authEnabled && !authenticated && !IsPreAuthAllowed(opcode))
+        {
+            if (auto const skipped = co_await reader.Skip(header.totalBodyLen); !skipped.has_value())
+                co_return;
+            if (!co_await ReplyError(socket, opcode, Status::AuthError, header.opaque))
+                co_return;
+            FC_FRAME_MARK;
+            continue;
+        }
+
         auto const body = co_await reader.ReadExactly(header.totalBodyLen);
         if (!body.has_value())
             co_return;
@@ -676,17 +700,6 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket,
         auto const extras = bodySpan.first(header.extrasLen);
         auto const key = bodySpan.subspan(header.extrasLen, header.keyLen);
         auto const value = bodySpan.subspan(static_cast<std::size_t>(header.extrasLen) + header.keyLen);
-
-        auto const opcode = static_cast<Opcode>(header.opcode);
-
-        // Gate data commands until authenticated when a credential is required.
-        if (authEnabled && !authenticated && !IsPreAuthAllowed(opcode))
-        {
-            if (!co_await ReplyError(socket, opcode, Status::AuthError, header.opaque))
-                co_return;
-            FC_FRAME_MARK;
-            continue;
-        }
 
         bool keepGoing = true;
         switch (opcode)

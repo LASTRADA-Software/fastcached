@@ -96,7 +96,11 @@ namespace
         }
         logger.Log(LogLevel::Info, "ready, accepting connections");
 
-        Server server { *listener, engine, logger, admission, metrics, options.session, options.tlsContext };
+        // Pin pub/sub delivery to this reactor: a message published from another
+        // connection's thread wakes a subscriber's loop via reactor.Submit.
+        auto session = options.session;
+        session.reactor = &reactor;
+        Server server { *listener, engine, logger, admission, metrics, session, options.tlsContext };
         auto runAccept = [](Server* s) -> DetachedTask {
             co_await s->Run();
             co_return;
@@ -131,6 +135,9 @@ namespace
                                         [[maybe_unused]] TlsContext* tls)
     {
         co_await ResumeOn { reactor };
+        // This connection now runs on `reactor`; pin pub/sub delivery to it so a
+        // message published elsewhere wakes this subscriber via reactor.Submit.
+        session.reactor = &reactor;
         // Firewall: this is a DetachedTask (unhandled_exception -> std::terminate),
         // so a handler exception must drop only this connection, not the daemon.
         try
@@ -278,8 +285,12 @@ namespace
                 return EXIT_FAILURE;
             }
             listeners.push_back(std::move(listener));
-            servers.push_back(std::make_unique<Server>(
-                *listeners[i], engine, logger, admission, metrics, options.session, options.tlsContext));
+            // Each Server's connections are pinned to this reactor, so a
+            // subscriber created here wakes its loop via this reactor's Submit.
+            auto session = options.session;
+            session.reactor = reactors[i].get();
+            servers.push_back(
+                std::make_unique<Server>(*listeners[i], engine, logger, admission, metrics, session, options.tlsContext));
         }
         logger.Logf(LogLevel::Info, "ready, accepting connections ({} reactors)", reactorCount);
 

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -55,6 +57,50 @@ class AuthPolicy
   private:
     std::string _username;
     std::string _secret;
+};
+
+/// Indirection over `AuthPolicy const*` that the protocol layer reads from on
+/// every command. Lets the daemon body atomically swap the policy on SIGHUP
+/// (live secret rotation) without restarting connections, while keeping the
+/// hot path on a single pointer load. Tests substitute a simple impl that
+/// returns a fixed policy.
+class IAuthSource
+{
+  public:
+    IAuthSource() = default;
+    IAuthSource(IAuthSource const&) = delete;
+    IAuthSource(IAuthSource&&) = delete;
+    IAuthSource& operator=(IAuthSource const&) = delete;
+    IAuthSource& operator=(IAuthSource&&) = delete;
+    virtual ~IAuthSource() = default;
+
+    /// @return A shared_ptr to the currently-active policy (may be null when
+    ///         auth is disabled). Callers hold the shared_ptr for the duration
+    ///         of one verify so a concurrent rotation cannot invalidate it.
+    [[nodiscard]] virtual std::shared_ptr<AuthPolicy const> Current() const noexcept = 0;
+};
+
+/// Concrete `IAuthSource` backed by a `std::atomic<std::shared_ptr<...>>`. The
+/// daemon body owns a single instance, hands `IAuthSource*` into every
+/// SessionContext, and calls `Store(...)` from the ConfigReloader callback to
+/// swap in a freshly-built `AuthPolicy` (or null for "auth now disabled").
+/// Readers see the new value on their next `Current()` load — no locking, and
+/// in-flight verifies finish against the policy they captured.
+class SharedAuthSource final: public IAuthSource
+{
+  public:
+    /// @param initial The initial policy (may be null for "auth disabled").
+    explicit SharedAuthSource(std::shared_ptr<AuthPolicy const> initial = {}) noexcept;
+
+    [[nodiscard]] std::shared_ptr<AuthPolicy const> Current() const noexcept override;
+
+    /// Atomically replace the active policy. Used by ConfigReloader.
+    /// @param next The new policy (null means "auth now disabled").
+    void Store(std::shared_ptr<AuthPolicy const> next) noexcept;
+
+  private:
+    mutable std::mutex _mu;
+    std::shared_ptr<AuthPolicy const> _policy; ///< Guarded by _mu.
 };
 
 } // namespace FastCache

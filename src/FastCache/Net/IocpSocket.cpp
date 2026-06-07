@@ -186,6 +186,37 @@ IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
     return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSARecv")) };
 }
 
+IoAwaitable IocpSocket::WaitReadable()
+{
+    if (_closed)
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    // Zero-byte WSARecv: a documented Winsock idiom for "wake when data is
+    // pending without consuming a byte". The completion fires when the socket
+    // is readable (data, EOF, or error); we report 1 to signal readiness. The
+    // caller is expected to issue a real Read next.
+    auto& op = _impl->readOp;
+    op.awaitable = nullptr;
+    op.completion.overlapped = OVERLAPPED {};
+
+    WSABUF wsaBuf;
+    wsaBuf.buf = nullptr;
+    wsaBuf.len = 0;
+    DWORD bytesReceived = 0;
+    DWORD flags = 0;
+    auto const rc = WSARecv(
+        _impl->native, &wsaBuf, 1, &bytesReceived, &flags, reinterpret_cast<LPWSAOVERLAPPED>(&op.completion), nullptr);
+    auto const lastErr = (rc == 0) ? 0 : WSAGetLastError();
+    if (rc == 0 || lastErr == WSA_IO_PENDING)
+    {
+        IoAwaitable a;
+        a.SetSuspendCallback(&SocketAwaitableSuspended, &op);
+        return a;
+    }
+    return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSARecv")) };
+}
+
 IoAwaitable IocpSocket::Write(std::span<std::byte const> buffer)
 {
     if (_closed)

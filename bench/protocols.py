@@ -30,7 +30,7 @@ import struct
 # fastcached auto-detects the protocol from the first byte a client sends
 # (see ProtocolAutodetect.cpp): 0x80 -> memcached binary, one of *+-:$ -> Redis
 # RESP2, anything else -> memcached text.
-PROTOCOLS = ("memcached-text", "memcached-binary", "redis")
+PROTOCOLS = ("memcached-text", "memcached-binary", "redis", "redis-resp3")
 
 
 class ProtocolError(RuntimeError):
@@ -193,6 +193,89 @@ class RedisRespClient:
         self._conn.close()
 
 
+class RedisResp3Client:
+    """Speaks Redis RESP3: sends ``HELLO 3`` on connect, then parses the RESP3
+    reply grammar (native null ``_``, double ``,``, boolean ``#``, verbatim
+    ``=``, map ``%``, set ``~``, push ``>``) in addition to the RESP2 types.
+
+    Exposes the same surface as :class:`RedisRespClient` so the load generator
+    drives RESP2 and RESP3 identically and the two can be compared head-to-head.
+    """
+
+    def __init__(self, host: str, port: int, timeout: float) -> None:
+        self._conn = _Connection(host, port, timeout)
+        # Upgrade the connection to RESP3 before any benchmarked command.
+        self._conn.send(self._encode(b"HELLO", b"3"))
+        self._read_reply()  # consume the HELLO map (or error)
+
+    @staticmethod
+    def _encode(*args: bytes) -> bytes:
+        parts = [b"*%d\r\n" % len(args)]
+        for arg in args:
+            parts.append(b"$%d\r\n%b\r\n" % (len(arg), arg))
+        return b"".join(parts)
+
+    def _read_aggregate(self, count: int) -> list:
+        return [self._read_reply() for _ in range(count)] if count >= 0 else None
+
+    def _read_map(self, pairs: int) -> dict:
+        out = {}
+        for _ in range(pairs):
+            key = self._read_reply()
+            out[bytes(key) if isinstance(key, (bytes, bytearray)) else key] = self._read_reply()
+        return out
+
+    def _read_reply(self) -> object:
+        line = self._conn.read_line()
+        kind, rest = line[:1], line[1:]
+        if kind in (b"+", b"-", b":", b","):  # simple, error, integer, double
+            return rest
+        if kind == b"_":  # RESP3 null
+            return None
+        if kind == b"#":  # RESP3 boolean
+            return rest == b"t"
+        if kind == b"(":  # RESP3 big number
+            return rest
+        if kind in (b"$", b"="):  # blob string / verbatim string
+            length = int(rest)
+            if length < 0:
+                return None
+            payload = self._conn.read_exact(length + 2)
+            return payload[:length]
+        if kind in (b"*", b"~", b">"):  # array / set / push
+            return self._read_aggregate(int(rest))
+        if kind == b"%":  # map
+            return self._read_map(int(rest))
+        raise ProtocolError(f"unexpected RESP3 reply: {line!r}")
+
+    def set(self, key: bytes, value: bytes) -> bool:
+        self._conn.send(self._encode(b"SET", key, value))
+        return self._read_reply() == b"OK"
+
+    def get(self, key: bytes) -> bytes | None:
+        self._conn.send(self._encode(b"GET", key))
+        reply = self._read_reply()
+        return reply if reply is None or isinstance(reply, bytes) else None
+
+    def delete(self, key: bytes) -> bool:
+        self._conn.send(self._encode(b"DEL", key))
+        return self._read_reply() == b"1"
+
+    def incr(self, key: bytes, delta: int) -> int | None:
+        raise Unsupported("Redis INCR is not implemented by fastcached")
+
+    def ping(self) -> bool:
+        self._conn.send(self._encode(b"PING"))
+        return self._read_reply() == b"PONG"
+
+    def flush(self) -> bool:
+        self._conn.send(self._encode(b"FLUSHALL"))
+        return self._read_reply() == b"OK"
+
+    def close(self) -> None:
+        self._conn.close()
+
+
 class MemcachedBinaryClient:
     """Speaks the memcached binary protocol (24-byte big-endian header)."""
 
@@ -271,6 +354,7 @@ _CLIENTS = {
     "memcached-text": MemcachedTextClient,
     "memcached-binary": MemcachedBinaryClient,
     "redis": RedisRespClient,
+    "redis-resp3": RedisResp3Client,
 }
 
 # Operations each protocol can drive (used by workloads to stay within support).
@@ -278,6 +362,7 @@ SUPPORTED_OPS = {
     "memcached-text": frozenset({"set", "get", "delete", "incr"}),
     "memcached-binary": frozenset({"set", "get", "delete", "incr"}),
     "redis": frozenset({"set", "get", "delete"}),
+    "redis-resp3": frozenset({"set", "get", "delete"}),
 }
 
 

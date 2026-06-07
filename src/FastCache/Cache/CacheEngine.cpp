@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/CacheEngine.hpp>
+#include <FastCache/Cache/SetCodec.hpp>
 #include <FastCache/Core/Profiling.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
+#include <string>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace FastCache
 {
@@ -163,6 +169,186 @@ void CacheEngine::FlushAll(std::uint32_t delaySeconds)
 {
     auto const effectiveAt = delaySeconds == 0 ? _clock.Now() : _clock.Now() + std::chrono::seconds { delaySeconds };
     _storage.FlushWithGeneration(effectiveAt);
+}
+
+std::expected<CasToken, StorageError> CacheEngine::Update(
+    std::string_view key, std::function<std::expected<IStorage::UpdateOutcome, StorageError>(GetResult const&)> const& fn)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::Update");
+    return _storage.Update(key, fn, _clock.Now());
+}
+
+namespace
+{
+    /// Decode the current entry as a set into `members`. Returns WrongType when
+    /// the entry exists but is not a set, KeyNotFound when absent (the caller
+    /// decides whether absence is an error or an empty set).
+    /// @param current The guarded read of the entry.
+    /// @param members Receives the decoded members.
+    [[nodiscard]] std::expected<bool, StorageError> LoadSet(GetResult const& current, std::vector<std::string>& members)
+    {
+        members.clear();
+        if (!current.found)
+            return false; // absent — treat as empty set.
+        if (!SetCodec::IsSet(current.entry.flags))
+            return std::unexpected(MakeStorageError(StorageErrorCode::WrongType));
+        if (!SetCodec::Decode(current.entry.ValueBytes(), members))
+            return std::unexpected(MakeStorageError(StorageErrorCode::Corrupt));
+        return true;
+    }
+
+    /// Read-only set lookup outside the guarded RMW: Peek the key, decode it, and
+    /// hand the members to `consume`. Centralises the WrongType / decode handling
+    /// shared by SMEMBERS / SISMEMBER / SMISMEMBER / SCARD.
+    template <typename Consume>
+    [[nodiscard]] auto WithSet(CacheEngine& engine, std::string_view key, Consume consume)
+        -> std::expected<decltype(consume(std::declval<std::vector<std::string> const&>())), StorageError>
+    {
+        auto const peek = engine.Peek(key);
+        if (!peek.has_value())
+            return std::unexpected(peek.error());
+        std::vector<std::string> members;
+        if (peek->found)
+        {
+            if (!SetCodec::IsSet(peek->entry.flags))
+                return std::unexpected(MakeStorageError(StorageErrorCode::WrongType));
+            if (!SetCodec::Decode(peek->entry.ValueBytes(), members))
+                return std::unexpected(MakeStorageError(StorageErrorCode::Corrupt));
+        }
+        return consume(members);
+    }
+
+} // namespace
+
+std::expected<std::int64_t, StorageError> CacheEngine::SetAdd(std::string_view key, std::span<std::string const> members)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::SetAdd");
+    std::int64_t added = 0;
+    auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
+        std::vector<std::string> existing;
+        auto const loaded = LoadSet(current, existing);
+        if (!loaded.has_value())
+            return std::unexpected(loaded.error());
+        // Build a hash-membership view of `existing` so per-member tests are
+        // O(1) and the answer is independent of insertion order. Using
+        // std::ranges::binary_search + push_back inside the loop broke the
+        // sorted invariant after the first push, turning subsequent searches
+        // into UB and over-counting `added` when the input contains duplicates
+        // or members that sort before earlier-added ones.
+        std::unordered_set<std::string_view> seen;
+        seen.reserve(existing.size() + members.size());
+        for (auto const& e: existing)
+            seen.insert(e);
+        added = 0;
+        for (auto const& m: members)
+            if (seen.insert(m).second) // newly inserted -> not previously in set
+            {
+                existing.push_back(m);
+                ++added;
+            }
+        if (added == 0)
+            return IStorage::UpdateOutcome { .value = {}, .flags = 0, .action = IStorage::UpdateAction::Unchanged };
+        SetCodec::Normalise(existing);
+        return IStorage::UpdateOutcome { .value = SetCodec::Encode(existing),
+                                         .flags = SetCodec::FcTypeSet,
+                                         .action = IStorage::UpdateAction::Store };
+    });
+    if (!result.has_value())
+        return std::unexpected(result.error());
+    return added;
+}
+
+std::expected<std::int64_t, StorageError> CacheEngine::SetRemove(std::string_view key, std::span<std::string const> members)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::SetRemove");
+    std::int64_t removed = 0;
+    auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
+        std::vector<std::string> existing;
+        auto const loaded = LoadSet(current, existing);
+        if (!loaded.has_value())
+            return std::unexpected(loaded.error());
+        removed = 0;
+        for (auto const& m: members)
+        {
+            auto const before = existing.size();
+            std::erase(existing, m);
+            if (existing.size() != before)
+                ++removed;
+        }
+        if (removed == 0)
+            return IStorage::UpdateOutcome { .value = {}, .flags = 0, .action = IStorage::UpdateAction::Unchanged };
+        if (existing.empty())
+            return IStorage::UpdateOutcome { .value = {}, .flags = 0, .action = IStorage::UpdateAction::Delete };
+        return IStorage::UpdateOutcome { .value = SetCodec::Encode(existing),
+                                         .flags = SetCodec::FcTypeSet,
+                                         .action = IStorage::UpdateAction::Store };
+    });
+    if (!result.has_value())
+        return std::unexpected(result.error());
+    return removed;
+}
+
+std::expected<std::vector<std::string>, StorageError> CacheEngine::SetMembers(std::string_view key)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::SetMembers");
+    return WithSet(*this, key, [](std::vector<std::string> const& members) { return members; });
+}
+
+std::expected<bool, StorageError> CacheEngine::SetIsMember(std::string_view key, std::string_view member)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::SetIsMember");
+    return WithSet(*this, key, [member](std::vector<std::string> const& members) {
+        return std::ranges::binary_search(members, member);
+    });
+}
+
+std::expected<std::vector<bool>, StorageError> CacheEngine::SetMIsMember(std::string_view key,
+                                                                         std::span<std::string const> members)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::SetMIsMember");
+    return WithSet(*this, key, [members](std::vector<std::string> const& existing) {
+        std::vector<bool> out;
+        out.reserve(members.size());
+        for (auto const& m: members)
+            out.push_back(std::ranges::binary_search(existing, m));
+        return out;
+    });
+}
+
+std::expected<std::int64_t, StorageError> CacheEngine::SetCard(std::string_view key)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::SetCard");
+    return WithSet(
+        *this, key, [](std::vector<std::string> const& members) { return static_cast<std::int64_t>(members.size()); });
+}
+
+std::expected<std::vector<std::string>, StorageError> CacheEngine::SetPop(std::string_view key, std::size_t count)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::SetPop");
+    std::vector<std::string> popped;
+    auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
+        std::vector<std::string> existing;
+        auto const loaded = LoadSet(current, existing);
+        if (!loaded.has_value())
+            return std::unexpected(loaded.error());
+        popped.clear();
+        // Deterministic "pop": take from the sorted front. fastcached has no
+        // injected RNG seam, and a cache set's pop order is not contractual;
+        // taking the lexicographically smallest members keeps it reproducible.
+        auto const take = std::min(count, existing.size());
+        popped.assign(existing.begin(), existing.begin() + static_cast<std::ptrdiff_t>(take));
+        existing.erase(existing.begin(), existing.begin() + static_cast<std::ptrdiff_t>(take));
+        if (take == 0)
+            return IStorage::UpdateOutcome { .value = {}, .flags = 0, .action = IStorage::UpdateAction::Unchanged };
+        if (existing.empty())
+            return IStorage::UpdateOutcome { .value = {}, .flags = 0, .action = IStorage::UpdateAction::Delete };
+        return IStorage::UpdateOutcome { .value = SetCodec::Encode(existing),
+                                         .flags = SetCodec::FcTypeSet,
+                                         .action = IStorage::UpdateAction::Store };
+    });
+    if (!result.has_value())
+        return std::unexpected(result.error());
+    return popped;
 }
 
 } // namespace FastCache

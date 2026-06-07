@@ -42,6 +42,7 @@ target_sources(FastCache
         Protocol/MemcachedMeta.cpp
         Protocol/MemcachedText.cpp
         Protocol/ProtocolAutodetect.cpp
+        Protocol/PubSubRegistry.cpp
         Protocol/RedisResp.cpp
         Server/AdminHttpServer.cpp
         Server/Connection.cpp

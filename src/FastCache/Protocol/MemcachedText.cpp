@@ -617,8 +617,6 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket,
     // credential is required there is no way to satisfy it over this protocol:
     // every command except `version`/`quit` is refused. Clients that need auth
     // must use the binary (SASL) or RESP (AUTH) protocols.
-    bool const authRequired = session.auth != nullptr && session.auth->Enabled();
-
     // Reused across commands: cleared each iteration, so its capacity persists
     // and the common path tokenizes without a per-command heap allocation.
     std::vector<std::string_view> parts;
@@ -646,6 +644,11 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket,
         auto const command = parts[0];
         auto const tail = std::span<std::string_view const> { parts.data() + 1, parts.size() - 1 };
 
+        // Resolve auth per-command so SIGHUP reload of requirepass is honoured
+        // immediately on the next request; the captured shared_ptr keeps the
+        // policy alive for the duration of this command's evaluation.
+        auto const auth = session.CurrentAuth();
+        bool const authRequired = auth != nullptr && auth->Enabled();
         if (authRequired && command != "version" && command != "quit")
         {
             // The text protocol has no auth handshake, so this command can never

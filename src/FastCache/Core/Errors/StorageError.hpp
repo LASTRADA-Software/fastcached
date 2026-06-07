@@ -22,6 +22,9 @@ enum class StorageErrorCode : std::uint8_t
     IoError,         ///< Underlying file I/O failed (inspect systemCode).
     ReadOnly,        ///< Storage is open in a read-only mode (e.g., crash-recovery replay).
     InvalidArgument, ///< Caller passed nonsensical arguments (e.g., negative ttl).
+    NotANumber,      ///< Value is not a valid integer/float for a numeric op (incr/incrbyfloat).
+    WrongType,       ///< Operation against a key holding a different value type (redis WRONGTYPE).
+    InfiniteOrNaN,   ///< Numeric op would produce a non-finite result (overflow / NaN); cf. redis incrbyfloat.
 };
 
 /// Structured storage error.
@@ -74,6 +77,12 @@ struct StorageError
             return "ReadOnly";
         case StorageErrorCode::InvalidArgument:
             return "InvalidArgument";
+        case StorageErrorCode::NotANumber:
+            return "NotANumber";
+        case StorageErrorCode::WrongType:
+            return "WrongType";
+        case StorageErrorCode::InfiniteOrNaN:
+            return "InfiniteOrNaN";
     }
     return "Unknown";
 }

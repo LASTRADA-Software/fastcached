@@ -177,6 +177,10 @@ struct KqueueSocket::Impl
     {
         IoAwaitable* awaitable { nullptr };
         std::span<std::byte> readBuffer {};
+        /// When true the read awaitable is a "wake on readability" probe
+        /// (WaitReadable): OnReadable must complete it WITHOUT consuming any
+        /// bytes from the socket. Mirrors EpollSocket's readPeekOnly.
+        bool readPeekOnly { false };
         std::span<std::byte const> writeRemaining {};
         std::size_t writeTotal { 0 };
 
@@ -232,8 +236,20 @@ void KqueueSocket::Impl::OnReadable(KqueueFdHandler* base)
     auto* impl = ImplFromHandler(base);
     if (!impl->readOp.awaitable)
         return;
-    auto buf = impl->readOp.readBuffer;
     auto* awaitable = impl->readOp.awaitable;
+    // WaitReadable parked: complete without consuming any bytes. Used by
+    // RESP3 subscribers, which need to wake on a readable edge but cannot
+    // consume the client's command bytes here.
+    if (impl->readOp.readPeekOnly)
+    {
+        impl->readOp.awaitable = nullptr;
+        impl->readOp.readBuffer = {};
+        impl->readOp.readPeekOnly = false;
+        impl->UpdateInterest();
+        awaitable->Complete(IoResult { std::size_t { 1 } });
+        return;
+    }
+    auto buf = impl->readOp.readBuffer;
     auto const got = ::recv(impl->handler.fd, buf.data(), buf.size(), 0);
     if (got >= 0)
     {
@@ -363,6 +379,32 @@ IoAwaitable KqueueSocket::Read(std::span<std::byte> buffer)
 
     _impl->readOp.awaitable = nullptr;
     _impl->readOp.readBuffer = buffer;
+    _impl->readOp.readPeekOnly = false;
+    IoAwaitable a;
+    a.SetSuspendCallback(&KqueueSocketAwaitableSuspended, &_impl->readOp);
+    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, true, _impl->writeOp.awaitable != nullptr);
+    return a;
+}
+
+IoAwaitable KqueueSocket::WaitReadable()
+{
+    if (_closed)
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    // Probe readability without consuming bytes: zero-length MSG_PEEK returns 0
+    // at EOF, >0 when data is pending, EAGAIN when nothing is ready. EOF/data
+    // means "go ahead and Read"; only EAGAIN parks on EVFILT_READ.
+    std::array<std::byte, 1> probe {};
+    auto const got = ::recv(_fd, probe.data(), probe.size(), MSG_PEEK);
+    if (got >= 0)
+        return IoAwaitable { IoResult { std::size_t { 1 } } };
+    if (errno != EAGAIN && errno != EINTR)
+        return IoAwaitable { std::unexpected(MakePosixError(errno, "recv")) };
+
+    _impl->readOp.awaitable = nullptr;
+    _impl->readOp.readBuffer = {};
+    _impl->readOp.readPeekOnly = true;
     IoAwaitable a;
     a.SetSuspendCallback(&KqueueSocketAwaitableSuspended, &_impl->readOp);
     std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, true, _impl->writeOp.awaitable != nullptr);

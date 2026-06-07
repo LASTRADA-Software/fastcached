@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -110,6 +111,11 @@ class ShardedStorage final: public IStorage
     [[nodiscard]] std::expected<void, StorageError> CompareAndDelete(std::string_view key,
                                                                      CasToken expected,
                                                                      TimePoint now) override;
+
+    [[nodiscard]] std::expected<CasToken, StorageError> Update(
+        std::string_view key,
+        std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
+        TimePoint now) override;
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;

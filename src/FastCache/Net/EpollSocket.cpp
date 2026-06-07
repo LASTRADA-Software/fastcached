@@ -184,6 +184,9 @@ struct EpollSocket::Impl
         IoAwaitable* awaitable { nullptr };
         // For Read: a writable view we fill in-place.
         std::span<std::byte> readBuffer {};
+        // For WaitReadable: arm EPOLLIN but do NOT consume bytes when readable —
+        // just complete the awaitable so the caller can decide to Read or not.
+        bool readPeekOnly { false };
         // For a scalar Write: bytes still to send.
         std::span<std::byte const> writeRemaining {};
         std::size_t writeTotal { 0 };
@@ -253,6 +256,17 @@ void EpollSocket::Impl::OnReadable(EpollFdHandler* base)
     auto* impl = ImplFromHandler(base);
     if (!impl->readOp.awaitable)
         return;
+
+    // WaitReadable: the fd is readable; report readiness without consuming.
+    if (impl->readOp.readPeekOnly)
+    {
+        auto* const peekAwaitable = impl->readOp.awaitable;
+        impl->readOp.awaitable = nullptr;
+        impl->readOp.readPeekOnly = false;
+        impl->UpdateInterest();
+        peekAwaitable->Complete(IoResult { std::size_t { 1 } });
+        return;
+    }
 
     auto buf = impl->readOp.readBuffer;
     auto* awaitable = impl->readOp.awaitable;
@@ -388,6 +402,34 @@ IoAwaitable EpollSocket::Read(std::span<std::byte> buffer)
     // Park: arm EPOLLIN and wait for the reactor to deliver readability.
     _impl->readOp.awaitable = nullptr;
     _impl->readOp.readBuffer = buffer;
+    _impl->readOp.readPeekOnly = false;
+    IoAwaitable a;
+    a.SetSuspendCallback(&EpollSocketAwaitableSuspended, &_impl->readOp);
+    std::ignore =
+        _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ true, /*write*/ _impl->writeOp.awaitable != nullptr);
+    return a;
+}
+
+IoAwaitable EpollSocket::WaitReadable()
+{
+    if (_closed)
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    // Probe readability with a zero-length MSG_PEEK recv: returns 0 at EOF, >0
+    // when data is pending, or EAGAIN when nothing is ready yet. Either of the
+    // first two means "go ahead and Read"; only EAGAIN parks on EPOLLIN.
+    std::array<std::byte, 1> probe {};
+    auto const got = ::recv(_fd, probe.data(), probe.size(), MSG_PEEK);
+    if (got >= 0)
+        return IoAwaitable { IoResult { std::size_t { 1 } } };
+    if (errno != EAGAIN && errno != EINTR)
+        return IoAwaitable { std::unexpected(MakePosixError(errno, "recv")) };
+
+    // Park: arm EPOLLIN, completing without consuming when readable.
+    _impl->readOp.awaitable = nullptr;
+    _impl->readOp.readBuffer = {};
+    _impl->readOp.readPeekOnly = true;
     IoAwaitable a;
     a.SetSuspendCallback(&EpollSocketAwaitableSuspended, &_impl->readOp);
     std::ignore =

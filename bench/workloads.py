@@ -142,7 +142,7 @@ def _keepalive_storm(connections: int = 256, ops_per_connection: int = 40) -> Sc
 
 def _quick() -> list[Scenario]:
     return [
-        *_matrix(("redis", "memcached-text"), ("set", "get"), ("memory", "disk"), (64,), ops_total=20_000),
+        *_matrix(("redis", "redis-resp3", "memcached-text"), ("set", "get"), ("memory", "disk"), (64,), ops_total=20_000),
         _keepalive_storm(connections=128, ops_per_connection=40),
     ]
 
@@ -150,7 +150,7 @@ def _quick() -> list[Scenario]:
 def _standard() -> list[Scenario]:
     return [
         *_matrix(
-            ("memcached-text", "memcached-binary", "redis"),
+            ("memcached-text", "memcached-binary", "redis", "redis-resp3"),
             ("set", "get", "mixed"),
             ("memory", "disk"),
             (1, 16, 64, 256),

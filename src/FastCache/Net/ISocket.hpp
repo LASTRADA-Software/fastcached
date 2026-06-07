@@ -186,6 +186,23 @@ class ISocket
         co_return std::expected<void, NetError> {};
     }
 
+    /// Suspend until the socket is readable (data or EOF pending) WITHOUT
+    /// consuming any bytes. Used by the pub/sub subscribe loop, which must wake
+    /// on either an incoming client command OR a delivered message and cannot
+    /// afford to block in `Read` while messages queue.
+    ///
+    /// The default resolves immediately as "readable" (IoResult{1}): for
+    /// blocking and in-memory transports the subsequent `Read` either returns
+    /// data or blocks/sees EOF inline, so treating the socket as always-ready is
+    /// correct and the subscribe loop simply falls through to `Read`. The
+    /// reactor-driven sockets override it to arm EPOLLIN/equivalent and resolve
+    /// only on actual readiness, so a parked subscriber consumes no CPU.
+    /// @return Awaitable resolving when readable (the result count is advisory).
+    [[nodiscard]] virtual IoAwaitable WaitReadable()
+    {
+        return IoAwaitable { IoResult { std::size_t { 1 } } };
+    }
+
     /// Close the socket. Idempotent; subsequent Read/Write resolves with
     /// NetErrorCode::BadFileHandle.
     virtual void Close() noexcept = 0;

@@ -50,6 +50,16 @@ class ByteReader
     /// @return Task resolving to the byte vector or a ProtocolError.
     [[nodiscard]] Task<BytesResult> ReadExactly(std::size_t count);
 
+    /// Drain (consume and discard) exactly `count` bytes from the stream
+    /// without buffering them all at once. Used by protocols that need to
+    /// step over a frame body — e.g. the memcached binary auth gate, which
+    /// must skip past the body of a request from an unauthenticated client
+    /// without buffering up to MaxBodyBytes (16 MiB) of attacker-supplied
+    /// data on the daemon. Reads up to the internal chunk size at a time.
+    /// @param count Number of bytes to skip.
+    /// @return Task resolving to success or a ProtocolError.
+    [[nodiscard]] Task<std::expected<void, ProtocolError>> Skip(std::size_t count);
+
     /// Prepend `bytes` to the internal buffer so subsequent reads see them
     /// first. Used by the protocol-autodetect layer to replay the bytes it
     /// peeked at the head of the stream.
