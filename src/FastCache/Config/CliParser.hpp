@@ -48,6 +48,9 @@ struct CliResult
     bool logTimestampsExplicit { false };
     bool requirePassExplicit { false };
     bool authUsernameExplicit { false };
+    bool metricsEnabledExplicit { false };
+    bool metricsBindAddressExplicit { false };
+    bool metricsPortExplicit { false };
 };
 
 /// Parse `argv[1..argc-1]` into a Config. Returns ConfigError on bad input.

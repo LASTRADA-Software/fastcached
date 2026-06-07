@@ -22,6 +22,7 @@ target_sources(FastCache
         Core/Crc32c.cpp
         Core/Logger.cpp
         Core/BufferPool.cpp
+        Metrics/PrometheusFormatter.cpp
         Net/BlockingSocket.cpp
         Net/EpollSocket.cpp
         Net/IocpSocket.cpp
@@ -41,6 +42,7 @@ target_sources(FastCache
         Protocol/MemcachedText.cpp
         Protocol/ProtocolAutodetect.cpp
         Protocol/RedisResp.cpp
+        Server/AdminHttpServer.cpp
         Server/Connection.cpp
         Server/ReactorServerLoop.cpp
         Server/Server.cpp

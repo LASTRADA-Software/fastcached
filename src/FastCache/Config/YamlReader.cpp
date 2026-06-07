@@ -5,6 +5,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <exception>
 #include <expected>
 #include <filesystem>
 #include <string>
@@ -161,6 +162,28 @@ namespace
             cfg.authUsername = valueNode.as<std::string>();
             return {};
         }
+        /// `metrics`: enable the admin HTTP endpoint (/metrics, /healthz).
+        if (key == "metrics")
+        {
+            cfg.metricsEnabled = valueNode.as<bool>();
+            return {};
+        }
+        /// `metrics_bind`: bind address for the admin HTTP endpoint.
+        if (key == "metrics_bind")
+        {
+            cfg.metricsBindAddress = valueNode.as<std::string>();
+            return {};
+        }
+        /// `metrics_port`: TCP port for the admin HTTP endpoint (1..65535).
+        if (key == "metrics_port")
+        {
+            auto const raw = valueNode.as<int>();
+            if (raw <= 0 || raw > 65535)
+                return std::unexpected(
+                    MakeError(ConfigErrorCode::OutOfRange, path, "metrics_port", "must be in 1..65535", line));
+            cfg.metricsPort = static_cast<std::uint16_t>(raw);
+            return {};
+        }
         /// `storage_durability`: fsync|batched|none.
         if (key == "storage_durability")
         {
@@ -278,11 +301,86 @@ std::expected<Config, ConfigError> ReadYamlConfig(std::filesystem::path const& p
                 ConfigErrorCode::ParseError, path, {}, "non-scalar key", static_cast<unsigned>(keyNode.Mark().line + 1)));
 
         auto const line = static_cast<unsigned>(valueNode.Mark().line + 1);
-        if (auto const result = ApplyEntry(cfg, keyNode.as<std::string>(), valueNode, path, line); !result.has_value())
-            return std::unexpected(result.error());
+        auto const key = keyNode.as<std::string>(); // safe: keyNode.IsScalar() checked above
+
+        // A malformed scalar (e.g. `metrics: maybe`, `metrics_port: oops`) makes
+        // yaml-cpp's valueNode.as<T>() throw TypedBadConversion. Translate it into
+        // a clean ConfigError so a config typo is reported as a TypeMismatch with
+        // file:line rather than escaping this std::expected API as an uncaught
+        // exception that terminates the process at startup.
+        try
+        {
+            if (auto const result = ApplyEntry(cfg, key, valueNode, path, line); !result.has_value())
+                return std::unexpected(result.error());
+        }
+        catch (std::exception const& ex)
+        {
+            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, path, key, ex.what(), line));
+        }
     }
 
     return cfg;
+}
+
+std::expected<YamlConfigWithPresence, ConfigError> ReadYamlConfigWithPresence(std::filesystem::path const& path)
+{
+    if (!std::filesystem::exists(path))
+        return std::unexpected(MakeError(ConfigErrorCode::FileNotFound, path, {}, "no such file"));
+
+    auto root = LoadRoot(path);
+    if (!root.has_value())
+        return std::unexpected(root.error());
+
+    if (!root->IsMap() && !root->IsNull())
+        return std::unexpected(MakeError(ConfigErrorCode::ParseError, path, {}, "top-level must be a map"));
+
+    YamlConfigWithPresence out;
+    if (!root->IsMap())
+        return out;
+
+    for (auto const& kv: *root)
+    {
+        auto const keyNode = kv.first;
+        auto const valueNode = kv.second;
+        if (!keyNode.IsScalar())
+            return std::unexpected(MakeError(
+                ConfigErrorCode::ParseError, path, {}, "non-scalar key", static_cast<unsigned>(keyNode.Mark().line + 1)));
+
+        auto const line = static_cast<unsigned>(valueNode.Mark().line + 1);
+        auto const key = keyNode.as<std::string>();
+
+        try
+        {
+            if (auto const result = ApplyEntry(out.config, key, valueNode, path, line); !result.has_value())
+                return std::unexpected(result.error());
+        }
+        catch (std::exception const& ex)
+        {
+            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, path, key, ex.what(), line));
+        }
+
+        // Record presence for fields whose env-fallback logic needs to
+        // distinguish "explicitly set to the default" from "not mentioned".
+        // Mirrors the per-flag *Explicit bits CliResult tracks for the CLI.
+        if (key == "metrics_port")
+            out.metricsPortExplicit = true;
+        else if (key == "metrics_bind")
+            out.metricsBindAddressExplicit = true;
+        else if (key == "metrics")
+            out.metricsEnabledExplicit = true;
+        else if (key == "requirepass")
+            out.requirePassExplicit = true;
+        else if (key == "auth_username")
+            out.authUsernameExplicit = true;
+        else if (key == "tls")
+            out.tlsEnabledExplicit = true;
+        else if (key == "tls_cert")
+            out.tlsCertPathExplicit = true;
+        else if (key == "tls_key")
+            out.tlsKeyPathExplicit = true;
+    }
+
+    return out;
 }
 
 } // namespace FastCache

@@ -5,6 +5,7 @@
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Net/ISocket.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <expected>
 #include <memory>
@@ -57,6 +58,17 @@ namespace Detail
     /// a thread parked in AcceptRaw().
     /// @param socket The handle to close.
     void CloseNativeSocket(NativeSocket socket) noexcept;
+
+    /// Apply receive/send timeouts (SO_RCVTIMEO / SO_SNDTIMEO) to a socket.
+    /// A non-positive duration leaves the OS default (no timeout) in place.
+    /// Best-effort: a setsockopt failure is ignored. Used to bound blocking
+    /// recv()/accept() so a stalled peer cannot park a thread indefinitely.
+    /// @param socket The socket handle to tune.
+    /// @param recvTimeout Receive timeout (also bounds ::accept() on POSIX).
+    /// @param sendTimeout Send timeout.
+    void SetIoTimeouts(NativeSocket socket,
+                       std::chrono::milliseconds recvTimeout,
+                       std::chrono::milliseconds sendTimeout) noexcept;
 
 } // namespace Detail
 
@@ -116,6 +128,15 @@ class BlockingListener final: public IListener
     [[nodiscard]] AcceptAwaitable Accept() override;
     void Close() noexcept override;
 
+    /// Enable bounded shutdown + slowloris protection (off by default).
+    /// @param acceptPoll Receive timeout for the listening socket so Accept()
+    ///        returns NetErrorCode::WouldBlock periodically, letting the accept
+    ///        loop re-check a shutdown flag (POSIX does not unblock a parked
+    ///        accept() on Close()). Zero leaves accept() fully blocking.
+    /// @param ioTimeout Receive/send timeout applied to every accepted socket so
+    ///        a stalled client cannot wedge a blocking recv(). Zero disables it.
+    void SetTimeouts(std::chrono::milliseconds acceptPoll, std::chrono::milliseconds ioTimeout) noexcept;
+
     /// @return true if the listener bound and listens cleanly.
     [[nodiscard]] bool IsBound() const noexcept
     {
@@ -133,6 +154,9 @@ class BlockingListener final: public IListener
 
     Detail::NativeSocket _native { Detail::InvalidSocket };
     std::string _bindError;
+    /// Receive/send timeout applied to accepted sockets (0 = none). Set via
+    /// SetTimeouts; the accept-poll timeout is applied directly to _native there.
+    std::chrono::milliseconds _ioTimeout { 0 };
 };
 
 } // namespace FastCache

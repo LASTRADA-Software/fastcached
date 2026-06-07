@@ -35,4 +35,30 @@ namespace FastCache
 /// @return Parsed Config or a ConfigError.
 [[nodiscard]] std::expected<Config, ConfigError> ReadYamlConfig(std::filesystem::path const& path);
 
+/// Parsed YAML, plus per-field "this key was present in the file" bits. The
+/// presence bits let the caller distinguish "the YAML explicitly set this to
+/// the default value" from "the YAML did not mention it" — important for the
+/// env-precedence guards in main.cpp, which would otherwise silently override
+/// an operator's explicit YAML value when it happens to equal the compiled
+/// default.
+struct YamlConfigWithPresence
+{
+    Config config {};
+    bool metricsPortExplicit { false };
+    bool metricsBindAddressExplicit { false };
+    bool metricsEnabledExplicit { false };
+    bool requirePassExplicit { false };
+    bool authUsernameExplicit { false };
+    bool tlsEnabledExplicit { false };
+    bool tlsCertPathExplicit { false };
+    bool tlsKeyPathExplicit { false };
+};
+
+/// Variant of `ReadYamlConfig` that also reports which keys were explicitly
+/// present in the file. Used by main.cpp's env-precedence logic.
+/// @param path Filesystem path of the YAML file.
+/// @return Parsed config + presence bits, or a ConfigError.
+[[nodiscard]] std::expected<YamlConfigWithPresence, ConfigError> ReadYamlConfigWithPresence(
+    std::filesystem::path const& path);
+
 } // namespace FastCache

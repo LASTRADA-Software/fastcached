@@ -115,6 +115,19 @@ struct Config
     /// TCP port. memcached default is 11211; fastcached's MVP follows.
     std::uint16_t port { 11211 };
 
+    /// Bind address for the admin HTTP endpoint (`/metrics`, `/healthz`).
+    /// Defaults to loopback so metrics are not exposed to the world unless the
+    /// operator opts in. Only used when `metricsEnabled` is true.
+    std::string metricsBindAddress { "127.0.0.1" };
+
+    /// TCP port for the admin HTTP endpoint. Served on a dedicated port so it
+    /// never collides with the cache protocols. Only used when `metricsEnabled`.
+    std::uint16_t metricsPort { 9259 };
+
+    /// Whether to start the admin HTTP endpoint (Prometheus `/metrics` plus a
+    /// `/healthz` liveness probe). Off by default.
+    bool metricsEnabled { false };
+
     /// ::listen() backlog — the depth of the kernel's queue of accepted-
     /// but-not-yet-handed-off connections. Bursts of parallel clients (a
     /// `make -jN` driving sccache opens many sockets at once) overflow a

@@ -49,8 +49,9 @@ place.
 
 ## Operational gaps
 
-- No live event subscription (`watch`) means observability is via
-  the `stats` snapshot only.
+- No live event subscription (`watch`). Observability is via the `stats`
+  snapshot and, when `--metrics` is set, a Prometheus `/metrics` endpoint
+  (plus a `/healthz` liveness probe) served on a dedicated HTTP port.
 - No built-in TLS termination. Run behind a TLS-terminating proxy
   if encryption-in-transit is required.
 

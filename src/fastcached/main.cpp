@@ -24,10 +24,13 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
+#include <FastCache/Server/AdminHttpServer.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 
 #include <atomic>
@@ -114,6 +117,12 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         fileCfg.requirePass = cliCfg.requirePass;
     if (cli.authUsernameExplicit)
         fileCfg.authUsername = cliCfg.authUsername;
+    if (cli.metricsEnabledExplicit)
+        fileCfg.metricsEnabled = cliCfg.metricsEnabled;
+    if (cli.metricsBindAddressExplicit)
+        fileCfg.metricsBindAddress = cliCfg.metricsBindAddress;
+    if (cli.metricsPortExplicit)
+        fileCfg.metricsPort = cliCfg.metricsPort;
     return fileCfg;
 }
 
@@ -322,10 +331,13 @@ int DaemonBody(FastCache::Config const& effective)
 
     // Wrap the backend in a ShardedStorage (its per-shard mutex serialises
     // access) whenever more than one thread can reach it: an explicit
-    // multi-shard layout, the persistent backend, or the reactor running on
-    // more than one thread. A lone reactor over in-memory storage stays
-    // unwrapped — one thread owns it, so the wrapper would be pure overhead.
-    auto const useShardingWrapper = physicalShards > 1 || usingPersistent || reactorCount > 1;
+    // multi-shard layout, the persistent backend, the reactor running on more
+    // than one thread, or the metrics endpoint (its fc-admin thread calls
+    // engine.Snapshot() concurrently with the reactor, and InMemoryLruStorage::
+    // Snapshot is only safe under the shard's exclusive lock). A lone reactor
+    // over in-memory storage with no metrics stays unwrapped — one thread owns
+    // it, so the wrapper would be pure overhead.
+    auto const useShardingWrapper = physicalShards > 1 || usingPersistent || reactorCount > 1 || effective.metricsEnabled;
 
     auto bundle = BuildStorageBackend(effective, usingPersistent, useShardingWrapper, physicalShards);
     if (!bundle.has_value())
@@ -346,6 +358,11 @@ int DaemonBody(FastCache::Config const& effective)
     }
 
     FastCache::CacheEngine engine { *storagePtr, clock };
+
+    // Connection-level metrics sink, shared by the server loop and the admin
+    // HTTP endpoint. Wiring it into RunReactorServer is what actually collects
+    // the connection counters; command/capacity stats come from the engine.
+    FastCache::AtomicMetricsSink metrics;
 
     reloader.Subscribe([&logger, backendPtr](auto const& /*prev*/, auto const& next) {
         logger.SetMinLevel(next->logLevel);
@@ -422,8 +439,60 @@ int DaemonBody(FastCache::Config const& effective)
     // a lone reactor gains nothing from pinning.
     serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
     serverOpts.session.auth = authPolicy ? &*authPolicy : nullptr;
-    int const exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
 
+    // Optional admin HTTP endpoint (/metrics, /healthz) on its own port and
+    // thread. A blocking listener is plenty for scrape-rate traffic; SetTimeouts
+    // below makes the accept loop poll so Shutdown() is observed even on POSIX
+    // (where Close() does not unblock a parked accept()) and bounds a stalled
+    // client's request read so it cannot wedge the single-threaded endpoint.
+    std::unique_ptr<FastCache::BlockingListener> adminListener;
+    std::unique_ptr<FastCache::AdminHttpServer> adminServer;
+    std::jthread adminThread;
+    if (effective.metricsEnabled)
+    {
+        adminListener = FastCache::BlockingListener::Bind(effective.metricsBindAddress, effective.metricsPort);
+        if (!adminListener || !adminListener->IsBound())
+        {
+            logger.Logf(FastCache::LogLevel::Error,
+                        "fastcached: cannot bind metrics endpoint {}:{} ({})",
+                        effective.metricsBindAddress,
+                        effective.metricsPort,
+                        adminListener ? adminListener->BindError() : std::string_view { "null listener" });
+        }
+        else
+        {
+            // Poll accept() every 500ms so Shutdown() is observed on POSIX, and
+            // time out a stalled request read after 2s so one idle client cannot
+            // wedge the single-threaded admin endpoint (slowloris).
+            adminListener->SetTimeouts(std::chrono::milliseconds { 500 }, std::chrono::seconds { 2 });
+
+            auto const adminStartedAt = clock.Now();
+            adminServer = std::make_unique<FastCache::AdminHttpServer>(
+                *adminListener,
+                metrics,
+                [&engine, &clock, adminStartedAt] {
+                    return FastCache::MetricsSnapshot {
+                        .storage = engine.Snapshot(),
+                        .uptime = FastCache::Uptime { std::chrono::duration_cast<std::chrono::seconds>(clock.Now()
+                                                                                                       - adminStartedAt) },
+                    };
+                },
+                logger);
+            adminThread = std::jthread { [&adminServer] {
+                FC_THREAD_NAME("fc-admin");
+                FastCache::SyncRun(adminServer->Run());
+            } };
+            logger.Logf(FastCache::LogLevel::Info,
+                        "metrics endpoint on http://{}:{}/metrics (and /healthz)",
+                        effective.metricsBindAddress,
+                        effective.metricsPort);
+        }
+    }
+
+    int const exitCode = FastCache::RunReactorServer(serverOpts, engine, logger, /*admission*/ nullptr, &metrics);
+
+    if (adminServer)
+        adminServer->Shutdown(); // unblocks the admin accept loop so adminThread joins
     reloaderQuit.store(true, std::memory_order_release);
     return exitCode;
 }
@@ -462,21 +531,43 @@ int main(int argc, char const* const* argv)
     }
 
     FastCache::Config effective;
+    bool metricsPortYamlExplicit = false;
     if (!parsed->config.configPath.empty())
     {
-        auto loaded = FastCache::ReadYamlConfig(parsed->config.configPath);
+        auto loaded = FastCache::ReadYamlConfigWithPresence(parsed->config.configPath);
         if (!loaded.has_value())
         {
             std::println(std::cerr, "fastcached: {}", loaded.error().ToString());
             return EXIT_FAILURE;
         }
-        effective = Merge(std::move(*loaded), *parsed);
+        metricsPortYamlExplicit = loaded->metricsPortExplicit;
+        effective = Merge(std::move(loaded->config), *parsed);
         effective.configPath = parsed->config.configPath;
     }
     else
     {
         effective = parsed->config;
     }
+
+    // Environment fallback for the metrics port: honour FASTCACHED_METRICS_PORT
+    // only when the port has NOT been set explicitly on the CLI *or* in the YAML
+    // config. This makes the precedence CLI > config-file > env > default, so a
+    // stray environment variable can never silently override a `metrics_port:`
+    // the operator wrote in their config file — even when they wrote the
+    // compiled-in default value (e.g. `metrics_port: 9259` is now distinguishable
+    // from "the key was absent" thanks to the YAML presence bit). A container
+    // that wants the env form simply omits the config/CLI value, letting both
+    // the daemon and its `--healthcheck` probe agree on the port via a single
+    // `-e FASTCACHED_METRICS_PORT=...`.
+    if (!parsed->metricsPortExplicit && !metricsPortYamlExplicit)
+        if (auto const envPort = MetricsPortFromEnv())
+            effective.metricsPort = *envPort;
+
+    // Health check: probe the running daemon's /healthz on loopback and exit
+    // 0/1. Loopback regardless of the configured metrics bind address, since the
+    // probe runs inside the same host/container as the daemon.
+    if (parsed->outcome == FastCache::CliOutcome::HealthCheck)
+        return FastCache::HttpHealthProbe("127.0.0.1", effective.metricsPort, "/healthz") ? EXIT_SUCCESS : EXIT_FAILURE;
 
     // Service-control requests act on the SCM and exit; they never run the
     // daemon body. The effective config is reused so every flag passed

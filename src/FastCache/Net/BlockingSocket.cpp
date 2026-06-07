@@ -5,6 +5,7 @@
 #include <FastCache/Net/SocketAddress.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +24,7 @@
     #include <ws2tcpip.h>
 #else
     #include <sys/socket.h>
+    #include <sys/time.h> // struct timeval for SO_RCVTIMEO/SO_SNDTIMEO
 
     #include <cerrno>
     #include <csignal>
@@ -82,6 +84,10 @@ namespace Detail
                     return NetErrorCode::BadFileHandle;
                 case WSAEINTR:
                     return NetErrorCode::Cancelled;
+                case WSAEWOULDBLOCK:
+                    return NetErrorCode::WouldBlock;
+                case WSAETIMEDOUT:
+                    return NetErrorCode::Timeout;
                 default:
                     return NetErrorCode::SystemError;
             }
@@ -143,6 +149,13 @@ namespace Detail
                     return NetErrorCode::BadFileHandle;
                 case EINTR:
                     return NetErrorCode::Cancelled;
+                case EWOULDBLOCK:
+    #if EAGAIN != EWOULDBLOCK
+                case EAGAIN:
+    #endif
+                    return NetErrorCode::WouldBlock;
+                case ETIMEDOUT:
+                    return NetErrorCode::Timeout;
                 default:
                     return NetErrorCode::SystemError;
             }
@@ -208,6 +221,30 @@ namespace Detail
     void CloseNativeSocket(NativeSocket socket) noexcept
     {
         std::ignore = CloseNative(socket);
+    }
+
+    void SetIoTimeouts(NativeSocket socket,
+                       std::chrono::milliseconds recvTimeout,
+                       std::chrono::milliseconds sendTimeout) noexcept
+    {
+        auto const apply = [socket](int option, std::chrono::milliseconds timeout) noexcept {
+            if (timeout.count() <= 0)
+                return; // 0 / negative: leave the OS default (no timeout) in place.
+#if defined(_WIN32)
+            // Windows SO_RCVTIMEO/SO_SNDTIMEO take a DWORD of milliseconds.
+            auto const millis = static_cast<DWORD>(timeout.count());
+            std::ignore = ::setsockopt(
+                static_cast<SOCKET>(socket), SOL_SOCKET, option, reinterpret_cast<char const*>(&millis), sizeof(millis));
+#else
+            // POSIX SO_RCVTIMEO/SO_SNDTIMEO take a struct timeval.
+            timeval tv {};
+            tv.tv_sec = static_cast<decltype(tv.tv_sec)>(timeout.count() / 1000);
+            tv.tv_usec = static_cast<decltype(tv.tv_usec)>((timeout.count() % 1000) * 1000);
+            std::ignore = ::setsockopt(socket, SOL_SOCKET, option, &tv, sizeof(tv));
+#endif
+        };
+        apply(SO_RCVTIMEO, recvTimeout);
+        apply(SO_SNDTIMEO, sendTimeout);
     }
 
 } // namespace Detail
@@ -337,6 +374,19 @@ void BlockingListener::Close() noexcept
     }
 }
 
+void BlockingListener::SetTimeouts(std::chrono::milliseconds acceptPoll, std::chrono::milliseconds ioTimeout) noexcept
+{
+    _ioTimeout = ioTimeout;
+    // A receive timeout on the listening socket makes ::accept() return
+    // periodically (POSIX honours SO_RCVTIMEO for accept), so the accept loop can
+    // wake to re-check a shutdown flag: POSIX does NOT unblock a parked accept()
+    // when another thread closes the socket. Windows ignores SO_RCVTIMEO for
+    // accept, but there closesocket() does unblock a parked accept(), so a clean
+    // shutdown works on both platforms.
+    if (_native != Detail::InvalidSocket)
+        Detail::SetIoTimeouts(_native, acceptPoll, std::chrono::milliseconds { 0 });
+}
+
 AcceptAwaitable BlockingListener::Accept()
 {
     if (_native == Detail::InvalidSocket)
@@ -356,6 +406,10 @@ AcceptAwaitable BlockingListener::Accept()
         return AcceptAwaitable { std::unexpected(MakeSystemError("accept")) };
 
     Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(acceptedRaw));
+    // Bound the request read so a stalled client cannot wedge a blocking recv()
+    // (and so the single-threaded admin endpoint stays available under slowloris).
+    if (_ioTimeout.count() > 0)
+        Detail::SetIoTimeouts(static_cast<Detail::NativeSocket>(acceptedRaw), _ioTimeout, _ioTimeout);
     return AcceptAwaitable { AcceptResult {
         std::make_unique<BlockingSocket>(static_cast<Detail::NativeSocket>(acceptedRaw)) } };
 }
