@@ -20,6 +20,7 @@
     #include <span>
     #include <string>
     #include <string_view>
+    #include <tuple>
     #include <utility>
     #include <vector>
 
@@ -203,7 +204,7 @@ struct KqueueSocket::Impl
 
     void UpdateInterest()
     {
-        reactor.UpdateInterest(&handler, readOp.awaitable != nullptr, writeOp.awaitable != nullptr);
+        std::ignore = reactor.UpdateInterest(&handler, readOp.awaitable != nullptr, writeOp.awaitable != nullptr);
     }
 
     Impl(KqueueReactor& r, int fd):
@@ -312,7 +313,7 @@ KqueueSocket::KqueueSocket(KqueueReactor& reactor, int fd) noexcept:
     _fd { fd }
 {
     SetNonBlocking(fd);
-    reactor.Attach(&_impl->handler);
+    std::ignore = reactor.Attach(&_impl->handler);
 }
 
 KqueueSocket::~KqueueSocket()
@@ -364,7 +365,7 @@ IoAwaitable KqueueSocket::Read(std::span<std::byte> buffer)
     _impl->readOp.readBuffer = buffer;
     IoAwaitable a;
     a.SetSuspendCallback(&KqueueSocketAwaitableSuspended, &_impl->readOp);
-    _impl->reactor.UpdateInterest(&_impl->handler, true, _impl->writeOp.awaitable != nullptr);
+    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, true, _impl->writeOp.awaitable != nullptr);
     return a;
 }
 
@@ -395,7 +396,7 @@ IoAwaitable KqueueSocket::Write(std::span<std::byte const> buffer)
     _impl->writeOp.writeTotal = buffer.size();
     IoAwaitable a;
     a.SetSuspendCallback(&KqueueSocketAwaitableSuspended, &_impl->writeOp);
-    _impl->reactor.UpdateInterest(&_impl->handler, _impl->readOp.awaitable != nullptr, true);
+    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, _impl->readOp.awaitable != nullptr, true);
     return a;
 }
 
@@ -425,7 +426,7 @@ IoAwaitable KqueueSocket::WriteVectored(std::span<std::span<std::byte const> con
     _impl->writeOp.writeKeepAlive = std::move(keepAlive);
     IoAwaitable a;
     a.SetSuspendCallback(&KqueueSocketAwaitableSuspended, &_impl->writeOp);
-    _impl->reactor.UpdateInterest(&_impl->handler, _impl->readOp.awaitable != nullptr, true);
+    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, _impl->readOp.awaitable != nullptr, true);
     return a;
 }
 
@@ -479,7 +480,7 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
             return;
         auto* awaitable = impl->pending;
         impl->pending = nullptr;
-        impl->reactor.UpdateInterest(&impl->handler, false, false);
+        std::ignore = impl->reactor.UpdateInterest(&impl->handler, false, false);
         awaitable->Complete(std::unexpected(MakePosixError(errno, "accept")));
         return;
     }
@@ -487,7 +488,7 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
     Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(fd));
     auto* awaitable = impl->pending;
     impl->pending = nullptr;
-    impl->reactor.UpdateInterest(&impl->handler, false, false);
+    std::ignore = impl->reactor.UpdateInterest(&impl->handler, false, false);
     awaitable->Complete(AcceptResult { std::make_unique<KqueueSocket>(impl->reactor, fd) });
 }
 
@@ -565,7 +566,7 @@ AcceptAwaitable KqueueListener::Accept()
     _impl->pending = nullptr;
     AcceptAwaitable a;
     a.SetSuspendCallback(&ListenerAwaitableSuspended, _impl.get());
-    _impl->reactor.UpdateInterest(&_impl->handler, true, false);
+    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, true, false);
     return a;
 }
 

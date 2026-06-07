@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [clang-debug, clang-release, gcc-debug, gcc-release]
+        preset: [clang-release, gcc-release]
     steps:
       - uses: actions/checkout@v4
 
@@ -68,10 +68,9 @@ jobs:
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
-          sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} clang-tidy-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
+          sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
           sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
           sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
-          sudo ln -sf /usr/bin/clang-tidy-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang-tidy
 
       - name: "Install GCC ${{ env.GCC_VERSION }}"
         if: startsWith(matrix.preset, 'gcc')
@@ -90,12 +89,102 @@ jobs:
         run: ctest --preset ${{ matrix.preset }}
 
       - name: "Upload Linux binary for the sccache smoke job"
-        if: matrix.preset == 'clang-debug'
+        if: matrix.preset == 'clang-release'
         uses: actions/upload-artifact@v4
         with:
           name: fastcached-linux
-          path: out/build/clang-debug/target/fastcached
+          path: out/build/clang-release/target/fastcached
           retention-days: 1
+
+  # clang-tidy runs in its own job (not folded into the release matrix above) so
+  # it surfaces as a distinct PR status check. It reuses the clang-debug preset,
+  # which is the only one wired with ENABLE_TIDY=ON (plus ASan/UBSan), so this job
+  # also preserves the sanitizer-enabled Debug test pass that left the linux
+  # matrix when that went release-only.
+  clang-tidy:
+    name: "clang-tidy"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Cache CPM packages"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-${{ runner.os }}-clang-debug-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-clang-debug-
+
+      - name: "ccache"
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-clang-debug
+          max-size: 256M
+
+      - name: "Install build tools"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libyaml-cpp-dev
+
+      - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
+          sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} clang-tidy-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
+          sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
+          sudo ln -sf /usr/bin/clang-tidy-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang-tidy
+
+      - name: "Configure"
+        run: cmake --preset clang-debug
+
+      - name: "Build (runs clang-tidy via CMAKE_CXX_CLANG_TIDY)"
+        run: cmake --build --preset clang-debug
+
+      - name: "Test"
+        run: ctest --preset clang-debug
+
+  macos:
+    name: "macOS-clang-release"
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Cache CPM packages"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-${{ runner.os }}-clang-release-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-clang-release-
+
+      - name: "ccache"
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-clang-release
+          max-size: 256M
+
+      # Apple's bundled AppleClang 15 ships a libc++ without std::jthread
+      # (libc++ only implemented it in LLVM 18). Use Homebrew's LLVM, whose
+      # modern libc++ has it. llvm is keg-only, so we point the compiler at its
+      # explicit path and add its libc++ to the linker search + rpath.
+      - name: "Install build tools"
+        run: brew install ninja llvm
+
+      # The clang-release preset pins CMAKE_C/CXX_COMPILER to bare clang/clang++
+      # (= AppleClang on PATH); override on the command line, which takes
+      # precedence over preset cache variables, to use Homebrew's LLVM instead.
+      - name: "Configure"
+        run: |
+          cmake --preset clang-release \
+            -DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang \
+            -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++ \
+            -DCMAKE_EXE_LINKER_FLAGS="-L/opt/homebrew/opt/llvm/lib/c++ -L/opt/homebrew/opt/llvm/lib -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++"
+
+      - name: "Build"
+        run: cmake --build --preset clang-release
+
+      - name: "Test"
+        run: ctest --preset clang-release
 
   # Smoke tests live in three sibling jobs so the PR status check tells you
   # *which* protocol broke without opening the log. They share the same
@@ -176,7 +265,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [cl-debug, cl-release, clangcl-debug, clangcl-release]
+        preset: [cl-release, clangcl-release]
     steps:
       - uses: actions/checkout@v4
 
