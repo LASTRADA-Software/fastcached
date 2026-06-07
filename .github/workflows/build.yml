@@ -13,7 +13,7 @@ concurrency:
 
 env:
   CTEST_OUTPUT_ON_FAILURE: 1
-  CLANG_TOOLS_VERSION: "20"
+  CLANG_TOOLS_VERSION: "22"
   GCC_VERSION: "14"
   CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/CPM
 
