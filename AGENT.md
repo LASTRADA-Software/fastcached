@@ -8,35 +8,43 @@ in-memory transport.
 
 ```
 src/FastCache/
-  Core/         Errors taxonomy, Clock, Logger, BufferPool, Bytes, Endian, Crc32c
-  Async/        Task<T>, DetachedTask, Cancellation, IReactor + TestReactor
-  Net/          ISocket, IListener, IoAwaitable, IAdmissionControl,
+  Core/         Errors taxonomy, Clock, Logger, BufferPool, Bytes, Endian,
+                Crc32c, StringHash, Owner, Profiling (Tracy wrappers)
+  Async/        Task<T>, Cancellation, ResumeOn, IReactor + TestReactor and the
+                platform reactors (EpollReactor / IocpReactor / KqueueReactor)
+  Net/          ISocket, IListener, IoAwaitable, IAdmissionControl, SocketAddress,
                 BlockingSocket (Winsock + POSIX),
+                EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
                 InMemoryTransport (paired pipes + InMemoryListener),
                 Framing/ByteReader (line and length-prefixed)
   Cache/        IStorage atomic primitives, CacheEntry, CacheEngine,
-                InMemoryLruStorage, DiskStorage (append-only log + CRC32C)
+                InMemoryLruStorage, CowTreeStorage (CoW B+tree, src/CowTree),
+                LayeredStorage (L1 LRU over L2 disk), ShardedStorage
+                (key-hash fan-out), TracingStorage (Tracy zones)
   Protocol/     IProtocolHandler, ProtocolAutodetect, MemcachedText,
-                MemcachedBinary, RedisResp (RESP2)
-  Server/       Connection (per-client coroutine), Server, BlockingServerLoop
-                (production thread-per-connection driver of the same handlers)
+                MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
+                RedisResp (RESP2)
+  Server/       Connection (per-client coroutine), Server,
+                ReactorServerLoop (the server driver)
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
-                ISignalSource, DaemonControls (process-wide stop/reload flags)
-  Config/       Config, CliParser, YamlReader (yaml-cpp), ConfigReloader
+                ISignalSource, DaemonControls (process-wide stop/reload flags),
+                CpuAffinity, HostMemory, ServiceControl, Terminal
+  Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader
   Metrics/      IMetricsSink + AtomicMetricsSink
 ```
 
 Production flow: `main()` -> CLI -> optional YAML -> `ConfigReloader` ->
-`CacheEngine` over `InMemoryLruStorage` (or a `ShardedStorage` of
-`CowTreeStorage` when `--storage` is set) -> platform `IListener` ->
-`RunReactorServer`. The reactor (IOCP / epoll / kqueue) multiplexes every
-connection on its event loop, so the number of concurrent clients is bounded
-by memory, not by a worker count. On Windows the persistent backend drives
-the IOCP reactor from several threads (sized by `--threads`) so a blocking
-page-store `fsync` overlaps with serving other connections; the disk backend
-is therefore always wrapped in a `ShardedStorage` for thread safety. The
-legacy thread-per-connection pool (`RunPooledServerLoop`) and blocking driver
-remain reachable via `--execution-model=threaded`.
+`CacheEngine` over `InMemoryLruStorage` (or, when `--storage` is set, a
+`ShardedStorage` of `LayeredStorage(InMemoryLruStorage, CowTreeStorage)` —
+an in-memory L1 over the on-disk B+tree L2) -> `RunReactorServer`. The
+reactor (IOCP / epoll / kqueue) multiplexes every connection on its event
+loop, so the number of concurrent clients is bounded by memory, not by a
+worker count. `--threads` runs that many independent single-threaded
+reactors, each pinned to a core, with every connection pinned to one reactor
+for its lifetime. On Windows the persistent backend additionally drains the
+IOCP reactor from several threads so a blocking page-store `fsync` overlaps
+with serving other connections; the disk backend is therefore always wrapped
+in a `ShardedStorage` for thread safety.
 
 ## Design Patterns & Principles
 

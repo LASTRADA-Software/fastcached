@@ -56,10 +56,12 @@ working example.
 ### Connection
 - [PING](redis/connection/ping.md) · [ECHO](redis/connection/echo.md) ·
   [HELLO](redis/connection/hello.md) · [AUTH](redis/connection/auth.md) ·
+  [SELECT](redis/connection/select.md) · [CLIENT](redis/connection/client.md) ·
   [QUIT](redis/connection/quit.md)
 
 ### Server
 - [INFO](redis/server/info.md) · [COMMAND](redis/server/command.md) ·
+  [CONFIG](redis/server/config.md) ·
   [FLUSHDB](redis/server/flushdb.md) · [FLUSHALL](redis/server/flushall.md)
 
 ### Unsupported

@@ -33,7 +33,9 @@ compatible with well-behaved clients written against those references.
   clients fail fast rather than hang.
 - Redis RESP3. `HELLO 3` is rejected with `-NOPROTO`.
 - The `watch` command's streaming event subscription.
-- A single flat keyspace; no Redis `SELECT` databases.
+- Multiple Redis databases. There is a single flat keyspace; `SELECT`
+  is accepted as a no-op (any index replies `+OK`) for client
+  compatibility but does not switch databases.
 
 See [Known limitations](operations/known-limitations.md) for the full
 list.

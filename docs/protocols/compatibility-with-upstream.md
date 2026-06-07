@@ -43,7 +43,8 @@ Reference: [memcached 1.6.x][mc].
 | Binary `Verbosity`                       | Accepted, no-op |
 | Binary SASL                              | Rejected with `AuthError` |
 | Meta `mg` / `ms` / `md` / `ma` / `me` / `mn` | Full |
-| Meta flags (`b c C E F I J D N M O T R h k l q s t u v x`) | Full |
+| Meta flags (`c f h k l O q s t u v T N` on `mg`; `c C F I k M N O q s T` on `ms`; `C I k O q T` on `md`; `c C D J k M N O q t T v` on `ma`) | Full |
+| Meta flags `b` (base64 key) / `E` (CAS override) / `R` (recache) / `x` (keep-metadata) | Accepted but ignored (parsed past, not acted on) |
 
 ## Redis (RESP2)
 
@@ -69,7 +70,9 @@ Reference: [Redis 7.x][redis], RESP2 subset only.
 | `FLUSHDB` / `FLUSHALL`                   | Full   |
 | `QUIT`                                   | Full   |
 | `AUTH`                                   | Rejected (no auth backend) |
-| `SELECT`                                 | Single keyspace; `SELECT 0` acknowledged |
+| `SELECT`                                 | No-op for any index (single keyspace; always `+OK`) |
+| `CLIENT`                                 | Connection-setup stub (`SETNAME`/`SETINFO`/`ID`/`GETNAME`) |
+| `CONFIG`                                 | Stub (`CONFIG GET` reports `0` per param; others reply `+OK`) |
 | Other Redis commands                     | Not supported (see [Unsupported Redis commands](../commands/redis/unsupported.md)) |
 
 This is a deliberate subset chosen to cover the `sccache` /

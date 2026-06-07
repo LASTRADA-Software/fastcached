@@ -38,6 +38,7 @@ Full table: [Meta flags reference](../../../protocols/meta-flags-reference.md).
 | `NF`  | Key does not exist and no `N` was set |
 | `NS`  | Not stored |
 | `EX`  | CAS mismatch |
+| `CLIENT_ERROR non-numeric value` | The stored value is not a base-10 unsigned integer |
 
 ## Examples
 

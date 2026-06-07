@@ -21,8 +21,7 @@ namespace
     /// DetachedTask, whose `unhandled_exception` calls std::terminate, so an
     /// exception escaping a handler (e.g. std::bad_alloc while serving a large
     /// value) would take down the entire daemon and every other connection.
-    /// We instead log it and drop only this connection. The legacy threaded
-    /// driver (PooledServerLoop) already has the equivalent guard.
+    /// We instead log it and drop only this connection.
     DetachedTask RunConnectionDetached(std::unique_ptr<Connection> connection, ILogger* logger, IAdmissionControl* admission)
     {
         try

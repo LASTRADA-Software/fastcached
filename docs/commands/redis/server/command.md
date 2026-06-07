@@ -15,6 +15,7 @@ COMMAND DOCS
 
 ## Response
 
-An array of arrays describing each supported command. Clients that
-use this for capability detection see only the commands fastcached
-implements.
+Always an empty array (`*0\r\n`), regardless of any sub-command or
+arguments. fastcached does not ship a command table; this reply exists
+only because `sccache` issues `COMMAND` as a connection sanity check
+and needs a well-formed array back rather than an error.

@@ -16,18 +16,22 @@ same minimal set today.
 
 ## Response
 
-Bulk string containing:
+A bulk string with three sections and a fixed, minimal field set:
 
 ```text
 # Server
-redis_version: <fastcached version>
-...
-# Clients
-...
+fastcached_version:<version>
+redis_version:6.0.0-fastcached
 # Memory
-used_memory: <bytes>
-...
+used_memory:<bytes>
+maxmemory:<byte limit>
+# Stats
+total_commands_processed:<count>
+keyspace_hits:<count>
+keyspace_misses:<count>
 ```
 
-The exact fields are a subset of what Redis emits; clients that look
-for `redis_version` and `used_memory` work as expected.
+The `section` argument is accepted but ignored — the same fields are
+always returned. There is no `# Clients` section. The values are drawn
+from the same counters the memcached `stats` command exposes. Clients
+that look for `redis_version` and `used_memory` work as expected.

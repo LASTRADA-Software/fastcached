@@ -174,25 +174,6 @@ namespace
             cfg.storageMaxValueBytes = *parsed;
             return {};
         }
-        /// `execution_model`: auto | threaded | reactor. `auto` picks
-        /// reactor for in-memory and threaded for CoW on-disk storage.
-        if (key == "execution_model")
-        {
-            auto const raw = valueNode.as<std::string>();
-            if (raw == "auto")
-                cfg.executionModel = ExecutionModel::Auto;
-            else if (raw == "threaded")
-                cfg.executionModel = ExecutionModel::Threaded;
-            else if (raw == "reactor")
-                cfg.executionModel = ExecutionModel::Reactor;
-            else
-                return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
-                                                 path,
-                                                 "execution_model",
-                                                 std::string { "unknown model (expect auto|threaded|reactor): " } + raw,
-                                                 line));
-            return {};
-        }
         /// `lru_mode`: approximate | strict in-memory LRU recency policy.
         if (key == "lru_mode")
         {

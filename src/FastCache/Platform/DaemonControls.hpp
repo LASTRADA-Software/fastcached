@@ -50,8 +50,7 @@ class DaemonControls
     }
 
     /// Direct atomic access for callers that want to share the bool with
-    /// signal-safe code (e.g. `RunBlockingServerLoop` which takes
-    /// `std::atomic<bool>&`).
+    /// signal-safe code that takes a `std::atomic<bool>&`.
     [[nodiscard]] std::atomic<bool>& StopFlag() noexcept
     {
         return _stop;

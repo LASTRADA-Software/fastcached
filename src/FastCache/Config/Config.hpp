@@ -20,30 +20,6 @@ enum class StorageDurability : std::uint8_t
     None = 2,    ///< OS page cache only; no fsync.
 };
 
-/// Server execution model. Controls how concurrent client connections
-/// are served.
-enum class ExecutionModel : std::uint8_t
-{
-    /// Pick the best model for the configured storage backend: reactor
-    /// for in-memory (single-threaded suffices — operations are
-    /// non-blocking and CPU-bound on hash lookups), threaded for CoW
-    /// on-disk storage (disk I/O and page-store writes benefit from
-    /// per-shard parallelism). The default.
-    Auto = 0,
-
-    /// Thread-pool-backed accept loop (fixed-size pool created at
-    /// startup). One accept thread feeds a bounded queue; N workers
-    /// drive Connection coroutines to completion. Required for
-    /// parallel sccache builds and other multi-client workloads.
-    Threaded = 1,
-
-    /// Single-threaded reactor (IOCP / epoll / kqueue). All
-    /// connections multiplexed on one thread. Useful for testing,
-    /// low-resource deployments, and single-client workloads where
-    /// CPU parallelism is not needed.
-    Reactor = 2,
-};
-
 /// CPU-affinity policy for the reactor worker threads.
 enum class CpuAffinity : std::uint8_t
 {
@@ -82,9 +58,11 @@ struct Config
     /// this return StorageErrorCode::ValueTooLarge.
     std::size_t storageMaxValueBytes { 16 * 1024 * 1024 };
 
-    /// Worker thread count for Threaded mode. 0 means "use
-    /// std::thread::hardware_concurrency()". Ignored when the
-    /// resolved execution model is Reactor.
+    /// Number of independent pinned reactors to run (the `--threads`
+    /// flag). Each reactor is a single-threaded event loop; connections
+    /// are pinned to one for their lifetime, so this is the server's
+    /// across-core parallelism. 0 means "use
+    /// std::thread::hardware_concurrency()".
     std::size_t workerThreads { 0 };
 
     /// Number of storage shards. 1 means "do not shard" (preserves
@@ -137,9 +115,6 @@ struct Config
     /// Durability mode for the persistent backend (ignored when
     /// storagePath is empty).
     StorageDurability storageDurability { StorageDurability::Batched };
-
-    /// Server execution model. See ExecutionModel docs.
-    ExecutionModel executionModel { ExecutionModel::Auto };
 
     /// In-memory LRU recency policy. Approximate (default) favours read
     /// throughput by letting same-shard reads run concurrently; Strict gives

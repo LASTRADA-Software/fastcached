@@ -175,25 +175,11 @@ TEST_CASE("CliParser: --storage-max-value rejects nonsense", "[config][cli][stor
     REQUIRE(result.error().field == "storage-max-value");
 }
 
-TEST_CASE("CliParser: --execution-model defaults to Auto", "[config][cli][execution-model]")
+TEST_CASE("CliParser: --execution-model is no longer a recognised flag", "[config][cli]")
 {
-    auto const args = std::array<char const*, 0> {};
+    auto const args = std::array<char const*, 1> { "--execution-model=reactor" };
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
-    REQUIRE(result.has_value());
-    REQUIRE(result->config.executionModel == FastCache::ExecutionModel::Auto);
-    REQUIRE_FALSE(result->executionModelExplicit);
-}
-
-TEST_CASE("CliParser: --execution-model=auto records the explicit-set flag", "[config][cli][execution-model]")
-{
-    // Distinguishes "user did not pass the flag" from "user typed
-    // --execution-model=auto" so a YAML value cannot shadow an
-    // explicit CLI auto.
-    auto const args = std::array<char const*, 1> { "--execution-model=auto" };
-    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
-    REQUIRE(result.has_value());
-    REQUIRE(result->config.executionModel == FastCache::ExecutionModel::Auto);
-    REQUIRE(result->executionModelExplicit);
+    REQUIRE_FALSE(result.has_value());
 }
 
 TEST_CASE("CliParser: --threads=0 records the explicit-set flag (regression for Merge default-collision)",
@@ -261,7 +247,6 @@ TEST_CASE("CliParser: omitting all flags leaves every explicit-tracker false", "
     REQUIRE_FALSE(result->storagePathExplicit);
     REQUIRE_FALSE(result->storageDurabilityExplicit);
     REQUIRE_FALSE(result->storageMaxValueBytesExplicit);
-    REQUIRE_FALSE(result->executionModelExplicit);
     REQUIRE_FALSE(result->workerThreadsExplicit);
     REQUIRE_FALSE(result->storageShardsExplicit);
     REQUIRE_FALSE(result->listenBacklogExplicit);
@@ -315,35 +300,10 @@ TEST_CASE("CliParser: --bind rejects syntactically invalid addresses", "[config]
     }
 }
 
-TEST_CASE("CliParser: --execution-model parses each mode", "[config][cli][execution-model]")
-{
-    for (auto const& [text, mode]: std::initializer_list<std::pair<char const*, FastCache::ExecutionModel>> {
-             { "--execution-model=auto", FastCache::ExecutionModel::Auto },
-             { "--execution-model=threaded", FastCache::ExecutionModel::Threaded },
-             { "--execution-model=reactor", FastCache::ExecutionModel::Reactor },
-         })
-    {
-        auto const args = std::array<char const*, 1> { text };
-        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
-        REQUIRE(result.has_value());
-        REQUIRE(result->config.executionModel == mode);
-    }
-}
-
-TEST_CASE("CliParser: --execution-model rejects unknown values", "[config][cli][execution-model]")
-{
-    auto const args = std::array<char const*, 1> { "--execution-model=fiber" };
-    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
-    REQUIRE_FALSE(result.has_value());
-    REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
-    REQUIRE(result.error().field == "execution-model");
-}
-
-TEST_CASE("CliParser: --help text mentions execution-model with auto", "[config][cli][execution-model]")
+TEST_CASE("CliParser: --help text does not mention the removed execution-model flag", "[config][cli]")
 {
     auto const usage = std::string { FastCache::CliUsage() };
-    REQUIRE(usage.contains("--execution-model"));
-    REQUIRE(usage.contains("auto|threaded|reactor"));
+    REQUIRE(!usage.contains("--execution-model"));
     REQUIRE(!usage.contains("--threading-model"));
 }
 
@@ -432,14 +392,14 @@ TEST_CASE("CliParser: --help wraps continuation lines to the description column"
     auto const usage = FastCache::CliUsage();
     auto const lines = SplitLines(usage);
 
-    // Find the --execution-model flag line and its continuation ("auto: ...").
+    // Find the --lru-mode flag line and its continuation ("approximate: ...").
     auto flagColumn = std::size_t { 0 };
     auto continuationColumn = std::size_t { 0 };
     for (auto const line: lines)
     {
-        if (line.starts_with("  --execution-model"))
+        if (line.starts_with("  --lru-mode"))
             flagColumn = DescriptionColumn(line);
-        else if (line.contains("auto: the reactor for both in-memory"))
+        else if (line.contains("approximate: same-shard reads run concurrently"))
             continuationColumn = line.find_first_not_of(' ');
     }
 

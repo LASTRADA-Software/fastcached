@@ -34,17 +34,23 @@ debugging.
 | `INFO`                                  | Returns version + basic stats |
 | `HELLO [2]`                             | Acknowledges RESP2 |
 | `HELLO 3`                               | `-NOPROTO` (RESP3 unsupported) |
-| `COMMAND`                               | Returns command introspection |
+| `COMMAND`                               | Always replies with an empty array (`*0`) |
 | `FLUSHDB` / `FLUSHALL`                  | Drops all entries |
 | `QUIT`                                  | `+OK` and close |
 | `AUTH ...`                              | `-ERR` (no auth backend) |
+| `SELECT <index>`                        | `+OK` no-op (single keyspace; any index accepted) |
+| `CLIENT <sub>`                          | Connection-setup stub (`SETNAME`/`SETINFO`/`ID`/`GETNAME`) |
+| `CONFIG <sub>`                          | Stub: `CONFIG GET` reports `0` for each param; `SET`/etc. reply `+OK` |
+
+`SELECT`, `CLIENT`, and `CONFIG` exist purely so the handshake a Redis
+client library performs on connect succeeds; they hold no real state.
 
 ## What is not supported
 
 Pub/sub, scripting (EVAL), cluster commands, streams, sorted sets,
-hashes, lists, transactions (MULTI/EXEC), CLIENT subcommands beyond
-the obvious, RESP3 features (push messages, big numbers, sets,
-attributes). See [Unsupported Redis commands](../commands/redis/unsupported.md)
+hashes, lists, transactions (MULTI/EXEC), and RESP3 features (push
+messages, big numbers, sets, attributes) are not supported.
+See [Unsupported Redis commands](../commands/redis/unsupported.md)
 for the full list of common commands that return `-ERR unknown command`.
 
 ## Why a subset?

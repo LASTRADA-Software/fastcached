@@ -15,4 +15,5 @@ HELLO [protocol-version]
 
 - For `HELLO` or `HELLO 2`: an array describing the server (server
   name, version, proto = 2, id, mode, role, modules)
-- For `HELLO 3`: `-NOPROTO sorry, this protocol version is not supported`
+- For `HELLO 3` (or any version other than 2):
+  `-NOPROTO sorry, RESP3 not supported`

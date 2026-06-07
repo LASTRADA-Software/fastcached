@@ -51,21 +51,6 @@ namespace
         return "batched";
     }
 
-    /// CLI spelling of an ExecutionModel, matching ParseExecutionModel.
-    [[nodiscard]] constexpr std::string_view ExecutionModelName(ExecutionModel model) noexcept
-    {
-        switch (model)
-        {
-            case ExecutionModel::Auto:
-                return "auto";
-            case ExecutionModel::Threaded:
-                return "threaded";
-            case ExecutionModel::Reactor:
-                return "reactor";
-        }
-        return "auto";
-    }
-
     /// Wrap @p value in double quotes when it contains whitespace, so the SCM's
     /// command-line tokenizer keeps it as a single argument. Quote-free values
     /// pass through unchanged for a stable, readable command line.
@@ -115,8 +100,6 @@ std::string BuildServiceCommandLine(std::filesystem::path const& exePath, Config
         out += std::format(" --storage-durability={}", DurabilityName(cfg.storageDurability));
     if (cfg.storageMaxValueBytes != defaults.storageMaxValueBytes)
         out += std::format(" --storage-max-value={}", cfg.storageMaxValueBytes);
-    if (cfg.executionModel != defaults.executionModel)
-        out += std::format(" --execution-model={}", ExecutionModelName(cfg.executionModel));
     if (cfg.workerThreads != defaults.workerThreads)
         out += std::format(" --threads={}", cfg.workerThreads);
     if (cfg.storageShards != defaults.storageShards)
