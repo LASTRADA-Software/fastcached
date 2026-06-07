@@ -44,8 +44,10 @@ column shows how that operation is expressed in a given protocol.
 | Authentication                               | – | SASL rejected | – | [`AUTH`](../commands/redis/connection/auth.md) rejected |
 | Echo                                         | – | – | – | [`ECHO`](../commands/redis/connection/echo.md) |
 | Server handshake                             | – | – | – | [`HELLO`](../commands/redis/connection/hello.md) |
-| Command introspection                        | – | – | – | [`COMMAND`](../commands/redis/server/command.md) |
-| Select database                              | – | – | – | single keyspace only |
+| Command introspection                        | – | – | – | [`COMMAND`](../commands/redis/server/command.md) (empty array) |
+| Select database                              | – | – | – | [`SELECT`](../commands/redis/connection/select.md) accepted (no-op, single keyspace) |
+| Client connection setup                      | – | – | – | [`CLIENT`](../commands/redis/connection/client.md) stub |
+| Runtime config probe                         | – | – | – | [`CONFIG`](../commands/redis/server/config.md) stub |
 | Pub / sub                                    | – | – | – | **no** |
 | Scripting (EVAL)                             | – | – | – | **no** |
 | Streams / sorted sets / hashes               | – | – | – | **no** |

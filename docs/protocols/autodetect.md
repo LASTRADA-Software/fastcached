@@ -1,9 +1,11 @@
 # Autodetection
 
-When a client connects, fastcached peeks the first bytes and routes
-the connection to one of four protocol handlers. The rule set is small
-and unambiguous; mis-classification would mean a closed connection,
-not a wrong answer.
+When a client connects, fastcached peeks the first byte and routes the
+connection to one of three protocol handlers — memcached binary,
+Redis RESP2, or memcached text. (The meta commands are dispatched from
+inside the text handler, so they need no first-byte rule of their own.)
+The rule set is small and unambiguous; mis-classification would mean a
+closed connection, not a wrong answer.
 
 ## Rules
 
@@ -43,3 +45,7 @@ If the bytes don't match a binary magic or a RESP marker, the text
 handler is invoked, which will eventually see a malformed line and
 respond `ERROR\r\n`. Persistently broken clients disconnect after
 the line-too-long limit (4 KiB).
+
+If the connection reaches EOF before sending a single byte, detection
+returns a `NetErrorCode::Eof` error and the connection is closed
+without dispatching any handler.

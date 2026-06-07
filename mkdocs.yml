@@ -4,8 +4,9 @@
 # Preview: mkdocs serve
 #
 # The strict flag fails on any broken link, missing nav entry, or
-# unresolved snippet — keeping the docs in lockstep with the code is
-# enforced mechanically by scripts/check-docs.py in CI.
+# unresolved snippet. Keeping the prose in lockstep with the code is,
+# for now, a manual discipline — there is no automated docs/code check
+# wired into CI yet.
 
 site_name: fastcached
 site_description: A memcached- and Redis-compatible cache daemon
@@ -134,10 +135,13 @@ nav:
       - ECHO: commands/redis/connection/echo.md
       - HELLO: commands/redis/connection/hello.md
       - AUTH: commands/redis/connection/auth.md
+      - SELECT: commands/redis/connection/select.md
+      - CLIENT: commands/redis/connection/client.md
       - QUIT: commands/redis/connection/quit.md
     - Redis server:
       - INFO: commands/redis/server/info.md
       - COMMAND: commands/redis/server/command.md
+      - CONFIG: commands/redis/server/config.md
       - FLUSHDB: commands/redis/server/flushdb.md
       - FLUSHALL: commands/redis/server/flushall.md
     - Unsupported Redis commands: commands/redis/unsupported.md

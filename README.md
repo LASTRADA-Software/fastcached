@@ -12,24 +12,31 @@ not been benchmarked against them and has not been used in production.
 
 ## Status
 
-All layers are wired and the daemon runs. The codebase covers a thread-pool-
-backed server (default) and a single-threaded reactor (IOCP / epoll / kqueue)
-opt-in, an LRU in-memory storage, an optional copy-on-write persistent
-backend (the sibling [`CowTree`](src/CowTree/README.md) library), key-hash
-sharding for parallel writes, CLI + YAML config with SIGHUP reload, and a
-POSIX-daemon / Windows-service host. CI builds on Linux (clang + gcc), macOS,
-and Windows (MSVC + clang-cl), and three separate jobs spin up the daemon and
-assert sccache gets a cache hit using each wire protocol.
+All layers are wired and the daemon runs. By default it serves connections on
+a **reactor** (IOCP / epoll / kqueue) — one event loop multiplexes every
+connection, optionally fanned out across several pinned reactor threads — so
+the number of concurrent clients is bounded by memory, not by a worker count.
+A legacy thread-pool driver remains reachable via `--execution-model=threaded`.
+On top of that the codebase covers an LRU in-memory storage, an optional
+copy-on-write persistent backend (the sibling
+[`CowTree`](src/CowTree/README.md) library) layered behind the LRU as an L2,
+key-hash sharding for parallel writes, CLI + YAML config with SIGHUP reload,
+and a POSIX-daemon / Windows-service host. CI builds on Linux (clang + gcc),
+macOS, and Windows (MSVC + clang-cl), and three separate jobs spin up the
+daemon and assert sccache gets a cache hit using each wire protocol.
 
 Protocol coverage is intentionally a subset:
 
-- **memcached text:** `get`, `set`, `add`, `replace`, `append`, `prepend`,
-  `cas`, `delete`, `incr`, `decr`, `flush_all`, `stats`, `version`, `quit`.
+- **memcached text:** `get`, `gets`, `set`, `add`, `replace`, `append`,
+  `prepend`, `cas`, `delete`, `incr`, `decr`, `touch`, `gat`, `gats`,
+  `flush_all`, `stats`, `version`, `quit`, plus the meta commands
+  `mg` / `ms` / `md` / `ma` / `me` / `mn` (a subset of the memcached 1.6 meta
+  flag matrix).
 - **memcached binary:** the core opcodes (Get / Set / Add / Replace / Delete /
   Increment / Decrement / Append / Prepend / Flush / Quit / NoOp / Version /
   Stat, plus their quiet variants and the SASL handshake stubs).
 - **Redis RESP2:** `GET`, `SET` (with `NX`/`XX`/`EX`/`PX`), `SETEX`,
-  `DEL` / `UNLINK`, `EXISTS`, `PING`, `ECHO`, `INFO`, `COMMAND`,
+  `DEL` / `UNLINK`, `EXISTS`, `PING`, `ECHO`, `INFO`, `COMMAND`, `SELECT`,
   `FLUSHDB` / `FLUSHALL`, `QUIT`.
 
 There is no clustering, no replication, and no authentication beyond the SASL
@@ -88,12 +95,22 @@ usage: fastcached [options]
   --port=<num>           TCP port (default 11211)
   --max-memory=<size>    in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)
   --log-level=<level>    trace|debug|info|warn|error|fatal (default info)
+  --log-timestamps       prefix every log line with an ISO 8601 UTC timestamp (default off)
   --storage=<path>       persist cache to a CoW-tree file (default: in-memory only)
   --storage-durability=<mode>  fsync|batched|none for --storage (default batched)
   --storage-max-value=<size>   per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)
   --execution-model=<mode>     auto|threaded|reactor (default auto)
-                                   auto: reactor for in-memory, threaded for --storage on disk
-  --threads=<N>                worker thread count for threaded mode (default: hardware_concurrency)
+                                   auto: the reactor for both in-memory and --storage on disk;
+                                   threaded selects the legacy per-connection worker pool
+  --lru-mode=<mode>            approximate|strict in-memory LRU recency (default approximate)
+                                   approximate: same-shard reads run concurrently (faster)
+                                   strict: exact LRU order, reads serialise per shard
+  --cpu-affinity=<mode>        none|per-core reactor thread pinning (default per-core;
+                                   pins each reactor to its own core when running >1 reactor)
+  --threads=<N>                server parallelism: number of pinned reactors (reactor model)
+                                   or worker-pool size (--execution-model=threaded);
+                                   default hardware_concurrency
+  --listen-backlog=<N>         ::listen() backlog depth (default 511; clamped to SOMAXCONN)
   --storage-shards=<N>         shard storage into N partitions for write parallelism
                                    default 1 (single-file mode) when --storage names a regular
                                    file or does not yet exist; min(16, hardware_concurrency)
@@ -162,20 +179,19 @@ The first run writes entries to disk; stop the daemon (Ctrl-C, kill, or a
 power loss) and start it again with the same flags and the cache picks back
 up from where it left off — no warm-up.
 
-### Concurrency: thread pool + sharded storage
+### Concurrency: reactor + sharded storage
 
-`--execution-model` defaults to `auto`, which picks **reactor** for the
-in-memory cache (single thread is plenty when every operation is a hash
-lookup) and **threaded** when `--storage=<path>` is set (disk I/O and
-per-shard locks benefit from parallel workers). Pass `--execution-model=threaded`
-or `=reactor` to force a choice.
-
-In threaded mode `fastcached` serves connections on a **thread pool** sized
-to `hardware_concurrency()` (override with `--threads=N`). One accept thread
-feeds a bounded queue; pool workers loop popping connections and driving
-each protocol coroutine to completion. Workers are created once at startup
-and reused — no per-connection thread spawn, which matters on builds where
-sccache opens hundreds of connections.
+`--execution-model` defaults to `auto`, which now resolves to the **reactor**
+for both the in-memory cache and on-disk `--storage`. One event loop
+multiplexes every connection, so concurrent clients are bounded by memory
+rather than a worker count — the older thread pool pinned one worker per
+keep-alive session, so a parallel sccache build could open more connections
+than the pool had workers and the surplus would be accepted but never served.
+`--threads=N` runs N independent pinned reactors (default
+`hardware_concurrency()`); on Windows the reactor is additionally drained by
+several threads so a blocking page-store `fsync` overlaps with serving other
+connections. Pass `--execution-model=threaded` to fall back to the legacy
+per-connection worker pool, or `=reactor` to force the reactor explicitly.
 
 Storage is **sharded by key hash** when `--storage-shards>1`. Each shard
 has its own `std::shared_mutex`: any number of `Get`s on the same shard
@@ -184,8 +200,8 @@ blocks operations on *that* shard, never across shards. For sccache's
 read-heavy, well-hashed key space this scales reads linearly across cores.
 
 ```sh
-# Pool + sharded persistent storage (--storage is treated as a directory
-# whenever --storage-shards > 1):
+# Reactor + sharded persistent storage (--storage is treated as a directory
+# whenever --storage-shards > 1); --threads sets the reactor count:
 ./fastcached \
     --port=11211 \
     --max-memory=30% \
@@ -193,8 +209,8 @@ read-heavy, well-hashed key space this scales reads linearly across cores.
     --storage-shards=16 \
     --threads=16
 
-# Fall back to single-threaded reactor if you need it for comparison:
-./fastcached --execution-model=reactor --port=11211 &
+# Fall back to the legacy thread-pool driver if you need it for comparison:
+./fastcached --execution-model=threaded --port=11211 &
 ```
 
 `--storage` is interpreted as a regular file when `--storage-shards=1`
@@ -227,18 +243,30 @@ port: 11611
 max_memory: 30%
 # one of: trace | debug | info | warn | error | fatal
 log_level: debug
+# optional: prefix every log line with an ISO 8601 UTC timestamp (default false)
+log_timestamps: false
 # optional: path to a CoW-tree file (single-shard) or directory (sharded).
 storage_path: /var/lib/fastcached/cache
 # optional: fsync | batched | none (default: batched)
 storage_durability: batched
+# optional: per-value byte cap for storage; k/m/g suffixes accepted (default 1m)
+storage_max_value: 1m
 # optional: shard storage across N partitions for parallel writes (0 = auto,
 # 1 = single file/instance, N>1 = directory with shard-NN.cow files)
 storage_shards: 16
 # optional: auto (default) | threaded | reactor
-# auto picks reactor for in-memory storage, threaded for CoW on-disk storage
+# auto resolves to the reactor for both in-memory and on-disk storage;
+# threaded selects the legacy per-connection worker pool
 execution_model: auto
-# optional: worker thread count for threaded mode (0 = hardware_concurrency)
+# optional: server parallelism — pinned reactor count (reactor model) or
+# worker-pool size (threaded model); 0 = hardware_concurrency
 threads: 0
+# optional: approximate (default) | strict in-memory LRU recency
+lru_mode: approximate
+# optional: none | per-core reactor thread pinning (default per-core)
+cpu_affinity: per-core
+# optional: ::listen() backlog depth (default 511; clamped to SOMAXCONN)
+listen_backlog: 511
 ```
 
 CLI flags override YAML values. On POSIX, `SIGHUP` triggers a re-read of the

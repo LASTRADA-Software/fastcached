@@ -7,9 +7,8 @@ The canonical table of every single-letter flag across `mg`, `ms`,
 
 | Flag    | Effect |
 |---------|--------|
-| `b`     | Key is base64-encoded (spec; fastcached parses but does not re-decode) |
+| `b`     | Key is base64-encoded (spec); accepted but not decoded — the key is used verbatim |
 | `c`     | Return CAS in response |
-| `C(token)` | Conditional fetch — only return value if CAS differs |
 | `f`     | Return client flags |
 | `h`     | Return hit status (`1` on hit) |
 | `k`     | Echo key in response |
@@ -29,7 +28,7 @@ The canonical table of every single-letter flag across `mg`, `ms`,
 
 | Flag    | Effect |
 |---------|--------|
-| `b`     | Key is base64-encoded |
+| `b`     | Key is base64-encoded (spec); accepted but not decoded — key used verbatim |
 | `c`     | Return CAS on success |
 | `C(token)` | Compare-and-swap against `token` |
 | `E(token)` | Override CAS to `token` *(accepted but not yet implemented)* |
@@ -47,7 +46,7 @@ The canonical table of every single-letter flag across `mg`, `ms`,
 
 | Flag    | Effect |
 |---------|--------|
-| `b`     | Key is base64-encoded |
+| `b`     | Key is base64-encoded (spec); accepted but not decoded — key used verbatim |
 | `C(token)` | Delete only if CAS matches |
 | `E(token)` | Override CAS to `token` *(accepted but not yet implemented)* |
 | `I`     | Mark stale rather than remove |
@@ -61,7 +60,7 @@ The canonical table of every single-letter flag across `mg`, `ms`,
 
 | Flag    | Effect |
 |---------|--------|
-| `b`     | Key is base64-encoded |
+| `b`     | Key is base64-encoded (spec); accepted but not decoded — key used verbatim |
 | `C(token)` | Compare-and-swap |
 | `E(token)` | Override CAS to `token` *(accepted but not yet implemented)* |
 | `N(token)` | Auto-vivify on miss with TTL |
@@ -80,7 +79,7 @@ The canonical table of every single-letter flag across `mg`, `ms`,
 
 | Flag    | Effect |
 |---------|--------|
-| `b`     | Key is base64-encoded |
+| `b`     | Key is base64-encoded (spec); accepted but not decoded — key used verbatim |
 
 `me` emits a single `ME <key> <field>=<value>...\r\n` line per entry
 listing internal state (expiry, last access, CAS, size). Format is

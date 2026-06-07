@@ -8,21 +8,28 @@ thing testable end-to-end against an in-memory transport.
 
 ```
 src/FastCache/
-  Core/         Errors taxonomy, Clock, Logger, BufferPool, Bytes, Endian, Crc32c
-  Async/        Task<T>, DetachedTask, Cancellation, IReactor + TestReactor
-  Net/          ISocket, IListener, IoAwaitable, IAdmissionControl,
+  Core/         Errors taxonomy, Clock, Logger, BufferPool, Bytes, Endian,
+                Crc32c, StringHash, Owner, Profiling (Tracy wrappers)
+  Async/        Task<T>, Cancellation, ResumeOn, IReactor + TestReactor and the
+                platform reactors (EpollReactor / IocpReactor / KqueueReactor)
+  Net/          ISocket, IListener, IoAwaitable, IAdmissionControl, SocketAddress,
                 BlockingSocket (Winsock + POSIX),
+                EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
                 InMemoryTransport (paired pipes + InMemoryListener),
                 Framing/ByteReader (line and length-prefixed)
   Cache/        IStorage atomic primitives, CacheEntry, CacheEngine,
-                InMemoryLruStorage, DiskStorage (append-only log + CRC32C)
+                InMemoryLruStorage, CowTreeStorage (CoW B+tree, src/CowTree),
+                LayeredStorage (L1 LRU over L2 disk), ShardedStorage
+                (key-hash fan-out), TracingStorage (Tracy zones)
   Protocol/     IProtocolHandler, ProtocolAutodetect, MemcachedText,
-                MemcachedBinary, MemcachedMeta, RedisResp (RESP2)
-  Server/       Connection (per-client coroutine), Server, BlockingServerLoop
-                (production thread-per-connection driver of the same handlers)
+                MemcachedMeta, MemcachedBinary, RedisResp (RESP2)
+  Server/       Connection (per-client coroutine), Server,
+                ReactorServerLoop (default production driver),
+                PooledServerLoop / BlockingServerLoop (legacy threaded driver)
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
-                ISignalSource, DaemonControls (process-wide stop/reload flags)
-  Config/       Config, CliParser, YamlReader (yaml-cpp), ConfigReloader
+                ISignalSource, DaemonControls (process-wide stop/reload flags),
+                CpuAffinity, HostMemory, ServiceControl, Terminal
+  Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader
   Metrics/      IMetricsSink + AtomicMetricsSink
 ```
 

@@ -22,8 +22,9 @@ place.
 - **`AUTH` (Redis)**: rejected. No auth backend.
 - **`HELLO 3` (Redis)**: rejected with `-NOPROTO`. RESP3 is not
   supported.
-- **`SELECT db` (Redis)**: only database `0` is accepted. fastcached
-  is a single flat keyspace.
+- **`SELECT db` (Redis)**: accepted as a no-op for any index — the
+  reply is always `+OK`, but fastcached is a single flat keyspace, so
+  the index is ignored rather than selecting a distinct database.
 
 ## Storage model differences from memcached
 

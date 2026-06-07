@@ -4,7 +4,9 @@
 
 Atomically interprets the stored value as an ASCII unsigned 64-bit
 integer and adds `delta`. The new value is stored back as ASCII and
-returned.
+returned. The addition is unsigned 64-bit and wraps modulo 2⁶⁴ on
+overflow, matching memcached (the complementary [decr](decr.md)
+saturates at zero rather than wrapping).
 
 ## Synopsis
 

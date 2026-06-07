@@ -44,12 +44,18 @@ docs in the project source).
 
 ## Multiple databases
 
-`SELECT` is acknowledged for database `0` and rejected otherwise.
-fastcached has a single flat keyspace.
+`SELECT` is accepted as a no-op for any index (it always replies
+`+OK`) so client connection setup succeeds, but fastcached has a single
+flat keyspace and the index is ignored. See [SELECT](connection/select.md).
 
 ## Server commands
 
-`CONFIG`, `DEBUG`, `MONITOR`, `CLIENT KILL`, `LASTSAVE`, `OBJECT *`,
-`MEMORY *`, `LATENCY *`, `SLOWLOG *` are not implemented. Use
-fastcached's `stats` (memcached text protocol) for similar
-information.
+`DEBUG`, `MONITOR`, `LASTSAVE`, `OBJECT *`, `MEMORY *`, `LATENCY *`,
+`SLOWLOG *` are not implemented. Use fastcached's `stats` (memcached
+text protocol) for similar information.
+
+`CLIENT` and `CONFIG` are accepted as compatibility stubs rather than
+fully implemented — they answer the handshake probes Redis client
+libraries send on connect (`CLIENT SETNAME` / `SETINFO` / `ID` /
+`GETNAME`, `CONFIG GET`) without holding any real state. See
+[CLIENT](connection/client.md) and [CONFIG](server/config.md).
