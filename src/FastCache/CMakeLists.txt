@@ -24,6 +24,7 @@ target_sources(FastCache
         Core/BufferPool.cpp
         Metrics/PrometheusFormatter.cpp
         Net/BlockingSocket.cpp
+        Net/HealthProbe.cpp
         Net/EpollSocket.cpp
         Net/IocpSocket.cpp
         Net/KqueueSocket.cpp

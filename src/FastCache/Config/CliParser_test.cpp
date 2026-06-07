@@ -445,3 +445,42 @@ TEST_CASE("CliParser: --uninstall-service selects the uninstall outcome", "[conf
     REQUIRE(result.has_value());
     REQUIRE(result->outcome == FastCache::CliOutcome::UninstallService);
 }
+
+TEST_CASE("CliParser: --requirepass / --auth-username are captured", "[config][cli][auth]")
+{
+    auto const args = std::array<char const*, 2> { "--requirepass=s3cr3t", "--auth-username=alice" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.requirePass == "s3cr3t");
+    REQUIRE(result->config.authUsername == "alice");
+    REQUIRE(result->requirePassExplicit);
+    REQUIRE(result->authUsernameExplicit);
+}
+
+TEST_CASE("CliParser: --metrics enables the endpoint with bind/port", "[config][cli][metrics]")
+{
+    auto const args = std::array<char const*, 3> { "--metrics", "--metrics-bind=0.0.0.0", "--metrics-port=9300" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.metricsEnabled);
+    REQUIRE(result->config.metricsBindAddress == "0.0.0.0");
+    REQUIRE(result->config.metricsPort == 9300U);
+}
+
+TEST_CASE("CliParser: --tls captures cert and key paths", "[config][cli][tls]")
+{
+    auto const args = std::array<char const*, 3> { "--tls", "--tls-cert=/c.pem", "--tls-key=/k.pem" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.tlsEnabled);
+    REQUIRE(result->config.tlsCertPath == "/c.pem");
+    REQUIRE(result->config.tlsKeyPath == "/k.pem");
+}
+
+TEST_CASE("CliParser: --healthcheck selects the health-check outcome", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--healthcheck" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->outcome == FastCache::CliOutcome::HealthCheck);
+}

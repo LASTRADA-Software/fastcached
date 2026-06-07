@@ -199,6 +199,32 @@ jobs:
       - name: "Test"
         run: ctest --preset clang-release
 
+  # Builds the container image (which compiles with TLS on against the system
+  # OpenSSL) and smoke-tests it: start the container, hit /healthz from the host,
+  # and run the in-image `--healthcheck`. This is the authoritative check that
+  # the Dockerfile builds and the health probe works end-to-end in the image.
+  docker:
+    name: "Docker image"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Build image"
+        run: docker build -t fastcached:ci .
+
+      - name: "Smoke test the image"
+        run: |
+          docker run -d --name fc -p 11211:11211 -p 9259:9259 fastcached:ci \
+            --bind=0.0.0.0 --port=11211 --metrics --metrics-bind=0.0.0.0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9259/healthz >/dev/null; then break; fi
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:9259/healthz
+          curl -fsS http://127.0.0.1:9259/metrics | grep -q fastcached_cmd_get_total
+          docker exec fc fastcached --healthcheck
+          docker rm -f fc
+
   # Smoke tests live in three sibling jobs so the PR status check tells you
   # *which* protocol broke without opening the log. They share the same
   # fastcached binary artifact and the same compile-twice / expect-cache-hit

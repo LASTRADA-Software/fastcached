@@ -10,6 +10,7 @@
 #include <FastCache/Protocol/SessionContext.hpp>
 
 #include <atomic>
+#include <cstdint>
 #include <exception>
 
 namespace FastCache

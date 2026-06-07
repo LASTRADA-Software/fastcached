@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Keep the build context small and reproducible: exclude build trees, VCS, and
+# editor/IDE cruft. The Dockerfile configures a fresh out-of-source build.
+out/
+build/
+.git/
+.github/
+.vs/
+.idea/
+.cache/
+*.user
+CMakeUserPresets.json
+vcpkg_installed/

@@ -36,17 +36,6 @@ namespace
         return err;
     }
 
-    [[nodiscard]] std::expected<std::uint16_t, ConfigError> ParsePort(std::string_view sv)
-    {
-        std::uint32_t raw = 0;
-        auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), raw);
-        if (ec != std::errc {} || ptr != sv.data() + sv.size())
-            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, "port", std::format("not a number: {}", sv)));
-        if (raw == 0 || raw > 65535)
-            return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, "port", std::format("out of range: {}", raw)));
-        return static_cast<std::uint16_t>(raw);
-    }
-
     /// Validate a bind address syntactically only. The authoritative check —
     /// "does this resolve to a bindable IPv4/IPv6 address?" — happens at bind
     /// time via getaddrinfo, so a hostname like "localhost" is accepted here
@@ -268,6 +257,11 @@ namespace
         if (arg == "--uninstall-service")
         {
             result.outcome = CliOutcome::UninstallService;
+            return ArgOutcome::Continue;
+        }
+        if (arg == "--healthcheck")
+        {
+            result.outcome = CliOutcome::HealthCheck;
             return ArgOutcome::Continue;
         }
 
@@ -498,6 +492,9 @@ namespace
                          "needs an elevated prompt; other flags are baked into the service)" },
         { .flag = "--uninstall-service",
           .description = "remove the fastcached Windows service (Windows only; needs elevation)" },
+        { .flag = "--healthcheck",
+          .description = "probe http://127.0.0.1:<metrics-port>/healthz and exit 0 (healthy) or 1\n"
+                         "(self-contained container HEALTHCHECK; needs --metrics on the daemon)" },
         { .flag = "--pidfile=<path>", .description = "POSIX daemon mode only" },
         { .flag = "--service-name=<name>", .description = "Windows service name (default FastCached)" },
         { .flag = "--help, -h", .description = "show this help and exit" },
@@ -604,6 +601,17 @@ namespace
         return out;
     }
 } // namespace
+
+std::expected<std::uint16_t, ConfigError> ParsePort(std::string_view sv)
+{
+    std::uint32_t raw = 0;
+    auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), raw);
+    if (ec != std::errc {} || ptr != sv.data() + sv.size())
+        return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, "port", std::format("not a number: {}", sv)));
+    if (raw == 0 || raw > 65535)
+        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, "port", std::format("out of range: {}", raw)));
+    return static_cast<std::uint16_t>(raw);
+}
 
 std::string CliUsage(UsageColor color)
 {

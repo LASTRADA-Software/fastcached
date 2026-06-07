@@ -8,6 +8,7 @@
 #include <FastCache/Protocol/SessionContext.hpp>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>

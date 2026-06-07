@@ -26,10 +26,12 @@
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/HealthProbe.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
+#include <FastCache/Protocol/PubSubRegistry.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 #if defined(FC_TLS_ENABLED)
@@ -48,6 +50,7 @@
 #include <optional>
 #include <print>
 #include <span>
+#include <string>
 #include <string_view>
 #include <thread>
 
@@ -55,6 +58,43 @@ namespace
 {
 
 constexpr std::string_view ProgramVersion = FastCache::VersionString;
+
+/// Parse a 1..65535 TCP port from a NUL-terminated string, reusing the CLI's
+/// `FastCache::ParsePort` so the environment fallback accepts exactly the same
+/// syntax and range as the `--metrics-port` flag (single source of truth).
+/// @param raw Candidate string (may be null/empty).
+/// @return The port, or nullopt when null/empty/out-of-range/garbage.
+[[nodiscard]] std::optional<std::uint16_t> ParsePortString(char const* raw) noexcept
+{
+    if (raw == nullptr || *raw == '\0')
+        return std::nullopt;
+    auto const parsed = FastCache::ParsePort(std::string_view { raw });
+    if (!parsed.has_value())
+        return std::nullopt;
+    return *parsed;
+}
+
+/// Read the metrics port from the FASTCACHED_METRICS_PORT environment variable.
+/// This lets a container's daemon CMD and its separate `--healthcheck` probe
+/// agree on a custom port via a single `-e FASTCACHED_METRICS_PORT=...`, without
+/// the static image HEALTHCHECK having to learn the daemon's runtime args.
+/// @return The parsed port, or nullopt when unset/empty/invalid.
+[[nodiscard]] std::optional<std::uint16_t> MetricsPortFromEnv()
+{
+#if defined(_WIN32)
+    // Secure CRT getenv_s keeps the build warning-clean under /WX.
+    std::size_t size = 0;
+    if (::getenv_s(&size, nullptr, 0, "FASTCACHED_METRICS_PORT") != 0 || size == 0)
+        return std::nullopt;
+    std::string buffer(size, '\0');
+    if (::getenv_s(&size, buffer.data(), buffer.size(), "FASTCACHED_METRICS_PORT") != 0)
+        return std::nullopt;
+    buffer.resize(size > 0 ? size - 1 : 0); // drop the trailing NUL getenv_s wrote
+    return ParsePortString(buffer.c_str());
+#else
+    return ParsePortString(std::getenv("FASTCACHED_METRICS_PORT"));
+#endif
+}
 
 extern "C" void HandleStopSignal(int /*signum*/)
 {
@@ -566,8 +606,9 @@ int main(int argc, char const* const* argv)
         case FastCache::CliOutcome::Run:
         case FastCache::CliOutcome::InstallService:
         case FastCache::CliOutcome::UninstallService:
-            // Run and the service-control requests all need the effective
-            // config assembled below; they branch apart afterwards.
+        case FastCache::CliOutcome::HealthCheck:
+            // These all need the effective config assembled below; they branch
+            // apart afterwards.
             break;
     }
 
