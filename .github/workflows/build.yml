@@ -173,12 +173,19 @@ jobs:
       # The clang-release preset pins CMAKE_C/CXX_COMPILER to bare clang/clang++
       # (= AppleClang on PATH); override on the command line, which takes
       # precedence over preset cache variables, to use Homebrew's LLVM instead.
+      #
+      # Homebrew's libc++.dylib has `@rpath/libc++abi.1.dylib` and
+      # `@rpath/libunwind.1.dylib` as runtime deps; libunwind lives under
+      # `lib/unwind/`, not `lib/c++/`. Without that second rpath, dyld
+      # resolves libunwind from /usr/lib/system instead — the resulting
+      # two-libunwind / two-libc++abi load corrupts exception unwinding
+      # on macos-14 and Catch2 sees SIGABRT instead of the C++ throw.
       - name: "Configure"
         run: |
           cmake --preset clang-release \
             -DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang \
             -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++ \
-            -DCMAKE_EXE_LINKER_FLAGS="-L/opt/homebrew/opt/llvm/lib/c++ -L/opt/homebrew/opt/llvm/lib -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++"
+            -DCMAKE_EXE_LINKER_FLAGS="-L/opt/homebrew/opt/llvm/lib/c++ -L/opt/homebrew/opt/llvm/lib/unwind -L/opt/homebrew/opt/llvm/lib -lunwind -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++ -Wl,-rpath,/opt/homebrew/opt/llvm/lib/unwind"
 
       - name: "Build"
         run: cmake --build --preset clang-release
