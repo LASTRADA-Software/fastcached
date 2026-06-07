@@ -7,8 +7,11 @@ first bytes on the wire. Its concrete reason to exist is being a usable
 backend for [sccache](https://github.com/mozilla/sccache); CI exercises that
 case across all three protocols on every build.
 
-This is a personal project, not a replacement for memcached or Redis. It has
-not been benchmarked against them and has not been used in production.
+It is not a general-purpose replacement for memcached or Redis — it implements
+only the slice of each protocol a cache backend needs, and has not been
+benchmarked against them. It is, however, in production use as a shared sccache
+compile cache for a large C++ codebase, backing both CI runners and developer
+machines.
 
 ## Status
 
