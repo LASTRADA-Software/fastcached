@@ -40,9 +40,7 @@ target_sources(FastCache
         Protocol/MemcachedText.cpp
         Protocol/ProtocolAutodetect.cpp
         Protocol/RedisResp.cpp
-        Server/BlockingServerLoop.cpp
         Server/Connection.cpp
-        Server/PooledServerLoop.cpp
         Server/ReactorServerLoop.cpp
         Server/Server.cpp
 )

@@ -48,7 +48,6 @@ TEST_CASE("ServiceControl: flags left at their default are omitted", "[platform]
     REQUIRE(!cmd.contains("--max-memory="));
     REQUIRE(!cmd.contains("--threads="));
     REQUIRE(!cmd.contains("--log-level="));
-    REQUIRE(!cmd.contains("--execution-model="));
     REQUIRE(!cmd.contains("--storage="));
 }
 
@@ -57,11 +56,9 @@ TEST_CASE("ServiceControl: enum flags use their CLI spellings", "[platform][serv
     FastCache::Config cfg {};
     cfg.logLevel = FastCache::LogLevel::Debug;
     cfg.storageDurability = FastCache::StorageDurability::Fsync;
-    cfg.executionModel = FastCache::ExecutionModel::Threaded;
     auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
     REQUIRE(cmd.contains("--log-level=debug"));
     REQUIRE(cmd.contains("--storage-durability=fsync"));
-    REQUIRE(cmd.contains("--execution-model=threaded"));
 }
 
 TEST_CASE("ServiceControl: the service name is always emitted, quoted when it has spaces", "[platform][service]")

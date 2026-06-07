@@ -3,9 +3,9 @@
 // fastcached — Fast Cache Daemon entry point.
 //
 // Wiring: CLI -> optional YAML file -> ConfigReloader -> CacheEngine over
-// InMemoryLruStorage -> BlockingListener -> RunBlockingServerLoop, hosted
-// by the requested IDaemonHost (foreground / POSIX daemon / Windows
-// service). SIGINT/SIGTERM and SCM stop trigger graceful shutdown;
+// the storage backend -> RunReactorServer, hosted by the requested
+// IDaemonHost (foreground / POSIX daemon / Windows service).
+// SIGINT/SIGTERM and SCM stop trigger graceful shutdown;
 // SIGHUP and SCM PARAMCHANGE trigger config reload.
 
 #include <FastCache/Cache/CacheEngine.hpp>
@@ -23,13 +23,10 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
-#include <FastCache/Server/BlockingServerLoop.hpp>
-#include <FastCache/Server/PooledServerLoop.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 
 #include <atomic>
@@ -103,8 +100,6 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         fileCfg.storageDurability = cliCfg.storageDurability;
     if (cli.storageMaxValueBytesExplicit)
         fileCfg.storageMaxValueBytes = cliCfg.storageMaxValueBytes;
-    if (cli.executionModelExplicit)
-        fileCfg.executionModel = cliCfg.executionModel;
     if (cli.workerThreadsExplicit)
         fileCfg.workerThreads = cliCfg.workerThreads;
     if (cli.storageShardsExplicit)
@@ -153,24 +148,6 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
     if (storagePath.has_extension())
         return 1;            // a new file-looking path (e.g. cache.cow) — single file
     return AutoShardCount(); // a new cache directory — fan out
-}
-
-/// Resolve `ExecutionModel::Auto` to a concrete model. Both the in-memory
-/// and the on-disk backend now run on the reactor: one event loop
-/// multiplexes every connection, so the number of concurrent clients is
-/// bounded by memory rather than by a worker count. (The legacy thread pool
-/// pinned one worker per keep-alive session, so once open connections
-/// exceeded the pool size — common under a parallel sccache build — the
-/// surplus connections were accepted but never served and the client timed
-/// out.) On Windows the reactor is additionally drained by several threads,
-/// so a blocking page-store fsync overlaps with serving other connections.
-/// `--execution-model=threaded` still selects the legacy pool explicitly.
-[[nodiscard]] FastCache::ExecutionModel ResolveExecutionModel(FastCache::ExecutionModel requested,
-                                                              bool /*usingPersistentStorage*/) noexcept
-{
-    if (requested != FastCache::ExecutionModel::Auto)
-        return requested;
-    return FastCache::ExecutionModel::Reactor;
 }
 
 /// Translate the user-facing StorageDurability into the page-store enum.
@@ -313,41 +290,6 @@ struct StorageBackendBundle
     return bundle;
 }
 
-/// Threaded server loop with a watchdog thread that closes the listener
-/// when DaemonControls reports a stop request.
-int RunThreadedServer(FastCache::Config const& effective, FastCache::CacheEngine& engine, FastCache::ConsoleLogger& logger)
-{
-    auto listener = FastCache::BlockingListener::Bind(effective.bindAddress, effective.port, effective.listenBacklog);
-    if (!listener || !listener->IsBound())
-    {
-        logger.Logf(FastCache::LogLevel::Fatal,
-                    "cannot bind: {}",
-                    listener ? listener->BindError() : std::string_view { "null listener" });
-        return EXIT_FAILURE;
-    }
-    logger.Log(FastCache::LogLevel::Info, "ready, accepting connections");
-
-    std::atomic<bool> watchdogQuit { false };
-    std::jthread watchdog { [&] {
-        auto& controls = FastCache::DaemonControls::Instance();
-        while (!watchdogQuit.load(std::memory_order_acquire))
-        {
-            if (controls.StopRequested())
-            {
-                listener->Close();
-                return;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds { 100 });
-        }
-    } };
-
-    std::atomic<bool> stop { false };
-    auto const accepted = FastCache::RunPooledServerLoop(*listener, engine, logger, stop, effective.workerThreads);
-    watchdogQuit.store(true, std::memory_order_release);
-    logger.Logf(FastCache::LogLevel::Info, "served {} connection(s)", accepted);
-    return EXIT_SUCCESS;
-}
-
 /// Daemon body: holds the actual server lifecycle. Runs under whatever
 /// IDaemonHost was selected (Foreground / Posix double-fork / Windows
 /// service).
@@ -358,18 +300,13 @@ int DaemonBody(FastCache::Config const& effective)
     FastCache::SteadyClock clock;
 
     auto const usingPersistent = !effective.storagePath.empty();
-    auto const resolvedExecutionModel = ResolveExecutionModel(effective.executionModel, usingPersistent);
 
-    // Reactor model scales across cores by running N independent
-    // single-threaded reactors (one per worker thread; default: hardware
-    // concurrency). The legacy threaded pool sizes itself from workerThreads
-    // instead, so reactorCount is 1 there.
+    // The server scales across cores by running N independent single-threaded
+    // reactors (--threads, default: hardware concurrency). Each connection is
+    // pinned to one reactor for its lifetime.
     auto const hardwareThreads = std::max(1U, std::thread::hardware_concurrency());
-    auto const reactorCount = [&]() -> unsigned {
-        if (resolvedExecutionModel != FastCache::ExecutionModel::Reactor)
-            return 1U; // the legacy threaded pool sizes itself from workerThreads
-        return effective.workerThreads != 0 ? static_cast<unsigned>(effective.workerThreads) : hardwareThreads;
-    }();
+    auto const reactorCount =
+        effective.workerThreads != 0 ? static_cast<unsigned>(effective.workerThreads) : hardwareThreads;
 
     auto physicalShards = ResolvePhysicalShards(effective.storageShards, usingPersistent, effective.storagePath);
     // Several reactor threads share one storage, so keep at least as many
@@ -378,13 +315,11 @@ int DaemonBody(FastCache::Config const& effective)
         physicalShards = std::max<std::size_t>(physicalShards, reactorCount);
 
     // Wrap the backend in a ShardedStorage (its per-shard mutex serialises
-    // access) whenever more than one thread can reach it: the legacy threaded
-    // pool, an explicit multi-shard layout, the persistent backend, or the
-    // reactor running on more than one thread. A lone reactor over in-memory
-    // storage stays unwrapped — one thread owns it, so the wrapper would be
-    // pure overhead.
-    auto const useShardingWrapper = physicalShards > 1 || resolvedExecutionModel == FastCache::ExecutionModel::Threaded
-                                    || usingPersistent || reactorCount > 1;
+    // access) whenever more than one thread can reach it: an explicit
+    // multi-shard layout, the persistent backend, or the reactor running on
+    // more than one thread. A lone reactor over in-memory storage stays
+    // unwrapped — one thread owns it, so the wrapper would be pure overhead.
+    auto const useShardingWrapper = physicalShards > 1 || usingPersistent || reactorCount > 1;
 
     auto bundle = BuildStorageBackend(effective, usingPersistent, useShardingWrapper, physicalShards);
     if (!bundle.has_value())
@@ -423,18 +358,10 @@ int DaemonBody(FastCache::Config const& effective)
         }
         return std::string_view { "?" };
     }();
-    auto const executionName = (resolvedExecutionModel == FastCache::ExecutionModel::Threaded)
-                                   ? std::string_view { "threaded" }
-                                   : std::string_view { "reactor" };
-    // Only annotate the resolved model with "(auto)" when it was actually
-    // resolved from Auto — there's nothing to disambiguate when the user
-    // typed --execution-model=threaded.
-    auto const executionAnnotation =
-        (effective.executionModel == FastCache::ExecutionModel::Auto) ? std::string_view { " (auto)" } : std::string_view {};
     auto const shardingMode = useShardingWrapper ? std::string_view { "" } : std::string_view { " (unwrapped)" };
     logger.Logf(FastCache::LogLevel::Info,
                 "fastcached {} starting; bind={}:{} max-memory={} config={} storage={} "
-                "durability={} max-value={} execution={}{} shards={}{}",
+                "durability={} max-value={} reactors={} shards={}{}",
                 ProgramVersion,
                 effective.bindAddress,
                 effective.port,
@@ -444,16 +371,15 @@ int DaemonBody(FastCache::Config const& effective)
                                               : std::string_view { effective.storagePath },
                 durabilityName,
                 FastCache::FormatByteSize(effective.storageMaxValueBytes),
-                executionName,
-                executionAnnotation,
+                reactorCount,
                 physicalShards,
                 shardingMode);
 
     InstallStopHandlers();
     // The "ready, accepting connections" line is emitted by the server loop
     // itself, only once its listener is actually bound and listening — see
-    // RunReactorServer / RunThreadedServer. Logging it here (before bind)
-    // would race a client that connects on the strength of the message.
+    // RunReactorServer. Logging it here (before bind) would race a client
+    // that connects on the strength of the message.
 
     std::atomic<bool> reloaderQuit { false };
     std::jthread reloaderThread { [&reloader, &logger, &reloaderQuit] {
@@ -471,26 +397,18 @@ int DaemonBody(FastCache::Config const& effective)
         }
     } };
 
-    int exitCode = EXIT_SUCCESS;
-    if (resolvedExecutionModel == FastCache::ExecutionModel::Reactor)
-    {
-        FastCache::ReactorServerOptions serverOpts;
-        serverOpts.bindAddress = effective.bindAddress;
-        serverOpts.port = effective.port;
-        serverOpts.listenBacklog = effective.listenBacklog;
-        // One reactor per core (each single-threaded, connections pinned). One
-        // reactor = today's single-loop behaviour; N reactors scale across
-        // cores without any cross-thread coroutine migration.
-        serverOpts.reactorThreads = reactorCount;
-        // Pin reactors to cores when asked (PerCore) and there's more than one;
-        // a lone reactor gains nothing from pinning.
-        serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
-        exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
-    }
-    else
-    {
-        exitCode = RunThreadedServer(effective, engine, logger);
-    }
+    FastCache::ReactorServerOptions serverOpts;
+    serverOpts.bindAddress = effective.bindAddress;
+    serverOpts.port = effective.port;
+    serverOpts.listenBacklog = effective.listenBacklog;
+    // One reactor per core (each single-threaded, connections pinned). One
+    // reactor = a single event loop; N reactors scale across cores without any
+    // cross-thread coroutine migration.
+    serverOpts.reactorThreads = reactorCount;
+    // Pin reactors to cores when asked (PerCore) and there's more than one;
+    // a lone reactor gains nothing from pinning.
+    serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
+    int const exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
 
     reloaderQuit.store(true, std::memory_order_release);
     return exitCode;

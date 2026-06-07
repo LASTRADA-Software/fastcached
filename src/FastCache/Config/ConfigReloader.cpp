@@ -93,8 +93,6 @@ std::expected<void, ConfigError> ConfigReloader::ValidateImmutable(Config const&
         return reject("storage-durability", "cannot change durability mode at runtime");
     if (previous.storageMaxValueBytes != candidate.storageMaxValueBytes)
         return reject("storage-max-value", "cannot change value-size cap at runtime");
-    if (previous.executionModel != candidate.executionModel)
-        return reject("execution-model", "cannot change execution model at runtime");
     if (previous.workerThreads != candidate.workerThreads)
         return reject("threads", "cannot change worker-thread count at runtime");
     return {};

@@ -107,19 +107,6 @@ namespace
         });
     }
 
-    [[nodiscard]] std::expected<ExecutionModel, ConfigError> ParseExecutionModel(std::string_view sv)
-    {
-        if (sv == "auto")
-            return ExecutionModel::Auto;
-        if (sv == "threaded")
-            return ExecutionModel::Threaded;
-        if (sv == "reactor")
-            return ExecutionModel::Reactor;
-        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
-                                         "execution-model",
-                                         std::format("unknown model (expect auto|threaded|reactor): {}", sv)));
-    }
-
     [[nodiscard]] std::expected<StorageDurability, ConfigError> ParseStorageDurability(std::string_view sv)
     {
         if (sv == "fsync")
@@ -357,16 +344,6 @@ namespace
             }
         }
         {
-            auto const matched = ApplyParsedFlag(args, i, "--execution-model", ParseExecutionModel, cfg.executionModel);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.executionModelExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
             auto const matched = ApplyParsedFlag(args, i, "--lru-mode", ParseLruRecency, cfg.lruRecency);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
@@ -456,10 +433,6 @@ namespace
         { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },
         { .flag = "--storage-max-value=<size>",
           .description = "per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)" },
-        { .flag = "--execution-model=<mode>",
-          .description = "auto|threaded|reactor (default auto)\n"
-                         "auto: the reactor for both in-memory and --storage on disk;\n"
-                         "threaded selects the legacy per-connection worker pool" },
         { .flag = "--lru-mode=<mode>",
           .description = "approximate|strict in-memory LRU recency (default approximate)\n"
                          "approximate: same-shard reads run concurrently (faster);\n"
@@ -468,8 +441,8 @@ namespace
           .description = "none|per-core reactor thread pinning (default per-core)\n"
                          "per-core: pin each reactor to its own core (multi-reactor only)" },
         { .flag = "--threads=<N>",
-          .description = "server parallelism: the number of pinned reactors (default reactor model)\n"
-                         "or the worker-pool size (--execution-model=threaded); default hardware_concurrency" },
+          .description = "number of independent pinned reactors to run (default hardware_concurrency);\n"
+                         "each is a single-threaded event loop, so this is the server's across-core parallelism" },
         { .flag = "--listen-backlog=<N>",
           .description = "::listen() backlog depth (default 511; clamped to the kernel's SOMAXCONN)" },
         { .flag = "--storage-shards=<N>",

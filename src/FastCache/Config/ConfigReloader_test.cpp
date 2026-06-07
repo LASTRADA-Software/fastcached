@@ -95,9 +95,8 @@ TEST_CASE("ConfigReloader::Reload rejects changes to storage_path (regression fo
 {
     // Regression for finding #13 — pre-fix, ValidateImmutable only
     // checked bindAddress and port. Changing storage_path, shards,
-    // durability, execution_model, threads, or storage_max_value via
-    // SIGHUP silently swapped Config but left the running backend on
-    // the old settings.
+    // durability, threads, or storage_max_value via SIGHUP silently
+    // swapped Config but left the running backend on the old settings.
     auto const path = WriteYaml("storage-path-immutable",
                                 "bind: 127.0.0.1\n"
                                 "port: 11710\n"
