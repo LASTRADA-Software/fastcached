@@ -302,7 +302,7 @@ auto CowTree::WriteLeaf(WriteTxn& txn, std::span<std::pair<std::vector<std::byte
         std::vector<LeafEntry> leafEntries;
         leafEntries.reserve(slice.size());
         for (auto const& [k, v]: slice)
-            leafEntries.push_back({ View(k), View(v) });
+            leafEntries.push_back({ .key = View(k), .value = View(v) });
         auto encoded = EncodeLeafPage(BytesSpan { buf.data(), buf.size() },
                                       std::span<LeafEntry const> { leafEntries.data(), leafEntries.size() });
         if (!encoded.has_value())
@@ -376,7 +376,7 @@ auto CowTree::WriteInternal(WriteTxn& txn,
         std::vector<InternalEntry> ies;
         ies.reserve(slice.size());
         for (auto const& [k, c]: slice)
-            ies.push_back({ View(k), c });
+            ies.push_back({ .key = View(k), .child = c });
         auto encoded = EncodeInternalPage(
             BytesSpan { buf.data(), buf.size() }, leftmost, std::span<InternalEntry const> { ies.data(), ies.size() });
         if (!encoded.has_value())

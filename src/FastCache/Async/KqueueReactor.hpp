@@ -57,22 +57,22 @@ class KqueueReactor: public IReactor
 
     /// Register an fd with the kqueue. Initial interest is none; use
     /// UpdateInterest to arm EVFILT_READ / EVFILT_WRITE.
-    [[nodiscard]] bool Attach(KqueueFdHandler* handler) noexcept;
+    [[nodiscard]] bool Attach(KqueueFdHandler* handler) const noexcept;
 
     /// Adjust read/write interest. Adds or removes EVFILT_READ /
     /// EVFILT_WRITE as needed.
-    [[nodiscard]] bool UpdateInterest(KqueueFdHandler* handler, bool read, bool write) noexcept;
+    [[nodiscard]] bool UpdateInterest(KqueueFdHandler* handler, bool read, bool write) const noexcept;
 
     /// Remove the fd from the kqueue.
-    void Detach(KqueueFdHandler* handler) noexcept;
+    void Detach(KqueueFdHandler* handler) const noexcept;
 
     /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
     /// can name the type. Treat as Detail.
     struct TimerEntry
     {
-        TimePoint deadline;
-        std::uint64_t sequence;
-        std::coroutine_handle<> handle;
+        TimePoint deadline {};
+        std::uint64_t sequence { 0 };
+        std::coroutine_handle<> handle {};
     };
 
   private:

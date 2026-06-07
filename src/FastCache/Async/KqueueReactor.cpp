@@ -7,12 +7,12 @@
     #include <sys/types.h>
 
     #include <algorithm>
+    #include <cerrno>
     #include <chrono>
     #include <cstdint>
     #include <cstring>
     #include <ranges>
 
-    #include <errno.h>
     #include <fcntl.h>
     #include <unistd.h>
 
@@ -31,10 +31,10 @@ namespace
     [[nodiscard]] timespec DeadlineToTimespec(TimePoint nextDeadline, TimePoint now) noexcept
     {
         if (nextDeadline <= now)
-            return timespec { 0, 0 };
+            return timespec { .tv_sec = 0, .tv_nsec = 0 };
         auto const nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(nextDeadline - now).count();
         if (nanos < 0)
-            return timespec { 0, 0 };
+            return timespec { .tv_sec = 0, .tv_nsec = 0 };
         constexpr std::int64_t NanosPerSecond = 1'000'000'000LL;
         return timespec {
             .tv_sec = static_cast<time_t>(nanos / NanosPerSecond),
@@ -45,9 +45,9 @@ namespace
 } // namespace
 
 KqueueReactor::KqueueReactor(IClock& clock):
-    _clock { clock }
+    _clock { clock },
+    _kq { ::kqueue() }
 {
-    _kq = ::kqueue();
     if (::pipe(_wakePipe) == 0)
     {
         // Make both ends non-blocking + CLOEXEC.
@@ -62,7 +62,7 @@ KqueueReactor::KqueueReactor(IClock& clock):
         }
         // Register the read end with kqueue; udata = nullptr is our
         // sentinel for "this is the wake-up pipe".
-        struct kevent ev;
+        struct kevent ev {};
         EV_SET(&ev, _wakePipe[0], EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, nullptr);
         ::kevent(_kq, &ev, 1, nullptr, 0, nullptr);
     }
@@ -78,14 +78,14 @@ KqueueReactor::~KqueueReactor()
         ::close(_kq);
 }
 
-bool KqueueReactor::Attach(KqueueFdHandler* handler) noexcept
+bool KqueueReactor::Attach(KqueueFdHandler* handler) const noexcept
 {
     // kqueue doesn't have a separate "add fd without filter" call; we
     // register filters on UpdateInterest. Return true if the fd is sane.
     return handler != nullptr && handler->fd >= 0 && _kq >= 0;
 }
 
-bool KqueueReactor::UpdateInterest(KqueueFdHandler* handler, bool read, bool write) noexcept
+bool KqueueReactor::UpdateInterest(KqueueFdHandler* handler, bool read, bool write) const noexcept
 {
     if (!handler || handler->fd < 0 || _kq < 0)
         return false;
@@ -98,7 +98,7 @@ bool KqueueReactor::UpdateInterest(KqueueFdHandler* handler, bool read, bool wri
     return true;
 }
 
-void KqueueReactor::Detach(KqueueFdHandler* handler) noexcept
+void KqueueReactor::Detach(KqueueFdHandler* handler) const noexcept
 {
     if (!handler || handler->fd < 0 || _kq < 0)
         return;
