@@ -173,9 +173,8 @@ class SharedValue
             return {};
         _ptr->AddRef();
         ImmutableBytes const* raw = _ptr;
-        return std::shared_ptr<void const> { static_cast<void const*>(raw->data()), [raw](void const*) noexcept {
-                                                raw->Release();
-                                            } };
+        return std::shared_ptr<void const> { static_cast<void const*>(raw->data()),
+                                             [raw](void const*) noexcept { raw->Release(); } };
     }
 
   private:
@@ -186,7 +185,7 @@ class SharedValue
     /// Refcount starts at 1; this handle is the sole owner. Keeping the
     /// placement-new here means the factory never holds a typed owner pointer.
     SharedValue(void* block, std::size_t size) noexcept:
-        _ptr { ::new(block) ImmutableBytes { size } }
+        _ptr { ::new (block) ImmutableBytes { size } }
     {
     }
 
