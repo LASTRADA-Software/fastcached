@@ -2,7 +2,6 @@
 #include <FastCache/Server/Connection.hpp>
 #include <FastCache/Server/Server.hpp>
 
-#include <exception>
 #include <memory>
 #include <utility>
 
@@ -28,13 +27,9 @@ namespace
         {
             co_await connection->Run();
         }
-        catch (std::exception const& e)
-        {
-            logger->Logf(LogLevel::Error, "connection dropped on exception: {}", e.what());
-        }
         catch (...)
         {
-            logger->Logf(LogLevel::Error, "connection dropped on unknown exception");
+            LogConnectionFirewallException(*logger);
         }
         if (admission)
             admission->OnConnectionEnded();

@@ -15,7 +15,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <exception>
 #include <format>
 #include <memory>
 #include <thread>
@@ -144,13 +143,9 @@ namespace
                 co_await connection.Run();
             }
         }
-        catch (std::exception const& e)
-        {
-            logger.Logf(LogLevel::Error, "connection dropped on exception: {}", e.what());
-        }
         catch (...)
         {
-            logger.Logf(LogLevel::Error, "connection dropped on unknown exception");
+            LogConnectionFirewallException(logger);
         }
         if (admission)
             admission->OnConnectionEnded();

@@ -9,9 +9,33 @@
 #include <FastCache/Net/IListener.hpp>
 
 #include <atomic>
+#include <exception>
 
 namespace FastCache
 {
+
+/// Log the in-flight exception caught by a per-connection firewall, then
+/// swallow it. MUST be called only from within a `catch` block — it rethrows
+/// internally to classify the active exception. Centralizes the
+/// drop-connection log policy shared by every per-connection DetachedTask
+/// driver (the single- and multi-reactor accept loops), so the wording lives
+/// in exactly one place.
+/// @param logger Sink for the drop-connection diagnostic.
+inline void LogConnectionFirewallException(ILogger& logger) noexcept
+{
+    try
+    {
+        throw;
+    }
+    catch (std::exception const& e)
+    {
+        logger.Logf(LogLevel::Error, "connection dropped on exception: {}", e.what());
+    }
+    catch (...)
+    {
+        logger.Logf(LogLevel::Error, "connection dropped on unknown exception");
+    }
+}
 
 /// Top-level accept loop. Owns a listener, accepts connections, and spawns
 /// a Connection coroutine per client. Tears down cleanly on Shutdown().
