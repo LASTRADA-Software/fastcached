@@ -7,6 +7,7 @@
 #include <bit>
 #include <charconv>
 #include <chrono>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -79,6 +80,22 @@ namespace
         auto const offset = buf.size();
         buf.resize(offset + sizeof(T));
         std::memcpy(buf.data() + offset, &value, sizeof(T));
+    }
+
+    /// Serialize an integer in little-endian byte order directly into a
+    /// caller-provided buffer (the in-place mirror of AppendLe). Lets hot-path
+    /// callers fill a fixed page layout without allocating a scratch vector.
+    /// Constrained to integral `T` so the byte-swap and memcpy are only ever
+    /// instantiated for trivially-copyable fixed-width integers.
+    /// @tparam T Integral type to serialize.
+    /// @param dst Destination span; must hold at least sizeof(T) bytes.
+    /// @param value Integer to store.
+    template <std::integral T>
+    void StoreLe(std::span<std::byte> dst, T value) noexcept
+    {
+        if constexpr (std::endian::native != std::endian::little)
+            value = std::byteswap(value);
+        std::memcpy(dst.data(), &value, sizeof(T));
     }
 
     template <typename T>
@@ -331,20 +348,18 @@ std::expected<CowTree::PageId, StorageError> CowTreeStorage::WriteOverflowChain(
         // Page layout: [u32 crc32c][u64 next][u32 chunkLen][chunk]. The CRC
         // covers everything after itself (next + chunkLen + chunk), so a torn
         // write to the chain LINK — not only the payload — is caught on read.
+        // The link and CRC fields are written straight into `page` (no scratch
+        // vectors) since this runs once per page on the large-value write path.
         std::vector<std::byte> page(pageSize, std::byte { 0 });
-        std::vector<std::byte> link;
-        link.reserve(OverflowPageHeaderSize - sizeof(std::uint32_t));
-        AppendLe<std::uint64_t>(link, next);
-        AppendLe<std::uint32_t>(link, static_cast<std::uint32_t>(chunkLen));
-        std::memcpy(page.data() + sizeof(std::uint32_t), link.data(), link.size());
+        StoreLe<std::uint64_t>(std::span { page }.subspan(sizeof(std::uint32_t)), next);
+        StoreLe<std::uint32_t>(std::span { page }.subspan(sizeof(std::uint32_t) + sizeof(std::uint64_t)),
+                               static_cast<std::uint32_t>(chunkLen));
         if (!chunk.empty())
             std::memcpy(page.data() + OverflowPageHeaderSize, chunk.data(), chunkLen);
 
         auto const crcRegion = std::span<std::byte const> { page.data() + sizeof(std::uint32_t),
                                                             (OverflowPageHeaderSize - sizeof(std::uint32_t)) + chunkLen };
-        std::vector<std::byte> crcBytes;
-        AppendLe<std::uint32_t>(crcBytes, CowTree::Crc32c::Compute(crcRegion));
-        std::memcpy(page.data(), crcBytes.data(), crcBytes.size());
+        StoreLe<std::uint32_t>(std::span { page }, CowTree::Crc32c::Compute(crcRegion));
 
         if (auto const r = _store->Write(ids[i], CowTree::BytesView { page.data(), page.size() }); !r.has_value())
         {
