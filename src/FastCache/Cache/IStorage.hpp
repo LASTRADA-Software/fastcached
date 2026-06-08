@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -190,6 +191,63 @@ class IStorage
     [[nodiscard]] virtual std::expected<CasToken, StorageError> MarkStale(std::string_view key,
                                                                           std::optional<TimePoint> newExpiry,
                                                                           TimePoint now) = 0;
+
+    /// What an `Update` callback decides to do with the entry under the key.
+    enum class UpdateAction : std::uint8_t
+    {
+        Store,     ///< Write `value`/`flags` (insert or overwrite).
+        Delete,    ///< Remove the entry (e.g. a set became empty).
+        Unchanged, ///< Leave the entry as-is (read-only outcome).
+    };
+
+    /// Result of an `Update` callback: the new entry state to apply atomically.
+    struct UpdateOutcome
+    {
+        std::vector<std::byte> value; ///< New value bytes (used when action == Store).
+        std::uint32_t flags { 0 };    ///< New flags / type tag (used when action == Store).
+        UpdateAction action { UpdateAction::Unchanged };
+    };
+
+    /// Guarded read-modify-write: atomically read the entry under `key`, hand it
+    /// to `fn`, and apply the returned outcome — all within the backend's
+    /// atomicity boundary for that key. This is the one primitive for
+    /// compound mutations (decode → mutate → re-encode → store) such as the
+    /// redis set commands and `INCRBYFLOAT`; doing them as a separate
+    /// `Get` + `Set` would race under concurrent writers.
+    ///
+    /// The default composes `Peek` + `Set`/`Delete` (correct for single-threaded
+    /// or already-locked backends); lock-owning decorators (`ShardedStorage`)
+    /// override it to hold the shard lock across the whole sequence.
+    /// @param key Lookup key.
+    /// @param fn  Callback given the current GetResult; returns the new state or
+    ///            a StorageError to abort without mutating.
+    /// @param now Current clock value (drives the existence/expiry check).
+    /// @return The new CAS token after a Store, the previous behaviour's token on
+    ///         Delete/Unchanged, or the callback's StorageError.
+    [[nodiscard]] virtual std::expected<CasToken, StorageError> Update(
+        std::string_view key,
+        std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
+        TimePoint now)
+    {
+        auto const current = Peek(key, now);
+        if (!current.has_value())
+            return std::unexpected(current.error());
+        auto outcome = fn(*current);
+        if (!outcome.has_value())
+            return std::unexpected(outcome.error());
+        switch (outcome->action)
+        {
+            case UpdateAction::Store:
+                return Set(key, std::move(outcome->value), outcome->flags, TimePoint::max());
+            case UpdateAction::Delete:
+                if (current->found)
+                    (void) Delete(key, now);
+                return CasToken { 0 };
+            case UpdateAction::Unchanged:
+                return current->found ? current->entry.cas : CasToken { 0 };
+        }
+        return CasToken { 0 };
+    }
 
     /// Atomically refresh `key`'s expiry and return the resulting entry
     /// (memcached's get-and-touch). Performing the touch and the read as a

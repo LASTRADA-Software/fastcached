@@ -561,13 +561,98 @@ namespace
         co_return co_await WriteResponse(socket, Opcode::Stat, Status::Ok, header.opaque, 0, {}, {}, {});
     }
 
+    /// Opcodes a client may issue before authenticating when a credential is
+    /// required: the SASL handshake plus the connection-control / no-op verbs.
+    /// Every other opcode replies AuthError until SASL auth succeeds.
+    [[nodiscard]] constexpr bool IsPreAuthAllowed(Opcode opcode) noexcept
+    {
+        switch (opcode)
+        {
+            case Opcode::SaslList:
+            case Opcode::SaslAuth:
+            case Opcode::SaslStep:
+            case Opcode::Quit:
+            case Opcode::QuitQ:
+            case Opcode::Version:
+            case Opcode::NoOp:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// Handle a SASL opcode. With no configured AuthPolicy (auth disabled) every
+    /// SASL opcode replies AuthError, preserving the historical "no SASL"
+    /// behaviour so non-authing clients fall back to the plain path. With a
+    /// policy configured, SaslList advertises PLAIN, SaslAuth verifies a PLAIN
+    /// `authzid\0authcid\0passwd` payload and flips `authenticated`, and SaslStep
+    /// (PLAIN is single-step) replies AuthError.
+    /// @param authenticated Per-connection flag, set true on a successful auth.
+    Task<bool> HandleSasl(ISocket* socket,
+                          Opcode opcode,
+                          RequestHeader header,
+                          std::span<std::byte const> key,
+                          std::span<std::byte const> value,
+                          SessionContext session,
+                          bool* authenticated)
+    {
+        auto const auth = session.CurrentAuth();
+        bool const authEnabled = auth != nullptr && auth->Enabled();
+        if (!authEnabled)
+            co_return co_await ReplyError(socket, opcode, Status::AuthError, header.opaque);
+
+        if (opcode == Opcode::SaslList)
+        {
+            constexpr std::string_view Mechanisms = "PLAIN";
+            co_return co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, 0, {}, {}, AsBytes(Mechanisms));
+        }
+        if (opcode == Opcode::SaslStep)
+            co_return co_await ReplyError(socket, opcode, Status::AuthError, header.opaque);
+
+        // SaslAuth: key = mechanism name, value = SASL initial response.
+        std::string_view const mechanism { reinterpret_cast<char const*>(key.data()), key.size() };
+        if (mechanism != "PLAIN")
+            co_return co_await ReplyError(socket, opcode, Status::AuthError, header.opaque);
+
+        // PLAIN payload is three NUL-separated fields: authzid, authcid, passwd.
+        std::string_view const payload { reinterpret_cast<char const*>(value.data()), value.size() };
+        auto const firstNul = payload.find('\0');
+        if (firstNul == std::string_view::npos)
+            co_return co_await ReplyError(socket, opcode, Status::AuthError, header.opaque);
+        auto const secondNul = payload.find('\0', firstNul + 1);
+        if (secondNul == std::string_view::npos)
+            co_return co_await ReplyError(socket, opcode, Status::AuthError, header.opaque);
+        auto const authcid = payload.substr(firstNul + 1, secondNul - firstNul - 1);
+        auto const passwd = payload.substr(secondNul + 1);
+
+        // An empty authcid means "the default user": validate the password alone
+        // (the redis one-argument AUTH semantics), so a minimal PLAIN client that
+        // sends `\0\0<pass>` is not locked out. A non-empty authcid must match the
+        // configured username.
+        bool const ok = authcid.empty() ? auth->Verify(passwd) : auth->Verify(authcid, passwd);
+        if (!ok)
+            co_return co_await ReplyError(socket, opcode, Status::AuthError, header.opaque);
+
+        *authenticated = true;
+        constexpr std::string_view Granted = "Authenticated";
+        co_return co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, 0, {}, {}, AsBytes(Granted));
+    }
+
 } // namespace
 
-Task<void> MemcachedBinaryHandler::Run(ISocket* socket, CacheEngine* engine, std::vector<std::byte> primingBytes)
+Task<void> MemcachedBinaryHandler::Run(ISocket* socket,
+                                       CacheEngine* engine,
+                                       std::vector<std::byte> primingBytes,
+                                       SessionContext session)
 {
     constexpr std::size_t MaxBodyBytes = 16 * 1024 * 1024;
     ByteReader reader { *socket, /*maxLineBytes*/ 1, /*maxPayloadBytes*/ MaxBodyBytes + HeaderSize };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
+
+    // Authenticated up-front unless a credential is required at session start;
+    // SASL flips this. Re-evaluated against the live auth source on every
+    // command so SIGHUP reload of requirepass is honoured immediately.
+    bool authenticated = !(session.CurrentAuth() != nullptr && session.CurrentAuth()->Enabled());
 
     while (true)
     {
@@ -583,6 +668,28 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket, CacheEngine* engine, std
         if (header.totalBodyLen > MaxBodyBytes)
             co_return;
 
+        auto const opcode = static_cast<Opcode>(header.opcode);
+        auto const authNow = session.CurrentAuth();
+        bool const authEnabled = authNow != nullptr && authNow->Enabled();
+        if (!authEnabled)
+            authenticated = true; // Reload turned auth off; no further gate.
+
+        // Gate data commands until authenticated when a credential is required.
+        // This MUST happen before the body is buffered: an unauthenticated
+        // attacker can otherwise pipeline requests with totalBodyLen close to
+        // the per-frame cap (16 MiB) and force the server to allocate that
+        // much memory per request before being told to authenticate. We drain
+        // the body without buffering it, then reply AuthError.
+        if (authEnabled && !authenticated && !IsPreAuthAllowed(opcode))
+        {
+            if (auto const skipped = co_await reader.Skip(header.totalBodyLen); !skipped.has_value())
+                co_return;
+            if (!co_await ReplyError(socket, opcode, Status::AuthError, header.opaque))
+                co_return;
+            FC_FRAME_MARK;
+            continue;
+        }
+
         auto const body = co_await reader.ReadExactly(header.totalBodyLen);
         if (!body.has_value())
             co_return;
@@ -594,7 +701,6 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket, CacheEngine* engine, std
         auto const key = bodySpan.subspan(header.extrasLen, header.keyLen);
         auto const value = bodySpan.subspan(static_cast<std::size_t>(header.extrasLen) + header.keyLen);
 
-        auto const opcode = static_cast<Opcode>(header.opcode);
         bool keepGoing = true;
         switch (opcode)
         {
@@ -662,7 +768,7 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket, CacheEngine* engine, std
             case Opcode::SaslList:
             case Opcode::SaslAuth:
             case Opcode::SaslStep:
-                keepGoing = co_await ReplyError(socket, opcode, Status::AuthError, header.opaque);
+                keepGoing = co_await HandleSasl(socket, opcode, header, key, value, session, &authenticated);
                 break;
             default:
                 keepGoing = co_await ReplyError(socket, opcode, Status::UnknownCommand, header.opaque);

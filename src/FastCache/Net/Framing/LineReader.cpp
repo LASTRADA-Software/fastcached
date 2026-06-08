@@ -166,4 +166,28 @@ Task<ByteReader::BytesResult> ByteReader::ReadExactly(std::size_t count)
     co_return out;
 }
 
+Task<std::expected<void, ProtocolError>> ByteReader::Skip(std::size_t count)
+{
+    // Drain `count` bytes WITHOUT materialising them all into a single
+    // _maxPayloadBytes-bounded vector. This is used by the memcached binary
+    // auth gate to step past the body of a rejected (unauthenticated) request
+    // up to the wire-frame cap (16 MiB) without holding that much memory.
+    auto remaining = count;
+    while (remaining > 0)
+    {
+        if (Available() == 0)
+        {
+            auto const pulled = co_await PullChunk();
+            if (!pulled.has_value())
+                co_return std::unexpected(pulled.error());
+            if (*pulled == 0)
+                co_return std::unexpected(MakeTruncated("EOF before payload satisfied"));
+        }
+        auto const drop = std::min<std::size_t>(remaining, Available());
+        _consumed += drop;
+        remaining -= drop;
+    }
+    co_return std::expected<void, ProtocolError> {};
+}
+
 } // namespace FastCache

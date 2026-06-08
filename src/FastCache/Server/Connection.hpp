@@ -5,6 +5,7 @@
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Protocol/SessionContext.hpp>
 
 #include <memory>
 
@@ -24,7 +25,9 @@ class Connection
     /// @param socket Owned socket; closed on connection end.
     /// @param engine Shared cache engine.
     /// @param logger Shared logger.
-    Connection(std::unique_ptr<ISocket> socket, CacheEngine& engine, ILogger& logger) noexcept;
+    /// @param session Per-server session context (auth policy etc.); copied by
+    ///        value (a cheap pointer-sized bundle). Defaults to no auth.
+    Connection(std::unique_ptr<ISocket> socket, CacheEngine& engine, ILogger& logger, SessionContext session = {}) noexcept;
 
     /// Run the connection's protocol loop to completion.
     /// @return Task that resolves when the connection closes.
@@ -34,6 +37,7 @@ class Connection
     std::unique_ptr<ISocket> _socket;
     CacheEngine& _engine;
     ILogger& _logger;
+    SessionContext _session;
 };
 
 } // namespace FastCache

@@ -19,6 +19,13 @@ target_link_libraries(FastCacheTest
         Catch2::Catch2
 )
 
+# Absolute path to checked-in test fixtures (e.g. the throwaway TLS cert/key),
+# so tests can open them regardless of the working directory.
+target_compile_definitions(FastCacheTest
+    PRIVATE
+        FASTCACHED_TESTDATA_DIR="${CMAKE_SOURCE_DIR}/testdata"
+)
+
 # Catch.cmake (catch_discover_tests) is placed on CMAKE_MODULE_PATH by the
 # top-level CMakeLists, regardless of whether Catch2 came from CPM source or a
 # system find_package.
@@ -36,6 +43,33 @@ catch_discover_tests(FastCacheTest)
 # environment-dependent: the "smoke" label lets you select (ctest -L smoke) or
 # skip (ctest -LE smoke) them, and a missing runtime prerequisite exits 77 to
 # report as skipped rather than failed.
+
+# ---------------------------------------------------------------------------
+# TLS smoke test. Registered only in TLS-enabled builds. Starts the freshly
+# built fastcached with the checked-in self-signed cert, connects a real TLS
+# client, and asserts a RESP PING is answered +PONG over the encrypted channel
+# — end-to-end coverage of the TlsSocket handshake/pump. A missing runtime
+# prerequisite exits 77 (reported as skipped).
+if(FASTCACHED_ENABLE_TLS)
+    if(WIN32)
+        add_test(
+            NAME "tls-smoke"
+            COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/tls-smoke.ps1"
+                -Fastcached "$<TARGET_FILE:fastcached>"
+                -Cert "${CMAKE_SOURCE_DIR}/testdata/tls/server.crt"
+                -Key "${CMAKE_SOURCE_DIR}/testdata/tls/server.key"
+        )
+    else()
+        add_test(
+            NAME "tls-smoke"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/tls-smoke.sh"
+                --fastcached "$<TARGET_FILE:fastcached>"
+                --cert "${CMAKE_SOURCE_DIR}/testdata/tls/server.crt"
+                --key "${CMAKE_SOURCE_DIR}/testdata/tls/server.key"
+        )
+    endif()
+    set_tests_properties("tls-smoke" PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
+endif()
 
 if(SCCACHE)
     set(FASTCACHED_SMOKE_PORT "11611" CACHE STRING "TCP port the sccache smoke tests bind fastcached to")

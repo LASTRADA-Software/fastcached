@@ -32,6 +32,8 @@
     #include <FastCache/Net/KqueueSocket.hpp>
 #endif
 
+#include <FastCache/Net/TlsWrap.hpp>
+
 namespace FastCache
 {
 
@@ -94,7 +96,11 @@ namespace
         }
         logger.Log(LogLevel::Info, "ready, accepting connections");
 
-        Server server { *listener, engine, logger, admission, metrics };
+        // Pin pub/sub delivery to this reactor: a message published from another
+        // connection's thread wakes a subscriber's loop via reactor.Submit.
+        auto session = options.session;
+        session.reactor = &reactor;
+        Server server { *listener, engine, logger, admission, metrics, session, options.tlsContext };
         auto runAccept = [](Server* s) -> DetachedTask {
             co_await s->Run();
             co_return;
@@ -120,10 +126,18 @@ namespace
     /// reschedules onto `reactor` (so the socket is created and all its I/O
     /// completions land on that one thread — no coroutine migration), then
     /// wraps the raw handle and runs the protocol session.
-    DetachedTask RunHandedOffConnection(
-        IocpReactor& reactor, Detail::NativeSocket raw, CacheEngine& engine, ILogger& logger, IAdmissionControl* admission)
+    DetachedTask RunHandedOffConnection(IocpReactor& reactor,
+                                        Detail::NativeSocket raw,
+                                        CacheEngine& engine,
+                                        ILogger& logger,
+                                        IAdmissionControl* admission,
+                                        SessionContext session,
+                                        [[maybe_unused]] TlsContext* tls)
     {
         co_await ResumeOn { reactor };
+        // This connection now runs on `reactor`; pin pub/sub delivery to it so a
+        // message published elsewhere wakes this subscriber via reactor.Submit.
+        session.reactor = &reactor;
         // Firewall: this is a DetachedTask (unhandled_exception -> std::terminate),
         // so a handler exception must drop only this connection, not the daemon.
         try
@@ -139,7 +153,7 @@ namespace
             }
             else
             {
-                Connection connection { std::move(socket), engine, logger };
+                Connection connection { WrapTls(std::move(socket), tls), engine, logger, session };
                 co_await connection.Run();
             }
         }
@@ -205,7 +219,7 @@ namespace
                     metrics->Increment(IMetricsSink::Counter::ConnectionsTotal);
                 auto& reactor = *reactors[next % reactorCount];
                 ++next;
-                RunHandedOffConnection(reactor, *raw, engine, logger, admission);
+                RunHandedOffConnection(reactor, *raw, engine, logger, admission, options.session, options.tlsContext);
             }
         } };
 
@@ -271,7 +285,12 @@ namespace
                 return EXIT_FAILURE;
             }
             listeners.push_back(std::move(listener));
-            servers.push_back(std::make_unique<Server>(*listeners[i], engine, logger, admission, metrics));
+            // Each Server's connections are pinned to this reactor, so a
+            // subscriber created here wakes its loop via this reactor's Submit.
+            auto session = options.session;
+            session.reactor = reactors[i].get();
+            servers.push_back(
+                std::make_unique<Server>(*listeners[i], engine, logger, admission, metrics, session, options.tlsContext));
         }
         logger.Logf(LogLevel::Info, "ready, accepting connections ({} reactors)", reactorCount);
 

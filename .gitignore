@@ -12,6 +12,7 @@ CMakeUserPresets.json
 compile_commands.json
 bench/results/
 __pycache__/
+vcpkg_installed/
 
 # Profiling artifacts
 callgrind.out.*

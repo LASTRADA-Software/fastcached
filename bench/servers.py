@@ -56,7 +56,9 @@ class RealServer:
 class RedisServer(RealServer):
     """A native ``redis-server`` with persistence disabled (pure in-memory)."""
 
-    protocols = frozenset({"redis"})
+    # redis-server speaks both RESP2 and (since 6.0) RESP3, so it can serve as a
+    # baseline for either fastcached protocol client in --vs mode.
+    protocols = frozenset({"redis", "redis-resp3"})
 
     def __init__(self, binary: str, host: str, port: int) -> None:
         self.name = "redis"

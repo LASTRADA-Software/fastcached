@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/MemcachedText.hpp>
+#include <FastCache/Protocol/SessionContext.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -66,14 +68,14 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
 /// MemcachedTextHandler's Run loop processes one command per iteration,
 /// then waits for the next line; we close the client socket after writing
 /// our request so the handler observes EOF and the task completes.
-std::string Exchange(TextFixture& fix, std::string_view request)
+std::string Exchange(TextFixture& fix, std::string_view request, FastCache::SessionContext session = {})
 {
     REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), request)));
     // Half-close: server will see EOF after consuming `request`, but the
     // client's read side stays open so we can read the response back.
     fix.pair.client->ShutdownWrite();
 
-    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primingBytes*/ {}));
+    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primingBytes*/ {}, session));
     // The handler closed the server-side socket when its loop ended,
     // which closed the server→client pipe's write side. The client can now
     // read the buffered response and then observe EOF.
@@ -355,4 +357,40 @@ TEST_CASE("memcached-text slabs/lru/lru_crawler stubs reply OK", "[protocol][tex
     TextFixture fix;
     auto const response = Exchange(fix, "slabs reassign 1 2\r\nlru tune\r\nlru_crawler enable\r\n");
     REQUIRE(response == "OK\r\nOK\r\nOK\r\n");
+}
+
+TEST_CASE("memcached-text rejects data commands when auth is required", "[protocol][text][auth]")
+{
+    // The text protocol has no auth handshake, so a configured credential
+    // makes every data command return CLIENT_ERROR; only version/quit work.
+    FastCache::AuthPolicy const policy { "default", "s3cr3t" };
+    FastCache::SharedAuthSource authSource { std::make_shared<FastCache::AuthPolicy const>(policy) };
+    FastCache::SessionContext const session { .authSource = &authSource };
+    TextFixture fix;
+    auto const response = Exchange(fix, "get k\r\n", session);
+    REQUIRE(response.starts_with("CLIENT_ERROR authentication required"));
+}
+
+TEST_CASE("memcached-text version still works when auth is required", "[protocol][text][auth]")
+{
+    FastCache::AuthPolicy const policy { "default", "s3cr3t" };
+    FastCache::SharedAuthSource authSource { std::make_shared<FastCache::AuthPolicy const>(policy) };
+    FastCache::SessionContext const session { .authSource = &authSource };
+    TextFixture fix;
+    auto const response = Exchange(fix, "version\r\n", session);
+    REQUIRE(response.starts_with("VERSION fastcached-"));
+}
+
+TEST_CASE("memcached-text refused storage command does not desync the parser", "[protocol][text][auth]")
+{
+    // A refused `set` carries a data block that must NOT be left in the stream to
+    // be parsed as the next command (which would emit a second, spurious error).
+    // The handler replies exactly once and ends the session, so the response is a
+    // single CLIENT_ERROR and the value bytes ("hello") are never interpreted.
+    FastCache::AuthPolicy const policy { "default", "s3cr3t" };
+    FastCache::SharedAuthSource authSource { std::make_shared<FastCache::AuthPolicy const>(policy) };
+    FastCache::SessionContext const session { .authSource = &authSource };
+    TextFixture fix;
+    auto const response = Exchange(fix, "set k 0 0 5\r\nhello\r\n", session);
+    REQUIRE(response == "CLIENT_ERROR authentication required\r\n");
 }

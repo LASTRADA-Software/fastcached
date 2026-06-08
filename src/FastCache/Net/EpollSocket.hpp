@@ -32,6 +32,7 @@ class EpollSocket final: public ISocket
     ~EpollSocket() override;
 
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
+    [[nodiscard]] IoAwaitable WaitReadable() override;
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
     [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override;

@@ -21,6 +21,7 @@ enum class CliOutcome : std::uint8_t
     ShowVersion,      ///< --version / -V was seen.
     InstallService,   ///< --install-service was seen; register a Windows service.
     UninstallService, ///< --uninstall-service was seen; remove the Windows service.
+    HealthCheck,      ///< --healthcheck was seen; probe /healthz and exit 0/1.
 };
 
 struct CliResult
@@ -46,6 +47,14 @@ struct CliResult
     bool storageShardsExplicit { false };
     bool listenBacklogExplicit { false };
     bool logTimestampsExplicit { false };
+    bool requirePassExplicit { false };
+    bool authUsernameExplicit { false };
+    bool metricsEnabledExplicit { false };
+    bool metricsBindAddressExplicit { false };
+    bool metricsPortExplicit { false };
+    bool tlsEnabledExplicit { false };
+    bool tlsCertPathExplicit { false };
+    bool tlsKeyPathExplicit { false };
 };
 
 /// Parse `argv[1..argc-1]` into a Config. Returns ConfigError on bad input.
@@ -62,6 +71,14 @@ struct CliResult
 /// @param args argv slice excluding the program name itself.
 /// @return Parsed CliResult on success; ConfigError on failure.
 [[nodiscard]] std::expected<CliResult, ConfigError> ParseCli(std::span<char const* const> args);
+
+/// Parse and range-check a TCP port (1..65535) from its decimal text. The single
+/// source of truth for port parsing, shared by the CLI flag handlers and the
+/// `FASTCACHED_METRICS_PORT` environment fallback so both accept exactly the same
+/// syntax and range.
+/// @param sv Decimal port text (no surrounding whitespace).
+/// @return The port on success, or a ConfigError describing the rejection.
+[[nodiscard]] std::expected<std::uint16_t, ConfigError> ParsePort(std::string_view sv);
 
 /// Whether CliUsage should colorize its output.
 enum class UsageColor : std::uint8_t

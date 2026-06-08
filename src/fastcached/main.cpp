@@ -8,6 +8,7 @@
 // SIGINT/SIGTERM and SCM stop trigger graceful shutdown;
 // SIGHUP and SCM PARAMCHANGE trigger config reload.
 
+#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
@@ -23,11 +24,19 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/HealthProbe.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
+#include <FastCache/Protocol/PubSubRegistry.hpp>
+#include <FastCache/Server/AdminHttpServer.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
+#if defined(FC_TLS_ENABLED)
+    #include <FastCache/Net/TlsContext.hpp>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -38,8 +47,10 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <print>
 #include <span>
+#include <string>
 #include <string_view>
 #include <thread>
 
@@ -47,6 +58,43 @@ namespace
 {
 
 constexpr std::string_view ProgramVersion = FastCache::VersionString;
+
+/// Parse a 1..65535 TCP port from a NUL-terminated string, reusing the CLI's
+/// `FastCache::ParsePort` so the environment fallback accepts exactly the same
+/// syntax and range as the `--metrics-port` flag (single source of truth).
+/// @param raw Candidate string (may be null/empty).
+/// @return The port, or nullopt when null/empty/out-of-range/garbage.
+[[nodiscard]] std::optional<std::uint16_t> ParsePortString(char const* raw) noexcept
+{
+    if (raw == nullptr || *raw == '\0')
+        return std::nullopt;
+    auto const parsed = FastCache::ParsePort(std::string_view { raw });
+    if (!parsed.has_value())
+        return std::nullopt;
+    return *parsed;
+}
+
+/// Read the metrics port from the FASTCACHED_METRICS_PORT environment variable.
+/// This lets a container's daemon CMD and its separate `--healthcheck` probe
+/// agree on a custom port via a single `-e FASTCACHED_METRICS_PORT=...`, without
+/// the static image HEALTHCHECK having to learn the daemon's runtime args.
+/// @return The parsed port, or nullopt when unset/empty/invalid.
+[[nodiscard]] std::optional<std::uint16_t> MetricsPortFromEnv()
+{
+#if defined(_WIN32)
+    // Secure CRT getenv_s keeps the build warning-clean under /WX.
+    std::size_t size = 0;
+    if (::getenv_s(&size, nullptr, 0, "FASTCACHED_METRICS_PORT") != 0 || size == 0)
+        return std::nullopt;
+    std::string buffer(size, '\0');
+    if (::getenv_s(&size, buffer.data(), buffer.size(), "FASTCACHED_METRICS_PORT") != 0)
+        return std::nullopt;
+    buffer.resize(size > 0 ? size - 1 : 0); // drop the trailing NUL getenv_s wrote
+    return ParsePortString(buffer.c_str());
+#else
+    return ParsePortString(std::getenv("FASTCACHED_METRICS_PORT"));
+#endif
+}
 
 extern "C" void HandleStopSignal(int /*signum*/)
 {
@@ -108,6 +156,22 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         fileCfg.listenBacklog = cliCfg.listenBacklog;
     if (cli.logTimestampsExplicit)
         fileCfg.logTimestamps = cliCfg.logTimestamps;
+    if (cli.requirePassExplicit)
+        fileCfg.requirePass = cliCfg.requirePass;
+    if (cli.authUsernameExplicit)
+        fileCfg.authUsername = cliCfg.authUsername;
+    if (cli.metricsEnabledExplicit)
+        fileCfg.metricsEnabled = cliCfg.metricsEnabled;
+    if (cli.metricsBindAddressExplicit)
+        fileCfg.metricsBindAddress = cliCfg.metricsBindAddress;
+    if (cli.metricsPortExplicit)
+        fileCfg.metricsPort = cliCfg.metricsPort;
+    if (cli.tlsEnabledExplicit)
+        fileCfg.tlsEnabled = cliCfg.tlsEnabled;
+    if (cli.tlsCertPathExplicit)
+        fileCfg.tlsCertPath = cliCfg.tlsCertPath;
+    if (cli.tlsKeyPathExplicit)
+        fileCfg.tlsKeyPath = cliCfg.tlsKeyPath;
     return fileCfg;
 }
 
@@ -316,10 +380,13 @@ int DaemonBody(FastCache::Config const& effective)
 
     // Wrap the backend in a ShardedStorage (its per-shard mutex serialises
     // access) whenever more than one thread can reach it: an explicit
-    // multi-shard layout, the persistent backend, or the reactor running on
-    // more than one thread. A lone reactor over in-memory storage stays
-    // unwrapped — one thread owns it, so the wrapper would be pure overhead.
-    auto const useShardingWrapper = physicalShards > 1 || usingPersistent || reactorCount > 1;
+    // multi-shard layout, the persistent backend, the reactor running on more
+    // than one thread, or the metrics endpoint (its fc-admin thread calls
+    // engine.Snapshot() concurrently with the reactor, and InMemoryLruStorage::
+    // Snapshot is only safe under the shard's exclusive lock). A lone reactor
+    // over in-memory storage with no metrics stays unwrapped — one thread owns
+    // it, so the wrapper would be pure overhead.
+    auto const useShardingWrapper = physicalShards > 1 || usingPersistent || reactorCount > 1 || effective.metricsEnabled;
 
     auto bundle = BuildStorageBackend(effective, usingPersistent, useShardingWrapper, physicalShards);
     if (!bundle.has_value())
@@ -341,10 +408,10 @@ int DaemonBody(FastCache::Config const& effective)
 
     FastCache::CacheEngine engine { *storagePtr, clock };
 
-    reloader.Subscribe([&logger, backendPtr](auto const& /*prev*/, auto const& next) {
-        logger.SetMinLevel(next->logLevel);
-        backendPtr->Resize(next->maxMemoryBytes);
-    });
+    // Connection-level metrics sink, shared by the server loop and the admin
+    // HTTP endpoint. Wiring it into RunReactorServer is what actually collects
+    // the connection counters; command/capacity stats come from the engine.
+    FastCache::AtomicMetricsSink metrics;
 
     auto const durabilityName = [&] {
         switch (effective.storageDurability)
@@ -358,10 +425,60 @@ int DaemonBody(FastCache::Config const& effective)
         }
         return std::string_view { "?" };
     }();
+    // Authentication policy: built once, shared read-only across connections.
+    // Never log the secret itself — only whether auth is on. Wrapped in a
+    // SharedAuthSource so a SIGHUP-driven reload can swap in a freshly-built
+    // policy without restarting connections; in-flight verifies finish on the
+    // policy they captured.
+    auto const makePolicy = [](FastCache::Config const& c) -> std::shared_ptr<FastCache::AuthPolicy const> {
+        if (c.requirePass.empty())
+            return {};
+        return std::make_shared<FastCache::AuthPolicy const>(c.authUsername, c.requirePass);
+    };
+    FastCache::SharedAuthSource authSource { makePolicy(effective) };
+
+    reloader.Subscribe([&logger, backendPtr, &authSource, &makePolicy](auto const& /*prev*/, auto const& next) {
+        logger.SetMinLevel(next->logLevel);
+        backendPtr->Resize(next->maxMemoryBytes);
+        // Rotate the shared secret: building a fresh AuthPolicy and atomically
+        // swapping it in lets a SIGHUP'd operator update requirepass without
+        // restarting the daemon. In-flight verifies finish against the policy
+        // they captured (kept alive by the returned shared_ptr).
+        authSource.Store(makePolicy(*next));
+    });
+
+    // TLS context: built once and shared read-only across connections. Fails
+    // fast on a missing build feature or unreadable cert/key.
+#if defined(FC_TLS_ENABLED)
+    std::unique_ptr<FastCache::TlsContext> tlsContext;
+#endif
+    if (effective.tlsEnabled)
+    {
+#if defined(FC_TLS_ENABLED)
+        if (effective.tlsCertPath.empty() || effective.tlsKeyPath.empty())
+        {
+            logger.Log(FastCache::LogLevel::Fatal, "fastcached: --tls requires both --tls-cert and --tls-key");
+            return EXIT_FAILURE;
+        }
+        auto created = FastCache::TlsContext::Create(effective.tlsCertPath, effective.tlsKeyPath);
+        if (!created.has_value())
+        {
+            logger.Logf(FastCache::LogLevel::Fatal, "fastcached: TLS init failed: {}", created.error().ToString());
+            return EXIT_FAILURE;
+        }
+        tlsContext = std::move(*created);
+#else
+        logger.Log(FastCache::LogLevel::Fatal,
+                   "fastcached: --tls requested but this build has no TLS support "
+                   "(rebuild with -DFASTCACHED_ENABLE_TLS=ON)");
+        return EXIT_FAILURE;
+#endif
+    }
+
     auto const shardingMode = useShardingWrapper ? std::string_view { "" } : std::string_view { " (unwrapped)" };
     logger.Logf(FastCache::LogLevel::Info,
                 "fastcached {} starting; bind={}:{} max-memory={} config={} storage={} "
-                "durability={} max-value={} reactors={} shards={}{}",
+                "durability={} max-value={} reactors={} shards={}{} auth={} tls={}",
                 ProgramVersion,
                 effective.bindAddress,
                 effective.port,
@@ -373,7 +490,9 @@ int DaemonBody(FastCache::Config const& effective)
                 FastCache::FormatByteSize(effective.storageMaxValueBytes),
                 reactorCount,
                 physicalShards,
-                shardingMode);
+                shardingMode,
+                authSource.Current() ? std::string_view { "on" } : std::string_view { "off" },
+                effective.tlsEnabled ? std::string_view { "on" } : std::string_view { "off" });
 
     InstallStopHandlers();
     // The "ready, accepting connections" line is emitted by the server loop
@@ -408,8 +527,68 @@ int DaemonBody(FastCache::Config const& effective)
     // Pin reactors to cores when asked (PerCore) and there's more than one;
     // a lone reactor gains nothing from pinning.
     serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
-    int const exitCode = FastCache::RunReactorServer(serverOpts, engine, logger);
+    serverOpts.session.authSource = &authSource;
+    // Publish/subscribe registry: one instance shared read-mostly across every
+    // connection (RESP PUBLISH/SUBSCRIBE). Lives for the whole server run.
+    FastCache::PubSubRegistry pubsub;
+    serverOpts.session.pubsub = &pubsub;
+#if defined(FC_TLS_ENABLED)
+    serverOpts.tlsContext = tlsContext.get(); // null unless --tls is active
+#endif
 
+    // Optional admin HTTP endpoint (/metrics, /healthz) on its own port and
+    // thread. A blocking listener is plenty for scrape-rate traffic; SetTimeouts
+    // below makes the accept loop poll so Shutdown() is observed even on POSIX
+    // (where Close() does not unblock a parked accept()) and bounds a stalled
+    // client's request read so it cannot wedge the single-threaded endpoint.
+    std::unique_ptr<FastCache::BlockingListener> adminListener;
+    std::unique_ptr<FastCache::AdminHttpServer> adminServer;
+    std::jthread adminThread;
+    if (effective.metricsEnabled)
+    {
+        adminListener = FastCache::BlockingListener::Bind(effective.metricsBindAddress, effective.metricsPort);
+        if (!adminListener || !adminListener->IsBound())
+        {
+            logger.Logf(FastCache::LogLevel::Error,
+                        "fastcached: cannot bind metrics endpoint {}:{} ({})",
+                        effective.metricsBindAddress,
+                        effective.metricsPort,
+                        adminListener ? adminListener->BindError() : std::string_view { "null listener" });
+        }
+        else
+        {
+            // Poll accept() every 500ms so Shutdown() is observed on POSIX, and
+            // time out a stalled request read after 2s so one idle client cannot
+            // wedge the single-threaded admin endpoint (slowloris).
+            adminListener->SetTimeouts(std::chrono::milliseconds { 500 }, std::chrono::seconds { 2 });
+
+            auto const adminStartedAt = clock.Now();
+            adminServer = std::make_unique<FastCache::AdminHttpServer>(
+                *adminListener,
+                metrics,
+                [&engine, &clock, adminStartedAt] {
+                    return FastCache::MetricsSnapshot {
+                        .storage = engine.Snapshot(),
+                        .uptime = FastCache::Uptime { std::chrono::duration_cast<std::chrono::seconds>(clock.Now()
+                                                                                                       - adminStartedAt) },
+                    };
+                },
+                logger);
+            adminThread = std::jthread { [&adminServer] {
+                FC_THREAD_NAME("fc-admin");
+                FastCache::SyncRun(adminServer->Run());
+            } };
+            logger.Logf(FastCache::LogLevel::Info,
+                        "metrics endpoint on http://{}:{}/metrics (and /healthz)",
+                        effective.metricsBindAddress,
+                        effective.metricsPort);
+        }
+    }
+
+    int const exitCode = FastCache::RunReactorServer(serverOpts, engine, logger, /*admission*/ nullptr, &metrics);
+
+    if (adminServer)
+        adminServer->Shutdown(); // unblocks the admin accept loop so adminThread joins
     reloaderQuit.store(true, std::memory_order_release);
     return exitCode;
 }
@@ -442,27 +621,50 @@ int main(int argc, char const* const* argv)
         case FastCache::CliOutcome::Run:
         case FastCache::CliOutcome::InstallService:
         case FastCache::CliOutcome::UninstallService:
-            // Run and the service-control requests all need the effective
-            // config assembled below; they branch apart afterwards.
+        case FastCache::CliOutcome::HealthCheck:
+            // These all need the effective config assembled below; they branch
+            // apart afterwards.
             break;
     }
 
     FastCache::Config effective;
+    bool metricsPortYamlExplicit = false;
     if (!parsed->config.configPath.empty())
     {
-        auto loaded = FastCache::ReadYamlConfig(parsed->config.configPath);
+        auto loaded = FastCache::ReadYamlConfigWithPresence(parsed->config.configPath);
         if (!loaded.has_value())
         {
             std::println(std::cerr, "fastcached: {}", loaded.error().ToString());
             return EXIT_FAILURE;
         }
-        effective = Merge(std::move(*loaded), *parsed);
+        metricsPortYamlExplicit = loaded->metricsPortExplicit;
+        effective = Merge(std::move(loaded->config), *parsed);
         effective.configPath = parsed->config.configPath;
     }
     else
     {
         effective = parsed->config;
     }
+
+    // Environment fallback for the metrics port: honour FASTCACHED_METRICS_PORT
+    // only when the port has NOT been set explicitly on the CLI *or* in the YAML
+    // config. This makes the precedence CLI > config-file > env > default, so a
+    // stray environment variable can never silently override a `metrics_port:`
+    // the operator wrote in their config file — even when they wrote the
+    // compiled-in default value (e.g. `metrics_port: 9259` is now distinguishable
+    // from "the key was absent" thanks to the YAML presence bit). A container
+    // that wants the env form simply omits the config/CLI value, letting both
+    // the daemon and its `--healthcheck` probe agree on the port via a single
+    // `-e FASTCACHED_METRICS_PORT=...`.
+    if (!parsed->metricsPortExplicit && !metricsPortYamlExplicit)
+        if (auto const envPort = MetricsPortFromEnv())
+            effective.metricsPort = *envPort;
+
+    // Health check: probe the running daemon's /healthz on loopback and exit
+    // 0/1. Loopback regardless of the configured metrics bind address, since the
+    // probe runs inside the same host/container as the daemon.
+    if (parsed->outcome == FastCache::CliOutcome::HealthCheck)
+        return FastCache::HttpHealthProbe("127.0.0.1", effective.metricsPort, "/healthz") ? EXIT_SUCCESS : EXIT_FAILURE;
 
     // Service-control requests act on the SCM and exit; they never run the
     // daemon body. The effective config is reused so every flag passed

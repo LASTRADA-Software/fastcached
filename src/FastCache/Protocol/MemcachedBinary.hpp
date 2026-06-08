@@ -24,13 +24,18 @@ namespace FastCache
 ///   Verbosity(0x1b), Touch(0x1c), GAT(0x1d), GATQ(0x1e),
 ///   GATK(0x23), GATKQ(0x24).
 ///
-/// SASL opcodes (0x20 List, 0x21 Auth, 0x22 Step) are recognised but
-/// replied to with auth_error so non-authing clients fail fast rather
-/// than hang. fastcached does not implement SASL authentication.
+/// SASL opcodes (0x20 List, 0x21 Auth, 0x22 Step) implement the PLAIN
+/// mechanism against the session's AuthPolicy when one is configured. With no
+/// policy they reply auth_error (as before) so non-authing clients fall back to
+/// the no-auth path. When a policy is configured, every data command before a
+/// successful SASL auth replies auth_error.
 class MemcachedBinaryHandler final: public IProtocolHandler
 {
   public:
-    [[nodiscard]] Task<void> Run(ISocket* socket, CacheEngine* engine, std::vector<std::byte> primingBytes) override;
+    [[nodiscard]] Task<void> Run(ISocket* socket,
+                                 CacheEngine* engine,
+                                 std::vector<std::byte> primingBytes,
+                                 SessionContext session) override;
 };
 
 } // namespace FastCache

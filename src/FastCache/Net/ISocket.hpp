@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Errors/NetError.hpp>
 
 #include <coroutine>
@@ -44,15 +45,32 @@ class IoAwaitable
         return _ready;
     }
 
-    /// Suspend hook — backends override the parent ISocket method to wire
-    /// the coroutine handle into their resume path. The default
-    /// implementation is "never suspend"; backends do their own subclassing
-    /// or use the SetSuspendCallback hook below.
-    void await_suspend(std::coroutine_handle<> handle) noexcept
+    /// Suspend hook — backends wire the coroutine handle into their resume
+    /// path through the SetSuspendCallback hook below.
+    ///
+    /// Returns `bool` (not `void`) so a backend that can satisfy the operation
+    /// *synchronously from inside its suspend callback* — e.g. the TLS decorator
+    /// finding a full record already buffered, or a wrapped transport that
+    /// resolves its raw I/O inline — does not have to resume re-entrantly. While
+    /// the callback runs, a synchronous Complete() only records the result (see
+    /// the `_inSuspendCallback` guard there); we then return `false`, telling the
+    /// coroutine machinery to resume immediately via the normal await_resume path
+    /// rather than suspending and being resumed from within await_suspend (which
+    /// is undefined behaviour). A backend that genuinely defers (the reactor
+    /// path) leaves `_ready` false, so we return `true` and stay suspended until
+    /// Complete() runs later from the reactor thread.
+    /// @param handle The suspended coroutine to resume on completion.
+    /// @return true to suspend; false if the op already completed synchronously.
+    bool await_suspend(std::coroutine_handle<> handle) noexcept
     {
         _handle = handle;
         if (_suspendCallback)
+        {
+            _inSuspendCallback = true;
             _suspendCallback(this, handle);
+            _inSuspendCallback = false;
+        }
+        return !_ready;
     }
 
     IoResult await_resume() noexcept
@@ -61,13 +79,18 @@ class IoAwaitable
     }
 
     /// Called by the backend to publish the result and resume the suspended
-    /// coroutine. Safe to call from any thread; the resume happens
-    /// immediately on the caller's thread (production backends marshal back
-    /// to the reactor thread before calling Complete()).
+    /// coroutine. Safe to call from the coroutine's own thread; production
+    /// backends marshal back to the reactor thread before calling Complete().
+    /// If invoked synchronously from within the suspend callback (a backend that
+    /// completed inline), the resume is suppressed — await_suspend observes the
+    /// published result and returns `false`, so the coroutine resumes without a
+    /// re-entrant `resume()` call.
     void Complete(IoResult result) noexcept
     {
         _result = result;
         _ready = true;
+        if (_inSuspendCallback)
+            return;
         if (_handle && !_handle.done())
             _handle.resume();
     }
@@ -94,6 +117,9 @@ class IoAwaitable
     SuspendCallback _suspendCallback { nullptr };
     void* _suspendCallbackState { nullptr };
     bool _ready { false };
+    /// True only while await_suspend is running the suspend callback, so a
+    /// synchronous Complete() can defer its resume to the await_suspend return.
+    bool _inSuspendCallback { false };
 };
 
 /// Connected, streamed, bidirectional byte transport. Implementations:
@@ -147,6 +173,35 @@ class ISocket
     /// @return Awaitable resolving to IoResult (total bytes written).
     [[nodiscard]] virtual IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
                                                     std::shared_ptr<void const> keepAlive = {}) = 0;
+
+    /// Perform any transport-level handshake required before application I/O.
+    /// Plaintext sockets need none, so the default resolves immediately; the
+    /// TLS decorator overrides it to drive the SSL handshake. The connection
+    /// loop awaits this once before protocol autodetection, so it stays
+    /// transport-agnostic and a slow handshake runs on the per-connection
+    /// coroutine rather than blocking the accept loop.
+    /// @return Awaitable resolving to success, or a NetError on failure.
+    [[nodiscard]] virtual Task<std::expected<void, NetError>> HandshakeIfNeeded()
+    {
+        co_return std::expected<void, NetError> {};
+    }
+
+    /// Suspend until the socket is readable (data or EOF pending) WITHOUT
+    /// consuming any bytes. Used by the pub/sub subscribe loop, which must wake
+    /// on either an incoming client command OR a delivered message and cannot
+    /// afford to block in `Read` while messages queue.
+    ///
+    /// The default resolves immediately as "readable" (IoResult{1}): for
+    /// blocking and in-memory transports the subsequent `Read` either returns
+    /// data or blocks/sees EOF inline, so treating the socket as always-ready is
+    /// correct and the subscribe loop simply falls through to `Read`. The
+    /// reactor-driven sockets override it to arm EPOLLIN/equivalent and resolve
+    /// only on actual readiness, so a parked subscriber consumes no CPU.
+    /// @return Awaitable resolving when readable (the result count is advisory).
+    [[nodiscard]] virtual IoAwaitable WaitReadable()
+    {
+        return IoAwaitable { IoResult { std::size_t { 1 } } };
+    }
 
     /// Close the socket. Idempotent; subsequent Read/Write resolves with
     /// NetErrorCode::BadFileHandle.

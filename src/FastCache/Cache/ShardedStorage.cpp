@@ -197,6 +197,37 @@ std::expected<void, StorageError> ShardedStorage::CompareAndDelete(std::string_v
     return shard.storage->Delete(key, now);
 }
 
+std::expected<CasToken, StorageError> ShardedStorage::Update(
+    std::string_view key,
+    std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
+    TimePoint now)
+{
+    // Hold the shard's exclusive lock across the whole read-modify-write so the
+    // decode → mutate → re-encode → store sequence is one atomic critical
+    // section; without this two concurrent SADDs (or an SADD racing an SREM)
+    // would each read the pre-image and the later write would clobber the other.
+    auto& shard = *_shards[ShardIndexFor(key)];
+    std::unique_lock const lock { shard.mu };
+    auto const current = shard.storage->Peek(key, now);
+    if (!current.has_value())
+        return std::unexpected(current.error());
+    auto outcome = fn(*current);
+    if (!outcome.has_value())
+        return std::unexpected(outcome.error());
+    switch (outcome->action)
+    {
+        case UpdateAction::Store:
+            return shard.storage->Set(key, std::move(outcome->value), outcome->flags, TimePoint::max());
+        case UpdateAction::Delete:
+            if (current->found)
+                (void) shard.storage->Delete(key, now);
+            return CasToken { 0 };
+        case UpdateAction::Unchanged:
+            return current->found ? current->entry.cas : CasToken { 0 };
+    }
+    return CasToken { 0 };
+}
+
 void ShardedStorage::FlushWithGeneration(TimePoint effectiveAt)
 {
     // Hold every shard's exclusive lock so the generation bump is

@@ -9,9 +9,11 @@ place.
 - **`watch` (memcached text)**: streaming event subscription is not
   implemented. Recognised commands return `OK` rather than starting
   the stream.
-- **SASL authentication (memcached binary)**: the opcodes are
-  recognised but always reply with `AuthError`. fastcached has no
-  authentication backend.
+- **SASL authentication (memcached binary)**: the PLAIN mechanism is
+  implemented and authenticates against the `--requirepass` secret. When
+  no secret is configured the opcodes reply `AuthError` (as before), so
+  non-authing clients fall back to the plain path. Other mechanisms
+  (CRAM-MD5, SCRAM) are not supported.
 - **`shutdown` (memcached text)**: not implemented. Stop the daemon
   via the OS (`Ctrl-C`, `SIGTERM`, systemd, Windows service control).
 - **`stats conns` (memcached text)**: returns an empty result.
@@ -19,7 +21,10 @@ place.
 - **`stats sizes` (memcached text)**: returns a single approximate
   bucket because the storage engine does not track per-entry sizes
   bucketed by size class.
-- **`AUTH` (Redis)**: rejected. No auth backend.
+- **`AUTH` (Redis)**: supported when `--requirepass` is set (single
+  shared secret, redis-style); with no secret configured it replies the
+  redis-compatible "no password is set" error. Per-user ACLs beyond the
+  single optional `--auth-username` are not supported.
 - **`HELLO 3` (Redis)**: rejected with `-NOPROTO`. RESP3 is not
   supported.
 - **`SELECT db` (Redis)**: accepted as a no-op for any index — the
@@ -44,10 +49,15 @@ place.
 
 ## Operational gaps
 
-- No live event subscription (`watch`) means observability is via
-  the `stats` snapshot only.
-- No built-in TLS termination. Run behind a TLS-terminating proxy
-  if encryption-in-transit is required.
+- No live event subscription (`watch`). Observability is via the `stats`
+  snapshot and, when `--metrics` is set, a Prometheus `/metrics` endpoint
+  (plus a `/healthz` liveness probe) served on a dedicated HTTP port.
+- TLS termination is opt-in and only present in builds compiled with
+  `-DFASTCACHED_ENABLE_TLS=ON` (links OpenSSL). Enable at runtime with
+  `--tls --tls-cert <pem> --tls-key <pem>`. The default build links no
+  OpenSSL and `--tls` then exits with a clear error; run behind a
+  TLS-terminating proxy in that case. Client-certificate (mutual TLS)
+  authentication is not yet implemented.
 
 See also [Compatibility with upstream](../protocols/compatibility-with-upstream.md)
 for a per-protocol completeness scorecard.

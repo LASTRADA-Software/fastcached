@@ -36,17 +36,6 @@ namespace
         return err;
     }
 
-    [[nodiscard]] std::expected<std::uint16_t, ConfigError> ParsePort(std::string_view sv)
-    {
-        std::uint32_t raw = 0;
-        auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), raw);
-        if (ec != std::errc {} || ptr != sv.data() + sv.size())
-            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, "port", std::format("not a number: {}", sv)));
-        if (raw == 0 || raw > 65535)
-            return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, "port", std::format("out of range: {}", raw)));
-        return static_cast<std::uint16_t>(raw);
-    }
-
     /// Validate a bind address syntactically only. The authoritative check —
     /// "does this resolve to a bindable IPv4/IPv6 address?" — happens at bind
     /// time via getaddrinfo, so a hostname like "localhost" is accepted here
@@ -245,6 +234,18 @@ namespace
             result.logTimestampsExplicit = true;
             return ArgOutcome::Continue;
         }
+        if (arg == "--metrics")
+        {
+            cfg.metricsEnabled = true;
+            result.metricsEnabledExplicit = true;
+            return ArgOutcome::Continue;
+        }
+        if (arg == "--tls")
+        {
+            cfg.tlsEnabled = true;
+            result.tlsEnabledExplicit = true;
+            return ArgOutcome::Continue;
+        }
         // Service-control requests record the desired outcome but keep parsing:
         // the remaining flags (--service-name, --port, --storage, ...) are
         // captured into the config that gets baked into the service command line.
@@ -258,6 +259,11 @@ namespace
             result.outcome = CliOutcome::UninstallService;
             return ArgOutcome::Continue;
         }
+        if (arg == "--healthcheck")
+        {
+            result.outcome = CliOutcome::HealthCheck;
+            return ArgOutcome::Continue;
+        }
 
         // String-valued flags. Each match flips an "explicit" bool so
         // Merge can override YAML even when the typed value happens to
@@ -267,6 +273,11 @@ namespace
                  { "--pidfile", &cfg.pidfile, nullptr },
                  { "--service-name", &cfg.serviceName, nullptr },
                  { "--storage", &cfg.storagePath, &result.storagePathExplicit },
+                 { "--requirepass", &cfg.requirePass, &result.requirePassExplicit },
+                 { "--auth-username", &cfg.authUsername, &result.authUsernameExplicit },
+                 { "--metrics-bind", &cfg.metricsBindAddress, &result.metricsBindAddressExplicit },
+                 { "--tls-cert", &cfg.tlsCertPath, &result.tlsCertPathExplicit },
+                 { "--tls-key", &cfg.tlsKeyPath, &result.tlsKeyPathExplicit },
              })
         {
             auto const matched = ApplyStringFlag(args, i, name, *target);
@@ -298,6 +309,16 @@ namespace
             if (*matched)
             {
                 result.portExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--metrics-port", ParsePort, cfg.metricsPort);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.metricsPortExplicit = true;
                 return ArgOutcome::Continue;
             }
         }
@@ -428,6 +449,20 @@ namespace
         { .flag = "--max-memory=<size>",
           .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)" },
         { .flag = "--log-level=<level>", .description = "trace|debug|info|warn|error|fatal (default info)" },
+        { .flag = "--requirepass=<secret>",
+          .description = "require clients to authenticate with this shared secret (default: no auth)\n"
+                         "redis: AUTH; memcached binary: SASL PLAIN; memcached text has no auth" },
+        { .flag = "--auth-username=<name>",
+          .description = "username for the AUTH <user> <pass> / SASL PLAIN form (default 'default')" },
+        { .flag = "--metrics",
+          .description = "serve Prometheus /metrics and /healthz on a dedicated HTTP port (default off)" },
+        { .flag = "--metrics-bind=<addr>", .description = "bind address for the metrics endpoint (default 127.0.0.1)" },
+        { .flag = "--metrics-port=<num>", .description = "TCP port for the metrics endpoint (default 9259)" },
+        { .flag = "--tls",
+          .description = "terminate TLS on the cache port (default off; needs a build with OpenSSL\n"
+                         "and both --tls-cert and --tls-key)" },
+        { .flag = "--tls-cert=<path>", .description = "PEM certificate (chain) file for --tls" },
+        { .flag = "--tls-key=<path>", .description = "PEM private key file for --tls" },
         { .flag = "--log-timestamps", .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)" },
         { .flag = "--storage=<path>", .description = "persist cache to a CoW-tree file (default: in-memory only)" },
         { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },
@@ -457,6 +492,9 @@ namespace
                          "needs an elevated prompt; other flags are baked into the service)" },
         { .flag = "--uninstall-service",
           .description = "remove the fastcached Windows service (Windows only; needs elevation)" },
+        { .flag = "--healthcheck",
+          .description = "probe http://127.0.0.1:<metrics-port>/healthz and exit 0 (healthy) or 1\n"
+                         "(self-contained container HEALTHCHECK; needs --metrics on the daemon)" },
         { .flag = "--pidfile=<path>", .description = "POSIX daemon mode only" },
         { .flag = "--service-name=<name>", .description = "Windows service name (default FastCached)" },
         { .flag = "--help, -h", .description = "show this help and exit" },
@@ -563,6 +601,17 @@ namespace
         return out;
     }
 } // namespace
+
+std::expected<std::uint16_t, ConfigError> ParsePort(std::string_view sv)
+{
+    std::uint32_t raw = 0;
+    auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), raw);
+    if (ec != std::errc {} || ptr != sv.data() + sv.size())
+        return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, "port", std::format("not a number: {}", sv)));
+    if (raw == 0 || raw > 65535)
+        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, "port", std::format("out of range: {}", raw)));
+    return static_cast<std::uint16_t>(raw);
+}
 
 std::string CliUsage(UsageColor color)
 {

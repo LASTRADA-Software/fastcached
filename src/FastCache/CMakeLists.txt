@@ -8,6 +8,7 @@ target_sources(FastCache
         Async/IocpReactor.cpp
         Async/KqueueReactor.cpp
         Async/TestReactor.cpp
+        Auth/AuthPolicy.cpp
         Cache/CacheEngine.cpp
         Cache/CowTreeStorage.cpp
         Cache/InMemoryLruStorage.cpp
@@ -21,7 +22,9 @@ target_sources(FastCache
         Core/Crc32c.cpp
         Core/Logger.cpp
         Core/BufferPool.cpp
+        Metrics/PrometheusFormatter.cpp
         Net/BlockingSocket.cpp
+        Net/HealthProbe.cpp
         Net/EpollSocket.cpp
         Net/IocpSocket.cpp
         Net/KqueueSocket.cpp
@@ -39,11 +42,27 @@ target_sources(FastCache
         Protocol/MemcachedMeta.cpp
         Protocol/MemcachedText.cpp
         Protocol/ProtocolAutodetect.cpp
+        Protocol/PubSubRegistry.cpp
         Protocol/RedisResp.cpp
+        Server/AdminHttpServer.cpp
         Server/Connection.cpp
         Server/ReactorServerLoop.cpp
         Server/Server.cpp
 )
+
+# Optional TLS support: compiled and linked only when FASTCACHED_ENABLE_TLS is
+# on, so the default build pulls in no OpenSSL header and links no OpenSSL
+# symbol. FC_TLS_ENABLED is PUBLIC so dependents (the test binary) can guard
+# TLS-only tests behind the same macro.
+if(FASTCACHED_ENABLE_TLS)
+    target_sources(FastCache
+        PRIVATE
+            Net/TlsContext.cpp
+            Net/TlsSocket.cpp
+    )
+    target_link_libraries(FastCache PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(FastCache PUBLIC FC_TLS_ENABLED=1)
+endif()
 
 # Header-only files surfaced for IDE indexing.
 target_sources(FastCache

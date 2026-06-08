@@ -5,14 +5,18 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IAdmissionControl.hpp>
+#include <FastCache/Protocol/SessionContext.hpp>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
 
 namespace FastCache
 {
+
+class TlsContext; // defined in Net/TlsContext.hpp; only used when TLS is built in
 
 /// Options for the reactor-driven server loop. Bundled so we can pass the
 /// same options across the three platform-specific implementations.
@@ -36,6 +40,15 @@ struct ReactorServerOptions
     /// caches instead of migrating across cores. Best-effort: ignored when the
     /// platform doesn't support pinning. Only meaningful with reactorThreads>1.
     bool pinReactorsToCpu { false };
+
+    /// Per-server session context forwarded to every connection (auth policy
+    /// and other optional collaborators). Default-constructed = auth disabled.
+    /// The referenced objects must outlive the server run.
+    SessionContext session {};
+
+    /// TLS context for terminating TLS on accepted connections, or nullptr for
+    /// plaintext. Only honoured in TLS-enabled builds; must outlive the run.
+    TlsContext* tlsContext { nullptr };
 };
 
 /// Run the reactor-driven server loop using the platform's native

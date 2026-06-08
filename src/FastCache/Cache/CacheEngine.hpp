@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -84,6 +85,51 @@ class CacheEngine
 
     [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> Increment(std::string_view key, std::uint64_t delta);
     [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> Decrement(std::string_view key, std::uint64_t delta);
+
+    /// Guarded atomic read-modify-write over the entry under `key`. Forwards to
+    /// `IStorage::Update`, supplying the current clock; the backend runs `fn`
+    /// within its per-key atomicity boundary. Used for compound mutations such
+    /// as the redis set commands and `INCRBYFLOAT`.
+    /// @param key Lookup key.
+    /// @param fn  Callback given the current GetResult; returns the new outcome
+    ///            or a StorageError to abort without mutating.
+    /// @return New CAS token, or the callback's/storage's StorageError.
+    [[nodiscard]] std::expected<CasToken, StorageError> Update(
+        std::string_view key,
+        std::function<std::expected<IStorage::UpdateOutcome, StorageError>(GetResult const&)> const& fn);
+
+    // -- redis set type (SADD/SREM/SMEMBERS/SISMEMBER/SMISMEMBER/SCARD/SPOP) --
+    //
+    // A set is stored as an ordinary value blob tagged with FcTypeSet in the
+    // entry flags; the members are sorted and length-prefixed (see SetCodec).
+    // The mutating ops go through Update so decode-modify-encode is atomic.
+
+    /// Add `members` to the set at `key` (creating it if absent).
+    /// @return Number of members newly added, or WrongType if `key` is a string.
+    [[nodiscard]] std::expected<std::int64_t, StorageError> SetAdd(std::string_view key,
+                                                                   std::span<std::string const> members);
+
+    /// Remove `members` from the set at `key`; deletes the key if it empties.
+    /// @return Number of members actually removed, or WrongType on a non-set key.
+    [[nodiscard]] std::expected<std::int64_t, StorageError> SetRemove(std::string_view key,
+                                                                      std::span<std::string const> members);
+
+    /// @return All members of the set at `key` (empty if absent), or WrongType.
+    [[nodiscard]] std::expected<std::vector<std::string>, StorageError> SetMembers(std::string_view key);
+
+    /// @return True if `member` is in the set at `key`, or WrongType.
+    [[nodiscard]] std::expected<bool, StorageError> SetIsMember(std::string_view key, std::string_view member);
+
+    /// @return One bool per `members` entry (membership), or WrongType.
+    [[nodiscard]] std::expected<std::vector<bool>, StorageError> SetMIsMember(std::string_view key,
+                                                                              std::span<std::string const> members);
+
+    /// @return Cardinality of the set at `key` (0 if absent), or WrongType.
+    [[nodiscard]] std::expected<std::int64_t, StorageError> SetCard(std::string_view key);
+
+    /// Remove and return up to `count` members from the set at `key`.
+    /// @return The popped members (empty if absent), or WrongType.
+    [[nodiscard]] std::expected<std::vector<std::string>, StorageError> SetPop(std::string_view key, std::size_t count);
 
     [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key);
 

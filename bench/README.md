@@ -1,7 +1,7 @@
 # fastcached benchmark suite
 
 A reproducible, cross-platform (Windows / Linux / macOS) benchmark that builds
-two git refs of fastcached, drives them across all three wire protocols, and
+two git refs of fastcached, drives them across all four wire protocols, and
 emits a side-by-side comparison — terminal tables, Markdown + JSON reports, and
 PNG / inline-Sixel charts.
 
@@ -62,7 +62,7 @@ For each scenario the suite reports **throughput** (ops/sec, median of reps;
 higher is better) and **latency** p50/p95/p99/max (ms; lower is better), plus
 error and timeout counts. The standard profile sweeps:
 
-- protocols: memcached text, memcached binary, Redis RESP2
+- protocols: memcached text, memcached binary, Redis RESP2, Redis RESP3
 - operation mixes: SET-only, GET-only, mixed 1:9 write:read
 - storage: in-memory and persistent (`--storage`)
 - concurrency: 1, 16, 64, 256 keep-alive connections
@@ -103,7 +103,7 @@ capability probe (or with `--charts sixel` to force; `--charts none` to disable)
 | File | Role |
 | --- | --- |
 | `fastcached_bench.py` | CLI orchestrator: build refs, run, compare, emit |
-| `protocols.py` | dependency-free clients for the three wire protocols |
+| `protocols.py` | dependency-free clients for the four wire protocols |
 | `workloads.py` | data-driven scenario catalog + profiles |
 | `runner.py` | daemon lifecycle, load generation, metric aggregation |
 | `report.py` | comparison model + `summary.json` / `report.md` |

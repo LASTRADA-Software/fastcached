@@ -7,8 +7,10 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IAdmissionControl.hpp>
 #include <FastCache/Net/IListener.hpp>
+#include <FastCache/Protocol/SessionContext.hpp>
 
 #include <atomic>
+#include <cstdint>
 #include <exception>
 
 namespace FastCache
@@ -37,6 +39,8 @@ inline void LogConnectionFirewallException(ILogger& logger) noexcept
     }
 }
 
+class TlsContext; // defined in Net/TlsContext.hpp; only used when TLS is built in
+
 /// Top-level accept loop. Owns a listener, accepts connections, and spawns
 /// a Connection coroutine per client. Tears down cleanly on Shutdown().
 ///
@@ -50,11 +54,17 @@ class Server
   public:
     /// Construct over the given collaborators; all references must outlive
     /// the server. Admission/metrics may be null.
+    /// @param session Per-server session context (auth policy etc.) forwarded
+    ///        to every connection. Copied by value; defaults to no auth.
+    /// @param tls TLS context to wrap accepted sockets with, or nullptr for
+    ///        plaintext. Only honoured in TLS-enabled builds.
     Server(IListener& listener,
            CacheEngine& engine,
            ILogger& logger,
            IAdmissionControl* admission = nullptr,
-           IMetricsSink* metrics = nullptr) noexcept;
+           IMetricsSink* metrics = nullptr,
+           SessionContext session = {},
+           TlsContext* tls = nullptr) noexcept;
 
     /// Run the accept loop until Shutdown() is called or the listener closes.
     /// @return Task that resolves when the accept loop exits.
@@ -77,6 +87,8 @@ class Server
     ILogger& _logger;
     IAdmissionControl* _admission;
     IMetricsSink* _metrics;
+    SessionContext _session;
+    TlsContext* _tls;
     std::atomic<std::uint64_t> _accepted { 0 };
     std::atomic<bool> _shuttingDown { false };
 };

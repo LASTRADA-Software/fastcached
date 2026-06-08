@@ -37,13 +37,17 @@ Protocol coverage is intentionally a subset:
   flag matrix).
 - **memcached binary:** the core opcodes (Get / Set / Add / Replace / Delete /
   Increment / Decrement / Append / Prepend / Flush / Quit / NoOp / Version /
-  Stat, plus their quiet variants and the SASL handshake stubs).
+  Stat, plus their quiet variants and SASL `PLAIN` authentication).
 - **Redis RESP2:** `GET`, `SET` (with `NX`/`XX`/`EX`/`PX`), `SETEX`,
   `DEL` / `UNLINK`, `EXISTS`, `PING`, `ECHO`, `INFO`, `COMMAND`, `SELECT`,
-  `FLUSHDB` / `FLUSHALL`, `QUIT`.
+  `AUTH`, `FLUSHDB` / `FLUSHALL`, `QUIT`.
 
-There is no clustering, no replication, and no authentication beyond the SASL
-stubs the binary protocol requires.
+For deployment beyond a trusted LAN it supports **authentication**
+(`--requirepass`; redis `AUTH` + memcached SASL PLAIN), optional **TLS**
+(`--tls`, an OpenSSL build), a Prometheus **`/metrics`** endpoint and a
+**`/healthz`** probe (`--metrics`), and a container image with a self-contained
+`--healthcheck`. See [docs/operations/deployment.md](docs/operations/deployment.md).
+There is still no clustering and no replication.
 
 ## Benchmarks
 
@@ -123,6 +127,30 @@ Redis RESP2:
 > *2\r\n$3\r\nGET\r\n$1\r\nk\r\n
 < $5\r\nhello\r\n
 ```
+
+## Production deployment
+
+Run it authenticated, encrypted, and monitored — in a container or on a host:
+
+```sh
+# Container: cache on 11211, Prometheus /metrics + /healthz on 9259.
+docker build -t fastcached .
+docker run --rm -p 11211:11211 -p 9259:9259 fastcached \
+    --bind=0.0.0.0 --metrics --metrics-bind=0.0.0.0 --requirepass=secret
+
+# Or directly, with TLS (needs an OpenSSL build: -DFASTCACHED_ENABLE_TLS=ON):
+fastcached --requirepass=secret --tls --tls-cert=server.crt --tls-key=server.key \
+           --metrics
+redis-cli --tls --insecure -a secret ping     # -> PONG
+curl http://127.0.0.1:9259/healthz             # -> 200 OK
+```
+
+The image's `HEALTHCHECK` calls `fastcached --healthcheck`, a self-contained
+probe of `/healthz` (no `curl` in the image). Binding `0.0.0.0` without
+`--requirepass` exposes the cache to the network — pair them. Full guide,
+including a Kubernetes manifest with liveness/readiness probes and a Prometheus
+scrape annotation, in
+[docs/operations/deployment.md](docs/operations/deployment.md).
 
 ## Command-line flags
 

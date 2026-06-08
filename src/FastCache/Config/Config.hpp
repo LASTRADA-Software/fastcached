@@ -87,6 +87,26 @@ struct Config
     /// Windows service name; defaults to FastCached.
     std::string serviceName { "FastCached" };
 
+    /// Shared authentication secret (redis `requirepass` style). Empty (the
+    /// default) means authentication is disabled and every client is served
+    /// without a credential check. When set, clients must authenticate before
+    /// any data command: redis via `AUTH`, the memcached binary protocol via
+    /// SASL PLAIN. The memcached text protocol has no auth handshake, so it
+    /// then rejects data commands.
+    std::string requirePass {};
+
+    /// Expected username for the two-argument auth form (redis
+    /// `AUTH <user> <pass>` and SASL PLAIN authcid). Defaults to "default",
+    /// mirroring redis's default ACL user. Only consulted when `requirePass`
+    /// is non-empty.
+    ///
+    /// Note: the one-argument redis form `AUTH <pass>` authenticates the default
+    /// user against `requirePass` alone and does NOT enforce this username
+    /// (standard redis semantics). The username only constrains the two-argument
+    /// `AUTH <user> <pass>` form and SASL PLAIN, where the supplied authcid must
+    /// match it.
+    std::string authUsername { "default" };
+
     /// Optional path to a persistent storage file. When set, the
     /// daemon uses a CoW-tree storage backed by this file; when empty,
     /// the cache is in-memory only.
@@ -94,6 +114,30 @@ struct Config
 
     /// TCP port. memcached default is 11211; fastcached's MVP follows.
     std::uint16_t port { 11211 };
+
+    /// Bind address for the admin HTTP endpoint (`/metrics`, `/healthz`).
+    /// Defaults to loopback so metrics are not exposed to the world unless the
+    /// operator opts in. Only used when `metricsEnabled` is true.
+    std::string metricsBindAddress { "127.0.0.1" };
+
+    /// TCP port for the admin HTTP endpoint. Served on a dedicated port so it
+    /// never collides with the cache protocols. Only used when `metricsEnabled`.
+    std::uint16_t metricsPort { 9259 };
+
+    /// Whether to start the admin HTTP endpoint (Prometheus `/metrics` plus a
+    /// `/healthz` liveness probe). Off by default.
+    bool metricsEnabled { false };
+
+    /// Whether to terminate TLS on the cache port. Off by default. Requires a
+    /// build with `FASTCACHED_ENABLE_TLS=ON` and both `tlsCertPath`/`tlsKeyPath`
+    /// set; the daemon fails fast at startup otherwise.
+    bool tlsEnabled { false };
+
+    /// PEM certificate (chain) file for TLS. Only used when `tlsEnabled`.
+    std::string tlsCertPath {};
+
+    /// PEM private key file for TLS. Only used when `tlsEnabled`.
+    std::string tlsKeyPath {};
 
     /// ::listen() backlog — the depth of the kernel's queue of accepted-
     /// but-not-yet-handed-off connections. Bursts of parallel clients (a

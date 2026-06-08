@@ -56,7 +56,7 @@ std::string Exchange(MetaFixture& fix, std::string_view req)
 {
     REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), req)));
     fix.pair.client->ShutdownWrite();
-    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*priming*/ {}));
+    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*priming*/ {}, /*session*/ {}));
     return FastCache::SyncRun(ReadAvailable(fix.pair.client.get()));
 }
 
@@ -431,7 +431,7 @@ TEST_CASE("meta mg l reports seconds since the previous read (regression)", "[pr
         auto pair = FastCache::InMemorySocketPair::Create();
         REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), req)));
         pair.client->ShutdownWrite();
-        FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*priming*/ {}));
+        FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*priming*/ {}, /*session*/ {}));
         return FastCache::SyncRun(ReadAvailable(pair.client.get()));
     };
 
