@@ -112,6 +112,12 @@ class ShardedStorage final: public IStorage
                                                                      CasToken expected,
                                                                      TimePoint now) override;
 
+    /// PERSIST primitive — clear the entry's TTL atomically under the
+    /// shard lock. Holds the shard's exclusive lock across the Peek +
+    /// Touch sequence so a concurrent SETEX cannot slip in between.
+    /// See IStorage::ClearExpiry for the return-value contract.
+    [[nodiscard]] std::expected<bool, StorageError> ClearExpiry(std::string_view key, TimePoint now) override;
+
     [[nodiscard]] std::expected<CasToken, StorageError> Update(
         std::string_view key,
         std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,

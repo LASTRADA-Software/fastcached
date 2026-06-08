@@ -674,3 +674,40 @@ TEST_CASE("ShardedStorage CompareAndDelete removes only on a CAS match", "[shard
     REQUIRE_FALSE(absent.has_value());
     REQUIRE(absent.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
+
+TEST_CASE("ShardedStorage::Update preserves prior expiry on Store", "[sharded][update][ttl]")
+{
+    // The pre-fix ShardedStorage::Update passed TimePoint::max() to the
+    // inner Set, silently wiping any EXPIRE'd TTL. Phase 1 forwards
+    // current->entry.expiry unless the callback overrides via
+    // UpdateOutcome::newExpiry. This test pins the contract under the
+    // sharded wrapper specifically (the path INCR/SADD take in
+    // production).
+    using namespace FastCache::Testing;
+    using namespace std::chrono_literals;
+    auto storage = MakeSharded(4);
+    FastCache::ManualClock clock;
+    auto const deadline = clock.Now() + 60s;
+
+    REQUIRE(storage->Set("k", MakeBytes("0"), 0, deadline).has_value());
+
+    auto const upd = storage->Update(
+        "k",
+        [](FastCache::GetResult const& current)
+            -> std::expected<FastCache::IStorage::UpdateOutcome, FastCache::StorageError> {
+            REQUIRE(current.found);
+            return FastCache::IStorage::UpdateOutcome {
+                .value = MakeBytes("1"),
+                .flags = 0,
+                .action = FastCache::IStorage::UpdateAction::Store,
+                // newExpiry left nullopt → preserve prior expiry
+            };
+        },
+        clock.Now());
+    REQUIRE(upd.has_value());
+
+    auto const after = storage->Peek("k", clock.Now());
+    REQUIRE(after.has_value());
+    REQUIRE(after->found);
+    REQUIRE(after->entry.expiry == deadline);
+}

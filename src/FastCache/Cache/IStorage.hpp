@@ -180,6 +180,29 @@ class IStorage
     /// @return GetResult, or StorageError on I/O failure.
     [[nodiscard]] virtual std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) = 0;
 
+    /// Read just the absolute expiry of the entry under `key` without
+    /// touching its value, LRU recency, hit/miss stats, or `lastAccess`.
+    /// Backs the redis `TTL`/`PTTL` introspection commands, which clients
+    /// can poll at high frequency — copying the value buffer or bumping
+    /// the LRU on every poll would be wrong twice. Defaults to a `Peek` +
+    /// expiry projection (so storages that already implement `Peek`
+    /// cheaply need no extra code); decorators may override to short-
+    /// circuit further.
+    /// @param key Lookup key.
+    /// @param now Current clock value (drives the TTL existence check).
+    /// @return The entry's absolute expiry, or std::nullopt if the key
+    ///         is absent or already expired.
+    [[nodiscard]] virtual std::expected<std::optional<TimePoint>, StorageError> PeekExpiry(std::string_view key,
+                                                                                           TimePoint now)
+    {
+        auto const peek = Peek(key, now);
+        if (!peek.has_value())
+            return std::unexpected(peek.error());
+        if (!peek->found)
+            return std::optional<TimePoint> {};
+        return std::optional<TimePoint> { peek->entry.expiry };
+    }
+
     /// Mark the live entry under `key` stale without removing it (the meta
     /// `md I` / `ms I` flags). The entry remains readable and a reader sees
     /// the `X` response flag; CAS is bumped. Optionally refresh the expiry
@@ -206,6 +229,14 @@ class IStorage
         std::vector<std::byte> value; ///< New value bytes (used when action == Store).
         std::uint32_t flags { 0 };    ///< New flags / type tag (used when action == Store).
         UpdateAction action { UpdateAction::Unchanged };
+        /// New absolute expiry to apply on Store. `nullopt` (the default)
+        /// means "preserve the prior entry's expiry", which is the
+        /// behaviour redis mandates for INCR/SADD/INCRBYFLOAT family —
+        /// the storage layer therefore forwards the existing
+        /// `current->entry.expiry` rather than wiping it. Callbacks that
+        /// DO want to change the TTL (a SETEX-like compound op) set
+        /// this explicitly; `TimePoint::max()` clears any TTL.
+        std::optional<TimePoint> newExpiry {};
     };
 
     /// Guarded read-modify-write: atomically read the entry under `key`, hand it
@@ -237,8 +268,15 @@ class IStorage
             return std::unexpected(outcome.error());
         switch (outcome->action)
         {
-            case UpdateAction::Store:
-                return Set(key, std::move(outcome->value), outcome->flags, TimePoint::max());
+            case UpdateAction::Store: {
+                // Redis semantics: INCR/SADD/INCRBYFLOAT preserve the
+                // prior TTL. The callback opts in to a TTL change via
+                // outcome->newExpiry; if it leaves that nullopt we
+                // forward the current entry's expiry (or
+                // TimePoint::max() for a fresh insert).
+                auto const expiry = outcome->newExpiry.value_or(current->found ? current->entry.expiry : TimePoint::max());
+                return Set(key, std::move(outcome->value), outcome->flags, expiry);
+            }
             case UpdateAction::Delete:
                 if (current->found)
                     (void) Delete(key, now);
@@ -269,6 +307,36 @@ class IStorage
         if (!touched.has_value())
             return std::unexpected(touched.error());
         return Get(key, now);
+    }
+
+    /// Atomically clear the entry's TTL (redis `PERSIST`). Reads the entry
+    /// and, if it has a TTL, applies a `TimePoint::max()` expiry in the
+    /// same critical section the inner backend uses for `Touch`. The
+    /// atomicity boundary is the lock-owning decorator's (ShardedStorage's
+    /// per-shard lock); the default-impl decomposition is safe only when
+    /// the caller already holds that lock or when no concurrent writer can
+    /// race. Returns:
+    ///   - true  if a TTL was actually cleared (the entry existed and had
+    ///           a non-max expiry — matches redis `:1`),
+    ///   - false if the entry existed but had no TTL (redis `:0`),
+    ///   - StorageError(KeyNotFound) if absent (also rendered as `:0` by
+    ///           the protocol handler — but distinguished here so callers
+    ///           that want to observe absence can).
+    /// @param key Lookup key.
+    /// @param now Current clock value (drives the existence check).
+    [[nodiscard]] virtual std::expected<bool, StorageError> ClearExpiry(std::string_view key, TimePoint now)
+    {
+        auto const peek = Peek(key, now);
+        if (!peek.has_value())
+            return std::unexpected(peek.error());
+        if (!peek->found)
+            return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
+        if (peek->entry.expiry == TimePoint::max())
+            return false;
+        auto const touched = Touch(key, TimePoint::max(), now);
+        if (!touched.has_value())
+            return std::unexpected(touched.error());
+        return true;
     }
 
     /// Atomically delete `key` only if its current CAS equals `expected`

@@ -235,6 +235,23 @@ std::expected<GetResult, StorageError> TracingStorage::Peek(std::string_view key
         });
 }
 
+std::expected<std::optional<TimePoint>, StorageError> TracingStorage::PeekExpiry(std::string_view key, TimePoint now)
+{
+    return TraceCall(
+        "PEEK_EXPIRY",
+        key,
+        [&] { return _inner.PeekExpiry(key, now); },
+        [](std::expected<std::optional<TimePoint>, StorageError> const& r) -> std::string {
+            if (!r.has_value())
+                return std::string { ErrorOutcome(r.error()) };
+            if (!r->has_value())
+                return "MISS";
+            if (**r == TimePoint::max())
+                return "NO_TTL";
+            return "HIT";
+        });
+}
+
 std::expected<CasToken, StorageError> TracingStorage::MarkStale(std::string_view key,
                                                                 std::optional<TimePoint> newExpiry,
                                                                 TimePoint now)
@@ -275,6 +292,35 @@ std::expected<void, StorageError> TracingStorage::CompareAndDelete(std::string_v
             if (!r.has_value())
                 return std::string { ErrorOutcome(r.error()) };
             return "DELETED";
+        });
+}
+
+std::expected<bool, StorageError> TracingStorage::ClearExpiry(std::string_view key, TimePoint now)
+{
+    return TraceCall(
+        "CLEAR_EXPIRY",
+        key,
+        [&] { return _inner.ClearExpiry(key, now); },
+        [](std::expected<bool, StorageError> const& r) -> std::string {
+            if (!r.has_value())
+                return std::string { ErrorOutcome(r.error()) };
+            return *r ? "CLEARED" : "NO_TTL";
+        });
+}
+
+std::expected<CasToken, StorageError> TracingStorage::Update(
+    std::string_view key,
+    std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
+    TimePoint now)
+{
+    return TraceCall(
+        "UPDATE",
+        key,
+        [&] { return _inner.Update(key, fn, now); },
+        [](std::expected<CasToken, StorageError> const& r) -> std::string {
+            if (!r.has_value())
+                return std::string { ErrorOutcome(r.error()) };
+            return "STORED";
         });
 }
 

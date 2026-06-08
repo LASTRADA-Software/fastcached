@@ -7,8 +7,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstddef>
+#include <expected>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using FastCache::Testing::MakeBytes;
@@ -254,4 +257,88 @@ TEST_CASE("TracingStorage forwards Touch and emits TOUCHED / NOT_FOUND", "[traci
     REQUIRE(ContainsSubstr(records[0].message, "storage: TOUCH"));
     REQUIRE(ContainsSubstr(records[0].message, "result=TOUCHED"));
     REQUIRE(ContainsSubstr(records[1].message, "result=NOT_FOUND"));
+}
+
+TEST_CASE("TracingStorage::PeekExpiry emits its own verb (not PEEK)", "[tracing][peek_expiry]")
+{
+    // Pre-Phase-1 the inherited default of PeekExpiry would re-enter
+    // Peek on the decorator, emitting a misleading "storage: PEEK"
+    // line for every TTL/PTTL poll. The override emits PEEK_EXPIRY,
+    // distinguishing TTL probe traffic from value Peek traffic.
+    FastCache::InMemoryLruStorage inner;
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::ManualClock clock;
+
+    auto const deadline = clock.Now() + std::chrono::seconds { 30 };
+    REQUIRE(inner.Set("k", MakeBytes("v"), 0, deadline).has_value());
+
+    FastCache::TracingStorage tracer { inner, logger, clock };
+    auto const exp = tracer.PeekExpiry("k", clock.Now());
+    REQUIRE(exp.has_value());
+    REQUIRE(exp->has_value());
+    if (exp.has_value() && exp->has_value())
+        REQUIRE(**exp == deadline);
+
+    auto records = logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(ContainsSubstr(records[0].message, "storage: PEEK_EXPIRY"));
+    REQUIRE(ContainsSubstr(records[0].message, "result=HIT"));
+    // Specifically must NOT misattribute as plain Peek.
+    REQUIRE_FALSE(ContainsSubstr(records[0].message, "storage: PEEK key"));
+}
+
+TEST_CASE("TracingStorage::PeekExpiry emits NO_TTL for keys without expiry", "[tracing][peek_expiry]")
+{
+    FastCache::InMemoryLruStorage inner;
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::ManualClock clock;
+    REQUIRE(inner.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+
+    FastCache::TracingStorage tracer { inner, logger, clock };
+    auto const exp = tracer.PeekExpiry("k", clock.Now());
+    REQUIRE(exp.has_value());
+
+    auto records = logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(ContainsSubstr(records[0].message, "result=NO_TTL"));
+}
+
+TEST_CASE("TracingStorage::Update forwards to the inner atomic implementation and emits UPDATE", "[tracing][update]")
+{
+    // The inherited default would have decomposed Update into a Peek
+    // followed by a Set on the decorator, losing the inner's atomic
+    // RMW guarantee and emitting two trace lines under the wrong
+    // verbs. With the override, the inner storage's Update is called
+    // directly and exactly one UPDATE trace line is emitted.
+    FastCache::InMemoryLruStorage inner;
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::ManualClock clock;
+    auto const deadline = clock.Now() + std::chrono::seconds { 60 };
+    REQUIRE(inner.Set("k", MakeBytes("0"), 0, deadline).has_value());
+
+    FastCache::TracingStorage tracer { inner, logger, clock };
+    auto const upd = tracer.Update(
+        "k",
+        [](FastCache::GetResult const&) -> std::expected<FastCache::IStorage::UpdateOutcome, FastCache::StorageError> {
+            return FastCache::IStorage::UpdateOutcome {
+                .value = MakeBytes("1"),
+                .flags = 0,
+                .action = FastCache::IStorage::UpdateAction::Store,
+            };
+        },
+        clock.Now());
+    REQUIRE(upd.has_value());
+
+    // Exactly one trace line, under the UPDATE verb.
+    auto records = logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(ContainsSubstr(records[0].message, "storage: UPDATE"));
+    REQUIRE(ContainsSubstr(records[0].message, "result=STORED"));
+
+    // And the inner storage preserved the TTL (Phase 1 contract holds
+    // through the decorator).
+    auto const after = inner.Peek("k", clock.Now());
+    REQUIRE(after.has_value());
+    REQUIRE(after->found);
+    REQUIRE(after->entry.expiry == deadline);
 }

@@ -541,3 +541,53 @@ TEST_CASE("LayeredStorage over a CowTree L2 rejects an oversized Set without pol
     REQUIRE_FALSE(storage.L1().Get("big", clock.Now())->found);
     REQUIRE_FALSE(storage.L2().Get("big", clock.Now())->found);
 }
+
+TEST_CASE("LayeredStorage::Update is atomic across L1+L2 and preserves expiry", "[layered][update][ttl]")
+{
+    // Two contracts in one test:
+    //   1. Update writes through L2 and mirrors verbatim to L1 (atomic
+    //      across tiers — the inherited IStorage default would have
+    //      decomposed into Peek+Set on `this`, leaking the L1 mirror
+    //      out of sync with the L2 result).
+    //   2. The prior entry's expiry is preserved on Store when the
+    //      callback leaves outcome.newExpiry nullopt (redis INCR
+    //      semantics).
+    auto storage = MakeLayered();
+    FastCache::ManualClock clock;
+    auto const deadline = clock.Now() + 60s;
+
+    // Seed with a value + TTL directly into L2 (no L1 mirror yet).
+    REQUIRE(storage->L2().Set("k", MakeBytes("0"), 0, deadline).has_value());
+
+    auto const upd = storage->Update(
+        "k",
+        [](FastCache::GetResult const& current)
+            -> std::expected<FastCache::IStorage::UpdateOutcome, FastCache::StorageError> {
+            REQUIRE(current.found);
+            // Callback sees the L2 (canonical) entry with its real TTL.
+            REQUIRE(Decode(current.entry.ValueBytes()) == "0");
+            return FastCache::IStorage::UpdateOutcome {
+                .value = MakeBytes("1"),
+                .flags = 0,
+                .action = FastCache::IStorage::UpdateAction::Store,
+                // .newExpiry left nullopt -> preserve prior TTL
+            };
+        },
+        clock.Now());
+    REQUIRE(upd.has_value());
+
+    // L2 sees the new value with the preserved expiry.
+    auto const l2 = storage->L2().Peek("k", clock.Now());
+    REQUIRE(l2.has_value());
+    REQUIRE(l2->found);
+    REQUIRE(Decode(l2->entry.ValueBytes()) == "1");
+    REQUIRE(l2->entry.expiry == deadline);
+
+    // L1 was refreshed verbatim with L2's CAS + expiry (mirror
+    // coherent).
+    auto const l1 = storage->L1().Peek("k", clock.Now());
+    REQUIRE(l1.has_value());
+    REQUIRE(l1->found);
+    REQUIRE(l1->entry.cas == l2->entry.cas);
+    REQUIRE(l1->entry.expiry == deadline);
+}
