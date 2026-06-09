@@ -83,4 +83,89 @@ class ManualClock final: public IClock
     TimePoint _now;
 };
 
+/// Wall-clock provider abstraction — distinct from IClock because
+/// fastcached's storage TTLs are anchored to `std::chrono::steady_clock`
+/// (immune to system-clock skew, see the TimePoint alias above), but the
+/// redis EXPIREAT/PEXPIREAT family carries an absolute UNIX timestamp
+/// that the protocol layer must translate against the wall clock. Tests
+/// use ManualWallClock for determinism; production uses SystemWallClock,
+/// which delegates to std::chrono::system_clock::now().
+class IWallClock
+{
+  public:
+    IWallClock() = default;
+    IWallClock(IWallClock const&) = delete;
+    IWallClock(IWallClock&&) = delete;
+    IWallClock& operator=(IWallClock const&) = delete;
+    IWallClock& operator=(IWallClock&&) = delete;
+    virtual ~IWallClock() = default;
+
+    /// @return Current wall-clock time (system_clock). Need not be
+    ///         monotonic and may jump under NTP adjustments.
+    [[nodiscard]] virtual std::chrono::system_clock::time_point Now() const noexcept = 0;
+};
+
+/// Default IWallClock implementation wrapping
+/// std::chrono::system_clock::now(). Production code injects this; tests
+/// inject ManualWallClock.
+class SystemWallClock final: public IWallClock
+{
+  public:
+    [[nodiscard]] std::chrono::system_clock::time_point Now() const noexcept override
+    {
+        return std::chrono::system_clock::now();
+    }
+};
+
+/// Test IWallClock with a manually-driven value. Mirrors ManualClock for
+/// the steady seam: deterministic, thread-safe so reactor-driven tests
+/// can share one across coroutines.
+class ManualWallClock final: public IWallClock
+{
+  public:
+    /// Construct with the given starting wall time.
+    /// @param start Initial value returned by Now().
+    explicit ManualWallClock(std::chrono::system_clock::time_point start = {}) noexcept:
+        _now { start }
+    {
+    }
+
+    [[nodiscard]] std::chrono::system_clock::time_point Now() const noexcept override
+    {
+        std::scoped_lock const lock { _mutex };
+        return _now;
+    }
+
+    /// Move the wall clock forward by the given duration.
+    /// @param delta Non-negative duration to advance the wall clock by.
+    void Advance(std::chrono::system_clock::duration delta) noexcept
+    {
+        std::scoped_lock const lock { _mutex };
+        _now += delta;
+    }
+
+    /// Hard-set the wall clock to a specific value.
+    /// @param when New value Now() will return.
+    void SetNow(std::chrono::system_clock::time_point when) noexcept
+    {
+        std::scoped_lock const lock { _mutex };
+        _now = when;
+    }
+
+  private:
+    mutable std::mutex _mutex;
+    std::chrono::system_clock::time_point _now;
+};
+
+/// Process-singleton SystemWallClock for callers (e.g. CacheEngine's
+/// default constructor) that want a wall-clock source without requiring
+/// every test to inject one. Tests that need determinism construct a
+/// ManualWallClock locally and pass it in.
+/// @return Reference to a singleton SystemWallClock with static storage.
+[[nodiscard]] inline IWallClock& DefaultSystemWallClock() noexcept
+{
+    static SystemWallClock instance;
+    return instance;
+}
+
 } // namespace FastCache

@@ -28,9 +28,16 @@ class CacheEngine
 {
   public:
     /// Construct over an IStorage and IClock; both must outlive the engine.
-    /// @param storage Backing storage.
-    /// @param clock Time provider.
-    CacheEngine(IStorage& storage, IClock& clock) noexcept;
+    /// An optional `IWallClock&` injects wall-time access for the
+    /// EXPIREAT/PEXPIREAT family and the memcached absolute-exptime
+    /// translation. Production callers omit the third argument (defaults
+    /// to `DefaultSystemWallClock()`); tests pass a ManualWallClock so
+    /// the wire path through HandleExpire's absolute branch is
+    /// deterministic.
+    /// @param storage   Backing storage.
+    /// @param clock     Monotonic clock for TTL/timeout semantics.
+    /// @param wallClock Wall clock for absolute-UNIX-time translations.
+    CacheEngine(IStorage& storage, IClock& clock, IWallClock& wallClock = DefaultSystemWallClock()) noexcept;
 
     // -- memcached-flavoured operations -------------------------------------
 
@@ -59,15 +66,42 @@ class CacheEngine
                                                             std::uint32_t flags,
                                                             std::uint32_t exptime);
 
+    /// Set with an explicit absolute deadline — the seam Redis SET ... PX /
+    /// PSETEX takes to preserve sub-second TTL precision (which the
+    /// `uint32_t exptime` overload above cannot represent, since it
+    /// translates milliseconds to whole seconds before reaching the
+    /// storage). `TimePoint::max()` clears any TTL.
+    /// @param key       Lookup key.
+    /// @param value     Value bytes.
+    /// @param flags     Memcached "flags" word.
+    /// @param deadline  Absolute steady-clock deadline.
+    /// @return New CAS token, or StorageError on failure.
+    [[nodiscard]] std::expected<CasToken, StorageError> SetWithDeadline(std::string_view key,
+                                                                        std::vector<std::byte> value,
+                                                                        std::uint32_t flags,
+                                                                        TimePoint deadline);
+
     [[nodiscard]] std::expected<CasToken, StorageError> Add(std::string_view key,
                                                             std::vector<std::byte> value,
                                                             std::uint32_t flags,
                                                             std::uint32_t exptime);
 
+    /// Like Add but with an explicit absolute deadline (Redis SET NX PX path).
+    [[nodiscard]] std::expected<CasToken, StorageError> AddWithDeadline(std::string_view key,
+                                                                        std::vector<std::byte> value,
+                                                                        std::uint32_t flags,
+                                                                        TimePoint deadline);
+
     [[nodiscard]] std::expected<CasToken, StorageError> Replace(std::string_view key,
                                                                 std::vector<std::byte> value,
                                                                 std::uint32_t flags,
                                                                 std::uint32_t exptime);
+
+    /// Like Replace but with an explicit absolute deadline (Redis SET XX PX path).
+    [[nodiscard]] std::expected<CasToken, StorageError> ReplaceWithDeadline(std::string_view key,
+                                                                            std::vector<std::byte> value,
+                                                                            std::uint32_t flags,
+                                                                            TimePoint deadline);
 
     /// Append `suffix` to the existing value. `expected` is an optional CAS
     /// precondition (0 = unconditional; drives meta `ms ... MA C(token)`).
@@ -140,6 +174,45 @@ class CacheEngine
     /// @return New CAS token, or StorageError(KeyNotFound).
     [[nodiscard]] std::expected<CasToken, StorageError> Touch(std::string_view key, std::uint32_t exptime);
 
+    /// Apply an absolute-deadline TTL to the live entry under `key`.
+    /// Used by the redis `EXPIREAT`/`PEXPIREAT` family, which carry a
+    /// fully resolved wall-clock instant rather than a relative offset
+    /// (so passing them through `Touch(uint32 exptime)` would lose
+    /// precision and the absolute-vs-relative distinction).
+    /// `TimePoint::max()` clears the expiry (the `PERSIST` semantics).
+    /// @param key       Lookup key.
+    /// @param newExpiry Absolute deadline on the steady clock.
+    /// @return New CAS token, or StorageError(KeyNotFound).
+    [[nodiscard]] std::expected<CasToken, StorageError> TouchAt(std::string_view key, TimePoint newExpiry);
+
+    /// Read the remaining time-to-live on the entry under `key`.
+    /// `std::nullopt` means "key absent or already expired" (the redis
+    /// `-2` return); a non-zero duration is the remaining time; a
+    /// zero duration is returned when the entry exists with no TTL
+    /// (`TimePoint::max()`), which the redis handler then renders as
+    /// `-1`. The distinction between "no TTL" and "has TTL of N" is
+    /// signalled via the returned variant in the protocol layer.
+    /// @param key Lookup key.
+    /// @return An optional pair {hasExpiry, remaining}. `hasExpiry` is
+    ///         false when the entry exists with no TTL.
+    struct TtlResult
+    {
+        bool hasExpiry { false };
+        Duration remaining { 0 };
+    };
+    [[nodiscard]] std::expected<std::optional<TtlResult>, StorageError> Ttl(std::string_view key);
+
+    /// Atomically clear the entry's TTL (redis `PERSIST`). Forwards to
+    /// `IStorage::ClearExpiry`, which holds the lock-owning decorator's
+    /// critical section across the Peek + Touch sequence. Returns:
+    ///   - true              if a TTL was actually cleared,
+    ///   - false             if the key existed but had no TTL,
+    ///   - KeyNotFound error if the key was absent.
+    /// The protocol layer collapses both `false` and `KeyNotFound` to
+    /// redis `:0`, but the distinction is preserved here so callers
+    /// that want to observe absence specifically can.
+    [[nodiscard]] std::expected<bool, StorageError> ClearExpiry(std::string_view key);
+
     /// Atomic get-and-touch: refresh the entry's expiry and return the
     /// refreshed entry in one critical section (memcached `gat`/`gats` and
     /// meta `mg ... T`). Closes the TOCTOU window of a separate Touch+Get.
@@ -185,9 +258,15 @@ class CacheEngine
         return _clock;
     }
 
+    [[nodiscard]] IWallClock& WallClock() noexcept
+    {
+        return _wallClock;
+    }
+
   private:
     IStorage& _storage;
     IClock& _clock;
+    IWallClock& _wallClock;
 };
 
 } // namespace FastCache

@@ -197,6 +197,26 @@ std::expected<void, StorageError> ShardedStorage::CompareAndDelete(std::string_v
     return shard.storage->Delete(key, now);
 }
 
+std::expected<bool, StorageError> ShardedStorage::ClearExpiry(std::string_view key, TimePoint now)
+{
+    // Peek + Touch under one shard-lock acquisition so a concurrent
+    // SETEX cannot slip a new TTL in between (the TOCTOU window the
+    // previous protocol-layer `Ttl + TouchAt` decomposition left open).
+    auto& shard = *_shards[ShardIndexFor(key)];
+    std::unique_lock const lock { shard.mu };
+    auto const peeked = shard.storage->Peek(key, now);
+    if (!peeked.has_value())
+        return std::unexpected(peeked.error());
+    if (!peeked->found)
+        return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
+    if (peeked->entry.expiry == TimePoint::max())
+        return false; // present but had no TTL
+    auto const touched = shard.storage->Touch(key, TimePoint::max(), now);
+    if (!touched.has_value())
+        return std::unexpected(touched.error());
+    return true;
+}
+
 std::expected<CasToken, StorageError> ShardedStorage::Update(
     std::string_view key,
     std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
@@ -216,8 +236,13 @@ std::expected<CasToken, StorageError> ShardedStorage::Update(
         return std::unexpected(outcome.error());
     switch (outcome->action)
     {
-        case UpdateAction::Store:
-            return shard.storage->Set(key, std::move(outcome->value), outcome->flags, TimePoint::max());
+        case UpdateAction::Store: {
+            // Preserve the prior entry's expiry unless the callback
+            // explicitly overrides via outcome->newExpiry (redis INCR/
+            // SADD semantics: TTL survives the read-modify-write).
+            auto const expiry = outcome->newExpiry.value_or(current->found ? current->entry.expiry : TimePoint::max());
+            return shard.storage->Set(key, std::move(outcome->value), outcome->flags, expiry);
+        }
         case UpdateAction::Delete:
             if (current->found)
                 (void) shard.storage->Delete(key, now);

@@ -246,6 +246,67 @@ std::expected<void, StorageError> LayeredStorage::CompareAndDelete(std::string_v
     return Delete(key, now);
 }
 
+std::expected<bool, StorageError> LayeredStorage::ClearExpiry(std::string_view key, TimePoint now)
+{
+    // L2 is canonical for the existence + TTL check; L1 is the mirror.
+    // The atomicity boundary is the enclosing ShardedStorage's shard
+    // lock (production wraps disk storage in ShardedStorage); the
+    // sequence here is L2.Peek + L2.Touch + L1 refresh.
+    auto const peeked = _l2->Peek(key, now);
+    if (!peeked.has_value())
+        return std::unexpected(peeked.error());
+    if (!peeked->found)
+        return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
+    if (peeked->entry.expiry == TimePoint::max())
+        return false;
+    auto const touched = _l2->Touch(key, TimePoint::max(), now);
+    if (!touched.has_value())
+        return std::unexpected(touched.error());
+    // Refresh L1 with the new expiry/CAS so a subsequent Get sees the
+    // cleared TTL. Drop-and-reload is simplest correct; the next Get
+    // will read-through populate the mirror.
+    DropFromL1(key);
+    return true;
+}
+
+std::expected<CasToken, StorageError> LayeredStorage::Update(
+    std::string_view key,
+    std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
+    TimePoint now)
+{
+    // Read the canonical entry from L2 directly; consulting L1 via
+    // Peek() would risk handing the callback a stale-mirror flags
+    // word for a key whose L2 expiry has since been updated by a
+    // sibling decorator. L2 is the source of truth for the RMW.
+    auto const current = _l2->Peek(key, now);
+    if (!current.has_value())
+        return std::unexpected(current.error());
+    auto outcome = fn(*current);
+    if (!outcome.has_value())
+        return std::unexpected(outcome.error());
+    switch (outcome->action)
+    {
+        case UpdateAction::Store: {
+            // Preserve the prior expiry unless the callback overrides
+            // (redis INCR/SADD semantics). Write through L2 and refresh
+            // L1 verbatim via MirrorL2WriteResult.
+            auto const expiry = outcome->newExpiry.value_or(current->found ? current->entry.expiry : TimePoint::max());
+            auto const cas = _l2->Set(key, std::move(outcome->value), outcome->flags, expiry);
+            if (!cas.has_value())
+                return std::unexpected(cas.error());
+            return MirrorL2WriteResult(key, *cas, TimePoint::min());
+        }
+        case UpdateAction::Delete:
+            if (current->found)
+                (void) _l2->Delete(key, now);
+            DropFromL1(key);
+            return CasToken { 0 };
+        case UpdateAction::Unchanged:
+            return current->found ? current->entry.cas : CasToken { 0 };
+    }
+    return CasToken { 0 };
+}
+
 void LayeredStorage::FlushWithGeneration(TimePoint effectiveAt)
 {
     _l2->FlushWithGeneration(effectiveAt);

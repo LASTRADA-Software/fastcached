@@ -83,6 +83,13 @@ class TracingStorage final: public IStorage
 
     [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
 
+    /// PeekExpiry override so trace lines distinguish TTL polling traffic
+    /// from genuine value Peek traffic; without this override the
+    /// inherited default would re-enter Peek (emitting a misleading
+    /// "PEEK" verb on every TTL/PTTL request).
+    [[nodiscard]] std::expected<std::optional<TimePoint>, StorageError> PeekExpiry(std::string_view key,
+                                                                                   TimePoint now) override;
+
     [[nodiscard]] std::expected<CasToken, StorageError> MarkStale(std::string_view key,
                                                                   std::optional<TimePoint> newExpiry,
                                                                   TimePoint now) override;
@@ -98,6 +105,20 @@ class TracingStorage final: public IStorage
     [[nodiscard]] std::expected<void, StorageError> CompareAndDelete(std::string_view key,
                                                                      CasToken expected,
                                                                      TimePoint now) override;
+
+    /// PERSIST primitive override so the inner storage's atomic
+    /// implementation is used and the trace surfaces TTL-clear operations.
+    [[nodiscard]] std::expected<bool, StorageError> ClearExpiry(std::string_view key, TimePoint now) override;
+
+    /// Update override so the inner ShardedStorage's per-shard atomicity
+    /// is preserved end-to-end and the trace surfaces RMW operations
+    /// (INCR/DECR/SADD/SREM/INCRBYFLOAT) under their own verb. The base
+    /// default would decompose into Peek + Set, losing both atomicity
+    /// and (until UpdateOutcome::newExpiry was added) the entry's TTL.
+    [[nodiscard]] std::expected<CasToken, StorageError> Update(
+        std::string_view key,
+        std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
+        TimePoint now) override;
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;

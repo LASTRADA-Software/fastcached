@@ -127,6 +127,24 @@ class LayeredStorage final: public IStorage
                                                                      CasToken expected,
                                                                      TimePoint now) override;
 
+    /// PERSIST primitive across both tiers. Forwards to L2 (the canonical
+    /// store), then refreshes the L1 mirror so a subsequent Get sees the
+    /// cleared TTL. See IStorage::ClearExpiry for the return contract.
+    [[nodiscard]] std::expected<bool, StorageError> ClearExpiry(std::string_view key, TimePoint now) override;
+
+    /// Read-modify-write across both tiers. Reads the canonical entry
+    /// from L2 (the inherited default would consult L1's stale mirror),
+    /// hands it to the callback, then writes the outcome through L2
+    /// and mirrors into L1. The atomicity boundary is the enclosing
+    /// ShardedStorage's per-shard lock. Without this override, the
+    /// IStorage default would (1) read a possibly-stale L1 mirror and
+    /// (2) wipe the entry's TTL because it cannot see UpdateOutcome's
+    /// newExpiry-vs-preserve semantics through the L1+L2 mirror dance.
+    [[nodiscard]] std::expected<CasToken, StorageError> Update(
+        std::string_view key,
+        std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
+        TimePoint now) override;
+
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;
     [[nodiscard]] StorageStats Snapshot() const noexcept override;

@@ -571,3 +571,94 @@ TEST_CASE("Prepend honours an optional CAS precondition", "[cache][prepend][cas]
     REQUIRE(right.has_value());
     REQUIRE(Decode(storage.Get("k", clock.Now())->entry.ValueBytes()) == "foobar");
 }
+
+TEST_CASE("IStorage::Update default preserves prior expiry on Store", "[cache][update][ttl]")
+{
+    // Direct-storage test pinning the Phase 1 contract: when an Update
+    // callback returns Store without an explicit newExpiry, the prior
+    // entry's expiry is preserved. The pre-fix default wrote
+    // TimePoint::max(), silently wiping any EXPIRE'd TTL.
+    FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
+    auto const deadline = clock.Now() + 60s;
+
+    REQUIRE(storage.Set("k", MakeBytes("0"), 0, deadline).has_value());
+
+    auto const upd = storage.Update(
+        "k",
+        [](FastCache::GetResult const& current)
+            -> std::expected<FastCache::IStorage::UpdateOutcome, FastCache::StorageError> {
+            REQUIRE(current.found);
+            return FastCache::IStorage::UpdateOutcome {
+                .value = MakeBytes("1"),
+                .flags = 0,
+                .action = FastCache::IStorage::UpdateAction::Store,
+                // .newExpiry left at default nullopt -> preserve prior expiry
+            };
+        },
+        clock.Now());
+    REQUIRE(upd.has_value());
+
+    auto const after = storage.Peek("k", clock.Now());
+    REQUIRE(after.has_value());
+    REQUIRE(after->found);
+    REQUIRE(after->entry.expiry == deadline);
+}
+
+TEST_CASE("IStorage::Update honours an explicit newExpiry override", "[cache][update][ttl]")
+{
+    // Callbacks that DO want to change the TTL (a SETEX-like compound op)
+    // set outcome.newExpiry explicitly; the storage applies it verbatim.
+    FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
+    auto const oldExpiry = clock.Now() + 60s;
+    auto const newExpiry = clock.Now() + 30s;
+
+    REQUIRE(storage.Set("k", MakeBytes("0"), 0, oldExpiry).has_value());
+
+    auto const upd = storage.Update(
+        "k",
+        [newExpiry](
+            FastCache::GetResult const&) -> std::expected<FastCache::IStorage::UpdateOutcome, FastCache::StorageError> {
+            return FastCache::IStorage::UpdateOutcome {
+                .value = MakeBytes("1"),
+                .flags = 0,
+                .action = FastCache::IStorage::UpdateAction::Store,
+                .newExpiry = newExpiry,
+            };
+        },
+        clock.Now());
+    REQUIRE(upd.has_value());
+
+    auto const after = storage.Peek("k", clock.Now());
+    REQUIRE(after.has_value());
+    REQUIRE(after->found);
+    REQUIRE(after->entry.expiry == newExpiry);
+}
+
+TEST_CASE("IStorage::Update on absent key without override uses TimePoint::max()", "[cache][update][ttl]")
+{
+    // A fresh insert (key absent) with no explicit newExpiry produces
+    // a key with no TTL — the same as Set without an expiry word.
+    FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
+
+    auto const upd = storage.Update(
+        "fresh",
+        [](FastCache::GetResult const& current)
+            -> std::expected<FastCache::IStorage::UpdateOutcome, FastCache::StorageError> {
+            REQUIRE_FALSE(current.found);
+            return FastCache::IStorage::UpdateOutcome {
+                .value = MakeBytes("new"),
+                .flags = 0,
+                .action = FastCache::IStorage::UpdateAction::Store,
+            };
+        },
+        clock.Now());
+    REQUIRE(upd.has_value());
+
+    auto const after = storage.Peek("fresh", clock.Now());
+    REQUIRE(after.has_value());
+    REQUIRE(after->found);
+    REQUIRE(after->entry.expiry == FastCache::TimePoint::max());
+}

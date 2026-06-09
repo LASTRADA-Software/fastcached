@@ -26,10 +26,12 @@
 #include <expected>
 #include <format>
 #include <limits>
+#include <locale>
 #include <memory>
 #include <mutex>
 #include <ranges>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -360,22 +362,19 @@ namespace
     /// Parse a finite double from `sv` in a locale-independent way, rejecting
     /// trailing garbage and non-finite inputs.
     ///
-    /// We can't use `std::from_chars<double>` because the floating-point
-    /// from_chars overload is unavailable on some libc++ versions (e.g. macOS
-    /// before 26.0). Plain `std::strtod` honours LC_NUMERIC, so on a
-    /// non-C-locale host (e.g. de_DE.UTF-8 with `,` as the decimal separator)
-    /// it would refuse to parse the same wire-format the daemon's own
-    /// `std::format` writes ('.'-separated). Fix: validate that the input
-    /// contains only locale-neutral characters from the redis grammar
-    /// (`[-+]?[0-9]*(\.[0-9]+)?([eE][-+]?[0-9]+)?`) and only then hand the
-    /// canonicalised text to strtod. Under a non-C LC_NUMERIC strtod will
-    /// reject the '.' as junk and our trailing-garbage check fires — but
-    /// because we have already validated the input is well-formed under the
-    /// C locale, the only way that can happen is the locale itself, and we
-    /// can correct it by retrying with a manual decimal-point swap if needed.
-    /// In practice, validating + using strtod is sufficient on every platform
-    /// we target; the validator below catches truly invalid inputs and the
-    /// strtod call is gated to a permitted character set.
+    /// Implementation: validate the byte sequence against the redis numeric
+    /// grammar (`[-+]?[0-9]*(\.[0-9]+)?([eE][-+]?[0-9]+)?`) first, then parse
+    /// the canonicalised text with `std::istringstream` pinned to the classic
+    /// C locale via `imbue(std::locale::classic())`. That side-steps the
+    /// global-LC_NUMERIC hazard that would otherwise let a non-`.`-LC_NUMERIC
+    /// host (e.g. de_DE.UTF-8) reject the wire format the daemon's own
+    /// `std::format` writes — and is portable across POSIX and Windows
+    /// (unlike `uselocale`).
+    ///
+    /// We don't use `std::from_chars<double>` because the floating-point
+    /// from_chars overload is unavailable on some libc++ versions (macOS
+    /// before 26.0). Once the project floor catches up, this collapses
+    /// to a single from_chars call.
     /// @param sv  Text to parse.
     /// @param out Receives the parsed value on success.
     /// @return True iff the whole string is a finite double.
@@ -384,10 +383,8 @@ namespace
         if (sv.empty())
             return false;
         // Locale-neutral pre-validation: every byte must be from the redis
-        // numeric grammar. This both rejects garbage early (e.g. embedded NUL,
-        // whitespace, locale-specific decimal separators like ',') and makes
-        // the subsequent strtod call safe under any LC_NUMERIC: strtod can
-        // only encounter ASCII digits, '.', '+', '-', 'e', 'E'.
+        // numeric grammar. Catches embedded NUL, whitespace, and any
+        // locale-specific decimal separators (',') the daemon doesn't speak.
         bool sawDot = false;
         bool sawExp = false;
         bool sawDigit = false;
@@ -395,9 +392,7 @@ namespace
         {
             auto const c = sv[i];
             if (c >= '0' && c <= '9')
-            {
                 sawDigit = true;
-            }
             else if (c == '.')
             {
                 if (sawDot || sawExp)
@@ -417,82 +412,31 @@ namespace
                     return false;
             }
             else
-            {
                 return false;
-            }
         }
         if (!sawDigit)
             return false;
-        // The validator above guarantees ASCII; strtod under any locale will
-        // either parse the whole string or stop at '.' (under a non-'.'-locale
-        // locale). For maximum portability and to side-step the LC_NUMERIC
-        // hazard entirely on hosts whose default locale is not C, build a
-        // manual sign+digits+exponent reading via `from_chars` for the integer
-        // pieces and recombine.
-        std::string const text { sv }; // strtod needs a NUL-terminated buffer.
-        char* end = nullptr;
-        errno = 0;
-        auto const value = std::strtod(text.c_str(), &end);
-        if (errno == 0 && end == text.c_str() + text.size() && std::isfinite(value))
+
+        // The validator guarantees ASCII; pin the stream to the classic
+        // (C) locale so a non-`.`-LC_NUMERIC host (e.g. de_DE.UTF-8)
+        // still parses the wire format the daemon emits. Portable across
+        // POSIX and Windows. One istringstream construction per call —
+        // not on any hot path (INCRBYFLOAT only).
+        try
         {
+            std::istringstream iss { std::string { sv } };
+            iss.imbue(std::locale::classic());
+            double value = 0;
+            iss >> value;
+            if (iss.fail() || !iss.eof() || !std::isfinite(value))
+                return false;
             out = value;
             return true;
         }
-        // strtod refused (likely a non-'.'-LC_NUMERIC); reconstruct manually.
-        // Split at the 'e'/'E', integer/fractional at '.'. All pieces are pure
-        // digit runs (plus an optional leading sign on the mantissa and
-        // exponent), validated above.
-        std::size_t expPos = sv.size();
-        for (auto const i: std::views::iota(std::size_t { 0 }, sv.size()))
-            if (sv[i] == 'e' || sv[i] == 'E')
-            {
-                expPos = i;
-                break;
-            }
-        auto const mantissaSv = sv.substr(0, expPos);
-        long exp = 0;
-        if (expPos < sv.size())
+        catch (...)
         {
-            auto const expSv = sv.substr(expPos + 1);
-            auto const [ptr, ec] = std::from_chars(expSv.data(), expSv.data() + expSv.size(), exp);
-            if (ec != std::errc {} || ptr != expSv.data() + expSv.size())
-                return false;
-        }
-        int sign = 1;
-        std::size_t mPos = 0;
-        if (mPos < mantissaSv.size() && (mantissaSv[mPos] == '+' || mantissaSv[mPos] == '-'))
-        {
-            if (mantissaSv[mPos] == '-')
-                sign = -1;
-            ++mPos;
-        }
-        auto const intStart = mPos;
-        while (mPos < mantissaSv.size() && mantissaSv[mPos] != '.')
-            ++mPos;
-        auto const intPart = mantissaSv.substr(intStart, mPos - intStart);
-        std::string_view fracPart;
-        if (mPos < mantissaSv.size())
-            fracPart = mantissaSv.substr(mPos + 1);
-        // Reassemble as integer-only mantissa with adjusted exponent so we can
-        // call from_chars<long long> once and then scale by 10^exp.
-        std::string concat;
-        concat.reserve(intPart.size() + fracPart.size());
-        concat.append(intPart);
-        concat.append(fracPart);
-        auto const adjustedExp = exp - static_cast<long>(fracPart.size());
-        long long mantissa = 0;
-        if (!concat.empty())
-        {
-            auto const [ptr, ec] = std::from_chars(concat.data(), concat.data() + concat.size(), mantissa);
-            if (ec != std::errc {} || ptr != concat.data() + concat.size())
-                return false;
-        }
-        auto const result =
-            static_cast<double>(sign) * static_cast<double>(mantissa) * std::pow(10.0, static_cast<double>(adjustedExp));
-        if (!std::isfinite(result))
             return false;
-        out = result;
-        return true;
+        }
     }
 
     Task<bool> WriteAll(ISocket* socket, std::string_view payload)
@@ -762,37 +706,82 @@ namespace
         co_return cmd;
     }
 
-    /// Optional argument parsing for SET command flags (EX/PX/NX/XX).
-    struct SetOptions
+    /// Family-tagged option representation for SET. Existence (NX vs XX vs
+    /// neither) and Expiry (EX vs PX vs neither) are independent families;
+    /// each option from a family is mutually exclusive with the others
+    /// in its family, so they're modelled as enums + optional rather
+    /// than parallel booleans / integers. Adding KEEPTTL / GET / IDLE is
+    /// a new field, not a new branch.
+    enum class Existence : std::uint8_t
     {
-        bool nx { false };
-        bool xx { false };
-        std::uint32_t exptime { 0 };
+        Any,           ///< No NX / XX clause.
+        OnlyIfAbsent,  ///< NX
+        OnlyIfPresent, ///< XX
     };
 
-    [[nodiscard]] std::expected<SetOptions, std::string> ParseSetOptions(std::span<std::string const> tail)
+    struct SetOptions
+    {
+        Existence existence { Existence::Any };
+        /// Absolute deadline when the SET carries an EX/PX clause;
+        /// nullopt = no TTL. Sub-second precision preserved (the wire
+        /// PX path goes through this end-to-end, not the lossy
+        /// (raw+999)/1000 path the prior implementation forced).
+        std::optional<TimePoint> deadline {};
+    };
+
+    /// Redis caps TTL inputs at INT32_MAX for the seconds form and the
+    /// corresponding ms value for the millisecond form. Values outside
+    /// that range — including the silent `0` and the silently-wrapping
+    /// UINT64_MAX-998 — reply `-ERR invalid expire time`.
+    constexpr std::uint64_t MaxTtlSeconds = std::numeric_limits<std::int32_t>::max();
+    constexpr std::uint64_t MaxTtlMillis = static_cast<std::uint64_t>(MaxTtlSeconds) * 1000ULL;
+
+    /// Parse the optional NX/XX/EX/PX clauses from a SET tail. Returns the
+    /// human-readable Redis error string on the first violation: an unknown
+    /// token, a missing argument, an EX/PX without a number, a TTL of 0,
+    /// a TTL above the documented Redis cap, or two options from the same
+    /// family (NX+XX, EX+PX).
+    /// @param tail  Args after `SET key value` (so opts[0] is the first flag).
+    /// @param clock Source of the current monotonic clock (to anchor PX/EX
+    ///        into an absolute deadline at parse time — one clock read per
+    ///        parse, deterministic under ManualClock).
+    [[nodiscard]] std::expected<SetOptions, std::string> ParseSetOptions(std::span<std::string const> tail, IClock& clock)
     {
         SetOptions opts;
         for (std::size_t i = 0; i < tail.size(); ++i)
         {
             auto const tok = Upper(tail[i]);
             if (tok == "NX")
-                opts.nx = true;
+            {
+                if (opts.existence != Existence::Any)
+                    return std::unexpected(std::string { "syntax error" });
+                opts.existence = Existence::OnlyIfAbsent;
+            }
             else if (tok == "XX")
-                opts.xx = true;
+            {
+                if (opts.existence != Existence::Any)
+                    return std::unexpected(std::string { "syntax error" });
+                opts.existence = Existence::OnlyIfPresent;
+            }
             else if (tok == "EX" || tok == "PX")
             {
+                if (opts.deadline.has_value())
+                    return std::unexpected(std::string { "syntax error" });
                 if (i + 1 >= tail.size())
-                    return std::unexpected(std::string { "missing argument for " } + tok);
+                    return std::unexpected(std::string { "syntax error" });
                 std::uint64_t raw = 0;
                 if (!ParseUnsigned(std::string_view { tail[i + 1] }, raw))
-                    return std::unexpected(std::string { "bad number for " } + tok);
-                opts.exptime =
-                    tok == "EX" ? static_cast<std::uint32_t>(raw) : static_cast<std::uint32_t>((raw + 999) / 1000);
+                    return std::unexpected(std::string { "value is not an integer or out of range" });
+                bool const millis = (tok == "PX");
+                auto const cap = millis ? MaxTtlMillis : MaxTtlSeconds;
+                if (raw == 0 || raw > cap)
+                    return std::unexpected(std::string { "invalid expire time in 'set'" });
+                opts.deadline =
+                    millis ? clock.Now() + std::chrono::milliseconds { raw } : clock.Now() + std::chrono::seconds { raw };
                 ++i;
             }
             else
-                return std::unexpected("unknown SET option: " + tok);
+                return std::unexpected("syntax error");
         }
         return opts;
     }
@@ -824,22 +813,28 @@ namespace
 
         auto const& key = args[0];
         auto const& value = args[1];
-        auto const opts = ParseSetOptions(args.subspan(2));
+        auto const opts = ParseSetOptions(args.subspan(2), engine->Clock());
         if (!opts.has_value())
             co_return co_await ReplyError(socket, opts.error());
 
-        std::vector<std::byte> bytes;
-        bytes.reserve(value.size());
-        for (auto const c: value)
-            bytes.push_back(static_cast<std::byte>(c));
+        auto bytes = BytesFromString(value);
+        // Deadline is either the absolute TimePoint the EX/PX clause
+        // anchored at parse time, or TimePoint::max() (no TTL).
+        auto const deadline = opts->deadline.value_or(TimePoint::max());
 
         std::expected<CasToken, StorageError> result { 0 };
-        if (opts->nx)
-            result = engine->Add(key, std::move(bytes), 0, opts->exptime);
-        else if (opts->xx)
-            result = engine->Replace(key, std::move(bytes), 0, opts->exptime);
-        else
-            result = engine->Set(key, std::move(bytes), 0, opts->exptime);
+        switch (opts->existence)
+        {
+            case Existence::OnlyIfAbsent:
+                result = engine->AddWithDeadline(key, std::move(bytes), 0, deadline);
+                break;
+            case Existence::OnlyIfPresent:
+                result = engine->ReplaceWithDeadline(key, std::move(bytes), 0, deadline);
+                break;
+            case Existence::Any:
+                result = engine->SetWithDeadline(key, std::move(bytes), 0, deadline);
+                break;
+        }
 
         if (result.has_value())
             co_return co_await ReplyOk(socket);
@@ -857,17 +852,193 @@ namespace
                 socket, millis ? "wrong number of arguments for 'psetex'" : "wrong number of arguments for 'setex'");
         std::uint64_t raw = 0;
         if (!ParseUnsigned(std::string_view { args[1] }, raw))
-            co_return co_await ReplyError(socket, "ttl must be a number");
-        auto const exptime = millis ? static_cast<std::uint32_t>((raw + 999) / 1000) : static_cast<std::uint32_t>(raw);
+            co_return co_await ReplyError(socket, "value is not an integer or out of range");
+        auto const cap = millis ? MaxTtlMillis : MaxTtlSeconds;
+        if (raw == 0 || raw > cap)
+            co_return co_await ReplyError(socket,
+                                          millis ? "invalid expire time in 'psetex'" : "invalid expire time in 'setex'");
 
-        std::vector<std::byte> bytes;
-        bytes.reserve(args[2].size());
-        for (auto const c: args[2])
-            bytes.push_back(static_cast<std::byte>(c));
-        auto const result = engine->Set(args[0], std::move(bytes), 0, exptime);
+        auto bytes = BytesFromString(args[2]);
+        // Route through the deadline-bearing seam so PSETEX keeps its
+        // wire-supplied millisecond precision (the prior path forced
+        // ceiling-division to whole seconds, turning `PSETEX k 50 v`
+        // into a 1-second TTL).
+        auto const deadline = millis ? engine->Clock().Now() + std::chrono::milliseconds { raw }
+                                     : engine->Clock().Now() + std::chrono::seconds { raw };
+        auto const result = engine->SetWithDeadline(args[0], std::move(bytes), 0, deadline);
         if (!result.has_value())
             co_return co_await ReplyError(socket, "storage failure");
         co_return co_await ReplyOk(socket);
+    }
+
+    /// Time unit a TTL command's wire word is denominated in. Drives the
+    /// integer conversions for EXPIRE (seconds) vs PEXPIRE (milliseconds)
+    /// and TTL/PTTL.
+    enum class TtlUnit : std::uint8_t
+    {
+        Seconds,
+        Milliseconds,
+    };
+
+    /// Saturating subtraction on signed-64-bit: returns the actual result
+    /// when representable, otherwise INT64_MAX / INT64_MIN. Used to compute
+    /// `absoluteTimestamp - now` for EXPIREAT/PEXPIREAT without UB on
+    /// arbitrary client input (a wire-supplied INT64_MIN would otherwise
+    /// trip signed-integer underflow).
+    /// @param a Left operand.
+    /// @param b Right operand.
+    /// @return `a - b` clamped to the int64 range.
+    [[nodiscard]] constexpr std::int64_t SaturatingSub(std::int64_t a, std::int64_t b) noexcept
+    {
+        constexpr auto Max = std::numeric_limits<std::int64_t>::max();
+        constexpr auto Min = std::numeric_limits<std::int64_t>::min();
+        // Portable overflow detection (MSVC lacks __builtin_sub_overflow): the
+        // guard operands are themselves chosen to never overflow — `Max + b`
+        // with b < 0 and `Min + b` with b > 0 both stay in range.
+        if (b < 0 && a > Max + b)
+            return Max; // a - b would exceed the positive range.
+        if (b > 0 && a < Min + b)
+            return Min; // a - b would underflow the negative range.
+        return a - b;
+    }
+
+    /// Resolve a possibly-out-of-range relative delta into a steady-clock
+    /// deadline, clamping to `TimePoint::max()` rather than allowing chrono
+    /// duration overflow (a wire-supplied INT64_MAX in nanoseconds via
+    /// `std::chrono::seconds{INT64_MAX}` would otherwise wrap into the
+    /// distant past). Negative or zero deltas resolve to `now` (immediate
+    /// expiry — matches the Redis "TTL in the past deletes" semantics).
+    /// @param now   Current monotonic clock.
+    /// @param delta Wire-unit count (seconds or milliseconds).
+    /// @param unit  Which unit `delta` is denominated in.
+    /// @return The clamped steady-clock deadline.
+    [[nodiscard]] TimePoint DeadlineFromDelta(TimePoint now, std::int64_t delta, TtlUnit unit) noexcept
+    {
+        if (delta <= 0)
+            return now;
+        // Cap delta to a value that, when scaled into the steady_clock's
+        // representation (nanoseconds on most hosts), cannot overflow the
+        // duration's underlying int64. A 100-year offset is well past any
+        // sane TTL and well inside the int64 range for nanoseconds.
+        constexpr std::int64_t HundredYearsSeconds = 100LL * 365LL * 24LL * 60LL * 60LL;
+        constexpr std::int64_t HundredYearsMillis = HundredYearsSeconds * 1000LL;
+        auto const cap = unit == TtlUnit::Seconds ? HundredYearsSeconds : HundredYearsMillis;
+        auto const clamped = delta > cap ? cap : delta;
+        return unit == TtlUnit::Seconds ? now + std::chrono::seconds { clamped }
+                                        : now + std::chrono::milliseconds { clamped };
+    }
+
+    /// EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT — relative or absolute TTL on
+    /// an existing key. The four wire commands differ only by data (unit and
+    /// absolute-vs-relative interpretation), so they share one handler.
+    ///
+    /// Redis EXPIREAT/PEXPIREAT take a UNIX timestamp; fastcached's
+    /// monotonic clock has no notion of wall time, so the implementation
+    /// approximates it by anchoring against std::chrono::system_clock once
+    /// per call (mirrors the absolute-exptime path in CacheEngine).
+    /// @param verb     One of "expire", "pexpire", "expireat", "pexpireat" — drives the
+    ///                 wrong-arg-count error string.
+    /// @param unit     Seconds vs milliseconds for the TTL word.
+    /// @param absolute When true, the TTL word is an absolute UNIX timestamp;
+    ///                 otherwise it's an offset from `now`.
+    Task<bool> HandleExpire(ISocket* socket,
+                            CacheEngine* engine,
+                            std::span<std::string const> args,
+                            std::string_view verb,
+                            TtlUnit unit,
+                            bool absolute)
+    {
+        if (args.size() != 2)
+            co_return co_await ReplyError(socket, std::format("wrong number of arguments for '{}'", verb));
+        std::int64_t raw = 0;
+        if (!ParseSigned(std::string_view { args[1] }, raw))
+            co_return co_await ReplyError(socket, "value is not an integer or out of range");
+
+        // Resolve the absolute steady-clock deadline. Redis semantics:
+        //   relative <= 0 -> key is deleted immediately (TTL already elapsed)
+        //   absolute in the past -> same
+        // We achieve this by passing `now` to Touch, which sets the entry to
+        // expire as soon as it is observed (the next operation purges it).
+        auto& clock = engine->Clock();
+        auto const now = clock.Now();
+
+        TimePoint deadline;
+        if (absolute)
+        {
+            // Anchor against the injected wall clock once per call;
+            // absolute-vs-relative arithmetic is then `delta = ts - sysNow`,
+            // mirroring CacheEngine::ExpiryFromExptime's translation for
+            // memcached absolute exptimes. SaturatingSub guards against UB
+            // when `raw` is the wire-supplied INT64_MIN — a plain signed
+            // subtraction would underflow. Going through the injected
+            // IWallClock (not std::chrono::system_clock::now() directly)
+            // lets tests drive the absolute branch deterministically via
+            // ManualWallClock.
+            auto const sysNow = engine->WallClock().Now().time_since_epoch();
+            auto const sysWord = unit == TtlUnit::Seconds
+                                     ? std::chrono::duration_cast<std::chrono::seconds>(sysNow).count()
+                                     : std::chrono::duration_cast<std::chrono::milliseconds>(sysNow).count();
+            auto const delta = SaturatingSub(raw, sysWord);
+            deadline = DeadlineFromDelta(now, delta, unit);
+        }
+        else
+        {
+            deadline = DeadlineFromDelta(now, raw, unit);
+        }
+
+        auto const result = engine->TouchAt(args[0], deadline);
+        if (result.has_value())
+            co_return co_await ReplyInteger(socket, 1);
+        if (result.error().code == StorageErrorCode::KeyNotFound)
+            co_return co_await ReplyInteger(socket, 0);
+        co_return co_await ReplyError(socket, "storage failure");
+    }
+
+    /// TTL / PTTL — remaining time on the entry under `key`.
+    /// Reply matches redis exactly: `-2` if the key is missing, `-1` if it
+    /// exists with no TTL, otherwise the remaining time in the requested unit.
+    /// Reads via `IStorage::PeekExpiry`, which does NOT bump LRU recency or
+    /// `lastAccess` — a TTL probe must not be observable as a client access,
+    /// or polling for expiry would keep the entry alive forever.
+    Task<bool> HandleTtl(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, TtlUnit unit)
+    {
+        if (args.size() != 1)
+            co_return co_await ReplyError(socket,
+                                          unit == TtlUnit::Seconds ? "wrong number of arguments for 'ttl'"
+                                                                   : "wrong number of arguments for 'pttl'");
+        auto const result = engine->Ttl(args[0]);
+        if (!result.has_value())
+            co_return co_await ReplyError(socket, "storage failure");
+        if (!result->has_value())
+            co_return co_await ReplyInteger(socket, -2); // missing
+        if (!(*result)->hasExpiry)
+            co_return co_await ReplyInteger(socket, -1); // present, no TTL
+        auto const remaining = (*result)->remaining;
+        auto const word = unit == TtlUnit::Seconds
+                              ? std::chrono::duration_cast<std::chrono::seconds>(remaining).count()
+                              : std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+        co_return co_await ReplyInteger(socket, static_cast<std::int64_t>(word));
+    }
+
+    /// PERSIST key — remove any TTL on `key`, leaving the value in place.
+    /// Reply: 1 if a TTL was actually cleared (the key existed and had a
+    /// TTL), 0 otherwise (key absent OR key existed with no TTL — redis
+    /// returns 0 in both no-cleared cases). Routes through
+    /// `IStorage::ClearExpiry`, an atomic Peek+Touch primitive that
+    /// closes the prior TOCTOU window — a concurrent SETEX between the
+    /// separate Ttl read and TouchAt write could let PERSIST clear the
+    /// new TTL while reporting :1, or report :0 against a stale view.
+    Task<bool> HandlePersist(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    {
+        if (args.size() != 1)
+            co_return co_await ReplyError(socket, "wrong number of arguments for 'persist'");
+        auto const result = engine->ClearExpiry(args[0]);
+        if (result.has_value())
+            co_return co_await ReplyInteger(socket, *result ? 1 : 0);
+        // KeyNotFound -> :0 (matches redis behaviour for absent keys).
+        if (result.error().code == StorageErrorCode::KeyNotFound)
+            co_return co_await ReplyInteger(socket, 0);
+        co_return co_await ReplyError(socket, "storage failure");
     }
 
     Task<bool> HandleDel(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
@@ -1053,12 +1224,114 @@ namespace
         co_return co_await WriteHelloMap(socket, negotiated);
     }
 
-    Task<bool> HandleCommand(ISocket* socket, std::span<std::string const> args)
+    /// Forward declarations so HandleCommand and its helpers can use the
+    /// dispatch table for `COMMAND` introspection. Definitions are below
+    /// (the table itself depends on the handler functions, so it can only
+    /// be defined after them).
+    extern std::size_t CommandTableSize() noexcept;
+    extern std::string_view CommandTableName(std::size_t index) noexcept;
+    extern std::int32_t CommandTableArity(std::size_t index) noexcept;
+    extern std::int32_t CommandTableFirstKey(std::size_t index) noexcept;
+    extern std::int32_t CommandTableLastKey(std::size_t index) noexcept;
+    extern std::int32_t CommandTableKeyStep(std::size_t index) noexcept;
+
+    /// Find a command in the table by name (case-sensitive match against the
+    /// canonical UPPER name in `CommandEntry`). Returns the index for
+    /// `COMMAND INFO <name>` lookups, or std::nullopt if the caller passed
+    /// an unknown name (which `COMMAND INFO` then renders as a RESP nil
+    /// per redis convention).
+    [[nodiscard]] std::optional<std::size_t> CommandTableFind(std::string_view upperName) noexcept;
+
+    /// Emit one 6-element command descriptor from the table at `index`:
+    /// `[name, arity, [flags], firstKey, lastKey, keyStep]`. Hoisted out
+    /// of HandleCommand so the bare-COMMAND walk and the INFO-filtered
+    /// walk emit identical wire shapes from one source.
+    /// @param socket Destination socket.
+    /// @param index  Row in the dispatch table to emit.
+    /// @param resp   Negotiated RESP version.
+    /// @return False on a socket write failure.
+    Task<bool> WriteCommandDescriptor(ISocket* socket, std::size_t index, RespVersion resp)
     {
-        // Always reply with an empty array; sccache only uses COMMAND
-        // DOCS/COUNT for sanity checks.
-        static_cast<void>(args);
-        co_return co_await WriteAll(socket, "*0\r\n");
+        if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, 6, resp))
+            co_return false;
+        if (!co_await ReplyBulkString(socket, CommandTableName(index)))
+            co_return false;
+        if (!co_await ReplyInteger(socket, CommandTableArity(index)))
+            co_return false;
+        // flags array — empty (no flag taxonomy modelled here).
+        if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, 0, resp))
+            co_return false;
+        if (!co_await ReplyInteger(socket, CommandTableFirstKey(index)))
+            co_return false;
+        if (!co_await ReplyInteger(socket, CommandTableLastKey(index)))
+            co_return false;
+        co_return co_await ReplyInteger(socket, CommandTableKeyStep(index));
+    }
+
+    /// COMMAND [COUNT|DOCS|INFO|LIST|GETKEYS …]
+    ///
+    /// Real redis clients (jedis, lettuce, go-redis, redis-py) probe this
+    /// at handshake to discover the server's command surface — a bare
+    /// `COMMAND` returns an array of per-command descriptors, `COMMAND
+    /// COUNT` returns the total. Each descriptor is a 6-element array:
+    /// [name, arity, [flags], firstKey, lastKey, keyStep]. The flags
+    /// array is empty here (we don't model flag categories yet); name
+    /// comes from the table and the rest is read straight off the entry.
+    ///
+    /// Replying `*0` (the prior behaviour) made clients believe the
+    /// daemon supported nothing and fall back to surprising defaults.
+    Task<bool> HandleCommand(ISocket* socket, std::span<std::string const> args, RespVersion resp)
+    {
+        auto const sub = args.empty() ? std::string {} : Upper(args[0]);
+        auto const total = CommandTableSize();
+
+        if (sub == "COUNT")
+            co_return co_await ReplyInteger(socket, static_cast<std::int64_t>(total));
+
+        // `COMMAND DOCS` would emit a map per command; clients are happy
+        // with an empty map here as long as it's well-formed.
+        if (sub == "DOCS")
+            co_return co_await ReplyAggregateHeader(socket, Aggregate::Map, 0, resp);
+
+        // `COMMAND GETKEYS` reports the keys touched by an example command
+        // line. We don't synthesise it here; the empty array is harmless.
+        if (sub == "GETKEYS")
+            co_return co_await ReplyAggregateHeader(socket, Aggregate::Array, 0, resp);
+
+        // `COMMAND INFO name [name ...]` filters by the requested names,
+        // emitting one descriptor per name (and RESP nil for unknown
+        // names). Pre-fix this branch fell through to the bare-COMMAND
+        // path and dumped descriptors for every command in the table,
+        // so jedis/lettuce/redis-py probes that compare
+        // `len(args[1:]) == len(reply)` saw a length mismatch.
+        if (sub == "INFO" && args.size() > 1)
+        {
+            auto const requested = args.subspan(1);
+            if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, requested.size(), resp))
+                co_return false;
+            for (auto const& name: requested)
+            {
+                auto const idx = CommandTableFind(Upper(name));
+                if (!idx.has_value())
+                {
+                    if (!co_await ReplyNull(socket, resp))
+                        co_return false;
+                    continue;
+                }
+                if (!co_await WriteCommandDescriptor(socket, *idx, resp))
+                    co_return false;
+            }
+            co_return true;
+        }
+
+        // Default — bare COMMAND or COMMAND INFO / LIST without specific
+        // names: emit a flat array of per-command descriptors.
+        if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, total, resp))
+            co_return false;
+        for (std::size_t i = 0; i < total; ++i)
+            if (!co_await WriteCommandDescriptor(socket, i, resp))
+                co_return false;
+        co_return true;
     }
 
     Task<bool> HandleFlush(ISocket* socket, CacheEngine* engine)
@@ -1400,6 +1673,10 @@ namespace
                 double base = 0;
                 if (current.found)
                 {
+                    // Redis: WRONGTYPE for INCRBYFLOAT on a non-string
+                    // key. Mirrors HandleIncrDecrBy / HandleGet.
+                    if (SetCodec::IsSet(current.entry.flags))
+                        return std::unexpected(MakeStorageError(StorageErrorCode::WrongType));
                     auto const bytes = current.entry.ValueBytes();
                     std::string_view const text { reinterpret_cast<char const*>(bytes.data()), bytes.size() };
                     if (!ParseDouble(text, base))
@@ -1421,6 +1698,8 @@ namespace
 
         if (!result.has_value())
         {
+            if (result.error().code == StorageErrorCode::WrongType)
+                co_return co_await ReplyWrongType(socket);
             if (result.error().code == StorageErrorCode::NotANumber)
                 co_return co_await ReplyError(socket, "value is not a valid float");
             if (result.error().code == StorageErrorCode::InfiniteOrNaN)
@@ -1430,6 +1709,196 @@ namespace
         co_return co_await ReplyBulkString(
             socket,
             std::span<std::byte const> { reinterpret_cast<std::byte const*>(encodedText.data()), encodedText.size() });
+    }
+
+    /// INCR / DECR / INCRBY / DECRBY — atomic signed-64-bit counter
+    /// operations on the string value at `key`. Missing keys are
+    /// initialised to `0` before the delta is applied (redis semantics);
+    /// a non-integer existing value is `-ERR`. Goes through the storage's
+    /// guarded `Update` primitive so the read-modify-write is atomic
+    /// under concurrent writers.
+    /// @param verb  Wire command name, drives the error string.
+    /// @param delta Signed amount to add (negative for DEC*).
+    Task<bool> HandleIncrDecrBy(
+        ISocket* socket, CacheEngine* engine, std::string_view key, std::string_view verb, std::int64_t delta)
+    {
+        std::int64_t newValue = 0;
+        bool overflow = false;
+        std::string encodedText;
+        auto const result =
+            engine->Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
+                std::int64_t base = 0;
+                if (current.found)
+                {
+                    // Redis returns WRONGTYPE (not the generic numeric
+                    // error) for INCR on a non-string key. HandleGet
+                    // line 815 has the same branch — repeat it here so
+                    // the wire reply matches when a client INCRs into
+                    // a set-typed key by mistake.
+                    if (SetCodec::IsSet(current.entry.flags))
+                        return std::unexpected(MakeStorageError(StorageErrorCode::WrongType));
+                    auto const bytes = current.entry.ValueBytes();
+                    std::string_view const text { reinterpret_cast<char const*>(bytes.data()), bytes.size() };
+                    if (text.empty())
+                        return std::unexpected(MakeStorageError(StorageErrorCode::NotANumber));
+                    if (!ParseSigned(text, base))
+                        return std::unexpected(MakeStorageError(StorageErrorCode::NotANumber));
+                }
+                // Signed overflow detection — same contract as redis: refuse,
+                // leave the previous value intact.
+                if ((delta > 0 && base > std::numeric_limits<std::int64_t>::max() - delta)
+                    || (delta < 0 && base < std::numeric_limits<std::int64_t>::min() - delta))
+                {
+                    overflow = true;
+                    return std::unexpected(MakeStorageError(StorageErrorCode::InfiniteOrNaN));
+                }
+                newValue = base + delta;
+                encodedText = std::format("{}", newValue);
+                std::vector<std::byte> encoded(encodedText.size());
+                std::memcpy(encoded.data(), encodedText.data(), encodedText.size());
+                return IStorage::UpdateOutcome { .value = std::move(encoded),
+                                                 .flags = 0,
+                                                 .action = IStorage::UpdateAction::Store };
+            });
+
+        if (!result.has_value())
+        {
+            if (result.error().code == StorageErrorCode::WrongType)
+                co_return co_await ReplyWrongType(socket);
+            if (result.error().code == StorageErrorCode::NotANumber)
+                co_return co_await ReplyError(socket, "value is not an integer or out of range");
+            if (overflow || result.error().code == StorageErrorCode::InfiniteOrNaN)
+                co_return co_await ReplyError(socket, "increment or decrement would overflow");
+            co_return co_await ReplyError(socket, std::format("storage failure for '{}'", verb));
+        }
+        co_return co_await ReplyInteger(socket, newValue);
+    }
+
+    /// INCR / DECR — fixed-magnitude variants. Dispatched separately so the
+    /// arg-count error string matches the wire verb exactly.
+    Task<bool> HandleIncrDecr(
+        ISocket* socket, CacheEngine* engine, std::span<std::string const> args, std::string_view verb, std::int64_t sign)
+    {
+        if (args.size() != 1)
+            co_return co_await ReplyError(socket, std::format("wrong number of arguments for '{}'", verb));
+        co_return co_await HandleIncrDecrBy(socket, engine, args[0], verb, sign);
+    }
+
+    /// INCRBY / DECRBY — variable-magnitude variants. The delta arg is
+    /// signed; DECRBY negates it before delegating.
+    Task<bool> HandleIncrDecrByVerb(
+        ISocket* socket, CacheEngine* engine, std::span<std::string const> args, std::string_view verb, bool negate)
+    {
+        if (args.size() != 2)
+            co_return co_await ReplyError(socket, std::format("wrong number of arguments for '{}'", verb));
+        std::int64_t delta = 0;
+        if (!ParseSigned(std::string_view { args[1] }, delta))
+            co_return co_await ReplyError(socket, "value is not an integer or out of range");
+        if (negate)
+        {
+            // Guard against INT64_MIN negation (UB). Refuse with the same
+            // overflow-style reply rather than wrapping silently.
+            if (delta == std::numeric_limits<std::int64_t>::min())
+                co_return co_await ReplyError(socket, "increment or decrement would overflow");
+            delta = -delta;
+        }
+        co_return co_await HandleIncrDecrBy(socket, engine, args[0], verb, delta);
+    }
+
+    /// MGET key [key ...] — array reply, one bulk-or-nil per key in order.
+    /// Uses non-mutating Peek so a probe via MGET does not bump LRU
+    /// recency on every key (which would defeat eviction under MGET-heavy
+    /// read workloads); compare GET which does promote.
+    Task<bool> HandleMget(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
+    {
+        if (args.empty())
+            co_return co_await ReplyError(socket, "wrong number of arguments for 'mget'");
+        if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, args.size(), resp))
+            co_return false;
+        for (auto const& key: args)
+        {
+            // Peek (not Get) — MGET is a probe, not a client access. A Get
+            // would bump LRU recency and stats on every key, defeating
+            // eviction under MGET-heavy read workloads (a 1000-key cold
+            // probe would re-promote all 1000 to MRU). Mirrors the no-bump
+            // contract the new TTL command family already honours.
+            auto const result = engine->Peek(key);
+            if (!result.has_value() || !result->found || SetCodec::IsSet(result->entry.flags))
+            {
+                if (!co_await ReplyNull(socket, resp))
+                    co_return false;
+                continue;
+            }
+            if (!co_await ReplyBulkString(socket, result->entry.ValueBytes(), result->entry.value.AsKeepAlive()))
+                co_return false;
+        }
+        co_return true;
+    }
+
+    /// MSET key value [key value ...] — unconditional batch set.
+    /// Pair-count is enforced; the operation is NOT atomic across keys
+    /// (matches redis cluster semantics where MSET on multiple slots is
+    /// rejected, but on a single instance MSET is best-effort). Reply
+    /// `+OK` once every key has been written.
+    Task<bool> HandleMset(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    {
+        if (args.empty() || (args.size() % 2) != 0)
+            co_return co_await ReplyError(socket, "wrong number of arguments for 'mset'");
+        for (std::size_t i = 0; i < args.size(); i += 2)
+        {
+            auto const r = engine->Set(args[i], BytesFromString(args[i + 1]), 0, 0);
+            if (!r.has_value())
+                co_return co_await ReplyError(socket, "storage failure");
+        }
+        co_return co_await ReplyOk(socket);
+    }
+
+    /// MSETNX key value [key value ...] — all-or-nothing set: every key
+    /// must be absent at the moment of the check, otherwise no key is
+    /// written. Reply `:1` on success, `:0` if any key already exists or
+    /// if any Add fails mid-batch (in which case earlier writes are
+    /// rolled back via Delete).
+    ///
+    /// Strict atomicity across multiple shards would require a global
+    /// lock; this implementation is two-pass (probe → Add) with a
+    /// best-effort rollback on partial failure. The wire contract now
+    /// matches the redis single-instance promise ("nothing was
+    /// committed" on `:0`); a concurrent SET racing into the gap can
+    /// still let one Add fail, but the rollback erases earlier writes
+    /// from the batch so the keyspace is not left half-written.
+    Task<bool> HandleMsetNx(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    {
+        if (args.empty() || (args.size() % 2) != 0)
+            co_return co_await ReplyError(socket, "wrong number of arguments for 'msetnx'");
+        // First pass: any key already present aborts the whole batch.
+        for (std::size_t i = 0; i < args.size(); i += 2)
+        {
+            auto const peek = engine->Peek(args[i]);
+            if (peek.has_value() && peek->found)
+                co_return co_await ReplyInteger(socket, 0);
+        }
+        // Second pass: write each via Add (NX semantics per key). Track
+        // committed keys so we can roll back if a later Add fails.
+        std::vector<std::string_view> committed;
+        committed.reserve(args.size() / 2);
+        for (std::size_t i = 0; i < args.size(); i += 2)
+        {
+            auto const& key = args[i];
+            auto const& value = args[i + 1];
+            auto const r = engine->Add(key, BytesFromString(value), 0, 0);
+            if (!r.has_value())
+            {
+                // Rollback any earlier writes from this batch. Best-effort:
+                // a concurrent SET on a rolled-back key would still observe
+                // an intermediate state, but the wire reply `:0` honestly
+                // means "no key from this batch is intentionally retained".
+                for (auto const& k: committed)
+                    (void) engine->Delete(k);
+                co_return co_await ReplyInteger(socket, 0);
+            }
+            committed.push_back(key);
+        }
+        co_return co_await ReplyInteger(socket, 1);
     }
 
     /// DEBUG <subcommand> — only `DEBUG PROTOCOL <type>` is meaningful here. It
@@ -1527,12 +1996,26 @@ namespace
 
     using CommandHandler = Task<bool> (*)(CommandContext);
 
-    /// One row of the command dispatch table: a command name and its handler.
-    /// Aliases (DEL/UNLINK, FLUSHDB/FLUSHALL) are separate rows sharing a handler.
+    /// One row of the command dispatch table: a command name, its handler,
+    /// and the metadata `COMMAND` and `COMMAND DOCS` introspection clients
+    /// (redis-cli completion, lettuce / go-redis health probes) read out of
+    /// the table. Aliases (DEL/UNLINK, FLUSHDB/FLUSHALL) are separate rows
+    /// sharing a handler so each spelling appears in the introspection
+    /// reply.
+    ///
+    /// `arity` matches redis exactly: positive N means *exactly* N args
+    /// including the command name, negative -N means *at least* N. So
+    /// `MGET key [key ...]` is `arity = -2`; `GET key` is `arity = 2`.
+    /// `firstKey` / `lastKey` / `keyStep` describe where key arguments
+    /// live; `lastKey = -1` denotes "to end of argv".
     struct CommandEntry
     {
         std::string_view name;
         CommandHandler handler;
+        std::int32_t arity { 1 };
+        std::int32_t firstKey { 0 };
+        std::int32_t lastKey { 0 };
+        std::int32_t keyStep { 0 };
     };
 
     /// Data-driven command dispatch table. Each handler is a captureless lambda
@@ -1542,54 +2025,282 @@ namespace
     /// need the SessionContext / must end the session.
     constexpr auto CommandTable = std::array {
         CommandEntry { .name = "GET",
-                       .handler = [](CommandContext c) { return HandleGet(c.socket, c.engine, c.tail, c.state->resp); } },
+                       .handler = [](CommandContext c) { return HandleGet(c.socket, c.engine, c.tail, c.state->resp); },
+                       .arity = 2,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
         CommandEntry { .name = "SET",
-                       .handler = [](CommandContext c) { return HandleSet(c.socket, c.engine, c.tail, c.state->resp); } },
-        CommandEntry {
-            .name = "SETEX",
-            .handler = [](CommandContext c) { return HandleSetEx(c.socket, c.engine, c.tail, /*millis*/ false); } },
-        CommandEntry {
-            .name = "PSETEX",
-            .handler = [](CommandContext c) { return HandleSetEx(c.socket, c.engine, c.tail, /*millis*/ true); } },
-        CommandEntry { .name = "DEL", .handler = [](CommandContext c) { return HandleDel(c.socket, c.engine, c.tail); } },
-        CommandEntry { .name = "UNLINK", .handler = [](CommandContext c) { return HandleDel(c.socket, c.engine, c.tail); } },
+                       .handler = [](CommandContext c) { return HandleSet(c.socket, c.engine, c.tail, c.state->resp); },
+                       .arity = -3,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "SETEX",
+                       .handler = [](CommandContext c) { return HandleSetEx(c.socket, c.engine, c.tail, /*millis*/ false); },
+                       .arity = 4,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "PSETEX",
+                       .handler = [](CommandContext c) { return HandleSetEx(c.socket, c.engine, c.tail, /*millis*/ true); },
+                       .arity = 4,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "DEL",
+                       .handler = [](CommandContext c) { return HandleDel(c.socket, c.engine, c.tail); },
+                       .arity = -2,
+                       .firstKey = 1,
+                       .lastKey = -1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "UNLINK",
+                       .handler = [](CommandContext c) { return HandleDel(c.socket, c.engine, c.tail); },
+                       .arity = -2,
+                       .firstKey = 1,
+                       .lastKey = -1,
+                       .keyStep = 1 },
         CommandEntry { .name = "EXISTS",
-                       .handler = [](CommandContext c) { return HandleExists(c.socket, c.engine, c.tail); } },
-        CommandEntry { .name = "PING", .handler = [](CommandContext c) { return HandlePing(c.socket, c.tail); } },
-        CommandEntry { .name = "ECHO", .handler = [](CommandContext c) { return HandleEcho(c.socket, c.tail); } },
-        CommandEntry { .name = "INFO",
-                       .handler = [](CommandContext c) { return HandleInfo(c.socket, c.engine, c.state->resp); } },
-        CommandEntry { .name = "HELLO",
-                       .handler = [](CommandContext c) { return HandleHello(c.socket, c.tail, c.session, c.state); } },
-        CommandEntry { .name = "COMMAND", .handler = [](CommandContext c) { return HandleCommand(c.socket, c.tail); } },
-        CommandEntry { .name = "FLUSHDB", .handler = [](CommandContext c) { return HandleFlush(c.socket, c.engine); } },
-        CommandEntry { .name = "FLUSHALL", .handler = [](CommandContext c) { return HandleFlush(c.socket, c.engine); } },
-        CommandEntry { .name = "SELECT", .handler = [](CommandContext c) { return HandleSelect(c.socket, c.tail); } },
-        CommandEntry { .name = "CLIENT", .handler = [](CommandContext c) { return HandleClient(c.socket, c.tail); } },
-        CommandEntry { .name = "CONFIG",
-                       .handler = [](CommandContext c) { return HandleConfig(c.socket, c.tail, c.state->resp); } },
-        CommandEntry { .name = "SADD", .handler = [](CommandContext c) { return HandleSAdd(c.socket, c.engine, c.tail); } },
-        CommandEntry { .name = "SREM", .handler = [](CommandContext c) { return HandleSRem(c.socket, c.engine, c.tail); } },
+                       .handler = [](CommandContext c) { return HandleExists(c.socket, c.engine, c.tail); },
+                       .arity = -2,
+                       .firstKey = 1,
+                       .lastKey = -1,
+                       .keyStep = 1 },
+        // TTL / EXPIRE family. EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT share one
+        // parametric handler (data: time unit + absolute-vs-relative).
         CommandEntry {
-            .name = "SMEMBERS",
-            .handler = [](CommandContext c) { return HandleSMembers(c.socket, c.engine, c.tail, c.state->resp); } },
+            .name = "EXPIRE",
+            .handler =
+                [](CommandContext c) { return HandleExpire(c.socket, c.engine, c.tail, "expire", TtlUnit::Seconds, false); },
+            .arity = 3,
+            .firstKey = 1,
+            .lastKey = 1,
+            .keyStep = 1 },
+        CommandEntry { .name = "PEXPIRE",
+                       .handler =
+                           [](CommandContext c) {
+                               return HandleExpire(c.socket, c.engine, c.tail, "pexpire", TtlUnit::Milliseconds, false);
+                           },
+                       .arity = 3,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "EXPIREAT",
+                       .handler =
+                           [](CommandContext c) {
+                               return HandleExpire(c.socket, c.engine, c.tail, "expireat", TtlUnit::Seconds, true);
+                           },
+                       .arity = 3,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "PEXPIREAT",
+                       .handler =
+                           [](CommandContext c) {
+                               return HandleExpire(c.socket, c.engine, c.tail, "pexpireat", TtlUnit::Milliseconds, true);
+                           },
+                       .arity = 3,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "TTL",
+                       .handler = [](CommandContext c) { return HandleTtl(c.socket, c.engine, c.tail, TtlUnit::Seconds); },
+                       .arity = 2,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry {
+            .name = "PTTL",
+            .handler = [](CommandContext c) { return HandleTtl(c.socket, c.engine, c.tail, TtlUnit::Milliseconds); },
+            .arity = 2,
+            .firstKey = 1,
+            .lastKey = 1,
+            .keyStep = 1 },
+        CommandEntry { .name = "PERSIST",
+                       .handler = [](CommandContext c) { return HandlePersist(c.socket, c.engine, c.tail); },
+                       .arity = 2,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        // Integer atomics. INCR/DECR are fixed-magnitude; INCRBY/DECRBY take a
+        // signed delta as a second arg (DECRBY negates before applying).
+        CommandEntry { .name = "INCR",
+                       .handler = [](CommandContext c) { return HandleIncrDecr(c.socket, c.engine, c.tail, "incr", +1); },
+                       .arity = 2,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "DECR",
+                       .handler = [](CommandContext c) { return HandleIncrDecr(c.socket, c.engine, c.tail, "decr", -1); },
+                       .arity = 2,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "INCRBY",
+                       .handler =
+                           [](CommandContext c) {
+                               return HandleIncrDecrByVerb(c.socket, c.engine, c.tail, "incrby", /*negate*/ false);
+                           },
+                       .arity = 3,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry {
+            .name = "DECRBY",
+            .handler =
+                [](CommandContext c) { return HandleIncrDecrByVerb(c.socket, c.engine, c.tail, "decrby", /*negate*/ true); },
+            .arity = 3,
+            .firstKey = 1,
+            .lastKey = 1,
+            .keyStep = 1 },
+        // Batch GET/SET. MSET / MSETNX have a 2-step keyStep (key, value, key,
+        // value, …); MGET is a contiguous key list.
+        CommandEntry { .name = "MGET",
+                       .handler = [](CommandContext c) { return HandleMget(c.socket, c.engine, c.tail, c.state->resp); },
+                       .arity = -2,
+                       .firstKey = 1,
+                       .lastKey = -1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "MSET",
+                       .handler = [](CommandContext c) { return HandleMset(c.socket, c.engine, c.tail); },
+                       .arity = -3,
+                       .firstKey = 1,
+                       .lastKey = -1,
+                       .keyStep = 2 },
+        CommandEntry { .name = "MSETNX",
+                       .handler = [](CommandContext c) { return HandleMsetNx(c.socket, c.engine, c.tail); },
+                       .arity = -3,
+                       .firstKey = 1,
+                       .lastKey = -1,
+                       .keyStep = 2 },
+        CommandEntry { .name = "PING",
+                       .handler = [](CommandContext c) { return HandlePing(c.socket, c.tail); },
+                       .arity = -1,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "ECHO",
+                       .handler = [](CommandContext c) { return HandleEcho(c.socket, c.tail); },
+                       .arity = 2,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "INFO",
+                       .handler = [](CommandContext c) { return HandleInfo(c.socket, c.engine, c.state->resp); },
+                       .arity = -1,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "HELLO",
+                       .handler = [](CommandContext c) { return HandleHello(c.socket, c.tail, c.session, c.state); },
+                       .arity = -1,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "COMMAND",
+                       .handler = [](CommandContext c) { return HandleCommand(c.socket, c.tail, c.state->resp); },
+                       .arity = -1,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "FLUSHDB",
+                       .handler = [](CommandContext c) { return HandleFlush(c.socket, c.engine); },
+                       .arity = -1,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "FLUSHALL",
+                       .handler = [](CommandContext c) { return HandleFlush(c.socket, c.engine); },
+                       .arity = -1,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "SELECT",
+                       .handler = [](CommandContext c) { return HandleSelect(c.socket, c.tail); },
+                       .arity = 2,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "CLIENT",
+                       .handler = [](CommandContext c) { return HandleClient(c.socket, c.tail); },
+                       .arity = -2,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "CONFIG",
+                       .handler = [](CommandContext c) { return HandleConfig(c.socket, c.tail, c.state->resp); },
+                       .arity = -2,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "SADD",
+                       .handler = [](CommandContext c) { return HandleSAdd(c.socket, c.engine, c.tail); },
+                       .arity = -3,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "SREM",
+                       .handler = [](CommandContext c) { return HandleSRem(c.socket, c.engine, c.tail); },
+                       .arity = -3,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "SMEMBERS",
+                       .handler = [](CommandContext c) { return HandleSMembers(c.socket, c.engine, c.tail, c.state->resp); },
+                       .arity = 2,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
         CommandEntry {
             .name = "SISMEMBER",
-            .handler = [](CommandContext c) { return HandleSIsMember(c.socket, c.engine, c.tail, c.state->resp); } },
+            .handler = [](CommandContext c) { return HandleSIsMember(c.socket, c.engine, c.tail, c.state->resp); },
+            .arity = 3,
+            .firstKey = 1,
+            .lastKey = 1,
+            .keyStep = 1 },
         CommandEntry {
             .name = "SMISMEMBER",
-            .handler = [](CommandContext c) { return HandleSMIsMember(c.socket, c.engine, c.tail, c.state->resp); } },
+            .handler = [](CommandContext c) { return HandleSMIsMember(c.socket, c.engine, c.tail, c.state->resp); },
+            .arity = -3,
+            .firstKey = 1,
+            .lastKey = 1,
+            .keyStep = 1 },
         CommandEntry { .name = "SCARD",
-                       .handler = [](CommandContext c) { return HandleSCard(c.socket, c.engine, c.tail); } },
+                       .handler = [](CommandContext c) { return HandleSCard(c.socket, c.engine, c.tail); },
+                       .arity = 2,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
         CommandEntry { .name = "SPOP",
-                       .handler = [](CommandContext c) { return HandleSPop(c.socket, c.engine, c.tail, c.state->resp); } },
-        CommandEntry { .name = "LOLWUT", .handler = [](CommandContext c) { return HandleLolwut(c.socket, c.state->resp); } },
+                       .handler = [](CommandContext c) { return HandleSPop(c.socket, c.engine, c.tail, c.state->resp); },
+                       .arity = -2,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "LOLWUT",
+                       .handler = [](CommandContext c) { return HandleLolwut(c.socket, c.state->resp); },
+                       .arity = -1,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
         CommandEntry { .name = "INCRBYFLOAT",
-                       .handler = [](CommandContext c) { return HandleIncrByFloat(c.socket, c.engine, c.tail); } },
+                       .handler = [](CommandContext c) { return HandleIncrByFloat(c.socket, c.engine, c.tail); },
+                       .arity = 3,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
         CommandEntry { .name = "DEBUG",
-                       .handler = [](CommandContext c) { return HandleDebug(c.socket, c.tail, c.state->resp); } },
+                       .handler = [](CommandContext c) { return HandleDebug(c.socket, c.tail, c.state->resp); },
+                       .arity = -2,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
         CommandEntry { .name = "PUBLISH",
-                       .handler = [](CommandContext c) { return HandlePublish(c.socket, c.session, c.tail); } },
+                       .handler = [](CommandContext c) { return HandlePublish(c.socket, c.session, c.tail); },
+                       .arity = 3,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
         CommandEntry { .name = "SUBSCRIBE",
                        .handler =
                            [](CommandContext c) {
@@ -1601,7 +2312,11 @@ namespace
                                                                             .subscribing = true,
                                                                             .pattern = false },
                                                             c.state);
-                           } },
+                           },
+                       .arity = -2,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
         CommandEntry { .name = "UNSUBSCRIBE",
                        .handler =
                            [](CommandContext c) {
@@ -1613,7 +2328,11 @@ namespace
                                                                             .subscribing = false,
                                                                             .pattern = false },
                                                             c.state);
-                           } },
+                           },
+                       .arity = -1,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
         CommandEntry { .name = "PSUBSCRIBE",
                        .handler =
                            [](CommandContext c) {
@@ -1625,7 +2344,11 @@ namespace
                                                                             .subscribing = true,
                                                                             .pattern = true },
                                                             c.state);
-                           } },
+                           },
+                       .arity = -2,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
         CommandEntry { .name = "PUNSUBSCRIBE",
                        .handler =
                            [](CommandContext c) {
@@ -1637,8 +2360,51 @@ namespace
                                                                             .subscribing = false,
                                                                             .pattern = true },
                                                             c.state);
-                           } },
+                           },
+                       .arity = -1,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
     };
+
+    /// Definitions for the `COMMAND` introspection accessors. Kept here
+    /// rather than as direct table iteration in HandleCommand because the
+    /// table is defined below HandleCommand (it references the handler
+    /// functions and would otherwise have to be split across two
+    /// translation passes). One source of truth: every accessor reads the
+    /// same row of CommandTable.
+    std::size_t CommandTableSize() noexcept
+    {
+        return CommandTable.size();
+    }
+    std::string_view CommandTableName(std::size_t index) noexcept
+    {
+        return CommandTable[index].name;
+    }
+    std::int32_t CommandTableArity(std::size_t index) noexcept
+    {
+        return CommandTable[index].arity;
+    }
+    std::int32_t CommandTableFirstKey(std::size_t index) noexcept
+    {
+        return CommandTable[index].firstKey;
+    }
+    std::int32_t CommandTableLastKey(std::size_t index) noexcept
+    {
+        return CommandTable[index].lastKey;
+    }
+    std::int32_t CommandTableKeyStep(std::size_t index) noexcept
+    {
+        return CommandTable[index].keyStep;
+    }
+
+    std::optional<std::size_t> CommandTableFind(std::string_view upperName) noexcept
+    {
+        for (std::size_t i = 0; i < CommandTable.size(); ++i)
+            if (CommandTable[i].name == upperName)
+                return i;
+        return std::nullopt;
+    }
 
     /// RESET — redis's "reset this connection to a clean state". Clears
     /// subscriptions, resets the negotiated protocol to RESP2, and replies

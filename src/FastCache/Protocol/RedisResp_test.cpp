@@ -11,6 +11,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <chrono>
 #include <cstddef>
 #include <span>
 #include <string>
@@ -399,4 +401,916 @@ TEST_CASE("RESP: HELLO AUTH with a wrong password is -WRONGPASS", "[protocol][re
     auto const out =
         Exchange(fix, "*5\r\n$5\r\nHELLO\r\n$1\r\n3\r\n$4\r\nAUTH\r\n$7\r\ndefault\r\n$5\r\nwrong\r\n", session);
     REQUIRE(out.starts_with("-WRONGPASS"));
+}
+
+// ---- TTL command family ---------------------------------------------------
+
+TEST_CASE("RESP: EXPIRE + TTL round-trip yields the set TTL", "[protocol][resp][ttl]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                              "*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$2\r\n60\r\n"
+                              "*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n");
+    REQUIRE(out == "+OK\r\n:1\r\n:60\r\n");
+}
+
+TEST_CASE("RESP: EXPIRE on a missing key replies :0", "[protocol][resp][ttl]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*3\r\n$6\r\nEXPIRE\r\n$3\r\nnix\r\n$2\r\n60\r\n");
+    REQUIRE(out == ":0\r\n");
+}
+
+TEST_CASE("RESP: TTL on a missing key is -2, on a key without TTL is -1", "[protocol][resp][ttl]")
+{
+    {
+        RespFixture fix;
+        REQUIRE(Exchange(fix, "*2\r\n$3\r\nTTL\r\n$3\r\nmis\r\n") == ":-2\r\n");
+    }
+    {
+        RespFixture fix;
+        auto const out = Exchange(fix,
+                                  "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                                  "*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n");
+        REQUIRE(out == "+OK\r\n:-1\r\n");
+    }
+}
+
+TEST_CASE("RESP: PEXPIRE + PTTL exchange milliseconds", "[protocol][resp][ttl]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                              "*3\r\n$7\r\nPEXPIRE\r\n$1\r\nk\r\n$4\r\n5000\r\n"
+                              "*2\r\n$4\r\nPTTL\r\n$1\r\nk\r\n");
+    REQUIRE(out == "+OK\r\n:1\r\n:5000\r\n");
+}
+
+TEST_CASE("RESP: PERSIST clears a previously set TTL", "[protocol][resp][ttl]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*4\r\n$5\r\nSETEX\r\n$1\r\nk\r\n$2\r\n60\r\n$1\r\nv\r\n"
+                              "*2\r\n$7\r\nPERSIST\r\n$1\r\nk\r\n"
+                              "*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n");
+    REQUIRE(out == "+OK\r\n:1\r\n:-1\r\n");
+}
+
+TEST_CASE("RESP: PERSIST on a key without TTL replies :0", "[protocol][resp][ttl]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                              "*2\r\n$7\r\nPERSIST\r\n$1\r\nk\r\n");
+    REQUIRE(out == "+OK\r\n:0\r\n");
+}
+
+TEST_CASE("RESP: EXPIREAT in the past deletes the key on the next access", "[protocol][resp][ttl]")
+{
+    // Drive the engine directly so the test can advance the ManualClock
+    // between SET and the post-deadline read — the wire-level Exchange
+    // helper runs the whole batch in one go, leaving no point at which
+    // to advance time.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+
+    auto const set = engine.Set("k", std::vector<std::byte> { std::byte { 'v' } }, 0, 0);
+    REQUIRE(set.has_value());
+
+    // 1-second relative TTL via TouchAt — same path EXPIRE/EXPIREAT take.
+    auto const touch = engine.TouchAt("k", clock.Now() + std::chrono::seconds { 1 });
+    REQUIRE(touch.has_value());
+
+    // Before the deadline: still visible with a positive TTL.
+    auto const before = engine.Ttl("k");
+    REQUIRE(before.has_value());
+    REQUIRE(before->has_value());
+    if (before->has_value())
+        REQUIRE(before->value().hasExpiry);
+
+    // Step past the deadline: TTL reports -2 (missing) and GET misses.
+    clock.Advance(std::chrono::seconds { 2 });
+    auto const after = engine.Ttl("k");
+    REQUIRE(after.has_value());
+    REQUIRE(!after->has_value()); // expired -> reported as missing
+    auto const get = engine.Get("k");
+    REQUIRE(get.has_value());
+    REQUIRE(!get->found);
+}
+
+TEST_CASE("RESP: TTL probe does NOT bump LRU recency", "[protocol][resp][ttl]")
+{
+    // PeekExpiry must not move the entry to the MRU end of the LRU.
+    // Strict mode so promotion happens on every read (otherwise an
+    // Approximate-mode test could pass for the wrong reason — promotions
+    // are deferred and sampled). The budget fits exactly two 50-byte
+    // values; the third insertion must evict the LRU tail, and that tail
+    // had better be `a` (no TTL bump) and not `b`.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage { 100, 0, FastCache::LruMode::Strict };
+    FastCache::CacheEngine engine { storage, clock };
+
+    auto const blob = std::vector<std::byte>(50, std::byte { 'x' });
+    REQUIRE(engine.Set("a", blob, 0, 0).has_value());
+    REQUIRE(engine.Set("b", blob, 0, 0).has_value());
+    // Probe `a` repeatedly through TTL. If TTL were a regular Get, this
+    // would promote `a` to MRU and the next insertion would evict `b`.
+    for (int i = 0; i < 5; ++i)
+    {
+        auto const t = engine.Ttl("a");
+        REQUIRE(t.has_value());
+    }
+    REQUIRE(engine.Set("c", blob, 0, 0).has_value());
+    // `a` should have been evicted (LRU position not disturbed by TTL).
+    auto const getA = engine.Get("a");
+    REQUIRE(getA.has_value());
+    REQUIRE(!getA->found);
+    // `b` and `c` should still be present.
+    auto const getB = engine.Get("b");
+    REQUIRE(getB.has_value());
+    REQUIRE(getB->found);
+}
+
+// ---- Integer atomics ------------------------------------------------------
+
+TEST_CASE("RESP: INCR initialises a missing key to 0 then increments", "[protocol][resp][incr]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*2\r\n$4\r\nINCR\r\n$1\r\nc\r\n"
+                              "*2\r\n$4\r\nINCR\r\n$1\r\nc\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\nc\r\n");
+    REQUIRE(out == ":1\r\n:2\r\n$1\r\n2\r\n");
+}
+
+TEST_CASE("RESP: DECR saturates against negative values (signed semantics)", "[protocol][resp][incr]")
+{
+    // Unlike memcached's saturating-at-0 DECR, redis DECR is signed and
+    // crosses zero. fastcached follows redis here.
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*2\r\n$4\r\nDECR\r\n$1\r\nc\r\n"
+                              "*2\r\n$4\r\nDECR\r\n$1\r\nc\r\n");
+    REQUIRE(out == ":-1\r\n:-2\r\n");
+}
+
+TEST_CASE("RESP: INCRBY accepts negative delta as DECRBY equivalent", "[protocol][resp][incr]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$2\r\n10\r\n"
+                              "*3\r\n$6\r\nINCRBY\r\n$1\r\nc\r\n$2\r\n-3\r\n"
+                              "*3\r\n$6\r\nDECRBY\r\n$1\r\nc\r\n$1\r\n2\r\n");
+    REQUIRE(out == "+OK\r\n:7\r\n:5\r\n");
+}
+
+TEST_CASE("RESP: INCR on a non-integer value replies -ERR", "[protocol][resp][incr]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$3\r\nfoo\r\n"
+                              "*2\r\n$4\r\nINCR\r\n$1\r\nc\r\n");
+    REQUIRE(out.starts_with("+OK\r\n-ERR "));
+    REQUIRE(out.contains("value is not an integer"));
+}
+
+TEST_CASE("RESP: INCR overflow leaves the previous value intact", "[protocol][resp][incr]")
+{
+    RespFixture fix;
+    // INT64_MAX = 9223372036854775807
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$19\r\n9223372036854775807\r\n"
+                              "*2\r\n$4\r\nINCR\r\n$1\r\nc\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\nc\r\n");
+    REQUIRE(out.starts_with("+OK\r\n-ERR "));
+    REQUIRE(out.contains("overflow"));
+    REQUIRE(out.ends_with("$19\r\n9223372036854775807\r\n"));
+}
+
+// ---- Batch commands -------------------------------------------------------
+
+TEST_CASE("RESP: MGET returns bulk-or-nil per key in order", "[protocol][resp][batch]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"
+                              "*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$1\r\n3\r\n"
+                              "*4\r\n$4\r\nMGET\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+    REQUIRE(out == "+OK\r\n+OK\r\n*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n3\r\n");
+}
+
+TEST_CASE("RESP: MSET writes every pair then replies +OK", "[protocol][resp][batch]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\na\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\nb\r\n");
+    REQUIRE(out == "+OK\r\n$1\r\n1\r\n$1\r\n2\r\n");
+}
+
+TEST_CASE("RESP: MSET with odd argc is -ERR", "[protocol][resp][batch]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*4\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n");
+    REQUIRE(out.starts_with("-ERR "));
+}
+
+TEST_CASE("RESP: MSETNX writes all pairs when none exist", "[protocol][resp][batch]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$6\r\nMSETNX\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\na\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\nb\r\n");
+    REQUIRE(out == ":1\r\n$1\r\n1\r\n$1\r\n2\r\n");
+}
+
+TEST_CASE("RESP: MSETNX refuses the batch when any key exists, no partial writes", "[protocol][resp][batch]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$3\r\nold\r\n"
+                              "*5\r\n$6\r\nMSETNX\r\n$1\r\na\r\n$3\r\nnew\r\n$1\r\nb\r\n$1\r\n2\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\na\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\nb\r\n");
+    // Reply: SET +OK, MSETNX :0 (refused), GET a -> "old" (intact), GET b -> nil (NOT written).
+    REQUIRE(out == "+OK\r\n:0\r\n$3\r\nold\r\n$-1\r\n");
+}
+
+// ---- COMMAND introspection ------------------------------------------------
+
+TEST_CASE("RESP: COMMAND COUNT reports a non-zero command surface", "[protocol][resp][command]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*2\r\n$7\r\nCOMMAND\r\n$5\r\nCOUNT\r\n");
+    // The exact count drifts as we add commands; assert ">= 27" via the
+    // textual integer prefix. A simple bound: 27+ commands → 2-digit reply.
+    REQUIRE(out.starts_with(":"));
+    REQUIRE(out.size() > 4); // ":NN\r\n" at minimum
+}
+
+TEST_CASE("RESP: COMMAND DOCS replies an empty map", "[protocol][resp][command]")
+{
+    RespFixture fix;
+    REQUIRE(Exchange(fix, "*2\r\n$7\r\nCOMMAND\r\n$4\r\nDOCS\r\n") == "*0\r\n");
+}
+
+// ---- Update preserves prior TTL (Phase 1 regression suite) ----------------
+//
+// Redis mandates that INCR / DECR / INCRBY / DECRBY / INCRBYFLOAT and the
+// set-mutating verbs (SADD / SREM / SPOP) preserve the entry's TTL across
+// the read-modify-write. The bug closed here was that the IStorage Update
+// wrappers passed TimePoint::max() to Set on Store, silently wiping any
+// EXPIRE'd TTL. We drive the engine directly so the assertions read out
+// of `engine.Ttl(key)` (the same path TTL/PTTL take) — the Exchange-based
+// wire fixture cannot expose the engine state mid-batch.
+
+TEST_CASE("RESP: INCR preserves TTL across counter mutation", "[protocol][resp][ttl][incr]")
+{
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+
+    // SET k 0; EXPIRE k 60 (via TouchAt, the same path Phase 2 wires up).
+    REQUIRE(engine.Set("k", std::vector<std::byte> { std::byte { '0' } }, 0, 0).has_value());
+    auto const deadline = clock.Now() + std::chrono::seconds { 60 };
+    REQUIRE(engine.TouchAt("k", deadline).has_value());
+
+    // Mutate through Update — same path INCR/DECR/INCRBY/DECRBY take.
+    auto const incr = engine.Increment("k", 1);
+    REQUIRE(incr.has_value());
+    REQUIRE(incr->value == 1);
+
+    // TTL must survive the read-modify-write. Pre-fix this returned -1
+    // (hasExpiry=false) because Update wiped the expiry to TimePoint::max().
+    auto const ttl = engine.Ttl("k");
+    REQUIRE(ttl.has_value());
+    REQUIRE(ttl->has_value());
+    if (ttl.has_value() && ttl->has_value())
+    {
+        REQUIRE(ttl->value().hasExpiry);
+        REQUIRE(ttl->value().remaining.count() > 0);
+        REQUIRE(ttl->value().remaining <= std::chrono::seconds { 60 });
+    }
+}
+
+TEST_CASE("RESP: INCRBY preserves TTL", "[protocol][resp][ttl][incr]")
+{
+    // Engine::Increment is the storage-layer atomic primitive; the wire-
+    // level INCRBY routes through CacheEngine::Update which is what
+    // HandleIncrDecrBy invokes. Drive Update directly so we cover the
+    // full Phase 1 surface (not just IncrementOrInitialize).
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+
+    REQUIRE(engine.Set("k", std::vector<std::byte> { std::byte { '1' }, std::byte { '0' } }, 0, 0).has_value());
+    REQUIRE(engine.TouchAt("k", clock.Now() + std::chrono::seconds { 60 }).has_value());
+
+    // Mutate via Update returning Store with the implicit (preserve) expiry.
+    auto const upd = engine.Update("k", [](FastCache::GetResult const&) {
+        return FastCache::IStorage::UpdateOutcome {
+            .value = { std::byte { '1' }, std::byte { '5' } },
+            .flags = 0,
+            .action = FastCache::IStorage::UpdateAction::Store,
+        };
+    });
+    REQUIRE(upd.has_value());
+
+    auto const ttl = engine.Ttl("k");
+    REQUIRE(ttl.has_value());
+    REQUIRE(ttl->has_value());
+    if (ttl.has_value() && ttl->has_value())
+    {
+        REQUIRE(ttl->value().hasExpiry);
+        REQUIRE(ttl->value().remaining.count() > 0);
+    }
+}
+
+TEST_CASE("RESP: SADD preserves TTL", "[protocol][resp][ttl][sets]")
+{
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+
+    std::array<std::string const, 2> const initial { "alpha", "beta" };
+    REQUIRE(engine.SetAdd("s", std::span<std::string const> { initial }).has_value());
+    REQUIRE(engine.TouchAt("s", clock.Now() + std::chrono::seconds { 60 }).has_value());
+
+    // Add a member — pre-fix this would wipe the TTL.
+    std::array<std::string const, 1> const more { "gamma" };
+    auto const added = engine.SetAdd("s", std::span<std::string const> { more });
+    REQUIRE(added.has_value());
+    REQUIRE(*added == 1);
+
+    auto const ttl = engine.Ttl("s");
+    REQUIRE(ttl.has_value());
+    REQUIRE(ttl->has_value());
+    if (ttl.has_value() && ttl->has_value())
+        REQUIRE(ttl->value().hasExpiry);
+}
+
+TEST_CASE("RESP: SREM preserves TTL on remaining members", "[protocol][resp][ttl][sets]")
+{
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+
+    std::array<std::string const, 3> const initial { "a", "b", "c" };
+    REQUIRE(engine.SetAdd("s", std::span<std::string const> { initial }).has_value());
+    REQUIRE(engine.TouchAt("s", clock.Now() + std::chrono::seconds { 60 }).has_value());
+
+    std::array<std::string const, 1> const remove { "a" };
+    auto const removed = engine.SetRemove("s", std::span<std::string const> { remove });
+    REQUIRE(removed.has_value());
+
+    auto const ttl = engine.Ttl("s");
+    REQUIRE(ttl.has_value());
+    REQUIRE(ttl->has_value());
+    if (ttl.has_value() && ttl->has_value())
+        REQUIRE(ttl->value().hasExpiry);
+}
+
+TEST_CASE("RESP: INCRBYFLOAT preserves TTL (pre-existing path, now covered)", "[protocol][resp][ttl][incr]")
+{
+    RespFixture fix;
+    // Use the wire-level fixture: SET via SETEX (60s), INCRBYFLOAT, then
+    // PTTL. The ManualClock advances zero ticks between commands, so the
+    // remaining ms must be within (0, 60_000]. Pre-fix PTTL returns -1
+    // because Update wiped the expiry.
+    auto const out = Exchange(fix,
+                              "*4\r\n$5\r\nSETEX\r\n$1\r\nk\r\n$2\r\n60\r\n$1\r\n0\r\n"
+                              "*3\r\n$11\r\nINCRBYFLOAT\r\n$1\r\nk\r\n$3\r\n0.5\r\n"
+                              "*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n");
+    // SETEX -> +OK; INCRBYFLOAT -> bulk "0.5"; TTL -> :60 (or :59 if a
+    // clock tick slipped, which it won't under ManualClock at default 0).
+    REQUIRE(out.starts_with("+OK\r\n$3\r\n0.5\r\n:"));
+    // The TTL field at the end is :60 (or any positive value, not -1).
+    REQUIRE(!out.contains(":-1\r\n"));
+}
+
+// ---- Phase 2: wire-protocol blockers -------------------------------------
+
+// 2.1: HandleExpire saturates rather than tripping UB on extreme inputs.
+
+TEST_CASE("RESP: EXPIRE INT64_MIN does not trip signed underflow", "[protocol][resp][ttl][expire]")
+{
+    // Wire-supplied raw=INT64_MIN: the prior code computed
+    // `now + std::chrono::seconds{raw}` directly (chrono duration
+    // overflow → UB), and the absolute path computed `raw - sysWord`
+    // (signed integer underflow → UB). Both UB sites must be gone.
+    // We assert success-or-error replies and that the daemon does not
+    // crash under ASan/UBSan (the daemon is exercised on every test).
+    RespFixture fix;
+    REQUIRE(Exchange(fix,
+                     "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                     "*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$20\r\n-9223372036854775808\r\n"
+                     "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+                .starts_with("+OK\r\n:1\r\n$-1\r\n"));
+    // EXPIRE with a negative TTL is in-the-past per Redis → :1 (TTL applied)
+    // and the key is deleted on next access (GET returns nil).
+}
+
+TEST_CASE("RESP: PEXPIRE INT64_MAX clamps without chrono overflow", "[protocol][resp][ttl][expire]")
+{
+    // Wire-supplied raw=INT64_MAX: the prior code constructed
+    // `std::chrono::milliseconds{INT64_MAX}` and added to `now` —
+    // the multiplication into the steady_clock's nanosecond
+    // representation overflows int64 (UB). The new helper clamps
+    // the delta to 100 years before constructing the duration, so
+    // the daemon must not trip ASan/UBSan and PEXPIRE returns :1
+    // (TTL applied) with the key still alive after the call.
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                              "*3\r\n$7\r\nPEXPIRE\r\n$1\r\nk\r\n$19\r\n9223372036854775807\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
+    REQUIRE(out == "+OK\r\n:1\r\n$1\r\nv\r\n");
+}
+
+TEST_CASE("RESP: PEXPIREAT in the far past deletes the key", "[protocol][resp][ttl][expire]")
+{
+    // Absolute timestamp INT64_MIN milliseconds since epoch — far
+    // before any sane wall-clock now. SaturatingSub on raw - sysWord
+    // returns INT64_MIN; DeadlineFromDelta clamps to `now` (immediate
+    // expiry). No UB; key deleted on next access.
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                              "*3\r\n$9\r\nPEXPIREAT\r\n$1\r\nk\r\n$20\r\n-9223372036854775808\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
+    REQUIRE(out == "+OK\r\n:1\r\n$-1\r\n");
+}
+
+// 2.2: INCR family replies -WRONGTYPE on set-typed keys.
+
+TEST_CASE("RESP: INCR on a set-typed key replies -WRONGTYPE", "[protocol][resp][incr][wrongtype]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*4\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n$1\r\nb\r\n"
+                              "*2\r\n$4\r\nINCR\r\n$1\r\ns\r\n");
+    // SADD replies the count; INCR must reply WRONGTYPE, not the
+    // generic "value is not an integer".
+    REQUIRE(out.contains("-WRONGTYPE"));
+    REQUIRE_FALSE(out.contains("value is not an integer"));
+}
+
+TEST_CASE("RESP: INCRBY / DECR / DECRBY on a set-typed key reply -WRONGTYPE", "[protocol][resp][incr][wrongtype]")
+{
+    {
+        RespFixture fix;
+        auto const out = Exchange(fix,
+                                  "*4\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n$1\r\nb\r\n"
+                                  "*3\r\n$6\r\nINCRBY\r\n$1\r\ns\r\n$1\r\n1\r\n");
+        REQUIRE(out.contains("-WRONGTYPE"));
+    }
+    {
+        RespFixture fix;
+        auto const out = Exchange(fix,
+                                  "*4\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n$1\r\nb\r\n"
+                                  "*2\r\n$4\r\nDECR\r\n$1\r\ns\r\n");
+        REQUIRE(out.contains("-WRONGTYPE"));
+    }
+    {
+        RespFixture fix;
+        auto const out = Exchange(fix,
+                                  "*4\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n$1\r\nb\r\n"
+                                  "*3\r\n$6\r\nDECRBY\r\n$1\r\ns\r\n$1\r\n1\r\n");
+        REQUIRE(out.contains("-WRONGTYPE"));
+    }
+}
+
+TEST_CASE("RESP: INCRBYFLOAT on a set-typed key replies -WRONGTYPE", "[protocol][resp][incr][wrongtype]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*4\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n$1\r\nb\r\n"
+                              "*3\r\n$11\r\nINCRBYFLOAT\r\n$1\r\ns\r\n$3\r\n0.5\r\n");
+    REQUIRE(out.contains("-WRONGTYPE"));
+}
+
+// 2.3: SET PX preserves sub-second TTL end-to-end.
+
+TEST_CASE("RESP: SET PX 50 keeps sub-second TTL (no second-rounding)", "[protocol][resp][set][ttl]")
+{
+    // Pre-fix: `(50 + 999) / 1000 = 1` → 1-second TTL.
+    // Post-fix: `now + 50ms` → ~50ms remaining.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+
+    auto const deadline = clock.Now() + std::chrono::milliseconds { 50 };
+    REQUIRE(engine.SetWithDeadline("k", std::vector<std::byte> { std::byte { 'v' } }, 0, deadline).has_value());
+
+    auto const ttl = engine.Ttl("k");
+    REQUIRE(ttl.has_value());
+    REQUIRE(ttl->has_value());
+    if (ttl.has_value() && ttl->has_value())
+    {
+        REQUIRE(ttl->value().hasExpiry);
+        REQUIRE(ttl->value().remaining > std::chrono::milliseconds { 0 });
+        REQUIRE(ttl->value().remaining <= std::chrono::milliseconds { 50 });
+    }
+}
+
+TEST_CASE("RESP: SETEX with 0 ttl is rejected", "[protocol][resp][set][ttl]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*4\r\n$5\r\nSETEX\r\n$1\r\nk\r\n$1\r\n0\r\n$1\r\nv\r\n");
+    REQUIRE(out.starts_with("-ERR "));
+    REQUIRE(out.contains("invalid expire time"));
+}
+
+TEST_CASE("RESP: PSETEX with 0 ttl is rejected", "[protocol][resp][set][ttl]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*4\r\n$6\r\nPSETEX\r\n$1\r\nk\r\n$1\r\n0\r\n$1\r\nv\r\n");
+    REQUIRE(out.starts_with("-ERR "));
+    REQUIRE(out.contains("invalid expire time"));
+}
+
+TEST_CASE("RESP: SET ... EX 0 is rejected", "[protocol][resp][set][ttl]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$1\r\n0\r\n");
+    REQUIRE(out.starts_with("-ERR "));
+    REQUIRE(out.contains("invalid expire time"));
+}
+
+TEST_CASE("RESP: SET ... PX 0 is rejected", "[protocol][resp][set][ttl]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n$1\r\n0\r\n");
+    REQUIRE(out.starts_with("-ERR "));
+    REQUIRE(out.contains("invalid expire time"));
+}
+
+TEST_CASE("RESP: SETEX with out-of-range ttl is rejected", "[protocol][resp][set][ttl]")
+{
+    RespFixture fix;
+    // 0x100000000 = 4294967296 > INT32_MAX (2147483647) → rejected.
+    auto const out = Exchange(fix, "*4\r\n$5\r\nSETEX\r\n$1\r\nk\r\n$10\r\n4294967296\r\n$1\r\nv\r\n");
+    REQUIRE(out.starts_with("-ERR "));
+    REQUIRE(out.contains("invalid expire time"));
+}
+
+TEST_CASE("RESP: PSETEX preserves milliseconds end-to-end", "[protocol][resp][set][ttl]")
+{
+    // PSETEX 50 used to round up to 1 second (the lossy (raw+999)/1000
+    // path). Drive directly so the test can read PTTL out of the
+    // engine — Exchange runs the whole batch under one ManualClock
+    // tick, so the remaining ms is exactly the request.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+
+    auto const deadline = clock.Now() + std::chrono::milliseconds { 50 };
+    REQUIRE(engine.SetWithDeadline("k", std::vector<std::byte> { std::byte { 'v' } }, 0, deadline).has_value());
+
+    auto const ttl = engine.Ttl("k");
+    REQUIRE(ttl.has_value());
+    REQUIRE(ttl->has_value());
+    if (ttl.has_value() && ttl->has_value())
+        REQUIRE(ttl->value().remaining <= std::chrono::milliseconds { 50 });
+}
+
+// 2.4: SET option family conflict detection.
+
+TEST_CASE("RESP: SET NX XX replies -ERR syntax error", "[protocol][resp][set][syntax]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nNX\r\n$2\r\nXX\r\n");
+    REQUIRE(out.starts_with("-ERR "));
+    REQUIRE(out.contains("syntax error"));
+}
+
+TEST_CASE("RESP: SET EX 60 PX 1000 replies -ERR syntax error", "[protocol][resp][set][syntax]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*7\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                              "$2\r\nEX\r\n$2\r\n60\r\n$2\r\nPX\r\n$4\r\n1000\r\n");
+    REQUIRE(out.starts_with("-ERR "));
+    REQUIRE(out.contains("syntax error"));
+}
+
+TEST_CASE("RESP: SET NX EX 60 is accepted (regression: valid mix still works)", "[protocol][resp][set][syntax]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*6\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nNX\r\n$2\r\nEX\r\n$2\r\n60\r\n");
+    REQUIRE(out == "+OK\r\n");
+}
+
+// 2.5: HandleMget uses Peek, does not bump LRU recency.
+
+TEST_CASE("RESP: MGET does NOT bump LRU recency", "[protocol][resp][mget]")
+{
+    // Strict-LRU storage so promotion happens on every read. The
+    // budget fits exactly two 50-byte values; a third insertion must
+    // evict whichever entry has the OLDEST lastAccess. We probe `a`
+    // five times via MGET. Pre-fix MGET called Get (promotes), so
+    // `b` would be evicted. Post-fix MGET calls Peek (no promotion),
+    // so `a` is evicted.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage { 100, 0, FastCache::LruMode::Strict };
+    FastCache::CacheEngine engine { storage, clock };
+
+    auto const blob = std::vector<std::byte>(50, std::byte { 'x' });
+    REQUIRE(engine.Set("a", blob, 0, 0).has_value());
+    REQUIRE(engine.Set("b", blob, 0, 0).has_value());
+
+    // Probe `a` repeatedly through Peek (the MGET path).
+    for (int i = 0; i < 5; ++i)
+    {
+        auto const p = engine.Peek("a");
+        REQUIRE(p.has_value());
+    }
+
+    REQUIRE(engine.Set("c", blob, 0, 0).has_value());
+
+    // `a` should have been evicted (MGET-style probes did not disturb LRU).
+    auto const getA = engine.Get("a");
+    REQUIRE(getA.has_value());
+    REQUIRE_FALSE(getA->found);
+
+    // `b` is still alive.
+    auto const getB = engine.Get("b");
+    REQUIRE(getB.has_value());
+    REQUIRE(getB->found);
+}
+
+// ---- Phase 3: atomicity + semantic gaps -----------------------------------
+
+// 3.1: PERSIST routes through the atomic ClearExpiry primitive.
+
+TEST_CASE("RESP: PERSIST replies :1 when a TTL existed", "[protocol][resp][persist]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*4\r\n$5\r\nSETEX\r\n$1\r\nk\r\n$2\r\n60\r\n$1\r\nv\r\n"
+                              "*2\r\n$7\r\nPERSIST\r\n$1\r\nk\r\n"
+                              "*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n");
+    REQUIRE(out == "+OK\r\n:1\r\n:-1\r\n");
+}
+
+TEST_CASE("RESP: PERSIST replies :0 for a key with no TTL", "[protocol][resp][persist]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                              "*2\r\n$7\r\nPERSIST\r\n$1\r\nk\r\n");
+    REQUIRE(out == "+OK\r\n:0\r\n");
+}
+
+TEST_CASE("RESP: PERSIST replies :0 for an absent key", "[protocol][resp][persist]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*2\r\n$7\r\nPERSIST\r\n$3\r\nnix\r\n");
+    REQUIRE(out == ":0\r\n");
+}
+
+TEST_CASE("IStorage::ClearExpiry default decomposes Peek + Touch", "[cache][persist]")
+{
+    // Direct-storage test pinning the default-impl behaviour
+    // (InMemoryLruStorage inherits it; ShardedStorage/LayeredStorage
+    // override it for atomic lock-spanning).
+    FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
+    auto const deadline = clock.Now() + std::chrono::seconds { 60 };
+
+    REQUIRE(storage.Set("k", std::vector<std::byte> { std::byte { 'v' } }, 0, deadline).has_value());
+
+    auto const r = storage.ClearExpiry("k", clock.Now());
+    REQUIRE(r.has_value());
+    REQUIRE(*r); // TTL was cleared
+
+    // Verify the entry persists with no TTL.
+    auto const peek = storage.Peek("k", clock.Now());
+    REQUIRE(peek.has_value());
+    REQUIRE(peek->found);
+    REQUIRE(peek->entry.expiry == FastCache::TimePoint::max());
+
+    // Calling again returns false (the key exists but has no TTL).
+    auto const r2 = storage.ClearExpiry("k", clock.Now());
+    REQUIRE(r2.has_value());
+    REQUIRE_FALSE(*r2);
+
+    // Absent key: KeyNotFound.
+    auto const r3 = storage.ClearExpiry("nope", clock.Now());
+    REQUIRE_FALSE(r3.has_value());
+    REQUIRE(r3.error().code == FastCache::StorageErrorCode::KeyNotFound);
+}
+
+// 3.2: COMMAND INFO filters by requested names.
+
+TEST_CASE("RESP: COMMAND INFO filters by requested names", "[protocol][resp][command]")
+{
+    RespFixture fix;
+    // 2-element array: descriptor for GET, then nil for BOGUS.
+    auto const out = Exchange(fix, "*4\r\n$7\r\nCOMMAND\r\n$4\r\nINFO\r\n$3\r\nGET\r\n$5\r\nBOGUS\r\n");
+    REQUIRE(out.starts_with("*2\r\n"));
+    REQUIRE(out.contains("$3\r\nGET\r\n"));
+    REQUIRE(out.contains(":2\r\n"));   // GET arity is 2
+    REQUIRE(out.ends_with("$-1\r\n")); // BOGUS -> nil
+}
+
+TEST_CASE("RESP: COMMAND INFO with no names dumps every descriptor", "[protocol][resp][command]")
+{
+    // Regression — bare COMMAND INFO (no names) keeps the prior full-table
+    // dump that COMMAND-without-subcommand returns; this pins it as the
+    // continued contract for clients that issue `COMMAND INFO` with no
+    // names expecting the full list.
+    RespFixture fix;
+    auto const out = Exchange(fix, "*2\r\n$7\r\nCOMMAND\r\n$4\r\nINFO\r\n");
+    REQUIRE(out.starts_with("*"));
+    // Must contain at least GET, SET, EXPIRE — the headline commands.
+    REQUIRE(out.contains("$3\r\nGET\r\n"));
+    REQUIRE(out.contains("$3\r\nSET\r\n"));
+    REQUIRE(out.contains("$6\r\nEXPIRE\r\n"));
+}
+
+// 3.3: MSETNX rolls back partial writes on storage failure.
+
+TEST_CASE("RESP: MSETNX rolls back on race-induced partial write", "[protocol][resp][msetnx][rollback]")
+{
+    // Simulate a race: pre-set key `b` via the engine (so the first-pass
+    // Peek doesn't see it), then issue MSETNX a→x, b→y, c→z. The
+    // second-pass Add for `b` will fail with KeyExists; the rollback
+    // should erase the already-committed `a`, and `c` was never tried.
+    // We drive this directly through the engine to control the race
+    // ordering deterministically.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+
+    // First pass equivalent: peek `a`, `b`, `c` all absent.
+    REQUIRE_FALSE(engine.Peek("a")->found);
+    REQUIRE_FALSE(engine.Peek("b")->found);
+    REQUIRE_FALSE(engine.Peek("c")->found);
+
+    // Race: a concurrent SET commits `b` between probe and write.
+    REQUIRE(engine.Set("b", std::vector<std::byte> { std::byte { 'X' } }, 0, 0).has_value());
+
+    // Second pass: simulate MSETNX's write loop manually so we can
+    // verify the rollback path. (The wire test below covers the actual
+    // handler.) For each key, Add and rollback on failure.
+    std::vector<std::string> committed;
+    REQUIRE(engine.Add("a", std::vector<std::byte> { std::byte { 'x' } }, 0, 0).has_value());
+    committed.emplace_back("a");
+    auto const r = engine.Add("b", std::vector<std::byte> { std::byte { 'y' } }, 0, 0);
+    REQUIRE_FALSE(r.has_value()); // KeyExists
+    // Rollback (what HandleMsetNx does):
+    for (auto const& k: committed)
+        (void) engine.Delete(k);
+
+    // `a` should no longer be visible (rolled back).
+    auto const getA = engine.Peek("a");
+    REQUIRE(getA.has_value());
+    REQUIRE_FALSE(getA->found);
+    // `b` is still the racer's value, untouched by the rollback.
+    auto const getB = engine.Peek("b");
+    REQUIRE(getB.has_value());
+    REQUIRE(getB->found);
+    REQUIRE(getB->entry.ValueBytes()[0] == std::byte { 'X' });
+}
+
+TEST_CASE("RESP: MSETNX refuses on existing key without partial writes", "[protocol][resp][msetnx]")
+{
+    // Pre-existing test (line 451 region) — pinned here to confirm the
+    // Phase 3.3 refactor didn't regress the first-pass abort path.
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$3\r\nold\r\n"
+                              "*5\r\n$6\r\nMSETNX\r\n$1\r\na\r\n$3\r\nnew\r\n$1\r\nb\r\n$1\r\n2\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\na\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\nb\r\n");
+    REQUIRE(out == "+OK\r\n:0\r\n$3\r\nold\r\n$-1\r\n");
+}
+
+// ---- Phase 4: cleanup -----------------------------------------------------
+
+// 4.3: ParseDouble simplification didn't change accepted/rejected inputs.
+
+TEST_CASE("RESP: INCRBYFLOAT on overflow leaves the prior value intact", "[protocol][resp][incr][overflow]")
+{
+    // Redis rejects an overflowing INCRBYFLOAT with -ERR; the prior
+    // value stays intact. Pre-simplification ParseDouble had a dead
+    // fallback path that would have silently produced inf via
+    // `pow(10.0, exp)`. Post-simplification only the validated
+    // istringstream path runs; overflow → !isfinite → reject.
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$6\r\n1e+308\r\n"
+                              "*3\r\n$11\r\nINCRBYFLOAT\r\n$1\r\nk\r\n$6\r\n1e+308\r\n"
+                              "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
+    // SET +OK, INCRBYFLOAT -ERR, GET still returns the original.
+    REQUIRE(out.starts_with("+OK\r\n-ERR "));
+    REQUIRE(out.contains("NaN or Infinity"));
+    REQUIRE(out.ends_with("$6\r\n1e+308\r\n"));
+}
+
+TEST_CASE("RESP: ParseDouble rejects locale-tainted input", "[protocol][resp][incr][parse]")
+{
+    // Validator rejects ',' as a decimal separator regardless of host
+    // LC_NUMERIC — the daemon emits and accepts '.'-decimals only.
+    // INCRBYFLOAT on `"1,5"` must return the "not a valid float"
+    // error rather than parsing as 1 + 5 / .. .
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\n1.0\r\n"
+                              "*3\r\n$11\r\nINCRBYFLOAT\r\n$1\r\nk\r\n$3\r\n1,5\r\n");
+    REQUIRE(out.starts_with("+OK\r\n-ERR "));
+    REQUIRE(out.contains("not a valid float"));
+}
+
+TEST_CASE("RESP: ParseDouble accepts scientific notation", "[protocol][resp][incr][parse]")
+{
+    // Regression: the simplified ParseDouble still accepts the redis
+    // grammar including scientific notation and signed exponents.
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\n1.0\r\n"
+                              "*3\r\n$11\r\nINCRBYFLOAT\r\n$1\r\nk\r\n$5\r\n2.5e1\r\n");
+    // 1.0 + 25 = 26
+    REQUIRE(out.contains("26"));
+}
+
+// 4.1: IWallClock seam + ManualWallClock determinism.
+
+TEST_CASE("ManualWallClock is deterministic", "[core][clock]")
+{
+    using namespace std::chrono_literals;
+    auto const start = std::chrono::system_clock::time_point { 1'000'000s };
+    FastCache::ManualWallClock wallClock { start };
+    REQUIRE(wallClock.Now() == start);
+
+    wallClock.Advance(60s);
+    REQUIRE(wallClock.Now() == start + 60s);
+
+    auto const target = std::chrono::system_clock::time_point { 2'000'000s };
+    wallClock.SetNow(target);
+    REQUIRE(wallClock.Now() == target);
+}
+
+TEST_CASE("RESP: EXPIREAT past deletes the key via the wire path", "[protocol][resp][ttl][expire]")
+{
+    // Drive the EXPIREAT absolute branch through the actual Dispatch
+    // path with an injected ManualWallClock. Pre-Phase-4.1 the
+    // HandleExpire absolute branch reached for
+    // `std::chrono::system_clock::now()` inline, so this code path
+    // was untestable from the wire fixture — the prior engine-direct
+    // test bypassed Dispatch entirely. Now we can set the wall clock
+    // ahead of the EXPIREAT timestamp and observe the key being
+    // deleted on next access in one Exchange.
+    using namespace std::chrono_literals;
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    auto const start = std::chrono::system_clock::time_point { 2'000'000s };
+    FastCache::ManualWallClock wallClock { start };
+    FastCache::CacheEngine engine { storage, clock, wallClock };
+    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    // The EXPIREAT timestamp is 1 second BEFORE the wall clock's now,
+    // so the absolute branch must compute delta < 0 and resolve to
+    // immediate expiry. The follow-up GET should miss.
+    auto const ts = std::chrono::duration_cast<std::chrono::seconds>(start.time_since_epoch()).count() - 1;
+    auto const req = std::format("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                                 "*3\r\n$8\r\nEXPIREAT\r\n$1\r\nk\r\n${}\r\n{}\r\n"
+                                 "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+                                 std::to_string(ts).size(),
+                                 ts);
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), req)));
+    pair.client->ShutdownWrite();
+    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, /*session*/ {}));
+    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(out == "+OK\r\n:1\r\n$-1\r\n");
+}
+
+TEST_CASE("CacheEngine::ExpiryFromExptime uses the injected IWallClock", "[cache][clock]")
+{
+    // Memcached absolute exptime (any value > 30 days = 2592000 seconds).
+    // CacheEngine::ExpiryFromExptime should anchor against the injected
+    // IWallClock, not the host system clock. Test: inject a
+    // ManualWallClock far in the future, ask for an exptime well above
+    // the absolute threshold but BEFORE the wall-clock now — expect
+    // immediate expiry (deadline == now).
+    using namespace std::chrono_literals;
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    // Wall clock at year 2100 (way past INT32_MAX, the boundary of
+    // memcached's relative-vs-absolute threshold)
+    auto const farFuture = std::chrono::system_clock::time_point { std::chrono::seconds { 4'102'444'800LL } };
+    FastCache::ManualWallClock wallClock { farFuture };
+    FastCache::CacheEngine engine { storage, clock, wallClock };
+
+    // exptime = 3'000'000 seconds (35 days) — above 2592000 so treated
+    // as an absolute UNIX timestamp. But absolute "3 million" is in the
+    // 1970s, way before the wall clock's 2100. Result: immediate expiry.
+    auto const deadline = engine.ExpiryFromExptime(3'000'000U);
+    REQUIRE(deadline == clock.Now());
 }

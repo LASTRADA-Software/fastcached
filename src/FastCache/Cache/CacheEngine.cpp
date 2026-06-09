@@ -26,9 +26,10 @@ namespace
 
 } // namespace
 
-CacheEngine::CacheEngine(IStorage& storage, IClock& clock) noexcept:
+CacheEngine::CacheEngine(IStorage& storage, IClock& clock, IWallClock& wallClock) noexcept:
     _storage { storage },
-    _clock { clock }
+    _clock { clock },
+    _wallClock { wallClock }
 {
 }
 
@@ -41,12 +42,12 @@ TimePoint CacheEngine::ExpiryFromExptime(std::uint32_t exptime) const noexcept
     if (exptime <= ExptimeAbsoluteThreshold)
         return now + std::chrono::seconds { exptime };
 
-    // Absolute UNIX timestamp. We approximate "now in unix seconds" by
-    // using the system clock once at the call site — this drifts vs. the
-    // steady clock but is acceptable for the sccache use case where TTLs
-    // are typically short. (For accurate absolute-time TTLs we'd need an
-    // IWallClock injected alongside IClock.)
-    auto const sysNow = std::chrono::system_clock::now();
+    // Absolute UNIX timestamp. Anchor against the injected wall clock so
+    // tests can drive deterministic absolute-time TTLs via
+    // ManualWallClock (the legacy code reached for
+    // std::chrono::system_clock::now() inline, which was both a DI
+    // violation and made the EXPIREAT wire path untestable).
+    auto const sysNow = _wallClock.Now();
     auto const sysSeconds = std::chrono::duration_cast<std::chrono::seconds>(sysNow.time_since_epoch()).count();
     auto const delta = static_cast<std::int64_t>(exptime) - sysSeconds;
     if (delta <= 0)
@@ -75,6 +76,15 @@ std::expected<CasToken, StorageError> CacheEngine::Set(std::string_view key,
     return _storage.Set(key, std::move(value), flags, ExpiryFromExptime(exptime));
 }
 
+std::expected<CasToken, StorageError> CacheEngine::SetWithDeadline(std::string_view key,
+                                                                   std::vector<std::byte> value,
+                                                                   std::uint32_t flags,
+                                                                   TimePoint deadline)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::SetWithDeadline");
+    return _storage.Set(key, std::move(value), flags, deadline);
+}
+
 std::expected<CasToken, StorageError> CacheEngine::Add(std::string_view key,
                                                        std::vector<std::byte> value,
                                                        std::uint32_t flags,
@@ -84,6 +94,15 @@ std::expected<CasToken, StorageError> CacheEngine::Add(std::string_view key,
     return _storage.Add(key, std::move(value), flags, ExpiryFromExptime(exptime), _clock.Now());
 }
 
+std::expected<CasToken, StorageError> CacheEngine::AddWithDeadline(std::string_view key,
+                                                                   std::vector<std::byte> value,
+                                                                   std::uint32_t flags,
+                                                                   TimePoint deadline)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::AddWithDeadline");
+    return _storage.Add(key, std::move(value), flags, deadline, _clock.Now());
+}
+
 std::expected<CasToken, StorageError> CacheEngine::Replace(std::string_view key,
                                                            std::vector<std::byte> value,
                                                            std::uint32_t flags,
@@ -91,6 +110,15 @@ std::expected<CasToken, StorageError> CacheEngine::Replace(std::string_view key,
 {
     FC_ZONE_SCOPED_N("CacheEngine::Replace");
     return _storage.Replace(key, std::move(value), flags, ExpiryFromExptime(exptime), _clock.Now());
+}
+
+std::expected<CasToken, StorageError> CacheEngine::ReplaceWithDeadline(std::string_view key,
+                                                                       std::vector<std::byte> value,
+                                                                       std::uint32_t flags,
+                                                                       TimePoint deadline)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::ReplaceWithDeadline");
+    return _storage.Replace(key, std::move(value), flags, deadline, _clock.Now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::Append(std::string_view key,
@@ -142,6 +170,34 @@ std::expected<CasToken, StorageError> CacheEngine::Touch(std::string_view key, s
 {
     FC_ZONE_SCOPED_N("CacheEngine::Touch");
     return _storage.Touch(key, ExpiryFromExptime(exptime), _clock.Now());
+}
+
+std::expected<CasToken, StorageError> CacheEngine::TouchAt(std::string_view key, TimePoint newExpiry)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::TouchAt");
+    return _storage.Touch(key, newExpiry, _clock.Now());
+}
+
+std::expected<std::optional<CacheEngine::TtlResult>, StorageError> CacheEngine::Ttl(std::string_view key)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::Ttl");
+    auto const now = _clock.Now();
+    auto const expiry = _storage.PeekExpiry(key, now);
+    if (!expiry.has_value())
+        return std::unexpected(expiry.error());
+    if (!expiry->has_value())
+        return std::optional<TtlResult> {};
+    auto const deadline = **expiry;
+    if (deadline == TimePoint::max())
+        return std::optional<TtlResult> { TtlResult { .hasExpiry = false, .remaining = Duration { 0 } } };
+    auto const remaining = deadline > now ? (deadline - now) : Duration { 0 };
+    return std::optional<TtlResult> { TtlResult { .hasExpiry = true, .remaining = remaining } };
+}
+
+std::expected<bool, StorageError> CacheEngine::ClearExpiry(std::string_view key)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::ClearExpiry");
+    return _storage.ClearExpiry(key, _clock.Now());
 }
 
 std::expected<GetResult, StorageError> CacheEngine::GetAndTouch(std::string_view key, std::uint32_t exptime)
