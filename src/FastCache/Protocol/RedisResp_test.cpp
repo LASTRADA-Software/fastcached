@@ -1533,6 +1533,53 @@ TEST_CASE("RESP: WATCH without a registry replies an explicit error", "[protocol
     REQUIRE(Exchange(fix, "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n") == "-ERR transactions are not available\r\n");
 }
 
+TEST_CASE("RESP: MSET with no watcher fans out without invoking the registry",
+          "[protocol][resp][batch][hoist]")
+{
+    // Hoist contract: with HasAnyWatchers() == false, the per-key inner
+    // loop must skip NotifyWatchers entirely. We exercise the
+    // observable consequence — the watch handle of an UN-watched
+    // connection must NOT become dirty after a 5-key MSET, even though
+    // the SAME registry would dirty it if any one of those keys had
+    // been watched.
+    TxFixture fix;
+    auto otherHandle = std::make_shared<FastCache::WatchHandle>();
+    // Register the OTHER handle for an unrelated key — keeps
+    // HasAnyWatchers() true so the inner loop's per-key Touched is
+    // exercised (the dirty bit on `otherHandle` stays clear because the
+    // keys we MSET don't match).
+    fix.watches.Register(otherHandle, "watched");
+
+    auto const out = ExchangeTx(fix,
+                                "*11\r\n$4\r\nMSET\r\n"
+                                "$2\r\nk1\r\n$1\r\nv\r\n$2\r\nk2\r\n$1\r\nv\r\n"
+                                "$2\r\nk3\r\n$1\r\nv\r\n$2\r\nk4\r\n$1\r\nv\r\n"
+                                "$2\r\nk5\r\n$1\r\nv\r\n");
+    REQUIRE(out == "+OK\r\n");
+    // The unrelated watched-key handle was never touched; the hoist
+    // didn't accidentally fan out the wrong keys.
+    REQUIRE_FALSE(otherHandle->IsDirty());
+}
+
+TEST_CASE("RESP: MSET with a watcher on one key still dirties only that watcher",
+          "[protocol][resp][batch][hoist]")
+{
+    // Per-key fan-out still works after the hoist — gating on a single
+    // up-front bool must not silently skip the inner Touched when the
+    // command should still publish per key.
+    TxFixture fix;
+    auto watched = std::make_shared<FastCache::WatchHandle>();
+    fix.watches.Register(watched, "k3");
+
+    auto const out = ExchangeTx(fix,
+                                "*11\r\n$4\r\nMSET\r\n"
+                                "$2\r\nk1\r\n$1\r\nv\r\n$2\r\nk2\r\n$1\r\nv\r\n"
+                                "$2\r\nk3\r\n$1\r\nv\r\n$2\r\nk4\r\n$1\r\nv\r\n"
+                                "$2\r\nk5\r\n$1\r\nv\r\n");
+    REQUIRE(out == "+OK\r\n");
+    REQUIRE(watched->IsDirty());
+}
+
 TEST_CASE("RESP: WATCH followed by disconnect leaves the registry index clean",
           "[protocol][resp][tx][cleanup]")
 {
@@ -1794,6 +1841,46 @@ TEST_CASE("RESP keyspace: SPOP on empty set publishes no event",
 
     (void) ExchangeKs(fix, "*2\r\n$4\r\nSPOP\r\n$1\r\ns\r\n");
     REQUIRE(fix.sub->messages.empty());
+}
+
+TEST_CASE("RESP keyspace: MSET still publishes 'set' per key when the gate is open",
+          "[protocol][resp][keyspace][batch][hoist]")
+{
+    // Hoist regression guard: the per-command anyK gate must not
+    // suppress the per-key publish when there ARE subscribers — every
+    // pair must still fire its own __keyevent@0__:set notification.
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyevent | FastCache::KeyspaceEvents::String);
+    fix.SubscribeTo("__keyevent@0__:set");
+
+    (void) ExchangeKs(fix,
+                      "*7\r\n$4\r\nMSET\r\n"
+                      "$1\r\na\r\n$1\r\n1\r\n"
+                      "$1\r\nb\r\n$1\r\n2\r\n"
+                      "$1\r\nc\r\n$1\r\n3\r\n");
+    REQUIRE(fix.sub->messages.size() == 3);
+    REQUIRE(fix.sub->messages[0].payload == "a");
+    REQUIRE(fix.sub->messages[1].payload == "b");
+    REQUIRE(fix.sub->messages[2].payload == "c");
+}
+
+TEST_CASE("RESP keyspace: DEL multi-key still publishes 'del' per key when the gate is open",
+          "[protocol][resp][keyspace][batch][hoist]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyevent | FastCache::KeyspaceEvents::Generic
+                     | FastCache::KeyspaceEvents::String);
+    fix.SubscribeTo("__keyevent@0__:del");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"
+                      "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n"
+                      "*3\r\n$3\r\nDEL\r\n$1\r\na\r\n$1\r\nb\r\n");
+    // Two `del` events expected (one per existing key); the SETs land on
+    // __keyevent@0__:set which we did NOT subscribe to.
+    REQUIRE(fix.sub->messages.size() == 2);
+    REQUIRE(fix.sub->messages[0].payload == "a");
+    REQUIRE(fix.sub->messages[1].payload == "b");
 }
 
 // ----- Redis transactions: forbidden verbs inside MULTI ----------------------

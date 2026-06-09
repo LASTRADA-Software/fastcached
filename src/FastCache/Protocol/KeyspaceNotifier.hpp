@@ -74,6 +74,15 @@ class KeyspaceNotifier
     /// notify-keyspace-events` would render once implemented.
     [[nodiscard]] std::uint32_t Classes() const noexcept;
 
+    /// Lock-free fast-path probe: would a `OnEvent` of `classFlag` plausibly
+    /// publish something? True iff this notifier is enabled, the class is
+    /// in the active bitmask, and the pub/sub registry has at least one
+    /// subscriber. Callers in per-key loops (MSET / MSETNX / DEL) probe
+    /// this ONCE per command and skip the per-key OnEvent entirely when
+    /// false — replacing N atomic loads with 1 on the hot write path.
+    /// @param classFlag One of `KeyspaceEvents::Generic` / `String` / `Expired`.
+    [[nodiscard]] bool WouldPublish(std::uint32_t classFlag) const noexcept;
+
   private:
     IPubSubRegistry* _pubsub;
     std::uint32_t _classes;

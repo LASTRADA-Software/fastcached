@@ -86,6 +86,15 @@ std::uint32_t KeyspaceNotifier::Classes() const noexcept
     return _classes;
 }
 
+bool KeyspaceNotifier::WouldPublish(std::uint32_t classFlag) const noexcept
+{
+    if (_pubsub == nullptr)
+        return false;
+    if ((_classes & classFlag) == 0)
+        return false;
+    return _pubsub->HasAnySubscribers();
+}
+
 void KeyspaceNotifier::OnEvent(std::uint32_t classFlag, std::string_view event, std::string_view key) const
 {
     if (_pubsub == nullptr)

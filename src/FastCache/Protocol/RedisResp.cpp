@@ -1165,14 +1165,24 @@ namespace
         if (args.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'del'");
         std::int64_t deleted = 0;
+        // Per-command gates: probe ONCE before the loop instead of per-key.
+        // For a `DEL k1 … k100` against an empty watch-registry and an empty
+        // pub/sub registry the inner loop now pays zero notification calls;
+        // the alternative was 100 atomic loads + (pre-#7) 100 mutex
+        // acquisitions on the hot write path.
+        bool const anyW = state != nullptr && state->watchRegistry != nullptr && state->watchRegistry->HasAnyWatchers();
+        bool const anyK = state != nullptr && state->keyspaceNotifier != nullptr
+                          && state->keyspaceNotifier->WouldPublish(KeyspaceEvents::Generic);
         for (auto const& key: args)
         {
             auto const result = engine->Delete(key);
             if (result.has_value())
             {
                 ++deleted;
-                NotifyWatchers(state, key);
-                NotifyKeyspace(state, KeyspaceEvents::Generic, "del", key);
+                if (anyW)
+                    NotifyWatchers(state, key);
+                if (anyK)
+                    NotifyKeyspace(state, KeyspaceEvents::Generic, "del", key);
             }
         }
         co_return co_await ReplyInteger(socket, deleted);
@@ -2179,13 +2189,19 @@ namespace
     {
         if (args.empty() || (args.size() % 2) != 0)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'mset'");
+        // Per-command gates — see HandleDel for the rationale.
+        bool const anyW = state != nullptr && state->watchRegistry != nullptr && state->watchRegistry->HasAnyWatchers();
+        bool const anyK = state != nullptr && state->keyspaceNotifier != nullptr
+                          && state->keyspaceNotifier->WouldPublish(KeyspaceEvents::String);
         for (std::size_t i = 0; i < args.size(); i += 2)
         {
             auto const r = engine->Set(args[i], BytesFromString(args[i + 1]), 0, 0);
             if (!r.has_value())
                 co_return co_await ReplyError(socket, "storage failure");
-            NotifyWatchers(state, args[i]);
-            NotifyKeyspace(state, KeyspaceEvents::String, "set", args[i]);
+            if (anyW)
+                NotifyWatchers(state, args[i]);
+            if (anyK)
+                NotifyKeyspace(state, KeyspaceEvents::String, "set", args[i]);
         }
         co_return co_await ReplyOk(socket);
     }
@@ -2214,6 +2230,14 @@ namespace
             if (peek.has_value() && peek->found)
                 co_return co_await ReplyInteger(socket, 0);
         }
+        // Per-command gates — see HandleDel. MSETNX needs two keyspace
+        // gates because the success path fires "set" (String class) and
+        // the rollback fires "del" (Generic class).
+        bool const anyW = state != nullptr && state->watchRegistry != nullptr && state->watchRegistry->HasAnyWatchers();
+        bool const anyKSet = state != nullptr && state->keyspaceNotifier != nullptr
+                             && state->keyspaceNotifier->WouldPublish(KeyspaceEvents::String);
+        bool const anyKDel = state != nullptr && state->keyspaceNotifier != nullptr
+                             && state->keyspaceNotifier->WouldPublish(KeyspaceEvents::Generic);
         // Second pass: write each via Add (NX semantics per key). Track
         // committed keys so we can roll back if a later Add fails.
         std::vector<std::string_view> committed;
@@ -2232,16 +2256,20 @@ namespace
                 for (auto const& k: committed)
                 {
                     (void) engine->Delete(k);
-                    NotifyWatchers(state, k);
+                    if (anyW)
+                        NotifyWatchers(state, k);
                     // The rollback Delete fires "del" — the keyspace
                     // would otherwise show the half-written batch.
-                    NotifyKeyspace(state, KeyspaceEvents::Generic, "del", k);
+                    if (anyKDel)
+                        NotifyKeyspace(state, KeyspaceEvents::Generic, "del", k);
                 }
                 co_return co_await ReplyInteger(socket, 0);
             }
             committed.push_back(key);
-            NotifyWatchers(state, key);
-            NotifyKeyspace(state, KeyspaceEvents::String, "set", key);
+            if (anyW)
+                NotifyWatchers(state, key);
+            if (anyKSet)
+                NotifyKeyspace(state, KeyspaceEvents::String, "set", key);
         }
         co_return co_await ReplyInteger(socket, 1);
     }
