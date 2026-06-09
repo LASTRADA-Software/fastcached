@@ -257,6 +257,43 @@ TEST_CASE("ValidateBindFlagShape: empty binds + any legacy flag is accepted",
     REQUIRE(FastCache::ValidateBindFlagShape(cli, binds).has_value());
 }
 
+TEST_CASE("FormatBindSummary: single plaintext bind", "[config][bind][summary]")
+{
+    std::vector<FastCache::BindConfig> binds {
+        { .address = "127.0.0.1", .port = 11211, .tls = false },
+    };
+    REQUIRE(FastCache::FormatBindSummary(binds) == "127.0.0.1:11211");
+}
+
+TEST_CASE("FormatBindSummary: single TLS bind carries [tls] marker", "[config][bind][summary]")
+{
+    std::vector<FastCache::BindConfig> binds {
+        { .address = "127.0.0.1", .port = 6379, .tls = true },
+    };
+    REQUIRE(FastCache::FormatBindSummary(binds) == "127.0.0.1:6379 [tls]");
+}
+
+TEST_CASE("FormatBindSummary: two binds (plain + TLS) join with ', '",
+          "[config][bind][summary]")
+{
+    // Regression test for the original banner bug: the daemon brought up
+    // with `--listen a:1 --listen-tls b:2` used to log
+    // "bind=127.0.0.1:11211" — the defaults of the unused legacy fields.
+    std::vector<FastCache::BindConfig> binds {
+        { .address = "10.0.0.1", .port = 11211, .tls = false },
+        { .address = "10.0.0.1", .port = 6380, .tls = true },
+    };
+    REQUIRE(FastCache::FormatBindSummary(binds) == "10.0.0.1:11211, 10.0.0.1:6380 [tls]");
+}
+
+TEST_CASE("FormatBindSummary: empty list renders <none>", "[config][bind][summary]")
+{
+    // Defensive — RunReactorServer rejects empty `binds` one layer up, but
+    // FormatBindSummary itself stays total.
+    std::vector<FastCache::BindConfig> binds {};
+    REQUIRE(FastCache::FormatBindSummary(binds) == "<none>");
+}
+
 TEST_CASE("ConfigMerge: YAML lru/cpu survive when CLI did not pass the flag",
           "[config][merge][lru][cpu-affinity]")
 {

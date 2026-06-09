@@ -424,12 +424,21 @@ int DaemonBody(FastCache::Config const& effective)
     }
 
     auto const shardingMode = useShardingWrapper ? std::string_view { "" } : std::string_view { " (unwrapped)" };
+    // The bind summary reflects what is actually being listened on. The
+    // original banner formatted the legacy single-bind fields verbatim and
+    // ignored `binds`, so a daemon brought up via `--listen` always logged
+    // "bind=127.0.0.1:11211" (the defaults of the unused legacy fields).
+    auto const bindSummary = FastCache::FormatBindSummary(serverOpts.binds);
+    // `anyTlsBind` was computed up-top against `effective.binds`; under the
+    // current ordering `serverOpts.binds` is either `effective.binds` (when
+    // non-empty) or the synthesised legacy single-bind. Either way, a TLS
+    // banner field that reports "off" while a TLS listener is up is the
+    // operator-misleading bug — fold `anyTlsBind` into the TLS field below.
     logger.Logf(FastCache::LogLevel::Info,
-                "fastcached {} starting; bind={}:{} max-memory={} config={} storage={} "
+                "fastcached {} starting; bind={} max-memory={} config={} storage={} "
                 "durability={} max-value={} reactors={} shards={}{} auth={} tls={}",
                 ProgramVersion,
-                effective.bindAddress,
-                effective.port,
+                bindSummary,
                 FastCache::FormatByteSize(effective.maxMemoryBytes),
                 effective.configPath.empty() ? std::string_view { "<none>" } : std::string_view { effective.configPath },
                 effective.storagePath.empty() ? std::string_view { "<in-memory>" }
@@ -440,7 +449,7 @@ int DaemonBody(FastCache::Config const& effective)
                 physicalShards,
                 shardingMode,
                 authSource.Current() ? std::string_view { "on" } : std::string_view { "off" },
-                effective.tlsEnabled ? std::string_view { "on" } : std::string_view { "off" });
+                (effective.tlsEnabled || anyTlsBind) ? std::string_view { "on" } : std::string_view { "off" });
 
     InstallStopHandlers();
     // The "ready, accepting connections" line is emitted by the server loop

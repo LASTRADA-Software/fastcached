@@ -136,4 +136,20 @@ std::expected<void, ConfigError> ValidateBinds(std::span<BindConfig const> binds
     return {};
 }
 
+std::string FormatBindSummary(std::span<BindConfig const> binds)
+{
+    if (binds.empty())
+        return "<none>";
+    std::string out;
+    for (auto const& b: binds)
+    {
+        if (!out.empty())
+            out += ", ";
+        std::format_to(std::back_inserter(out), "{}:{}", b.address, b.port);
+        if (b.tls)
+            out += " [tls]";
+    }
+    return out;
+}
+
 } // namespace FastCache

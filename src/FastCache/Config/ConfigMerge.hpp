@@ -48,4 +48,16 @@ namespace FastCache
 [[nodiscard]] std::expected<void, ConfigError> ValidateBindFlagShape(CliResult const& cli,
                                                                      std::span<BindConfig const> binds);
 
+/// Render the listener list for the startup banner. The original banner
+/// formatted `bind={bindAddress}:{port}` from the legacy single-bind
+/// fields and ignored `binds`, so a daemon brought up via `--listen` /
+/// YAML `listeners:` always logged "bind=127.0.0.1:11211" — the defaults
+/// of the unused legacy fields. This helper renders every endpoint that
+/// will actually be listening, with a `[tls]` suffix per TLS bind.
+/// @param binds The active listener list (typically `serverOpts.binds`).
+/// @return A human-readable summary string, "<none>" when `binds` is
+///         empty (defensive — `RunReactorServer` already errors on
+///         empty).
+[[nodiscard]] std::string FormatBindSummary(std::span<BindConfig const> binds);
+
 } // namespace FastCache
