@@ -539,6 +539,26 @@ int DaemonBody(FastCache::Config const& effective)
     }
     FastCache::KeyspaceNotifier keyspaceNotifier { &pubsub, *eventsMask };
     serverOpts.session.keyspaceNotifier = &keyspaceNotifier;
+    // Make the notifier reloadable: a SIGHUP that changes
+    // notify-keyspace-events now updates the live bitmask on the
+    // already-running notifier. Existing connections' cached
+    // state->keyspaceEnabled stays as it was at connect time (that's
+    // documented per-connection behaviour); NEW connections opened after
+    // the reload read the updated bitmask immediately. A parse error in
+    // the reloaded config is logged but the previous mask is kept — the
+    // daemon never silently falls back to an empty mask.
+    reloader.Subscribe([&logger, &keyspaceNotifier](auto const& /*prev*/, auto const& next) {
+        auto const newMask = FastCache::ParseKeyspaceEvents(next->notifyKeyspaceEvents);
+        if (!newMask.has_value())
+        {
+            logger.Logf(FastCache::LogLevel::Error,
+                        "config reload: invalid notify-keyspace-events '{}': {} (keeping previous mask)",
+                        next->notifyKeyspaceEvents,
+                        newMask.error().context);
+            return;
+        }
+        keyspaceNotifier.SetClasses(*newMask);
+    });
 #if defined(FC_TLS_ENABLED)
     serverOpts.tlsContext = tlsContext.get(); // null unless --tls is active
 #endif
@@ -683,6 +703,20 @@ int main(int argc, char const* const* argv)
     if (auto const shape = FastCache::ValidateBindFlagShape(bindShapeCli, effective.binds); !shape.has_value())
     {
         std::println(std::cerr, "fastcached: {}", shape.error().context);
+        return EXIT_FAILURE;
+    }
+
+    // Validate notify-keyspace-events BEFORE handing off to the daemon
+    // host (which may fork) so a typo reaches the operator's terminal,
+    // not a syslog the child has already detached from. DaemonBody
+    // re-parses the same value — parsing is pure and the error here was
+    // caught well before any state was constructed.
+    if (auto const eventsMask = FastCache::ParseKeyspaceEvents(effective.notifyKeyspaceEvents); !eventsMask.has_value())
+    {
+        std::println(std::cerr,
+                     "fastcached: invalid --notify-keyspace-events '{}': {}",
+                     effective.notifyKeyspaceEvents,
+                     eventsMask.error().context);
         return EXIT_FAILURE;
     }
 

@@ -4,6 +4,7 @@
 #include <FastCache/Core/Errors/ConfigError.hpp>
 #include <FastCache/Protocol/IPubSubRegistry.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <string_view>
@@ -69,10 +70,23 @@ class KeyspaceNotifier
     /// building string-formatted event names when this is false).
     [[nodiscard]] bool IsEnabled() const noexcept;
 
-    /// @return The class bitmask this notifier was constructed with. Mainly
-    /// for tests and for the introspection that `CONFIG GET
-    /// notify-keyspace-events` would render once implemented.
+    /// @return The currently-active class bitmask. Atomic load — the
+    /// daemon's ConfigReloader may swap this on SIGHUP via SetClasses.
     [[nodiscard]] std::uint32_t Classes() const noexcept;
+
+    /// Atomically replace the active class bitmask. Called by
+    /// ConfigReloader when the operator changes `notify-keyspace-events`
+    /// at runtime. New connections AND existing connections (which read
+    /// `Classes()` on each OnEvent / IsEnabled call) observe the new mask
+    /// on their next probe — no restart required.
+    ///
+    /// Per-connection `state->keyspaceEnabled` is a separate snapshot
+    /// cached at connection start; that's documented as fixed-for-life
+    /// because flipping the off-fast-path under an existing connection
+    /// would surprise mid-flight handlers. New connections see the
+    /// updated mask immediately.
+    /// @param classes New bitmask (KeyspaceEvents::None disables).
+    void SetClasses(std::uint32_t classes) noexcept;
 
     /// Lock-free fast-path probe: would a `OnEvent` of `classFlag` plausibly
     /// publish something? True iff this notifier is enabled, the class is
@@ -85,7 +99,7 @@ class KeyspaceNotifier
 
   private:
     IPubSubRegistry* _pubsub;
-    std::uint32_t _classes;
+    std::atomic<std::uint32_t> _classes;
 };
 
 } // namespace FastCache

@@ -67,9 +67,9 @@ std::expected<std::uint32_t, ConfigError> ParseKeyspaceEvents(std::string_view f
 }
 
 KeyspaceNotifier::KeyspaceNotifier(IPubSubRegistry* pubsub, std::uint32_t classes) noexcept:
-    _pubsub { pubsub },
-    _classes { classes }
+    _pubsub { pubsub }
 {
+    _classes.store(classes, std::memory_order_relaxed);
 }
 
 bool KeyspaceNotifier::IsEnabled() const noexcept
@@ -78,19 +78,25 @@ bool KeyspaceNotifier::IsEnabled() const noexcept
     // K and E are both off, the class flags are unreachable.
     auto constexpr ChannelMask = KeyspaceEvents::Keyspace | KeyspaceEvents::Keyevent;
     auto constexpr ClassMask = KeyspaceEvents::Generic | KeyspaceEvents::String | KeyspaceEvents::Expired;
-    return (_classes & ChannelMask) != 0 && (_classes & ClassMask) != 0;
+    auto const classes = _classes.load(std::memory_order_relaxed);
+    return (classes & ChannelMask) != 0 && (classes & ClassMask) != 0;
 }
 
 std::uint32_t KeyspaceNotifier::Classes() const noexcept
 {
-    return _classes;
+    return _classes.load(std::memory_order_relaxed);
+}
+
+void KeyspaceNotifier::SetClasses(std::uint32_t classes) noexcept
+{
+    _classes.store(classes, std::memory_order_relaxed);
 }
 
 bool KeyspaceNotifier::WouldPublish(std::uint32_t classFlag) const noexcept
 {
     if (_pubsub == nullptr)
         return false;
-    if ((_classes & classFlag) == 0)
+    if ((_classes.load(std::memory_order_relaxed) & classFlag) == 0)
         return false;
     return _pubsub->HasAnySubscribers();
 }
@@ -99,7 +105,10 @@ void KeyspaceNotifier::OnEvent(std::uint32_t classFlag, std::string_view event, 
 {
     if (_pubsub == nullptr)
         return;
-    if ((_classes & classFlag) == 0)
+    // Snapshot _classes once so all per-event branches below see a
+    // consistent mask, even if SetClasses fires mid-call.
+    auto const classes = _classes.load(std::memory_order_relaxed);
+    if ((classes & classFlag) == 0)
         return;
     // Subscriberless fast path: when nothing is subscribed to anything, skip
     // the std::format of the channel names entirely. This matters on hot-
@@ -109,12 +118,12 @@ void KeyspaceNotifier::OnEvent(std::uint32_t classFlag, std::string_view event, 
     // allocate two std::strings just to look them up and find no subscriber.
     if (!_pubsub->HasAnySubscribers())
         return;
-    if ((_classes & KeyspaceEvents::Keyspace) != 0)
+    if ((classes & KeyspaceEvents::Keyspace) != 0)
     {
         auto const channel = std::format("__keyspace@0__:{}", key);
         (void) _pubsub->Publish(channel, event);
     }
-    if ((_classes & KeyspaceEvents::Keyevent) != 0)
+    if ((classes & KeyspaceEvents::Keyevent) != 0)
     {
         auto const channel = std::format("__keyevent@0__:{}", event);
         (void) _pubsub->Publish(channel, key);

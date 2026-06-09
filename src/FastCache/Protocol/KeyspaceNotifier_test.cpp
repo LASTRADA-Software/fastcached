@@ -257,3 +257,39 @@ TEST_CASE("PubSubRegistry: HasAnySubscribers flips as subscriptions come and go"
     registry.UnsubscribeAll(sub.get());
     REQUIRE_FALSE(registry.HasAnySubscribers());
 }
+
+TEST_CASE("KeyspaceNotifier::SetClasses swaps the active mask atomically",
+          "[protocol][keyspace][reload]")
+{
+    // The reloadability seam: an operator who SIGHUPs after editing
+    // notify-keyspace-events must see new events flow on existing
+    // notifier instances. The previous shape held `_classes` as a plain
+    // uint32_t set at construction; ConfigReloader had no way to update
+    // it without destroying the notifier and rebuilding the server.
+    PubSubRegistry registry;
+    auto sub = Subscribe(registry, "__keyspace@0__:foo");
+
+    // Start with the daemon-equivalent of `notify-keyspace-events=""`.
+    KeyspaceNotifier notifier { &registry, KeyspaceEvents::None };
+    REQUIRE_FALSE(notifier.IsEnabled());
+    notifier.OnEvent(KeyspaceEvents::Generic, "del", "foo");
+    REQUIRE(sub->messages.empty());
+
+    // Simulate the SIGHUP path: ParseKeyspaceEvents("Kg") => Keyspace |
+    // Generic; ConfigReloader calls SetClasses.
+    notifier.SetClasses(KeyspaceEvents::Keyspace | KeyspaceEvents::Generic);
+    REQUIRE(notifier.IsEnabled());
+    REQUIRE(notifier.Classes() == (KeyspaceEvents::Keyspace | KeyspaceEvents::Generic));
+
+    // Events now flow on the same notifier object.
+    notifier.OnEvent(KeyspaceEvents::Generic, "del", "foo");
+    REQUIRE(sub->messages.size() == 1);
+    REQUIRE(sub->messages[0].channel == "__keyspace@0__:foo");
+    REQUIRE(sub->messages[0].payload == "del");
+
+    // And another swap back to off silences delivery again.
+    notifier.SetClasses(KeyspaceEvents::None);
+    REQUIRE_FALSE(notifier.IsEnabled());
+    notifier.OnEvent(KeyspaceEvents::Generic, "del", "foo");
+    REQUIRE(sub->messages.size() == 1);   // no additional delivery
+}
