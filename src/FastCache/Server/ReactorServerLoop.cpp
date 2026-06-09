@@ -73,6 +73,30 @@ namespace
         } };
     }
 
+    /// Defensive guard: every Run* entry point checks that any TLS-flagged
+    /// bind also has a TLS context. The caller (main.cpp) already validates
+    /// this at startup, but a future test fixture or refactor that builds
+    /// `ReactorServerOptions` directly could deliver `binds=[{tls=true}]`
+    /// with `tlsContext=nullptr` — the existing code would silently accept
+    /// plaintext on the supposedly-TLS bind. Fail loudly instead.
+    /// @return EXIT_SUCCESS if every TLS bind has a context, else
+    /// EXIT_FAILURE (already logged).
+    [[nodiscard]] int VerifyTlsContextForTlsBinds(ReactorServerOptions const& options, ILogger& logger)
+    {
+        for (auto const& bind: options.binds)
+        {
+            if (bind.tls && options.tlsContext == nullptr)
+            {
+                logger.Logf(LogLevel::Fatal,
+                            "fastcached: TLS bind {}:{} requested but no TLS context configured",
+                            bind.address,
+                            bind.port);
+                return EXIT_FAILURE;
+            }
+        }
+        return EXIT_SUCCESS;
+    }
+
     /// Single-reactor server: one event loop multiplexes every connection on
     /// this thread. No connection-concurrency ceiling and no cross-thread
     /// coroutine migration. This is the default (reactorCount == 1).
@@ -84,6 +108,8 @@ namespace
                          IAdmissionControl* admission,
                          IMetricsSink* metrics)
     {
+        if (int const r = VerifyTlsContextForTlsBinds(options, logger); r != EXIT_SUCCESS)
+            return r;
         FC_THREAD_NAME("fc-reactor");
         SteadyClock clock;
         PlatformReactor reactor { clock };
@@ -198,6 +224,8 @@ namespace
                                IMetricsSink* metrics,
                                unsigned reactorCount)
     {
+        if (int const r = VerifyTlsContextForTlsBinds(options, logger); r != EXIT_SUCCESS)
+            return r;
         SteadyClock clock;
         std::vector<std::unique_ptr<IocpReactor>> reactors;
         reactors.reserve(reactorCount);
@@ -230,17 +258,29 @@ namespace
 
         std::atomic<std::uint64_t> accepted { 0 };
         std::atomic<bool> stopping { false };
+        // ONE round-robin counter shared across all acceptor threads. The
+        // previous per-acceptor `std::size_t next = 0` per lambda meant
+        // every bind's first connections landed on reactors[0], because
+        // each acceptor's counter was independent — under steady low-rate
+        // multi-bind load, reactors 0 and 1 silently received ~2x the
+        // connections of reactors 2 and 3. A single atomic counter
+        // restores the round-robin contract the leading comment promises.
+        std::atomic<std::size_t> nextReactor { 0 };
 
         std::vector<std::jthread> acceptors;
         acceptors.reserve(options.binds.size());
         for (std::size_t bindIdx = 0; bindIdx < options.binds.size(); ++bindIdx)
         {
-            acceptors.emplace_back([&, bindIdx] {
-                FC_THREAD_NAME(std::format("fc-acceptor-{}", bindIdx).c_str());
-                std::size_t next = 0;
+            acceptors.emplace_back([&, bindIdx](std::stop_token stopToken) {
+                // Hoist the formatted thread name into a stack local: Tracy's
+                // SetThreadName stores the const char* and reads it on later
+                // zone records, so a `std::format(...).c_str()` would dangle
+                // immediately after the full-expression's semicolon.
+                [[maybe_unused]] auto const threadName = std::format("fc-acceptor-{}", bindIdx);
+                FC_THREAD_NAME(threadName.c_str());
                 auto const listenSock = listenSocks[bindIdx];
                 auto* const perBindTls = bindTls[bindIdx] ? options.tlsContext : nullptr;
-                while (!stopping.load(std::memory_order_acquire))
+                while (!stopping.load(std::memory_order_acquire) && !stopToken.stop_requested())
                 {
                     auto raw = Detail::AcceptRaw(listenSock);
                     if (!raw.has_value())
@@ -257,33 +297,44 @@ namespace
                     accepted.fetch_add(1, std::memory_order_relaxed);
                     if (metrics)
                         metrics->Increment(IMetricsSink::Counter::ConnectionsTotal);
-                    auto& reactor = *reactors[next % reactorCount];
-                    ++next;
+                    auto const idx = nextReactor.fetch_add(1, std::memory_order_relaxed) % reactorCount;
+                    auto& reactor = *reactors[idx];
                     RunHandedOffConnection(reactor, *raw, engine, logger, admission, options.session, perBindTls);
                 }
             });
         }
 
         std::atomic<bool> watchdogQuit { false };
-        auto watchdog = MakeWatchdog(watchdogQuit, [&] {
+        auto stopAll = [&] {
             stopping.store(true, std::memory_order_release);
             for (auto const sock: listenSocks)
                 Detail::CloseNativeSocket(sock);
             for (auto& reactor: reactors)
                 reactor->Stop();
-        });
+        };
+        auto watchdog = MakeWatchdog(watchdogQuit, stopAll);
 
         std::vector<std::jthread> threads;
         threads.reserve(reactorCount - 1);
         for (auto i = 1U; i < reactorCount; ++i)
             threads.emplace_back([&reactors, i] {
-                FC_THREAD_NAME(std::format("fc-reactor-{}", i).c_str());
+                [[maybe_unused]] auto const threadName = std::format("fc-reactor-{}", i);
+                FC_THREAD_NAME(threadName.c_str());
                 reactors[i]->Run();
             });
         FC_THREAD_NAME("fc-reactor-0");
         reactors[0]->Run();
         threads.clear();
 
+        // Unconditional cleanup: if reactors[0]->Run() returned through any
+        // path other than the watchdog firing (test calls Stop() directly,
+        // an unhandled exception unwinds, the IOCP completion port is
+        // externally closed), the watchdog quits via watchdogQuit without
+        // ever invoking onStop — leaving listenSocks open and the acceptor
+        // jthreads blocked in AcceptRaw forever. Calling stopAll() here
+        // closes the sockets so AcceptRaw returns WSAEINTR/EBADF and the
+        // acceptor lambdas exit; ~jthread joins cleanly.
+        stopAll();
         watchdogQuit.store(true, std::memory_order_release);
         logger.Logf(LogLevel::Info, "served {} connection(s)", accepted.load(std::memory_order_relaxed));
         return EXIT_SUCCESS;
@@ -303,6 +354,8 @@ namespace
                              IMetricsSink* metrics,
                              unsigned reactorCount)
     {
+        if (int const r = VerifyTlsContextForTlsBinds(options, logger); r != EXIT_SUCCESS)
+            return r;
         SteadyClock clock;
         std::vector<std::unique_ptr<PlatformReactor>> reactors;
         // Listeners and servers are laid out as `[reactor * binds + bind]`
@@ -377,7 +430,10 @@ namespace
         threads.reserve(reactorCount - 1);
         for (auto i = 1U; i < reactorCount; ++i)
             threads.emplace_back([&runReactor, i] {
-                FC_THREAD_NAME(std::format("fc-reactor-{}", i).c_str());
+                // Hoist into a stack local; Tracy's SetThreadName does not
+                // copy and would dangle on a `std::format(...).c_str()`.
+                [[maybe_unused]] auto const threadName = std::format("fc-reactor-{}", i);
+                FC_THREAD_NAME(threadName.c_str());
                 runReactor(i);
             });
         FC_THREAD_NAME("fc-reactor-0");
