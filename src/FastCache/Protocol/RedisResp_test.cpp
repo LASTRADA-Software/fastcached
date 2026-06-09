@@ -1680,6 +1680,95 @@ TEST_CASE("RESP keyspace: EXPIRE fires the verb-named event under K + g",
     REQUIRE(fix.sub->messages[1].payload == "expire");
 }
 
+// Set-mutating verbs (SADD / SREM / SPOP) must publish keyspace events too.
+// Pre-fix they fired NotifyWatchers but not NotifyKeyspace — a Redis client
+// subscribed to __keyspace@0__:<key> with notify-keyspace-events=KEg saw the
+// SET and DEL but silently missed every membership change, breaking the
+// standard cache-invalidation pattern.
+
+TEST_CASE("RESP keyspace: SADD fires 'sadd' under K + g when members are added",
+          "[protocol][resp][keyspace][set]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix, "*4\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n$1\r\nb\r\n");
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].channel == "__keyspace@0__:s");
+    REQUIRE(fix.sub->messages[0].payload == "sadd");
+}
+
+TEST_CASE("RESP keyspace: SADD that adds zero members publishes no event",
+          "[protocol][resp][keyspace][set]")
+{
+    // Preserves the `*added > 0` guard — an idempotent SADD must not fire a
+    // spurious keyspace event (matches Redis behaviour).
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n"
+                      "*3\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n");
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].payload == "sadd");
+}
+
+TEST_CASE("RESP keyspace: SREM fires 'srem' under E + g when a member is removed",
+          "[protocol][resp][keyspace][set]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyevent | FastCache::KeyspaceEvents::Generic);
+    fix.SubscribeTo("__keyevent@0__:srem");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n"
+                      "*3\r\n$4\r\nSREM\r\n$1\r\ns\r\n$1\r\na\r\n");
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].channel == "__keyevent@0__:srem");
+    REQUIRE(fix.sub->messages[0].payload == "s");
+}
+
+TEST_CASE("RESP keyspace: SREM that removes nothing publishes no event",
+          "[protocol][resp][keyspace][set]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    // SREM on a missing key. Returns 0 and must NOT fire keyspace events.
+    (void) ExchangeKs(fix, "*3\r\n$4\r\nSREM\r\n$1\r\ns\r\n$1\r\na\r\n");
+    REQUIRE(fix.sub->messages.empty());
+}
+
+TEST_CASE("RESP keyspace: SPOP fires 'spop' under K + g when something is popped",
+          "[protocol][resp][keyspace][set]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n"
+                      "*2\r\n$4\r\nSPOP\r\n$1\r\ns\r\n");
+    REQUIRE(fix.sub->messages.size() == 2);
+    REQUIRE(fix.sub->messages[0].payload == "sadd");
+    REQUIRE(fix.sub->messages[1].channel == "__keyspace@0__:s");
+    REQUIRE(fix.sub->messages[1].payload == "spop");
+}
+
+TEST_CASE("RESP keyspace: SPOP on empty set publishes no event",
+          "[protocol][resp][keyspace][set]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix, "*2\r\n$4\r\nSPOP\r\n$1\r\ns\r\n");
+    REQUIRE(fix.sub->messages.empty());
+}
+
 // ----- Redis transactions: forbidden verbs inside MULTI ----------------------
 
 TEST_CASE("RESP: SUBSCRIBE inside MULTI is rejected and aborts EXEC", "[protocol][resp][tx]")

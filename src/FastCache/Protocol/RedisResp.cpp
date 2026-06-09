@@ -1837,7 +1837,11 @@ namespace
         if (!added.has_value())
             co_return co_await ReplySetError(socket, added.error());
         if (*added > 0)
+        {
             NotifyWatchers(state, args[0]);
+            // Redis emits "sadd" under the generic class for set-mutating verbs.
+            NotifyKeyspace(state, KeyspaceEvents::Generic, "sadd", args[0]);
+        }
         co_return co_await ReplyInteger(socket, *added);
     }
 
@@ -1849,7 +1853,10 @@ namespace
         if (!removed.has_value())
             co_return co_await ReplySetError(socket, removed.error());
         if (*removed > 0)
+        {
             NotifyWatchers(state, args[0]);
+            NotifyKeyspace(state, KeyspaceEvents::Generic, "srem", args[0]);
+        }
         co_return co_await ReplyInteger(socket, *removed);
     }
 
@@ -1921,7 +1928,10 @@ namespace
         if (!popped.has_value())
             co_return co_await ReplySetError(socket, popped.error());
         if (!popped->empty())
+        {
             NotifyWatchers(state, args[0]);
+            NotifyKeyspace(state, KeyspaceEvents::Generic, "spop", args[0]);
+        }
 
         if (!hasCount)
         {
