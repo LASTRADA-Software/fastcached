@@ -89,9 +89,24 @@ class WatchRegistry
     /// Returns the number of handles dirtied (mainly useful for tests).
     std::size_t Touched(std::string_view key);
 
+    /// Lock-free fast path: true iff at least one handle is currently
+    /// registered for some key. Callers in hot paths (MSET/DEL multi-key
+    /// loops) probe this once per command to skip the per-key Touched
+    /// fan-out when nothing is watching.
+    /// @return True iff `Touched` could plausibly dirty a handle.
+    [[nodiscard]] bool HasAnyWatchers() const noexcept;
+
   private:
     mutable std::mutex _mu;
     std::unordered_map<std::string, std::unordered_map<WatchHandle*, std::weak_ptr<WatchHandle>>> _index;
+    /// Total number of (handle, key) entries across all _index buckets.
+    /// Updated under `_mu` so it stays consistent with `_index`, but read
+    /// lock-free in `Touched` so the steady-state "nothing watching"
+    /// fast path is a single atomic load on the hot write path. Without
+    /// it every successful cache mutation paid a global mutex
+    /// acquisition AND a `std::string` heap allocation just to find an
+    /// empty index bucket.
+    std::atomic<std::size_t> _entryCount { 0 };
 };
 
 } // namespace FastCache

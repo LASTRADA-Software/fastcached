@@ -95,6 +95,45 @@ TEST_CASE("WatchRegistry: Touched between Register and Remember still dirties th
     REQUIRE(handle->IsDirty());                         //     dirty bit survives Remember
 }
 
+TEST_CASE("WatchRegistry: HasAnyWatchers reflects index size lock-free",
+          "[protocol][redis][transaction][fast-path]")
+{
+    // Steady-state for a daemon with no transactions in flight is
+    // "_entryCount == 0", and Touched must skip its global mutex
+    // acquisition entirely in that case. This is the hot-write path
+    // optimisation that motivated the lock-free counter.
+    WatchRegistry registry;
+    REQUIRE_FALSE(registry.HasAnyWatchers());
+
+    auto handle = std::make_shared<WatchHandle>();
+    registry.Register(handle, "k1");
+    REQUIRE(registry.HasAnyWatchers());
+
+    registry.Register(handle, "k2");
+    REQUIRE(registry.HasAnyWatchers());
+
+    // Re-Register on an existing (handle, key) pair must NOT double-count
+    // the entry — otherwise the counter would drift up over time.
+    registry.Register(handle, "k1");
+    REQUIRE(registry.HasAnyWatchers());
+
+    registry.UnregisterAll(handle.get());
+    REQUIRE_FALSE(registry.HasAnyWatchers());
+}
+
+TEST_CASE("WatchRegistry: Touched on empty registry returns 0 without entering the locked section",
+          "[protocol][redis][transaction][fast-path]")
+{
+    // The contract: when nothing is watching, Touched is a single
+    // acquire-load on the atomic counter and a return. We exercise this by
+    // verifying it returns 0 — the lock-free shortcut is unobservable from
+    // the outside beyond the absence of side effects, but the behavioural
+    // contract (zero handles dirtied) holds.
+    WatchRegistry registry;
+    for (auto i = 0; i < 1000; ++i)
+        REQUIRE(registry.Touched("nope") == 0);
+}
+
 TEST_CASE("WatchHandle::Clear forgets snapshots and resets dirty", "[protocol][redis][transaction]")
 {
     WatchHandle handle;

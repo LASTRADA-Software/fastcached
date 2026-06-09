@@ -46,7 +46,13 @@ void WatchRegistry::Register(std::shared_ptr<WatchHandle> const& handle, std::st
     if (!handle)
         return;
     std::scoped_lock const lock { _mu };
-    _index[std::string { key }].insert_or_assign(handle.get(), std::weak_ptr<WatchHandle> { handle });
+    auto& bucket = _index[std::string { key }];
+    // insert_or_assign returns {iterator, true} only on a fresh insert; on
+    // re-Register of the same handle for the same key we must NOT bump
+    // the counter (the entry was already counted).
+    auto const [_, inserted] = bucket.insert_or_assign(handle.get(), std::weak_ptr<WatchHandle> { handle });
+    if (inserted)
+        _entryCount.fetch_add(1, std::memory_order_release);
 }
 
 void WatchRegistry::UnregisterAll(WatchHandle* handle)
@@ -54,14 +60,17 @@ void WatchRegistry::UnregisterAll(WatchHandle* handle)
     if (handle == nullptr)
         return;
     std::scoped_lock const lock { _mu };
+    std::size_t removed = 0;
     for (auto it = _index.begin(); it != _index.end();)
     {
-        it->second.erase(handle);
+        removed += it->second.erase(handle);
         if (it->second.empty())
             it = _index.erase(it);
         else
             ++it;
     }
+    if (removed > 0)
+        _entryCount.fetch_sub(removed, std::memory_order_release);
     // The handle's snapshot map is also cleared so a future MULTI on the
     // same connection starts with no watched keys.
     handle->Clear();
@@ -69,6 +78,14 @@ void WatchRegistry::UnregisterAll(WatchHandle* handle)
 
 std::size_t WatchRegistry::Touched(std::string_view key)
 {
+    // Lock-free fast path — the steady state for a daemon with no active
+    // WATCHers is "_entryCount == 0", so every successful cache mutation
+    // skips the global mutex + heap allocation for the key string before
+    // ever finding an empty bucket. Acquire pairs with the release stores
+    // in Register / UnregisterAll so the lock-free reader sees a
+    // consistent count.
+    if (_entryCount.load(std::memory_order_acquire) == 0)
+        return 0;
     // Snapshot the live handles under the lock so we can fire MarkDirty
     // outside it — MarkDirty is a single atomic store, but holding the lock
     // across cross-handle work courts deadlocks if the dirty flag is ever
@@ -87,6 +104,11 @@ std::size_t WatchRegistry::Touched(std::string_view key)
     for (auto const& t: targets)
         t->MarkDirty();
     return targets.size();
+}
+
+bool WatchRegistry::HasAnyWatchers() const noexcept
+{
+    return _entryCount.load(std::memory_order_acquire) > 0;
 }
 
 } // namespace FastCache
