@@ -99,10 +99,11 @@ TEST_CASE("CliParser: --storage-durability rejects unknown values", "[config][cl
 
 TEST_CASE("CliParser: --lru-mode parses each policy and defaults to approximate", "[config][cli]")
 {
-    // Default (flag absent) is Approximate.
+    // Default (flag absent) is Approximate, and the explicit-bit is clear.
     auto const def = FastCache::ParseCli(std::span<char const* const> {});
     REQUIRE(def.has_value());
     REQUIRE(def->config.lruRecency == FastCache::LruRecency::Approximate);
+    REQUIRE_FALSE(def->lruRecencyExplicit);
 
     for (auto const& [text, mode]: std::initializer_list<std::pair<char const*, FastCache::LruRecency>> {
              { "--lru-mode=approximate", FastCache::LruRecency::Approximate },
@@ -113,6 +114,10 @@ TEST_CASE("CliParser: --lru-mode parses each policy and defaults to approximate"
         auto const result = FastCache::ParseCli(std::span<char const* const> { args });
         REQUIRE(result.has_value());
         REQUIRE(result->config.lruRecency == mode);
+        // Whenever the flag was typed, the explicit-bit must be set so the
+        // CLI value wins over a YAML default in Merge — regression for the
+        // silent-drop bug that motivated this fix.
+        REQUIRE(result->lruRecencyExplicit);
     }
 }
 
@@ -129,6 +134,7 @@ TEST_CASE("CliParser: --cpu-affinity parses each policy and defaults to per-core
     auto const def = FastCache::ParseCli(std::span<char const* const> {});
     REQUIRE(def.has_value());
     REQUIRE(def->config.cpuAffinity == FastCache::CpuAffinity::PerCore);
+    REQUIRE_FALSE(def->cpuAffinityExplicit);
 
     for (auto const& [text, mode]: std::initializer_list<std::pair<char const*, FastCache::CpuAffinity>> {
              { "--cpu-affinity=none", FastCache::CpuAffinity::None },
@@ -139,6 +145,10 @@ TEST_CASE("CliParser: --cpu-affinity parses each policy and defaults to per-core
         auto const result = FastCache::ParseCli(std::span<char const* const> { args });
         REQUIRE(result.has_value());
         REQUIRE(result->config.cpuAffinity == mode);
+        // Same explicit-bit contract as --lru-mode: regression guard against
+        // YAML silently shadowing a typed `--cpu-affinity=per-core` when the
+        // value equals the default.
+        REQUIRE(result->cpuAffinityExplicit);
     }
 }
 
@@ -250,6 +260,8 @@ TEST_CASE("CliParser: omitting all flags leaves every explicit-tracker false", "
     REQUIRE_FALSE(result->workerThreadsExplicit);
     REQUIRE_FALSE(result->storageShardsExplicit);
     REQUIRE_FALSE(result->listenBacklogExplicit);
+    REQUIRE_FALSE(result->lruRecencyExplicit);
+    REQUIRE_FALSE(result->cpuAffinityExplicit);
 }
 
 TEST_CASE("CliParser: --bind sets the address and records the explicit-set flag", "[config][cli][bind]")

@@ -60,6 +60,10 @@ Config Merge(Config fileCfg, CliResult const& cli)
         fileCfg.tlsKeyPath = cliCfg.tlsKeyPath;
     if (cli.notifyKeyspaceEventsExplicit)
         fileCfg.notifyKeyspaceEvents = cliCfg.notifyKeyspaceEvents;
+    if (cli.lruRecencyExplicit)
+        fileCfg.lruRecency = cliCfg.lruRecency;
+    if (cli.cpuAffinityExplicit)
+        fileCfg.cpuAffinity = cliCfg.cpuAffinity;
     // Listener endpoints: any explicit CLI `--listen` / `--listen-tls` wins
     // wholesale over whatever the YAML file declared. We deliberately do NOT
     // append-merge — mixing partial YAML listeners with partial CLI listeners

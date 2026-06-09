@@ -439,14 +439,20 @@ namespace
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.lruRecencyExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         {
             auto const matched = ApplyParsedFlag(args, i, "--cpu-affinity", ParseCpuAffinity, cfg.cpuAffinity);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.cpuAffinityExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         {
             auto const matched = ApplyParsedFlag(args, i, "--threads", ParseThreads, cfg.workerThreads);

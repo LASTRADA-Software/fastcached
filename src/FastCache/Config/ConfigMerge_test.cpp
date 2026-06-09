@@ -138,3 +138,69 @@ TEST_CASE("ValidateBinds: empty list is trivially valid", "[config][bind][valida
     std::vector<FastCache::BindConfig> binds {};
     REQUIRE(FastCache::ValidateBinds(binds).has_value());
 }
+
+TEST_CASE("ConfigMerge: --lru-mode strict overrides YAML default approximate",
+          "[config][merge][lru]")
+{
+    // The original Merge() shipped without lruRecency/cpuAffinity propagation,
+    // so `--config foo.yaml --lru-mode=strict` silently kept the YAML default.
+    FastCache::Config fileCfg {};
+    fileCfg.lruRecency = FastCache::LruRecency::Approximate;
+
+    auto cli = EmptyCli();
+    cli.lruRecencyExplicit = true;
+    cli.config.lruRecency = FastCache::LruRecency::Strict;
+
+    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+    REQUIRE(merged.lruRecency == FastCache::LruRecency::Strict);
+}
+
+TEST_CASE("ConfigMerge: --cpu-affinity none overrides YAML default per-core",
+          "[config][merge][cpu-affinity]")
+{
+    FastCache::Config fileCfg {};
+    fileCfg.cpuAffinity = FastCache::CpuAffinity::PerCore;
+
+    auto cli = EmptyCli();
+    cli.cpuAffinityExplicit = true;
+    cli.config.cpuAffinity = FastCache::CpuAffinity::None;
+
+    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+    REQUIRE(merged.cpuAffinity == FastCache::CpuAffinity::None);
+}
+
+TEST_CASE("ConfigMerge: --lru-mode default-value still overrides YAML when explicit",
+          "[config][merge][lru]")
+{
+    // Mirrors the explicit-bit-not-value-comparison invariant: `--lru-mode
+    // approximate` on top of a YAML `lru_mode: strict` must win, even though
+    // approximate happens to equal the field's compiled-in default.
+    FastCache::Config fileCfg {};
+    fileCfg.lruRecency = FastCache::LruRecency::Strict;
+
+    auto cli = EmptyCli();
+    cli.lruRecencyExplicit = true;
+    cli.config.lruRecency = FastCache::LruRecency::Approximate;
+
+    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+    REQUIRE(merged.lruRecency == FastCache::LruRecency::Approximate);
+}
+
+TEST_CASE("ConfigMerge: YAML lru/cpu survive when CLI did not pass the flag",
+          "[config][merge][lru][cpu-affinity]")
+{
+    // Negative case: without the explicit bit, the YAML value must survive
+    // even if cliCfg.lruRecency happens to differ from it (it shouldn't, but
+    // it must be invisible to Merge).
+    FastCache::Config fileCfg {};
+    fileCfg.lruRecency = FastCache::LruRecency::Strict;
+    fileCfg.cpuAffinity = FastCache::CpuAffinity::None;
+
+    auto cli = EmptyCli();
+    cli.config.lruRecency = FastCache::LruRecency::Approximate; // not explicit
+    cli.config.cpuAffinity = FastCache::CpuAffinity::PerCore;   // not explicit
+
+    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+    REQUIRE(merged.lruRecency == FastCache::LruRecency::Strict);
+    REQUIRE(merged.cpuAffinity == FastCache::CpuAffinity::None);
+}
