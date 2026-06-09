@@ -11,6 +11,7 @@
 #include <FastCache/Protocol/IPubSubRegistry.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
+#include <FastCache/Protocol/RedisRespDetail.hpp>
 #include <FastCache/Protocol/RedisTransaction.hpp>
 
 #include <algorithm>
@@ -3209,15 +3210,27 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
         Cleanup& operator=(Cleanup&&) = delete;
         ~Cleanup()
         {
-            if (_session.pubsub != nullptr)
-                _session.pubsub->UnsubscribeAll(_subscriber.get());
+            // Run each cleanup step under SwallowDestructorException so a
+            // throw from one (e.g. a std::scoped_lock raising
+            // std::system_error under abnormal pthread state — mutex
+            // resource exhaustion, PRIO_PI inheritance failure) does
+            // NOT std::terminate the process before the remaining steps
+            // run. The destructor is implicitly noexcept; a propagating
+            // exception would otherwise leak the watcher coroutine frame
+            // AND stale WATCH index entries until process exit.
+            Detail::SwallowDestructorException([this] {
+                if (_session.pubsub != nullptr)
+                    _session.pubsub->UnsubscribeAll(_subscriber.get());
+            });
             // Trip any latch the watcher is parked on so its coroutine frame is
             // freed promptly, instead of leaking until the daemon exits.
-            _subscriber->ShutdownWatcher();
+            Detail::SwallowDestructorException([this] { _subscriber->ShutdownWatcher(); });
             // Drop every WATCH index entry referencing this connection so a
             // stale weak_ptr cannot be upgraded by a later Touched call.
-            if (_state.watch && _state.watchRegistry != nullptr)
-                _state.watchRegistry->UnregisterAll(_state.watch.get());
+            Detail::SwallowDestructorException([this] {
+                if (_state.watch && _state.watchRegistry != nullptr)
+                    _state.watchRegistry->UnregisterAll(_state.watch.get());
+            });
         }
 
       private:
