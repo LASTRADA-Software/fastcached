@@ -183,3 +183,28 @@ TEST_CASE("YamlReader: listeners out-of-range port is rejected", "[config][yaml]
     REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::OutOfRange);
 }
 
+TEST_CASE("YamlReader: ReadYamlConfigWithPresence reports bind:/port: presence",
+          "[config][yaml][presence]")
+{
+    // These presence bits let main.cpp's ValidateBindFlagShape see the YAML
+    // legacy single-bind triplet — without them the YAML mix of `bind:` +
+    // `listeners:` silently dropped `bind:`.
+    auto const both = WriteTempYaml("with-bind-port",
+                                    "bind: 10.0.0.1\n"
+                                    "port: 6380\n");
+    auto const withBoth = FastCache::ReadYamlConfigWithPresence(both);
+    REQUIRE(withBoth.has_value());
+    REQUIRE(withBoth->bindAddressExplicit);
+    REQUIRE(withBoth->portExplicit);
+}
+
+TEST_CASE("YamlReader: ReadYamlConfigWithPresence leaves bind/port presence clear when absent",
+          "[config][yaml][presence]")
+{
+    auto const path = WriteTempYaml("no-bind", "max_memory: 4096\n");
+    auto const cfg = FastCache::ReadYamlConfigWithPresence(path);
+    REQUIRE(cfg.has_value());
+    REQUIRE_FALSE(cfg->bindAddressExplicit);
+    REQUIRE_FALSE(cfg->portExplicit);
+}
+

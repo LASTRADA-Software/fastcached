@@ -186,6 +186,77 @@ TEST_CASE("ConfigMerge: --lru-mode default-value still overrides YAML when expli
     REQUIRE(merged.lruRecency == FastCache::LruRecency::Approximate);
 }
 
+TEST_CASE("ValidateBindFlagShape: --bind alongside --listen is rejected",
+          "[config][bind][validate]")
+{
+    // Pre-fix, main.cpp silently picked `binds` and discarded `bindAddress`.
+    // We now fail fast and name the offending flag.
+    std::vector<FastCache::BindConfig> binds {
+        { .address = "1.2.3.4", .port = 6379, .tls = false },
+    };
+    auto cli = EmptyCli();
+    cli.bindAddressExplicit = true;
+
+    auto const result = FastCache::ValidateBindFlagShape(cli, binds);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().field == "listeners");
+    REQUIRE(result.error().context.contains("--bind"));
+}
+
+TEST_CASE("ValidateBindFlagShape: --port alongside --listen is rejected",
+          "[config][bind][validate]")
+{
+    std::vector<FastCache::BindConfig> binds {
+        { .address = "1.2.3.4", .port = 6379, .tls = false },
+    };
+    auto cli = EmptyCli();
+    cli.portExplicit = true;
+
+    auto const result = FastCache::ValidateBindFlagShape(cli, binds);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().context.contains("--port"));
+}
+
+TEST_CASE("ValidateBindFlagShape: --tls alongside --listen is rejected",
+          "[config][bind][validate]")
+{
+    // --listen-tls is the correct shape; --tls (the legacy enable bit) mixed
+    // with --listen would silently drop tlsEnabled.
+    std::vector<FastCache::BindConfig> binds {
+        { .address = "1.2.3.4", .port = 6379, .tls = true },
+    };
+    auto cli = EmptyCli();
+    cli.tlsEnabledExplicit = true;
+
+    auto const result = FastCache::ValidateBindFlagShape(cli, binds);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().context.contains("--tls"));
+}
+
+TEST_CASE("ValidateBindFlagShape: --listen alone is accepted",
+          "[config][bind][validate]")
+{
+    // The normal multi-listener case — only --listen / --listen-tls were typed.
+    std::vector<FastCache::BindConfig> binds {
+        { .address = "1.2.3.4", .port = 6379, .tls = false },
+    };
+    auto const cli = EmptyCli();
+    REQUIRE(FastCache::ValidateBindFlagShape(cli, binds).has_value());
+}
+
+TEST_CASE("ValidateBindFlagShape: empty binds + any legacy flag is accepted",
+          "[config][bind][validate]")
+{
+    // Legacy single-bind path — binds is empty, so main.cpp synthesises from
+    // bindAddress/port/tlsEnabled and nothing is silently dropped.
+    std::vector<FastCache::BindConfig> binds {};
+    auto cli = EmptyCli();
+    cli.bindAddressExplicit = true;
+    cli.portExplicit = true;
+    cli.tlsEnabledExplicit = true;
+    REQUIRE(FastCache::ValidateBindFlagShape(cli, binds).has_value());
+}
+
 TEST_CASE("ConfigMerge: YAML lru/cpu survive when CLI did not pass the flag",
           "[config][merge][lru][cpu-affinity]")
 {

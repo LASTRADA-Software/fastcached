@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/ConfigMerge.hpp>
 
+#include <array>
 #include <format>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 
@@ -73,6 +75,40 @@ Config Merge(Config fileCfg, CliResult const& cli)
     if (!cliCfg.binds.empty())
         fileCfg.binds = cliCfg.binds;
     return fileCfg;
+}
+
+std::expected<void, ConfigError> ValidateBindFlagShape(CliResult const& cli, std::span<BindConfig const> binds)
+{
+    if (binds.empty())
+        return {};
+    // Map each explicit-bit to the user-facing flag name it represents so the
+    // diagnostic names the actual flag the operator typed. Data-driven row
+    // table — adding a new legacy bind flag is one more entry here.
+    struct LegacyFlag
+    {
+        bool isExplicit;
+        std::string_view name;
+    };
+    auto const flags = std::array<LegacyFlag, 3> { {
+        { .isExplicit = cli.bindAddressExplicit, .name = "--bind" },
+        { .isExplicit = cli.portExplicit, .name = "--port" },
+        { .isExplicit = cli.tlsEnabledExplicit, .name = "--tls" },
+    } };
+    for (auto const& f: flags)
+    {
+        if (f.isExplicit)
+            return std::unexpected(ConfigError {
+                .code = ConfigErrorCode::ParseError,
+                .source = "listeners",
+                .line = 0,
+                .field = "listeners",
+                .context = std::format(
+                    "{} cannot be combined with --listen / --listen-tls / YAML listeners:; "
+                    "use one shape or the other, not both",
+                    f.name),
+            });
+    }
+    return {};
 }
 
 std::expected<void, ConfigError> ValidateBinds(std::span<BindConfig const> binds)

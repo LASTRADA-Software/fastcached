@@ -523,6 +523,10 @@ std::expected<YamlConfigWithPresence, ConfigError> ReadYamlConfigWithPresence(st
             out.tlsCertPathExplicit = true;
         else if (key == "tls_key")
             out.tlsKeyPathExplicit = true;
+        else if (key == "bind")
+            out.bindAddressExplicit = true;
+        else if (key == "port")
+            out.portExplicit = true;
     }
 
     return out;

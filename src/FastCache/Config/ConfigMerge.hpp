@@ -33,4 +33,19 @@ namespace FastCache
 ///         otherwise.
 [[nodiscard]] std::expected<void, ConfigError> ValidateBinds(std::span<BindConfig const> binds);
 
+/// Reject CLI flag combinations that would silently drop user-typed values.
+/// The dual-listener commit introduced two ways to declare endpoints: the
+/// legacy single-bind triplet (`--bind` / `--port` / `--tls`) and the
+/// repeatable `--listen` / `--listen-tls` (which also reads YAML
+/// `listeners:`). When BOTH shapes are given on one invocation, main.cpp
+/// silently picks `binds` and discards the legacy values — the operator's
+/// `--bind 0.0.0.0` vanishes with no diagnostic. Fail fast at startup
+/// instead, the same way we reject duplicate {address, port} pairs.
+/// @param cli   The parsed CLI result (carries the per-flag explicit bits).
+/// @param binds The merged listener list — `effective.binds` after `Merge`.
+/// @return Empty on success; ConfigError naming the offending flag
+///         otherwise.
+[[nodiscard]] std::expected<void, ConfigError> ValidateBindFlagShape(CliResult const& cli,
+                                                                     std::span<BindConfig const> binds);
+
 } // namespace FastCache

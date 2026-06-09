@@ -480,6 +480,19 @@ int DaemonBody(FastCache::Config const& effective)
         serverOpts.binds.push_back(
             FastCache::BindConfig { .address = effective.bindAddress, .port = effective.port, .tls = effective.tlsEnabled });
     }
+    // Reject shapes that would silently drop user-typed values: combining
+    // the legacy single-bind triplet (`--bind / --port / --tls` OR YAML
+    // `bind: / port: / tls:`) with `--listen / --listen-tls` (or YAML
+    // `listeners:`) makes the legacy values vanish — main.cpp picks `binds`
+    // and discards the singletons. Fail fast and name the offending flag so
+    // the operator can pick one shape. The combined `bindShapeCli` carries
+    // explicit bits from BOTH the CLI and the YAML so the check catches
+    // either mix source.
+    if (auto const shape = FastCache::ValidateBindFlagShape(bindShapeCli, serverOpts.binds); !shape.has_value())
+    {
+        logger.Logf(FastCache::LogLevel::Fatal, "fastcached: {}", shape.error().context);
+        return EXIT_FAILURE;
+    }
     // Reject duplicate {address, port} endpoints before we hit the kernel:
     // SO_REUSEPORT would let both bind succeed and silently split traffic
     // 50/50 between mismatched protocols (plaintext vs TLS).
@@ -616,6 +629,10 @@ int main(int argc, char const* const* argv)
 
     FastCache::Config effective;
     bool metricsPortYamlExplicit = false;
+    // Aggregate "was the legacy single-bind triplet typed by the operator,
+    // CLI or YAML?" so a downstream mix-with-`listeners:` check sees both
+    // sources. Starts from the CLI explicit bits and ORs in YAML presence.
+    auto bindShapeCli = *parsed;
     if (!parsed->config.configPath.empty())
     {
         auto loaded = FastCache::ReadYamlConfigWithPresence(parsed->config.configPath);
@@ -625,6 +642,9 @@ int main(int argc, char const* const* argv)
             return EXIT_FAILURE;
         }
         metricsPortYamlExplicit = loaded->metricsPortExplicit;
+        bindShapeCli.bindAddressExplicit = bindShapeCli.bindAddressExplicit || loaded->bindAddressExplicit;
+        bindShapeCli.portExplicit = bindShapeCli.portExplicit || loaded->portExplicit;
+        bindShapeCli.tlsEnabledExplicit = bindShapeCli.tlsEnabledExplicit || loaded->tlsEnabledExplicit;
         effective = FastCache::Merge(std::move(loaded->config), *parsed);
         effective.configPath = parsed->config.configPath;
     }

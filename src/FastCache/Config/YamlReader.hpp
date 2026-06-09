@@ -52,6 +52,12 @@ struct YamlConfigWithPresence
     bool tlsEnabledExplicit { false };
     bool tlsCertPathExplicit { false };
     bool tlsKeyPathExplicit { false };
+    /// Whether the YAML carried a `bind:` key. Together with
+    /// `portExplicit` this lets main.cpp reject a config that mixes the
+    /// legacy single-bind shape with `listeners:` — they would otherwise
+    /// silently pick `listeners:` and discard `bind:`/`port:`.
+    bool bindAddressExplicit { false };
+    bool portExplicit { false };
 };
 
 /// Variant of `ReadYamlConfig` that also reports which keys were explicitly
