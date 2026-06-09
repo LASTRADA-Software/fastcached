@@ -184,6 +184,14 @@ namespace
                                                  std::format("missing :port in: {}", sv)));
             host = sv.substr(0, colon);
             portText = sv.substr(colon + 1);
+            // Reject unbracketed IPv6 literals: if `host` contains a `:`
+            // we silently mis-parsed it (e.g. `2001:db8::1` would land
+            // here with host=`2001:db8:` and portText=`1`). The comment
+            // above promises rejection; the code now matches.
+            if (host.contains(':'))
+                return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch,
+                                                 tls ? "listen-tls" : "listen",
+                                                 std::format("IPv6 literal requires brackets: [{}]:port (got: {})", host, sv)));
         }
         auto const address = ParseBindAddress(host);
         if (!address.has_value())
@@ -340,7 +348,7 @@ namespace
         for (auto const& [name, target, seenPtr]: std::initializer_list<std::tuple<std::string_view, std::string*, bool*>> {
                  { "--config", &cfg.configPath, nullptr },
                  { "--pidfile", &cfg.pidfile, nullptr },
-                 { "--service-name", &cfg.serviceName, nullptr },
+                 { "--service-name", &cfg.serviceName, &result.serviceNameExplicit },
                  { "--storage", &cfg.storagePath, &result.storagePathExplicit },
                  { "--requirepass", &cfg.requirePass, &result.requirePassExplicit },
                  { "--auth-username", &cfg.authUsername, &result.authUsernameExplicit },

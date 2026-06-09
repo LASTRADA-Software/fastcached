@@ -58,6 +58,7 @@ struct CliResult
     bool notifyKeyspaceEventsExplicit { false };
     bool lruRecencyExplicit { false };
     bool cpuAffinityExplicit { false };
+    bool serviceNameExplicit { false };
 };
 
 /// Parse `argv[1..argc-1]` into a Config. Returns ConfigError on bad input.

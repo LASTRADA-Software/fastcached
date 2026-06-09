@@ -106,6 +106,39 @@ TEST_CASE("ConfigMerge: explicit-bit drives override even when CLI value equals 
     REQUIRE(merged.storageShards == 0U);
 }
 
+TEST_CASE("ConfigMerge: --service-name explicit value overrides YAML even when CLI equals default",
+          "[config][merge]")
+{
+    // serviceName previously used `cliCfg.serviceName != Config{}.serviceName`
+    // (value comparison against the compiled default) instead of the
+    // serviceNameExplicit bit every other field uses. Passing the default
+    // value on the CLI silently fell back to the YAML value — defying the
+    // documented "CLI overrides YAML" contract whenever the operator's
+    // explicit choice happened to match the default.
+    FastCache::Config fileCfg {};
+    fileCfg.serviceName = "yaml-name";
+
+    auto cli = EmptyCli();
+    cli.serviceNameExplicit = true;
+    cli.config.serviceName = FastCache::Config {}.serviceName; // == "FastCached"
+
+    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+    REQUIRE(merged.serviceName == FastCache::Config {}.serviceName);
+}
+
+TEST_CASE("ConfigMerge: --service-name absent leaves YAML value intact",
+          "[config][merge]")
+{
+    // Symmetric guard: without the explicit bit, the YAML value must win.
+    FastCache::Config fileCfg {};
+    fileCfg.serviceName = "yaml-name";
+
+    auto const cli = EmptyCli(); // serviceNameExplicit defaults to false
+
+    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+    REQUIRE(merged.serviceName == "yaml-name");
+}
+
 TEST_CASE("ValidateBinds: distinct endpoints pass", "[config][bind][validate]")
 {
     std::vector<FastCache::BindConfig> binds {

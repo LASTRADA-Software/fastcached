@@ -536,6 +536,34 @@ TEST_CASE("CliParser: --listen rejects malformed [ipv6 spec", "[config][cli][bin
     REQUIRE_FALSE(result.has_value());
 }
 
+TEST_CASE("CliParser: --listen rejects unbracketed IPv6 literal with a clear diagnostic",
+          "[config][cli][bind][ipv6-bracket-required]")
+{
+    // The inline comment in ParseListenSpec's unbracketed branch promises
+    // rejection of IPv6 literals without brackets, but the implementation
+    // silently split on rfind(':') — `2001:db8::1` became host=`2001:db8:`
+    // (trailing colon!) + portText=`1`. The kernel later rejected the
+    // bogus address with a low-level EINVAL the operator could not
+    // attribute back to the missing brackets. Reject at parse time with
+    // the bracket-hint diagnostic instead.
+    auto const args = std::array<char const*, 1> { "--listen=2001:db8::1" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
+    // Diagnostic mentions brackets so the operator knows the fix.
+    REQUIRE(result.error().context.contains("brackets"));
+}
+
+TEST_CASE("CliParser: --listen-tls rejects unbracketed IPv6 literal too",
+          "[config][cli][bind][ipv6-bracket-required]")
+{
+    // Symmetric guard for the --listen-tls path (shared parser).
+    auto const args = std::array<char const*, 1> { "--listen-tls=2001:db8::1" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
+}
+
 TEST_CASE("CliParser: legacy --bind/--port keeps cfg.binds empty (main collapses)", "[config][cli][bind]")
 {
     // The single-bind flags do NOT push into cfg.binds; main.cpp does the

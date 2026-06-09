@@ -28,7 +28,7 @@ Config Merge(Config fileCfg, CliResult const& cli)
         fileCfg.daemon = true;
     if (!cliCfg.pidfile.empty())
         fileCfg.pidfile = cliCfg.pidfile;
-    if (cliCfg.serviceName != Config {}.serviceName)
+    if (cli.serviceNameExplicit)
         fileCfg.serviceName = cliCfg.serviceName;
     if (cli.storagePathExplicit)
         fileCfg.storagePath = cliCfg.storagePath;
