@@ -37,6 +37,7 @@ class PubSubRegistry final: public IPubSubRegistry
     [[nodiscard]] std::size_t Publish(std::string_view channel, std::string_view message) override;
     [[nodiscard]] std::vector<std::string> SnapshotChannels(ISubscriber* sub) const override;
     [[nodiscard]] std::vector<std::string> SnapshotPatterns(ISubscriber* sub) const override;
+    [[nodiscard]] bool HasAnySubscribers() const noexcept override;
 
   private:
     /// Count a subscriber's live subscriptions (channels + patterns) while the

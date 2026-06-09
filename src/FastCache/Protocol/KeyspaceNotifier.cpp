@@ -87,6 +87,14 @@ void KeyspaceNotifier::OnEvent(std::uint32_t classFlag, std::string_view event, 
         return;
     if ((_classes & classFlag) == 0)
         return;
+    // Subscriberless fast path: when nothing is subscribed to anything, skip
+    // the std::format of the channel names entirely. This matters on hot-
+    // write workloads where the operator enabled `notify-keyspace-events`
+    // (e.g. "AKE") for the option to subscribe later but has no subscriber
+    // attached right now. Without this probe every SET/DEL/EXPIRE would
+    // allocate two std::strings just to look them up and find no subscriber.
+    if (!_pubsub->HasAnySubscribers())
+        return;
     if ((_classes & KeyspaceEvents::Keyspace) != 0)
     {
         auto const channel = std::format("__keyspace@0__:{}", key);

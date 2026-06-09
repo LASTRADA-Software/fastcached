@@ -269,4 +269,14 @@ std::size_t PubSubRegistry::Publish(std::string_view channel, std::string_view m
     return deliveries.size();
 }
 
+bool PubSubRegistry::HasAnySubscribers() const noexcept
+{
+    // Cheap probe: both maps are kept empty when nobody's subscribed (the
+    // unsubscribe paths erase empty buckets). Lock is taken briefly under
+    // the assumption that mutations and probes share the same mutex; this is
+    // the only thread-safe way to observe both maps consistently.
+    std::scoped_lock const lock { _mu };
+    return !_channels.empty() || !_patterns.empty();
+}
+
 } // namespace FastCache

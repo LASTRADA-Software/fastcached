@@ -4,9 +4,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using FastCache::IPubSubRegistry;
@@ -142,4 +144,101 @@ TEST_CASE("KeyspaceNotifier: null pub/sub is a safe no-op", "[protocol][keyspace
 {
     KeyspaceNotifier notifier { nullptr, KeyspaceEvents::Keyspace | KeyspaceEvents::Generic };
     notifier.OnEvent(KeyspaceEvents::Generic, "del", "foo"); // must not crash
+}
+
+namespace
+{
+
+/// Counting IPubSubRegistry: records every Publish() call so a test can
+/// assert "zero publishes" or "n publishes". The subscribe/snapshot
+/// surface is unused by the fast-path test, so the methods are stubs.
+class CountingPubSub final: public IPubSubRegistry
+{
+  public:
+    std::atomic<std::size_t> publishCount { 0 };
+    bool hasSubs { false };
+
+    std::size_t Subscribe(std::shared_ptr<ISubscriber> /*sub*/, std::string_view /*channel*/) override
+    {
+        return 0;
+    }
+    std::size_t Unsubscribe(ISubscriber* /*sub*/, std::string_view /*channel*/) override
+    {
+        return 0;
+    }
+    std::size_t PSubscribe(std::shared_ptr<ISubscriber> /*sub*/, std::string_view /*pattern*/) override
+    {
+        return 0;
+    }
+    std::size_t PUnsubscribe(ISubscriber* /*sub*/, std::string_view /*pattern*/) override
+    {
+        return 0;
+    }
+    void UnsubscribeAll(ISubscriber* /*sub*/) override {}
+    std::size_t Publish(std::string_view /*channel*/, std::string_view /*message*/) override
+    {
+        publishCount.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    [[nodiscard]] std::vector<std::string> SnapshotChannels(ISubscriber* /*sub*/) const override
+    {
+        return {};
+    }
+    [[nodiscard]] std::vector<std::string> SnapshotPatterns(ISubscriber* /*sub*/) const override
+    {
+        return {};
+    }
+    [[nodiscard]] bool HasAnySubscribers() const noexcept override
+    {
+        return hasSubs;
+    }
+};
+
+} // namespace
+
+TEST_CASE("KeyspaceNotifier: zero-subscriber short-circuit skips Publish entirely",
+          "[protocol][keyspace]")
+{
+    // The whole point of the fast path: when nothing is subscribed we must
+    // not call Publish() at all. Otherwise an operator running with
+    // notify-keyspace-events=AKE on a hot write workload would pay the
+    // channel-format cost on every SET.
+    CountingPubSub pubsub;
+    pubsub.hasSubs = false;
+
+    KeyspaceNotifier notifier { &pubsub,
+                                KeyspaceEvents::Keyspace | KeyspaceEvents::Keyevent
+                                    | KeyspaceEvents::String };
+    notifier.OnEvent(KeyspaceEvents::String, "set", "foo");
+    REQUIRE(pubsub.publishCount.load() == 0);
+}
+
+TEST_CASE("KeyspaceNotifier: with subscribers, Publish is called", "[protocol][keyspace]")
+{
+    // Symmetric guard: a subscriber present must NOT silence the publish
+    // (a regression where HasAnySubscribers always returned false would pass
+    // the prior test but break delivery in production).
+    CountingPubSub pubsub;
+    pubsub.hasSubs = true;
+
+    KeyspaceNotifier notifier { &pubsub,
+                                KeyspaceEvents::Keyspace | KeyspaceEvents::Keyevent
+                                    | KeyspaceEvents::String };
+    notifier.OnEvent(KeyspaceEvents::String, "set", "foo");
+    // K + E: one publish per channel (__keyspace and __keyevent).
+    REQUIRE(pubsub.publishCount.load() == 2);
+}
+
+TEST_CASE("PubSubRegistry: HasAnySubscribers flips as subscriptions come and go",
+          "[protocol][keyspace]")
+{
+    PubSubRegistry registry;
+    REQUIRE_FALSE(registry.HasAnySubscribers());
+
+    auto sub = std::make_shared<CapturingSubscriber>();
+    (void) registry.Subscribe(sub, "ch");
+    REQUIRE(registry.HasAnySubscribers());
+
+    registry.UnsubscribeAll(sub.get());
+    REQUIRE_FALSE(registry.HasAnySubscribers());
 }
