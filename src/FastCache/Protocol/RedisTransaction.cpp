@@ -41,11 +41,10 @@ bool WatchHandle::IsDirty() const noexcept
     return _dirty.load(std::memory_order_acquire);
 }
 
-void WatchRegistry::Register(std::shared_ptr<WatchHandle> const& handle, std::string_view key, CasToken cas)
+void WatchRegistry::Register(std::shared_ptr<WatchHandle> const& handle, std::string_view key)
 {
     if (!handle)
         return;
-    handle->Remember(key, cas);
     std::scoped_lock const lock { _mu };
     _index[std::string { key }].insert_or_assign(handle.get(), std::weak_ptr<WatchHandle> { handle });
 }

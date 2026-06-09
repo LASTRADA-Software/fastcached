@@ -1707,24 +1707,34 @@ namespace
             state->watch = std::make_shared<WatchHandle>();
         for (auto const& key: args)
         {
-            // Snapshot via PeekCas (non-bumping) — a WATCH probe must not
-            // promote LRU recency the way GET would. A missing key snapshots
-            // as CAS 0; any subsequent SET on it will Touch the registry and
-            // flip dirty (the entry's first CAS is non-zero by construction).
+            // Order matters under multi-reactor load:
+            //   1. Register the index entry FIRST,
+            //   2. Then PeekCas (non-bumping — a WATCH probe must not
+            //      promote LRU recency the way GET would),
+            //   3. Then store the snapshot on the handle.
+            // Inserting the index before reading the CAS ensures any
+            // concurrent `SET` that lands between PeekCas and Remember
+            // calls `Touched` against an index that ALREADY contains this
+            // handle — MarkDirty fires and EXEC aborts. The previous
+            // "PeekCas-then-Register-with-cas" shape had a race window
+            // where Touched found the index empty (handle not yet
+            // registered), no handle dirtied, EXEC committed over the
+            // racing write. Real Redis avoids this by being
+            // single-threaded; fastcached cannot.
             //
-            // A StorageError here means the snapshot is unreliable — treating
-            // an I/O failure as "key absent" would silently commit a later
-            // EXEC against state we never read. Roll back every snapshot
-            // already taken in THIS WATCH call (UnregisterAll wipes the lot)
-            // and surface the error to the client, matching how every other
-            // engine call site treats StorageError.
+            // A StorageError on PeekCas means the snapshot is unreliable —
+            // treating an I/O failure as "key absent" would silently
+            // commit a later EXEC against state we never read. Roll back
+            // every Register already taken in THIS WATCH call
+            // (UnregisterAll wipes the lot) and surface the error.
+            state->watchRegistry->Register(state->watch, key);
             auto const cas = engine->PeekCas(key);
             if (!cas.has_value())
             {
                 state->watchRegistry->UnregisterAll(state->watch.get());
                 co_return co_await ReplyError(socket, "storage failure during WATCH");
             }
-            state->watchRegistry->Register(state->watch, key, *cas);
+            state->watch->Remember(key, *cas);
         }
         co_return co_await ReplyOk(socket);
     }

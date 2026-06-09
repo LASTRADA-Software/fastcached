@@ -12,7 +12,8 @@ TEST_CASE("WatchRegistry: Touched flips dirty on a registered handle", "[protoco
 {
     WatchRegistry registry;
     auto handle = std::make_shared<WatchHandle>();
-    registry.Register(handle, "foo", 7);
+    registry.Register(handle, "foo");
+    handle->Remember("foo", 7);
 
     REQUIRE_FALSE(handle->IsDirty());
     auto const dirtied = registry.Touched("foo");
@@ -24,7 +25,7 @@ TEST_CASE("WatchRegistry: Touched on an unwatched key dirties nothing", "[protoc
 {
     WatchRegistry registry;
     auto handle = std::make_shared<WatchHandle>();
-    registry.Register(handle, "foo", 1);
+    registry.Register(handle, "foo");
 
     REQUIRE(registry.Touched("bar") == 0);
     REQUIRE_FALSE(handle->IsDirty());
@@ -35,8 +36,8 @@ TEST_CASE("WatchRegistry: a Touched call dirties every handle watching the key",
     WatchRegistry registry;
     auto a = std::make_shared<WatchHandle>();
     auto b = std::make_shared<WatchHandle>();
-    registry.Register(a, "foo", 1);
-    registry.Register(b, "foo", 1);
+    registry.Register(a, "foo");
+    registry.Register(b, "foo");
 
     REQUIRE(registry.Touched("foo") == 2);
     REQUIRE(a->IsDirty());
@@ -47,8 +48,10 @@ TEST_CASE("WatchRegistry: UnregisterAll drops the index entries and clears the h
 {
     WatchRegistry registry;
     auto handle = std::make_shared<WatchHandle>();
-    registry.Register(handle, "foo", 1);
-    registry.Register(handle, "bar", 2);
+    registry.Register(handle, "foo");
+    handle->Remember("foo", 1);
+    registry.Register(handle, "bar");
+    handle->Remember("bar", 2);
     REQUIRE(handle->WatchedKeys().size() == 2);
 
     registry.UnregisterAll(handle.get());
@@ -66,11 +69,30 @@ TEST_CASE("WatchRegistry: an expired handle is skipped without crashing", "[prot
     WatchRegistry registry;
     {
         auto handle = std::make_shared<WatchHandle>();
-        registry.Register(handle, "foo", 1);
+        registry.Register(handle, "foo");
         // handle goes out of scope and is destroyed; the registry holds
         // only a weak_ptr so Touched must not try to dereference it.
     }
     REQUIRE(registry.Touched("foo") == 0);
+}
+
+TEST_CASE("WatchRegistry: Touched between Register and Remember still dirties the handle",
+          "[protocol][redis][transaction][race]")
+{
+    // Direct unit-test of the fix for the WATCH race. HandleWatch does
+    // (1) Register, (2) PeekCas, (3) Remember. Any concurrent SET that
+    // lands BETWEEN (1) and (3) must dirty the handle so EXEC aborts —
+    // even if the snapshot hasn't been stored yet. The old "Remember
+    // first, Register second" shape lost this dirty bit because Touched
+    // walked an empty index until step 2 finished.
+    WatchRegistry registry;
+    auto handle = std::make_shared<WatchHandle>();
+
+    registry.Register(handle, "k");                     // (1) index entry inserted
+    REQUIRE(registry.Touched("k") == 1);                // (2) racing SET in the gap
+    REQUIRE(handle->IsDirty());                         //     handle is dirtied
+    handle->Remember("k", 5);                           // (3) Remember runs last
+    REQUIRE(handle->IsDirty());                         //     dirty bit survives Remember
 }
 
 TEST_CASE("WatchHandle::Clear forgets snapshots and resets dirty", "[protocol][redis][transaction]")

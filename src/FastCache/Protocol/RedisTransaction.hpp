@@ -64,13 +64,21 @@ class WatchHandle
 class WatchRegistry
 {
   public:
-    /// Register `handle` as watching `key` and remember the snapshot. Caller
-    /// has already read the current CAS via `CacheEngine::PeekCas` on its own
-    /// thread; the registry only stores the index entry.
+    /// Register `handle` as a watcher of `key`. Inserts the index entry
+    /// only; the snapshot CAS is stored separately by the caller via
+    /// `handle->Remember`. The split ordering closes a race that the
+    /// previous "insert + remember in one call" shape had: when WATCH ran
+    /// (a) `PeekCas` → (b) `Register` (which inserted the index AND stored
+    /// the snapshot), a concurrent `SET` between (a) and (b) called
+    /// `Touched` against an empty index and dirtied no handle — `EXEC`
+    /// later read `IsDirty() == false` and committed over the racing
+    /// write. The fix inverts the WATCH order: insert the index FIRST,
+    /// then `PeekCas`, then `Remember`. Any concurrent `Touched` that
+    /// lands in the window now finds the index entry and dirties the
+    /// handle.
     /// @param handle The connection's handle.
     /// @param key    Lookup key.
-    /// @param cas    Snapshotted CAS at WATCH time (0 = key absent).
-    void Register(std::shared_ptr<WatchHandle> const& handle, std::string_view key, CasToken cas);
+    void Register(std::shared_ptr<WatchHandle> const& handle, std::string_view key);
 
     /// Drop every key-index entry referencing `handle`. Called on UNWATCH,
     /// EXEC, DISCARD, and connection teardown.
