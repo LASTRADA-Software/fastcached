@@ -6,6 +6,46 @@
 - [ ] Add `fastcached stats` command to show in-process stats of the currently running instance (assuming we auto-detect it via config file)
 - [ ] Add `fastcached live-stats` command to show in-process stats live on the terminal (using Sixels, if supported by the connected terminal, otherwise Unicode or ASCII art)
 - [ ] Reactor `UpdateInterest` swallows real `kevent`/`epoll_ctl` failures — surface them instead of stalling. See risk note below.
+- [ ] **Data-driven `ConfigMerge` (review follow-up — Group D #12).**
+      The current `Merge()` in `src/FastCache/Config/ConfigMerge.cpp` is 25
+      hand-rolled if-branches; adding a Config field requires touching
+      Config + CliResult bit + CliParser + YamlReader + Merge, and the
+      `lruRecency` / `cpuAffinity` silent-drop bug from the
+      transactions-keyspace-dual-listener review was the predictable
+      consequence. Replace the if-ladder with a descriptor table
+      (`{explicit-bit-getter, src-field-getter, dst-field-setter, mode}`,
+      where `mode` is one of `ExplicitWins` / `NonDefaultWins`) and a
+      coverage test that asserts every `CliResult::*Explicit` bit is
+      referenced by exactly one descriptor — that guard fails fast the next
+      time someone adds a field without wiring it into Merge.
+- [ ] **`NotifyingStorage` IStorage decorator (review follow-up — Group D #13).**
+      Keyspace notifications are currently scattered across each Redis verb
+      handler in `RedisResp.cpp` (~12 `NotifyKeyspace` call sites). This
+      bolts notifications to the Redis protocol only — Memcached writes
+      silently miss keyspace events, and lazy-expiry has no callback to fire
+      `expired` at all (which is why the `x` flag and `Expired` event class
+      had to be removed from the parser in #3). The right altitude is an
+      `IStorage` decorator (`NotifyingStorage` wrapping the inner storage),
+      matching the existing `LayeredStorage` / `ShardedStorage` /
+      `TracingStorage` decorator chain pattern. Every mutation funnels
+      through `IStorage::Set/Delete/CompareAndSwap/Update/Remove`, so one
+      decorator publishes for every protocol *and* every backend. Once
+      this lands, restore the `x` flag and `Expired` class in
+      `KeyspaceNotifier`, and the per-protocol `NotifyKeyspace` scatter
+      in `RedisResp.cpp` collapses to a no-op (the decorator publishes
+      first, the protocol handler only handles the reply).
+- [ ] **Startup-failure log on partial bind (review follow-up — Group D #14).**
+      `RunMultiReactorPosix` in `src/FastCache/Server/ReactorServerLoop.cpp`
+      binds `reactorCount × binds` listeners. When one bind fails mid-loop,
+      the function logs a generic "cannot bind A:P on reactor R" and
+      returns; the storage chain and reloader thread are already running.
+      Add an `OnBindFailure` log path that names which (reactorIndex,
+      bindIndex) pair failed and surfaces the kernel errno verbatim, so the
+      operator can distinguish "port already in use on reactor 0" from
+      "fd-table exhaustion on reactor 14". Inject a fake listener factory in
+      `ReactorServerLoop_test.cpp` (create if absent) that succeeds for
+      the first N calls then fails, assert the message names the
+      offending pair.
 - [x] Add support for Tracy (via CMake variable, off by default)
 - [x] disk storage should be btrfs-like copy-on-write to allow O(1) blocking disk saves
 
