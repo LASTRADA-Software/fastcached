@@ -8,6 +8,7 @@ namespace FastCache
 
 class IReactor;        // Async/IReactor.hpp — the reactor this connection is pinned to.
 class IPubSubRegistry; // Protocol/IPubSubRegistry.hpp — process-wide pub/sub registry.
+class WatchRegistry;   // Protocol/RedisTransaction.hpp — process-wide WATCH registry for Redis transactions.
 
 /// Per-server, immutable context handed to every protocol handler's command
 /// loop. Bundles the optional collaborators a connection needs beyond its
@@ -39,6 +40,13 @@ struct SessionContext
     /// thread. Null when there is no reactor (blocking/in-memory transports);
     /// pub/sub delivery then resumes inline on the same thread.
     IReactor* reactor { nullptr };
+
+    /// Process-wide WATCH registry for the Redis `WATCH`/`MULTI`/`EXEC`
+    /// transaction family. Null when transactions are not wired in (unit
+    /// tests that don't exercise them); the Redis handler then rejects WATCH
+    /// with the standard error and the MULTI/EXEC flow runs without
+    /// invalidation. Shared, thread-safe; owned by the daemon body.
+    WatchRegistry* watches { nullptr };
 
     /// Resolve the currently-active policy through `authSource`. Callers hold
     /// the returned shared_ptr for the lifetime of a single verify so a

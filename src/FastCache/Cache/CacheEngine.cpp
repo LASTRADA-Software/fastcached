@@ -67,6 +67,15 @@ std::expected<GetResult, StorageError> CacheEngine::Peek(std::string_view key)
     return _storage.Peek(key, _clock.Now());
 }
 
+std::expected<CasToken, StorageError> CacheEngine::PeekCas(std::string_view key)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::PeekCas");
+    auto const result = _storage.Peek(key, _clock.Now());
+    if (!result.has_value())
+        return std::unexpected(result.error());
+    return result->found ? result->entry.cas : CasToken { 0 };
+}
+
 std::expected<CasToken, StorageError> CacheEngine::Set(std::string_view key,
                                                        std::vector<std::byte> value,
                                                        std::uint32_t flags,

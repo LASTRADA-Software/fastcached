@@ -10,6 +10,7 @@
 #include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/IPubSubRegistry.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
+#include <FastCache/Protocol/RedisTransaction.hpp>
 
 #include <algorithm>
 #include <array>
@@ -335,7 +336,50 @@ namespace
         /// Number of active channel + pattern subscriptions. >0 means the
         /// connection is in "subscribe mode" (restricted command set).
         std::size_t subscriptionCount { 0 };
+
+        /// True between a successful `MULTI` and the matching `EXEC`/`DISCARD`.
+        /// While set, every non-transaction-control command is queued instead
+        /// of executed, and the dispatcher replies `+QUEUED` to the client.
+        bool inMulti { false };
+
+        /// Set when a queued command produced a parse-time error (unknown
+        /// command, wrong arity by table lookup). Mirrors redis: a dirty
+        /// transaction must abort on EXEC with `-EXECABORT`. Reset by DISCARD
+        /// and after EXEC.
+        bool multiDirty { false };
+
+        /// Commands enqueued under `MULTI`. Each entry is the full argv (verb +
+        /// args) as owned strings. Played back through Dispatch on EXEC, in
+        /// FIFO order, with the responses framed as a single multi-bulk.
+        std::vector<std::vector<std::string>> queue {};
+
+        /// Per-connection WATCH state: snapshots taken by `WATCH` and a dirty
+        /// flag that the WatchRegistry's mutation hook flips from any reactor
+        /// thread. Created lazily on the first WATCH; null otherwise. Held by
+        /// shared_ptr so the registry's weak_ptr upgrade in Touched can pin
+        /// its lifetime past a concurrent connection teardown (mirrors the
+        /// Subscriber pattern above).
+        std::shared_ptr<WatchHandle> watch {};
+
+        /// Cached pointer to the process-wide WATCH registry, copied from
+        /// `SessionContext::watches` once at the start of `Run`. Null when
+        /// transactions are not wired in. Caching here lets every write-verb
+        /// handler call `NotifyWatchers(state, key)` without threading the
+        /// SessionContext through their signatures.
+        WatchRegistry* watchRegistry { nullptr };
     };
+
+    /// Mutation hook: every Redis write verb calls this after its engine
+    /// mutation succeeds, so any `WATCH` snapshot on the touched key flips
+    /// the watcher's dirty flag and a subsequent `EXEC` aborts. Centralised
+    /// so adding a new write verb only has to call one helper.
+    /// @param state Per-connection state (carries the cached registry pointer).
+    /// @param key   Key just mutated.
+    inline void NotifyWatchers(ConnectionState const* state, std::string_view key) noexcept
+    {
+        if (state != nullptr && state->watchRegistry != nullptr)
+            (void) state->watchRegistry->Touched(key);
+    }
 
     [[nodiscard]] std::string Upper(std::string_view sv)
     {
@@ -806,7 +850,11 @@ namespace
         co_return co_await ReplyBulkString(socket, result->entry.ValueBytes(), result->entry.value.AsKeepAlive());
     }
 
-    Task<bool> HandleSet(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
+    Task<bool> HandleSet(ISocket* socket,
+                         CacheEngine* engine,
+                         ConnectionState* state,
+                         std::span<std::string const> args,
+                         RespVersion resp)
     {
         if (args.size() < 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'set'");
@@ -837,7 +885,10 @@ namespace
         }
 
         if (result.has_value())
+        {
+            NotifyWatchers(state, key);
             co_return co_await ReplyOk(socket);
+        }
         if (result.error().code == StorageErrorCode::KeyExists || result.error().code == StorageErrorCode::KeyNotFound)
             co_return co_await ReplyNull(socket, resp); // NX/XX precondition unmet.
         if (result.error().code == StorageErrorCode::ValueTooLarge)
@@ -845,7 +896,8 @@ namespace
         co_return co_await ReplyError(socket, "storage failure");
     }
 
-    Task<bool> HandleSetEx(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, bool millis)
+    Task<bool> HandleSetEx(
+        ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args, bool millis)
     {
         if (args.size() != 3)
             co_return co_await ReplyError(
@@ -868,6 +920,7 @@ namespace
         auto const result = engine->SetWithDeadline(args[0], std::move(bytes), 0, deadline);
         if (!result.has_value())
             co_return co_await ReplyError(socket, "storage failure");
+        NotifyWatchers(state, args[0]);
         co_return co_await ReplyOk(socket);
     }
 
@@ -943,6 +996,7 @@ namespace
     ///                 otherwise it's an offset from `now`.
     Task<bool> HandleExpire(ISocket* socket,
                             CacheEngine* engine,
+                            ConnectionState* state,
                             std::span<std::string const> args,
                             std::string_view verb,
                             TtlUnit unit,
@@ -988,7 +1042,10 @@ namespace
 
         auto const result = engine->TouchAt(args[0], deadline);
         if (result.has_value())
+        {
+            NotifyWatchers(state, args[0]);
             co_return co_await ReplyInteger(socket, 1);
+        }
         if (result.error().code == StorageErrorCode::KeyNotFound)
             co_return co_await ReplyInteger(socket, 0);
         co_return co_await ReplyError(socket, "storage failure");
@@ -1028,20 +1085,27 @@ namespace
     /// closes the prior TOCTOU window — a concurrent SETEX between the
     /// separate Ttl read and TouchAt write could let PERSIST clear the
     /// new TTL while reporting :1, or report :0 against a stale view.
-    Task<bool> HandlePersist(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    Task<bool> HandlePersist(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
     {
         if (args.size() != 1)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'persist'");
         auto const result = engine->ClearExpiry(args[0]);
         if (result.has_value())
+        {
+            // Only an actual TTL-clearing transition counts as a mutation
+            // for WATCH purposes: a no-op PERSIST on a TTL-less key does
+            // not bump CAS in the storage layer either.
+            if (*result)
+                NotifyWatchers(state, args[0]);
             co_return co_await ReplyInteger(socket, *result ? 1 : 0);
+        }
         // KeyNotFound -> :0 (matches redis behaviour for absent keys).
         if (result.error().code == StorageErrorCode::KeyNotFound)
             co_return co_await ReplyInteger(socket, 0);
         co_return co_await ReplyError(socket, "storage failure");
     }
 
-    Task<bool> HandleDel(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    Task<bool> HandleDel(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
     {
         if (args.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'del'");
@@ -1050,7 +1114,10 @@ namespace
         {
             auto const result = engine->Delete(key);
             if (result.has_value())
+            {
                 ++deleted;
+                NotifyWatchers(state, key);
+            }
         }
         co_return co_await ReplyInteger(socket, deleted);
     }
@@ -1529,6 +1596,124 @@ namespace
         co_return co_await ReplyInteger(socket, static_cast<std::int64_t>(receivers));
     }
 
+    /// `MULTI` — open a transaction queue. Subsequent non-transaction-control
+    /// commands are queued (reply `+QUEUED`) until `EXEC` / `DISCARD`.
+    /// Nested `MULTI` is rejected with the redis-standard error and does not
+    /// affect the queue.
+    Task<bool> HandleMulti(ISocket* socket, ConnectionState* state)
+    {
+        if (state->inMulti)
+            co_return co_await ReplyError(socket, "MULTI calls can not be nested");
+        state->inMulti = true;
+        state->multiDirty = false;
+        state->queue.clear();
+        co_return co_await ReplyOk(socket);
+    }
+
+    /// `DISCARD` — abort the transaction: drop the queue and every WATCH.
+    /// Outside `MULTI` redis replies `-ERR DISCARD without MULTI`.
+    Task<bool> HandleDiscard(ISocket* socket, ConnectionState* state)
+    {
+        if (!state->inMulti)
+            co_return co_await ReplyError(socket, "DISCARD without MULTI");
+        state->inMulti = false;
+        state->multiDirty = false;
+        state->queue.clear();
+        if (state->watch && state->watchRegistry != nullptr)
+            state->watchRegistry->UnregisterAll(state->watch.get());
+        co_return co_await ReplyOk(socket);
+    }
+
+    /// `UNWATCH` — drop every WATCH snapshot on this connection. Always +OK
+    /// (no-op if there were no watches). Valid both inside and outside MULTI.
+    Task<bool> HandleUnwatch(ISocket* socket, ConnectionState* state)
+    {
+        if (state->watch && state->watchRegistry != nullptr)
+            state->watchRegistry->UnregisterAll(state->watch.get());
+        co_return co_await ReplyOk(socket);
+    }
+
+    /// `WATCH key [key ...]` — snapshot each key's current CAS. A later
+    /// mutation on any of them flips the connection's dirty flag and
+    /// aborts the matching `EXEC` with a nil multi-bulk. Disallowed inside
+    /// `MULTI` (matches redis).
+    Task<bool> HandleWatch(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    {
+        if (args.empty())
+            co_return co_await ReplyError(socket, "wrong number of arguments for 'watch'");
+        if (state->inMulti)
+            co_return co_await ReplyError(socket, "WATCH inside MULTI is not allowed");
+        if (state->watchRegistry == nullptr)
+            co_return co_await ReplyError(socket, "transactions are not available");
+        if (!state->watch)
+            state->watch = std::make_shared<WatchHandle>();
+        for (auto const& key: args)
+        {
+            // Snapshot via PeekCas (non-bumping) — a WATCH probe must not
+            // promote LRU recency the way GET would. A missing key snapshots
+            // as CAS 0; any subsequent SET on it will Touch the registry and
+            // flip dirty (the entry's first CAS is non-zero by construction).
+            auto const cas = engine->PeekCas(key);
+            state->watchRegistry->Register(state->watch, key, cas.has_value() ? *cas : CasToken { 0 });
+        }
+        co_return co_await ReplyOk(socket);
+    }
+
+    /// Forward declaration: EXEC re-enters Dispatch with `inMulti=false` to
+    /// drive each queued command's normal reply path.
+    Task<bool> Dispatch(
+        ISocket* socket, CacheEngine* engine, ParsedCommand cmd, SessionContext session, ConnectionState* state);
+
+    /// `EXEC` — commit the queued transaction. If any watched key has been
+    /// touched since `WATCH`, drop the queue and reply `*-1` (nil multi-bulk,
+    /// redis's "aborted" sentinel). Otherwise frame the responses of every
+    /// queued command as a single `*N` multi-bulk in FIFO order.
+    Task<bool> HandleExec(ISocket* socket, CacheEngine* engine, SessionContext session, ConnectionState* state)
+    {
+        if (!state->inMulti)
+            co_return co_await ReplyError(socket, "EXEC without MULTI");
+
+        // Snapshot+clear local state up front so the EXEC reply is the only
+        // thing that runs from here on, even if a replayed command throws.
+        auto queue = std::exchange(state->queue, {});
+        auto const wasDirty = state->multiDirty;
+        auto const watchTripped = state->watch && state->watch->IsDirty();
+        state->inMulti = false;
+        state->multiDirty = false;
+        if (state->watch && state->watchRegistry != nullptr)
+            state->watchRegistry->UnregisterAll(state->watch.get());
+
+        if (wasDirty)
+            co_return co_await WriteAll(socket, "-EXECABORT Transaction discarded because of previous errors.\r\n");
+        if (watchTripped)
+        {
+            // Redis: nil multi-bulk reply on a tripped WATCH. RESP2 spells
+            // this as the null array `*-1\r\n` (NOT the null bulk `$-1\r\n`,
+            // which is what `ReplyNull` writes); RESP3 collapses both to
+            // the canonical null `_\r\n`.
+            co_return co_await WriteAll(socket, state->resp == RespVersion::Resp3 ? "_\r\n" : "*-1\r\n");
+        }
+
+        // Write the multi-bulk header up front and then re-dispatch each
+        // queued command; each handler appends its own one reply element.
+        if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, queue.size(), state->resp))
+            co_return false;
+        for (auto& argv: queue)
+        {
+            if (!co_await Dispatch(socket, engine, ParsedCommand { .args = std::move(argv) }, session, state))
+                co_return false;
+        }
+        co_return true;
+    }
+
+    /// True for the small set of verbs that pass straight through the queue
+    /// branch in Dispatch when `inMulti` is set (MULTI / EXEC / DISCARD /
+    /// WATCH-rejection / UNWATCH all carry their own queue semantics).
+    [[nodiscard]] constexpr bool IsTransactionControl(std::string_view name) noexcept
+    {
+        return name == "MULTI" || name == "EXEC" || name == "DISCARD" || name == "WATCH" || name == "UNWATCH";
+    }
+
     /// Map a StorageError from a set command to the appropriate RESP error,
     /// returning std::nullopt when there is no error to report (the caller then
     /// renders the success value). Centralises WRONGTYPE / generic-failure
@@ -1542,23 +1727,27 @@ namespace
         co_return co_await ReplyError(socket, "storage failure");
     }
 
-    Task<bool> HandleSAdd(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    Task<bool> HandleSAdd(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
     {
         if (args.size() < 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'sadd'");
         auto const added = engine->SetAdd(args[0], args.subspan(1));
         if (!added.has_value())
             co_return co_await ReplySetError(socket, added.error());
+        if (*added > 0)
+            NotifyWatchers(state, args[0]);
         co_return co_await ReplyInteger(socket, *added);
     }
 
-    Task<bool> HandleSRem(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    Task<bool> HandleSRem(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
     {
         if (args.size() < 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'srem'");
         auto const removed = engine->SetRemove(args[0], args.subspan(1));
         if (!removed.has_value())
             co_return co_await ReplySetError(socket, removed.error());
+        if (*removed > 0)
+            NotifyWatchers(state, args[0]);
         co_return co_await ReplyInteger(socket, *removed);
     }
 
@@ -1614,7 +1803,8 @@ namespace
         co_return co_await ReplyInteger(socket, *card);
     }
 
-    Task<bool> HandleSPop(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
+    Task<bool> HandleSPop(
+        ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args, RespVersion resp)
     {
         if (args.empty() || args.size() > 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'spop'");
@@ -1628,6 +1818,8 @@ namespace
         auto const popped = engine->SetPop(args[0], static_cast<std::size_t>(count));
         if (!popped.has_value())
             co_return co_await ReplySetError(socket, popped.error());
+        if (!popped->empty())
+            NotifyWatchers(state, args[0]);
 
         if (!hasCount)
         {
@@ -1656,7 +1848,8 @@ namespace
     /// the value bytes. Per redis/valkey the reply is the new value as a bulk
     /// string in BOTH RESP2 and RESP3 (it does not use the RESP3 double type);
     /// the dedicated double type is exercised by `DEBUG PROTOCOL double` instead.
-    Task<bool> HandleIncrByFloat(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    Task<bool> HandleIncrByFloat(
+        ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
     {
         if (args.size() != 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'incrbyfloat'");
@@ -1706,6 +1899,7 @@ namespace
                 co_return co_await ReplyError(socket, "increment would produce NaN or Infinity");
             co_return co_await ReplyError(socket, "storage failure");
         }
+        NotifyWatchers(state, args[0]);
         co_return co_await ReplyBulkString(
             socket,
             std::span<std::byte const> { reinterpret_cast<std::byte const*>(encodedText.data()), encodedText.size() });
@@ -1719,8 +1913,12 @@ namespace
     /// under concurrent writers.
     /// @param verb  Wire command name, drives the error string.
     /// @param delta Signed amount to add (negative for DEC*).
-    Task<bool> HandleIncrDecrBy(
-        ISocket* socket, CacheEngine* engine, std::string_view key, std::string_view verb, std::int64_t delta)
+    Task<bool> HandleIncrDecrBy(ISocket* socket,
+                                CacheEngine* engine,
+                                ConnectionState* state,
+                                std::string_view key,
+                                std::string_view verb,
+                                std::int64_t delta)
     {
         std::int64_t newValue = 0;
         bool overflow = false;
@@ -1771,23 +1969,32 @@ namespace
                 co_return co_await ReplyError(socket, "increment or decrement would overflow");
             co_return co_await ReplyError(socket, std::format("storage failure for '{}'", verb));
         }
+        NotifyWatchers(state, key);
         co_return co_await ReplyInteger(socket, newValue);
     }
 
     /// INCR / DECR — fixed-magnitude variants. Dispatched separately so the
     /// arg-count error string matches the wire verb exactly.
-    Task<bool> HandleIncrDecr(
-        ISocket* socket, CacheEngine* engine, std::span<std::string const> args, std::string_view verb, std::int64_t sign)
+    Task<bool> HandleIncrDecr(ISocket* socket,
+                              CacheEngine* engine,
+                              ConnectionState* state,
+                              std::span<std::string const> args,
+                              std::string_view verb,
+                              std::int64_t sign)
     {
         if (args.size() != 1)
             co_return co_await ReplyError(socket, std::format("wrong number of arguments for '{}'", verb));
-        co_return co_await HandleIncrDecrBy(socket, engine, args[0], verb, sign);
+        co_return co_await HandleIncrDecrBy(socket, engine, state, args[0], verb, sign);
     }
 
     /// INCRBY / DECRBY — variable-magnitude variants. The delta arg is
     /// signed; DECRBY negates it before delegating.
-    Task<bool> HandleIncrDecrByVerb(
-        ISocket* socket, CacheEngine* engine, std::span<std::string const> args, std::string_view verb, bool negate)
+    Task<bool> HandleIncrDecrByVerb(ISocket* socket,
+                                    CacheEngine* engine,
+                                    ConnectionState* state,
+                                    std::span<std::string const> args,
+                                    std::string_view verb,
+                                    bool negate)
     {
         if (args.size() != 2)
             co_return co_await ReplyError(socket, std::format("wrong number of arguments for '{}'", verb));
@@ -1802,7 +2009,7 @@ namespace
                 co_return co_await ReplyError(socket, "increment or decrement would overflow");
             delta = -delta;
         }
-        co_return co_await HandleIncrDecrBy(socket, engine, args[0], verb, delta);
+        co_return co_await HandleIncrDecrBy(socket, engine, state, args[0], verb, delta);
     }
 
     /// MGET key [key ...] — array reply, one bulk-or-nil per key in order.
@@ -1840,7 +2047,7 @@ namespace
     /// (matches redis cluster semantics where MSET on multiple slots is
     /// rejected, but on a single instance MSET is best-effort). Reply
     /// `+OK` once every key has been written.
-    Task<bool> HandleMset(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    Task<bool> HandleMset(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
     {
         if (args.empty() || (args.size() % 2) != 0)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'mset'");
@@ -1849,6 +2056,7 @@ namespace
             auto const r = engine->Set(args[i], BytesFromString(args[i + 1]), 0, 0);
             if (!r.has_value())
                 co_return co_await ReplyError(socket, "storage failure");
+            NotifyWatchers(state, args[i]);
         }
         co_return co_await ReplyOk(socket);
     }
@@ -1866,7 +2074,7 @@ namespace
     /// committed" on `:0`); a concurrent SET racing into the gap can
     /// still let one Add fail, but the rollback erases earlier writes
     /// from the batch so the keyspace is not left half-written.
-    Task<bool> HandleMsetNx(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    Task<bool> HandleMsetNx(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
     {
         if (args.empty() || (args.size() % 2) != 0)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'msetnx'");
@@ -1893,10 +2101,14 @@ namespace
                 // an intermediate state, but the wire reply `:0` honestly
                 // means "no key from this batch is intentionally retained".
                 for (auto const& k: committed)
+                {
                     (void) engine->Delete(k);
+                    NotifyWatchers(state, k);
+                }
                 co_return co_await ReplyInteger(socket, 0);
             }
             committed.push_back(key);
+            NotifyWatchers(state, key);
         }
         co_return co_await ReplyInteger(socket, 1);
     }
@@ -2031,31 +2243,35 @@ namespace
                        .lastKey = 1,
                        .keyStep = 1 },
         CommandEntry { .name = "SET",
-                       .handler = [](CommandContext c) { return HandleSet(c.socket, c.engine, c.tail, c.state->resp); },
+                       .handler = [](CommandContext c) { return HandleSet(c.socket, c.engine, c.state, c.tail, c.state->resp); },
                        .arity = -3,
                        .firstKey = 1,
                        .lastKey = 1,
                        .keyStep = 1 },
         CommandEntry { .name = "SETEX",
-                       .handler = [](CommandContext c) { return HandleSetEx(c.socket, c.engine, c.tail, /*millis*/ false); },
+                       .handler = [](CommandContext c) {
+                           return HandleSetEx(c.socket, c.engine, c.state, c.tail, /*millis*/ false);
+                       },
                        .arity = 4,
                        .firstKey = 1,
                        .lastKey = 1,
                        .keyStep = 1 },
         CommandEntry { .name = "PSETEX",
-                       .handler = [](CommandContext c) { return HandleSetEx(c.socket, c.engine, c.tail, /*millis*/ true); },
+                       .handler = [](CommandContext c) {
+                           return HandleSetEx(c.socket, c.engine, c.state, c.tail, /*millis*/ true);
+                       },
                        .arity = 4,
                        .firstKey = 1,
                        .lastKey = 1,
                        .keyStep = 1 },
         CommandEntry { .name = "DEL",
-                       .handler = [](CommandContext c) { return HandleDel(c.socket, c.engine, c.tail); },
+                       .handler = [](CommandContext c) { return HandleDel(c.socket, c.engine, c.state, c.tail); },
                        .arity = -2,
                        .firstKey = 1,
                        .lastKey = -1,
                        .keyStep = 1 },
         CommandEntry { .name = "UNLINK",
-                       .handler = [](CommandContext c) { return HandleDel(c.socket, c.engine, c.tail); },
+                       .handler = [](CommandContext c) { return HandleDel(c.socket, c.engine, c.state, c.tail); },
                        .arity = -2,
                        .firstKey = 1,
                        .lastKey = -1,
@@ -2068,18 +2284,21 @@ namespace
                        .keyStep = 1 },
         // TTL / EXPIRE family. EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT share one
         // parametric handler (data: time unit + absolute-vs-relative).
-        CommandEntry {
-            .name = "EXPIRE",
-            .handler =
-                [](CommandContext c) { return HandleExpire(c.socket, c.engine, c.tail, "expire", TtlUnit::Seconds, false); },
-            .arity = 3,
-            .firstKey = 1,
-            .lastKey = 1,
-            .keyStep = 1 },
+        CommandEntry { .name = "EXPIRE",
+                       .handler =
+                           [](CommandContext c) {
+                               return HandleExpire(
+                                   c.socket, c.engine, c.state, c.tail, "expire", TtlUnit::Seconds, false);
+                           },
+                       .arity = 3,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
         CommandEntry { .name = "PEXPIRE",
                        .handler =
                            [](CommandContext c) {
-                               return HandleExpire(c.socket, c.engine, c.tail, "pexpire", TtlUnit::Milliseconds, false);
+                               return HandleExpire(
+                                   c.socket, c.engine, c.state, c.tail, "pexpire", TtlUnit::Milliseconds, false);
                            },
                        .arity = 3,
                        .firstKey = 1,
@@ -2088,7 +2307,7 @@ namespace
         CommandEntry { .name = "EXPIREAT",
                        .handler =
                            [](CommandContext c) {
-                               return HandleExpire(c.socket, c.engine, c.tail, "expireat", TtlUnit::Seconds, true);
+                               return HandleExpire(c.socket, c.engine, c.state, c.tail, "expireat", TtlUnit::Seconds, true);
                            },
                        .arity = 3,
                        .firstKey = 1,
@@ -2097,7 +2316,8 @@ namespace
         CommandEntry { .name = "PEXPIREAT",
                        .handler =
                            [](CommandContext c) {
-                               return HandleExpire(c.socket, c.engine, c.tail, "pexpireat", TtlUnit::Milliseconds, true);
+                               return HandleExpire(
+                                   c.socket, c.engine, c.state, c.tail, "pexpireat", TtlUnit::Milliseconds, true);
                            },
                        .arity = 3,
                        .firstKey = 1,
@@ -2117,7 +2337,7 @@ namespace
             .lastKey = 1,
             .keyStep = 1 },
         CommandEntry { .name = "PERSIST",
-                       .handler = [](CommandContext c) { return HandlePersist(c.socket, c.engine, c.tail); },
+                       .handler = [](CommandContext c) { return HandlePersist(c.socket, c.engine, c.state, c.tail); },
                        .arity = 2,
                        .firstKey = 1,
                        .lastKey = 1,
@@ -2125,13 +2345,19 @@ namespace
         // Integer atomics. INCR/DECR are fixed-magnitude; INCRBY/DECRBY take a
         // signed delta as a second arg (DECRBY negates before applying).
         CommandEntry { .name = "INCR",
-                       .handler = [](CommandContext c) { return HandleIncrDecr(c.socket, c.engine, c.tail, "incr", +1); },
+                       .handler =
+                           [](CommandContext c) {
+                               return HandleIncrDecr(c.socket, c.engine, c.state, c.tail, "incr", +1);
+                           },
                        .arity = 2,
                        .firstKey = 1,
                        .lastKey = 1,
                        .keyStep = 1 },
         CommandEntry { .name = "DECR",
-                       .handler = [](CommandContext c) { return HandleIncrDecr(c.socket, c.engine, c.tail, "decr", -1); },
+                       .handler =
+                           [](CommandContext c) {
+                               return HandleIncrDecr(c.socket, c.engine, c.state, c.tail, "decr", -1);
+                           },
                        .arity = 2,
                        .firstKey = 1,
                        .lastKey = 1,
@@ -2139,20 +2365,23 @@ namespace
         CommandEntry { .name = "INCRBY",
                        .handler =
                            [](CommandContext c) {
-                               return HandleIncrDecrByVerb(c.socket, c.engine, c.tail, "incrby", /*negate*/ false);
+                               return HandleIncrDecrByVerb(
+                                   c.socket, c.engine, c.state, c.tail, "incrby", /*negate*/ false);
                            },
                        .arity = 3,
                        .firstKey = 1,
                        .lastKey = 1,
                        .keyStep = 1 },
-        CommandEntry {
-            .name = "DECRBY",
-            .handler =
-                [](CommandContext c) { return HandleIncrDecrByVerb(c.socket, c.engine, c.tail, "decrby", /*negate*/ true); },
-            .arity = 3,
-            .firstKey = 1,
-            .lastKey = 1,
-            .keyStep = 1 },
+        CommandEntry { .name = "DECRBY",
+                       .handler =
+                           [](CommandContext c) {
+                               return HandleIncrDecrByVerb(
+                                   c.socket, c.engine, c.state, c.tail, "decrby", /*negate*/ true);
+                           },
+                       .arity = 3,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
         // Batch GET/SET. MSET / MSETNX have a 2-step keyStep (key, value, key,
         // value, …); MGET is a contiguous key list.
         CommandEntry { .name = "MGET",
@@ -2162,13 +2391,13 @@ namespace
                        .lastKey = -1,
                        .keyStep = 1 },
         CommandEntry { .name = "MSET",
-                       .handler = [](CommandContext c) { return HandleMset(c.socket, c.engine, c.tail); },
+                       .handler = [](CommandContext c) { return HandleMset(c.socket, c.engine, c.state, c.tail); },
                        .arity = -3,
                        .firstKey = 1,
                        .lastKey = -1,
                        .keyStep = 2 },
         CommandEntry { .name = "MSETNX",
-                       .handler = [](CommandContext c) { return HandleMsetNx(c.socket, c.engine, c.tail); },
+                       .handler = [](CommandContext c) { return HandleMsetNx(c.socket, c.engine, c.state, c.tail); },
                        .arity = -3,
                        .firstKey = 1,
                        .lastKey = -1,
@@ -2234,13 +2463,13 @@ namespace
                        .lastKey = 0,
                        .keyStep = 0 },
         CommandEntry { .name = "SADD",
-                       .handler = [](CommandContext c) { return HandleSAdd(c.socket, c.engine, c.tail); },
+                       .handler = [](CommandContext c) { return HandleSAdd(c.socket, c.engine, c.state, c.tail); },
                        .arity = -3,
                        .firstKey = 1,
                        .lastKey = 1,
                        .keyStep = 1 },
         CommandEntry { .name = "SREM",
-                       .handler = [](CommandContext c) { return HandleSRem(c.socket, c.engine, c.tail); },
+                       .handler = [](CommandContext c) { return HandleSRem(c.socket, c.engine, c.state, c.tail); },
                        .arity = -3,
                        .firstKey = 1,
                        .lastKey = 1,
@@ -2272,7 +2501,8 @@ namespace
                        .lastKey = 1,
                        .keyStep = 1 },
         CommandEntry { .name = "SPOP",
-                       .handler = [](CommandContext c) { return HandleSPop(c.socket, c.engine, c.tail, c.state->resp); },
+                       .handler =
+                           [](CommandContext c) { return HandleSPop(c.socket, c.engine, c.state, c.tail, c.state->resp); },
                        .arity = -2,
                        .firstKey = 1,
                        .lastKey = 1,
@@ -2284,7 +2514,7 @@ namespace
                        .lastKey = 0,
                        .keyStep = 0 },
         CommandEntry { .name = "INCRBYFLOAT",
-                       .handler = [](CommandContext c) { return HandleIncrByFloat(c.socket, c.engine, c.tail); },
+                       .handler = [](CommandContext c) { return HandleIncrByFloat(c.socket, c.engine, c.state, c.tail); },
                        .arity = 3,
                        .firstKey = 1,
                        .lastKey = 1,
@@ -2346,6 +2576,36 @@ namespace
                                                             c.state);
                            },
                        .arity = -2,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "MULTI",
+                       .handler = [](CommandContext c) { return HandleMulti(c.socket, c.state); },
+                       .arity = 1,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "EXEC",
+                       .handler = [](CommandContext c) { return HandleExec(c.socket, c.engine, c.session, c.state); },
+                       .arity = 1,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "DISCARD",
+                       .handler = [](CommandContext c) { return HandleDiscard(c.socket, c.state); },
+                       .arity = 1,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
+        CommandEntry { .name = "WATCH",
+                       .handler = [](CommandContext c) { return HandleWatch(c.socket, c.engine, c.state, c.tail); },
+                       .arity = -2,
+                       .firstKey = 1,
+                       .lastKey = -1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "UNWATCH",
+                       .handler = [](CommandContext c) { return HandleUnwatch(c.socket, c.state); },
+                       .arity = 1,
                        .firstKey = 0,
                        .lastKey = 0,
                        .keyStep = 0 },
@@ -2422,6 +2682,12 @@ namespace
             session.pubsub->UnsubscribeAll(state->subscriber.get());
         state->subscriptionCount = 0;
         state->resp = RespVersion::Resp2;
+        // Redis RESET also clears any in-flight transaction and WATCH set.
+        state->inMulti = false;
+        state->multiDirty = false;
+        state->queue.clear();
+        if (state->watch && state->watchRegistry != nullptr)
+            state->watchRegistry->UnregisterAll(state->watch.get());
         co_return co_await WriteAll(socket, "+RESET\r\n");
     }
 
@@ -2471,6 +2737,44 @@ namespace
         }
         if (name == "RESET")
             co_return co_await HandleReset(socket, session, state);
+
+        // Inside `MULTI`, every non-transaction-control command is queued
+        // instead of executed; the dispatcher then replies `+QUEUED`. We
+        // still consult the table for an arity / unknown-command check at
+        // queue time so the matching `EXEC` aborts (`-EXECABORT`) — matches
+        // redis's `MULTI_DIRTY_EXEC` semantics.
+        if (state->inMulti && !IsTransactionControl(name))
+        {
+            auto const idx = CommandTableFind(name);
+            if (!idx.has_value())
+            {
+                state->multiDirty = true;
+                co_return co_await ReplyError(socket, std::format("unknown command '{}'", name));
+            }
+            auto const arity = CommandTableArity(*idx);
+            auto const actual = static_cast<std::int32_t>(cmd.args.size());
+            bool const arityOk = (arity >= 0) ? (actual == arity) : (actual >= -arity);
+            if (!arityOk)
+            {
+                state->multiDirty = true;
+                co_return co_await ReplyError(socket, std::format("wrong number of arguments for '{}'", name));
+            }
+            state->queue.push_back(std::move(cmd.args));
+            co_return co_await WriteAll(socket, "+QUEUED\r\n");
+        }
+
+        // Transaction-control verbs sit outside the data table because they
+        // need ConnectionState (queue + watch handle) directly.
+        if (name == "MULTI")
+            co_return co_await HandleMulti(socket, state);
+        if (name == "EXEC")
+            co_return co_await HandleExec(socket, engine, session, state);
+        if (name == "DISCARD")
+            co_return co_await HandleDiscard(socket, state);
+        if (name == "WATCH")
+            co_return co_await HandleWatch(socket, engine, state, tail);
+        if (name == "UNWATCH")
+            co_return co_await HandleUnwatch(socket, state);
 
         // Table lookup by name. A range-based scan keeps this portable: MSVC's
         // std::array iterator is a class type (not a raw pointer like libstdc++),
@@ -2532,6 +2836,9 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
     ConnectionState state;
     auto const initialAuth = session.CurrentAuth();
     state.authenticated = !(initialAuth != nullptr && initialAuth->Enabled());
+    // Cache the WATCH registry pointer once so per-write-verb mutation hooks
+    // do not have to chase it through SessionContext at every callsite.
+    state.watchRegistry = session.watches;
 
     // The subscriber is heap-allocated and held via shared_ptr so the registry's
     // weak_ptr upgrade in Publish (and the long-lived readable-watcher detached
@@ -2549,6 +2856,10 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
         // Trip any latch the watcher is parked on so its coroutine frame is
         // freed promptly, instead of leaking until the daemon exits.
         subscriber->ShutdownWatcher();
+        // Drop every WATCH index entry referencing this connection so a stale
+        // weak_ptr cannot be upgraded by a later Touched call.
+        if (state.watch && state.watchRegistry != nullptr)
+            state.watchRegistry->UnregisterAll(state.watch.get());
     };
 
     while (true)

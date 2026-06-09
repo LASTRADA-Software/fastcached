@@ -32,6 +32,7 @@
 #include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Protocol/PubSubRegistry.hpp>
+#include <FastCache/Protocol/RedisTransaction.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 #if defined(FC_TLS_ENABLED)
@@ -532,6 +533,11 @@ int DaemonBody(FastCache::Config const& effective)
     // connection (RESP PUBLISH/SUBSCRIBE). Lives for the whole server run.
     FastCache::PubSubRegistry pubsub;
     serverOpts.session.pubsub = &pubsub;
+    // Redis transaction WATCH registry: one instance shared across every
+    // connection so a write on connection A flips the dirty flag on every
+    // WATCH snapshot taken by connection B. Lives for the whole server run.
+    FastCache::WatchRegistry watches;
+    serverOpts.session.watches = &watches;
 #if defined(FC_TLS_ENABLED)
     serverOpts.tlsContext = tlsContext.get(); // null unless --tls is active
 #endif

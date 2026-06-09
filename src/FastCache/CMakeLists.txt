@@ -44,6 +44,7 @@ target_sources(FastCache
         Protocol/ProtocolAutodetect.cpp
         Protocol/PubSubRegistry.cpp
         Protocol/RedisResp.cpp
+        Protocol/RedisTransaction.cpp
         Server/AdminHttpServer.cpp
         Server/Connection.cpp
         Server/ReactorServerLoop.cpp
