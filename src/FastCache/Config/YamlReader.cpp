@@ -89,6 +89,117 @@ namespace
         }
     }
 
+    /// Parse one entry of a `listeners:` YAML sequence into a `BindConfig`.
+    /// Required fields: `address` (string), `port` (1..65535). Optional: `tls`
+    /// (boolean, defaults to false). Any other key is rejected so a typo
+    /// (`tsl: true`) fails fast instead of silently disabling TLS.
+    /// @param node The YAML node for one listener entry (must be a Map).
+    /// @param path Source YAML file for error reporting.
+    /// @param idx  Zero-based index within the `listeners:` sequence.
+    /// @return The populated BindConfig, or ConfigError on malformed input.
+    /// One-based YAML source line for an error message. yaml-cpp's `Mark::line`
+    /// is zero-based and signed; this normalises to the human convention.
+    [[nodiscard]] unsigned YamlLine(YAML::Node const& node) noexcept
+    {
+        auto const raw = node.Mark().line;
+        return raw < 0 ? 0U : static_cast<unsigned>(raw) + 1U;
+    }
+
+    [[nodiscard]] std::expected<BindConfig, ConfigError> ParseListenerEntry(YAML::Node const& node,
+                                                                            std::filesystem::path const& path,
+                                                                            std::size_t idx)
+    {
+        auto field = std::string { "listeners[" };
+        field += std::to_string(idx);
+        field += ']';
+        if (!node.IsMap())
+            return std::unexpected(MakeError(
+                ConfigErrorCode::TypeMismatch, path, field, "expected a map with address/port/tls", YamlLine(node)));
+        BindConfig bind {};
+        bool sawAddress = false;
+        bool sawPort = false;
+        for (auto const& kv: node)
+        {
+            auto const k = kv.first.as<std::string>();
+            auto const line = YamlLine(kv.second);
+            if (k == "address")
+            {
+                bind.address = kv.second.as<std::string>();
+                sawAddress = true;
+            }
+            else if (k == "port")
+            {
+                auto const raw = kv.second.as<int>();
+                if (raw <= 0 || raw > 65535)
+                {
+                    auto portField = field;
+                    portField += ".port";
+                    return std::unexpected(
+                        MakeError(ConfigErrorCode::OutOfRange, path, std::move(portField), "must be in 1..65535", line));
+                }
+                bind.port = static_cast<std::uint16_t>(raw);
+                sawPort = true;
+            }
+            else if (k == "tls")
+            {
+                bind.tls = kv.second.as<bool>();
+            }
+            else
+            {
+                auto unknownField = field;
+                unknownField += '.';
+                unknownField += k;
+                return std::unexpected(MakeError(
+                    ConfigErrorCode::ParseError, path, std::move(unknownField), "unknown listener field", line));
+            }
+        }
+        if (!sawAddress)
+        {
+            auto missingField = field;
+            missingField += ".address";
+            return std::unexpected(MakeError(
+                ConfigErrorCode::ParseError, path, std::move(missingField), "missing required field", YamlLine(node)));
+        }
+        if (!sawPort)
+        {
+            auto missingField = field;
+            missingField += ".port";
+            return std::unexpected(MakeError(
+                ConfigErrorCode::ParseError, path, std::move(missingField), "missing required field", YamlLine(node)));
+        }
+        return bind;
+    }
+
+    /// Parse the top-level `listeners:` YAML sequence into `cfg.binds`.
+    /// Extracted from ApplyEntry to keep that function under the
+    /// cognitive-complexity threshold; the body is just a sequence loop with
+    /// validation around it.
+    [[nodiscard]] std::expected<void, ConfigError> ApplyListenersKey(Config& cfg,
+                                                                     YAML::Node const& valueNode,
+                                                                     std::filesystem::path const& path,
+                                                                     unsigned line)
+    {
+        if (!valueNode.IsSequence())
+            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch,
+                                             path,
+                                             "listeners",
+                                             "expected a sequence of {address, port, tls?} maps",
+                                             line));
+        if (valueNode.size() == 0)
+            return std::unexpected(
+                MakeError(ConfigErrorCode::ParseError, path, "listeners", "listener sequence must not be empty", line));
+        cfg.binds.clear();
+        cfg.binds.reserve(valueNode.size());
+        for (std::size_t i = 0; i < valueNode.size(); ++i)
+        {
+            auto entry = ParseListenerEntry(valueNode[i], path, i);
+            if (!entry.has_value())
+                return std::unexpected(std::move(entry).error());
+            cfg.binds.push_back(*entry);
+        }
+        return {};
+    }
+
     [[nodiscard]] std::expected<void, ConfigError> ApplyEntry(
         Config& cfg, std::string const& key, YAML::Node const& valueNode, std::filesystem::path const& path, unsigned line)
     {
@@ -210,6 +321,14 @@ namespace
             cfg.notifyKeyspaceEvents = valueNode.as<std::string>();
             return {};
         }
+        /// `listeners`: sequence of {address, port, tls?} maps. Populates
+        /// `cfg.binds`. When present, supersedes the legacy single-bind
+        /// `bind:` / `port:` fields. Empty sequence is rejected — the
+        /// operator likely meant to write a list and is asking for a footgun
+        /// (a daemon that comes up with zero listeners would still pass the
+        /// legacy fallback in main.cpp and may not be what they intended).
+        if (key == "listeners")
+            return ApplyListenersKey(cfg, valueNode, path, line);
         /// `storage_durability`: fsync|batched|none.
         if (key == "storage_durability")
         {

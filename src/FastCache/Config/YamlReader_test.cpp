@@ -111,3 +111,75 @@ TEST_CASE("YamlReader: threading_model is no longer accepted", "[config][yaml]")
     REQUIRE_FALSE(cfg.has_value());
     REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::UnknownKey);
 }
+
+TEST_CASE("YamlReader: listeners sequence populates cfg.binds", "[config][yaml][listeners]")
+{
+    auto const path = WriteTempYaml("listeners-ok",
+                                    "listeners:\n"
+                                    "  - address: 0.0.0.0\n"
+                                    "    port: 11211\n"
+                                    "  - address: 0.0.0.0\n"
+                                    "    port: 6380\n"
+                                    "    tls: true\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE(cfg.has_value());
+    REQUIRE(cfg->binds.size() == 2);
+    REQUIRE(cfg->binds[0].address == "0.0.0.0");
+    REQUIRE(cfg->binds[0].port == 11211U);
+    REQUIRE_FALSE(cfg->binds[0].tls);
+    REQUIRE(cfg->binds[1].port == 6380U);
+    REQUIRE(cfg->binds[1].tls);
+}
+
+TEST_CASE("YamlReader: listeners with missing port is rejected", "[config][yaml][listeners]")
+{
+    auto const path = WriteTempYaml("listeners-noport",
+                                    "listeners:\n"
+                                    "  - address: 0.0.0.0\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE_FALSE(cfg.has_value());
+    REQUIRE(cfg.error().field == "listeners[0].port");
+}
+
+TEST_CASE("YamlReader: listeners with unknown field is rejected", "[config][yaml][listeners]")
+{
+    // A typo like `tsl` instead of `tls` must fail fast — otherwise the
+    // operator silently ships a daemon that comes up plaintext.
+    auto const path = WriteTempYaml("listeners-typo",
+                                    "listeners:\n"
+                                    "  - address: 0.0.0.0\n"
+                                    "    port: 6380\n"
+                                    "    tsl: true\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE_FALSE(cfg.has_value());
+    REQUIRE(cfg.error().field == "listeners[0].tsl");
+}
+
+TEST_CASE("YamlReader: listeners with non-sequence is rejected", "[config][yaml][listeners]")
+{
+    auto const path = WriteTempYaml("listeners-scalar", "listeners: 6379\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE_FALSE(cfg.has_value());
+    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::TypeMismatch);
+    REQUIRE(cfg.error().field == "listeners");
+}
+
+TEST_CASE("YamlReader: listeners empty sequence is rejected", "[config][yaml][listeners]")
+{
+    auto const path = WriteTempYaml("listeners-empty", "listeners: []\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE_FALSE(cfg.has_value());
+    REQUIRE(cfg.error().field == "listeners");
+}
+
+TEST_CASE("YamlReader: listeners out-of-range port is rejected", "[config][yaml][listeners]")
+{
+    auto const path = WriteTempYaml("listeners-bigport",
+                                    "listeners:\n"
+                                    "  - address: 0.0.0.0\n"
+                                    "    port: 99999\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE_FALSE(cfg.has_value());
+    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::OutOfRange);
+}
+

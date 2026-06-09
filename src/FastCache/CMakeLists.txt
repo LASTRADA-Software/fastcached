@@ -17,6 +17,7 @@ target_sources(FastCache
         Cache/TracingStorage.cpp
         Config/ByteSize.cpp
         Config/CliParser.cpp
+        Config/ConfigMerge.cpp
         Config/ConfigReloader.cpp
         Config/YamlReader.cpp
         Core/Crc32c.cpp

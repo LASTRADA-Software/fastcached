@@ -18,6 +18,7 @@
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
+#include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -119,66 +120,6 @@ void InstallStopHandlers()
 #if !defined(_WIN32)
     std::signal(SIGHUP, &HandleReloadSignal);
 #endif
-}
-
-/// Merge CLI flags into the YAML-loaded Config. A CLI value overrides
-/// the file value when the corresponding flag was explicitly passed —
-/// driven by the per-flag "explicit" booleans on `CliResult`, not by
-/// value comparison against the default. The latter would silently
-/// drop `--threads=0` / `--storage-shards=0` / `--storage-durability=batched`
-/// / any other typed value that matches the field's default.
-FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& cli)
-{
-    auto const& cliCfg = cli.config;
-    if (cli.bindAddressExplicit)
-        fileCfg.bindAddress = cliCfg.bindAddress;
-    if (cli.portExplicit)
-        fileCfg.port = cliCfg.port;
-    if (cli.maxMemoryBytesExplicit)
-        fileCfg.maxMemoryBytes = cliCfg.maxMemoryBytes;
-    if (cli.logLevelExplicit)
-        fileCfg.logLevel = cliCfg.logLevel;
-    if (!cliCfg.configPath.empty())
-        fileCfg.configPath = cliCfg.configPath;
-    if (cliCfg.daemon)
-        fileCfg.daemon = true;
-    if (!cliCfg.pidfile.empty())
-        fileCfg.pidfile = cliCfg.pidfile;
-    if (cliCfg.serviceName != FastCache::Config {}.serviceName)
-        fileCfg.serviceName = cliCfg.serviceName;
-    if (cli.storagePathExplicit)
-        fileCfg.storagePath = cliCfg.storagePath;
-    if (cli.storageDurabilityExplicit)
-        fileCfg.storageDurability = cliCfg.storageDurability;
-    if (cli.storageMaxValueBytesExplicit)
-        fileCfg.storageMaxValueBytes = cliCfg.storageMaxValueBytes;
-    if (cli.workerThreadsExplicit)
-        fileCfg.workerThreads = cliCfg.workerThreads;
-    if (cli.storageShardsExplicit)
-        fileCfg.storageShards = cliCfg.storageShards;
-    if (cli.listenBacklogExplicit)
-        fileCfg.listenBacklog = cliCfg.listenBacklog;
-    if (cli.logTimestampsExplicit)
-        fileCfg.logTimestamps = cliCfg.logTimestamps;
-    if (cli.requirePassExplicit)
-        fileCfg.requirePass = cliCfg.requirePass;
-    if (cli.authUsernameExplicit)
-        fileCfg.authUsername = cliCfg.authUsername;
-    if (cli.metricsEnabledExplicit)
-        fileCfg.metricsEnabled = cliCfg.metricsEnabled;
-    if (cli.metricsBindAddressExplicit)
-        fileCfg.metricsBindAddress = cliCfg.metricsBindAddress;
-    if (cli.metricsPortExplicit)
-        fileCfg.metricsPort = cliCfg.metricsPort;
-    if (cli.tlsEnabledExplicit)
-        fileCfg.tlsEnabled = cliCfg.tlsEnabled;
-    if (cli.tlsCertPathExplicit)
-        fileCfg.tlsCertPath = cliCfg.tlsCertPath;
-    if (cli.tlsKeyPathExplicit)
-        fileCfg.tlsKeyPath = cliCfg.tlsKeyPath;
-    if (cli.notifyKeyspaceEventsExplicit)
-        fileCfg.notifyKeyspaceEvents = cliCfg.notifyKeyspaceEvents;
-    return fileCfg;
 }
 
 /// Pick a default shard count when the user left it at 0 (auto):
@@ -539,6 +480,14 @@ int DaemonBody(FastCache::Config const& effective)
         serverOpts.binds.push_back(
             FastCache::BindConfig { .address = effective.bindAddress, .port = effective.port, .tls = effective.tlsEnabled });
     }
+    // Reject duplicate {address, port} endpoints before we hit the kernel:
+    // SO_REUSEPORT would let both bind succeed and silently split traffic
+    // 50/50 between mismatched protocols (plaintext vs TLS).
+    if (auto const v = FastCache::ValidateBinds(serverOpts.binds); !v.has_value())
+    {
+        logger.Logf(FastCache::LogLevel::Fatal, "fastcached: {}", v.error().context);
+        return EXIT_FAILURE;
+    }
     serverOpts.listenBacklog = effective.listenBacklog;
     // One reactor per core (each single-threaded, connections pinned). One
     // reactor = a single event loop; N reactors scale across cores without any
@@ -676,7 +625,7 @@ int main(int argc, char const* const* argv)
             return EXIT_FAILURE;
         }
         metricsPortYamlExplicit = loaded->metricsPortExplicit;
-        effective = Merge(std::move(loaded->config), *parsed);
+        effective = FastCache::Merge(std::move(loaded->config), *parsed);
         effective.configPath = parsed->config.configPath;
     }
     else
