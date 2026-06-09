@@ -13,6 +13,7 @@ target_sources(FastCache
         Cache/CowTreeStorage.cpp
         Cache/InMemoryLruStorage.cpp
         Cache/LayeredStorage.cpp
+        Cache/NotifyingStorage.cpp
         Cache/ShardedStorage.cpp
         Cache/TracingStorage.cpp
         Config/ByteSize.cpp
@@ -45,6 +46,7 @@ target_sources(FastCache
         Protocol/ProtocolAutodetect.cpp
         Protocol/KeyspaceNotifier.cpp
         Protocol/PubSubRegistry.cpp
+        Protocol/RedisMutationObserver.cpp
         Protocol/RedisResp.cpp
         Protocol/RedisTransaction.cpp
         Server/AdminHttpServer.cpp

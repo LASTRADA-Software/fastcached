@@ -155,9 +155,8 @@ namespace
     [[nodiscard]] std::expected<BindConfig, ConfigError> ParseListenSpec(std::string_view sv, bool tls)
     {
         if (sv.empty())
-            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch,
-                                             tls ? "listen-tls" : "listen",
-                                             "empty value (expected host:port)"));
+            return std::unexpected(
+                MakeError(ConfigErrorCode::TypeMismatch, tls ? "listen-tls" : "listen", "empty value (expected host:port)"));
         std::string_view host;
         std::string_view portText;
         if (sv.front() == '[')
@@ -179,9 +178,8 @@ namespace
             // unbracketed IPv6 we reject (the standard requires brackets).
             auto const colon = sv.rfind(':');
             if (colon == std::string_view::npos)
-                return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch,
-                                                 tls ? "listen-tls" : "listen",
-                                                 std::format("missing :port in: {}", sv)));
+                return std::unexpected(MakeError(
+                    ConfigErrorCode::TypeMismatch, tls ? "listen-tls" : "listen", std::format("missing :port in: {}", sv)));
             host = sv.substr(0, colon);
             portText = sv.substr(colon + 1);
             // Reject unbracketed IPv6 literals: if `host` contains a `:`
@@ -189,9 +187,10 @@ namespace
             // here with host=`2001:db8:` and portText=`1`). The comment
             // above promises rejection; the code now matches.
             if (host.contains(':'))
-                return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch,
-                                                 tls ? "listen-tls" : "listen",
-                                                 std::format("IPv6 literal requires brackets: [{}]:port (got: {})", host, sv)));
+                return std::unexpected(
+                    MakeError(ConfigErrorCode::TypeMismatch,
+                              tls ? "listen-tls" : "listen",
+                              std::format("IPv6 literal requires brackets: [{}]:port (got: {})", host, sv)));
         }
         auto const address = ParseBindAddress(host);
         if (!address.has_value())

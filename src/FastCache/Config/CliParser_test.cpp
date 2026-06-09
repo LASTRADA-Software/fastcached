@@ -529,7 +529,7 @@ TEST_CASE("CliParser: --listen without :port rejects with TypeMismatch", "[confi
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
 }
 
-TEST_CASE("CliParser: --listen rejects malformed [ipv6 spec", "[config][cli][bind]")
+TEST_CASE("CliParser: --listen rejects malformed (ipv6) spec", "[config][cli][bind]")
 {
     auto const args = std::array<char const*, 1> { "--listen=[::1:11211" };
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
@@ -554,8 +554,7 @@ TEST_CASE("CliParser: --listen rejects unbracketed IPv6 literal with a clear dia
     REQUIRE(result.error().context.contains("brackets"));
 }
 
-TEST_CASE("CliParser: --listen-tls rejects unbracketed IPv6 literal too",
-          "[config][cli][bind][ipv6-bracket-required]")
+TEST_CASE("CliParser: --listen-tls rejects unbracketed IPv6 literal too", "[config][cli][bind][ipv6-bracket-required]")
 {
     // Symmetric guard for the --listen-tls path (shared parser).
     auto const args = std::array<char const*, 1> { "--listen-tls=2001:db8::1" };

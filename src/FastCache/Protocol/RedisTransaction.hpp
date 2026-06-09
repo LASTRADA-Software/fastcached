@@ -35,7 +35,14 @@ class WatchHandle
     /// @param cas Current CAS token (0 = key absent at snapshot time).
     void Remember(std::string_view key, CasToken cas);
 
-    /// Forget every snapshot (UNWATCH / DISCARD / EXEC tail).
+    /// Forget every snapshot (UNWATCH / DISCARD / EXEC tail). Does NOT
+    /// reset the dirty flag — that is the exclusive responsibility of
+    /// `ClaimAndClearDirty`. If `Clear` also stored `_dirty=false`, a
+    /// racing `Touched` whose `MarkDirty` happens BETWEEN the registry
+    /// index erase and `Clear` would be silently wiped (the EXEC race).
+    /// Callers that need to drop the dirty bit too must do so explicitly
+    /// via `ClaimAndClearDirty` (which atomically exchanges, so no racing
+    /// MarkDirty is lost across the read).
     void Clear() noexcept;
 
     /// Currently-watched keys, for the registry to walk on UnregisterAll.
@@ -90,7 +97,11 @@ class WatchRegistry
     /// handle.
     /// @param handle The connection's handle.
     /// @param key    Lookup key.
-    void Register(std::shared_ptr<WatchHandle> const& handle, std::string_view key);
+    /// @return True iff a fresh (handle, key) entry was inserted; false on
+    ///         idempotent re-register (already present from an earlier
+    ///         WATCH call). Callers driving partial-failure rollback use
+    ///         this to avoid Unregister-ing the prior registration.
+    [[nodiscard]] bool Register(std::shared_ptr<WatchHandle> const& handle, std::string_view key);
 
     /// Drop a single (handle, key) index entry. Used by `HandleWatch`'s
     /// partial-failure rollback so a failing later WATCH does NOT wipe keys
@@ -116,6 +127,15 @@ class WatchRegistry
     /// mutation succeeds. Flips MarkDirty on every handle subscribed to `key`.
     /// Returns the number of handles dirtied (mainly useful for tests).
     std::size_t Touched(std::string_view key);
+
+    /// Whole-database mutation hook for FLUSHDB / flush_all. Flips
+    /// MarkDirty on every registered handle, regardless of which keys
+    /// the handle had been watching — the database-wide wipe
+    /// invalidates every WATCH snapshot. Returns the number of handles
+    /// dirtied. Steady-state cost when nothing is watched is a single
+    /// atomic load (the same lock-free fast path used by `Touched`).
+    /// @return Number of WatchHandles dirtied by this call.
+    std::size_t TouchedAll();
 
     /// Lock-free fast path: true iff at least one handle is currently
     /// registered for some key. Callers in hot paths (MSET/DEL multi-key

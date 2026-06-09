@@ -7,7 +7,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <cstdlib>
+#include <string>
 
 TEST_CASE("RunReactorServer rejects a TLS-flagged bind when no TLS context is configured",
           "[server][reactor-loop][tls-null-guard]")
@@ -42,35 +44,103 @@ TEST_CASE("RunReactorServer rejects a TLS-flagged bind when no TLS context is co
     REQUIRE(exitCode == EXIT_FAILURE);
 }
 
-TEST_CASE("RunReactorServer accepts a plaintext bind without a TLS context",
+TEST_CASE("Detail::VerifyTlsContextForTlsBinds accepts a plaintext bind without a TLS context",
           "[server][reactor-loop][tls-null-guard]")
 {
-    // Symmetric guard: the new TLS check must NOT reject plaintext binds
-    // when the context is null — that would break every non-TLS daemon.
-    // We can't actually run the server to completion (it would block on
-    // accept), so we only test that VerifyTlsContextForTlsBinds returns
-    // success: invoke a tiny stand-alone scenario via an unbindable
-    // address (a non-routable address) so RunSingleReactor fails the
-    // bind step rather than the TLS check, returning EXIT_FAILURE for a
-    // different reason.
+    // Symmetric guard: the TLS check must NOT reject plaintext binds when
+    // the context is null — that would break every non-TLS daemon. The
+    // verifier is now exposed in the FastCache::Detail namespace so we
+    // can drive it directly without spawning a real listener.
     //
-    // The easier observable contract: with tls=false on every bind, the
-    // TLS check is a no-op. We exercise this by constructing options
-    // identical to the failing test above EXCEPT tls=false, and check
-    // that RunReactorServer's failure path is NOT the TLS guard's log
-    // line (Fatal "TLS bind ... requested but no TLS context"). A bind
-    // failure path returns the same EXIT_FAILURE, so a CapturingLogger
-    // would let us distinguish them — but the project's NullLogger drops
-    // every record. Instead, assert the behavioural contract: tls=false
-    // + tlsContext=nullptr is a VALID configuration that the guard
-    // accepts. The downstream bind() may fail on port=0 selection or
-    // another reason, but the guard itself does not.
+    // Pre-fix this test was a SUCCEED-only stub that asserted nothing;
+    // any regression tightening the guard to "context required for every
+    // bind" would have passed CI while breaking every plaintext daemon.
+    FastCache::CapturingLogger logger;
+    FastCache::ReactorServerOptions options;
+    options.binds.push_back(FastCache::BindConfig { .address = "127.0.0.1", .port = 0, .tls = false });
+    options.tlsContext = nullptr;
+
+    auto const exitCode = FastCache::Detail::VerifyTlsContextForTlsBinds(options, logger);
+    REQUIRE(exitCode == EXIT_SUCCESS);
+    // No fatal diagnostic was emitted.
+    REQUIRE(logger.Snapshot().empty());
+}
+
+TEST_CASE("Detail::VerifyTlsContextForTlsBinds rejects a TLS-flagged bind with no context",
+          "[server][reactor-loop][tls-null-guard]")
+{
+    // Companion assertion to the integration test above: at the
+    // primitive level, a TLS-flagged bind with a null context must
+    // produce EXIT_FAILURE with a Fatal log record naming the bind.
+    FastCache::CapturingLogger logger;
+    FastCache::ReactorServerOptions options;
+    options.binds.push_back(FastCache::BindConfig { .address = "127.0.0.1", .port = 6379, .tls = true });
+    options.tlsContext = nullptr;
+
+    auto const exitCode = FastCache::Detail::VerifyTlsContextForTlsBinds(options, logger);
+    REQUIRE(exitCode == EXIT_FAILURE);
+
+    auto const records = logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(records.front().level == FastCache::LogLevel::Fatal);
+    REQUIRE(records.front().message.contains("TLS bind 127.0.0.1:6379"));
+    REQUIRE(records.front().message.contains("no TLS context"));
+}
+
+TEST_CASE("RunMultiReactorWindows-style stopAll is idempotent under double invocation",
+          "[server][reactor-loop][shutdown-guard]")
+{
+    // Finding #12: RunMultiReactorWindows invokes stopAll via two paths
+    // (the watchdog onStop on SIGINT, and an unconditional call at function
+    // tail). Pre-fix, both invocations ran the listener-close loop —
+    // closing every SOCKET handle twice. On Windows SOCKET handles are
+    // recyclable; a stale second close could land on a freshly-accepted
+    // unrelated socket that happened to receive the same numeric value.
     //
-    // We cannot run RunReactorServer here without it blocking on
-    // accept(), so the test is implicitly satisfied by the green
-    // tls-smoke / Server_test cases that already exercise the plaintext
-    // path. Document the invariant explicitly via this assertion-less
-    // test case so the test catalogue records the contract.
-    SUCCEED("plaintext bind without TLS context is a valid configuration "
-            "(exercised by all existing plaintext server tests)");
+    // The fix wraps stopAll in `std::atomic_flag::test_and_set`. This
+    // test exercises the structural guarantee: the wrapped lambda's
+    // side effects run exactly once even under repeated calls (we only
+    // test the structural pattern here because the production stopAll
+    // is a function-local lambda; the platform-specific behaviour is
+    // exercised by the end-to-end Server tests).
+    std::atomic_flag stopRun = ATOMIC_FLAG_INIT;
+    int closeCount = 0;
+    int stopCount = 0;
+    auto stopAll = [&] {
+        if (stopRun.test_and_set(std::memory_order_acq_rel))
+            return;
+        // Stand-in for the production "close every listenSock" + "stop
+        // every reactor" body. Production calls Detail::CloseNativeSocket
+        // and reactor->Stop, both of which would fire side effects.
+        ++closeCount;
+        ++stopCount;
+    };
+
+    stopAll();
+    stopAll();
+    stopAll();
+
+    REQUIRE(closeCount == 1);
+    REQUIRE(stopCount == 1);
+}
+
+TEST_CASE("Detail::VerifyTlsContextForTlsBinds accepts mixed plaintext+TLS binds when a context is set",
+          "[server][reactor-loop][tls-null-guard]")
+{
+    // The dual-listener (plaintext + TLS) scenario: a single shared
+    // TlsContext is enough for both binds; the verifier should not
+    // complain. We can't construct a real TlsContext without OpenSSL
+    // initialisation, but the verifier only checks the pointer for
+    // nullness, so a non-null dummy address is sufficient.
+    FastCache::CapturingLogger logger;
+    FastCache::ReactorServerOptions options;
+    options.binds.push_back(FastCache::BindConfig { .address = "127.0.0.1", .port = 6379, .tls = false });
+    options.binds.push_back(FastCache::BindConfig { .address = "127.0.0.1", .port = 6380, .tls = true });
+    // Non-null sentinel; the verifier only checks the pointer for nullness.
+    // reinterpret_cast is intentional — the verifier never dereferences.
+    options.tlsContext = reinterpret_cast<FastCache::TlsContext*>(0x1);
+
+    auto const exitCode = FastCache::Detail::VerifyTlsContextForTlsBinds(options, logger);
+    REQUIRE(exitCode == EXIT_SUCCESS);
+    REQUIRE(logger.Snapshot().empty());
 }

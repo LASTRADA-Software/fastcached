@@ -89,8 +89,7 @@ TEST_CASE("ConfigMerge: bindAddress/port from CLI override YAML even with binds 
     REQUIRE(merged.binds.empty());
 }
 
-TEST_CASE("ConfigMerge: explicit-bit drives override even when CLI value equals default",
-          "[config][merge]")
+TEST_CASE("ConfigMerge: explicit-bit drives override even when CLI value equals default", "[config][merge]")
 {
     // Regression guard for the original Merge design: typed flags use the
     // `explicit` bit, NOT value comparison. Setting --storage-shards=0 must
@@ -106,8 +105,7 @@ TEST_CASE("ConfigMerge: explicit-bit drives override even when CLI value equals 
     REQUIRE(merged.storageShards == 0U);
 }
 
-TEST_CASE("ConfigMerge: --service-name explicit value overrides YAML even when CLI equals default",
-          "[config][merge]")
+TEST_CASE("ConfigMerge: --service-name explicit value overrides YAML even when CLI equals default", "[config][merge]")
 {
     // serviceName previously used `cliCfg.serviceName != Config{}.serviceName`
     // (value comparison against the compiled default) instead of the
@@ -126,8 +124,7 @@ TEST_CASE("ConfigMerge: --service-name explicit value overrides YAML even when C
     REQUIRE(merged.serviceName == FastCache::Config {}.serviceName);
 }
 
-TEST_CASE("ConfigMerge: --service-name absent leaves YAML value intact",
-          "[config][merge]")
+TEST_CASE("ConfigMerge: --service-name absent leaves YAML value intact", "[config][merge]")
 {
     // Symmetric guard: without the explicit bit, the YAML value must win.
     FastCache::Config fileCfg {};
@@ -172,8 +169,7 @@ TEST_CASE("ValidateBinds: empty list is trivially valid", "[config][bind][valida
     REQUIRE(FastCache::ValidateBinds(binds).has_value());
 }
 
-TEST_CASE("ConfigMerge: --lru-mode strict overrides YAML default approximate",
-          "[config][merge][lru]")
+TEST_CASE("ConfigMerge: --lru-mode strict overrides YAML default approximate", "[config][merge][lru]")
 {
     // The original Merge() shipped without lruRecency/cpuAffinity propagation,
     // so `--config foo.yaml --lru-mode=strict` silently kept the YAML default.
@@ -188,8 +184,7 @@ TEST_CASE("ConfigMerge: --lru-mode strict overrides YAML default approximate",
     REQUIRE(merged.lruRecency == FastCache::LruRecency::Strict);
 }
 
-TEST_CASE("ConfigMerge: --cpu-affinity none overrides YAML default per-core",
-          "[config][merge][cpu-affinity]")
+TEST_CASE("ConfigMerge: --cpu-affinity none overrides YAML default per-core", "[config][merge][cpu-affinity]")
 {
     FastCache::Config fileCfg {};
     fileCfg.cpuAffinity = FastCache::CpuAffinity::PerCore;
@@ -202,8 +197,7 @@ TEST_CASE("ConfigMerge: --cpu-affinity none overrides YAML default per-core",
     REQUIRE(merged.cpuAffinity == FastCache::CpuAffinity::None);
 }
 
-TEST_CASE("ConfigMerge: --lru-mode default-value still overrides YAML when explicit",
-          "[config][merge][lru]")
+TEST_CASE("ConfigMerge: --lru-mode default-value still overrides YAML when explicit", "[config][merge][lru]")
 {
     // Mirrors the explicit-bit-not-value-comparison invariant: `--lru-mode
     // approximate` on top of a YAML `lru_mode: strict` must win, even though
@@ -219,8 +213,7 @@ TEST_CASE("ConfigMerge: --lru-mode default-value still overrides YAML when expli
     REQUIRE(merged.lruRecency == FastCache::LruRecency::Approximate);
 }
 
-TEST_CASE("ValidateBindFlagShape: --bind alongside --listen is rejected",
-          "[config][bind][validate]")
+TEST_CASE("ValidateBindFlagShape: --bind alongside --listen is rejected", "[config][bind][validate]")
 {
     // Pre-fix, main.cpp silently picked `binds` and discarded `bindAddress`.
     // We now fail fast and name the offending flag.
@@ -236,8 +229,7 @@ TEST_CASE("ValidateBindFlagShape: --bind alongside --listen is rejected",
     REQUIRE(result.error().context.contains("--bind"));
 }
 
-TEST_CASE("ValidateBindFlagShape: --port alongside --listen is rejected",
-          "[config][bind][validate]")
+TEST_CASE("ValidateBindFlagShape: --port alongside --listen is rejected", "[config][bind][validate]")
 {
     std::vector<FastCache::BindConfig> binds {
         { .address = "1.2.3.4", .port = 6379, .tls = false },
@@ -250,8 +242,7 @@ TEST_CASE("ValidateBindFlagShape: --port alongside --listen is rejected",
     REQUIRE(result.error().context.contains("--port"));
 }
 
-TEST_CASE("ValidateBindFlagShape: --tls alongside --listen is rejected",
-          "[config][bind][validate]")
+TEST_CASE("ValidateBindFlagShape: --tls alongside --listen is rejected", "[config][bind][validate]")
 {
     // --listen-tls is the correct shape; --tls (the legacy enable bit) mixed
     // with --listen would silently drop tlsEnabled.
@@ -266,8 +257,7 @@ TEST_CASE("ValidateBindFlagShape: --tls alongside --listen is rejected",
     REQUIRE(result.error().context.contains("--tls"));
 }
 
-TEST_CASE("ValidateBindFlagShape: --listen alone is accepted",
-          "[config][bind][validate]")
+TEST_CASE("ValidateBindFlagShape: --listen alone is accepted", "[config][bind][validate]")
 {
     // The normal multi-listener case — only --listen / --listen-tls were typed.
     std::vector<FastCache::BindConfig> binds {
@@ -277,8 +267,7 @@ TEST_CASE("ValidateBindFlagShape: --listen alone is accepted",
     REQUIRE(FastCache::ValidateBindFlagShape(cli, binds).has_value());
 }
 
-TEST_CASE("ValidateBindFlagShape: empty binds + any legacy flag is accepted",
-          "[config][bind][validate]")
+TEST_CASE("ValidateBindFlagShape: empty binds + any legacy flag is accepted", "[config][bind][validate]")
 {
     // Legacy single-bind path — binds is empty, so main.cpp synthesises from
     // bindAddress/port/tlsEnabled and nothing is silently dropped.
@@ -306,8 +295,7 @@ TEST_CASE("FormatBindSummary: single TLS bind carries [tls] marker", "[config][b
     REQUIRE(FastCache::FormatBindSummary(binds) == "127.0.0.1:6379 [tls]");
 }
 
-TEST_CASE("FormatBindSummary: two binds (plain + TLS) join with ', '",
-          "[config][bind][summary]")
+TEST_CASE("FormatBindSummary: two binds (plain + TLS) join with ', '", "[config][bind][summary]")
 {
     // Regression test for the original banner bug: the daemon brought up
     // with `--listen a:1 --listen-tls b:2` used to log
@@ -327,8 +315,7 @@ TEST_CASE("FormatBindSummary: empty list renders <none>", "[config][bind][summar
     REQUIRE(FastCache::FormatBindSummary(binds) == "<none>");
 }
 
-TEST_CASE("ConfigMerge: YAML lru/cpu survive when CLI did not pass the flag",
-          "[config][merge][lru][cpu-affinity]")
+TEST_CASE("ConfigMerge: YAML lru/cpu survive when CLI did not pass the flag", "[config][merge][lru][cpu-affinity]")
 {
     // Negative case: without the explicit bit, the YAML value must survive
     // even if cliCfg.lruRecency happens to differ from it (it shouldn't, but

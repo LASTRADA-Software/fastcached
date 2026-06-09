@@ -3,7 +3,9 @@
 
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace FastCache
 {
@@ -24,9 +26,15 @@ void WatchHandle::Remember(std::string_view key, CasToken cas)
 
 void WatchHandle::Clear() noexcept
 {
+    // Drop the snapshot map only. The `_dirty` atomic is owned by
+    // `ClaimAndClearDirty` so a racing `MarkDirty` that lands between the
+    // registry index erase and this call is preserved for the next
+    // claim-and-clear. Previously this also stored `_dirty=false`, which
+    // silently wiped any racing dirty bit set BETWEEN UnregisterAll's
+    // index-erase (under _mu) and Clear() (outside _mu) — exactly the
+    // EXEC race the comment at HandleExec asserted was closed.
     std::scoped_lock const lock { _mu };
     _snapshots.clear();
-    _dirty.store(false, std::memory_order_release);
 }
 
 std::vector<std::string> WatchHandle::WatchedKeys() const
@@ -62,10 +70,10 @@ bool WatchHandle::ClaimAndClearDirty() noexcept
     return wasDirty;
 }
 
-void WatchRegistry::Register(std::shared_ptr<WatchHandle> const& handle, std::string_view key)
+bool WatchRegistry::Register(std::shared_ptr<WatchHandle> const& handle, std::string_view key)
 {
     if (!handle)
-        return;
+        return false;
     std::scoped_lock const lock { _mu };
     // Transparent lookup first so the common re-Register path on an
     // existing bucket re-uses its allocation; only allocate a fresh
@@ -75,10 +83,13 @@ void WatchRegistry::Register(std::shared_ptr<WatchHandle> const& handle, std::st
         it = _index.emplace(std::string { key }, decltype(_index)::mapped_type {}).first;
     // insert_or_assign returns {iterator, true} only on a fresh insert; on
     // re-Register of the same handle for the same key we must NOT bump
-    // the counter (the entry was already counted).
+    // the counter (the entry was already counted) AND the caller's
+    // rollback path must NOT Unregister this key — that would wipe the
+    // prior registration from an earlier WATCH call.
     auto const [_, inserted] = it->second.insert_or_assign(handle.get(), std::weak_ptr<WatchHandle> { handle });
     if (inserted)
         _entryCount.fetch_add(1, std::memory_order_release);
+    return inserted;
 }
 
 std::size_t WatchRegistry::Unregister(WatchHandle* handle, std::string_view key)
@@ -155,6 +166,36 @@ std::size_t WatchRegistry::Touched(std::string_view key)
         for (auto const& [_, weak]: it->second)
             if (auto strong = weak.lock())
                 targets.push_back(std::move(strong));
+    }
+    for (auto const& t: targets)
+        t->MarkDirty();
+    return targets.size();
+}
+
+std::size_t WatchRegistry::TouchedAll()
+{
+    // Same lock-free fast path as Touched: when nothing is watched, a
+    // FLUSHDB pays only a single atomic load.
+    if (_entryCount.load(std::memory_order_acquire) == 0)
+        return 0;
+    // Snapshot every distinct handle under the lock, then fire MarkDirty
+    // outside the lock — same pattern as Touched but iterates every
+    // bucket instead of one. Use an unordered_set to dedupe: a handle
+    // watching N keys appears in N buckets but should be dirtied only once.
+    std::vector<std::shared_ptr<WatchHandle>> targets;
+    {
+        std::scoped_lock const lock { _mu };
+        std::unordered_set<WatchHandle*> seen;
+        for (auto const& [_, bucket]: _index)
+        {
+            for (auto const& [raw, weak]: bucket)
+            {
+                if (!seen.insert(raw).second)
+                    continue;
+                if (auto strong = weak.lock())
+                    targets.push_back(std::move(strong));
+            }
+        }
     }
     for (auto const& t: targets)
         t->MarkDirty();

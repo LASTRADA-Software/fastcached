@@ -13,6 +13,7 @@
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/LayeredStorage.hpp>
+#include <FastCache/Cache/NotifyingStorage.hpp>
 #include <FastCache/Cache/ShardedStorage.hpp>
 #include <FastCache/Cache/TracingStorage.hpp>
 #include <FastCache/Config/ByteSize.hpp>
@@ -34,6 +35,7 @@
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>
 #include <FastCache/Protocol/PubSubRegistry.hpp>
+#include <FastCache/Protocol/RedisMutationObserver.hpp>
 #include <FastCache/Protocol/RedisTransaction.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
@@ -45,7 +47,6 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
-#include <ranges>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -54,6 +55,7 @@
 #include <memory>
 #include <optional>
 #include <print>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -353,6 +355,39 @@ int DaemonBody(FastCache::Config const& effective)
         storagePtr = tracer.get();
     }
 
+    // Daemon-lifetime sinks: WATCH registry, pubsub, and keyspace
+    // notifier are created BEFORE `reloaderThread` (declared further
+    // below) so LIFO stack unwind destroys the thread before any
+    // object its subscribers capture by reference.
+    FastCache::PubSubRegistry pubsub;
+    FastCache::WatchRegistry watches;
+    auto const eventsMask = FastCache::ParseKeyspaceEvents(effective.notifyKeyspaceEvents);
+    if (!eventsMask.has_value())
+    {
+        logger.Logf(FastCache::LogLevel::Fatal,
+                    "fastcached: invalid --notify-keyspace-events '{}': {}",
+                    effective.notifyKeyspaceEvents,
+                    eventsMask.error().context);
+        return EXIT_FAILURE;
+    }
+    FastCache::KeyspaceNotifier keyspaceNotifier { &pubsub, *eventsMask };
+
+    // Storage-layer WATCH fan-out: NotifyingStorage wraps the inner
+    // chain with a RedisMutationObserver that fires
+    // WatchRegistry::Touched on every successful mutation. This closes
+    // two cross-protocol bugs:
+    //   * memcached writes never called Touched, so a Redis WATCH on a
+    //     key mutated by a memcached client silently passed EXEC;
+    //   * FLUSHDB had no per-key fan-out, leaving every WATCH'd key
+    //     undirty after a database wipe.
+    // The decorator is intentionally narrow: WATCH dirty signalling
+    // ONLY. Per-verb keyspace events stay where they are (Redis
+    // handlers fire them with verb-specific names), and double-firing
+    // WATCH dirties is harmless because MarkDirty is idempotent.
+    FastCache::RedisMutationObserver mutationObserver { &watches };
+    FastCache::NotifyingStorage notifyingStorage { *storagePtr, &mutationObserver };
+    storagePtr = &notifyingStorage;
+
     FastCache::CacheEngine engine { *storagePtr, clock };
 
     // Connection-level metrics sink, shared by the server loop and the admin
@@ -433,10 +468,11 @@ int DaemonBody(FastCache::Config const& effective)
     // a few dozen lines below; the synthesis rule is the same (prefer the
     // explicit list, otherwise fold the legacy single-bind triplet into a
     // synthetic BindConfig).
-    auto const bannerBinds = !effective.binds.empty()
-        ? effective.binds
-        : std::vector<FastCache::BindConfig> { FastCache::BindConfig {
-            .address = effective.bindAddress, .port = effective.port, .tls = effective.tlsEnabled } };
+    auto const bannerBinds =
+        !effective.binds.empty()
+            ? effective.binds
+            : std::vector<FastCache::BindConfig> { FastCache::BindConfig {
+                  .address = effective.bindAddress, .port = effective.port, .tls = effective.tlsEnabled } };
     auto const bindSummary = FastCache::FormatBindSummary(bannerBinds);
     // `anyTlsBind` was computed up-top against `effective.binds`; under the
     // current ordering `serverOpts.binds` is either `effective.binds` (when
@@ -466,22 +502,13 @@ int DaemonBody(FastCache::Config const& effective)
     // RunReactorServer. Logging it here (before bind) would race a client
     // that connects on the strength of the message.
 
-    std::atomic<bool> reloaderQuit { false };
-    std::jthread reloaderThread { [&reloader, &logger, &reloaderQuit] {
-        auto& controls = FastCache::DaemonControls::Instance();
-        while (!reloaderQuit.load(std::memory_order_acquire))
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds { 250 });
-            if (!controls.TakeReloadRequest())
-                continue;
-            auto const result = reloader.Reload();
-            if (!result.has_value())
-                logger.Logf(FastCache::LogLevel::Error, "config reload failed: {}", result.error().ToString());
-            else
-                logger.Log(FastCache::LogLevel::Info, "config reloaded");
-        }
-    } };
-
+    // Shared daemon-lifetime objects MUST be declared BEFORE reloaderThread
+    // below: the jthread joins in its destructor during stack unwind, which
+    // happens in LIFO order. If pubsub / watches / keyspaceNotifier were
+    // declared after the thread, a SIGHUP racing shutdown could invoke a
+    // reload subscriber against a freshly-destroyed notifier (UAF). Putting
+    // them ahead of the thread guarantees the thread joins BEFORE these
+    // objects are torn down.
     FastCache::ReactorServerOptions serverOpts;
     // Listener endpoints: prefer the explicit list when given, otherwise
     // synthesise one from the legacy single-bind fields. This keeps the
@@ -517,27 +544,12 @@ int DaemonBody(FastCache::Config const& effective)
     // a lone reactor gains nothing from pinning.
     serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
     serverOpts.session.authSource = &authSource;
-    // Publish/subscribe registry: one instance shared read-mostly across every
-    // connection (RESP PUBLISH/SUBSCRIBE). Lives for the whole server run.
-    FastCache::PubSubRegistry pubsub;
+    // pubsub / watches / keyspaceNotifier are declared further up
+    // (immediately before the engine) so the NotifyingStorage decorator
+    // can wire them into the storage chain. Just publish the pointers
+    // into the session here.
     serverOpts.session.pubsub = &pubsub;
-    // Redis transaction WATCH registry: one instance shared across every
-    // connection so a write on connection A flips the dirty flag on every
-    // WATCH snapshot taken by connection B. Lives for the whole server run.
-    FastCache::WatchRegistry watches;
     serverOpts.session.watches = &watches;
-    // Redis keyspace-notification publisher. Parses the operator-supplied
-    // flag string and rejects unknown letters loudly. Defaults to off.
-    auto const eventsMask = FastCache::ParseKeyspaceEvents(effective.notifyKeyspaceEvents);
-    if (!eventsMask.has_value())
-    {
-        logger.Logf(FastCache::LogLevel::Fatal,
-                    "fastcached: invalid --notify-keyspace-events '{}': {}",
-                    effective.notifyKeyspaceEvents,
-                    eventsMask.error().context);
-        return EXIT_FAILURE;
-    }
-    FastCache::KeyspaceNotifier keyspaceNotifier { &pubsub, *eventsMask };
     serverOpts.session.keyspaceNotifier = &keyspaceNotifier;
     // Make the notifier reloadable: a SIGHUP that changes
     // notify-keyspace-events now updates the live bitmask on the
@@ -547,6 +559,10 @@ int DaemonBody(FastCache::Config const& effective)
     // the reload read the updated bitmask immediately. A parse error in
     // the reloaded config is logged but the previous mask is kept — the
     // daemon never silently falls back to an empty mask.
+    //
+    // Subscribe BEFORE the reloaderThread is constructed: the thread's
+    // destructor joins on unwind, and we must guarantee the subscriber
+    // table is fully populated before the thread can dispatch a reload.
     reloader.Subscribe([&logger, &keyspaceNotifier](auto const& /*prev*/, auto const& next) {
         auto const newMask = FastCache::ParseKeyspaceEvents(next->notifyKeyspaceEvents);
         if (!newMask.has_value())
@@ -559,6 +575,28 @@ int DaemonBody(FastCache::Config const& effective)
         }
         keyspaceNotifier.SetClasses(*newMask);
     });
+
+    // Reloader thread MUST be declared AFTER every object its subscribers
+    // capture by reference (logger, keyspaceNotifier, ...). jthread joins
+    // in its destructor; stack unwind destroys locals in reverse
+    // declaration order, so the thread's destructor runs BEFORE the
+    // captured objects' destructors. This prevents a SIGHUP racing
+    // shutdown from invoking a subscriber against freed memory.
+    std::atomic<bool> reloaderQuit { false };
+    std::jthread reloaderThread { [&reloader, &logger, &reloaderQuit] {
+        auto& controls = FastCache::DaemonControls::Instance();
+        while (!reloaderQuit.load(std::memory_order_acquire))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds { 250 });
+            if (!controls.TakeReloadRequest())
+                continue;
+            auto const result = reloader.Reload();
+            if (!result.has_value())
+                logger.Logf(FastCache::LogLevel::Error, "config reload failed: {}", result.error().ToString());
+            else
+                logger.Log(FastCache::LogLevel::Info, "config reloaded");
+        }
+    } };
 #if defined(FC_TLS_ENABLED)
     serverOpts.tlsContext = tlsContext.get(); // null unless --tls is active
 #endif

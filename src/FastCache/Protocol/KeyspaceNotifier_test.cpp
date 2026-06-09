@@ -71,8 +71,7 @@ TEST_CASE("ParseKeyspaceEvents: KEg$ mirrors A explicitly", "[protocol][keyspace
     REQUIRE(*a == *explicitly);
 }
 
-TEST_CASE("ParseKeyspaceEvents: 'x' is rejected pending the storage-layer expiry hook",
-          "[protocol][keyspace]")
+TEST_CASE("ParseKeyspaceEvents: 'x' is rejected pending the storage-layer expiry hook", "[protocol][keyspace]")
 {
     // Original branch silently accepted `x` (and `A` set the Expired bit)
     // but the daemon had no code path that ever published an `expired`
@@ -211,8 +210,7 @@ class CountingPubSub final: public IPubSubRegistry
 
 } // namespace
 
-TEST_CASE("KeyspaceNotifier: zero-subscriber short-circuit skips Publish entirely",
-          "[protocol][keyspace]")
+TEST_CASE("KeyspaceNotifier: zero-subscriber short-circuit skips Publish entirely", "[protocol][keyspace]")
 {
     // The whole point of the fast path: when nothing is subscribed we must
     // not call Publish() at all. Otherwise an operator running with
@@ -221,9 +219,7 @@ TEST_CASE("KeyspaceNotifier: zero-subscriber short-circuit skips Publish entirel
     CountingPubSub pubsub;
     pubsub.hasSubs = false;
 
-    KeyspaceNotifier notifier { &pubsub,
-                                KeyspaceEvents::Keyspace | KeyspaceEvents::Keyevent
-                                    | KeyspaceEvents::String };
+    KeyspaceNotifier notifier { &pubsub, KeyspaceEvents::Keyspace | KeyspaceEvents::Keyevent | KeyspaceEvents::String };
     notifier.OnEvent(KeyspaceEvents::String, "set", "foo");
     REQUIRE(pubsub.publishCount.load() == 0);
 }
@@ -236,16 +232,13 @@ TEST_CASE("KeyspaceNotifier: with subscribers, Publish is called", "[protocol][k
     CountingPubSub pubsub;
     pubsub.hasSubs = true;
 
-    KeyspaceNotifier notifier { &pubsub,
-                                KeyspaceEvents::Keyspace | KeyspaceEvents::Keyevent
-                                    | KeyspaceEvents::String };
+    KeyspaceNotifier notifier { &pubsub, KeyspaceEvents::Keyspace | KeyspaceEvents::Keyevent | KeyspaceEvents::String };
     notifier.OnEvent(KeyspaceEvents::String, "set", "foo");
     // K + E: one publish per channel (__keyspace and __keyevent).
     REQUIRE(pubsub.publishCount.load() == 2);
 }
 
-TEST_CASE("PubSubRegistry: HasAnySubscribers flips as subscriptions come and go",
-          "[protocol][keyspace]")
+TEST_CASE("PubSubRegistry: HasAnySubscribers flips as subscriptions come and go", "[protocol][keyspace]")
 {
     PubSubRegistry registry;
     REQUIRE_FALSE(registry.HasAnySubscribers());
@@ -258,8 +251,7 @@ TEST_CASE("PubSubRegistry: HasAnySubscribers flips as subscriptions come and go"
     REQUIRE_FALSE(registry.HasAnySubscribers());
 }
 
-TEST_CASE("KeyspaceNotifier::SetClasses swaps the active mask atomically",
-          "[protocol][keyspace][reload]")
+TEST_CASE("KeyspaceNotifier::SetClasses swaps the active mask atomically", "[protocol][keyspace][reload]")
 {
     // The reloadability seam: an operator who SIGHUPs after editing
     // notify-keyspace-events must see new events flow on existing
@@ -291,5 +283,5 @@ TEST_CASE("KeyspaceNotifier::SetClasses swaps the active mask atomically",
     notifier.SetClasses(KeyspaceEvents::None);
     REQUIRE_FALSE(notifier.IsEnabled());
     notifier.OnEvent(KeyspaceEvents::Generic, "del", "foo");
-    REQUIRE(sub->messages.size() == 1);   // no additional delivery
+    REQUIRE(sub->messages.size() == 1); // no additional delivery
 }

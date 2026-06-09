@@ -26,6 +26,11 @@ struct BindConfig
     /// When true, accepted sockets on this endpoint are wrapped through
     /// `TlsWrap` before the protocol handler ever sees a byte.
     bool tls { false };
+
+    /// Structural equality. Used by ConfigReloader::ValidateImmutable
+    /// (the listener set is live-wired at startup; a SIGHUP that mutates
+    /// it must reject), plus by tests asserting parsed binds verbatim.
+    friend bool operator==(BindConfig const&, BindConfig const&) = default;
 };
 
 /// Durability policy for the persistent storage backend. Decoupled from

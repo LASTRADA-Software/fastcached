@@ -8,6 +8,7 @@
 #include <exception>
 #include <expected>
 #include <filesystem>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -89,6 +90,16 @@ namespace
         }
     }
 
+    /// One-based YAML source line for an error message. yaml-cpp's `Mark::line`
+    /// is zero-based and signed; this normalises to the human convention.
+    /// @param node Source node whose mark is consulted.
+    /// @return One-based line number, or 0 if the mark is missing.
+    [[nodiscard]] unsigned YamlLine(YAML::Node const& node) noexcept
+    {
+        auto const raw = node.Mark().line;
+        return raw < 0 ? 0U : static_cast<unsigned>(raw) + 1U;
+    }
+
     /// Parse one entry of a `listeners:` YAML sequence into a `BindConfig`.
     /// Required fields: `address` (string), `port` (1..65535). Optional: `tls`
     /// (boolean, defaults to false). Any other key is rejected so a typo
@@ -97,14 +108,6 @@ namespace
     /// @param path Source YAML file for error reporting.
     /// @param idx  Zero-based index within the `listeners:` sequence.
     /// @return The populated BindConfig, or ConfigError on malformed input.
-    /// One-based YAML source line for an error message. yaml-cpp's `Mark::line`
-    /// is zero-based and signed; this normalises to the human convention.
-    [[nodiscard]] unsigned YamlLine(YAML::Node const& node) noexcept
-    {
-        auto const raw = node.Mark().line;
-        return raw < 0 ? 0U : static_cast<unsigned>(raw) + 1U;
-    }
-
     [[nodiscard]] std::expected<BindConfig, ConfigError> ParseListenerEntry(YAML::Node const& node,
                                                                             std::filesystem::path const& path,
                                                                             std::size_t idx)
@@ -149,8 +152,8 @@ namespace
                 auto unknownField = field;
                 unknownField += '.';
                 unknownField += k;
-                return std::unexpected(MakeError(
-                    ConfigErrorCode::ParseError, path, std::move(unknownField), "unknown listener field", line));
+                return std::unexpected(
+                    MakeError(ConfigErrorCode::ParseError, path, std::move(unknownField), "unknown listener field", line));
             }
         }
         if (!sawAddress)
@@ -190,7 +193,11 @@ namespace
                 MakeError(ConfigErrorCode::ParseError, path, "listeners", "listener sequence must not be empty", line));
         cfg.binds.clear();
         cfg.binds.reserve(valueNode.size());
-        for (std::size_t i = 0; i < valueNode.size(); ++i)
+        // yaml-cpp's Node has no iterator concept we can pipe through
+        // std::ranges, so iterate over an index range with std::views::iota.
+        // Each listener row's diagnostic must name its position in the
+        // sequence, so we need the index, not just the element.
+        for (auto const i: std::views::iota(std::size_t { 0 }, valueNode.size()))
         {
             auto entry = ParseListenerEntry(valueNode[i], path, i);
             if (!entry.has_value())

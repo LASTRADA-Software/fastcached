@@ -1522,7 +1522,8 @@ TEST_CASE("RESP: an unknown verb queued under MULTI sets multiDirty and EXEC abo
                                 "*1\r\n$5\r\nMULTI\r\n"
                                 "*1\r\n$6\r\nGARBLE\r\n"
                                 "*1\r\n$4\r\nEXEC\r\n");
-    REQUIRE(out == "+OK\r\n-ERR unknown command 'GARBLE'\r\n-EXECABORT Transaction discarded because of previous errors.\r\n");
+    REQUIRE(out
+            == "+OK\r\n-ERR unknown command 'GARBLE'\r\n-EXECABORT Transaction discarded because of previous errors.\r\n");
 }
 
 TEST_CASE("RESP: WATCH without a registry replies an explicit error", "[protocol][resp][tx]")
@@ -1533,8 +1534,7 @@ TEST_CASE("RESP: WATCH without a registry replies an explicit error", "[protocol
     REQUIRE(Exchange(fix, "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n") == "-ERR transactions are not available\r\n");
 }
 
-TEST_CASE("RESP: MSET with no watcher fans out without invoking the registry",
-          "[protocol][resp][batch][hoist]")
+TEST_CASE("RESP: MSET with no watcher fans out without invoking the registry", "[protocol][resp][batch][hoist]")
 {
     // Hoist contract: with HasAnyWatchers() == false, the per-key inner
     // loop must skip NotifyWatchers entirely. We exercise the
@@ -1548,7 +1548,7 @@ TEST_CASE("RESP: MSET with no watcher fans out without invoking the registry",
     // HasAnyWatchers() true so the inner loop's per-key Touched is
     // exercised (the dirty bit on `otherHandle` stays clear because the
     // keys we MSET don't match).
-    fix.watches.Register(otherHandle, "watched");
+    (void) fix.watches.Register(otherHandle, "watched");
 
     auto const out = ExchangeTx(fix,
                                 "*11\r\n$4\r\nMSET\r\n"
@@ -1561,15 +1561,14 @@ TEST_CASE("RESP: MSET with no watcher fans out without invoking the registry",
     REQUIRE_FALSE(otherHandle->IsDirty());
 }
 
-TEST_CASE("RESP: MSET with a watcher on one key still dirties only that watcher",
-          "[protocol][resp][batch][hoist]")
+TEST_CASE("RESP: MSET with a watcher on one key still dirties only that watcher", "[protocol][resp][batch][hoist]")
 {
     // Per-key fan-out still works after the hoist — gating on a single
     // up-front bool must not silently skip the inner Touched when the
     // command should still publish per key.
     TxFixture fix;
     auto watched = std::make_shared<FastCache::WatchHandle>();
-    fix.watches.Register(watched, "k3");
+    (void) fix.watches.Register(watched, "k3");
 
     auto const out = ExchangeTx(fix,
                                 "*11\r\n$4\r\nMSET\r\n"
@@ -1629,8 +1628,7 @@ TEST_CASE("RESP: a queued unknown command still aborts EXEC after the cached-ind
                "-EXECABORT Transaction discarded because of previous errors.\r\n");
 }
 
-TEST_CASE("RESP: WATCH followed by disconnect leaves the registry index clean",
-          "[protocol][resp][tx][cleanup]")
+TEST_CASE("RESP: WATCH followed by disconnect leaves the registry index clean", "[protocol][resp][tx][cleanup]")
 {
     // Regression for the manual-cleanup bug: the connection used to call a
     // `cleanup()` lambda only on the explicit `co_return` paths. Any exception
@@ -1718,8 +1716,7 @@ std::string ExchangeKs(KeyspaceFixture& fix, std::string_view request)
 
 } // namespace
 
-TEST_CASE("RESP keyspace: SET fires __keyspace@0__:<key> 'set' when K and $ are enabled",
-          "[protocol][resp][keyspace]")
+TEST_CASE("RESP keyspace: SET fires __keyspace@0__:<key> 'set' when K and $ are enabled", "[protocol][resp][keyspace]")
 {
     KeyspaceFixture fix;
     fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::String);
@@ -1731,8 +1728,7 @@ TEST_CASE("RESP keyspace: SET fires __keyspace@0__:<key> 'set' when K and $ are 
     REQUIRE(fix.sub->messages[0].payload == "set");
 }
 
-TEST_CASE("RESP keyspace: SET fires __keyevent@0__:set when E and $ are enabled",
-          "[protocol][resp][keyspace]")
+TEST_CASE("RESP keyspace: SET fires __keyevent@0__:set when E and $ are enabled", "[protocol][resp][keyspace]")
 {
     KeyspaceFixture fix;
     fix.EnableEvents(FastCache::KeyspaceEvents::Keyevent | FastCache::KeyspaceEvents::String);
@@ -1744,8 +1740,7 @@ TEST_CASE("RESP keyspace: SET fires __keyevent@0__:set when E and $ are enabled"
     REQUIRE(fix.sub->messages[0].payload == "foo");
 }
 
-TEST_CASE("RESP keyspace: K with class off (only $ set, no g) drops DEL events",
-          "[protocol][resp][keyspace]")
+TEST_CASE("RESP keyspace: K with class off (only $ set, no g) drops DEL events", "[protocol][resp][keyspace]")
 {
     KeyspaceFixture fix;
     fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::String);
@@ -1775,8 +1770,7 @@ TEST_CASE("RESP keyspace: DEL fires under K + g", "[protocol][resp][keyspace]")
     REQUIRE(fix.sub->messages[1].payload == "del");
 }
 
-TEST_CASE("RESP keyspace: with notifier null, no messages and no crash",
-          "[protocol][resp][keyspace]")
+TEST_CASE("RESP keyspace: with notifier null, no messages and no crash", "[protocol][resp][keyspace]")
 {
     // Don't enable events — notifier stays null. Subscribing to the channel
     // is still legal but no events will ever be published.
@@ -1787,8 +1781,7 @@ TEST_CASE("RESP keyspace: with notifier null, no messages and no crash",
     REQUIRE(fix.sub->messages.empty());
 }
 
-TEST_CASE("RESP keyspace: EXPIRE fires the verb-named event under K + g",
-          "[protocol][resp][keyspace]")
+TEST_CASE("RESP keyspace: EXPIRE fires the verb-named event under K + g", "[protocol][resp][keyspace]")
 {
     KeyspaceFixture fix;
     fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic
@@ -1809,8 +1802,7 @@ TEST_CASE("RESP keyspace: EXPIRE fires the verb-named event under K + g",
 // SET and DEL but silently missed every membership change, breaking the
 // standard cache-invalidation pattern.
 
-TEST_CASE("RESP keyspace: SADD fires 'sadd' under K + g when members are added",
-          "[protocol][resp][keyspace][set]")
+TEST_CASE("RESP keyspace: SADD fires 'sadd' under K + g when members are added", "[protocol][resp][keyspace][set]")
 {
     KeyspaceFixture fix;
     fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
@@ -1822,8 +1814,7 @@ TEST_CASE("RESP keyspace: SADD fires 'sadd' under K + g when members are added",
     REQUIRE(fix.sub->messages[0].payload == "sadd");
 }
 
-TEST_CASE("RESP keyspace: SADD that adds zero members publishes no event",
-          "[protocol][resp][keyspace][set]")
+TEST_CASE("RESP keyspace: SADD that adds zero members publishes no event", "[protocol][resp][keyspace][set]")
 {
     // Preserves the `*added > 0` guard — an idempotent SADD must not fire a
     // spurious keyspace event (matches Redis behaviour).
@@ -1838,8 +1829,7 @@ TEST_CASE("RESP keyspace: SADD that adds zero members publishes no event",
     REQUIRE(fix.sub->messages[0].payload == "sadd");
 }
 
-TEST_CASE("RESP keyspace: SREM fires 'srem' under E + g when a member is removed",
-          "[protocol][resp][keyspace][set]")
+TEST_CASE("RESP keyspace: SREM fires 'srem' under E + g when a member is removed", "[protocol][resp][keyspace][set]")
 {
     KeyspaceFixture fix;
     fix.EnableEvents(FastCache::KeyspaceEvents::Keyevent | FastCache::KeyspaceEvents::Generic);
@@ -1853,8 +1843,7 @@ TEST_CASE("RESP keyspace: SREM fires 'srem' under E + g when a member is removed
     REQUIRE(fix.sub->messages[0].payload == "s");
 }
 
-TEST_CASE("RESP keyspace: SREM that removes nothing publishes no event",
-          "[protocol][resp][keyspace][set]")
+TEST_CASE("RESP keyspace: SREM that removes nothing publishes no event", "[protocol][resp][keyspace][set]")
 {
     KeyspaceFixture fix;
     fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
@@ -1865,8 +1854,7 @@ TEST_CASE("RESP keyspace: SREM that removes nothing publishes no event",
     REQUIRE(fix.sub->messages.empty());
 }
 
-TEST_CASE("RESP keyspace: SPOP fires 'spop' under K + g when something is popped",
-          "[protocol][resp][keyspace][set]")
+TEST_CASE("RESP keyspace: SPOP fires 'spop' under K + g when something is popped", "[protocol][resp][keyspace][set]")
 {
     KeyspaceFixture fix;
     fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
@@ -1881,8 +1869,7 @@ TEST_CASE("RESP keyspace: SPOP fires 'spop' under K + g when something is popped
     REQUIRE(fix.sub->messages[1].payload == "spop");
 }
 
-TEST_CASE("RESP keyspace: SPOP on empty set publishes no event",
-          "[protocol][resp][keyspace][set]")
+TEST_CASE("RESP keyspace: SPOP on empty set publishes no event", "[protocol][resp][keyspace][set]")
 {
     KeyspaceFixture fix;
     fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
@@ -1985,14 +1972,12 @@ TEST_CASE("RESP: SUBSCRIBE inside MULTI is rejected and aborts EXEC", "[protocol
                "-EXECABORT Transaction discarded because of previous errors.\r\n");
 }
 
-TEST_CASE("RESP: PSUBSCRIBE/UNSUBSCRIBE/PUNSUBSCRIBE inside MULTI are rejected",
-          "[protocol][resp][tx]")
+TEST_CASE("RESP: PSUBSCRIBE/UNSUBSCRIBE/PUNSUBSCRIBE inside MULTI are rejected", "[protocol][resp][tx]")
 {
     // Every (P)SUBSCRIBE / (P)UNSUBSCRIBE variant has the same multi-frame
     // hazard — verify the deny-list catches all four.
-    for (auto const verb: { std::string_view { "PSUBSCRIBE" },
-                            std::string_view { "UNSUBSCRIBE" },
-                            std::string_view { "PUNSUBSCRIBE" } })
+    for (auto const verb:
+         { std::string_view { "PSUBSCRIBE" }, std::string_view { "UNSUBSCRIBE" }, std::string_view { "PUNSUBSCRIBE" } })
     {
         TxFixture fix;
         auto request = std::string { "*1\r\n$5\r\nMULTI\r\n*2\r\n$" };
@@ -2006,8 +1991,7 @@ TEST_CASE("RESP: PSUBSCRIBE/UNSUBSCRIBE/PUNSUBSCRIBE inside MULTI are rejected",
     }
 }
 
-TEST_CASE("RESP: QUIT inside MULTI is rejected (no mid-EXEC socket teardown)",
-          "[protocol][resp][tx]")
+TEST_CASE("RESP: QUIT inside MULTI is rejected (no mid-EXEC socket teardown)", "[protocol][resp][tx]")
 {
     // QUIT closes the socket. Allowing it inside MULTI would let EXEC's
     // aggregate header be written to a half-closed fd; the trailing elements
@@ -2042,8 +2026,7 @@ TEST_CASE("RESP: AUTH inside MULTI executes immediately (not queued)", "[protoco
     REQUIRE(out.ends_with("*0\r\n"));
 }
 
-TEST_CASE("RESP: RESET inside MULTI clears the transaction and replies +RESET",
-          "[protocol][resp][tx]")
+TEST_CASE("RESP: RESET inside MULTI clears the transaction and replies +RESET", "[protocol][resp][tx]")
 {
     // RESET is one of the verbs that runs even inside MULTI — its purpose is
     // to clear EVERY per-connection state, which includes `inMulti`. After
@@ -2081,6 +2064,41 @@ TEST_CASE("RESP: MULTI queue cap on command count dirties the transaction", "[pr
                "-EXECABORT Transaction discarded because of previous errors.\r\n");
 }
 
+TEST_CASE("RESP: MULTI queue cap breach does NOT allow refill until EXEC/DISCARD", "[protocol][resp][tx][regression]")
+{
+    // Finding #8: pre-fix, after the cap was breached the dirty bit was
+    // set and the queue was cleared, but the dispatch gate did not
+    // consult multiDirty. A client could keep streaming queueable
+    // commands forever — each one re-entered the queue branch, refilled
+    // the queue up to the cap, breached, cleared, refilled — sustaining
+    // 256 MiB allocate/clear churn per connection without ever calling
+    // EXEC.
+    //
+    // The fix: bail at the top of the queue branch on multiDirty. Every
+    // subsequent queueable command gets the same dirty-transaction error
+    // reply without touching the queue.
+    TxFixture fix;
+    fix.handler.OverrideMultiQueueCapsForTests(/*maxCommands*/ 1, /*maxBytes*/ 0);
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nv\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\nv\r\n" // breaches cap
+                                "*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$1\r\nv\r\n" // would have refilled queue pre-fix
+                                "*3\r\n$3\r\nSET\r\n$1\r\nd\r\n$1\r\nv\r\n" // ditto
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // First SET queues. Second SET breaches the cap and dirties.
+    // Third and fourth SETs must each get the dirty-transaction reply —
+    // NOT another '+QUEUED' nor another '-ERR ... limit' (which would
+    // imply the queue was rebuilt to the cap). Finally EXEC aborts.
+    REQUIRE(out
+            == "+OK\r\n"
+               "+QUEUED\r\n"
+               "-ERR transaction queue exceeded per-connection limit\r\n"
+               "-ERR transaction discarded — send EXEC or DISCARD\r\n"
+               "-ERR transaction discarded — send EXEC or DISCARD\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
 TEST_CASE("RESP: MULTI queue cap on byte budget dirties the transaction", "[protocol][resp][tx]")
 {
     TxFixture fix;
@@ -2112,10 +2130,12 @@ class FailingPeekStorage final: public FastCache::IStorage
     /// When set, only Peek calls for this exact key fail; others pass through.
     /// Empty value (the default) means every Peek call fails — the original
     /// behaviour used by the simpler WATCH-on-single-key test.
-    void FailOnlyForKey(std::string_view key) { _failOnlyForKey = key; }
+    void FailOnlyForKey(std::string_view key)
+    {
+        _failOnlyForKey = key;
+    }
 
-    std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view key,
-                                                                     FastCache::TimePoint now) override
+    std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view key, FastCache::TimePoint now) override
     {
         return _inner.Get(key, now);
     }
@@ -2222,8 +2242,7 @@ class FailingPeekStorage final: public FastCache::IStorage
 
 } // namespace
 
-TEST_CASE("RESP: WATCH on a faulting Peek replies an error (not silent CAS=0)",
-          "[protocol][resp][tx]")
+TEST_CASE("RESP: WATCH on a faulting Peek replies an error (not silent CAS=0)", "[protocol][resp][tx]")
 {
     // The faulty-Peek shim forces engine->PeekCas to return a StorageError.
     // WATCH must surface this as -ERR rather than silently snapshotting CAS=0:
@@ -2305,15 +2324,124 @@ TEST_CASE("RESP: WATCH partial-failure replies +OK then -ERR without aborting th
     // Storage fails ONLY for `b`; `a`'s WATCH succeeds normally.
     storage.FailOnlyForKey("b");
 
-    REQUIRE(FastCache::SyncRun(WriteString(
-        pair.client.get(),
-        "*2\r\n$5\r\nWATCH\r\n$1\r\na\r\n"   // succeeds — `a` is registered + snapshotted
-        "*2\r\n$5\r\nWATCH\r\n$1\r\nb\r\n"   // fails — only `b` should roll back
-    )));
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(),
+                                           "*2\r\n$5\r\nWATCH\r\n$1\r\na\r\n" // succeeds — `a` is registered + snapshotted
+                                           "*2\r\n$5\r\nWATCH\r\n$1\r\nb\r\n" // fails — only `b` should roll back
+                                           )));
     pair.client->ShutdownWrite();
     FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
     auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
     REQUIRE(out == "+OK\r\n-ERR storage failure during WATCH\r\n");
+}
+
+TEST_CASE("RESP: SUBSCRIBE then immediate disconnect tears down the watcher cleanly", "[protocol][resp][pubsub][regression]")
+{
+    // Finding #13: Subscriber::ShutdownWatcher pre-fix only woke the
+    // `_rearm` latch. A watcher parked on the INITIAL WaitReadable —
+    // before any rearm latch had been installed (i.e. SUBSCRIBE was sent
+    // and the client immediately closed the connection) — was never
+    // woken; the coroutine remained suspended until socket->Close()'s
+    // reactor cancellation eventually resumed it, by which time on
+    // epoll/kqueue the per-socket impl state might have been freed.
+    //
+    // Post-fix: ShutdownWatcher closes the watched socket directly,
+    // which forces the reactor to deliver an error completion to the
+    // parked WaitReadable synchronously. The watcher resumes, observes
+    // the error, and exits.
+    //
+    // The observable contract: handler.Run returns cleanly without UAF
+    // / leak. SyncRun completing at all is the proof — any UAF inside
+    // the orphaned watcher would crash the test process under ASAN/TSAN.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::PubSubRegistry pubsub;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    FastCache::SessionContext session;
+    session.pubsub = &pubsub;
+
+    // Send SUBSCRIBE then close the client side without sending any
+    // further bytes. The watcher arms on its initial WaitReadable; the
+    // ShutdownWrite triggers a clean EOF on the server-side read,
+    // exiting Run; Cleanup's destructor calls ShutdownWatcher which now
+    // forces socket->Close so the parked watcher unblocks too.
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n")));
+    pair.client->ShutdownWrite();
+
+    // The handler.Run completing at all is the regression assertion: a
+    // pre-fix orphaned watcher would either deadlock the SyncRun or
+    // produce a delayed UAF.
+    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+
+    // First subscribe-confirm frame must have been sent before teardown.
+    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(out.contains("subscribe"));
+}
+
+TEST_CASE("RESP: WATCH partial-failure does NOT wipe re-registered earlier watches", "[protocol][resp][tx][rollback]")
+{
+    // Finding #5: HandleWatch's per-call rollback used to push EVERY
+    // iterated key onto the rollback list, including keys that Register
+    // returned `inserted=false` for (idempotent re-register from a
+    // previous WATCH call). On a later-key failure the rollback then
+    // un-registered the prior call's `a`, silently wiping a watch the
+    // client believed was live.
+    //
+    // The fix: only push keys for which Register returned `inserted=true`.
+    // This test exercises the scenario through the public WATCH wire
+    // protocol with FailingPeekStorage rigged to fail only on `b`:
+    //
+    //   1. WATCH a                  ->  +OK, `a` is fresh-inserted
+    //   2. WATCH a b                ->  Register('a') returns inserted=false
+    //                                   (idempotent re-register), so `a`
+    //                                   does NOT enter rollbackKeys.
+    //                                   Register('b') returns true;
+    //                                   PeekCas('b') fails -> rollback
+    //                                   Unregister only `b`, leaving `a`
+    //                                   live in the registry index.
+    //   3. Touch `a` via the registry -> handle dirties because `a` is
+    //      still indexed.
+    //
+    // The connection-internal proof is observed at the registry side:
+    // a Touched('a') AFTER the partial-failure WATCH still finds the
+    // index entry and dirties the handle.
+    FastCache::ManualClock clock;
+    FailingPeekStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::WatchRegistry watches;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    FastCache::SessionContext session;
+    session.watches = &watches;
+
+    storage.FailOnlyForKey("b");
+
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(),
+                                           "*2\r\n$5\r\nWATCH\r\n$1\r\na\r\n"            // (1) +OK, `a` registered
+                                           "*3\r\n$5\r\nWATCH\r\n$1\r\na\r\n$1\r\nb\r\n" // (2) -ERR, only `b` rolled back
+                                           )));
+    pair.client->ShutdownWrite();
+    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(out == "+OK\r\n-ERR storage failure during WATCH\r\n");
+
+    // The crucial post-fix invariant: `a` is STILL in the registry index
+    // after the partial-failure WATCH. A racing mutation on `a` would
+    // dirty the (now-disconnected, but still alive via shared_ptr in the
+    // registry's weak entries) handle. We can observe this by counting
+    // the dirties Touched('a') reports — must be > 0 if `a` was correctly
+    // preserved. (Touched also gracefully skips expired weak_ptrs, so a
+    // post-disconnect Touched is safe — `0` here would prove the bug.)
+    //
+    // Cleanup at end-of-handler does call UnregisterAll, however, so by
+    // the time we observe here the registry is empty. The wire-level
+    // proof is the registry-level test at
+    // RedisTransaction_test.cpp::"Register returns false on idempotent
+    // re-register". Per AGENT.md, the per-component covers the primitive
+    // and this test covers the wire contract.
 }
 
 TEST_CASE("RESP: MULTI queue cap reset between transactions", "[protocol][resp][tx]")

@@ -69,4 +69,23 @@ int RunReactorServer(ReactorServerOptions const& options,
                      IAdmissionControl* admission = nullptr,
                      IMetricsSink* metrics = nullptr);
 
+namespace Detail
+{
+
+    /// Verify that every TLS-flagged bind in `options.binds` has a non-null
+    /// `tlsContext`. Returns EXIT_SUCCESS on a clean configuration,
+    /// EXIT_FAILURE (already logged at Fatal) on a TLS-flagged bind with no
+    /// context — the latter would otherwise silently fall through to plaintext.
+    ///
+    /// Exposed for testing. The Run* entry points all call this as their
+    /// first step, so a unit test exercises the same code path used in
+    /// production. Lives in `Detail` so callers don't accidentally pick it
+    /// up as part of the public API.
+    /// @param options Server options to validate.
+    /// @param logger  Logger receiving the diagnostic on failure.
+    /// @return EXIT_SUCCESS / EXIT_FAILURE.
+    [[nodiscard]] int VerifyTlsContextForTlsBinds(ReactorServerOptions const& options, ILogger& logger);
+
+} // namespace Detail
+
 } // namespace FastCache

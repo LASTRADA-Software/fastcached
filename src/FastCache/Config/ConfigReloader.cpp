@@ -85,6 +85,15 @@ std::expected<void, ConfigError> ConfigReloader::ValidateImmutable(Config const&
         return reject("bind", "cannot change bind address at runtime");
     if (previous.port != candidate.port)
         return reject("port", "cannot change port at runtime");
+    // The explicit-listeners vector is just as live-wired as the legacy
+    // single-bind triplet: main.cpp constructs the listener pool from
+    // `serverOpts.binds` once at startup, and there is no live-rebuild
+    // path. A SIGHUP that adds, removes, or swaps a `listeners:` entry
+    // must therefore reject — silently accepting it would leave
+    // reloader.Current() reporting a Config whose `binds` no longer
+    // matches the kernel-bound sockets (split-brain).
+    if (previous.binds != candidate.binds)
+        return reject("listeners", "cannot change listeners at runtime");
     if (previous.storagePath != candidate.storagePath)
         return reject("storage", "cannot change storage path at runtime");
     if (previous.storageShards != candidate.storageShards)

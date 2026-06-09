@@ -6,9 +6,9 @@
 namespace FastCache
 {
 
-class IReactor;        // Async/IReactor.hpp — the reactor this connection is pinned to.
-class IPubSubRegistry; // Protocol/IPubSubRegistry.hpp — process-wide pub/sub registry.
-class WatchRegistry;   // Protocol/RedisTransaction.hpp — process-wide WATCH registry for Redis transactions.
+class IReactor;         // Async/IReactor.hpp — the reactor this connection is pinned to.
+class IPubSubRegistry;  // Protocol/IPubSubRegistry.hpp — process-wide pub/sub registry.
+class WatchRegistry;    // Protocol/RedisTransaction.hpp — process-wide WATCH registry for Redis transactions.
 class KeyspaceNotifier; // Protocol/KeyspaceNotifier.hpp — Redis keyspace notification publisher.
 
 /// Per-server, immutable context handed to every protocol handler's command

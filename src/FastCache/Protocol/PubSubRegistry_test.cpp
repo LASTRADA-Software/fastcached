@@ -148,9 +148,7 @@ TEST_CASE("PubSubRegistry: SnapshotChannels / SnapshotPatterns enumerate live re
     CHECK(patterns[0] == "p.*");
 }
 
-
-TEST_CASE("PubSubRegistry: HasAnySubscribers reflects live entry count lock-free",
-          "[pubsub][fast-path]")
+TEST_CASE("PubSubRegistry: HasAnySubscribers reflects live entry count lock-free", "[pubsub][fast-path]")
 {
     // Steady state for a daemon with `notify-keyspace-events` configured but
     // no subscriber yet must be HasAnySubscribers() == false, which lets

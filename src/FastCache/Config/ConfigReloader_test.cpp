@@ -151,6 +151,43 @@ TEST_CASE("ConfigReloader::Reload rejects changes to storage_durability", "[conf
     REQUIRE(result.error().field == "storage-durability");
 }
 
+TEST_CASE("ConfigReloader::Reload rejects changes to listeners (binds vector)", "[config][reload][regression]")
+{
+    // Finding #7: pre-fix, ValidateImmutable did not check the new
+    // Config::binds vector. A SIGHUP that added/removed/swapped a
+    // `listeners:` entry was silently accepted, but main.cpp builds the
+    // listener pool from `serverOpts.binds` once at start, so the new
+    // listeners never came up — split-brain between reloader.Current()
+    // and the live wiring.
+    auto const path = WriteYaml("listeners-immutable",
+                                "listeners:\n"
+                                "  - { address: 127.0.0.1, port: 11730 }\n"
+                                "max_memory: 1024\n");
+    FastCache::Config initial {
+        .maxMemoryBytes = 1024,
+        .configPath = path.string(),
+        .binds = { FastCache::BindConfig { .address = "127.0.0.1", .port = 11730, .tls = false } },
+    };
+    FastCache::ConfigReloader reloader { initial, path };
+
+    // Add a second listener via SIGHUP — must reject, not silently accept.
+    {
+        std::ofstream out { path, std::ios::trunc };
+        out << "listeners:\n"
+               "  - { address: 127.0.0.1, port: 11730 }\n"
+               "  - { address: 0.0.0.0, port: 11731 }\n"
+               "max_memory: 1024\n";
+    }
+
+    auto const result = reloader.Reload();
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::ImmutableChanged);
+    REQUIRE(result.error().field == "listeners");
+    // Live snapshot still names the single original listener.
+    REQUIRE(reloader.Current()->binds.size() == 1);
+    REQUIRE(reloader.Current()->binds.front().port == 11730);
+}
+
 TEST_CASE("ConfigReloader: Reload with no config path returns FileNotFound", "[config][reload]")
 {
     FastCache::ConfigReloader reloader { FastCache::Config {}, {} };
