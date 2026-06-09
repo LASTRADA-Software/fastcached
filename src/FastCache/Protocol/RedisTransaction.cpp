@@ -49,6 +49,19 @@ bool WatchHandle::IsDirty() const noexcept
     return _dirty.load(std::memory_order_acquire);
 }
 
+bool WatchHandle::ClaimAndClearDirty() noexcept
+{
+    // exchange returns the previous value AND atomically stores false; acq_rel
+    // pairs with the release in MarkDirty and the acquire in IsDirty. Holding
+    // _mu while wiping _snapshots ensures a concurrent Remember-on-the-same-
+    // handle (impossible in normal use — the owner is single-threaded for the
+    // handle — but defensive) sees a consistent map.
+    bool const wasDirty = _dirty.exchange(false, std::memory_order_acq_rel);
+    std::scoped_lock const lock { _mu };
+    _snapshots.clear();
+    return wasDirty;
+}
+
 void WatchRegistry::Register(std::shared_ptr<WatchHandle> const& handle, std::string_view key)
 {
     if (!handle)
@@ -68,24 +81,52 @@ void WatchRegistry::Register(std::shared_ptr<WatchHandle> const& handle, std::st
         _entryCount.fetch_add(1, std::memory_order_release);
 }
 
+std::size_t WatchRegistry::Unregister(WatchHandle* handle, std::string_view key)
+{
+    if (handle == nullptr)
+        return 0;
+    std::scoped_lock const lock { _mu };
+    auto const it = _index.find(key);
+    if (it == _index.end())
+        return 0;
+    std::size_t const removed = it->second.erase(handle);
+    if (it->second.empty())
+        _index.erase(it);
+    if (removed > 0)
+        _entryCount.fetch_sub(removed, std::memory_order_release);
+    return removed;
+}
+
 void WatchRegistry::UnregisterAll(WatchHandle* handle)
 {
     if (handle == nullptr)
         return;
-    std::scoped_lock const lock { _mu };
-    std::size_t removed = 0;
-    for (auto it = _index.begin(); it != _index.end();)
+    // Scope the registry lock TIGHTLY around the index walk so the handle's
+    // own mutex is never acquired while we hold _mu. This avoids a
+    // registry→handle lock-order edge that any future caller taking
+    // handle->_mu before registry._mu would deadlock against, AND it closes
+    // the EXEC race: a Touched that snapshotted a strong_ptr to the handle
+    // before our scoped_lock had finished cannot land its MarkDirty after
+    // our Clear(), because the EXEC caller now invokes ClaimAndClearDirty
+    // *after* this function returns (the index entry is already gone, so
+    // no new Touched can snapshot us).
     {
-        removed += it->second.erase(handle);
-        if (it->second.empty())
-            it = _index.erase(it);
-        else
-            ++it;
+        std::scoped_lock const lock { _mu };
+        std::size_t removed = 0;
+        for (auto it = _index.begin(); it != _index.end();)
+        {
+            removed += it->second.erase(handle);
+            if (it->second.empty())
+                it = _index.erase(it);
+            else
+                ++it;
+        }
+        if (removed > 0)
+            _entryCount.fetch_sub(removed, std::memory_order_release);
     }
-    if (removed > 0)
-        _entryCount.fetch_sub(removed, std::memory_order_release);
     // The handle's snapshot map is also cleared so a future MULTI on the
-    // same connection starts with no watched keys.
+    // same connection starts with no watched keys. Done OUTSIDE the
+    // registry lock — Clear acquires handle->_mu.
     handle->Clear();
 }
 

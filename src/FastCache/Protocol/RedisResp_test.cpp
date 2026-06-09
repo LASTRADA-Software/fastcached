@@ -2109,6 +2109,11 @@ namespace
 class FailingPeekStorage final: public FastCache::IStorage
 {
   public:
+    /// When set, only Peek calls for this exact key fail; others pass through.
+    /// Empty value (the default) means every Peek call fails — the original
+    /// behaviour used by the simpler WATCH-on-single-key test.
+    void FailOnlyForKey(std::string_view key) { _failOnlyForKey = key; }
+
     std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view key,
                                                                      FastCache::TimePoint now) override
     {
@@ -2177,9 +2182,14 @@ class FailingPeekStorage final: public FastCache::IStorage
     {
         return _inner.Touch(key, newExpiry, now);
     }
-    std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view /*key*/,
-                                                                      FastCache::TimePoint /*now*/) override
+    std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view key,
+                                                                      FastCache::TimePoint now) override
     {
+        // When `_failOnlyForKey` is set, behave like a normal storage for
+        // every key EXCEPT that one — lets the partial-WATCH-rollback test
+        // drive a multi-key WATCH where only the last key fails.
+        if (!_failOnlyForKey.empty() && key != _failOnlyForKey)
+            return _inner.Peek(key, now);
         return std::unexpected(FastCache::MakeStorageError(FastCache::StorageErrorCode::IoError));
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(std::string_view key,
@@ -2207,6 +2217,7 @@ class FailingPeekStorage final: public FastCache::IStorage
 
   private:
     FastCache::InMemoryLruStorage _inner;
+    std::string _failOnlyForKey;
 };
 
 } // namespace
@@ -2232,6 +2243,55 @@ TEST_CASE("RESP: WATCH on a faulting Peek replies an error (not silent CAS=0)",
     FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
     auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
     REQUIRE(out == "-ERR storage failure during WATCH\r\n");
+}
+
+TEST_CASE("RESP: WATCH partial-failure replies +OK then -ERR without aborting the connection",
+          "[protocol][resp][tx][rollback]")
+{
+    // Regression for the silent-data-loss bug: when a multi-key WATCH
+    // hits a StorageError on a key partway through, the rollback used to
+    // call UnregisterAll which wiped EVERY key the handle had ever
+    // registered — including snapshots from earlier successful WATCH
+    // calls. The fix calls per-key Unregister for only the failing call's
+    // keys.
+    //
+    // The wire-level contract we can observe end-to-end here is:
+    //   - The first WATCH replies +OK (it succeeded).
+    //   - The second WATCH replies -ERR with the storage-failure detail.
+    //   - The connection survives to process subsequent commands.
+    // The per-key Unregister rollback (vs blast-radius UnregisterAll) is
+    // exercised exhaustively at the registry level by
+    // RedisTransaction_test.cpp's
+    // `WatchRegistry::Unregister removes only that key…` test; this
+    // higher-level test ensures HandleWatch wires up the correct primitive.
+    //
+    // Note: the connection's ~Cleanup destructor calls UnregisterAll on
+    // disconnect, so we cannot observe registry state *after* handler.Run
+    // returns. That's fine — the production guarantee for partial rollback
+    // is "subsequent WATCH/MULTI/EXEC on the SAME connection sees the
+    // prior watch as live", which the registry-level tests already cover.
+    FastCache::ManualClock clock;
+    FailingPeekStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::WatchRegistry watches;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    FastCache::SessionContext session;
+    session.watches = &watches;
+
+    // Storage fails ONLY for `b`; `a`'s WATCH succeeds normally.
+    storage.FailOnlyForKey("b");
+
+    REQUIRE(FastCache::SyncRun(WriteString(
+        pair.client.get(),
+        "*2\r\n$5\r\nWATCH\r\n$1\r\na\r\n"   // succeeds — `a` is registered + snapshotted
+        "*2\r\n$5\r\nWATCH\r\n$1\r\nb\r\n"   // fails — only `b` should roll back
+    )));
+    pair.client->ShutdownWrite();
+    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(out == "+OK\r\n-ERR storage failure during WATCH\r\n");
 }
 
 TEST_CASE("RESP: MULTI queue cap reset between transactions", "[protocol][resp][tx]")

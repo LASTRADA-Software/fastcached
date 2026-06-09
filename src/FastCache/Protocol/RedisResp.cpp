@@ -1194,24 +1194,23 @@ namespace
         if (args.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'del'");
         std::int64_t deleted = 0;
-        // Per-command gates: probe ONCE before the loop instead of per-key.
-        // For a `DEL k1 … k100` against an empty watch-registry and an empty
-        // pub/sub registry the inner loop now pays zero notification calls;
-        // the alternative was 100 atomic loads + (pre-#7) 100 mutex
-        // acquisitions on the hot write path.
-        bool const anyW = state != nullptr && state->watchRegistry != nullptr && state->watchRegistry->HasAnyWatchers();
-        bool const anyK = state != nullptr && state->keyspaceNotifier != nullptr
-                          && state->keyspaceNotifier->WouldPublish(KeyspaceEvents::Generic);
+        // NotifyWatchers / NotifyKeyspace each have a lock-free fast path
+        // (atomic _entryCount==0 / WouldPublish gate) so a per-key call
+        // against an empty registry is a single atomic load. The previous
+        // shape hoisted HasAnyWatchers() / WouldPublish() ONCE before the
+        // loop — under multi-reactor, a WATCH issued on another reactor
+        // between the hoist and a later key's mutation made that mutation
+        // skip NotifyWatchers, letting a racing EXEC commit over a write
+        // that should have aborted it. Per-key probes close the race at no
+        // measurable steady-state cost.
         for (auto const& key: args)
         {
             auto const result = engine->Delete(key);
             if (result.has_value())
             {
                 ++deleted;
-                if (anyW)
-                    NotifyWatchers(state, key);
-                if (anyK)
-                    NotifyKeyspace(state, KeyspaceEvents::Generic, "del", key);
+                NotifyWatchers(state, key);
+                NotifyKeyspace(state, KeyspaceEvents::Generic, "del", key);
             }
         }
         co_return co_await ReplyInteger(socket, deleted);
@@ -1764,6 +1763,17 @@ namespace
             co_return co_await ReplyError(socket, "transactions are not available");
         if (!state->watch)
             state->watch = std::make_shared<WatchHandle>();
+        // Track this-call's successfully-registered keys so a mid-call
+        // storage failure rolls back ONLY those keys, not the connection's
+        // accumulated WATCH state. A previous shape called
+        // `UnregisterAll(handle)` here, which wiped every key the handle
+        // ever registered (including from earlier WATCH commands) AND
+        // reset the dirty flag — silently nullifying watches the client
+        // believed were still in effect. With per-key Unregister, the
+        // inline contract ("Roll back every Register already taken in
+        // THIS WATCH call") finally matches the code.
+        std::vector<std::string_view> thisCallKeys;
+        thisCallKeys.reserve(args.size());
         for (auto const& key: args)
         {
             // Order matters under multi-reactor load:
@@ -1784,13 +1794,14 @@ namespace
             // A StorageError on PeekCas means the snapshot is unreliable —
             // treating an I/O failure as "key absent" would silently
             // commit a later EXEC against state we never read. Roll back
-            // every Register already taken in THIS WATCH call
-            // (UnregisterAll wipes the lot) and surface the error.
+            // every Register already taken in THIS WATCH call only.
             state->watchRegistry->Register(state->watch, key);
+            thisCallKeys.push_back(key);
             auto const cas = engine->PeekCas(key);
             if (!cas.has_value())
             {
-                state->watchRegistry->UnregisterAll(state->watch.get());
+                for (auto const rollbackKey: thisCallKeys)
+                    state->watchRegistry->Unregister(state->watch.get(), rollbackKey);
                 co_return co_await ReplyError(socket, "storage failure during WATCH");
             }
             state->watch->Remember(key, *cas);
@@ -1820,12 +1831,37 @@ namespace
         // cannot leak a stale dirty bit into the next EXEC).
         auto queue = std::exchange(state->queue, {});
         auto const wasDirty = state->multiDirty;
-        auto const watchTripped = state->watch && state->watch->IsDirty();
         state->inMulti = false;
         state->multiDirty = false;
         state->queueBytes = 0;
+        // Order is load-bearing for the EXEC race:
+        //   1. UnregisterAll removes the handle from the registry index
+        //      under WatchRegistry::_mu (and now releases _mu BEFORE
+        //      touching the handle). Once we return, no new Touched call
+        //      can find a strong_ptr to this handle.
+        //   2. ClaimAndClearDirty atomically reads-and-clears the bit.
+        //      Any racing Touched that snapshotted the strong_ptr BEFORE
+        //      we erased the index entry and is still in flight may yet
+        //      fire MarkDirty — that's fine: it lands on the handle that
+        //      this connection will keep using, and the NEXT WATCH/EXEC
+        //      cycle will pick it up. Crucially, the bit we read here
+        //      for THIS EXEC is no longer racing with Clear because
+        //      Clear() is no longer in the picture: ClaimAndClearDirty
+        //      does the read AND the reset in one atomic exchange.
+        bool watchTripped = false;
         if (state->watch && state->watchRegistry != nullptr)
+        {
             state->watchRegistry->UnregisterAll(state->watch.get());
+            // UnregisterAll already wiped the snapshot map (via Clear)
+            // AND reset the dirty flag inside its post-_mu Clear() call.
+            // For correctness of THIS EXEC we re-read the bit via
+            // ClaimAndClearDirty: any racing Touched between our
+            // UnregisterAll-_mu-release and this load is now visible.
+            // For the NEXT MULTI on the same handle, ClaimAndClearDirty's
+            // atomic exchange ensures we leave the bit false even if the
+            // race made it momentarily true.
+            watchTripped = state->watch->ClaimAndClearDirty();
+        }
 
         if (wasDirty)
             co_return co_await WriteAll(socket, "-EXECABORT Transaction discarded because of previous errors.\r\n");
@@ -2247,19 +2283,18 @@ namespace
     {
         if (args.empty() || (args.size() % 2) != 0)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'mset'");
-        // Per-command gates — see HandleDel for the rationale.
-        bool const anyW = state != nullptr && state->watchRegistry != nullptr && state->watchRegistry->HasAnyWatchers();
-        bool const anyK = state != nullptr && state->keyspaceNotifier != nullptr
-                          && state->keyspaceNotifier->WouldPublish(KeyspaceEvents::String);
+        // Per-key probes (no hoist): NotifyWatchers/NotifyKeyspace each
+        // have a lock-free fast path — see HandleDel for the rationale.
+        // The previous hoist allowed a concurrent WATCH on another reactor
+        // mid-loop to be silently skipped for later keys, breaking the
+        // WATCH guarantee for that racing transaction.
         for (std::size_t i = 0; i < args.size(); i += 2)
         {
             auto const r = engine->Set(args[i], BytesFromString(args[i + 1]), 0, 0);
             if (!r.has_value())
                 co_return co_await ReplyError(socket, "storage failure");
-            if (anyW)
-                NotifyWatchers(state, args[i]);
-            if (anyK)
-                NotifyKeyspace(state, KeyspaceEvents::String, "set", args[i]);
+            NotifyWatchers(state, args[i]);
+            NotifyKeyspace(state, KeyspaceEvents::String, "set", args[i]);
         }
         co_return co_await ReplyOk(socket);
     }
@@ -2288,14 +2323,10 @@ namespace
             if (peek.has_value() && peek->found)
                 co_return co_await ReplyInteger(socket, 0);
         }
-        // Per-command gates — see HandleDel. MSETNX needs two keyspace
-        // gates because the success path fires "set" (String class) and
-        // the rollback fires "del" (Generic class).
-        bool const anyW = state != nullptr && state->watchRegistry != nullptr && state->watchRegistry->HasAnyWatchers();
-        bool const anyKSet = state != nullptr && state->keyspaceNotifier != nullptr
-                             && state->keyspaceNotifier->WouldPublish(KeyspaceEvents::String);
-        bool const anyKDel = state != nullptr && state->keyspaceNotifier != nullptr
-                             && state->keyspaceNotifier->WouldPublish(KeyspaceEvents::Generic);
+        // Per-key probes (no hoist) — see HandleDel for the rationale.
+        // The previous hoist allowed a concurrent WATCH on another reactor
+        // mid-loop to be silently skipped for later keys.
+        //
         // Second pass: write each via Add (NX semantics per key). Track
         // committed keys so we can roll back if a later Add fails.
         std::vector<std::string_view> committed;
@@ -2314,20 +2345,16 @@ namespace
                 for (auto const& k: committed)
                 {
                     (void) engine->Delete(k);
-                    if (anyW)
-                        NotifyWatchers(state, k);
+                    NotifyWatchers(state, k);
                     // The rollback Delete fires "del" — the keyspace
                     // would otherwise show the half-written batch.
-                    if (anyKDel)
-                        NotifyKeyspace(state, KeyspaceEvents::Generic, "del", k);
+                    NotifyKeyspace(state, KeyspaceEvents::Generic, "del", k);
                 }
                 co_return co_await ReplyInteger(socket, 0);
             }
             committed.push_back(key);
-            if (anyW)
-                NotifyWatchers(state, key);
-            if (anyKSet)
-                NotifyKeyspace(state, KeyspaceEvents::String, "set", key);
+            NotifyWatchers(state, key);
+            NotifyKeyspace(state, KeyspaceEvents::String, "set", key);
         }
         co_return co_await ReplyInteger(socket, 1);
     }

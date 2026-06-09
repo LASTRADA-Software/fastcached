@@ -189,3 +189,137 @@ TEST_CASE("WatchHandle::Clear forgets snapshots and resets dirty", "[protocol][r
     REQUIRE_FALSE(handle.IsDirty());
     REQUIRE(handle.WatchedKeys().empty());
 }
+
+TEST_CASE("WatchRegistry::Unregister removes only that key and leaves others intact",
+          "[protocol][redis][transaction]")
+{
+    // Per-key Unregister is the building block for HandleWatch's
+    // partial-failure rollback: a later WATCH that hits a StorageError
+    // must roll back its own keys without wiping registrations from
+    // earlier successful WATCH calls. UnregisterAll's blast radius is
+    // wrong for that path.
+    WatchRegistry registry;
+    auto handle = std::make_shared<WatchHandle>();
+    registry.Register(handle, "a");
+    registry.Register(handle, "b");
+    handle->Remember("a", 1);
+    handle->Remember("b", 2);
+
+    REQUIRE(registry.Unregister(handle.get(), "b") == 1);
+    // Unregister must NOT touch _snapshots: both 'a' and 'b' snapshots
+    // remain on the handle. (HandleWatch's partial-failure rollback drops
+    // index entries only; the snapshots are inert without the index, but
+    // leaving them avoids the per-key map mutation under WatchHandle::_mu.)
+    {
+        auto const keys = handle->WatchedKeys();
+        REQUIRE(keys.size() == 2);
+    }
+    // `a` still in the registry index — racing SET on `a` dirties the handle.
+    REQUIRE(registry.Touched("a") == 1);
+    REQUIRE(handle->IsDirty());
+    // `b` is no longer in the registry index — racing SET on `b` is a no-op.
+    handle->Clear();
+    REQUIRE(registry.Touched("b") == 0);
+    REQUIRE_FALSE(handle->IsDirty());
+}
+
+TEST_CASE("WatchRegistry::Unregister is a no-op when the key is not registered",
+          "[protocol][redis][transaction]")
+{
+    WatchRegistry registry;
+    auto handle = std::make_shared<WatchHandle>();
+    registry.Register(handle, "a");
+    REQUIRE(registry.Unregister(handle.get(), "missing") == 0);
+    REQUIRE(registry.HasAnyWatchers());
+}
+
+TEST_CASE("WatchRegistry::Unregister tolerates a null handle pointer",
+          "[protocol][redis][transaction]")
+{
+    WatchRegistry registry;
+    REQUIRE(registry.Unregister(nullptr, "k") == 0);
+}
+
+TEST_CASE("WatchHandle::ClaimAndClearDirty returns prior state and resets the bit",
+          "[protocol][redis][transaction]")
+{
+    // ClaimAndClearDirty is the atomic read-and-clear primitive that closes
+    // the EXEC race. The previous shape was IsDirty + Clear in two atomic
+    // operations; a racing MarkDirty between them could either be observed
+    // (and then wiped by Clear) or missed entirely. exchange() collapses
+    // the read and the clear into one indivisible step.
+    WatchHandle handle;
+    handle.Remember("k", 9);
+    handle.MarkDirty();
+
+    REQUIRE(handle.ClaimAndClearDirty());
+    REQUIRE_FALSE(handle.IsDirty());
+    // Second claim returns false — no new dirty signal since the clear.
+    REQUIRE_FALSE(handle.ClaimAndClearDirty());
+    // Snapshots are wiped — a future MULTI on the same handle starts fresh.
+    REQUIRE(handle.WatchedKeys().empty());
+}
+
+TEST_CASE("WatchRegistry::UnregisterAll releases _mu before calling handle->Clear",
+          "[protocol][redis][transaction][lock-order]")
+{
+    // Behavioural assertion: while UnregisterAll runs, a concurrent Touched
+    // on a DIFFERENT handle for a DIFFERENT key must NOT block (would have
+    // blocked under the old shape if Clear held handle->_mu while
+    // UnregisterAll held registry._mu). We cannot directly observe lock
+    // release ordering from the outside, but we CAN observe that the
+    // handle's Clear() runs and the dirty/snapshot wipe is complete by the
+    // time UnregisterAll returns.
+    WatchRegistry registry;
+    auto handle = std::make_shared<WatchHandle>();
+    registry.Register(handle, "k");
+    handle->Remember("k", 1);
+    handle->MarkDirty();
+    REQUIRE(handle->IsDirty());
+
+    registry.UnregisterAll(handle.get());
+
+    // Index entry is gone; dirty was reset; snapshots are wiped.
+    REQUIRE_FALSE(handle->IsDirty());
+    REQUIRE(handle->WatchedKeys().empty());
+    REQUIRE_FALSE(registry.HasAnyWatchers());
+}
+
+TEST_CASE("WatchRegistry: a MarkDirty that races past UnregisterAll is collected by the NEXT EXEC's ClaimAndClearDirty",
+          "[protocol][redis][transaction][race]")
+{
+    // Simulates the EXEC race in deterministic order:
+    //   1. Touched runs partially — snapshots a strong_ptr to the handle
+    //      under _mu, releases _mu, but the MarkDirty store hasn't fired
+    //      yet (modelled by snapshotting the strong_ptr by hand).
+    //   2. HandleExec's UnregisterAll runs (index entry erased; Clear
+    //      stores dirty=false).
+    //   3. The deferred MarkDirty lands — dirty=true on the same handle.
+    //   4. HandleExec calls ClaimAndClearDirty AFTER UnregisterAll.
+    // Under the fix, the next EXEC will read dirty=true exactly once
+    // (the racing signal is collected, not lost) and the bit will be
+    // cleared so a third EXEC on a different key does not spuriously
+    // abort. Under the OLD shape, the dirty bit either leaked into the
+    // next EXEC (spurious *-1) or was wiped before being read.
+    WatchRegistry registry;
+    auto handle = std::make_shared<WatchHandle>();
+    registry.Register(handle, "k");
+    handle->Remember("k", 1);
+
+    // Step 2: UnregisterAll runs (index entry removed; dirty cleared).
+    registry.UnregisterAll(handle.get());
+    REQUIRE_FALSE(handle->IsDirty());
+
+    // Step 3: the deferred MarkDirty from the racing Touched lands.
+    handle->MarkDirty();
+    REQUIRE(handle->IsDirty());
+
+    // Step 4: the connection issues a fresh WATCH; we model the NEXT
+    // EXEC's ClaimAndClearDirty. It should observe the racing dirty bit
+    // and reset it in one atomic step.
+    REQUIRE(handle->ClaimAndClearDirty());
+
+    // A SUBSEQUENT EXEC (no further mutations) must see dirty=false —
+    // the racing signal was collected exactly once.
+    REQUIRE_FALSE(handle->ClaimAndClearDirty());
+}

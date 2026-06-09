@@ -49,6 +49,13 @@ class WatchHandle
     /// True iff at least one Touched(key) since the last Clear().
     [[nodiscard]] bool IsDirty() const noexcept;
 
+    /// Atomically read-and-clear the dirty flag, also wiping `_snapshots`.
+    /// Used by EXEC after the handle has been removed from the registry
+    /// index so no further Touched can target it. Returns the pre-clear
+    /// dirty state — the caller uses it to decide EXEC commit vs *-1 abort.
+    /// @return True iff the dirty flag was set before the clear.
+    [[nodiscard]] bool ClaimAndClearDirty() noexcept;
+
   private:
     mutable std::mutex _mu;
     /// Transparent hashing lets `Remember`'s lookup-by-string_view avoid
@@ -85,8 +92,24 @@ class WatchRegistry
     /// @param key    Lookup key.
     void Register(std::shared_ptr<WatchHandle> const& handle, std::string_view key);
 
+    /// Drop a single (handle, key) index entry. Used by `HandleWatch`'s
+    /// partial-failure rollback so a failing later WATCH does NOT wipe keys
+    /// that earlier WATCH calls successfully registered. Returns the number
+    /// of entries removed (0 if absent, 1 on success).
+    /// Does NOT touch `handle->_snapshots` or the dirty flag — partial
+    /// rollback keeps the earlier snapshots and any racing dirty bit live.
+    /// @param handle The connection's handle.
+    /// @param key    Lookup key registered earlier in this same WATCH call.
+    /// @return Number of (handle, key) entries removed.
+    std::size_t Unregister(WatchHandle* handle, std::string_view key);
+
     /// Drop every key-index entry referencing `handle`. Called on UNWATCH,
     /// EXEC, DISCARD, and connection teardown.
+    ///
+    /// The handle's `Clear()` is invoked AFTER the registry mutex has been
+    /// released so the registry→handle lock-order edge does not exist —
+    /// any future code path that wants to take `handle->_mu` before the
+    /// registry mutex cannot deadlock against this call.
     void UnregisterAll(WatchHandle* handle);
 
     /// Mutation hook: every Redis write verb calls this after its engine
