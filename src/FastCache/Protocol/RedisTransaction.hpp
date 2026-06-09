@@ -2,9 +2,11 @@
 #pragma once
 
 #include <FastCache/Cache/CacheEntry.hpp>
+#include <FastCache/Core/StringHash.hpp>
 
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -49,7 +51,10 @@ class WatchHandle
 
   private:
     mutable std::mutex _mu;
-    std::unordered_map<std::string, CasToken> _snapshots;
+    /// Transparent hashing lets `Remember`'s lookup-by-string_view avoid
+    /// the per-call `std::string` allocation that the default
+    /// `std::hash<std::string>` map would force.
+    std::unordered_map<std::string, CasToken, TransparentStringHash, std::equal_to<>> _snapshots;
     std::atomic<bool> _dirty { false };
 };
 
@@ -98,7 +103,16 @@ class WatchRegistry
 
   private:
     mutable std::mutex _mu;
-    std::unordered_map<std::string, std::unordered_map<WatchHandle*, std::weak_ptr<WatchHandle>>> _index;
+    /// Transparent hashing — every `Touched(key)` call previously
+    /// allocated a `std::string` to look up `_index`. With
+    /// `TransparentStringHash` + `std::equal_to<>` the lookup accepts the
+    /// caller's `std::string_view` directly, zero-alloc, on the hot
+    /// write path.
+    std::unordered_map<std::string,
+                       std::unordered_map<WatchHandle*, std::weak_ptr<WatchHandle>>,
+                       TransparentStringHash,
+                       std::equal_to<>>
+        _index;
     /// Total number of (handle, key) entries across all _index buckets.
     /// Updated under `_mu` so it stays consistent with `_index`, but read
     /// lock-free in `Touched` so the steady-state "nothing watching"

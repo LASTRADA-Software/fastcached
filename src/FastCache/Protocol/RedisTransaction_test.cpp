@@ -76,6 +76,50 @@ TEST_CASE("WatchRegistry: an expired handle is skipped without crashing", "[prot
     REQUIRE(registry.Touched("foo") == 0);
 }
 
+TEST_CASE("WatchRegistry: Touched accepts a non-NUL-terminated string_view (transparent hashing)",
+          "[protocol][redis][transaction][transparent-hash]")
+{
+    // Pre-fix `_index` defaulted to `hash<std::string>` so every Touched
+    // call allocated a `std::string` to find the bucket. With
+    // TransparentStringHash + std::equal_to<>, a string_view over a
+    // non-NUL-terminated buffer must locate the entry verbatim. If the
+    // map silently fell back to a string conversion, this test would still
+    // pass — but the test_fixture lookup pattern (a string_view aliasing
+    // a larger buffer) is the realistic hot path from RedisResp where
+    // ParsedCommand args are owned string slices.
+    WatchRegistry registry;
+    auto handle = std::make_shared<WatchHandle>();
+    registry.Register(handle, "myKey");
+
+    // A view that aliases a longer buffer (no embedded NUL) — must match
+    // the registered key "myKey" by content, not by C-string identity.
+    char const buffer[] = "myKeyExtraBytes"; // longer than "myKey"
+    auto const view = std::string_view { buffer, 5 };
+    REQUIRE(view == "myKey");
+    REQUIRE(registry.Touched(view) == 1);
+    REQUIRE(handle->IsDirty());
+}
+
+TEST_CASE("WatchHandle: Remember accepts a non-NUL-terminated string_view",
+          "[protocol][redis][transaction][transparent-hash]")
+{
+    // Symmetric guard for WatchHandle::_snapshots — same transparent
+    // hashing contract applies.
+    WatchHandle handle;
+    char const buffer[] = "snapKeyExtra";
+    auto const view = std::string_view { buffer, 7 };
+    REQUIRE(view == "snapKey");
+
+    handle.Remember(view, 42);
+    auto const keys = handle.WatchedKeys();
+    REQUIRE(keys.size() == 1);
+    REQUIRE(keys[0] == "snapKey");
+
+    // Re-Remember by view must update in place, not push a duplicate.
+    handle.Remember(view, 99);
+    REQUIRE(handle.WatchedKeys().size() == 1);
+}
+
 TEST_CASE("WatchRegistry: Touched between Register and Remember still dirties the handle",
           "[protocol][redis][transaction][race]")
 {

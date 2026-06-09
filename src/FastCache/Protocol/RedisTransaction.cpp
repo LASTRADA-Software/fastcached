@@ -11,7 +11,15 @@ namespace FastCache
 void WatchHandle::Remember(std::string_view key, CasToken cas)
 {
     std::scoped_lock const lock { _mu };
-    _snapshots.insert_or_assign(std::string { key }, cas);
+    // Transparent lookup: try-find by string_view first so we re-use the
+    // existing key allocation on the common "re-Remember of the same key"
+    // path; only allocate a new std::string on a fresh insert.
+    if (auto const it = _snapshots.find(key); it != _snapshots.end())
+    {
+        it->second = cas;
+        return;
+    }
+    _snapshots.emplace(std::string { key }, cas);
 }
 
 void WatchHandle::Clear() noexcept
@@ -46,11 +54,16 @@ void WatchRegistry::Register(std::shared_ptr<WatchHandle> const& handle, std::st
     if (!handle)
         return;
     std::scoped_lock const lock { _mu };
-    auto& bucket = _index[std::string { key }];
+    // Transparent lookup first so the common re-Register path on an
+    // existing bucket re-uses its allocation; only allocate a fresh
+    // std::string when the bucket is brand new.
+    auto it = _index.find(key);
+    if (it == _index.end())
+        it = _index.emplace(std::string { key }, decltype(_index)::mapped_type {}).first;
     // insert_or_assign returns {iterator, true} only on a fresh insert; on
     // re-Register of the same handle for the same key we must NOT bump
     // the counter (the entry was already counted).
-    auto const [_, inserted] = bucket.insert_or_assign(handle.get(), std::weak_ptr<WatchHandle> { handle });
+    auto const [_, inserted] = it->second.insert_or_assign(handle.get(), std::weak_ptr<WatchHandle> { handle });
     if (inserted)
         _entryCount.fetch_add(1, std::memory_order_release);
 }
@@ -93,7 +106,8 @@ std::size_t WatchRegistry::Touched(std::string_view key)
     std::vector<std::shared_ptr<WatchHandle>> targets;
     {
         std::scoped_lock const lock { _mu };
-        auto const it = _index.find(std::string { key });
+        // Transparent find — accept the caller's string_view zero-alloc.
+        auto const it = _index.find(key);
         if (it == _index.end())
             return 0;
         targets.reserve(it->second.size());
