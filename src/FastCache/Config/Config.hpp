@@ -170,8 +170,12 @@ struct Config
     ///   E  publish on `__keyevent@<db>__:<event>` channels
     ///   g  generic events: del / expire / persist
     ///   $  string events: set
-    ///   x  expiration events: expired (fired on lazy-expiry observation)
-    ///   A  alias for `g$x` — everything we currently emit
+    ///   A  alias for `g$` — everything we currently emit
+    /// `x` (expiration events) is documented by Redis but not yet
+    /// implemented here — the storage layer has no expiry callback, so
+    /// the parser rejects `x` until the NotifyingStorage decorator lands
+    /// (see TODO.md). Operators who set `x` get a startup error rather
+    /// than the silent miss the original branch shipped with.
     /// Each enabled write verb fires `__keyspace@0__:<key> <event>` (with K)
     /// and `__keyevent@0__:<event> <key>` (with E). At least one of K or E
     /// must be set for any event to actually be published.

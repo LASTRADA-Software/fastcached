@@ -15,18 +15,23 @@ namespace
     /// Data-driven flag→bit lookup. One row per recognised letter; unknown
     /// letters fall through to a hard ConfigError so a typo in a YAML
     /// `notify-keyspace-events: AKE` doesn't silently disable notifications.
+    ///
+    /// `x` (Expired) is intentionally absent: the daemon has no expiry
+    /// callback at the storage layer yet, so accepting `x` would advertise
+    /// a capability we don't deliver. The bit itself stays defined in
+    /// KeyspaceEvents so the follow-up `NotifyingStorage` decorator (see
+    /// TODO.md) can add it back in one edit.
     struct FlagBit
     {
         char letter;
         std::uint32_t mask;
     };
 
-    constexpr std::array<FlagBit, 6> FlagTable { {
+    constexpr std::array<FlagBit, 5> FlagTable { {
         { .letter = 'K', .mask = KeyspaceEvents::Keyspace },
         { .letter = 'E', .mask = KeyspaceEvents::Keyevent },
         { .letter = 'g', .mask = KeyspaceEvents::Generic },
         { .letter = '$', .mask = KeyspaceEvents::String },
-        { .letter = 'x', .mask = KeyspaceEvents::Expired },
         { .letter = 'A', .mask = KeyspaceEvents::All },
     } };
 

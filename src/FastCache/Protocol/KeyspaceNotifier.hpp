@@ -21,10 +21,16 @@ namespace KeyspaceEvents
     constexpr std::uint32_t Keyevent = 1U << 1; ///< `E` — publish to __keyevent@N__:event
     constexpr std::uint32_t Generic = 1U << 2;  ///< `g` — del / expire / persist
     constexpr std::uint32_t String = 1U << 3;   ///< `$` — set
-    constexpr std::uint32_t Expired = 1U << 4;  ///< `x` — expired (lazy-expiry)
+    /// `x` — expired (lazy-expiry). The flag bit is reserved but unwired: the
+    /// daemon currently has no expiry callback at the storage layer, so no
+    /// code path can publish an `expired` event. Once the
+    /// `NotifyingStorage` decorator lands (see TODO.md), restore `x` to
+    /// `FlagTable` in KeyspaceNotifier.cpp and include `Expired` in `All`.
+    constexpr std::uint32_t Expired = 1U << 4;
 
     /// `A` is shorthand for every class type the daemon currently emits.
-    constexpr std::uint32_t All = Generic | String | Expired;
+    /// `Expired` is intentionally absent — see the note on `Expired` above.
+    constexpr std::uint32_t All = Generic | String;
 } // namespace KeyspaceEvents
 
 /// Parse a redis-style keyspace-event flag string into a bitmask. Each

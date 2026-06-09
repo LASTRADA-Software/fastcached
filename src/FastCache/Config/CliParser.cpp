@@ -548,7 +548,8 @@ namespace
         { .flag = "--notify-keyspace-events=<flags>",
           .description = "redis-style keyspace-event flag string; empty = off (default).\n"
                          "K=__keyspace, E=__keyevent, g=generic (del/expire/persist),\n"
-                         "$=string (set/incr*), x=expired, A=alias for g$x" },
+                         "$=string (set/incr*), A=alias for g$\n"
+                         "(x=expired is not yet wired — rejected pending storage callback)" },
         { .flag = "--log-timestamps", .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)" },
         { .flag = "--storage=<path>", .description = "persist cache to a CoW-tree file (default: in-memory only)" },
         { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },

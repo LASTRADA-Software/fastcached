@@ -56,16 +56,31 @@ TEST_CASE("ParseKeyspaceEvents: AKE expands and ORs to the all-events mask", "[p
     REQUIRE((*mask & KeyspaceEvents::Keyevent) != 0);
     REQUIRE((*mask & KeyspaceEvents::Generic) != 0);
     REQUIRE((*mask & KeyspaceEvents::String) != 0);
-    REQUIRE((*mask & KeyspaceEvents::Expired) != 0);
+    // Expired is NOT part of `A` until the storage-layer expiry callback
+    // lands (see TODO.md NotifyingStorage entry). Including it here would
+    // promise an event the daemon never fires.
+    REQUIRE((*mask & KeyspaceEvents::Expired) == 0);
 }
 
-TEST_CASE("ParseKeyspaceEvents: KEg$x mirrors A explicitly", "[protocol][keyspace]")
+TEST_CASE("ParseKeyspaceEvents: KEg$ mirrors A explicitly", "[protocol][keyspace]")
 {
     auto const a = ParseKeyspaceEvents("AKE");
-    auto const explicitly = ParseKeyspaceEvents("KEg$x");
+    auto const explicitly = ParseKeyspaceEvents("KEg$");
     REQUIRE(a.has_value());
     REQUIRE(explicitly.has_value());
     REQUIRE(*a == *explicitly);
+}
+
+TEST_CASE("ParseKeyspaceEvents: 'x' is rejected pending the storage-layer expiry hook",
+          "[protocol][keyspace]")
+{
+    // Original branch silently accepted `x` (and `A` set the Expired bit)
+    // but the daemon had no code path that ever published an `expired`
+    // event. Rejecting `x` at startup is preferable to advertising the
+    // capability and silently dropping every event.
+    auto const mask = ParseKeyspaceEvents("Ex");
+    REQUIRE_FALSE(mask.has_value());
+    REQUIRE(mask.error().field == "notify-keyspace-events");
 }
 
 TEST_CASE("ParseKeyspaceEvents: unknown letter is a ConfigError", "[protocol][keyspace]")
