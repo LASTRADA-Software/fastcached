@@ -122,9 +122,7 @@ std::expected<void, StorageError> NotifyingStorage::Delete(std::string_view key,
     return result;
 }
 
-std::expected<CasToken, StorageError> NotifyingStorage::Touch(std::string_view key,
-                                                              TimePoint newExpiry,
-                                                              TimePoint now)
+std::expected<CasToken, StorageError> NotifyingStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
 {
     auto result = _inner.Touch(key, newExpiry, now);
     if (result.has_value())
@@ -137,8 +135,7 @@ std::expected<GetResult, StorageError> NotifyingStorage::Peek(std::string_view k
     return _inner.Peek(key, now);
 }
 
-std::expected<std::optional<TimePoint>, StorageError> NotifyingStorage::PeekExpiry(std::string_view key,
-                                                                                   TimePoint now)
+std::expected<std::optional<TimePoint>, StorageError> NotifyingStorage::PeekExpiry(std::string_view key, TimePoint now)
 {
     return _inner.PeekExpiry(key, now);
 }
@@ -163,9 +160,7 @@ std::expected<GetResult, StorageError> NotifyingStorage::GetAndTouch(std::string
     return result;
 }
 
-std::expected<void, StorageError> NotifyingStorage::CompareAndDelete(std::string_view key,
-                                                                     CasToken expected,
-                                                                     TimePoint now)
+std::expected<void, StorageError> NotifyingStorage::CompareAndDelete(std::string_view key, CasToken expected, TimePoint now)
 {
     auto result = _inner.CompareAndDelete(key, expected, now);
     if (result.has_value())
@@ -199,9 +194,8 @@ std::expected<CasToken, StorageError> NotifyingStorage::Update(
     // fire the notification once the inner Update returns.
     UpdateAction observedAction { UpdateAction::Unchanged };
     bool calledOnce = false;
-    auto const wrapped = [&fn, &observedAction, &calledOnce](GetResult const& gr)
-        -> std::expected<UpdateOutcome, StorageError>
-    {
+    auto const wrapped =
+        [&fn, &observedAction, &calledOnce](GetResult const& gr) -> std::expected<UpdateOutcome, StorageError> {
         auto outcome = fn(gr);
         if (outcome.has_value())
         {

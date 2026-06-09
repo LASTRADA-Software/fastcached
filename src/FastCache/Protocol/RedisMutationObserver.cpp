@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Protocol/RedisMutationObserver.hpp>
-
 #include <FastCache/Protocol/RedisTransaction.hpp>
 
 namespace FastCache

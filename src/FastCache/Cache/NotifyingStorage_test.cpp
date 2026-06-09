@@ -57,8 +57,7 @@ TEST_CASE("NotifyingStorage fires Set on successful Set", "[cache][notifying-sto
     REQUIRE(obs.records[0].key == "k");
 }
 
-TEST_CASE("NotifyingStorage does NOT fire when inner storage returns an error",
-          "[cache][notifying-storage]")
+TEST_CASE("NotifyingStorage does NOT fire when inner storage returns an error", "[cache][notifying-storage]")
 {
     // Add against a key that already exists -> StorageError(KeyExists).
     // The observer must NOT see a Set event for a failed mutation.
@@ -93,8 +92,7 @@ TEST_CASE("NotifyingStorage HasObservers fast probe skips OnMutation when nothin
     REQUIRE(obs.records.empty());
 }
 
-TEST_CASE("NotifyingStorage with a null observer forwards every call to the inner storage",
-          "[cache][notifying-storage]")
+TEST_CASE("NotifyingStorage with a null observer forwards every call to the inner storage", "[cache][notifying-storage]")
 {
     // Defensive shape: a daemon that never wires an observer (e.g. tests
     // that just want a passthrough) must not crash on Notify.
@@ -122,8 +120,7 @@ TEST_CASE("NotifyingStorage fires Delete on successful Delete", "[cache][notifyi
     REQUIRE(obs.records[0].key == "k");
 }
 
-TEST_CASE("NotifyingStorage fires FlushDb with an empty key on FlushWithGeneration",
-          "[cache][notifying-storage][flushdb]")
+TEST_CASE("NotifyingStorage fires FlushDb with an empty key on FlushWithGeneration", "[cache][notifying-storage][flushdb]")
 {
     FastCache::ManualClock clock;
     FastCache::InMemoryLruStorage inner;
@@ -139,8 +136,7 @@ TEST_CASE("NotifyingStorage fires FlushDb with an empty key on FlushWithGenerati
     REQUIRE(obs.records[0].key.empty()); // whole-database event
 }
 
-TEST_CASE("NotifyingStorage forwards Peek without firing an event",
-          "[cache][notifying-storage]")
+TEST_CASE("NotifyingStorage forwards Peek without firing an event", "[cache][notifying-storage]")
 {
     // Peek is non-mutating; the observer must not be invoked.
     FastCache::ManualClock clock;
@@ -171,8 +167,8 @@ TEST_CASE("NotifyingStorage Update fires Update on Store, Delete on Delete, noth
         "k",
         [](FastCache::GetResult const&) {
             return FastCache::IStorage::UpdateOutcome { .value = std::vector<std::byte>(4),
-                                                       .flags = 0,
-                                                       .action = FastCache::IStorage::UpdateAction::Store };
+                                                        .flags = 0,
+                                                        .action = FastCache::IStorage::UpdateAction::Store };
         },
         clock.Now());
     REQUIRE(stored.has_value());
@@ -184,8 +180,9 @@ TEST_CASE("NotifyingStorage Update fires Update on Store, Delete on Delete, noth
     auto const unchanged = notifying.Update(
         "k",
         [](FastCache::GetResult const&) {
-            return FastCache::IStorage::UpdateOutcome { .value = {}, .flags = 0,
-                .action = FastCache::IStorage::UpdateAction::Unchanged };
+            return FastCache::IStorage::UpdateOutcome { .value = {},
+                                                        .flags = 0,
+                                                        .action = FastCache::IStorage::UpdateAction::Unchanged };
         },
         clock.Now());
     REQUIRE(unchanged.has_value());
@@ -195,8 +192,9 @@ TEST_CASE("NotifyingStorage Update fires Update on Store, Delete on Delete, noth
     auto const deleted = notifying.Update(
         "k",
         [](FastCache::GetResult const&) {
-            return FastCache::IStorage::UpdateOutcome { .value = {}, .flags = 0,
-                .action = FastCache::IStorage::UpdateAction::Delete };
+            return FastCache::IStorage::UpdateOutcome { .value = {},
+                                                        .flags = 0,
+                                                        .action = FastCache::IStorage::UpdateAction::Delete };
         },
         clock.Now());
     REQUIRE(deleted.has_value());

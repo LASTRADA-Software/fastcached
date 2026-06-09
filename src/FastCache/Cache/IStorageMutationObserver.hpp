@@ -20,19 +20,19 @@ namespace FastCache
 /// hook regardless of which protocol caused the mutation.
 enum class MutationKind : std::uint8_t
 {
-    Set,         ///< SET / set — full overwrite or new insert.
-    Delete,      ///< DEL / delete — explicit removal.
-    Append,      ///< APPEND / append — value extended at the tail.
-    Prepend,     ///< PREPEND / prepend — value extended at the head.
-    Incr,        ///< INCR / DECR / INCRBY family — numeric counter mutation.
-    Touch,       ///< TOUCH / EXPIRE / PEXPIRE / EXPIREAT family — TTL refresh.
-    Persist,     ///< PERSIST — TTL clear.
-    MarkStale,   ///< meta `md I` / `ms I` — entry marked stale.
-    Cas,         ///< Compare-and-swap success.
-    Update,      ///< Update primitive (SADD/SREM/SPOP/INCRBYFLOAT/...).
-    Expire,      ///< Lazy or scheduled TTL expiry consumed the entry.
-    Evict,       ///< LRU eviction reclaimed the entry under memory pressure.
-    FlushDb,     ///< FLUSHDB / flush_all — entire database wiped.
+    Set,       ///< SET / set — full overwrite or new insert.
+    Delete,    ///< DEL / delete — explicit removal.
+    Append,    ///< APPEND / append — value extended at the tail.
+    Prepend,   ///< PREPEND / prepend — value extended at the head.
+    Incr,      ///< INCR / DECR / INCRBY family — numeric counter mutation.
+    Touch,     ///< TOUCH / EXPIRE / PEXPIRE / EXPIREAT family — TTL refresh.
+    Persist,   ///< PERSIST — TTL clear.
+    MarkStale, ///< meta `md I` / `ms I` — entry marked stale.
+    Cas,       ///< Compare-and-swap success.
+    Update,    ///< Update primitive (SADD/SREM/SPOP/INCRBYFLOAT/...).
+    Expire,    ///< Lazy or scheduled TTL expiry consumed the entry.
+    Evict,     ///< LRU eviction reclaimed the entry under memory pressure.
+    FlushDb,   ///< FLUSHDB / flush_all — entire database wiped.
 };
 
 /// Notification sink consumed by `NotifyingStorage` on every mutation that

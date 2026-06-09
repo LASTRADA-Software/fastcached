@@ -50,7 +50,7 @@ class RedisMutationObserver final: public IStorageMutationObserver
     /// use OnMutation.
     struct EventDescriptor
     {
-        std::string_view name {};  ///< Redis keyspace event name.
+        std::string_view name {};   ///< Redis keyspace event name.
         std::uint32_t classFlag {}; ///< KeyspaceEvents::* bit.
     };
 
@@ -61,7 +61,6 @@ class RedisMutationObserver final: public IStorageMutationObserver
     [[nodiscard]] static EventDescriptor DescriptorFor(MutationKind kind) noexcept;
 
   private:
-
     /// Iterate every WATCH-registered key and trip its dirty flag.
     /// Used for FlushDb where no single key identifies the event.
     /// @return The number of handles dirtied (mainly for tests/metrics).

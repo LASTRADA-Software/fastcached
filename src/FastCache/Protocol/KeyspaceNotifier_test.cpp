@@ -41,7 +41,7 @@ class CapturingSubscriber: public ISubscriber
 
 } // namespace
 
-TEST_CASE("ParseKeyspaceEvents: empty string → no flags", "[protocol][keyspace]")
+TEST_CASE("ParseKeyspaceEvents: empty string yields no flags", "[protocol][keyspace]")
 {
     auto const mask = ParseKeyspaceEvents("");
     REQUIRE(mask.has_value());
