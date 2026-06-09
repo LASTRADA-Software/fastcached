@@ -34,6 +34,19 @@ class RedisRespHandler final: public IProtocolHandler
                                  CacheEngine* engine,
                                  std::vector<std::byte> primingBytes,
                                  SessionContext session) override;
+
+    /// Test seam: override the per-connection MULTI queue caps so unit tests
+    /// can exercise the breach path without actually allocating the
+    /// production default (256 MiB / 65 536 commands). A value of 0 means
+    /// "keep the production default". Production code never calls this.
+    /// @param maxCommands Replacement for `MaxQueuedCommands`; 0 = no change.
+    /// @param maxBytes    Replacement for `MaxQueuedBytes`;     0 = no change.
+    void OverrideMultiQueueCapsForTests(std::size_t maxCommands, std::size_t maxBytes) noexcept;
+
+  private:
+    /// Test-only overrides; zero means "use the module default".
+    std::size_t _testMaxQueuedCommands { 0 };
+    std::size_t _testMaxQueuedBytes { 0 };
 };
 
 } // namespace FastCache

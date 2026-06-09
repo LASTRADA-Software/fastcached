@@ -17,10 +17,14 @@ namespace FastCache
 
 /// Per-connection state shared between WatchRegistry (which flips the dirty
 /// flag from any reactor thread on a Touched(key) hit) and the connection's
-/// command loop (which reads it on EXEC). Held by shared_ptr so a publisher
-/// snapshotting `weak_ptr<WatchHandle>` cannot race a disconnection — the
-/// upgrade-under-lock either yields a live owner or the weak has expired.
-class WatchHandle: public std::enable_shared_from_this<WatchHandle>
+/// command loop (which reads it on EXEC). Held by shared_ptr by the
+/// connection; the registry indexes weak_ptr copies for upgrade-under-lock
+/// inside Touched(), so a publisher snapshotting `weak_ptr<WatchHandle>`
+/// cannot race a disconnection — the upgrade either yields a live owner or
+/// the weak has expired. (No enable_shared_from_this: nothing inside the
+/// class ever calls shared_from_this(); the ownership story is driven
+/// externally by the connection's `state.watch` shared_ptr.)
+class WatchHandle
 {
   public:
     /// Snapshot a key's current CAS at WATCH time. Called from the connection's

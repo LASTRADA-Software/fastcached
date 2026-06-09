@@ -1679,3 +1679,295 @@ TEST_CASE("RESP keyspace: EXPIRE fires the verb-named event under K + g",
     REQUIRE(fix.sub->messages[1].channel == "__keyspace@0__:k");
     REQUIRE(fix.sub->messages[1].payload == "expire");
 }
+
+// ----- Redis transactions: forbidden verbs inside MULTI ----------------------
+
+TEST_CASE("RESP: SUBSCRIBE inside MULTI is rejected and aborts EXEC", "[protocol][resp][tx]")
+{
+    // SUBSCRIBE writes one frame per channel, which would split EXEC's *N
+    // aggregate header from the actual element count. Reject at queue time
+    // and dirty the transaction so EXEC reports EXECABORT.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n"
+               "-ERR SUBSCRIBE is not allowed inside a transaction\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
+TEST_CASE("RESP: PSUBSCRIBE/UNSUBSCRIBE/PUNSUBSCRIBE inside MULTI are rejected",
+          "[protocol][resp][tx]")
+{
+    // Every (P)SUBSCRIBE / (P)UNSUBSCRIBE variant has the same multi-frame
+    // hazard — verify the deny-list catches all four.
+    for (auto const verb: { std::string_view { "PSUBSCRIBE" },
+                            std::string_view { "UNSUBSCRIBE" },
+                            std::string_view { "PUNSUBSCRIBE" } })
+    {
+        TxFixture fix;
+        auto request = std::string { "*1\r\n$5\r\nMULTI\r\n*2\r\n$" };
+        request += std::to_string(verb.size());
+        request += "\r\n";
+        request += verb;
+        request += "\r\n$2\r\nch\r\n*1\r\n$4\r\nEXEC\r\n";
+        auto const out = ExchangeTx(fix, request);
+        REQUIRE(out.contains("is not allowed inside a transaction"));
+        REQUIRE(out.contains("EXECABORT"));
+    }
+}
+
+TEST_CASE("RESP: QUIT inside MULTI is rejected (no mid-EXEC socket teardown)",
+          "[protocol][resp][tx]")
+{
+    // QUIT closes the socket. Allowing it inside MULTI would let EXEC's
+    // aggregate header be written to a half-closed fd; the trailing elements
+    // would never reach the client. Reject at queue time, dirty the tx.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*1\r\n$4\r\nQUIT\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n"
+               "-ERR QUIT is not allowed inside a transaction\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
+TEST_CASE("RESP: AUTH inside MULTI executes immediately (not queued)", "[protocol][resp][tx]")
+{
+    // Real redis queues AUTH; we deliberately diverge by running it inline so
+    // the existing AUTH/QUIT/RESET fast-track does not need to be rewired into
+    // the queue. The visible effect: AUTH replies its usual error path
+    // immediately (no `+QUEUED`) and the subsequent EXEC commits without
+    // including AUTH's reply. This locks in the documented divergence.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*2\r\n$4\r\nAUTH\r\n$3\r\nfoo\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // MULTI +OK, AUTH replies inline (-ERR no password set, since the fixture
+    // has no auth), EXEC commits empty queue → *0.
+    REQUIRE(out.starts_with("+OK\r\n"));
+    REQUIRE(out.contains("Client sent AUTH"));
+    REQUIRE(out.ends_with("*0\r\n"));
+}
+
+TEST_CASE("RESP: RESET inside MULTI clears the transaction and replies +RESET",
+          "[protocol][resp][tx]")
+{
+    // RESET is one of the verbs that runs even inside MULTI — its purpose is
+    // to clear EVERY per-connection state, which includes `inMulti`. After
+    // RESET, a subsequent EXEC must be an error (no MULTI in flight).
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                                "*1\r\n$5\r\nRESET\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n"
+               "+QUEUED\r\n"
+               "+RESET\r\n"
+               "-ERR EXEC without MULTI\r\n");
+}
+
+TEST_CASE("RESP: MULTI queue cap on command count dirties the transaction", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    // Tiny cap so the breach happens after two queued commands.
+    fix.handler.OverrideMultiQueueCapsForTests(/*maxCommands*/ 2, /*maxBytes*/ 0);
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nv\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\nv\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$1\r\nv\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // Two QUEUED, then the third trips the cap → -ERR, EXEC aborts.
+    REQUIRE(out
+            == "+OK\r\n"
+               "+QUEUED\r\n"
+               "+QUEUED\r\n"
+               "-ERR transaction queue exceeded per-connection limit\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
+TEST_CASE("RESP: MULTI queue cap on byte budget dirties the transaction", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    // Cap at ~32 bytes — enough for one small SET but not two.
+    fix.handler.OverrideMultiQueueCapsForTests(/*maxCommands*/ 0, /*maxBytes*/ 32);
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$20\r\nxxxxxxxxxxxxxxxxxxxx\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$20\r\nxxxxxxxxxxxxxxxxxxxx\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // First SET queues (24 bytes of argv: "SET" + "k" + 20 x's), second breaches.
+    REQUIRE(out
+            == "+OK\r\n"
+               "+QUEUED\r\n"
+               "-ERR transaction queue exceeded per-connection limit\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
+namespace
+{
+
+/// IStorage shim that delegates every method to a real InMemoryLruStorage
+/// EXCEPT `Peek`, which always returns a synthetic StorageError. Lets us
+/// drive HandleWatch through the engine->PeekCas->storage.Peek path so the
+/// failure mode is exercised end-to-end without a real disk fault.
+class FailingPeekStorage final: public FastCache::IStorage
+{
+  public:
+    std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view key,
+                                                                     FastCache::TimePoint now) override
+    {
+        return _inner.Get(key, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Set(std::string_view key,
+                                                                    std::vector<std::byte> value,
+                                                                    std::uint32_t flags,
+                                                                    FastCache::TimePoint expiry) override
+    {
+        return _inner.Set(key, std::move(value), flags, expiry);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Add(std::string_view key,
+                                                                    std::vector<std::byte> value,
+                                                                    std::uint32_t flags,
+                                                                    FastCache::TimePoint expiry,
+                                                                    FastCache::TimePoint now) override
+    {
+        return _inner.Add(key, std::move(value), flags, expiry, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Replace(std::string_view key,
+                                                                        std::vector<std::byte> value,
+                                                                        std::uint32_t flags,
+                                                                        FastCache::TimePoint expiry,
+                                                                        FastCache::TimePoint now) override
+    {
+        return _inner.Replace(key, std::move(value), flags, expiry, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Append(std::string_view key,
+                                                                       std::span<std::byte const> suffix,
+                                                                       FastCache::CasToken expected,
+                                                                       FastCache::TimePoint now) override
+    {
+        return _inner.Append(key, suffix, expected, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view key,
+                                                                        std::span<std::byte const> prefix,
+                                                                        FastCache::CasToken expected,
+                                                                        FastCache::TimePoint now) override
+    {
+        return _inner.Prepend(key, prefix, expected, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> CompareAndSwap(std::string_view key,
+                                                                               FastCache::CasToken expected,
+                                                                               std::vector<std::byte> value,
+                                                                               std::uint32_t flags,
+                                                                               FastCache::TimePoint expiry,
+                                                                               FastCache::TimePoint now) override
+    {
+        return _inner.CompareAndSwap(key, expected, std::move(value), flags, expiry, now);
+    }
+    std::expected<IncrResult, FastCache::StorageError> IncrementOrInitialize(std::string_view key,
+                                                                             std::uint64_t magnitude,
+                                                                             bool decrement,
+                                                                             FastCache::TimePoint now) override
+    {
+        return _inner.IncrementOrInitialize(key, magnitude, decrement, now);
+    }
+    std::expected<void, FastCache::StorageError> Delete(std::string_view key, FastCache::TimePoint now) override
+    {
+        return _inner.Delete(key, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Touch(std::string_view key,
+                                                                      FastCache::TimePoint newExpiry,
+                                                                      FastCache::TimePoint now) override
+    {
+        return _inner.Touch(key, newExpiry, now);
+    }
+    std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view /*key*/,
+                                                                      FastCache::TimePoint /*now*/) override
+    {
+        return std::unexpected(FastCache::MakeStorageError(FastCache::StorageErrorCode::IoError));
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(std::string_view key,
+                                                                          std::optional<FastCache::TimePoint> newExpiry,
+                                                                          FastCache::TimePoint now) override
+    {
+        return _inner.MarkStale(key, newExpiry, now);
+    }
+    void FlushWithGeneration(FastCache::TimePoint effectiveAt) override
+    {
+        _inner.FlushWithGeneration(effectiveAt);
+    }
+    std::size_t PurgeExpired(FastCache::TimePoint now) override
+    {
+        return _inner.PurgeExpired(now);
+    }
+    void Resize(std::size_t newMaxBytes) override
+    {
+        _inner.Resize(newMaxBytes);
+    }
+    [[nodiscard]] FastCache::StorageStats Snapshot() const noexcept override
+    {
+        return _inner.Snapshot();
+    }
+
+  private:
+    FastCache::InMemoryLruStorage _inner;
+};
+
+} // namespace
+
+TEST_CASE("RESP: WATCH on a faulting Peek replies an error (not silent CAS=0)",
+          "[protocol][resp][tx]")
+{
+    // The faulty-Peek shim forces engine->PeekCas to return a StorageError.
+    // WATCH must surface this as -ERR rather than silently snapshotting CAS=0:
+    // the latter would let a later EXEC commit against an unread storage view.
+    FastCache::ManualClock clock;
+    FailingPeekStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::WatchRegistry watches;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    FastCache::SessionContext session;
+    session.watches = &watches;
+
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n")));
+    pair.client->ShutdownWrite();
+    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(out == "-ERR storage failure during WATCH\r\n");
+}
+
+TEST_CASE("RESP: MULTI queue cap reset between transactions", "[protocol][resp][tx]")
+{
+    // After DISCARD, the next MULTI must start with a fresh queueBytes counter
+    // — otherwise the cap would be effectively cumulative across transactions
+    // on the same connection.
+    TxFixture fix;
+    fix.handler.OverrideMultiQueueCapsForTests(/*maxCommands*/ 2, /*maxBytes*/ 0);
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nv\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\nv\r\n"
+                                "*1\r\n$7\r\nDISCARD\r\n"
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$1\r\nv\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n"
+               "+QUEUED\r\n"
+               "+QUEUED\r\n"
+               "+OK\r\n"
+               "+OK\r\n"
+               "+QUEUED\r\n"
+               "*1\r\n+OK\r\n");
+}

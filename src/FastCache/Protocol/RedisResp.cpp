@@ -49,6 +49,17 @@ namespace
     constexpr std::size_t MaxPayloadBytes = 64 * 1024 * 1024;
     constexpr std::string_view Crlf = "\r\n";
 
+    /// MULTI queue caps — guard against a malicious client that streams an
+    /// unbounded number (or size) of QUEUED commands without ever sending
+    /// EXEC, exhausting the daemon's memory before storage eviction kicks in.
+    /// Once either cap is breached the transaction is marked dirty (the
+    /// matching EXEC replies `-EXECABORT`) and the queue is cleared to free
+    /// memory immediately. The numbers are conservative defaults sized for
+    /// realistic transaction batches; clients that legitimately need more can
+    /// always split into multiple MULTI/EXEC rounds.
+    constexpr std::size_t MaxQueuedCommands = 65'536;
+    constexpr std::size_t MaxQueuedBytes = 256ULL * 1024ULL * 1024ULL;
+
     /// The RESP protocol version negotiated for a connection. A connection
     /// starts in RESP2 and may upgrade to RESP3 via `HELLO 3`. The reply writers
     /// branch on this so a single code path serves both wire formats.
@@ -353,6 +364,18 @@ namespace
         /// args) as owned strings. Played back through Dispatch on EXEC, in
         /// FIFO order, with the responses framed as a single multi-bulk.
         std::vector<std::vector<std::string>> queue {};
+
+        /// Total bytes of `queue` argv payload. Tracked separately from
+        /// `queue.size()` so the cap check is O(1) without re-walking the
+        /// queue. Reset alongside `queue.clear()` on DISCARD / EXEC / RESET.
+        std::size_t queueBytes { 0 };
+
+        /// Per-connection caps on the MULTI queue. Defaults to the
+        /// module-level `MaxQueuedCommands` / `MaxQueuedBytes`. Tests inject
+        /// smaller values via the test-only seam below so they can exercise
+        /// the breach path without allocating a real 256 MiB.
+        std::size_t maxQueuedCommands { MaxQueuedCommands };
+        std::size_t maxQueuedBytes { MaxQueuedBytes };
 
         /// Per-connection WATCH state: snapshots taken by `WATCH` and a dirty
         /// flag that the WatchRegistry's mutation hook flips from any reactor
@@ -1640,6 +1663,7 @@ namespace
         state->inMulti = true;
         state->multiDirty = false;
         state->queue.clear();
+        state->queueBytes = 0;
         co_return co_await ReplyOk(socket);
     }
 
@@ -1652,6 +1676,7 @@ namespace
         state->inMulti = false;
         state->multiDirty = false;
         state->queue.clear();
+        state->queueBytes = 0;
         if (state->watch && state->watchRegistry != nullptr)
             state->watchRegistry->UnregisterAll(state->watch.get());
         co_return co_await ReplyOk(socket);
@@ -1686,8 +1711,20 @@ namespace
             // promote LRU recency the way GET would. A missing key snapshots
             // as CAS 0; any subsequent SET on it will Touch the registry and
             // flip dirty (the entry's first CAS is non-zero by construction).
+            //
+            // A StorageError here means the snapshot is unreliable — treating
+            // an I/O failure as "key absent" would silently commit a later
+            // EXEC against state we never read. Roll back every snapshot
+            // already taken in THIS WATCH call (UnregisterAll wipes the lot)
+            // and surface the error to the client, matching how every other
+            // engine call site treats StorageError.
             auto const cas = engine->PeekCas(key);
-            state->watchRegistry->Register(state->watch, key, cas.has_value() ? *cas : CasToken { 0 });
+            if (!cas.has_value())
+            {
+                state->watchRegistry->UnregisterAll(state->watch.get());
+                co_return co_await ReplyError(socket, "storage failure during WATCH");
+            }
+            state->watchRegistry->Register(state->watch, key, *cas);
         }
         co_return co_await ReplyOk(socket);
     }
@@ -1708,11 +1745,17 @@ namespace
 
         // Snapshot+clear local state up front so the EXEC reply is the only
         // thing that runs from here on, even if a replayed command throws.
+        // Reset multiDirty BEFORE reading wasDirty so the snapshot is the
+        // load-bearing copy — the field is then zeroed for the next MULTI
+        // (defensive: every entry into MULTI also zeroes it, but doubling up
+        // here means a future code path that fails to call HandleMulti
+        // cannot leak a stale dirty bit into the next EXEC).
         auto queue = std::exchange(state->queue, {});
         auto const wasDirty = state->multiDirty;
         auto const watchTripped = state->watch && state->watch->IsDirty();
         state->inMulti = false;
         state->multiDirty = false;
+        state->queueBytes = 0;
         if (state->watch && state->watchRegistry != nullptr)
             state->watchRegistry->UnregisterAll(state->watch.get());
 
@@ -1739,12 +1782,38 @@ namespace
         co_return true;
     }
 
-    /// True for the small set of verbs that pass straight through the queue
-    /// branch in Dispatch when `inMulti` is set (MULTI / EXEC / DISCARD /
-    /// WATCH-rejection / UNWATCH all carry their own queue semantics).
-    [[nodiscard]] constexpr bool IsTransactionControl(std::string_view name) noexcept
+    /// Verbs that bypass the MULTI queue branch entirely. Two groups land here:
+    ///   - The transaction-control verbs themselves (MULTI/EXEC/DISCARD/WATCH/
+    ///     UNWATCH) — they steer the queue and therefore cannot be queued.
+    ///   - The session-control verbs AUTH and RESET — every other write in
+    ///     this Dispatch needs to see their effect IMMEDIATELY (AUTH unlocks
+    ///     the connection, RESET clears every per-connection state, including
+    ///     `inMulti`), so queuing them would either let unauthenticated
+    ///     commands sneak in or fight RESET's clear-the-slate semantics.
+    /// Note: QUIT is deliberately NOT in this list. Allowing QUIT to tear the
+    /// session down mid-MULTI would leave EXEC writing aggregate elements to a
+    /// closed fd — see `IsForbiddenInMulti`.
+    [[nodiscard]] constexpr bool RunsEvenInsideMulti(std::string_view name) noexcept
     {
-        return name == "MULTI" || name == "EXEC" || name == "DISCARD" || name == "WATCH" || name == "UNWATCH";
+        return name == "MULTI" || name == "EXEC" || name == "DISCARD" || name == "WATCH" || name == "UNWATCH"
+               || name == "AUTH" || name == "RESET";
+    }
+
+    /// Verbs that MUST NOT be queued inside MULTI. Two reasons land here:
+    ///   1. The handler writes more than one RESP frame per reply, which would
+    ///      desync EXEC's `*N` aggregate header from the actual element count
+    ///      (every SUBSCRIBE channel produces its own confirmation frame).
+    ///   2. The handler tears down the session mid-frame (QUIT closes the
+    ///      socket; a subsequent queued command's reply would land on a closed
+    ///      fd and the multi-bulk would never complete on the wire).
+    /// Real redis simply queues these and replays them, accepting both
+    /// hazards; we trade a smidge of compatibility for protocol robustness.
+    /// A rejected command sets `multiDirty` so the matching EXEC aborts with
+    /// `-EXECABORT` — the queue cannot silently lose the rejected verb.
+    [[nodiscard]] constexpr bool IsForbiddenInMulti(std::string_view name) noexcept
+    {
+        return name == "SUBSCRIBE" || name == "UNSUBSCRIBE" || name == "PSUBSCRIBE" || name == "PUNSUBSCRIBE"
+               || name == "QUIT";
     }
 
     /// Map a StorageError from a set command to the appropriate RESP error,
@@ -2730,6 +2799,7 @@ namespace
         state->inMulti = false;
         state->multiDirty = false;
         state->queue.clear();
+        state->queueBytes = 0;
         if (state->watch && state->watchRegistry != nullptr)
             state->watchRegistry->UnregisterAll(state->watch.get());
         co_return co_await WriteAll(socket, "+RESET\r\n");
@@ -2769,26 +2839,23 @@ namespace
         if (authEnabled && !state->authenticated && !IsPreAuthAllowed(name))
             co_return co_await WriteAll(socket, "-NOAUTH Authentication required.\r\n");
 
-        // AUTH, QUIT and RESET carry side-effects beyond a plain reply, so they
-        // sit outside the data table; every other command is a table lookup.
-        if (name == "AUTH")
-            co_return co_await HandleAuth(socket, tail, session, state);
-        if (name == "QUIT")
-        {
-            (void) co_await ReplyOk(socket);
-            socket->Close();
-            co_return false; // signal session end
-        }
-        if (name == "RESET")
-            co_return co_await HandleReset(socket, session, state);
-
         // Inside `MULTI`, every non-transaction-control command is queued
         // instead of executed; the dispatcher then replies `+QUEUED`. We
         // still consult the table for an arity / unknown-command check at
         // queue time so the matching `EXEC` aborts (`-EXECABORT`) — matches
-        // redis's `MULTI_DIRTY_EXEC` semantics.
-        if (state->inMulti && !IsTransactionControl(name))
+        // redis's `MULTI_DIRTY_EXEC` semantics. The queue branch runs BEFORE
+        // the AUTH/QUIT/RESET fast-track below: a few side-effect verbs
+        // (notably QUIT and the SUBSCRIBE family) would otherwise tear down
+        // the session or split EXEC's `*N` aggregate header from the actual
+        // element count — see `IsForbiddenInMulti`.
+        if (state->inMulti && !RunsEvenInsideMulti(name))
         {
+            if (IsForbiddenInMulti(name))
+            {
+                state->multiDirty = true;
+                co_return co_await ReplyError(
+                    socket, std::format("{} is not allowed inside a transaction", name));
+            }
             auto const idx = CommandTableFind(name);
             if (!idx.has_value())
             {
@@ -2803,9 +2870,40 @@ namespace
                 state->multiDirty = true;
                 co_return co_await ReplyError(socket, std::format("wrong number of arguments for '{}'", name));
             }
+            // Enforce the MULTI queue caps before we copy the args into our
+            // owned storage — a single client must not be able to OOM the
+            // daemon by streaming SETs without ever sending EXEC.
+            std::size_t argvBytes = 0;
+            for (auto const& arg: cmd.args)
+                argvBytes += arg.size();
+            if (state->queue.size() >= state->maxQueuedCommands
+                || state->queueBytes + argvBytes > state->maxQueuedBytes)
+            {
+                state->multiDirty = true;
+                // Drop the existing queue immediately to reclaim memory; the
+                // dirty flag ensures EXEC still aborts deterministically.
+                state->queue.clear();
+                state->queueBytes = 0;
+                co_return co_await ReplyError(
+                    socket, "transaction queue exceeded per-connection limit");
+            }
+            state->queueBytes += argvBytes;
             state->queue.push_back(std::move(cmd.args));
             co_return co_await WriteAll(socket, "+QUEUED\r\n");
         }
+
+        // AUTH, QUIT and RESET carry side-effects beyond a plain reply, so they
+        // sit outside the data table; every other command is a table lookup.
+        if (name == "AUTH")
+            co_return co_await HandleAuth(socket, tail, session, state);
+        if (name == "QUIT")
+        {
+            (void) co_await ReplyOk(socket);
+            socket->Close();
+            co_return false; // signal session end
+        }
+        if (name == "RESET")
+            co_return co_await HandleReset(socket, session, state);
 
         // Transaction-control verbs sit outside the data table because they
         // need ConnectionState (queue + watch handle) directly.
@@ -2865,6 +2963,12 @@ std::string_view RedisRespHandler::ServerVersion() noexcept
     return ServerVersionBanner;
 }
 
+void RedisRespHandler::OverrideMultiQueueCapsForTests(std::size_t maxCommands, std::size_t maxBytes) noexcept
+{
+    _testMaxQueuedCommands = maxCommands;
+    _testMaxQueuedBytes = maxBytes;
+}
+
 Task<void> RedisRespHandler::Run(ISocket* socket,
                                  CacheEngine* engine,
                                  std::vector<std::byte> primingBytes,
@@ -2885,6 +2989,11 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
     // chasing them through SessionContext at every callsite.
     state.watchRegistry = session.watches;
     state.keyspaceNotifier = session.keyspaceNotifier;
+    // Honour test-only cap overrides set via OverrideMultiQueueCapsForTests.
+    if (_testMaxQueuedCommands > 0)
+        state.maxQueuedCommands = _testMaxQueuedCommands;
+    if (_testMaxQueuedBytes > 0)
+        state.maxQueuedBytes = _testMaxQueuedBytes;
 
     // The subscriber is heap-allocated and held via shared_ptr so the registry's
     // weak_ptr upgrade in Publish (and the long-lived readable-watcher detached
