@@ -366,6 +366,15 @@ namespace
         /// the entire Dispatch prologue (Upper, auth lookup, command-table
         /// scan, arity re-check), all of which already ran when the command
         /// was queued.
+        ///
+        /// Invariant: `argv` MUST be non-empty (size >= 1). HandleExec's
+        /// replay computes a `tail` span as `{ argv.data() + 1, argv.size()
+        /// - 1 }`; an empty argv would underflow `size() - 1` to
+        /// `size_t(-1)` and the replay would walk all addressable memory.
+        /// Today the arity check in Dispatch guarantees the invariant
+        /// before the push_back; this static_assert-style guard prevents a
+        /// future bypass (savepoint replay, script verb, test code) from
+        /// reintroducing the underflow silently.
         struct QueuedCommand
         {
             std::vector<std::string> argv;
@@ -1881,10 +1890,40 @@ namespace
         // CommandTable scan (the one that already ran at queue time), and
         // the per-arg byte-cap walk. For an EXEC of N commands this turns
         // 2N Dispatch prologues into N direct handler invocations.
+        // EXEC's aggregate header is written before the queue is replayed.
+        // If a queued handler returns false mid-replay (socket write
+        // failure, e.g. EPIPE from a half-closed peer), the multi-bulk is
+        // on-the-wire truncated and the outer co_return false triggers
+        // connection teardown — the client sees `*N\r\n` + K<N elements
+        // then EOF. A pooled-connection client that hands the closed
+        // socket back to its pool for reuse would desync, but that's a
+        // client-side pool bug (handing out a closed fd); the server-side
+        // contract here is: a partial-EXEC reply is paired with an
+        // immediate connection close, never with a `+OK` for a subsequent
+        // command on the same fd. Buffering the entire EXEC reply before
+        // flushing would close the desync window for misbehaving pools
+        // but at the cost of holding every replay's bytes in memory until
+        // the last handler completes — accept the simpler shape since
+        // ISocket already guarantees post-failure unreachability.
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, queue.size(), state->resp))
             co_return false;
         for (auto& entry: queue)
         {
+            // QueuedCommand invariant: argv.size() >= 1 (the verb name
+            // occupies index 0). Today this is enforced by the arity
+            // check upstream of state->queue.push_back; defending it here
+            // means a future code path that bypasses the arity check (a
+            // savepoint replay, a script verb, a test seam) cannot trip
+            // the `size() - 1` underflow that would produce a span over
+            // `size_t(-1)` bytes. Surface the breach as a per-element
+            // -ERR rather than a SEGV — the outer aggregate header has
+            // already been written with `queue.size()` elements promised.
+            if (entry.argv.empty())
+            {
+                if (!co_await ReplyError(socket, "internal: queued command with empty argv"))
+                    co_return false;
+                continue;
+            }
             auto const tail = std::span<std::string const> {
                 entry.argv.data() + 1, entry.argv.size() - 1
             };
@@ -1913,13 +1952,18 @@ namespace
                || name == "AUTH" || name == "RESET";
     }
 
-    /// Verbs that MUST NOT be queued inside MULTI. Two reasons land here:
+    /// Verbs that MUST NOT be queued inside MULTI. Three reasons land here:
     ///   1. The handler writes more than one RESP frame per reply, which would
     ///      desync EXEC's `*N` aggregate header from the actual element count
     ///      (every SUBSCRIBE channel produces its own confirmation frame).
     ///   2. The handler tears down the session mid-frame (QUIT closes the
     ///      socket; a subsequent queued command's reply would land on a closed
     ///      fd and the multi-bulk would never complete on the wire).
+    ///   3. The handler mutates `state->resp` (HELLO ... <version>). EXEC has
+    ///      ALREADY written the multi-bulk aggregate header using the
+    ///      pre-replay resp version; flipping it mid-replay would mix RESP2
+    ///      and RESP3 element encodings inside the same `*N` aggregate and
+    ///      desync any strict client parser.
     /// Real redis simply queues these and replays them, accepting both
     /// hazards; we trade a smidge of compatibility for protocol robustness.
     /// A rejected command sets `multiDirty` so the matching EXEC aborts with
@@ -1927,7 +1971,7 @@ namespace
     [[nodiscard]] constexpr bool IsForbiddenInMulti(std::string_view name) noexcept
     {
         return name == "SUBSCRIBE" || name == "UNSUBSCRIBE" || name == "PSUBSCRIBE" || name == "PUNSUBSCRIBE"
-               || name == "QUIT";
+               || name == "QUIT" || name == "HELLO";
     }
 
     /// Map a StorageError from a set command to the appropriate RESP error,

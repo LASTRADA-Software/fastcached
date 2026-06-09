@@ -2245,6 +2245,28 @@ TEST_CASE("RESP: WATCH on a faulting Peek replies an error (not silent CAS=0)",
     REQUIRE(out == "-ERR storage failure during WATCH\r\n");
 }
 
+TEST_CASE("RESP: HELLO inside MULTI is rejected at queue time (does not corrupt EXEC framing)",
+          "[protocol][resp][tx][hello-forbidden]")
+{
+    // Regression: HELLO mutates state->resp to switch protocol versions.
+    // The previous version allowed HELLO to be queued; EXEC's replay then
+    // flipped state->resp mid-aggregate while the outer multi-bulk header
+    // had already been written with the pre-replay version. A strict RESP2
+    // client would see `*N\r\n` (RESP2) followed by RESP3 element
+    // encodings — desync. The fix lists HELLO in IsForbiddenInMulti so
+    // it's rejected at queue time with -ERR + multiDirty=true, EXEC then
+    // aborts with -EXECABORT and the connection's frame stays coherent.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n"
+               "-ERR HELLO is not allowed inside a transaction\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
 TEST_CASE("RESP: WATCH partial-failure replies +OK then -ERR without aborting the connection",
           "[protocol][resp][tx][rollback]")
 {
