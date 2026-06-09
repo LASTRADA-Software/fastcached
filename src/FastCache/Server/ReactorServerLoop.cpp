@@ -76,6 +76,8 @@ namespace
     /// Single-reactor server: one event loop multiplexes every connection on
     /// this thread. No connection-concurrency ceiling and no cross-thread
     /// coroutine migration. This is the default (reactorCount == 1).
+    /// Iterates `options.binds` so multiple endpoints (e.g. plaintext + TLS)
+    /// share the same reactor when only one is requested.
     int RunSingleReactor(ReactorServerOptions const& options,
                          CacheEngine& engine,
                          ILogger& logger,
@@ -86,36 +88,54 @@ namespace
         SteadyClock clock;
         PlatformReactor reactor { clock };
 
-        auto listener = PlatformListener::Bind(reactor, options.bindAddress, options.port, options.listenBacklog);
-        if (!listener || !listener->IsBound())
+        std::vector<std::unique_ptr<PlatformListener>> listeners;
+        std::vector<std::unique_ptr<Server>> servers;
+        listeners.reserve(options.binds.size());
+        servers.reserve(options.binds.size());
+        for (auto const& bind: options.binds)
         {
-            logger.Logf(LogLevel::Error,
-                        "fastcached: cannot bind: {}",
-                        listener ? listener->BindError() : std::string_view { "null listener" });
-            return EXIT_FAILURE;
+            auto listener = PlatformListener::Bind(reactor, bind.address, bind.port, options.listenBacklog);
+            if (!listener || !listener->IsBound())
+            {
+                logger.Logf(LogLevel::Error,
+                            "fastcached: cannot bind {}:{} : {}",
+                            bind.address,
+                            bind.port,
+                            listener ? listener->BindError() : std::string_view { "null listener" });
+                return EXIT_FAILURE;
+            }
+            listeners.push_back(std::move(listener));
+            // Per-bind tls flag: a plaintext bind passes nullptr so accepted
+            // sockets bypass the TLS wrapper; a TLS bind reuses the single
+            // shared TlsContext (no per-bind cert/SNI in this iteration).
+            auto* const perBindTls = bind.tls ? options.tlsContext : nullptr;
+            auto session = options.session;
+            session.reactor = &reactor;
+            servers.push_back(std::make_unique<Server>(
+                *listeners.back(), engine, logger, admission, metrics, session, perBindTls));
         }
-        logger.Log(LogLevel::Info, "ready, accepting connections");
+        logger.Logf(LogLevel::Info, "ready, accepting connections ({} bind(s))", options.binds.size());
 
-        // Pin pub/sub delivery to this reactor: a message published from another
-        // connection's thread wakes a subscriber's loop via reactor.Submit.
-        auto session = options.session;
-        session.reactor = &reactor;
-        Server server { *listener, engine, logger, admission, metrics, session, options.tlsContext };
         auto runAccept = [](Server* s) -> DetachedTask {
             co_await s->Run();
             co_return;
         };
-        runAccept(&server);
+        for (auto& s: servers)
+            runAccept(s.get());
 
         std::atomic<bool> watchdogQuit { false };
         auto watchdog = MakeWatchdog(watchdogQuit, [&] {
-            server.Shutdown();
+            for (auto& s: servers)
+                s->Shutdown();
             reactor.Stop();
         });
 
         reactor.Run();
         watchdogQuit.store(true, std::memory_order_release);
-        logger.Logf(LogLevel::Info, "served {} connection(s)", server.AcceptedCount());
+        std::uint64_t total = 0;
+        for (auto const& s: servers)
+            total += s->AcceptedCount();
+        logger.Logf(LogLevel::Info, "served {} connection(s)", total);
         return EXIT_SUCCESS;
     }
 
@@ -166,10 +186,11 @@ namespace
         co_return;
     }
 
-    /// Windows multi-core: one blocking acceptor thread distributes raw sockets
-    /// round-robin across N independent single-threaded IOCP reactors (Windows
-    /// has no SO_REUSEPORT load-balancing). Each connection is pinned to the
-    /// reactor it was handed to.
+    /// Windows multi-core: one blocking acceptor thread *per BindConfig*
+    /// distributes raw sockets round-robin across N independent
+    /// single-threaded IOCP reactors (Windows has no SO_REUSEPORT
+    /// load-balancing). Each connection is pinned to the reactor it was
+    /// handed to and wrapped with the bind's TLS flag.
     int RunMultiReactorWindows(ReactorServerOptions const& options,
                                CacheEngine& engine,
                                ILogger& logger,
@@ -183,50 +204,71 @@ namespace
         for (auto i = 0U; i < reactorCount; ++i)
             reactors.push_back(std::make_unique<IocpReactor>(clock));
 
-        // A plain (non-IOCP) listening socket; the acceptor blocks on it.
-        auto bound = Detail::BindAndListen(
-            DefaultAddressResolver(), options.bindAddress, options.port, options.listenBacklog, /*extraTypeFlags*/ 0);
-        if (!bound.has_value())
+        // One listening socket per BindConfig; each acceptor thread owns one.
+        std::vector<Detail::NativeSocket> listenSocks;
+        std::vector<bool> bindTls; // parallel to listenSocks
+        listenSocks.reserve(options.binds.size());
+        bindTls.reserve(options.binds.size());
+        for (auto const& bind: options.binds)
         {
-            logger.Logf(LogLevel::Error, "fastcached: cannot bind: {}", bound.error());
-            return EXIT_FAILURE;
+            auto bound = Detail::BindAndListen(
+                DefaultAddressResolver(), bind.address, bind.port, options.listenBacklog, /*extraTypeFlags*/ 0);
+            if (!bound.has_value())
+            {
+                logger.Logf(LogLevel::Error, "fastcached: cannot bind {}:{} : {}", bind.address, bind.port, bound.error());
+                for (auto const sock: listenSocks)
+                    Detail::CloseNativeSocket(sock);
+                return EXIT_FAILURE;
+            }
+            listenSocks.push_back(bound->socket);
+            bindTls.push_back(bind.tls);
         }
-        auto const listenSock = bound->socket;
-        logger.Logf(LogLevel::Info, "ready, accepting connections ({} reactors)", reactorCount);
+        logger.Logf(LogLevel::Info,
+                    "ready, accepting connections ({} bind(s) x {} reactors)",
+                    options.binds.size(),
+                    reactorCount);
 
         std::atomic<std::uint64_t> accepted { 0 };
         std::atomic<bool> stopping { false };
 
-        std::jthread acceptor { [&] {
-            FC_THREAD_NAME("fc-acceptor");
-            std::size_t next = 0;
-            while (!stopping.load(std::memory_order_acquire))
-            {
-                auto raw = Detail::AcceptRaw(listenSock);
-                if (!raw.has_value())
-                    break; // listening socket closed (shutdown) or fatal accept error
-                if (admission && !admission->AllowAccept())
+        std::vector<std::jthread> acceptors;
+        acceptors.reserve(options.binds.size());
+        for (std::size_t bindIdx = 0; bindIdx < options.binds.size(); ++bindIdx)
+        {
+            acceptors.emplace_back([&, bindIdx] {
+                FC_THREAD_NAME(std::format("fc-acceptor-{}", bindIdx).c_str());
+                std::size_t next = 0;
+                auto const listenSock = listenSocks[bindIdx];
+                auto* const perBindTls = bindTls[bindIdx] ? options.tlsContext : nullptr;
+                while (!stopping.load(std::memory_order_acquire))
                 {
+                    auto raw = Detail::AcceptRaw(listenSock);
+                    if (!raw.has_value())
+                        break;
+                    if (admission && !admission->AllowAccept())
+                    {
+                        if (metrics)
+                            metrics->Increment(IMetricsSink::Counter::ConnectionsAdmissionRejected);
+                        Detail::CloseNativeSocket(*raw);
+                        continue;
+                    }
+                    if (admission)
+                        admission->OnConnectionStarted();
+                    accepted.fetch_add(1, std::memory_order_relaxed);
                     if (metrics)
-                        metrics->Increment(IMetricsSink::Counter::ConnectionsAdmissionRejected);
-                    Detail::CloseNativeSocket(*raw);
-                    continue;
+                        metrics->Increment(IMetricsSink::Counter::ConnectionsTotal);
+                    auto& reactor = *reactors[next % reactorCount];
+                    ++next;
+                    RunHandedOffConnection(reactor, *raw, engine, logger, admission, options.session, perBindTls);
                 }
-                if (admission)
-                    admission->OnConnectionStarted();
-                accepted.fetch_add(1, std::memory_order_relaxed);
-                if (metrics)
-                    metrics->Increment(IMetricsSink::Counter::ConnectionsTotal);
-                auto& reactor = *reactors[next % reactorCount];
-                ++next;
-                RunHandedOffConnection(reactor, *raw, engine, logger, admission, options.session, options.tlsContext);
-            }
-        } };
+            });
+        }
 
         std::atomic<bool> watchdogQuit { false };
         auto watchdog = MakeWatchdog(watchdogQuit, [&] {
             stopping.store(true, std::memory_order_release);
-            Detail::CloseNativeSocket(listenSock); // unblock the acceptor's accept()
+            for (auto const sock: listenSocks)
+                Detail::CloseNativeSocket(sock);
             for (auto& reactor: reactors)
                 reactor->Stop();
         });
@@ -249,10 +291,11 @@ namespace
 
 #else
 
-    /// POSIX multi-core: N independent single-threaded reactors, each with its
-    /// own listener bound with SO_REUSEPORT on the same port. The kernel
-    /// load-balances new connections across the listeners, so every connection
-    /// is accepted, owned, and served entirely by one reactor — no handoff.
+    /// POSIX multi-core: N independent single-threaded reactors, each with
+    /// one listener per BindConfig (all bound with SO_REUSEPORT so the
+    /// kernel load-balances connections across listeners on the same
+    /// {address, port}). Every connection is accepted, owned, and served
+    /// entirely by one reactor — no handoff.
     int RunMultiReactorPosix(ReactorServerOptions const& options,
                              CacheEngine& engine,
                              ILogger& logger,
@@ -262,37 +305,46 @@ namespace
     {
         SteadyClock clock;
         std::vector<std::unique_ptr<PlatformReactor>> reactors;
+        // Listeners and servers are laid out as `[reactor * binds + bind]`
+        // — a flat array indexed by `reactor * binds.size() + bindIdx`. This
+        // keeps the lifetime simple and lets the watchdog tear them down with
+        // a single pass.
         std::vector<std::unique_ptr<PlatformListener>> listeners;
         std::vector<std::unique_ptr<Server>> servers;
         reactors.reserve(reactorCount);
-        listeners.reserve(reactorCount);
-        servers.reserve(reactorCount);
+        auto const bindCount = options.binds.size();
+        listeners.reserve(reactorCount * bindCount);
+        servers.reserve(reactorCount * bindCount);
 
         for (auto i = 0U; i < reactorCount; ++i)
         {
             reactors.push_back(std::make_unique<PlatformReactor>(clock));
-            auto listener = PlatformListener::Bind(*reactors[i],
-                                                   options.bindAddress,
-                                                   options.port,
-                                                   options.listenBacklog,
-                                                   DefaultAddressResolver(),
-                                                   ReusePort::Yes);
-            if (!listener || !listener->IsBound())
+            for (auto const& bind: options.binds)
             {
-                logger.Logf(LogLevel::Error,
-                            "fastcached: cannot bind: {}",
-                            listener ? listener->BindError() : std::string_view { "null listener" });
-                return EXIT_FAILURE;
+                auto listener = PlatformListener::Bind(
+                    *reactors[i], bind.address, bind.port, options.listenBacklog, DefaultAddressResolver(), ReusePort::Yes);
+                if (!listener || !listener->IsBound())
+                {
+                    logger.Logf(LogLevel::Error,
+                                "fastcached: cannot bind {}:{} on reactor {}: {}",
+                                bind.address,
+                                bind.port,
+                                i,
+                                listener ? listener->BindError() : std::string_view { "null listener" });
+                    return EXIT_FAILURE;
+                }
+                listeners.push_back(std::move(listener));
+                auto* const perBindTls = bind.tls ? options.tlsContext : nullptr;
+                auto session = options.session;
+                session.reactor = reactors[i].get();
+                servers.push_back(std::make_unique<Server>(
+                    *listeners.back(), engine, logger, admission, metrics, session, perBindTls));
             }
-            listeners.push_back(std::move(listener));
-            // Each Server's connections are pinned to this reactor, so a
-            // subscriber created here wakes its loop via this reactor's Submit.
-            auto session = options.session;
-            session.reactor = reactors[i].get();
-            servers.push_back(
-                std::make_unique<Server>(*listeners[i], engine, logger, admission, metrics, session, options.tlsContext));
         }
-        logger.Logf(LogLevel::Info, "ready, accepting connections ({} reactors)", reactorCount);
+        logger.Logf(LogLevel::Info,
+                    "ready, accepting connections ({} bind(s) x {} reactors)",
+                    bindCount,
+                    reactorCount);
 
         std::atomic<bool> watchdogQuit { false };
         auto watchdog = MakeWatchdog(watchdogQuit, [&] {
@@ -315,7 +367,9 @@ namespace
                 co_await s->Run();
                 co_return;
             };
-            runAccept(servers[index].get());
+            // Run one accept loop per bind on this reactor.
+            for (std::size_t b = 0; b < bindCount; ++b)
+                runAccept(servers[(index * bindCount) + b].get());
             reactors[index]->Run();
         };
 
@@ -348,6 +402,11 @@ int RunReactorServer(ReactorServerOptions const& options,
                      IAdmissionControl* admission,
                      IMetricsSink* metrics)
 {
+    if (options.binds.empty())
+    {
+        logger.Log(LogLevel::Error, "fastcached: no listener configured (set --bind or --listen)");
+        return EXIT_FAILURE;
+    }
     auto const reactorCount = std::max(1U, options.reactorThreads);
     if (reactorCount == 1)
         return RunSingleReactor(options, engine, logger, admission, metrics);

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cache/CacheEngine.hpp>
+#include <FastCache/Config/Config.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IAdmissionControl.hpp>
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache
 {
@@ -22,8 +24,8 @@ class TlsContext; // defined in Net/TlsContext.hpp; only used when TLS is built 
 /// same options across the three platform-specific implementations.
 struct ReactorServerOptions
 {
-    std::string bindAddress { "127.0.0.1" };
-    std::uint16_t port { 11211 };
+    /// Every listener endpoint to bring up. Must be non-empty.
+    std::vector<BindConfig> binds {};
     std::size_t maxConnections { 0 }; ///< 0 = unlimited.
     int listenBacklog { 511 };        ///< ::listen() backlog depth.
 

@@ -40,9 +40,11 @@
     #include <FastCache/Net/TlsContext.hpp>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <ranges>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -456,7 +458,8 @@ int DaemonBody(FastCache::Config const& effective)
 #if defined(FC_TLS_ENABLED)
     std::unique_ptr<FastCache::TlsContext> tlsContext;
 #endif
-    if (effective.tlsEnabled)
+    auto const anyTlsBind = std::ranges::any_of(effective.binds, [](auto const& b) { return b.tls; });
+    if (effective.tlsEnabled || anyTlsBind)
     {
 #if defined(FC_TLS_ENABLED)
         if (effective.tlsCertPath.empty() || effective.tlsKeyPath.empty())
@@ -521,8 +524,21 @@ int DaemonBody(FastCache::Config const& effective)
     } };
 
     FastCache::ReactorServerOptions serverOpts;
-    serverOpts.bindAddress = effective.bindAddress;
-    serverOpts.port = effective.port;
+    // Listener endpoints: prefer the explicit list when given, otherwise
+    // synthesise one from the legacy single-bind fields. This keeps the
+    // common single-port case working without an explicit --listen, and
+    // lets advanced operators bring up multiple binds (e.g. plaintext on a
+    // private interface + TLS on the public one) with repeated --listen /
+    // --listen-tls flags.
+    if (!effective.binds.empty())
+    {
+        serverOpts.binds = effective.binds;
+    }
+    else
+    {
+        serverOpts.binds.push_back(
+            FastCache::BindConfig { .address = effective.bindAddress, .port = effective.port, .tls = effective.tlsEnabled });
+    }
     serverOpts.listenBacklog = effective.listenBacklog;
     // One reactor per core (each single-threaded, connections pinned). One
     // reactor = a single event loop; N reactors scale across cores without any

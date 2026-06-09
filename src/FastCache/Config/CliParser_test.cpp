@@ -484,3 +484,54 @@ TEST_CASE("CliParser: --healthcheck selects the health-check outcome", "[config]
     REQUIRE(result.has_value());
     REQUIRE(result->outcome == FastCache::CliOutcome::HealthCheck);
 }
+
+TEST_CASE("CliParser: --listen and --listen-tls populate cfg.binds in order", "[config][cli][bind]")
+{
+    auto const args = std::array<char const*, 2> { "--listen=127.0.0.1:11211", "--listen-tls=0.0.0.0:6380" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.binds.size() == 2);
+    REQUIRE(result->config.binds[0].address == "127.0.0.1");
+    REQUIRE(result->config.binds[0].port == 11211U);
+    REQUIRE_FALSE(result->config.binds[0].tls);
+    REQUIRE(result->config.binds[1].address == "0.0.0.0");
+    REQUIRE(result->config.binds[1].port == 6380U);
+    REQUIRE(result->config.binds[1].tls);
+}
+
+TEST_CASE("CliParser: --listen accepts IPv6 literal with brackets", "[config][cli][bind]")
+{
+    auto const args = std::array<char const*, 1> { "--listen=[::1]:11211" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.binds.size() == 1);
+    REQUIRE(result->config.binds[0].address == "::1");
+    REQUIRE(result->config.binds[0].port == 11211U);
+}
+
+TEST_CASE("CliParser: --listen without :port rejects with TypeMismatch", "[config][cli][bind]")
+{
+    auto const args = std::array<char const*, 1> { "--listen=127.0.0.1" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
+}
+
+TEST_CASE("CliParser: --listen rejects malformed [ipv6 spec", "[config][cli][bind]")
+{
+    auto const args = std::array<char const*, 1> { "--listen=[::1:11211" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("CliParser: legacy --bind/--port keeps cfg.binds empty (main collapses)", "[config][cli][bind]")
+{
+    // The single-bind flags do NOT push into cfg.binds; main.cpp does the
+    // collapse so the wire surface stays predictable for old configs.
+    auto const args = std::array<char const*, 2> { "--bind=0.0.0.0", "--port=6379" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.binds.empty());
+    REQUIRE(result->config.bindAddress == "0.0.0.0");
+    REQUIRE(result->config.port == 6379U);
+}
