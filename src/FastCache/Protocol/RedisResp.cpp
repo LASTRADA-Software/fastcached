@@ -3015,17 +3015,46 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
     if (session.pubsub != nullptr)
         state.subscriber = subscriber;
 
-    auto const cleanup = [&] {
-        if (session.pubsub != nullptr)
-            session.pubsub->UnsubscribeAll(subscriber.get());
-        // Trip any latch the watcher is parked on so its coroutine frame is
-        // freed promptly, instead of leaking until the daemon exits.
-        subscriber->ShutdownWatcher();
-        // Drop every WATCH index entry referencing this connection so a stale
-        // weak_ptr cannot be upgraded by a later Touched call.
-        if (state.watch && state.watchRegistry != nullptr)
-            state.watchRegistry->UnregisterAll(state.watch.get());
+    // RAII teardown: runs on every exit path, INCLUDING coroutine-frame
+    // unwind from an exception. The original shape was a `cleanup` lambda
+    // called manually at every `co_return`; an exception thrown inside
+    // `Dispatch` (or any deeper co_await) bypassed the lambda and left
+    // WATCH-index entries referencing this connection's now-dying handle.
+    // The weak_ptr still expired cleanly, but the orphaned `_index` rows
+    // accumulated under churn until some other touch happened on the same
+    // key. The scope guard closes that gap.
+    class Cleanup
+    {
+      public:
+        Cleanup(SessionContext const& sess, std::shared_ptr<Subscriber> sub, ConnectionState& st) noexcept:
+            _session { sess },
+            _subscriber { std::move(sub) },
+            _state { st }
+        {
+        }
+        Cleanup(Cleanup const&) = delete;
+        Cleanup(Cleanup&&) = delete;
+        Cleanup& operator=(Cleanup const&) = delete;
+        Cleanup& operator=(Cleanup&&) = delete;
+        ~Cleanup()
+        {
+            if (_session.pubsub != nullptr)
+                _session.pubsub->UnsubscribeAll(_subscriber.get());
+            // Trip any latch the watcher is parked on so its coroutine frame is
+            // freed promptly, instead of leaking until the daemon exits.
+            _subscriber->ShutdownWatcher();
+            // Drop every WATCH index entry referencing this connection so a
+            // stale weak_ptr cannot be upgraded by a later Touched call.
+            if (_state.watch && _state.watchRegistry != nullptr)
+                _state.watchRegistry->UnregisterAll(_state.watch.get());
+        }
+
+      private:
+        SessionContext const& _session;
+        std::shared_ptr<Subscriber> _subscriber;
+        ConnectionState& _state;
     };
+    Cleanup const cleanup { session, subscriber, state };
 
     while (true)
     {
@@ -3040,18 +3069,12 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
         {
             subscriber->StartReadableWatcher(socket);
             if (!co_await DrainPushes(socket, subscriber.get(), state.resp))
-            {
-                cleanup();
                 co_return;
-            }
             if (reader.Buffered().empty() && !subscriber->ReadablePending())
             {
                 co_await subscriber->WaitForPushOrReadable();
                 if (!co_await DrainPushes(socket, subscriber.get(), state.resp))
-                {
-                    cleanup();
                     co_return;
-                }
                 // Woken by a push (no readable bytes): loop back to wait again.
                 if (reader.Buffered().empty() && !subscriber->ReadablePending())
                     continue;
@@ -3064,10 +3087,7 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
         if (state.subscriptionCount > 0)
             subscriber->RearmReadable();
         if (!cmd.has_value())
-        {
-            cleanup();
-            co_return; // truncated / malformed — drop connection
-        }
+            co_return; // truncated / malformed — drop connection (RAII cleans up)
         if (cmd->args.empty())
             continue;
 
@@ -3088,10 +3108,7 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
 
         auto const keepGoing = co_await Dispatch(socket, engine, std::move(*cmd), session, &state);
         if (!keepGoing)
-        {
-            cleanup();
-            co_return;
-        }
+            co_return; // RAII cleanup fires on the way out
 
         // One command handled and replied — mark the request frame.
         FC_FRAME_MARK;

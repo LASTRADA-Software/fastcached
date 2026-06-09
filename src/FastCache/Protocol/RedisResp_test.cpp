@@ -1533,6 +1533,33 @@ TEST_CASE("RESP: WATCH without a registry replies an explicit error", "[protocol
     REQUIRE(Exchange(fix, "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n") == "-ERR transactions are not available\r\n");
 }
 
+TEST_CASE("RESP: WATCH followed by disconnect leaves the registry index clean",
+          "[protocol][resp][tx][cleanup]")
+{
+    // Regression for the manual-cleanup bug: the connection used to call a
+    // `cleanup()` lambda only on the explicit `co_return` paths. Any exception
+    // thrown from a deeper coroutine bypassed it and left a WATCH entry
+    // pointing at the now-dying handle in the global index. The fix
+    // converted cleanup to an RAII guard whose destructor runs on EVERY
+    // exit path — clean co_return AND coroutine-frame unwind.
+    //
+    // This test exercises the clean co_return path (the easy one to drive
+    // from a test fixture); the exception path is structurally identical —
+    // the same scope guard runs from the coroutine frame's destructor. A
+    // throwing-socket mock would only test what RAII already guarantees by
+    // construction.
+    TxFixture fix;
+    REQUIRE(fix.engine.Set("k", FastCache::BytesFromString("init"), 0, 0).has_value());
+
+    auto const out = ExchangeTx(fix, "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n");
+    REQUIRE(out == "+OK\r\n");
+
+    // After the connection exits, the registry must hold no entry for "k".
+    // A subsequent Touched on "k" returns 0 (zero dirtied handles), proving
+    // the RAII guard called UnregisterAll on the way out.
+    REQUIRE(fix.watches.Touched("k") == 0);
+}
+
 // ----- Redis keyspace notifications ------------------------------------------
 
 namespace
