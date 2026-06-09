@@ -360,10 +360,22 @@ namespace
         /// and after EXEC.
         bool multiDirty { false };
 
-        /// Commands enqueued under `MULTI`. Each entry is the full argv (verb +
-        /// args) as owned strings. Played back through Dispatch on EXEC, in
-        /// FIFO order, with the responses framed as a single multi-bulk.
-        std::vector<std::vector<std::string>> queue {};
+        /// One queued command: the full argv (verb + args, owned strings) and
+        /// the CommandTable index resolved at queue time. EXEC dispatches
+        /// directly via `CommandTable[commandTableIdx].handler` and skips
+        /// the entire Dispatch prologue (Upper, auth lookup, command-table
+        /// scan, arity re-check), all of which already ran when the command
+        /// was queued.
+        struct QueuedCommand
+        {
+            std::vector<std::string> argv;
+            std::size_t commandTableIdx;
+        };
+
+        /// Commands enqueued under `MULTI`. Each entry carries its argv plus
+        /// the cached command-table index. Played back in FIFO order on
+        /// EXEC, with the responses framed as a single multi-bulk.
+        std::vector<QueuedCommand> queue {};
 
         /// Total bytes of `queue` argv payload. Tracked separately from
         /// `queue.size()` so the cap check is O(1) without re-walking the
@@ -1385,6 +1397,26 @@ namespace
     extern std::int32_t CommandTableLastKey(std::size_t index) noexcept;
     extern std::int32_t CommandTableKeyStep(std::size_t index) noexcept;
 
+    /// Everything a command handler needs, bundled so the dispatch table can hold
+    /// one uniform handler signature. Pointers borrow from Dispatch's frame /
+    /// SessionContext and outlive the awaited handler. Defined here (not at the
+    /// table's site below) so HandleExec can pass it by value into
+    /// `CommandTableInvoke` for queue-replay.
+    struct CommandContext
+    {
+        ISocket* socket;
+        CacheEngine* engine;
+        std::span<std::string const> tail; ///< Arguments after the command name.
+        ConnectionState* state;
+        SessionContext session; ///< Per-server collaborators (auth, pub/sub).
+    };
+
+    /// Invoke `CommandTable[index].handler(ctx)`. Used by HandleExec to
+    /// bypass Dispatch's prologue when replaying queued commands — at
+    /// queue time the table index, arity, and auth state were already
+    /// validated, so EXEC just re-invokes the handler directly.
+    [[nodiscard]] Task<bool> CommandTableInvoke(std::size_t index, CommandContext ctx);
+
     /// Find a command in the table by name (case-sensitive match against the
     /// canonical UPPER name in `CommandEntry`). Returns the index for
     /// `COMMAND INFO <name>` lookups, or std::nullopt if the caller passed
@@ -1766,10 +1798,9 @@ namespace
         co_return co_await ReplyOk(socket);
     }
 
-    /// Forward declaration: EXEC re-enters Dispatch with `inMulti=false` to
-    /// drive each queued command's normal reply path.
-    Task<bool> Dispatch(
-        ISocket* socket, CacheEngine* engine, ParsedCommand cmd, SessionContext session, ConnectionState* state);
+    // (Forward declarations for CommandTable et al. live in the prior
+    // declaration block above; HandleExec routes queued commands through
+    // `CommandTableInvoke(idx, ctx)` instead of re-entering Dispatch.)
 
     /// `EXEC` — commit the queued transaction. If any watched key has been
     /// touched since `WATCH`, drop the queue and reply `*-1` (nil multi-bulk,
@@ -1807,13 +1838,23 @@ namespace
             co_return co_await WriteAll(socket, state->resp == RespVersion::Resp3 ? "_\r\n" : "*-1\r\n");
         }
 
-        // Write the multi-bulk header up front and then re-dispatch each
-        // queued command; each handler appends its own one reply element.
+        // Write the multi-bulk header up front and then invoke each queued
+        // command's handler DIRECTLY via its cached CommandTable index.
+        // Bypassing Dispatch saves, per queued command: an Upper()
+        // heap-allocation, an auth-source shared_ptr copy, a linear
+        // CommandTable scan (the one that already ran at queue time), and
+        // the per-arg byte-cap walk. For an EXEC of N commands this turns
+        // 2N Dispatch prologues into N direct handler invocations.
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, queue.size(), state->resp))
             co_return false;
-        for (auto& argv: queue)
+        for (auto& entry: queue)
         {
-            if (!co_await Dispatch(socket, engine, ParsedCommand { .args = std::move(argv) }, session, state))
+            auto const tail = std::span<std::string const> {
+                entry.argv.data() + 1, entry.argv.size() - 1
+            };
+            if (!co_await CommandTableInvoke(
+                    entry.commandTableIdx,
+                    CommandContext { .socket = socket, .engine = engine, .tail = tail, .state = state, .session = session }))
                 co_return false;
         }
         co_return true;
@@ -2372,17 +2413,8 @@ namespace
         return name == "AUTH" || name == "QUIT" || name == "HELLO";
     }
 
-    /// Everything a command handler needs, bundled so the dispatch table can hold
-    /// one uniform handler signature. Pointers borrow from Dispatch's frame /
-    /// SessionContext and outlive the awaited handler.
-    struct CommandContext
-    {
-        ISocket* socket;
-        CacheEngine* engine;
-        std::span<std::string const> tail; ///< Arguments after the command name.
-        ConnectionState* state;
-        SessionContext session; ///< Per-server collaborators (auth, pub/sub).
-    };
+    // (CommandContext was moved to the forward-declare block above so
+    // HandleExec can use it.)
 
     using CommandHandler = Task<bool> (*)(CommandContext);
 
@@ -2844,6 +2876,11 @@ namespace
         return std::nullopt;
     }
 
+    Task<bool> CommandTableInvoke(std::size_t index, CommandContext ctx)
+    {
+        return CommandTable[index].handler(ctx);
+    }
+
     /// RESET — redis's "reset this connection to a clean state". Clears
     /// subscriptions, resets the negotiated protocol to RESP2, and replies
     /// `+RESET\r\n`. Listed in IsAllowedInSubscribeMode but lacked a handler;
@@ -2953,7 +2990,10 @@ namespace
                     socket, "transaction queue exceeded per-connection limit");
             }
             state->queueBytes += argvBytes;
-            state->queue.push_back(std::move(cmd.args));
+            // Stash the resolved CommandTable index alongside the argv —
+            // EXEC will use it to bypass Dispatch's prologue.
+            state->queue.push_back(ConnectionState::QueuedCommand {
+                .argv = std::move(cmd.args), .commandTableIdx = *idx });
             co_return co_await WriteAll(socket, "+QUEUED\r\n");
         }
 

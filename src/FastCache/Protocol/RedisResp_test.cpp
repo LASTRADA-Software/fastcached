@@ -1580,6 +1580,55 @@ TEST_CASE("RESP: MSET with a watcher on one key still dirties only that watcher"
     REQUIRE(watched->IsDirty());
 }
 
+TEST_CASE("RESP: EXEC replays via cached commandTableIdx without re-running Dispatch",
+          "[protocol][resp][tx][exec][cached-dispatch]")
+{
+    // Behavioural contract for the cached-index dispatch: an EXEC of a
+    // mixed-verb queue must produce the EXACT same reply stream as
+    // single-shot dispatch would. The path is now:
+    //   queue-time: Dispatch validates name/arity, resolves the
+    //               CommandTable index, stores it on QueuedCommand.
+    //   EXEC: CommandTableInvoke(idx, ctx) calls the handler directly,
+    //         bypassing Upper/auth/table-scan/arity-check in Dispatch.
+    // If the cached index is wrong (off-by-one, stale on re-MULTI, etc.)
+    // this test surfaces it as a mismatched reply.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*2\r\n$4\r\nINCR\r\n$1\r\na\r\n"
+                                "*2\r\n$3\r\nGET\r\n$1\r\na\r\n"
+                                "*2\r\n$4\r\nINCR\r\n$1\r\na\r\n"
+                                "*2\r\n$3\r\nGET\r\n$1\r\na\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // SET → +OK
+    // MULTI → +OK; four +QUEUED; EXEC → *4 with INCR=2, GET="2", INCR=3, GET="3"
+    REQUIRE(out
+            == "+OK\r\n"
+               "+OK\r\n"
+               "+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n"
+               "*4\r\n:2\r\n$1\r\n2\r\n:3\r\n$1\r\n3\r\n");
+}
+
+TEST_CASE("RESP: a queued unknown command still aborts EXEC after the cached-index path",
+          "[protocol][resp][tx][exec][cached-dispatch]")
+{
+    // Regression: the queue-time arity / unknown-name check still runs
+    // BEFORE the index is cached. If we ever moved validation past the
+    // table lookup we'd lose this rejection — EXEC of unknown commands
+    // would silently dispatch to whatever the (uninitialised) index
+    // pointed at. Keep both halves green.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*2\r\n$5\r\nGZNRP\r\n$1\r\nk\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n"
+               "-ERR unknown command 'GZNRP'\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
 TEST_CASE("RESP: WATCH followed by disconnect leaves the registry index clean",
           "[protocol][resp][tx][cleanup]")
 {
