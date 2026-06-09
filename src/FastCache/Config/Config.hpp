@@ -139,6 +139,23 @@ struct Config
     /// PEM private key file for TLS. Only used when `tlsEnabled`.
     std::string tlsKeyPath {};
 
+    /// Redis-style keyspace-event flag string. Empty (the default) disables
+    /// every keyspace notification. Each letter enables one event class
+    /// (matches redis-server's `notify-keyspace-events`):
+    ///   K  publish on `__keyspace@<db>__:<key>` channels
+    ///   E  publish on `__keyevent@<db>__:<event>` channels
+    ///   g  generic events: del / expire / persist
+    ///   $  string events: set
+    ///   x  expiration events: expired (fired on lazy-expiry observation)
+    ///   A  alias for `g$x` — everything we currently emit
+    /// Each enabled write verb fires `__keyspace@0__:<key> <event>` (with K)
+    /// and `__keyevent@0__:<event> <key>` (with E). At least one of K or E
+    /// must be set for any event to actually be published.
+    /// The database index is fixed at 0 (this daemon does not implement
+    /// `SELECT`).
+    /// Unknown letters cause main.cpp to fail fast at startup.
+    std::string notifyKeyspaceEvents {};
+
     /// ::listen() backlog — the depth of the kernel's queue of accepted-
     /// but-not-yet-handed-off connections. Bursts of parallel clients (a
     /// `make -jN` driving sccache opens many sockets at once) overflow a

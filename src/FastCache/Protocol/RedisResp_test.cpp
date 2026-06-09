@@ -6,6 +6,8 @@
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
+#include <FastCache/Protocol/KeyspaceNotifier.hpp>
+#include <FastCache/Protocol/PubSubRegistry.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
 #include <FastCache/Protocol/RedisTransaction.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
@@ -1529,4 +1531,151 @@ TEST_CASE("RESP: WATCH without a registry replies an explicit error", "[protocol
     // explicitly rather than crashing or silently no-op'ing.
     RespFixture fix;
     REQUIRE(Exchange(fix, "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n") == "-ERR transactions are not available\r\n");
+}
+
+// ----- Redis keyspace notifications ------------------------------------------
+
+namespace
+{
+
+class RecordingSubscriber: public FastCache::ISubscriber
+{
+  public:
+    void Deliver(FastCache::PushMessage message) override
+    {
+        messages.push_back(std::move(message));
+    }
+    std::vector<FastCache::PushMessage> messages;
+};
+
+struct KeyspaceFixture
+{
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::PubSubRegistry pubsub;
+    // Subscribed to capture published events. Constructed AFTER pubsub so the
+    // registry pointer is valid for the whole fixture lifetime.
+    std::shared_ptr<RecordingSubscriber> sub = std::make_shared<RecordingSubscriber>();
+    std::unique_ptr<FastCache::KeyspaceNotifier> notifier;
+    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    void EnableEvents(std::uint32_t mask)
+    {
+        notifier = std::make_unique<FastCache::KeyspaceNotifier>(&pubsub, mask);
+    }
+
+    void SubscribeTo(std::string_view channel)
+    {
+        (void) pubsub.Subscribe(sub, channel);
+    }
+
+    void PSubscribeTo(std::string_view pattern)
+    {
+        (void) pubsub.PSubscribe(sub, pattern);
+    }
+
+    [[nodiscard]] FastCache::SessionContext Session() noexcept
+    {
+        FastCache::SessionContext s;
+        s.pubsub = &pubsub;
+        s.keyspaceNotifier = notifier.get();
+        return s;
+    }
+};
+
+std::string ExchangeKs(KeyspaceFixture& fix, std::string_view request)
+{
+    REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), request)));
+    fix.pair.client->ShutdownWrite();
+    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, fix.Session()));
+    return FastCache::SyncRun(DrainResponse(fix.pair.client.get()));
+}
+
+} // namespace
+
+TEST_CASE("RESP keyspace: SET fires __keyspace@0__:<key> 'set' when K and $ are enabled",
+          "[protocol][resp][keyspace]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::String);
+    fix.SubscribeTo("__keyspace@0__:foo");
+
+    (void) ExchangeKs(fix, "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].channel == "__keyspace@0__:foo");
+    REQUIRE(fix.sub->messages[0].payload == "set");
+}
+
+TEST_CASE("RESP keyspace: SET fires __keyevent@0__:set when E and $ are enabled",
+          "[protocol][resp][keyspace]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyevent | FastCache::KeyspaceEvents::String);
+    fix.SubscribeTo("__keyevent@0__:set");
+
+    (void) ExchangeKs(fix, "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].channel == "__keyevent@0__:set");
+    REQUIRE(fix.sub->messages[0].payload == "foo");
+}
+
+TEST_CASE("RESP keyspace: K with class off (only $ set, no g) drops DEL events",
+          "[protocol][resp][keyspace]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::String);
+    // Pattern-subscribe to anything so we'd catch a spurious del.
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                      "*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
+    // Exactly one message — the SET. The DEL is suppressed because g is off.
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].payload == "set");
+}
+
+TEST_CASE("RESP keyspace: DEL fires under K + g", "[protocol][resp][keyspace]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic
+                     | FastCache::KeyspaceEvents::String);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                      "*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
+    REQUIRE(fix.sub->messages.size() == 2);
+    REQUIRE(fix.sub->messages[0].payload == "set");
+    REQUIRE(fix.sub->messages[1].payload == "del");
+}
+
+TEST_CASE("RESP keyspace: with notifier null, no messages and no crash",
+          "[protocol][resp][keyspace]")
+{
+    // Don't enable events — notifier stays null. Subscribing to the channel
+    // is still legal but no events will ever be published.
+    KeyspaceFixture fix;
+    fix.SubscribeTo("__keyspace@0__:foo");
+
+    (void) ExchangeKs(fix, "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+    REQUIRE(fix.sub->messages.empty());
+}
+
+TEST_CASE("RESP keyspace: EXPIRE fires the verb-named event under K + g",
+          "[protocol][resp][keyspace]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic
+                     | FastCache::KeyspaceEvents::String);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                      "*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$2\r\n60\r\n");
+    REQUIRE(fix.sub->messages.size() == 2);
+    REQUIRE(fix.sub->messages[1].channel == "__keyspace@0__:k");
+    REQUIRE(fix.sub->messages[1].payload == "expire");
 }

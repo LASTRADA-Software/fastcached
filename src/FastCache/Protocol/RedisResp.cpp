@@ -9,6 +9,7 @@
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/IPubSubRegistry.hpp>
+#include <FastCache/Protocol/KeyspaceNotifier.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
 #include <FastCache/Protocol/RedisTransaction.hpp>
 
@@ -367,6 +368,13 @@ namespace
         /// handler call `NotifyWatchers(state, key)` without threading the
         /// SessionContext through their signatures.
         WatchRegistry* watchRegistry { nullptr };
+
+        /// Cached pointer to the process-wide keyspace-notification helper,
+        /// copied from `SessionContext::keyspaceNotifier` once at the start
+        /// of `Run`. Null when no notifier is wired in (tests). When non-null
+        /// but `IsEnabled() == false`, every `OnEvent` call short-circuits
+        /// to the early return inside the helper — same effective no-op.
+        KeyspaceNotifier* keyspaceNotifier { nullptr };
     };
 
     /// Mutation hook: every Redis write verb calls this after its engine
@@ -379,6 +387,22 @@ namespace
     {
         if (state != nullptr && state->watchRegistry != nullptr)
             (void) state->watchRegistry->Touched(key);
+    }
+
+    /// Keyspace-notification hook: same call sites as `NotifyWatchers`, fires
+    /// `__keyspace@0__:<key> <event>` and/or `__keyevent@0__:<event> <key>`
+    /// depending on the configured bitmask.
+    /// @param state     Per-connection state (carries the cached notifier).
+    /// @param classFlag One of `KeyspaceEvents::Generic` / `String` / `Expired`.
+    /// @param event     The wire event name (e.g. "set", "del", "expire").
+    /// @param key       The key the mutation applied to.
+    inline void NotifyKeyspace(ConnectionState const* state,
+                               std::uint32_t classFlag,
+                               std::string_view event,
+                               std::string_view key)
+    {
+        if (state != nullptr && state->keyspaceNotifier != nullptr)
+            state->keyspaceNotifier->OnEvent(classFlag, event, key);
     }
 
     [[nodiscard]] std::string Upper(std::string_view sv)
@@ -887,6 +911,7 @@ namespace
         if (result.has_value())
         {
             NotifyWatchers(state, key);
+            NotifyKeyspace(state, KeyspaceEvents::String, "set", key);
             co_return co_await ReplyOk(socket);
         }
         if (result.error().code == StorageErrorCode::KeyExists || result.error().code == StorageErrorCode::KeyNotFound)
@@ -921,6 +946,7 @@ namespace
         if (!result.has_value())
             co_return co_await ReplyError(socket, "storage failure");
         NotifyWatchers(state, args[0]);
+        NotifyKeyspace(state, KeyspaceEvents::String, "set", args[0]);
         co_return co_await ReplyOk(socket);
     }
 
@@ -1044,6 +1070,9 @@ namespace
         if (result.has_value())
         {
             NotifyWatchers(state, args[0]);
+            // Redis fires the verb-named event (one of expire / pexpire /
+            // expireat / pexpireat) under the `g` (generic) class.
+            NotifyKeyspace(state, KeyspaceEvents::Generic, verb, args[0]);
             co_return co_await ReplyInteger(socket, 1);
         }
         if (result.error().code == StorageErrorCode::KeyNotFound)
@@ -1096,7 +1125,10 @@ namespace
             // for WATCH purposes: a no-op PERSIST on a TTL-less key does
             // not bump CAS in the storage layer either.
             if (*result)
+            {
                 NotifyWatchers(state, args[0]);
+                NotifyKeyspace(state, KeyspaceEvents::Generic, "persist", args[0]);
+            }
             co_return co_await ReplyInteger(socket, *result ? 1 : 0);
         }
         // KeyNotFound -> :0 (matches redis behaviour for absent keys).
@@ -1117,6 +1149,7 @@ namespace
             {
                 ++deleted;
                 NotifyWatchers(state, key);
+                NotifyKeyspace(state, KeyspaceEvents::Generic, "del", key);
             }
         }
         co_return co_await ReplyInteger(socket, deleted);
@@ -1900,6 +1933,9 @@ namespace
             co_return co_await ReplyError(socket, "storage failure");
         }
         NotifyWatchers(state, args[0]);
+        // Redis emits "incrbyfloat" under the string class for INCRBYFLOAT
+        // (matches the keyspace-events table in the redis docs).
+        NotifyKeyspace(state, KeyspaceEvents::String, "incrbyfloat", args[0]);
         co_return co_await ReplyBulkString(
             socket,
             std::span<std::byte const> { reinterpret_cast<std::byte const*>(encodedText.data()), encodedText.size() });
@@ -1970,6 +2006,9 @@ namespace
             co_return co_await ReplyError(socket, std::format("storage failure for '{}'", verb));
         }
         NotifyWatchers(state, key);
+        // Verb is "incr" / "decr" / "incrby" / "decrby"; the keyspace event
+        // matches the wire verb (redis convention).
+        NotifyKeyspace(state, KeyspaceEvents::String, verb, key);
         co_return co_await ReplyInteger(socket, newValue);
     }
 
@@ -2057,6 +2096,7 @@ namespace
             if (!r.has_value())
                 co_return co_await ReplyError(socket, "storage failure");
             NotifyWatchers(state, args[i]);
+            NotifyKeyspace(state, KeyspaceEvents::String, "set", args[i]);
         }
         co_return co_await ReplyOk(socket);
     }
@@ -2104,11 +2144,15 @@ namespace
                 {
                     (void) engine->Delete(k);
                     NotifyWatchers(state, k);
+                    // The rollback Delete fires "del" — the keyspace
+                    // would otherwise show the half-written batch.
+                    NotifyKeyspace(state, KeyspaceEvents::Generic, "del", k);
                 }
                 co_return co_await ReplyInteger(socket, 0);
             }
             committed.push_back(key);
             NotifyWatchers(state, key);
+            NotifyKeyspace(state, KeyspaceEvents::String, "set", key);
         }
         co_return co_await ReplyInteger(socket, 1);
     }
@@ -2836,9 +2880,11 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
     ConnectionState state;
     auto const initialAuth = session.CurrentAuth();
     state.authenticated = !(initialAuth != nullptr && initialAuth->Enabled());
-    // Cache the WATCH registry pointer once so per-write-verb mutation hooks
-    // do not have to chase it through SessionContext at every callsite.
+    // Cache the WATCH registry and keyspace-notifier pointers once so every
+    // write-verb mutation hook can call them through `state` rather than
+    // chasing them through SessionContext at every callsite.
     state.watchRegistry = session.watches;
+    state.keyspaceNotifier = session.keyspaceNotifier;
 
     // The subscriber is heap-allocated and held via shared_ptr so the registry's
     // weak_ptr upgrade in Publish (and the long-lived readable-watcher detached

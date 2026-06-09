@@ -55,6 +55,7 @@ struct CliResult
     bool tlsEnabledExplicit { false };
     bool tlsCertPathExplicit { false };
     bool tlsKeyPathExplicit { false };
+    bool notifyKeyspaceEventsExplicit { false };
 };
 
 /// Parse `argv[1..argc-1]` into a Config. Returns ConfigError on bad input.

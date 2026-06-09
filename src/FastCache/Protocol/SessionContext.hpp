@@ -9,6 +9,7 @@ namespace FastCache
 class IReactor;        // Async/IReactor.hpp — the reactor this connection is pinned to.
 class IPubSubRegistry; // Protocol/IPubSubRegistry.hpp — process-wide pub/sub registry.
 class WatchRegistry;   // Protocol/RedisTransaction.hpp — process-wide WATCH registry for Redis transactions.
+class KeyspaceNotifier; // Protocol/KeyspaceNotifier.hpp — Redis keyspace notification publisher.
 
 /// Per-server, immutable context handed to every protocol handler's command
 /// loop. Bundles the optional collaborators a connection needs beyond its
@@ -47,6 +48,12 @@ struct SessionContext
     /// with the standard error and the MULTI/EXEC flow runs without
     /// invalidation. Shared, thread-safe; owned by the daemon body.
     WatchRegistry* watches { nullptr };
+
+    /// Redis keyspace-notification publisher. Null when notifications are
+    /// disabled (the default) or unwired (tests). A non-null pointer with
+    /// `IsEnabled() == false` is also a valid "off" state. Owned by the
+    /// daemon body; outlives every connection.
+    KeyspaceNotifier* keyspaceNotifier { nullptr };
 
     /// Resolve the currently-active policy through `authSource`. Callers hold
     /// the returned shared_ptr for the lifetime of a single verify so a

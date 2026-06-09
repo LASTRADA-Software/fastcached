@@ -202,6 +202,14 @@ namespace
             cfg.tlsKeyPath = valueNode.as<std::string>();
             return {};
         }
+        /// `notify_keyspace_events`: redis-style keyspace-event flag string
+        /// (e.g. "AKE"). Default empty (off). Parsed (validated) at daemon
+        /// startup; an unknown letter fails fast.
+        if (key == "notify_keyspace_events")
+        {
+            cfg.notifyKeyspaceEvents = valueNode.as<std::string>();
+            return {};
+        }
         /// `storage_durability`: fsync|batched|none.
         if (key == "storage_durability")
         {

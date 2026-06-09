@@ -278,6 +278,7 @@ namespace
                  { "--metrics-bind", &cfg.metricsBindAddress, &result.metricsBindAddressExplicit },
                  { "--tls-cert", &cfg.tlsCertPath, &result.tlsCertPathExplicit },
                  { "--tls-key", &cfg.tlsKeyPath, &result.tlsKeyPathExplicit },
+                 { "--notify-keyspace-events", &cfg.notifyKeyspaceEvents, &result.notifyKeyspaceEventsExplicit },
              })
         {
             auto const matched = ApplyStringFlag(args, i, name, *target);
@@ -463,6 +464,10 @@ namespace
                          "and both --tls-cert and --tls-key)" },
         { .flag = "--tls-cert=<path>", .description = "PEM certificate (chain) file for --tls" },
         { .flag = "--tls-key=<path>", .description = "PEM private key file for --tls" },
+        { .flag = "--notify-keyspace-events=<flags>",
+          .description = "redis-style keyspace-event flag string; empty = off (default).\n"
+                         "K=__keyspace, E=__keyevent, g=generic (del/expire/persist),\n"
+                         "$=string (set/incr*), x=expired, A=alias for g$x" },
         { .flag = "--log-timestamps", .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)" },
         { .flag = "--storage=<path>", .description = "persist cache to a CoW-tree file (default: in-memory only)" },
         { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },

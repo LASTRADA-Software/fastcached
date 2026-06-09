@@ -31,6 +31,7 @@
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
+#include <FastCache/Protocol/KeyspaceNotifier.hpp>
 #include <FastCache/Protocol/PubSubRegistry.hpp>
 #include <FastCache/Protocol/RedisTransaction.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
@@ -173,6 +174,8 @@ FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& c
         fileCfg.tlsCertPath = cliCfg.tlsCertPath;
     if (cli.tlsKeyPathExplicit)
         fileCfg.tlsKeyPath = cliCfg.tlsKeyPath;
+    if (cli.notifyKeyspaceEventsExplicit)
+        fileCfg.notifyKeyspaceEvents = cliCfg.notifyKeyspaceEvents;
     return fileCfg;
 }
 
@@ -538,6 +541,19 @@ int DaemonBody(FastCache::Config const& effective)
     // WATCH snapshot taken by connection B. Lives for the whole server run.
     FastCache::WatchRegistry watches;
     serverOpts.session.watches = &watches;
+    // Redis keyspace-notification publisher. Parses the operator-supplied
+    // flag string and rejects unknown letters loudly. Defaults to off.
+    auto const eventsMask = FastCache::ParseKeyspaceEvents(effective.notifyKeyspaceEvents);
+    if (!eventsMask.has_value())
+    {
+        logger.Logf(FastCache::LogLevel::Fatal,
+                    "fastcached: invalid --notify-keyspace-events '{}': {}",
+                    effective.notifyKeyspaceEvents,
+                    eventsMask.error().context);
+        return EXIT_FAILURE;
+    }
+    FastCache::KeyspaceNotifier keyspaceNotifier { &pubsub, *eventsMask };
+    serverOpts.session.keyspaceNotifier = &keyspaceNotifier;
 #if defined(FC_TLS_ENABLED)
     serverOpts.tlsContext = tlsContext.get(); // null unless --tls is active
 #endif
