@@ -324,7 +324,7 @@ namespace
         // Repeatable listen flags. `--listen` is plaintext, `--listen-tls`
         // is TLS — separate flags rather than a `+tls` suffix so the intent
         // is explicit at the call site. Each match appends to cfg.binds.
-        for (auto const [flagName, isTls]: std::initializer_list<std::tuple<std::string_view, bool>> {
+        for (auto const& [flagName, isTls]: std::initializer_list<std::tuple<std::string_view, bool>> {
                  { "--listen", false },
                  { "--listen-tls", true },
              })
