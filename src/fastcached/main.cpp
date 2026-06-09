@@ -428,7 +428,16 @@ int DaemonBody(FastCache::Config const& effective)
     // original banner formatted the legacy single-bind fields verbatim and
     // ignored `binds`, so a daemon brought up via `--listen` always logged
     // "bind=127.0.0.1:11211" (the defaults of the unused legacy fields).
-    auto const bindSummary = FastCache::FormatBindSummary(serverOpts.binds);
+    // We build the binds-shaped list from `effective` here so the banner
+    // is computable before the equivalent `serverOpts.binds` is populated
+    // a few dozen lines below; the synthesis rule is the same (prefer the
+    // explicit list, otherwise fold the legacy single-bind triplet into a
+    // synthetic BindConfig).
+    auto const bannerBinds = !effective.binds.empty()
+        ? effective.binds
+        : std::vector<FastCache::BindConfig> { FastCache::BindConfig {
+            .address = effective.bindAddress, .port = effective.port, .tls = effective.tlsEnabled } };
+    auto const bindSummary = FastCache::FormatBindSummary(bannerBinds);
     // `anyTlsBind` was computed up-top against `effective.binds`; under the
     // current ordering `serverOpts.binds` is either `effective.binds` (when
     // non-empty) or the synthesised legacy single-bind. Either way, a TLS
@@ -489,19 +498,8 @@ int DaemonBody(FastCache::Config const& effective)
         serverOpts.binds.push_back(
             FastCache::BindConfig { .address = effective.bindAddress, .port = effective.port, .tls = effective.tlsEnabled });
     }
-    // Reject shapes that would silently drop user-typed values: combining
-    // the legacy single-bind triplet (`--bind / --port / --tls` OR YAML
-    // `bind: / port: / tls:`) with `--listen / --listen-tls` (or YAML
-    // `listeners:`) makes the legacy values vanish — main.cpp picks `binds`
-    // and discards the singletons. Fail fast and name the offending flag so
-    // the operator can pick one shape. The combined `bindShapeCli` carries
-    // explicit bits from BOTH the CLI and the YAML so the check catches
-    // either mix source.
-    if (auto const shape = FastCache::ValidateBindFlagShape(bindShapeCli, serverOpts.binds); !shape.has_value())
-    {
-        logger.Logf(FastCache::LogLevel::Fatal, "fastcached: {}", shape.error().context);
-        return EXIT_FAILURE;
-    }
+    // (ValidateBindFlagShape ran in main() before the daemon host was
+    // invoked, so the mixed-shape rejection has already happened.)
     // Reject duplicate {address, port} endpoints before we hit the kernel:
     // SO_REUSEPORT would let both bind succeed and silently split traffic
     // 50/50 between mismatched protocols (plaintext vs TLS).
@@ -675,6 +673,18 @@ int main(int argc, char const* const* argv)
     if (!parsed->metricsPortExplicit && !metricsPortYamlExplicit)
         if (auto const envPort = MetricsPortFromEnv())
             effective.metricsPort = *envPort;
+
+    // Reject shapes that would silently drop user-typed values: combining the
+    // legacy single-bind triplet (`--bind / --port / --tls` OR YAML
+    // `bind: / port: / tls:`) with `--listen / --listen-tls` (or YAML
+    // `listeners:`) makes the legacy values vanish — DaemonBody picks
+    // `binds` and discards the singletons. Validate BEFORE handing off to
+    // the daemon host (which may fork) so the error reaches the operator.
+    if (auto const shape = FastCache::ValidateBindFlagShape(bindShapeCli, effective.binds); !shape.has_value())
+    {
+        std::println(std::cerr, "fastcached: {}", shape.error().context);
+        return EXIT_FAILURE;
+    }
 
     // Health check: probe the running daemon's /healthz on loopback and exit
     // 0/1. Loopback regardless of the configured metrics bind address, since the
