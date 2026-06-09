@@ -1843,6 +1843,41 @@ TEST_CASE("RESP keyspace: SPOP on empty set publishes no event",
     REQUIRE(fix.sub->messages.empty());
 }
 
+TEST_CASE("RESP keyspace: SET with notifier present but disabled publishes nothing",
+          "[protocol][resp][keyspace][cached-enable]")
+{
+    // Per-connection cached `keyspaceEnabled` shortcut: when the notifier
+    // exists but IsEnabled() == false (e.g. operator set
+    // `notify-keyspace-events=g` — a class without a channel flag, so no
+    // event can ever ship), the SET path must short-circuit before
+    // touching the notifier. We exercise the contract via behaviour: the
+    // subscriber sees no message.
+    KeyspaceFixture fix;
+    // Generic class only — no K or E — so IsEnabled() returns false.
+    fix.EnableEvents(FastCache::KeyspaceEvents::Generic);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    REQUIRE(fix.sub->messages.empty());
+}
+
+TEST_CASE("RESP keyspace: cached keyspaceEnabled survives Run for the connection's lifetime",
+          "[protocol][resp][keyspace][cached-enable]")
+{
+    // The cache is captured ONCE at the start of Run. This is the
+    // deliberate behavioural contract: a mid-session reload of
+    // `notify-keyspace-events` does not retro-enable an already-running
+    // connection. Test by enabling events BEFORE Run starts — the
+    // connection captures `true` and publishes normally.
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::String);
+    fix.SubscribeTo("__keyspace@0__:k");
+
+    (void) ExchangeKs(fix, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].payload == "set");
+}
+
 TEST_CASE("RESP keyspace: MSET still publishes 'set' per key when the gate is open",
           "[protocol][resp][keyspace][batch][hoist]")
 {

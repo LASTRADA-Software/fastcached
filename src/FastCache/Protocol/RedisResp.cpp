@@ -394,10 +394,20 @@ namespace
 
         /// Cached pointer to the process-wide keyspace-notification helper,
         /// copied from `SessionContext::keyspaceNotifier` once at the start
-        /// of `Run`. Null when no notifier is wired in (tests). When non-null
-        /// but `IsEnabled() == false`, every `OnEvent` call short-circuits
-        /// to the early return inside the helper — same effective no-op.
+        /// of `Run`. Null when no notifier is wired in (tests).
         KeyspaceNotifier* keyspaceNotifier { nullptr };
+
+        /// `keyspaceNotifier != nullptr && keyspaceNotifier->IsEnabled()`,
+        /// captured once at the start of `Run` and read on the hot path by
+        /// `NotifyKeyspace` to skip the helper's indirect call entirely when
+        /// keyspace notifications are off. Documented as fixed-for-life:
+        /// flipping `notify-keyspace-events` mid-session does NOT affect
+        /// connections already running — they keep their captured value
+        /// until they exit. This is deliberate (same shape as `watchRegistry`
+        /// and `keyspaceNotifier` caching) and lets the hottest write-path
+        /// branch on a per-connection bool instead of chasing a notifier
+        /// pointer through ConnectionState.
+        bool keyspaceEnabled { false };
     };
 
     /// Mutation hook: every Redis write verb calls this after its engine
@@ -424,8 +434,15 @@ namespace
                                std::string_view event,
                                std::string_view key)
     {
-        if (state != nullptr && state->keyspaceNotifier != nullptr)
-            state->keyspaceNotifier->OnEvent(classFlag, event, key);
+        // Read the per-connection cached enable bit FIRST so the disabled
+        // case (the daemon-wide default) costs one branch on a hot field,
+        // no indirect call. Without this, every successful cache mutation
+        // dereferenced `state->keyspaceNotifier`, called through the
+        // notifier's vtable... ish path, and then bottomed out at
+        // `_classes == 0` inside the helper.
+        if (state == nullptr || !state->keyspaceEnabled)
+            return;
+        state->keyspaceNotifier->OnEvent(classFlag, event, key);
     }
 
     [[nodiscard]] std::string Upper(std::string_view sv)
@@ -3037,6 +3054,11 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
     // chasing them through SessionContext at every callsite.
     state.watchRegistry = session.watches;
     state.keyspaceNotifier = session.keyspaceNotifier;
+    // Snapshot "is the notifier configured to publish anything at all?" once
+    // per connection. Same shape as the watchRegistry pointer cache: a
+    // mid-session reload of `notify-keyspace-events` does not affect
+    // already-running connections, by design.
+    state.keyspaceEnabled = state.keyspaceNotifier != nullptr && state.keyspaceNotifier->IsEnabled();
     // Honour test-only cap overrides set via OverrideMultiQueueCapsForTests.
     if (_testMaxQueuedCommands > 0)
         state.maxQueuedCommands = _testMaxQueuedCommands;
