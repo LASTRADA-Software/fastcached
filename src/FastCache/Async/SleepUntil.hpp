@@ -4,6 +4,7 @@
 #include <FastCache/Async/IReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
 
+#include <cassert>
 #include <coroutine>
 
 namespace FastCache
@@ -36,9 +37,15 @@ struct SleepUntil
     }
 
     /// Park the handle on the reactor's timer wheel for the deadline.
+    ///
+    /// Only ever reached after `await_ready()` returned false, which can only
+    /// happen when `reactor != nullptr` — the assert states that precondition
+    /// (and lets the static analyzer prune the impossible null-deref path the
+    /// nullptr-reactor test would otherwise appear to take).
     /// @param handle The suspended coroutine to resume once the deadline elapses.
     void await_suspend(std::coroutine_handle<> handle) const
     {
+        assert(reactor != nullptr);
         reactor->Schedule(deadline, handle);
     }
 
