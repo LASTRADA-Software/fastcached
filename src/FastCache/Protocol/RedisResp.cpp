@@ -464,6 +464,144 @@ namespace
         bool keyspaceEnabled { false };
     };
 
+    /// Awaitable that suspends until the reactor's clock reaches `deadline`.
+    /// Built directly on `IReactor::Schedule`; used by the blocking-read timeout
+    /// trampoline below. Resolves immediately if the deadline is already past.
+    struct SleepUntil
+    {
+        IReactor* reactor { nullptr };
+        TimePoint deadline {};
+
+        [[nodiscard]] bool await_ready() const noexcept
+        {
+            return reactor == nullptr || deadline <= reactor->Clock().Now();
+        }
+        void await_suspend(std::coroutine_handle<> handle) const
+        {
+            reactor->Schedule(deadline, handle);
+        }
+        void await_resume() const noexcept {}
+    };
+
+    /// Per-call coordinator for a blocking XREAD/XREADGROUP. The handler creates
+    /// one on the heap (shared_ptr), registers it with the process-wide
+    /// `IStreamWaiterRegistry` for the keys it is blocked on, then co_awaits
+    /// `Wait()`. Resolution comes from exactly one of two arms:
+    ///   - an XADD on any reactor thread calls `Wake()` via the registry, or
+    ///   - the reactor's timer fires at the BLOCK deadline (see ArmTimeout).
+    /// A one-shot latch (mirroring the pub/sub `WakeLatch`) makes the two arms
+    /// race-safe: whichever fires first resumes the parked coroutine once; the
+    /// loser is a no-op. The waiter is held by shared_ptr so a `Wake()` racing
+    /// the handler's teardown lands on live memory (the registry holds only a
+    /// weak_ptr and upgrades under its lock).
+    class StreamWaiter final: public IStreamWaiter
+    {
+      public:
+        /// @param reactor Reactor to marshal the resume onto (the connection's),
+        ///        or nullptr for non-reactor transports (resume inline).
+        explicit StreamWaiter(IReactor* reactor) noexcept:
+            _reactor { reactor }
+        {
+        }
+
+        /// Registry arm: wake the parked coroutine if not already resolved.
+        /// Thread-safe; may be called from any reactor thread.
+        void Wake() noexcept override
+        {
+            WakeOnce();
+        }
+
+        /// Whether the wait resolved because of the timeout arm rather than data.
+        [[nodiscard]] bool TimedOut() const noexcept
+        {
+            std::scoped_lock const lock { _mu };
+            return _timedOut;
+        }
+
+        /// Awaitable that parks the handler until either arm resolves it.
+        struct Awaiter
+        {
+            StreamWaiter* self;
+
+            [[nodiscard]] bool await_ready() const noexcept
+            {
+                std::scoped_lock const lock { self->_mu };
+                return self->_resolved;
+            }
+            [[nodiscard]] bool await_suspend(std::coroutine_handle<> handle) const
+            {
+                std::scoped_lock const lock { self->_mu };
+                if (self->_resolved)
+                    return false; // raced: resolved between await_ready and here.
+                self->_handle = handle;
+                return true;
+            }
+            void await_resume() const noexcept {}
+        };
+
+        /// Park until `Wake()` (data) or `WakeTimeout()` (the deadline) fires.
+        [[nodiscard]] Awaiter Wait() noexcept
+        {
+            return Awaiter { this };
+        }
+
+        /// Timeout arm: resolve the wait as a timeout (idempotent).
+        void WakeTimeout() noexcept
+        {
+            WakeOnce(/*timedOut*/ true);
+        }
+
+        /// The reactor this waiter resumes on (used to arm the timeout trampoline).
+        [[nodiscard]] IReactor* Reactor() const noexcept
+        {
+            return _reactor;
+        }
+
+      private:
+        /// Resolve the wait (idempotent) and resume the parked coroutine exactly
+        /// once, marshalling onto the connection's reactor when present.
+        /// @param timedOut True when resolved by the timeout arm.
+        void WakeOnce(bool timedOut = false) noexcept
+        {
+            std::coroutine_handle<> toWake {};
+            {
+                std::scoped_lock const lock { _mu };
+                if (_resolved)
+                    return;
+                _resolved = true;
+                _timedOut = timedOut;
+                toWake = std::exchange(_handle, {});
+            }
+            if (toWake)
+            {
+                if (_reactor != nullptr)
+                    _reactor->Submit(toWake);
+                else
+                    toWake.resume();
+            }
+        }
+
+        IReactor* _reactor;
+        mutable std::mutex _mu;
+        std::coroutine_handle<> _handle {};
+        bool _resolved { false };
+        bool _timedOut { false };
+    };
+
+    /// Detached trampoline arming the timeout arm of a blocking read: sleep to
+    /// `deadline` on the reactor, then resolve the waiter as a timeout. Holds a
+    /// shared_ptr so the waiter outlives this task even if the data arm won and
+    /// the handler already moved on. A no-op when there is no reactor (the
+    /// in-memory transport case) or no finite deadline.
+    /// @param waiter   The waiter to time out (kept alive by this task).
+    /// @param deadline Absolute timeout instant.
+    DetachedTask ArmTimeout(std::shared_ptr<StreamWaiter> waiter, TimePoint deadline)
+    {
+        auto* const reactor = waiter->Reactor();
+        co_await SleepUntil { .reactor = reactor, .deadline = deadline };
+        waiter->WakeTimeout();
+    }
+
     /// Mutation hook: every Redis write verb calls this after its engine
     /// mutation succeeds, so any `WATCH` snapshot on the touched key flips
     /// the watcher's dirty flag and a subsequent `EXEC` aborts. Centralised
@@ -2684,7 +2822,55 @@ namespace
         co_return true;
     }
 
-    Task<bool> HandleXRead(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
+    /// Poll every requested key once, reading entries strictly after its cursor.
+    /// @param engine  The cache engine.
+    /// @param req     The parsed request (keys + count).
+    /// @param cursors One resolved cursor ID per key.
+    /// @param perKey  Receives the per-key entry lists (cleared first).
+    /// @return Total entry count across all keys, or a StorageError (WrongType).
+    [[nodiscard]] std::expected<std::size_t, StorageError> PollXRead(
+        CacheEngine* engine,
+        XReadRequest const& req,
+        std::span<StreamCodec::StreamId const> cursors,
+        std::vector<std::vector<StreamCodec::StreamEntry>>& perKey)
+    {
+        perKey.clear();
+        perKey.reserve(req.keys.size());
+        std::size_t total = 0;
+        for (auto k = std::size_t { 0 }; k < req.keys.size(); ++k)
+        {
+            auto entries = engine->StreamRead(req.keys[k], cursors[k], static_cast<std::size_t>(req.count));
+            if (!entries.has_value())
+                return std::unexpected(entries.error());
+            total += entries->size();
+            perKey.push_back(std::move(*entries));
+        }
+        return total;
+    }
+
+    /// Block the calling coroutine until any of `keys` is appended to or the
+    /// deadline elapses, parking on a `StreamWaiter` registered with the
+    /// process-wide coordinator. A no-op (returns immediately) when blocking is
+    /// not wired in (`streamWaiters == nullptr`).
+    /// @param session  Carries the waiter registry and the connection's reactor.
+    /// @param keys     Stream keys to wait on.
+    /// @param deadline Absolute timeout, or TimePoint::max() for BLOCK 0.
+    /// @return True if woken by an append; false on timeout (or no coordinator).
+    Task<bool> BlockOnStreams(SessionContext session, std::span<std::string const> keys, TimePoint deadline)
+    {
+        if (session.streamWaiters == nullptr)
+            co_return false;
+        auto const waiter = std::make_shared<StreamWaiter>(session.reactor);
+        session.streamWaiters->Register(waiter, keys);
+        if (session.reactor != nullptr && deadline != TimePoint::max())
+            ArmTimeout(waiter, deadline);
+        co_await waiter->Wait();
+        session.streamWaiters->Unregister(waiter.get());
+        co_return !waiter->TimedOut();
+    }
+
+    Task<bool> HandleXRead(
+        ISocket* socket, CacheEngine* engine, SessionContext session, std::span<std::string const> args, RespVersion resp)
     {
         XReadRequest req;
         bool noAck = false;
@@ -2699,23 +2885,28 @@ namespace
             co_return co_await ReplyError(socket, *err);
         }
 
-        // Poll once. Blocking (BLOCK) parking is wired in a later phase; for now
-        // a BLOCK request that finds no data returns the nil/again reply
-        // immediately rather than parking.
+        // Compute the BLOCK deadline once (relative to now). BLOCK 0 blocks
+        // forever (TimePoint::max()); without BLOCK, poll exactly once.
+        bool const blocking = req.blockMs.has_value() && session.streamWaiters != nullptr;
+        auto const deadline = (req.blockMs.has_value() && *req.blockMs != 0)
+                                  ? engine->Clock().Now() + std::chrono::milliseconds { *req.blockMs }
+                                  : TimePoint::max();
+
         std::vector<std::vector<StreamCodec::StreamEntry>> perKey;
-        perKey.reserve(req.keys.size());
-        std::size_t total = 0;
-        for (auto k = std::size_t { 0 }; k < req.keys.size(); ++k)
+        while (true)
         {
-            auto const entries = engine->StreamRead(req.keys[k], cursors[k], static_cast<std::size_t>(req.count));
-            if (!entries.has_value())
-                co_return co_await ReplyStreamError(socket, entries.error());
-            total += entries->size();
-            perKey.push_back(*entries);
+            auto const total = PollXRead(engine, req, cursors, perKey);
+            if (!total.has_value())
+                co_return co_await ReplyStreamError(socket, total.error());
+            if (*total > 0)
+                co_return co_await WriteXReadReply(socket, req.keys, perKey, resp);
+            if (!blocking)
+                co_return co_await ReplyNull(socket, resp);
+            // Park until an append on one of our keys or the deadline. A spurious
+            // wake just re-polls; a timeout ends the wait with a nil reply.
+            if (!co_await BlockOnStreams(session, req.keys, deadline))
+                co_return co_await ReplyNull(socket, resp);
         }
-        if (total == 0)
-            co_return co_await ReplyNull(socket, resp);
-        co_return co_await WriteXReadReply(socket, req.keys, perKey, resp);
     }
 
     // -- consumer groups (XGROUP / XREADGROUP / XACK / XPENDING / XCLAIM / XINFO) --
@@ -2857,8 +3048,12 @@ namespace
         co_return co_await ReplyError(socket, "syntax error");
     }
 
-    Task<bool> HandleXReadGroup(
-        ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args, RespVersion resp)
+    Task<bool> HandleXReadGroup(ISocket* socket,
+                                CacheEngine* engine,
+                                ConnectionState* state,
+                                SessionContext session,
+                                std::span<std::string const> args,
+                                RespVersion resp)
     {
         // XREADGROUP GROUP <group> <consumer> [COUNT n] [BLOCK ms] [NOACK] STREAMS key... id...
         if (args.size() < 3 || Upper(args[0]) != "GROUP")
@@ -2871,36 +3066,59 @@ namespace
         if (auto const err = ParseXRead(args.subspan(3), req, noAck); err.has_value())
             co_return co_await ReplyError(socket, *err);
 
-        std::vector<std::vector<StreamCodec::StreamEntry>> perKey;
-        perKey.reserve(req.keys.size());
-        std::size_t total = 0;
-        for (auto k = std::size_t { 0 }; k < req.keys.size(); ++k)
+        // Pre-parse the per-key cursors. `>` (nullopt) reads new entries and may
+        // block; an explicit ID replays the consumer's PEL and never blocks.
+        std::vector<std::optional<StreamCodec::StreamId>> afters;
+        afters.reserve(req.keys.size());
+        bool allNewEntries = !req.keys.empty();
+        for (auto const& idArg: req.idArgs)
         {
-            auto const& idArg = req.idArgs[k];
-            std::optional<StreamCodec::StreamId> after;
-            if (idArg != ">")
+            if (idArg == ">")
+                afters.emplace_back(std::nullopt);
+            else
             {
                 auto const parsed = StreamCodec::ParseId(idArg);
                 if (!parsed.has_value())
                     co_return co_await ReplyError(socket, "Invalid stream ID specified as stream command argument");
-                after = *parsed;
+                afters.push_back(parsed);
+                allNewEntries = false;
             }
-            auto const entries =
-                engine->StreamReadGroup(req.keys[k], group, consumer, after, static_cast<std::size_t>(req.count), noAck);
-            if (!entries.has_value())
-            {
-                if (entries.error().code == StorageErrorCode::WrongType)
-                    co_return co_await ReplyWrongType(socket);
-                co_return co_await ReplyNoGroup(socket, req.keys[k], group);
-            }
-            total += entries->size();
-            perKey.push_back(*entries);
-            if (!entries->empty())
-                NotifyWatchers(state, req.keys[k]);
         }
-        if (total == 0)
-            co_return co_await ReplyNull(socket, resp);
-        co_return co_await WriteXReadReply(socket, req.keys, perKey, resp);
+
+        // BLOCK only applies to the `>` (new-entries) form, matching redis.
+        bool const blocking = req.blockMs.has_value() && session.streamWaiters != nullptr && allNewEntries;
+        auto const deadline = (req.blockMs.has_value() && *req.blockMs != 0)
+                                  ? engine->Clock().Now() + std::chrono::milliseconds { *req.blockMs }
+                                  : TimePoint::max();
+
+        std::vector<std::vector<StreamCodec::StreamEntry>> perKey;
+        while (true)
+        {
+            perKey.clear();
+            perKey.reserve(req.keys.size());
+            std::size_t total = 0;
+            for (auto k = std::size_t { 0 }; k < req.keys.size(); ++k)
+            {
+                auto entries = engine->StreamReadGroup(
+                    req.keys[k], group, consumer, afters[k], static_cast<std::size_t>(req.count), noAck);
+                if (!entries.has_value())
+                {
+                    if (entries.error().code == StorageErrorCode::WrongType)
+                        co_return co_await ReplyWrongType(socket);
+                    co_return co_await ReplyNoGroup(socket, req.keys[k], group);
+                }
+                total += entries->size();
+                if (!entries->empty())
+                    NotifyWatchers(state, req.keys[k]);
+                perKey.push_back(std::move(*entries));
+            }
+            if (total > 0)
+                co_return co_await WriteXReadReply(socket, req.keys, perKey, resp);
+            if (!blocking)
+                co_return co_await ReplyNull(socket, resp);
+            if (!co_await BlockOnStreams(session, req.keys, deadline))
+                co_return co_await ReplyNull(socket, resp);
+        }
     }
 
     Task<bool> HandleXAck(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
@@ -4067,25 +4285,28 @@ namespace
                        .firstKey = 1,
                        .lastKey = 1,
                        .keyStep = 1 },
-        CommandEntry { .name = "XREAD",
-                       .handler = [](CommandContext c) { return HandleXRead(c.socket, c.engine, c.tail, c.state->resp); },
-                       .arity = -4,
-                       .firstKey = 0,
-                       .lastKey = 0,
-                       .keyStep = 0 },
+        CommandEntry {
+            .name = "XREAD",
+            .handler = [](CommandContext c) { return HandleXRead(c.socket, c.engine, c.session, c.tail, c.state->resp); },
+            .arity = -4,
+            .firstKey = 0,
+            .lastKey = 0,
+            .keyStep = 0 },
         CommandEntry { .name = "XGROUP",
                        .handler = [](CommandContext c) { return HandleXGroup(c.socket, c.engine, c.state, c.tail); },
                        .arity = -2,
                        .firstKey = 2,
                        .lastKey = 2,
                        .keyStep = 1 },
-        CommandEntry {
-            .name = "XREADGROUP",
-            .handler = [](CommandContext c) { return HandleXReadGroup(c.socket, c.engine, c.state, c.tail, c.state->resp); },
-            .arity = -7,
-            .firstKey = 0,
-            .lastKey = 0,
-            .keyStep = 0 },
+        CommandEntry { .name = "XREADGROUP",
+                       .handler =
+                           [](CommandContext c) {
+                               return HandleXReadGroup(c.socket, c.engine, c.state, c.session, c.tail, c.state->resp);
+                           },
+                       .arity = -7,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
         CommandEntry { .name = "XACK",
                        .handler = [](CommandContext c) { return HandleXAck(c.socket, c.engine, c.state, c.tail); },
                        .arity = -4,

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
@@ -11,6 +12,7 @@
 #include <FastCache/Protocol/RedisResp.hpp>
 #include <FastCache/Protocol/RedisTransaction.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
+#include <FastCache/Protocol/StreamWaiterRegistry.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -3042,4 +3044,129 @@ TEST_CASE("RESP: XCLAIM transfers ownership of an idle pending entry", "[protoco
                  "*7\r\n$6\r\nXCLAIM\r\n$1\r\ns\r\n$2\r\ng1\r\n$2\r\nc2\r\n$1\r\n0\r\n$3\r\n1-0\r\n$6\r\nJUSTID\r\n");
     // JUSTID -> array of claimed IDs: *1 $3 1-0.
     REQUIRE(out.ends_with("*1\r\n$3\r\n1-0\r\n"));
+}
+
+// -- blocking reads (XREAD BLOCK / XREADGROUP BLOCK) ------------------------
+
+TEST_CASE("RESP: XREAD BLOCK with no waiter registry falls back to non-blocking nil", "[protocol][resp][stream]")
+{
+    // The default RespFixture wires no StreamWaiterRegistry, so a BLOCK request
+    // that finds no data returns nil immediately rather than parking — the
+    // documented "blocking disabled" fallback.
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$3\r\n100\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n");
+    REQUIRE(out == "$3\r\n1-0\r\n$-1\r\n");
+}
+
+TEST_CASE("RESP: XREAD BLOCK returns immediately when data is already present", "[protocol][resp][stream]")
+{
+    // Even with a registry wired, the handler polls first; available data is
+    // returned without ever parking. Exercises the blocking handler's
+    // poll-before-block path against a real registry.
+    FastCache::StreamWaiterRegistry waiters;
+    RespFixture fix;
+    FastCache::SessionContext session;
+    session.streamWaiters = &waiters;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n2-0\r\n$1\r\ng\r\n$1\r\nw\r\n"
+                              // BLOCK 0 (forever) but data after 1-0 exists -> returns now.
+                              "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n",
+                              session);
+    REQUIRE(out.ends_with("*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\ng\r\n$1\r\nw\r\n"));
+}
+
+namespace
+{
+
+/// Drive a genuinely-parking XREAD BLOCK to completion on a single-threaded
+/// TestReactor: the handler parks on the StreamWaiter, then a simulated XADD on
+/// another "connection" appends to the engine and notifies the registry, waking
+/// the blocked read. Fully deterministic — no threads, the reactor is ticked
+/// explicitly between the two phases.
+struct BlockingHarness
+{
+    FastCache::ManualClock clock;
+    FastCache::TestReactor reactor { clock };
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::StreamWaiterRegistry waiters;
+    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+    std::string reply;
+
+    /// Launcher coroutine: runs the handler to completion and captures the reply.
+    FastCache::Task<void> RunHandler(FastCache::SessionContext session)
+    {
+        co_await handler.Run(pair.server.get(), &engine, /*primer*/ {}, session);
+        pair.server->Close();
+        reply = co_await DrainResponse(pair.client.get());
+    }
+};
+
+} // namespace
+
+TEST_CASE("RESP: XREAD BLOCK parks then wakes on a later XADD", "[protocol][resp][stream]")
+{
+    BlockingHarness h;
+    FastCache::SessionContext session;
+    session.streamWaiters = &h.waiters;
+    session.reactor = &h.reactor;
+
+    // Seed an entry and arm a blocking read for entries strictly after it.
+    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
+                                           "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
+    h.pair.client->ShutdownWrite();
+
+    // Launch the handler on the reactor; it processes the XADD, then parks on
+    // the blocking XREAD (no entry after 1-0 yet).
+    auto launcher = h.RunHandler(session);
+    h.reactor.Submit(launcher.Native());
+    h.reactor.Run();
+    REQUIRE(h.reply.empty()); // still parked — nothing returned yet.
+
+    // A second "connection" appends 2-0 and notifies the registry, which wakes
+    // the parked reader; ticking the reactor resumes it to read + reply.
+    auto const added = h.engine.StreamAdd("s",
+                                          FastCache::StreamCodec::StreamId { .ms = 2, .seq = 0 },
+                                          false,
+                                          std::vector<std::pair<std::string, std::string>> { { "g", "w" } },
+                                          std::nullopt,
+                                          false);
+    REQUIRE(added.has_value());
+    h.waiters.NotifyAppended("s");
+    h.reactor.Run();
+
+    REQUIRE(h.reply.ends_with("*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\ng\r\n$1\r\nw\r\n"));
+}
+
+TEST_CASE("RESP: XREAD BLOCK times out to nil when the deadline elapses", "[protocol][resp][stream]")
+{
+    BlockingHarness h;
+    FastCache::SessionContext session;
+    session.streamWaiters = &h.waiters;
+    session.reactor = &h.reactor;
+
+    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
+                                           "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$2\r\n50\r\n"
+                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
+    h.pair.client->ShutdownWrite();
+
+    auto launcher = h.RunHandler(session);
+    h.reactor.Submit(launcher.Native());
+    h.reactor.Run();
+    REQUIRE(h.reply.empty()); // parked, waiting on the 50ms deadline.
+
+    // Advance past the deadline; the scheduled timeout fires, waking the reader
+    // which finds no data and replies nil.
+    h.clock.SetNow(h.clock.Now() + std::chrono::milliseconds { 51 });
+    h.reactor.Run();
+    REQUIRE(h.reply.ends_with("$-1\r\n"));
 }
