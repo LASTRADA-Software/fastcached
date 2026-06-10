@@ -2468,3 +2468,288 @@ TEST_CASE("RESP: MULTI queue cap reset between transactions", "[protocol][resp][
                "+QUEUED\r\n"
                "*1\r\n+OK\r\n");
 }
+
+// =========================================================================
+// RESP3 wire-format coverage.
+//
+// The encoder writers (ReplyNull, ReplyBoolean, ReplyDouble, ReplyBigNumber,
+// ReplyVerbatim, ReplyAttributeHeader, ReplyAggregateHeader for Map/Set/Push)
+// branch on the connection's negotiated RespVersion. The tests below pin every
+// reachable branch by driving DEBUG PROTOCOL (the canonical conformance command
+// for type writers that no cache verb naturally produces) and asserting the
+// exact suffix bytes under each version. Where the encoder shape is the whole
+// reply, the entire wire payload is asserted; where DEBUG composes a multi-
+// frame reply (HELLO map + type) only the type's bytes are asserted.
+// =========================================================================
+
+namespace
+{
+
+// Drive a `DEBUG PROTOCOL <type>` after an optional HELLO. Returns the bytes
+// AFTER the HELLO reply so each test can assert just the DEBUG output.
+// Without a HELLO prefix the connection stays at RESP2 (the default).
+std::string ExchangeDebugProtocol(std::string_view type, std::string_view helloPrefix)
+{
+    RespFixture fix;
+    std::string req { helloPrefix };
+    req += "*3\r\n$5\r\nDEBUG\r\n$8\r\nPROTOCOL\r\n$";
+    req += std::to_string(type.size());
+    req += "\r\n";
+    req += type;
+    req += "\r\n";
+    auto out = Exchange(fix, req);
+    // Strip the HELLO reply prefix when present so the assertion can pin
+    // exact bytes. HELLO 3 → map starts with `%6\r\n` and ends after 6 pairs;
+    // HELLO 2 → flat array starts with `*12\r\n`. Both replies terminate at
+    // the moment the dispatch returns to read the next command, so the
+    // remaining bytes are exactly the DEBUG response.
+    if (helloPrefix.empty())
+        return out;
+    // Find the end of the HELLO reply: the last byte of the role field's
+    // value bulk. Both versions emit `$6\r\nmaster\r\n` as their final pair
+    // value, which is unique enough to use as a delimiter.
+    constexpr std::string_view HelloTrailer = "$6\r\nmaster\r\n";
+    auto const pos = out.find(HelloTrailer);
+    REQUIRE(pos != std::string::npos);
+    return out.substr(pos + HelloTrailer.size());
+}
+
+constexpr std::string_view Hello3 = "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n";
+constexpr std::string_view Hello2 = "*2\r\n$5\r\nHELLO\r\n$1\r\n2\r\n";
+
+} // namespace
+
+TEST_CASE("RESP3 encoder: null is `_` under RESP3, `$-1` under RESP2", "[protocol][resp3][encoder]")
+{
+    REQUIRE(ExchangeDebugProtocol("null", Hello3) == "_\r\n");
+    REQUIRE(ExchangeDebugProtocol("null", Hello2) == "$-1\r\n");
+    REQUIRE(ExchangeDebugProtocol("null", "") == "$-1\r\n"); // default-RESP2 path
+}
+
+TEST_CASE("RESP3 encoder: boolean is `#t`/`#f` under RESP3, `:1`/`:0` under RESP2", "[protocol][resp3][encoder]")
+{
+    REQUIRE(ExchangeDebugProtocol("true", Hello3) == "#t\r\n");
+    REQUIRE(ExchangeDebugProtocol("false", Hello3) == "#f\r\n");
+    REQUIRE(ExchangeDebugProtocol("true", Hello2) == ":1\r\n");
+    REQUIRE(ExchangeDebugProtocol("false", Hello2) == ":0\r\n");
+}
+
+TEST_CASE("RESP3 encoder: double is `,1.5` under RESP3, bulk string under RESP2", "[protocol][resp3][encoder]")
+{
+    REQUIRE(ExchangeDebugProtocol("double", Hello3) == ",1.5\r\n");
+    // RESP2 fallback formats the same number as a bulk string. `1.5` is
+    // 3 chars; the resulting frame is `$3\r\n1.5\r\n`.
+    REQUIRE(ExchangeDebugProtocol("double", Hello2) == "$3\r\n1.5\r\n");
+}
+
+TEST_CASE("RESP3 encoder: big number is `(digits` under RESP3, bulk string under RESP2", "[protocol][resp3][encoder]")
+{
+    constexpr std::string_view Digits = "1234567999999999999999999999999999999";
+    // Length is 37; `$37\r\n<digits>\r\n` under RESP2.
+    REQUIRE(ExchangeDebugProtocol("bignum", Hello3) == std::string { "(" } + std::string { Digits } + "\r\n");
+    auto const expectedR2 = std::string { "$" } + std::to_string(Digits.size()) + "\r\n" + std::string { Digits } + "\r\n";
+    REQUIRE(ExchangeDebugProtocol("bignum", Hello2) == expectedR2);
+}
+
+TEST_CASE("RESP3 encoder: verbatim is `=<len>\\r\\ntxt:<text>` under RESP3, bulk text under RESP2",
+          "[protocol][resp3][encoder]")
+{
+    // Body is "This is a verbatim\nstring" (25 chars). RESP3 prefixes with
+    // "txt:" giving a 29-byte payload: `=29\r\ntxt:This is a verbatim\nstring\r\n`.
+    REQUIRE(ExchangeDebugProtocol("verbatim", Hello3) == "=29\r\ntxt:This is a verbatim\nstring\r\n");
+    // RESP2 drops the format hint, payload is the bare 25-byte text.
+    REQUIRE(ExchangeDebugProtocol("verbatim", Hello2) == "$25\r\nThis is a verbatim\nstring\r\n");
+}
+
+TEST_CASE("RESP3 encoder: map is `%<n>` under RESP3, flat `*<2n>` under RESP2", "[protocol][resp3][encoder]")
+{
+    // DEBUG PROTOCOL map emits one pair: integer 1 -> boolean true.
+    // RESP3: `%1\r\n:1\r\n#t\r\n`.
+    // RESP2: 2-element array, boolean as :1. `*2\r\n:1\r\n:1\r\n`.
+    REQUIRE(ExchangeDebugProtocol("map", Hello3) == "%1\r\n:1\r\n#t\r\n");
+    REQUIRE(ExchangeDebugProtocol("map", Hello2) == "*2\r\n:1\r\n:1\r\n");
+}
+
+TEST_CASE("RESP3 encoder: set is `~<n>` under RESP3, flat `*<n>` under RESP2", "[protocol][resp3][encoder]")
+{
+    // DEBUG PROTOCOL set emits two integer members (1, 2).
+    REQUIRE(ExchangeDebugProtocol("set", Hello3) == "~2\r\n:1\r\n:2\r\n");
+    REQUIRE(ExchangeDebugProtocol("set", Hello2) == "*2\r\n:1\r\n:2\r\n");
+}
+
+TEST_CASE("RESP3 encoder: array shape is identical across versions", "[protocol][resp3][encoder]")
+{
+    // The Array aggregate has no version difference (RESP2 and RESP3 both
+    // prefix with `*`). Both branches must produce identical bytes.
+    constexpr std::string_view Expected = "*3\r\n:1\r\n:2\r\n:3\r\n";
+    REQUIRE(ExchangeDebugProtocol("array", Hello3) == Expected);
+    REQUIRE(ExchangeDebugProtocol("array", Hello2) == Expected);
+}
+
+TEST_CASE("RESP3 encoder: push is `><n>` under RESP3, flat `*<n>` under RESP2", "[protocol][resp3][encoder]")
+{
+    // DEBUG PROTOCOL push emits [pubsub, channel, payload].
+    REQUIRE(ExchangeDebugProtocol("push", Hello3) == ">3\r\n$6\r\npubsub\r\n$7\r\nchannel\r\n$7\r\npayload\r\n");
+    REQUIRE(ExchangeDebugProtocol("push", Hello2) == "*3\r\n$6\r\npubsub\r\n$7\r\nchannel\r\n$7\r\npayload\r\n");
+}
+
+TEST_CASE("RESP3 encoder: attribute prefixes a real reply under RESP3, drops to bulk under RESP2",
+          "[protocol][resp3][encoder]")
+{
+    // DEBUG PROTOCOL attrib emits an attribute pair followed by an empty
+    // array as the real reply. Under RESP2 the attribute is dropped and the
+    // implementation falls back to a single bulk string "none" (mirroring
+    // what an attribute-aware client would see after stripping the
+    // advisory attribute).
+    REQUIRE(ExchangeDebugProtocol("attrib", Hello3) == "|1\r\n$14\r\nkey-popularity\r\n$4\r\nnone\r\n*0\r\n");
+    REQUIRE(ExchangeDebugProtocol("attrib", Hello2) == "$4\r\nnone\r\n");
+}
+
+TEST_CASE("RESP3 encoder: unknown DEBUG PROTOCOL type errors", "[protocol][resp3][encoder]")
+{
+    REQUIRE(ExchangeDebugProtocol("nosuchtype", Hello3) == "-ERR Wrong protocol type name: NOSUCHTYPE\r\n");
+}
+
+// -------------------------------------------------------------------------
+// HELLO / RESET / version-switch semantics.
+// -------------------------------------------------------------------------
+
+TEST_CASE("RESP3 HELLO: bare HELLO with no version keeps the current version", "[protocol][resp3][hello]")
+{
+    RespFixture fix;
+    // HELLO with no args after HELLO 3 must reply a RESP3 map (proto:3).
+    auto const out = Exchange(fix, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n*1\r\n$5\r\nHELLO\r\n");
+    // Both replies are RESP3 maps; second one starts where the first ends.
+    REQUIRE(out.starts_with("%6\r\n"));
+    // The second %6\r\n header must appear in the stream (a bare HELLO
+    // returning RESP3 means proto:3 is still in effect).
+    auto const secondMap = out.find("%6\r\n", 4);
+    REQUIRE(secondMap != std::string::npos);
+}
+
+TEST_CASE("RESP3 HELLO: HELLO 2 after HELLO 3 downgrades the connection", "[protocol][resp3][hello]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n" // start at RESP3
+                              "*2\r\n$5\r\nHELLO\r\n$1\r\n2\r\n" // downgrade
+                              "*2\r\n$3\r\nGET\r\n$4\r\nnope\r\n");
+    // Tail must be the RESP2 null bulk, not the RESP3 `_` null.
+    REQUIRE(out.ends_with("$-1\r\n"));
+    // The downgrade reply is itself a flat *12 array.
+    REQUIRE(out.contains("*12\r\n"));
+}
+
+TEST_CASE("RESP3 HELLO: RESET drops the connection back to RESP2", "[protocol][resp3][hello][reset]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n" // upgrade
+                              "*1\r\n$5\r\nRESET\r\n"            // clears resp -> 2
+                              "*2\r\n$3\r\nGET\r\n$4\r\nnope\r\n");
+    REQUIRE(out.ends_with("+RESET\r\n$-1\r\n"));
+}
+
+TEST_CASE("RESP3 HELLO: unknown option in HELLO replies syntax error", "[protocol][resp3][hello]")
+{
+    RespFixture fix;
+    // `HELLO 3 BOGUS` — BOGUS is neither AUTH nor SETNAME.
+    auto const out = Exchange(fix, "*3\r\n$5\r\nHELLO\r\n$1\r\n3\r\n$5\r\nBOGUS\r\n");
+    REQUIRE(out == "-ERR Syntax error in HELLO option 'BOGUS'\r\n");
+}
+
+TEST_CASE("RESP3 HELLO: bare HELLO is a RESP2 map by default", "[protocol][resp3][hello]")
+{
+    // First-ever HELLO with no version arg, no prior negotiation: connection
+    // stays at the default (RESP2), so the map is rendered as a flat *12 array.
+    RespFixture fix;
+    auto const out = Exchange(fix, "*1\r\n$5\r\nHELLO\r\n");
+    REQUIRE(out.starts_with("*12\r\n"));
+    REQUIRE(out.contains("$5\r\nproto\r\n:2\r\n"));
+}
+
+// -------------------------------------------------------------------------
+// Pub/sub Push frame: SUBSCRIBE under RESP3 must use `>`, under RESP2 `*`.
+// -------------------------------------------------------------------------
+
+TEST_CASE("RESP3 pubsub: SUBSCRIBE under RESP3 emits a Push frame", "[protocol][resp3][pubsub]")
+{
+    // Two-frame request: HELLO 3 (RESP3 map) then SUBSCRIBE ch (push or
+    // array confirm). We assert the confirm frame's prefix exactly.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::PubSubRegistry pubsub;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    FastCache::SessionContext session;
+    session.pubsub = &pubsub;
+
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(),
+                                           "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n"
+                                           "*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n")));
+    pair.client->ShutdownWrite();
+    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    // The SUBSCRIBE confirm frame, under RESP3, is:
+    //   >3\r\n$9\r\nsubscribe\r\n$2\r\nch\r\n:1\r\n
+    REQUIRE(out.ends_with(">3\r\n$9\r\nsubscribe\r\n$2\r\nch\r\n:1\r\n"));
+}
+
+TEST_CASE("RESP3 pubsub: SUBSCRIBE under RESP2 emits an array frame", "[protocol][resp3][pubsub]")
+{
+    // Negative control for the case above — confirms the encoder is
+    // version-sensitive at the Aggregate::Push branch.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::PubSubRegistry pubsub;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    FastCache::SessionContext session;
+    session.pubsub = &pubsub;
+
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n")));
+    pair.client->ShutdownWrite();
+    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(out == "*3\r\n$9\r\nsubscribe\r\n$2\r\nch\r\n:1\r\n");
+}
+
+// -------------------------------------------------------------------------
+// Existing data verbs continue to use RESP3-aware null replies.
+// -------------------------------------------------------------------------
+
+TEST_CASE("RESP3: SET NX/XX precondition unmet yields `_` under RESP3", "[protocol][resp3][set]")
+{
+    // The SET NX-unmet and SET XX-unmet branches go through ReplyNull, so
+    // they must follow the negotiated version's null spelling. RESP2 is
+    // covered already by "SET with NX refuses overwrite".
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n"
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nfst\r\n"
+                              "*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nsnd\r\n$2\r\nNX\r\n");
+    // The trailing reply (SET ... NX) must be the RESP3 null `_`.
+    REQUIRE(out.ends_with("_\r\n"));
+}
+
+TEST_CASE("RESP3: HELLO map renders 6 fields in stable order", "[protocol][resp3][hello]")
+{
+    // The HELLO map is data-driven (WriteHelloMap iterates a fixed field
+    // table). Pin the exact byte sequence so a future field reorder or
+    // accidental drop is caught.
+    RespFixture fix;
+    auto const out = Exchange(fix, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n");
+    // Note: the version banner is whatever Core/Version.hpp publishes, so
+    // assert the surrounding structure rather than the full payload.
+    REQUIRE(out.starts_with("%6\r\n"
+                            "$6\r\nserver\r\n$10\r\nfastcached\r\n"
+                            "$7\r\nversion\r\n"));
+    REQUIRE(out.contains("$5\r\nproto\r\n:3\r\n"));
+    REQUIRE(out.contains("$2\r\nid\r\n:1\r\n"));
+    REQUIRE(out.contains("$4\r\nmode\r\n$10\r\nstandalone\r\n"));
+    REQUIRE(out.ends_with("$4\r\nrole\r\n$6\r\nmaster\r\n"));
+}

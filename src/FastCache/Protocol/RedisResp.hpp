@@ -13,16 +13,32 @@
 namespace FastCache
 {
 
-/// Redis RESP2 protocol handler. Implements the subset of Redis commands
-/// that sccache actually exercises:
-///   GET, SET (with EX/PX/NX/XX), SETEX, PSETEX, DEL, EXISTS,
-///   PING, ECHO, INFO, COMMAND, HELLO, QUIT, FLUSHDB, FLUSHALL
+/// Redis RESP protocol handler. Negotiates RESP2 or RESP3 per the client's
+/// `HELLO <version>` (any other version replies `-NOPROTO`); a connection
+/// starts in RESP2 and may upgrade once HELLO succeeds. `RESET` and a later
+/// `HELLO 2` both downgrade the connection back to RESP2.
 ///
-/// RESP3 is not supported — `HELLO 3` replies `-NOPROTO`.
+/// Under RESP3 the encoder uses the dedicated wire types — null `_`, boolean
+/// `#t`/`#f`, double `,<n>` (with `inf`/`-inf`/`nan` spellings), big number
+/// `(<digits>`, verbatim `=<len>\r\n<fmt>:<text>`, map `%`, set `~`, push
+/// `>`, attribute `|` — and pub/sub deliveries arrive as out-of-band Push
+/// frames. Under RESP2 the same replies fall back to the array/bulk-string
+/// representations every RESP2 client expects (Map flattens to a `*<2N>`
+/// array, Set to a `*<N>` array, attributes are dropped, etc.).
+///
+/// Implements the Redis command surface that points at fastcached's engine
+/// primitives: GET/SET (with EX/PX/NX/XX), SETEX/PSETEX, MGET/MSET/MSETNX,
+/// DEL/UNLINK, EXISTS, EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT, TTL/PTTL,
+/// PERSIST, INCR/DECR/INCRBY/DECRBY/INCRBYFLOAT, SADD/SREM/SCARD/SISMEMBER/
+/// SMEMBERS/SMISMEMBER/SPOP, PING/ECHO/INFO/COMMAND/CLIENT/CONFIG/SELECT,
+/// MULTI/EXEC/DISCARD/WATCH/UNWATCH, SUBSCRIBE/UNSUBSCRIBE/PSUBSCRIBE/
+/// PUNSUBSCRIBE/PUBLISH, HELLO/RESET/QUIT, FLUSHDB/FLUSHALL, DEBUG PROTOCOL.
+///
 /// AUTH authenticates against the session's AuthPolicy when one is configured;
 /// with no policy it replies the redis "no password is set" error. When a
 /// policy is configured, every data command before a successful AUTH replies
-/// `-NOAUTH`.
+/// `-NOAUTH`. The modern RESP3 handshake `HELLO 3 AUTH <user> <pass>`
+/// authenticates and switches version in the same round trip.
 /// Unknown commands reply `-ERR unknown command`.
 class RedisRespHandler final: public IProtocolHandler
 {
