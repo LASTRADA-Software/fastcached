@@ -2472,6 +2472,16 @@ namespace
             co_return co_await ReplyBoolean(socket, false, resp);
         if (type == "NULL")
             co_return co_await ReplyNull(socket, resp);
+        if (type == "ARRAY")
+        {
+            if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, 3, resp))
+                co_return false;
+            if (!co_await ReplyInteger(socket, 1))
+                co_return false;
+            if (!co_await ReplyInteger(socket, 2))
+                co_return false;
+            co_return co_await ReplyInteger(socket, 3);
+        }
         if (type == "VERBATIM")
             co_return co_await ReplyVerbatim(socket, "txt", "This is a verbatim\nstring", resp);
         if (type == "MAP")
@@ -2489,6 +2499,20 @@ namespace
             if (!co_await ReplyInteger(socket, 1))
                 co_return false;
             co_return co_await ReplyInteger(socket, 2);
+        }
+        if (type == "PUSH")
+        {
+            // Out-of-band push frame. Under RESP3 this is `>`-prefixed;
+            // under RESP2 it flattens to a regular array so a RESP2 client
+            // sees the same payload it would see for a pub/sub delivery
+            // under that version.
+            if (!co_await ReplyAggregateHeader(socket, Aggregate::Push, 3, resp))
+                co_return false;
+            if (!co_await ReplyBulkString(socket, std::string_view { "pubsub" }))
+                co_return false;
+            if (!co_await ReplyBulkString(socket, std::string_view { "channel" }))
+                co_return false;
+            co_return co_await ReplyBulkString(socket, std::string_view { "payload" });
         }
         if (type == "ATTRIB")
         {
