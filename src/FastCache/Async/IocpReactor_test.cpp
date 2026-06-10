@@ -2,6 +2,7 @@
 #if defined(_WIN32)
 
     #include <FastCache/Async/IocpReactor.hpp>
+    #include <FastCache/Async/SleepUntil.hpp>
     #include <FastCache/Async/Task.hpp>
     #include <FastCache/Core/Clock.hpp>
 
@@ -30,22 +31,6 @@ struct YieldAwaitable
     void await_resume() const noexcept {}
 };
 
-/// Awaitable that resumes when the reactor's clock reaches `deadline`.
-struct SleepUntil
-{
-    FastCache::IReactor& reactor;
-    FastCache::TimePoint deadline;
-    [[nodiscard]] bool await_ready() const noexcept
-    {
-        return reactor.Clock().Now() >= deadline;
-    }
-    void await_suspend(std::coroutine_handle<> handle) const
-    {
-        reactor.Schedule(deadline, handle);
-    }
-    void await_resume() const noexcept {}
-};
-
 FastCache::DetachedTask Worker(FastCache::IReactor& reactor, std::atomic<int>& counter, int yields)
 {
     for (auto i = 0; i < yields; ++i)
@@ -61,7 +46,7 @@ FastCache::DetachedTask TimerWorker(FastCache::IReactor& reactor,
                                     std::atomic<bool>& fired,
                                     FastCache::IReactor* stopReactor)
 {
-    co_await SleepUntil { reactor, deadline };
+    co_await FastCache::SleepUntil { .reactor = &reactor, .deadline = deadline };
     fired.store(true, std::memory_order_release);
     if (stopReactor)
         stopReactor->Stop();

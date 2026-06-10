@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/SetCodec.hpp>
@@ -471,25 +472,6 @@ namespace
         /// branch on a per-connection bool instead of chasing a notifier
         /// pointer through ConnectionState.
         bool keyspaceEnabled { false };
-    };
-
-    /// Awaitable that suspends until the reactor's clock reaches `deadline`.
-    /// Built directly on `IReactor::Schedule`; used by the blocking-read timeout
-    /// trampoline below. Resolves immediately if the deadline is already past.
-    struct SleepUntil
-    {
-        IReactor* reactor { nullptr };
-        TimePoint deadline {};
-
-        [[nodiscard]] bool await_ready() const noexcept
-        {
-            return reactor == nullptr || deadline <= reactor->Clock().Now();
-        }
-        void await_suspend(std::coroutine_handle<> handle) const
-        {
-            reactor->Schedule(deadline, handle);
-        }
-        void await_resume() const noexcept {}
     };
 
     /// Per-call coordinator for a blocking XREAD/XREADGROUP. The handler creates
