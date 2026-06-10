@@ -1398,7 +1398,11 @@ namespace
             }
             else
             {
-                co_return co_await ReplyError(socket, std::format("Syntax error in HELLO option '{}'", args[next]));
+                // Canonicalise the echoed option name (the upper-cased `opt`,
+                // not the wire-original casing) so the error message is
+                // case-insensitive and matches the upper-case comparison logic
+                // immediately above.
+                co_return co_await ReplyError(socket, std::format("Syntax error in HELLO option '{}'", opt));
             }
         }
 

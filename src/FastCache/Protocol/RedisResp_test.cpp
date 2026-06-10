@@ -2652,9 +2652,15 @@ TEST_CASE("RESP3 HELLO: RESET drops the connection back to RESP2", "[protocol][r
 
 TEST_CASE("RESP3 HELLO: unknown option in HELLO replies syntax error", "[protocol][resp3][hello]")
 {
+    // `HELLO 3 Bogus` — mixed-case Bogus is neither AUTH nor SETNAME. The
+    // error echoes the option name in CANONICAL upper-case so the message is
+    // independent of how the client cased the wire bytes (HandleHello upper-
+    // cases the option for its own comparison and uses the same value in the
+    // error). Using a mixed-case input here pins that canonicalisation; a
+    // prior version sent already-uppercase BOGUS and would have passed even
+    // if the canonicalisation regressed.
     RespFixture fix;
-    // `HELLO 3 BOGUS` — BOGUS is neither AUTH nor SETNAME.
-    auto const out = Exchange(fix, "*3\r\n$5\r\nHELLO\r\n$1\r\n3\r\n$5\r\nBOGUS\r\n");
+    auto const out = Exchange(fix, "*3\r\n$5\r\nHELLO\r\n$1\r\n3\r\n$5\r\nBogus\r\n");
     REQUIRE(out == "-ERR Syntax error in HELLO option 'BOGUS'\r\n");
 }
 
