@@ -43,7 +43,7 @@ constexpr std::size_t HeaderSize = 6; // magic(1) + type(1) + count(4).
 
 /// @param flags The stored entry's flags word.
 /// @return True if the flags tag marks the entry as a set.
-[[nodiscard]] inline bool IsSet(std::uint32_t flags) noexcept
+[[nodiscard]] constexpr bool IsSet(std::uint32_t flags) noexcept
 {
     return flags == FcTypeSet;
 }

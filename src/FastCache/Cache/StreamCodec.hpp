@@ -66,7 +66,7 @@ constexpr std::byte TypeStream { 0x02 };
 
 /// @param flags The stored entry's flags word.
 /// @return True if the flags tag marks the entry as a stream.
-[[nodiscard]] inline bool IsStream(std::uint32_t flags) noexcept
+[[nodiscard]] constexpr bool IsStream(std::uint32_t flags) noexcept
 {
     return flags == FcTypeStream;
 }

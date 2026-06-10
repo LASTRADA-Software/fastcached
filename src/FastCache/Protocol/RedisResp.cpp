@@ -4157,10 +4157,22 @@ namespace
         if (sub != "PROTOCOL" || args.size() < 2)
             co_return co_await ReplyOk(socket); // accept other DEBUG subcommands as no-ops
         auto const type = Upper(args[1]);
-        auto const* const it = std::ranges::find(DebugProtocolTypes, type, &DebugProtocolType::name);
-        if (it == DebugProtocolTypes.end())
+        // Look the writer up by name and fold the result straight down to the
+        // function pointer. We deliberately do NOT bind the iterator to a named
+        // variable: MSVC's std::array iterator is a wrapper class while
+        // libc++/libstdc++ expose a raw pointer, so no single declaration of an
+        // iterator variable satisfies both the Windows compilers and
+        // clang-tidy's readability-qualified-auto. The function pointer has the
+        // same type on every toolchain.
+        Task<bool> (*const write)(ISocket*, RespVersion) = [&]() -> Task<bool> (*)(ISocket*, RespVersion) {
+            for (auto const& row: DebugProtocolTypes)
+                if (row.name == type)
+                    return row.write;
+            return nullptr;
+        }();
+        if (write == nullptr)
             co_return co_await ReplyError(socket, std::format("Wrong protocol type name: {}", type));
-        co_return co_await it->write(socket, resp);
+        co_return co_await write(socket, resp);
     }
 
     /// Commands a client may issue before authenticating when a credential is
