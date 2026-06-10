@@ -2951,3 +2951,95 @@ TEST_CASE("RESP: XADD auto-ID returns a well-formed ms-seq id", "[protocol][resp
     REQUIRE(out.ends_with("\r\n"));
     REQUIRE(out.contains('-'));
 }
+
+// -- consumer groups --------------------------------------------------------
+
+TEST_CASE("RESP: XGROUP CREATE then XREADGROUP > delivers the backlog", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"       // -> $3 1-0
+                              "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$1\r\ns\r\n$2\r\ng1\r\n$1\r\n0\r\n" // -> +OK
+                              // XREADGROUP GROUP g1 c1 STREAMS s >
+                              "*7\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$2\r\ng1\r\n$2\r\nc1\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n>\r\n");
+    REQUIRE(out.starts_with("$3\r\n1-0\r\n+OK\r\n"));
+    REQUIRE(out.ends_with("*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n1-0\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n"));
+}
+
+TEST_CASE("RESP: XREADGROUP on a missing group is NOGROUP", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*7\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$4\r\nnope\r\n$2\r\nc1\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n>\r\n");
+    REQUIRE(out.contains("-NOGROUP No such key 's' or consumer group 'nope'"));
+}
+
+TEST_CASE("RESP: XACK removes from the PEL and is idempotent", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$1\r\ns\r\n$2\r\ng1\r\n$1\r\n0\r\n"
+                              "*7\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$2\r\ng1\r\n$2\r\nc1\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n>\r\n"
+                              "*4\r\n$4\r\nXACK\r\n$1\r\ns\r\n$2\r\ng1\r\n$3\r\n1-0\r\n"   // -> :1
+                              "*4\r\n$4\r\nXACK\r\n$1\r\ns\r\n$2\r\ng1\r\n$3\r\n1-0\r\n"); // -> :0 (already acked)
+    REQUIRE(out.ends_with(":1\r\n:0\r\n"));
+}
+
+TEST_CASE("RESP: XPENDING summary reports the PEL count", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$1\r\ns\r\n$2\r\ng1\r\n$1\r\n0\r\n"
+                              "*7\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$2\r\ng1\r\n$2\r\nc1\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n>\r\n"
+                              "*3\r\n$8\r\nXPENDING\r\n$1\r\ns\r\n$2\r\ng1\r\n");
+    // Summary: [ 1, "1-0", "1-0", [ ["c1", "1"] ] ]
+    REQUIRE(out.ends_with("*4\r\n:1\r\n$3\r\n1-0\r\n$3\r\n1-0\r\n*1\r\n*2\r\n$2\r\nc1\r\n$1\r\n1\r\n"));
+}
+
+TEST_CASE("RESP: XGROUP CREATE on an absent key without MKSTREAM errors", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$4\r\nmiss\r\n$2\r\ng1\r\n$1\r\n0\r\n");
+    REQUIRE(out.starts_with("-ERR The XGROUP subcommand requires the key to exist"));
+}
+
+TEST_CASE("RESP: XGROUP CREATE MKSTREAM creates an empty stream", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*6\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$1\r\ns\r\n$2\r\ng1\r\n$1\r\n$\r\n$8\r\nMKSTREAM\r\n"
+                              "*2\r\n$4\r\nXLEN\r\n$1\r\ns\r\n");
+    REQUIRE(out == "+OK\r\n:0\r\n");
+}
+
+TEST_CASE("RESP: XINFO STREAM reports length and last id", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*3\r\n$5\r\nXINFO\r\n$6\r\nSTREAM\r\n$1\r\ns\r\n");
+    REQUIRE(out.contains("$6\r\nlength\r\n:1\r\n"));
+    REQUIRE(out.contains("$17\r\nlast-generated-id\r\n$3\r\n1-0\r\n"));
+}
+
+TEST_CASE("RESP: XCLAIM transfers ownership of an idle pending entry", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out =
+        Exchange(fix,
+                 "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                 "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$1\r\ns\r\n$2\r\ng1\r\n$1\r\n0\r\n"
+                 "*7\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$2\r\ng1\r\n$2\r\nc1\r\n"
+                 "$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n>\r\n"
+                 // XCLAIM s g1 c2 0 1-0  (min-idle 0 -> always claims), JUSTID
+                 "*7\r\n$6\r\nXCLAIM\r\n$1\r\ns\r\n$2\r\ng1\r\n$2\r\nc2\r\n$1\r\n0\r\n$3\r\n1-0\r\n$6\r\nJUSTID\r\n");
+    // JUSTID -> array of claimed IDs: *1 $3 1-0.
+    REQUIRE(out.ends_with("*1\r\n$3\r\n1-0\r\n"));
+}
