@@ -3,6 +3,7 @@
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/SetCodec.hpp>
+#include <FastCache/Cache/StreamCodec.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/Profiling.hpp>
@@ -387,6 +388,14 @@ namespace
         /// of executed, and the dispatcher replies `+QUEUED` to the client.
         bool inMulti { false };
 
+        /// True only while `EXEC` is replaying the queued commands. Blocking
+        /// verbs (XREAD/XREADGROUP BLOCK) consult this to serve non-blockingly
+        /// inside a transaction — redis never parks a command during EXEC, since
+        /// the connection is mid-reply and could otherwise wedge forever. Set
+        /// around the replay loop and cleared when it ends. Distinct from
+        /// `inMulti`, which EXEC clears before replaying.
+        bool inExecReplay { false };
+
         /// Set when a queued command produced a parse-time error (unknown
         /// command, wrong arity by table lookup). Mirrors redis: a dirty
         /// transaction must abort on EXEC with `-EXECABORT`. Reset by DISCARD
@@ -518,6 +527,24 @@ namespace
             return _timedOut;
         }
 
+        /// Whether the wait resolved because the client disconnected (the socket
+        /// became readable/closed while parked) rather than data or timeout. Lets
+        /// the handler abandon the read so the connection coroutine can unwind and
+        /// release its socket/admission slot instead of parking forever.
+        [[nodiscard]] bool Disconnected() const noexcept
+        {
+            std::scoped_lock const lock { _mu };
+            return _disconnected;
+        }
+
+        /// Disconnect arm: resolve the wait because the client went away
+        /// (idempotent). The handler treats this like a timeout but skips the
+        /// nil reply, since there is no live peer to receive it.
+        void WakeDisconnect() noexcept
+        {
+            WakeOnce(/*timedOut*/ false, /*disconnected*/ true);
+        }
+
         /// Awaitable that parks the handler until either arm resolves it.
         struct Awaiter
         {
@@ -560,8 +587,9 @@ namespace
       private:
         /// Resolve the wait (idempotent) and resume the parked coroutine exactly
         /// once, marshalling onto the connection's reactor when present.
-        /// @param timedOut True when resolved by the timeout arm.
-        void WakeOnce(bool timedOut = false) noexcept
+        /// @param timedOut     True when resolved by the timeout arm.
+        /// @param disconnected True when resolved by the client-disconnect arm.
+        void WakeOnce(bool timedOut = false, bool disconnected = false) noexcept
         {
             std::coroutine_handle<> toWake {};
             {
@@ -570,6 +598,7 @@ namespace
                     return;
                 _resolved = true;
                 _timedOut = timedOut;
+                _disconnected = disconnected;
                 toWake = std::exchange(_handle, {});
             }
             if (toWake)
@@ -586,6 +615,7 @@ namespace
         std::coroutine_handle<> _handle {};
         bool _resolved { false };
         bool _timedOut { false };
+        bool _disconnected { false };
     };
 
     /// Detached trampoline arming the timeout arm of a blocking read: sleep to
@@ -600,6 +630,29 @@ namespace
         auto* const reactor = waiter->Reactor();
         co_await SleepUntil { .reactor = reactor, .deadline = deadline };
         waiter->WakeTimeout();
+    }
+
+    /// Detached trampoline arming the disconnect arm of a blocking read: park on
+    /// the socket's readability and, when it fires (incoming bytes or EOF while
+    /// the client is supposedly idle on a BLOCK), resolve the waiter as a
+    /// disconnect so the handler can abandon the wait and let the connection
+    /// coroutine unwind — otherwise a `BLOCK 0` reader whose peer vanished would
+    /// stay parked forever, leaking its socket and admission slot. Holds a
+    /// shared_ptr so the waiter outlives this task.
+    ///
+    /// Only an ERROR from `WaitReadable` (the reactor reporting the socket
+    /// closed/hung-up) counts as a disconnect. Mere readability does NOT: it can
+    /// mean pipelined bytes for the next command, or a half-close where the
+    /// client shut its write side but still awaits this reply — abandoning the
+    /// read there would be wrong, and reading to disambiguate would consume bytes
+    /// meant for the next command. A full peer close surfaces as the error case.
+    /// @param waiter The waiter to resolve on disconnect (kept alive here).
+    /// @param socket The connection socket to watch for closure.
+    DetachedTask ArmDisconnect(std::shared_ptr<StreamWaiter> waiter, ISocket* socket)
+    {
+        auto const readable = co_await socket->WaitReadable();
+        if (!readable.has_value())
+            waiter->WakeDisconnect();
     }
 
     /// Mutation hook: every Redis write verb calls this after its engine
@@ -847,6 +900,22 @@ namespace
     Task<bool> ReplyError(ISocket* socket, std::string_view detail)
     {
         co_return co_await WriteAll(socket, std::format("-ERR {}\r\n", detail));
+    }
+
+    /// Sanitise a client-controlled token for safe interpolation into a RESP
+    /// simple-error line. RESP error lines are CR/LF-delimited, but bulk-string
+    /// arguments (keys, group/consumer names) may legally contain CR or LF; left
+    /// raw, those bytes would terminate the error frame early and let a client
+    /// inject a forged reply (response splitting / pipeline desync). Replace any
+    /// CR/LF with a space so the token stays on one line.
+    /// @param token The raw, possibly CR/LF-bearing name.
+    /// @return A copy with CR and LF replaced by spaces.
+    [[nodiscard]] std::string SanitizeErrorToken(std::string_view token)
+    {
+        std::string safe { token };
+        std::ranges::replace(safe, '\r', ' ');
+        std::ranges::replace(safe, '\n', ' ');
+        return safe;
     }
 
     /// Aggregate-header writer for arrays/maps/sets/pushes. RESP3 distinguishes
@@ -1100,6 +1169,19 @@ namespace
         co_return co_await WriteAll(socket, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
     }
 
+    /// Whether an entry's type tag denotes a plain redis string (the only type
+    /// the string command family — GET/MGET/INCR/DECR/INCRBYFLOAT — may touch).
+    /// Sets (`FcTypeSet`) and streams (`FcTypeStream`) both carry a non-zero tag
+    /// and must be rejected with WRONGTYPE rather than have their internal blob
+    /// returned or numerically parsed. Adding a new value type means this single
+    /// predicate gains a clause, not every string handler.
+    /// @param flags The entry's `flags` type tag.
+    /// @return `true` iff the entry holds a plain string value.
+    [[nodiscard]] constexpr bool IsPlainString(std::uint32_t flags) noexcept
+    {
+        return !SetCodec::IsSet(flags) && !StreamCodec::IsStream(flags);
+    }
+
     Task<bool> HandleGet(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
     {
         if (args.size() != 1)
@@ -1107,8 +1189,9 @@ namespace
         auto const result = engine->Get(args[0]);
         if (!result.has_value() || !result->found)
             co_return co_await ReplyNull(socket, resp);
-        // A GET against a set (or any non-string type) is a WRONGTYPE error.
-        if (SetCodec::IsSet(result->entry.flags))
+        // A GET against a set, stream, or any non-string type is a WRONGTYPE
+        // error — never return the type's internal encoded blob to the client.
+        if (!IsPlainString(result->entry.flags))
             co_return co_await ReplyWrongType(socket);
         co_return co_await ReplyBulkString(socket, result->entry.ValueBytes(), result->entry.value.AsKeepAlive());
     }
@@ -2099,6 +2182,27 @@ namespace
         // ISocket already guarantees post-failure unreachability.
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, queue.size(), state->resp))
             co_return false;
+        // Mark the replay window so blocking verbs (XREAD/XREADGROUP BLOCK) serve
+        // non-blockingly here — parking mid-EXEC would wedge the connection. An
+        // RAII guard restores the flag on every exit (including an early
+        // co_return false on a mid-replay write failure).
+        struct ReplayGuard
+        {
+            bool* flag;
+            explicit ReplayGuard(bool* f) noexcept:
+                flag { f }
+            {
+                *flag = true;
+            }
+            ReplayGuard(ReplayGuard const&) = delete;
+            ReplayGuard(ReplayGuard&&) = delete;
+            ReplayGuard& operator=(ReplayGuard const&) = delete;
+            ReplayGuard& operator=(ReplayGuard&&) = delete;
+            ~ReplayGuard()
+            {
+                *flag = false;
+            }
+        } const replayGuard { &state->inExecReplay };
         for (auto& entry: queue)
         {
             // QueuedCommand invariant: argv.size() >= 1 (the verb name
@@ -2574,11 +2678,18 @@ namespace
         if (!ParseRangeBound(lowText, /*isLowBound*/ true, low) || !ParseRangeBound(highText, /*isLowBound*/ false, high))
             co_return co_await ReplyError(socket, "Invalid stream ID specified as stream command argument");
         std::uint64_t count = 0;
+        bool hasCount = false;
         if (args.size() == 5)
         {
             if (Upper(args[3]) != "COUNT" || !ParseUnsigned(std::string_view { args[4] }, count))
                 co_return co_await ReplyError(socket, "syntax error");
+            hasCount = true;
         }
+        // Redis special-cases an explicit COUNT 0 as "return nothing" rather than
+        // "no limit" (the latter is what count==0 means to the engine), so a
+        // client probing with COUNT 0 gets an empty array, never the full range.
+        if (hasCount && count == 0)
+            co_return co_await WriteStreamEntries(socket, {}, resp);
         auto const entries = engine->StreamRange(args[0], low, high, static_cast<std::size_t>(count), reverse);
         if (!entries.has_value())
             co_return co_await ReplyStreamError(socket, entries.error());
@@ -2781,22 +2892,33 @@ namespace
         return std::nullopt;
     }
 
-    /// Write the XREAD/XREADGROUP top-level reply, including only streams that
-    /// produced entries. Under RESP3 this is a map (`%`) of stream-key → entry
-    /// list; under RESP2 it is an array (`*`) of two-element `[key, entries]`
-    /// arrays (redis does NOT flatten the XREAD reply to key/value pairs the way
-    /// the generic map writer would — each stream is its own nested array). The
-    /// caller handles the "no streams" case with a nil reply before calling.
-    /// @param resp The connection's negotiated protocol version.
+    /// Write the XREAD/XREADGROUP top-level reply. Under RESP3 this is a map
+    /// (`%`) of stream-key → entry list; under RESP2 it is an array (`*`) of
+    /// two-element `[key, entries]` arrays (redis does NOT flatten the XREAD
+    /// reply to key/value pairs the way the generic map writer would — each
+    /// stream is its own nested array).
+    ///
+    /// `includeEmpty` controls the empty-stream shape. The XREAD `$` form and
+    /// the XREADGROUP `>` form omit streams with no entries (the caller has
+    /// already replied nil when ALL are empty). The XREADGROUP history form
+    /// (explicit ID) instead includes every requested stream even when its
+    /// entry list is empty — redis returns `[key, (empty array)]` for a history
+    /// read with nothing pending, never nil — so a client's history-replay loop
+    /// sees an empty array and stops rather than misreading nil as a timeout.
+    /// @param keys         Requested stream keys, in order.
+    /// @param perKey       Per-key entry lists, parallel to `keys`.
+    /// @param resp         The connection's negotiated protocol version.
+    /// @param includeEmpty Emit a `[key, (empty array)]` pair for empty streams.
     Task<bool> WriteXReadReply(ISocket* socket,
                                std::span<std::string const> keys,
                                std::span<std::vector<StreamCodec::StreamEntry> const> perKey,
-                               RespVersion resp)
+                               RespVersion resp,
+                               bool includeEmpty = false)
     {
-        // Count streams that actually have entries.
+        // Count the streams that will be emitted.
         std::size_t present = 0;
         for (auto const& entries: perKey)
-            if (!entries.empty())
+            if (includeEmpty || !entries.empty())
                 ++present;
         if (resp == RespVersion::Resp3)
         {
@@ -2807,7 +2929,7 @@ namespace
             co_return false;
         for (auto k = std::size_t { 0 }; k < keys.size(); ++k)
         {
-            if (perKey[k].empty())
+            if (!includeEmpty && perKey[k].empty())
                 continue;
             // RESP2 wraps each (key, entries) in its own 2-element array; RESP3's
             // map header already accounts for the pair, so the two fields follow
@@ -2848,34 +2970,124 @@ namespace
         return total;
     }
 
-    /// Block the calling coroutine until any of `keys` is appended to or the
-    /// deadline elapses, parking on a `StreamWaiter` registered with the
-    /// process-wide coordinator. A no-op (returns immediately) when blocking is
-    /// not wired in (`streamWaiters == nullptr`).
-    /// @param session  Carries the waiter registry and the connection's reactor.
-    /// @param keys     Stream keys to wait on.
-    /// @param deadline Absolute timeout, or TimePoint::max() for BLOCK 0.
-    /// @return True if woken by an append; false on timeout (or no coordinator).
-    Task<bool> BlockOnStreams(SessionContext session, std::span<std::string const> keys, TimePoint deadline)
+    /// Compute the absolute BLOCK deadline from a client-supplied millisecond
+    /// count, clamping to avoid overflowing the steady-clock time_point. BLOCK 0
+    /// means "wait forever" (TimePoint::max()); an absent BLOCK also maps to max
+    /// (the caller polls once and never parks). A pathologically large value is
+    /// capped at max() rather than wrapping to a past instant (which would make
+    /// the block return nil immediately) or tripping signed-overflow UB in the
+    /// chrono addition.
+    /// @param now     The current monotonic clock value.
+    /// @param blockMs The parsed BLOCK argument (nullopt = no BLOCK).
+    /// @return The absolute deadline, or TimePoint::max() for forever.
+    [[nodiscard]] TimePoint BlockDeadline(TimePoint now, std::optional<std::uint64_t> blockMs) noexcept
     {
-        if (session.streamWaiters == nullptr)
-            co_return false;
-        auto const waiter = std::make_shared<StreamWaiter>(session.reactor);
-        session.streamWaiters->Register(waiter, keys);
-        if (session.reactor != nullptr && deadline != TimePoint::max())
-            ArmTimeout(waiter, deadline);
-        co_await waiter->Wait();
-        session.streamWaiters->Unregister(waiter.get());
-        co_return !waiter->TimedOut();
+        if (!blockMs.has_value() || *blockMs == 0)
+            return TimePoint::max();
+        // Headroom from now to max(), in milliseconds (always >= 0 since now is a
+        // real instant and max() is the end of the epoch); if the requested block
+        // meets or exceeds it, treat the block as forever rather than wrapping the
+        // time_point to a past instant or tripping signed-overflow UB.
+        auto const headroomMs = std::chrono::duration_cast<std::chrono::milliseconds>(TimePoint::max() - now).count();
+        auto const headroom = headroomMs > 0 ? static_cast<std::uint64_t>(headroomMs) : std::uint64_t { 0 };
+        if (*blockMs >= headroom)
+            return TimePoint::max();
+        return now + std::chrono::milliseconds { static_cast<std::chrono::milliseconds::rep>(*blockMs) };
     }
 
-    Task<bool> HandleXRead(
-        ISocket* socket, CacheEngine* engine, SessionContext session, std::span<std::string const> args, RespVersion resp)
+    /// Drive a blocking-capable stream read: poll once, reply if data is ready,
+    /// else (when blocking is in effect) register-park-repoll until data, the
+    /// deadline, or a disconnect. The single driver is shared by XREAD and
+    /// XREADGROUP, which differ only in how they poll and whether they may
+    /// block; `poll` is invoked once per iteration and writes its per-key
+    /// results, returning the total entry count or a StorageError.
+    ///
+    /// The register-before-repoll ordering is essential: `BlockOnStreams`
+    /// registers the waiter, and only THEN does the loop poll again — so an
+    /// append racing the park is never lost.
+    /// @param socket   Connection socket (for the reply and disconnect arm).
+    /// @param session  Session context (registry + reactor).
+    /// @param keys     Stream keys involved (for registration).
+    /// @param blocking Whether BLOCK is in effect and wired in.
+    /// @param deadline Absolute BLOCK deadline.
+    /// @param resp     Negotiated RESP version for the reply.
+    /// @param poll     Polls all keys once; returns total entries or an error.
+    /// @param write    Writes the success reply from the last poll's results.
+    /// @param onError  Writes the error reply for a failed poll (XREAD maps every
+    ///                 error to its RESP form; XREADGROUP maps a missing group to
+    ///                 NOGROUP). Passed by value — a coroutine must not hold a
+    ///                 reference parameter across a suspension.
+    /// @param emptyIsNil When the (non-blocking) poll yields no entries, reply
+    ///                 nil if true (the `>` / plain-XREAD shape) or let `write`
+    ///                 emit the empty-array shape if false (XREADGROUP history).
+    Task<bool> RunBlockingRead(ISocket* socket,
+                               SessionContext session,
+                               std::span<std::string const> keys,
+                               bool blocking,
+                               TimePoint deadline,
+                               RespVersion resp,
+                               std::function<std::expected<std::size_t, StorageError>()> poll,
+                               std::function<Task<bool>()> write,
+                               std::function<Task<bool>(StorageError const&)> onError,
+                               bool emptyIsNil)
+    {
+        // Non-blocking fast path: poll exactly once, reply data-or-empty.
+        if (!blocking)
+        {
+            auto const total = poll();
+            if (!total.has_value())
+                co_return co_await onError(total.error());
+            if (*total > 0 || !emptyIsNil)
+                co_return co_await write();
+            co_return co_await ReplyNull(socket, resp);
+        }
+        // Blocking path: register first, then poll, so no append is missed.
+        while (true)
+        {
+            auto const waiter = std::make_shared<StreamWaiter>(session.reactor);
+            session.streamWaiters->Register(waiter, keys);
+            if (session.reactor != nullptr)
+            {
+                if (deadline != TimePoint::max())
+                    ArmTimeout(waiter, deadline);
+                ArmDisconnect(waiter, socket);
+            }
+            auto const total = poll();
+            if (!total.has_value())
+            {
+                session.streamWaiters->Unregister(waiter.get());
+                co_return co_await onError(total.error());
+            }
+            if (*total > 0)
+            {
+                session.streamWaiters->Unregister(waiter.get());
+                co_return co_await write();
+            }
+            co_await waiter->Wait();
+            session.streamWaiters->Unregister(waiter.get());
+            if (waiter->Disconnected())
+                co_return false; // client gone; let Run() unwind and release the slot.
+            if (waiter->TimedOut())
+                co_return co_await ReplyNull(socket, resp);
+            // Appended (or spurious): loop, re-register, and re-poll.
+        }
+    }
+
+    Task<bool> HandleXRead(ISocket* socket,
+                           CacheEngine* engine,
+                           ConnectionState* state,
+                           SessionContext session,
+                           std::span<std::string const> args,
+                           RespVersion resp)
     {
         XReadRequest req;
         bool noAck = false;
         if (auto const err = ParseXRead(args, req, noAck); err.has_value())
             co_return co_await ReplyError(socket, *err);
+        // NOACK is an XREADGROUP-only option; plain XREAD must reject it.
+        if (noAck)
+            co_return co_await ReplyError(socket,
+                                          "The NOACK option is only supported by XREADGROUP. You called XREAD instead.");
 
         std::vector<StreamCodec::StreamId> cursors;
         if (auto const err = ResolveReadCursors(engine, req, cursors); err.has_value())
@@ -2885,41 +3097,48 @@ namespace
             co_return co_await ReplyError(socket, *err);
         }
 
-        // Compute the BLOCK deadline once (relative to now). BLOCK 0 blocks
-        // forever (TimePoint::max()); without BLOCK, poll exactly once.
-        bool const blocking = req.blockMs.has_value() && session.streamWaiters != nullptr;
-        auto const deadline = (req.blockMs.has_value() && *req.blockMs != 0)
-                                  ? engine->Clock().Now() + std::chrono::milliseconds { *req.blockMs }
-                                  : TimePoint::max();
+        // BLOCK is ignored inside MULTI/EXEC (redis serves blocking commands
+        // non-blockingly in a transaction so EXEC cannot wedge), and needs the
+        // registry wired in.
+        bool const inExec = state != nullptr && state->inExecReplay;
+        bool const blocking = req.blockMs.has_value() && session.streamWaiters != nullptr && !inExec;
+        auto const deadline = BlockDeadline(engine->Clock().Now(), req.blockMs);
 
         std::vector<std::vector<StreamCodec::StreamEntry>> perKey;
-        while (true)
-        {
-            auto const total = PollXRead(engine, req, cursors, perKey);
-            if (!total.has_value())
-                co_return co_await ReplyStreamError(socket, total.error());
-            if (*total > 0)
-                co_return co_await WriteXReadReply(socket, req.keys, perKey, resp);
-            if (!blocking)
-                co_return co_await ReplyNull(socket, resp);
-            // Park until an append on one of our keys or the deadline. A spurious
-            // wake just re-polls; a timeout ends the wait with a nil reply.
-            if (!co_await BlockOnStreams(session, req.keys, deadline))
-                co_return co_await ReplyNull(socket, resp);
-        }
+        co_return co_await RunBlockingRead(
+            socket,
+            session,
+            req.keys,
+            blocking,
+            deadline,
+            resp,
+            [&]() -> std::expected<std::size_t, StorageError> { return PollXRead(engine, req, cursors, perKey); },
+            [&]() -> Task<bool> { return WriteXReadReply(socket, req.keys, perKey, resp); },
+            [&](StorageError const& err) -> Task<bool> { return ReplyStreamError(socket, err); },
+            /*emptyIsNil=*/true);
     }
 
     // -- consumer groups (XGROUP / XREADGROUP / XACK / XPENDING / XCLAIM / XINFO) --
 
     /// The canonical redis NOGROUP error, raised when a group command targets a
-    /// stream/group that does not exist. Carries both names like redis does.
-    /// @param key   The stream key named in the command.
-    /// @param group The group name named in the command.
-    Task<bool> ReplyNoGroup(ISocket* socket, std::string_view key, std::string_view group)
+    /// stream/group that does not exist. Carries both names like redis does and
+    /// names the originating command (redis's message ends with the verb, e.g.
+    /// "... in XPENDING", not always XREADGROUP). Both names are CR/LF-sanitised
+    /// so a crafted key/group cannot split the error frame.
+    /// @param socket Destination socket.
+    /// @param key    The stream key named in the command.
+    /// @param group  The group name named in the command.
+    /// @param verb   The command name to cite (defaults to XREADGROUP's wording).
+    Task<bool> ReplyNoGroup(ISocket* socket,
+                            std::string_view key,
+                            std::string_view group,
+                            std::string_view verb = "XREADGROUP with GROUP option")
     {
-        co_return co_await WriteAll(
-            socket,
-            std::format("-NOGROUP No such key '{}' or consumer group '{}' in XREADGROUP with GROUP option\r\n", key, group));
+        co_return co_await WriteAll(socket,
+                                    std::format("-NOGROUP No such key '{}' or consumer group '{}' in {}\r\n",
+                                                SanitizeErrorToken(key),
+                                                SanitizeErrorToken(group),
+                                                verb));
     }
 
     /// Resolve a group-start token (`0` / `$` / explicit ID) for XGROUP
@@ -3002,7 +3221,7 @@ namespace
             {
                 if (result.error().code == StorageErrorCode::WrongType)
                     co_return co_await ReplyWrongType(socket);
-                co_return co_await ReplyNoGroup(socket, args[1], args[2]);
+                co_return co_await ReplyNoGroup(socket, args[1], args[2], "XGROUP");
             }
             NotifyWatchers(state, args[1]);
             co_return co_await ReplyOk(socket);
@@ -3014,6 +3233,11 @@ namespace
             {
                 if (result.error().code == StorageErrorCode::WrongType)
                     co_return co_await ReplyWrongType(socket);
+                if (result.error().code == StorageErrorCode::KeyNotFound)
+                    co_return co_await ReplyError(
+                        socket,
+                        "The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the "
+                        "MKSTREAM option to create an empty stream automatically.");
                 co_return co_await ReplyStreamError(socket, result.error());
             }
             if (*result)
@@ -3027,7 +3251,7 @@ namespace
             {
                 if (result.error().code == StorageErrorCode::WrongType)
                     co_return co_await ReplyWrongType(socket);
-                co_return co_await ReplyNoGroup(socket, args[1], args[2]);
+                co_return co_await ReplyNoGroup(socket, args[1], args[2], "XGROUP");
             }
             if (*result)
                 NotifyWatchers(state, args[1]);
@@ -3040,7 +3264,7 @@ namespace
             {
                 if (result.error().code == StorageErrorCode::WrongType)
                     co_return co_await ReplyWrongType(socket);
-                co_return co_await ReplyNoGroup(socket, args[1], args[2]);
+                co_return co_await ReplyNoGroup(socket, args[1], args[2], "XGROUP");
             }
             NotifyWatchers(state, args[1]);
             co_return co_await ReplyInteger(socket, *result);
@@ -3085,15 +3309,18 @@ namespace
             }
         }
 
-        // BLOCK only applies to the `>` (new-entries) form, matching redis.
-        bool const blocking = req.blockMs.has_value() && session.streamWaiters != nullptr && allNewEntries;
-        auto const deadline = (req.blockMs.has_value() && *req.blockMs != 0)
-                                  ? engine->Clock().Now() + std::chrono::milliseconds { *req.blockMs }
-                                  : TimePoint::max();
+        // BLOCK only applies to the `>` (new-entries) form, and never inside an
+        // EXEC replay (a transaction must not park mid-reply). The explicit-ID
+        // history form never blocks and returns the empty-array (not nil) shape.
+        bool const inExec = state != nullptr && state->inExecReplay;
+        bool const isHistory = !allNewEntries;
+        bool const blocking = req.blockMs.has_value() && session.streamWaiters != nullptr && allNewEntries && !inExec;
+        auto const deadline = BlockDeadline(engine->Clock().Now(), req.blockMs);
 
+        // The poll records which key failed so the NOGROUP reply can name it.
         std::vector<std::vector<StreamCodec::StreamEntry>> perKey;
-        while (true)
-        {
+        std::size_t failedKey = 0;
+        auto const poll = [&]() -> std::expected<std::size_t, StorageError> {
             perKey.clear();
             perKey.reserve(req.keys.size());
             std::size_t total = 0;
@@ -3103,22 +3330,32 @@ namespace
                     req.keys[k], group, consumer, afters[k], static_cast<std::size_t>(req.count), noAck);
                 if (!entries.has_value())
                 {
-                    if (entries.error().code == StorageErrorCode::WrongType)
-                        co_return co_await ReplyWrongType(socket);
-                    co_return co_await ReplyNoGroup(socket, req.keys[k], group);
+                    failedKey = k;
+                    return std::unexpected(entries.error());
                 }
                 total += entries->size();
                 if (!entries->empty())
                     NotifyWatchers(state, req.keys[k]);
                 perKey.push_back(std::move(*entries));
             }
-            if (total > 0)
-                co_return co_await WriteXReadReply(socket, req.keys, perKey, resp);
-            if (!blocking)
-                co_return co_await ReplyNull(socket, resp);
-            if (!co_await BlockOnStreams(session, req.keys, deadline))
-                co_return co_await ReplyNull(socket, resp);
-        }
+            return total;
+        };
+
+        co_return co_await RunBlockingRead(
+            socket,
+            session,
+            req.keys,
+            blocking,
+            deadline,
+            resp,
+            poll,
+            [&]() -> Task<bool> { return WriteXReadReply(socket, req.keys, perKey, resp, isHistory); },
+            [&](StorageError const& err) -> Task<bool> {
+                if (err.code == StorageErrorCode::WrongType)
+                    return ReplyWrongType(socket);
+                return ReplyNoGroup(socket, req.keys[failedKey], group);
+            },
+            /*emptyIsNil=*/!isHistory);
     }
 
     Task<bool> HandleXAck(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
@@ -3176,7 +3413,7 @@ namespace
             {
                 if (overview.error().code == StorageErrorCode::WrongType)
                     co_return co_await ReplyWrongType(socket);
-                co_return co_await ReplyNoGroup(socket, key, group);
+                co_return co_await ReplyNoGroup(socket, key, group, "XPENDING");
             }
             // [ count, min-id, max-id, [ [consumer, count], ... ] ]
             if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, 4, resp))
@@ -3223,6 +3460,10 @@ namespace
         std::uint64_t count = 0;
         if (!ParseUnsigned(std::string_view { args[i + 2] }, count))
             co_return co_await ReplyError(socket, "value is not an integer or out of range");
+        // Redis returns an empty array for COUNT 0 here (the engine would instead
+        // treat 0 as "no limit" and dump the whole PEL), so short-circuit it.
+        if (count == 0)
+            co_return co_await ReplyAggregateHeader(socket, Aggregate::Array, 0, resp);
         std::optional<std::string_view> consumer;
         if (i + 3 < args.size())
             consumer = std::string_view { args[i + 3] };
@@ -3233,7 +3474,7 @@ namespace
         {
             if (rows.error().code == StorageErrorCode::WrongType)
                 co_return co_await ReplyWrongType(socket);
-            co_return co_await ReplyNoGroup(socket, key, group);
+            co_return co_await ReplyNoGroup(socket, key, group, "XPENDING");
         }
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, rows->size(), resp))
             co_return false;
@@ -3271,8 +3512,10 @@ namespace
             co_return co_await ReplyError(socket, "Invalid min-idle-time argument for XCLAIM");
         std::vector<StreamCodec::StreamId> ids;
         bool justId = false;
+        bool force = false;
         // IDs run until the first option keyword; trailing options we accept and
-        // (for the value-bearing ones) skip without acting on, except JUSTID.
+        // (for the value-bearing ones) skip without acting on, except JUSTID and
+        // FORCE which change the claim behaviour.
         std::size_t i = 4;
         for (; i < args.size(); ++i)
         {
@@ -3286,8 +3529,10 @@ namespace
             auto const opt = Upper(args[i]);
             if (opt == "JUSTID")
                 justId = true;
-            else if (opt == "FORCE" || opt == "LASTID")
-                continue;
+            else if (opt == "FORCE")
+                force = true;
+            else if (opt == "LASTID" && i + 1 < args.size())
+                ++i; // value consumed, not modelled.
             else if ((opt == "IDLE" || opt == "TIME" || opt == "RETRYCOUNT") && i + 1 < args.size())
                 ++i; // value consumed, not modelled.
             else
@@ -3296,12 +3541,12 @@ namespace
         if (ids.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'xclaim'");
 
-        auto const result = engine->StreamClaim(args[0], args[1], args[2], minIdleMs, ids, justId);
+        auto const result = engine->StreamClaim(args[0], args[1], args[2], minIdleMs, ids, justId, force);
         if (!result.has_value())
         {
             if (result.error().code == StorageErrorCode::WrongType)
                 co_return co_await ReplyWrongType(socket);
-            co_return co_await ReplyNoGroup(socket, args[0], args[1]);
+            co_return co_await ReplyNoGroup(socket, args[0], args[1], "XCLAIM");
         }
         if (!result->ids.empty())
             NotifyWatchers(state, args[0]);
@@ -3329,6 +3574,10 @@ namespace
             {
                 if (!ParseUnsigned(std::string_view { args[j + 1] }, count))
                     co_return co_await ReplyError(socket, "value is not an integer or out of range");
+                // Redis rejects COUNT <= 0; here 0 would otherwise be coerced to
+                // the default batch size by the engine, silently honouring it.
+                if (count == 0)
+                    co_return co_await ReplyError(socket, "COUNT must be > 0");
                 j += 2;
             }
             else if (opt == "JUSTID")
@@ -3346,7 +3595,7 @@ namespace
         {
             if (result.error().code == StorageErrorCode::WrongType)
                 co_return co_await ReplyWrongType(socket);
-            co_return co_await ReplyNoGroup(socket, args[0], args[1]);
+            co_return co_await ReplyNoGroup(socket, args[0], args[1], "XAUTOCLAIM");
         }
         if (!result->ids.empty())
             NotifyWatchers(state, args[0]);
@@ -3429,7 +3678,9 @@ namespace
             co_return false;
         for (auto const& g: *groups)
         {
-            if (!co_await ReplyAggregateHeader(socket, Aggregate::Map, 4, resp))
+            // redis >= 7.0 returns six fields per group; entries-read and lag were
+            // added then and clients (redis-py, lettuce) index them by name.
+            if (!co_await ReplyAggregateHeader(socket, Aggregate::Map, 6, resp))
                 co_return false;
             if (!co_await WriteMapStr(socket, "name", g.name))
                 co_return false;
@@ -3438,6 +3689,10 @@ namespace
             if (!co_await WriteMapInt(socket, "pending", static_cast<std::int64_t>(g.pending)))
                 co_return false;
             if (!co_await WriteMapStr(socket, "last-delivered-id", g.lastDelivered.Format()))
+                co_return false;
+            if (!co_await WriteMapInt(socket, "entries-read", static_cast<std::int64_t>(g.entriesRead)))
+                co_return false;
+            if (!co_await WriteMapInt(socket, "lag", static_cast<std::int64_t>(g.lag)))
                 co_return false;
         }
         co_return true;
@@ -3516,8 +3771,8 @@ namespace
                 if (current.found)
                 {
                     // Redis: WRONGTYPE for INCRBYFLOAT on a non-string
-                    // key. Mirrors HandleIncrDecrBy / HandleGet.
-                    if (SetCodec::IsSet(current.entry.flags))
+                    // key (set or stream). Mirrors HandleIncrDecrBy / HandleGet.
+                    if (!IsPlainString(current.entry.flags))
                         return std::unexpected(MakeStorageError(StorageErrorCode::WrongType));
                     auto const bytes = current.entry.ValueBytes();
                     std::string_view const text { reinterpret_cast<char const*>(bytes.data()), bytes.size() };
@@ -3581,11 +3836,10 @@ namespace
                 if (current.found)
                 {
                     // Redis returns WRONGTYPE (not the generic numeric
-                    // error) for INCR on a non-string key. HandleGet
-                    // line 815 has the same branch — repeat it here so
-                    // the wire reply matches when a client INCRs into
-                    // a set-typed key by mistake.
-                    if (SetCodec::IsSet(current.entry.flags))
+                    // error) for INCR on a non-string key (set or stream),
+                    // so the blob is never parsed as a number. Mirrors
+                    // HandleGet / HandleIncrByFloat via IsPlainString.
+                    if (!IsPlainString(current.entry.flags))
                         return std::unexpected(MakeStorageError(StorageErrorCode::WrongType));
                     auto const bytes = current.entry.ValueBytes();
                     std::string_view const text { reinterpret_cast<char const*>(bytes.data()), bytes.size() };
@@ -3685,7 +3939,10 @@ namespace
             // probe would re-promote all 1000 to MRU). Mirrors the no-bump
             // contract the new TTL command family already honours.
             auto const result = engine->Peek(key);
-            if (!result.has_value() || !result->found || SetCodec::IsSet(result->entry.flags))
+            // MGET replies nil (not WRONGTYPE) for any non-string key, so a
+            // set/stream slot is reported as missing rather than leaking its
+            // internal encoded blob.
+            if (!result.has_value() || !result->found || !IsPlainString(result->entry.flags))
             {
                 if (!co_await ReplyNull(socket, resp))
                     co_return false;
@@ -4287,7 +4544,8 @@ namespace
                        .keyStep = 1 },
         CommandEntry {
             .name = "XREAD",
-            .handler = [](CommandContext c) { return HandleXRead(c.socket, c.engine, c.session, c.tail, c.state->resp); },
+            .handler =
+                [](CommandContext c) { return HandleXRead(c.socket, c.engine, c.state, c.session, c.tail, c.state->resp); },
             .arity = -4,
             .firstKey = 0,
             .lastKey = 0,
@@ -4329,7 +4587,9 @@ namespace
         CommandEntry {
             .name = "XAUTOCLAIM",
             .handler = [](CommandContext c) { return HandleXAutoClaim(c.socket, c.engine, c.state, c.tail, c.state->resp); },
-            .arity = -7,
+            // XAUTOCLAIM key group consumer min-idle-time start [COUNT n] [JUSTID]
+            // — six mandatory tokens (verb + 5 args); COUNT/JUSTID are optional.
+            .arity = -6,
             .firstKey = 1,
             .lastKey = 1,
             .keyStep = 1 },

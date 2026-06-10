@@ -107,6 +107,20 @@ TEST_CASE("StreamCodec: rejects a foreign / corrupt blob", "[cache][stream]")
         blob.resize(blob.size() - 4);
         REQUIRE_FALSE(StreamCodec::Decode(std::span<std::byte const> { blob }, decoded));
     }
+    SECTION("huge entry count on a tiny blob fails cleanly without a giant allocation")
+    {
+        // magic, type, lastId(16), maxDeletedId(16), entriesAdded(8), then a
+        // bogus entryCount of 0xFFFFFFFF with no entry bytes following. The
+        // decoder must clamp the reserve to the remaining bytes and return false
+        // on the missing entry data, not attempt a ~100+GB allocation.
+        std::vector<std::byte> blob;
+        blob.push_back(StreamCodec::Magic);
+        blob.push_back(StreamCodec::TypeStream);
+        blob.insert(blob.end(), 40, std::byte { 0 }); // lastId + maxDeletedId + entriesAdded
+        for (int i = 0; i < 4; ++i)
+            blob.push_back(std::byte { 0xFF }); // entryCount = 0xFFFFFFFF
+        REQUIRE_FALSE(StreamCodec::Decode(std::span<std::byte const> { blob }, decoded));
+    }
 }
 
 TEST_CASE("StreamCodec: IsStream tag discriminates the type", "[cache][stream]")

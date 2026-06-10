@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -130,12 +131,55 @@ std::expected<CasToken, StorageError> CacheEngine::ReplaceWithDeadline(std::stri
     return _storage.Replace(key, std::move(value), flags, deadline, _clock.Now());
 }
 
+std::expected<CasToken, StorageError> CacheEngine::ConcatGuarded(std::string_view key,
+                                                                 std::span<std::byte const> extra,
+                                                                 CasToken expected,
+                                                                 bool atFront)
+{
+    // APPEND/PREPEND are string-only in redis and a raw byte concat on a typed
+    // value (set/stream) would silently corrupt its encoded blob while keeping
+    // the type tag — a later decode then fails irrecoverably. The type guard,
+    // the CAS precondition, and the concat must be atomic with respect to a
+    // concurrent SET/DEL, so the whole sequence runs inside the storage's
+    // per-key Update boundary rather than as a separate Peek + Append.
+    return _storage.Update(
+        key,
+        [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
+            if (current.found)
+            {
+                if (SetCodec::IsSet(current.entry.flags) || StreamCodec::IsStream(current.entry.flags))
+                    return std::unexpected(MakeStorageError(StorageErrorCode::WrongType));
+                if (expected != CasToken { 0 } && current.entry.cas != expected)
+                    return std::unexpected(MakeStorageError(StorageErrorCode::CasMismatch));
+            }
+            else if (expected != CasToken { 0 })
+            {
+                // A CAS precondition on a missing key cannot hold.
+                return std::unexpected(MakeStorageError(StorageErrorCode::CasMismatch));
+            }
+            auto const existing = current.found ? current.entry.ValueBytes() : std::span<std::byte const> {};
+            std::vector<std::byte> combined;
+            combined.reserve(existing.size() + extra.size());
+            auto const& first = atFront ? extra : existing;
+            auto const& second = atFront ? existing : extra;
+            combined.insert(combined.end(), first.begin(), first.end());
+            combined.insert(combined.end(), second.begin(), second.end());
+            // Preserve the prior entry's flags (a plain string carries 0); a
+            // missing key is created as a plain string, matching memcached's
+            // append/prepend-creates-on-absent behaviour.
+            return IStorage::UpdateOutcome { .value = std::move(combined),
+                                             .flags = current.found ? current.entry.flags : 0U,
+                                             .action = IStorage::UpdateAction::Store };
+        },
+        _clock.Now());
+}
+
 std::expected<CasToken, StorageError> CacheEngine::Append(std::string_view key,
                                                           std::span<std::byte const> suffix,
                                                           CasToken expected)
 {
     FC_ZONE_SCOPED_N("CacheEngine::Append");
-    return _storage.Append(key, suffix, expected, _clock.Now());
+    return ConcatGuarded(key, suffix, expected, /*atFront=*/false);
 }
 
 std::expected<CasToken, StorageError> CacheEngine::Prepend(std::string_view key,
@@ -143,7 +187,7 @@ std::expected<CasToken, StorageError> CacheEngine::Prepend(std::string_view key,
                                                            CasToken expected)
 {
     FC_ZONE_SCOPED_N("CacheEngine::Prepend");
-    return _storage.Prepend(key, prefix, expected, _clock.Now());
+    return ConcatGuarded(key, prefix, expected, /*atFront=*/true);
 }
 
 std::expected<CasToken, StorageError> CacheEngine::CompareAndSwap(
@@ -472,14 +516,17 @@ namespace
         return consume(&stream);
     }
 
-    /// Store the (possibly mutated) stream back, or delete the key if it has no
-    /// entries and no groups left.
+    /// Store the (possibly mutated) stream back. Once a stream key exists it is
+    /// persisted as a (possibly empty) stream and is NEVER auto-deleted here:
+    /// redis only removes a stream key on an explicit DEL/UNLINK or TTL expiry,
+    /// not as a side effect of XDEL/XTRIM emptying it or XGROUP DESTROY removing
+    /// its last group. (An earlier heuristic that deleted an empty, never-
+    /// appended stream wrongly destroyed a stream created via XGROUP CREATE ...
+    /// MKSTREAM once its last group was dropped.)
     /// @param stream The stream to persist.
-    /// @return The Store/Delete outcome for an Update callback.
+    /// @return The Store outcome for an Update callback.
     [[nodiscard]] IStorage::UpdateOutcome PersistStream(Stream const& stream)
     {
-        if (stream.entries.empty() && stream.groups.empty() && stream.entriesAdded == 0)
-            return IStorage::UpdateOutcome { .value = {}, .flags = 0, .action = IStorage::UpdateAction::Delete };
         return IStorage::UpdateOutcome { .value = StreamCodec::Encode(stream),
                                          .flags = StreamCodec::FcTypeStream,
                                          .action = IStorage::UpdateAction::Store };
@@ -508,7 +555,10 @@ namespace
         return true;
     }
 
-    /// Apply a trim directive to a decoded stream in place.
+    /// Apply a trim directive to a decoded stream in place. Trimming does NOT
+    /// advance `maxDeletedId`: redis only moves max-deleted-entry-id on explicit
+    /// deletions (XDEL) and XSETID, never as a side effect of MAXLEN/MINID
+    /// trimming, so XINFO STREAM keeps reporting the prior max-deleted ID.
     /// @param stream The stream to trim.
     /// @param trim   The directive.
     /// @return Number of entries removed.
@@ -520,24 +570,12 @@ namespace
             if (stream.entries.size() > trim.threshold)
             {
                 auto const drop = stream.entries.size() - trim.threshold;
-                if (drop > 0)
-                {
-                    auto const newMaxDeleted = stream.entries[drop - 1].id;
-                    if (newMaxDeleted > stream.maxDeletedId)
-                        stream.maxDeletedId = newMaxDeleted;
-                }
                 stream.entries.erase(stream.entries.begin(), stream.entries.begin() + static_cast<std::ptrdiff_t>(drop));
             }
         }
         else
         {
             auto const cut = std::ranges::lower_bound(stream.entries, trim.minId, {}, &StreamEntry::id);
-            if (cut != stream.entries.begin())
-            {
-                auto const lastDropped = std::prev(cut)->id;
-                if (lastDropped > stream.maxDeletedId)
-                    stream.maxDeletedId = lastDropped;
-            }
             stream.entries.erase(stream.entries.begin(), cut);
         }
         return static_cast<std::int64_t>(before - stream.entries.size());
@@ -573,17 +611,35 @@ std::expected<StreamId, StorageError> CacheEngine::StreamAdd(std::string_view ke
         // continues within the same ms or resets. Explicit ms with `*` seq
         // (`<ms>-*`): auto-sequence within that ms. Fully explicit: must be
         // strictly greater than the current last ID.
+        // Helper: the next sequence within `ms`, given the current last ID.
+        // When the sequence would wrap past UINT64_MAX within the same ms, redis
+        // rejects the append ("sequence number overflow") rather than wrapping to
+        // a smaller (non-monotonic) ID; surface that as InvalidArgument.
+        auto const nextSeqWithin = [&](std::uint64_t ms) -> std::expected<std::uint64_t, StorageError> {
+            if (ms != stream.lastId.ms)
+                return std::uint64_t { 0 };
+            if (stream.lastId.seq == std::numeric_limits<std::uint64_t>::max())
+                return std::unexpected(MakeStorageError(StorageErrorCode::InvalidArgument));
+            return stream.lastId.seq + 1;
+        };
+
         if (!requestedId.has_value())
         {
             assigned.ms = std::max(nowMs, stream.lastId.ms);
-            assigned.seq = assigned.ms == stream.lastId.ms ? stream.lastId.seq + 1 : 0;
+            auto const seq = nextSeqWithin(assigned.ms);
+            if (!seq.has_value())
+                return std::unexpected(seq.error());
+            assigned.seq = *seq;
         }
         else if (seqAuto)
         {
             assigned.ms = requestedId->ms;
             if (assigned.ms < stream.lastId.ms)
                 return std::unexpected(MakeStorageError(StorageErrorCode::InvalidArgument));
-            assigned.seq = assigned.ms == stream.lastId.ms ? stream.lastId.seq + 1 : 0;
+            auto const seq = nextSeqWithin(assigned.ms);
+            if (!seq.has_value())
+                return std::unexpected(seq.error());
+            assigned.seq = *seq;
         }
         else
         {
@@ -643,6 +699,12 @@ std::expected<std::vector<StreamEntry>, StorageError> CacheEngine::StreamRead(st
                                                                               std::size_t count)
 {
     FC_ZONE_SCOPED_N("CacheEngine::StreamRead");
+    // Nothing can be strictly after the maximal ID. Next() saturates at Max(),
+    // so without this guard a cursor already at Max() would form the inclusive
+    // range [Max, Max] and re-return the maximal entry on every poll (an
+    // infinite redelivery loop for a reader parked at the top of the stream).
+    if (after == StreamId::Max())
+        return std::vector<StreamEntry> {};
     return StreamRange(key, after.Next(), StreamId::Max(), count, /*reverse*/ false);
 }
 
@@ -808,6 +870,11 @@ std::expected<bool, StorageError> CacheEngine::StreamGroupDestroy(std::string_vi
         auto const loaded = LoadStream(current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
+        // XGROUP DESTROY (like every XGROUP subcommand except CREATE ... MKSTREAM)
+        // requires the key to exist; redis errors rather than reporting "0 groups
+        // removed" for a missing stream.
+        if (!*loaded)
+            return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
         auto const erased = std::erase_if(stream.groups, [group](ConsumerGroup const& g) { return g.name == group; });
         removed = erased != 0;
         if (!removed)
@@ -890,7 +957,11 @@ std::expected<std::vector<StreamEntry>, StorageError> CacheEngine::StreamReadGro
         auto* const g = FindGroup(stream, group);
         if (g == nullptr)
             return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
-        TouchConsumer(*g, consumer);
+        // XREADGROUP registers the consumer unconditionally — even when the read
+        // yields nothing — so the registration must be persisted even on the
+        // otherwise-Unchanged paths below (an earlier version returned Unchanged
+        // and silently dropped a brand-new consumer that read no entries).
+        bool const consumerCreated = TouchConsumer(*g, consumer);
 
         if (!after.has_value())
         {
@@ -907,19 +978,22 @@ std::expected<std::vector<StreamEntry>, StorageError> CacheEngine::StreamReadGro
                         .id = it->id, .consumer = std::string { consumer }, .deliveryTimeMs = nowMs, .deliveryCount = 1 });
             }
             if (out.empty())
-                return IStorage::UpdateOutcome { .value = {}, .flags = 0, .action = IStorage::UpdateAction::Unchanged };
+                return consumerCreated ? PersistStream(stream)
+                                       : IStorage::UpdateOutcome { .value = {},
+                                                                   .flags = 0,
+                                                                   .action = IStorage::UpdateAction::Unchanged };
             // Keep the PEL sorted by ID for linear range scans.
             std::ranges::sort(g->pel, {}, &PendingEntry::id);
             return PersistStream(stream);
         }
 
-        // Explicit ID: re-read this consumer's own pending history (>= after),
-        // refreshing delivery metadata. Entries no longer present yield an
-        // empty field list (redis behaviour), but here we surface only those
-        // still present.
+        // Explicit ID: re-read this consumer's own pending history strictly after
+        // `after` (redis treats the supplied ID as an EXCLUSIVE cursor, so a
+        // client paging with its last-seen ID does not re-receive the boundary
+        // entry). Entries no longer present yield an empty field list.
         for (auto& pending: g->pel)
         {
-            if (pending.consumer != consumer || pending.id < *after)
+            if (pending.consumer != consumer || pending.id <= *after)
                 continue;
             if (count != 0 && out.size() >= count)
                 break;
@@ -929,8 +1003,11 @@ std::expected<std::vector<StreamEntry>, StorageError> CacheEngine::StreamReadGro
             else
                 out.push_back(StreamEntry { .id = pending.id, .fields = {} });
         }
-        // Re-reading the PEL does not mutate the stream.
-        return IStorage::UpdateOutcome { .value = {}, .flags = 0, .action = IStorage::UpdateAction::Unchanged };
+        // Re-reading the PEL does not mutate the stream — except that the consumer
+        // may have just been registered, which must be persisted.
+        return consumerCreated
+                   ? PersistStream(stream)
+                   : IStorage::UpdateOutcome { .value = {}, .flags = 0, .action = IStorage::UpdateAction::Unchanged };
     });
     if (!result.has_value())
         return std::unexpected(result.error());
@@ -1064,10 +1141,16 @@ namespace
             }
             pending.consumer = std::string { consumer };
             pending.deliveryTimeMs = nowMs;
-            ++pending.deliveryCount;
-            result.ids.push_back(pending.id);
+            // JUSTID explicitly does NOT bump the delivery counter (redis: the
+            // entry is reassigned but not "re-delivered"), so a JUSTID-based
+            // recovery sweep does not inflate retry counts toward a dead-letter
+            // threshold. A normal claim does increment it.
             if (!justId)
+            {
+                ++pending.deliveryCount;
                 result.entries.push_back(*it);
+            }
+            result.ids.push_back(pending.id);
         }
         // Drop PEL rows whose entries are gone.
         for (auto const& goneId: result.deleted)
@@ -1080,7 +1163,8 @@ std::expected<CacheEngine::ClaimResult, StorageError> CacheEngine::StreamClaim(s
                                                                                std::string_view consumer,
                                                                                std::uint64_t minIdleMs,
                                                                                std::span<StreamId const> ids,
-                                                                               bool justId)
+                                                                               bool justId,
+                                                                               bool force)
 {
     FC_ZONE_SCOPED_N("CacheEngine::StreamClaim");
     auto const nowMs = WallNowMs();
@@ -1096,6 +1180,26 @@ std::expected<CacheEngine::ClaimResult, StorageError> CacheEngine::StreamClaim(s
             return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
         TouchConsumer(*g, consumer);
         std::vector<StreamId> wanted { ids.begin(), ids.end() };
+        // FORCE: create a PEL entry for any requested ID that exists in the
+        // stream but is not currently pending, so it can be claimed below. Redis
+        // uses this to recover an entry into a group that never delivered it.
+        // The min-idle-time check does not gate a freshly forced entry (idle 0),
+        // so seed its delivery time far enough back that the predicate accepts.
+        if (force)
+        {
+            for (auto const& id: wanted)
+            {
+                auto const inPel = std::ranges::any_of(g->pel, [&](PendingEntry const& p) { return p.id == id; });
+                if (inPel)
+                    continue;
+                auto const it = std::ranges::lower_bound(stream.entries, id, {}, &StreamEntry::id);
+                if (it == stream.entries.end() || it->id != id)
+                    continue; // not in the stream — nothing to force.
+                g->pel.push_back(PendingEntry {
+                    .id = id, .consumer = std::string { consumer }, .deliveryTimeMs = nowMs, .deliveryCount = 0 });
+            }
+            std::ranges::sort(g->pel, {}, &PendingEntry::id);
+        }
         ClaimCore(
             stream,
             *g,
@@ -1105,6 +1209,9 @@ std::expected<CacheEngine::ClaimResult, StorageError> CacheEngine::StreamClaim(s
             [&](PendingEntry const& p) {
                 if (std::ranges::find(wanted, p.id) == wanted.end())
                     return false;
+                // A just-forced entry has deliveryTimeMs == nowMs (idle 0); the
+                // >= comparison still admits it when minIdleMs == 0 (the common
+                // FORCE case), and a non-zero min-idle naturally excludes it.
                 auto const idle = nowMs >= p.deliveryTimeMs ? nowMs - p.deliveryTimeMs : 0;
                 return idle >= minIdleMs;
             },
@@ -1204,11 +1311,15 @@ std::expected<std::vector<CacheEngine::GroupInfo>, StorageError> CacheEngine::St
         std::vector<GroupInfo> out;
         out.reserve(stream->groups.size());
         for (auto const& g: stream->groups)
-            out.push_back(GroupInfo { .name = g.name,
-                                      .consumers = g.consumers.size(),
-                                      .pending = g.pel.size(),
-                                      .lastDelivered = g.lastDelivered,
-                                      .entriesRead = g.entriesRead });
+            out.push_back(
+                GroupInfo { .name = g.name,
+                            .consumers = g.consumers.size(),
+                            .pending = g.pel.size(),
+                            .lastDelivered = g.lastDelivered,
+                            .entriesRead = g.entriesRead,
+                            // lag = entries ever added minus entries this group has read,
+                            // clamped at 0 (a group created at the tail reads everything).
+                            .lag = stream->entriesAdded > g.entriesRead ? stream->entriesAdded - g.entriesRead : 0 });
         return out;
     });
 }

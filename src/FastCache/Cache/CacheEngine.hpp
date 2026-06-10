@@ -380,13 +380,22 @@ class CacheEngine
 
     /// XCLAIM: transfer ownership of `ids` in `group` to `consumer` when their
     /// idle time is at least `minIdleMs`.
+    /// @param key       Stream key.
+    /// @param group     Consumer group.
+    /// @param consumer  New owner.
+    /// @param minIdleMs Idle threshold a pending entry must meet to be claimed.
+    /// @param ids       Entry IDs to claim.
+    /// @param justId    Populate only IDs (and do not bump delivery counts).
+    /// @param force     Create a PEL entry for a requested ID that exists in the
+    ///                  stream but is not currently pending, then claim it.
     /// @return The claimed entries/ids, or WrongType / KeyNotFound (NOGROUP).
     [[nodiscard]] std::expected<ClaimResult, StorageError> StreamClaim(std::string_view key,
                                                                        std::string_view group,
                                                                        std::string_view consumer,
                                                                        std::uint64_t minIdleMs,
                                                                        std::span<StreamCodec::StreamId const> ids,
-                                                                       bool justId);
+                                                                       bool justId,
+                                                                       bool force = false);
 
     /// XAUTOCLAIM: scan the PEL from `start`, claiming up to `count` entries
     /// idle at least `minIdleMs` for `consumer`.
@@ -423,6 +432,7 @@ class CacheEngine
         std::uint64_t pending { 0 };            ///< PEL size.
         StreamCodec::StreamId lastDelivered {}; ///< Last-delivered ID.
         std::uint64_t entriesRead { 0 };        ///< Entries read by the group.
+        std::uint64_t lag { 0 };                ///< Entries added but not yet read (entriesAdded - entriesRead).
     };
 
     /// XINFO GROUPS.
@@ -546,6 +556,20 @@ class CacheEngine
     [[nodiscard]] std::uint64_t WallNowMs() const noexcept;
 
   private:
+    /// Shared implementation of Append/Prepend. Concatenates `extra` onto the
+    /// existing value (at the front when `atFront`, else the back) atomically
+    /// inside the storage's per-key Update boundary, rejecting non-string
+    /// (set/stream) keys with `WrongType` and honouring the CAS precondition.
+    /// @param key      Lookup key.
+    /// @param extra    Bytes to splice in.
+    /// @param expected CAS precondition (0 = unconditional).
+    /// @param atFront  `true` for PREPEND, `false` for APPEND.
+    /// @return New CAS token, or a StorageError (WrongType / CasMismatch / I/O).
+    [[nodiscard]] std::expected<CasToken, StorageError> ConcatGuarded(std::string_view key,
+                                                                      std::span<std::byte const> extra,
+                                                                      CasToken expected,
+                                                                      bool atFront);
+
     IStorage& _storage;
     IClock& _clock;
     IWallClock& _wallClock;

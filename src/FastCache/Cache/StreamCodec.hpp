@@ -3,6 +3,7 @@
 
 #include <FastCache/Core/Endian.hpp>
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cstddef>
@@ -190,6 +191,15 @@ namespace detail
         std::size_t offset { 0 };
         bool ok { true };
 
+        /// Bytes still unread. Used to clamp count-driven `reserve()` calls so a
+        /// corrupt blob claiming a huge element count cannot trigger a giant
+        /// allocation before the per-element reads fail on the missing bytes.
+        /// @return Number of remaining bytes (0 once exhausted).
+        [[nodiscard]] std::size_t Remaining() const noexcept
+        {
+            return offset < blob.size() ? blob.size() - offset : 0;
+        }
+
         [[nodiscard]] bool ReadU32(std::uint32_t& out)
         {
             if (!ok || offset + 4 > blob.size())
@@ -225,6 +235,21 @@ namespace detail
             return true;
         }
     };
+
+    /// Reserve capacity for `count` elements in `vec`, but never more than `cap`
+    /// (the bytes left in the blob — every element costs at least one byte, so a
+    /// count exceeding the remaining bytes is necessarily corrupt). This keeps a
+    /// truncated/corrupt blob with a huge count field from triggering a multi-GB
+    /// allocation; the per-element reads that follow then fail cleanly on the
+    /// missing bytes and `Decode` returns false.
+    /// @param vec   The vector to reserve into.
+    /// @param count The (untrusted) element count read from the blob.
+    /// @param cap   Upper bound on the reservation (remaining blob bytes).
+    template <typename T>
+    inline void BoundedReserve(std::vector<T>& vec, std::uint32_t count, std::size_t cap)
+    {
+        vec.reserve(std::min<std::size_t>(count, cap));
+    }
 
 } // namespace detail
 
@@ -286,7 +311,7 @@ namespace detail
     std::uint32_t entryCount = 0;
     if (!r.ReadU32(entryCount))
         return false;
-    out.entries.reserve(entryCount);
+    detail::BoundedReserve(out.entries, entryCount, r.Remaining());
     for (auto i = std::uint32_t { 0 }; i < entryCount; ++i)
     {
         StreamEntry entry;
@@ -295,7 +320,7 @@ namespace detail
         std::uint32_t fieldCount = 0;
         if (!r.ReadU32(fieldCount))
             return false;
-        entry.fields.reserve(fieldCount);
+        detail::BoundedReserve(entry.fields, fieldCount, r.Remaining());
         for (auto f = std::uint32_t { 0 }; f < fieldCount; ++f)
         {
             std::string name;
@@ -309,7 +334,7 @@ namespace detail
     std::uint32_t groupCount = 0;
     if (!r.ReadU32(groupCount))
         return false;
-    out.groups.reserve(groupCount);
+    detail::BoundedReserve(out.groups, groupCount, r.Remaining());
     for (auto g = std::uint32_t { 0 }; g < groupCount; ++g)
     {
         ConsumerGroup group;
@@ -318,7 +343,7 @@ namespace detail
         std::uint32_t consumerCount = 0;
         if (!r.ReadU32(consumerCount))
             return false;
-        group.consumers.reserve(consumerCount);
+        detail::BoundedReserve(group.consumers, consumerCount, r.Remaining());
         for (auto c = std::uint32_t { 0 }; c < consumerCount; ++c)
         {
             std::string consumer;
@@ -329,7 +354,7 @@ namespace detail
         std::uint32_t pelCount = 0;
         if (!r.ReadU32(pelCount))
             return false;
-        group.pel.reserve(pelCount);
+        detail::BoundedReserve(group.pel, pelCount, r.Remaining());
         for (auto p = std::uint32_t { 0 }; p < pelCount; ++p)
         {
             PendingEntry pending;

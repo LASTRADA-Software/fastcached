@@ -2859,6 +2859,63 @@ TEST_CASE("RESP: XADD against a string key is WRONGTYPE", "[protocol][resp][stre
     REQUIRE(out == "+OK\r\n-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
 }
 
+TEST_CASE("RESP: GET / MGET / INCR on a stream key do not leak the blob", "[protocol][resp][stream][wrongtype]")
+{
+    SECTION("GET on a stream replies WRONGTYPE, never the encoded blob")
+    {
+        RespFixture fix;
+        auto const out = Exchange(fix,
+                                  "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                  "*2\r\n$3\r\nGET\r\n$1\r\ns\r\n");
+        REQUIRE(out == "$3\r\n1-0\r\n-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    }
+    SECTION("MGET on a stream replies nil for that slot, never the blob")
+    {
+        RespFixture fix;
+        auto const out = Exchange(fix,
+                                  "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                  "*2\r\n$4\r\nMGET\r\n$1\r\ns\r\n");
+        REQUIRE(out == "$3\r\n1-0\r\n*1\r\n$-1\r\n");
+    }
+    SECTION("INCR on a stream replies WRONGTYPE, not a numeric error")
+    {
+        RespFixture fix;
+        auto const out = Exchange(fix,
+                                  "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                  "*2\r\n$4\r\nINCR\r\n$1\r\ns\r\n");
+        REQUIRE(out == "$3\r\n1-0\r\n-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    }
+}
+
+TEST_CASE("RESP: XRANGE COUNT 0 returns an empty array, not the whole range", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*6\r\n$6\r\nXRANGE\r\n$1\r\ns\r\n$1\r\n-\r\n$1\r\n+\r\n$5\r\nCOUNT\r\n$1\r\n0\r\n");
+    REQUIRE(out == "$3\r\n1-0\r\n*0\r\n");
+}
+
+TEST_CASE("RESP: plain XREAD rejects the NOACK option", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    // XREAD NOACK STREAMS s 0 — balanced (one key, one id), so the NOACK reject
+    // (not an unbalanced-list error) is what fires.
+    auto const out = Exchange(fix, "*5\r\n$5\r\nXREAD\r\n$5\r\nNOACK\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n0\r\n");
+    REQUIRE(out.starts_with("-ERR The NOACK option is only supported by XREADGROUP"));
+}
+
+TEST_CASE("RESP: XAUTOCLAIM accepts its minimal 6-token form", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    // XAUTOCLAIM s g c 0 0-0 (no COUNT/JUSTID): must not be rejected for arity.
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$1\r\ns\r\n$1\r\ng\r\n$1\r\n0\r\n"
+                              "*6\r\n$10\r\nXAUTOCLAIM\r\n$1\r\ns\r\n$1\r\ng\r\n$1\r\nc\r\n$1\r\n0\r\n$3\r\n0-0\r\n");
+    REQUIRE_FALSE(out.contains("wrong number of arguments"));
+}
+
 TEST_CASE("RESP: XRANGE returns entries as [id, [field, value]] arrays", "[protocol][resp][stream]")
 {
     RespFixture fix;
@@ -3169,4 +3226,32 @@ TEST_CASE("RESP: XREAD BLOCK times out to nil when the deadline elapses", "[prot
     h.clock.SetNow(h.clock.Now() + std::chrono::milliseconds { 51 });
     h.reactor.Run();
     REQUIRE(h.reply.ends_with("$-1\r\n"));
+}
+
+TEST_CASE("RESP: XREAD BLOCK inside MULTI/EXEC does not park; EXEC returns immediately", "[protocol][resp][stream][multi]")
+{
+    BlockingHarness h;
+    FastCache::SessionContext session;
+    session.streamWaiters = &h.waiters; // blocking wired in — yet EXEC must not park.
+    session.reactor = &h.reactor;
+
+    // MULTI; XREAD BLOCK 0 STREAMS s $ ; EXEC — on an empty stream the blocking
+    // read would otherwise park forever mid-EXEC. Inside a transaction it must
+    // serve non-blockingly and EXEC must complete in a single reactor run.
+    REQUIRE(FastCache::SyncRun(
+        WriteString(h.pair.client.get(),
+                    "*1\r\n$5\r\nMULTI\r\n"
+                    "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n$\r\n"
+                    "*1\r\n$4\r\nEXEC\r\n")));
+    h.pair.client->ShutdownWrite();
+
+    auto launcher = h.RunHandler(session);
+    h.reactor.Submit(launcher.Native());
+    h.reactor.Run();
+
+    // The connection completed (handler returned, reply drained) without any
+    // further XADD/wake: EXEC produced its aggregate with a nil element for the
+    // non-blocking XREAD rather than wedging.
+    REQUIRE_FALSE(h.reply.empty());
+    REQUIRE(h.reply.ends_with("*1\r\n$-1\r\n")); // EXEC: [ nil ]
 }

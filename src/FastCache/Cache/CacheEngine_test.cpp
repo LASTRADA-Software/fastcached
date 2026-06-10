@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -273,4 +274,202 @@ TEST_CASE("CacheEngine stream: XINFO reports length, watermarks and groups", "[c
     REQUIRE(groups->size() == 1);
     REQUIRE(groups->front().name == "g1");
     REQUIRE(groups->front().lastDelivered == StreamId { .ms = 20, .seq = 0 }); // `$` start
+}
+
+TEST_CASE("CacheEngine stream: XADD auto-sequence overflow at max seq is rejected, not wrapped", "[cache][stream]")
+{
+    StreamEngineFixture fix;
+    auto const max = std::numeric_limits<std::uint64_t>::max();
+    // Seed the top ID with the maximal sequence within a future ms.
+    REQUIRE(fix.engine.StreamAdd("s", StreamId { .ms = 5000, .seq = max }, false, Fields("f", "v"), std::nullopt, false)
+                .has_value());
+    // `<ms>-*` within the same ms would wrap seq to 0 (a smaller ID); redis
+    // rejects this rather than producing a non-monotonic ID.
+    auto const wrapped =
+        fix.engine.StreamAdd("s", StreamId { .ms = 5000, .seq = 0 }, true, Fields("f", "v"), std::nullopt, false);
+    REQUIRE_FALSE(wrapped.has_value());
+    REQUIRE(wrapped.error().code == StorageErrorCode::InvalidArgument);
+}
+
+TEST_CASE("CacheEngine stream: XREAD past the maximal ID returns nothing (no re-delivery loop)", "[cache][stream]")
+{
+    StreamEngineFixture fix;
+    auto const max = std::numeric_limits<std::uint64_t>::max();
+    REQUIRE(fix.engine.StreamAdd("s", StreamId { .ms = max, .seq = max }, false, Fields("f", "v"), std::nullopt, false)
+                .has_value());
+    // A cursor at the maximal entry must yield nothing — not re-return the entry
+    // forever (Next() saturates at Max, which would otherwise form [Max, Max]).
+    auto const after = fix.engine.StreamRead("s", StreamId::Max(), 0);
+    REQUIRE(after.has_value());
+    REQUIRE(after->empty());
+}
+
+TEST_CASE("CacheEngine stream: XREADGROUP history cursor is exclusive", "[cache][stream]")
+{
+    StreamEngineFixture fix;
+    for (auto const ms: { 10U, 20U })
+        REQUIRE(fix.engine.StreamAdd("s", StreamId { .ms = ms, .seq = 0 }, false, Fields("f", "v"), std::nullopt, false)
+                    .has_value());
+    REQUIRE(fix.engine.StreamGroupCreate("s", "g1", CacheEngine::GroupStart::Beginning, {}, false).has_value());
+    REQUIRE(fix.engine.StreamReadGroup("s", "g1", "c1", std::nullopt, 0, false)->size() == 2); // PEL = {10-0, 20-0}
+
+    // History read from 10-0 must return only entries STRICTLY after it (20-0),
+    // not redeliver the boundary entry.
+    auto const hist = fix.engine.StreamReadGroup("s", "g1", "c1", StreamId { .ms = 10, .seq = 0 }, 0, false);
+    REQUIRE(hist.has_value());
+    REQUIRE(hist->size() == 1);
+    REQUIRE(hist->front().id == StreamId { .ms = 20, .seq = 0 });
+}
+
+TEST_CASE("CacheEngine stream: a new consumer that reads nothing is still registered", "[cache][stream]")
+{
+    StreamEngineFixture fix;
+    // Group created at the tail; no entries exist after it.
+    REQUIRE(fix.engine.StreamGroupCreate("s", "g1", CacheEngine::GroupStart::End, {}, true).has_value());
+    auto const read = fix.engine.StreamReadGroup("s", "g1", "c_new", std::nullopt, 0, false);
+    REQUIRE(read.has_value());
+    REQUIRE(read->empty()); // nothing new...
+    // ...but the consumer must have been registered by the XREADGROUP.
+    auto const consumers = fix.engine.StreamConsumerInfo("s", "g1");
+    REQUIRE(consumers.has_value());
+    REQUIRE(consumers->size() == 1);
+    REQUIRE(consumers->front().name == "c_new");
+}
+
+TEST_CASE("CacheEngine stream: XCLAIM JUSTID does not bump the delivery counter", "[cache][stream]")
+{
+    StreamEngineFixture fix;
+    REQUIRE(
+        fix.engine.StreamAdd("s", StreamId { .ms = 1, .seq = 0 }, false, Fields("f", "v"), std::nullopt, false).has_value());
+    REQUIRE(fix.engine.StreamGroupCreate("s", "g1", CacheEngine::GroupStart::Beginning, {}, false).has_value());
+    REQUIRE(fix.engine.StreamReadGroup("s", "g1", "c1", std::nullopt, 0, false)->size() == 1); // deliveryCount = 1
+
+    std::vector<StreamId> const ids { StreamId { .ms = 1, .seq = 0 } };
+    // JUSTID claims (idle 0) repeatedly; delivery count must stay 1.
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(fix.engine.StreamClaim("s", "g1", "c2", /*minIdleMs*/ 0, ids, /*justId*/ true, /*force*/ false).has_value());
+    auto const pend = fix.engine.StreamPendingRange("s", "g1", StreamId::Min(), StreamId::Max(), 0, std::nullopt, 0);
+    REQUIRE(pend.has_value());
+    REQUIRE(pend->size() == 1);
+    REQUIRE(pend->front().deliveryCount == 1);
+
+    // A non-JUSTID claim DOES bump it.
+    REQUIRE(fix.engine.StreamClaim("s", "g1", "c3", 0, ids, /*justId*/ false, false).has_value());
+    auto const pend2 = fix.engine.StreamPendingRange("s", "g1", StreamId::Min(), StreamId::Max(), 0, std::nullopt, 0);
+    REQUIRE(pend2->front().deliveryCount == 2);
+}
+
+TEST_CASE("CacheEngine stream: XCLAIM FORCE creates a PEL entry for a non-pending id", "[cache][stream]")
+{
+    StreamEngineFixture fix;
+    REQUIRE(
+        fix.engine.StreamAdd("s", StreamId { .ms = 1, .seq = 0 }, false, Fields("f", "v"), std::nullopt, false).has_value());
+    // Group at the tail: 1-0 exists in the stream but is NOT pending in g1.
+    REQUIRE(fix.engine.StreamGroupCreate("s", "g1", CacheEngine::GroupStart::End, {}, false).has_value());
+
+    std::vector<StreamId> const ids { StreamId { .ms = 1, .seq = 0 } };
+    auto const noForce = fix.engine.StreamClaim("s", "g1", "c1", 0, ids, false, /*force*/ false);
+    REQUIRE(noForce.has_value());
+    REQUIRE(noForce->ids.empty()); // nothing pending → nothing claimed.
+
+    auto const forced = fix.engine.StreamClaim("s", "g1", "c1", 0, ids, false, /*force*/ true);
+    REQUIRE(forced.has_value());
+    REQUIRE(forced->ids.size() == 1);
+    REQUIRE(forced->ids.front() == StreamId { .ms = 1, .seq = 0 });
+    auto const pend = fix.engine.StreamPendingRange("s", "g1", StreamId::Min(), StreamId::Max(), 0, std::nullopt, 0);
+    REQUIRE(pend->size() == 1);
+    REQUIRE(pend->front().consumer == "c1");
+}
+
+TEST_CASE("CacheEngine stream: an empty MKSTREAM'd stream survives destroying its last group", "[cache][stream]")
+{
+    StreamEngineFixture fix;
+    REQUIRE(fix.engine.StreamGroupCreate("s", "g1", CacheEngine::GroupStart::End, {}, /*mkStream*/ true).has_value());
+    auto const destroyed = fix.engine.StreamGroupDestroy("s", "g1");
+    REQUIRE(destroyed.has_value());
+    REQUIRE(*destroyed); // the group was removed...
+    // ...but the (now empty) stream key must remain a stream, not be deleted.
+    auto const peek = fix.engine.Peek("s");
+    REQUIRE(peek.has_value());
+    REQUIRE(peek->found);
+    REQUIRE(StreamCodec::IsStream(peek->entry.flags));
+    REQUIRE(fix.engine.StreamLen("s").value() == 0);
+}
+
+TEST_CASE("CacheEngine stream: XGROUP DESTROY on a missing key errors (requires key to exist)", "[cache][stream]")
+{
+    StreamEngineFixture fix;
+    auto const r = fix.engine.StreamGroupDestroy("missing", "g1");
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(r.error().code == StorageErrorCode::KeyNotFound);
+}
+
+TEST_CASE("CacheEngine stream: MAXLEN/MINID trimming does not advance max-deleted-id", "[cache][stream]")
+{
+    StreamEngineFixture fix;
+    for (auto const ms: { 10U, 20U, 30U })
+        REQUIRE(fix.engine.StreamAdd("s", StreamId { .ms = ms, .seq = 0 }, false, Fields("f", "v"), std::nullopt, false)
+                    .has_value());
+    // Trim to the newest entry only; redis does NOT treat trimmed entries as
+    // deletions, so max-deleted-entry-id stays at its initial 0-0.
+    REQUIRE(fix.engine
+                .StreamTrimTo(
+                    "s", CacheEngine::StreamTrim { .strategy = CacheEngine::StreamTrim::Strategy::MaxLen, .threshold = 1 })
+                .has_value());
+    auto const info = fix.engine.StreamInfoOf("s");
+    REQUIRE(info.has_value());
+    REQUIRE(info->maxDeletedId == StreamId::Min());
+}
+
+TEST_CASE("CacheEngine stream: Append/Prepend refuse a stream key (no silent corruption)", "[cache][stream]")
+{
+    StreamEngineFixture fix;
+    REQUIRE(
+        fix.engine.StreamAdd("s", StreamId { .ms = 1, .seq = 0 }, false, Fields("f", "v"), std::nullopt, false).has_value());
+
+    auto const extra = std::vector<std::byte> { std::byte { 'x' }, std::byte { 'y' } };
+    auto const appended = fix.engine.Append("s", extra);
+    REQUIRE_FALSE(appended.has_value());
+    REQUIRE(appended.error().code == StorageErrorCode::WrongType);
+
+    auto const prepended = fix.engine.Prepend("s", extra);
+    REQUIRE_FALSE(prepended.has_value());
+    REQUIRE(prepended.error().code == StorageErrorCode::WrongType);
+
+    // The stream is intact and still decodes (XLEN works).
+    REQUIRE(fix.engine.StreamLen("s").value() == 1);
+}
+
+TEST_CASE("CacheEngine: Append/Prepend still work on a plain string key", "[cache][stream]")
+{
+    StreamEngineFixture fix;
+    std::vector<std::byte> const a { std::byte { 'a' } };
+    std::vector<std::byte> const b { std::byte { 'b' } };
+    std::vector<std::byte> const z { std::byte { 'z' } };
+    REQUIRE(fix.engine.Set("k", a, 0, 0).has_value());
+    REQUIRE(fix.engine.Append("k", b).has_value());
+    REQUIRE(fix.engine.Prepend("k", z).has_value());
+    auto const got = fix.engine.Get("k");
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
+    auto const bytes = got->entry.ValueBytes();
+    std::string const text { reinterpret_cast<char const*>(bytes.data()), bytes.size() };
+    REQUIRE(text == "zab");
+}
+
+TEST_CASE("CacheEngine stream: XINFO GROUPS reports entries-read and lag", "[cache][stream]")
+{
+    StreamEngineFixture fix;
+    for (auto const ms: { 10U, 20U, 30U })
+        REQUIRE(fix.engine.StreamAdd("s", StreamId { .ms = ms, .seq = 0 }, false, Fields("f", "v"), std::nullopt, false)
+                    .has_value());
+    REQUIRE(fix.engine.StreamGroupCreate("s", "g1", CacheEngine::GroupStart::Beginning, {}, false).has_value());
+    // Read two of the three entries.
+    REQUIRE(fix.engine.StreamReadGroup("s", "g1", "c1", std::nullopt, 2, false)->size() == 2);
+
+    auto const groups = fix.engine.StreamGroupInfo("s");
+    REQUIRE(groups.has_value());
+    REQUIRE(groups->size() == 1);
+    REQUIRE(groups->front().entriesRead == 2);
+    REQUIRE(groups->front().lag == 1); // 3 added - 2 read
 }
