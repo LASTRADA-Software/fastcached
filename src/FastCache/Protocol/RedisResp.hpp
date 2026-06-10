@@ -26,13 +26,18 @@ namespace FastCache
 /// representations every RESP2 client expects (Map flattens to a `*<2N>`
 /// array, Set to a `*<N>` array, attributes are dropped, etc.).
 ///
-/// Implements the Redis command surface that points at fastcached's engine
-/// primitives: GET/SET (with EX/PX/NX/XX), SETEX/PSETEX, MGET/MSET/MSETNX,
-/// DEL/UNLINK, EXISTS, EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT, TTL/PTTL,
-/// PERSIST, INCR/DECR/INCRBY/DECRBY/INCRBYFLOAT, SADD/SREM/SCARD/SISMEMBER/
-/// SMEMBERS/SMISMEMBER/SPOP, PING/ECHO/INFO/COMMAND/CLIENT/CONFIG/SELECT,
+/// The authoritative supported-command list is the `CommandTable` dispatch
+/// array in `RedisResp.cpp` (every row also feeds `COMMAND` introspection).
+/// At time of writing it covers — non-exhaustively, in broad strokes — the
+/// Redis surface that maps onto fastcached's engine primitives:
+/// GET/SET (with EX/PX/NX/XX), SETEX/PSETEX, MGET/MSET/MSETNX, DEL/UNLINK,
+/// EXISTS, EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT, TTL/PTTL, PERSIST,
+/// INCR/DECR/INCRBY/DECRBY/INCRBYFLOAT, SADD/SREM/SCARD/SISMEMBER/SMEMBERS/
+/// SMISMEMBER/SPOP, PING/ECHO/INFO/COMMAND/CLIENT/CONFIG/SELECT,
 /// MULTI/EXEC/DISCARD/WATCH/UNWATCH, SUBSCRIBE/UNSUBSCRIBE/PSUBSCRIBE/
 /// PUNSUBSCRIBE/PUBLISH, HELLO/RESET/QUIT, FLUSHDB/FLUSHALL, DEBUG PROTOCOL.
+/// If this prose drifts from `CommandTable`, `CommandTable` is the source of
+/// truth.
 ///
 /// AUTH authenticates against the session's AuthPolicy when one is configured;
 /// with no policy it replies the redis "no password is set" error. When a

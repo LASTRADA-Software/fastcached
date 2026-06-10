@@ -2605,7 +2605,14 @@ namespace
     /// trip; HandleHello parses that clause and still requires the connection to
     /// be authenticated before it returns the server map (it replies `-NOAUTH`
     /// otherwise), so allowing it here does not leak anything to an unauthenticated
-    /// client. Every other command replies `-NOAUTH` until AUTH succeeds.
+    /// client.
+    ///
+    /// `DEBUG` is intentionally NOT pre-auth allowed — matches redis, which
+    /// requires authentication for `DEBUG` subcommands. Tests that exercise
+    /// `DEBUG PROTOCOL` against an auth-enabled fixture must send `AUTH`
+    /// first (or use the `HELLO 3 AUTH <user> <pass>` round-trip handshake).
+    ///
+    /// Every other command replies `-NOAUTH` until AUTH succeeds.
     [[nodiscard]] bool IsPreAuthAllowed(std::string_view name) noexcept
     {
         return name == "AUTH" || name == "QUIT" || name == "HELLO";
