@@ -46,6 +46,23 @@
       `ReactorServerLoop_test.cpp` (create if absent) that succeeds for
       the first N calls then fails, assert the message names the
       offending pair.
+- [ ] **HTTP/1.1 + JSON REST wire protocol (extra-clients survey, option B).**
+      Add an HTTP/1.1 listener that speaks JSON for `GET /v1/keys/:k`,
+      `PUT /v1/keys/:k`, `DELETE /v1/keys/:k`, `HEAD /v1/keys/:k` (TTL),
+      `PATCH /v1/keys/:k` (CAS), `POST /v1/batch`, `GET /stats`, `GET /healthz`.
+      Unlocks curl, browser `fetch`, serverless platforms that ban raw TCP,
+      k8s sidecars, Prometheus-style scrapers. Architecture: new
+      `HttpRest` `IProtocolHandler` under `src/FastCache/Protocol/` —
+      verb routing must be data-driven (descriptor table of
+      `{method, path-shape, engine-call}`, **not** a hand-rolled
+      `if`/`switch` ladder). Listener selection: introduce
+      `BindConfig::protocol` (enum `auto | http | resp | memcached-text |
+      memcached-binary`) so HTTP gets its own port and the
+      `ProtocolAutodetect` one-byte peek stays unambiguous (HTTP method
+      letters collide with Memcached text verbs). Future hook (out of
+      scope for the first cut): WebSocket upgrade on the same listener
+      gives browsers a bidirectional channel for the existing keyspace
+      notifier — reuses `IPubSubRegistry`, no engine change.
 - [x] Add support for Tracy (via CMake variable, off by default)
 - [x] disk storage should be btrfs-like copy-on-write to allow O(1) blocking disk saves
 
