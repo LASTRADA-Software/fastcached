@@ -145,6 +145,62 @@ namespace
         return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, "log-level", std::format("unknown level: {}", sv)));
     }
 
+    /// Parse a `--listen` / `--listen-tls` argument into a `BindConfig`. The
+    /// grammar is the standard `host:port` form, with `[ipv6]:port` for
+    /// IPv6 literals. The `tls` flag is supplied by the caller (the two
+    /// flags share this parser and only differ by which value they pass).
+    /// @param sv  The flag's value text.
+    /// @param tls Whether to set `BindConfig::tls` on the produced entry.
+    /// @return A populated BindConfig on success; ConfigError otherwise.
+    [[nodiscard]] std::expected<BindConfig, ConfigError> ParseListenSpec(std::string_view sv, bool tls)
+    {
+        if (sv.empty())
+            return std::unexpected(
+                MakeError(ConfigErrorCode::TypeMismatch, tls ? "listen-tls" : "listen", "empty value (expected host:port)"));
+        std::string_view host;
+        std::string_view portText;
+        if (sv.front() == '[')
+        {
+            // `[ipv6-literal]:port` form. Find the matching `]` and require
+            // a `:port` tail immediately after.
+            auto const close = sv.find(']');
+            if (close == std::string_view::npos || close + 1 >= sv.size() || sv[close + 1] != ':')
+                return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch,
+                                                 tls ? "listen-tls" : "listen",
+                                                 std::format("malformed [ipv6]:port spec: {}", sv)));
+            host = sv.substr(1, close - 1);
+            portText = sv.substr(close + 2);
+        }
+        else
+        {
+            // `host:port` form. The last `:` separates host and port — for
+            // a bare IPv4 / hostname there is exactly one colon; for an
+            // unbracketed IPv6 we reject (the standard requires brackets).
+            auto const colon = sv.rfind(':');
+            if (colon == std::string_view::npos)
+                return std::unexpected(MakeError(
+                    ConfigErrorCode::TypeMismatch, tls ? "listen-tls" : "listen", std::format("missing :port in: {}", sv)));
+            host = sv.substr(0, colon);
+            portText = sv.substr(colon + 1);
+            // Reject unbracketed IPv6 literals: if `host` contains a `:`
+            // we silently mis-parsed it (e.g. `2001:db8::1` would land
+            // here with host=`2001:db8:` and portText=`1`). The comment
+            // above promises rejection; the code now matches.
+            if (host.contains(':'))
+                return std::unexpected(
+                    MakeError(ConfigErrorCode::TypeMismatch,
+                              tls ? "listen-tls" : "listen",
+                              std::format("IPv6 literal requires brackets: [{}]:port (got: {})", host, sv)));
+        }
+        auto const address = ParseBindAddress(host);
+        if (!address.has_value())
+            return std::unexpected(address.error());
+        auto const port = ParsePort(portText);
+        if (!port.has_value())
+            return std::unexpected(port.error());
+        return BindConfig { .address = *address, .port = *port, .tls = tls };
+    }
+
     [[nodiscard]] bool FlagMatches(std::string_view arg, std::string_view name) noexcept
     {
         if (arg == name)
@@ -265,19 +321,40 @@ namespace
             return ArgOutcome::Continue;
         }
 
+        // Repeatable listen flags. `--listen` is plaintext, `--listen-tls`
+        // is TLS — separate flags rather than a `+tls` suffix so the intent
+        // is explicit at the call site. Each match appends to cfg.binds.
+        for (auto const& [flagName, isTls]: std::initializer_list<std::tuple<std::string_view, bool>> {
+                 { "--listen", false },
+                 { "--listen-tls", true },
+             })
+        {
+            if (!FlagMatches(arg, flagName))
+                continue;
+            auto const value = TakeValue(args, i, flagName);
+            if (!value.has_value())
+                return std::unexpected(value.error());
+            auto const parsed = ParseListenSpec(*value, isTls);
+            if (!parsed.has_value())
+                return std::unexpected(parsed.error());
+            cfg.binds.push_back(*parsed);
+            return ArgOutcome::Continue;
+        }
+
         // String-valued flags. Each match flips an "explicit" bool so
         // Merge can override YAML even when the typed value happens to
         // equal the field's default.
         for (auto const& [name, target, seenPtr]: std::initializer_list<std::tuple<std::string_view, std::string*, bool*>> {
                  { "--config", &cfg.configPath, nullptr },
                  { "--pidfile", &cfg.pidfile, nullptr },
-                 { "--service-name", &cfg.serviceName, nullptr },
+                 { "--service-name", &cfg.serviceName, &result.serviceNameExplicit },
                  { "--storage", &cfg.storagePath, &result.storagePathExplicit },
                  { "--requirepass", &cfg.requirePass, &result.requirePassExplicit },
                  { "--auth-username", &cfg.authUsername, &result.authUsernameExplicit },
                  { "--metrics-bind", &cfg.metricsBindAddress, &result.metricsBindAddressExplicit },
                  { "--tls-cert", &cfg.tlsCertPath, &result.tlsCertPathExplicit },
                  { "--tls-key", &cfg.tlsKeyPath, &result.tlsKeyPathExplicit },
+                 { "--notify-keyspace-events", &cfg.notifyKeyspaceEvents, &result.notifyKeyspaceEventsExplicit },
              })
         {
             auto const matched = ApplyStringFlag(args, i, name, *target);
@@ -369,14 +446,20 @@ namespace
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.lruRecencyExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         {
             auto const matched = ApplyParsedFlag(args, i, "--cpu-affinity", ParseCpuAffinity, cfg.cpuAffinity);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.cpuAffinityExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         {
             auto const matched = ApplyParsedFlag(args, i, "--threads", ParseThreads, cfg.workerThreads);
@@ -461,8 +544,19 @@ namespace
         { .flag = "--tls",
           .description = "terminate TLS on the cache port (default off; needs a build with OpenSSL\n"
                          "and both --tls-cert and --tls-key)" },
-        { .flag = "--tls-cert=<path>", .description = "PEM certificate (chain) file for --tls" },
-        { .flag = "--tls-key=<path>", .description = "PEM private key file for --tls" },
+        { .flag = "--tls-cert=<path>", .description = "PEM certificate (chain) file for --tls / --listen-tls" },
+        { .flag = "--tls-key=<path>", .description = "PEM private key file for --tls / --listen-tls" },
+        { .flag = "--listen=<host:port>",
+          .description = "additional plaintext listener; repeatable. Use [::1]:11211 for IPv6 literals.\n"
+                         "When given, supersedes --bind/--port — every endpoint must be listed." },
+        { .flag = "--listen-tls=<host:port>",
+          .description = "additional TLS listener; repeatable. Shares --tls-cert / --tls-key.\n"
+                         "Needs a build with OpenSSL (FC_TLS_ENABLED)" },
+        { .flag = "--notify-keyspace-events=<flags>",
+          .description = "redis-style keyspace-event flag string; empty = off (default).\n"
+                         "K=__keyspace, E=__keyevent, g=generic (del/expire/persist),\n"
+                         "$=string (set/incr*), A=alias for g$\n"
+                         "(x=expired is not yet wired — rejected pending storage callback)" },
         { .flag = "--log-timestamps", .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)" },
         { .flag = "--storage=<path>", .description = "persist cache to a CoW-tree file (default: in-memory only)" },
         { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },

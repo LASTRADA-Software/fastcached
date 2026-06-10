@@ -13,10 +13,12 @@ target_sources(FastCache
         Cache/CowTreeStorage.cpp
         Cache/InMemoryLruStorage.cpp
         Cache/LayeredStorage.cpp
+        Cache/NotifyingStorage.cpp
         Cache/ShardedStorage.cpp
         Cache/TracingStorage.cpp
         Config/ByteSize.cpp
         Config/CliParser.cpp
+        Config/ConfigMerge.cpp
         Config/ConfigReloader.cpp
         Config/YamlReader.cpp
         Core/Crc32c.cpp
@@ -42,8 +44,11 @@ target_sources(FastCache
         Protocol/MemcachedMeta.cpp
         Protocol/MemcachedText.cpp
         Protocol/ProtocolAutodetect.cpp
+        Protocol/KeyspaceNotifier.cpp
         Protocol/PubSubRegistry.cpp
+        Protocol/RedisMutationObserver.cpp
         Protocol/RedisResp.cpp
+        Protocol/RedisTransaction.cpp
         Server/AdminHttpServer.cpp
         Server/Connection.cpp
         Server/ReactorServerLoop.cpp

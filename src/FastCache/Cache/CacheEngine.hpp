@@ -61,6 +61,16 @@ class CacheEngine
     /// @return GetResult, or StorageError on I/O failure.
     [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key);
 
+    /// Snapshot only the CAS token of the entry under `key`, without bumping
+    /// LRU recency or `lastAccess`. Used by the Redis `WATCH` handler to
+    /// record the entry's version at WATCH time so a later mutation on the
+    /// same key (detected via `WatchRegistry::Touched`) can abort the
+    /// transaction. Returns 0 when the key is absent — the "no entry"
+    /// sentinel mirrors `CacheEntry::cas`'s reserved value.
+    /// @param key Lookup key.
+    /// @return The current CAS token, or StorageError on I/O failure.
+    [[nodiscard]] std::expected<CasToken, StorageError> PeekCas(std::string_view key);
+
     [[nodiscard]] std::expected<CasToken, StorageError> Set(std::string_view key,
                                                             std::vector<std::byte> value,
                                                             std::uint32_t flags,

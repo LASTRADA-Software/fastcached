@@ -150,7 +150,9 @@ std::size_t PubSubRegistry::Subscribe(std::shared_ptr<ISubscriber> sub, std::str
 {
     std::scoped_lock const lock { _mu };
     auto* const raw = sub.get();
-    _channels[std::string { channel }].emplace(raw, std::weak_ptr<ISubscriber> { sub });
+    auto const [_, inserted] = _channels[std::string { channel }].emplace(raw, std::weak_ptr<ISubscriber> { sub });
+    if (inserted)
+        _entryCount.fetch_add(1, std::memory_order_release);
     return CountFor(raw);
 }
 
@@ -159,7 +161,8 @@ std::size_t PubSubRegistry::Unsubscribe(ISubscriber* sub, std::string_view chann
     std::scoped_lock const lock { _mu };
     if (auto it = _channels.find(std::string { channel }); it != _channels.end())
     {
-        it->second.erase(sub);
+        if (it->second.erase(sub) > 0)
+            _entryCount.fetch_sub(1, std::memory_order_release);
         if (it->second.empty())
             _channels.erase(it);
     }
@@ -170,7 +173,9 @@ std::size_t PubSubRegistry::PSubscribe(std::shared_ptr<ISubscriber> sub, std::st
 {
     std::scoped_lock const lock { _mu };
     auto* const raw = sub.get();
-    _patterns[std::string { pattern }].emplace(raw, std::weak_ptr<ISubscriber> { sub });
+    auto const [_, inserted] = _patterns[std::string { pattern }].emplace(raw, std::weak_ptr<ISubscriber> { sub });
+    if (inserted)
+        _entryCount.fetch_add(1, std::memory_order_release);
     return CountFor(raw);
 }
 
@@ -179,7 +184,8 @@ std::size_t PubSubRegistry::PUnsubscribe(ISubscriber* sub, std::string_view patt
     std::scoped_lock const lock { _mu };
     if (auto it = _patterns.find(std::string { pattern }); it != _patterns.end())
     {
-        it->second.erase(sub);
+        if (it->second.erase(sub) > 0)
+            _entryCount.fetch_sub(1, std::memory_order_release);
         if (it->second.empty())
             _patterns.erase(it);
     }
@@ -209,17 +215,20 @@ std::vector<std::string> PubSubRegistry::SnapshotPatterns(ISubscriber* sub) cons
 void PubSubRegistry::UnsubscribeAll(ISubscriber* sub)
 {
     std::scoped_lock const lock { _mu };
+    std::size_t removed = 0;
     // Erase the subscriber from every channel/pattern; drop now-empty buckets.
     for (auto it = _channels.begin(); it != _channels.end();)
     {
-        it->second.erase(sub);
+        removed += it->second.erase(sub);
         it = it->second.empty() ? _channels.erase(it) : std::next(it);
     }
     for (auto it = _patterns.begin(); it != _patterns.end();)
     {
-        it->second.erase(sub);
+        removed += it->second.erase(sub);
         it = it->second.empty() ? _patterns.erase(it) : std::next(it);
     }
+    if (removed > 0)
+        _entryCount.fetch_sub(removed, std::memory_order_release);
 }
 
 std::size_t PubSubRegistry::Publish(std::string_view channel, std::string_view message)
@@ -267,6 +276,20 @@ std::size_t PubSubRegistry::Publish(std::string_view channel, std::string_view m
     for (auto& delivery: deliveries)
         delivery.sub->Deliver(std::move(delivery.message));
     return deliveries.size();
+}
+
+bool PubSubRegistry::HasAnySubscribers() const noexcept
+{
+    // Lock-free fast path — every successful cache mutation calls into
+    // `KeyspaceNotifier::OnEvent`, which probes this. For daemons with
+    // `notify-keyspace-events` enabled but no subscriber yet (the "enabled
+    // for later" case explicitly called out in KeyspaceNotifier.cpp), the
+    // steady state is `_entryCount == 0`; collapsing this to a single
+    // atomic load removes a global mutex acquisition from the hot write
+    // path. Acquire pairs with the release stores in Subscribe /
+    // PSubscribe / Unsubscribe / PUnsubscribe / UnsubscribeAll so the
+    // reader sees a count consistent with the maps.
+    return _entryCount.load(std::memory_order_acquire) > 0;
 }
 
 } // namespace FastCache

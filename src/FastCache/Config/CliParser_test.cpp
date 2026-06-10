@@ -99,10 +99,11 @@ TEST_CASE("CliParser: --storage-durability rejects unknown values", "[config][cl
 
 TEST_CASE("CliParser: --lru-mode parses each policy and defaults to approximate", "[config][cli]")
 {
-    // Default (flag absent) is Approximate.
+    // Default (flag absent) is Approximate, and the explicit-bit is clear.
     auto const def = FastCache::ParseCli(std::span<char const* const> {});
     REQUIRE(def.has_value());
     REQUIRE(def->config.lruRecency == FastCache::LruRecency::Approximate);
+    REQUIRE_FALSE(def->lruRecencyExplicit);
 
     for (auto const& [text, mode]: std::initializer_list<std::pair<char const*, FastCache::LruRecency>> {
              { "--lru-mode=approximate", FastCache::LruRecency::Approximate },
@@ -113,6 +114,10 @@ TEST_CASE("CliParser: --lru-mode parses each policy and defaults to approximate"
         auto const result = FastCache::ParseCli(std::span<char const* const> { args });
         REQUIRE(result.has_value());
         REQUIRE(result->config.lruRecency == mode);
+        // Whenever the flag was typed, the explicit-bit must be set so the
+        // CLI value wins over a YAML default in Merge — regression for the
+        // silent-drop bug that motivated this fix.
+        REQUIRE(result->lruRecencyExplicit);
     }
 }
 
@@ -129,6 +134,7 @@ TEST_CASE("CliParser: --cpu-affinity parses each policy and defaults to per-core
     auto const def = FastCache::ParseCli(std::span<char const* const> {});
     REQUIRE(def.has_value());
     REQUIRE(def->config.cpuAffinity == FastCache::CpuAffinity::PerCore);
+    REQUIRE_FALSE(def->cpuAffinityExplicit);
 
     for (auto const& [text, mode]: std::initializer_list<std::pair<char const*, FastCache::CpuAffinity>> {
              { "--cpu-affinity=none", FastCache::CpuAffinity::None },
@@ -139,6 +145,10 @@ TEST_CASE("CliParser: --cpu-affinity parses each policy and defaults to per-core
         auto const result = FastCache::ParseCli(std::span<char const* const> { args });
         REQUIRE(result.has_value());
         REQUIRE(result->config.cpuAffinity == mode);
+        // Same explicit-bit contract as --lru-mode: regression guard against
+        // YAML silently shadowing a typed `--cpu-affinity=per-core` when the
+        // value equals the default.
+        REQUIRE(result->cpuAffinityExplicit);
     }
 }
 
@@ -250,6 +260,8 @@ TEST_CASE("CliParser: omitting all flags leaves every explicit-tracker false", "
     REQUIRE_FALSE(result->workerThreadsExplicit);
     REQUIRE_FALSE(result->storageShardsExplicit);
     REQUIRE_FALSE(result->listenBacklogExplicit);
+    REQUIRE_FALSE(result->lruRecencyExplicit);
+    REQUIRE_FALSE(result->cpuAffinityExplicit);
 }
 
 TEST_CASE("CliParser: --bind sets the address and records the explicit-set flag", "[config][cli][bind]")
@@ -483,4 +495,82 @@ TEST_CASE("CliParser: --healthcheck selects the health-check outcome", "[config]
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE(result.has_value());
     REQUIRE(result->outcome == FastCache::CliOutcome::HealthCheck);
+}
+
+TEST_CASE("CliParser: --listen and --listen-tls populate cfg.binds in order", "[config][cli][bind]")
+{
+    auto const args = std::array<char const*, 2> { "--listen=127.0.0.1:11211", "--listen-tls=0.0.0.0:6380" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.binds.size() == 2);
+    REQUIRE(result->config.binds[0].address == "127.0.0.1");
+    REQUIRE(result->config.binds[0].port == 11211U);
+    REQUIRE_FALSE(result->config.binds[0].tls);
+    REQUIRE(result->config.binds[1].address == "0.0.0.0");
+    REQUIRE(result->config.binds[1].port == 6380U);
+    REQUIRE(result->config.binds[1].tls);
+}
+
+TEST_CASE("CliParser: --listen accepts IPv6 literal with brackets", "[config][cli][bind]")
+{
+    auto const args = std::array<char const*, 1> { "--listen=[::1]:11211" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.binds.size() == 1);
+    REQUIRE(result->config.binds[0].address == "::1");
+    REQUIRE(result->config.binds[0].port == 11211U);
+}
+
+TEST_CASE("CliParser: --listen without :port rejects with TypeMismatch", "[config][cli][bind]")
+{
+    auto const args = std::array<char const*, 1> { "--listen=127.0.0.1" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
+}
+
+TEST_CASE("CliParser: --listen rejects malformed (ipv6) spec", "[config][cli][bind]")
+{
+    auto const args = std::array<char const*, 1> { "--listen=[::1:11211" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("CliParser: --listen rejects unbracketed IPv6 literal with a clear diagnostic",
+          "[config][cli][bind][ipv6-bracket-required]")
+{
+    // The inline comment in ParseListenSpec's unbracketed branch promises
+    // rejection of IPv6 literals without brackets, but the implementation
+    // silently split on rfind(':') — `2001:db8::1` became host=`2001:db8:`
+    // (trailing colon!) + portText=`1`. The kernel later rejected the
+    // bogus address with a low-level EINVAL the operator could not
+    // attribute back to the missing brackets. Reject at parse time with
+    // the bracket-hint diagnostic instead.
+    auto const args = std::array<char const*, 1> { "--listen=2001:db8::1" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
+    // Diagnostic mentions brackets so the operator knows the fix.
+    REQUIRE(result.error().context.contains("brackets"));
+}
+
+TEST_CASE("CliParser: --listen-tls rejects unbracketed IPv6 literal too", "[config][cli][bind][ipv6-bracket-required]")
+{
+    // Symmetric guard for the --listen-tls path (shared parser).
+    auto const args = std::array<char const*, 1> { "--listen-tls=2001:db8::1" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
+}
+
+TEST_CASE("CliParser: legacy --bind/--port keeps cfg.binds empty (main collapses)", "[config][cli][bind]")
+{
+    // The single-bind flags do NOT push into cfg.binds; main.cpp does the
+    // collapse so the wire surface stays predictable for old configs.
+    auto const args = std::array<char const*, 2> { "--bind=0.0.0.0", "--port=6379" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.binds.empty());
+    REQUIRE(result->config.bindAddress == "0.0.0.0");
+    REQUIRE(result->config.port == 6379U);
 }

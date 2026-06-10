@@ -120,6 +120,14 @@ class IPubSubRegistry
     /// @param sub The subscriber whose patterns to enumerate.
     /// @return Owned copies of the patterns currently registered for `sub`.
     [[nodiscard]] virtual std::vector<std::string> SnapshotPatterns(ISubscriber* sub) const = 0;
+
+    /// O(1) probe for "is anyone subscribed to anything?". Cheap fast path for
+    /// publishers (notably the keyspace-notification helper) that would
+    /// otherwise format channel names and call Publish even when no subscriber
+    /// exists — wasteful when an operator enables `notify-keyspace-events` on
+    /// a hot-write workload purely for the option to subscribe later.
+    /// @return True iff at least one channel or pattern has a subscriber.
+    [[nodiscard]] virtual bool HasAnySubscribers() const noexcept = 0;
 };
 
 } // namespace FastCache

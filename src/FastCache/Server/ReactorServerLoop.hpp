@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cache/CacheEngine.hpp>
+#include <FastCache/Config/Config.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IAdmissionControl.hpp>
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache
 {
@@ -22,8 +24,8 @@ class TlsContext; // defined in Net/TlsContext.hpp; only used when TLS is built 
 /// same options across the three platform-specific implementations.
 struct ReactorServerOptions
 {
-    std::string bindAddress { "127.0.0.1" };
-    std::uint16_t port { 11211 };
+    /// Every listener endpoint to bring up. Must be non-empty.
+    std::vector<BindConfig> binds {};
     std::size_t maxConnections { 0 }; ///< 0 = unlimited.
     int listenBacklog { 511 };        ///< ::listen() backlog depth.
 
@@ -66,5 +68,24 @@ int RunReactorServer(ReactorServerOptions const& options,
                      ILogger& logger,
                      IAdmissionControl* admission = nullptr,
                      IMetricsSink* metrics = nullptr);
+
+namespace Detail
+{
+
+    /// Verify that every TLS-flagged bind in `options.binds` has a non-null
+    /// `tlsContext`. Returns EXIT_SUCCESS on a clean configuration,
+    /// EXIT_FAILURE (already logged at Fatal) on a TLS-flagged bind with no
+    /// context — the latter would otherwise silently fall through to plaintext.
+    ///
+    /// Exposed for testing. The Run* entry points all call this as their
+    /// first step, so a unit test exercises the same code path used in
+    /// production. Lives in `Detail` so callers don't accidentally pick it
+    /// up as part of the public API.
+    /// @param options Server options to validate.
+    /// @param logger  Logger receiving the diagnostic on failure.
+    /// @return EXIT_SUCCESS / EXIT_FAILURE.
+    [[nodiscard]] int VerifyTlsContextForTlsBinds(ReactorServerOptions const& options, ILogger& logger);
+
+} // namespace Detail
 
 } // namespace FastCache

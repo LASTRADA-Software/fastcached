@@ -3,6 +3,7 @@
 
 #include <FastCache/Protocol/IPubSubRegistry.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -37,6 +38,7 @@ class PubSubRegistry final: public IPubSubRegistry
     [[nodiscard]] std::size_t Publish(std::string_view channel, std::string_view message) override;
     [[nodiscard]] std::vector<std::string> SnapshotChannels(ISubscriber* sub) const override;
     [[nodiscard]] std::vector<std::string> SnapshotPatterns(ISubscriber* sub) const override;
+    [[nodiscard]] bool HasAnySubscribers() const noexcept override;
 
   private:
     /// Count a subscriber's live subscriptions (channels + patterns) while the
@@ -56,6 +58,15 @@ class PubSubRegistry final: public IPubSubRegistry
     std::unordered_map<std::string, SubscriberSet> _channels;
     /// pattern -> subscribers subscribed to that glob pattern.
     std::unordered_map<std::string, SubscriberSet> _patterns;
+    /// Total live (subscriber, channel-or-pattern) entries across both
+    /// maps. Maintained under `_mu` (same critical section that mutates
+    /// the maps) but read lock-free in `HasAnySubscribers` so the
+    /// keyspace notifier's hot-write probe collapses to a single atomic
+    /// load. Without this, every successful cache mutation on a daemon
+    /// with `notify-keyspace-events=AKE` set but no subscriber yet (the
+    /// "enabled for later" case in the doc) paid a global mutex
+    /// acquisition just to read map emptiness.
+    std::atomic<std::size_t> _entryCount { 0 };
 };
 
 } // namespace FastCache

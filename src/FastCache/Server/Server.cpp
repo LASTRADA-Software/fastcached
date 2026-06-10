@@ -69,11 +69,18 @@ Task<void> Server::Run()
 
         // Admission control: refuse if the cap is full. We still accepted
         // the socket (the OS already did the SYN-ACK), so close it and
-        // count the rejection.
+        // count the rejection. We also bump a TLS-specific counter when
+        // this Server is wrapping accepted sockets in TLS, so operators
+        // can attribute traffic to plaintext vs TLS without a per-bind
+        // metrics label dimension.
         if (_admission && !_admission->AllowAccept())
         {
             if (_metrics)
+            {
                 _metrics->Increment(IMetricsSink::Counter::ConnectionsAdmissionRejected);
+                if (_tls != nullptr)
+                    _metrics->Increment(IMetricsSink::Counter::ConnectionsAdmissionRejectedTls);
+            }
             (*accepted)->Close();
             continue;
         }
@@ -82,7 +89,11 @@ Task<void> Server::Run()
             _admission->OnConnectionStarted();
         _accepted.fetch_add(1, std::memory_order_relaxed);
         if (_metrics)
+        {
             _metrics->Increment(IMetricsSink::Counter::ConnectionsTotal);
+            if (_tls != nullptr)
+                _metrics->Increment(IMetricsSink::Counter::ConnectionsTotalTls);
+        }
 
         auto connection = std::make_unique<Connection>(WrapTls(std::move(*accepted), _tls), _engine, _logger, _session);
         RunConnectionDetached(std::move(connection), &_logger, _admission);

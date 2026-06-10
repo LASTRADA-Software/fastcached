@@ -6,6 +6,9 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
+#if defined(FC_TLS_ENABLED)
+    #include <FastCache/Net/TlsContext.hpp>
+#endif
 #include <FastCache/Server/Server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -283,4 +286,53 @@ TEST_CASE("Server admits + tracks ConnectionsTotal", "[server][admission]")
     REQUIRE(server.AcceptedCount() == 2);
     REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsTotal) == 2);
     REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsAdmissionRejected) == 0);
+    // No TLS context passed -> the TLS-bind counters stay at zero.
+    REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsTotalTls) == 0);
+    REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsAdmissionRejectedTls) == 0);
 }
+
+#if defined(FC_TLS_ENABLED)
+TEST_CASE("Server: ConnectionsTotalTls / ConnectionsAdmissionRejectedTls bumped on a TLS bind", "[server][admission][tls]")
+{
+    // Finding #14: per-bind metrics labels. The IMetricsSink interface
+    // is counter-only (no labels); we instead expose paired counters so
+    // operators can attribute traffic to plaintext vs TLS. A Server
+    // constructed with a non-null TlsContext bumps both
+    // `ConnectionsTotal` AND `ConnectionsTotalTls`, and similarly for
+    // the admission-reject pair.
+    //
+    // Construct a real TlsContext from the testdata cert/key. The
+    // accepted InMemorySocket will be wrapped in a TlsSocket which can
+    // never complete a real handshake on top of an in-memory pipe, but
+    // the metric is bumped BEFORE the wrap; the connection itself just
+    // drops a few bytes into the void and exits when the client
+    // ShutdownWrite-closes.
+    auto const certPath = std::string { FASTCACHED_TESTDATA_DIR } + "/tls/server.crt";
+    auto const keyPath = std::string { FASTCACHED_TESTDATA_DIR } + "/tls/server.key";
+    auto tlsContextResult = FastCache::TlsContext::Create(certPath, keyPath);
+    REQUIRE(tlsContextResult.has_value());
+    auto tlsContext = std::move(*tlsContextResult);
+
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::NullLogger logger;
+    FastCache::InMemoryListener listener;
+    FastCache::CountingAdmissionControl admission { /*maxConcurrent*/ 4 };
+    FastCache::AtomicMetricsSink metrics;
+    FastCache::Server server { listener, engine, logger, &admission, &metrics, /*session*/ {}, tlsContext.get() };
+
+    auto c1 = listener.ConnectClient();
+    auto c2 = listener.ConnectClient();
+    c1->ShutdownWrite();
+    c2->ShutdownWrite();
+
+    listener.Close();
+    FastCache::SyncRun(server.Run());
+
+    REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsTotal) == 2);
+    REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsTotalTls) == 2);
+    REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsAdmissionRejected) == 0);
+    REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsAdmissionRejectedTls) == 0);
+}
+#endif

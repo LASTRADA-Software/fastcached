@@ -147,3 +147,35 @@ TEST_CASE("PubSubRegistry: SnapshotChannels / SnapshotPatterns enumerate live re
     REQUIRE(patterns.size() == 1);
     CHECK(patterns[0] == "p.*");
 }
+
+TEST_CASE("PubSubRegistry: HasAnySubscribers reflects live entry count lock-free", "[pubsub][fast-path]")
+{
+    // Steady state for a daemon with `notify-keyspace-events` configured but
+    // no subscriber yet must be HasAnySubscribers() == false, which lets
+    // KeyspaceNotifier::OnEvent skip the channel-format + lookup on every
+    // SET. Counter rises on each Subscribe/PSubscribe and falls back to zero
+    // through Unsubscribe/PUnsubscribe and UnsubscribeAll.
+    PubSubRegistry registry;
+    REQUIRE_FALSE(registry.HasAnySubscribers());
+
+    auto sub = std::make_shared<RecordingSubscriber>();
+    CHECK(registry.Subscribe(sub, "ch") == 1);
+    REQUIRE(registry.HasAnySubscribers());
+
+    CHECK(registry.PSubscribe(sub, "p.*") == 2);
+    REQUIRE(registry.HasAnySubscribers());
+
+    // Idempotent re-Subscribe of the same (sub, channel) must NOT double the
+    // counter — otherwise the entry-count would drift up over time.
+    CHECK(registry.Subscribe(sub, "ch") == 2);
+    REQUIRE(registry.HasAnySubscribers());
+
+    CHECK(registry.Unsubscribe(sub.get(), "ch") == 1);
+    REQUIRE(registry.HasAnySubscribers()); // pattern still present
+    CHECK(registry.PUnsubscribe(sub.get(), "p.*") == 0);
+    REQUIRE_FALSE(registry.HasAnySubscribers());
+
+    // UnsubscribeAll on an already-empty registry stays at zero (no underflow).
+    registry.UnsubscribeAll(sub.get());
+    REQUIRE_FALSE(registry.HasAnySubscribers());
+}

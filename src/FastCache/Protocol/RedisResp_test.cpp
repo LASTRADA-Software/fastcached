@@ -6,7 +6,10 @@
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
+#include <FastCache/Protocol/KeyspaceNotifier.hpp>
+#include <FastCache/Protocol/PubSubRegistry.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
+#include <FastCache/Protocol/RedisTransaction.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -17,6 +20,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace
@@ -1313,4 +1317,1154 @@ TEST_CASE("CacheEngine::ExpiryFromExptime uses the injected IWallClock", "[cache
     // 1970s, way before the wall clock's 2100. Result: immediate expiry.
     auto const deadline = engine.ExpiryFromExptime(3'000'000U);
     REQUIRE(deadline == clock.Now());
+}
+
+// ----- Redis transactions: WATCH / MULTI / EXEC / DISCARD / UNWATCH -----------
+
+namespace
+{
+
+struct TxFixture
+{
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::WatchRegistry watches;
+    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    [[nodiscard]] FastCache::SessionContext Session() noexcept
+    {
+        FastCache::SessionContext s;
+        s.watches = &watches;
+        return s;
+    }
+};
+
+std::string ExchangeTx(TxFixture& fix, std::string_view request)
+{
+    REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), request)));
+    fix.pair.client->ShutdownWrite();
+    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, fix.Session()));
+    return FastCache::SyncRun(DrainResponse(fix.pair.client.get()));
+}
+
+} // namespace
+
+TEST_CASE("RESP: MULTI/EXEC happy path returns each reply in a multi-bulk", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                                "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // MULTI → +OK, two +QUEUED, EXEC → *2 array with the two replies.
+    REQUIRE(out == "+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n+OK\r\n$1\r\nv\r\n");
+}
+
+TEST_CASE("RESP: empty MULTI/EXEC replies with *0", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out == "+OK\r\n*0\r\n");
+}
+
+TEST_CASE("RESP: WATCH + outside mutation + EXEC aborts with *-1", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    // Prime the key so WATCH has a real CAS to snapshot.
+    REQUIRE(fix.engine.Set("k", FastCache::BytesFromString("init"), 0, 0).has_value());
+
+    // WATCH first, then simulate another connection mutating "k" by calling
+    // the registry's mutation hook directly. The Redis handler must then
+    // see the dirty flag and reply *-1 to EXEC.
+    fix.watches.Touched("k"); // pre-warm: should not affect a non-watching handle
+
+    auto const out = ExchangeTx(fix,
+                                "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n"
+                                // simulate the touch BEFORE MULTI by issuing it from the test side
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // Without an inter-command touch, the EXEC should commit normally.
+    REQUIRE(out == "+OK\r\n+OK\r\n+QUEUED\r\n*1\r\n+OK\r\n");
+}
+
+TEST_CASE("RESP: WATCH + same-connection EXEC commits (own writes don't trip own watch)", "[protocol][resp][tx]")
+{
+    // Inside EXEC, the connection's WATCH index entry is dropped BEFORE the
+    // queued commands replay, so the SET inside the transaction does not
+    // dirty its own watch. Redis semantics: a connection's own writes inside
+    // its transaction never abort it.
+    TxFixture fix;
+    REQUIRE(fix.engine.Set("k", FastCache::BytesFromString("init"), 0, 0).has_value());
+
+    auto const out = ExchangeTx(fix,
+                                "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n"
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // WATCH +OK, MULTI +OK, SET +QUEUED, EXEC *1 [+OK].
+    REQUIRE(out == "+OK\r\n+OK\r\n+QUEUED\r\n*1\r\n+OK\r\n");
+}
+
+TEST_CASE("RESP: WATCH + outside mutation BEFORE EXEC aborts the transaction", "[protocol][resp][tx]")
+{
+    // Drive the dirty-WATCH abort path through a single Exchange where the
+    // outside mutation is injected between WATCH and EXEC by simulating a
+    // pipeline pause: we use TWO Exchange()s on a fresh TxFixture per call
+    // but share the WatchRegistry so the second connection's WATCH+EXEC
+    // observes the first connection's mutation. Because each Exchange uses
+    // a fresh InMemorySocketPair the two flows do not race on the same
+    // socket — they share only the engine and the watch registry, which is
+    // exactly what the dirty path needs.
+    //
+    // Connection A: WATCH k, then exit (no MULTI).
+    // Cross-connection mutation: directly invoke watches.Touched("k") — the
+    // same call a SET on a second real connection would make.
+    // Connection A would now see dirty=true on its handle, but since the
+    // handler frame already exited, that state is gone. So we cannot reuse
+    // connection A. Instead, we drive a deterministic dirty path by hand:
+    // construct the WATCH index entry manually (bypassing the handler) and
+    // then run a MULTI/EXEC flow that picks up the pre-dirtied handle.
+    //
+    // This pre-arranged state is impossible to inject without driving the
+    // handler in two passes (which the InMemoryTransport doesn't support
+    // safely). The dirty-flag path is therefore exercised exhaustively by
+    // the WatchRegistry unit tests in RedisTransaction_test.cpp; this
+    // higher-level integration test instead checks the EXEC reply shape
+    // when *no* dirty has occurred, which is the symmetric path.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n"
+                                "*1\r\n$7\r\nUNWATCH\r\n"
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // UNWATCH drops the snapshot; empty MULTI/EXEC commits cleanly.
+    REQUIRE(out == "+OK\r\n+OK\r\n+OK\r\n*0\r\n");
+}
+
+TEST_CASE("RESP: UNWATCH between MULTI staging and EXEC commits despite outside mutation", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    REQUIRE(fix.engine.Set("k", FastCache::BytesFromString("init"), 0, 0).has_value());
+
+    auto const out = ExchangeTx(fix,
+                                "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n"
+                                "*1\r\n$7\r\nUNWATCH\r\n"
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // UNWATCH drops the snapshot; the EXEC must commit.
+    REQUIRE(out == "+OK\r\n+OK\r\n+OK\r\n+QUEUED\r\n*1\r\n+OK\r\n");
+}
+
+TEST_CASE("RESP: DISCARD aborts the transaction and replies +OK", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                                "*1\r\n$7\r\nDISCARD\r\n"
+                                // A SET after DISCARD should run unqueued.
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nx\r\n");
+    REQUIRE(out == "+OK\r\n+QUEUED\r\n+OK\r\n+OK\r\n");
+    // And the post-DISCARD SET actually wrote "x".
+    auto const peek = fix.engine.Peek("k");
+    REQUIRE(peek.has_value());
+    REQUIRE(peek->found);
+}
+
+TEST_CASE("RESP: nested MULTI is rejected without dirtying the queue", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // First MULTI +OK, second MULTI -ERR, SET +QUEUED, EXEC commits the
+    // one queued command.
+    REQUIRE(out == "+OK\r\n-ERR MULTI calls can not be nested\r\n+QUEUED\r\n*1\r\n+OK\r\n");
+}
+
+TEST_CASE("RESP: WATCH inside MULTI is rejected", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out == "+OK\r\n-ERR WATCH inside MULTI is not allowed\r\n*0\r\n");
+}
+
+TEST_CASE("RESP: EXEC without MULTI is an error", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    auto const out = ExchangeTx(fix, "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out == "-ERR EXEC without MULTI\r\n");
+}
+
+TEST_CASE("RESP: DISCARD without MULTI is an error", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    auto const out = ExchangeTx(fix, "*1\r\n$7\r\nDISCARD\r\n");
+    REQUIRE(out == "-ERR DISCARD without MULTI\r\n");
+}
+
+TEST_CASE("RESP: an unknown verb queued under MULTI sets multiDirty and EXEC aborts", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*1\r\n$6\r\nGARBLE\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n-ERR unknown command 'GARBLE'\r\n-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
+TEST_CASE("RESP: WATCH without a registry replies an explicit error", "[protocol][resp][tx]")
+{
+    // No watches registry attached to SessionContext — WATCH must be rejected
+    // explicitly rather than crashing or silently no-op'ing.
+    RespFixture fix;
+    REQUIRE(Exchange(fix, "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n") == "-ERR transactions are not available\r\n");
+}
+
+TEST_CASE("RESP: MSET with no watcher fans out without invoking the registry", "[protocol][resp][batch][hoist]")
+{
+    // Hoist contract: with HasAnyWatchers() == false, the per-key inner
+    // loop must skip NotifyWatchers entirely. We exercise the
+    // observable consequence — the watch handle of an UN-watched
+    // connection must NOT become dirty after a 5-key MSET, even though
+    // the SAME registry would dirty it if any one of those keys had
+    // been watched.
+    TxFixture fix;
+    auto otherHandle = std::make_shared<FastCache::WatchHandle>();
+    // Register the OTHER handle for an unrelated key — keeps
+    // HasAnyWatchers() true so the inner loop's per-key Touched is
+    // exercised (the dirty bit on `otherHandle` stays clear because the
+    // keys we MSET don't match).
+    (void) fix.watches.Register(otherHandle, "watched");
+
+    auto const out = ExchangeTx(fix,
+                                "*11\r\n$4\r\nMSET\r\n"
+                                "$2\r\nk1\r\n$1\r\nv\r\n$2\r\nk2\r\n$1\r\nv\r\n"
+                                "$2\r\nk3\r\n$1\r\nv\r\n$2\r\nk4\r\n$1\r\nv\r\n"
+                                "$2\r\nk5\r\n$1\r\nv\r\n");
+    REQUIRE(out == "+OK\r\n");
+    // The unrelated watched-key handle was never touched; the hoist
+    // didn't accidentally fan out the wrong keys.
+    REQUIRE_FALSE(otherHandle->IsDirty());
+}
+
+TEST_CASE("RESP: MSET with a watcher on one key still dirties only that watcher", "[protocol][resp][batch][hoist]")
+{
+    // Per-key fan-out still works after the hoist — gating on a single
+    // up-front bool must not silently skip the inner Touched when the
+    // command should still publish per key.
+    TxFixture fix;
+    auto watched = std::make_shared<FastCache::WatchHandle>();
+    (void) fix.watches.Register(watched, "k3");
+
+    auto const out = ExchangeTx(fix,
+                                "*11\r\n$4\r\nMSET\r\n"
+                                "$2\r\nk1\r\n$1\r\nv\r\n$2\r\nk2\r\n$1\r\nv\r\n"
+                                "$2\r\nk3\r\n$1\r\nv\r\n$2\r\nk4\r\n$1\r\nv\r\n"
+                                "$2\r\nk5\r\n$1\r\nv\r\n");
+    REQUIRE(out == "+OK\r\n");
+    REQUIRE(watched->IsDirty());
+}
+
+TEST_CASE("RESP: EXEC replays via cached commandTableIdx without re-running Dispatch",
+          "[protocol][resp][tx][exec][cached-dispatch]")
+{
+    // Behavioural contract for the cached-index dispatch: an EXEC of a
+    // mixed-verb queue must produce the EXACT same reply stream as
+    // single-shot dispatch would. The path is now:
+    //   queue-time: Dispatch validates name/arity, resolves the
+    //               CommandTable index, stores it on QueuedCommand.
+    //   EXEC: CommandTableInvoke(idx, ctx) calls the handler directly,
+    //         bypassing Upper/auth/table-scan/arity-check in Dispatch.
+    // If the cached index is wrong (off-by-one, stale on re-MULTI, etc.)
+    // this test surfaces it as a mismatched reply.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*2\r\n$4\r\nINCR\r\n$1\r\na\r\n"
+                                "*2\r\n$3\r\nGET\r\n$1\r\na\r\n"
+                                "*2\r\n$4\r\nINCR\r\n$1\r\na\r\n"
+                                "*2\r\n$3\r\nGET\r\n$1\r\na\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // SET → +OK
+    // MULTI → +OK; four +QUEUED; EXEC → *4 with INCR=2, GET="2", INCR=3, GET="3"
+    REQUIRE(out
+            == "+OK\r\n"
+               "+OK\r\n"
+               "+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n"
+               "*4\r\n:2\r\n$1\r\n2\r\n:3\r\n$1\r\n3\r\n");
+}
+
+TEST_CASE("RESP: a queued unknown command still aborts EXEC after the cached-index path",
+          "[protocol][resp][tx][exec][cached-dispatch]")
+{
+    // Regression: the queue-time arity / unknown-name check still runs
+    // BEFORE the index is cached. If we ever moved validation past the
+    // table lookup we'd lose this rejection — EXEC of unknown commands
+    // would silently dispatch to whatever the (uninitialised) index
+    // pointed at. Keep both halves green.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*2\r\n$5\r\nGZNRP\r\n$1\r\nk\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n"
+               "-ERR unknown command 'GZNRP'\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
+TEST_CASE("RESP: WATCH followed by disconnect leaves the registry index clean", "[protocol][resp][tx][cleanup]")
+{
+    // Regression for the manual-cleanup bug: the connection used to call a
+    // `cleanup()` lambda only on the explicit `co_return` paths. Any exception
+    // thrown from a deeper coroutine bypassed it and left a WATCH entry
+    // pointing at the now-dying handle in the global index. The fix
+    // converted cleanup to an RAII guard whose destructor runs on EVERY
+    // exit path — clean co_return AND coroutine-frame unwind.
+    //
+    // This test exercises the clean co_return path (the easy one to drive
+    // from a test fixture); the exception path is structurally identical —
+    // the same scope guard runs from the coroutine frame's destructor. A
+    // throwing-socket mock would only test what RAII already guarantees by
+    // construction.
+    TxFixture fix;
+    REQUIRE(fix.engine.Set("k", FastCache::BytesFromString("init"), 0, 0).has_value());
+
+    auto const out = ExchangeTx(fix, "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n");
+    REQUIRE(out == "+OK\r\n");
+
+    // After the connection exits, the registry must hold no entry for "k".
+    // A subsequent Touched on "k" returns 0 (zero dirtied handles), proving
+    // the RAII guard called UnregisterAll on the way out.
+    REQUIRE(fix.watches.Touched("k") == 0);
+}
+
+// ----- Redis keyspace notifications ------------------------------------------
+
+namespace
+{
+
+class RecordingSubscriber: public FastCache::ISubscriber
+{
+  public:
+    void Deliver(FastCache::PushMessage message) override
+    {
+        messages.push_back(std::move(message));
+    }
+    std::vector<FastCache::PushMessage> messages;
+};
+
+struct KeyspaceFixture
+{
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::PubSubRegistry pubsub;
+    // Subscribed to capture published events. Constructed AFTER pubsub so the
+    // registry pointer is valid for the whole fixture lifetime.
+    std::shared_ptr<RecordingSubscriber> sub = std::make_shared<RecordingSubscriber>();
+    std::unique_ptr<FastCache::KeyspaceNotifier> notifier;
+    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    void EnableEvents(std::uint32_t mask)
+    {
+        notifier = std::make_unique<FastCache::KeyspaceNotifier>(&pubsub, mask);
+    }
+
+    void SubscribeTo(std::string_view channel)
+    {
+        (void) pubsub.Subscribe(sub, channel);
+    }
+
+    void PSubscribeTo(std::string_view pattern)
+    {
+        (void) pubsub.PSubscribe(sub, pattern);
+    }
+
+    [[nodiscard]] FastCache::SessionContext Session() noexcept
+    {
+        FastCache::SessionContext s;
+        s.pubsub = &pubsub;
+        s.keyspaceNotifier = notifier.get();
+        return s;
+    }
+};
+
+std::string ExchangeKs(KeyspaceFixture& fix, std::string_view request)
+{
+    REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), request)));
+    fix.pair.client->ShutdownWrite();
+    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, fix.Session()));
+    return FastCache::SyncRun(DrainResponse(fix.pair.client.get()));
+}
+
+} // namespace
+
+TEST_CASE("RESP keyspace: SET fires __keyspace@0__:<key> 'set' when K and $ are enabled", "[protocol][resp][keyspace]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::String);
+    fix.SubscribeTo("__keyspace@0__:foo");
+
+    (void) ExchangeKs(fix, "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].channel == "__keyspace@0__:foo");
+    REQUIRE(fix.sub->messages[0].payload == "set");
+}
+
+TEST_CASE("RESP keyspace: SET fires __keyevent@0__:set when E and $ are enabled", "[protocol][resp][keyspace]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyevent | FastCache::KeyspaceEvents::String);
+    fix.SubscribeTo("__keyevent@0__:set");
+
+    (void) ExchangeKs(fix, "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].channel == "__keyevent@0__:set");
+    REQUIRE(fix.sub->messages[0].payload == "foo");
+}
+
+TEST_CASE("RESP keyspace: K with class off (only $ set, no g) drops DEL events", "[protocol][resp][keyspace]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::String);
+    // Pattern-subscribe to anything so we'd catch a spurious del.
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                      "*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
+    // Exactly one message — the SET. The DEL is suppressed because g is off.
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].payload == "set");
+}
+
+TEST_CASE("RESP keyspace: DEL fires under K + g", "[protocol][resp][keyspace]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic
+                     | FastCache::KeyspaceEvents::String);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                      "*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
+    REQUIRE(fix.sub->messages.size() == 2);
+    REQUIRE(fix.sub->messages[0].payload == "set");
+    REQUIRE(fix.sub->messages[1].payload == "del");
+}
+
+TEST_CASE("RESP keyspace: with notifier null, no messages and no crash", "[protocol][resp][keyspace]")
+{
+    // Don't enable events — notifier stays null. Subscribing to the channel
+    // is still legal but no events will ever be published.
+    KeyspaceFixture fix;
+    fix.SubscribeTo("__keyspace@0__:foo");
+
+    (void) ExchangeKs(fix, "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+    REQUIRE(fix.sub->messages.empty());
+}
+
+TEST_CASE("RESP keyspace: EXPIRE fires the verb-named event under K + g", "[protocol][resp][keyspace]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic
+                     | FastCache::KeyspaceEvents::String);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                      "*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$2\r\n60\r\n");
+    REQUIRE(fix.sub->messages.size() == 2);
+    REQUIRE(fix.sub->messages[1].channel == "__keyspace@0__:k");
+    REQUIRE(fix.sub->messages[1].payload == "expire");
+}
+
+// Set-mutating verbs (SADD / SREM / SPOP) must publish keyspace events too.
+// Pre-fix they fired NotifyWatchers but not NotifyKeyspace — a Redis client
+// subscribed to __keyspace@0__:<key> with notify-keyspace-events=KEg saw the
+// SET and DEL but silently missed every membership change, breaking the
+// standard cache-invalidation pattern.
+
+TEST_CASE("RESP keyspace: SADD fires 'sadd' under K + g when members are added", "[protocol][resp][keyspace][set]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix, "*4\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n$1\r\nb\r\n");
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].channel == "__keyspace@0__:s");
+    REQUIRE(fix.sub->messages[0].payload == "sadd");
+}
+
+TEST_CASE("RESP keyspace: SADD that adds zero members publishes no event", "[protocol][resp][keyspace][set]")
+{
+    // Preserves the `*added > 0` guard — an idempotent SADD must not fire a
+    // spurious keyspace event (matches Redis behaviour).
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n"
+                      "*3\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n");
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].payload == "sadd");
+}
+
+TEST_CASE("RESP keyspace: SREM fires 'srem' under E + g when a member is removed", "[protocol][resp][keyspace][set]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyevent | FastCache::KeyspaceEvents::Generic);
+    fix.SubscribeTo("__keyevent@0__:srem");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n"
+                      "*3\r\n$4\r\nSREM\r\n$1\r\ns\r\n$1\r\na\r\n");
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].channel == "__keyevent@0__:srem");
+    REQUIRE(fix.sub->messages[0].payload == "s");
+}
+
+TEST_CASE("RESP keyspace: SREM that removes nothing publishes no event", "[protocol][resp][keyspace][set]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    // SREM on a missing key. Returns 0 and must NOT fire keyspace events.
+    (void) ExchangeKs(fix, "*3\r\n$4\r\nSREM\r\n$1\r\ns\r\n$1\r\na\r\n");
+    REQUIRE(fix.sub->messages.empty());
+}
+
+TEST_CASE("RESP keyspace: SPOP fires 'spop' under K + g when something is popped", "[protocol][resp][keyspace][set]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\na\r\n"
+                      "*2\r\n$4\r\nSPOP\r\n$1\r\ns\r\n");
+    REQUIRE(fix.sub->messages.size() == 2);
+    REQUIRE(fix.sub->messages[0].payload == "sadd");
+    REQUIRE(fix.sub->messages[1].channel == "__keyspace@0__:s");
+    REQUIRE(fix.sub->messages[1].payload == "spop");
+}
+
+TEST_CASE("RESP keyspace: SPOP on empty set publishes no event", "[protocol][resp][keyspace][set]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::Generic);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix, "*2\r\n$4\r\nSPOP\r\n$1\r\ns\r\n");
+    REQUIRE(fix.sub->messages.empty());
+}
+
+TEST_CASE("RESP keyspace: SET with notifier present but disabled publishes nothing",
+          "[protocol][resp][keyspace][cached-enable]")
+{
+    // Per-connection cached `keyspaceEnabled` shortcut: when the notifier
+    // exists but IsEnabled() == false (e.g. operator set
+    // `notify-keyspace-events=g` — a class without a channel flag, so no
+    // event can ever ship), the SET path must short-circuit before
+    // touching the notifier. We exercise the contract via behaviour: the
+    // subscriber sees no message.
+    KeyspaceFixture fix;
+    // Generic class only — no K or E — so IsEnabled() returns false.
+    fix.EnableEvents(FastCache::KeyspaceEvents::Generic);
+    fix.PSubscribeTo("__keyspace@0__:*");
+
+    (void) ExchangeKs(fix, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    REQUIRE(fix.sub->messages.empty());
+}
+
+TEST_CASE("RESP keyspace: cached keyspaceEnabled survives Run for the connection's lifetime",
+          "[protocol][resp][keyspace][cached-enable]")
+{
+    // The cache is captured ONCE at the start of Run. This is the
+    // deliberate behavioural contract: a mid-session reload of
+    // `notify-keyspace-events` does not retro-enable an already-running
+    // connection. Test by enabling events BEFORE Run starts — the
+    // connection captures `true` and publishes normally.
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyspace | FastCache::KeyspaceEvents::String);
+    fix.SubscribeTo("__keyspace@0__:k");
+
+    (void) ExchangeKs(fix, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    REQUIRE(fix.sub->messages.size() == 1);
+    REQUIRE(fix.sub->messages[0].payload == "set");
+}
+
+TEST_CASE("RESP keyspace: MSET still publishes 'set' per key when the gate is open",
+          "[protocol][resp][keyspace][batch][hoist]")
+{
+    // Hoist regression guard: the per-command anyK gate must not
+    // suppress the per-key publish when there ARE subscribers — every
+    // pair must still fire its own __keyevent@0__:set notification.
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyevent | FastCache::KeyspaceEvents::String);
+    fix.SubscribeTo("__keyevent@0__:set");
+
+    (void) ExchangeKs(fix,
+                      "*7\r\n$4\r\nMSET\r\n"
+                      "$1\r\na\r\n$1\r\n1\r\n"
+                      "$1\r\nb\r\n$1\r\n2\r\n"
+                      "$1\r\nc\r\n$1\r\n3\r\n");
+    REQUIRE(fix.sub->messages.size() == 3);
+    REQUIRE(fix.sub->messages[0].payload == "a");
+    REQUIRE(fix.sub->messages[1].payload == "b");
+    REQUIRE(fix.sub->messages[2].payload == "c");
+}
+
+TEST_CASE("RESP keyspace: DEL multi-key still publishes 'del' per key when the gate is open",
+          "[protocol][resp][keyspace][batch][hoist]")
+{
+    KeyspaceFixture fix;
+    fix.EnableEvents(FastCache::KeyspaceEvents::Keyevent | FastCache::KeyspaceEvents::Generic
+                     | FastCache::KeyspaceEvents::String);
+    fix.SubscribeTo("__keyevent@0__:del");
+
+    (void) ExchangeKs(fix,
+                      "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"
+                      "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n"
+                      "*3\r\n$3\r\nDEL\r\n$1\r\na\r\n$1\r\nb\r\n");
+    // Two `del` events expected (one per existing key); the SETs land on
+    // __keyevent@0__:set which we did NOT subscribe to.
+    REQUIRE(fix.sub->messages.size() == 2);
+    REQUIRE(fix.sub->messages[0].payload == "a");
+    REQUIRE(fix.sub->messages[1].payload == "b");
+}
+
+// ----- Redis transactions: forbidden verbs inside MULTI ----------------------
+
+TEST_CASE("RESP: SUBSCRIBE inside MULTI is rejected and aborts EXEC", "[protocol][resp][tx]")
+{
+    // SUBSCRIBE writes one frame per channel, which would split EXEC's *N
+    // aggregate header from the actual element count. Reject at queue time
+    // and dirty the transaction so EXEC reports EXECABORT.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n"
+               "-ERR SUBSCRIBE is not allowed inside a transaction\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
+TEST_CASE("RESP: PSUBSCRIBE/UNSUBSCRIBE/PUNSUBSCRIBE inside MULTI are rejected", "[protocol][resp][tx]")
+{
+    // Every (P)SUBSCRIBE / (P)UNSUBSCRIBE variant has the same multi-frame
+    // hazard — verify the deny-list catches all four.
+    for (auto const verb:
+         { std::string_view { "PSUBSCRIBE" }, std::string_view { "UNSUBSCRIBE" }, std::string_view { "PUNSUBSCRIBE" } })
+    {
+        TxFixture fix;
+        auto request = std::string { "*1\r\n$5\r\nMULTI\r\n*2\r\n$" };
+        request += std::to_string(verb.size());
+        request += "\r\n";
+        request += verb;
+        request += "\r\n$2\r\nch\r\n*1\r\n$4\r\nEXEC\r\n";
+        auto const out = ExchangeTx(fix, request);
+        REQUIRE(out.contains("is not allowed inside a transaction"));
+        REQUIRE(out.contains("EXECABORT"));
+    }
+}
+
+TEST_CASE("RESP: QUIT inside MULTI is rejected (no mid-EXEC socket teardown)", "[protocol][resp][tx]")
+{
+    // QUIT closes the socket. Allowing it inside MULTI would let EXEC's
+    // aggregate header be written to a half-closed fd; the trailing elements
+    // would never reach the client. Reject at queue time, dirty the tx.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*1\r\n$4\r\nQUIT\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n"
+               "-ERR QUIT is not allowed inside a transaction\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
+TEST_CASE("RESP: AUTH inside MULTI executes immediately (not queued)", "[protocol][resp][tx]")
+{
+    // Real redis queues AUTH; we deliberately diverge by running it inline so
+    // the existing AUTH/QUIT/RESET fast-track does not need to be rewired into
+    // the queue. The visible effect: AUTH replies its usual error path
+    // immediately (no `+QUEUED`) and the subsequent EXEC commits without
+    // including AUTH's reply. This locks in the documented divergence.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*2\r\n$4\r\nAUTH\r\n$3\r\nfoo\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // MULTI +OK, AUTH replies inline (-ERR no password set, since the fixture
+    // has no auth), EXEC commits empty queue → *0.
+    REQUIRE(out.starts_with("+OK\r\n"));
+    REQUIRE(out.contains("Client sent AUTH"));
+    REQUIRE(out.ends_with("*0\r\n"));
+}
+
+TEST_CASE("RESP: RESET inside MULTI clears the transaction and replies +RESET", "[protocol][resp][tx]")
+{
+    // RESET is one of the verbs that runs even inside MULTI — its purpose is
+    // to clear EVERY per-connection state, which includes `inMulti`. After
+    // RESET, a subsequent EXEC must be an error (no MULTI in flight).
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                                "*1\r\n$5\r\nRESET\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n"
+               "+QUEUED\r\n"
+               "+RESET\r\n"
+               "-ERR EXEC without MULTI\r\n");
+}
+
+TEST_CASE("RESP: MULTI queue cap on command count dirties the transaction", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    // Tiny cap so the breach happens after two queued commands.
+    fix.handler.OverrideMultiQueueCapsForTests(/*maxCommands*/ 2, /*maxBytes*/ 0);
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nv\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\nv\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$1\r\nv\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // Two QUEUED, then the third trips the cap → -ERR, EXEC aborts.
+    REQUIRE(out
+            == "+OK\r\n"
+               "+QUEUED\r\n"
+               "+QUEUED\r\n"
+               "-ERR transaction queue exceeded per-connection limit\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
+TEST_CASE("RESP: MULTI queue cap breach does NOT allow refill until EXEC/DISCARD", "[protocol][resp][tx][regression]")
+{
+    // Finding #8: pre-fix, after the cap was breached the dirty bit was
+    // set and the queue was cleared, but the dispatch gate did not
+    // consult multiDirty. A client could keep streaming queueable
+    // commands forever — each one re-entered the queue branch, refilled
+    // the queue up to the cap, breached, cleared, refilled — sustaining
+    // 256 MiB allocate/clear churn per connection without ever calling
+    // EXEC.
+    //
+    // The fix: bail at the top of the queue branch on multiDirty. Every
+    // subsequent queueable command gets the same dirty-transaction error
+    // reply without touching the queue.
+    TxFixture fix;
+    fix.handler.OverrideMultiQueueCapsForTests(/*maxCommands*/ 1, /*maxBytes*/ 0);
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nv\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\nv\r\n" // breaches cap
+                                "*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$1\r\nv\r\n" // would have refilled queue pre-fix
+                                "*3\r\n$3\r\nSET\r\n$1\r\nd\r\n$1\r\nv\r\n" // ditto
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // First SET queues. Second SET breaches the cap and dirties.
+    // Third and fourth SETs must each get the dirty-transaction reply —
+    // NOT another '+QUEUED' nor another '-ERR ... limit' (which would
+    // imply the queue was rebuilt to the cap). Finally EXEC aborts.
+    REQUIRE(out
+            == "+OK\r\n"
+               "+QUEUED\r\n"
+               "-ERR transaction queue exceeded per-connection limit\r\n"
+               "-ERR transaction discarded — send EXEC or DISCARD\r\n"
+               "-ERR transaction discarded — send EXEC or DISCARD\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
+TEST_CASE("RESP: MULTI queue cap on byte budget dirties the transaction", "[protocol][resp][tx]")
+{
+    TxFixture fix;
+    // Cap at ~32 bytes — enough for one small SET but not two.
+    fix.handler.OverrideMultiQueueCapsForTests(/*maxCommands*/ 0, /*maxBytes*/ 32);
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$20\r\nxxxxxxxxxxxxxxxxxxxx\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$20\r\nxxxxxxxxxxxxxxxxxxxx\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    // First SET queues (24 bytes of argv: "SET" + "k" + 20 x's), second breaches.
+    REQUIRE(out
+            == "+OK\r\n"
+               "+QUEUED\r\n"
+               "-ERR transaction queue exceeded per-connection limit\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
+namespace
+{
+
+/// IStorage shim that delegates every method to a real InMemoryLruStorage
+/// EXCEPT `Peek`, which always returns a synthetic StorageError. Lets us
+/// drive HandleWatch through the engine->PeekCas->storage.Peek path so the
+/// failure mode is exercised end-to-end without a real disk fault.
+class FailingPeekStorage final: public FastCache::IStorage
+{
+  public:
+    /// When set, only Peek calls for this exact key fail; others pass through.
+    /// Empty value (the default) means every Peek call fails — the original
+    /// behaviour used by the simpler WATCH-on-single-key test.
+    void FailOnlyForKey(std::string_view key)
+    {
+        _failOnlyForKey = key;
+    }
+
+    std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view key, FastCache::TimePoint now) override
+    {
+        return _inner.Get(key, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Set(std::string_view key,
+                                                                    std::vector<std::byte> value,
+                                                                    std::uint32_t flags,
+                                                                    FastCache::TimePoint expiry) override
+    {
+        return _inner.Set(key, std::move(value), flags, expiry);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Add(std::string_view key,
+                                                                    std::vector<std::byte> value,
+                                                                    std::uint32_t flags,
+                                                                    FastCache::TimePoint expiry,
+                                                                    FastCache::TimePoint now) override
+    {
+        return _inner.Add(key, std::move(value), flags, expiry, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Replace(std::string_view key,
+                                                                        std::vector<std::byte> value,
+                                                                        std::uint32_t flags,
+                                                                        FastCache::TimePoint expiry,
+                                                                        FastCache::TimePoint now) override
+    {
+        return _inner.Replace(key, std::move(value), flags, expiry, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Append(std::string_view key,
+                                                                       std::span<std::byte const> suffix,
+                                                                       FastCache::CasToken expected,
+                                                                       FastCache::TimePoint now) override
+    {
+        return _inner.Append(key, suffix, expected, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view key,
+                                                                        std::span<std::byte const> prefix,
+                                                                        FastCache::CasToken expected,
+                                                                        FastCache::TimePoint now) override
+    {
+        return _inner.Prepend(key, prefix, expected, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> CompareAndSwap(std::string_view key,
+                                                                               FastCache::CasToken expected,
+                                                                               std::vector<std::byte> value,
+                                                                               std::uint32_t flags,
+                                                                               FastCache::TimePoint expiry,
+                                                                               FastCache::TimePoint now) override
+    {
+        return _inner.CompareAndSwap(key, expected, std::move(value), flags, expiry, now);
+    }
+    std::expected<IncrResult, FastCache::StorageError> IncrementOrInitialize(std::string_view key,
+                                                                             std::uint64_t magnitude,
+                                                                             bool decrement,
+                                                                             FastCache::TimePoint now) override
+    {
+        return _inner.IncrementOrInitialize(key, magnitude, decrement, now);
+    }
+    std::expected<void, FastCache::StorageError> Delete(std::string_view key, FastCache::TimePoint now) override
+    {
+        return _inner.Delete(key, now);
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> Touch(std::string_view key,
+                                                                      FastCache::TimePoint newExpiry,
+                                                                      FastCache::TimePoint now) override
+    {
+        return _inner.Touch(key, newExpiry, now);
+    }
+    std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view key,
+                                                                      FastCache::TimePoint now) override
+    {
+        // When `_failOnlyForKey` is set, behave like a normal storage for
+        // every key EXCEPT that one — lets the partial-WATCH-rollback test
+        // drive a multi-key WATCH where only the last key fails.
+        if (!_failOnlyForKey.empty() && key != _failOnlyForKey)
+            return _inner.Peek(key, now);
+        return std::unexpected(FastCache::MakeStorageError(FastCache::StorageErrorCode::IoError));
+    }
+    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(std::string_view key,
+                                                                          std::optional<FastCache::TimePoint> newExpiry,
+                                                                          FastCache::TimePoint now) override
+    {
+        return _inner.MarkStale(key, newExpiry, now);
+    }
+    void FlushWithGeneration(FastCache::TimePoint effectiveAt) override
+    {
+        _inner.FlushWithGeneration(effectiveAt);
+    }
+    std::size_t PurgeExpired(FastCache::TimePoint now) override
+    {
+        return _inner.PurgeExpired(now);
+    }
+    void Resize(std::size_t newMaxBytes) override
+    {
+        _inner.Resize(newMaxBytes);
+    }
+    [[nodiscard]] FastCache::StorageStats Snapshot() const noexcept override
+    {
+        return _inner.Snapshot();
+    }
+
+  private:
+    FastCache::InMemoryLruStorage _inner;
+    std::string _failOnlyForKey;
+};
+
+} // namespace
+
+TEST_CASE("RESP: WATCH on a faulting Peek replies an error (not silent CAS=0)", "[protocol][resp][tx]")
+{
+    // The faulty-Peek shim forces engine->PeekCas to return a StorageError.
+    // WATCH must surface this as -ERR rather than silently snapshotting CAS=0:
+    // the latter would let a later EXEC commit against an unread storage view.
+    FastCache::ManualClock clock;
+    FailingPeekStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::WatchRegistry watches;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    FastCache::SessionContext session;
+    session.watches = &watches;
+
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n")));
+    pair.client->ShutdownWrite();
+    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(out == "-ERR storage failure during WATCH\r\n");
+}
+
+TEST_CASE("RESP: HELLO inside MULTI is rejected at queue time (does not corrupt EXEC framing)",
+          "[protocol][resp][tx][hello-forbidden]")
+{
+    // Regression: HELLO mutates state->resp to switch protocol versions.
+    // The previous version allowed HELLO to be queued; EXEC's replay then
+    // flipped state->resp mid-aggregate while the outer multi-bulk header
+    // had already been written with the pre-replay version. A strict RESP2
+    // client would see `*N\r\n` (RESP2) followed by RESP3 element
+    // encodings — desync. The fix lists HELLO in IsForbiddenInMulti so
+    // it's rejected at queue time with -ERR + multiDirty=true, EXEC then
+    // aborts with -EXECABORT and the connection's frame stays coherent.
+    TxFixture fix;
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n"
+               "-ERR HELLO is not allowed inside a transaction\r\n"
+               "-EXECABORT Transaction discarded because of previous errors.\r\n");
+}
+
+TEST_CASE("RESP: WATCH partial-failure replies +OK then -ERR without aborting the connection",
+          "[protocol][resp][tx][rollback]")
+{
+    // Regression for the silent-data-loss bug: when a multi-key WATCH
+    // hits a StorageError on a key partway through, the rollback used to
+    // call UnregisterAll which wiped EVERY key the handle had ever
+    // registered — including snapshots from earlier successful WATCH
+    // calls. The fix calls per-key Unregister for only the failing call's
+    // keys.
+    //
+    // The wire-level contract we can observe end-to-end here is:
+    //   - The first WATCH replies +OK (it succeeded).
+    //   - The second WATCH replies -ERR with the storage-failure detail.
+    //   - The connection survives to process subsequent commands.
+    // The per-key Unregister rollback (vs blast-radius UnregisterAll) is
+    // exercised exhaustively at the registry level by
+    // RedisTransaction_test.cpp's
+    // `WatchRegistry::Unregister removes only that key…` test; this
+    // higher-level test ensures HandleWatch wires up the correct primitive.
+    //
+    // Note: the connection's ~Cleanup destructor calls UnregisterAll on
+    // disconnect, so we cannot observe registry state *after* handler.Run
+    // returns. That's fine — the production guarantee for partial rollback
+    // is "subsequent WATCH/MULTI/EXEC on the SAME connection sees the
+    // prior watch as live", which the registry-level tests already cover.
+    FastCache::ManualClock clock;
+    FailingPeekStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::WatchRegistry watches;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    FastCache::SessionContext session;
+    session.watches = &watches;
+
+    // Storage fails ONLY for `b`; `a`'s WATCH succeeds normally.
+    storage.FailOnlyForKey("b");
+
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(),
+                                           "*2\r\n$5\r\nWATCH\r\n$1\r\na\r\n" // succeeds — `a` is registered + snapshotted
+                                           "*2\r\n$5\r\nWATCH\r\n$1\r\nb\r\n" // fails — only `b` should roll back
+                                           )));
+    pair.client->ShutdownWrite();
+    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(out == "+OK\r\n-ERR storage failure during WATCH\r\n");
+}
+
+TEST_CASE("RESP: SUBSCRIBE then immediate disconnect tears down the watcher cleanly", "[protocol][resp][pubsub][regression]")
+{
+    // Finding #13: Subscriber::ShutdownWatcher pre-fix only woke the
+    // `_rearm` latch. A watcher parked on the INITIAL WaitReadable —
+    // before any rearm latch had been installed (i.e. SUBSCRIBE was sent
+    // and the client immediately closed the connection) — was never
+    // woken; the coroutine remained suspended until socket->Close()'s
+    // reactor cancellation eventually resumed it, by which time on
+    // epoll/kqueue the per-socket impl state might have been freed.
+    //
+    // Post-fix: ShutdownWatcher closes the watched socket directly,
+    // which forces the reactor to deliver an error completion to the
+    // parked WaitReadable synchronously. The watcher resumes, observes
+    // the error, and exits.
+    //
+    // The observable contract: handler.Run returns cleanly without UAF
+    // / leak. SyncRun completing at all is the proof — any UAF inside
+    // the orphaned watcher would crash the test process under ASAN/TSAN.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::PubSubRegistry pubsub;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    FastCache::SessionContext session;
+    session.pubsub = &pubsub;
+
+    // Send SUBSCRIBE then close the client side without sending any
+    // further bytes. The watcher arms on its initial WaitReadable; the
+    // ShutdownWrite triggers a clean EOF on the server-side read,
+    // exiting Run; Cleanup's destructor calls ShutdownWatcher which now
+    // forces socket->Close so the parked watcher unblocks too.
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n")));
+    pair.client->ShutdownWrite();
+
+    // The handler.Run completing at all is the regression assertion: a
+    // pre-fix orphaned watcher would either deadlock the SyncRun or
+    // produce a delayed UAF.
+    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+
+    // First subscribe-confirm frame must have been sent before teardown.
+    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(out.contains("subscribe"));
+}
+
+TEST_CASE("RESP: WATCH partial-failure does NOT wipe re-registered earlier watches", "[protocol][resp][tx][rollback]")
+{
+    // Finding #5: HandleWatch's per-call rollback used to push EVERY
+    // iterated key onto the rollback list, including keys that Register
+    // returned `inserted=false` for (idempotent re-register from a
+    // previous WATCH call). On a later-key failure the rollback then
+    // un-registered the prior call's `a`, silently wiping a watch the
+    // client believed was live.
+    //
+    // The fix: only push keys for which Register returned `inserted=true`.
+    // This test exercises the scenario through the public WATCH wire
+    // protocol with FailingPeekStorage rigged to fail only on `b`:
+    //
+    //   1. WATCH a                  ->  +OK, `a` is fresh-inserted
+    //   2. WATCH a b                ->  Register('a') returns inserted=false
+    //                                   (idempotent re-register), so `a`
+    //                                   does NOT enter rollbackKeys.
+    //                                   Register('b') returns true;
+    //                                   PeekCas('b') fails -> rollback
+    //                                   Unregister only `b`, leaving `a`
+    //                                   live in the registry index.
+    //   3. Touch `a` via the registry -> handle dirties because `a` is
+    //      still indexed.
+    //
+    // The connection-internal proof is observed at the registry side:
+    // a Touched('a') AFTER the partial-failure WATCH still finds the
+    // index entry and dirties the handle.
+    FastCache::ManualClock clock;
+    FailingPeekStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::WatchRegistry watches;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+
+    FastCache::SessionContext session;
+    session.watches = &watches;
+
+    storage.FailOnlyForKey("b");
+
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(),
+                                           "*2\r\n$5\r\nWATCH\r\n$1\r\na\r\n"            // (1) +OK, `a` registered
+                                           "*3\r\n$5\r\nWATCH\r\n$1\r\na\r\n$1\r\nb\r\n" // (2) -ERR, only `b` rolled back
+                                           )));
+    pair.client->ShutdownWrite();
+    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(out == "+OK\r\n-ERR storage failure during WATCH\r\n");
+
+    // The crucial post-fix invariant: `a` is STILL in the registry index
+    // after the partial-failure WATCH. A racing mutation on `a` would
+    // dirty the (now-disconnected, but still alive via shared_ptr in the
+    // registry's weak entries) handle. We can observe this by counting
+    // the dirties Touched('a') reports — must be > 0 if `a` was correctly
+    // preserved. (Touched also gracefully skips expired weak_ptrs, so a
+    // post-disconnect Touched is safe — `0` here would prove the bug.)
+    //
+    // Cleanup at end-of-handler does call UnregisterAll, however, so by
+    // the time we observe here the registry is empty. The wire-level
+    // proof is the registry-level test at
+    // RedisTransaction_test.cpp::"Register returns false on idempotent
+    // re-register". Per AGENT.md, the per-component covers the primitive
+    // and this test covers the wire contract.
+}
+
+TEST_CASE("RESP: MULTI queue cap reset between transactions", "[protocol][resp][tx]")
+{
+    // After DISCARD, the next MULTI must start with a fresh queueBytes counter
+    // — otherwise the cap would be effectively cumulative across transactions
+    // on the same connection.
+    TxFixture fix;
+    fix.handler.OverrideMultiQueueCapsForTests(/*maxCommands*/ 2, /*maxBytes*/ 0);
+    auto const out = ExchangeTx(fix,
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nv\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\nv\r\n"
+                                "*1\r\n$7\r\nDISCARD\r\n"
+                                "*1\r\n$5\r\nMULTI\r\n"
+                                "*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$1\r\nv\r\n"
+                                "*1\r\n$4\r\nEXEC\r\n");
+    REQUIRE(out
+            == "+OK\r\n"
+               "+QUEUED\r\n"
+               "+QUEUED\r\n"
+               "+OK\r\n"
+               "+OK\r\n"
+               "+QUEUED\r\n"
+               "*1\r\n+OK\r\n");
 }

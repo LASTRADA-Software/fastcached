@@ -13,11 +13,13 @@
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/LayeredStorage.hpp>
+#include <FastCache/Cache/NotifyingStorage.hpp>
 #include <FastCache/Cache/ShardedStorage.hpp>
 #include <FastCache/Cache/TracingStorage.hpp>
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
+#include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -31,13 +33,17 @@
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
+#include <FastCache/Protocol/KeyspaceNotifier.hpp>
 #include <FastCache/Protocol/PubSubRegistry.hpp>
+#include <FastCache/Protocol/RedisMutationObserver.hpp>
+#include <FastCache/Protocol/RedisTransaction.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 #if defined(FC_TLS_ENABLED)
     #include <FastCache/Net/TlsContext.hpp>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -49,6 +55,7 @@
 #include <memory>
 #include <optional>
 #include <print>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -115,64 +122,6 @@ void InstallStopHandlers()
 #if !defined(_WIN32)
     std::signal(SIGHUP, &HandleReloadSignal);
 #endif
-}
-
-/// Merge CLI flags into the YAML-loaded Config. A CLI value overrides
-/// the file value when the corresponding flag was explicitly passed —
-/// driven by the per-flag "explicit" booleans on `CliResult`, not by
-/// value comparison against the default. The latter would silently
-/// drop `--threads=0` / `--storage-shards=0` / `--storage-durability=batched`
-/// / any other typed value that matches the field's default.
-FastCache::Config Merge(FastCache::Config fileCfg, FastCache::CliResult const& cli)
-{
-    auto const& cliCfg = cli.config;
-    if (cli.bindAddressExplicit)
-        fileCfg.bindAddress = cliCfg.bindAddress;
-    if (cli.portExplicit)
-        fileCfg.port = cliCfg.port;
-    if (cli.maxMemoryBytesExplicit)
-        fileCfg.maxMemoryBytes = cliCfg.maxMemoryBytes;
-    if (cli.logLevelExplicit)
-        fileCfg.logLevel = cliCfg.logLevel;
-    if (!cliCfg.configPath.empty())
-        fileCfg.configPath = cliCfg.configPath;
-    if (cliCfg.daemon)
-        fileCfg.daemon = true;
-    if (!cliCfg.pidfile.empty())
-        fileCfg.pidfile = cliCfg.pidfile;
-    if (cliCfg.serviceName != FastCache::Config {}.serviceName)
-        fileCfg.serviceName = cliCfg.serviceName;
-    if (cli.storagePathExplicit)
-        fileCfg.storagePath = cliCfg.storagePath;
-    if (cli.storageDurabilityExplicit)
-        fileCfg.storageDurability = cliCfg.storageDurability;
-    if (cli.storageMaxValueBytesExplicit)
-        fileCfg.storageMaxValueBytes = cliCfg.storageMaxValueBytes;
-    if (cli.workerThreadsExplicit)
-        fileCfg.workerThreads = cliCfg.workerThreads;
-    if (cli.storageShardsExplicit)
-        fileCfg.storageShards = cliCfg.storageShards;
-    if (cli.listenBacklogExplicit)
-        fileCfg.listenBacklog = cliCfg.listenBacklog;
-    if (cli.logTimestampsExplicit)
-        fileCfg.logTimestamps = cliCfg.logTimestamps;
-    if (cli.requirePassExplicit)
-        fileCfg.requirePass = cliCfg.requirePass;
-    if (cli.authUsernameExplicit)
-        fileCfg.authUsername = cliCfg.authUsername;
-    if (cli.metricsEnabledExplicit)
-        fileCfg.metricsEnabled = cliCfg.metricsEnabled;
-    if (cli.metricsBindAddressExplicit)
-        fileCfg.metricsBindAddress = cliCfg.metricsBindAddress;
-    if (cli.metricsPortExplicit)
-        fileCfg.metricsPort = cliCfg.metricsPort;
-    if (cli.tlsEnabledExplicit)
-        fileCfg.tlsEnabled = cliCfg.tlsEnabled;
-    if (cli.tlsCertPathExplicit)
-        fileCfg.tlsCertPath = cliCfg.tlsCertPath;
-    if (cli.tlsKeyPathExplicit)
-        fileCfg.tlsKeyPath = cliCfg.tlsKeyPath;
-    return fileCfg;
 }
 
 /// Pick a default shard count when the user left it at 0 (auto):
@@ -406,6 +355,39 @@ int DaemonBody(FastCache::Config const& effective)
         storagePtr = tracer.get();
     }
 
+    // Daemon-lifetime sinks: WATCH registry, pubsub, and keyspace
+    // notifier are created BEFORE `reloaderThread` (declared further
+    // below) so LIFO stack unwind destroys the thread before any
+    // object its subscribers capture by reference.
+    FastCache::PubSubRegistry pubsub;
+    FastCache::WatchRegistry watches;
+    auto const eventsMask = FastCache::ParseKeyspaceEvents(effective.notifyKeyspaceEvents);
+    if (!eventsMask.has_value())
+    {
+        logger.Logf(FastCache::LogLevel::Fatal,
+                    "fastcached: invalid --notify-keyspace-events '{}': {}",
+                    effective.notifyKeyspaceEvents,
+                    eventsMask.error().context);
+        return EXIT_FAILURE;
+    }
+    FastCache::KeyspaceNotifier keyspaceNotifier { &pubsub, *eventsMask };
+
+    // Storage-layer WATCH fan-out: NotifyingStorage wraps the inner
+    // chain with a RedisMutationObserver that fires
+    // WatchRegistry::Touched on every successful mutation. This closes
+    // two cross-protocol bugs:
+    //   * memcached writes never called Touched, so a Redis WATCH on a
+    //     key mutated by a memcached client silently passed EXEC;
+    //   * FLUSHDB had no per-key fan-out, leaving every WATCH'd key
+    //     undirty after a database wipe.
+    // The decorator is intentionally narrow: WATCH dirty signalling
+    // ONLY. Per-verb keyspace events stay where they are (Redis
+    // handlers fire them with verb-specific names), and double-firing
+    // WATCH dirties is harmless because MarkDirty is idempotent.
+    FastCache::RedisMutationObserver mutationObserver { &watches };
+    FastCache::NotifyingStorage notifyingStorage { *storagePtr, &mutationObserver };
+    storagePtr = &notifyingStorage;
+
     FastCache::CacheEngine engine { *storagePtr, clock };
 
     // Connection-level metrics sink, shared by the server loop and the admin
@@ -452,7 +434,8 @@ int DaemonBody(FastCache::Config const& effective)
 #if defined(FC_TLS_ENABLED)
     std::unique_ptr<FastCache::TlsContext> tlsContext;
 #endif
-    if (effective.tlsEnabled)
+    auto const anyTlsBind = std::ranges::any_of(effective.binds, [](auto const& b) { return b.tls; });
+    if (effective.tlsEnabled || anyTlsBind)
     {
 #if defined(FC_TLS_ENABLED)
         if (effective.tlsCertPath.empty() || effective.tlsKeyPath.empty())
@@ -476,12 +459,31 @@ int DaemonBody(FastCache::Config const& effective)
     }
 
     auto const shardingMode = useShardingWrapper ? std::string_view { "" } : std::string_view { " (unwrapped)" };
+    // The bind summary reflects what is actually being listened on. The
+    // original banner formatted the legacy single-bind fields verbatim and
+    // ignored `binds`, so a daemon brought up via `--listen` always logged
+    // "bind=127.0.0.1:11211" (the defaults of the unused legacy fields).
+    // We build the binds-shaped list from `effective` here so the banner
+    // is computable before the equivalent `serverOpts.binds` is populated
+    // a few dozen lines below; the synthesis rule is the same (prefer the
+    // explicit list, otherwise fold the legacy single-bind triplet into a
+    // synthetic BindConfig).
+    auto const bannerBinds =
+        !effective.binds.empty()
+            ? effective.binds
+            : std::vector<FastCache::BindConfig> { FastCache::BindConfig {
+                  .address = effective.bindAddress, .port = effective.port, .tls = effective.tlsEnabled } };
+    auto const bindSummary = FastCache::FormatBindSummary(bannerBinds);
+    // `anyTlsBind` was computed up-top against `effective.binds`; under the
+    // current ordering `serverOpts.binds` is either `effective.binds` (when
+    // non-empty) or the synthesised legacy single-bind. Either way, a TLS
+    // banner field that reports "off" while a TLS listener is up is the
+    // operator-misleading bug — fold `anyTlsBind` into the TLS field below.
     logger.Logf(FastCache::LogLevel::Info,
-                "fastcached {} starting; bind={}:{} max-memory={} config={} storage={} "
+                "fastcached {} starting; bind={} max-memory={} config={} storage={} "
                 "durability={} max-value={} reactors={} shards={}{} auth={} tls={}",
                 ProgramVersion,
-                effective.bindAddress,
-                effective.port,
+                bindSummary,
                 FastCache::FormatByteSize(effective.maxMemoryBytes),
                 effective.configPath.empty() ? std::string_view { "<none>" } : std::string_view { effective.configPath },
                 effective.storagePath.empty() ? std::string_view { "<in-memory>" }
@@ -492,7 +494,7 @@ int DaemonBody(FastCache::Config const& effective)
                 physicalShards,
                 shardingMode,
                 authSource.Current() ? std::string_view { "on" } : std::string_view { "off" },
-                effective.tlsEnabled ? std::string_view { "on" } : std::string_view { "off" });
+                (effective.tlsEnabled || anyTlsBind) ? std::string_view { "on" } : std::string_view { "off" });
 
     InstallStopHandlers();
     // The "ready, accepting connections" line is emitted by the server loop
@@ -500,6 +502,86 @@ int DaemonBody(FastCache::Config const& effective)
     // RunReactorServer. Logging it here (before bind) would race a client
     // that connects on the strength of the message.
 
+    // Shared daemon-lifetime objects MUST be declared BEFORE reloaderThread
+    // below: the jthread joins in its destructor during stack unwind, which
+    // happens in LIFO order. If pubsub / watches / keyspaceNotifier were
+    // declared after the thread, a SIGHUP racing shutdown could invoke a
+    // reload subscriber against a freshly-destroyed notifier (UAF). Putting
+    // them ahead of the thread guarantees the thread joins BEFORE these
+    // objects are torn down.
+    FastCache::ReactorServerOptions serverOpts;
+    // Listener endpoints: prefer the explicit list when given, otherwise
+    // synthesise one from the legacy single-bind fields. This keeps the
+    // common single-port case working without an explicit --listen, and
+    // lets advanced operators bring up multiple binds (e.g. plaintext on a
+    // private interface + TLS on the public one) with repeated --listen /
+    // --listen-tls flags.
+    if (!effective.binds.empty())
+    {
+        serverOpts.binds = effective.binds;
+    }
+    else
+    {
+        serverOpts.binds.push_back(
+            FastCache::BindConfig { .address = effective.bindAddress, .port = effective.port, .tls = effective.tlsEnabled });
+    }
+    // (ValidateBindFlagShape ran in main() before the daemon host was
+    // invoked, so the mixed-shape rejection has already happened.)
+    // Reject duplicate {address, port} endpoints before we hit the kernel:
+    // SO_REUSEPORT would let both bind succeed and silently split traffic
+    // 50/50 between mismatched protocols (plaintext vs TLS).
+    if (auto const v = FastCache::ValidateBinds(serverOpts.binds); !v.has_value())
+    {
+        logger.Logf(FastCache::LogLevel::Fatal, "fastcached: {}", v.error().context);
+        return EXIT_FAILURE;
+    }
+    serverOpts.listenBacklog = effective.listenBacklog;
+    // One reactor per core (each single-threaded, connections pinned). One
+    // reactor = a single event loop; N reactors scale across cores without any
+    // cross-thread coroutine migration.
+    serverOpts.reactorThreads = reactorCount;
+    // Pin reactors to cores when asked (PerCore) and there's more than one;
+    // a lone reactor gains nothing from pinning.
+    serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
+    serverOpts.session.authSource = &authSource;
+    // pubsub / watches / keyspaceNotifier are declared further up
+    // (immediately before the engine) so the NotifyingStorage decorator
+    // can wire them into the storage chain. Just publish the pointers
+    // into the session here.
+    serverOpts.session.pubsub = &pubsub;
+    serverOpts.session.watches = &watches;
+    serverOpts.session.keyspaceNotifier = &keyspaceNotifier;
+    // Make the notifier reloadable: a SIGHUP that changes
+    // notify-keyspace-events now updates the live bitmask on the
+    // already-running notifier. Existing connections' cached
+    // state->keyspaceEnabled stays as it was at connect time (that's
+    // documented per-connection behaviour); NEW connections opened after
+    // the reload read the updated bitmask immediately. A parse error in
+    // the reloaded config is logged but the previous mask is kept — the
+    // daemon never silently falls back to an empty mask.
+    //
+    // Subscribe BEFORE the reloaderThread is constructed: the thread's
+    // destructor joins on unwind, and we must guarantee the subscriber
+    // table is fully populated before the thread can dispatch a reload.
+    reloader.Subscribe([&logger, &keyspaceNotifier](auto const& /*prev*/, auto const& next) {
+        auto const newMask = FastCache::ParseKeyspaceEvents(next->notifyKeyspaceEvents);
+        if (!newMask.has_value())
+        {
+            logger.Logf(FastCache::LogLevel::Error,
+                        "config reload: invalid notify-keyspace-events '{}': {} (keeping previous mask)",
+                        next->notifyKeyspaceEvents,
+                        newMask.error().context);
+            return;
+        }
+        keyspaceNotifier.SetClasses(*newMask);
+    });
+
+    // Reloader thread MUST be declared AFTER every object its subscribers
+    // capture by reference (logger, keyspaceNotifier, ...). jthread joins
+    // in its destructor; stack unwind destroys locals in reverse
+    // declaration order, so the thread's destructor runs BEFORE the
+    // captured objects' destructors. This prevents a SIGHUP racing
+    // shutdown from invoking a subscriber against freed memory.
     std::atomic<bool> reloaderQuit { false };
     std::jthread reloaderThread { [&reloader, &logger, &reloaderQuit] {
         auto& controls = FastCache::DaemonControls::Instance();
@@ -515,23 +597,6 @@ int DaemonBody(FastCache::Config const& effective)
                 logger.Log(FastCache::LogLevel::Info, "config reloaded");
         }
     } };
-
-    FastCache::ReactorServerOptions serverOpts;
-    serverOpts.bindAddress = effective.bindAddress;
-    serverOpts.port = effective.port;
-    serverOpts.listenBacklog = effective.listenBacklog;
-    // One reactor per core (each single-threaded, connections pinned). One
-    // reactor = a single event loop; N reactors scale across cores without any
-    // cross-thread coroutine migration.
-    serverOpts.reactorThreads = reactorCount;
-    // Pin reactors to cores when asked (PerCore) and there's more than one;
-    // a lone reactor gains nothing from pinning.
-    serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
-    serverOpts.session.authSource = &authSource;
-    // Publish/subscribe registry: one instance shared read-mostly across every
-    // connection (RESP PUBLISH/SUBSCRIBE). Lives for the whole server run.
-    FastCache::PubSubRegistry pubsub;
-    serverOpts.session.pubsub = &pubsub;
 #if defined(FC_TLS_ENABLED)
     serverOpts.tlsContext = tlsContext.get(); // null unless --tls is active
 #endif
@@ -629,6 +694,10 @@ int main(int argc, char const* const* argv)
 
     FastCache::Config effective;
     bool metricsPortYamlExplicit = false;
+    // Aggregate "was the legacy single-bind triplet typed by the operator,
+    // CLI or YAML?" so a downstream mix-with-`listeners:` check sees both
+    // sources. Starts from the CLI explicit bits and ORs in YAML presence.
+    auto bindShapeCli = *parsed;
     if (!parsed->config.configPath.empty())
     {
         auto loaded = FastCache::ReadYamlConfigWithPresence(parsed->config.configPath);
@@ -638,7 +707,10 @@ int main(int argc, char const* const* argv)
             return EXIT_FAILURE;
         }
         metricsPortYamlExplicit = loaded->metricsPortExplicit;
-        effective = Merge(std::move(loaded->config), *parsed);
+        bindShapeCli.bindAddressExplicit = bindShapeCli.bindAddressExplicit || loaded->bindAddressExplicit;
+        bindShapeCli.portExplicit = bindShapeCli.portExplicit || loaded->portExplicit;
+        bindShapeCli.tlsEnabledExplicit = bindShapeCli.tlsEnabledExplicit || loaded->tlsEnabledExplicit;
+        effective = FastCache::Merge(std::move(loaded->config), *parsed);
         effective.configPath = parsed->config.configPath;
     }
     else
@@ -659,6 +731,32 @@ int main(int argc, char const* const* argv)
     if (!parsed->metricsPortExplicit && !metricsPortYamlExplicit)
         if (auto const envPort = MetricsPortFromEnv())
             effective.metricsPort = *envPort;
+
+    // Reject shapes that would silently drop user-typed values: combining the
+    // legacy single-bind triplet (`--bind / --port / --tls` OR YAML
+    // `bind: / port: / tls:`) with `--listen / --listen-tls` (or YAML
+    // `listeners:`) makes the legacy values vanish — DaemonBody picks
+    // `binds` and discards the singletons. Validate BEFORE handing off to
+    // the daemon host (which may fork) so the error reaches the operator.
+    if (auto const shape = FastCache::ValidateBindFlagShape(bindShapeCli, effective.binds); !shape.has_value())
+    {
+        std::println(std::cerr, "fastcached: {}", shape.error().context);
+        return EXIT_FAILURE;
+    }
+
+    // Validate notify-keyspace-events BEFORE handing off to the daemon
+    // host (which may fork) so a typo reaches the operator's terminal,
+    // not a syslog the child has already detached from. DaemonBody
+    // re-parses the same value — parsing is pure and the error here was
+    // caught well before any state was constructed.
+    if (auto const eventsMask = FastCache::ParseKeyspaceEvents(effective.notifyKeyspaceEvents); !eventsMask.has_value())
+    {
+        std::println(std::cerr,
+                     "fastcached: invalid --notify-keyspace-events '{}': {}",
+                     effective.notifyKeyspaceEvents,
+                     eventsMask.error().context);
+        return EXIT_FAILURE;
+    }
 
     // Health check: probe the running daemon's /healthz on loopback and exit
     // 0/1. Loopback regardless of the configured metrics bind address, since the

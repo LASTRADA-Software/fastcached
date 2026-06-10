@@ -35,6 +35,15 @@ class IMetricsSink
         Evictions,
         ConnectionsTotal,
         ConnectionsAdmissionRejected,
+        /// Subset of `ConnectionsTotal` that came in on a TLS-flagged
+        /// bind. Lets operators attribute traffic to plaintext vs TLS
+        /// without a per-bind label dimension (the IMetricsSink
+        /// interface is intentionally counter-only, no labels). Sum:
+        ///   connections_total_plaintext = ConnectionsTotal − ConnectionsTotalTls
+        ConnectionsTotalTls,
+        /// Subset of `ConnectionsAdmissionRejected` that came in on a
+        /// TLS-flagged bind. Pairs with ConnectionsTotalTls.
+        ConnectionsAdmissionRejectedTls,
         BytesIn,
         BytesOut,
         Last,
@@ -95,6 +104,10 @@ class AtomicMetricsSink final: public IMetricsSink
             return "connections_total";
         case IMetricsSink::Counter::ConnectionsAdmissionRejected:
             return "connections_rejected";
+        case IMetricsSink::Counter::ConnectionsTotalTls:
+            return "connections_total_tls";
+        case IMetricsSink::Counter::ConnectionsAdmissionRejectedTls:
+            return "connections_rejected_tls";
         case IMetricsSink::Counter::BytesIn:
             return "bytes_in";
         case IMetricsSink::Counter::BytesOut:

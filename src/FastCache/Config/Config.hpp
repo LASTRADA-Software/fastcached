@@ -6,9 +6,32 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace FastCache
 {
+
+/// One listening endpoint. Multiple `BindConfig` entries on a single daemon
+/// let an operator serve plaintext on one interface (e.g. a private LAN)
+/// while terminating TLS on another (e.g. the public WAN) from one process.
+/// When `tls` is true the daemon must also be built with `FC_TLS_ENABLED`
+/// and the legacy `tlsCertPath` / `tlsKeyPath` fields must be populated;
+/// per-bind certs (SNI) are out of scope.
+struct BindConfig
+{
+    /// Bind address: IPv4/IPv6 literal or hostname. `::` selects dual-stack.
+    std::string address {};
+    /// TCP port (1..65535).
+    std::uint16_t port { 0 };
+    /// When true, accepted sockets on this endpoint are wrapped through
+    /// `TlsWrap` before the protocol handler ever sees a byte.
+    bool tls { false };
+
+    /// Structural equality. Used by ConfigReloader::ValidateImmutable
+    /// (the listener set is live-wired at startup; a SIGHUP that mutates
+    /// it must reject), plus by tests asserting parsed binds verbatim.
+    friend bool operator==(BindConfig const&, BindConfig const&) = default;
+};
 
 /// Durability policy for the persistent storage backend. Decoupled from
 /// the storage subsystem so the Config layer does not depend on Cache
@@ -75,6 +98,12 @@ struct Config
     /// Bind address: IPv4/IPv6 literal or hostname. Default 127.0.0.1
     /// (IPv4 loopback). An IPv6 wildcard (`::`) binds dual-stack and
     /// serves both IPv4 and IPv6 on every platform.
+    ///
+    /// Legacy single-bind shorthand. When `binds` is non-empty this field
+    /// is ignored: every endpoint is described as a `BindConfig` instead.
+    /// When `binds` is empty (the common case), main.cpp synthesises a
+    /// single `BindConfig { bindAddress, port, tlsEnabled }` so the rest
+    /// of the daemon body sees only the data-driven view.
     std::string bindAddress { "127.0.0.1" };
 
     /// Path of the YAML config file (if any) that produced this Config.
@@ -138,6 +167,36 @@ struct Config
 
     /// PEM private key file for TLS. Only used when `tlsEnabled`.
     std::string tlsKeyPath {};
+
+    /// Redis-style keyspace-event flag string. Empty (the default) disables
+    /// every keyspace notification. Each letter enables one event class
+    /// (matches redis-server's `notify-keyspace-events`):
+    ///   K  publish on `__keyspace@<db>__:<key>` channels
+    ///   E  publish on `__keyevent@<db>__:<event>` channels
+    ///   g  generic events: del / expire / persist
+    ///   $  string events: set
+    ///   A  alias for `g$` — everything we currently emit
+    /// `x` (expiration events) is documented by Redis but not yet
+    /// implemented here — the storage layer has no expiry callback, so
+    /// the parser rejects `x` until the NotifyingStorage decorator lands
+    /// (see TODO.md). Operators who set `x` get a startup error rather
+    /// than the silent miss the original branch shipped with.
+    /// Each enabled write verb fires `__keyspace@0__:<key> <event>` (with K)
+    /// and `__keyevent@0__:<event> <key>` (with E). At least one of K or E
+    /// must be set for any event to actually be published.
+    /// The database index is fixed at 0 (this daemon does not implement
+    /// `SELECT`).
+    /// Unknown letters cause main.cpp to fail fast at startup.
+    std::string notifyKeyspaceEvents {};
+
+    /// Listener endpoints. When empty (the default), main.cpp collapses the
+    /// legacy single-bind fields (`bindAddress`, `port`, `tlsEnabled`) into
+    /// a single synthesised `BindConfig` and proceeds. When non-empty,
+    /// every entry defines one endpoint and the legacy single-bind fields
+    /// are ignored. The CLI populates this vector from repeatable
+    /// `--listen address:port` / `--listen-tls address:port` flags; the
+    /// YAML reader populates it from the top-level `listeners:` list.
+    std::vector<BindConfig> binds {};
 
     /// ::listen() backlog — the depth of the kernel's queue of accepted-
     /// but-not-yet-handed-off connections. Bursts of parallel clients (a
