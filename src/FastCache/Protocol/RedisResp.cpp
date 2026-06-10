@@ -756,6 +756,13 @@ namespace
     /// caller writes the pairs, then the real reply value. RESP2 has no attribute
     /// type, so under RESP2 this writes nothing and the caller's reply stands
     /// alone (attributes are purely advisory).
+    ///
+    /// IMPORTANT for RESP2 callers: dropping ONLY the header (and still writing
+    /// the attribute's key/value bulks) would desync the wire — each bulk would
+    /// be read by the client as a separate top-level reply. Callers that emit
+    /// attribute payloads must check `resp` and skip the payload writes too
+    /// (substituting an equivalent attribute-stripped reply), not just rely on
+    /// this writer's silent no-op.
     /// @param resp The connection's negotiated protocol version.
     Task<bool> ReplyAttributeHeader(ISocket* socket, std::size_t count, RespVersion resp)
     {
@@ -2449,96 +2456,146 @@ namespace
         co_return co_await ReplyInteger(socket, 1);
     }
 
-    /// DEBUG <subcommand> — only `DEBUG PROTOCOL <type>` is meaningful here. It
-    /// emits exactly one value of the requested RESP3 type, mirroring redis's
-    /// conformance command. This is the canonical, non-contrived way to exercise
-    /// the writers that no cache command naturally produces (bignum, attribute,
-    /// double, verbatim, true/false, null, set, map, push), so a RESP3 client or
-    /// test can validate the full type system. Data-driven: one row per type.
+    // -- DEBUG PROTOCOL type writers --------------------------------------
+    //
+    // One leaf coroutine per RESP3 wire type, named so the dispatch table
+    // below is a flat list of `{name, writer}` rows. Each writer emits
+    // exactly one value of its type under the negotiated `resp` version, so
+    // a conformance client (`DEBUG PROTOCOL <type>`) can validate the full
+    // type system. Adding a new type is one descriptor row, not another `if`
+    // branch in HandleDebug.
+
+    Task<bool> WriteDebugString(ISocket* socket, RespVersion /*resp*/)
+    {
+        co_return co_await ReplyBulkString(socket, std::string_view { "Simple status string" });
+    }
+    Task<bool> WriteDebugInteger(ISocket* socket, RespVersion /*resp*/)
+    {
+        co_return co_await ReplyInteger(socket, 12345);
+    }
+    Task<bool> WriteDebugDouble(ISocket* socket, RespVersion resp)
+    {
+        co_return co_await ReplyDouble(socket, 1.5, resp);
+    }
+    Task<bool> WriteDebugBigNum(ISocket* socket, RespVersion resp)
+    {
+        co_return co_await ReplyBigNumber(socket, "1234567999999999999999999999999999999", resp);
+    }
+    Task<bool> WriteDebugTrue(ISocket* socket, RespVersion resp)
+    {
+        co_return co_await ReplyBoolean(socket, true, resp);
+    }
+    Task<bool> WriteDebugFalse(ISocket* socket, RespVersion resp)
+    {
+        co_return co_await ReplyBoolean(socket, false, resp);
+    }
+    Task<bool> WriteDebugNull(ISocket* socket, RespVersion resp)
+    {
+        co_return co_await ReplyNull(socket, resp);
+    }
+    Task<bool> WriteDebugArray(ISocket* socket, RespVersion resp)
+    {
+        if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, 3, resp))
+            co_return false;
+        if (!co_await ReplyInteger(socket, 1))
+            co_return false;
+        if (!co_await ReplyInteger(socket, 2))
+            co_return false;
+        co_return co_await ReplyInteger(socket, 3);
+    }
+    Task<bool> WriteDebugVerbatim(ISocket* socket, RespVersion resp)
+    {
+        co_return co_await ReplyVerbatim(socket, "txt", "This is a verbatim\nstring", resp);
+    }
+    Task<bool> WriteDebugMap(ISocket* socket, RespVersion resp)
+    {
+        if (!co_await ReplyAggregateHeader(socket, Aggregate::Map, 1, resp))
+            co_return false;
+        if (!co_await ReplyInteger(socket, 1))
+            co_return false;
+        co_return co_await ReplyBoolean(socket, true, resp);
+    }
+    Task<bool> WriteDebugSet(ISocket* socket, RespVersion resp)
+    {
+        if (!co_await ReplyAggregateHeader(socket, Aggregate::Set, 2, resp))
+            co_return false;
+        if (!co_await ReplyInteger(socket, 1))
+            co_return false;
+        co_return co_await ReplyInteger(socket, 2);
+    }
+    /// DEBUG PROTOCOL push — conformance frame, NOT a representative pub/sub
+    /// delivery. ReplyAggregateHeader flattens `Aggregate::Push` to `*` under
+    /// RESP2 (see its docstring); the three literals here are arbitrary
+    /// markers chosen to make the frame visible on the wire, not the shape
+    /// `WritePushMessage` produces for a real subscription (which starts
+    /// with `message`/`pmessage`).
+    Task<bool> WriteDebugPush(ISocket* socket, RespVersion resp)
+    {
+        if (!co_await ReplyAggregateHeader(socket, Aggregate::Push, 3, resp))
+            co_return false;
+        if (!co_await ReplyBulkString(socket, std::string_view { "pubsub" }))
+            co_return false;
+        if (!co_await ReplyBulkString(socket, std::string_view { "channel" }))
+            co_return false;
+        co_return co_await ReplyBulkString(socket, std::string_view { "payload" });
+    }
+    /// DEBUG PROTOCOL attrib — RESP3 emits an attribute pair prefixing an
+    /// empty array as the "real" reply. Under RESP2 the RESP2-drop policy
+    /// (see ReplyAttributeHeader) means the attribute and its payload would
+    /// desync the stream, so we substitute the bulk string "none" instead —
+    /// the canonical view an attribute-aware client gets after stripping
+    /// the advisory attribute.
+    Task<bool> WriteDebugAttrib(ISocket* socket, RespVersion resp)
+    {
+        if (resp != RespVersion::Resp3)
+            co_return co_await ReplyBulkString(socket, std::string_view { "none" });
+        if (!co_await ReplyAttributeHeader(socket, 1, resp))
+            co_return false;
+        if (!co_await ReplyBulkString(socket, std::string_view { "key-popularity" }))
+            co_return false;
+        if (!co_await ReplyBulkString(socket, std::string_view { "none" }))
+            co_return false;
+        co_return co_await ReplyAggregateHeader(socket, Aggregate::Array, 0, resp);
+    }
+
+    /// One row of the DEBUG PROTOCOL dispatch table.
+    struct DebugProtocolType
+    {
+        std::string_view name;                      ///< Upper-cased wire name.
+        Task<bool> (*write)(ISocket*, RespVersion); ///< Writer for one value.
+    };
+
+    /// Data-driven DEBUG PROTOCOL type table. Adding a new conformance type
+    /// is one row here plus one leaf writer above — no edits to HandleDebug.
+    constexpr auto DebugProtocolTypes = std::array {
+        DebugProtocolType { .name = "STRING", .write = &WriteDebugString },
+        DebugProtocolType { .name = "INTEGER", .write = &WriteDebugInteger },
+        DebugProtocolType { .name = "DOUBLE", .write = &WriteDebugDouble },
+        DebugProtocolType { .name = "BIGNUM", .write = &WriteDebugBigNum },
+        DebugProtocolType { .name = "TRUE", .write = &WriteDebugTrue },
+        DebugProtocolType { .name = "FALSE", .write = &WriteDebugFalse },
+        DebugProtocolType { .name = "NULL", .write = &WriteDebugNull },
+        DebugProtocolType { .name = "ARRAY", .write = &WriteDebugArray },
+        DebugProtocolType { .name = "VERBATIM", .write = &WriteDebugVerbatim },
+        DebugProtocolType { .name = "MAP", .write = &WriteDebugMap },
+        DebugProtocolType { .name = "SET", .write = &WriteDebugSet },
+        DebugProtocolType { .name = "PUSH", .write = &WriteDebugPush },
+        DebugProtocolType { .name = "ATTRIB", .write = &WriteDebugAttrib },
+    };
+
+    /// DEBUG <subcommand> — only `DEBUG PROTOCOL <type>` is meaningful here.
+    /// Looks up the upper-cased `<type>` in `DebugProtocolTypes` and invokes
+    /// its writer; an unknown type replies the canonical redis error.
     Task<bool> HandleDebug(ISocket* socket, std::span<std::string const> args, RespVersion resp)
     {
         auto const sub = args.empty() ? std::string {} : Upper(args[0]);
         if (sub != "PROTOCOL" || args.size() < 2)
             co_return co_await ReplyOk(socket); // accept other DEBUG subcommands as no-ops
         auto const type = Upper(args[1]);
-
-        if (type == "STRING")
-            co_return co_await ReplyBulkString(socket, std::string_view { "Simple status string" });
-        if (type == "INTEGER")
-            co_return co_await ReplyInteger(socket, 12345);
-        if (type == "DOUBLE")
-            co_return co_await ReplyDouble(socket, 1.5, resp);
-        if (type == "BIGNUM")
-            co_return co_await ReplyBigNumber(socket, "1234567999999999999999999999999999999", resp);
-        if (type == "TRUE")
-            co_return co_await ReplyBoolean(socket, true, resp);
-        if (type == "FALSE")
-            co_return co_await ReplyBoolean(socket, false, resp);
-        if (type == "NULL")
-            co_return co_await ReplyNull(socket, resp);
-        if (type == "ARRAY")
-        {
-            if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, 3, resp))
-                co_return false;
-            if (!co_await ReplyInteger(socket, 1))
-                co_return false;
-            if (!co_await ReplyInteger(socket, 2))
-                co_return false;
-            co_return co_await ReplyInteger(socket, 3);
-        }
-        if (type == "VERBATIM")
-            co_return co_await ReplyVerbatim(socket, "txt", "This is a verbatim\nstring", resp);
-        if (type == "MAP")
-        {
-            if (!co_await ReplyAggregateHeader(socket, Aggregate::Map, 1, resp))
-                co_return false;
-            if (!co_await ReplyInteger(socket, 1))
-                co_return false;
-            co_return co_await ReplyBoolean(socket, true, resp);
-        }
-        if (type == "SET")
-        {
-            if (!co_await ReplyAggregateHeader(socket, Aggregate::Set, 2, resp))
-                co_return false;
-            if (!co_await ReplyInteger(socket, 1))
-                co_return false;
-            co_return co_await ReplyInteger(socket, 2);
-        }
-        if (type == "PUSH")
-        {
-            // Out-of-band push frame. Under RESP3 this is `>`-prefixed;
-            // under RESP2 it flattens to a regular array so a RESP2 client
-            // sees the same payload it would see for a pub/sub delivery
-            // under that version.
-            if (!co_await ReplyAggregateHeader(socket, Aggregate::Push, 3, resp))
-                co_return false;
-            if (!co_await ReplyBulkString(socket, std::string_view { "pubsub" }))
-                co_return false;
-            if (!co_await ReplyBulkString(socket, std::string_view { "channel" }))
-                co_return false;
-            co_return co_await ReplyBulkString(socket, std::string_view { "payload" });
-        }
-        if (type == "ATTRIB")
-        {
-            // Attributes are a RESP3-only frame; under RESP2 the writer drops
-            // the attribute header entirely. Emitting the same attribute-payload
-            // sequence then would desync the wire — each payload bulk would be
-            // read by the client as a separate top-level reply. So on RESP2
-            // reply with a single bulk-string ("none"), matching what an
-            // attribute-aware client would see after stripping the (advisory)
-            // attribute.
-            if (resp != RespVersion::Resp3)
-                co_return co_await ReplyBulkString(socket, std::string_view { "none" });
-            // RESP3: attribute prefixes a real reply; here an empty map follows.
-            if (!co_await ReplyAttributeHeader(socket, 1, resp))
-                co_return false;
-            if (!co_await ReplyBulkString(socket, std::string_view { "key-popularity" }))
-                co_return false;
-            if (!co_await ReplyBulkString(socket, std::string_view { "none" }))
-                co_return false;
-            co_return co_await ReplyAggregateHeader(socket, Aggregate::Array, 0, resp);
-        }
-        co_return co_await ReplyError(socket, std::format("Wrong protocol type name: {}", type));
+        auto const* const it = std::ranges::find(DebugProtocolTypes, type, &DebugProtocolType::name);
+        if (it == DebugProtocolTypes.end())
+            co_return co_await ReplyError(socket, std::format("Wrong protocol type name: {}", type));
+        co_return co_await it->write(socket, resp);
     }
 
     /// Commands a client may issue before authenticating when a credential is
