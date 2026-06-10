@@ -6,10 +6,11 @@
 namespace FastCache
 {
 
-class IReactor;         // Async/IReactor.hpp — the reactor this connection is pinned to.
-class IPubSubRegistry;  // Protocol/IPubSubRegistry.hpp — process-wide pub/sub registry.
-class WatchRegistry;    // Protocol/RedisTransaction.hpp — process-wide WATCH registry for Redis transactions.
-class KeyspaceNotifier; // Protocol/KeyspaceNotifier.hpp — Redis keyspace notification publisher.
+class IReactor;              // Async/IReactor.hpp — the reactor this connection is pinned to.
+class IPubSubRegistry;       // Protocol/IPubSubRegistry.hpp — process-wide pub/sub registry.
+class IStreamWaiterRegistry; // Protocol/IStreamWaiterRegistry.hpp — blocking stream-read coordinator.
+class WatchRegistry;         // Protocol/RedisTransaction.hpp — process-wide WATCH registry for Redis transactions.
+class KeyspaceNotifier;      // Protocol/KeyspaceNotifier.hpp — Redis keyspace notification publisher.
 
 /// Per-server, immutable context handed to every protocol handler's command
 /// loop. Bundles the optional collaborators a connection needs beyond its
@@ -35,6 +36,13 @@ struct SessionContext
     /// wired in (e.g. unit tests that don't exercise it). Shared, read-mostly,
     /// thread-safe; owned by the daemon body.
     IPubSubRegistry* pubsub { nullptr };
+
+    /// Process-wide registry coordinating blocking XREAD/XREADGROUP reads with
+    /// XADD-side appends, or nullptr when blocking reads are not wired in (unit
+    /// tests, or a build without the coordinator). A null pointer makes the
+    /// Redis handler serve XREAD/XREADGROUP non-blockingly (poll once) instead
+    /// of parking the connection. Shared, thread-safe; owned by the daemon body.
+    IStreamWaiterRegistry* streamWaiters { nullptr };
 
     /// The reactor this connection is pinned to, used by a subscriber to wake
     /// its own command loop when a message is delivered from another reactor

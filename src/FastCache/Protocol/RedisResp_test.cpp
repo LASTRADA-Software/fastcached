@@ -2816,3 +2816,138 @@ TEST_CASE("RESP3: HELLO map renders 6 fields in stable order", "[protocol][resp3
     REQUIRE(hole.starts_with("$"));
     REQUIRE(hole.ends_with("\r\n"));
 }
+
+// -- streams (X* command family) -------------------------------------------
+//
+// These exercise the wire path with EXPLICIT entry IDs so the assertions are
+// deterministic regardless of the wall clock (auto-ID generation is covered
+// deterministically at the engine layer in CacheEngine_test.cpp, with a
+// ManualWallClock).
+
+TEST_CASE("RESP: XADD explicit ID echoes the ID; XLEN counts", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-1\r\n$1\r\nf\r\n$1\r\nv\r\n" // -> $3 1-1
+                              "*2\r\n$4\r\nXLEN\r\n$1\r\ns\r\n");                                  // -> :1
+    REQUIRE(out == "$3\r\n1-1\r\n:1\r\n");
+}
+
+TEST_CASE("RESP: XADD rejects a non-increasing ID", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n5-0\r\n$1\r\nf\r\n$1\r\nv\r\n"   // -> $3 5-0
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n3-0\r\n$1\r\nf\r\n$1\r\nv\r\n"); // -> -ERR
+    REQUIRE(out.starts_with("$3\r\n5-0\r\n-ERR The ID specified in XADD is equal or smaller"));
+}
+
+TEST_CASE("RESP: XLEN on an absent stream is zero", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    REQUIRE(Exchange(fix, "*2\r\n$4\r\nXLEN\r\n$4\r\nmiss\r\n") == ":0\r\n");
+}
+
+TEST_CASE("RESP: XADD against a string key is WRONGTYPE", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"                          // -> +OK
+                              "*5\r\n$4\r\nXADD\r\n$1\r\nk\r\n$1\r\n*\r\n$1\r\nf\r\n$1\r\nv\r\n"); // -> -WRONGTYPE
+    REQUIRE(out == "+OK\r\n-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+}
+
+TEST_CASE("RESP: XRANGE returns entries as [id, [field, value]] arrays", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n2-0\r\n$1\r\ng\r\n$1\r\nw\r\n"
+                              "*4\r\n$6\r\nXRANGE\r\n$1\r\ns\r\n$1\r\n-\r\n$1\r\n+\r\n");
+    REQUIRE(out
+            == "$3\r\n1-0\r\n$3\r\n2-0\r\n"
+               "*2\r\n"
+               "*2\r\n$3\r\n1-0\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n"
+               "*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\ng\r\n$1\r\nw\r\n");
+}
+
+TEST_CASE("RESP: XREVRANGE reverses order and COUNT caps it", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n2-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n3-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              // XREVRANGE s + - COUNT 1 -> only the newest (3-0).
+                              "*6\r\n$9\r\nXREVRANGE\r\n$1\r\ns\r\n$1\r\n+\r\n$1\r\n-\r\n$5\r\nCOUNT\r\n$1\r\n1\r\n");
+    REQUIRE(out.ends_with("*1\r\n*2\r\n$3\r\n3-0\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n"));
+}
+
+TEST_CASE("RESP: XDEL removes entries and reports the count", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n" // -> $3 1-0
+                              "*3\r\n$4\r\nXDEL\r\n$1\r\ns\r\n$3\r\n1-0\r\n"                       // -> :1
+                              "*2\r\n$4\r\nXLEN\r\n$1\r\ns\r\n");                                  // -> :0
+    REQUIRE(out == "$3\r\n1-0\r\n:1\r\n:0\r\n");
+}
+
+TEST_CASE("RESP: XTRIM MAXLEN keeps the newest entries", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n2-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n3-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*4\r\n$5\r\nXTRIM\r\n$1\r\ns\r\n$6\r\nMAXLEN\r\n$1\r\n1\r\n" // -> :2
+                              "*2\r\n$4\r\nXLEN\r\n$1\r\ns\r\n");                           // -> :1
+    REQUIRE(out.ends_with(":2\r\n:1\r\n"));
+}
+
+TEST_CASE("RESP: XREAD returns a map of stream to entries after the cursor", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n2-0\r\n$1\r\ng\r\n$1\r\nw\r\n"
+                              // XREAD COUNT 10 STREAMS s 1-0 -> only entries after 1-0 (i.e. 2-0).
+                              "*6\r\n$5\r\nXREAD\r\n$5\r\nCOUNT\r\n$2\r\n10\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n");
+    REQUIRE(out.ends_with("*1\r\n"      // one stream present (RESP2: array of [key, entries])
+                          "*2\r\n"      // the (key, entries) pair
+                          "$1\r\ns\r\n" // key
+                          "*1\r\n"      // its entry list (one entry)
+                          "*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\ng\r\n$1\r\nw\r\n"));
+}
+
+TEST_CASE("RESP: XREAD with no new entries replies nil", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n" // -> $3 1-0
+                              // Cursor at the last ID -> nothing new -> nil.
+                              "*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n");
+    REQUIRE(out == "$3\r\n1-0\r\n$-1\r\n");
+}
+
+TEST_CASE("RESP: XREAD with the $ cursor rejects future-only with no data as nil", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    // $ resolves to the last ID; with no later append the read is empty -> nil.
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n$\r\n");
+    REQUIRE(out == "$3\r\n1-0\r\n$-1\r\n");
+}
+
+TEST_CASE("RESP: XADD auto-ID returns a well-formed ms-seq id", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$1\r\n*\r\n$1\r\nf\r\n$1\r\nv\r\n");
+    // Reply is a bulk string `$<len>\r\n<ms>-<seq>\r\n`; assert the shape only,
+    // since the ms component is the (real) wall clock here.
+    REQUIRE(out.starts_with("$"));
+    REQUIRE(out.ends_with("\r\n"));
+    REQUIRE(out.contains('-'));
+}

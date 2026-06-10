@@ -9,6 +9,7 @@
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/IPubSubRegistry.hpp>
+#include <FastCache/Protocol/IStreamWaiterRegistry.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
 #include <FastCache/Protocol/RedisRespDetail.hpp>
@@ -2156,6 +2157,567 @@ namespace
         co_return true;
     }
 
+    // -- redis stream type (X* command family) ------------------------------
+
+    /// Map a stream-op StorageError onto the redis wire error. WrongType becomes
+    /// the canonical WRONGTYPE; everything else a generic ERR. The stream
+    /// command-level "no such key/group" cases are handled by the callers (they
+    /// carry command-specific spellings such as NOGROUP), so this never sees a
+    /// bare KeyNotFound it must translate.
+    /// @param err The storage error to report (by value — a coroutine parameter
+    ///        must not be a reference).
+    Task<bool> ReplyStreamError(ISocket* socket, StorageError err)
+    {
+        if (err.code == StorageErrorCode::WrongType)
+            co_return co_await ReplyWrongType(socket);
+        co_return co_await ReplyError(socket, "storage failure");
+    }
+
+    /// Write a single stream entry as the redis 2-element array
+    /// `[ id, [field, value, ...] ]`. The field/value list is always a flat
+    /// array in both RESP2 and RESP3 (redis does not switch it to a map under
+    /// RESP3). A nullopt `fields` (an entry whose underlying log entry was
+    /// trimmed away, surfaced by XREADGROUP history reads) writes a null in the
+    /// value slot, matching redis.
+    /// @param resp The connection's negotiated protocol version.
+    Task<bool> WriteStreamEntry(ISocket* socket, StreamCodec::StreamEntry entry, RespVersion resp)
+    {
+        if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, 2, resp))
+            co_return false;
+        if (!co_await ReplyBulkString(socket, entry.id.Format()))
+            co_return false;
+        if (entry.fields.empty())
+            co_return co_await ReplyNull(socket, resp);
+        if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, entry.fields.size() * 2, resp))
+            co_return false;
+        for (auto const& [name, value]: entry.fields)
+        {
+            if (!co_await ReplyBulkString(socket, name))
+                co_return false;
+            if (!co_await ReplyBulkString(socket, value))
+                co_return false;
+        }
+        co_return true;
+    }
+
+    /// Write a list of stream entries as a top-level array of entries.
+    /// @param resp The connection's negotiated protocol version.
+    Task<bool> WriteStreamEntries(ISocket* socket, std::span<StreamCodec::StreamEntry const> entries, RespVersion resp)
+    {
+        if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, entries.size(), resp))
+            co_return false;
+        for (auto const& entry: entries)
+            if (!co_await WriteStreamEntry(socket, entry, resp))
+                co_return false;
+        co_return true;
+    }
+
+    /// Parse a range-bound stream ID for XRANGE/XREVRANGE/XPENDING. Honours the
+    /// `-`/`+` sentinels and the exclusive `(` prefix; a bare `<ms>` defaults
+    /// its sequence to 0 for the low bound and max for the high bound.
+    /// @param text       The bound text.
+    /// @param isLowBound True for the range start (`-`, seq default 0); false
+    ///                   for the end (`+`, seq default max).
+    /// @param out        Receives the resolved (already exclusivity-adjusted) ID.
+    /// @return True on a well-formed bound.
+    [[nodiscard]] bool ParseRangeBound(std::string_view text, bool isLowBound, StreamCodec::StreamId& out) noexcept
+    {
+        if (text == "-")
+        {
+            out = StreamCodec::StreamId::Min();
+            return true;
+        }
+        if (text == "+")
+        {
+            out = StreamCodec::StreamId::Max();
+            return true;
+        }
+        bool const exclusive = !text.empty() && text.front() == '(';
+        if (exclusive)
+            text.remove_prefix(1);
+        auto const parsed = StreamCodec::ParseId(text, isLowBound ? 0 : ~std::uint64_t { 0 });
+        if (!parsed.has_value())
+            return false;
+        out = *parsed;
+        if (exclusive)
+        {
+            // An exclusive low bound starts just after the ID; an exclusive high
+            // bound ends just before it. `+`/`-` already handled above.
+            if (isLowBound)
+                out = out.Next();
+            else if (out == StreamCodec::StreamId::Min())
+                return false; // nothing is below 0-0.
+            else
+                out = StreamCodec::StreamId { .ms = out.seq == 0 ? out.ms - 1 : out.ms,
+                                              .seq = out.seq == 0 ? ~std::uint64_t { 0 } : out.seq - 1 };
+        }
+        return true;
+    }
+
+    /// Parse an explicit XADD ID argument, resolving the `*` (full auto) and
+    /// `<ms>-*` (auto-sequence) forms.
+    /// @param text     The ID argument.
+    /// @param id       Receives the requested ID (unset for full `*`).
+    /// @param autoFull Set true for a bare `*`.
+    /// @param seqAuto  Set true for the `<ms>-*` form.
+    /// @return True on a well-formed ID argument.
+    [[nodiscard]] bool ParseAddId(std::string_view text,
+                                  std::optional<StreamCodec::StreamId>& id,
+                                  bool& autoFull,
+                                  bool& seqAuto) noexcept
+    {
+        autoFull = false;
+        seqAuto = false;
+        id.reset();
+        if (text == "*")
+        {
+            autoFull = true;
+            return true;
+        }
+        auto const dash = text.find('-');
+        if (dash != std::string_view::npos && text.substr(dash + 1) == "*")
+        {
+            std::uint64_t ms = 0;
+            if (!StreamCodec::ParseU64(text.substr(0, dash), ms))
+                return false;
+            id = StreamCodec::StreamId { .ms = ms, .seq = 0 };
+            seqAuto = true;
+            return true;
+        }
+        auto const parsed = StreamCodec::ParseId(text);
+        if (!parsed.has_value())
+            return false;
+        id = *parsed;
+        return true;
+    }
+
+    /// Parse an optional trailing `MAXLEN [~|=] count` / `MINID [~|=] id` clause
+    /// shared by XADD and XTRIM, advancing `idx` past it.
+    /// @param args The full argument list.
+    /// @param idx  In/out cursor; advanced past the clause on success.
+    /// @param trim Receives the parsed directive.
+    /// @return True if a (well-formed) clause was consumed; false if `idx` does
+    ///         not point at a trim keyword (leaving `idx` unchanged) or the
+    ///         clause is malformed (the caller distinguishes via `consumed`).
+    [[nodiscard]] bool ParseTrim(std::span<std::string const> args,
+                                 std::size_t& idx,
+                                 CacheEngine::StreamTrim& trim,
+                                 bool& malformed) noexcept
+    {
+        malformed = false;
+        if (idx >= args.size())
+            return false;
+        auto const keyword = Upper(args[idx]);
+        if (keyword != "MAXLEN" && keyword != "MINID")
+            return false;
+        auto cursor = idx + 1;
+        if (cursor < args.size() && (args[cursor] == "~" || args[cursor] == "="))
+            ++cursor; // approximate/exact marker — we always trim exactly.
+        if (cursor >= args.size())
+        {
+            malformed = true;
+            return false;
+        }
+        if (keyword == "MAXLEN")
+        {
+            trim.strategy = CacheEngine::StreamTrim::Strategy::MaxLen;
+            if (!ParseUnsigned(std::string_view { args[cursor] }, trim.threshold))
+            {
+                malformed = true;
+                return false;
+            }
+        }
+        else
+        {
+            trim.strategy = CacheEngine::StreamTrim::Strategy::MinId;
+            auto const parsed = StreamCodec::ParseId(args[cursor]);
+            if (!parsed.has_value())
+            {
+                malformed = true;
+                return false;
+            }
+            trim.minId = *parsed;
+        }
+        idx = cursor + 1;
+        return true;
+    }
+
+    Task<bool> HandleXAdd(ISocket* socket,
+                          CacheEngine* engine,
+                          ConnectionState* state,
+                          SessionContext session,
+                          std::span<std::string const> args)
+    {
+        // XADD key [NOMKSTREAM] [MAXLEN|MINID [~|=] threshold] <id|*> field value [field value ...]
+        if (args.size() < 4)
+            co_return co_await ReplyError(socket, "wrong number of arguments for 'xadd'");
+        auto const& key = args[0];
+        std::size_t idx = 1;
+        bool noMkStream = false;
+        if (idx < args.size() && Upper(args[idx]) == "NOMKSTREAM")
+        {
+            noMkStream = true;
+            ++idx;
+        }
+        std::optional<CacheEngine::StreamTrim> trim;
+        {
+            CacheEngine::StreamTrim parsed;
+            bool malformed = false;
+            if (ParseTrim(args, idx, parsed, malformed))
+                trim = parsed;
+            else if (malformed)
+                co_return co_await ReplyError(socket, "syntax error");
+        }
+        if (idx >= args.size())
+            co_return co_await ReplyError(socket, "wrong number of arguments for 'xadd'");
+
+        std::optional<StreamCodec::StreamId> requestedId;
+        bool autoFull = false;
+        bool seqAuto = false;
+        if (!ParseAddId(args[idx], requestedId, autoFull, seqAuto))
+            co_return co_await ReplyError(socket, "Invalid stream ID specified as stream command argument");
+        ++idx;
+
+        // The remaining args are field/value pairs and must be even and non-empty.
+        if (idx >= args.size() || ((args.size() - idx) % 2) != 0)
+            co_return co_await ReplyError(socket, "wrong number of arguments for 'xadd'");
+        std::vector<std::pair<std::string, std::string>> fields;
+        fields.reserve((args.size() - idx) / 2);
+        for (auto i = idx; i + 1 < args.size(); i += 2)
+            fields.emplace_back(args[i], args[i + 1]);
+
+        auto const added = engine->StreamAdd(key, autoFull ? std::nullopt : requestedId, seqAuto, fields, trim, noMkStream);
+        if (!added.has_value())
+        {
+            switch (added.error().code)
+            {
+                case StorageErrorCode::WrongType:
+                    co_return co_await ReplyWrongType(socket);
+                case StorageErrorCode::KeyNotFound:
+                    // NOMKSTREAM on an absent key -> nil.
+                    co_return co_await ReplyNull(socket, state->resp);
+                case StorageErrorCode::InvalidArgument:
+                    co_return co_await ReplyError(
+                        socket, "The ID specified in XADD is equal or smaller than the target stream top item");
+                default:
+                    co_return co_await ReplyError(socket, "storage failure");
+            }
+        }
+        NotifyWatchers(state, key);
+        NotifyKeyspace(state, KeyspaceEvents::Generic, "xadd", key);
+        // Wake any client blocked in XREAD/XREADGROUP on this key.
+        if (session.streamWaiters != nullptr)
+            session.streamWaiters->NotifyAppended(key);
+        co_return co_await ReplyBulkString(socket, added->Format());
+    }
+
+    Task<bool> HandleXLen(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    {
+        if (args.size() != 1)
+            co_return co_await ReplyError(socket, "wrong number of arguments for 'xlen'");
+        auto const len = engine->StreamLen(args[0]);
+        if (!len.has_value())
+            co_return co_await ReplyStreamError(socket, len.error());
+        co_return co_await ReplyInteger(socket, *len);
+    }
+
+    Task<bool> HandleXRange(
+        ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp, bool reverse)
+    {
+        // XRANGE key start end [COUNT n]   /   XREVRANGE key end start [COUNT n]
+        if (args.size() != 3 && args.size() != 5)
+            co_return co_await ReplyError(
+                socket, std::format("wrong number of arguments for '{}'", reverse ? "xrevrange" : "xrange"));
+        // XREVRANGE takes its bounds high-then-low; normalise to (low, high).
+        auto const& lowText = reverse ? args[2] : args[1];
+        auto const& highText = reverse ? args[1] : args[2];
+        StreamCodec::StreamId low;
+        StreamCodec::StreamId high;
+        if (!ParseRangeBound(lowText, /*isLowBound*/ true, low) || !ParseRangeBound(highText, /*isLowBound*/ false, high))
+            co_return co_await ReplyError(socket, "Invalid stream ID specified as stream command argument");
+        std::uint64_t count = 0;
+        if (args.size() == 5)
+        {
+            if (Upper(args[3]) != "COUNT" || !ParseUnsigned(std::string_view { args[4] }, count))
+                co_return co_await ReplyError(socket, "syntax error");
+        }
+        auto const entries = engine->StreamRange(args[0], low, high, static_cast<std::size_t>(count), reverse);
+        if (!entries.has_value())
+            co_return co_await ReplyStreamError(socket, entries.error());
+        co_return co_await WriteStreamEntries(socket, *entries, resp);
+    }
+
+    Task<bool> HandleXDel(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    {
+        if (args.size() < 2)
+            co_return co_await ReplyError(socket, "wrong number of arguments for 'xdel'");
+        std::vector<StreamCodec::StreamId> ids;
+        ids.reserve(args.size() - 1);
+        for (auto const& text: args.subspan(1))
+        {
+            auto const parsed = StreamCodec::ParseId(text);
+            if (!parsed.has_value())
+                co_return co_await ReplyError(socket, "Invalid stream ID specified as stream command argument");
+            ids.push_back(*parsed);
+        }
+        auto const removed = engine->StreamDelete(args[0], ids);
+        if (!removed.has_value())
+            co_return co_await ReplyStreamError(socket, removed.error());
+        if (*removed > 0)
+        {
+            NotifyWatchers(state, args[0]);
+            NotifyKeyspace(state, KeyspaceEvents::Generic, "xdel", args[0]);
+        }
+        co_return co_await ReplyInteger(socket, *removed);
+    }
+
+    Task<bool> HandleXTrim(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    {
+        // XTRIM key MAXLEN|MINID [~|=] threshold
+        if (args.size() < 3)
+            co_return co_await ReplyError(socket, "wrong number of arguments for 'xtrim'");
+        std::size_t idx = 1;
+        CacheEngine::StreamTrim trim;
+        bool malformed = false;
+        if (!ParseTrim(args, idx, trim, malformed) || idx != args.size())
+            co_return co_await ReplyError(socket, "syntax error");
+        auto const evicted = engine->StreamTrimTo(args[0], trim);
+        if (!evicted.has_value())
+            co_return co_await ReplyStreamError(socket, evicted.error());
+        if (*evicted > 0)
+        {
+            NotifyWatchers(state, args[0]);
+            NotifyKeyspace(state, KeyspaceEvents::Generic, "xtrim", args[0]);
+        }
+        co_return co_await ReplyInteger(socket, *evicted);
+    }
+
+    Task<bool> HandleXSetId(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    {
+        // XSETID key id [ENTRIESADDED n] [MAXDELETEDID id]
+        if (args.size() < 2)
+            co_return co_await ReplyError(socket, "wrong number of arguments for 'xsetid'");
+        auto const lastId = StreamCodec::ParseId(args[1]);
+        if (!lastId.has_value())
+            co_return co_await ReplyError(socket, "Invalid stream ID specified as stream command argument");
+        std::optional<std::uint64_t> entriesAdded;
+        std::optional<StreamCodec::StreamId> maxDeletedId;
+        for (auto i = std::size_t { 2 }; i < args.size();)
+        {
+            auto const opt = Upper(args[i]);
+            if (opt == "ENTRIESADDED" && i + 1 < args.size())
+            {
+                std::uint64_t n = 0;
+                if (!ParseUnsigned(std::string_view { args[i + 1] }, n))
+                    co_return co_await ReplyError(socket, "value is not an integer or out of range");
+                entriesAdded = n;
+                i += 2;
+            }
+            else if (opt == "MAXDELETEDID" && i + 1 < args.size())
+            {
+                auto const parsed = StreamCodec::ParseId(args[i + 1]);
+                if (!parsed.has_value())
+                    co_return co_await ReplyError(socket, "Invalid stream ID specified as stream command argument");
+                maxDeletedId = *parsed;
+                i += 2;
+            }
+            else
+                co_return co_await ReplyError(socket, "syntax error");
+        }
+        auto const result = engine->StreamSetId(args[0], *lastId, entriesAdded, maxDeletedId);
+        if (!result.has_value())
+        {
+            switch (result.error().code)
+            {
+                case StorageErrorCode::WrongType:
+                    co_return co_await ReplyWrongType(socket);
+                case StorageErrorCode::KeyNotFound:
+                    co_return co_await ReplyError(socket, "The XSETID command requires the key to exist.");
+                case StorageErrorCode::InvalidArgument:
+                    co_return co_await ReplyError(socket,
+                                                  "The ID specified in XSETID is smaller than the target stream top item");
+                default:
+                    co_return co_await ReplyError(socket, "storage failure");
+            }
+        }
+        NotifyWatchers(state, args[0]);
+        co_return co_await ReplyOk(socket);
+    }
+
+    /// Parsed form of an XREAD request: the COUNT/BLOCK options plus the
+    /// per-stream (key, after-id) pairs. The `$` sentinel resolves to each
+    /// stream's current last ID at parse time (deferred to the handler, which
+    /// has the engine); we record it as a flag per stream.
+    struct XReadRequest
+    {
+        std::uint64_t count { 0 };               ///< COUNT n; 0 = unlimited.
+        std::optional<std::uint64_t> blockMs {}; ///< BLOCK ms (present even if 0 = forever).
+        std::vector<std::string> keys {};        ///< Stream keys, in request order.
+        std::vector<std::string> idArgs {};      ///< Raw ID arg per key (`$`/`>`/explicit).
+    };
+
+    /// Parse the shared `[COUNT n] [BLOCK ms] STREAMS key... id...` tail of
+    /// XREAD / XREADGROUP (the leading GROUP/NOACK options are consumed by the
+    /// caller before this point).
+    /// @param args The argument slice beginning at the first option.
+    /// @param req  Receives the parsed request.
+    /// @param noAck Receives whether NOACK was present (XREADGROUP only).
+    /// @return Empty on success, or an error message for a malformed request.
+    [[nodiscard]] std::optional<std::string> ParseXRead(std::span<std::string const> args, XReadRequest& req, bool& noAck)
+    {
+        noAck = false;
+        std::size_t i = 0;
+        while (i < args.size())
+        {
+            auto const opt = Upper(args[i]);
+            if (opt == "COUNT" && i + 1 < args.size())
+            {
+                if (!ParseUnsigned(std::string_view { args[i + 1] }, req.count))
+                    return "value is not an integer or out of range";
+                i += 2;
+            }
+            else if (opt == "BLOCK" && i + 1 < args.size())
+            {
+                std::uint64_t ms = 0;
+                if (!ParseUnsigned(std::string_view { args[i + 1] }, ms))
+                    return "timeout is not an integer or out of range";
+                req.blockMs = ms;
+                i += 2;
+            }
+            else if (opt == "NOACK")
+            {
+                noAck = true;
+                ++i;
+            }
+            else if (opt == "STREAMS")
+            {
+                ++i;
+                auto const rest = args.size() - i;
+                if (rest == 0 || (rest % 2) != 0)
+                    return "Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.";
+                auto const n = rest / 2;
+                req.keys.assign(args.begin() + static_cast<std::ptrdiff_t>(i),
+                                args.begin() + static_cast<std::ptrdiff_t>(i + n));
+                req.idArgs.assign(args.begin() + static_cast<std::ptrdiff_t>(i + n), args.end());
+                return std::nullopt;
+            }
+            else
+                return "syntax error";
+        }
+        return "syntax error"; // STREAMS keyword never seen.
+    }
+
+    /// Resolve each stream's read cursor for a plain XREAD: an explicit ID is
+    /// "entries strictly after", `$` is "only entries added after now" (the
+    /// current last ID). `>` is invalid for XREAD (XREADGROUP only).
+    /// @param engine The cache engine (for `$` resolution).
+    /// @param req    The parsed request.
+    /// @param cursors Receives one resolved cursor ID per key.
+    /// @return Empty on success, or an error message.
+    [[nodiscard]] std::optional<std::string> ResolveReadCursors(CacheEngine* engine,
+                                                                XReadRequest const& req,
+                                                                std::vector<StreamCodec::StreamId>& cursors)
+    {
+        cursors.clear();
+        cursors.reserve(req.keys.size());
+        for (auto k = std::size_t { 0 }; k < req.keys.size(); ++k)
+        {
+            auto const& idArg = req.idArgs[k];
+            if (idArg == "$")
+            {
+                auto const last = engine->StreamLastId(req.keys[k]);
+                if (!last.has_value())
+                    return "WRONGTYPE";
+                cursors.push_back(*last);
+            }
+            else if (idArg == ">")
+                return "The > ID can be specified only when calling XREADGROUP using the GROUP <group> <consumer> option.";
+            else
+            {
+                auto const parsed = StreamCodec::ParseId(idArg);
+                if (!parsed.has_value())
+                    return "Invalid stream ID specified as stream command argument";
+                cursors.push_back(*parsed);
+            }
+        }
+        return std::nullopt;
+    }
+
+    /// Write the XREAD/XREADGROUP top-level reply, including only streams that
+    /// produced entries. Under RESP3 this is a map (`%`) of stream-key → entry
+    /// list; under RESP2 it is an array (`*`) of two-element `[key, entries]`
+    /// arrays (redis does NOT flatten the XREAD reply to key/value pairs the way
+    /// the generic map writer would — each stream is its own nested array). The
+    /// caller handles the "no streams" case with a nil reply before calling.
+    /// @param resp The connection's negotiated protocol version.
+    Task<bool> WriteXReadReply(ISocket* socket,
+                               std::span<std::string const> keys,
+                               std::span<std::vector<StreamCodec::StreamEntry> const> perKey,
+                               RespVersion resp)
+    {
+        // Count streams that actually have entries.
+        std::size_t present = 0;
+        for (auto const& entries: perKey)
+            if (!entries.empty())
+                ++present;
+        if (resp == RespVersion::Resp3)
+        {
+            if (!co_await ReplyAggregateHeader(socket, Aggregate::Map, present, resp))
+                co_return false;
+        }
+        else if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, present, resp))
+            co_return false;
+        for (auto k = std::size_t { 0 }; k < keys.size(); ++k)
+        {
+            if (perKey[k].empty())
+                continue;
+            // RESP2 wraps each (key, entries) in its own 2-element array; RESP3's
+            // map header already accounts for the pair, so the two fields follow
+            // directly.
+            if (resp != RespVersion::Resp3 && !co_await ReplyAggregateHeader(socket, Aggregate::Array, 2, resp))
+                co_return false;
+            if (!co_await ReplyBulkString(socket, keys[k]))
+                co_return false;
+            if (!co_await WriteStreamEntries(socket, perKey[k], resp))
+                co_return false;
+        }
+        co_return true;
+    }
+
+    Task<bool> HandleXRead(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
+    {
+        XReadRequest req;
+        bool noAck = false;
+        if (auto const err = ParseXRead(args, req, noAck); err.has_value())
+            co_return co_await ReplyError(socket, *err);
+
+        std::vector<StreamCodec::StreamId> cursors;
+        if (auto const err = ResolveReadCursors(engine, req, cursors); err.has_value())
+        {
+            if (*err == "WRONGTYPE")
+                co_return co_await ReplyWrongType(socket);
+            co_return co_await ReplyError(socket, *err);
+        }
+
+        // Poll once. Blocking (BLOCK) parking is wired in a later phase; for now
+        // a BLOCK request that finds no data returns the nil/again reply
+        // immediately rather than parking.
+        std::vector<std::vector<StreamCodec::StreamEntry>> perKey;
+        perKey.reserve(req.keys.size());
+        std::size_t total = 0;
+        for (auto k = std::size_t { 0 }; k < req.keys.size(); ++k)
+        {
+            auto const entries = engine->StreamRead(req.keys[k], cursors[k], static_cast<std::size_t>(req.count));
+            if (!entries.has_value())
+                co_return co_await ReplyStreamError(socket, entries.error());
+            total += entries->size();
+            perKey.push_back(*entries);
+        }
+        if (total == 0)
+            co_return co_await ReplyNull(socket, resp);
+        co_return co_await WriteXReadReply(socket, req.keys, perKey, resp);
+    }
+
     /// LOLWUT — redis's whimsical version/art command. We reply a short banner
     /// as a verbatim string (txt) under RESP3, a bulk string under RESP2. Cheap,
     /// and it exercises the verbatim writer on a second command besides INFO.
@@ -2914,6 +3476,57 @@ namespace
             .firstKey = 1,
             .lastKey = 1,
             .keyStep = 1 },
+        CommandEntry {
+            .name = "XADD",
+            .handler = [](CommandContext c) { return HandleXAdd(c.socket, c.engine, c.state, c.session, c.tail); },
+            .arity = -5,
+            .firstKey = 1,
+            .lastKey = 1,
+            .keyStep = 1 },
+        CommandEntry { .name = "XLEN",
+                       .handler = [](CommandContext c) { return HandleXLen(c.socket, c.engine, c.tail); },
+                       .arity = 2,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry {
+            .name = "XRANGE",
+            .handler = [](CommandContext c) { return HandleXRange(c.socket, c.engine, c.tail, c.state->resp, false); },
+            .arity = -4,
+            .firstKey = 1,
+            .lastKey = 1,
+            .keyStep = 1 },
+        CommandEntry {
+            .name = "XREVRANGE",
+            .handler = [](CommandContext c) { return HandleXRange(c.socket, c.engine, c.tail, c.state->resp, true); },
+            .arity = -4,
+            .firstKey = 1,
+            .lastKey = 1,
+            .keyStep = 1 },
+        CommandEntry { .name = "XDEL",
+                       .handler = [](CommandContext c) { return HandleXDel(c.socket, c.engine, c.state, c.tail); },
+                       .arity = -3,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "XTRIM",
+                       .handler = [](CommandContext c) { return HandleXTrim(c.socket, c.engine, c.state, c.tail); },
+                       .arity = -4,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "XSETID",
+                       .handler = [](CommandContext c) { return HandleXSetId(c.socket, c.engine, c.state, c.tail); },
+                       .arity = -3,
+                       .firstKey = 1,
+                       .lastKey = 1,
+                       .keyStep = 1 },
+        CommandEntry { .name = "XREAD",
+                       .handler = [](CommandContext c) { return HandleXRead(c.socket, c.engine, c.tail, c.state->resp); },
+                       .arity = -4,
+                       .firstKey = 0,
+                       .lastKey = 0,
+                       .keyStep = 0 },
         CommandEntry { .name = "LOLWUT",
                        .handler = [](CommandContext c) { return HandleLolwut(c.socket, c.state->resp); },
                        .arity = -1,
