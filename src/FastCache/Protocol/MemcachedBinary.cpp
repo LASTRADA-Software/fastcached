@@ -210,6 +210,11 @@ namespace
                 return Status::OutOfMemory;
             case StorageErrorCode::InvalidArgument:
                 return Status::InvalidArguments;
+            case StorageErrorCode::WrongType:
+                // append/prepend onto a typed value (a redis set/stream sharing
+                // the keyspace) is refused, not corrupting it; the binary
+                // protocol's closest "couldn't store this item" status.
+                return Status::ItemNotStored;
             default:
                 return Status::UnknownCommand;
         }

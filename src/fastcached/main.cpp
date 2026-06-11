@@ -37,6 +37,7 @@
 #include <FastCache/Protocol/PubSubRegistry.hpp>
 #include <FastCache/Protocol/RedisMutationObserver.hpp>
 #include <FastCache/Protocol/RedisTransaction.hpp>
+#include <FastCache/Protocol/StreamWaiterRegistry.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 #if defined(FC_TLS_ENABLED)
@@ -360,6 +361,7 @@ int DaemonBody(FastCache::Config const& effective)
     // below) so LIFO stack unwind destroys the thread before any
     // object its subscribers capture by reference.
     FastCache::PubSubRegistry pubsub;
+    FastCache::StreamWaiterRegistry streamWaiters;
     FastCache::WatchRegistry watches;
     auto const eventsMask = FastCache::ParseKeyspaceEvents(effective.notifyKeyspaceEvents);
     if (!eventsMask.has_value())
@@ -549,6 +551,7 @@ int DaemonBody(FastCache::Config const& effective)
     // can wire them into the storage chain. Just publish the pointers
     // into the session here.
     serverOpts.session.pubsub = &pubsub;
+    serverOpts.session.streamWaiters = &streamWaiters;
     serverOpts.session.watches = &watches;
     serverOpts.session.keyspaceNotifier = &keyspaceNotifier;
     // Make the notifier reloadable: a SIGHUP that changes

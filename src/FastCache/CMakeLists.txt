@@ -49,6 +49,7 @@ target_sources(FastCache
         Protocol/RedisMutationObserver.cpp
         Protocol/RedisResp.cpp
         Protocol/RedisTransaction.cpp
+        Protocol/StreamWaiterRegistry.cpp
         Server/AdminHttpServer.cpp
         Server/Connection.cpp
         Server/ReactorServerLoop.cpp

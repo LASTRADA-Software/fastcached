@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
@@ -11,6 +12,7 @@
 #include <FastCache/Protocol/RedisResp.hpp>
 #include <FastCache/Protocol/RedisTransaction.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
+#include <FastCache/Protocol/StreamWaiterRegistry.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -2815,4 +2817,441 @@ TEST_CASE("RESP3: HELLO map renders 6 fields in stable order", "[protocol][resp3
     auto const hole = out.substr(ExpectedPrefix.size(), out.size() - ExpectedPrefix.size() - ExpectedSuffix.size());
     REQUIRE(hole.starts_with("$"));
     REQUIRE(hole.ends_with("\r\n"));
+}
+
+// -- streams (X* command family) -------------------------------------------
+//
+// These exercise the wire path with EXPLICIT entry IDs so the assertions are
+// deterministic regardless of the wall clock (auto-ID generation is covered
+// deterministically at the engine layer in CacheEngine_test.cpp, with a
+// ManualWallClock).
+
+TEST_CASE("RESP: XADD explicit ID echoes the ID; XLEN counts", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-1\r\n$1\r\nf\r\n$1\r\nv\r\n" // -> $3 1-1
+                              "*2\r\n$4\r\nXLEN\r\n$1\r\ns\r\n");                                  // -> :1
+    REQUIRE(out == "$3\r\n1-1\r\n:1\r\n");
+}
+
+TEST_CASE("RESP: XADD rejects a non-increasing ID", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n5-0\r\n$1\r\nf\r\n$1\r\nv\r\n"   // -> $3 5-0
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n3-0\r\n$1\r\nf\r\n$1\r\nv\r\n"); // -> -ERR
+    REQUIRE(out.starts_with("$3\r\n5-0\r\n-ERR The ID specified in XADD is equal or smaller"));
+}
+
+TEST_CASE("RESP: XLEN on an absent stream is zero", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    REQUIRE(Exchange(fix, "*2\r\n$4\r\nXLEN\r\n$4\r\nmiss\r\n") == ":0\r\n");
+}
+
+TEST_CASE("RESP: XADD against a string key is WRONGTYPE", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"                          // -> +OK
+                              "*5\r\n$4\r\nXADD\r\n$1\r\nk\r\n$1\r\n*\r\n$1\r\nf\r\n$1\r\nv\r\n"); // -> -WRONGTYPE
+    REQUIRE(out == "+OK\r\n-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+}
+
+TEST_CASE("RESP: GET / MGET / INCR on a stream key do not leak the blob", "[protocol][resp][stream][wrongtype]")
+{
+    SECTION("GET on a stream replies WRONGTYPE, never the encoded blob")
+    {
+        RespFixture fix;
+        auto const out = Exchange(fix,
+                                  "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                  "*2\r\n$3\r\nGET\r\n$1\r\ns\r\n");
+        REQUIRE(out == "$3\r\n1-0\r\n-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    }
+    SECTION("MGET on a stream replies nil for that slot, never the blob")
+    {
+        RespFixture fix;
+        auto const out = Exchange(fix,
+                                  "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                  "*2\r\n$4\r\nMGET\r\n$1\r\ns\r\n");
+        REQUIRE(out == "$3\r\n1-0\r\n*1\r\n$-1\r\n");
+    }
+    SECTION("INCR on a stream replies WRONGTYPE, not a numeric error")
+    {
+        RespFixture fix;
+        auto const out = Exchange(fix,
+                                  "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                  "*2\r\n$4\r\nINCR\r\n$1\r\ns\r\n");
+        REQUIRE(out == "$3\r\n1-0\r\n-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    }
+}
+
+TEST_CASE("RESP: XRANGE COUNT 0 returns an empty array, not the whole range", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*6\r\n$6\r\nXRANGE\r\n$1\r\ns\r\n$1\r\n-\r\n$1\r\n+\r\n$5\r\nCOUNT\r\n$1\r\n0\r\n");
+    REQUIRE(out == "$3\r\n1-0\r\n*0\r\n");
+}
+
+TEST_CASE("RESP: plain XREAD rejects the NOACK option", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    // XREAD NOACK STREAMS s 0 — balanced (one key, one id), so the NOACK reject
+    // (not an unbalanced-list error) is what fires.
+    auto const out = Exchange(fix, "*5\r\n$5\r\nXREAD\r\n$5\r\nNOACK\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n0\r\n");
+    REQUIRE(out.starts_with("-ERR The NOACK option is only supported by XREADGROUP"));
+}
+
+TEST_CASE("RESP: XAUTOCLAIM accepts its minimal 6-token form", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    // XAUTOCLAIM s g c 0 0-0 (no COUNT/JUSTID): must not be rejected for arity.
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$1\r\ns\r\n$1\r\ng\r\n$1\r\n0\r\n"
+                              "*6\r\n$10\r\nXAUTOCLAIM\r\n$1\r\ns\r\n$1\r\ng\r\n$1\r\nc\r\n$1\r\n0\r\n$3\r\n0-0\r\n");
+    REQUIRE_FALSE(out.contains("wrong number of arguments"));
+}
+
+TEST_CASE("RESP: XRANGE returns entries as [id, [field, value]] arrays", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n2-0\r\n$1\r\ng\r\n$1\r\nw\r\n"
+                              "*4\r\n$6\r\nXRANGE\r\n$1\r\ns\r\n$1\r\n-\r\n$1\r\n+\r\n");
+    REQUIRE(out
+            == "$3\r\n1-0\r\n$3\r\n2-0\r\n"
+               "*2\r\n"
+               "*2\r\n$3\r\n1-0\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n"
+               "*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\ng\r\n$1\r\nw\r\n");
+}
+
+TEST_CASE("RESP: XREVRANGE reverses order and COUNT caps it", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n2-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n3-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              // XREVRANGE s + - COUNT 1 -> only the newest (3-0).
+                              "*6\r\n$9\r\nXREVRANGE\r\n$1\r\ns\r\n$1\r\n+\r\n$1\r\n-\r\n$5\r\nCOUNT\r\n$1\r\n1\r\n");
+    REQUIRE(out.ends_with("*1\r\n*2\r\n$3\r\n3-0\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n"));
+}
+
+TEST_CASE("RESP: XDEL removes entries and reports the count", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n" // -> $3 1-0
+                              "*3\r\n$4\r\nXDEL\r\n$1\r\ns\r\n$3\r\n1-0\r\n"                       // -> :1
+                              "*2\r\n$4\r\nXLEN\r\n$1\r\ns\r\n");                                  // -> :0
+    REQUIRE(out == "$3\r\n1-0\r\n:1\r\n:0\r\n");
+}
+
+TEST_CASE("RESP: XTRIM MAXLEN keeps the newest entries", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n2-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n3-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*4\r\n$5\r\nXTRIM\r\n$1\r\ns\r\n$6\r\nMAXLEN\r\n$1\r\n1\r\n" // -> :2
+                              "*2\r\n$4\r\nXLEN\r\n$1\r\ns\r\n");                           // -> :1
+    REQUIRE(out.ends_with(":2\r\n:1\r\n"));
+}
+
+TEST_CASE("RESP: XREAD returns a map of stream to entries after the cursor", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n2-0\r\n$1\r\ng\r\n$1\r\nw\r\n"
+                              // XREAD COUNT 10 STREAMS s 1-0 -> only entries after 1-0 (i.e. 2-0).
+                              "*6\r\n$5\r\nXREAD\r\n$5\r\nCOUNT\r\n$2\r\n10\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n");
+    REQUIRE(out.ends_with("*1\r\n"      // one stream present (RESP2: array of [key, entries])
+                          "*2\r\n"      // the (key, entries) pair
+                          "$1\r\ns\r\n" // key
+                          "*1\r\n"      // its entry list (one entry)
+                          "*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\ng\r\n$1\r\nw\r\n"));
+}
+
+TEST_CASE("RESP: XREAD with no new entries replies nil", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n" // -> $3 1-0
+                              // Cursor at the last ID -> nothing new -> nil.
+                              "*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n");
+    REQUIRE(out == "$3\r\n1-0\r\n$-1\r\n");
+}
+
+TEST_CASE("RESP: XREAD with the $ cursor rejects future-only with no data as nil", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    // $ resolves to the last ID; with no later append the read is empty -> nil.
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n$\r\n");
+    REQUIRE(out == "$3\r\n1-0\r\n$-1\r\n");
+}
+
+TEST_CASE("RESP: XADD auto-ID returns a well-formed ms-seq id", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$1\r\n*\r\n$1\r\nf\r\n$1\r\nv\r\n");
+    // Reply is a bulk string `$<len>\r\n<ms>-<seq>\r\n`; assert the shape only,
+    // since the ms component is the (real) wall clock here.
+    REQUIRE(out.starts_with("$"));
+    REQUIRE(out.ends_with("\r\n"));
+    REQUIRE(out.contains('-'));
+}
+
+// -- consumer groups --------------------------------------------------------
+
+TEST_CASE("RESP: XGROUP CREATE then XREADGROUP > delivers the backlog", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"       // -> $3 1-0
+                              "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$1\r\ns\r\n$2\r\ng1\r\n$1\r\n0\r\n" // -> +OK
+                              // XREADGROUP GROUP g1 c1 STREAMS s >
+                              "*7\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$2\r\ng1\r\n$2\r\nc1\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n>\r\n");
+    REQUIRE(out.starts_with("$3\r\n1-0\r\n+OK\r\n"));
+    REQUIRE(out.ends_with("*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n1-0\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n"));
+}
+
+TEST_CASE("RESP: XREADGROUP on a missing group is NOGROUP", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*7\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$4\r\nnope\r\n$2\r\nc1\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n>\r\n");
+    REQUIRE(out.contains("-NOGROUP No such key 's' or consumer group 'nope'"));
+}
+
+TEST_CASE("RESP: XACK removes from the PEL and is idempotent", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$1\r\ns\r\n$2\r\ng1\r\n$1\r\n0\r\n"
+                              "*7\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$2\r\ng1\r\n$2\r\nc1\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n>\r\n"
+                              "*4\r\n$4\r\nXACK\r\n$1\r\ns\r\n$2\r\ng1\r\n$3\r\n1-0\r\n"   // -> :1
+                              "*4\r\n$4\r\nXACK\r\n$1\r\ns\r\n$2\r\ng1\r\n$3\r\n1-0\r\n"); // -> :0 (already acked)
+    REQUIRE(out.ends_with(":1\r\n:0\r\n"));
+}
+
+TEST_CASE("RESP: XPENDING summary reports the PEL count", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$1\r\ns\r\n$2\r\ng1\r\n$1\r\n0\r\n"
+                              "*7\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$2\r\ng1\r\n$2\r\nc1\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n>\r\n"
+                              "*3\r\n$8\r\nXPENDING\r\n$1\r\ns\r\n$2\r\ng1\r\n");
+    // Summary: [ 1, "1-0", "1-0", [ ["c1", "1"] ] ]
+    REQUIRE(out.ends_with("*4\r\n:1\r\n$3\r\n1-0\r\n$3\r\n1-0\r\n*1\r\n*2\r\n$2\r\nc1\r\n$1\r\n1\r\n"));
+}
+
+TEST_CASE("RESP: XGROUP CREATE on an absent key without MKSTREAM errors", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix, "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$4\r\nmiss\r\n$2\r\ng1\r\n$1\r\n0\r\n");
+    REQUIRE(out.starts_with("-ERR The XGROUP subcommand requires the key to exist"));
+}
+
+TEST_CASE("RESP: XGROUP CREATE MKSTREAM creates an empty stream", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*6\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$1\r\ns\r\n$2\r\ng1\r\n$1\r\n$\r\n$8\r\nMKSTREAM\r\n"
+                              "*2\r\n$4\r\nXLEN\r\n$1\r\ns\r\n");
+    REQUIRE(out == "+OK\r\n:0\r\n");
+}
+
+TEST_CASE("RESP: XINFO STREAM reports length and last id", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*3\r\n$5\r\nXINFO\r\n$6\r\nSTREAM\r\n$1\r\ns\r\n");
+    REQUIRE(out.contains("$6\r\nlength\r\n:1\r\n"));
+    REQUIRE(out.contains("$17\r\nlast-generated-id\r\n$3\r\n1-0\r\n"));
+}
+
+TEST_CASE("RESP: XCLAIM transfers ownership of an idle pending entry", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out =
+        Exchange(fix,
+                 "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                 "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$1\r\ns\r\n$2\r\ng1\r\n$1\r\n0\r\n"
+                 "*7\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$2\r\ng1\r\n$2\r\nc1\r\n"
+                 "$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n>\r\n"
+                 // XCLAIM s g1 c2 0 1-0  (min-idle 0 -> always claims), JUSTID
+                 "*7\r\n$6\r\nXCLAIM\r\n$1\r\ns\r\n$2\r\ng1\r\n$2\r\nc2\r\n$1\r\n0\r\n$3\r\n1-0\r\n$6\r\nJUSTID\r\n");
+    // JUSTID -> array of claimed IDs: *1 $3 1-0.
+    REQUIRE(out.ends_with("*1\r\n$3\r\n1-0\r\n"));
+}
+
+// -- blocking reads (XREAD BLOCK / XREADGROUP BLOCK) ------------------------
+
+TEST_CASE("RESP: XREAD BLOCK with no waiter registry falls back to non-blocking nil", "[protocol][resp][stream]")
+{
+    // The default RespFixture wires no StreamWaiterRegistry, so a BLOCK request
+    // that finds no data returns nil immediately rather than parking — the
+    // documented "blocking disabled" fallback.
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$3\r\n100\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n");
+    REQUIRE(out == "$3\r\n1-0\r\n$-1\r\n");
+}
+
+TEST_CASE("RESP: XREAD BLOCK returns immediately when data is already present", "[protocol][resp][stream]")
+{
+    // Even with a registry wired, the handler polls first; available data is
+    // returned without ever parking. Exercises the blocking handler's
+    // poll-before-block path against a real registry.
+    FastCache::StreamWaiterRegistry waiters;
+    RespFixture fix;
+    FastCache::SessionContext session;
+    session.streamWaiters = &waiters;
+    auto const out = Exchange(fix,
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                              "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n2-0\r\n$1\r\ng\r\n$1\r\nw\r\n"
+                              // BLOCK 0 (forever) but data after 1-0 exists -> returns now.
+                              "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                              "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n",
+                              session);
+    REQUIRE(out.ends_with("*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\ng\r\n$1\r\nw\r\n"));
+}
+
+namespace
+{
+
+/// Drive a genuinely-parking XREAD BLOCK to completion on a single-threaded
+/// TestReactor: the handler parks on the StreamWaiter, then a simulated XADD on
+/// another "connection" appends to the engine and notifies the registry, waking
+/// the blocked read. Fully deterministic — no threads, the reactor is ticked
+/// explicitly between the two phases.
+struct BlockingHarness
+{
+    FastCache::ManualClock clock;
+    FastCache::TestReactor reactor { clock };
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::StreamWaiterRegistry waiters;
+    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    FastCache::RedisRespHandler handler;
+    std::string reply;
+
+    /// Launcher coroutine: runs the handler to completion and captures the reply.
+    FastCache::Task<void> RunHandler(FastCache::SessionContext session)
+    {
+        co_await handler.Run(pair.server.get(), &engine, /*primer*/ {}, session);
+        pair.server->Close();
+        reply = co_await DrainResponse(pair.client.get());
+    }
+};
+
+} // namespace
+
+TEST_CASE("RESP: XREAD BLOCK parks then wakes on a later XADD", "[protocol][resp][stream]")
+{
+    BlockingHarness h;
+    FastCache::SessionContext session;
+    session.streamWaiters = &h.waiters;
+    session.reactor = &h.reactor;
+
+    // Seed an entry and arm a blocking read for entries strictly after it.
+    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
+                                           "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
+    h.pair.client->ShutdownWrite();
+
+    // Launch the handler on the reactor; it processes the XADD, then parks on
+    // the blocking XREAD (no entry after 1-0 yet).
+    auto launcher = h.RunHandler(session);
+    h.reactor.Submit(launcher.Native());
+    h.reactor.Run();
+    REQUIRE(h.reply.empty()); // still parked — nothing returned yet.
+
+    // A second "connection" appends 2-0 and notifies the registry, which wakes
+    // the parked reader; ticking the reactor resumes it to read + reply.
+    auto const added = h.engine.StreamAdd("s",
+                                          FastCache::StreamCodec::StreamId { .ms = 2, .seq = 0 },
+                                          false,
+                                          std::vector<std::pair<std::string, std::string>> { { "g", "w" } },
+                                          std::nullopt,
+                                          false);
+    REQUIRE(added.has_value());
+    h.waiters.NotifyAppended("s");
+    h.reactor.Run();
+
+    REQUIRE(h.reply.ends_with("*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\ng\r\n$1\r\nw\r\n"));
+}
+
+TEST_CASE("RESP: XREAD BLOCK times out to nil when the deadline elapses", "[protocol][resp][stream]")
+{
+    BlockingHarness h;
+    FastCache::SessionContext session;
+    session.streamWaiters = &h.waiters;
+    session.reactor = &h.reactor;
+
+    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
+                                           "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$2\r\n50\r\n"
+                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
+    h.pair.client->ShutdownWrite();
+
+    auto launcher = h.RunHandler(session);
+    h.reactor.Submit(launcher.Native());
+    h.reactor.Run();
+    REQUIRE(h.reply.empty()); // parked, waiting on the 50ms deadline.
+
+    // Advance past the deadline; the scheduled timeout fires, waking the reader
+    // which finds no data and replies nil.
+    h.clock.SetNow(h.clock.Now() + std::chrono::milliseconds { 51 });
+    h.reactor.Run();
+    REQUIRE(h.reply.ends_with("$-1\r\n"));
+}
+
+TEST_CASE("RESP: XREAD BLOCK inside MULTI/EXEC does not park; EXEC returns immediately", "[protocol][resp][stream][multi]")
+{
+    BlockingHarness h;
+    FastCache::SessionContext session;
+    session.streamWaiters = &h.waiters; // blocking wired in — yet EXEC must not park.
+    session.reactor = &h.reactor;
+
+    // MULTI; XREAD BLOCK 0 STREAMS s $ ; EXEC — on an empty stream the blocking
+    // read would otherwise park forever mid-EXEC. Inside a transaction it must
+    // serve non-blockingly and EXEC must complete in a single reactor run.
+    REQUIRE(FastCache::SyncRun(
+        WriteString(h.pair.client.get(),
+                    "*1\r\n$5\r\nMULTI\r\n"
+                    "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n$\r\n"
+                    "*1\r\n$4\r\nEXEC\r\n")));
+    h.pair.client->ShutdownWrite();
+
+    auto launcher = h.RunHandler(session);
+    h.reactor.Submit(launcher.Native());
+    h.reactor.Run();
+
+    // The connection completed (handler returned, reply drained) without any
+    // further XADD/wake: EXEC produced its aggregate with a nil element for the
+    // non-blocking XREAD rather than wedging.
+    REQUIRE_FALSE(h.reply.empty());
+    REQUIRE(h.reply.ends_with("*1\r\n$-1\r\n")); // EXEC: [ nil ]
 }

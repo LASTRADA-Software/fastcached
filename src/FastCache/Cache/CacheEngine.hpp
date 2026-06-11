@@ -3,6 +3,7 @@
 
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/IStorage.hpp>
+#include <FastCache/Cache/StreamCodec.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 
@@ -175,6 +176,281 @@ class CacheEngine
     /// @return The popped members (empty if absent), or WrongType.
     [[nodiscard]] std::expected<std::vector<std::string>, StorageError> SetPop(std::string_view key, std::size_t count);
 
+    // -- redis stream type (X* command family) ------------------------------
+    //
+    // A stream is stored as an ordinary value blob tagged with FcTypeStream in
+    // the entry flags; the entries, ID watermarks and consumer-group
+    // bookkeeping are length-prefixed (see StreamCodec). The mutating ops go
+    // through Update so decode-modify-encode is atomic per key, and entry IDs
+    // are generated from the injected IWallClock.
+
+    /// A trim directive for XADD .../XTRIM (MAXLEN keeps the newest `threshold`
+    /// entries; MINID drops entries with an ID below `minId`).
+    struct StreamTrim
+    {
+        enum class Strategy : std::uint8_t
+        {
+            MaxLen, ///< Keep at most `threshold` newest entries.
+            MinId,  ///< Drop entries with ID < `minId`.
+        };
+        Strategy strategy { Strategy::MaxLen };
+        std::uint64_t threshold { 0 };  ///< Entry count for MaxLen.
+        StreamCodec::StreamId minId {}; ///< Lower bound for MinId.
+    };
+
+    /// Append an entry to the stream at `key` (creating it unless `noMkStream`).
+    /// @param key         Stream key.
+    /// @param requestedId Explicit ID, or nullopt to auto-generate (`*`). A
+    ///                    requested ID with `seqAuto` true means `<ms>-*`.
+    /// @param seqAuto     When `requestedId` carries only a ms (the `<ms>-*`
+    ///                    form), auto-assign the sequence within that ms.
+    /// @param fields      Ordered field/value pairs for the new entry.
+    /// @param trim        Optional trim applied after the append.
+    /// @param noMkStream  When true, do not create the stream if it is absent
+    ///                    (XADD NOMKSTREAM); returns KeyNotFound instead.
+    /// @return The assigned entry ID, or WrongType / KeyNotFound /
+    ///         InvalidArgument (ID not greater than the last).
+    [[nodiscard]] std::expected<StreamCodec::StreamId, StorageError> StreamAdd(
+        std::string_view key,
+        std::optional<StreamCodec::StreamId> requestedId,
+        bool seqAuto,
+        std::span<std::pair<std::string, std::string> const> fields,
+        std::optional<StreamTrim> trim,
+        bool noMkStream);
+
+    /// @return Entry count of the stream at `key` (0 if absent), or WrongType.
+    [[nodiscard]] std::expected<std::int64_t, StorageError> StreamLen(std::string_view key);
+
+    /// Return entries with ID in `[start, end]`, at most `count` of them.
+    /// @param key     Stream key.
+    /// @param start   Inclusive lower bound (use StreamId::Min for `-`).
+    /// @param end     Inclusive upper bound (use StreamId::Max for `+`).
+    /// @param count   Maximum entries to return; 0 means unlimited.
+    /// @param reverse When true, scan high→low (XREVRANGE); `start`/`end` are
+    ///                still the logical low/high bounds.
+    /// @return Matching entries in scan order, or WrongType.
+    [[nodiscard]] std::expected<std::vector<StreamCodec::StreamEntry>, StorageError> StreamRange(
+        std::string_view key, StreamCodec::StreamId start, StreamCodec::StreamId end, std::size_t count, bool reverse);
+
+    /// Return up to `count` entries with ID strictly greater than `after`
+    /// (the non-blocking core of XREAD).
+    /// @return Matching entries in ascending order, or WrongType.
+    [[nodiscard]] std::expected<std::vector<StreamCodec::StreamEntry>, StorageError> StreamRead(std::string_view key,
+                                                                                                StreamCodec::StreamId after,
+                                                                                                std::size_t count);
+
+    /// Delete the entries with the given `ids` from the stream at `key`.
+    /// @return Number of entries actually removed, or WrongType.
+    [[nodiscard]] std::expected<std::int64_t, StorageError> StreamDelete(std::string_view key,
+                                                                         std::span<StreamCodec::StreamId const> ids);
+
+    /// Trim the stream at `key` per `trim`.
+    /// @return Number of entries evicted, or WrongType.
+    [[nodiscard]] std::expected<std::int64_t, StorageError> StreamTrimTo(std::string_view key, StreamTrim trim);
+
+    /// Set the stream's last-ID watermark (XSETID), optionally adjusting the
+    /// entries-added and max-deleted-id counters.
+    /// @return Empty on success, or WrongType / KeyNotFound / InvalidArgument
+    ///         (new last-id below an existing entry).
+    [[nodiscard]] std::expected<void, StorageError> StreamSetId(std::string_view key,
+                                                                StreamCodec::StreamId lastId,
+                                                                std::optional<std::uint64_t> entriesAdded,
+                                                                std::optional<StreamCodec::StreamId> maxDeletedId);
+
+    /// The highest entry ID currently in the stream at `key` (the `$` target
+    /// for XREAD), or StreamId::Min when the stream is absent/empty.
+    /// @return The last entry's ID, or WrongType.
+    [[nodiscard]] std::expected<StreamCodec::StreamId, StorageError> StreamLastId(std::string_view key);
+
+    // -- consumer groups (XGROUP / XREADGROUP / XACK / XPENDING / XCLAIM) ----
+
+    /// How a freshly created group's read cursor is positioned.
+    enum class GroupStart : std::uint8_t
+    {
+        Beginning, ///< `0` — deliver the whole backlog.
+        End,       ///< `$` — deliver only entries added after creation.
+        At,        ///< An explicit start ID.
+    };
+
+    /// Create consumer group `group` on the stream at `key`.
+    /// @param key        Stream key.
+    /// @param group      Group name.
+    /// @param start      Where the group's cursor begins.
+    /// @param at         Explicit start ID when `start == At`.
+    /// @param mkStream   Create the stream if absent (XGROUP CREATE MKSTREAM).
+    /// @return Empty on success, KeyNotFound when absent and `!mkStream`,
+    ///         KeyExists when the group already exists, or WrongType.
+    [[nodiscard]] std::expected<void, StorageError> StreamGroupCreate(
+        std::string_view key, std::string_view group, GroupStart start, StreamCodec::StreamId at, bool mkStream);
+
+    /// Reposition group `group`'s read cursor (XGROUP SETID).
+    /// @return Empty on success, KeyNotFound (stream/group absent), or WrongType.
+    [[nodiscard]] std::expected<void, StorageError> StreamGroupSetId(std::string_view key,
+                                                                     std::string_view group,
+                                                                     GroupStart start,
+                                                                     StreamCodec::StreamId at);
+
+    /// Destroy group `group` (XGROUP DESTROY).
+    /// @return True if a group was removed, false if it was absent, or WrongType.
+    [[nodiscard]] std::expected<bool, StorageError> StreamGroupDestroy(std::string_view key, std::string_view group);
+
+    /// Create consumer `consumer` in group `group` (XGROUP CREATECONSUMER).
+    /// @return True if newly created, false if it already existed, or WrongType /
+    ///         KeyNotFound (NOGROUP).
+    [[nodiscard]] std::expected<bool, StorageError> StreamConsumerCreate(std::string_view key,
+                                                                         std::string_view group,
+                                                                         std::string_view consumer);
+
+    /// Delete consumer `consumer` from group `group` (XGROUP DELCONSUMER).
+    /// @return Number of pending entries the consumer owned, or WrongType /
+    ///         KeyNotFound (NOGROUP).
+    [[nodiscard]] std::expected<std::int64_t, StorageError> StreamConsumerDelete(std::string_view key,
+                                                                                 std::string_view group,
+                                                                                 std::string_view consumer);
+
+    /// Read entries for a consumer group (the non-blocking core of XREADGROUP).
+    /// @param key      Stream key.
+    /// @param group    Group name.
+    /// @param consumer Consumer name (created on demand).
+    /// @param after    Read cursor: `>` for new entries (use nullopt), or an
+    ///                 explicit ID to re-read that consumer's PEL history.
+    /// @param count    Maximum entries to return; 0 means unlimited.
+    /// @param noAck    When true, deliveries are not added to the PEL.
+    /// @return Matching entries, or WrongType / KeyNotFound (NOGROUP).
+    [[nodiscard]] std::expected<std::vector<StreamCodec::StreamEntry>, StorageError> StreamReadGroup(
+        std::string_view key,
+        std::string_view group,
+        std::string_view consumer,
+        std::optional<StreamCodec::StreamId> after,
+        std::size_t count,
+        bool noAck);
+
+    /// Acknowledge `ids` for group `group`, removing them from the PEL (XACK).
+    /// @return Number of entries actually acknowledged, or WrongType /
+    ///         KeyNotFound (NOGROUP).
+    [[nodiscard]] std::expected<std::int64_t, StorageError> StreamAck(std::string_view key,
+                                                                      std::string_view group,
+                                                                      std::span<StreamCodec::StreamId const> ids);
+
+    /// One row of an XPENDING extended reply.
+    struct PendingSummary
+    {
+        StreamCodec::StreamId id {};       ///< Pending entry ID.
+        std::string consumer {};           ///< Owning consumer.
+        std::uint64_t idleMs { 0 };        ///< Time since last delivery.
+        std::uint64_t deliveryCount { 0 }; ///< Delivery count so far.
+    };
+
+    /// Summary form of XPENDING: count + min/max IDs + per-consumer tallies.
+    struct PendingOverview
+    {
+        std::uint64_t count { 0 };                                         ///< Total pending entries.
+        StreamCodec::StreamId minId {};                                    ///< Smallest pending ID.
+        StreamCodec::StreamId maxId {};                                    ///< Largest pending ID.
+        std::vector<std::pair<std::string, std::uint64_t>> perConsumer {}; ///< (consumer, count).
+    };
+
+    /// XPENDING summary form.
+    /// @return The overview (count 0 when none), or WrongType / KeyNotFound.
+    [[nodiscard]] std::expected<PendingOverview, StorageError> StreamPendingSummary(std::string_view key,
+                                                                                    std::string_view group);
+
+    /// XPENDING extended form: pending entries in `[start, end]` (optionally
+    /// filtered to one consumer / a minimum idle time), at most `count`.
+    /// @return The matching rows, or WrongType / KeyNotFound.
+    [[nodiscard]] std::expected<std::vector<PendingSummary>, StorageError> StreamPendingRange(
+        std::string_view key,
+        std::string_view group,
+        StreamCodec::StreamId start,
+        StreamCodec::StreamId end,
+        std::size_t count,
+        std::optional<std::string_view> consumer,
+        std::uint64_t minIdleMs);
+
+    /// Result of an XCLAIM/XAUTOCLAIM: the claimed entries plus, for JUSTID,
+    /// just their IDs. `deleted` lists PEL IDs whose entry no longer exists
+    /// (XAUTOCLAIM drains these from the PEL).
+    struct ClaimResult
+    {
+        std::vector<StreamCodec::StreamEntry> entries {}; ///< Claimed entries (empty for JUSTID).
+        std::vector<StreamCodec::StreamId> ids {};        ///< Claimed IDs (always populated).
+        std::vector<StreamCodec::StreamId> deleted {};    ///< PEL IDs dropped because the entry is gone.
+        StreamCodec::StreamId cursor {};                  ///< Next scan cursor (XAUTOCLAIM).
+    };
+
+    /// XCLAIM: transfer ownership of `ids` in `group` to `consumer` when their
+    /// idle time is at least `minIdleMs`.
+    /// @param key       Stream key.
+    /// @param group     Consumer group.
+    /// @param consumer  New owner.
+    /// @param minIdleMs Idle threshold a pending entry must meet to be claimed.
+    /// @param ids       Entry IDs to claim.
+    /// @param justId    Populate only IDs (and do not bump delivery counts).
+    /// @param force     Create a PEL entry for a requested ID that exists in the
+    ///                  stream but is not currently pending, then claim it.
+    /// @return The claimed entries/ids, or WrongType / KeyNotFound (NOGROUP).
+    [[nodiscard]] std::expected<ClaimResult, StorageError> StreamClaim(std::string_view key,
+                                                                       std::string_view group,
+                                                                       std::string_view consumer,
+                                                                       std::uint64_t minIdleMs,
+                                                                       std::span<StreamCodec::StreamId const> ids,
+                                                                       bool justId,
+                                                                       bool force = false);
+
+    /// XAUTOCLAIM: scan the PEL from `start`, claiming up to `count` entries
+    /// idle at least `minIdleMs` for `consumer`.
+    /// @return The claimed entries/ids, the deleted set, and the next cursor.
+    [[nodiscard]] std::expected<ClaimResult, StorageError> StreamAutoClaim(std::string_view key,
+                                                                           std::string_view group,
+                                                                           std::string_view consumer,
+                                                                           std::uint64_t minIdleMs,
+                                                                           StreamCodec::StreamId start,
+                                                                           std::size_t count,
+                                                                           bool justId);
+
+    /// Snapshot of a stream for XINFO STREAM.
+    struct StreamInfo
+    {
+        std::uint64_t length { 0 };                       ///< Entry count.
+        StreamCodec::StreamId lastId {};                  ///< Last-ID watermark.
+        StreamCodec::StreamId maxDeletedId {};            ///< Max deleted ID.
+        std::uint64_t entriesAdded { 0 };                 ///< Entries ever added.
+        std::uint64_t groupCount { 0 };                   ///< Number of consumer groups.
+        std::optional<StreamCodec::StreamEntry> first {}; ///< First entry, if any.
+        std::optional<StreamCodec::StreamEntry> last {};  ///< Last entry, if any.
+    };
+
+    /// XINFO STREAM.
+    /// @return The snapshot, or WrongType / KeyNotFound.
+    [[nodiscard]] std::expected<StreamInfo, StorageError> StreamInfoOf(std::string_view key);
+
+    /// Snapshot of one consumer group for XINFO GROUPS.
+    struct GroupInfo
+    {
+        std::string name {};                    ///< Group name.
+        std::uint64_t consumers { 0 };          ///< Number of consumers.
+        std::uint64_t pending { 0 };            ///< PEL size.
+        StreamCodec::StreamId lastDelivered {}; ///< Last-delivered ID.
+        std::uint64_t entriesRead { 0 };        ///< Entries read by the group.
+        std::uint64_t lag { 0 };                ///< Entries added but not yet read (entriesAdded - entriesRead).
+    };
+
+    /// XINFO GROUPS.
+    /// @return One row per group, or WrongType / KeyNotFound.
+    [[nodiscard]] std::expected<std::vector<GroupInfo>, StorageError> StreamGroupInfo(std::string_view key);
+
+    /// Snapshot of one consumer for XINFO CONSUMERS.
+    struct ConsumerInfo
+    {
+        std::string name {};         ///< Consumer name.
+        std::uint64_t pending { 0 }; ///< Entries pending for this consumer.
+    };
+
+    /// XINFO CONSUMERS.
+    /// @return One row per consumer, or WrongType / KeyNotFound (NOGROUP).
+    [[nodiscard]] std::expected<std::vector<ConsumerInfo>, StorageError> StreamConsumerInfo(std::string_view key,
+                                                                                            std::string_view group);
+
     [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key);
 
     /// Refresh the entry's expiry without rewriting its value. Wraps
@@ -273,7 +549,27 @@ class CacheEngine
         return _wallClock;
     }
 
+    /// Current wall-clock time in milliseconds since the UNIX epoch, taken from
+    /// the injected `IWallClock`. Drives stream entry-ID timestamps and the
+    /// PEL idle-time accounting; deterministic under `ManualWallClock`.
+    /// @return Milliseconds since the epoch.
+    [[nodiscard]] std::uint64_t WallNowMs() const noexcept;
+
   private:
+    /// Shared implementation of Append/Prepend. Concatenates `extra` onto the
+    /// existing value (at the front when `atFront`, else the back) atomically
+    /// inside the storage's per-key Update boundary, rejecting non-string
+    /// (set/stream) keys with `WrongType` and honouring the CAS precondition.
+    /// @param key      Lookup key.
+    /// @param extra    Bytes to splice in.
+    /// @param expected CAS precondition (0 = unconditional).
+    /// @param atFront  `true` for PREPEND, `false` for APPEND.
+    /// @return New CAS token, or a StorageError (WrongType / CasMismatch / I/O).
+    [[nodiscard]] std::expected<CasToken, StorageError> ConcatGuarded(std::string_view key,
+                                                                      std::span<std::byte const> extra,
+                                                                      CasToken expected,
+                                                                      bool atFront);
+
     IStorage& _storage;
     IClock& _clock;
     IWallClock& _wallClock;

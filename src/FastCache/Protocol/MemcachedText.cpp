@@ -307,6 +307,11 @@ namespace
                 co_return co_await WriteLine(socket, "NOT_STORED");
             case StorageErrorCode::CasMismatch:
                 co_return co_await WriteLine(socket, "EXISTS");
+            case StorageErrorCode::WrongType:
+                // append/prepend onto a typed value (a redis set/stream sharing
+                // the keyspace) is refused rather than corrupting its blob;
+                // memcached has no WRONGTYPE, so report it as NOT_STORED.
+                co_return co_await WriteLine(socket, "NOT_STORED");
             case StorageErrorCode::ValueTooLarge:
                 co_return co_await WriteError(socket, "SERVER_ERROR", "object too large for cache");
             default:
