@@ -9,6 +9,7 @@
 #include <expected>
 #include <memory>
 #include <span>
+#include <string>
 #include <utility>
 
 namespace FastCache
@@ -201,6 +202,16 @@ class ISocket
     [[nodiscard]] virtual IoAwaitable WaitReadable()
     {
         return IoAwaitable { IoResult { std::size_t { 1 } } };
+    }
+
+    /// The remote peer's address as a printable host string ("203.0.113.7" /
+    /// "::1"), captured at accept time. Used by the `--log-source` connection
+    /// log prefix. The default returns "" so transports that have no peer
+    /// address (the in-memory test transport) need no override.
+    /// @return Printable peer host, or "" when unknown.
+    [[nodiscard]] virtual std::string PeerAddress() const
+    {
+        return {};
     }
 
     /// Close the socket. Idempotent; subsequent Read/Write resolves with

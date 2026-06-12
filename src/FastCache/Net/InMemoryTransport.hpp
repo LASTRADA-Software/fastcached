@@ -8,6 +8,7 @@
 #include <deque>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace FastCache
@@ -80,7 +81,13 @@ class InMemorySocket: public ISocket
     /// Construct over two pipes (one for each direction).
     /// @param inbound Pipe this socket reads from (peer's outbound).
     /// @param outbound Pipe this socket writes into (peer's inbound).
-    InMemorySocket(std::shared_ptr<InMemoryPipe> inbound, std::shared_ptr<InMemoryPipe> outbound) noexcept;
+    /// @param peerAddress Printable peer host this socket reports via
+    ///        PeerAddress(); "" (the default) means "no peer address", as a
+    ///        real in-process transport has none. Tests set it to exercise the
+    ///        `--log-source` connection prefix with a known value.
+    InMemorySocket(std::shared_ptr<InMemoryPipe> inbound,
+                   std::shared_ptr<InMemoryPipe> outbound,
+                   std::string peerAddress = {}) noexcept;
     InMemorySocket(InMemorySocket const&) = delete;
     InMemorySocket(InMemorySocket&&) = delete;
     InMemorySocket& operator=(InMemorySocket const&) = delete;
@@ -95,6 +102,10 @@ class InMemorySocket: public ISocket
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return _closed;
+    }
+    [[nodiscard]] std::string PeerAddress() const override
+    {
+        return _peerAddress;
     }
 
     /// Half-close: signal EOF to the peer on the outbound pipe but leave
@@ -117,6 +128,7 @@ class InMemorySocket: public ISocket
 
     std::shared_ptr<InMemoryPipe> _inbound;
     std::shared_ptr<InMemoryPipe> _outbound;
+    std::string _peerAddress;
     IoAwaitable* _pendingRead { nullptr };
     std::span<std::byte> _pendingReadBuffer {};
     bool _closed { false };
@@ -131,8 +143,11 @@ struct InMemorySocketPair
 
     /// Construct a pair with the given backpressure cap (0 = unlimited).
     /// @param maxBytesInFlight Per-direction in-flight byte cap.
+    /// @param serverPeerAddress Printable peer host the *server*-side socket
+    ///        reports via PeerAddress() — i.e. the client's apparent address.
+    ///        "" (the default) means none. Lets tests drive `--log-source`.
     /// @return Two sockets sharing a pair of pipes.
-    [[nodiscard]] static InMemorySocketPair Create(std::size_t maxBytesInFlight = 0);
+    [[nodiscard]] static InMemorySocketPair Create(std::size_t maxBytesInFlight = 0, std::string serverPeerAddress = {});
 };
 
 /// Test listener: tests Push() pre-made server sockets onto its accept
@@ -154,8 +169,12 @@ class InMemoryListener final: public IListener
     /// Make a connected pair, retain the server side internally so the next
     /// Accept() resolves to it, and return the client side for the test.
     /// @param maxBytesInFlight Per-direction backpressure cap.
+    /// @param peerAddress Printable peer host the accepted (server-side) socket
+    ///        reports via PeerAddress(); "" (the default) means none. Lets a
+    ///        test assert the `--log-source` connection prefix.
     /// @return Client-side socket the test drives.
-    [[nodiscard]] std::unique_ptr<InMemorySocket> ConnectClient(std::size_t maxBytesInFlight = 0);
+    [[nodiscard]] std::unique_ptr<InMemorySocket> ConnectClient(std::size_t maxBytesInFlight = 0,
+                                                                std::string peerAddress = {});
 
   private:
     struct Pending

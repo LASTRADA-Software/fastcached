@@ -32,7 +32,9 @@ class IocpSocket final: public ISocket
     /// header portability) and attach it to the given reactor's IOCP.
     /// @param reactor Reactor that drives this socket's I/O.
     /// @param native Native SOCKET handle.
-    IocpSocket(IocpReactor& reactor, std::uintptr_t native) noexcept;
+    /// @param peerAddress Printable peer host captured at accept time, or ""
+    ///        when unknown. Surfaced via PeerAddress() for `--log-source`.
+    IocpSocket(IocpReactor& reactor, std::uintptr_t native, std::string peerAddress = {}) noexcept;
     ~IocpSocket() override;
 
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
@@ -44,6 +46,10 @@ class IocpSocket final: public ISocket
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return _closed;
+    }
+    [[nodiscard]] std::string PeerAddress() const override
+    {
+        return _peerAddress;
     }
 
     /// @return Native SOCKET handle.
@@ -68,6 +74,7 @@ class IocpSocket final: public ISocket
   private:
     std::unique_ptr<Impl> _impl;
     std::uintptr_t _native;
+    std::string _peerAddress;
     bool _closed { false };
     bool _attached { false };
 };

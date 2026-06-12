@@ -251,8 +251,9 @@ namespace Detail
 
 // -- BlockingSocket --------------------------------------------------------
 
-BlockingSocket::BlockingSocket(Detail::NativeSocket native) noexcept:
-    _native { native }
+BlockingSocket::BlockingSocket(Detail::NativeSocket native, std::string peerAddress) noexcept:
+    _native { native },
+    _peerAddress { std::move(peerAddress) }
 {
 }
 
@@ -410,8 +411,9 @@ AcceptAwaitable BlockingListener::Accept()
     // (and so the single-threaded admin endpoint stays available under slowloris).
     if (_ioTimeout.count() > 0)
         Detail::SetIoTimeouts(static_cast<Detail::NativeSocket>(acceptedRaw), _ioTimeout, _ioTimeout);
+    auto peer = FormatPeerAddress(Detail::EndpointFromSockaddr(&client, static_cast<std::uint32_t>(addrLen)));
     return AcceptAwaitable { AcceptResult {
-        std::make_unique<BlockingSocket>(static_cast<Detail::NativeSocket>(acceptedRaw)) } };
+        std::make_unique<BlockingSocket>(static_cast<Detail::NativeSocket>(acceptedRaw), std::move(peer)) } };
 }
 
 } // namespace FastCache
