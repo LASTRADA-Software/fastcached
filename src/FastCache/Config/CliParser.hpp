@@ -47,6 +47,8 @@ struct CliResult
     bool storageShardsExplicit { false };
     bool listenBacklogExplicit { false };
     bool logTimestampsExplicit { false };
+    bool logSourceExplicit { false };
+    bool logEverythingExplicit { false };
     bool requirePassExplicit { false };
     bool authUsernameExplicit { false };
     bool metricsEnabledExplicit { false };

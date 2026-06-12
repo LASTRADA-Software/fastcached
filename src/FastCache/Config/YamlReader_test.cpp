@@ -38,6 +38,29 @@ TEST_CASE("YamlReader: parses all recognised keys", "[config][yaml]")
     REQUIRE(cfg->logLevel == FastCache::LogLevel::Debug);
 }
 
+TEST_CASE("YamlReader: log_source toggles the connection source prefix", "[config][yaml]")
+{
+    auto const on = FastCache::ReadYamlConfig(WriteTempYaml("logsrc-on", "log_source: true\n"));
+    REQUIRE(on.has_value());
+    REQUIRE(on->logSource);
+
+    // Absent key keeps the default (off).
+    auto const off = FastCache::ReadYamlConfig(WriteTempYaml("logsrc-off", "port: 11211\n"));
+    REQUIRE(off.has_value());
+    REQUIRE_FALSE(off->logSource);
+}
+
+TEST_CASE("YamlReader: log_everything toggles full command logging", "[config][yaml]")
+{
+    auto const on = FastCache::ReadYamlConfig(WriteTempYaml("logall-on", "log_everything: true\n"));
+    REQUIRE(on.has_value());
+    REQUIRE(on->logEverything);
+
+    auto const off = FastCache::ReadYamlConfig(WriteTempYaml("logall-off", "port: 11211\n"));
+    REQUIRE(off.has_value());
+    REQUIRE_FALSE(off->logEverything);
+}
+
 TEST_CASE("YamlReader: missing file is reported", "[config][yaml]")
 {
     auto const cfg = FastCache::ReadYamlConfig("/no/such/path/qwerty.yaml");

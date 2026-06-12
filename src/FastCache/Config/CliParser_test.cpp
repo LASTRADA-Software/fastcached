@@ -66,6 +66,42 @@ TEST_CASE("CliParser: --log-timestamps absent leaves the explicit-override flag 
     REQUIRE_FALSE(result->config.logTimestamps);
 }
 
+TEST_CASE("CliParser: --log-source sets the value and the explicit-override flag", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--log-source" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.logSource);
+    REQUIRE(result->logSourceExplicit);
+}
+
+TEST_CASE("CliParser: --log-source absent leaves the explicit-override flag clear", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--port=11211" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE_FALSE(result->logSourceExplicit);
+    REQUIRE_FALSE(result->config.logSource);
+}
+
+TEST_CASE("CliParser: --log-everything sets the value and the explicit-override flag", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--log-everything" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.logEverything);
+    REQUIRE(result->logEverythingExplicit);
+}
+
+TEST_CASE("CliParser: --log-everything absent leaves the explicit-override flag clear", "[config][cli]")
+{
+    auto const args = std::array<char const*, 1> { "--port=11211" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE_FALSE(result->logEverythingExplicit);
+    REQUIRE_FALSE(result->config.logEverything);
+}
+
 TEST_CASE("CliParser: --storage parses into Config::storagePath", "[config][cli][storage]")
 {
     auto const args = std::array<char const*, 1> { "--storage=/var/lib/fastcached/cache.cow" };
