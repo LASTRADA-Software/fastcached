@@ -49,6 +49,24 @@ enum class LogLevel : std::uint8_t
     return "?";
 }
 
+namespace Detail
+{
+    /// Thread-local "source" tag (typically a bracketed client IP like
+    /// "[203.0.113.7]") consulted by trace logging that runs *below* the
+    /// connection layer — chiefly TracingStorage — so a storage trace line can
+    /// name the client that triggered it. The connection layer cannot pass the
+    /// source down the synchronous IStorage call chain without threading it
+    /// through every method, so it is published here instead.
+    ///
+    /// Contract: a protocol handler assigns this immediately before a
+    /// *synchronous* storage call (the engine calls run in co_await-free blocks),
+    /// so the value is current when TracingStorage reads it. It is a view: the
+    /// referenced string lives in the connection's coroutine frame and outlives
+    /// the storage call. Empty means "no source" — the line is logged unprefixed.
+    /// Each command assigns it afresh, so a connection never inherits another's.
+    inline thread_local std::string_view StorageSourceTag {};
+} // namespace Detail
+
 /// Logger abstraction. Implementations are expected to be O(memcpy) on the
 /// caller's thread — protocol/reactor code logs inline. Asynchronous flushing
 /// is a post-MVP add-on; the contract is "writes return promptly."
@@ -93,6 +111,42 @@ class ILogger
             return;
         Log(level, std::format(fmt, std::forward<Args>(args)...));
     }
+};
+
+/// Whether connection-scoped log lines carry the client source (its IP).
+/// Modelled as a scoped enum rather than a bare bool so call sites read
+/// `LogSource::Yes` instead of an unlabelled `true`.
+enum class LogSource : std::uint8_t
+{
+    No,  ///< Do not prefix the source; log lines are unchanged.
+    Yes, ///< Prefix each connection log line with the client IP.
+};
+
+/// Logging decorator that prefixes a fixed source tag onto every record before
+/// delegating to an inner ILogger, then forwards the level-filter calls
+/// unchanged. Used per connection so each client's log lines carry its IP
+/// (`[INFO] [203.0.113.7] ...`) without every call site repeating the IP. An
+/// empty source forwards the message untouched, so a connection with no known
+/// peer address (the in-memory transport) costs nothing extra.
+///
+/// Thread safety: forwards to the inner logger, which owns synchronisation; the
+/// decorator holds only immutable state after construction.
+class SourceLogger final: public ILogger
+{
+  public:
+    /// Wrap an inner logger with a source tag.
+    /// @param inner Logger every record is forwarded to; must outlive this.
+    /// @param source Already-bracketed source tag (e.g. "[203.0.113.7]"), or ""
+    ///        to forward records unchanged.
+    SourceLogger(ILogger& inner, std::string source) noexcept;
+
+    void Log(LogLevel level, std::string_view message) override;
+    [[nodiscard]] LogLevel MinLevel() const noexcept override;
+    void SetMinLevel(LogLevel level) noexcept override;
+
+  private:
+    ILogger& _inner;
+    std::string _source;
 };
 
 /// Null logger that drops every record. Useful as the default in tests so a

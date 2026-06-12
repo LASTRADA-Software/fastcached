@@ -4812,6 +4812,22 @@ namespace
         auto const name = Upper(cmd.args[0]);
         auto const tail = std::span<std::string const> { cmd.args.data() + 1, cmd.args.size() - 1 };
 
+        // Attribute this command's storage trace line to the client: keyspace
+        // commands (GET/SET/DEL/...) surface on the TracingStorage `storage:`
+        // line, which reads this tag. Set on every command so a connection
+        // never inherits another's; empty when --log-source is off.
+        Detail::StorageSourceTag = session.sourceTag;
+        // Keyless commands (firstKey == 0: PING, HELLO, COMMAND, CLIENT,
+        // SUBSCRIBE, ...) never touch storage, so log them at the connection
+        // level — only under --log-everything, and only when trace is active.
+        if (session.logEverything && session.CommandLogEnabled())
+        {
+            auto const logIdx = CommandTableFind(name);
+            bool const isData = logIdx.has_value() && CommandTable[logIdx.value()].firstKey != 0;
+            if (!isData)
+                session.LogCommand(name, tail.empty() ? std::string_view {} : std::string_view { tail[0] });
+        }
+
         auto const auth = session.CurrentAuth();
         bool const authEnabled = auth != nullptr && auth->Enabled();
         if (authEnabled && !state->authenticated && !IsPreAuthAllowed(name))

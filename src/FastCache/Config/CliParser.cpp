@@ -290,6 +290,18 @@ namespace
             result.logTimestampsExplicit = true;
             return ArgOutcome::Continue;
         }
+        if (arg == "--log-source")
+        {
+            cfg.logSource = true;
+            result.logSourceExplicit = true;
+            return ArgOutcome::Continue;
+        }
+        if (arg == "--log-everything")
+        {
+            cfg.logEverything = true;
+            result.logEverythingExplicit = true;
+            return ArgOutcome::Continue;
+        }
         if (arg == "--metrics")
         {
             cfg.metricsEnabled = true;
@@ -558,6 +570,10 @@ namespace
                          "$=string (set/incr*), A=alias for g$\n"
                          "(x=expired is not yet wired — rejected pending storage callback)" },
         { .flag = "--log-timestamps", .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)" },
+        { .flag = "--log-source", .description = "prefix every connection log line with the client IP (default off)" },
+        { .flag = "--log-everything",
+          .description = "include keepalive/admin commands (PING, HELLO, ...) in the trace command log, not just "
+                         "keyspace data operations (default off)" },
         { .flag = "--storage=<path>", .description = "persist cache to a CoW-tree file (default: in-memory only)" },
         { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },
         { .flag = "--storage-max-value=<size>",

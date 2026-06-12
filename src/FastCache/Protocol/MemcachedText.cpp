@@ -33,6 +33,38 @@ namespace
     constexpr std::size_t MaxLineBytes = 4096;
     constexpr std::size_t MaxPayloadBytes = 16 * 1024 * 1024; // 16 MiB
 
+    /// Verbs that read or write a keyspace entry — the commands the command log
+    /// shows by default. Everything else (version, stats, flush_all, verbosity,
+    /// slabs, quit, meta debug/no-op, ...) is connection/admin chatter, logged
+    /// only under --log-everything. One source of truth for the text protocol's
+    /// data/non-data split.
+    constexpr auto DataCommands = std::to_array<std::string_view>({ "get",
+                                                                    "gets",
+                                                                    "set",
+                                                                    "add",
+                                                                    "replace",
+                                                                    "append",
+                                                                    "prepend",
+                                                                    "cas",
+                                                                    "delete",
+                                                                    "incr",
+                                                                    "decr",
+                                                                    "touch",
+                                                                    "gat",
+                                                                    "gats",
+                                                                    // meta data verbs: get / set / delete / arithmetic
+                                                                    "mg",
+                                                                    "ms",
+                                                                    "md",
+                                                                    "ma" });
+
+    /// @param command Lower-case command verb as parsed from the request line.
+    /// @return true when `command` reads or writes a keyspace entry.
+    [[nodiscard]] bool IsDataCommand(std::string_view command) noexcept
+    {
+        return std::ranges::find(DataCommands, command) != DataCommands.end();
+    }
+
     /// Split a line on whitespace into `out` (cleared first). `maxParts == 0`
     /// (the default) imposes no limit: the line length is already bounded by
     /// ByteReader's MaxLineBytes, so a multi-key `get`/`gets`/`gat`/`gats`
@@ -250,7 +282,8 @@ namespace
                              CacheEngine* engine,
                              ByteReader* reader,
                              std::string_view commandName,
-                             std::span<std::string_view const> args)
+                             std::span<std::string_view const> args,
+                             std::string_view sourceTag)
     {
         auto const isCas = commandName == "cas";
         StorageArgs parsed {};
@@ -273,6 +306,11 @@ namespace
             // Synchronous storage dispatch — scoped so the zone closes before
             // any co_await below (a zone must not straddle a suspension point).
             FC_ZONE_SCOPED_N("memcached.HandleStorage.dispatch");
+            // Re-publish the source tag here: the payload read above is a
+            // co_await that may have let another connection run and overwrite
+            // the thread-local. This block is co_await-free, so the tag stays
+            // valid through the engine call TracingStorage logs.
+            Detail::StorageSourceTag = sourceTag;
             if (commandName == "set")
                 result = engine->Set(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
             else if (commandName == "add")
@@ -649,6 +687,17 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket,
         auto const command = parts[0];
         auto const tail = std::span<std::string_view const> { parts.data() + 1, parts.size() - 1 };
 
+        // Attribute this command's storage trace line(s) to the client: data
+        // verbs (get/set/...) surface on the TracingStorage `storage:` line,
+        // which reads this tag. Set every command so a connection never inherits
+        // another's; empty when --log-source is off.
+        Detail::StorageSourceTag = session.sourceTag;
+        // Non-data verbs (version, stats, quit, meta debug/no-op, ...) never
+        // reach storage, so log them at the connection level — only under
+        // --log-everything, and only when trace logging is active.
+        if (session.logEverything && session.CommandLogEnabled() && !IsDataCommand(command))
+            session.LogCommand(command, tail.empty() ? std::string_view {} : tail[0]);
+
         // Resolve auth per-command so SIGHUP reload of requirepass is honoured
         // immediately on the next request; the captured shared_ptr keeps the
         // policy alive for the duration of this command's evaluation.
@@ -674,7 +723,7 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket,
             ok = co_await HandleGet(socket, engine, tail, /*includeCas*/ true);
         else if (command == "set" || command == "add" || command == "replace" || command == "append" || command == "prepend"
                  || command == "cas")
-            ok = co_await HandleStorage(socket, engine, &reader, command, tail);
+            ok = co_await HandleStorage(socket, engine, &reader, command, tail, session.sourceTag);
         else if (command == "delete")
             ok = co_await HandleDelete(socket, engine, tail);
         else if (command == "incr")

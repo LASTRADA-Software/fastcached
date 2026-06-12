@@ -27,7 +27,14 @@ class Connection
     /// @param logger Shared logger.
     /// @param session Per-server session context (auth policy etc.); copied by
     ///        value (a cheap pointer-sized bundle). Defaults to no auth.
-    Connection(std::unique_ptr<ISocket> socket, CacheEngine& engine, ILogger& logger, SessionContext session = {}) noexcept;
+    /// @param logSource When LogSource::Yes, this connection's log lines are
+    ///        prefixed with the client IP (the socket's PeerAddress()). Defaults
+    ///        to LogSource::No, leaving log output unchanged.
+    Connection(std::unique_ptr<ISocket> socket,
+               CacheEngine& engine,
+               ILogger& logger,
+               SessionContext session = {},
+               LogSource logSource = LogSource::No) noexcept;
 
     /// Run the connection's protocol loop to completion.
     /// @return Task that resolves when the connection closes.
@@ -38,6 +45,7 @@ class Connection
     CacheEngine& _engine;
     ILogger& _logger;
     SessionContext _session;
+    LogSource _logSource;
 };
 
 } // namespace FastCache

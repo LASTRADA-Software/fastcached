@@ -79,7 +79,11 @@ namespace Detail
 class BlockingSocket final: public ISocket
 {
   public:
-    explicit BlockingSocket(Detail::NativeSocket native) noexcept;
+    /// Wrap a native socket handle.
+    /// @param native The accepted/connected socket handle.
+    /// @param peerAddress Printable peer host captured at accept time, or ""
+    ///        when unknown. Surfaced via PeerAddress() for `--log-source`.
+    explicit BlockingSocket(Detail::NativeSocket native, std::string peerAddress = {}) noexcept;
     BlockingSocket(BlockingSocket const&) = delete;
     BlockingSocket(BlockingSocket&&) = delete;
     BlockingSocket& operator=(BlockingSocket const&) = delete;
@@ -95,9 +99,14 @@ class BlockingSocket final: public ISocket
     {
         return _closed;
     }
+    [[nodiscard]] std::string PeerAddress() const override
+    {
+        return _peerAddress;
+    }
 
   private:
     Detail::NativeSocket _native;
+    std::string _peerAddress;
     bool _closed { false };
 };
 

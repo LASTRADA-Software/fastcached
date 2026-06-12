@@ -545,6 +545,12 @@ int DaemonBody(FastCache::Config const& effective)
     // Pin reactors to cores when asked (PerCore) and there's more than one;
     // a lone reactor gains nothing from pinning.
     serverOpts.pinReactorsToCpu = effective.cpuAffinity == FastCache::CpuAffinity::PerCore && reactorCount > 1;
+    // When --log-source is set, every connection prefixes its log lines with
+    // the client IP.
+    serverOpts.logSource = effective.logSource;
+    // --log-everything widens the Trace command log to non-data commands too.
+    // Carried on the session bundle that every connection's handlers receive.
+    serverOpts.session.logEverything = effective.logEverything;
     serverOpts.session.authSource = &authSource;
     // pubsub / watches / keyspaceNotifier are declared further up
     // (immediately before the engine) so the NotifyingStorage decorator

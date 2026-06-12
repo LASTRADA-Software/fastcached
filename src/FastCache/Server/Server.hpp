@@ -58,13 +58,16 @@ class Server
     ///        to every connection. Copied by value; defaults to no auth.
     /// @param tls TLS context to wrap accepted sockets with, or nullptr for
     ///        plaintext. Only honoured in TLS-enabled builds.
+    /// @param logSource When LogSource::Yes, every connection prefixes its log
+    ///        lines with the client IP. Defaults to LogSource::No.
     Server(IListener& listener,
            CacheEngine& engine,
            ILogger& logger,
            IAdmissionControl* admission = nullptr,
            IMetricsSink* metrics = nullptr,
            SessionContext session = {},
-           TlsContext* tls = nullptr) noexcept;
+           TlsContext* tls = nullptr,
+           LogSource logSource = LogSource::No) noexcept;
 
     /// Run the accept loop until Shutdown() is called or the listener closes.
     /// @return Task that resolves when the accept loop exits.
@@ -89,6 +92,7 @@ class Server
     IMetricsSink* _metrics;
     SessionContext _session;
     TlsContext* _tls;
+    LogSource _logSource;
     std::atomic<std::uint64_t> _accepted { 0 };
     std::atomic<bool> _shuttingDown { false };
 };

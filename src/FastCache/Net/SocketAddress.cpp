@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Net/SocketAddress.hpp>
 
+#include <array>
 #include <cstring>
 #include <expected>
 #include <format>
@@ -22,6 +23,7 @@
     #include <netdb.h>
     #include <unistd.h>
 
+    #include <arpa/inet.h>
     #include <netinet/in.h>
     #include <netinet/tcp.h>
 #endif
@@ -244,6 +246,52 @@ namespace Detail
         return std::unexpected(lastError.empty() ? std::format("no usable address for '{}:{}'", host, port) : lastError);
     }
 
+    ResolvedEndpoint EndpointFromSockaddr(void const* sockaddr, std::uint32_t length) noexcept
+    {
+        ResolvedEndpoint endpoint;
+        if (length == 0 || length > ResolvedEndpoint::StorageSize)
+            return endpoint;
+        std::memcpy(endpoint.storage.data(), sockaddr, length);
+        endpoint.length = length;
+        // The address family lives in the first field of every sockaddr variant.
+        endpoint.family = reinterpret_cast<struct sockaddr const*>(sockaddr)->sa_family;
+        return endpoint;
+    }
+
+    std::string PeerAddressOf(NativeSocket socket) noexcept
+    {
+        sockaddr_storage peer {};
+        AddrLen length = sizeof(peer);
+        if (::getpeername(socket, reinterpret_cast<sockaddr*>(&peer), &length) != 0)
+            return {};
+        return FormatPeerAddress(EndpointFromSockaddr(&peer, static_cast<std::uint32_t>(length)));
+    }
+
 } // namespace Detail
+
+std::string FormatPeerAddress(ResolvedEndpoint const& endpoint)
+{
+    if (endpoint.length == 0)
+        return {};
+
+    // The address pointer differs per family; the textual conversion does not.
+    void const* addr = nullptr;
+    switch (endpoint.family)
+    {
+        case AF_INET:
+            addr = &reinterpret_cast<sockaddr_in const*>(endpoint.storage.data())->sin_addr;
+            break;
+        case AF_INET6:
+            addr = &reinterpret_cast<sockaddr_in6 const*>(endpoint.storage.data())->sin6_addr;
+            break;
+        default:
+            return {};
+    }
+
+    std::array<char, INET6_ADDRSTRLEN> text {};
+    if (::inet_ntop(endpoint.family, addr, text.data(), text.size()) == nullptr)
+        return {};
+    return std::string { text.data() };
+}
 
 } // namespace FastCache

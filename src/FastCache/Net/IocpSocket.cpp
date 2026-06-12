@@ -117,9 +117,10 @@ struct IocpSocket::Impl
     }
 };
 
-IocpSocket::IocpSocket(IocpReactor& reactor, std::uintptr_t native) noexcept:
+IocpSocket::IocpSocket(IocpReactor& reactor, std::uintptr_t native, std::string peerAddress) noexcept:
     _impl { std::make_unique<Impl>(reactor, static_cast<SOCKET>(native)) },
-    _native { native }
+    _native { native },
+    _peerAddress { std::move(peerAddress) }
 {
     // Record whether the IOCP association succeeded. If it didn't, no
     // completion will ever be dequeued for this socket; callers must check
@@ -330,6 +331,10 @@ struct IocpListener::Impl
         SOCKET acceptSock { INVALID_SOCKET };
         std::array<std::byte, AcceptAddrSize * 2> addrBuf {};
         IocpReactor* reactor { nullptr };
+        /// GetAcceptExSockaddrs, loaded once at Bind() and copied here so the
+        /// static Dispatch can extract the peer address from `addrBuf` without
+        /// reaching back into the listener Impl.
+        LPFN_GETACCEPTEXSOCKADDRS getAcceptExSockaddrsFn { nullptr };
     };
 
     AcceptOp current;
@@ -354,7 +359,29 @@ struct IocpListener::Impl
 
         // Hand the accepted SOCKET off into an IocpSocket wrapping it.
         Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(op->acceptSock));
-        auto sock = std::make_unique<IocpSocket>(*op->reactor, static_cast<std::uintptr_t>(op->acceptSock));
+
+        // AcceptEx already wrote the local + remote sockaddrs into addrBuf;
+        // GetAcceptExSockaddrs parses out the remote peer with no extra syscall.
+        std::string peer;
+        if (op->getAcceptExSockaddrsFn != nullptr)
+        {
+            sockaddr* localAddr = nullptr;
+            sockaddr* remoteAddr = nullptr;
+            int localLen = 0;
+            int remoteLen = 0;
+            op->getAcceptExSockaddrsFn(op->addrBuf.data(),
+                                       0,
+                                       static_cast<DWORD>(AcceptAddrSize),
+                                       static_cast<DWORD>(AcceptAddrSize),
+                                       &localAddr,
+                                       &localLen,
+                                       &remoteAddr,
+                                       &remoteLen);
+            if (remoteAddr != nullptr && remoteLen > 0)
+                peer = FormatPeerAddress(Detail::EndpointFromSockaddr(remoteAddr, static_cast<std::uint32_t>(remoteLen)));
+        }
+
+        auto sock = std::make_unique<IocpSocket>(*op->reactor, static_cast<std::uintptr_t>(op->acceptSock), std::move(peer));
         op->acceptSock = INVALID_SOCKET;
         if (awaitable)
             awaitable->Complete(AcceptResult { std::move(sock) });
@@ -414,6 +441,26 @@ std::unique_ptr<IocpListener> IocpListener::Bind(
     }
     listener->_impl->acceptExFn = fn;
 
+    // Fetch GetAcceptExSockaddrs the same way, to parse the peer address out of
+    // the AcceptEx output buffer. A failure here is non-fatal: peer-address
+    // capture (used only by --log-source) is simply disabled for this listener.
+    GUID guidGetAcceptExSockaddrs = WSAID_GETACCEPTEXSOCKADDRS;
+    LPFN_GETACCEPTEXSOCKADDRS getAddrsFn = nullptr;
+    DWORD addrsBytesReturned = 0;
+    if (WSAIoctl(sock,
+                 SIO_GET_EXTENSION_FUNCTION_POINTER,
+                 &guidGetAcceptExSockaddrs,
+                 sizeof(guidGetAcceptExSockaddrs),
+                 &getAddrsFn,
+                 sizeof(getAddrsFn),
+                 &addrsBytesReturned,
+                 nullptr,
+                 nullptr)
+        != 0)
+    {
+        getAddrsFn = nullptr;
+    }
+
     if (!reactor.AttachHandle(reinterpret_cast<void*>(sock)))
     {
         listener->_impl->bindError = "CreateIoCompletionPort failed";
@@ -424,6 +471,7 @@ std::unique_ptr<IocpListener> IocpListener::Bind(
     listener->_impl->listenSock = sock;
     listener->_impl->current.completion.dispatch = &Impl::Dispatch;
     listener->_impl->current.reactor = &reactor;
+    listener->_impl->current.getAcceptExSockaddrsFn = getAddrsFn;
     return listener;
 }
 

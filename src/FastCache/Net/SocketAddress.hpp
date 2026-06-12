@@ -73,6 +73,15 @@ class SystemAddressResolver final: public IAddressResolver
 // which is where the bind-time resolver DI seam lives; re-declaring it here
 // would be redundant.
 
+/// Format the address held in a ResolvedEndpoint as a printable host string —
+/// an IPv4 dotted-quad ("203.0.113.7") or an IPv6 textual address ("::1"). The
+/// port is intentionally omitted: this feeds the `--log-source` connection
+/// prefix, which records the client IP only.
+/// @param endpoint Endpoint whose stored sockaddr is rendered.
+/// @return The printable host string, or "" for an empty / unknown-family
+///         endpoint (e.g. a peer address that was never captured).
+[[nodiscard]] std::string FormatPeerAddress(ResolvedEndpoint const& endpoint);
+
 namespace Detail
 {
 
@@ -104,6 +113,23 @@ namespace Detail
                                                                           int backlog,
                                                                           int extraTypeFlags,
                                                                           ReusePort reusePort = ReusePort::No);
+
+    /// Copy a raw sockaddr (as filled by accept/accept4/AcceptEx) into a
+    /// platform-free ResolvedEndpoint, reading the address family from the
+    /// sockaddr itself. The single home for the peer-capture memcpy the
+    /// platform listeners share.
+    /// @param sockaddr Pointer to a sockaddr / sockaddr_in / sockaddr_in6.
+    /// @param length Valid byte count of the sockaddr (a socklen_t value).
+    /// @return The captured endpoint; an all-zero endpoint when `length` is 0
+    ///         or exceeds ResolvedEndpoint::StorageSize.
+    [[nodiscard]] ResolvedEndpoint EndpointFromSockaddr(void const* sockaddr, std::uint32_t length) noexcept;
+
+    /// Query a connected socket's remote peer with ::getpeername and format it
+    /// as a printable host string. Used by the Windows multi-reactor acceptor,
+    /// whose AcceptRaw hands off a raw connected handle without a captured peer.
+    /// @param socket A connected stream-socket handle.
+    /// @return The peer host ("203.0.113.7" / "::1"), or "" on failure.
+    [[nodiscard]] std::string PeerAddressOf(NativeSocket socket) noexcept;
 
 } // namespace Detail
 

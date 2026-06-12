@@ -321,8 +321,16 @@ jobs:
       - name: "Install ninja"
         run: choco install ninja --no-progress
 
+      # Pin the MSVC toolset to 14.44. The windows-2025 image moved to VS 18 /
+      # MSVC STL 14.51, whose <xutility> trips a "static assertion failed:
+      # unexpected size" under the runner's bundled clang-cl 20.1.8 (the cl
+      # job is unaffected — MSVC compiles its own STL). 14.44 is the last
+      # toolset clang-cl 20.1.8 accepts and the version CI was green on before
+      # the image bump; cl-release builds against it equally well.
       - name: "Setup MSVC dev environment"
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          toolset: "14.44"
 
       # TLS on, against the OpenSSL preinstalled on the GitHub Windows runner
       # (vcpkg is the local-dev path; CI uses the runner's OpenSSL to avoid a

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <memory>
 #include <span>
+#include <string>
 #include <utility>
 
 namespace FastCache
@@ -58,9 +59,12 @@ std::size_t InMemoryPipe::TryPull(std::span<std::byte> into) noexcept
 
 // -- InMemorySocket --------------------------------------------------------
 
-InMemorySocket::InMemorySocket(std::shared_ptr<InMemoryPipe> inbound, std::shared_ptr<InMemoryPipe> outbound) noexcept:
+InMemorySocket::InMemorySocket(std::shared_ptr<InMemoryPipe> inbound,
+                               std::shared_ptr<InMemoryPipe> outbound,
+                               std::string peerAddress) noexcept:
     _inbound { std::move(inbound) },
-    _outbound { std::move(outbound) }
+    _outbound { std::move(outbound) },
+    _peerAddress { std::move(peerAddress) }
 {
     _inbound->SetProgressCallback(&InMemorySocket::OnInboundProgress, this);
 }
@@ -184,13 +188,13 @@ void InMemorySocket::OnInboundProgress(void* state) noexcept
 
 // -- InMemorySocketPair ----------------------------------------------------
 
-InMemorySocketPair InMemorySocketPair::Create(std::size_t maxBytesInFlight)
+InMemorySocketPair InMemorySocketPair::Create(std::size_t maxBytesInFlight, std::string serverPeerAddress)
 {
     auto clientToServer = std::make_shared<InMemoryPipe>(maxBytesInFlight);
     auto serverToClient = std::make_shared<InMemoryPipe>(maxBytesInFlight);
     InMemorySocketPair pair;
     pair.client = std::make_unique<InMemorySocket>(serverToClient, clientToServer);
-    pair.server = std::make_unique<InMemorySocket>(clientToServer, serverToClient);
+    pair.server = std::make_unique<InMemorySocket>(clientToServer, serverToClient, std::move(serverPeerAddress));
     return pair;
 }
 
@@ -231,9 +235,9 @@ void InMemoryListener::Close() noexcept
     }
 }
 
-std::unique_ptr<InMemorySocket> InMemoryListener::ConnectClient(std::size_t maxBytesInFlight)
+std::unique_ptr<InMemorySocket> InMemoryListener::ConnectClient(std::size_t maxBytesInFlight, std::string peerAddress)
 {
-    auto pair = InMemorySocketPair::Create(maxBytesInFlight);
+    auto pair = InMemorySocketPair::Create(maxBytesInFlight, std::move(peerAddress));
     _ready.push_back(Pending { .socket = std::move(pair.server) });
     TryCompletePendingAccept();
     return std::move(pair.client);

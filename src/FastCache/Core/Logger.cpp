@@ -47,6 +47,34 @@ void ConsoleLogger::SetMinLevel(LogLevel level) noexcept
     _minLevel.store(level, std::memory_order_relaxed);
 }
 
+// -- SourceLogger ----------------------------------------------------------
+
+SourceLogger::SourceLogger(ILogger& inner, std::string source) noexcept:
+    _inner { inner },
+    _source { std::move(source) }
+{
+}
+
+void SourceLogger::Log(LogLevel level, std::string_view message)
+{
+    if (_source.empty())
+    {
+        _inner.Log(level, message);
+        return;
+    }
+    _inner.Log(level, std::format("{} {}", _source, message));
+}
+
+LogLevel SourceLogger::MinLevel() const noexcept
+{
+    return _inner.MinLevel();
+}
+
+void SourceLogger::SetMinLevel(LogLevel level) noexcept
+{
+    _inner.SetMinLevel(level);
+}
+
 // -- CapturingLogger -------------------------------------------------------
 
 CapturingLogger::CapturingLogger(LogLevel initialMinLevel) noexcept:
