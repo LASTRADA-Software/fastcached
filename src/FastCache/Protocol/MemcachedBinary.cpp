@@ -70,6 +70,127 @@ namespace
         GatKQ = 0x24,
     };
 
+    /// Canonical verb name for an opcode, used by command (access) logging.
+    /// Quiet ("Q") and key-returning ("K") variants collapse to their base
+    /// verb — an access log cares about the operation, not the reply shape.
+    /// @param opcode Binary protocol opcode.
+    /// @return Lower-case verb name, or "unknown" for an unrecognised opcode.
+    [[nodiscard]] constexpr std::string_view OpcodeName(Opcode opcode) noexcept
+    {
+        switch (opcode)
+        {
+            case Opcode::Get:
+            case Opcode::GetQ:
+            case Opcode::GetK:
+            case Opcode::GetKQ:
+                return "get";
+            case Opcode::Set:
+            case Opcode::SetQ:
+                return "set";
+            case Opcode::Add:
+            case Opcode::AddQ:
+                return "add";
+            case Opcode::Replace:
+            case Opcode::ReplaceQ:
+                return "replace";
+            case Opcode::Delete:
+            case Opcode::DeleteQ:
+                return "delete";
+            case Opcode::Increment:
+            case Opcode::IncrementQ:
+                return "incr";
+            case Opcode::Decrement:
+            case Opcode::DecrementQ:
+                return "decr";
+            case Opcode::Quit:
+            case Opcode::QuitQ:
+                return "quit";
+            case Opcode::Flush:
+            case Opcode::FlushQ:
+                return "flush_all";
+            case Opcode::NoOp:
+                return "noop";
+            case Opcode::Version:
+                return "version";
+            case Opcode::Append:
+            case Opcode::AppendQ:
+                return "append";
+            case Opcode::Prepend:
+            case Opcode::PrependQ:
+                return "prepend";
+            case Opcode::Stat:
+                return "stats";
+            case Opcode::Verbosity:
+                return "verbosity";
+            case Opcode::Touch:
+                return "touch";
+            case Opcode::Gat:
+            case Opcode::GatQ:
+            case Opcode::GatK:
+            case Opcode::GatKQ:
+                return "gat";
+            case Opcode::SaslList:
+                return "sasl_list";
+            case Opcode::SaslAuth:
+                return "sasl_auth";
+            case Opcode::SaslStep:
+                return "sasl_step";
+        }
+        return "unknown";
+    }
+
+    /// Whether an opcode reads or writes a keyspace entry — the commands the
+    /// command log shows by default. Quit/Flush/NoOp/Version/Stat/Verbosity and
+    /// the SASL handshake opcodes are connection/admin chatter, logged only
+    /// under --log-everything.
+    /// @param opcode Binary protocol opcode.
+    /// @return true for keyspace data operations.
+    [[nodiscard]] constexpr bool IsDataOpcode(Opcode opcode) noexcept
+    {
+        switch (opcode)
+        {
+            case Opcode::Get:
+            case Opcode::GetQ:
+            case Opcode::GetK:
+            case Opcode::GetKQ:
+            case Opcode::Set:
+            case Opcode::SetQ:
+            case Opcode::Add:
+            case Opcode::AddQ:
+            case Opcode::Replace:
+            case Opcode::ReplaceQ:
+            case Opcode::Delete:
+            case Opcode::DeleteQ:
+            case Opcode::Increment:
+            case Opcode::IncrementQ:
+            case Opcode::Decrement:
+            case Opcode::DecrementQ:
+            case Opcode::Append:
+            case Opcode::AppendQ:
+            case Opcode::Prepend:
+            case Opcode::PrependQ:
+            case Opcode::Touch:
+            case Opcode::Gat:
+            case Opcode::GatQ:
+            case Opcode::GatK:
+            case Opcode::GatKQ:
+                return true;
+            case Opcode::Quit:
+            case Opcode::QuitQ:
+            case Opcode::Flush:
+            case Opcode::FlushQ:
+            case Opcode::NoOp:
+            case Opcode::Version:
+            case Opcode::Stat:
+            case Opcode::Verbosity:
+            case Opcode::SaslList:
+            case Opcode::SaslAuth:
+            case Opcode::SaslStep:
+                return false;
+        }
+        return false;
+    }
+
     enum class Status : std::uint8_t
     {
         Ok = 0x00,
@@ -705,6 +826,18 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket,
         auto const extras = bodySpan.first(header.extrasLen);
         auto const key = bodySpan.subspan(header.extrasLen, header.keyLen);
         auto const value = bodySpan.subspan(static_cast<std::size_t>(header.extrasLen) + header.keyLen);
+
+        // Attribute this command's storage trace line to the client: keyspace
+        // opcodes surface on the TracingStorage `storage:` line which reads this
+        // tag. The full body was read above, so this is co_await-free through
+        // the engine calls in the switch below. Set every command so no
+        // connection inherits another's; empty when --log-source is off.
+        Detail::StorageSourceTag = session.sourceTag;
+        // Non-data opcodes (Quit/Flush/NoOp/Version/Stat/Verbosity/Sasl*) never
+        // touch storage; log them at the connection level only under
+        // --log-everything.
+        if (session.logEverything && session.CommandLogEnabled() && !IsDataOpcode(opcode))
+            session.LogCommand(OpcodeName(opcode), AsStringView(key));
 
         bool keepGoing = true;
         switch (opcode)

@@ -2,6 +2,9 @@
 #pragma once
 
 #include <FastCache/Auth/AuthPolicy.hpp>
+#include <FastCache/Core/Logger.hpp>
+
+#include <string_view>
 
 namespace FastCache
 {
@@ -62,6 +65,52 @@ struct SessionContext
     /// `IsEnabled() == false` is also a valid "off" state. Owned by the
     /// daemon body; outlives every connection.
     KeyspaceNotifier* keyspaceNotifier { nullptr };
+
+    /// Per-connection logger used for connection-level trace logging (the
+    /// "connection accepted" line and, under `--log-everything`, non-data
+    /// commands). Set by Connection to its source-decorated logger, so lines
+    /// carry the client IP when `--log-source` is on. Null in tests that drive
+    /// a handler directly — `LogCommand` then no-ops. Data operations are NOT
+    /// logged here; they surface on the TracingStorage `storage:` line instead
+    /// (see `sourceTag`), which avoids logging each GET/SET twice.
+    ILogger* logger { nullptr };
+
+    /// Source tag (bracketed client IP, e.g. "[203.0.113.7]", or empty) that
+    /// handlers publish to `Detail::StorageSourceTag` before each storage call
+    /// so the `storage:` trace line names the client. Set by Connection; a view
+    /// into the connection frame, valid for the session's lifetime.
+    std::string_view sourceTag {};
+
+    /// When true (`--log-everything`), non-data commands (PING, HELLO, COMMAND,
+    /// AUTH, ...) are also logged at the connection level. These never reach
+    /// storage, so without this flag they are invisible. Data operations are
+    /// unaffected — they always appear on the `storage:` line at Trace.
+    bool logEverything { false };
+
+    /// Whether connection-level command logging is currently active — i.e. a
+    /// logger is wired and its threshold admits Trace. Handlers check this
+    /// before classifying a command, so the hot path pays nothing when trace
+    /// logging is off.
+    /// @return true when a non-data command line would actually be emitted.
+    [[nodiscard]] bool CommandLogEnabled() const noexcept
+    {
+        return logger != nullptr && logger->MinLevel() <= LogLevel::Trace;
+    }
+
+    /// Trace-log one connection-level command line (verb, plus an optional key)
+    /// through the per-connection `logger`. Used only for non-data commands
+    /// under `--log-everything`; the one place that line's format lives.
+    /// @param verb Command verb as the client issued it (e.g. "PING", "hello").
+    /// @param key Primary argument, or empty for argument-less commands.
+    void LogCommand(std::string_view verb, std::string_view key = {}) const
+    {
+        if (logger == nullptr)
+            return;
+        if (key.empty())
+            logger->Logf(LogLevel::Trace, "{}", verb);
+        else
+            logger->Logf(LogLevel::Trace, "{} {}", verb, key);
+    }
 
     /// Resolve the currently-active policy through `authSource`. Callers hold
     /// the returned shared_ptr for the lifetime of a single verify so a

@@ -48,6 +48,10 @@ struct ReactorServerOptions
     /// The referenced objects must outlive the server run.
     SessionContext session {};
 
+    /// When true, every connection prefixes its log lines with the client IP
+    /// (the accepted socket's peer address). Maps `Config::logSource`.
+    bool logSource { false };
+
     /// TLS context for terminating TLS on accepted connections, or nullptr for
     /// plaintext. Only honoured in TLS-enabled builds; must outlive the run.
     TlsContext* tlsContext { nullptr };
