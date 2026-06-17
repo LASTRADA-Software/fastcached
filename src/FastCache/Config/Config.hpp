@@ -212,6 +212,17 @@ struct Config
     /// When true, each ConsoleLogger line is prefixed with an ISO 8601 UTC timestamp.
     bool logTimestamps { false };
 
+    /// When true, each connection-scoped log line is prefixed with the client
+    /// IP that caused it (e.g. `[INFO] [203.0.113.7] ...`). Global/server log
+    /// lines, which have no client, are unaffected.
+    bool logSource { false };
+
+    /// When true, the Trace-level command (access) log includes every command,
+    /// not just keyspace data operations — i.e. also connection/keepalive/admin
+    /// chatter such as PING, COMMAND, HELLO, CLIENT, AUTH. Off by default so the
+    /// command log stays focused on GET/SET-style traffic.
+    bool logEverything { false };
+
     /// If true, daemonize (POSIX) or self-register as a Windows service.
     bool daemon { false };
 

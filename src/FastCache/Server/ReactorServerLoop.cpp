@@ -114,8 +114,14 @@ namespace
             auto* const perBindTls = bind.tls ? options.tlsContext : nullptr;
             auto session = options.session;
             session.reactor = &reactor;
-            servers.push_back(
-                std::make_unique<Server>(*listeners.back(), engine, logger, admission, metrics, session, perBindTls));
+            servers.push_back(std::make_unique<Server>(*listeners.back(),
+                                                       engine,
+                                                       logger,
+                                                       admission,
+                                                       metrics,
+                                                       session,
+                                                       perBindTls,
+                                                       options.logSource ? LogSource::Yes : LogSource::No));
         }
         logger.Logf(LogLevel::Info, "ready, accepting connections ({} bind(s))", options.binds.size());
 
@@ -155,7 +161,9 @@ namespace
                                         ILogger& logger,
                                         IAdmissionControl* admission,
                                         SessionContext session,
-                                        [[maybe_unused]] TlsContext* tls)
+                                        [[maybe_unused]] TlsContext* tls,
+                                        std::string peerAddress,
+                                        LogSource logSource)
     {
         co_await ResumeOn { reactor };
         // This connection now runs on `reactor`; pin pub/sub delivery to it so a
@@ -165,7 +173,7 @@ namespace
         // so a handler exception must drop only this connection, not the daemon.
         try
         {
-            auto socket = std::make_unique<IocpSocket>(reactor, static_cast<std::uintptr_t>(raw));
+            auto socket = std::make_unique<IocpSocket>(reactor, static_cast<std::uintptr_t>(raw), std::move(peerAddress));
             if (!socket->IsAttached())
             {
                 // CreateIoCompletionPort failed for this socket: no completion
@@ -176,7 +184,7 @@ namespace
             }
             else
             {
-                Connection connection { WrapTls(std::move(socket), tls), engine, logger, session };
+                Connection connection { WrapTls(std::move(socket), tls), engine, logger, session, logSource };
                 co_await connection.Run();
             }
         }
@@ -282,7 +290,19 @@ namespace
                     }
                     auto const idx = nextReactor.fetch_add(1, std::memory_order_relaxed) % reactorCount;
                     auto& reactor = *reactors[idx];
-                    RunHandedOffConnection(reactor, *raw, engine, logger, admission, options.session, perBindTls);
+                    // AcceptRaw hands off a connected handle without a captured
+                    // peer; query it now (on the acceptor thread) so --log-source
+                    // can prefix this connection's log lines with the client IP.
+                    auto peer = options.logSource ? Detail::PeerAddressOf(*raw) : std::string {};
+                    RunHandedOffConnection(reactor,
+                                           *raw,
+                                           engine,
+                                           logger,
+                                           admission,
+                                           options.session,
+                                           perBindTls,
+                                           std::move(peer),
+                                           options.logSource ? LogSource::Yes : LogSource::No);
                 }
             });
         }
@@ -384,8 +404,14 @@ namespace
                 auto* const perBindTls = bind.tls ? options.tlsContext : nullptr;
                 auto session = options.session;
                 session.reactor = reactors[i].get();
-                servers.push_back(
-                    std::make_unique<Server>(*listeners.back(), engine, logger, admission, metrics, session, perBindTls));
+                servers.push_back(std::make_unique<Server>(*listeners.back(),
+                                                           engine,
+                                                           logger,
+                                                           admission,
+                                                           metrics,
+                                                           session,
+                                                           perBindTls,
+                                                           options.logSource ? LogSource::Yes : LogSource::No));
             }
         }
         logger.Logf(LogLevel::Info, "ready, accepting connections ({} bind(s) x {} reactors)", bindCount, reactorCount);

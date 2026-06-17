@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <expected>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace FastCache
@@ -23,6 +24,25 @@ enum class ProtocolFlavor : std::uint8_t
     MemcachedBinary, ///< Not yet implemented; recognised but currently treated like MemcachedText.
     RedisResp,       ///< Not yet implemented; recognised but currently treated like MemcachedText.
 };
+
+/// Stable, lower-case name for a ProtocolFlavor, suitable for log output.
+/// @param flavor Flavor to translate.
+/// @return Static string view; never empty.
+[[nodiscard]] constexpr std::string_view ToStringView(ProtocolFlavor flavor) noexcept
+{
+    switch (flavor)
+    {
+        case ProtocolFlavor::MemcachedText:
+            return "memcached-text";
+        case ProtocolFlavor::MemcachedBinary:
+            return "memcached-binary";
+        case ProtocolFlavor::RedisResp:
+            return "redis-resp";
+        case ProtocolFlavor::Unknown:
+            return "unknown";
+    }
+    return "unknown";
+}
 
 /// Outcome of peeking the start of a stream: which protocol to dispatch to
 /// and the bytes consumed during the peek (must be replayed by the chosen

@@ -55,6 +55,8 @@ Config Merge(Config fileCfg, CliResult const& cli)
     MergeField(fileCfg, cli, &CliResult::storageShardsExplicit, &Config::storageShards);
     MergeField(fileCfg, cli, &CliResult::listenBacklogExplicit, &Config::listenBacklog);
     MergeField(fileCfg, cli, &CliResult::logTimestampsExplicit, &Config::logTimestamps);
+    MergeField(fileCfg, cli, &CliResult::logSourceExplicit, &Config::logSource);
+    MergeField(fileCfg, cli, &CliResult::logEverythingExplicit, &Config::logEverything);
     MergeField(fileCfg, cli, &CliResult::requirePassExplicit, &Config::requirePass);
     MergeField(fileCfg, cli, &CliResult::authUsernameExplicit, &Config::authUsername);
     MergeField(fileCfg, cli, &CliResult::metricsEnabledExplicit, &Config::metricsEnabled);

@@ -48,6 +48,40 @@ TEST_CASE("TracingStorage emits one Trace line per Get with HIT outcome", "[trac
     REQUIRE(ContainsSubstr(records[0].message, "bytes=3"));
 }
 
+TEST_CASE("TracingStorage prefixes the line with the published source tag", "[tracing][logsource]")
+{
+    FastCache::InMemoryLruStorage inner;
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::ManualClock clock;
+    FastCache::TracingStorage tracer { inner, logger, clock };
+
+    // A handler publishes the client tag immediately before the (synchronous)
+    // storage call; the trace line carries it. Restore to empty afterwards.
+    FastCache::Detail::StorageSourceTag = "[203.0.113.7]";
+    auto const got = tracer.Get("foo", clock.Now());
+    FastCache::Detail::StorageSourceTag = {};
+    REQUIRE(got.has_value());
+
+    auto const records = logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0].message.starts_with("[203.0.113.7] storage: GET key=foo"));
+}
+
+TEST_CASE("TracingStorage omits the prefix when no source tag is published", "[tracing][logsource]")
+{
+    FastCache::InMemoryLruStorage inner;
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::ManualClock clock;
+    FastCache::TracingStorage tracer { inner, logger, clock };
+
+    FastCache::Detail::StorageSourceTag = {}; // no source
+    REQUIRE(tracer.Get("foo", clock.Now()).has_value());
+
+    auto const records = logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0].message.starts_with("storage: GET key=foo"));
+}
+
 TEST_CASE("TracingStorage emits MISS for missing key", "[tracing]")
 {
     FastCache::InMemoryLruStorage inner;

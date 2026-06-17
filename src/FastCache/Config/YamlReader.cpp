@@ -260,6 +260,18 @@ namespace
             cfg.logTimestamps = valueNode.as<bool>();
             return {};
         }
+        /// `log_source`: prefix connection log lines with the client IP.
+        if (key == "log_source")
+        {
+            cfg.logSource = valueNode.as<bool>();
+            return {};
+        }
+        /// `log_everything`: include keepalive/admin commands in the command log.
+        if (key == "log_everything")
+        {
+            cfg.logEverything = valueNode.as<bool>();
+            return {};
+        }
         /// `storage_path`: filesystem path of the CoW-tree backing file.
         if (key == "storage_path")
         {

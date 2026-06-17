@@ -345,9 +345,10 @@ void EpollSocket::Impl::OnWritable(EpollFdHandler* base)
     awaitable->Complete(IoResult { total });
 }
 
-EpollSocket::EpollSocket(EpollReactor& reactor, int fd) noexcept:
+EpollSocket::EpollSocket(EpollReactor& reactor, int fd, std::string peerAddress) noexcept:
     _impl { std::make_unique<Impl>(reactor, fd) },
-    _fd { fd }
+    _fd { fd },
+    _peerAddress { std::move(peerAddress) }
 {
     SetNonBlocking(fd);
     std::ignore = reactor.Attach(&_impl->handler);
@@ -564,7 +565,8 @@ void EpollListener::Impl::OnReadable(EpollFdHandler* base)
     auto* awaitable = impl->pending;
     impl->pending = nullptr;
     std::ignore = impl->reactor.UpdateInterest(&impl->handler, false, false);
-    awaitable->Complete(AcceptResult { std::make_unique<EpollSocket>(impl->reactor, fd) });
+    auto peer = FormatPeerAddress(Detail::EndpointFromSockaddr(&client, static_cast<std::uint32_t>(len)));
+    awaitable->Complete(AcceptResult { std::make_unique<EpollSocket>(impl->reactor, fd, std::move(peer)) });
 }
 
 EpollListener::EpollListener() noexcept = default;
@@ -638,7 +640,10 @@ AcceptAwaitable EpollListener::Accept()
     socklen_t len = sizeof(client);
     auto const fd = ::accept4(_impl->handler.fd, reinterpret_cast<sockaddr*>(&client), &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd >= 0)
-        return AcceptAwaitable { AcceptResult { std::make_unique<EpollSocket>(_impl->reactor, fd) } };
+    {
+        auto peer = FormatPeerAddress(Detail::EndpointFromSockaddr(&client, static_cast<std::uint32_t>(len)));
+        return AcceptAwaitable { AcceptResult { std::make_unique<EpollSocket>(_impl->reactor, fd, std::move(peer)) } };
+    }
     if (errno != EAGAIN && errno != EINTR)
         return AcceptAwaitable { std::unexpected(MakePosixError(errno, "accept4")) };
 

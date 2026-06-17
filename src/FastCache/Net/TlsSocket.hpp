@@ -10,6 +10,7 @@
 #include <expected>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 // Forward declarations so this header pulls in no OpenSSL headers.
@@ -63,6 +64,13 @@ class TlsSocket final: public ISocket
     [[nodiscard]] Task<std::expected<void, NetError>> HandshakeIfNeeded() override;
     void Close() noexcept override;
     [[nodiscard]] bool IsClosed() const noexcept override;
+    /// Forward the peer address of the wrapped transport so `--log-source`
+    /// works identically for TLS and plaintext connections.
+    /// @return The underlying socket's peer host, or "" when unknown.
+    [[nodiscard]] std::string PeerAddress() const override
+    {
+        return _raw ? _raw->PeerAddress() : std::string {};
+    }
 
   private:
     /// Decrypt up to out.size() bytes into `out`, feeding ciphertext from the

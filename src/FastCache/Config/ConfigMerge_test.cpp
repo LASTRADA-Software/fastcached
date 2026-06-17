@@ -105,6 +105,49 @@ TEST_CASE("ConfigMerge: explicit-bit drives override even when CLI value equals 
     REQUIRE(merged.storageShards == 0U);
 }
 
+TEST_CASE("ConfigMerge: --log-source explicit bit overrides YAML in both directions", "[config][merge]")
+{
+    // CLI --log-source must win over a YAML log_source: false, and the absence
+    // of the flag must leave a YAML log_source: true intact — the same
+    // explicit-bit contract every other typed flag uses.
+    {
+        FastCache::Config fileCfg {};
+        fileCfg.logSource = false;
+        auto cli = EmptyCli();
+        cli.logSourceExplicit = true;
+        cli.config.logSource = true;
+        auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+        REQUIRE(merged.logSource);
+    }
+    {
+        FastCache::Config fileCfg {};
+        fileCfg.logSource = true;
+        auto const cli = EmptyCli(); // logSourceExplicit defaults to false
+        auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+        REQUIRE(merged.logSource);
+    }
+}
+
+TEST_CASE("ConfigMerge: --log-everything explicit bit overrides YAML in both directions", "[config][merge]")
+{
+    {
+        FastCache::Config fileCfg {};
+        fileCfg.logEverything = false;
+        auto cli = EmptyCli();
+        cli.logEverythingExplicit = true;
+        cli.config.logEverything = true;
+        auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+        REQUIRE(merged.logEverything);
+    }
+    {
+        FastCache::Config fileCfg {};
+        fileCfg.logEverything = true;
+        auto const cli = EmptyCli(); // logEverythingExplicit defaults to false
+        auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+        REQUIRE(merged.logEverything);
+    }
+}
+
 TEST_CASE("ConfigMerge: --service-name explicit value overrides YAML even when CLI equals default", "[config][merge]")
 {
     // serviceName previously used `cliCfg.serviceName != Config{}.serviceName`

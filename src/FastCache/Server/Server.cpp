@@ -45,14 +45,16 @@ Server::Server(IListener& listener,
                IAdmissionControl* admission,
                IMetricsSink* metrics,
                SessionContext session,
-               TlsContext* tls) noexcept:
+               TlsContext* tls,
+               LogSource logSource) noexcept:
     _listener { listener },
     _engine { engine },
     _logger { logger },
     _admission { admission },
     _metrics { metrics },
     _session { session },
-    _tls { tls }
+    _tls { tls },
+    _logSource { logSource }
 {
 }
 
@@ -95,7 +97,8 @@ Task<void> Server::Run()
                 _metrics->Increment(IMetricsSink::Counter::ConnectionsTotalTls);
         }
 
-        auto connection = std::make_unique<Connection>(WrapTls(std::move(*accepted), _tls), _engine, _logger, _session);
+        auto connection =
+            std::make_unique<Connection>(WrapTls(std::move(*accepted), _tls), _engine, _logger, _session, _logSource);
         RunConnectionDetached(std::move(connection), &_logger, _admission);
     }
     co_return;

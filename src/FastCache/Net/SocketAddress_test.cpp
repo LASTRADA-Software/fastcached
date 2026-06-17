@@ -202,6 +202,57 @@ TEST_CASE("BindAndListen reports failure when no candidate is bindable", "[net][
     REQUIRE_FALSE(bound.has_value());
 }
 
+TEST_CASE("FormatPeerAddress renders the host without the port", "[net][peer]")
+{
+    SECTION("IPv4 dotted-quad")
+    {
+        REQUIRE(FastCache::FormatPeerAddress(MakeV4Endpoint("203.0.113.7", 54321)) == "203.0.113.7");
+    }
+    SECTION("IPv6 textual address")
+    {
+        REQUIRE(FastCache::FormatPeerAddress(MakeV6Endpoint("::1", 54321)) == "::1");
+        REQUIRE(FastCache::FormatPeerAddress(MakeV6Endpoint("2001:db8::1", 0)) == "2001:db8::1");
+    }
+}
+
+TEST_CASE("FormatPeerAddress returns empty for an unknown or empty endpoint", "[net][peer]")
+{
+    SECTION("default-constructed endpoint (length 0)")
+    {
+        REQUIRE(FastCache::FormatPeerAddress(FastCache::ResolvedEndpoint {}).empty());
+    }
+    SECTION("non-zero length but unsupported family")
+    {
+        FastCache::ResolvedEndpoint endpoint;
+        endpoint.length = 8;
+        endpoint.family = AF_UNSPEC;
+        REQUIRE(FastCache::FormatPeerAddress(endpoint).empty());
+    }
+}
+
+TEST_CASE("EndpointFromSockaddr round-trips through FormatPeerAddress", "[net][peer]")
+{
+    // Mirror what a listener does: a sockaddr filled by accept() is copied into
+    // a ResolvedEndpoint, which formats back to the original host string.
+    sockaddr_in sa {};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(40000);
+    ::inet_pton(AF_INET, "198.51.100.23", &sa.sin_addr);
+
+    auto const endpoint = FastCache::Detail::EndpointFromSockaddr(&sa, sizeof(sa));
+    REQUIRE(endpoint.family == AF_INET);
+    REQUIRE(endpoint.length == sizeof(sa));
+    REQUIRE(FastCache::FormatPeerAddress(endpoint) == "198.51.100.23");
+}
+
+TEST_CASE("EndpointFromSockaddr rejects a zero or oversized length", "[net][peer]")
+{
+    sockaddr_in sa {};
+    sa.sin_family = AF_INET;
+    REQUIRE(FastCache::Detail::EndpointFromSockaddr(&sa, 0).length == 0);
+    REQUIRE(FastCache::Detail::EndpointFromSockaddr(&sa, FastCache::ResolvedEndpoint::StorageSize + 1).length == 0);
+}
+
 TEST_CASE("BindAndListen forces dual-stack (IPV6_V6ONLY=0) on an IPv6 wildcard bind", "[net][bind][dual-stack]")
 {
     FakeAddressResolver resolver { std::vector { MakeV6Endpoint("::", 0) } };

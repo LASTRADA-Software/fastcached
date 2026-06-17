@@ -324,9 +324,10 @@ void KqueueSocket::Impl::OnWritable(KqueueFdHandler* base)
     awaitable->Complete(IoResult { total });
 }
 
-KqueueSocket::KqueueSocket(KqueueReactor& reactor, int fd) noexcept:
+KqueueSocket::KqueueSocket(KqueueReactor& reactor, int fd, std::string peerAddress) noexcept:
     _impl { std::make_unique<Impl>(reactor, fd) },
-    _fd { fd }
+    _fd { fd },
+    _peerAddress { std::move(peerAddress) }
 {
     SetNonBlocking(fd);
     std::ignore = reactor.Attach(&_impl->handler);
@@ -531,7 +532,8 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
     auto* awaitable = impl->pending;
     impl->pending = nullptr;
     std::ignore = impl->reactor.UpdateInterest(&impl->handler, false, false);
-    awaitable->Complete(AcceptResult { std::make_unique<KqueueSocket>(impl->reactor, fd) });
+    auto peer = FormatPeerAddress(Detail::EndpointFromSockaddr(&client, static_cast<std::uint32_t>(len)));
+    awaitable->Complete(AcceptResult { std::make_unique<KqueueSocket>(impl->reactor, fd, std::move(peer)) });
 }
 
 KqueueListener::KqueueListener() noexcept = default;
@@ -600,7 +602,8 @@ AcceptAwaitable KqueueListener::Accept()
     if (fd >= 0)
     {
         SetNonBlocking(fd);
-        return AcceptAwaitable { AcceptResult { std::make_unique<KqueueSocket>(_impl->reactor, fd) } };
+        auto peer = FormatPeerAddress(Detail::EndpointFromSockaddr(&client, static_cast<std::uint32_t>(len)));
+        return AcceptAwaitable { AcceptResult { std::make_unique<KqueueSocket>(_impl->reactor, fd, std::move(peer)) } };
     }
     if (errno != EAGAIN && errno != EINTR)
         return AcceptAwaitable { std::unexpected(MakePosixError(errno, "accept")) };

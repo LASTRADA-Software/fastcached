@@ -2,6 +2,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Cache/TracingStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -13,6 +14,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -180,6 +182,175 @@ TEST_CASE("Server accepts and serves a memcached-text client end-to-end", "[serv
     auto const response = FastCache::SyncRun(ReadResponse(client.get()));
     REQUIRE(response == "STORED\r\nVALUE foo 0 5\r\nhello\r\nEND\r\n");
     REQUIRE(server.AcceptedCount() == 1);
+}
+
+TEST_CASE("Server with LogSource::Yes prefixes connection logs with the client IP", "[server][logsource]")
+{
+    // A connection that EOFs before any byte makes autodetect fail, which the
+    // Connection logs at Debug. With --log-source on, that line carries the
+    // accepted socket's peer address as a bracketed prefix.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::CapturingLogger logger; // captures from Trace up
+    FastCache::InMemoryListener listener;
+    FastCache::Server server {
+        listener, engine, logger, nullptr, nullptr, FastCache::SessionContext {}, nullptr, FastCache::LogSource::Yes
+    };
+
+    auto client = listener.ConnectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
+    client->ShutdownWrite(); // EOF with no bytes -> autodetect fails -> Debug log
+    listener.Close();
+    FastCache::SyncRun(server.Run());
+
+    auto const records = logger.Snapshot();
+    REQUIRE_FALSE(records.empty());
+    REQUIRE(std::ranges::any_of(
+        records, [](auto const& r) { return r.message.starts_with("[203.0.113.7] Connection: autodetect failed"); }));
+}
+
+TEST_CASE("Server with LogSource::Yes prefixes the storage trace line with the client IP", "[server][logsource]")
+{
+    // The real use case: a well-behaved client. Each data operation produces
+    // exactly ONE line — the TracingStorage `storage:` line — now carrying the
+    // client IP. There is no separate connection-level command line to duplicate it.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage lru;
+    FastCache::CapturingLogger logger; // captures from Trace up
+    FastCache::TracingStorage storage { lru, logger, clock };
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::InMemoryListener listener;
+    FastCache::Server server {
+        listener, engine, logger, nullptr, nullptr, FastCache::SessionContext {}, nullptr, FastCache::LogSource::Yes
+    };
+
+    auto client = listener.ConnectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
+    REQUIRE(FastCache::SyncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
+    client->ShutdownWrite();
+    listener.Close();
+    FastCache::SyncRun(server.Run());
+
+    auto const messages = logger.Snapshot();
+    REQUIRE(std::ranges::any_of(
+        messages, [](auto const& r) { return r.message.starts_with("[203.0.113.7] storage: SET key=foo result=STORED"); }));
+    REQUIRE(std::ranges::any_of(
+        messages, [](auto const& r) { return r.message.starts_with("[203.0.113.7] storage: GET key=foo result=HIT"); }));
+    // No duplicate connection-level data-command line.
+    REQUIRE(std::ranges::none_of(messages, [](auto const& r) { return r.message == "[203.0.113.7] set foo"; }));
+    REQUIRE(std::ranges::none_of(messages, [](auto const& r) { return r.message == "[203.0.113.7] get foo"; }));
+}
+
+TEST_CASE("Server without --log-source leaves the storage trace line unprefixed", "[server][logsource]")
+{
+    // Storage trace logging is independent of --log-source; the flag only adds
+    // the IP prefix. At Trace without the flag the line is the original format.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage lru;
+    FastCache::CapturingLogger logger;
+    FastCache::TracingStorage storage { lru, logger, clock };
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::InMemoryListener listener;
+    FastCache::Server server { listener, engine, logger }; // LogSource defaults to No
+
+    auto client = listener.ConnectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
+    REQUIRE(FastCache::SyncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
+    client->ShutdownWrite();
+    listener.Close();
+    FastCache::SyncRun(server.Run());
+
+    auto const messages = logger.Snapshot();
+    REQUIRE(std::ranges::any_of(messages, [](auto const& r) { return r.message.starts_with("storage: SET key=foo"); }));
+    REQUIRE(std::ranges::none_of(messages, [](auto const& r) { return r.message.contains("203.0.113.7"); }));
+}
+
+TEST_CASE("Server: non-data commands are logged only under --log-everything", "[server][logsource]")
+{
+    // "version" is a non-data command — it never reaches storage, so it has no
+    // `storage:` line. By default it is invisible; under --log-everything it is
+    // surfaced at the connection level (with the IP under --log-source). The
+    // data "set" always appears on its storage line either way.
+    auto run = [](bool logEverything) {
+        FastCache::ManualClock clock;
+        FastCache::InMemoryLruStorage lru;
+        FastCache::CapturingLogger logger;
+        FastCache::TracingStorage storage { lru, logger, clock };
+        FastCache::CacheEngine engine { storage, clock };
+        FastCache::InMemoryListener listener;
+        FastCache::SessionContext session {};
+        session.logEverything = logEverything;
+        FastCache::Server server { listener, engine, logger, nullptr, nullptr, session, nullptr, FastCache::LogSource::Yes };
+
+        auto client = listener.ConnectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
+        REQUIRE(FastCache::SyncRun(Send(client.get(), "version\r\nset foo 0 0 5\r\nhello\r\n")));
+        client->ShutdownWrite();
+        listener.Close();
+        FastCache::SyncRun(server.Run());
+        return logger.Snapshot();
+    };
+
+    SECTION("default: storage line present, admin command suppressed")
+    {
+        auto const messages = run(/*logEverything*/ false);
+        REQUIRE(std::ranges::any_of(
+            messages, [](auto const& r) { return r.message.starts_with("[203.0.113.7] storage: SET key=foo"); }));
+        REQUIRE(std::ranges::none_of(messages, [](auto const& r) { return r.message.contains("version"); }));
+    }
+    SECTION("--log-everything: admin command logged at the connection level")
+    {
+        auto const messages = run(/*logEverything*/ true);
+        REQUIRE(std::ranges::any_of(
+            messages, [](auto const& r) { return r.message.starts_with("[203.0.113.7] storage: SET key=foo"); }));
+        REQUIRE(std::ranges::any_of(messages, [](auto const& r) { return r.message == "[203.0.113.7] version"; }));
+    }
+}
+
+TEST_CASE("Server: command logging is silent at the default Info level", "[server][logsource]")
+{
+    // Trace-level access logging (including the storage line) must not appear
+    // at the default level, so normal production output is unchanged whether or
+    // not --log-source is set.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage lru;
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Info }; // default threshold
+    FastCache::TracingStorage storage { lru, logger, clock };
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::InMemoryListener listener;
+    FastCache::Server server {
+        listener, engine, logger, nullptr, nullptr, FastCache::SessionContext {}, nullptr, FastCache::LogSource::Yes
+    };
+
+    auto client = listener.ConnectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
+    REQUIRE(FastCache::SyncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
+    client->ShutdownWrite();
+    listener.Close();
+    FastCache::SyncRun(server.Run());
+
+    auto const messages = logger.Snapshot();
+    REQUIRE(std::ranges::none_of(messages, [](auto const& r) {
+        return r.message.contains("connection accepted") || r.message.contains("storage:") || r.message.contains("foo");
+    }));
+}
+
+TEST_CASE("Server with LogSource::No leaves connection logs unprefixed", "[server][logsource]")
+{
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::CapturingLogger logger;
+    FastCache::InMemoryListener listener;
+    FastCache::Server server { listener, engine, logger }; // LogSource defaults to No
+
+    auto client = listener.ConnectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
+    client->ShutdownWrite();
+    listener.Close();
+    FastCache::SyncRun(server.Run());
+
+    auto const records = logger.Snapshot();
+    REQUIRE_FALSE(records.empty());
+    // The diagnostic is present, but with no source prefix.
+    REQUIRE(
+        std::ranges::any_of(records, [](auto const& r) { return r.message.starts_with("Connection: autodetect failed"); }));
+    REQUIRE(std::ranges::none_of(records, [](auto const& r) { return r.message.contains("203.0.113.7"); }));
 }
 
 TEST_CASE("Server drops a connection whose handler throws instead of terminating", "[server][regression]")

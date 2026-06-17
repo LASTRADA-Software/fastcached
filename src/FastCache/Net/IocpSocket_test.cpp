@@ -61,7 +61,7 @@ std::uint16_t FindFreePort()
     return port;
 }
 
-FastCache::DetachedTask Echo(FastCache::IocpReactor& reactor, FastCache::IocpListener& listener)
+FastCache::DetachedTask Echo(FastCache::IocpReactor& reactor, FastCache::IocpListener& listener, std::string& peerOut)
 {
     auto accept = co_await listener.Accept();
     if (!accept.has_value())
@@ -70,6 +70,9 @@ FastCache::DetachedTask Echo(FastCache::IocpReactor& reactor, FastCache::IocpLis
         co_return;
     }
     auto socket = std::move(*accept);
+    // AcceptEx wrote the peer sockaddr into its output buffer; the IOCP listener
+    // parses it out via GetAcceptExSockaddrs so the socket can report it.
+    peerOut = socket->PeerAddress();
 
     // Read up to 64 bytes, then echo them back.
     std::array<std::byte, 64> buf {};
@@ -94,7 +97,8 @@ TEST_CASE("IocpReactor + IocpListener + IocpSocket round-trip", "[reactor][iocp]
     REQUIRE(listener);
     REQUIRE(listener->IsBound());
 
-    Echo(reactor, *listener);
+    std::string peer;
+    Echo(reactor, *listener, peer);
 
     // Client lives on a separate thread so the reactor thread (this one)
     // can drive the accept + read + write.
@@ -113,6 +117,9 @@ TEST_CASE("IocpReactor + IocpListener + IocpSocket round-trip", "[reactor][iocp]
     reactor.Run();
     client.join();
     REQUIRE(response == "ping!");
+    // The client connected from the IPv4 loopback, so AcceptEx's peer address
+    // resolves to 127.0.0.1 (port omitted by FormatPeerAddress).
+    REQUIRE(peer == "127.0.0.1");
 }
 
 #endif // _WIN32

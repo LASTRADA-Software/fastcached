@@ -333,7 +333,8 @@ void TracingStorage::FlushWithGeneration(TimePoint effectiveAt)
     {
         auto const took = _clock.Now() - startedAt;
         _logger.Logf(LogLevel::Trace,
-                     "storage: FLUSH result=OK took={}us",
+                     "{}storage: FLUSH result=OK took={}us",
+                     SourcePrefix(),
                      std::chrono::duration_cast<std::chrono::microseconds>(took).count());
     }
 }

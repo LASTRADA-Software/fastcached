@@ -89,3 +89,52 @@ TEST_CASE("ILogger::Logf only formats when the level passes the filter", "[logge
     REQUIRE(records.size() == 1);
     REQUIRE(records[0].message == "kept 42");
 }
+
+TEST_CASE("SourceLogger prefixes the source tag onto every record", "[logger][source]")
+{
+    FastCache::CapturingLogger inner;
+    FastCache::SourceLogger logger { inner, "[203.0.113.7]" };
+
+    logger.Log(FastCache::LogLevel::Info, "hello");
+    logger.Logf(FastCache::LogLevel::Warn, "code {}", 7);
+
+    auto const records = inner.Snapshot();
+    REQUIRE(records.size() == 2);
+    REQUIRE(records[0].level == FastCache::LogLevel::Info);
+    REQUIRE(records[0].message == "[203.0.113.7] hello");
+    REQUIRE(records[1].level == FastCache::LogLevel::Warn);
+    REQUIRE(records[1].message == "[203.0.113.7] code 7");
+}
+
+TEST_CASE("SourceLogger with an empty source forwards records unchanged", "[logger][source]")
+{
+    FastCache::CapturingLogger inner;
+    FastCache::SourceLogger logger { inner, "" };
+
+    logger.Log(FastCache::LogLevel::Info, "untouched");
+
+    auto const records = inner.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0].message == "untouched");
+}
+
+TEST_CASE("SourceLogger forwards the level filter to its inner logger", "[logger][source]")
+{
+    // The inner logger owns the threshold; a below-threshold Logf must neither
+    // format nor reach the inner sink, exactly as if logging directly.
+    FastCache::CapturingLogger inner { FastCache::LogLevel::Warn };
+    FastCache::SourceLogger logger { inner, "[::1]" };
+
+    REQUIRE(logger.MinLevel() == FastCache::LogLevel::Warn);
+
+    logger.Logf(FastCache::LogLevel::Debug, "dropped");
+    logger.Logf(FastCache::LogLevel::Error, "kept");
+
+    auto const records = inner.Snapshot();
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0].message == "[::1] kept");
+
+    // SetMinLevel is forwarded too.
+    logger.SetMinLevel(FastCache::LogLevel::Trace);
+    REQUIRE(inner.MinLevel() == FastCache::LogLevel::Trace);
+}

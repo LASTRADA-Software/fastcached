@@ -24,7 +24,12 @@ namespace FastCache
 class EpollSocket final: public ISocket
 {
   public:
-    EpollSocket(EpollReactor& reactor, int fd) noexcept;
+    /// Wrap an accepted, non-blocking fd driven by `reactor`.
+    /// @param reactor The reactor this socket is pinned to.
+    /// @param fd The accepted socket fd.
+    /// @param peerAddress Printable peer host captured at accept time, or ""
+    ///        when unknown. Surfaced via PeerAddress() for `--log-source`.
+    EpollSocket(EpollReactor& reactor, int fd, std::string peerAddress = {}) noexcept;
     EpollSocket(EpollSocket const&) = delete;
     EpollSocket(EpollSocket&&) = delete;
     EpollSocket& operator=(EpollSocket const&) = delete;
@@ -41,6 +46,10 @@ class EpollSocket final: public ISocket
     {
         return _closed;
     }
+    [[nodiscard]] std::string PeerAddress() const override
+    {
+        return _peerAddress;
+    }
 
     [[nodiscard]] int Native() const noexcept
     {
@@ -53,6 +62,7 @@ class EpollSocket final: public ISocket
   private:
     std::unique_ptr<Impl> _impl;
     int _fd;
+    std::string _peerAddress;
     bool _closed { false };
 };
 

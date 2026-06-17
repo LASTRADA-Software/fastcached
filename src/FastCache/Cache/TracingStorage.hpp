@@ -130,6 +130,19 @@ class TracingStorage final: public IStorage
     ILogger& _logger;
     IClock& _clock;
 
+    /// The client-source prefix for the current trace line: "[203.0.113.7] "
+    /// when a handler published `Detail::StorageSourceTag` for this call, else
+    /// "". Only evaluated on the trace-enabled path, so the small allocation is
+    /// off the hot path.
+    /// @return The bracketed-source-plus-space prefix, or an empty string.
+    [[nodiscard]] static std::string SourcePrefix()
+    {
+        auto const tag = Detail::StorageSourceTag;
+        if (tag.empty())
+            return {};
+        return std::string { tag } + ' ';
+    }
+
     /// Single point of truth for the trace-line shape.
     ///
     /// Invokes `op`, then (when trace is on) computes latency and emits
@@ -144,8 +157,12 @@ class TracingStorage final: public IStorage
         if (traceOn)
         {
             auto const took = _clock.Now() - startedAt;
+            // Prefix the client source (e.g. "[203.0.113.7] ") when a handler
+            // published one for this call — see Detail::StorageSourceTag. Empty
+            // tag => the line is unprefixed, exactly as before --log-source.
             _logger.Logf(LogLevel::Trace,
-                         "storage: {} key={} result={} took={}us",
+                         "{}storage: {} key={} result={} took={}us",
+                         SourcePrefix(),
                          verb,
                          key,
                          std::forward<OutcomeFmt>(fmt)(result),
