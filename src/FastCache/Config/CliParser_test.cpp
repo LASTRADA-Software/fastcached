@@ -133,6 +133,59 @@ TEST_CASE("CliParser: --storage-durability rejects unknown values", "[config][cl
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
 }
 
+TEST_CASE("CliParser: --compression parses each codec", "[config][cli][compression]")
+{
+    for (auto const& [text, codec]: std::initializer_list<std::pair<char const*, FastCache::CompressionCodec>> {
+             { "--compression=none", FastCache::CompressionCodec::Identity },
+             { "--compression=lz4", FastCache::CompressionCodec::Lz4 },
+             { "--compression=zstd", FastCache::CompressionCodec::Zstd },
+         })
+    {
+        if (!FastCache::Compression::IsAvailable(codec))
+            continue;
+        auto const args = std::array<char const*, 1> { text };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(result.has_value());
+        REQUIRE(result->config.compression == codec);
+        REQUIRE(result->compressionExplicit);
+    }
+}
+
+TEST_CASE("CliParser: --compression rejects unknown codecs", "[config][cli][compression]")
+{
+    auto const args = std::array<char const*, 1> { "--compression=brotli" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
+}
+
+TEST_CASE("CliParser: --compression-level parses and range-checks", "[config][cli][compression]")
+{
+    {
+        auto const args = std::array<char const*, 1> { "--compression-level=9" };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(result.has_value());
+        REQUIRE(result->config.compressionLevel == 9);
+        REQUIRE(result->compressionLevelExplicit);
+    }
+    for (auto const* bad: { "--compression-level=0", "--compression-level=23" })
+    {
+        auto const args = std::array<char const*, 1> { bad };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
+    }
+}
+
+TEST_CASE("CliParser: --compression-min-bytes parses byte sizes", "[config][cli][compression]")
+{
+    auto const args = std::array<char const*, 1> { "--compression-min-bytes=4k" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.compressionMinBytes == 4096);
+    REQUIRE(result->compressionMinBytesExplicit);
+}
+
 TEST_CASE("CliParser: --lru-mode parses each policy and defaults to approximate", "[config][cli]")
 {
     // Default (flag absent) is Approximate, and the explicit-bit is clear.

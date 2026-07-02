@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Logger.hpp>
 
 #include <cstddef>
@@ -239,6 +240,21 @@ struct Config
     /// reactor to its own core when running more than one; with a single
     /// reactor it is a no-op regardless. None lets the scheduler place threads.
     CpuAffinity cpuAffinity { CpuAffinity::PerCore };
+
+    /// Codec applied to values before they are written to the persistent
+    /// backend (ignored when storagePath is empty). Zstd by default; set to
+    /// Identity ("none") to store values verbatim. Reads always return
+    /// plaintext, so the codec can be changed between runs with no migration —
+    /// each record is decoded by its own stored codec tag.
+    CompressionCodec compression { CompressionCodec::Zstd };
+
+    /// Effort level for `compression` (higher = smaller/slower). Ignored by
+    /// codecs without a level. Defaults to zstd level 3.
+    int compressionLevel { 3 };
+
+    /// Values smaller than this are never compressed (their CPU cost is not
+    /// worth it and tiny values rarely shrink). Defaults to 256 bytes.
+    std::size_t compressionMinBytes { 256 };
 };
 
 } // namespace FastCache

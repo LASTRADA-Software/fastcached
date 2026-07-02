@@ -128,6 +128,38 @@ namespace
             ConfigErrorCode::OutOfRange, "cpu-affinity", std::format("unknown mode (expect none|per-core): {}", sv)));
     }
 
+    [[nodiscard]] std::expected<CompressionCodec, ConfigError> ParseCompression(std::string_view sv)
+    {
+        auto const codec = Compression::CodecFromName(sv);
+        if (!codec.has_value())
+            return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+                                             "compression",
+                                             std::format("unknown codec (expect {}): {}", Compression::NameList(), sv)));
+        if (!Compression::IsAvailable(*codec))
+            return std::unexpected(MakeError(
+                ConfigErrorCode::OutOfRange,
+                "compression",
+                std::format("codec '{}' is not available in this build (rebuild with FASTCACHED_ENABLE_COMPRESSION)", sv)));
+        return *codec;
+    }
+
+    [[nodiscard]] std::expected<int, ConfigError> ParseCompressionLevel(std::string_view sv)
+    {
+        // zstd accepts roughly 1..22; keep a generous, codec-agnostic 1..22
+        // guard so an absurd value is rejected up front.
+        return ParsePositiveInt(sv, "compression-level").and_then([](std::size_t value) -> std::expected<int, ConfigError> {
+            if (value == 0 || value > 22)
+                return std::unexpected(MakeError(
+                    ConfigErrorCode::OutOfRange, "compression-level", std::format("out of range (1..22): {}", value)));
+            return static_cast<int>(value);
+        });
+    }
+
+    [[nodiscard]] std::expected<std::size_t, ConfigError> ParseCompressionMinBytes(std::string_view sv)
+    {
+        return ParseByteSize(sv, "compression-min-bytes").transform_error(WithArgvSource);
+    }
+
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv)
     {
         if (sv == "trace")
@@ -474,6 +506,38 @@ namespace
             }
         }
         {
+            auto const matched = ApplyParsedFlag(args, i, "--compression", ParseCompression, cfg.compression);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.compressionExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched =
+                ApplyParsedFlag(args, i, "--compression-level", ParseCompressionLevel, cfg.compressionLevel);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.compressionLevelExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched =
+                ApplyParsedFlag(args, i, "--compression-min-bytes", ParseCompressionMinBytes, cfg.compressionMinBytes);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.compressionMinBytesExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
             auto const matched = ApplyParsedFlag(args, i, "--threads", ParseThreads, cfg.workerThreads);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
@@ -578,6 +642,13 @@ namespace
         { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },
         { .flag = "--storage-max-value=<size>",
           .description = "per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)" },
+        { .flag = "--compression=<codec>",
+          .description = "on-disk value codec for --storage: none|lz4|zstd (default zstd)\n"
+                         "reads always return plaintext; each record decodes by its own tag" },
+        { .flag = "--compression-level=<N>",
+          .description = "codec effort level for --compression (1..22; default 3, zstd)" },
+        { .flag = "--compression-min-bytes=<size>",
+          .description = "skip compression for values smaller than this; k/m/g accepted (default 256)" },
         { .flag = "--lru-mode=<mode>",
           .description = "approximate|strict in-memory LRU recency (default approximate)\n"
                          "approximate: same-shard reads run concurrently (faster);\n"

@@ -4,6 +4,7 @@
 #include <FastCache/Core/Clock.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -92,6 +93,19 @@ auto WithOpenStorage(std::filesystem::path const& path, F&& fn)
 {
     FastCache::CowTreeStorage::Options opts;
     opts.path = path;
+    auto storage = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(storage.has_value());
+    return std::forward<F>(fn)(**storage);
+}
+
+/// Like WithOpenStorage but opens the store with the given compression codec,
+/// so a test can drive the compress/decompress path across a reopen.
+template <class F>
+auto WithOpenStorageCompressed(std::filesystem::path const& path, FastCache::CompressionCodec codec, F&& fn)
+{
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = path;
+    opts.compression = codec;
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
     return std::forward<F>(fn)(**storage);
@@ -1456,4 +1470,211 @@ TEST_CASE("Touch on a large value reuses the overflow chain without an O(value) 
     REQUIRE(got->found);
     REQUIRE(ValueOf(got->entry) == big);
     REQUIRE(got->entry.expiry == newExpiry);
+}
+
+// ============================================================================
+// On-disk value compression (per-entry codec tag, v4 record format)
+// ============================================================================
+
+namespace
+{
+
+/// A highly compressible payload of `size` bytes: a short repeated pattern so
+/// zstd/lz4 shrink it dramatically. Deterministic (no baked-in literal).
+std::vector<std::byte> CompressibleBytes(std::size_t size)
+{
+    static constexpr std::string_view pattern = "fastcached-compresses-this-well-0123456789 ";
+    std::vector<std::byte> out;
+    out.reserve(size);
+    for (std::size_t i = 0; i < size; ++i)
+        out.push_back(static_cast<std::byte>(static_cast<unsigned char>(pattern[i % pattern.size()])));
+    return out;
+}
+
+/// Current on-disk size of the store file at `path`.
+std::uintmax_t StoreFileSize(std::filesystem::path const& path)
+{
+    std::error_code ec;
+    auto const size = std::filesystem::file_size(path, ec);
+    return ec ? 0 : size;
+}
+
+} // namespace
+
+TEST_CASE("Compression: values round-trip under every codec, inline and overflow", "[cowstorage][compression]")
+{
+    auto const codec =
+        GENERATE(FastCache::CompressionCodec::Identity, FastCache::CompressionCodec::Lz4, FastCache::CompressionCodec::Zstd);
+    if (!FastCache::Compression::IsAvailable(codec))
+        return;
+
+    TempFile tmp;
+    // Small value stays inline; large value spills to an overflow chain.
+    auto const small = CompressibleBytes(300);
+    auto const large = CompressibleBytes(64 * 1024);
+
+    WithOpenStorageCompressed(tmp.path, codec, [&](FastCache::CowTreeStorage& storage) {
+        REQUIRE(storage.Set("small", small, 1, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set("large", large, 2, FastCache::TimePoint::max()).has_value());
+    });
+
+    // Reopen (fresh LRU mirror, values materialised from disk) and verify the
+    // plaintext survives a decompress round-trip.
+    WithOpenStorageCompressed(tmp.path, codec, [&](FastCache::CowTreeStorage& storage) {
+        FastCache::ManualClock clock;
+        auto gotSmall = storage.Get("small", clock.Now());
+        REQUIRE(gotSmall.has_value());
+        REQUIRE(gotSmall->found);
+        REQUIRE(ValueOf(gotSmall->entry) == small);
+        REQUIRE(gotSmall->entry.flags == 1U);
+
+        auto gotLarge = storage.Get("large", clock.Now());
+        REQUIRE(gotLarge.has_value());
+        REQUIRE(gotLarge->found);
+        REQUIRE(ValueOf(gotLarge->entry) == large);
+        REQUIRE(gotLarge->entry.flags == 2U);
+    });
+}
+
+TEST_CASE("Compression: a compressible value shrinks the on-disk file", "[cowstorage][compression]")
+{
+    if (!FastCache::Compression::IsAvailable(FastCache::CompressionCodec::Zstd))
+        return;
+
+    auto const value = CompressibleBytes(128 * 1024);
+
+    TempFile rawFile;
+    WithOpenStorageCompressed(rawFile.path, FastCache::CompressionCodec::Identity, [&](FastCache::CowTreeStorage& s) {
+        REQUIRE(s.Set("k", value, 0, FastCache::TimePoint::max()).has_value());
+    });
+
+    TempFile zstdFile;
+    WithOpenStorageCompressed(zstdFile.path, FastCache::CompressionCodec::Zstd, [&](FastCache::CowTreeStorage& s) {
+        REQUIRE(s.Set("k", value, 0, FastCache::TimePoint::max()).has_value());
+    });
+
+    CHECK(StoreFileSize(zstdFile.path) < StoreFileSize(rawFile.path));
+}
+
+TEST_CASE("Compression: an incompressible value falls back to Identity (shrink-check)", "[cowstorage][compression]")
+{
+    if (!FastCache::Compression::IsAvailable(FastCache::CompressionCodec::Zstd))
+        return;
+
+    // Random bytes do not compress; the shrink-check must store them verbatim,
+    // so the zstd store is not meaningfully larger than the identity store.
+    auto const value = RandomBytes(64 * 1024, 0xFEEDFACEULL);
+
+    TempFile rawFile;
+    WithOpenStorageCompressed(rawFile.path, FastCache::CompressionCodec::Identity, [&](FastCache::CowTreeStorage& s) {
+        REQUIRE(s.Set("k", value, 0, FastCache::TimePoint::max()).has_value());
+    });
+    TempFile zstdFile;
+    WithOpenStorageCompressed(zstdFile.path, FastCache::CompressionCodec::Zstd, [&](FastCache::CowTreeStorage& s) {
+        REQUIRE(s.Set("k", value, 0, FastCache::TimePoint::max()).has_value());
+        // Value still reads back correctly despite the Identity fallback.
+        auto got = s.Get("k", FastCache::ManualClock {}.Now());
+        REQUIRE(got.has_value());
+        REQUIRE(got->found);
+        REQUIRE(ValueOf(got->entry) == value);
+    });
+
+    // The compressed store must not be dramatically larger than the raw one
+    // (a naive "always compress" would inflate incompressible data).
+    CHECK(StoreFileSize(zstdFile.path) <= StoreFileSize(rawFile.path) + 4096);
+}
+
+TEST_CASE("Compression: Append/Prepend on a compressed entry yield correct plaintext", "[cowstorage][compression]")
+{
+    if (!FastCache::Compression::IsAvailable(FastCache::CompressionCodec::Zstd))
+        return;
+
+    TempFile tmp;
+    WithOpenStorageCompressed(tmp.path, FastCache::CompressionCodec::Zstd, [&](FastCache::CowTreeStorage& storage) {
+        FastCache::ManualClock clock;
+        auto const base = CompressibleBytes(2000);
+        REQUIRE(storage.Set("k", base, 0, FastCache::TimePoint::max()).has_value());
+
+        auto const suffix = MakeBytes("-SUFFIX");
+        REQUIRE(
+            storage.Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, 0, clock.Now()).has_value());
+        auto const prefix = MakeBytes("PREFIX-");
+        REQUIRE(
+            storage.Prepend("k", std::span<std::byte const> { prefix.data(), prefix.size() }, 0, clock.Now()).has_value());
+
+        std::vector<std::byte> expected;
+        expected.insert(expected.end(), prefix.begin(), prefix.end());
+        expected.insert(expected.end(), base.begin(), base.end());
+        expected.insert(expected.end(), suffix.begin(), suffix.end());
+
+        auto got = storage.Get("k", clock.Now());
+        REQUIRE(got.has_value());
+        REQUIRE(got->found);
+        REQUIRE(ValueOf(got->entry) == expected);
+    });
+}
+
+TEST_CASE("Compression: Touch preserves the compressed value unchanged", "[cowstorage][compression]")
+{
+    if (!FastCache::Compression::IsAvailable(FastCache::CompressionCodec::Zstd))
+        return;
+
+    TempFile tmp;
+    auto const value = CompressibleBytes(64 * 1024);
+    WithOpenStorageCompressed(tmp.path, FastCache::CompressionCodec::Zstd, [&](FastCache::CowTreeStorage& storage) {
+        using namespace std::chrono_literals;
+        FastCache::ManualClock clock;
+        REQUIRE(storage.Set("k", value, 5, clock.Now() + 1s).has_value());
+
+        auto const newExpiry = clock.Now() + 3600s;
+        REQUIRE(storage.Touch("k", newExpiry, clock.Now()).has_value());
+
+        auto got = storage.Get("k", clock.Now() + 60s);
+        REQUIRE(got.has_value());
+        REQUIRE(got->found);
+        REQUIRE(ValueOf(got->entry) == value); // value survived the metadata rewrite
+        REQUIRE(got->entry.expiry == newExpiry);
+        REQUIRE(got->entry.flags == 5U);
+    });
+}
+
+TEST_CASE("Compression: a store mixes codecs and reads each by its own tag", "[cowstorage][compression]")
+{
+    if (!FastCache::Compression::IsAvailable(FastCache::CompressionCodec::Lz4)
+        || !FastCache::Compression::IsAvailable(FastCache::CompressionCodec::Zstd))
+        return;
+
+    TempFile tmp;
+    auto const lz4Value = CompressibleBytes(8000);
+    auto const zstdValue = CompressibleBytes(9000);
+
+    // First session writes an lz4-tagged entry.
+    WithOpenStorageCompressed(tmp.path, FastCache::CompressionCodec::Lz4, [&](FastCache::CowTreeStorage& storage) {
+        REQUIRE(storage.Set("lz4key", lz4Value, 0, FastCache::TimePoint::max()).has_value());
+    });
+
+    // Second session is configured for zstd. The old lz4 entry must still read
+    // (decoded by its own per-entry tag), and a new entry is written as zstd.
+    WithOpenStorageCompressed(tmp.path, FastCache::CompressionCodec::Zstd, [&](FastCache::CowTreeStorage& storage) {
+        FastCache::ManualClock clock;
+        auto oldGot = storage.Get("lz4key", clock.Now());
+        REQUIRE(oldGot.has_value());
+        REQUIRE(oldGot->found);
+        REQUIRE(ValueOf(oldGot->entry) == lz4Value);
+
+        REQUIRE(storage.Set("zstdkey", zstdValue, 0, FastCache::TimePoint::max()).has_value());
+    });
+
+    // Reopen once more: both entries survive and decode correctly.
+    WithOpenStorageCompressed(tmp.path, FastCache::CompressionCodec::Zstd, [&](FastCache::CowTreeStorage& storage) {
+        FastCache::ManualClock clock;
+        auto a = storage.Get("lz4key", clock.Now());
+        REQUIRE(a.has_value());
+        REQUIRE(a->found);
+        REQUIRE(ValueOf(a->entry) == lz4Value);
+        auto b = storage.Get("zstdkey", clock.Now());
+        REQUIRE(b.has_value());
+        REQUIRE(b->found);
+        REQUIRE(ValueOf(b->entry) == zstdValue);
+    });
 }

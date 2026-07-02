@@ -4,6 +4,7 @@
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/StringHash.hpp>
 
@@ -44,24 +45,33 @@ namespace FastCache
 /// A value larger than `PageSize()/4` is stored out-of-line as a chain of
 /// overflow pages; the leaf then holds only a small descriptor.
 ///
-/// Leaf-record encoding (little-endian on disk; format v3):
+/// Leaf-record encoding (little-endian on disk; format v4):
 /// ```
 /// u8  kind                 (0 = inline, 1 = overflow)
+/// u8  codec                (CompressionCodec id: 0 = none, 1 = lz4, 2 = zstd)
 /// u32 flags
 /// u64 cas
 /// i64 expiry_us            (steady-clock microseconds; INT64_MAX = never)
 /// u64 generation
 /// i64 lastAccess_us        (INT64_MIN = never accessed)
 /// u8  stale                (0 = live, 1 = stale)
-/// -- inline:   u32 value_len ; [value bytes]
-/// -- overflow: u64 total_len ; u64 root_page_id
+/// -- inline:   u32 stored_len ; u32 original_len ; [stored bytes]
+/// -- overflow: u64 stored_len ; u64 original_len ; u64 root_page_id
 /// ```
+/// The value bytes are stored **compressed** when `codec != none`; `stored_len`
+/// (inline `value_len` / overflow `total_len`) is the on-disk byte count and
+/// `original_len` is the pre-compression length used to size the decompress
+/// buffer. `codec == none` stores the value verbatim and `original_len ==
+/// stored_len`. Each record carries its own codec, so a store may freely mix
+/// codecs; changing the configured codec only affects subsequent writes and no
+/// migration is ever required.
+///
 /// Each overflow page is `[u32 crc32c][u64 next_page_id][u32 chunk_len][chunk]`
 /// (next == 0 marks the last page). The CRC is computed over everything that
 /// follows it — the `next` link, `chunk_len`, and the chunk — so a torn write
 /// to the chain linkage (not just the payload) is detected on read; data pages
-/// otherwise carry no read-time checksum. v3 breaks the older on-disk format
-/// (acceptable pre-release).
+/// otherwise carry no read-time checksum. v4 breaks the older v3 on-disk format
+/// (acceptable pre-release); an old-format store is rejected on Open.
 class CowTreeStorage final: public IStorage
 {
   public:
@@ -88,6 +98,22 @@ class CowTreeStorage final: public IStorage
         /// return StorageErrorCode::ValueTooLarge. Default: 1 MiB,
         /// which fits typical sccache compile-cache values.
         std::size_t maxValueBytes { 1 * 1024 * 1024 };
+
+        /// Codec applied to value bytes before they are written to disk.
+        /// Reads always return plaintext (decompression happens on the
+        /// on-disk-miss path only). Default: Zstd. A value is only stored
+        /// compressed when it is at least `compressionMinBytes` and the
+        /// compressed form is actually smaller (see the shrink-check in
+        /// StoreEntry); otherwise it is stored verbatim under `Identity`.
+        CompressionCodec compression { CompressionCodec::Zstd };
+
+        /// Codec effort level for `compression` (higher = smaller/slower).
+        /// Ignored by codecs without a level. Default: zstd level 3.
+        int compressionLevel { 3 };
+
+        /// Values smaller than this are never compressed (the CPU cost is not
+        /// worth it and tiny values rarely shrink). Default: 256 bytes.
+        std::size_t compressionMinBytes { 256 };
     };
 
     /// Open or create the storage. Replays existing entries into the
@@ -191,6 +217,14 @@ class CowTreeStorage final: public IStorage
     /// owning and borrowing Open paths.
     [[nodiscard]] std::expected<void, StorageError> Initialize();
 
+    /// Validate (or, for a fresh store, stamp) the on-disk record-format
+    /// version. A store carrying a marker for a different version — or an
+    /// older, pre-marker store that already holds data — is rejected with
+    /// StorageErrorCode::Corrupt so its records are never mis-parsed under the
+    /// current layout. An empty store is stamped with the current version.
+    /// @return Empty on success; Corrupt on a version mismatch / legacy store.
+    [[nodiscard]] std::expected<void, StorageError> EnsureFormatVersion();
+
     /// Result of a tree lookup with the encoded entry materialised.
     struct LoadedEntry
     {
@@ -222,12 +256,14 @@ class CowTreeStorage final: public IStorage
     /// an overflow descriptor (the value itself is materialised separately).
     struct ParsedRecord
     {
-        CacheEntry entry;                                 ///< All fields except `value`.
-        bool overflow { false };                          ///< True when the value is out-of-line.
-        std::uint32_t inlineLen { 0 };                    ///< Inline value length (inline records).
-        std::size_t inlineOffset { 0 };                   ///< Offset of the inline value in `raw`.
-        std::uint64_t totalLen { 0 };                     ///< Full value length (overflow records).
-        CowTree::PageId root { CowTree::PageId::None() }; ///< Overflow chain head.
+        CacheEntry entry;                                      ///< All fields except `value`.
+        bool overflow { false };                               ///< True when the value is out-of-line.
+        CompressionCodec codec { CompressionCodec::Identity }; ///< Codec of the stored bytes.
+        std::uint64_t originalLen { 0 };                       ///< Pre-compression value length.
+        std::uint32_t inlineLen { 0 };                         ///< Inline STORED (on-disk) length.
+        std::size_t inlineOffset { 0 };                        ///< Offset of the inline stored bytes in `raw`.
+        std::uint64_t totalLen { 0 };                          ///< Overflow STORED (on-disk) length.
+        CowTree::PageId root { CowTree::PageId::None() };      ///< Overflow chain head.
     };
 
     /// A lightweight reference to a stored value's out-of-line backing, used to
@@ -255,13 +291,27 @@ class CowTreeStorage final: public IStorage
     [[nodiscard]] std::expected<OverflowPage, StorageError> ReadOverflowPage(CowTree::PageId id) const;
 
     /// Encode an entry whose value is stored inline in the leaf.
-    [[nodiscard]] static std::vector<std::byte> EncodeInline(CacheEntry const& entry);
+    /// @param entry      Entry metadata (value bytes are ignored; `stored` wins).
+    /// @param codec      Codec the `stored` bytes were produced with.
+    /// @param stored     The bytes to write inline (possibly compressed).
+    /// @param originalLen Pre-compression length of the value.
+    [[nodiscard]] static std::vector<std::byte> EncodeInline(CacheEntry const& entry,
+                                                             CompressionCodec codec,
+                                                             std::span<std::byte const> stored,
+                                                             std::uint64_t originalLen);
 
     /// Encode an entry whose value lives in an overflow chain; the leaf holds
-    /// only the descriptor (total length + chain head).
+    /// only the descriptor (codec + stored/original length + chain head).
+    /// @param entry      Entry metadata (value bytes are ignored).
+    /// @param codec      Codec the chain's bytes were produced with.
+    /// @param root       Overflow chain head.
+    /// @param storedLen  On-disk (compressed) byte count of the chain.
+    /// @param originalLen Pre-compression length of the value.
     [[nodiscard]] static std::vector<std::byte> EncodeOverflowDescriptor(CacheEntry const& entry,
+                                                                         CompressionCodec codec,
                                                                          CowTree::PageId root,
-                                                                         std::uint64_t totalLen);
+                                                                         std::uint64_t storedLen,
+                                                                         std::uint64_t originalLen);
 
     /// Parse a leaf record's header (everything but the materialised value).
     [[nodiscard]] static std::expected<ParsedRecord, StorageError> ParseRecord(CowTree::BytesView raw);

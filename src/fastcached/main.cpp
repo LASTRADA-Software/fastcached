@@ -206,6 +206,9 @@ struct StorageBackendBundle
     opts.maxBytes = 0; // L2 is unbounded; L1 holds the byte budget
     opts.durability = ToPageStoreDurability(effective.storageDurability);
     opts.maxValueBytes = effective.storageMaxValueBytes;
+    opts.compression = effective.compression;
+    opts.compressionLevel = effective.compressionLevel;
+    opts.compressionMinBytes = effective.compressionMinBytes;
     auto opened = FastCache::CowTreeStorage::Open(opts);
     if (!opened.has_value())
         return std::unexpected(opened.error().ToString());
@@ -483,7 +486,7 @@ int DaemonBody(FastCache::Config const& effective)
     // operator-misleading bug — fold `anyTlsBind` into the TLS field below.
     logger.Logf(FastCache::LogLevel::Info,
                 "fastcached {} starting; bind={} max-memory={} config={} storage={} "
-                "durability={} max-value={} reactors={} shards={}{} auth={} tls={}",
+                "durability={} compression={} max-value={} reactors={} shards={}{} auth={} tls={}",
                 ProgramVersion,
                 bindSummary,
                 FastCache::FormatByteSize(effective.maxMemoryBytes),
@@ -491,6 +494,7 @@ int DaemonBody(FastCache::Config const& effective)
                 effective.storagePath.empty() ? std::string_view { "<in-memory>" }
                                               : std::string_view { effective.storagePath },
                 durabilityName,
+                FastCache::Compression::NameOf(effective.compression),
                 FastCache::FormatByteSize(effective.storageMaxValueBytes),
                 reactorCount,
                 physicalShards,

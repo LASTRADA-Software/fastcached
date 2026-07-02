@@ -1,5 +1,14 @@
 # TODO items
 
+---
+
+Evaluate the use of compression (various algorithms - zstd/lz4/zlib) for on-disk storage to reduce disk footprint and improve I/O throughput.
+What are the pros and cons of each algorithm in terms of compression ratio, speed, and resource usage? How does compression affect the performance of read/write operations, especially for large datasets and very I/O heavy clients? Consider implementing a configurable option to enable/disable compression based on administrator preference or workload characteristics.
+
+
+
+---
+
 - [ ] CoW storage needs to expose the on-disk format version, such that we can identify old stores on newer fastcached versions with a newer on-disk format (to gracefully bail, or migrate)
 - [ ] Add valgrind memcheck CI job to ensure no memory issues on clang release build
 - [ ] Github CI should create a static `fastcached` binary and provide it as artifact.

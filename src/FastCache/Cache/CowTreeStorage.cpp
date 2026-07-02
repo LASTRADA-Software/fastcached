@@ -12,8 +12,10 @@
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <format>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -150,6 +152,23 @@ namespace
     constexpr std::uint8_t RecordKindInline = 0;
     constexpr std::uint8_t RecordKindOverflow = 1;
 
+    /// On-disk record-layout version. Bumped from 3 to 4 when the per-entry
+    /// compression codec + original-length fields were added (see the class
+    /// doc). A store written by an older version is rejected on Open rather
+    /// than mis-parsed under the new layout.
+    constexpr std::uint32_t StorageFormatVersion = 4;
+
+    /// Reserved tree key holding the format-version sentinel. Chosen to be
+    /// unreachable by the memcached-family wire protocols: it leads with
+    /// control bytes (NUL + SOH), which those protocols forbid in keys. A RESP
+    /// binary key could in principle collide, but a client would have to store
+    /// this exact magic; even then only the sentinel read is affected, never
+    /// the integrity of other data. The value is `[u32 StorageFormatVersion]`.
+    /// Built via an explicit length so the embedded NULs are not truncated.
+    constexpr char FormatMarkerKeyBytes[] = { '\0', '\1', 'f', 'a', 's', 't', 'c', 'a', 'c',
+                                              'h',  'e',  'd', '.', 'f', 'm', 't', '\0' };
+    constexpr std::string_view FormatMarkerKey { FormatMarkerKeyBytes, sizeof(FormatMarkerKeyBytes) };
+
     [[nodiscard]] std::expected<std::uint64_t, StorageError> ParseUnsigned(std::span<std::byte const> bytes)
     {
         if (bytes.empty())
@@ -210,9 +229,47 @@ std::expected<void, StorageError> CowTreeStorage::Initialize()
     _tree = std::make_unique<CowTree::CowTree>(*_store);
     if (auto const r = _tree->Open(); !r.has_value())
         return std::unexpected(TranslateError(r.error(), "CowTree::Open"));
+    if (auto const r = EnsureFormatVersion(); !r.has_value())
+        return std::unexpected(r.error());
     if (auto const r = Replay(); !r.has_value())
         return std::unexpected(r.error());
     _stats.bytesLimit = _options.maxBytes;
+    return {};
+}
+
+std::expected<void, StorageError> CowTreeStorage::EnsureFormatVersion()
+{
+    auto reader = _tree->BeginRead();
+    auto marker = reader.Get(KeyView(FormatMarkerKey));
+    if (!marker.has_value())
+        return std::unexpected(TranslateError(marker.error(), "format-marker read"));
+
+    if (marker->has_value())
+    {
+        // A marker exists: it must name exactly the current format version.
+        CowTree::BytesView cursor { (*marker)->data(), (*marker)->size() };
+        std::uint32_t onDisk = 0;
+        if (!ReadLe<std::uint32_t>(cursor, onDisk) || onDisk != StorageFormatVersion)
+            return std::unexpected(MakeError(
+                StorageErrorCode::Corrupt,
+                std::format("unsupported on-disk storage format version {} (expected {})", onDisk, StorageFormatVersion)));
+        return {};
+    }
+
+    // No marker. A brand-new (empty) store gets stamped; a non-empty store
+    // predates the marker (legacy v3 or earlier) and must not be mis-parsed.
+    if (_tree->ItemCount() != 0)
+        return std::unexpected(
+            MakeError(StorageErrorCode::Corrupt, "on-disk store predates the versioned record format; refusing to open"));
+
+    std::vector<std::byte> value;
+    AppendLe<std::uint32_t>(value, StorageFormatVersion);
+    auto txn = _tree->BeginWrite();
+    if (auto const put = txn.Put(KeyView(FormatMarkerKey), CowTree::BytesView { value.data(), value.size() });
+        !put.has_value())
+        return std::unexpected(TranslateError(put.error(), "format-marker write"));
+    if (auto const c = txn.Commit(); !c.has_value())
+        return std::unexpected(TranslateError(c.error(), "format-marker commit"));
     return {};
 }
 
@@ -220,9 +277,10 @@ namespace
 {
     /// Append the common v3 leaf-record header (everything but the value /
     /// overflow descriptor).
-    void AppendCommonHeader(std::vector<std::byte>& out, std::uint8_t kind, CacheEntry const& entry)
+    void AppendCommonHeader(std::vector<std::byte>& out, std::uint8_t kind, CompressionCodec codec, CacheEntry const& entry)
     {
         AppendLe<std::uint8_t>(out, kind);
+        AppendLe<std::uint8_t>(out, static_cast<std::uint8_t>(codec));
         AppendLe<std::uint32_t>(out, entry.flags);
         AppendLe<std::uint64_t>(out, entry.cas);
         AppendLe<std::int64_t>(out, TimePointToMicros(entry.expiry));
@@ -232,28 +290,34 @@ namespace
     }
 } // namespace
 
-std::vector<std::byte> CowTreeStorage::EncodeInline(CacheEntry const& entry)
+std::vector<std::byte> CowTreeStorage::EncodeInline(CacheEntry const& entry,
+                                                    CompressionCodec codec,
+                                                    std::span<std::byte const> stored,
+                                                    std::uint64_t originalLen)
 {
-    auto const bytes = entry.ValueBytes();
     std::vector<std::byte> out;
-    out.reserve(1 + 4 + 8 + 8 + 8 + 8 + 1 + 4 + bytes.size());
-    AppendCommonHeader(out, RecordKindInline, entry);
-    AppendLe<std::uint32_t>(out, static_cast<std::uint32_t>(bytes.size()));
+    out.reserve(1 + 1 + 4 + 8 + 8 + 8 + 8 + 1 + 4 + 4 + stored.size());
+    AppendCommonHeader(out, RecordKindInline, codec, entry);
+    AppendLe<std::uint32_t>(out, static_cast<std::uint32_t>(stored.size()));
+    AppendLe<std::uint32_t>(out, static_cast<std::uint32_t>(originalLen));
     auto const offset = out.size();
-    out.resize(offset + bytes.size());
-    if (!bytes.empty())
-        std::memcpy(out.data() + offset, bytes.data(), bytes.size());
+    out.resize(offset + stored.size());
+    if (!stored.empty())
+        std::memcpy(out.data() + offset, stored.data(), stored.size());
     return out;
 }
 
 std::vector<std::byte> CowTreeStorage::EncodeOverflowDescriptor(CacheEntry const& entry,
+                                                                CompressionCodec codec,
                                                                 CowTree::PageId root,
-                                                                std::uint64_t totalLen)
+                                                                std::uint64_t storedLen,
+                                                                std::uint64_t originalLen)
 {
     std::vector<std::byte> out;
-    out.reserve(1 + 4 + 8 + 8 + 8 + 8 + 1 + 8 + 8);
-    AppendCommonHeader(out, RecordKindOverflow, entry);
-    AppendLe<std::uint64_t>(out, totalLen);
+    out.reserve(1 + 1 + 4 + 8 + 8 + 8 + 8 + 1 + 8 + 8 + 8);
+    AppendCommonHeader(out, RecordKindOverflow, codec, entry);
+    AppendLe<std::uint64_t>(out, storedLen);
+    AppendLe<std::uint64_t>(out, originalLen);
     AppendLe<std::uint64_t>(out, root.value);
     return out;
 }
@@ -266,6 +330,10 @@ std::expected<CowTreeStorage::ParsedRecord, StorageError> CowTreeStorage::ParseR
     std::uint8_t kind = 0;
     if (!ReadLe<std::uint8_t>(cursor, kind))
         return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+    std::uint8_t codecByte = 0;
+    if (!ReadLe<std::uint8_t>(cursor, codecByte))
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+    parsed.codec = static_cast<CompressionCodec>(codecByte);
     if (!ReadLe<std::uint32_t>(cursor, e.flags))
         return std::unexpected(MakeError(StorageErrorCode::Corrupt));
     if (!ReadLe<std::uint64_t>(cursor, e.cas))
@@ -289,6 +357,10 @@ std::expected<CowTreeStorage::ParsedRecord, StorageError> CowTreeStorage::ParseR
     {
         if (!ReadLe<std::uint32_t>(cursor, parsed.inlineLen))
             return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+        std::uint32_t originalLen = 0;
+        if (!ReadLe<std::uint32_t>(cursor, originalLen))
+            return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+        parsed.originalLen = originalLen;
         if (cursor.size() < parsed.inlineLen)
             return std::unexpected(MakeError(StorageErrorCode::Corrupt));
         parsed.inlineOffset = static_cast<std::size_t>(raw.size() - cursor.size());
@@ -298,6 +370,8 @@ std::expected<CowTreeStorage::ParsedRecord, StorageError> CowTreeStorage::ParseR
     {
         parsed.overflow = true;
         if (!ReadLe<std::uint64_t>(cursor, parsed.totalLen))
+            return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+        if (!ReadLe<std::uint64_t>(cursor, parsed.originalLen))
             return std::unexpected(MakeError(StorageErrorCode::Corrupt));
         std::uint64_t rootValue = 0;
         if (!ReadLe<std::uint64_t>(cursor, rootValue))
@@ -501,23 +575,46 @@ std::expected<std::optional<CowTreeStorage::LoadedEntry>, StorageError> CowTreeS
     if (!parsed.has_value())
         return std::unexpected(parsed.error());
     auto entry = std::move(parsed->entry);
+    // Materialise the STORED (possibly compressed) bytes, then decompress to
+    // plaintext so every caller — L1 mirror, wire protocols, decorators — only
+    // ever sees the original value. Decompression is on the on-disk-miss path,
+    // never the L1 hit path.
+    std::vector<std::byte> storedBytes;
     if (parsed->overflow)
     {
         auto value = ReadOverflowChain(parsed->root, parsed->totalLen);
         if (!value.has_value())
             return std::unexpected(value.error());
-        // Disk-backend fallback: the value was just materialized from the
-        // overflow chain into a fresh heap buffer, so wrapping it in a
-        // SharedValue is correct (it outlives any read lock) — it simply
-        // yields no copy-elimination benefit, unlike the in-memory backend.
-        entry.value = MakeSharedValue(*value);
+        storedBytes = std::move(*value);
     }
     else
     {
         auto const& raw = **got;
-        entry.value = MakeSharedValue(
-            std::vector<std::byte> { raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset),
-                                     raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset + parsed->inlineLen) });
+        storedBytes.assign(raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset),
+                           raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset + parsed->inlineLen));
+    }
+
+    if (parsed->codec == CompressionCodec::Identity)
+    {
+        // Disk-backend fallback: the bytes live in a fresh heap buffer that
+        // outlives any read lock, so wrapping in a SharedValue is correct (it
+        // copies into its single-allocation layout, yielding no copy-elimination
+        // benefit here, unlike the in-memory tier).
+        entry.value = MakeSharedValue(storedBytes);
+    }
+    else
+    {
+        // Defence in depth: a corrupt descriptor must not drive a huge
+        // decompress-buffer allocation. A legitimate value never exceeds
+        // maxValueBytes (enforced at write time), so a larger originalLen is
+        // a corrupt record. (Guard only when a cap is configured.)
+        if (_options.maxValueBytes != 0 && parsed->originalLen > _options.maxValueBytes)
+            return std::unexpected(MakeError(StorageErrorCode::Corrupt, "decompressed length exceeds maxValueBytes"));
+        auto const plain =
+            Compression::Decompress(parsed->codec, storedBytes, static_cast<std::size_t>(parsed->originalLen));
+        if (!plain.has_value())
+            return std::unexpected(plain.error());
+        entry.value = MakeSharedValue(*plain);
     }
     return LoadedEntry { std::move(entry) };
 }
@@ -525,11 +622,32 @@ std::expected<std::optional<CowTreeStorage::LoadedEntry>, StorageError> CowTreeS
 std::expected<void, StorageError> CowTreeStorage::StoreEntry(std::string_view key, CacheEntry const& entry)
 {
     auto const bytes = entry.ValueBytes();
+    auto const originalLen = static_cast<std::uint64_t>(bytes.size());
+
+    // Compress once, up front, then let the (possibly smaller) STORED bytes
+    // drive the inline-vs-overflow decision. Threshold + shrink-check: only
+    // attempt compression above the configured minimum, and only keep the
+    // compressed form when it is actually smaller — otherwise store verbatim
+    // under Identity so a read never pays a pointless decompress.
+    auto codec = CompressionCodec::Identity;
+    std::vector<std::byte> compressed;
+    std::span<std::byte const> stored = bytes;
+    if (_options.compression != CompressionCodec::Identity && bytes.size() >= _options.compressionMinBytes
+        && Compression::IsAvailable(_options.compression))
+    {
+        compressed = Compression::Compress(_options.compression, bytes, _options.compressionLevel);
+        if (!compressed.empty() && compressed.size() < bytes.size())
+        {
+            codec = _options.compression;
+            stored = compressed;
+        }
+    }
+
     std::vector<std::byte> encoded;
     CowTree::PageId newChain = CowTree::PageId::None();
-    if (bytes.size() > InlineValueLimit())
+    if (stored.size() > InlineValueLimit())
     {
-        auto chain = WriteOverflowChain(bytes);
+        auto chain = WriteOverflowChain(stored);
         if (!chain.has_value())
             return std::unexpected(chain.error());
         newChain = *chain;
@@ -539,11 +657,11 @@ std::expected<void, StorageError> CowTreeStorage::StoreEntry(std::string_view ke
             FreeChain(newChain);
             return std::unexpected(TranslateError(r.error(), "overflow SyncData"));
         }
-        encoded = EncodeOverflowDescriptor(entry, newChain, static_cast<std::uint64_t>(bytes.size()));
+        encoded = EncodeOverflowDescriptor(entry, codec, newChain, static_cast<std::uint64_t>(stored.size()), originalLen);
     }
     else
     {
-        encoded = EncodeInline(entry);
+        encoded = EncodeInline(entry, codec, stored, originalLen);
     }
 
     auto txn = _tree->BeginWrite();
@@ -723,29 +841,32 @@ std::expected<CasToken, StorageError> CowTreeStorage::UpdateRecordMetadata(std::
     if (entry.expiry <= now || entry.generation < _liveGeneration)
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
 
-    // Re-encode ONLY the leaf record. For an overflow value we keep the existing
-    // chain (same root + totalLen) and rewrite just the descriptor; for an inline
-    // value we copy its bytes out of the current record and re-encode inline.
-    // Either way the value bytes are never re-read or re-written.
+    // Re-encode ONLY the leaf record. The value bytes are never decompressed,
+    // re-read, or re-compressed — the record's existing codec + original length
+    // are carried through verbatim. For an overflow value we keep the existing
+    // chain (same root + stored/original length) and rewrite just the
+    // descriptor; for an inline value we copy the STORED (possibly compressed)
+    // bytes out of the current record and re-encode them inline unchanged.
     std::size_t valueSize = 0;
     std::vector<std::byte> encoded;
     if (parsed->overflow)
     {
-        valueSize = static_cast<std::size_t>(parsed->totalLen);
+        valueSize = static_cast<std::size_t>(parsed->originalLen);
         mutate(entry);
         entry.cas = _nextCas++;
-        encoded = EncodeOverflowDescriptor(entry, parsed->root, parsed->totalLen);
+        encoded = EncodeOverflowDescriptor(entry, parsed->codec, parsed->root, parsed->totalLen, parsed->originalLen);
     }
     else
     {
         auto const& raw = **got;
-        entry.value = MakeSharedValue(
-            std::vector<std::byte> { raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset),
-                                     raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset + parsed->inlineLen) });
-        valueSize = entry.ValueSize();
+        std::vector<std::byte> const storedBytes {
+            raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset),
+            raw.begin() + static_cast<std::ptrdiff_t>(parsed->inlineOffset + parsed->inlineLen)
+        };
+        valueSize = static_cast<std::size_t>(parsed->originalLen);
         mutate(entry);
         entry.cas = _nextCas++;
-        encoded = EncodeInline(entry);
+        encoded = EncodeInline(entry, parsed->codec, storedBytes, parsed->originalLen);
     }
 
     auto txn = _tree->BeginWrite();

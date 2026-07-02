@@ -34,6 +34,14 @@ option(USE_SCCACHE "Use sccache as the compiler launcher when the binary is on P
 # is pulled in via the vcpkg manifest's "tls" feature (see vcpkg.json).
 option(FASTCACHED_ENABLE_TLS "Enable TLS support (requires OpenSSL)" OFF)
 
+# On-disk value compression is ON by default: the standard build ships zstd +
+# lz4 and the runtime default codec is zstd (admins opt out with
+# `--compression none`). When explicitly built OFF, no compression library is
+# fetched or linked, the codec table degrades to identity-only, and selecting
+# zstd/lz4 from config becomes a clean startup error. Our code keys off the
+# FC_COMPRESSION_ENABLED compile definition (set in src/FastCache/CMakeLists.txt).
+option(FASTCACHED_ENABLE_COMPRESSION "Enable on-disk value compression (zstd + lz4)" ON)
+
 # Tracy profiler. TRACY_ENABLE is Tracy's own gate; reusing the name means the
 # fetched client library actually emits instrumentation rather than its no-op
 # stub. Our code keys off the separate FC_TRACY_ENABLED compile definition
@@ -129,6 +137,36 @@ endif()
 # rather than at link time.
 if(FASTCACHED_ENABLE_TLS)
     find_package(OpenSSL REQUIRED)
+endif()
+
+# zstd + lz4 for on-disk value compression. Fetched (like yaml-cpp/Tracy)
+# BEFORE the pedantic/clang-tidy includes so the global -Werror -Wconversion
+# and clang-tidy hooks never apply to their third-party sources. CPM tries a
+# system package first (CPM_USE_LOCAL_PACKAGES), otherwise fetches the source.
+# Both build static, programs/tests off, to keep the dependency footprint small.
+if(FASTCACHED_ENABLE_COMPRESSION)
+    CPMAddPackage(
+        NAME zstd
+        GITHUB_REPOSITORY facebook/zstd
+        VERSION 1.5.6
+        SOURCE_SUBDIR build/cmake
+        OPTIONS
+            "ZSTD_BUILD_PROGRAMS OFF"
+            "ZSTD_BUILD_TESTS OFF"
+            "ZSTD_BUILD_SHARED OFF"
+            "ZSTD_BUILD_STATIC ON"
+    )
+    CPMAddPackage(
+        NAME lz4
+        GITHUB_REPOSITORY lz4/lz4
+        VERSION 1.10.0
+        SOURCE_SUBDIR build/cmake
+        OPTIONS
+            "LZ4_BUILD_CLI OFF"
+            "LZ4_BUILD_LEGACY_LZ4C OFF"
+            "BUILD_SHARED_LIBS OFF"
+            "BUILD_STATIC_LIBS ON"
+    )
 endif()
 
 # ----------------------------------------------------------------------------

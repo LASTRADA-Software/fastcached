@@ -68,6 +68,9 @@ Config Merge(Config fileCfg, CliResult const& cli)
     MergeField(fileCfg, cli, &CliResult::notifyKeyspaceEventsExplicit, &Config::notifyKeyspaceEvents);
     MergeField(fileCfg, cli, &CliResult::lruRecencyExplicit, &Config::lruRecency);
     MergeField(fileCfg, cli, &CliResult::cpuAffinityExplicit, &Config::cpuAffinity);
+    MergeField(fileCfg, cli, &CliResult::compressionExplicit, &Config::compression);
+    MergeField(fileCfg, cli, &CliResult::compressionLevelExplicit, &Config::compressionLevel);
+    MergeField(fileCfg, cli, &CliResult::compressionMinBytesExplicit, &Config::compressionMinBytes);
 
     // Three legacy "value-comparison" shapes remain because they have no
     // explicit-bit: `configPath` and `pidfile` are non-empty when set
