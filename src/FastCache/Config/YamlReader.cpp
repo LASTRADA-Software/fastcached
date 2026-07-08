@@ -8,6 +8,7 @@
 #include <exception>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -46,6 +47,26 @@ namespace
                                          "storage_durability",
                                          std::string { "unknown durability mode: " } + std::string { sv },
                                          line));
+    }
+
+    [[nodiscard]] std::expected<CompressionCodec, ConfigError> ParseCompression(std::string_view sv,
+                                                                                std::filesystem::path const& path,
+                                                                                unsigned line)
+    {
+        auto const codec = Compression::CodecFromName(sv);
+        if (!codec.has_value())
+            return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+                                             path,
+                                             "compression",
+                                             std::string { "unknown codec (expect none|lz4|zstd): " } + std::string { sv },
+                                             line));
+        if (!Compression::IsAvailable(*codec))
+            return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+                                             path,
+                                             "compression",
+                                             std::string { "codec not available in this build: " } + std::string { sv },
+                                             line));
+        return *codec;
     }
 
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv,
@@ -205,6 +226,53 @@ namespace
             cfg.binds.push_back(*entry);
         }
         return {};
+    }
+
+    /// Apply the compression-related YAML keys. Factored out of ApplyEntry to
+    /// keep that function's branch count within the clang-tidy cognitive-
+    /// complexity budget while preserving the one-arm-per-key style.
+    /// @return `nullopt` if `key` is not a compression key (caller keeps
+    ///         matching); otherwise the parse result for that key.
+    [[nodiscard]] std::optional<std::expected<void, ConfigError>> ApplyCompressionEntry(
+        Config& cfg, std::string const& key, YAML::Node const& valueNode, std::filesystem::path const& path, unsigned line)
+    {
+        /// `compression`: none | lz4 | zstd on-disk value codec.
+        if (key == "compression")
+        {
+            auto const c = ParseCompression(valueNode.as<std::string>(), path, line);
+            if (!c.has_value())
+                return std::expected<void, ConfigError> { std::unexpect, c.error() };
+            cfg.compression = *c;
+            return std::expected<void, ConfigError> {};
+        }
+        /// `compression_level`: codec effort level (1..22).
+        if (key == "compression_level")
+        {
+            auto const raw = valueNode.as<int>();
+            if (raw < 1 || raw > 22)
+                return std::expected<void, ConfigError> {
+                    std::unexpect,
+                    MakeError(ConfigErrorCode::OutOfRange, path, "compression_level", "must be in 1..22", line)
+                };
+            cfg.compressionLevel = raw;
+            return std::expected<void, ConfigError> {};
+        }
+        /// `compression_min_bytes`: skip compression below this size.
+        if (key == "compression_min_bytes")
+        {
+            auto const raw = valueNode.as<std::string>();
+            auto parsed = ParseByteSize(raw, "compression_min_bytes");
+            if (!parsed.has_value())
+            {
+                auto err = std::move(parsed).error();
+                err.source = path.string();
+                err.line = line;
+                return std::expected<void, ConfigError> { std::unexpect, std::move(err) };
+            }
+            cfg.compressionMinBytes = *parsed;
+            return std::expected<void, ConfigError> {};
+        }
+        return std::nullopt;
     }
 
     [[nodiscard]] std::expected<void, ConfigError> ApplyEntry(
@@ -407,6 +475,10 @@ namespace
                                                  line));
             return {};
         }
+        /// Compression keys are handled in a dedicated helper to keep this
+        /// function within the cognitive-complexity budget.
+        if (auto handled = ApplyCompressionEntry(cfg, key, valueNode, path, line); handled.has_value())
+            return std::move(*handled);
         /// `threads`: positive integer worker count for threaded mode.
         if (key == "threads")
         {

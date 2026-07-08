@@ -375,3 +375,39 @@ TEST_CASE("ConfigMerge: YAML lru/cpu survive when CLI did not pass the flag", "[
     REQUIRE(merged.lruRecency == FastCache::LruRecency::Strict);
     REQUIRE(merged.cpuAffinity == FastCache::CpuAffinity::None);
 }
+
+TEST_CASE("ConfigMerge: explicit CLI compression flags override YAML", "[config][merge][compression]")
+{
+    FastCache::Config fileCfg {};
+    fileCfg.compression = FastCache::CompressionCodec::Zstd;
+    fileCfg.compressionLevel = 3;
+    fileCfg.compressionMinBytes = 256;
+
+    auto cli = EmptyCli();
+    cli.compressionExplicit = true;
+    cli.config.compression = FastCache::CompressionCodec::Identity;
+    cli.compressionLevelExplicit = true;
+    cli.config.compressionLevel = 12;
+    cli.compressionMinBytesExplicit = true;
+    cli.config.compressionMinBytes = 4096;
+
+    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+    REQUIRE(merged.compression == FastCache::CompressionCodec::Identity);
+    REQUIRE(merged.compressionLevel == 12);
+    REQUIRE(merged.compressionMinBytes == 4096);
+}
+
+TEST_CASE("ConfigMerge: YAML compression survives when CLI did not pass the flag", "[config][merge][compression]")
+{
+    FastCache::Config fileCfg {};
+    fileCfg.compression = FastCache::CompressionCodec::Lz4;
+    fileCfg.compressionLevel = 9;
+
+    auto cli = EmptyCli();
+    cli.config.compression = FastCache::CompressionCodec::Zstd; // not explicit
+    cli.config.compressionLevel = 1;                            // not explicit
+
+    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+    REQUIRE(merged.compression == FastCache::CompressionCodec::Lz4);
+    REQUIRE(merged.compressionLevel == 9);
+}

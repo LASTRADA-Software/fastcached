@@ -61,6 +61,9 @@ struct CliResult
     bool lruRecencyExplicit { false };
     bool cpuAffinityExplicit { false };
     bool serviceNameExplicit { false };
+    bool compressionExplicit { false };
+    bool compressionLevelExplicit { false };
+    bool compressionMinBytesExplicit { false };
 };
 
 /// Parse `argv[1..argc-1]` into a Config. Returns ConfigError on bad input.

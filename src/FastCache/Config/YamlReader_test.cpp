@@ -228,3 +228,47 @@ TEST_CASE("YamlReader: ReadYamlConfigWithPresence leaves bind/port presence clea
     REQUIRE_FALSE(cfg->bindAddressExplicit);
     REQUIRE_FALSE(cfg->portExplicit);
 }
+
+TEST_CASE("YamlReader: compression keys parse", "[config][yaml][compression]")
+{
+    // The codec key is only valid when the codec is compiled in; the level and
+    // min-bytes keys are build-independent, so a codec-less build still parses
+    // them from a `compression: none` document.
+    auto const* const codecLine = FastCache::Compression::IsAvailable(FastCache::CompressionCodec::Zstd)
+                                      ? "compression: zstd\n"
+                                      : "compression: none\n";
+    auto const doc = std::string { codecLine } + "compression_level: 7\n" + "compression_min_bytes: 1k\n";
+    auto const path = WriteTempYaml("compress", doc);
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE(cfg.has_value());
+    if (FastCache::Compression::IsAvailable(FastCache::CompressionCodec::Zstd))
+        REQUIRE(cfg->compression == FastCache::CompressionCodec::Zstd);
+    else
+        REQUIRE(cfg->compression == FastCache::CompressionCodec::Identity);
+    REQUIRE(cfg->compressionLevel == 7);
+    REQUIRE(cfg->compressionMinBytes == 1024);
+}
+
+TEST_CASE("YamlReader: compression=none selects Identity", "[config][yaml][compression]")
+{
+    auto const path = WriteTempYaml("compress-none", "compression: none\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE(cfg.has_value());
+    REQUIRE(cfg->compression == FastCache::CompressionCodec::Identity);
+}
+
+TEST_CASE("YamlReader: unknown compression codec is rejected", "[config][yaml][compression]")
+{
+    auto const path = WriteTempYaml("compress-bad", "compression: brotli\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE_FALSE(cfg.has_value());
+    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::OutOfRange);
+}
+
+TEST_CASE("YamlReader: compression_level out of range is rejected", "[config][yaml][compression]")
+{
+    auto const path = WriteTempYaml("compress-lvl", "compression_level: 99\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE_FALSE(cfg.has_value());
+    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::OutOfRange);
+}
