@@ -1207,7 +1207,12 @@ std::expected<CacheEngine::ClaimResult, StorageError> CacheEngine::StreamClaim(s
             nowMs,
             justId,
             [&](PendingEntry const& p) {
-                if (std::ranges::find(wanted, p.id) == wanted.end())
+                // Membership via a predicate rather than std::ranges::find(wanted, p.id):
+                // StreamId is a 16-byte, trivially-equality-comparable struct, and under
+                // clang-cl the MSVC STL routes identity-projected find through its
+                // vectorized fast path, which only supports 1/2/4/8-byte elements and
+                // hard-errors ("unexpected size") on 16-byte ones. none_of sidesteps it.
+                if (std::ranges::none_of(wanted, [&](StreamId const& id) { return id == p.id; }))
                     return false;
                 // A just-forced entry has deliveryTimeMs == nowMs (idle 0); the
                 // >= comparison still admits it when minIdleMs == 0 (the common
