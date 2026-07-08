@@ -564,6 +564,11 @@ int DaemonBody(FastCache::Config const& effective)
     serverOpts.session.streamWaiters = &streamWaiters;
     serverOpts.session.watches = &watches;
     serverOpts.session.keyspaceNotifier = &keyspaceNotifier;
+    // The RESP wire cap must admit the largest value the cache will store, so a
+    // client can push a value up to --storage-max-value without the connection
+    // being dropped mid-command. Keep the protocol default floor when the
+    // configured value is smaller; --storage-max-value drives both limits.
+    serverOpts.session.maxPayloadBytes = std::max(serverOpts.session.maxPayloadBytes, effective.storageMaxValueBytes);
     // Make the notifier reloadable: a SIGHUP that changes
     // notify-keyspace-events now updates the live bitmask on the
     // already-running notifier. Existing connections' cached
