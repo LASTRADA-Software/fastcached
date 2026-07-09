@@ -81,6 +81,14 @@ struct SessionContext
     /// into the connection frame, valid for the session's lifetime.
     std::string_view sourceTag {};
 
+    /// Maximum size, in bytes, of a single length-prefixed protocol payload (a
+    /// RESP bulk string). Bounds how many bytes one command may push before the
+    /// connection is dropped, capping per-request memory. The daemon raises this
+    /// to at least the configured storage max-value (`--storage-max-value`) so any
+    /// value the cache will accept can also be received off the wire; it defaults
+    /// to the 64 MiB protocol floor for tests and handlers that leave it unset.
+    std::size_t maxPayloadBytes { 64 * 1024 * 1024 };
+
     /// When true (`--log-everything`), non-data commands (PING, HELLO, COMMAND,
     /// AUTH, ...) are also logged at the connection level. These never reach
     /// storage, so without this flag they are invisible. Data operations are

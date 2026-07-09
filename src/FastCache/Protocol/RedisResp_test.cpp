@@ -96,6 +96,37 @@ TEST_CASE("RESP: PING with payload echoes back as bulk", "[protocol][resp]")
     REQUIRE(Exchange(fix, "*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n") == "$5\r\nhello\r\n");
 }
 
+TEST_CASE("RESP: bulk payload cap is driven by SessionContext::maxPayloadBytes", "[protocol][resp]")
+{
+    // A 4 KiB value, unbounded by the fixture's storage (maxValueBytes == 0),
+    // isolates the wire cap from the storage cap: only SessionContext::
+    // maxPayloadBytes decides whether the value is admitted off the wire.
+    // Regression for large SETs (e.g. sccache objects) being dropped mid-command
+    // instead of stored, when the cap was a hard-coded 64 MiB constant.
+    std::string const value(4096, 'x');
+    std::string const setCommand =
+        "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$" + std::to_string(value.size()) + "\r\n" + value + "\r\n";
+
+    SECTION("a value within the cap is stored")
+    {
+        RespFixture fix;
+        FastCache::SessionContext session;
+        session.maxPayloadBytes = 8 * 1024; // admits the 4 KiB value
+        REQUIRE(Exchange(fix, setCommand, session) == "+OK\r\n");
+    }
+
+    SECTION("a value exceeding the cap gets a protocol error reply, not a bare reset")
+    {
+        RespFixture fix;
+        FastCache::SessionContext session;
+        session.maxPayloadBytes = 1024; // rejects the 4 KiB value
+        // The connection still closes (the stream is desynced), but the client
+        // first receives a diagnosable "-ERR Protocol error: ..." rather than an
+        // abrupt TCP reset.
+        REQUIRE(Exchange(fix, setCommand, session).starts_with("-ERR Protocol error:"));
+    }
+}
+
 TEST_CASE("RESP: SELECT accepts any database index with +OK", "[protocol][resp]")
 {
     RespFixture fix;

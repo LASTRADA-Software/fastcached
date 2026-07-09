@@ -50,7 +50,6 @@ namespace
 {
 
     constexpr std::size_t MaxLineBytes = 65536;
-    constexpr std::size_t MaxPayloadBytes = 64 * 1024 * 1024;
     constexpr std::string_view Crlf = "\r\n";
 
     /// MULTI queue caps — guard against a malicious client that streams an
@@ -4981,7 +4980,7 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
                                  std::vector<std::byte> primingBytes,
                                  SessionContext session)
 {
-    ByteReader reader { *socket, MaxLineBytes, MaxPayloadBytes };
+    ByteReader reader { *socket, MaxLineBytes, session.maxPayloadBytes };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
 
     // Per-connection protocol state. Authenticated up-front unless a credential
@@ -5101,7 +5100,14 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
         if (state.subscriptionCount > 0)
             subscriber->RearmReadable();
         if (!cmd.has_value())
-            co_return; // truncated / malformed — drop connection (RAII cleans up)
+        {
+            // Truncated means the peer hung up mid-frame — nothing to reply to.
+            // Any other parse error is a protocol violation: mirror Redis and send
+            // "-ERR Protocol error: ..." before closing, rather than a bare reset.
+            if (cmd.error().code != ProtocolErrorCode::Truncated)
+                co_await ReplyError(socket, std::format("Protocol error: {}", cmd.error().context));
+            co_return; // stream is desynced — drop the connection (RAII cleans up)
+        }
         if (cmd->args.empty())
             continue;
 
