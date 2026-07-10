@@ -25,6 +25,7 @@ TEST_CASE("RenderPrometheus emits HELP/TYPE/value triples", "[metrics][prometheu
     stats.bytesUsed = 4096;
     stats.bytesLimit = 65536;
     stats.evictions = 3;
+    stats.writeErrors = 9;
 
     auto const body = RenderPrometheus(metrics, MetricsSnapshot { .storage = stats, .uptime = Uptime { 42s } });
 
@@ -35,6 +36,8 @@ TEST_CASE("RenderPrometheus emits HELP/TYPE/value triples", "[metrics][prometheu
         CHECK(body.contains("fastcached_get_hits_total 80\n"));
         CHECK(body.contains("fastcached_get_misses_total 20\n"));
         CHECK(body.contains("fastcached_evictions_total 3\n"));
+        CHECK(body.contains("# TYPE fastcached_write_errors_total counter\n"));
+        CHECK(body.contains("fastcached_write_errors_total 9\n"));
     }
     SECTION("gauges from the storage snapshot")
     {

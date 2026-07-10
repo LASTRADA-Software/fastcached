@@ -16,6 +16,7 @@ target_sources(FastCache
         Cache/NotifyingStorage.cpp
         Cache/ShardedStorage.cpp
         Cache/TracingStorage.cpp
+        Cache/WriteErrorReportingStorage.cpp
         Config/ByteSize.cpp
         Config/CliParser.cpp
         Config/ConfigMerge.cpp

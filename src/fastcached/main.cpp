@@ -16,6 +16,7 @@
 #include <FastCache/Cache/NotifyingStorage.hpp>
 #include <FastCache/Cache/ShardedStorage.hpp>
 #include <FastCache/Cache/TracingStorage.hpp>
+#include <FastCache/Cache/WriteErrorReportingStorage.hpp>
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
@@ -350,12 +351,21 @@ int DaemonBody(FastCache::Config const& effective)
     auto backend = std::move(bundle->backend);
     auto* const backendPtr = backend.get();
 
+    // Always surface value-write failures. A write that cannot be persisted
+    // (full disk / I/O error / corruption / read-only) is otherwise invisible
+    // at the default log level: it never reaches the trace-only TracingStorage,
+    // so a store silently does not happen. This decorator logs each such failure
+    // at Warn and counts it into Snapshot().writeErrors (Prometheus
+    // `fastcached_write_errors_total`). It wraps the raw backend so it observes
+    // the true storage result (e.g. the disk error LayeredStorage propagates).
+    FastCache::WriteErrorReportingStorage writeErrorReporter { *backend, logger };
+    FastCache::IStorage* storagePtr = &writeErrorReporter;
+
     // Optionally wrap in TracingStorage when trace logging is requested.
     std::unique_ptr<FastCache::TracingStorage> tracer;
-    FastCache::IStorage* storagePtr = backend.get();
     if (effective.logLevel <= FastCache::LogLevel::Trace)
     {
-        tracer = std::make_unique<FastCache::TracingStorage>(*backend, logger, clock);
+        tracer = std::make_unique<FastCache::TracingStorage>(*storagePtr, logger, clock);
         storagePtr = tracer.get();
     }
 
