@@ -283,7 +283,7 @@ namespace
                              ByteReader* reader,
                              std::string_view commandName,
                              std::span<std::string_view const> args,
-                             std::string_view sourceTag)
+                             SessionContext session)
     {
         auto const isCas = commandName == "cas";
         StorageArgs parsed {};
@@ -293,12 +293,22 @@ namespace
         // Read the payload (bytes + trailing CRLF).
         auto payload = co_await reader->ReadExactly(parsed.bytes);
         if (!payload.has_value())
+        {
+            // The value never reached storage, so it leaves no `storage:` trace
+            // line — surface the drop so a discarded write (an oversized value =>
+            // PayloadTooLarge, or a client that reset mid-value => Truncated) is
+            // visible instead of silently vanishing from the trace.
+            session.LogFrameDrop("memcached", payload.error());
             co_return co_await WriteError(socket, "CLIENT_ERROR", "bad payload");
+        }
 
         // Consume the CRLF that follows the payload — memcached sends it.
         auto const trailing = co_await reader->ReadExactly(2);
         if (!trailing.has_value())
+        {
+            session.LogFrameDrop("memcached", trailing.error());
             co_return co_await WriteError(socket, "CLIENT_ERROR", "missing CRLF after payload");
+        }
 
         std::expected<CasToken, StorageError> result { 0 };
         bool unknownCommand = false;
@@ -310,7 +320,7 @@ namespace
             // co_await that may have let another connection run and overwrite
             // the thread-local. This block is co_await-free, so the tag stays
             // valid through the engine call TracingStorage logs.
-            Detail::StorageSourceTag = sourceTag;
+            Detail::StorageSourceTag = session.sourceTag;
             if (commandName == "set")
                 result = engine->Set(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
             else if (commandName == "add")
@@ -669,7 +679,10 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket,
         auto const lineResult = co_await reader.ReadLine();
         if (!lineResult.has_value())
         {
-            // Truncated or LineTooLong — drop the connection.
+            // Truncated or LineTooLong — drop the connection. Surface it so an
+            // over-long command line (LineTooLong) or a mid-frame reset is
+            // visible rather than a silent disconnect.
+            session.LogFrameDrop("memcached", lineResult.error());
             co_return;
         }
 
@@ -723,7 +736,7 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket,
             ok = co_await HandleGet(socket, engine, tail, /*includeCas*/ true);
         else if (command == "set" || command == "add" || command == "replace" || command == "append" || command == "prepend"
                  || command == "cas")
-            ok = co_await HandleStorage(socket, engine, &reader, command, tail, session.sourceTag);
+            ok = co_await HandleStorage(socket, engine, &reader, command, tail, session);
         else if (command == "delete")
             ok = co_await HandleDelete(socket, engine, tail);
         else if (command == "incr")

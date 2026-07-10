@@ -5,17 +5,20 @@
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/MemcachedText.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <format>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace
@@ -133,6 +136,66 @@ TEST_CASE("memcached-text multi-key get gathers every value block in order", "[p
                     big.size(),
                     big);
     REQUIRE(response == expected);
+}
+
+namespace
+{
+
+// Drive the handler with the request supplied as priming bytes, then inspect the
+// logger. The drop paths write no reply and do not close, so the fixture's
+// `Exchange` response-drain would suspend forever without a reactor; priming +
+// a half-closed client lets `Run` complete synchronously with nothing to drain.
+void DriveWithPriming(TextFixture& fix, std::string_view request, FastCache::SessionContext const& session)
+{
+    auto const bytes = FastCache::AsBytes(request);
+    std::vector<std::byte> priming { bytes.begin(), bytes.end() };
+    fix.pair.client->ShutdownWrite();
+    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, std::move(priming), session));
+}
+
+} // namespace
+
+TEST_CASE("memcached-text frame-reader drops are logged so a discarded value is visible", "[protocol][text][observability]")
+{
+    SECTION("an over-long command line logs a Warn LineTooLong drop")
+    {
+        TextFixture fix;
+        FastCache::CapturingLogger logger;
+        FastCache::SessionContext session;
+        session.logger = &logger;
+        // MaxLineBytes is 4096; a 5000-byte line with no CRLF trips LineTooLong.
+        DriveWithPriming(fix, std::string(5000, 'a'), session);
+
+        auto const records = logger.Snapshot();
+        auto const drop = std::ranges::find_if(records, [](FastCache::CapturingLogger::Record const& r) {
+            return r.message.contains("frame dropped") && r.message.contains("LineTooLong");
+        });
+        REQUIRE(drop != records.end());
+        REQUIRE(drop->level == FastCache::LogLevel::Warn);
+        REQUIRE(drop->message.contains("memcached"));
+    }
+
+    SECTION("a value truncated by a mid-write disconnect logs a Debug Truncated drop")
+    {
+        TextFixture fix;
+        FastCache::CapturingLogger logger;
+        FastCache::SessionContext session;
+        session.logger = &logger;
+        // Declare a 100-byte value but supply only 3 bytes, then EOF: the payload
+        // read aborts as Truncated — the shape of an sccache SET whose connection
+        // reset mid-write. It never reaches storage, so only this line records it.
+        DriveWithPriming(fix, "set k 0 0 100\r\nABC", session);
+
+        auto const records = logger.Snapshot();
+        auto const drop = std::ranges::find_if(records, [](FastCache::CapturingLogger::Record const& r) {
+            return r.message.contains("frame dropped") && r.message.contains("Truncated");
+        });
+        REQUIRE(drop != records.end());
+        // A peer that closed mid-frame is routine, so the drop stays at Debug
+        // (quiet at the default level) rather than Warn.
+        REQUIRE(drop->level == FastCache::LogLevel::Debug);
+        REQUIRE(drop->message.contains("memcached"));
+    }
 }
 
 TEST_CASE("memcached-text set over the value cap yields SERVER_ERROR object too large", "[protocol][text][max-value]")

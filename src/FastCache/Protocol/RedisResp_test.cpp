@@ -6,6 +6,7 @@
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>
 #include <FastCache/Protocol/PubSubRegistry.hpp>
@@ -16,6 +17,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -125,6 +127,37 @@ TEST_CASE("RESP: bulk payload cap is driven by SessionContext::maxPayloadBytes",
         // abrupt TCP reset.
         REQUIRE(Exchange(fix, setCommand, session).starts_with("-ERR Protocol error:"));
     }
+}
+
+TEST_CASE("RESP: an oversized bulk logs a Warn frame-drop line so a discarded SET is visible",
+          "[protocol][resp][observability]")
+{
+    // A SET whose value exceeds the per-session wire cap is rejected by the
+    // frame reader before the command is parsed, so it never reaches storage and
+    // leaves no TracingStorage `storage:` line. Regression guard for the
+    // "reads log HIT/MISS but a dropped SET vanishes" confusion: LogFrameDrop
+    // surfaces the discarded write instead of a silent connection close.
+    RespFixture fix;
+    FastCache::CapturingLogger logger;
+    FastCache::SessionContext session;
+    session.logger = &logger;
+    session.maxPayloadBytes = 1024; // rejects the 4 KiB value below
+
+    std::string const value(4096, 'x');
+    std::string const setCommand =
+        "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$" + std::to_string(value.size()) + "\r\n" + value + "\r\n";
+    static_cast<void>(Exchange(fix, setCommand, session));
+
+    auto const records = logger.Snapshot();
+    auto const drop = std::ranges::find_if(records, [](FastCache::CapturingLogger::Record const& r) {
+        return r.message.contains("frame dropped") && r.message.contains("PayloadTooLarge");
+    });
+    REQUIRE(drop != records.end());
+    // An actively-rejected frame is Warn (visible at the default level), names the
+    // protocol, and carries the cap so the fix (raise --storage-max-value) is obvious.
+    REQUIRE(drop->level == FastCache::LogLevel::Warn);
+    REQUIRE(drop->message.contains("resp"));
+    REQUIRE(drop->message.contains("cap is 1024"));
 }
 
 TEST_CASE("RESP: SELECT accepts any database index with +OK", "[protocol][resp]")

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Auth/AuthPolicy.hpp>
+#include <FastCache/Core/Errors/ProtocolError.hpp>
 #include <FastCache/Core/Logger.hpp>
 
 #include <string_view>
@@ -118,6 +119,41 @@ struct SessionContext
             logger->Logf(LogLevel::Trace, "{}", verb);
         else
             logger->Logf(LogLevel::Trace, "{} {}", verb, key);
+    }
+
+    /// Severity at which a frame-reader drop is logged, selected by error code
+    /// so the classification lives in exactly one place. A peer that closed
+    /// mid-frame (`Truncated`) is routine — an ordinary client disconnect — and
+    /// logs at Debug so it stays quiet at the default level. Every other framing
+    /// error (an oversized payload, an over-long line, a malformed frame) means
+    /// the daemon actively rejected and discarded a client's bytes — e.g. a
+    /// cache `SET` value too large for the wire cap — so it logs at Warn and is
+    /// visible without enabling trace.
+    /// @param code The framing error code that ended the command loop.
+    /// @return The log severity for the drop line.
+    [[nodiscard]] static constexpr LogLevel FrameDropSeverity(ProtocolErrorCode code) noexcept
+    {
+        return code == ProtocolErrorCode::Truncated ? LogLevel::Debug : LogLevel::Warn;
+    }
+
+    /// Log one connection-level line when the frame reader aborts a command
+    /// before it reaches storage. Such a drop is otherwise invisible: storage is
+    /// never called, so no TracingStorage `storage:` line is emitted and a
+    /// discarded write (e.g. an oversized cache `SET`) silently vanishes from the
+    /// trace — the symptom being a stream of reads with no matching store. The
+    /// line names the protocol, the error code, and its context string (which for
+    /// an oversized payload carries the attempted byte count and the cap), so an
+    /// operator can tell a rejected write from a benign disconnect. Severity is
+    /// data-driven via `FrameDropSeverity`. No-ops when no connection logger is
+    /// wired (a handler driven directly in tests) or when the level is filtered.
+    /// @param protocol Short protocol label for the line (e.g. "resp").
+    /// @param error The framing error that ended the command loop.
+    void LogFrameDrop(std::string_view protocol, ProtocolError const& error) const
+    {
+        if (logger == nullptr)
+            return;
+        logger->Logf(
+            FrameDropSeverity(error.code), "{}: frame dropped, {} ({})", protocol, ToStringView(error.code), error.context);
     }
 
     /// Resolve the currently-active policy through `authSource`. Callers hold

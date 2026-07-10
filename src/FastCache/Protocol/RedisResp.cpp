@@ -5106,6 +5106,11 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
             // "-ERR Protocol error: ..." before closing, rather than a bare reset.
             if (cmd.error().code != ProtocolErrorCode::Truncated)
                 co_await ReplyError(socket, std::format("Protocol error: {}", cmd.error().context));
+            // Surface the drop: the command never reached storage, so it leaves no
+            // `storage:` trace line. Without this, an oversized SET (PayloadTooLarge)
+            // looks identical to "nothing happened" — the very reason a discarded
+            // cache write is invisible in the trace.
+            session.LogFrameDrop("resp", cmd.error());
             co_return; // stream is desynced — drop the connection (RAII cleans up)
         }
         if (cmd->args.empty())

@@ -2,6 +2,7 @@
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/Errors/ProtocolError.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
@@ -13,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <format>
 #include <memory>
 #include <span>
 #include <string>
@@ -784,15 +786,39 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket,
     {
         auto const headerBytes = co_await reader.ReadExactly(HeaderSize);
         if (!headerBytes.has_value())
+        {
+            session.LogFrameDrop("memcached-binary", headerBytes.error());
             co_return;
+        }
 
         RequestHeader header {};
         if (!ParseHeader(std::span<std::byte const> { headerBytes->data(), headerBytes->size() }, header))
+        {
+            session.LogFrameDrop(
+                "memcached-binary",
+                ProtocolError { .code = ProtocolErrorCode::MalformedFrame, .context = "unparseable request header" });
             co_return;
+        }
         if (header.magic != static_cast<std::uint8_t>(RequestMagic))
-            co_return; // protocol error — drop the connection
-        if (header.totalBodyLen > MaxBodyBytes)
+        {
+            // protocol error — drop the connection
+            session.LogFrameDrop(
+                "memcached-binary",
+                ProtocolError { .code = ProtocolErrorCode::MalformedFrame,
+                                .context = std::format("bad request magic 0x{:02x}", static_cast<unsigned>(header.magic)) });
             co_return;
+        }
+        if (header.totalBodyLen > MaxBodyBytes)
+        {
+            // The body is rejected before it is read (the RESP PayloadTooLarge
+            // analogue): no storage call, so no `storage:` line — surface it so an
+            // oversized binary SET does not vanish silently from the trace.
+            session.LogFrameDrop(
+                "memcached-binary",
+                ProtocolError { .code = ProtocolErrorCode::PayloadTooLarge,
+                                .context = std::format("body {} bytes, cap is {}", header.totalBodyLen, MaxBodyBytes) });
+            co_return;
+        }
 
         auto const opcode = static_cast<Opcode>(header.opcode);
         auto const authNow = session.CurrentAuth();
@@ -818,11 +844,22 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket,
 
         auto const body = co_await reader.ReadExactly(header.totalBodyLen);
         if (!body.has_value())
+        {
+            session.LogFrameDrop("memcached-binary", body.error());
             co_return;
+        }
 
         std::span<std::byte const> const bodySpan { body->data(), body->size() };
         if (bodySpan.size() < std::size_t { header.extrasLen } + header.keyLen)
+        {
+            session.LogFrameDrop("memcached-binary",
+                                 ProtocolError { .code = ProtocolErrorCode::MalformedFrame,
+                                                 .context = std::format("body {} bytes < extras {} + key {}",
+                                                                        bodySpan.size(),
+                                                                        static_cast<unsigned>(header.extrasLen),
+                                                                        header.keyLen) });
             co_return;
+        }
         auto const extras = bodySpan.first(header.extrasLen);
         auto const key = bodySpan.subspan(header.extrasLen, header.keyLen);
         auto const value = bodySpan.subspan(static_cast<std::size_t>(header.extrasLen) + header.keyLen);
