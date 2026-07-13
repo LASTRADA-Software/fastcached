@@ -6,18 +6,21 @@
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/MemcachedBinary.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace
@@ -111,6 +114,39 @@ std::vector<std::byte> Exchange(BinaryFixture& fix,
     return FastCache::SyncRun(Drain(fix.pair.client.get()));
 }
 
+/// Drive Run with `frame` as priming bytes and a half-closed client, then
+/// return the session logger's records. Used by the frame-drop observability
+/// tests: those paths write no reply and do not close, so the response-draining
+/// Exchange above would suspend forever without a reactor.
+std::vector<FastCache::CapturingLogger::Record> DrivePrimedAndSnapshot(BinaryFixture& fix,
+                                                                       std::span<std::byte const> frame,
+                                                                       FastCache::CapturingLogger& logger)
+{
+    FastCache::SessionContext session;
+    session.logger = &logger;
+    std::vector<std::byte> priming { frame.begin(), frame.end() };
+    fix.pair.client->ShutdownWrite();
+    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, std::move(priming), session));
+    return logger.Snapshot();
+}
+
+/// @return A 24-byte binary request header with the given magic byte, opcode,
+///         and total body length, and all other fields zeroed. No body follows.
+std::vector<std::byte> BuildBareHeader(std::uint8_t magic, std::uint8_t opcode, std::uint32_t totalBodyLen)
+{
+    std::vector<std::byte> header;
+    header.push_back(std::byte { magic });
+    header.push_back(std::byte { opcode });
+    AppendBe16(header, 0);             // key length
+    header.push_back(std::byte { 0 }); // extras length
+    header.push_back(std::byte { 0 }); // data type
+    AppendBe16(header, 0);             // vbucket
+    AppendBe32(header, totalBodyLen);
+    AppendBe32(header, 0); // opaque
+    AppendBe64(header, 0); // cas
+    return header;
+}
+
 /// One decoded binary response packet.
 struct BinaryRecord
 {
@@ -190,6 +226,60 @@ TEST_CASE("memcached-binary: GET miss yields KeyNotFound", "[protocol][binary]")
     REQUIRE(response.size() >= 24);
     auto const status = FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { response.data() + 6, 2 });
     REQUIRE(status == 1); // Status::KeyNotFound
+}
+
+TEST_CASE("memcached-binary: a body over the frame cap logs a Warn frame-drop line", "[protocol][binary][observability]")
+{
+    // Announce a body larger than the 16 MiB per-frame cap in the 24-byte header
+    // only (no body sent): the handler rejects it before reading, so it never
+    // reaches storage and leaves no `storage:` line. LogFrameDrop makes the
+    // discarded write visible rather than a silent connection close.
+    BinaryFixture fix;
+    FastCache::CapturingLogger logger;
+    constexpr std::uint32_t OversizeBody = 17U * 1024U * 1024U; // > 16 MiB cap
+    auto const header = BuildBareHeader(/*magic*/ 0x80, /*opcode Set*/ 0x01, OversizeBody);
+
+    auto const records = DrivePrimedAndSnapshot(fix, std::span<std::byte const> { header.data(), header.size() }, logger);
+    auto const drop = std::ranges::find_if(records, [](FastCache::CapturingLogger::Record const& r) {
+        return r.message.contains("frame dropped") && r.message.contains("PayloadTooLarge");
+    });
+    REQUIRE(drop != records.end());
+    REQUIRE(drop->level == FastCache::LogLevel::Warn);
+    REQUIRE(drop->message.contains("memcached-binary"));
+}
+
+TEST_CASE("memcached-binary: a bad request magic logs a Warn MalformedFrame drop", "[protocol][binary][observability]")
+{
+    // A garbage / wrong-protocol first byte is a protocol violation the handler
+    // drops on; surface it as MalformedFrame at Warn (an actively rejected frame).
+    BinaryFixture fix;
+    FastCache::CapturingLogger logger;
+    auto const header = BuildBareHeader(/*magic*/ 0x00, /*opcode*/ 0x01, /*totalBodyLen*/ 0);
+
+    auto const records = DrivePrimedAndSnapshot(fix, std::span<std::byte const> { header.data(), header.size() }, logger);
+    auto const drop = std::ranges::find_if(records, [](FastCache::CapturingLogger::Record const& r) {
+        return r.message.contains("frame dropped") && r.message.contains("MalformedFrame");
+    });
+    REQUIRE(drop != records.end());
+    REQUIRE(drop->level == FastCache::LogLevel::Warn);
+    REQUIRE(drop->message.contains("magic"));
+}
+
+TEST_CASE("memcached-binary: a truncated header logs a Debug Truncated drop", "[protocol][binary][observability]")
+{
+    // Fewer than the 24 header bytes, then EOF: the header read aborts as
+    // Truncated. A peer that closed mid-frame is routine, so it stays at Debug.
+    BinaryFixture fix;
+    FastCache::CapturingLogger logger;
+    std::array<std::byte, 10> const partial {};
+
+    auto const records = DrivePrimedAndSnapshot(fix, std::span<std::byte const> { partial.data(), partial.size() }, logger);
+    auto const drop = std::ranges::find_if(records, [](FastCache::CapturingLogger::Record const& r) {
+        return r.message.contains("frame dropped") && r.message.contains("Truncated");
+    });
+    REQUIRE(drop != records.end());
+    REQUIRE(drop->level == FastCache::LogLevel::Debug);
+    REQUIRE(drop->message.contains("memcached-binary"));
 }
 
 TEST_CASE("memcached-binary: NoOp echoes opaque", "[protocol][binary]")

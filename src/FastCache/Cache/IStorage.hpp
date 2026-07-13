@@ -67,6 +67,16 @@ struct StorageStats
 
     std::uint64_t evictedUnfetched { 0 };
     std::uint64_t expiredUnfetched { 0 };
+
+    /// Value writes (SET/ADD/REPLACE/APPEND/PREPEND/CAS/INCR/UPDATE) that
+    /// failed to persist because the storage could not accept them: a full
+    /// disk or I/O error (`IoError`), an exhausted memory budget
+    /// (`OutOfMemory`), on-disk corruption (`Corrupt`), or read-only storage
+    /// (`ReadOnly`). Excludes benign conditional-write outcomes (KeyExists,
+    /// KeyNotFound, CasMismatch) and client-side rejections (ValueTooLarge).
+    /// Populated by `WriteErrorReportingStorage`; 0 for backends not wrapped
+    /// by it.
+    std::uint64_t writeErrors { 0 };
 };
 
 /// Storage backend abstraction. The cache engine routes every command
