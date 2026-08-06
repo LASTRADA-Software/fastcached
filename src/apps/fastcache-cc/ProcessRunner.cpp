@@ -27,7 +27,13 @@
 
     #include <poll.h>
     #include <spawn.h>
-    #include <unistd.h> // also declares `environ`, which posix_spawnp needs
+    #include <unistd.h>
+
+    #if defined(__APPLE__)
+        // On macOS `environ` is not available to anything but the main
+        // executable; _NSGetEnviron() is the documented way to reach it.
+        #include <crt_externs.h>
+    #endif
 #endif
 
 namespace FastCache::Cc
@@ -340,8 +346,16 @@ namespace
                 cargv.push_back(a.data());
             cargv.push_back(nullptr);
 
+            // The child inherits our environment: the compiler needs INCLUDE,
+            // PATH and friends exactly as the build system set them.
+    #if defined(__APPLE__)
+            char** const inherited = *::_NSGetEnviron();
+    #else
+            char** const inherited = environ;
+    #endif
+
             ::pid_t pid = -1;
-            int const spawned = ::posix_spawnp(&pid, cargv[0], &actions, nullptr, cargv.data(), environ);
+            int const spawned = ::posix_spawnp(&pid, cargv[0], &actions, nullptr, cargv.data(), inherited);
             ::posix_spawn_file_actions_destroy(&actions);
             if (spawned != 0)
                 return result;
