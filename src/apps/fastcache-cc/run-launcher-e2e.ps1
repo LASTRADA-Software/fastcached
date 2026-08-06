@@ -32,6 +32,12 @@ $ranAnyCompiler = $false
 if (-not (Test-Path $Fastcached)) { Write-Host "fastcached not found: $Fastcached; skipping"; exit $SKIP }
 if (-not (Test-Path $Launcher))   { Write-Host "fastcache-cc not found: $Launcher; skipping"; exit $SKIP }
 
+# Start-Process resolves a relative -FilePath against the PROCESS working
+# directory, not PowerShell's, so a caller passing "out/build/..." would get a
+# spurious "file not found". Resolve both up front.
+$Fastcached = (Resolve-Path $Fastcached).Path
+$Launcher   = (Resolve-Path $Launcher).Path
+
 function Start-Fastcached {
     # --storage-max-value raises the wire payload cap along with the value cap;
     # pass it explicitly so the flag stays exercised even on tiny fixtures.

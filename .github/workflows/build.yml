@@ -456,12 +456,16 @@ jobs:
       - name: "Compile-cache E2E (cl / clang-cl)"
         shell: pwsh
         run: |
-          pwsh -NoProfile -File src/apps/fastcache-cc/run-launcher-e2e.ps1 `
+          # Do not let a non-zero exit abort the step before the 77 check below:
+          # a skip means nothing was verified and must fail rather than pass.
+          $ErrorActionPreference = 'Continue'
+          & pwsh -NoProfile -File src/apps/fastcache-cc/run-launcher-e2e.ps1 `
             -Fastcached out/build/cl-release/target/fastcached.exe `
             -Launcher out/build/cl-release/target/fastcache-cc.exe `
             -Port 21714
-          if ($LASTEXITCODE -eq 77) {
-            Write-Error "E2E skipped: no MSVC-style compiler was available"
+          $code = $LASTEXITCODE
+          if ($code -eq 77) {
+            Write-Host "::error::E2E skipped, nothing verified"
             exit 1
           }
-          exit $LASTEXITCODE
+          exit $code
