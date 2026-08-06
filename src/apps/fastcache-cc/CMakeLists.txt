@@ -86,7 +86,14 @@ if(FASTCACHED_BUILD_TESTS)
     # Labelled "smoke" so it can be selected (ctest -L smoke) or skipped
     # (ctest -LE smoke); a missing prerequisite exits 77 and reports as
     # skipped rather than failed. Both platforms assert the same contract.
-    if(WIN32)
+    #
+    # The test drives a real daemon, so it only exists when the daemon is being
+    # built: the app table makes each executable independently gateable, and an
+    # unguarded $<TARGET_FILE:fastcached> would break configuration outright
+    # under -DFASTCACHED_BUILD_DAEMON=OFF.
+    if(NOT TARGET fastcached)
+        message(STATUS "fastcache-cc: skipping compile-cache-e2e test (fastcached not built)")
+    elseif(WIN32)
         add_test(
             NAME "compile-cache-e2e"
             COMMAND pwsh -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/run-launcher-e2e.ps1"
@@ -102,11 +109,13 @@ if(FASTCACHED_BUILD_TESTS)
                 --compiler "${CMAKE_CXX_COMPILER}"
         )
     endif()
-    # Binds a fixed port and spawns a daemon, so it must not run concurrently
-    # with the other server-starting smoke tests.
-    set_tests_properties("compile-cache-e2e" PROPERTIES
-        LABELS "smoke"
-        SKIP_RETURN_CODE 77
-        RUN_SERIAL TRUE
-    )
+    if(TARGET fastcached)
+        # Binds a fixed port and spawns a daemon, so it must not run concurrently
+        # with the other server-starting smoke tests.
+        set_tests_properties("compile-cache-e2e" PROPERTIES
+            LABELS "smoke"
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE
+        )
+    endif()
 endif()
