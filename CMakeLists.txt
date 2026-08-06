@@ -248,6 +248,13 @@ if(FASTCACHE_BUILD_TESTCLIENT)
     add_subdirectory(tools/compile-cache-testclient)
 endif()
 
+# The sccache-style compiler launcher (drop-in local cache client). Defaults to
+# following the test-client option so a validation build gets both.
+option(FASTCACHE_BUILD_LAUNCHER "Build the fastcache-cc compiler launcher" ${FASTCACHE_BUILD_TESTCLIENT})
+if(FASTCACHE_BUILD_LAUNCHER)
+    add_subdirectory(tools/fastcache-cc)
+endif()
+
 # ----------------------------------------------------------------------------
 # Installation. Lays out the daemon binary and project docs under the standard
 # GNUInstallDirs prefix (bin/ + share/doc/fastcached/). The FastCache/CowTree
