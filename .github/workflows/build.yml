@@ -353,3 +353,110 @@ jobs:
           name: fastcached-windows-${{ matrix.preset }}
           path: out/build/${{ matrix.preset }}/target/fastcached.exe
           if-no-files-found: error
+
+  # End-to-end compile-cache tests. These live in their own jobs, one per
+  # platform, so a PR status check names the platform that broke rather than
+  # burying it inside a build matrix. Each starts a real fastcached, drives real
+  # compiles through fastcache-cc, and asserts the launcher's actual contract:
+  # MISS then HIT, the cached object reproduced byte-identically, cross-depth
+  # portability (content stored from a deep checkout hits from a shallow one),
+  # and a safe fallback when the daemon is unreachable.
+  #
+  # Cross-depth is the property that distinguishes this launcher from
+  # ccache/sccache, and it is only observable end-to-end — a unit test cannot
+  # run two checkouts through a real compiler and a real server.
+
+  compile-cache-e2e-linux:
+    name: "compile-cache E2E (Linux)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Cache CPM packages"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-${{ runner.os }}-cc-e2e-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-cc-e2e-
+
+      - name: "ccache"
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-cc-e2e
+          max-size: 256M
+
+      - name: "Install build tools"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libyaml-cpp-dev g++-14
+
+      - name: "Configure"
+        run: cmake --preset gcc-release
+
+      - name: "Build"
+        run: cmake --build --preset gcc-release --target fastcached fastcache-cc
+
+      # Run the harness directly rather than through ctest so a skip (exit 77)
+      # is visible here as a skip, and any failure output lands in this job.
+      - name: "Compile-cache E2E (gcc)"
+        run: |
+          bash scripts/compile-cache-e2e.sh \
+            --fastcached out/build/gcc-release/target/fastcached \
+            --launcher out/build/gcc-release/target/fastcache-cc \
+            --compiler g++-14 \
+            --port 21713
+
+      # The launcher must work with the clang driver too, not just gcc.
+      - name: "Compile-cache E2E (clang)"
+        run: |
+          bash scripts/compile-cache-e2e.sh \
+            --fastcached out/build/gcc-release/target/fastcached \
+            --launcher out/build/gcc-release/target/fastcache-cc \
+            --compiler clang++ \
+            --port 21715
+
+  compile-cache-e2e-windows:
+    name: "compile-cache E2E (Windows)"
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Cache CPM packages"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-${{ runner.os }}-cc-e2e-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-cc-e2e-
+
+      - name: "sccache"
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: "Install ninja"
+        run: choco install ninja --no-progress
+
+      # Same toolset pin as the windows build matrix; see the comment there.
+      - name: "Setup MSVC dev environment"
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          toolset: "14.44"
+
+      - name: "Configure"
+        run: cmake --preset cl-release
+
+      - name: "Build"
+        run: cmake --build --preset cl-release --target fastcached fastcache-cc
+
+      # The harness exercises both cl and clang-cl when they are on PATH, and
+      # exits 77 if neither is — which must not silently pass, so it is checked.
+      - name: "Compile-cache E2E (cl / clang-cl)"
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File src/apps/fastcache-cc/run-launcher-e2e.ps1 `
+            -Fastcached out/build/cl-release/target/fastcached.exe `
+            -Launcher out/build/cl-release/target/fastcache-cc.exe `
+            -Port 21714
+          if ($LASTEXITCODE -eq 77) {
+            Write-Error "E2E skipped: no MSVC-style compiler was available"
+            exit 1
+          }
+          exit $LASTEXITCODE
