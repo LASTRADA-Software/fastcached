@@ -324,6 +324,13 @@ namespace
             }
 
             // Child stdout -> outWrite; stderr -> errWrite (or outWrite when merged).
+            //
+            // When merged, BOTH dup2 actions target the same descriptor. File
+            // actions run in order, so nothing may close outWrite between them:
+            // adding an addclose(outWrite) below would leave the second dup2
+            // duplicating a closed descriptor and silently lose all stderr. The
+            // parent closes the write ends after the spawn instead, where the
+            // ordering cannot matter.
             int const childErrWrite = merge == Merge::Yes ? outWrite.Get() : errWrite.Get();
 
             posix_spawn_file_actions_t actions {};
