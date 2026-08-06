@@ -7,7 +7,11 @@
 #
 #   1. MISS then HIT      — a repeated compile is served from the cache.
 #   2. Byte-identical     — the cached object equals the compiled one.
-#   3. Cross-depth        — content stored from a DEEP checkout path HITs from a
+#   3. Large values       — an object past the daemon's 1 MiB socket send buffer
+#                           still round-trips. Only such a reply reaches the
+#                           reactor's park-and-resume path, and a bug there wedged
+#                           a real build while every small fixture kept passing.
+#   4. Cross-depth        — content stored from a DEEP checkout path HITs from a
 #                           SHALLOW one, which is the whole reason this launcher
 #                           exists instead of ccache/sccache.
 #
@@ -132,7 +136,60 @@ grep -q "hdr.hpp" "${proj}/build/a.d" \
     || fail "restored depfile does not list the header the TU includes"
 echo "   depfile restored on the hit"
 
-# --- 3: cross-depth portability ---------------------------------------------
+# --- 3: a value larger than the socket send buffer ---------------------------
+# Every other fixture here compiles to a few KB, which never fills a send buffer
+# and so never exercises the reactor's park-and-resume path. A reply that does
+# is how a real build wedged: the daemon parked mid-reply and the launcher waited
+# forever for bytes the header had already promised. The object must clear 1 MiB
+# (the daemon's SO_SNDBUF) for this to mean anything, so assert that it does
+# rather than assuming the compiler emitted what we expected.
+echo "== large object (> 1 MiB) must round-trip =="
+big="${workdir}/bigproj"
+mkdir -p "${big}/build"
+{
+    echo "extern const int data[300000];"
+    echo "const int data[300000] = {"
+    awk 'BEGIN { for (i = 0; i < 300000; i++) printf "%d,\n", (i * 2654435761) % 2147483647 }'
+    echo "};"
+    echo "int main() { return data[0]; }"
+} > "${big}/big.cpp"
+
+export FASTCACHE_SRCROOT="$big" FASTCACHE_BUILDTREE="${big}/build"
+
+"$launcher" "$compiler" -std=c++23 -O0 -c "${big}/big.cpp" -o "${big}/build/big.o" \
+    2> "${workdir}/big-miss.log" || fail "large-object compile returned non-zero"
+cat "${workdir}/big-miss.log"
+grep -q "STORED" "${workdir}/big-miss.log" || fail "large object was not stored"
+
+objbytes=$(wc -c < "${big}/build/big.o" | tr -d ' ')
+[[ "$objbytes" -gt 1048576 ]] \
+    || fail "large-object fixture is only ${objbytes} bytes; it must exceed 1 MiB to exercise the park path"
+echo "   object is ${objbytes} bytes"
+
+cp "${big}/build/big.o" "${workdir}/big-expected.o"
+rm -f "${big}/build/big.o"
+
+# A hung FETCH is the failure this guards, so bound the wait: without a cap a
+# regression would hang CI until the job timed out instead of reporting.
+"$launcher" "$compiler" -std=c++23 -O0 -c "${big}/big.cpp" -o "${big}/build/big.o" \
+    2> "${workdir}/big-hit.log" &
+big_pid=$!
+big_waited=0
+while kill -0 "$big_pid" 2>/dev/null; do
+    if [[ "$big_waited" -ge 600 ]]; then
+        kill -9 "$big_pid" 2>/dev/null || true
+        fail "large-object FETCH did not complete within 60s (the daemon stalled mid-reply)"
+    fi
+    sleep 0.1
+    big_waited=$((big_waited + 1))
+done
+wait "$big_pid" || fail "large-object second compile returned non-zero"
+cat "${workdir}/big-hit.log"
+grep -q "HIT" "${workdir}/big-hit.log" || fail "large object was not served from the cache"
+cmp "${workdir}/big-expected.o" "${big}/build/big.o" || fail "large cached object differs from the compiled one"
+echo "   large object reproduced byte-identically"
+
+# --- 4: cross-depth portability ---------------------------------------------
 # Same content, different checkout depth. The key must match, because paths
 # under SRCROOT/BUILDTREE are tokenized before hashing.
 deep="${workdir}/a/b/c/d/e/deepproj"
@@ -179,7 +236,7 @@ if grep -q "${deep}" "${shallow}/build/t.d"; then
 fi
 echo "   depfile localized to the consuming checkout"
 
-# --- 4: the cache is never load-bearing -------------------------------------
+# --- 5: the cache is never load-bearing -------------------------------------
 # With no daemon reachable the build must still succeed, uncached.
 echo "== unreachable daemon must still compile =="
 FASTCACHE_ADDR="127.0.0.1:1" "$launcher" "$compiler" -std=c++23 -c "${proj}/a.cpp" -o "${proj}/build/fb.o" \
@@ -187,7 +244,7 @@ FASTCACHE_ADDR="127.0.0.1:1" "$launcher" "$compiler" -std=c++23 -c "${proj}/a.cp
 cat "${workdir}/fallback.log"
 [[ -f "${proj}/build/fb.o" ]] || fail "fallback compile produced no object"
 
-# --- 5: forms the launcher must decline to cache ----------------------------
+# --- 6: forms the launcher must decline to cache ----------------------------
 # A compile with no -o defaults its output to ./a.o, a path the launcher cannot
 # reconstruct. It must pass straight through rather than claim the compile and
 # then fail to store it on every single invocation.
@@ -229,5 +286,5 @@ echo "   -coverage survived the preprocess line"
 echo "== statistics =="
 "$launcher" --stats || fail "--stats returned non-zero"
 
-echo "compile-cache E2E OK: miss/hit, byte-identical, cross-depth, and safe fallback"
+echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, cross-depth, and safe fallback"
 exit 0
