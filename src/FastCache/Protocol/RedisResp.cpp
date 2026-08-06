@@ -778,7 +778,10 @@ namespace
         if (payload.empty())
             co_return true;
         auto const r = co_await socket->Write(AsBytes(payload));
-        co_return r.has_value();
+        // Verify the byte count, not merely that the call succeeded: ISocket::Write
+        // is a write-all contract, so a short count is a backend bug that must
+        // surface as a failed reply rather than a silently truncated one.
+        co_return r.has_value() && *r == payload.size();
     }
 
     /// Gather-write ordered segments as one reply, pinning the payload owner

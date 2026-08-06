@@ -69,7 +69,12 @@ namespace
     [[nodiscard]] Task<bool> WriteAll(ISocket* socket, std::span<std::byte const> payload)
     {
         auto const r = co_await socket->Write(payload);
-        co_return r.has_value();
+        // Verify the byte count, not merely that the call succeeded: ISocket::Write
+        // is a write-all contract, so a short count is a backend bug that must
+        // surface as a failed reply rather than a silently truncated one. A
+        // truncated FETCH reply is especially bad here — the frame declares its
+        // length up front, so the client blocks waiting for bytes that never come.
+        co_return r.has_value() && *r == payload.size();
     }
 
     /// Build the STORE error reply `[0x00][u32 msgLen][msg]`.

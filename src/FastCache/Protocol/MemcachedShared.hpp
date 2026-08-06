@@ -40,7 +40,10 @@ inline Task<bool> WriteAll(ISocket* socket, std::string_view payload)
     if (payload.empty())
         co_return true;
     auto const result = co_await socket->Write(AsBytes(payload));
-    co_return result.has_value();
+    // Verify the byte count, not merely that the call succeeded: ISocket::Write
+    // is a write-all contract, so a short count is a backend bug that must
+    // surface as a failed reply rather than a silently truncated one.
+    co_return result.has_value() && *result == payload.size();
 }
 
 /// Gather-write an ordered set of byte segments as one logical reply, pinning
