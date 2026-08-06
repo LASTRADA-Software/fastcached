@@ -17,13 +17,21 @@ src/FastCache/
                 EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
                 InMemoryTransport (paired pipes + InMemoryListener),
                 Framing/ByteReader (line and length-prefixed)
-  Cache/        IStorage atomic primitives, CacheEntry, CacheEngine,
+  Cache/        IStorage atomic primitives (incl. Prefetch — warm a tier with
+                no read side effect), CacheEntry, CacheEngine,
                 InMemoryLruStorage, CowTreeStorage (CoW B+tree, src/CowTree),
                 LayeredStorage (L1 LRU over L2 disk), ShardedStorage
                 (key-hash fan-out), TracingStorage (Tracy zones)
+  CompileCache/ PathCanon (absolute<->canonical-token path rewriting +
+                showIncludes/depfile region grammar), CompileValue (object-blob
+                + tagged-text-region framing), CohortManifest (cohort-id ->
+                key-set + reverse index) — the compile-cache executor's domain
+                logic
   Protocol/     IProtocolHandler, ProtocolAutodetect, MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
-                RedisResp (RESP2)
+                RedisResp (RESP2), CompileCacheHandler (the executor: custom
+                0xFC binary protocol, canonicalize-on-STORE / serve-canonical-
+                on-FETCH, leading-key cohort prefetch)
   Server/       Connection (per-client coroutine), Server,
                 ReactorServerLoop (the server driver)
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
@@ -32,6 +40,13 @@ src/FastCache/
   Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader
   Metrics/      IMetricsSink + AtomicMetricsSink
 ```
+
+Two client-side tools live under `tools/` (opt-in CMake options, not shipped):
+`compile-cache-testclient` (low-level `0xFC` protocol probe + cross-depth
+validation) and `fastcache-cc` (a drop-in sccache-style **compiler launcher** —
+keys on preprocess+relativized-args, FETCHes/hit-replays with `/showIncludes`
+localized, misses→compile→STORE, falls back safely on any cache error; config
+via `FASTCACHE_*` env, wired through `CMAKE_CXX_COMPILER_LAUNCHER`).
 
 Production flow: `main()` -> CLI -> optional YAML -> `ConfigReloader` ->
 `CacheEngine` over `InMemoryLruStorage` (or, when `--storage` is set, a
