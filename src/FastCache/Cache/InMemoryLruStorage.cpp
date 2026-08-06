@@ -122,19 +122,22 @@ CasToken InMemoryLruStorage::InsertNew(std::string key,
 {
     FC_ZONE_SCOPED_N("LruStorage::InsertNew");
     auto const cas = _nextCas++;
-    auto const size = value.size();
 
     Node node;
     node.key = std::move(key);
-    node.entry.value = MakeSharedValue(value);
+    node.entry.value = EncodeForStorage(value, node.storedCodec, node.plainSize);
     node.entry.flags = flags;
     node.entry.cas = cas;
     node.entry.expiry = expiry;
     node.entry.generation = _liveGeneration;
 
+    // Budget the STORED size: the point of compressing is to hold more entries per
+    // byte of RAM, which only happens if the cap counts what is actually resident.
+    auto const storedSize = node.entry.ValueSize();
+
     _lru.push_front(std::move(node));
     _index.emplace(_lru.front().key, _lru.begin());
-    _bytesUsed += size;
+    _bytesUsed += storedSize;
 
     EvictToFit();
     return cas;
@@ -148,8 +151,10 @@ CasToken InMemoryLruStorage::MutateExisting(Iterator it,
     FC_ZONE_SCOPED_N("LruStorage::MutateExisting");
     _bytesUsed -= it->entry.ValueSize();
     // Rebind to a fresh immutable buffer (copy-on-write): any reader still
-    // holding the previous SharedValue keeps a valid, unchanged payload.
-    it->entry.value = MakeSharedValue(value);
+    // holding the previous SharedValue keeps a valid, unchanged payload. Re-encode
+    // rather than reuse the old codec state — the new value may compress differently
+    // (or not at all), and a stale codec tag would misread it on the next Get.
+    it->entry.value = EncodeForStorage(value, it->storedCodec, it->plainSize);
     it->entry.flags = flags;
     it->entry.expiry = expiry;
     it->entry.generation = _liveGeneration;
@@ -163,6 +168,74 @@ CasToken InMemoryLruStorage::MutateExisting(Iterator it,
     return it->entry.cas;
 }
 
+SharedValue InMemoryLruStorage::EncodeForStorage(std::span<std::byte const> value,
+                                                 CompressionCodec& storedCodec,
+                                                 std::size_t& plainSize) const
+{
+    storedCodec = CompressionCodec::Identity;
+    plainSize = value.size();
+
+    // Small values rarely shrink enough to repay a decompress on every read, and a
+    // codec that is not built in must never silently drop data.
+    if (_compression.codec == CompressionCodec::Identity || value.size() < _compression.minBytes
+        || !Compression::IsAvailable(_compression.codec))
+        return MakeSharedValue(value);
+
+    auto packed = Compression::Compress(_compression.codec, value, _compression.level);
+
+    // Keep the plaintext when compression does not actually help; an incompressible
+    // value would otherwise cost both extra bytes and a pointless decompress.
+    if (packed.empty() || packed.size() >= value.size())
+        return MakeSharedValue(value);
+
+    storedCodec = _compression.codec;
+    return MakeSharedValue(packed);
+}
+
+std::vector<std::byte> InMemoryLruStorage::PlaintextBytes(Node const& node) const
+{
+    auto const stored = node.entry.ValueBytes();
+    if (node.storedCodec == CompressionCodec::Identity)
+        return { stored.begin(), stored.end() };
+
+    auto plain = Compression::Decompress(node.storedCodec, stored, node.plainSize);
+    if (!plain.has_value())
+        return {};
+    return std::move(*plain);
+}
+
+CacheEntry InMemoryLruStorage::PlaintextEntry(Node const& node) const
+{
+    if (node.storedCodec == CompressionCodec::Identity)
+        return node.entry;
+
+    auto plain = Compression::Decompress(node.storedCodec, node.entry.ValueBytes(), node.plainSize);
+    if (!plain.has_value())
+    {
+        // A failed decompress means the stored bytes are unusable. Reporting a miss
+        // is the only safe outcome: returning the compressed bytes as if they were
+        // plaintext would hand the caller silent garbage.
+        CacheEntry broken = node.entry;
+        broken.value = {};
+        return broken;
+    }
+
+    CacheEntry entry = node.entry;
+    entry.value = MakeSharedValue(*plain);
+    return entry;
+}
+
+InMemoryLruStorage::Node const* InMemoryLruStorage::FindNodeReadOnly(std::string_view key, TimePoint now) const
+{
+    auto const it = _index.find(key);
+    if (it == _index.end())
+        return nullptr;
+    auto const& node = *it->second;
+    if (node.entry.generation < _liveGeneration || node.entry.expiry <= now)
+        return nullptr;
+    return &node;
+}
+
 std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view key, TimePoint now)
 {
     FC_ZONE_SCOPED_N("LruStorage::Get");
@@ -174,17 +247,20 @@ std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view 
         // Counters are atomic; promotion + lastAccess/fetched advance are
         // deferred to the sampled, exclusively-locked PromoteOnRead.
         _readCmdGet.fetch_add(1, std::memory_order_relaxed);
-        auto const* entry = FindAliveReadOnly(key, now);
-        if (entry == nullptr)
+        auto const* node = FindNodeReadOnly(key, now);
+        if (node == nullptr)
         {
             _readGetMisses.fetch_add(1, std::memory_order_relaxed);
             return GetResult { .found = false, .entry = {} };
         }
         _readGetHits.fetch_add(1, std::memory_order_relaxed);
-        // Copy the entry (cheap: the value is a refcounted handle). The
-        // returned lastAccess reflects the value *before* this read, matching
-        // the meta `l` semantics; the stored advance happens in PromoteOnRead.
-        return GetResult { .found = true, .entry = *entry };
+        // Copy the entry (cheap: the value is a refcounted handle) — unless the tier
+        // is compressed, in which case this decompresses into a fresh buffer. That
+        // allocation is safe under the shared lock because it never touches the
+        // stored node. The returned lastAccess reflects the value *before* this read,
+        // matching the meta `l` semantics; the stored advance happens in
+        // PromoteOnRead.
+        return GetResult { .found = true, .entry = PlaintextEntry(*node) };
     }
 
     // Strict path: promote on every read; the caller holds an exclusive lock.
@@ -199,7 +275,7 @@ std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view 
     // Snapshot the entry as it was *before* this read so the meta `l` flag
     // reports seconds since the PREVIOUS access; then advance the stored
     // lastAccess and mark it fetched for the next reader.
-    GetResult result { .found = true, .entry = it->entry };
+    GetResult result { .found = true, .entry = PlaintextEntry(*it) };
     it->entry.lastAccess = now;
     it->entry.fetched = true;
     return result;
@@ -272,7 +348,9 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Append(std::string_vie
     if (ExceedsValueLimit(it->entry.ValueSize() + suffix.size()))
         return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
 
-    auto const existing = it->entry.ValueBytes();
+    // Plaintext, not the stored bytes: on a compressed tier the stored form is
+    // opaque, and concatenating onto it would produce an undecodable value.
+    auto const existing = PlaintextBytes(*it);
     std::vector<std::byte> combined;
     combined.reserve(existing.size() + suffix.size());
     combined.insert(combined.end(), existing.begin(), existing.end());
@@ -293,7 +371,7 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Prepend(std::string_vi
     if (ExceedsValueLimit(it->entry.ValueSize() + prefix.size()))
         return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
 
-    auto const existing = it->entry.ValueBytes();
+    auto const existing = PlaintextBytes(*it);
     std::vector<std::byte> combined;
     combined.reserve(prefix.size() + existing.size());
     combined.insert(combined.end(), prefix.begin(), prefix.end());
@@ -342,7 +420,7 @@ std::expected<IStorage::IncrResult, StorageError> InMemoryLruStorage::IncrementO
 
     // Decode the existing value as ASCII unsigned 64-bit *before* booking a
     // hit: a non-numeric value is a client error, not a successful incr/decr.
-    auto const bytes = it->entry.ValueBytes();
+    auto const bytes = PlaintextBytes(*it);
     std::string asText;
     asText.reserve(bytes.size());
     for (auto const b: bytes)
@@ -414,10 +492,10 @@ std::expected<GetResult, StorageError> InMemoryLruStorage::Peek(std::string_view
     auto const indexIt = _index.find(key);
     if (indexIt == _index.end())
         return GetResult { .found = false, .entry = {} };
-    auto const& entry = indexIt->second->entry;
-    if (!IsAlive(entry, _liveGeneration, now))
+    auto const& node = *indexIt->second;
+    if (!IsAlive(node.entry, _liveGeneration, now))
         return GetResult { .found = false, .entry = {} };
-    return GetResult { .found = true, .entry = entry };
+    return GetResult { .found = true, .entry = PlaintextEntry(node) };
 }
 
 std::expected<CasToken, StorageError> InMemoryLruStorage::MarkStale(std::string_view key,
@@ -494,12 +572,27 @@ void InMemoryLruStorage::InsertVerbatim(std::string_view key, CacheEntry entry)
     // Bypass the CAS / generation machinery and store the entry as the
     // caller supplied it. The whole point is to mirror a lower-tier
     // entry without rewriting its identity.
+    //
+    // "Verbatim" refers to that IDENTITY (cas, generation, expiry), not to the
+    // value's storage form: this is the path LayeredStorage uses to mirror every
+    // L2 read into L1, so skipping the codec here would leave the in-memory tier
+    // entirely uncompressed in exactly the configuration that needs it most.
+    CompressionCodec storedCodec = CompressionCodec::Identity;
+    std::size_t plainSize = 0;
+    // Hold the incoming handle while encoding: EncodeForStorage reads a span into it,
+    // so assigning straight back into entry.value would depend on argument-lifetime
+    // subtleties for its correctness.
+    SharedValue const incoming = entry.value;
+    entry.value = EncodeForStorage(incoming.Bytes(), storedCodec, plainSize);
+
     auto const indexIt = _index.find(key);
     if (indexIt != _index.end())
     {
         auto const nodeIt = indexIt->second;
         _bytesUsed -= nodeIt->entry.ValueSize();
         nodeIt->entry = std::move(entry);
+        nodeIt->storedCodec = storedCodec;
+        nodeIt->plainSize = plainSize;
         _bytesUsed += nodeIt->entry.ValueSize();
         _lru.splice(_lru.begin(), _lru, nodeIt);
         EvictToFit();
@@ -508,6 +601,8 @@ void InMemoryLruStorage::InsertVerbatim(std::string_view key, CacheEntry entry)
     Node node;
     node.key = std::string { key };
     node.entry = std::move(entry);
+    node.storedCodec = storedCodec;
+    node.plainSize = plainSize;
     auto const size = node.entry.ValueSize();
     _lru.push_front(std::move(node));
     _index.emplace(_lru.front().key, _lru.begin());

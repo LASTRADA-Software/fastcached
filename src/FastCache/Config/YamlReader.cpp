@@ -272,6 +272,42 @@ namespace
             cfg.compressionMinBytes = *parsed;
             return std::expected<void, ConfigError> {};
         }
+        /// `memory_compression`: none | lz4 | zstd codec for the IN-MEMORY tier.
+        if (key == "memory_compression")
+        {
+            auto const c = ParseCompression(valueNode.as<std::string>(), path, line);
+            if (!c.has_value())
+                return std::expected<void, ConfigError> { std::unexpect, c.error() };
+            cfg.memoryCompression = *c;
+            return std::expected<void, ConfigError> {};
+        }
+        /// `memory_compression_level`: codec effort level (1..22).
+        if (key == "memory_compression_level")
+        {
+            auto const raw = valueNode.as<int>();
+            if (raw < 1 || raw > 22)
+                return std::expected<void, ConfigError> {
+                    std::unexpect,
+                    MakeError(ConfigErrorCode::OutOfRange, path, "memory_compression_level", "must be in 1..22", line)
+                };
+            cfg.memoryCompressionLevel = raw;
+            return std::expected<void, ConfigError> {};
+        }
+        /// `memory_compression_min_bytes`: keep values below this uncompressed.
+        if (key == "memory_compression_min_bytes")
+        {
+            auto const raw = valueNode.as<std::string>();
+            auto parsed = ParseByteSize(raw, "memory_compression_min_bytes");
+            if (!parsed.has_value())
+            {
+                auto err = std::move(parsed).error();
+                err.source = path.string();
+                err.line = line;
+                return std::expected<void, ConfigError> { std::unexpect, std::move(err) };
+            }
+            cfg.memoryCompressionMinBytes = *parsed;
+            return std::expected<void, ConfigError> {};
+        }
         return std::nullopt;
     }
 
@@ -441,6 +477,23 @@ namespace
                 return std::unexpected(std::move(err));
             }
             cfg.storageMaxValueBytes = *parsed;
+            return {};
+        }
+        /// `storage_max_disk`: cap the on-disk (L2) tier for the persistent
+        /// backend; the CoW tree evicts its LRU tail to fit. Same byte-size
+        /// grammar as `storage_max_value`. 0 (or unset) = unbounded.
+        if (key == "storage_max_disk")
+        {
+            auto const raw = valueNode.as<std::string>();
+            auto parsed = ParseByteSize(raw, "storage_max_disk");
+            if (!parsed.has_value())
+            {
+                auto err = std::move(parsed).error();
+                err.source = path.string();
+                err.line = line;
+                return std::unexpected(std::move(err));
+            }
+            cfg.storageMaxDiskBytes = *parsed;
             return {};
         }
         /// `lru_mode`: approximate | strict in-memory LRU recency policy.
