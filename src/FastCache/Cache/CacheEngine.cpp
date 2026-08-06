@@ -68,6 +68,12 @@ std::expected<GetResult, StorageError> CacheEngine::Peek(std::string_view key)
     return _storage.Peek(key, _clock.Now());
 }
 
+std::expected<bool, StorageError> CacheEngine::Prefetch(std::string_view key)
+{
+    FC_ZONE_SCOPED_N("CacheEngine::Prefetch");
+    return _storage.Prefetch(key, _clock.Now());
+}
+
 std::expected<CasToken, StorageError> CacheEngine::PeekCas(std::string_view key)
 {
     FC_ZONE_SCOPED_N("CacheEngine::PeekCas");

@@ -72,6 +72,24 @@ class CacheEngine
     /// @return The current CAS token, or StorageError on I/O failure.
     [[nodiscard]] std::expected<CasToken, StorageError> PeekCas(std::string_view key);
 
+    /// Warm the entry under `key` into the backing storage's in-memory tier
+    /// without recording a client read (no hit/miss change, no LRU-as-hit
+    /// promotion). Forwards to IStorage::Prefetch. Used by the compile-cache
+    /// executor to pre-load a build cohort ahead of demand.
+    /// @param key Key to warm.
+    /// @return true if a live entry now resides warm, false on miss, or
+    ///         StorageError on I/O failure.
+    [[nodiscard]] std::expected<bool, StorageError> Prefetch(std::string_view key);
+
+    /// Access the backing storage directly. Used by components that maintain
+    /// their own in-cache side structures (e.g. the compile-cache cohort
+    /// manifest) and need the same IStorage the engine routes through.
+    /// @return The backing storage.
+    [[nodiscard]] IStorage& Storage() noexcept
+    {
+        return _storage;
+    }
+
     [[nodiscard]] std::expected<CasToken, StorageError> Set(std::string_view key,
                                                             std::vector<std::byte> value,
                                                             std::uint32_t flags,

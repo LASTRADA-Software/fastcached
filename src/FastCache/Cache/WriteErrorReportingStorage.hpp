@@ -99,6 +99,10 @@ class WriteErrorReportingStorage final: public IStorage
 
     [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
 
+    /// Forward Prefetch to the inner storage (a prefetch performs no value
+    /// write, so there is no write-error to meter). See IStorage::Prefetch.
+    [[nodiscard]] std::expected<bool, StorageError> Prefetch(std::string_view key, TimePoint now) override;
+
     [[nodiscard]] std::expected<std::optional<TimePoint>, StorageError> PeekExpiry(std::string_view key,
                                                                                    TimePoint now) override;
 

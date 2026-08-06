@@ -102,6 +102,10 @@ class NotifyingStorage final: public IStorage
 
     [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
 
+    /// Forward Prefetch to the inner storage (no notification semantics —
+    /// a prefetch is not a client-visible mutation). See IStorage::Prefetch.
+    [[nodiscard]] std::expected<bool, StorageError> Prefetch(std::string_view key, TimePoint now) override;
+
     [[nodiscard]] std::expected<std::optional<TimePoint>, StorageError> PeekExpiry(std::string_view key,
                                                                                    TimePoint now) override;
 

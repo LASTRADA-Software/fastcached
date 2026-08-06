@@ -407,6 +407,30 @@ class IStorage
         return false;
     }
 
+    /// Warm the entry under `key` into any in-memory tier this backend
+    /// fronts, **without** treating the access as a client read: no LRU
+    /// promotion counted as a hit, no hit/miss statistic change, no
+    /// `lastAccess`/`fetched` stamping. Used by the compile-cache executor to
+    /// pre-load a build cohort disk→memory ahead of demand, so the cohort's
+    /// FETCHes are served from L1.
+    ///
+    /// The default is correct for single-tier backends (there is no lower tier
+    /// to pull from): it Peeks and reports whether the entry exists, warming
+    /// nothing. Tiered decorators (`LayeredStorage`) override it to pull the
+    /// entry from the lower tier into the in-memory mirror; routing decorators
+    /// (`ShardedStorage`, `TracingStorage`, …) forward it.
+    /// @param key Key to warm.
+    /// @param now Current clock value (drives the TTL existence check).
+    /// @return true if a live entry now resides warm (or already existed),
+    ///         false on miss, or StorageError on I/O failure.
+    [[nodiscard]] virtual std::expected<bool, StorageError> Prefetch(std::string_view key, TimePoint now)
+    {
+        auto const peek = Peek(key, now);
+        if (!peek.has_value())
+            return std::unexpected(peek.error());
+        return peek->found;
+    }
+
     /// Best-effort LRU promotion + access-time advance for a key just read
     /// under a shared lock. Called by a lock-owning decorator (ShardedStorage)
     /// on a *sampled* fraction of reads, holding an **exclusive** lock — so it

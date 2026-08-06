@@ -235,6 +235,18 @@ std::expected<GetResult, StorageError> TracingStorage::Peek(std::string_view key
         });
 }
 
+std::expected<bool, StorageError> TracingStorage::Prefetch(std::string_view key, TimePoint now)
+{
+    return TraceCall(
+        "PREFETCH",
+        key,
+        [&] { return _inner.Prefetch(key, now); },
+        [](std::expected<bool, StorageError> const& r) -> std::string {
+            if (!r.has_value())
+                return std::string { ErrorOutcome(r.error()) };
+            return *r ? "WARM" : "MISS";
+        });
+}
 std::expected<std::optional<TimePoint>, StorageError> TracingStorage::PeekExpiry(std::string_view key, TimePoint now)
 {
     return TraceCall(

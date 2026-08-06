@@ -54,6 +54,44 @@ TEST_CASE("LayeredStorage Set + Get write-through roundtrip", "[layered]")
     REQUIRE(got->entry.cas == *cas);
 }
 
+TEST_CASE("LayeredStorage Prefetch warms L1 from L2 without altering hit/miss stats", "[layered][prefetch]")
+{
+    auto storage = MakeLayered();
+    FastCache::ManualClock clock;
+
+    REQUIRE(storage->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    // Evict the L1 mirror so the entry lives only in L2 (canonical).
+    storage->L1().EraseIfPresent("k");
+    REQUIRE_FALSE(storage->L1().Get("k", clock.Now())->found);
+
+    auto const before = storage->Snapshot();
+    auto const warmed = storage->Prefetch("k", clock.Now());
+    REQUIRE(warmed.has_value());
+    CHECK(*warmed == true);
+    auto const after = storage->Snapshot();
+
+    // A prefetch is not a client read: hit/miss counters are unchanged.
+    CHECK(after.getHits == before.getHits);
+    CHECK(after.getMisses == before.getMisses);
+    CHECK(after.cmdGet == before.cmdGet);
+
+    // The entry is now warm in L1 (a direct L1 Peek finds it, no L2 needed).
+    auto const l1 = storage->L1().Peek("k", clock.Now());
+    REQUIRE(l1.has_value());
+    CHECK(l1->found);
+}
+
+TEST_CASE("LayeredStorage Prefetch of an absent key reports miss and warms nothing", "[layered][prefetch]")
+{
+    auto storage = MakeLayered();
+    FastCache::ManualClock clock;
+
+    auto const warmed = storage->Prefetch("absent", clock.Now());
+    REQUIRE(warmed.has_value());
+    CHECK(*warmed == false);
+    CHECK_FALSE(storage->L1().Peek("absent", clock.Now())->found);
+}
+
 TEST_CASE("LayeredStorage write-through populates BOTH tiers", "[layered][write-through]")
 {
     auto storage = MakeLayered();
