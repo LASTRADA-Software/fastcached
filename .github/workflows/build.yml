@@ -385,10 +385,14 @@ jobs:
           key: ${{ runner.os }}-cc-e2e
           max-size: 256M
 
+      # clang is installed explicitly rather than relied on: the second E2E step
+      # below exits 77 (skip) when its compiler is absent, and a skipped step
+      # still reports green — so a missing compiler would silently mean the
+      # clang driver was never exercised at all.
       - name: "Install build tools"
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libyaml-cpp-dev g++-14
+          sudo apt-get install -y ninja-build libyaml-cpp-dev g++-14 clang
 
       - name: "Configure"
         run: cmake --preset gcc-release
@@ -396,15 +400,16 @@ jobs:
       - name: "Build"
         run: cmake --build --preset gcc-release --target fastcached fastcache-cc
 
-      # Run the harness directly rather than through ctest so a skip (exit 77)
-      # is visible here as a skip, and any failure output lands in this job.
+      # Run the harness directly rather than through ctest so any failure output
+      # lands in this job. Exit 77 means a prerequisite was missing and nothing
+      # was actually verified, which must fail here rather than report green.
       - name: "Compile-cache E2E (gcc)"
         run: |
           bash scripts/compile-cache-e2e.sh \
             --fastcached out/build/gcc-release/target/fastcached \
             --launcher out/build/gcc-release/target/fastcache-cc \
             --compiler g++-14 \
-            --port 21713
+            --port 21713 || { c=$?; [ "$c" = 77 ] && echo "::error::E2E skipped, nothing verified"; exit "$c"; }
 
       # The launcher must work with the clang driver too, not just gcc.
       - name: "Compile-cache E2E (clang)"
@@ -413,7 +418,7 @@ jobs:
             --fastcached out/build/gcc-release/target/fastcached \
             --launcher out/build/gcc-release/target/fastcache-cc \
             --compiler clang++ \
-            --port 21715
+            --port 21715 || { c=$?; [ "$c" = 77 ] && echo "::error::E2E skipped, nothing verified"; exit "$c"; }
 
   compile-cache-e2e-windows:
     name: "compile-cache E2E (Windows)"
