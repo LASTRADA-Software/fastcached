@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: Apache-2.0
+# fastcache-cc — the sccache-style compiler launcher, plus its unit tests.
+#
+# The launcher only needs the path-canonicalization + compile-value codec (and
+# CRC32C for the key), which have no third-party dependencies. We compile those
+# few FastCache sources directly into the tool rather than linking the whole
+# FastCache static library, so the launcher pulls in NO vcpkg deps (zstd, lz4,
+# yaml-cpp). That keeps it a small, self-contained binary and lets it link the
+# CRT statically without a runtime-library mismatch against vcpkg objects.
+
+set(_fc_cc_core
+    "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/PathCanon.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/CompileValue.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Crc32c.cpp")
+
+# The launcher's own reusable pieces. Process spawning and the TCP client are
+# reached through interfaces (IProcessRunner / ITcpClient) so the flow logic
+# stays platform-free and testable against fakes on every host.
+set(_fc_cc_sources
+    CmdLine.cpp
+    CacheKey.cpp
+    DirectManifest.cpp
+    Stats.cpp
+    ProcessRunner.cpp
+    TcpClient.cpp)
+
+# Fully static, copy-anywhere binary: statically link the MSVC C++ runtime so
+# the launcher depends only on always-present Windows system DLLs (WS2_32,
+# KERNEL32) and needs no VC++ redistributable on build agents. On by default;
+# turn off to use the shared runtime (smaller binary, needs the redist).
+option(FASTCACHED_STATIC_LAUNCHER "Statically link the CRT into fastcache-cc" ON)
+
+add_executable(fastcache-cc
+    main.cpp
+    ${_fc_cc_sources}
+    ${_fc_cc_core}
+)
+target_include_directories(fastcache-cc PRIVATE "${CMAKE_SOURCE_DIR}/src")
+target_compile_definitions(fastcache-cc PRIVATE
+    FASTCACHE_CC_VERSION="${FASTCACHED_VERSION_STRING}")
+
+if(WIN32)
+    target_link_libraries(fastcache-cc PRIVATE ws2_32)
+endif()
+
+if(FASTCACHED_STATIC_LAUNCHER AND MSVC)
+    # CMP0091: MSVC_RUNTIME_LIBRARY selects /MT(d) vs /MD(d). Static so the CRT
+    # is baked in; the generator expression keeps the Debug variant (/MTd) for
+    # Debug configs.
+    set_property(TARGET fastcache-cc PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
+install(TARGETS fastcache-cc
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+)
+
+# Unit tests for the reusable launcher pieces (parsing, keying, statistics, and
+# the platform seams). Like the launcher itself these avoid the FastCache
+# library, so the test binary stays dependency-light — Catch2 is the only extra.
+if(FASTCACHED_BUILD_TESTS)
+    add_executable(fastcache-cc-tests
+        test_main.cpp
+        ${_fc_cc_sources}
+        CmdLine_test.cpp
+        CacheKey_test.cpp
+        DirectManifest_test.cpp
+        ProcessRunner_test.cpp
+        Stats_test.cpp
+        TcpClient_test.cpp
+        ${_fc_cc_core}
+    )
+    target_include_directories(fastcache-cc-tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+    target_link_libraries(fastcache-cc-tests PRIVATE Catch2::Catch2)
+    if(WIN32)
+        target_link_libraries(fastcache-cc-tests PRIVATE ws2_32)
+    endif()
+    include(Catch)
+    catch_discover_tests(fastcache-cc-tests)
+
+    # ---------------------------------------------------------------------
+    # End-to-end compile-cache test. Starts a real daemon, drives real
+    # compiles through the launcher, and asserts miss/hit, byte-identical
+    # object reproduction, and cross-depth portability — the properties unit
+    # tests cannot cover because they need a compiler and a server.
+    #
+    # Labelled "smoke" so it can be selected (ctest -L smoke) or skipped
+    # (ctest -LE smoke); a missing prerequisite exits 77 and reports as
+    # skipped rather than failed. Both platforms assert the same contract.
+    #
+    # The test drives a real daemon, so it only exists when the daemon is being
+    # built: the app table makes each executable independently gateable, and an
+    # unguarded $<TARGET_FILE:fastcached> would break configuration outright
+    # under -DFASTCACHED_BUILD_DAEMON=OFF.
+    if(NOT TARGET fastcached)
+        message(STATUS "fastcache-cc: skipping compile-cache-e2e test (fastcached not built)")
+    elseif(WIN32)
+        add_test(
+            NAME "compile-cache-e2e"
+            COMMAND pwsh -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/run-launcher-e2e.ps1"
+                -Fastcached "$<TARGET_FILE:fastcached>"
+                -Launcher "$<TARGET_FILE:fastcache-cc>"
+        )
+    else()
+        add_test(
+            NAME "compile-cache-e2e"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/compile-cache-e2e.sh"
+                --fastcached "$<TARGET_FILE:fastcached>"
+                --launcher "$<TARGET_FILE:fastcache-cc>"
+                --compiler "${CMAKE_CXX_COMPILER}"
+        )
+    endif()
+    if(TARGET fastcached)
+        # Binds a fixed port and spawns a daemon, so it must not run concurrently
+        # with the other server-starting smoke tests.
+        set_tests_properties("compile-cache-e2e" PROPERTIES
+            LABELS "smoke"
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE
+        )
+    endif()
+endif()

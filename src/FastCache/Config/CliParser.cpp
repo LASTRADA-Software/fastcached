@@ -654,7 +654,9 @@ namespace
         { .flag = "--storage=<path>", .description = "persist cache to a CoW-tree file (default: in-memory only)" },
         { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },
         { .flag = "--storage-max-value=<size>",
-          .description = "per-value byte cap for --storage; k/m/g suffixes accepted (default 1m)" },
+          .description = "per-value byte cap for --storage; k/m/g suffixes accepted (default 16m).\n"
+                         "also raises the wire frame-payload cap, so compile caches storing\n"
+                         "large object files need this set above their biggest object" },
         { .flag = "--storage-max-disk=<size>",
           .description = "cap the on-disk (L2) tier for --storage; the CoW tree evicts its LRU tail to fit "
                          "(default 0 = unbounded). k/m/g suffixes accepted" },

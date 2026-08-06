@@ -106,3 +106,33 @@ TEST_CASE("ComputeKey is a stable 32-hex-char string")
     CHECK(k.size() == 32);
     CHECK(k == ComputeKey(a)); // deterministic
 }
+
+TEST_CASE("RelativizeArgs tokenizes POSIX absolute paths under either root")
+{
+    // Regression guard. A leading '/' introduces an option only on Windows; on
+    // POSIX it starts an absolute path. Skipping those left the checkout path
+    // in the cache key, so two checkouts of identical content at different
+    // paths keyed differently and never shared a hit — the exact property this
+    // launcher exists to provide.
+    std::vector<std::string> const args { "-c", "/home/dev/proj/a.cpp", "-o", "/home/dev/proj/build/a.o" };
+    auto const out = RelativizeArgs(args, "/home/dev/proj", "/home/dev/proj/build");
+
+    CHECK(out[1] != "/home/dev/proj/a.cpp"); // rewritten, not passed through
+    CHECK_FALSE(out[1].contains("/home/dev"));
+    CHECK_FALSE(out[3].contains("/home/dev"));
+}
+
+TEST_CASE("Two POSIX checkouts at different depths relativize identically")
+{
+    std::vector<std::string> const deep { "-c", "/ci/w/1/s/proj/a.cpp", "-o", "/ci/w/1/s/proj/build/a.o" };
+    std::vector<std::string> const shallow { "-c", "/home/a/proj/a.cpp", "-o", "/home/a/proj/build/a.o" };
+
+    auto const fromDeep = RelativizeArgs(deep, "/ci/w/1/s/proj", "/ci/w/1/s/proj/build");
+    auto const fromShallow = RelativizeArgs(shallow, "/home/a/proj", "/home/a/proj/build");
+    CHECK(fromDeep == fromShallow);
+
+    // ...and therefore produce the same key for identical content.
+    KeyInputs const a { .compilerId = "g++ 14", .preprocessed = "int main(){}", .relativizedArgs = fromDeep };
+    KeyInputs const b { .compilerId = "g++ 14", .preprocessed = "int main(){}", .relativizedArgs = fromShallow };
+    CHECK(ComputeKey(a) == ComputeKey(b));
+}

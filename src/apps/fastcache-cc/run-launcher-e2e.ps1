@@ -10,6 +10,12 @@
 #      compiled from a SHALLOW srcroot (different checkout), with showIncludes
 #      localized so the deps resolve.
 #
+# The POSIX counterpart (scripts/compile-cache-e2e.sh) additionally asserts that
+# a hit restores the GNU depfile, localized to the consuming checkout. That has
+# no analogue here: the MSVC drivers report dependencies inline via
+# /showIncludes (asserted above) and set usesDepfile = false, so -MF is never
+# parsed and no depfile region is ever stored for them.
+#
 # Output is generic status only; nothing project-private is read or emitted,
 # nothing is committed.
 
@@ -24,9 +30,26 @@ param(
 
 $ErrorActionPreference = "Stop"
 $exit = 0
+# CTest's SKIP_RETURN_CODE. A missing binary or compiler is a missing runtime
+# prerequisite, not a failure, so it must be distinguishable from a real fault.
+$SKIP = 77
+$ranAnyCompiler = $false
+
+if (-not (Test-Path $Fastcached)) { Write-Host "fastcached not found: $Fastcached; skipping"; exit $SKIP }
+if (-not (Test-Path $Launcher))   { Write-Host "fastcache-cc not found: $Launcher; skipping"; exit $SKIP }
+
+# Start-Process resolves a relative -FilePath against the PROCESS working
+# directory, not PowerShell's, so a caller passing "out/build/..." would get a
+# spurious "file not found". Resolve both up front.
+$Fastcached = (Resolve-Path $Fastcached).Path
+$Launcher   = (Resolve-Path $Launcher).Path
 
 function Start-Fastcached {
-    $p = Start-Process -FilePath $Fastcached -ArgumentList "--bind","127.0.0.1","--port","$Port" -PassThru -WindowStyle Hidden
+    # --storage-max-value raises the wire payload cap along with the value cap;
+    # pass it explicitly so the flag stays exercised even on tiny fixtures.
+    $p = Start-Process -FilePath $Fastcached `
+        -ArgumentList "--bind","127.0.0.1","--port","$Port","--storage-max-value","64M" `
+        -PassThru -WindowStyle Hidden
     Start-Sleep -Milliseconds 600
     if ($p.HasExited) { throw "fastcached exited immediately (exit $($p.ExitCode))" }
     return $p
@@ -64,10 +87,54 @@ function Get-Outcome([string]$stderr) {
     return "UNKNOWN"
 }
 
+# A source whose object clears 1 MiB. Small fixtures never fill the daemon's
+# socket send buffer, so they never reach its park-and-resume path — a stall
+# there wedged a real build while every small case here kept passing. `long long`
+# rather than `int` halves the element count for the same object size, which
+# keeps cl's initializer-list parse time reasonable.
+function New-BigTree([string]$root) {
+    $src = Join-Path $root "src"
+    New-Item -ItemType Directory -Force -Path $src | Out-Null
+    $count = 150000
+    $vals = [int64[]]::new($count)
+    for ($i = 0; $i -lt $count; $i++) { $vals[$i] = ($i * 7919) % 2147483647 }
+    $text = "extern const long long data[$count];`nconst long long data[$count] = {`n" `
+          + [string]::Join(",`n", $vals) `
+          + "`n};`nint main(){return (int)data[0];}`n"
+    Set-Content -Path (Join-Path $src "big.cpp") -Value $text
+    return $src
+}
+
+# Like Invoke-Launcher but for an arbitrary source and with a bounded wait. The
+# failure this guards is a launcher that never returns, so an unbounded -Wait
+# would hang the CI job instead of reporting a regression.
+function Invoke-LauncherBounded([string]$compiler, [string]$srcRoot, [string]$buildTree,
+                                [string]$obj, [string]$sourceName, [int]$timeoutSec) {
+    $env:FASTCACHE_ADDR      = "127.0.0.1:$Port"
+    $env:FASTCACHE_SRCROOT   = $srcRoot
+    $env:FASTCACHE_BUILDTREE = $buildTree
+    $env:FASTCACHE_VERBOSE   = "1"
+    $source = Join-Path $srcRoot $sourceName
+    $errFile = New-TemporaryFile
+    $p = Start-Process -FilePath $Launcher `
+        -ArgumentList $compiler,"/nologo","/c","/Fo$obj",$source `
+        -NoNewWindow -PassThru -RedirectStandardError $errFile
+    $exited = $p.WaitForExit($timeoutSec * 1000)
+    if (-not $exited) {
+        try { $p.Kill() } catch { }
+        Remove-Item $errFile -ErrorAction SilentlyContinue
+        return @{ code = -1; stderr = ""; timedOut = $true }
+    }
+    $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
+    Remove-Item $errFile -ErrorAction SilentlyContinue
+    return @{ code = $p.ExitCode; stderr = $err; timedOut = $false }
+}
+
 $server = Start-Fastcached
 try {
     foreach ($cc in @("cl","clang-cl")) {
         if (-not (Get-Command $cc -ErrorAction SilentlyContinue)) { Write-Host "skip $cc (not on PATH)"; continue }
+        $ranAnyCompiler = $true
         Write-Host "=== launcher miss/hit ($cc) ==="
         Remove-Item -Recurse -Force $ShallowTemp -ErrorAction SilentlyContinue
         $src = New-Tree $ShallowTemp
@@ -90,6 +157,39 @@ try {
         } else {
             Write-Host "  FAIL ($cc): run1=$o1 run2=$o2 objMatch=$($hash2 -eq $hash1)" -ForegroundColor Red
             $exit = 1
+        }
+
+        Write-Host "=== launcher large object > 1 MiB ($cc) ==="
+        Remove-Item -Recurse -Force $ShallowTemp -ErrorAction SilentlyContinue
+        $bigSrc = New-BigTree $ShallowTemp
+        $bigBuild = Join-Path $ShallowTemp "build"; New-Item -ItemType Directory -Force $bigBuild | Out-Null
+        $bigObj = Join-Path $bigBuild "big.obj"
+
+        $b1 = Invoke-LauncherBounded $cc $bigSrc $bigBuild $bigObj "big.cpp" 300
+        if ($b1.timedOut -or $b1.code -ne 0 -or -not (Test-Path $bigObj)) {
+            Write-Host "  LARGE FAIL ($cc): first compile did not produce an object (timedOut=$($b1.timedOut))" -ForegroundColor Red
+            $exit = 1
+        } else {
+            $bigBytes = (Get-Item $bigObj).Length
+            $bigHash1 = (Get-FileHash $bigObj -Algorithm SHA256).Hash
+            Remove-Item $bigObj -Force
+
+            $b2 = Invoke-LauncherBounded $cc $bigSrc $bigBuild $bigObj "big.cpp" 300
+            $bigOutcome = Get-Outcome $b2.stderr
+            $bigHash2 = if (Test-Path $bigObj) { (Get-FileHash $bigObj -Algorithm SHA256).Hash } else { "<none>" }
+
+            if ($bigBytes -le 1048576) {
+                Write-Host "  LARGE FAIL ($cc): object is only $bigBytes bytes; it must exceed 1 MiB to exercise the park path" -ForegroundColor Red
+                $exit = 1
+            } elseif ($b2.timedOut) {
+                Write-Host "  LARGE FAIL ($cc): FETCH never returned (the daemon stalled mid-reply)" -ForegroundColor Red
+                $exit = 1
+            } elseif ($bigOutcome -eq "HIT" -and $bigHash2 -eq $bigHash1) {
+                Write-Host "  large object ($bigBytes bytes) HIT and reproduced identically: OK ($cc)" -ForegroundColor Green
+            } else {
+                Write-Host "  LARGE FAIL ($cc): run2=$bigOutcome objMatch=$($bigHash2 -eq $bigHash1)" -ForegroundColor Red
+                $exit = 1
+            }
         }
 
         Write-Host "=== launcher cross-depth ($cc) ==="
@@ -121,6 +221,13 @@ finally {
     $server | Stop-Process -Force -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $DeepTemp,$ShallowTemp -ErrorAction SilentlyContinue
     Remove-Item Env:\FASTCACHE_ADDR,Env:\FASTCACHE_SRCROOT,Env:\FASTCACHE_BUILDTREE,Env:\FASTCACHE_VERBOSE -ErrorAction SilentlyContinue
+}
+
+if (-not $ranAnyCompiler) {
+    # No MSVC-style compiler on PATH: nothing was actually verified, so report a
+    # skip rather than a pass. A silent success here would hide a broken build.
+    Write-Host "no cl/clang-cl on PATH; skipping"
+    exit $SKIP
 }
 
 if ($exit -eq 0) { Write-Host "ALL LAUNCHER E2E CHECKS PASSED" -ForegroundColor Green }

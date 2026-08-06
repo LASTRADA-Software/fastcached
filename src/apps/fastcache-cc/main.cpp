@@ -19,6 +19,8 @@
 //   FASTCACHE_COHORT     optional cohort id (default "default")
 //   FASTCACHE_VERBOSE    if set, print fall-back diagnostics to stderr
 //   FASTCACHE_NO_STATS   if set, do not record invocations to the statistics log
+//   FASTCACHE_NO_DIRECT  if set, disable direct mode (always preprocess)
+//   FASTCACHE_TIMEOUT_MS per-call socket deadline in ms (default 10000; 0 = none)
 //
 // Run `fastcache-cc --help` for the flag and environment reference, and
 // `--stats` for the recorded per-machine cache statistics.
@@ -28,13 +30,17 @@
 #include "CacheKey.hpp"
 #include "CmdLine.hpp"
 #include "DirectManifest.hpp"
+#include "IProcessRunner.hpp"
+#include "ITcpClient.hpp"
 #include "Stats.hpp"
 
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Endian.hpp>
 
+#include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -43,12 +49,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <ostream>
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -77,6 +84,9 @@ constexpr std::byte StatusOk { 0x01 };
 
 // --- config ----------------------------------------------------------------
 
+/// Default per-call socket deadline, overridable with FASTCACHE_TIMEOUT_MS.
+constexpr std::chrono::milliseconds DefaultIoTimeout { 10000 };
+
 struct Config
 {
     std::string addr;
@@ -86,6 +96,10 @@ struct Config
     bool verbose { false };
     bool stats { true };  ///< Record each invocation to the per-user log.
     bool direct { true }; ///< Try the manifest shortcut before preprocessing.
+    /// Per-call deadline for every blocking send/recv against the daemon. The
+    /// default keeps a wedged daemon from hanging a build while staying far
+    /// above any healthy round-trip, including multi-megabyte objects.
+    std::chrono::milliseconds ioTimeout { DefaultIoTimeout };
 };
 
 /// Read an environment variable, or a fallback when unset/empty. Uses the
@@ -113,6 +127,29 @@ struct Config
     return !EnvOr(name, "").empty();
 }
 
+/// Read a non-negative millisecond count from the environment.
+///
+/// Anything unparseable, negative, or trailing junk falls back to `fallback`
+/// rather than failing the compile: a typo in a build-system variable must not
+/// break the build, which is the same principle as every other cache fall-back.
+/// An explicit `0` is honoured and means "no timeout".
+/// @param name Variable to read.
+/// @param fallback Value to use when unset or malformed.
+/// @return The parsed duration, or `fallback`.
+[[nodiscard]] std::chrono::milliseconds EnvMillis(char const* name, std::chrono::milliseconds fallback)
+{
+    auto const raw = EnvOr(name, "");
+    if (raw.empty())
+        return fallback;
+    auto value = std::int64_t { 0 };
+    auto const* const begin = raw.data();
+    auto const* const end = std::next(begin, static_cast<std::ptrdiff_t>(raw.size()));
+    auto const [ptr, ec] = std::from_chars(begin, end, value);
+    if (ec != std::errc {} || ptr != end || value < 0)
+        return fallback;
+    return std::chrono::milliseconds { value };
+}
+
 [[nodiscard]] Config LoadConfig()
 {
     Config c;
@@ -123,6 +160,7 @@ struct Config
     c.verbose = EnvSet("FASTCACHE_VERBOSE");
     c.stats = !EnvSet("FASTCACHE_NO_STATS");
     c.direct = !EnvSet("FASTCACHE_NO_DIRECT");
+    c.ioTimeout = EnvMillis("FASTCACHE_TIMEOUT_MS", DefaultIoTimeout);
     return c;
 }
 
@@ -153,7 +191,24 @@ bool g_directHit = false;
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(delta).count());
 }
 
-/// Print a one-line fall-back diagnostic when FASTCACHE_VERBOSE is set.
+/// Print a one-line fall-back diagnostic when FASTCACHE_VERBOSE is set, without
+/// touching the recorded outcome. For diagnostics issued AFTER the outcome is
+/// already decided — a miss that compiled successfully but could not be stored
+/// is still a miss, and recording it as a cache failure would inflate the
+/// "unavailable" bucket in `--stats` and hide the real cause.
+/// @param reason The diagnostic text.
+void Note(std::string_view reason)
+{
+    if (g_verbose)
+        std::cerr << "fastcache-cc: " << reason << '\n';
+}
+
+/// Report that the cache could not serve this compile, and record why.
+///
+/// Only for the fall-back path, where the launcher gives up on the cache and
+/// runs the real compiler: it OVERWRITES the recorded outcome. Once a HIT or
+/// MISS has been traced, use Note() instead.
+/// @param reason The fall-back reason, recorded as the statistics detail.
 void Warn(std::string_view reason)
 {
     // A fall-back reason distinguishes "deliberately not cacheable" from "the
@@ -176,171 +231,35 @@ void TraceOutcome(std::string_view outcome, std::string_view key)
         std::cerr << "fastcache-cc: " << outcome << " key=" << key << '\n';
 }
 
-// --- shell quoting / process exec ------------------------------------------
+// --- process exec -----------------------------------------------------------
 
-/// Quote one argument for a Windows command line following the CommandLineToArgvW
-/// rules: backslashes are literal except when they precede a `"`, where each
-/// must be doubled, and a run of backslashes immediately before the closing
-/// quote must also be doubled — otherwise a path ending in `\` (common for
-/// MSVC/SDK include dirs) would escape the closing quote and split the arg.
-/// @param a The raw argument.
-/// @return The argument, quoted if it contains whitespace or a quote.
-[[nodiscard]] std::string Quote(std::string_view a)
+/// The process runner used by every spawn in this file. Created once; the
+/// concrete implementation (CreateProcess on Windows, posix_spawn elsewhere)
+/// is chosen behind the IProcessRunner seam.
+[[nodiscard]] Cc::IProcessRunner& ProcessRunner()
 {
-    if (!a.empty() && a.find_first_of(" \t\"") == std::string_view::npos)
-        return std::string { a };
-    std::string out = "\"";
-    std::size_t backslashes = 0;
-    for (char const c: a)
-    {
-        if (c == '\\')
-        {
-            ++backslashes;
-            out += c;
-            continue;
-        }
-        if (c == '"')
-        {
-            // Double the run of backslashes that precede this quote, then escape it.
-            out.append(backslashes, '\\');
-            out += '\\';
-            out += '"';
-        }
-        else
-        {
-            out += c;
-        }
-        backslashes = 0;
-    }
-    // Double any trailing backslashes so they do not escape the closing quote.
-    out.append(backslashes, '\\');
-    out += '"';
-    return out;
+    static std::unique_ptr<Cc::IProcessRunner> const runner = Cc::MakeProcessRunner();
+    return *runner;
 }
 
-/// Join argv into a single command-line string.
-[[nodiscard]] std::string JoinCommand(std::span<std::string const> argv)
-{
-    std::string cmd;
-    for (auto const& a: argv)
-    {
-        if (!cmd.empty())
-            cmd += ' ';
-        cmd += Quote(a);
-    }
-    return cmd;
-}
+using Cc::CompileRun;
 
-/// Combined-output capture (stdout+stderr merged via 2>&1). Used only where the
-/// separation does not matter — preprocessing and the compiler-id probe.
-/// @return (exit code, combined output). Exit -1 means the process could not
-///         be spawned.
-[[nodiscard]] std::pair<int, std::string> RunCaptureCombined(std::string const& command)
-{
-    std::string out;
-#if defined(_WIN32)
-    FILE* pipe = _popen((command + " 2>&1").c_str(), "rb");
-#else
-    FILE* pipe = popen((command + " 2>&1").c_str(), "r");
-#endif
-    if (pipe == nullptr)
-        return { -1, {} };
-    std::array<char, 4096> buf {};
-    std::size_t n = 0;
-    while ((n = std::fread(buf.data(), 1, buf.size(), pipe)) > 0)
-        out.append(buf.data(), n);
-#if defined(_WIN32)
-    int const code = _pclose(pipe);
-#else
-    int const code = pclose(pipe);
-#endif
-    return { code, out };
-}
-
-/// The result of running the real compiler with stdout and stderr captured
-/// separately, so a cache hit can replay each on its correct stream.
-struct CompileRun
-{
-    int exitCode { -1 };
-    std::string out; ///< captured stdout
-    std::string err; ///< captured stderr
-};
-
-#if defined(_WIN32)
-/// Drain a pipe read-end fully into `dst`.
-void DrainPipe(HANDLE readEnd, std::string& dst)
-{
-    std::array<char, 4096> buf {};
-    DWORD n = 0;
-    while (ReadFile(readEnd, buf.data(), static_cast<DWORD>(buf.size()), &n, nullptr) && n > 0)
-        dst.append(buf.data(), n);
-}
-#endif
-
-/// Run the real compiler with stdout and stderr captured SEPARATELY. Full
-/// fidelity: a hit can replay each stream on its own channel (warnings on
-/// stderr, etc.). Uses CreateProcess + two pipes on Windows.
-/// @param argv Full invocation (argv[0] = compiler).
-/// @return exit code + captured streams (exitCode -1 on spawn failure).
+/// Run `argv` with stdout and stderr captured separately.
+/// @param argv Full invocation; argv[0] is the compiler.
+/// @return Exit code plus both captured streams.
 [[nodiscard]] CompileRun RunCaptureSplit(std::span<std::string const> argv)
 {
-    CompileRun result;
-#if defined(_WIN32)
-    SECURITY_ATTRIBUTES sa {};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
+    return ProcessRunner().RunCaptureSplit(argv);
+}
 
-    HANDLE outR = nullptr;
-    HANDLE outW = nullptr;
-    HANDLE errR = nullptr;
-    HANDLE errW = nullptr;
-    if (!CreatePipe(&outR, &outW, &sa, 0) || !CreatePipe(&errR, &errW, &sa, 0))
-        return result;
-    SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(errR, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOA si {};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = outW;
-    si.hStdError = errW;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-
-    std::string cmd = JoinCommand(argv);
-    std::vector<char> mutableCmd { cmd.begin(), cmd.end() };
-    mutableCmd.push_back('\0');
-
-    PROCESS_INFORMATION pi {};
-    BOOL const ok = CreateProcessA(nullptr, mutableCmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
-    // Parent closes the write ends so its reads see EOF when the child exits.
-    CloseHandle(outW);
-    CloseHandle(errW);
-    if (!ok)
-    {
-        CloseHandle(outR);
-        CloseHandle(errR);
-        return result;
-    }
-    // Drain both pipes CONCURRENTLY. Sequential draining deadlocks (and then
-    // captures a truncated, run-varying amount) whenever the not-yet-drained
-    // stream fills its ~64 KB pipe buffer — which preprocessed output routinely
-    // does. A truncated/varying stdout capture would make the cache key
-    // nondeterministic and defeat all caching, so this must be correct.
-    std::thread errThread { [&] { DrainPipe(errR, result.err); } };
-    DrainPipe(outR, result.out);
-    errThread.join();
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exit = 0;
-    GetExitCodeProcess(pi.hProcess, &exit);
-    result.exitCode = static_cast<int>(exit);
-    CloseHandle(outR);
-    CloseHandle(errR);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-#else
-    static_cast<void>(argv);
-#endif
-    return result;
+/// Run `argv` with stdout and stderr merged. Used where the split does not
+/// matter — the compiler-id probe.
+/// @param argv Full invocation; argv[0] is the compiler.
+/// @return (exit code, combined output).
+[[nodiscard]] std::pair<int, std::string> RunCaptureCombined(std::span<std::string const> argv)
+{
+    auto const run = ProcessRunner().RunCaptureCombined(argv);
+    return { run.exitCode, run.out };
 }
 
 /// Replay captured child bytes on one of our own streams verbatim.
@@ -410,108 +329,45 @@ void ReplayStreams(std::string_view out, std::string_view err)
     return out.good();
 }
 
-// --- minimal blocking TCP client -------------------------------------------
+// --- TCP client -------------------------------------------------------------
 
+/// Thin owning wrapper over the injected ITcpClient seam, so call sites keep
+/// the `TcpClient::Connect(addr)` -> optional shape they already use while the
+/// platform socket code lives behind the interface.
 class TcpClient
 {
   public:
-    [[nodiscard]] static std::optional<TcpClient> Connect(std::string_view hostPort)
+    /// Connect to `hostPort`.
+    /// @param hostPort "host:port"; hostnames and [::1]:port are accepted.
+    /// @param ioTimeout Per-call send/recv deadline; 0 disables it.
+    /// @return A connected client, or nullopt when unreachable.
+    [[nodiscard]] static std::optional<TcpClient> Connect(std::string_view hostPort, std::chrono::milliseconds ioTimeout)
     {
-        auto const colon = hostPort.rfind(':');
-        if (colon == std::string_view::npos)
+        auto impl = Cc::ConnectTcp(hostPort, ioTimeout);
+        if (impl == nullptr)
             return std::nullopt;
-        std::string const host { hostPort.substr(0, colon) };
-        std::string const portStr { hostPort.substr(colon + 1) };
-#if defined(_WIN32)
-        WSADATA wsa {};
-        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
-            return std::nullopt;
-        SOCKET fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (fd == INVALID_SOCKET)
-        {
-            WSACleanup();
-            return std::nullopt;
-        }
-        sockaddr_in addr {};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(static_cast<std::uint16_t>(std::atoi(portStr.c_str())));
-        if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1
-            || connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
-        {
-            closesocket(fd);
-            WSACleanup();
-            return std::nullopt;
-        }
-        return TcpClient { fd };
-#else
-        return std::nullopt;
-#endif
+        return TcpClient { std::move(impl) };
     }
 
-    ~TcpClient()
-    {
-#if defined(_WIN32)
-        if (_fd != INVALID_SOCKET)
-        {
-            closesocket(_fd);
-            WSACleanup();
-        }
-#endif
-    }
-
-    TcpClient(TcpClient const&) = delete;
-    TcpClient& operator=(TcpClient const&) = delete;
-    TcpClient(TcpClient&& o) noexcept
-    {
-#if defined(_WIN32)
-        _fd = o._fd;
-        o._fd = INVALID_SOCKET;
-#endif
-    }
-    TcpClient& operator=(TcpClient&&) = delete;
-
+    /// @see Cc::ITcpClient::SendAll
     [[nodiscard]] bool SendAll(std::span<std::byte const> bytes)
     {
-#if defined(_WIN32)
-        std::size_t sent = 0;
-        while (sent < bytes.size())
-        {
-            int const n =
-                send(_fd, reinterpret_cast<char const*>(bytes.data()) + sent, static_cast<int>(bytes.size() - sent), 0);
-            if (n <= 0)
-                return false;
-            sent += static_cast<std::size_t>(n);
-        }
-        return true;
-#else
-        return false;
-#endif
+        return _impl->SendAll(bytes);
     }
 
+    /// @see Cc::ITcpClient::RecvExactly
     [[nodiscard]] std::optional<std::vector<std::byte>> RecvExactly(std::size_t count)
     {
-        std::vector<std::byte> out(count);
-#if defined(_WIN32)
-        std::size_t got = 0;
-        while (got < count)
-        {
-            int const n = recv(_fd, reinterpret_cast<char*>(out.data()) + got, static_cast<int>(count - got), 0);
-            if (n <= 0)
-                return std::nullopt;
-            got += static_cast<std::size_t>(n);
-        }
-#endif
-        return out;
+        return _impl->RecvExactly(count);
     }
 
   private:
-#if defined(_WIN32)
-    explicit TcpClient(SOCKET fd):
-        _fd(fd)
+    explicit TcpClient(std::unique_ptr<Cc::ITcpClient> impl):
+        _impl { std::move(impl) }
     {
     }
-    SOCKET _fd { INVALID_SOCKET };
-#endif
+
+    std::unique_ptr<Cc::ITcpClient> _impl;
 };
 
 // --- protocol framing helpers ----------------------------------------------
@@ -542,6 +398,67 @@ void AppendField(std::vector<std::byte>& out, std::span<std::byte const> bytes)
     return PathCanon::Grammar::ShowIncludes;
 }
 
+/// Index of the depfile inside a stored value's text regions.
+///
+/// Regions are positional: 0 = stdout, 1 = stderr, 2 = the GNU depfile. A value
+/// stored before depfile support simply has no region 2, so it decodes and
+/// replays exactly as before — the addition is backward compatible.
+constexpr std::size_t DepFileRegionIndex = 2;
+
+/// Number of captured streams replayed to our own stdout/stderr. Regions beyond
+/// these are files, not streams, and must never be replayed.
+constexpr std::size_t ReplayRegionCount = 2;
+
+/// Read the depfile a GNU-driver compile just wrote, for storing alongside the
+/// object.
+///
+/// A depfile is the build system's record of which headers a translation unit
+/// depends on. Ninja and Make read it to decide whether to recompile; without
+/// it the TU appears to depend on nothing and stops rebuilding when its headers
+/// change. It therefore has to be reproduced on a hit exactly like the object.
+///
+/// @param cmd The parsed compile command.
+/// @return The depfile text, or nullopt when the line requested none (or it is
+///         unreadable, in which case there is simply nothing to cache).
+[[nodiscard]] std::optional<std::string> ReadDepFile(Cc::ParsedCommand const& cmd)
+{
+    if (cmd.depPath.empty())
+        return std::nullopt;
+    auto const bytes = ReadFileBytes(std::filesystem::path { cmd.depPath });
+    if (!bytes.has_value())
+        return std::nullopt;
+    return std::string { reinterpret_cast<char const*>(bytes->data()), bytes->size() };
+}
+
+/// Write the cached depfile back, localized to this machine's layout.
+///
+/// Called on every hit. A miss wrote its own depfile as a side effect of running
+/// the real compiler; a hit runs no compiler, so without this the file the build
+/// system depends on would simply be absent (or, worse, left stale from an
+/// earlier build).
+///
+/// @param cmd     The parsed compile command (its depPath is the destination).
+/// @param regions The decoded value's text regions.
+/// @param layout  This machine's roots, for localizing the recorded paths.
+/// @return True when there was nothing to do or the write succeeded.
+[[nodiscard]] bool RestoreDepFile(Cc::ParsedCommand const& cmd,
+                                  std::vector<TextRegion> const& regions,
+                                  PathCanon::Layout const& layout)
+{
+    if (cmd.depPath.empty() || regions.size() <= DepFileRegionIndex)
+        return true; // nothing requested, or a value stored before depfile support
+
+    auto const& region = regions[DepFileRegionIndex];
+    auto localized = PathCanon::LocalizeRegion(region.bytes, region.grammar, layout);
+    std::string const& text = localized.has_value() ? *localized : region.bytes;
+
+    std::ofstream out { std::filesystem::path { cmd.depPath }, std::ios::binary };
+    if (!out)
+        return false;
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    return out.good();
+}
+
 /// True if the source file at `path` references a compile-time-varying macro
 /// (`__TIME__` / `__DATE__` / `__TIMESTAMP__`). Such a TU cannot be cached
 /// because it re-keys every second. Reads the file text and looks for the
@@ -555,31 +472,24 @@ void AppendField(std::vector<std::byte>& out, std::span<std::byte const> bytes)
     if (!bytes.has_value())
         return false; // cannot read → let the normal flow handle it
     std::string_view const text { reinterpret_cast<char const*>(bytes->data()), bytes->size() };
-    for (std::string_view const macro: { "__TIME__", "__DATE__", "__TIMESTAMP__" })
-        if (text.find(macro) != std::string_view::npos)
-            return true;
-    return false;
+    constexpr auto VolatileMacros = std::to_array<std::string_view>({ "__TIME__", "__DATE__", "__TIMESTAMP__" });
+    return std::ranges::any_of(VolatileMacros, [text](std::string_view const macro) { return text.contains(macro); });
 }
 
 // --- preprocess + compiler identity ----------------------------------------
 
 /// Preprocess the source (compiler-native, no line markers) for the cache key.
-/// cl/clang-cl both support `/EP /P`-style, but `/EP` alone writes preprocessed
-/// output to stdout without `#line` directives — ideal for a stable key.
+///
+/// The per-driver spelling lives in the CmdLine driver table: MSVC drivers use
+/// `/EP` (preprocess to stdout with no `#line` directives), GNU drivers `-E`.
+/// Either way the compile action and any dependency-writing flags are dropped.
+///
+/// @param cmd The parsed compile command.
+/// @param originalArgs The original full invocation.
+/// @return The preprocessed text, or nullopt when the probe failed.
 [[nodiscard]] std::optional<std::string> Preprocess(Cc::ParsedCommand const& cmd, std::span<std::string const> originalArgs)
 {
-    // Rebuild the argv replacing the compile action with preprocess-to-stdout.
-    // /EP = preprocess to stdout, no #line. /c and /Fo are dropped.
-    std::vector<std::string> pp;
-    pp.push_back(cmd.compiler);
-    pp.emplace_back("/nologo");
-    pp.emplace_back("/EP");
-    for (auto const& a: originalArgs.subspan(1)) // skip compiler
-    {
-        if (a == "/c" || a == "/showIncludes" || a.starts_with("/Fo") || a == "/Fo" || a == "-o" || a == "-c")
-            continue;
-        pp.push_back(a);
-    }
+    auto const pp = Cc::PreprocessCommand(cmd, originalArgs);
     // Capture stdout ONLY. Merging stderr (2>&1) would fold the compiler's
     // diagnostic lines into the hashed text, and the interleave point of two
     // independently-buffered streams is not stable run-to-run — which would
@@ -599,7 +509,10 @@ void AppendField(std::vector<std::byte>& out, std::span<std::byte const> bytes)
 {
     // `cl` with no args prints its version banner (to stderr). clang-cl honours
     // `--version`. Try --version first; fall back to the basename.
-    auto const [code, out] = RunCaptureCombined(Quote(compiler) + " --version");
+    // Passed as argv, not a shell string: the runner spawns the process
+    // directly, so a compiler path containing spaces needs no quoting.
+    std::array<std::string, 2> const probe { compiler, "--version" };
+    auto const [code, out] = RunCaptureCombined(probe);
     if (code == 0 && !out.empty())
         return out.substr(0, out.find('\n'));
     auto const slash = compiler.find_last_of("/\\");
@@ -610,12 +523,12 @@ void AppendField(std::vector<std::byte>& out, std::span<std::byte const> bytes)
 
 /// FETCH one key and return its raw stored bytes, or nullopt on miss or any
 /// transport failure. Used for manifests, whose payload is not a compile-value.
-/// @param addr Daemon address.
+/// @param cfg  Launcher config (daemon address and socket deadline).
 /// @param key  The key to fetch.
 /// @return The stored bytes on hit.
-[[nodiscard]] std::optional<std::vector<std::byte>> FetchRaw(std::string const& addr, std::string const& key)
+[[nodiscard]] std::optional<std::vector<std::byte>> FetchRaw(Config const& cfg, std::string const& key)
 {
-    auto client = TcpClient::Connect(addr);
+    auto client = TcpClient::Connect(cfg.addr, cfg.ioTimeout);
     if (!client.has_value())
         return std::nullopt;
 
@@ -650,7 +563,7 @@ void AppendField(std::vector<std::byte>& out, std::span<std::byte const> bytes)
 /// @param body The bytes to store.
 void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key, std::string_view body)
 {
-    auto client = TcpClient::Connect(addr);
+    auto client = TcpClient::Connect(addr, cfg.ioTimeout);
     if (!client.has_value())
         return;
 
@@ -684,7 +597,7 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
                                                    std::string const& key,
                                                    PathCanon::Layout const& layout)
 {
-    auto const payload = FetchRaw(cfg.addr, key);
+    auto const payload = FetchRaw(cfg, key);
     if (!payload.has_value())
         return std::nullopt;
 
@@ -694,15 +607,24 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
     if (!WriteFileBytes(cmd.objPath, decoded->objectBlob))
         return std::nullopt;
 
+    // The depfile is a file, not a stream: restore it before replaying, so a
+    // failure to write it is not reported after the build has already seen the
+    // compiler's output.
+    if (!RestoreDepFile(cmd, decoded->textRegions, layout))
+        return std::nullopt;
+
     // Region 0 = stdout, region 1 = stderr, per the STORE ordering.
     std::string_view replayOut;
     std::string_view replayErr;
-    std::array<std::string, 2> localizedText;
+    std::array<std::string, ReplayRegionCount> localizedText;
     for (std::size_t idx = 0; idx < decoded->textRegions.size() && idx < localizedText.size(); ++idx)
     {
         auto const& region = decoded->textRegions[idx];
         auto localized = PathCanon::LocalizeRegion(region.bytes, region.grammar, layout);
-        localizedText[idx] = localized.has_value() ? std::move(*localized) : region.bytes;
+        if (localized.has_value())
+            localizedText[idx] = *std::move(localized);
+        else
+            localizedText[idx] = region.bytes;
         if (idx == 0)
             replayOut = localizedText[idx];
         else
@@ -750,6 +672,14 @@ void RecordManifest(Config const& cfg,
     auto includes = Cc::ParseIncludePaths(includeTextOut);
     auto const fromErr = Cc::ParseIncludePaths(includeTextErr);
     includes.insert(includes.end(), fromErr.begin(), fromErr.end());
+
+    // GNU drivers report nothing on either stream — their dependencies go to the
+    // depfile. Without this, direct mode could never populate on POSIX: every
+    // compile would pay for a manifest lookup that always missed.
+    if (includes.empty())
+        if (auto const depText = ReadDepFile(cmd))
+            includes = Cc::ParseDepFilePaths(*depText);
+
     if (includes.empty())
         return;
 
@@ -781,6 +711,61 @@ void RecordManifest(Config const& cfg,
         std::cerr << "fastcache-cc: MANIFEST stored key=" << manifestKey << " entries=" << manifest->entries.size() << '\n';
 }
 
+/// DIRECT MODE. Preprocessing a translation unit to derive its key costs ~1.4 s
+/// on a large codebase (it expands ~25 MB of headers); re-hashing the project
+/// headers a previous compile recorded costs ~18 ms. So before preprocessing,
+/// try to reach the object through a stored manifest instead.
+///
+/// Any failure here just means we preprocess as before: direct mode never
+/// decides a compile is uncacheable, only that it cannot shortcut.
+///
+/// @param cfg Launcher config.
+/// @param cmd The parsed compile command.
+/// @param layout This machine's source-root / build-tree layout.
+/// @param relativizedArgs The command line with checkout-rooted paths tokenized.
+/// @param toolchainStamp The compiler identity folded into the manifest key.
+/// @return The exit code if the object was served, nullopt to keep going.
+[[nodiscard]] std::optional<int> TryDirectMode(Config const& cfg,
+                                               Cc::ParsedCommand const& cmd,
+                                               PathCanon::Layout const& layout,
+                                               std::vector<std::string> const& relativizedArgs,
+                                               std::string const& toolchainStamp)
+{
+    auto const directStarted = std::chrono::steady_clock::now();
+    // Every early return records how long the attempt took, so the statistics
+    // show the cost of a direct-mode miss as well as a direct-mode hit.
+    auto const giveUp = [directStarted]() -> std::optional<int> {
+        g_directMs = MsSince(directStarted);
+        return std::nullopt;
+    };
+
+    auto const canonicalSource = PathCanon::Canonicalize(cmd.source, layout);
+    if (!canonicalSource.has_value())
+        return giveUp();
+
+    auto const manifestKey = Cc::ComputeManifestKey(*canonicalSource, relativizedArgs, toolchainStamp);
+    auto const manifestBytes = FetchRaw(cfg, manifestKey);
+    if (!manifestBytes.has_value())
+        return giveUp();
+
+    // Unwrap the compile-value envelope the manifest was stored in.
+    auto const envelope = DecodeCompileValue(*manifestBytes);
+    auto const manifestSpan =
+        envelope.has_value() ? std::span<std::byte const> { envelope->objectBlob } : std::span<std::byte const> {};
+    auto const manifest =
+        Cc::DecodeManifest(std::string_view { reinterpret_cast<char const*>(manifestSpan.data()), manifestSpan.size() });
+    if (!manifest.has_value() || manifest->objectKey.empty() || !Cc::ValidateManifest(*manifest, layout, toolchainStamp))
+        return giveUp();
+
+    g_directMs = MsSince(directStarted);
+    // Follow the manifest's pointer to the object, which is stored exactly once
+    // under its ordinary preprocessed key.
+    auto served = TryServeFromCache(cfg, cmd, manifest->objectKey, layout);
+    if (served.has_value())
+        g_directHit = true;
+    return served;
+}
+
 /// Try to serve `cmd` from the cache; returns the process exit code if handled
 /// (hit or miss-then-stored), or std::nullopt to signal "fall back to a plain
 /// real compile" (any cache error).
@@ -798,44 +783,9 @@ void RecordManifest(Config const& cfg,
     auto const relativizedArgs = Cc::RelativizeArgs(argv.subspan(1), cfg.srcRoot, cfg.buildTree);
     auto const toolchainStamp = CompilerId(cmd.compiler);
 
-    // DIRECT MODE. Preprocessing a translation unit to derive its key costs ~1.4 s
-    // on this codebase (it expands ~25 MB of headers); re-hashing the project
-    // headers a previous compile recorded costs ~18 ms. So before preprocessing,
-    // try to reach the object through a stored manifest instead.
     if (cfg.direct && !SourceReferencesVolatileMacro(cmd.source))
-    {
-        auto const directStarted = std::chrono::steady_clock::now();
-        auto const canonicalSource = PathCanon::Canonicalize(cmd.source, layout);
-        if (canonicalSource.has_value())
-        {
-            auto const manifestKey = Cc::ComputeManifestKey(*canonicalSource, relativizedArgs, toolchainStamp);
-            auto manifestBytes = FetchRaw(cfg.addr, manifestKey);
-            if (manifestBytes.has_value())
-            {
-                // Unwrap the compile-value envelope the manifest was stored in.
-                auto const envelope = DecodeCompileValue(*manifestBytes);
-                auto const manifestSpan = envelope.has_value() ? std::span<std::byte const> { envelope->objectBlob }
-                                                               : std::span<std::byte const> {};
-                auto manifest = Cc::DecodeManifest(
-                    std::string_view { reinterpret_cast<char const*>(manifestSpan.data()), manifestSpan.size() });
-                if (manifest.has_value() && !manifest->objectKey.empty()
-                    && Cc::ValidateManifest(*manifest, layout, toolchainStamp))
-                {
-                    g_directMs = MsSince(directStarted);
-                    // Follow the manifest's pointer to the object, which is stored
-                    // exactly once under its ordinary preprocessed key.
-                    if (auto const served = TryServeFromCache(cfg, cmd, manifest->objectKey, layout))
-                    {
-                        g_directHit = true;
-                        return *served;
-                    }
-                }
-            }
-        }
-        // Any failure here just means we preprocess as before; direct mode never
-        // decides a compile is uncacheable, only that it cannot shortcut.
-        g_directMs = MsSince(directStarted);
-    }
+        if (auto served = TryDirectMode(cfg, cmd, layout, relativizedArgs, toolchainStamp))
+            return served;
 
     auto const preprocessStarted = std::chrono::steady_clock::now();
     auto const preprocessed = Preprocess(cmd, argv);
@@ -871,7 +821,7 @@ void RecordManifest(Config const& cfg,
 
     // FETCH.
     {
-        auto client = TcpClient::Connect(cfg.addr);
+        auto client = TcpClient::Connect(cfg.addr, cfg.ioTimeout);
         if (!client.has_value())
         {
             Warn("connect failed");
@@ -920,15 +870,28 @@ void RecordManifest(Config const& cfg,
                 return std::nullopt;
             }
             PathCanon::Layout const consumer { .sourceRoot = cfg.srcRoot, .buildTree = cfg.buildTree };
+
+            // Reproduce the depfile the compiler would have written. Skipping it
+            // silently breaks incremental builds: Ninja/Make would see no header
+            // dependencies for this TU and stop rebuilding it when they change.
+            if (!RestoreDepFile(cmd, decoded->textRegions, consumer))
+            {
+                Warn("could not write depfile on hit");
+                return std::nullopt;
+            }
+
             // Region 0 = stdout, region 1 = stderr (see STORE below).
             std::string_view replayOut;
             std::string_view replayErr;
-            std::array<std::string, 2> localizedText;
+            std::array<std::string, ReplayRegionCount> localizedText;
             for (std::size_t idx = 0; idx < decoded->textRegions.size() && idx < localizedText.size(); ++idx)
             {
                 auto const& region = decoded->textRegions[idx];
                 auto localized = PathCanon::LocalizeRegion(region.bytes, region.grammar, consumer);
-                localizedText[idx] = localized.has_value() ? std::move(*localized) : region.bytes;
+                if (localized.has_value())
+                    localizedText[idx] = *std::move(localized);
+                else
+                    localizedText[idx] = region.bytes;
                 if (idx == 0)
                     replayOut = localizedText[idx];
                 else
@@ -960,14 +923,19 @@ void RecordManifest(Config const& cfg,
     auto const run = RunCaptureSplit(argv);
     // Always surface the compiler's output on its true streams and its exit code.
     ReplayStreams(run.out, run.err);
-    int const code = run.exitCode;
+    // A spawn failure reports -1, which a POSIX exit status truncates to 255 —
+    // an arbitrary code no build system can interpret. Normalize it the same way
+    // the fall-back path does.
+    int const code = run.exitCode == -1 ? 1 : run.exitCode;
     if (code != 0)
         return code; // do not cache a failed compile
 
     auto const objectBytes = ReadFileBytes(cmd.objPath);
     if (!objectBytes.has_value())
     {
-        Warn("object missing after compile; not caching");
+        // The compile itself succeeded, so this stays a MISS: only the caching
+        // of it failed. Note() rather than Warn() keeps the recorded outcome.
+        Note("object missing after compile; not caching");
         return code;
     }
 
@@ -978,14 +946,22 @@ void RecordManifest(Config const& cfg,
     // /showIncludes on stdout, cl on stderr — we tag BOTH with the ShowIncludes
     // grammar so whichever stream carries include notes gets canonicalized; a
     // non-matching line in either region is preserved verbatim.
-    value.textRegions.push_back({ IncludeGrammar(), run.out });
-    value.textRegions.push_back({ IncludeGrammar(), run.err });
+    value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = run.out });
+    value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = run.err });
+
+    // Region 2, when present, is the GNU depfile the compile just wrote. It is
+    // tagged with the depfile grammar so the daemon canonicalizes the header
+    // paths inside it — a depfile full of this machine's absolute paths would be
+    // useless (and wrong) when replayed on another checkout.
+    if (auto const depText = ReadDepFile(cmd))
+        value.textRegions.push_back({ .grammar = PathCanon::Grammar::GccDepfile, .bytes = *depText });
 
     auto const encoded = EncodeCompileValue(value);
-    auto client = TcpClient::Connect(cfg.addr);
+    auto client = TcpClient::Connect(cfg.addr, cfg.ioTimeout);
     if (!client.has_value())
     {
-        Warn("connect failed for store");
+        // Same reasoning as above: the compile succeeded, so this remains a MISS.
+        Note("connect failed for store");
         return code; // compile already succeeded; just skip caching
     }
     std::vector<std::byte> frame;
@@ -1061,6 +1037,17 @@ ENVIRONMENT
                         Direct mode is on by default: it reaches a cached object by
                         re-hashing the project headers a previous compile recorded,
                         which is far cheaper than preprocessing the translation unit.
+  FASTCACHE_TIMEOUT_MS  Per-call deadline, in milliseconds, for every send/recv to
+                        the daemon (default 10000; 0 disables it). A daemon that
+                        accepts the connection and then stalls mid-reply would
+                        otherwise block the compile forever, which would make the
+                        cache load-bearing. On expiry the launcher gives up on the
+                        cache and compiles for real, like any other cache error.
+                        Raise it if a heavily loaded daemon is legitimately slow.
+                        This bounds each call, not the whole invocation: direct
+                        mode makes a separate manifest round-trip, so one compile
+                        against a wedged daemon can wait up to twice this before
+                        falling back.
 
 ADDR, SRCROOT and BUILDTREE must ALL be set to cache; any missing one makes the
 launcher run the real compiler and report "missing FASTCACHE_ADDR/SRCROOT/BUILDTREE"

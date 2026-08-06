@@ -4,8 +4,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace FastCache::Cc;
@@ -229,7 +231,7 @@ TEST_CASE("Two machines with different checkout roots derive the same object key
     // different checkout roots must produce one shared object key, or the two
     // machines would never hit each other's entries.
     std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };
-    auto const stamp = "cl-19.51";
+    auto const* const stamp = "cl-19.51";
 
     auto const keyHere = ComputeManifestKey("<SRCROOT>/src/a.cpp", args, stamp);
     auto const keyThere = ComputeManifestKey("<SRCROOT>/src/a.cpp", args, stamp);
@@ -379,6 +381,134 @@ TEST_CASE("BuildManifest drops toolchain headers and deduplicates project header
     auto const built = BuildManifest(includes, layout, "cl-test-1", "objkey-1");
     REQUIRE(built.has_value());
     CHECK(built->entries.size() == 1);
+
+    std::filesystem::remove_all(root);
+}
+
+// --- GNU depfile parsing ----------------------------------------------------
+
+TEST_CASE("ParseDepFilePaths reads the dependencies of a simple rule")
+{
+    // The target (before the colon) is an OUTPUT, not a dependency: listing it
+    // would put the object file into the manifest and make every validation
+    // compare an object against a recorded header hash.
+    auto const paths = ParseDepFilePaths("build/a.o: src/a.cpp src/a.hpp /usr/include/stdio.h\n");
+    REQUIRE(paths.size() == 3);
+    CHECK(paths[0] == "src/a.cpp");
+    CHECK(paths[1] == "src/a.hpp");
+    CHECK(paths[2] == "/usr/include/stdio.h");
+}
+
+TEST_CASE("ParseDepFilePaths follows backslash-newline continuations")
+{
+    // gcc wraps at ~76 columns, so a parser that stopped at the first newline
+    // would see only the first few headers of a real translation unit — a
+    // manifest that silently under-records its dependencies is worse than none.
+    constexpr std::string_view depFile = "build/a.o: src/a.cpp \\\n"
+                                         "  src/one.hpp \\\n"
+                                         "  src/two.hpp \\\n"
+                                         "  src/three.hpp\n";
+    auto const paths = ParseDepFilePaths(depFile);
+    REQUIRE(paths.size() == 4);
+    CHECK(paths[1] == "src/one.hpp");
+    CHECK(paths[3] == "src/three.hpp");
+}
+
+TEST_CASE("ParseDepFilePaths handles CRLF continuations")
+{
+    auto const paths = ParseDepFilePaths("a.o: a.cpp \\\r\n  b.hpp\r\n");
+    REQUIRE(paths.size() == 2);
+    CHECK(paths[0] == "a.cpp");
+    CHECK(paths[1] == "b.hpp");
+}
+
+TEST_CASE("ParseDepFilePaths unescapes spaces inside a path")
+{
+    // A checkout under "C:\My Projects\..." or "~/Code Reviews/..." is ordinary,
+    // and make escapes the space; splitting on it would yield two bogus paths.
+    auto const paths = ParseDepFilePaths(R"(a.o: src/My\ File.hpp other.hpp)"
+                                         "\n");
+    REQUIRE(paths.size() == 2);
+    CHECK(paths[0] == "src/My File.hpp");
+    CHECK(paths[1] == "other.hpp");
+}
+
+TEST_CASE("ParseDepFilePaths keeps a Windows drive letter intact")
+{
+    // "C:" must not read as a rule separator, or every absolute Windows path
+    // would be truncated to its drive and the manifest would be nonsense.
+    auto const paths = ParseDepFilePaths(R"(D:\b\a.obj: D:\s\a.cpp D:\s\a.hpp)"
+                                         "\n");
+    REQUIRE(paths.size() == 2);
+    CHECK(paths[0] == R"(D:\s\a.cpp)");
+    CHECK(paths[1] == R"(D:\s\a.hpp)");
+}
+
+TEST_CASE("ParseDepFilePaths ignores the phony targets -MP emits")
+{
+    // -MP appends a bare `header:` rule per dependency so a deleted header does
+    // not break the build. Those lines declare no dependencies of their own.
+    constexpr std::string_view depFile = "a.o: a.cpp a.hpp\n"
+                                         "\n"
+                                         "a.cpp:\n"
+                                         "\n"
+                                         "a.hpp:\n";
+    auto const paths = ParseDepFilePaths(depFile);
+    REQUIRE(paths.size() == 2);
+    CHECK(paths[0] == "a.cpp");
+    CHECK(paths[1] == "a.hpp");
+}
+
+TEST_CASE("ParseDepFilePaths returns nothing for text that is not a rule")
+{
+    CHECK(ParseDepFilePaths("").empty());
+    CHECK(ParseDepFilePaths("no colon here\n").empty());
+    CHECK(ParseDepFilePaths("a.o:\n").empty()); // a rule with no dependencies
+}
+
+TEST_CASE("A GNU depfile drives a manifest exactly as showIncludes notes do")
+{
+    // The point of parsing depfiles at all: on POSIX the GNU drivers report
+    // dependencies ONLY here, so without this direct mode can never populate —
+    // it would pay for a manifest lookup on every compile and never hit.
+    auto const root = std::filesystem::temp_directory_path() / "fc-direct-depfile";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "src");
+
+    auto const headerPath = root / "src" / "dep.hpp";
+    {
+        std::ofstream out { headerPath, std::ios::binary };
+        out << "#pragma once\n";
+    }
+
+    auto const sourcePath = root / "src" / "a.cpp";
+    {
+        std::ofstream out { sourcePath, std::ios::binary };
+        out << "#include \"dep.hpp\"\n";
+    }
+
+    FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
+
+    // A depfile as gcc -MD -MF writes it: the object as the target, then the
+    // source and its headers, wrapped across a continuation.
+    auto const depFile =
+        std::format("{}: {} \\\n  {}\n", (root / "out" / "a.o").string(), sourcePath.string(), headerPath.string());
+
+    auto const paths = ParseDepFilePaths(depFile);
+    REQUIRE(paths.size() == 2);
+
+    auto const built = BuildManifest(paths, layout, "gcc-test-1", "objkey-dep");
+    REQUIRE(built.has_value());
+    CHECK(built->entries.size() == 2); // the source and its header, both under the root
+    CHECK(ValidateManifest(*built, layout, "gcc-test-1"));
+
+    // Editing the recorded header must invalidate the manifest — otherwise a
+    // direct hit would serve an object built from stale headers.
+    {
+        std::ofstream out { headerPath, std::ios::binary };
+        out << "#pragma once\nint changed();\n";
+    }
+    CHECK_FALSE(ValidateManifest(*built, layout, "gcc-test-1"));
 
     std::filesystem::remove_all(root);
 }

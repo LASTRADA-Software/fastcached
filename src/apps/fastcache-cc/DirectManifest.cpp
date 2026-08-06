@@ -5,10 +5,13 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdio>
+#include <cctype>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <ranges>
 #include <span>
+#include <string>
 #include <system_error>
 #include <vector>
 
@@ -25,10 +28,10 @@ namespace
     /// Matched case-insensitively: Windows paths reach us in whatever case the
     /// compiler emitted, which is not stable across include-directory spellings.
     constexpr std::array<std::string_view, 4> ToolchainMarkers {
-        "\\windows kits\\",
-        "\\microsoft visual studio\\",
-        "\\vcpkg_installed\\",
-        "\\vcpkg\\installed\\",
+        R"(\windows kits\)",
+        R"(\microsoft visual studio\)",
+        R"(\vcpkg_installed\)",
+        R"(\vcpkg\installed\)",
     };
 
     /// Collapse a compiler-emitted include path to one stable form.
@@ -99,10 +102,10 @@ namespace
     {
         // Big-endian, matching the compile-cache framing so both codecs read the
         // same way on every host.
-        out.push_back(static_cast<char>((value >> 24) & 0xFFu));
-        out.push_back(static_cast<char>((value >> 16) & 0xFFu));
-        out.push_back(static_cast<char>((value >> 8) & 0xFFu));
-        out.push_back(static_cast<char>(value & 0xFFu));
+        out.push_back(static_cast<char>((value >> 24) & 0xFFU));
+        out.push_back(static_cast<char>((value >> 16) & 0xFFU));
+        out.push_back(static_cast<char>((value >> 8) & 0xFFU));
+        out.push_back(static_cast<char>(value & 0xFFU));
     }
 
     void AppendField(std::string& out, std::string_view field)
@@ -222,7 +225,7 @@ bool IsToolchainHeader(std::string_view absolutePath, PathCanon::Layout const& l
     // A vcpkg tree nested under the build tree is toolchain content even though it
     // is canonicalizable, so the marker check comes first.
     for (auto const marker: ToolchainMarkers)
-        if (comparable.find(marker) != std::string::npos)
+        if (comparable.contains(marker))
             return true;
 
     // Anything under a build root is project content; anything else has no
@@ -236,24 +239,25 @@ bool IsToolchainHeader(std::string_view absolutePath, PathCanon::Layout const& l
 std::string HashFileContents(std::string_view absolutePath)
 {
     std::string const path { absolutePath };
-    std::FILE* file = std::fopen(path.c_str(), "rb");
-    if (file == nullptr)
+    // std::ifstream rather than std::fopen: the stream owns the handle, so every
+    // early return closes it without a hand-written fclose on each path.
+    std::ifstream file { path, std::ios::binary };
+    if (!file)
         return {};
 
     std::uint32_t state = Crc32c::Seed;
     std::uint64_t length = 0;
     std::array<std::byte, 64 * 1024> buffer {};
-    while (true)
+    while (file)
     {
-        auto const read = std::fread(buffer.data(), 1, buffer.size(), file);
+        file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        auto const read = static_cast<std::size_t>(file.gcount());
         if (read == 0)
             break;
         length += read;
         Crc32c::Update(state, std::span<std::byte const> { buffer.data(), read });
     }
-    bool const failed = std::ferror(file) != 0;
-    std::fclose(file);
-    if (failed)
+    if (file.bad())
         return {};
 
     // Length is folded in alongside the digest: CRC32C is not collision-resistant
@@ -293,6 +297,96 @@ std::vector<std::string> ParseIncludePaths(std::string_view showIncludesText)
         if (!path.empty())
             paths.emplace_back(path);
     }
+    return paths;
+}
+
+std::vector<std::string> ParseDepFilePaths(std::string_view depFileText)
+{
+    std::vector<std::string> paths;
+
+    // Splice out line continuations first, so a dependency list wrapped across
+    // several lines reads as one rule. Real depfiles wrap aggressively — gcc
+    // breaks at ~76 columns — so a parser that ignored this would see only the
+    // first handful of headers.
+    std::string spliced;
+    spliced.reserve(depFileText.size());
+    for (std::size_t i = 0; i < depFileText.size(); ++i)
+    {
+        if (depFileText[i] == '\\' && i + 1 < depFileText.size() && depFileText[i + 1] == '\n')
+        {
+            spliced.push_back(' ');
+            ++i;
+            continue;
+        }
+        if (depFileText[i] == '\\' && i + 2 < depFileText.size() && depFileText[i + 1] == '\r' && depFileText[i + 2] == '\n')
+        {
+            spliced.push_back(' ');
+            i += 2;
+            continue;
+        }
+        spliced.push_back(depFileText[i]);
+    }
+
+    // Walk each rule: everything before the unescaped ':' is a target (an output,
+    // not a dependency); everything after it is a dependency list.
+    for (auto const& rule: std::views::split(std::string_view { spliced }, '\n'))
+    {
+        std::string_view line { rule.begin(), rule.end() };
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+
+        // Find the rule separator, skipping ':' that is escaped or part of a
+        // Windows drive letter ("C:\..." must not read as a target boundary).
+        std::size_t colon = std::string_view::npos;
+        for (std::size_t i = 0; i < line.size(); ++i)
+        {
+            if (line[i] == '\\')
+            {
+                ++i; // skip the escaped character
+                continue;
+            }
+            if (line[i] != ':')
+                continue;
+            bool const driveLetter = i == 1 && std::isalpha(static_cast<unsigned char>(line[0])) != 0;
+            if (!driveLetter)
+            {
+                colon = i;
+                break;
+            }
+        }
+        if (colon == std::string_view::npos)
+            continue; // not a rule line (blank, or a stray continuation remnant)
+
+        auto deps = line.substr(colon + 1);
+
+        // Split the dependency list on unescaped whitespace. `\ ` is a literal
+        // space inside a path, which is ordinary on Windows and in any checkout
+        // under a directory with a space in its name.
+        std::string current;
+        auto const flush = [&paths, &current]() {
+            if (!current.empty())
+                paths.push_back(current);
+            current.clear();
+        };
+        for (std::size_t i = 0; i < deps.size(); ++i)
+        {
+            char const c = deps[i];
+            if (c == '\\' && i + 1 < deps.size() && (deps[i + 1] == ' ' || deps[i + 1] == '\\' || deps[i + 1] == ':'))
+            {
+                current.push_back(deps[i + 1]);
+                ++i;
+                continue;
+            }
+            if (c == ' ' || c == '\t')
+            {
+                flush();
+                continue;
+            }
+            current.push_back(c);
+        }
+        flush();
+    }
+
     return paths;
 }
 
@@ -345,17 +439,12 @@ bool ValidateManifest(DirectManifest const& manifest, PathCanon::Layout const& l
     if (manifest.toolchainStamp != toolchainStamp)
         return false;
 
-    for (auto const& entry: manifest.entries)
-    {
+    // HashFileContents returns empty for a deleted or unreadable header, which
+    // cannot equal a recorded hash — so removal invalidates the manifest too.
+    return std::ranges::all_of(manifest.entries, [&layout](DirectManifest::Entry const& entry) {
         auto const localized = PathCanon::Localize(entry.canonicalPath, layout);
-        if (!localized.has_value())
-            return false;
-        // HashFileContents returns empty for a deleted or unreadable header, which
-        // cannot equal a recorded hash — so removal invalidates too.
-        if (HashFileContents(*localized) != entry.contentHash)
-            return false;
-    }
-    return true;
+        return localized.has_value() && HashFileContents(*localized) == entry.contentHash;
+    });
 }
 
 std::string ComputeManifestKey(std::string_view canonicalSource,

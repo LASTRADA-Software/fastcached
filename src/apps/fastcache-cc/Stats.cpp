@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
-#include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -14,6 +14,9 @@
 
 #if defined(_WIN32)
     #include <windows.h>
+#else
+    #include <fcntl.h>
+    #include <unistd.h>
 #endif
 
 namespace FastCache::Cc
@@ -46,11 +49,15 @@ namespace
             return {};
         base.resize(size > 0 ? size - 1 : 0);
 #else
-        char const* xdg = std::getenv("XDG_STATE_HOME");
-        char const* home = std::getenv("HOME");
-        std::string base = (xdg != nullptr && xdg[0] != '\0') ? std::string { xdg }
-                           : (home != nullptr)                ? std::string { home } + "/.local/state"
-                                                              : std::string {};
+        // XDG_STATE_HOME wins when set; otherwise the spec's default location
+        // under $HOME. Neither present means we have nowhere to record.
+        char const* const xdg = std::getenv("XDG_STATE_HOME");
+        char const* const home = std::getenv("HOME");
+        std::string base;
+        if (xdg != nullptr && xdg[0] != '\0')
+            base = std::string { xdg };
+        else if (home != nullptr)
+            base = std::string { home } + "/.local/state";
 #endif
         if (base.empty())
             return {};
@@ -162,7 +169,7 @@ namespace
         if (sorted.empty())
             return 0;
         auto const scaled = fraction * static_cast<double>(sorted.size() - 1);
-        auto const index = static_cast<std::size_t>(scaled + 0.5);
+        auto const index = static_cast<std::size_t>(std::lround(scaled));
         return sorted[index < sorted.size() ? index : sorted.size() - 1];
     }
 
@@ -231,8 +238,9 @@ namespace
             }
             // Non-empty buckets start at glyph 1, so a single outlier stays visible
             // next to a tall neighbour instead of rendering as the faintest mark.
-            auto const scaled = (static_cast<double>(count) / static_cast<double>(peak)) * (RampGlyphs.size() - 1);
-            auto const glyph = static_cast<std::size_t>(scaled + 0.5);
+            auto const scaled =
+                (static_cast<double>(count) / static_cast<double>(peak)) * static_cast<double>(RampGlyphs.size() - 1);
+            auto const glyph = static_cast<std::size_t>(std::lround(scaled));
             spark += RampGlyphs[glyph < RampGlyphs.size() ? glyph : RampGlyphs.size() - 1];
         }
 
@@ -359,11 +367,15 @@ void AppendRecord(Record const& record)
     ::CloseHandle(handle);
 #else
     // O_APPEND gives the same atomicity for writes under PIPE_BUF on POSIX.
-    std::FILE* file = std::fopen(path.c_str(), "ae");
-    if (file == nullptr)
+    // Opened through the raw syscall rather than std::ofstream: only O_APPEND
+    // on a single write() guarantees whole lines from the hundreds of compilers
+    // in one build interleave instead of shredding each other.
+    int const fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0)
         return;
-    std::fwrite(line.data(), 1, line.size(), file);
-    std::fclose(file);
+    auto const written = ::write(fd, line.data(), line.size());
+    static_cast<void>(written); // recording failures never break a build
+    ::close(fd);
 #endif
 }
 

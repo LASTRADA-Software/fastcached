@@ -14,7 +14,7 @@ What are the pros and cons of each algorithm in terms of compression ratio, spee
 - [ ] Github CI should create a static `fastcached` binary and provide it as artifact.
 - [ ] Add `fastcached stats` command to show in-process stats of the currently running instance (assuming we auto-detect it via config file)
 - [ ] Add `fastcached live-stats` command to show in-process stats live on the terminal (using Sixels, if supported by the connected terminal, otherwise Unicode or ASCII art)
-- [ ] Reactor `UpdateInterest` swallows real `kevent`/`epoll_ctl` failures — surface them instead of stalling. See risk note below.
+- [x] Reactor `UpdateInterest` swallows real `kevent`/`epoll_ctl` failures — surface them instead of stalling. See risk note below. **Done** — and the hazard was not hypothetical: `KqueueReactor::UpdateInterest` submitted both filter changes in one `kevent()` changelist with no eventlist, so the benign `ENOENT` on the `EVFILT_READ` delete aborted the batch before the `EVFILT_WRITE` add was applied. Every reply too large for the socket send buffer parked forever. Fixed with `EV_RECEIPT` (per-change results, no early abort); park sites now fail the awaitable instead of suspending when arming fails. Regression tests in `Net/KqueueSocket_test.cpp`.
 - [ ] **Data-driven `ConfigMerge` (review follow-up — Group D #12).**
       The current `Merge()` in `src/FastCache/Config/ConfigMerge.cpp` is 25
       hand-rolled if-branches; adding a Config field requires touching
@@ -76,6 +76,12 @@ What are the pros and cons of each algorithm in terms of compression ratio, spee
 - [x] disk storage should be btrfs-like copy-on-write to allow O(1) blocking disk saves
 
 ## Risk note: ignoring `Attach`/`UpdateInterest` return values in the socket layer
+
+> **Resolved.** Kept for the reasoning, which turned out to under-state the
+> problem. The note assumed a `false` return was unreachable in practice; the
+> actual failure needed no error at all, just kqueue's documented changelist
+> semantics — an `ENOENT` on the first change silently dropped the second. See
+> the closed item at the top of this file.
 
 **Context.** `KqueueSocket.cpp` / `EpollSocket.cpp` call the reactor's
 `[[nodiscard]] bool Attach(...)` and `bool UpdateInterest(...)` at fire-and-forget

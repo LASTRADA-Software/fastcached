@@ -86,6 +86,31 @@ Task<std::vector<std::byte>> ReadAvailable(ISocket* socket)
     co_return out;
 }
 
+/// Read exactly `count` reply bytes.
+///
+/// ReadAvailable stops as soon as a Read returns less than its chunk size,
+/// which cannot express "the reply is an exact multiple of the chunk" — there
+/// it would loop and park on a Read that nothing will ever satisfy. When the
+/// expected length is known up front (a FETCH hit is 1 + 4 + payload), asking
+/// for exactly that many bytes sidesteps the guesswork entirely.
+/// @param socket Socket to read from.
+/// @param count Exact byte count expected.
+/// @return The bytes read; shorter than `count` if the peer stopped early.
+Task<std::vector<std::byte>> ReadExactlyN(ISocket* socket, std::size_t count)
+{
+    std::vector<std::byte> out;
+    out.reserve(count);
+    while (out.size() < count)
+    {
+        std::vector<std::byte> chunk(count - out.size());
+        auto const r = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        if (!r.has_value() || *r == 0)
+            break;
+        out.insert(out.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*r));
+    }
+    co_return out;
+}
+
 /// Drive one batch of request bytes through the handler and return the raw
 /// reply bytes. Half-closes the client write side so the handler sees EOF.
 std::vector<std::byte> Exchange(CcFixture& fix, std::vector<std::byte> const& request)
@@ -188,6 +213,64 @@ TEST_CASE("STORE canonicalizes showIncludes; FETCH returns the canonical form", 
     CHECK(fetched.textRegions[0].bytes.contains("<SRCROOT>/a.h"));
     CHECK_FALSE(fetched.textRegions[0].bytes.contains(R"(ci\deep)"));
     CHECK(fetched.objectBlob == std::vector<std::byte> { std::byte { 0xDE }, std::byte { 0xAD } });
+}
+
+// Every other handler test uses a two-byte object blob, so nothing here ever
+// exercised a reply big enough to matter. A FETCH reply declares its length up
+// front, which means a transport that delivers fewer bytes than declared leaves
+// the client blocked forever rather than failing — the failure mode that took
+// down a real build. This pins the protocol end of that contract: what STORE
+// accepted is exactly what FETCH hands back, at a size well past any buffer.
+TEST_CASE("STORE/FETCH round-trips an object blob larger than 1 MiB", "[compile-cache][handler][large]")
+{
+    CcFixture fix;
+
+    // Deliberately not a round number: a reply whose length is an exact
+    // multiple of a reader's chunk size is its own (separate) trap, and the
+    // odd size also makes an off-by-one in the framing visible.
+    constexpr std::size_t BlobByteCount = (1024U * 1024U) + 4099U;
+    CompileValue v;
+    v.objectBlob.resize(BlobByteCount);
+    for (std::size_t i = 0; i < BlobByteCount; ++i)
+        v.objectBlob[i] = static_cast<std::byte>((i * 31U) & 0xFF);
+    v.textRegions.push_back({ .grammar = Grammar::ShowIncludes,
+                              .bytes = "Note: including file: "
+                                       R"(C:\ci\deep\src\big.h)"
+                                       "\r\n" });
+
+    auto const storeReply = Exchange(
+        fix,
+        StoreFrame(
+            { .key = "big-obj", .cohort = "envCI", .srcRoot = R"(C:\ci\deep\src)", .buildTree = R"(C:\ci\deep\build)" }, v));
+    REQUIRE(storeReply.size() == 1);
+    REQUIRE(storeReply[0] == static_cast<std::byte>(CompileCacheHandler::Status::Ok));
+
+    InMemorySocketPair pair2 = InMemorySocketPair::Create();
+    CompileCacheHandler handler2;
+    REQUIRE(SyncRun(WriteBytes(pair2.client.get(), FetchFrame("big-obj"))));
+    pair2.client->ShutdownWrite();
+    SessionContext session {};
+    SyncRun(handler2.Run(pair2.server.get(), &fix.engine, {}, session));
+
+    // Read the 5-byte header first so the declared length drives the rest: that
+    // is exactly what a real client does, so a truncated reply shows up here as
+    // a short read instead of as a hang.
+    auto const header = SyncRun(ReadExactlyN(pair2.client.get(), 5));
+    REQUIRE(header.size() == 5);
+    REQUIRE(header[0] == static_cast<std::byte>(CompileCacheHandler::Status::Ok));
+    auto const declared = ReadBigEndian<std::uint32_t>(std::span<std::byte const> { header }.subspan(1, 4));
+    REQUIRE(declared > 1024U * 1024U);
+
+    auto const payload = SyncRun(ReadExactlyN(pair2.client.get(), declared));
+    REQUIRE(payload.size() == declared);
+
+    auto const decoded = DecodeCompileValue(std::span<std::byte const> { payload });
+    REQUIRE(decoded.has_value());
+    auto const fetched = decoded.value_or(CompileValue {});
+    REQUIRE(fetched.objectBlob.size() == BlobByteCount);
+    CHECK(fetched.objectBlob == v.objectBlob);
+    REQUIRE(fetched.textRegions.size() == 1);
+    CHECK(fetched.textRegions[0].bytes.contains("<SRCROOT>/big.h"));
 }
 
 TEST_CASE("FETCH of an absent key replies miss", "[compile-cache][handler]")

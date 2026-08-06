@@ -7,10 +7,12 @@
     #include <sys/types.h>
 
     #include <algorithm>
+    #include <array>
     #include <cerrno>
     #include <chrono>
     #include <cstdint>
     #include <cstring>
+    #include <iterator>
     #include <ranges>
 
     #include <fcntl.h>
@@ -26,6 +28,15 @@ namespace
         if (a.deadline != b.deadline)
             return a.deadline > b.deadline;
         return a.sequence > b.sequence;
+    };
+
+    /// One kqueue filter and whether the caller wants it armed. Lets
+    /// UpdateInterest express "arm or drop" once and drive both filters from a
+    /// table instead of two hand-written EV_SET calls that must stay in sync.
+    struct FilterInterest
+    {
+        std::int16_t filter; ///< EVFILT_READ or EVFILT_WRITE.
+        bool wanted;         ///< True to arm the filter, false to drop it.
     };
 
     [[nodiscard]] timespec DeadlineToTimespec(TimePoint nextDeadline, TimePoint now) noexcept
@@ -89,23 +100,66 @@ bool KqueueReactor::UpdateInterest(KqueueFdHandler* handler, bool read, bool wri
 {
     if (!handler || handler->fd < 0 || _kq < 0)
         return false;
-    struct kevent changes[2];
-    int n = 0;
-    EV_SET(&changes[n++], handler->fd, EVFILT_READ, read ? (EV_ADD | EV_ENABLE) : EV_DELETE, 0, 0, handler);
-    EV_SET(&changes[n++], handler->fd, EVFILT_WRITE, write ? (EV_ADD | EV_ENABLE) : EV_DELETE, 0, 0, handler);
-    // Ignore ENOENT from EV_DELETE on filters that weren't added yet.
-    (void) ::kevent(_kq, changes, n, nullptr, 0, nullptr);
-    return true;
+    // EV_RECEIPT is load-bearing, not a nicety. Without an eventlist, kevent()
+    // stops at the FIRST failing change and returns -1 — the remaining changes
+    // are silently never applied. Deleting a filter that was never armed fails
+    // with ENOENT, so the routine (read=false, write=true) case — a reply write
+    // parking while no read is outstanding — used to abort on the EVFILT_READ
+    // delete and never arm EVFILT_WRITE. The write then parked forever holding
+    // its unsent tail and the client blocked in recv() until it gave up.
+    // EV_RECEIPT forces one result entry per change, so every change is
+    // processed and each error comes back individually in `data`.
+    //
+    // One row per filter: the whole routine is "arm it or drop it", so the two
+    // filters differ only by which flag decides their fate.
+    std::array<FilterInterest, 2> const interests { {
+        { .filter = EVFILT_READ, .wanted = read },
+        { .filter = EVFILT_WRITE, .wanted = write },
+    } };
+
+    std::array<struct kevent, interests.size()> changes {};
+    for (auto const i: std::views::iota(std::size_t { 0 }, interests.size()))
+        EV_SET(std::next(changes.data(), static_cast<std::ptrdiff_t>(i)),
+               handler->fd,
+               interests[i].filter,
+               (interests[i].wanted ? (EV_ADD | EV_ENABLE) : EV_DELETE) | EV_RECEIPT,
+               0,
+               0,
+               handler);
+
+    std::array<struct kevent, interests.size()> results {};
+    auto const applied = ::kevent(
+        _kq, changes.data(), static_cast<int>(changes.size()), results.data(), static_cast<int>(results.size()), nullptr);
+    if (applied < 0)
+        return false;
+
+    // With EV_RECEIPT every returned entry carries EV_ERROR and `data` holds the
+    // errno (0 when the change applied cleanly). Results are matched back by
+    // filter rather than by position so the check does not depend on the kernel
+    // preserving changelist order. ENOENT on a filter we asked to drop just
+    // means it was not armed — the normal steady state, not a failure.
+    return std::ranges::all_of(std::views::counted(results.begin(), applied), [&](struct kevent const& r) noexcept {
+        if (r.data == 0)
+            return true;
+        auto const* const row = std::ranges::find(interests, r.filter, &FilterInterest::filter);
+        return r.data == ENOENT && row != interests.end() && !row->wanted;
+    });
 }
 
 void KqueueReactor::Detach(KqueueFdHandler* handler) const noexcept
 {
     if (!handler || handler->fd < 0 || _kq < 0)
         return;
-    struct kevent changes[2];
-    EV_SET(&changes[0], handler->fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-    EV_SET(&changes[1], handler->fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
-    (void) ::kevent(_kq, changes, 2, nullptr, 0, nullptr);
+    // EV_RECEIPT for the same reason as UpdateInterest: without an eventlist an
+    // ENOENT on the first delete (a filter that was never armed) would abort the
+    // changelist and leave the second filter registered against a handler that
+    // is going away.
+    std::array<struct kevent, 2> changes {};
+    EV_SET(changes.data(), handler->fd, EVFILT_READ, EV_DELETE | EV_RECEIPT, 0, 0, nullptr);
+    EV_SET(std::next(changes.data()), handler->fd, EVFILT_WRITE, EV_DELETE | EV_RECEIPT, 0, 0, nullptr);
+    std::array<struct kevent, 2> results {};
+    (void) ::kevent(
+        _kq, changes.data(), static_cast<int>(changes.size()), results.data(), static_cast<int>(results.size()), nullptr);
 }
 
 void KqueueReactor::Submit(std::coroutine_handle<> handle)

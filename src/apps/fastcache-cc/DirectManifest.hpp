@@ -115,6 +115,22 @@ enum class DirectError : std::uint8_t
 /// @return Every included path, in emission order, with duplicates preserved.
 [[nodiscard]] std::vector<std::string> ParseIncludePaths(std::string_view showIncludesText);
 
+/// Extract the dependency paths from a GNU-style Makefile depfile (`-MF`).
+///
+/// The GNU drivers report header dependencies here rather than on a stream, so
+/// this is the direct-mode counterpart to ParseIncludePaths on POSIX: without
+/// it, direct mode can never populate a manifest for gcc/clang and costs a
+/// wasted lookup per compile while never yielding a hit.
+///
+/// Understands the format's real syntax: a `target: dep dep` rule (the target,
+/// before the unescaped colon, is an output and is NOT a dependency),
+/// backslash-newline continuations, `\ ` escapes for spaces inside a path, and
+/// the phony `dep:` lines `-MP` emits (which have no dependencies of their own).
+///
+/// @param depFileText The depfile contents.
+/// @return Every dependency path, in emission order, with duplicates preserved.
+[[nodiscard]] std::vector<std::string> ParseDepFilePaths(std::string_view depFileText);
+
 /// Build a manifest from one compile's include set.
 ///
 /// Toolchain headers are dropped (the stamp covers them); project headers are

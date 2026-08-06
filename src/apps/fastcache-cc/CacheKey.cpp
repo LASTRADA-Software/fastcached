@@ -20,6 +20,23 @@ namespace
     /// Order matters: the longer `/external:I` must be tried before `/I`.
     constexpr std::array<std::string_view, 4> IncludePrefixes { "/external:I", "-external:I", "/I", "-I" };
 
+    /// True if `c` introduces a command-line option in the MSVC style.
+    ///
+    /// Only meaningful on Windows: on POSIX a leading `/` starts an absolute
+    /// path, never an option, so treating it as one would leave absolute paths
+    /// unrelativized and bake the checkout location into the cache key.
+    /// @param c The argument's first character.
+    /// @return True when `c` introduces an option on this platform.
+    [[nodiscard]] constexpr bool IsWindowsOptionPrefix(char c) noexcept
+    {
+#if defined(_WIN32)
+        return c == '/';
+#else
+        static_cast<void>(c);
+        return false;
+#endif
+    }
+
     /// Relativize one argument against both roots: if it is a bare path or an
     /// include-dir flag whose path lies under the source root or the build tree,
     /// replace the path portion with its canonical token; otherwise return it
@@ -47,7 +64,13 @@ namespace
         // Bare path argument (a source file or a response path). Only rewrite when
         // it actually lies under the source root (Canonicalize returns it verbatim
         // otherwise, so a no-op change is left as-is).
-        if (!arg.empty() && arg.front() != '/' && arg.front() != '-')
+        //
+        // `-` introduces an option everywhere. `/` does so only on Windows: on
+        // POSIX a leading slash is an ABSOLUTE PATH, and skipping those would
+        // leave the checkout path in the key — which is exactly what breaks
+        // cross-machine sharing, since two checkouts at different paths would
+        // then key differently despite identical content.
+        if (!arg.empty() && arg.front() != '-' && !(IsWindowsOptionPrefix(arg.front())))
         {
             auto const canon = PathCanon::Canonicalize(arg, layout);
             if (canon.has_value())

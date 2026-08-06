@@ -234,36 +234,19 @@ endif()
 add_subdirectory(src/FastCache)
 
 # ----------------------------------------------------------------------------
-# Executable target.
+# Executables. Every binary lives under src/apps/<name>/ and declares its own
+# target and install rule there; src/apps/CMakeLists.txt holds the app table
+# that gates each one. The shipped binaries are fastcached and fastcache-cc;
+# compile-cache-testclient is test infrastructure and is off by default.
 
-add_executable(fastcached src/fastcached/main.cpp)
-target_link_libraries(fastcached PRIVATE FastCache)
-
-# ----------------------------------------------------------------------------
-# Optional standalone compile-cache test client — the reference localizer used
-# by the cross-depth validation harness (tools/compile-cache-testclient). Off
-# by default; not shipped in the install tree.
-option(FASTCACHE_BUILD_TESTCLIENT "Build the compile-cache test client" OFF)
-if(FASTCACHE_BUILD_TESTCLIENT)
-    add_subdirectory(tools/compile-cache-testclient)
-endif()
-
-# The sccache-style compiler launcher (drop-in local cache client). Defaults to
-# following the test-client option so a validation build gets both.
-option(FASTCACHE_BUILD_LAUNCHER "Build the fastcache-cc compiler launcher" ${FASTCACHE_BUILD_TESTCLIENT})
-if(FASTCACHE_BUILD_LAUNCHER)
-    add_subdirectory(tools/fastcache-cc)
-endif()
+add_subdirectory(src/apps)
 
 # ----------------------------------------------------------------------------
-# Installation. Lays out the daemon binary and project docs under the standard
-# GNUInstallDirs prefix (bin/ + share/doc/fastcached/). The FastCache/CowTree
-# static libraries and headers are intentionally not installed: they PUBLIC-link
-# an un-installed CPM yaml-cpp, so exporting a consumable SDK is out of scope.
-
-install(TARGETS fastcached
-    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
-)
+# Installation of the project docs, under the standard GNUInstallDirs prefix
+# (share/doc/fastcached/). Each executable installs itself into bin/ from its
+# own subdirectory. The FastCache/CowTree static libraries and headers are
+# intentionally not installed: they PUBLIC-link an un-installed CPM yaml-cpp,
+# so exporting a consumable SDK is out of scope.
 
 install(FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"

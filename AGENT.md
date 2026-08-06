@@ -41,12 +41,39 @@ src/FastCache/
   Metrics/      IMetricsSink + AtomicMetricsSink
 ```
 
-Two client-side tools live under `tools/` (opt-in CMake options, not shipped):
-`compile-cache-testclient` (low-level `0xFC` protocol probe + cross-depth
-validation) and `fastcache-cc` (a drop-in sccache-style **compiler launcher** —
-keys on preprocess+relativized-args, FETCHes/hit-replays with `/showIncludes`
-localized, misses→compile→STORE, falls back safely on any cache error; config
-via `FASTCACHE_*` env, wired through `CMAKE_CXX_COMPILER_LAUNCHER`).
+Every executable lives under `src/apps/<name>/` and declares its own target and
+install rule there; `src/apps/CMakeLists.txt` holds the app table that gates
+each one, so adding an executable is adding a row:
+
+```
+src/apps/
+  fastcached/               the daemon (FASTCACHED_BUILD_DAEMON, default ON)
+  fastcache-cc/             the compiler launcher (FASTCACHED_BUILD_LAUNCHER,
+                            default ON) — a drop-in sccache-style launcher that
+                            keys on preprocess+relativized-args, FETCHes and
+                            hit-replays with include paths localized,
+                            misses→compile→STORE, and falls back safely on any
+                            cache error. Config via `FASTCACHE_*` env, wired
+                            through `CMAKE_<LANG>_COMPILER_LAUNCHER`. Platform
+                            work sits behind `IProcessRunner` / `ITcpClient`,
+                            so main.cpp's flow logic is platform-free.
+  compile-cache-testclient/ low-level `0xFC` protocol probe + cross-depth
+                            validation (FASTCACHED_BUILD_TESTCLIENT, default
+                            OFF — test infrastructure, never installed)
+```
+
+`fastcached` and `fastcache-cc` are both installed. Two things the launcher's
+cache key depends on, both of which have already caused silent hit-rate
+collapses and are now covered by regression tests:
+
+- **Preprocessing must suppress line markers** (`/EP` on MSVC, `-E -P` on GNU).
+  A `# 1 "/abs/path.cpp"` marker embeds the checkout path in the hashed text.
+- **`/` introduces an option only on Windows.** On POSIX it starts an absolute
+  path, and treating it as an option leaves absolute paths unrelativized.
+
+Both break cross-checkout sharing while every unit test still passes, so
+`scripts/compile-cache-e2e.sh` (POSIX) and `run-launcher-e2e.ps1` (Windows)
+assert the property end-to-end in CI on both platforms.
 
 Production flow: `main()` -> CLI -> optional YAML -> `ConfigReloader` ->
 `CacheEngine` over `InMemoryLruStorage` (or, when `--storage` is set, a
