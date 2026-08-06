@@ -207,11 +207,120 @@ namespace
                 return true;
             }
             case Grammar::GccDepfile:
-                // Depfile handling is multi-token; v1 treats each whitespace-split
-                // token via the caller. Not reached as a single-span line here.
+                // A depfile line carries MANY path spans (a target plus its whole
+                // dependency list), so it cannot be expressed as one head/path/tail
+                // split. RewriteDepfile handles this grammar instead.
                 return false;
         }
         return false;
+    }
+
+    /// Rewrite every path token in a GNU-style Makefile depfile.
+    ///
+    /// A depfile line is `target: dep dep ...`, so unlike the single-span
+    /// grammars it carries many paths per line. Both sides are rewritten: the
+    /// target is the object path (under the build tree) and the dependencies are
+    /// the source and its headers (under the source root), and a consumer needs
+    /// all of them pointing into ITS checkout, not the producer's.
+    ///
+    /// Everything that is not a path token — whitespace, the `:` separator,
+    /// backslash-newline continuations, and `\ ` escapes inside a path — is
+    /// copied through byte-for-byte, so the file the build system reads keeps the
+    /// exact syntax the compiler emitted.
+    ///
+    /// @param text  The depfile bytes.
+    /// @param xform Path transform applied to each token (Canonicalize/Localize).
+    /// @return The rewritten depfile.
+    template <class Xform>
+    [[nodiscard]] std::string RewriteDepfile(std::string_view text, Xform const& xform)
+    {
+        std::string out;
+        out.reserve(text.size());
+
+        std::string token; // the path token being accumulated, unescaped
+        std::string raw;   // the same token exactly as written, escapes intact
+
+        // Emit the pending token, transformed, re-applying the original escaping
+        // when the transform left the token unchanged (so an untouched path keeps
+        // its bytes) and escaping spaces afresh when it rewrote it.
+        auto const flush = [&out, &token, &raw, &xform]() {
+            if (token.empty())
+                return;
+            auto const rewritten = xform(std::string_view { token });
+            if (rewritten == token)
+            {
+                out.append(raw); // unchanged — preserve the exact original spelling
+            }
+            else
+            {
+                // A rewritten path may contain spaces that make must not split on.
+                for (char const c: rewritten)
+                {
+                    if (c == ' ')
+                        out.push_back('\\');
+                    out.push_back(c);
+                }
+            }
+            token.clear();
+            raw.clear();
+        };
+
+        for (std::size_t i = 0; i < text.size(); ++i)
+        {
+            char const c = text[i];
+
+            // An escape pair belongs to the token: `\ ` is a literal space inside
+            // a path. A backslash-newline is a line continuation and is not.
+            if (c == '\\' && i + 1 < text.size() && (text[i + 1] == ' ' || text[i + 1] == '\\' || text[i + 1] == ':'))
+            {
+                token.push_back(text[i + 1]);
+                raw.push_back(c);
+                raw.push_back(text[i + 1]);
+                ++i;
+                continue;
+            }
+
+            // A backslash immediately before a newline is a line continuation and
+            // ends the token; anywhere else it is a Windows path separator and
+            // belongs to the path ("D:\src\a.cpp" is ONE token, not three).
+            if (c == '\\')
+            {
+                bool const continuation =
+                    i + 1 < text.size()
+                    && (text[i + 1] == '\n' || (text[i + 1] == '\r' && i + 2 < text.size() && text[i + 2] == '\n'));
+                if (continuation)
+                {
+                    flush();
+                    out.push_back(c);
+                    continue;
+                }
+                token.push_back(c);
+                raw.push_back(c);
+                continue;
+            }
+
+            // Any separator ends the current token and is copied verbatim.
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+            {
+                flush();
+                out.push_back(c);
+                continue;
+            }
+
+            // A ':' separates target from dependencies — unless it is a Windows
+            // drive letter, which is part of the path itself ("C:\src\a.cpp").
+            if (c == ':' && !(token.size() == 1 && std::isalpha(static_cast<unsigned char>(token.front())) != 0))
+            {
+                flush();
+                out.push_back(c);
+                continue;
+            }
+
+            token.push_back(c);
+            raw.push_back(c);
+        }
+        flush();
+        return out;
     }
 
     /// Apply `xform` to each grammar-identified path span across every line of
@@ -279,12 +388,23 @@ std::expected<std::string, CanonError> Localize(std::string_view token, Layout c
 
 std::expected<std::string, CanonError> CanonicalizeRegion(std::string_view text, Grammar grammar, Layout const& layout)
 {
-    return RewriteRegion(text, grammar, [&](std::string_view span) { return CanonicalizeOne(span, layout); });
+    auto const xform = [&](std::string_view span) {
+        return CanonicalizeOne(span, layout);
+    };
+    // The depfile grammar is multi-token per line, so it needs its own walker.
+    if (grammar == Grammar::GccDepfile)
+        return RewriteDepfile(text, xform);
+    return RewriteRegion(text, grammar, xform);
 }
 
 std::expected<std::string, CanonError> LocalizeRegion(std::string_view text, Grammar grammar, Layout const& layout)
 {
-    return RewriteRegion(text, grammar, [&](std::string_view span) { return LocalizeOne(span, layout); });
+    auto const xform = [&](std::string_view span) {
+        return LocalizeOne(span, layout);
+    };
+    if (grammar == Grammar::GccDepfile)
+        return RewriteDepfile(text, xform);
+    return RewriteRegion(text, grammar, xform);
 }
 
 } // namespace FastCache::PathCanon
