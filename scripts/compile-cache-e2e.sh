@@ -106,9 +106,13 @@ cat "${workdir}/miss.log"
 [[ -f "${proj}/build/a.o" ]] || fail "first compile produced no object"
 grep -q "MISS" "${workdir}/miss.log" || fail "first compile was not reported as a MISS"
 grep -q "STORED" "${workdir}/miss.log" || fail "first compile did not store its result"
+[[ -f "${proj}/build/a.d" ]] || fail "first compile produced no depfile"
 
 cp "${proj}/build/a.o" "${workdir}/expected.o"
-rm -f "${proj}/build/a.o"
+cp "${proj}/build/a.d" "${workdir}/expected.d"
+# Remove BOTH: a hit must reproduce the depfile as well as the object. Leaving
+# the depfile in place would let a launcher that never restores it still pass.
+rm -f "${proj}/build/a.o" "${proj}/build/a.d"
 
 echo "== compile 2 (expect HIT) =="
 "$launcher" "$compiler" -std=c++23 -MD -MF "${proj}/build/a.d" -c "${proj}/a.cpp" -o "${proj}/build/a.o" \
@@ -118,6 +122,15 @@ grep -q "HIT" "${workdir}/hit.log" || fail "second compile was not served from t
 [[ -f "${proj}/build/a.o" ]] || fail "cache hit did not write the object"
 cmp "${workdir}/expected.o" "${proj}/build/a.o" || fail "cached object differs from the compiled one"
 echo "   object reproduced byte-identically"
+
+# The depfile is the build system's header-dependency record. A hit that omits
+# it leaves Ninja/Make believing the TU depends on nothing, so it silently stops
+# rebuilding when its headers change — a correctness bug no object comparison
+# catches, because the object itself is perfect.
+[[ -f "${proj}/build/a.d" ]] || fail "cache hit did not restore the depfile"
+grep -q "hdr.hpp" "${proj}/build/a.d" \
+    || fail "restored depfile does not list the header the TU includes"
+echo "   depfile restored on the hit"
 
 # --- 3: cross-depth portability ---------------------------------------------
 # Same content, different checkout depth. The key must match, because paths
@@ -153,6 +166,19 @@ grep -q "HIT" "${workdir}/shallow.log" \
 cmp "${deep}/build/t.o" "${shallow}/build/t.o" || fail "cross-depth object differs"
 echo "   cross-depth hit reproduced the object byte-identically"
 
+# The depfile restored from a hit must name THIS checkout's paths. If the stored
+# depfile were replayed verbatim, the shallow checkout would get a file full of
+# the deep checkout's absolute paths — pointing at another tree, or at nothing.
+[[ -f "${shallow}/build/t.d" ]] || fail "cross-depth hit did not restore the depfile"
+grep -q "${shallow}" "${shallow}/build/t.d" \
+    || fail "restored depfile was not localized to the consuming checkout"
+# `if !` rather than `grep && fail`: under `set -e` a non-matching grep exits 1
+# and would abort the script on the SUCCESS path.
+if grep -q "${deep}" "${shallow}/build/t.d"; then
+    fail "restored depfile still carries the producing checkout's paths"
+fi
+echo "   depfile localized to the consuming checkout"
+
 # --- 4: the cache is never load-bearing -------------------------------------
 # With no daemon reachable the build must still succeed, uncached.
 echo "== unreachable daemon must still compile =="
@@ -160,6 +186,44 @@ FASTCACHE_ADDR="127.0.0.1:1" "$launcher" "$compiler" -std=c++23 -c "${proj}/a.cp
     2> "${workdir}/fallback.log" || fail "compile failed when the cache was unreachable"
 cat "${workdir}/fallback.log"
 [[ -f "${proj}/build/fb.o" ]] || fail "fallback compile produced no object"
+
+# --- 5: forms the launcher must decline to cache ----------------------------
+# A compile with no -o defaults its output to ./a.o, a path the launcher cannot
+# reconstruct. It must pass straight through rather than claim the compile and
+# then fail to store it on every single invocation.
+echo "== a compile with no -o must pass through and still build =="
+nooutdir="${workdir}/noout"
+mkdir -p "$nooutdir"
+cp "${proj}/a.cpp" "${proj}/hdr.hpp" "$nooutdir/"
+export FASTCACHE_SRCROOT="$nooutdir" FASTCACHE_BUILDTREE="$nooutdir"
+# The compiler defaults its output to ./a.o, so this must run FROM that
+# directory; `$launcher` may be a relative path, so resolve it before the cd.
+launcher_abs="$(cd "$(dirname "$launcher")" && pwd)/$(basename "$launcher")"
+( cd "$nooutdir" && "$launcher_abs" "$compiler" -std=c++23 -c a.cpp 2> "${workdir}/noout.log" ) \
+    || { cat "${workdir}/noout.log" >&2; fail "compile without -o returned non-zero"; }
+cat "${workdir}/noout.log"
+[[ -f "${nooutdir}/a.o" ]] || fail "compile without -o produced no object"
+# It is not a cache candidate at all, so it must report neither outcome.
+if grep -qE "MISS|HIT" "${workdir}/noout.log"; then
+    fail "compile without -o was treated as cacheable"
+fi
+echo "   passed through uncached, object still produced"
+
+# A flag that merely starts like a dropped one must not be dropped: -coverage
+# begins with -c, and eating it used to break preprocessing and force a
+# permanent, silent fallback to uncached compiles.
+echo "== a flag prefixed like a dropped flag must not break caching =="
+export FASTCACHE_SRCROOT="$proj" FASTCACHE_BUILDTREE="${proj}/build"
+"$launcher" "$compiler" -std=c++23 -coverage -c "${proj}/a.cpp" -o "${proj}/build/cov.o" \
+    2> "${workdir}/coverage.log" || fail "compile with -coverage returned non-zero"
+cat "${workdir}/coverage.log"
+[[ -f "${proj}/build/cov.o" ]] || fail "compile with -coverage produced no object"
+if grep -q "preprocess failed" "${workdir}/coverage.log"; then
+    fail "-coverage was mistaken for -c and broke the preprocess probe"
+fi
+grep -qE "MISS|HIT" "${workdir}/coverage.log" \
+    || fail "compile with -coverage was not a cache candidate"
+echo "   -coverage survived the preprocess line"
 
 # --- statistics -------------------------------------------------------------
 echo "== statistics =="

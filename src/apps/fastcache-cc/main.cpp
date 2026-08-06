@@ -346,6 +346,67 @@ void AppendField(std::vector<std::byte>& out, std::span<std::byte const> bytes)
     return PathCanon::Grammar::ShowIncludes;
 }
 
+/// Index of the depfile inside a stored value's text regions.
+///
+/// Regions are positional: 0 = stdout, 1 = stderr, 2 = the GNU depfile. A value
+/// stored before depfile support simply has no region 2, so it decodes and
+/// replays exactly as before — the addition is backward compatible.
+constexpr std::size_t DepFileRegionIndex = 2;
+
+/// Number of captured streams replayed to our own stdout/stderr. Regions beyond
+/// these are files, not streams, and must never be replayed.
+constexpr std::size_t ReplayRegionCount = 2;
+
+/// Read the depfile a GNU-driver compile just wrote, for storing alongside the
+/// object.
+///
+/// A depfile is the build system's record of which headers a translation unit
+/// depends on. Ninja and Make read it to decide whether to recompile; without
+/// it the TU appears to depend on nothing and stops rebuilding when its headers
+/// change. It therefore has to be reproduced on a hit exactly like the object.
+///
+/// @param cmd The parsed compile command.
+/// @return The depfile text, or nullopt when the line requested none (or it is
+///         unreadable, in which case there is simply nothing to cache).
+[[nodiscard]] std::optional<std::string> ReadDepFile(Cc::ParsedCommand const& cmd)
+{
+    if (cmd.depPath.empty())
+        return std::nullopt;
+    auto const bytes = ReadFileBytes(std::filesystem::path { cmd.depPath });
+    if (!bytes.has_value())
+        return std::nullopt;
+    return std::string { reinterpret_cast<char const*>(bytes->data()), bytes->size() };
+}
+
+/// Write the cached depfile back, localized to this machine's layout.
+///
+/// Called on every hit. A miss wrote its own depfile as a side effect of running
+/// the real compiler; a hit runs no compiler, so without this the file the build
+/// system depends on would simply be absent (or, worse, left stale from an
+/// earlier build).
+///
+/// @param cmd     The parsed compile command (its depPath is the destination).
+/// @param regions The decoded value's text regions.
+/// @param layout  This machine's roots, for localizing the recorded paths.
+/// @return True when there was nothing to do or the write succeeded.
+[[nodiscard]] bool RestoreDepFile(Cc::ParsedCommand const& cmd,
+                                  std::vector<TextRegion> const& regions,
+                                  PathCanon::Layout const& layout)
+{
+    if (cmd.depPath.empty() || regions.size() <= DepFileRegionIndex)
+        return true; // nothing requested, or a value stored before depfile support
+
+    auto const& region = regions[DepFileRegionIndex];
+    auto localized = PathCanon::LocalizeRegion(region.bytes, region.grammar, layout);
+    std::string const& text = localized.has_value() ? *localized : region.bytes;
+
+    std::ofstream out { std::filesystem::path { cmd.depPath }, std::ios::binary };
+    if (!out)
+        return false;
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    return out.good();
+}
+
 /// True if the source file at `path` references a compile-time-varying macro
 /// (`__TIME__` / `__DATE__` / `__TIMESTAMP__`). Such a TU cannot be cached
 /// because it re-keys every second. Reads the file text and looks for the
@@ -494,10 +555,16 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
     if (!WriteFileBytes(cmd.objPath, decoded->objectBlob))
         return std::nullopt;
 
+    // The depfile is a file, not a stream: restore it before replaying, so a
+    // failure to write it is not reported after the build has already seen the
+    // compiler's output.
+    if (!RestoreDepFile(cmd, decoded->textRegions, layout))
+        return std::nullopt;
+
     // Region 0 = stdout, region 1 = stderr, per the STORE ordering.
     std::string_view replayOut;
     std::string_view replayErr;
-    std::array<std::string, 2> localizedText;
+    std::array<std::string, ReplayRegionCount> localizedText;
     for (std::size_t idx = 0; idx < decoded->textRegions.size() && idx < localizedText.size(); ++idx)
     {
         auto const& region = decoded->textRegions[idx];
@@ -553,6 +620,14 @@ void RecordManifest(Config const& cfg,
     auto includes = Cc::ParseIncludePaths(includeTextOut);
     auto const fromErr = Cc::ParseIncludePaths(includeTextErr);
     includes.insert(includes.end(), fromErr.begin(), fromErr.end());
+
+    // GNU drivers report nothing on either stream — their dependencies go to the
+    // depfile. Without this, direct mode could never populate on POSIX: every
+    // compile would pay for a manifest lookup that always missed.
+    if (includes.empty())
+        if (auto const depText = ReadDepFile(cmd))
+            includes = Cc::ParseDepFilePaths(*depText);
+
     if (includes.empty())
         return;
 
@@ -743,10 +818,20 @@ void RecordManifest(Config const& cfg,
                 return std::nullopt;
             }
             PathCanon::Layout const consumer { .sourceRoot = cfg.srcRoot, .buildTree = cfg.buildTree };
+
+            // Reproduce the depfile the compiler would have written. Skipping it
+            // silently breaks incremental builds: Ninja/Make would see no header
+            // dependencies for this TU and stop rebuilding it when they change.
+            if (!RestoreDepFile(cmd, decoded->textRegions, consumer))
+            {
+                Warn("could not write depfile on hit");
+                return std::nullopt;
+            }
+
             // Region 0 = stdout, region 1 = stderr (see STORE below).
             std::string_view replayOut;
             std::string_view replayErr;
-            std::array<std::string, 2> localizedText;
+            std::array<std::string, ReplayRegionCount> localizedText;
             for (std::size_t idx = 0; idx < decoded->textRegions.size() && idx < localizedText.size(); ++idx)
             {
                 auto const& region = decoded->textRegions[idx];
@@ -806,6 +891,13 @@ void RecordManifest(Config const& cfg,
     // non-matching line in either region is preserved verbatim.
     value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = run.out });
     value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = run.err });
+
+    // Region 2, when present, is the GNU depfile the compile just wrote. It is
+    // tagged with the depfile grammar so the daemon canonicalizes the header
+    // paths inside it — a depfile full of this machine's absolute paths would be
+    // useless (and wrong) when replayed on another checkout.
+    if (auto const depText = ReadDepFile(cmd))
+        value.textRegions.push_back({ .grammar = PathCanon::Grammar::GccDepfile, .bytes = *depText });
 
     auto const encoded = EncodeCompileValue(value);
     auto client = TcpClient::Connect(cfg.addr);

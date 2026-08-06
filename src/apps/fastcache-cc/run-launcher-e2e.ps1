@@ -10,6 +10,12 @@
 #      compiled from a SHALLOW srcroot (different checkout), with showIncludes
 #      localized so the deps resolve.
 #
+# The POSIX counterpart (scripts/compile-cache-e2e.sh) additionally asserts that
+# a hit restores the GNU depfile, localized to the consuming checkout. That has
+# no analogue here: the MSVC drivers report dependencies inline via
+# /showIncludes (asserted above) and set usesDepfile = false, so -MF is never
+# parsed and no depfile region is ever stored for them.
+#
 # Output is generic status only; nothing project-private is read or emitted,
 # nothing is committed.
 
