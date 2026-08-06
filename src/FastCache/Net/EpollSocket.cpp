@@ -372,12 +372,41 @@ void EpollSocket::Close() noexcept
             ::close(_impl->handler.fd);
             _impl->handler.fd = -1;
         }
+        // Fail whatever was parked. The interest is gone, so nothing will ever
+        // complete these awaitables; leaving them set leaks the suspended
+        // coroutine on abrupt teardown.
+        for (auto* op: { &_impl->readOp, &_impl->writeOp })
+        {
+            if (op->awaitable == nullptr)
+                continue;
+            auto* awaitable = op->awaitable;
+            op->awaitable = nullptr;
+            op->readBuffer = {};
+            op->writeRemaining = {};
+            op->ClearVectored();
+            awaitable->Complete(
+                std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+        }
     }
     _fd = -1;
 }
 
 namespace
 {
+
+    /// The awaitable to return when the reactor refuses to arm interest for an
+    /// operation that is about to park.
+    ///
+    /// Parking on interest the kernel did not register is unrecoverable: the
+    /// event never fires, so the coroutine never resumes and the connection
+    /// stalls forever holding whatever it had left to transfer. A reported
+    /// error tears the connection down instead, which the peer can observe.
+    /// @return An awaitable already resolved to a NetError.
+    [[nodiscard]] IoAwaitable ArmFailed()
+    {
+        return IoAwaitable { std::unexpected(NetError {
+            .code = NetErrorCode::SystemError, .systemCode = errno, .context = "epoll_ctl: could not arm interest" }) };
+    }
 
     void EpollSocketAwaitableSuspended(IoAwaitable* self, std::coroutine_handle<> /*handle*/)
     {
@@ -406,8 +435,11 @@ IoAwaitable EpollSocket::Read(std::span<std::byte> buffer)
     _impl->readOp.readPeekOnly = false;
     IoAwaitable a;
     a.SetSuspendCallback(&EpollSocketAwaitableSuspended, &_impl->readOp);
-    std::ignore =
-        _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ true, /*write*/ _impl->writeOp.awaitable != nullptr);
+    if (!_impl->reactor.UpdateInterest(&_impl->handler, /*read*/ true, /*write*/ _impl->writeOp.awaitable != nullptr))
+    {
+        _impl->readOp.readBuffer = {};
+        return ArmFailed();
+    }
     return a;
 }
 
@@ -433,8 +465,11 @@ IoAwaitable EpollSocket::WaitReadable()
     _impl->readOp.readPeekOnly = true;
     IoAwaitable a;
     a.SetSuspendCallback(&EpollSocketAwaitableSuspended, &_impl->readOp);
-    std::ignore =
-        _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ true, /*write*/ _impl->writeOp.awaitable != nullptr);
+    if (!_impl->reactor.UpdateInterest(&_impl->handler, /*read*/ true, /*write*/ _impl->writeOp.awaitable != nullptr))
+    {
+        _impl->readOp.readPeekOnly = false;
+        return ArmFailed();
+    }
     return a;
 }
 
@@ -463,12 +498,20 @@ IoAwaitable EpollSocket::Write(std::span<std::byte const> buffer)
 
     // Park.
     _impl->writeOp.awaitable = nullptr;
+    // Drop any vectored state before parking a scalar write: OnWritable checks
+    // writeSegments first, so a leftover cursor would make it re-send the
+    // previous operation's bytes and then report THIS buffer's size as sent.
+    _impl->writeOp.ClearVectored();
     _impl->writeOp.writeRemaining = remaining;
     _impl->writeOp.writeTotal = buffer.size();
     IoAwaitable a;
     a.SetSuspendCallback(&EpollSocketAwaitableSuspended, &_impl->writeOp);
-    std::ignore =
-        _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ _impl->readOp.awaitable != nullptr, /*write*/ true);
+    if (!_impl->reactor.UpdateInterest(&_impl->handler, /*read*/ _impl->readOp.awaitable != nullptr, /*write*/ true))
+    {
+        _impl->writeOp.writeRemaining = {};
+        _impl->writeOp.writeTotal = 0;
+        return ArmFailed();
+    }
     return a;
 }
 
@@ -495,6 +538,9 @@ IoAwaitable EpollSocket::WriteVectored(std::span<std::span<std::byte const> cons
 
     // Park: stash the cursor + keep-alive and arm EPOLLOUT.
     _impl->writeOp.awaitable = nullptr;
+    // Symmetric to the scalar path: a stale writeRemaining must not outlive the
+    // operation that set it.
+    _impl->writeOp.writeRemaining = {};
     _impl->writeOp.writeSegments = std::move(owned);
     _impl->writeOp.writeSegIndex = segIndex;
     _impl->writeOp.writeSegOffset = segOffset;
@@ -502,8 +548,11 @@ IoAwaitable EpollSocket::WriteVectored(std::span<std::span<std::byte const> cons
     _impl->writeOp.writeKeepAlive = std::move(keepAlive);
     IoAwaitable a;
     a.SetSuspendCallback(&EpollSocketAwaitableSuspended, &_impl->writeOp);
-    std::ignore =
-        _impl->reactor.UpdateInterest(&_impl->handler, /*read*/ _impl->readOp.awaitable != nullptr, /*write*/ true);
+    if (!_impl->reactor.UpdateInterest(&_impl->handler, /*read*/ _impl->readOp.awaitable != nullptr, /*write*/ true))
+    {
+        _impl->writeOp.ClearVectored();
+        return ArmFailed();
+    }
     return a;
 }
 
@@ -641,6 +690,11 @@ AcceptAwaitable EpollListener::Accept()
     auto const fd = ::accept4(_impl->handler.fd, reinterpret_cast<sockaddr*>(&client), &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd >= 0)
     {
+        // Same tuning as the reactor-driven accept path (Impl::OnReadable):
+        // without it, connections accepted through this fast path keep the
+        // default send buffer and Nagle, so large replies park far sooner and
+        // behave differently depending on which path happened to accept them.
+        Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(fd));
         auto peer = FormatPeerAddress(Detail::EndpointFromSockaddr(&client, static_cast<std::uint32_t>(len)));
         return AcceptAwaitable { AcceptResult { std::make_unique<EpollSocket>(_impl->reactor, fd, std::move(peer)) } };
     }

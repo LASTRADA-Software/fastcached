@@ -96,8 +96,10 @@ namespace
     };
 
     /// Send segments from cursor `[segIndex, segOffset]` onward, advancing the
-    /// cursor in place. macOS lacks `MSG_NOSIGNAL`; SIGPIPE is suppressed via
-    /// the `SO_NOSIGPIPE` option applied at accept, so the flags stay 0.
+    /// cursor in place. macOS lacks `MSG_NOSIGNAL`; SIGPIPE is suppressed
+    /// process-wide by `::signal(SIGPIPE, SIG_IGN)` in
+    /// `Detail::EnsureNetworkInitialised` (BlockingSocket.cpp), so the flags
+    /// stay 0.
     /// @param fd Socket file descriptor.
     /// @param segments Ordered payload segments.
     /// @param segIndex In/out: index of the first unsent segment.
@@ -206,6 +208,14 @@ struct KqueueSocket::Impl
     static void OnReadable(KqueueFdHandler* base);
     static void OnWritable(KqueueFdHandler* base);
 
+    /// Re-arm interest to match the currently pending operations.
+    ///
+    /// Called from the completion paths, where the result is genuinely not
+    /// actionable: the awaitable is about to be completed either way, and a
+    /// filter left armed with no pending op is harmless — OnReadable/OnWritable
+    /// return immediately when there is no awaitable. The park paths do NOT use
+    /// this helper; there a failed arm must fail the awaitable, because nothing
+    /// would ever resume it.
     void UpdateInterest()
     {
         std::ignore = reactor.UpdateInterest(&handler, readOp.awaitable != nullptr, writeOp.awaitable != nullptr);
@@ -351,6 +361,21 @@ void KqueueSocket::Close() noexcept
             ::close(_impl->handler.fd);
             _impl->handler.fd = -1;
         }
+        // Fail whatever was parked. The filters are gone, so nothing will ever
+        // complete these awaitables; leaving them set leaks the suspended
+        // coroutine on abrupt teardown. Mirrors KqueueListener::Close.
+        for (auto* op: { &_impl->readOp, &_impl->writeOp })
+        {
+            if (op->awaitable == nullptr)
+                continue;
+            auto* awaitable = op->awaitable;
+            op->awaitable = nullptr;
+            op->readBuffer = {};
+            op->writeRemaining = {};
+            op->ClearVectored();
+            awaitable->Complete(
+                std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+        }
     }
     _fd = -1;
 }
@@ -362,6 +387,20 @@ namespace
     {
         auto* op = static_cast<KqueueSocket::Impl::Op*>(self->CallbackState());
         op->awaitable = self;
+    }
+
+    /// The awaitable to return when the reactor refuses to arm interest for an
+    /// operation that is about to park.
+    ///
+    /// Parking on a filter the kernel did not register is unrecoverable: the
+    /// event never fires, so the coroutine never resumes and the connection
+    /// stalls forever holding whatever it had left to transfer. A reported
+    /// error tears the connection down instead, which the peer can observe.
+    /// @return An awaitable already resolved to a NetError.
+    [[nodiscard]] IoAwaitable ArmFailed()
+    {
+        return IoAwaitable { std::unexpected(NetError {
+            .code = NetErrorCode::SystemError, .systemCode = errno, .context = "kevent: could not arm interest" }) };
     }
 
 } // namespace
@@ -383,7 +422,11 @@ IoAwaitable KqueueSocket::Read(std::span<std::byte> buffer)
     _impl->readOp.readPeekOnly = false;
     IoAwaitable a;
     a.SetSuspendCallback(&KqueueSocketAwaitableSuspended, &_impl->readOp);
-    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, true, _impl->writeOp.awaitable != nullptr);
+    if (!_impl->reactor.UpdateInterest(&_impl->handler, true, _impl->writeOp.awaitable != nullptr))
+    {
+        _impl->readOp.readBuffer = {};
+        return ArmFailed();
+    }
     return a;
 }
 
@@ -408,7 +451,11 @@ IoAwaitable KqueueSocket::WaitReadable()
     _impl->readOp.readPeekOnly = true;
     IoAwaitable a;
     a.SetSuspendCallback(&KqueueSocketAwaitableSuspended, &_impl->readOp);
-    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, true, _impl->writeOp.awaitable != nullptr);
+    if (!_impl->reactor.UpdateInterest(&_impl->handler, true, _impl->writeOp.awaitable != nullptr))
+    {
+        _impl->readOp.readPeekOnly = false;
+        return ArmFailed();
+    }
     return a;
 }
 
@@ -435,11 +482,20 @@ IoAwaitable KqueueSocket::Write(std::span<std::byte const> buffer)
         return IoAwaitable { IoResult { buffer.size() } };
 
     _impl->writeOp.awaitable = nullptr;
+    // Drop any vectored state before parking a scalar write: OnWritable checks
+    // writeSegments first, so a leftover cursor would make it re-send the
+    // previous operation's bytes and then report THIS buffer's size as sent.
+    _impl->writeOp.ClearVectored();
     _impl->writeOp.writeRemaining = remaining;
     _impl->writeOp.writeTotal = buffer.size();
     IoAwaitable a;
     a.SetSuspendCallback(&KqueueSocketAwaitableSuspended, &_impl->writeOp);
-    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, _impl->readOp.awaitable != nullptr, true);
+    if (!_impl->reactor.UpdateInterest(&_impl->handler, _impl->readOp.awaitable != nullptr, true))
+    {
+        _impl->writeOp.writeRemaining = {};
+        _impl->writeOp.writeTotal = 0;
+        return ArmFailed();
+    }
     return a;
 }
 
@@ -462,6 +518,9 @@ IoAwaitable KqueueSocket::WriteVectored(std::span<std::span<std::byte const> con
         return IoAwaitable { IoResult { sent } };
 
     _impl->writeOp.awaitable = nullptr;
+    // Symmetric to the scalar path: a stale writeRemaining must not outlive the
+    // operation that set it.
+    _impl->writeOp.writeRemaining = {};
     _impl->writeOp.writeSegments = std::move(owned);
     _impl->writeOp.writeSegIndex = segIndex;
     _impl->writeOp.writeSegOffset = segOffset;
@@ -469,7 +528,11 @@ IoAwaitable KqueueSocket::WriteVectored(std::span<std::span<std::byte const> con
     _impl->writeOp.writeKeepAlive = std::move(keepAlive);
     IoAwaitable a;
     a.SetSuspendCallback(&KqueueSocketAwaitableSuspended, &_impl->writeOp);
-    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, _impl->readOp.awaitable != nullptr, true);
+    if (!_impl->reactor.UpdateInterest(&_impl->handler, _impl->readOp.awaitable != nullptr, true))
+    {
+        _impl->writeOp.ClearVectored();
+        return ArmFailed();
+    }
     return a;
 }
 
@@ -602,6 +665,11 @@ AcceptAwaitable KqueueListener::Accept()
     if (fd >= 0)
     {
         SetNonBlocking(fd);
+        // Same tuning as the reactor-driven accept path (Impl::OnReadable):
+        // without it, connections accepted through this fast path keep the
+        // default send buffer and Nagle, so large replies park far sooner and
+        // behave differently depending on which path happened to accept them.
+        Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(fd));
         auto peer = FormatPeerAddress(Detail::EndpointFromSockaddr(&client, static_cast<std::uint32_t>(len)));
         return AcceptAwaitable { AcceptResult { std::make_unique<KqueueSocket>(_impl->reactor, fd, std::move(peer)) } };
     }
@@ -611,7 +679,9 @@ AcceptAwaitable KqueueListener::Accept()
     _impl->pending = nullptr;
     AcceptAwaitable a;
     a.SetSuspendCallback(&ListenerAwaitableSuspended, _impl.get());
-    std::ignore = _impl->reactor.UpdateInterest(&_impl->handler, true, false);
+    if (!_impl->reactor.UpdateInterest(&_impl->handler, true, false))
+        return AcceptAwaitable { std::unexpected(NetError {
+            .code = NetErrorCode::SystemError, .systemCode = errno, .context = "kevent: could not arm accept interest" }) };
     return a;
 }
 
