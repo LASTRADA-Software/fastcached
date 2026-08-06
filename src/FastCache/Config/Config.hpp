@@ -82,6 +82,15 @@ struct Config
     /// this return StorageErrorCode::ValueTooLarge.
     std::size_t storageMaxValueBytes { 16 * 1024 * 1024 };
 
+    /// Maximum bytes the on-disk (L2) tier may hold, across all shards
+    /// (the `--storage-max-disk` flag). Only meaningful with `--storage`.
+    /// 0 (the default) means unbounded — the disk file grows to whatever the
+    /// cached content needs. When non-zero, the budget is split evenly across
+    /// the physical shards and each shard's CoW tree evicts its LRU tail to
+    /// stay within its share, so the total on-disk footprint is capped. Set
+    /// this to keep a build cache within a fixed disk allotment.
+    std::size_t storageMaxDiskBytes { 0 };
+
     /// Number of independent pinned reactors to run (the `--threads`
     /// flag). Each reactor is a single-threaded event loop; connections
     /// are pinned to one for their lifetime, so this is the server's
@@ -255,6 +264,23 @@ struct Config
     /// Values smaller than this are never compressed (their CPU cost is not
     /// worth it and tiny values rarely shrink). Defaults to 256 bytes.
     std::size_t compressionMinBytes { 256 };
+
+    /// Codec for the IN-MEMORY (L1) tier, independent of the on-disk `compression`
+    /// above. `Identity` (the default) keeps reads allocation-free; anything else
+    /// trades a decompress on every read for a much larger effective cache.
+    ///
+    /// Worth enabling when the working set exceeds RAM: compile-cache objects with
+    /// embedded debug info compress ~4.5x, so a 27 GB working set becomes ~6 GB, at
+    /// ~3.5 ms per 3.3 MB value read. Leave it off for small values or
+    /// latency-critical reads, where the decompress dominates.
+    CompressionCodec memoryCompression { CompressionCodec::Identity };
+
+    /// Effort level for `memoryCompression`. Level 3 is the measured speed/ratio
+    /// knee; higher levels cost much more to write for a few percent of size.
+    int memoryCompressionLevel { 3 };
+
+    /// Values smaller than this stay uncompressed in memory.
+    std::size_t memoryCompressionMinBytes { 4096 };
 };
 
 } // namespace FastCache

@@ -139,6 +139,10 @@ std::expected<std::optional<TimePoint>, StorageError> NotifyingStorage::PeekExpi
 {
     return _inner.PeekExpiry(key, now);
 }
+std::expected<bool, StorageError> NotifyingStorage::Prefetch(std::string_view key, TimePoint now)
+{
+    return _inner.Prefetch(key, now);
+}
 
 std::expected<CasToken, StorageError> NotifyingStorage::MarkStale(std::string_view key,
                                                                   std::optional<TimePoint> newExpiry,

@@ -100,6 +100,11 @@ class ShardedStorage final: public IStorage
 
     [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
 
+    /// Warm `key` into its owning shard's in-memory tier under that shard's
+    /// exclusive lock. Forwards to the shard storage's Prefetch. See
+    /// IStorage::Prefetch.
+    [[nodiscard]] std::expected<bool, StorageError> Prefetch(std::string_view key, TimePoint now) override;
+
     [[nodiscard]] std::expected<CasToken, StorageError> MarkStale(std::string_view key,
                                                                   std::optional<TimePoint> newExpiry,
                                                                   TimePoint now) override;

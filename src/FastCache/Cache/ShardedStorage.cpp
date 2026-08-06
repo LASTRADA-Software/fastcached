@@ -159,6 +159,13 @@ std::expected<GetResult, StorageError> ShardedStorage::Peek(std::string_view key
     return shard.storage->Peek(key, now);
 }
 
+std::expected<bool, StorageError> ShardedStorage::Prefetch(std::string_view key, TimePoint now)
+{
+    auto& shard = *_shards[ShardIndexFor(key)];
+    std::unique_lock const lock { shard.mu };
+    return shard.storage->Prefetch(key, now);
+}
+
 std::expected<CasToken, StorageError> ShardedStorage::MarkStale(std::string_view key,
                                                                 std::optional<TimePoint> newExpiry,
                                                                 TimePoint now)

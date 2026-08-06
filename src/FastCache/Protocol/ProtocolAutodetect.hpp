@@ -23,7 +23,12 @@ enum class ProtocolFlavor : std::uint8_t
     MemcachedText,
     MemcachedBinary, ///< Not yet implemented; recognised but currently treated like MemcachedText.
     RedisResp,       ///< Not yet implemented; recognised but currently treated like MemcachedText.
+    CompileCache,    ///< fastcached's own compile-cache binary protocol (magic 0xFC).
 };
+
+/// First byte of the compile-cache protocol. Distinct from the memcached
+/// binary magic (0x80) and every RESP first byte, so autodetect can route it.
+inline constexpr std::byte CompileCacheMagic { 0xFC };
 
 /// Stable, lower-case name for a ProtocolFlavor, suitable for log output.
 /// @param flavor Flavor to translate.
@@ -38,6 +43,8 @@ enum class ProtocolFlavor : std::uint8_t
             return "memcached-binary";
         case ProtocolFlavor::RedisResp:
             return "redis-resp";
+        case ProtocolFlavor::CompileCache:
+            return "compile-cache";
         case ProtocolFlavor::Unknown:
             return "unknown";
     }
@@ -52,6 +59,16 @@ struct AutodetectResult
     ProtocolFlavor flavor { ProtocolFlavor::Unknown };
     std::vector<std::byte> primer;
 };
+
+/// Classify the protocol from the very first byte of a connection. Exposed so
+/// the routing logic is unit-testable without a socket.
+///   0x80 → memcached binary
+///   0xFC → compile-cache
+///   '*'/'+'/'-'/':'/'$' → Redis RESP
+///   anything else → memcached text
+/// @param first The first byte read from the stream.
+/// @return The detected flavor.
+[[nodiscard]] ProtocolFlavor ClassifyFirstByte(std::byte first) noexcept;
 
 /// Read enough bytes from `socket` to determine the protocol.
 /// Heuristic: the very first byte is sufficient.

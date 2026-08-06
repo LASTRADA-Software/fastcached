@@ -210,6 +210,23 @@ std::expected<GetResult, StorageError> LayeredStorage::Peek(std::string_view key
     return _l2->Peek(key, now);
 }
 
+std::expected<bool, StorageError> LayeredStorage::Prefetch(std::string_view key, TimePoint now)
+{
+    // Warm L1 from L2 via the shared mirror path. Deliberately does NOT touch
+    // _stats: a prefetch is not a client read (see IStorage::Prefetch). If the
+    // entry is already in L1, this still re-mirrors it harmlessly; the common
+    // case (cold L1) pulls it up from the canonical tier.
+    auto const l1 = _l1->Peek(key, now);
+    if (!l1.has_value())
+        return std::unexpected(l1.error());
+    if (l1->found)
+        return true; // Already warm — nothing to pull.
+    auto const fromL2 = LoadFromL2AndMirror(key, now);
+    if (!fromL2.has_value())
+        return std::unexpected(fromL2.error());
+    return fromL2->found;
+}
+
 std::expected<CasToken, StorageError> LayeredStorage::MarkStale(std::string_view key,
                                                                 std::optional<TimePoint> newExpiry,
                                                                 TimePoint now)

@@ -4,6 +4,7 @@
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/StringHash.hpp>
 
@@ -32,9 +33,26 @@ namespace FastCache
 /// an insert/replace would push bytesUsed above maxBytes, the LRU tail is
 /// evicted until under budget. The key string and per-entry overhead are
 /// not counted — the budget is approximate.
+///
+/// **Optional in-memory compression.** With a codec configured, values are held
+/// compressed and the budget counts their *compressed* size, so the tier holds far
+/// more entries per byte of RAM. Compile-cache objects built with embedded debug
+/// info compress ~4.5x (measured on 400 MB of real `/Z7` objects), turning a
+/// 27 GB working set into ~6 GB. The cost is a decompress on every read —
+/// ~3.5 ms for a 3.3 MB object, against the ~200 ms a cache hit already takes —
+/// so it is opt-in and off by default for latency-sensitive workloads.
 class InMemoryLruStorage final: public IStorage
 {
   public:
+    /// In-memory compression settings. `codec == Identity` (the default) stores
+    /// values verbatim and keeps reads allocation-free.
+    struct CompressionOptions
+    {
+        CompressionCodec codec { CompressionCodec::Identity };
+        int level { 3 };               ///< Codec effort; 3 is zstd's speed/ratio knee.
+        std::size_t minBytes { 4096 }; ///< Below this, compression rarely pays for itself.
+    };
+
     /// Construct with the given byte budget and per-value size cap.
     /// `maxBytes == 0` disables eviction entirely; `maxValueBytes == 0`
     /// disables the per-value limit. Both default to 0 (useful for unit
@@ -51,6 +69,17 @@ class InMemoryLruStorage final: public IStorage
     explicit InMemoryLruStorage(std::size_t maxBytes = 0,
                                 std::size_t maxValueBytes = 0,
                                 LruMode lruMode = LruMode::Approximate) noexcept;
+
+    /// Enable in-memory compression.
+    ///
+    /// Safe to call at any time: whether a value is compressed is recorded per
+    /// entry (in storage-private node state, not in `CacheEntry`), so values stored
+    /// under an earlier setting stay readable and small values may be kept verbatim.
+    /// @param options Codec, level and minimum size.
+    void SetCompression(CompressionOptions const& options) noexcept
+    {
+        _compression = options;
+    }
 
     [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key, TimePoint now) override;
 
@@ -136,6 +165,17 @@ class InMemoryLruStorage final: public IStorage
     {
         std::string key;
         CacheEntry entry;
+
+        /// Codec the stored bytes are in. `Identity` means `entry.value` already
+        /// holds plaintext — the case for small values and for a tier with
+        /// compression disabled. Kept here rather than in `CacheEntry` so the
+        /// compression scheme stays private to this tier and does not widen a
+        /// struct that every protocol handler constructs.
+        CompressionCodec storedCodec { CompressionCodec::Identity };
+
+        /// Plaintext length, needed to size the decompression buffer. Meaningful
+        /// only when `storedCodec != Identity`.
+        std::size_t plainSize { 0 };
     };
 
     using LruList = std::list<Node>;
@@ -154,6 +194,34 @@ class InMemoryLruStorage final: public IStorage
     /// @param now Current clock value.
     /// @return Pointer to the live entry, or nullptr.
     [[nodiscard]] CacheEntry const* FindAliveReadOnly(std::string_view key, TimePoint now) const;
+
+    /// Read-only lookup that also reports the node's codec state, so a caller can
+    /// decompress. Returns nullptr on miss.
+    /// @param key The key to find.
+    /// @param now Current time, for expiry.
+    /// @return The node, or nullptr.
+    [[nodiscard]] Node const* FindNodeReadOnly(std::string_view key, TimePoint now) const;
+
+    /// Compress `value` when the configured codec applies, else return it verbatim.
+    /// @param value      Plaintext bytes.
+    /// @param storedCodec [out] Codec the returned bytes are in.
+    /// @param plainSize   [out] Original plaintext length.
+    /// @return The bytes to store.
+    [[nodiscard]] SharedValue EncodeForStorage(std::span<std::byte const> value,
+                                               CompressionCodec& storedCodec,
+                                               std::size_t& plainSize) const;
+
+    /// Materialize a node's plaintext entry, decompressing when needed.
+    /// @param node The node to read.
+    /// @return A copy of the entry whose value is plaintext.
+    [[nodiscard]] CacheEntry PlaintextEntry(Node const& node) const;
+
+    /// A node's value as plaintext bytes, for the in-place mutators (append,
+    /// prepend, incr/decr) that must read the current value before rewriting it.
+    /// Empty when a compressed value cannot be decoded.
+    /// @param node The node to read.
+    /// @return The plaintext bytes.
+    [[nodiscard]] std::vector<std::byte> PlaintextBytes(Node const& node) const;
 
     /// Insert a new entry; evicts as needed to stay under the byte budget.
     /// The value bytes are copied into a fresh immutable buffer.
@@ -184,6 +252,7 @@ class InMemoryLruStorage final: public IStorage
     std::size_t _maxBytes;
     std::size_t _maxValueBytes;
     LruMode _lruMode;
+    CompressionOptions _compression {};
     std::size_t _bytesUsed { 0 };
     std::uint64_t _liveGeneration { 1 };
     TimePoint _flushEffectiveAt { TimePoint::min() };

@@ -38,6 +38,31 @@ TEST_CASE("YamlReader: parses all recognised keys", "[config][yaml]")
     REQUIRE(cfg->logLevel == FastCache::LogLevel::Debug);
 }
 
+TEST_CASE("YamlReader: storage_max_value and storage_max_disk parse byte-size suffixes", "[config][yaml][storage]")
+{
+    auto const path = WriteTempYaml("storagecaps",
+                                    "storage_path: /tmp/cache.cow\n"
+                                    "storage_max_value: 256m\n"
+                                    "storage_max_disk: 10g\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE(cfg.has_value());
+    REQUIRE(cfg->storageMaxValueBytes == 256ULL * 1024U * 1024U);
+    REQUIRE(cfg->storageMaxDiskBytes == 10ULL * 1024U * 1024U * 1024U);
+}
+
+TEST_CASE("YamlReader: storage_max_disk defaults to 0 (unbounded) when unset", "[config][yaml][storage]")
+{
+    auto const cfg = FastCache::ReadYamlConfig(WriteTempYaml("nodisk", "storage_path: /tmp/c.cow\n"));
+    REQUIRE(cfg.has_value());
+    REQUIRE(cfg->storageMaxDiskBytes == 0U);
+}
+
+TEST_CASE("YamlReader: malformed storage_max_disk is rejected", "[config][yaml][storage]")
+{
+    auto const cfg = FastCache::ReadYamlConfig(WriteTempYaml("baddisk", "storage_max_disk: lots\n"));
+    REQUIRE_FALSE(cfg.has_value());
+}
+
 TEST_CASE("YamlReader: log_source toggles the connection source prefix", "[config][yaml]")
 {
     auto const on = FastCache::ReadYamlConfig(WriteTempYaml("logsrc-on", "log_source: true\n"));

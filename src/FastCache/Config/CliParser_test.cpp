@@ -265,6 +265,36 @@ TEST_CASE("CliParser: --storage-max-value parses byte-size suffixes", "[config][
     }
 }
 
+TEST_CASE("CliParser: --storage-max-disk parses byte-size suffixes; defaults to 0 (unbounded)", "[config][cli][storage]")
+{
+    {
+        // Default: unbounded disk tier.
+        auto const args = std::array<char const*, 1> { "--storage=/tmp/x.cow" };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(result.has_value());
+        REQUIRE(result->config.storageMaxDiskBytes == 0U);
+    }
+    {
+        auto const args = std::array<char const*, 1> { "--storage-max-disk=10g" };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(result.has_value());
+        REQUIRE(result->config.storageMaxDiskBytes == 10ULL * 1024U * 1024U * 1024U);
+    }
+    {
+        auto const args = std::array<char const*, 1> { "--storage-max-disk=512m" };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(result.has_value());
+        REQUIRE(result->config.storageMaxDiskBytes == 512ULL * 1024U * 1024U);
+    }
+}
+
+TEST_CASE("CliParser: --storage-max-disk rejects nonsense", "[config][cli][storage]")
+{
+    auto const args = std::array<char const*, 1> { "--storage-max-disk=lots" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE_FALSE(result.has_value());
+}
+
 TEST_CASE("CliParser: --storage-max-value rejects nonsense", "[config][cli][storage]")
 {
     auto const args = std::array<char const*, 1> { "--storage-max-value=abc" };

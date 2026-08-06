@@ -188,6 +188,23 @@ CowTree::FilePageStore::Durability ToPageStoreDurability(FastCache::StorageDurab
     return r == FastCache::LruRecency::Strict ? FastCache::LruMode::Strict : FastCache::LruMode::Approximate;
 }
 
+/// Build an L1 tier with the configured byte budget and in-memory codec.
+///
+/// Every L1 instance goes through here so the memory-compression settings cannot be
+/// applied to some shards and silently missed on others.
+/// @param effective  Merged configuration.
+/// @param maxBytes   Byte budget for this instance (per-shard where sharded).
+/// @return The configured storage.
+[[nodiscard]] std::unique_ptr<FastCache::InMemoryLruStorage> MakeL1(FastCache::Config const& effective, std::size_t maxBytes)
+{
+    auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(
+        maxBytes, effective.storageMaxValueBytes, ToLruMode(effective.lruRecency));
+    l1->SetCompression({ .codec = effective.memoryCompression,
+                         .level = effective.memoryCompressionLevel,
+                         .minBytes = effective.memoryCompressionMinBytes });
+    return l1;
+}
+
 /// Holds the assembled storage chain. The reload subscriber resizes it
 /// through the virtual `IStorage::Resize`, so no typed observer pointers
 /// are needed.
@@ -200,11 +217,17 @@ struct StorageBackendBundle
 /// InMemoryLruStorage, L2 CowTreeStorage). The L1 cache owns the
 /// per-shard memory budget; the disk tier is unbounded for now.
 [[nodiscard]] std::expected<std::unique_ptr<FastCache::LayeredStorage>, std::string> BuildLayeredShard(
-    std::filesystem::path const& path, FastCache::Config const& effective, std::size_t perShardBytes)
+    std::filesystem::path const& path,
+    FastCache::Config const& effective,
+    std::size_t perShardBytes,
+    std::size_t perShardDiskBytes)
 {
     FastCache::CowTreeStorage::Options opts;
     opts.path = path;
-    opts.maxBytes = 0; // L2 is unbounded; L1 holds the byte budget
+    // L2 disk budget: 0 = unbounded (grows as needed); non-zero caps the
+    // on-disk tier and makes the CoW tree evict its LRU tail to fit. L1 holds
+    // the RAM byte budget (perShardBytes) independently.
+    opts.maxBytes = perShardDiskBytes;
     opts.durability = ToPageStoreDurability(effective.storageDurability);
     opts.maxValueBytes = effective.storageMaxValueBytes;
     opts.compression = effective.compression;
@@ -213,8 +236,7 @@ struct StorageBackendBundle
     auto opened = FastCache::CowTreeStorage::Open(opts);
     if (!opened.has_value())
         return std::unexpected(opened.error().ToString());
-    auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(
-        perShardBytes, effective.storageMaxValueBytes, ToLruMode(effective.lruRecency));
+    auto l1 = MakeL1(effective, perShardBytes);
     return std::make_unique<FastCache::LayeredStorage>(std::move(l1), std::move(*opened));
 }
 
@@ -222,7 +244,11 @@ struct StorageBackendBundle
 /// wrapper. Handles three shapes: in-memory fan-out, single-file
 /// persistent, and multi-file persistent (directory of shard-NN.cow).
 [[nodiscard]] std::expected<std::vector<std::unique_ptr<FastCache::IStorage>>, std::string> BuildShardedInners(
-    FastCache::Config const& effective, bool usingPersistent, std::size_t physicalShards, std::size_t perShardBytes)
+    FastCache::Config const& effective,
+    bool usingPersistent,
+    std::size_t physicalShards,
+    std::size_t perShardBytes,
+    std::size_t perShardDiskBytes)
 {
     std::vector<std::unique_ptr<FastCache::IStorage>> inners;
     inners.reserve(physicalShards);
@@ -230,14 +256,13 @@ struct StorageBackendBundle
     if (!usingPersistent)
     {
         for (std::size_t i = 0; i < physicalShards; ++i)
-            inners.emplace_back(std::make_unique<FastCache::InMemoryLruStorage>(
-                perShardBytes, effective.storageMaxValueBytes, ToLruMode(effective.lruRecency)));
+            inners.emplace_back(MakeL1(effective, perShardBytes));
         return inners;
     }
 
     if (physicalShards == 1)
     {
-        auto layered = BuildLayeredShard(effective.storagePath, effective, perShardBytes);
+        auto layered = BuildLayeredShard(effective.storagePath, effective, perShardBytes, perShardDiskBytes);
         if (!layered.has_value())
             return std::unexpected(std::format("failed to open storage '{}': {}", effective.storagePath, layered.error()));
         inners.push_back(std::move(*layered));
@@ -254,7 +279,7 @@ struct StorageBackendBundle
     for (std::size_t i = 0; i < physicalShards; ++i)
     {
         auto const path = dir / std::format("shard-{:02d}.cow", i);
-        auto layered = BuildLayeredShard(path, effective, perShardBytes);
+        auto layered = BuildLayeredShard(path, effective, perShardBytes, perShardDiskBytes);
         if (!layered.has_value())
             return std::unexpected(std::format("failed to open shard '{}': {}", path.string(), layered.error()));
         inners.push_back(std::move(*layered));
@@ -282,11 +307,15 @@ struct StorageBackendBundle
                                                                                    std::size_t physicalShards)
 {
     auto const perShardBytes = physicalShards > 0 ? effective.maxMemoryBytes / physicalShards : effective.maxMemoryBytes;
+    // Split the on-disk budget the same way as the RAM budget. 0 stays 0
+    // (unbounded) after the division, so the default remains "grow as needed".
+    auto const perShardDiskBytes =
+        physicalShards > 0 ? effective.storageMaxDiskBytes / physicalShards : effective.storageMaxDiskBytes;
     StorageBackendBundle bundle;
 
     if (useShardingWrapper)
     {
-        auto inners = BuildShardedInners(effective, usingPersistent, physicalShards, perShardBytes);
+        auto inners = BuildShardedInners(effective, usingPersistent, physicalShards, perShardBytes, perShardDiskBytes);
         if (!inners.has_value())
             return std::unexpected(std::move(inners.error()));
         bundle.backend = std::make_unique<FastCache::ShardedStorage>(std::move(*inners));
@@ -296,12 +325,11 @@ struct StorageBackendBundle
     // Unwrapped single-shard reactor path.
     if (!usingPersistent)
     {
-        bundle.backend = std::make_unique<FastCache::InMemoryLruStorage>(
-            effective.maxMemoryBytes, effective.storageMaxValueBytes, ToLruMode(effective.lruRecency));
+        bundle.backend = MakeL1(effective, effective.maxMemoryBytes);
         return bundle;
     }
 
-    auto layered = BuildLayeredShard(effective.storagePath, effective, perShardBytes);
+    auto layered = BuildLayeredShard(effective.storagePath, effective, perShardBytes, perShardDiskBytes);
     if (!layered.has_value())
         return std::unexpected(std::format("failed to open storage '{}': {}", effective.storagePath, layered.error()));
     bundle.backend = std::move(*layered);

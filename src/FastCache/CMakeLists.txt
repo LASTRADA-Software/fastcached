@@ -17,6 +17,9 @@ target_sources(FastCache
         Cache/ShardedStorage.cpp
         Cache/TracingStorage.cpp
         Cache/WriteErrorReportingStorage.cpp
+        CompileCache/CohortManifest.cpp
+        CompileCache/CompileValue.cpp
+        CompileCache/PathCanon.cpp
         Config/ByteSize.cpp
         Config/CliParser.cpp
         Config/ConfigMerge.cpp
@@ -41,6 +44,7 @@ target_sources(FastCache
         Platform/WindowsServiceHost.cpp
         Net/InMemoryTransport.cpp
         Net/Framing/LineReader.cpp
+        Protocol/CompileCacheHandler.cpp
         Protocol/MemcachedBinary.cpp
         Protocol/MemcachedMeta.cpp
         Protocol/MemcachedText.cpp

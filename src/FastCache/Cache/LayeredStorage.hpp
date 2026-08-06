@@ -110,6 +110,12 @@ class LayeredStorage final: public IStorage
 
     [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
 
+    /// Warm `key` from L2 into the L1 mirror without any client-read side
+    /// effect (no hit/miss stat change, no LRU-as-hit promotion). Reuses the
+    /// same L2→L1 mirror path as a read-through Get but skips the stat
+    /// bookkeeping. See IStorage::Prefetch.
+    [[nodiscard]] std::expected<bool, StorageError> Prefetch(std::string_view key, TimePoint now) override;
+
     [[nodiscard]] std::expected<CasToken, StorageError> MarkStale(std::string_view key,
                                                                   std::optional<TimePoint> newExpiry,
                                                                   TimePoint now) override;
