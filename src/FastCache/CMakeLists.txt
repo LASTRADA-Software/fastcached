@@ -44,6 +44,7 @@ target_sources(FastCache
         Platform/WindowsServiceHost.cpp
         Net/InMemoryTransport.cpp
         Net/Framing/LineReader.cpp
+        Protocol/CompileCacheHandler.cpp
         Protocol/MemcachedBinary.cpp
         Protocol/MemcachedMeta.cpp
         Protocol/MemcachedText.cpp

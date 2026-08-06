@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/MemcachedBinary.hpp>
 #include <FastCache/Protocol/MemcachedText.hpp>
 #include <FastCache/Protocol/ProtocolAutodetect.hpp>
@@ -87,6 +88,11 @@ Task<void> Connection::Run()
         }
         case ProtocolFlavor::RedisResp: {
             RedisRespHandler handler;
+            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer), _session);
+            break;
+        }
+        case ProtocolFlavor::CompileCache: {
+            CompileCacheHandler handler;
             co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer), _session);
             break;
         }

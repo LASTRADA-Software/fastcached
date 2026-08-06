@@ -16,25 +16,27 @@ namespace
 
     constexpr std::byte BinaryMagic { 0x80 };
 
-    [[nodiscard]] ProtocolFlavor ClassifyFirstByte(std::byte b) noexcept
-    {
-        if (b == BinaryMagic)
-            return ProtocolFlavor::MemcachedBinary;
-        auto const c = static_cast<char>(b);
-        switch (c)
-        {
-            case '*':
-            case '+':
-            case '-':
-            case ':':
-            case '$':
-                return ProtocolFlavor::RedisResp;
-            default:
-                return ProtocolFlavor::MemcachedText;
-        }
-    }
-
 } // namespace
+
+ProtocolFlavor ClassifyFirstByte(std::byte first) noexcept
+{
+    if (first == BinaryMagic)
+        return ProtocolFlavor::MemcachedBinary;
+    if (first == CompileCacheMagic)
+        return ProtocolFlavor::CompileCache;
+    auto const c = static_cast<char>(first);
+    switch (c)
+    {
+        case '*':
+        case '+':
+        case '-':
+        case ':':
+        case '$':
+            return ProtocolFlavor::RedisResp;
+        default:
+            return ProtocolFlavor::MemcachedText;
+    }
+}
 
 Task<std::expected<AutodetectResult, NetError>> DetectProtocol(ISocket* socket)
 {
