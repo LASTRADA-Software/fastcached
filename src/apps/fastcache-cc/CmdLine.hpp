@@ -84,8 +84,9 @@ struct ParsedCommand
 /// depfile path, and whether inline include reporting was requested.
 ///
 /// `parsedOk` is false when the line has no single source file (a link step, a
-/// multi-TU line) or is preprocess-only — the launcher then falls back to a
-/// plain exec.
+/// multi-TU line), names no explicit object output (`g++ -c a.cpp`, which
+/// defaults to `./a.o` — a path the launcher cannot reconstruct), or is
+/// preprocess-only — the launcher then falls back to a plain exec.
 ///
 /// @param argv The full invocation, argv[0] being the compiler.
 /// @return The parsed command; `parsedOk` gates cacheability.

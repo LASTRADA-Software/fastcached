@@ -314,7 +314,13 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
     // A cacheable line compiles exactly one TU to an object. A preprocess-only
     // run produces text, not an object, so it is never cached; a line with no
     // -c/​/c is a link (or a compile-and-link) and is likewise left alone.
-    out.parsedOk = !out.source.empty() && sawCompileOnly && !preprocessOnly;
+    //
+    // The object path must be known, too. `g++ -c a.cpp` (no -o) is a perfectly
+    // ordinary compile that defaults its output to ./a.o, but the launcher has
+    // no path to read the object back from or write it to — treating it as
+    // cacheable makes every such compile report a MISS and then fail to store,
+    // forever, and would hand an empty path to the file writer on a hit.
+    out.parsedOk = !out.source.empty() && !out.objPath.empty() && sawCompileOnly && !preprocessOnly;
     return out;
 }
 

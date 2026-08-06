@@ -259,6 +259,24 @@ TEST_CASE("ParseCommand accepts a separator-joined value")
     CHECK(Parse({ "g++", "-c", "a.cpp", "-MF=dep/a.d", "-o", "a.o" }).depPath == "dep/a.d");
 }
 
+TEST_CASE("ParseCommand refuses a compile with no explicit object output")
+{
+    // Regression guard. `g++ -c a.cpp` defaults its output to ./a.o, a path the
+    // launcher does not reconstruct. Treating it as cacheable made every such
+    // compile report a MISS and then fail to store — permanently, on every
+    // invocation — and would hand an empty path to the object writer on a hit.
+    auto const p = Parse({ "g++", "-c", "a.cpp" });
+    CHECK(p.source == "a.cpp");
+    CHECK(p.objPath.empty());
+    CHECK_FALSE(p.parsedOk);
+
+    // The MSVC spelling of the same thing.
+    CHECK_FALSE(Parse({ "cl.exe", "/c", "a.cpp" }).parsedOk);
+    // ...while the explicit forms stay cacheable.
+    CHECK(Parse({ "g++", "-c", "a.cpp", "-o", "a.o" }).parsedOk);
+    CHECK(Parse({ "cl.exe", "/c", "a.cpp", "/Foa.obj" }).parsedOk);
+}
+
 TEST_CASE("DriverOf reports where each driver reports its dependencies")
 {
     // cl prints /showIncludes notes on stderr, clang-cl on stdout; the GNU
