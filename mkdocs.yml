@@ -9,8 +9,11 @@
 # wired into CI yet.
 
 site_name: fastcached
-site_description: A memcached- and Redis-compatible cache daemon
+site_description: A memcached- and Redis-compatible cache daemon, and a portable compile cache
 site_author: fastcached contributors
+site_url: https://lastrada-software.github.io/fastcached/
+repo_url: https://github.com/LASTRADA-Software/fastcached
+edit_uri: edit/master/docs/
 copyright: Apache-2.0 licensed. Memcached and Redis are registered trademarks of their respective owners.
 
 theme:
@@ -70,6 +73,10 @@ nav:
   - Getting started:
     - Install: getting-started/install.md
     - Quickstart: getting-started/quickstart.md
+  - Tools:
+    - Overview: tools/index.md
+    - fastcache-cc (compiler launcher): tools/fastcache-cc.md
+    - compile-cache-testclient: tools/compile-cache-testclient.md
   - Protocols:
     - Overview: protocols/overview.md
     - Coverage matrix: protocols/coverage-matrix.md
@@ -82,6 +89,7 @@ nav:
     - Binary opcodes: protocols/binary-opcodes.md
     - Binary status codes: protocols/status-codes.md
     - Redis RESP2: protocols/redis-resp.md
+    - Compile cache (0xFC): protocols/compile-cache.md
   - Commands:
     - Index: commands/index.md
     - memcached storage:
@@ -146,6 +154,8 @@ nav:
       - FLUSHALL: commands/redis/server/flushall.md
     - Unsupported Redis commands: commands/redis/unsupported.md
   - Operations:
+    - Deployment: operations/deployment.md
+    - Running a compile cache: operations/compile-cache-server.md
     - Known limitations: operations/known-limitations.md
   - Internals:
     - Architecture: internals/architecture.md
