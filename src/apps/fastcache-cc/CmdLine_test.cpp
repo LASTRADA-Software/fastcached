@@ -186,6 +186,79 @@ TEST_CASE("PreprocessCommand uses the MSVC spelling for MSVC drivers")
     CHECK_FALSE(std::ranges::contains(pp, "/Foout.obj"));
 }
 
+TEST_CASE("PreprocessCommand does not drop a flag that merely starts like a dropped one")
+{
+    // Regression guard. Matching drop flags by bare prefix made `-c` swallow
+    // `-coverage` and `-cxx-isystem`, and `/c` swallow `/clr` — removing a real
+    // flag from the probe line and stranding its separated value as a second
+    // input file. The probe then fails and the TU compiles UNCACHED forever,
+    // while every other unit test still passes. Silent hit-rate collapse.
+    struct Case
+    {
+        std::vector<std::string> argv;
+        std::string mustKeep; ///< Flag that must survive onto the probe line.
+        std::string alsoKeep; ///< Its value, when given separately.
+    };
+    auto const cases = std::vector<Case> {
+        { .argv = { "g++", "-c", "-cxx-isystem", "/inc", "a.cpp", "-o", "a.o" },
+          .mustKeep = "-cxx-isystem",
+          .alsoKeep = "/inc" },
+        { .argv = { "g++", "-c", "-coverage", "a.cpp", "-o", "a.o" }, .mustKeep = "-coverage", .alsoKeep = "" },
+        { .argv = { "clang++", "-c", "-current_version", "2", "a.cpp", "-o", "a.o" },
+          .mustKeep = "-current_version",
+          .alsoKeep = "2" },
+        // MSVC: /clr, /constexpr:steps and /cgthreads all begin with "/c".
+        { .argv = { "cl.exe", "/c", "/clr", "a.cpp", "/Foa.obj" }, .mustKeep = "/clr", .alsoKeep = "" },
+        { .argv = { "cl.exe", "/c", "/constexpr:steps1000", "a.cpp", "/Foa.obj" },
+          .mustKeep = "/constexpr:steps1000",
+          .alsoKeep = "" },
+        { .argv = { "cl.exe", "/c", "/cgthreads4", "a.cpp", "/Foa.obj" }, .mustKeep = "/cgthreads4", .alsoKeep = "" },
+        // -MP / -MMD start like -M-family drop flags but are distinct flags.
+        { .argv = { "g++", "-c", "-MMD", "a.cpp", "-o", "a.o" }, .mustKeep = "", .alsoKeep = "" },
+    };
+
+    for (auto const& c: cases)
+    {
+        INFO("flag: " << c.mustKeep);
+        auto const pp = PreprocessCommand(Parse(c.argv), c.argv);
+        if (!c.mustKeep.empty())
+            CHECK(std::ranges::contains(pp, c.mustKeep));
+        if (!c.alsoKeep.empty())
+            CHECK(std::ranges::contains(pp, c.alsoKeep));
+        // The source must always survive, and be the only non-flag input.
+        CHECK(std::ranges::contains(pp, "a.cpp"));
+    }
+}
+
+TEST_CASE("PreprocessCommand still drops the joined forms of real dropped flags")
+{
+    // The fix must not overshoot: a genuinely joined value (`-MFdep.d`,
+    // `/Foout.obj`) is still the dropped flag and must go, value and all.
+    std::vector<std::string> const gnu { "g++", "-c", "a.cpp", "-oout/a.o", "-MD", "-MFdep/a.d" };
+    auto const gnuPp = PreprocessCommand(Parse(gnu), gnu);
+    CHECK_FALSE(std::ranges::contains(gnuPp, "-oout/a.o"));
+    CHECK_FALSE(std::ranges::contains(gnuPp, "-MFdep/a.d"));
+    CHECK(std::ranges::contains(gnuPp, "a.cpp"));
+
+    std::vector<std::string> const msvc { "cl.exe", "/c", "/Foout.obj", "a.cpp" };
+    CHECK_FALSE(std::ranges::contains(PreprocessCommand(Parse(msvc), msvc), "/Foout.obj"));
+}
+
+TEST_CASE("PreprocessCommand consumes a separated value only for the bare flag")
+{
+    // A joined form carries its own value, so consuming the NEXT argument too
+    // would eat a real flag — here the -I that follows.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-MFdep.d", "-Iinclude", "-o", "a.o" };
+    auto const pp = PreprocessCommand(Parse(argv), argv);
+    CHECK(std::ranges::contains(pp, "-Iinclude"));
+    CHECK_FALSE(std::ranges::contains(pp, "-MFdep.d"));
+}
+
+TEST_CASE("ParseCommand accepts a separator-joined value")
+{
+    CHECK(Parse({ "g++", "-c", "a.cpp", "-MF=dep/a.d", "-o", "a.o" }).depPath == "dep/a.d");
+}
+
 TEST_CASE("DriverOf reports where each driver reports its dependencies")
 {
     // cl prints /showIncludes notes on stderr, clang-cl on stdout; the GNU

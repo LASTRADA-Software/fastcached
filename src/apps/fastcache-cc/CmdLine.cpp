@@ -153,6 +153,61 @@ namespace
         return std::ranges::contains(ValueFlags, flag);
     }
 
+    /// Characters that may separate a flag from a value fused onto it.
+    ///
+    /// Only a value-taking flag may appear in joined form at all, and the join
+    /// must be a value — never more flag name. `-MFdep.d` and `-o=x.o` are the
+    /// joined forms; `-MP` merely starts with `-M`, and `-coverage` with `-c`.
+    constexpr std::string_view JoinSeparators = "=:";
+
+    /// True if `arg` is `flag` carrying a fused value, rather than a different
+    /// flag that merely begins with the same characters.
+    ///
+    /// Getting this wrong is expensive and silent: matching on `starts_with`
+    /// alone makes `-c` swallow `-coverage` and `/c` swallow `/clr`, dropping a
+    /// real flag from the preprocess line (and stranding its value as a stray
+    /// input file), so the probe fails and every such TU compiles uncached
+    /// forever while all unit tests still pass.
+    ///
+    /// A value-taking flag joins directly (`-MFdep.d`, `/Fox.obj`) or through a
+    /// separator (`-MF=dep.d`). A flag that takes no value has no joined form,
+    /// so anything longer than it is a different flag.
+    ///
+    /// @param arg  The argument as it appeared on the command line.
+    /// @param flag The candidate flag.
+    /// @return True when `arg` is `flag` with a value fused onto it.
+    [[nodiscard]] bool IsJoinedValue(std::string_view arg, std::string_view flag)
+    {
+        if (!arg.starts_with(flag) || arg.size() <= flag.size())
+            return false;
+        if (!TakesValue(flag))
+            return false;
+        auto const tail = arg.substr(flag.size());
+        // `/Fo` and `-o` fuse their value directly; a separator is also accepted
+        // so `-MF=dep.d` is not mistaken for an unrelated flag.
+        return !JoinSeparators.contains(tail.front()) || tail.size() > 1;
+    }
+
+    /// Drop a leading join separator from a fused value, so `-MF=dep.d` and
+    /// `-MFdep.d` both yield `dep.d`.
+    /// @param tail The text following the flag in its joined form.
+    /// @return The value proper.
+    [[nodiscard]] std::string_view StripJoinSeparator(std::string_view tail)
+    {
+        if (!tail.empty() && JoinSeparators.contains(tail.front()))
+            tail.remove_prefix(1);
+        return tail;
+    }
+
+    /// True if `arg` is `flag` exactly, or `flag` with a fused value.
+    /// @param arg  The argument as it appeared on the command line.
+    /// @param flag The candidate flag.
+    /// @return True on either the bare or the joined form.
+    [[nodiscard]] bool MatchesFlag(std::string_view arg, std::string_view flag)
+    {
+        return arg == flag || IsJoinedValue(arg, flag);
+    }
+
 } // namespace
 
 DriverSpec const& DriverOf(Flavor flavor)
@@ -205,11 +260,11 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
         }
 
         // Object output, joined (`/Fo<path>`) or separated (`/Fo <path>`, `-o <path>`).
-        if (!driver.objectFlag.empty() && a.starts_with(driver.objectFlag))
+        if (!driver.objectFlag.empty() && MatchesFlag(a, driver.objectFlag))
         {
             if (a.size() > driver.objectFlag.size())
             {
-                out.objPath = std::string { a.substr(driver.objectFlag.size()) };
+                out.objPath = std::string { StripJoinSeparator(a.substr(driver.objectFlag.size())) };
                 continue;
             }
             if (i + 1 < args.size())
@@ -228,11 +283,12 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
         }
 
         // Depfile destination (GNU drivers): -MF <path> or -MF<path>.
-        if (driver.usesDepfile && a.starts_with("-MF"))
+        constexpr std::string_view DepFileFlag = "-MF";
+        if (driver.usesDepfile && MatchesFlag(a, DepFileFlag))
         {
-            if (a.size() > 3)
+            if (a.size() > DepFileFlag.size())
             {
-                out.depPath = std::string { a.substr(3) };
+                out.depPath = std::string { StripJoinSeparator(a.substr(DepFileFlag.size())) };
                 continue;
             }
             if (i + 1 < args.size())
@@ -280,12 +336,15 @@ std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd, std::span<s
         std::string_view const a = argv[i];
 
         // Drop a dropped flag together with its separated value, so a `-MF dep.d`
-        // pair never leaves a stray "dep.d" argument behind.
-        auto const dropped = std::ranges::find_if(driver.preprocessDropFlags, [a](std::string_view flag) {
-            return a == flag || (a.starts_with(flag) && a.size() > flag.size());
-        });
+        // pair never leaves a stray "dep.d" argument behind. Matching is exact or
+        // joined-with-a-value only — see IsJoinedValue: a prefix match would drop
+        // `-coverage` for `-c` and `/clr` for `/c`.
+        auto const dropped =
+            std::ranges::find_if(driver.preprocessDropFlags, [a](std::string_view flag) { return MatchesFlag(a, flag); });
         if (dropped != driver.preprocessDropFlags.end())
         {
+            // Only the bare form takes the NEXT argument; a joined form already
+            // carries its value, so consuming the successor would eat a real flag.
             if (a == *dropped && TakesValue(*dropped) && i + 1 < argv.size())
                 skipUntil = i + 2;
             continue;
