@@ -67,6 +67,7 @@ if(FASTCACHED_BUILD_TESTS)
         DirectManifest_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp
+        TcpClient_test.cpp
         ${_fc_cc_core}
     )
     target_include_directories(fastcache-cc-tests PRIVATE "${CMAKE_SOURCE_DIR}/src")

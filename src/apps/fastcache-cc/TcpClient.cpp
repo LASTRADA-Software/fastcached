@@ -6,6 +6,7 @@
 
 #include "ITcpClient.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -13,6 +14,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #if defined(_WIN32)
@@ -21,6 +23,7 @@
     #include <ws2tcpip.h>
 #else
     #include <sys/socket.h>
+    #include <sys/time.h>
 
     #include <netdb.h>
     #include <unistd.h>
@@ -82,6 +85,44 @@ namespace
         return true;
     }
 #endif
+
+    /// Bound how long a single blocking send/recv on `fd` may stall.
+    ///
+    /// Without this the launcher waits forever on a daemon that accepted the
+    /// connection and then went quiet mid-reply, which turns an optional cache
+    /// into a build-stopping dependency. A timed-out call returns -1, which the
+    /// send/recv loops already treat as "give up", so the existing fall-back to
+    /// a real compile does the rest.
+    ///
+    /// Deliberately duplicated from `FastCache::Detail::SetIoTimeouts` rather
+    /// than shared: the launcher compiles only a handful of FastCache sources so
+    /// it stays free of third-party dependencies and can link the CRT
+    /// statically. `CloseSocket`/`EnsureWinsock` above are duplicated for the
+    /// same reason.
+    ///
+    /// Best-effort: a setsockopt failure leaves the OS default in place.
+    /// @param fd The connected socket to tune.
+    /// @param timeout Per-call deadline; zero or negative leaves no timeout.
+    void SetIoTimeouts(NativeSocket fd, std::chrono::milliseconds timeout) noexcept
+    {
+        if (timeout.count() <= 0)
+            return;
+        for (auto const option: { SO_RCVTIMEO, SO_SNDTIMEO })
+        {
+#if defined(_WIN32)
+            // Windows SO_RCVTIMEO/SO_SNDTIMEO take a DWORD of milliseconds.
+            auto const millis = static_cast<DWORD>(timeout.count());
+            std::ignore = ::setsockopt(fd, SOL_SOCKET, option, reinterpret_cast<char const*>(&millis), sizeof(millis));
+#else
+            // POSIX SO_RCVTIMEO/SO_SNDTIMEO take a struct timeval.
+            constexpr auto MillisPerSecond = 1000;
+            timeval tv {};
+            tv.tv_sec = static_cast<decltype(tv.tv_sec)>(timeout.count() / MillisPerSecond);
+            tv.tv_usec = static_cast<decltype(tv.tv_usec)>((timeout.count() % MillisPerSecond) * MillisPerSecond);
+            std::ignore = ::setsockopt(fd, SOL_SOCKET, option, &tv, sizeof(tv));
+#endif
+        }
+    }
 
     /// Split "host:port" into its parts, honouring the bracketed IPv6 form
     /// `[::1]:11211` — an unbracketed rfind(':') would split an IPv6 literal at
@@ -161,7 +202,7 @@ namespace
 
 } // namespace
 
-std::unique_ptr<ITcpClient> ConnectTcp(std::string_view hostPort)
+std::unique_ptr<ITcpClient> ConnectTcp(std::string_view hostPort, std::chrono::milliseconds ioTimeout)
 {
     if (!EnsureWinsock())
         return nullptr;
@@ -189,6 +230,9 @@ std::unique_ptr<ITcpClient> ConnectTcp(std::string_view hostPort)
             continue;
         if (::connect(fd, candidate->ai_addr, static_cast<ConnectLen>(candidate->ai_addrlen)) == 0)
         {
+            // Arm the deadline before the first send: from here on every
+            // blocking call on this socket is bounded.
+            SetIoTimeouts(fd, ioTimeout);
             ::freeaddrinfo(resolved);
             return std::make_unique<TcpClient>(fd);
         }

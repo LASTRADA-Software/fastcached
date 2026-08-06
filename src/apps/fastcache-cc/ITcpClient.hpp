@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -44,10 +45,19 @@ class ITcpClient
 /// (`[::1]:11211`); resolution goes through getaddrinfo and every returned
 /// address is tried in turn.
 ///
+/// `ioTimeout` bounds each individual blocking send/recv on the returned
+/// connection, so a daemon that accepts and then stalls mid-reply cannot hang
+/// the build — the call fails and the caller falls back to a real compile.
+/// Note this is a per-call deadline, not a deadline for a whole transfer: a
+/// peer that dribbles bytes slower than the timeout can still take longer. It
+/// bounds the failure mode that matters (a peer that stops entirely).
+///
 /// @param hostPort The endpoint, e.g. "127.0.0.1:11211".
+/// @param ioTimeout Per-call send/recv deadline; zero or negative means no
+///                  timeout (the OS default, i.e. block indefinitely).
 /// @return A connected client, or nullptr if the endpoint is malformed or
 ///         unreachable — callers treat that as "cache unavailable" and fall
 ///         back to a real compile.
-[[nodiscard]] std::unique_ptr<ITcpClient> ConnectTcp(std::string_view hostPort);
+[[nodiscard]] std::unique_ptr<ITcpClient> ConnectTcp(std::string_view hostPort, std::chrono::milliseconds ioTimeout);
 
 } // namespace FastCache::Cc

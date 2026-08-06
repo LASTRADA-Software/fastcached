@@ -19,6 +19,8 @@
 //   FASTCACHE_COHORT     optional cohort id (default "default")
 //   FASTCACHE_VERBOSE    if set, print fall-back diagnostics to stderr
 //   FASTCACHE_NO_STATS   if set, do not record invocations to the statistics log
+//   FASTCACHE_NO_DIRECT  if set, disable direct mode (always preprocess)
+//   FASTCACHE_TIMEOUT_MS per-call socket deadline in ms (default 10000; 0 = none)
 //
 // Run `fastcache-cc --help` for the flag and environment reference, and
 // `--stats` for the recorded per-machine cache statistics.
@@ -38,6 +40,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -81,6 +84,9 @@ constexpr std::byte StatusOk { 0x01 };
 
 // --- config ----------------------------------------------------------------
 
+/// Default per-call socket deadline, overridable with FASTCACHE_TIMEOUT_MS.
+constexpr std::chrono::milliseconds DefaultIoTimeout { 10000 };
+
 struct Config
 {
     std::string addr;
@@ -90,6 +96,10 @@ struct Config
     bool verbose { false };
     bool stats { true };  ///< Record each invocation to the per-user log.
     bool direct { true }; ///< Try the manifest shortcut before preprocessing.
+    /// Per-call deadline for every blocking send/recv against the daemon. The
+    /// default keeps a wedged daemon from hanging a build while staying far
+    /// above any healthy round-trip, including multi-megabyte objects.
+    std::chrono::milliseconds ioTimeout { DefaultIoTimeout };
 };
 
 /// Read an environment variable, or a fallback when unset/empty. Uses the
@@ -117,6 +127,29 @@ struct Config
     return !EnvOr(name, "").empty();
 }
 
+/// Read a non-negative millisecond count from the environment.
+///
+/// Anything unparseable, negative, or trailing junk falls back to `fallback`
+/// rather than failing the compile: a typo in a build-system variable must not
+/// break the build, which is the same principle as every other cache fall-back.
+/// An explicit `0` is honoured and means "no timeout".
+/// @param name Variable to read.
+/// @param fallback Value to use when unset or malformed.
+/// @return The parsed duration, or `fallback`.
+[[nodiscard]] std::chrono::milliseconds EnvMillis(char const* name, std::chrono::milliseconds fallback)
+{
+    auto const raw = EnvOr(name, "");
+    if (raw.empty())
+        return fallback;
+    auto value = std::int64_t { 0 };
+    auto const* const begin = raw.data();
+    auto const* const end = std::next(begin, static_cast<std::ptrdiff_t>(raw.size()));
+    auto const [ptr, ec] = std::from_chars(begin, end, value);
+    if (ec != std::errc {} || ptr != end || value < 0)
+        return fallback;
+    return std::chrono::milliseconds { value };
+}
+
 [[nodiscard]] Config LoadConfig()
 {
     Config c;
@@ -127,6 +160,7 @@ struct Config
     c.verbose = EnvSet("FASTCACHE_VERBOSE");
     c.stats = !EnvSet("FASTCACHE_NO_STATS");
     c.direct = !EnvSet("FASTCACHE_NO_DIRECT");
+    c.ioTimeout = EnvMillis("FASTCACHE_TIMEOUT_MS", DefaultIoTimeout);
     return c;
 }
 
@@ -305,10 +339,11 @@ class TcpClient
   public:
     /// Connect to `hostPort`.
     /// @param hostPort "host:port"; hostnames and [::1]:port are accepted.
+    /// @param ioTimeout Per-call send/recv deadline; 0 disables it.
     /// @return A connected client, or nullopt when unreachable.
-    [[nodiscard]] static std::optional<TcpClient> Connect(std::string_view hostPort)
+    [[nodiscard]] static std::optional<TcpClient> Connect(std::string_view hostPort, std::chrono::milliseconds ioTimeout)
     {
-        auto impl = Cc::ConnectTcp(hostPort);
+        auto impl = Cc::ConnectTcp(hostPort, ioTimeout);
         if (impl == nullptr)
             return std::nullopt;
         return TcpClient { std::move(impl) };
@@ -488,12 +523,12 @@ constexpr std::size_t ReplayRegionCount = 2;
 
 /// FETCH one key and return its raw stored bytes, or nullopt on miss or any
 /// transport failure. Used for manifests, whose payload is not a compile-value.
-/// @param addr Daemon address.
+/// @param cfg  Launcher config (daemon address and socket deadline).
 /// @param key  The key to fetch.
 /// @return The stored bytes on hit.
-[[nodiscard]] std::optional<std::vector<std::byte>> FetchRaw(std::string const& addr, std::string const& key)
+[[nodiscard]] std::optional<std::vector<std::byte>> FetchRaw(Config const& cfg, std::string const& key)
 {
-    auto client = TcpClient::Connect(addr);
+    auto client = TcpClient::Connect(cfg.addr, cfg.ioTimeout);
     if (!client.has_value())
         return std::nullopt;
 
@@ -528,7 +563,7 @@ constexpr std::size_t ReplayRegionCount = 2;
 /// @param body The bytes to store.
 void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key, std::string_view body)
 {
-    auto client = TcpClient::Connect(addr);
+    auto client = TcpClient::Connect(addr, cfg.ioTimeout);
     if (!client.has_value())
         return;
 
@@ -562,7 +597,7 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
                                                    std::string const& key,
                                                    PathCanon::Layout const& layout)
 {
-    auto const payload = FetchRaw(cfg.addr, key);
+    auto const payload = FetchRaw(cfg, key);
     if (!payload.has_value())
         return std::nullopt;
 
@@ -709,7 +744,7 @@ void RecordManifest(Config const& cfg,
         return giveUp();
 
     auto const manifestKey = Cc::ComputeManifestKey(*canonicalSource, relativizedArgs, toolchainStamp);
-    auto const manifestBytes = FetchRaw(cfg.addr, manifestKey);
+    auto const manifestBytes = FetchRaw(cfg, manifestKey);
     if (!manifestBytes.has_value())
         return giveUp();
 
@@ -786,7 +821,7 @@ void RecordManifest(Config const& cfg,
 
     // FETCH.
     {
-        auto client = TcpClient::Connect(cfg.addr);
+        auto client = TcpClient::Connect(cfg.addr, cfg.ioTimeout);
         if (!client.has_value())
         {
             Warn("connect failed");
@@ -922,7 +957,7 @@ void RecordManifest(Config const& cfg,
         value.textRegions.push_back({ .grammar = PathCanon::Grammar::GccDepfile, .bytes = *depText });
 
     auto const encoded = EncodeCompileValue(value);
-    auto client = TcpClient::Connect(cfg.addr);
+    auto client = TcpClient::Connect(cfg.addr, cfg.ioTimeout);
     if (!client.has_value())
     {
         // Same reasoning as above: the compile succeeded, so this remains a MISS.
@@ -1002,6 +1037,17 @@ ENVIRONMENT
                         Direct mode is on by default: it reaches a cached object by
                         re-hashing the project headers a previous compile recorded,
                         which is far cheaper than preprocessing the translation unit.
+  FASTCACHE_TIMEOUT_MS  Per-call deadline, in milliseconds, for every send/recv to
+                        the daemon (default 10000; 0 disables it). A daemon that
+                        accepts the connection and then stalls mid-reply would
+                        otherwise block the compile forever, which would make the
+                        cache load-bearing. On expiry the launcher gives up on the
+                        cache and compiles for real, like any other cache error.
+                        Raise it if a heavily loaded daemon is legitimately slow.
+                        This bounds each call, not the whole invocation: direct
+                        mode makes a separate manifest round-trip, so one compile
+                        against a wedged daemon can wait up to twice this before
+                        falling back.
 
 ADDR, SRCROOT and BUILDTREE must ALL be set to cache; any missing one makes the
 launcher run the real compiler and report "missing FASTCACHE_ADDR/SRCROOT/BUILDTREE"

@@ -83,6 +83,7 @@ prefix. An empty value counts as unset.
 | `FASTCACHE_VERBOSE` | Print `HIT`/`MISS` and fall-back diagnostics to stderr. | unset (quiet) |
 | `FASTCACHE_NO_STATS` | Do not record invocations to the statistics log. | unset (recording on) |
 | `FASTCACHE_NO_DIRECT` | Disable direct mode, always preprocessing to derive the key. | unset (direct on) |
+| `FASTCACHE_TIMEOUT_MS` | Per-call deadline, in milliseconds, for every send/recv to the daemon. `0` disables it. A daemon that accepts and then stalls mid-reply would otherwise block the compile forever. Bounds each call, not the whole invocation — see below. | `10000` |
 
 `ADDR`, `SRCROOT` and `BUILDTREE` must **all** be set. If any is missing every
 compile runs uncached — the build still succeeds, which is exactly why this is
@@ -176,7 +177,7 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
 | `connect failed` | The daemon is unreachable at `FASTCACHE_ADDR`. |
 | `preprocess failed` | The compiler rejected the preprocess probe; the line may use an unsupported option form. |
 | `uses __TIME__/__DATE__/__TIMESTAMP__` | Deliberate: the TU is non-deterministic and would never hit. Reported as *uncacheable*, not as an error. |
-| `fetch send/recv failed`, `fetch decoded malformed` | Transport or protocol trouble mid-request. |
+| `fetch send/recv failed`, `fetch decoded malformed` | Transport or protocol trouble mid-request. Also how a `FASTCACHE_TIMEOUT_MS` expiry surfaces: a daemon that accepted the connection and then went quiet. If these appear in bulk and each compile stalls for the full timeout first, suspect a wedged daemon rather than a flaky network. |
 | `could not write object on hit` | The object output path was not writable. |
 
 ## Known limitations
@@ -191,6 +192,12 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
   matches dependencies separator-insensitively, so this is cosmetic.
 - Non-C/C++ inputs (for example Windows `.rc` resource files) are correctly
   classified as non-cacheable and passed through.
+- `FASTCACHE_TIMEOUT_MS` bounds each individual send/recv, not a whole
+  invocation. Direct mode makes a separate manifest round-trip before the object
+  fetch, so a compile against a daemon that accepts and then goes silent can wait
+  up to twice the timeout before falling back. It is also not a total-transfer
+  deadline: a peer dribbling bytes slower than the timeout can still take longer.
+  It bounds the failure mode that matters — a peer that stops entirely.
 
 ## Measured behaviour
 
