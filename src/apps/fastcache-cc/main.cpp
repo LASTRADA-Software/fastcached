@@ -157,7 +157,24 @@ bool g_directHit = false;
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(delta).count());
 }
 
-/// Print a one-line fall-back diagnostic when FASTCACHE_VERBOSE is set.
+/// Print a one-line fall-back diagnostic when FASTCACHE_VERBOSE is set, without
+/// touching the recorded outcome. For diagnostics issued AFTER the outcome is
+/// already decided — a miss that compiled successfully but could not be stored
+/// is still a miss, and recording it as a cache failure would inflate the
+/// "unavailable" bucket in `--stats` and hide the real cause.
+/// @param reason The diagnostic text.
+void Note(std::string_view reason)
+{
+    if (g_verbose)
+        std::cerr << "fastcache-cc: " << reason << '\n';
+}
+
+/// Report that the cache could not serve this compile, and record why.
+///
+/// Only for the fall-back path, where the launcher gives up on the cache and
+/// runs the real compiler: it OVERWRITES the recorded outcome. Once a HIT or
+/// MISS has been traced, use Note() instead.
+/// @param reason The fall-back reason, recorded as the statistics detail.
 void Warn(std::string_view reason)
 {
     // A fall-back reason distinguishes "deliberately not cacheable" from "the
@@ -871,14 +888,19 @@ void RecordManifest(Config const& cfg,
     auto const run = RunCaptureSplit(argv);
     // Always surface the compiler's output on its true streams and its exit code.
     ReplayStreams(run.out, run.err);
-    int const code = run.exitCode;
+    // A spawn failure reports -1, which a POSIX exit status truncates to 255 —
+    // an arbitrary code no build system can interpret. Normalize it the same way
+    // the fall-back path does.
+    int const code = run.exitCode == -1 ? 1 : run.exitCode;
     if (code != 0)
         return code; // do not cache a failed compile
 
     auto const objectBytes = ReadFileBytes(cmd.objPath);
     if (!objectBytes.has_value())
     {
-        Warn("object missing after compile; not caching");
+        // The compile itself succeeded, so this stays a MISS: only the caching
+        // of it failed. Note() rather than Warn() keeps the recorded outcome.
+        Note("object missing after compile; not caching");
         return code;
     }
 
@@ -903,7 +925,8 @@ void RecordManifest(Config const& cfg,
     auto client = TcpClient::Connect(cfg.addr);
     if (!client.has_value())
     {
-        Warn("connect failed for store");
+        // Same reasoning as above: the compile succeeded, so this remains a MISS.
+        Note("connect failed for store");
         return code; // compile already succeeded; just skip caching
     }
     std::vector<std::byte> frame;
