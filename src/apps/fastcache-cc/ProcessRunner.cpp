@@ -326,7 +326,7 @@ namespace
             // Child stdout -> outWrite; stderr -> errWrite (or outWrite when merged).
             int const childErrWrite = merge == Merge::Yes ? outWrite.Get() : errWrite.Get();
 
-            posix_spawn_file_actions_t actions;
+            posix_spawn_file_actions_t actions {};
             if (::posix_spawn_file_actions_init(&actions) != 0)
                 return result;
             // The read ends must not leak into the child: if the child holds them
