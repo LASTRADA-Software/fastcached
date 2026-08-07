@@ -35,16 +35,24 @@
          1 = start the service when the installer finishes. -->
     <Property Id="FASTCACHED_START_SERVICE" Value="1" Secure="yes" />
 
+    <!-- The command line uses paths RELATIVE to Directory, never [INSTALLFOLDER]
+         references. A deferred action runs in its own context where session
+         properties are not available, so a bracketed property inside
+         ExeCommand expands to nothing and the action fails the install with
+         1603. Directory= still resolves at schedule time and becomes the
+         action's working directory, which is what makes the relative form
+         work. (fastcached itself then makes the config path absolute, since a
+         service starts in C:\Windows\System32.) -->
     <CustomAction Id="FastCachedInstallService"
                   Directory="INSTALLFOLDER"
-                  ExeCommand="&quot;[INSTALLFOLDER]fastcached.exe&quot; --install-service --config=&quot;[INSTALLFOLDER]fastcached.yaml&quot;"
+                  ExeCommand="fastcached.exe --install-service --config=fastcached.yaml"
                   Execute="deferred"
                   Impersonate="no"
                   Return="check" />
 
     <CustomAction Id="FastCachedStartService"
                   Directory="INSTALLFOLDER"
-                  ExeCommand="&quot;[System64Folder]sc.exe&quot; start FastCached"
+                  ExeCommand="sc.exe start FastCached"
                   Execute="deferred"
                   Impersonate="no"
                   Return="ignore" />
@@ -53,7 +61,7 @@
          hence Return="ignore". It best-effort stops before deleting. -->
     <CustomAction Id="FastCachedUninstallService"
                   Directory="INSTALLFOLDER"
-                  ExeCommand="&quot;[INSTALLFOLDER]fastcached.exe&quot; --uninstall-service"
+                  ExeCommand="fastcached.exe --uninstall-service"
                   Execute="deferred"
                   Impersonate="no"
                   Return="ignore" />
