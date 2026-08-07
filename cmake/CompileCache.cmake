@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+#
 # Compiler-cache launcher selection.
 #
 # Three launchers are supported, in preference order:
