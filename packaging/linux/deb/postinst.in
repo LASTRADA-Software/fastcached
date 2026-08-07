@@ -22,11 +22,16 @@ case "$1" in
             systemctl daemon-reload >/dev/null 2>&1 || true
         fi
 
-        # deb-systemd-helper records the operator's enable/disable choice, so a
-        # unit deliberately disabled before an upgrade stays disabled.
+        # $2 holds the previously-configured version: empty means this is a
+        # fresh install, non-empty means an upgrade.
+        #
+        # On a fresh install the unit is enabled unconditionally. On an upgrade
+        # deb-systemd-helper decides, so a unit the operator deliberately
+        # disabled stays disabled — `was-enabled` reports the recorded choice
+        # rather than the current symlink state.
         if command -v deb-systemd-helper >/dev/null 2>&1; then
             deb-systemd-helper unmask "${SERVICE}" >/dev/null 2>&1 || true
-            if deb-systemd-helper --quiet was-enabled "${SERVICE}"; then
+            if [ -z "$2" ] || deb-systemd-helper --quiet was-enabled "${SERVICE}"; then
                 deb-systemd-helper enable "${SERVICE}" >/dev/null 2>&1 || true
             else
                 deb-systemd-helper update-state "${SERVICE}" >/dev/null 2>&1 || true
