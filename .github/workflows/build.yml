@@ -389,10 +389,16 @@ jobs:
       # below exits 77 (skip) when its compiler is absent, and a skipped step
       # still reports green — so a missing compiler would silently mean the
       # clang driver was never exercised at all.
+      # g++-14 must also be put on PATH as plain `g++`: the gcc-release preset
+      # pins CMAKE_CXX_COMPILER to the bare name, which otherwise resolves to
+      # the runner's default GCC 13 — and that has no <print>, so main.cpp
+      # fails to compile. Same symlink the Linux build matrix installs.
       - name: "Install build tools"
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build libyaml-cpp-dev g++-14 clang
+          sudo ln -sf /usr/bin/gcc-14 /usr/local/bin/gcc
+          sudo ln -sf /usr/bin/g++-14 /usr/local/bin/g++
 
       - name: "Configure"
         run: cmake --preset gcc-release
@@ -496,12 +502,16 @@ jobs:
           key: ${{ runner.os }}-package
           max-size: 256M
 
-      # rpm builds the .rpm on this Debian-family runner; systemd-container
-      # provides systemd-analyze for the unit check below.
+      # rpm builds the .rpm on this Debian-family runner; systemd provides
+      # systemd-analyze for the unit check below. g++-14 is symlinked as plain
+      # `g++` because the gcc-release preset pins the bare name, which would
+      # otherwise resolve to the runner's GCC 13 — no <print>, no build.
       - name: "Install build tools"
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev rpm systemd
+          sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev rpm systemd g++-14
+          sudo ln -sf /usr/bin/gcc-14 /usr/local/bin/gcc
+          sudo ln -sf /usr/bin/g++-14 /usr/local/bin/g++
 
       - name: "Configure"
         run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF
