@@ -90,13 +90,19 @@ jobs:
       - name: "Test"
         run: ctest --preset ${{ matrix.preset }}
 
-      - name: "Upload Linux binary for the sccache smoke job"
+      # Both binaries the smoke jobs drive: the daemon every job starts, and the
+      # launcher the compile-cache smoke job points at it. They share a parent
+      # directory, so the artifact keeps them side by side at its root.
+      - name: "Upload Linux binaries for the smoke jobs"
         if: matrix.preset == 'clang-release'
         uses: actions/upload-artifact@v4
         with:
           name: fastcached-linux
-          path: out/build/clang-release/target/fastcached
+          path: |
+            out/build/clang-release/target/fastcached
+            out/build/clang-release/target/fastcache-cc
           retention-days: 1
+          if-no-files-found: error
 
   # clang-tidy runs in its own job (not folded into the release matrix above) so
   # it surfaces as a distinct PR status check. It reuses the clang-debug preset,
@@ -225,13 +231,17 @@ jobs:
           docker exec fc fastcached --healthcheck
           docker rm -f fc
 
-  # Smoke tests live in three sibling jobs so the PR status check tells you
-  # *which* protocol broke without opening the log. They share the same
+  # Smoke tests live in sibling jobs so the PR status check tells you *which*
+  # client or protocol broke without opening the log. They share the same
   # fastcached binary artifact and the same compile-twice / expect-cache-hit
-  # assertion. The only deltas are which sccache version is installed (apt
-  # = 0.7.7 = OpenDAL 0.44 = memcached TEXT wire; mozilla-actions's prebuilt
-  # = >=0.8 = OpenDAL >=0.45 = memcached BINARY wire) and which SCCACHE_*
-  # env var points sccache at fastcached.
+  # assertion, and cover one supported compile-cache client each: sccache over
+  # the three wire protocols it can reach us on, and our own fastcache-cc over
+  # the compile-cache 0xFC protocol.
+  #
+  # Between the three sccache jobs the only deltas are which sccache version is
+  # installed (apt = 0.7.7 = OpenDAL 0.44 = memcached TEXT wire;
+  # mozilla-actions's prebuilt = >=0.8 = OpenDAL >=0.45 = memcached BINARY wire)
+  # and which SCCACHE_* env var points sccache at fastcached.
 
   sccache-smoke-memcached-text:
     name: "sccache smoke (memcached text)"
@@ -297,6 +307,40 @@ jobs:
           sudo apt-get install -y sccache g++-14
       - name: "Smoke"
         run: bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached --protocol redis --port 11611 --compiler g++-14
+
+  # The fourth client: our own launcher over the compile-cache 0xFC protocol.
+  # It runs the same harness the E2E jobs do rather than a cut-down copy of its
+  # assertions, but points it at the *uploaded release binaries* instead of a
+  # freshly built tree — so this job answers "do the artifacts we ship
+  # interoperate", the same question the sccache smoke jobs answer for the
+  # daemon, while the E2E jobs answer "does the contract hold for each compiler
+  # driver on each platform".
+  fastcache-cc-smoke:
+    name: "fastcache-cc smoke (compile-cache 0xFC)"
+    runs-on: ubuntu-24.04
+    needs: linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Download the fastcached + fastcache-cc binaries"
+        uses: actions/download-artifact@v4
+        with:
+          name: fastcached-linux
+          path: bin
+      - name: "Make the binaries executable"
+        run: chmod +x bin/fastcached bin/fastcache-cc
+      - name: "Install a C++ compiler + libyaml-cpp runtime"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 libyaml-cpp0.8
+      # Exit 77 means a prerequisite was missing and nothing was verified, which
+      # must fail here rather than report green.
+      - name: "Smoke"
+        run: |
+          bash scripts/compile-cache-e2e.sh \
+            --fastcached ./bin/fastcached \
+            --launcher ./bin/fastcache-cc \
+            --compiler g++-14 \
+            --port 11611 || { c=$?; [ "$c" = 77 ] && echo "::error::smoke skipped, nothing verified"; exit "$c"; }
 
   windows:
     name: "Windows-${{ matrix.preset }}"
