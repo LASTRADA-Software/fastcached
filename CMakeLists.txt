@@ -14,6 +14,32 @@ project(fastcached
 
 include(GNUInstallDirs)
 
+# Lay the install tree out for a distro package: the payload is rooted at /
+# instead of /usr, because the systemd units and the /etc config sit at fixed
+# absolute locations that cannot be rebased onto a /usr prefix (systemd does
+# not read config from /usr/etc). See cmake/Packaging.cmake.
+#
+# On Linux this is the default, since that is where the packages are built and
+# where the service assets are meaningful. Turn it OFF for a conventional
+# `cmake --install --prefix /usr/local` developer install.
+if(UNIX AND NOT APPLE)
+    option(FASTCACHED_PACKAGE_ROOT_PREFIX "Lay out the install tree for .deb/.rpm packaging" ON)
+else()
+    option(FASTCACHED_PACKAGE_ROOT_PREFIX "Lay out the install tree for .deb/.rpm packaging" OFF)
+endif()
+
+# Install destinations for the relocatable artifacts (binaries, docs). With the
+# prefix moved to /, the ordinary FHS paths have to spell `usr/` themselves, or
+# the binaries would land in /bin and the docs in /share/doc. Outside packaging
+# these stay the plain GNUInstallDirs values.
+if(FASTCACHED_PACKAGE_ROOT_PREFIX)
+    set(FASTCACHED_INSTALL_BINDIR "usr/${CMAKE_INSTALL_BINDIR}")
+    set(FASTCACHED_INSTALL_DOCDIR "usr/${CMAKE_INSTALL_DOCDIR}")
+else()
+    set(FASTCACHED_INSTALL_BINDIR "${CMAKE_INSTALL_BINDIR}")
+    set(FASTCACHED_INSTALL_DOCDIR "${CMAKE_INSTALL_DOCDIR}")
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -251,8 +277,21 @@ add_subdirectory(src/apps)
 install(FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
         "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
-    DESTINATION "${CMAKE_INSTALL_DOCDIR}"
+    DESTINATION "${FASTCACHED_INSTALL_DOCDIR}"
+    COMPONENT Runtime
 )
+
+# ----------------------------------------------------------------------------
+# Service-integration assets (systemd units, sysusers/tmpfiles declarations,
+# the example config, the WiX service fragment) and the CPack configuration
+# that wraps everything installed above into .deb / .rpm / .msi.
+#
+# Order matters twice over: packaging/ exports the variables Packaging.cmake
+# consumes, and CPack only sees install() rules declared before include(CPack)
+# — so this stays at the end, after every install() in the project.
+
+add_subdirectory(packaging)
+include(Packaging)
 
 # ----------------------------------------------------------------------------
 # Tests.
