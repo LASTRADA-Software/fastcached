@@ -31,7 +31,7 @@ RUN cmake -S . -B build -G Ninja \
         -DCMAKE_CXX_COMPILER=g++ \
         -DFASTCACHED_BUILD_TESTS=OFF \
         -DFASTCACHED_ENABLE_TLS=ON \
-        -DUSE_SCCACHE=OFF \
+        -DUSE_COMPILER_CACHE=OFF \
     && cmake --build build --target fastcached
 
 # ---- runtime stage --------------------------------------------------------

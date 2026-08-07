@@ -251,6 +251,15 @@ cmake --build --preset clangcl-debug
 
 `PEDANTIC_COMPILER_WERROR=ON` is the default for Windows presets — warnings break the build, fix them at the source.
 
+`USE_COMPILER_CACHE` (default ON, `cmake/CompileCache.cmake`) fronts the compiler
+with our own `fastcache-cc` when it is on `PATH` and `FASTCACHE_ADDR=host:port`
+names a daemon — `FASTCACHE_SRCROOT`/`FASTCACHE_BUILDTREE` are injected from the
+source and build trees — and otherwise falls back to `sccache`. A cache hit
+reproduces only the object file, so with either launcher active the module scan
+and precompiled headers are turned off and MSVC debug info is forced to `/Z7`
+(a modmap flag makes the launcher's preprocess step fail, and a PCH or shared
+PDB is a second artefact no hit can reproduce).
+
 ## Testing
 
 Catch2 tests live next to the implementation files, so `Foo.cpp` has a `Foo_test.cpp`. A `test_main.cpp` serves as the entry point.
