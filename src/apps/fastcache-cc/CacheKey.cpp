@@ -20,21 +20,35 @@ namespace
     /// Order matters: the longer `/external:I` must be tried before `/I`.
     constexpr std::array<std::string_view, 4> IncludePrefixes { "/external:I", "-external:I", "/I", "-I" };
 
-    /// True if `c` introduces a command-line option in the MSVC style.
+    /// True if `c` introduces a command-line option in the MSVC style, for the
+    /// layout being relativized against.
     ///
-    /// Only meaningful on Windows: on POSIX a leading `/` starts an absolute
-    /// path, never an option, so treating it as one would leave absolute paths
-    /// unrelativized and bake the checkout location into the cache key.
-    /// @param c The argument's first character.
-    /// @return True when `c` introduces an option on this platform.
-    [[nodiscard]] constexpr bool IsWindowsOptionPrefix(char c) noexcept
+    /// The answer comes from the LAYOUT, not from the compiling host. A leading
+    /// `/` introduces an option under a Windows layout, but on POSIX it starts
+    /// an absolute path; treating it as an option there would leave absolute
+    /// paths unrelativized and bake the checkout location into the cache key —
+    /// the exact failure that breaks cross-checkout sharing.
+    ///
+    /// Keying off `_WIN32` instead would make a Windows-hosted launcher
+    /// mis-handle POSIX paths, and it made the behaviour untestable from the
+    /// other platform. `PathCanon::SeparatorOf` derives separator style from
+    /// the layout for the same reason: a cache is shared across machines, so
+    /// path conventions are a property of the data, not of the running binary.
+    ///
+    /// @param c      The argument's first character.
+    /// @param layout The layout whose path conventions apply.
+    /// @return True when `c` introduces an option under that layout.
+    [[nodiscard]] bool IsWindowsOptionPrefix(char c, PathCanon::Layout const& layout) noexcept
     {
-#if defined(_WIN32)
-        return c == '/';
-#else
-        static_cast<void>(c);
-        return false;
-#endif
+        if (c != '/')
+            return false;
+        // A Windows layout is recognised by a backslash separator or a drive
+        // letter ("C:..."); anything else is treated as POSIX, where `/` can
+        // only begin an absolute path.
+        auto const isWindowsRoot = [](std::string_view root) noexcept {
+            return root.contains('\\') || (root.size() >= 2 && root[1] == ':');
+        };
+        return isWindowsRoot(layout.sourceRoot) || isWindowsRoot(layout.buildTree);
     }
 
     /// Relativize one argument against both roots: if it is a bare path or an
@@ -65,12 +79,12 @@ namespace
         // it actually lies under the source root (Canonicalize returns it verbatim
         // otherwise, so a no-op change is left as-is).
         //
-        // `-` introduces an option everywhere. `/` does so only on Windows: on
-        // POSIX a leading slash is an ABSOLUTE PATH, and skipping those would
-        // leave the checkout path in the key — which is exactly what breaks
-        // cross-machine sharing, since two checkouts at different paths would
-        // then key differently despite identical content.
-        if (!arg.empty() && arg.front() != '-' && !(IsWindowsOptionPrefix(arg.front())))
+        // `-` introduces an option everywhere. `/` does so only under a Windows
+        // layout: on POSIX a leading slash is an ABSOLUTE PATH, and skipping
+        // those would leave the checkout path in the key — which is exactly
+        // what breaks cross-machine sharing, since two checkouts at different
+        // paths would then key differently despite identical content.
+        if (!arg.empty() && arg.front() != '-' && !IsWindowsOptionPrefix(arg.front(), layout))
         {
             auto const canon = PathCanon::Canonicalize(arg, layout);
             if (canon.has_value())

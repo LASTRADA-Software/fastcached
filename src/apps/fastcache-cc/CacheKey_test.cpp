@@ -122,6 +122,23 @@ TEST_CASE("RelativizeArgs tokenizes POSIX absolute paths under either root")
     CHECK_FALSE(out[3].contains("/home/dev"));
 }
 
+TEST_CASE("Under a Windows layout a leading slash still introduces an option")
+{
+    // The mirror of the case above, and the reason the decision is made from
+    // the layout rather than from the host: MSVC options start with '/', so
+    // under a Windows layout they must NOT be mistaken for absolute paths and
+    // rewritten. Both directions have to hold on every platform, otherwise the
+    // behaviour is only testable on the OS that happens to match.
+    std::vector<std::string> const args { "/c", R"(C:\src\proj\a.cpp)", "/Fo", R"(C:\src\proj\build\a.obj)" };
+    auto const out = RelativizeArgs(args, R"(C:\src\proj)", R"(C:\src\proj\build)");
+
+    CHECK(out[0] == "/c");    // an option, left alone
+    CHECK(out[2] == "/Fo");   // ditto
+    CHECK(out[1] != args[1]); // the paths are still tokenized
+    CHECK_FALSE(out[1].contains("C:"));
+    CHECK_FALSE(out[3].contains("C:"));
+}
+
 TEST_CASE("Two POSIX checkouts at different depths relativize identically")
 {
     std::vector<std::string> const deep { "-c", "/ci/w/1/s/proj/a.cpp", "-o", "/ci/w/1/s/proj/build/a.o" };
