@@ -284,7 +284,32 @@ echo "   -coverage survived the preprocess line"
 
 # --- statistics -------------------------------------------------------------
 echo "== statistics =="
-"$launcher" --stats || fail "--stats returned non-zero"
+"$launcher" --show-stats || fail "--show-stats returned non-zero"
+"$launcher" -s >/dev/null || fail "-s returned non-zero"
+"$launcher" --show-stats --cohort "e2e" >/dev/null || fail "--show-stats --cohort returned non-zero"
+
+# The launcher's help must describe the flags it actually accepts; a drift here
+# is exactly what the unit-level guard in LauncherCli_test.cpp protects, and this
+# repeats it against the shipped binary.
+help="$("$launcher" --help)" || fail "--help returned non-zero"
+for flag in --show-stats -s --zero-stats -z --help -h --version --cohort; do
+    case "$help" in
+        *"$flag"*) ;;
+        *) fail "--help does not document ${flag}" ;;
+    esac
+done
+echo "   --help documents every accepted flag"
+
+# Retired spellings must be diagnosed, not spawned as if they were a compiler.
+if "$launcher" --stats >/dev/null 2>&1; then
+    fail "the retired --stats flag still succeeds"
+fi
+"$launcher" --stats >/dev/null 2>&1 || rc=$?
+[ "${rc:-0}" -eq 2 ] || fail "retired flag should exit 2, got ${rc:-0}"
+echo "   retired flags exit 2 with a diagnostic"
+
+"$launcher" -z >/dev/null || fail "-z returned non-zero"
+"$launcher" --zero-stats >/dev/null || fail "--zero-stats returned non-zero"
 
 echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, cross-depth, and safe fallback"
 exit 0

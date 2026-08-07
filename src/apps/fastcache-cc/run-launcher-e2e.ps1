@@ -216,6 +216,36 @@ try {
             $exit = 1
         }
     }
+
+    # --- CLI surface --------------------------------------------------------
+    # The help text must describe the flags the binary actually accepts. This
+    # repeats the unit-level guard against the shipped launcher, and it is the
+    # only place the Windows-only "/?" spelling gets exercised.
+    $help = (& $Launcher --help | Out-String)
+    foreach ($flag in @('--show-stats','-s','--zero-stats','-z','--help','-h','/?','--version','--cohort')) {
+        if ($help -notmatch [regex]::Escape($flag)) {
+            Write-Host "  HELP DRIFT: --help does not document $flag" -ForegroundColor Red
+            $exit = 1
+        }
+    }
+
+    & $Launcher /? | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "  '/?' did not print help" -ForegroundColor Red; $exit = 1 }
+
+    & $Launcher -s | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "  '-s' returned non-zero" -ForegroundColor Red; $exit = 1 }
+
+    # Retired spellings must be diagnosed (exit 2), not spawned as a compiler.
+    & $Launcher --stats 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 2) {
+        Write-Host "  retired --stats should exit 2, got $LASTEXITCODE" -ForegroundColor Red
+        $exit = 1
+    }
+
+    & $Launcher -z | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "  '-z' returned non-zero" -ForegroundColor Red; $exit = 1 }
+
+    if ($exit -eq 0) { Write-Host "  CLI surface matches --help: OK" -ForegroundColor Green }
 }
 finally {
     $server | Stop-Process -Force -ErrorAction SilentlyContinue
