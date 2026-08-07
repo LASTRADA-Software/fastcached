@@ -41,23 +41,29 @@
          1 = start the service when the installer finishes. -->
     <Property Id="FASTCACHED_START_SERVICE" Value="1" Secure="yes" />
 
-    <!-- The command line uses paths RELATIVE to Directory, never bracketed
-         property references. A deferred action runs in its own context where
-         session properties are not available, so a property inside ExeCommand
-         expands to nothing and the action fails the install. Directory= still
-         resolves at schedule time and becomes the action's working directory,
-         which is what makes the relative form work. (fastcached itself then
-         makes the config path absolute when it registers the service, since a
-         service starts in C:\Windows\System32.) -->
-    <!-- Paths are relative to INSTALL_ROOT: the executables install under
-         bin\ (CMAKE_INSTALL_BINDIR) while the config sits at the install
-         root, so only the exe carries the bin\ prefix. -->
+    <!-- Command lines use paths RELATIVE to Directory, never bracketed
+         property references: a deferred action runs in its own context where
+         session properties are unavailable, so a property inside ExeCommand
+         expands to nothing. Directory= does still resolve at schedule time and
+         becomes the working directory, which is what makes the relative form
+         work. Executables install under bin\ (CMAKE_INSTALL_BINDIR) while the
+         config sits at the install root, so only the exe carries a prefix.
+         fastcached itself absolutizes the config path against that working
+         directory when it registers the service, which is what matters at boot
+         since a service starts in C:\Windows\System32.
+
+         Return="ignore": registering the service must never fail the whole
+         installation. It legitimately returns non-zero when the service is
+         already present (a repair, or a reinstall over a previous version),
+         and a machine with the files installed but the service unregistered is
+         far more recoverable than one rolled back to nothing: the operator can
+         simply re-run the install-service flag by hand. -->
     <CustomAction Id="FastCachedInstallService"
                   Directory="INSTALL_ROOT"
                   ExeCommand="bin\fastcached.exe --install-service --config=fastcached.yaml"
                   Execute="deferred"
                   Impersonate="no"
-                  Return="check" />
+                  Return="ignore" />
 
     <CustomAction Id="FastCachedStartService"
                   Directory="INSTALL_ROOT"
