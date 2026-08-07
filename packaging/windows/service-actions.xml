@@ -41,16 +41,19 @@
          1 = start the service when the installer finishes. -->
     <Property Id="FASTCACHED_START_SERVICE" Value="1" Secure="yes" />
 
-    <!-- Command lines use paths RELATIVE to Directory, never bracketed
-         property references: a deferred action runs in its own context where
-         session properties are unavailable, so a property inside ExeCommand
-         expands to nothing. Directory= does still resolve at schedule time and
-         becomes the working directory, which is what makes the relative form
-         work. Executables install under bin\ (CMAKE_INSTALL_BINDIR) while the
-         config sits at the install root, so only the exe carries a prefix.
-         fastcached itself absolutizes the config path against that working
-         directory when it registers the service, which is what matters at boot
-         since a service starts in C:\Windows\System32.
+    <!-- Directory + ExeCommand is a type 34 custom action, whose Target must be
+         the FULL path to the executable, quoted when it contains spaces (it
+         does: "C:\Program Files\fastcached\"). Directory= is NOT a working
+         directory that makes a relative command resolve; a relative Target
+         simply cannot be launched, which is error 1721 ("a program required
+         for this install to complete could not be run").
+         See https://learn.microsoft.com/en-us/windows/win32/msi/custom-action-type-34
+
+         [INSTALL_ROOT] is safe here even though the action is deferred: the
+         Target of a type 34 action is formatted when the action is SCHEDULED,
+         in the immediate sequence, where properties are still available. It is
+         the deferred action's own session that cannot read properties, which
+         is a different thing.
 
          Return="ignore": registering the service must never fail the whole
          installation. It legitimately returns non-zero when the service is
@@ -60,14 +63,14 @@
          simply re-run the install-service flag by hand. -->
     <CustomAction Id="FastCachedInstallService"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="bin\fastcached.exe --install-service --config=fastcached.yaml"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcached.exe&quot; --install-service --config=&quot;[INSTALL_ROOT]fastcached.yaml&quot;"
                   Execute="deferred"
                   Impersonate="no"
                   Return="ignore" />
 
     <CustomAction Id="FastCachedStartService"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="sc.exe start FastCached"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; start FastCached"
                   Execute="deferred"
                   Impersonate="no"
                   Return="ignore" />
@@ -76,7 +79,7 @@
          hence Return="ignore". It best-effort stops before deleting. -->
     <CustomAction Id="FastCachedUninstallService"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="bin\fastcached.exe --uninstall-service"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcached.exe&quot; --uninstall-service"
                   Execute="deferred"
                   Impersonate="no"
                   Return="ignore" />
