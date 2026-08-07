@@ -215,8 +215,9 @@ namespace
 
 DriverSpec const& DriverOf(Flavor flavor)
 {
-    auto const* const match =
-        std::ranges::find_if(Drivers, [flavor](DriverSpec const& spec) { return spec.flavor == flavor; });
+    // `auto const`, not `auto const*` — see the note in ClassifyCompiler:
+    // std::array's iterator is only a raw pointer on libstdc++/libc++.
+    auto const match = std::ranges::find_if(Drivers, [flavor](DriverSpec const& spec) { return spec.flavor == flavor; });
     return match != Drivers.end() ? *match : Drivers.front();
 }
 
