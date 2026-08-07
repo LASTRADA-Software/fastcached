@@ -708,9 +708,25 @@ jobs:
       - name: "Build"
         run: cmake --build --preset cl-release --target fastcached fastcache-cc
 
+      # On failure CPack only says "check wix.log", which lives in the build
+      # tree and is otherwise discarded with the runner — so the actual WiX
+      # diagnostic never reaches the job output. Dump it here.
       - name: "Package"
+        shell: pwsh
         working-directory: out/build/cl-release
-        run: cpack -G WIX
+        run: |
+          cpack -G WIX
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $log = '_CPack_Packages/win64/WIX/wix.log'
+            if (Test-Path $log) {
+              Write-Host "===== wix.log ====="
+              Get-Content $log
+            } else {
+              Write-Host "no wix.log at $log"
+            }
+          }
+          exit $code
 
       # Install silently, then assert the MSI really registered an auto-start
       # service and started it — the behaviour the installer promises.
