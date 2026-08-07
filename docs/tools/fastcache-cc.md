@@ -69,6 +69,14 @@ cmake -S . -B build -G Ninja \
   -DCMAKE_CXX_COMPILER_LAUNCHER=fastcache-cc
 ```
 
+The fastcached build does this for itself: `cmake/CompileCache.cmake` picks
+`fastcache-cc` up automatically whenever the binary is on `PATH` and a daemon
+address is known — exported as `FASTCACHE_ADDR` or passed as
+`-DFASTCACHE_ADDR=host:port` — and injects `FASTCACHE_SRCROOT` /
+`FASTCACHE_BUILDTREE` from the source and binary directories, so those two need
+not be exported. Without an address it falls back to `sccache`;
+`-DUSE_COMPILER_CACHE=OFF` disables both.
+
 ## Environment
 
 Configuration is entirely environmental, so a launcher invocation stays a drop-in

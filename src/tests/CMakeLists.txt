@@ -34,7 +34,7 @@ catch_discover_tests(FastCacheTest)
 
 # ---------------------------------------------------------------------------
 # sccache smoke tests. Registered only when an sccache binary is present
-# (SCCACHE is the find_program result from cmake/cache.cmake). Each test starts
+# (SCCACHE is the find_program result from cmake/CompileCache.cmake). Each test starts
 # the freshly-built fastcached, points sccache at it over one wire protocol,
 # and asserts a cache hit — the same compile-twice check the CI smoke jobs run,
 # via the same scripts/sccache-smoke driver.

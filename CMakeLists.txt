@@ -53,7 +53,7 @@ set(CMAKE_COLOR_DIAGNOSTICS ON)
 # Project-wide options
 
 option(FASTCACHED_BUILD_TESTS "Build unit tests" ON)
-option(USE_SCCACHE "Use sccache as the compiler launcher when the binary is on PATH" ON)
+option(USE_COMPILER_CACHE "Use a compiler-cache launcher when one is available (fastcache-cc when configured, else sccache)" ON)
 
 # TLS is opt-in and off by default so the standard build stays dependency-free
 # (mirroring TRACY_ENABLE). When on, the build links OpenSSL and our code keys
@@ -79,11 +79,12 @@ option(TRACY_ENABLE "Enable Tracy profiler instrumentation (fetches & links the 
 option(TRACY_ON_DEMAND "Tracy: only collect data while a profiler is connected" ON)
 
 # ----------------------------------------------------------------------------
-# Compiler caching (sccache). Loaded before any compiler invocation so that
-# CPM-fetched dependencies also get cached. cache.cmake silently no-ops when
-# sccache is not installed or USE_SCCACHE=OFF.
+# Compiler caching. Loaded before any compiler invocation so that CPM-fetched
+# dependencies also get cached. CompileCache.cmake prefers our own fastcache-cc
+# launcher (when installed and FASTCACHE_ADDR names a daemon), falls back to
+# sccache, and silently no-ops when neither is usable or USE_COMPILER_CACHE=OFF.
 
-include(cache)
+include(CompileCache)
 
 # Default install/runtime/library output directories.
 if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
