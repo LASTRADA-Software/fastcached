@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    SPDX-License-Identifier: Apache-2.0
+
+    CPack WiX patch fragment: registers fastcached as an auto-start Windows
+    service at install time and removes it on uninstall.
+
+    Rather than declaring a WiX <ServiceInstall> element, this drives the
+    daemon's own `--install-service` / `--uninstall-service` code path
+    (FastCache/Platform/ServiceControl.cpp). That keeps one implementation of
+    "how fastcached registers itself" shared with the command line, including
+    BuildServiceCommandLine's absolutization of --config — which matters
+    because a service starts with its working directory set to
+    C:\Windows\System32, so a relative path captured at install time would
+    resolve somewhere else entirely at boot.
+
+    --install-service deliberately leaves the new service STOPPED, so starting
+    it is a separate action, conditioned on FASTCACHED_START_SERVICE so the
+    user can opt out in the installer UI.
+
+    All actions are deferred with Impersonate="no": creating a service needs
+    the elevated context, which is only available to a deferred action running
+    as the install account.
+-->
+<CPackWiXPatch>
+
+  <!-- INSTALLFOLDER is what CPack's WiX generator names the install root. -->
+  <CPackWiXFragment Id="#PRODUCT">
+
+    <!-- Checkbox state, surfaced in the UI (see the exit dialog below).
+         1 = start the service when the installer finishes. -->
+    <Property Id="FASTCACHED_START_SERVICE" Value="1" Secure="yes" />
+
+    <CustomAction Id="FastCachedInstallService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]fastcached.exe&quot; --install-service --config=&quot;[INSTALLFOLDER]fastcached.yaml&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <CustomAction Id="FastCachedStartService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; start FastCached"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!-- Uninstall must not fail the removal if the service is already gone,
+         hence Return="ignore". It best-effort stops before deleting. -->
+    <CustomAction Id="FastCachedUninstallService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]fastcached.exe&quot; --uninstall-service"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- Register after the files are on disk (InstallFiles), since the
+           action executes the installed binary. NOT REMOVE keeps it off the
+           uninstall path; upgrades re-register with a refreshed command line. -->
+      <Custom Action="FastCachedInstallService" After="InstallFiles"
+              Condition="NOT REMOVE" />
+
+      <Custom Action="FastCachedStartService" After="FastCachedInstallService"
+              Condition="NOT REMOVE AND FASTCACHED_START_SERVICE = &quot;1&quot;" />
+
+      <!-- Deregister before the files are removed — the action needs
+           fastcached.exe to still exist. -->
+      <Custom Action="FastCachedUninstallService" Before="RemoveFiles"
+              Condition="REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+
+  </CPackWiXFragment>
+
+</CPackWiXPatch>

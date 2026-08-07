@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# RPM %preun — $1 is 0 on the final erase, >=1 when an upgrade is replacing
+# this version. Only tear the service down on a real removal.
+set -e
+
+SERVICE="@FASTCACHED_SERVICE_NAME@"
+
+if [ "$1" -eq 0 ] && [ -d /run/systemd/system ]; then
+    systemctl --no-reload disable "${SERVICE}" >/dev/null 2>&1 || true
+    systemctl stop "${SERVICE}" >/dev/null 2>&1 || true
+fi
+
+exit 0

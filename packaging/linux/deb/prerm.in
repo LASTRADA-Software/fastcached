@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Debian pre-removal: stop the daemon before its binary disappears. Not on
+# upgrade — postinst's try-restart handles that, so the cache stays warm.
+set -e
+
+SERVICE="@FASTCACHED_SERVICE_NAME@"
+
+case "$1" in
+    remove|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            systemctl stop "${SERVICE}" >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0
