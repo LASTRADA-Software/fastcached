@@ -16,25 +16,38 @@ namespace FastCache::Cc
 namespace
 {
 
-    /// Include-dir flag prefixes whose trailing value is a path we relativize.
-    /// Order matters: the longer `/external:I` must be tried before `/I`.
+    /// Include-dir flag prefixes whose trailing value is a path we relativize,
+    /// paired with the leading character that introduces them.
+    ///
+    /// Order matters: the longer `/external:I` must be tried before `/I`. The
+    /// `/`-led spellings are MSVC's and are only recognised under a Windows
+    /// layout — on POSIX a leading slash begins an absolute path, and matching
+    /// `/I` there would split a checkout rooted at `/Infra` into the prefix
+    /// `/I` plus the fragment `nfra/...`, which lies under neither root and so
+    /// comes back verbatim with the absolute path still embedded in the key.
     constexpr std::array<std::string_view, 4> IncludePrefixes { "/external:I", "-external:I", "/I", "-I" };
 
-    /// True if `c` introduces a command-line option in the MSVC style.
+    /// True if `c` introduces a command-line option in the MSVC style, for the
+    /// layout being relativized against.
     ///
-    /// Only meaningful on Windows: on POSIX a leading `/` starts an absolute
-    /// path, never an option, so treating it as one would leave absolute paths
-    /// unrelativized and bake the checkout location into the cache key.
-    /// @param c The argument's first character.
-    /// @return True when `c` introduces an option on this platform.
-    [[nodiscard]] constexpr bool IsWindowsOptionPrefix(char c) noexcept
+    /// The answer comes from the LAYOUT, not from the compiling host. A leading
+    /// `/` introduces an option under a Windows layout, but on POSIX it starts
+    /// an absolute path; treating it as an option there would leave absolute
+    /// paths unrelativized and bake the checkout location into the cache key —
+    /// the exact failure that breaks cross-checkout sharing.
+    ///
+    /// Keying off `_WIN32` instead would make a Windows-hosted launcher
+    /// mis-handle POSIX paths, and it made the behaviour untestable from the
+    /// other platform. `PathCanon::IsWindowsLayout` is the one definition of
+    /// "is this a Windows layout", shared with the canonicalizer, so the two
+    /// cannot drift apart on a root such as `C:/src/proj`.
+    ///
+    /// @param c      The argument's first character.
+    /// @param layout The layout whose path conventions apply.
+    /// @return True when `c` introduces an option under that layout.
+    [[nodiscard]] bool IsWindowsOptionPrefix(char c, PathCanon::Layout const& layout) noexcept
     {
-#if defined(_WIN32)
-        return c == '/';
-#else
-        static_cast<void>(c);
-        return false;
-#endif
+        return c == '/' && PathCanon::IsWindowsLayout(layout);
     }
 
     /// Relativize one argument against both roots: if it is a bare path or an
@@ -48,9 +61,15 @@ namespace
     [[nodiscard]] std::string RelativizeOne(std::string_view arg, PathCanon::Layout const& layout)
     {
 
-        // Include-dir forms: <prefix><path>.
+        // Include-dir forms: <prefix><path>. A `/`-led spelling is only an
+        // option under a Windows layout; under POSIX it is the head of an
+        // absolute path and must fall through to the bare-path branch below,
+        // or a checkout rooted at `/Infra` would be mis-split at `/I`.
         for (std::string_view const prefix: IncludePrefixes)
         {
+            if (prefix.starts_with('/') && !PathCanon::IsWindowsLayout(layout))
+                continue;
+
             if (arg.starts_with(prefix) && arg.size() > prefix.size())
             {
                 std::string_view const path = arg.substr(prefix.size());
@@ -65,12 +84,12 @@ namespace
         // it actually lies under the source root (Canonicalize returns it verbatim
         // otherwise, so a no-op change is left as-is).
         //
-        // `-` introduces an option everywhere. `/` does so only on Windows: on
-        // POSIX a leading slash is an ABSOLUTE PATH, and skipping those would
-        // leave the checkout path in the key — which is exactly what breaks
-        // cross-machine sharing, since two checkouts at different paths would
-        // then key differently despite identical content.
-        if (!arg.empty() && arg.front() != '-' && !(IsWindowsOptionPrefix(arg.front())))
+        // `-` introduces an option everywhere. `/` does so only under a Windows
+        // layout: on POSIX a leading slash is an ABSOLUTE PATH, and skipping
+        // those would leave the checkout path in the key — which is exactly
+        // what breaks cross-machine sharing, since two checkouts at different
+        // paths would then key differently despite identical content.
+        if (!arg.empty() && arg.front() != '-' && !IsWindowsOptionPrefix(arg.front(), layout))
         {
             auto const canon = PathCanon::Canonicalize(arg, layout);
             if (canon.has_value())

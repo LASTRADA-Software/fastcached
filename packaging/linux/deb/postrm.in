@@ -1,0 +1,43 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Debian post-removal: drop the enable-state symlinks and reload systemd.
+set -e
+
+SERVICE="@FASTCACHED_SERVICE_NAME@"
+
+case "$1" in
+    remove)
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper mask "${SERVICE}" >/dev/null 2>&1 || true
+        fi
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+    purge)
+        # purge also forgets the enable/disable state deb-systemd-helper kept.
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper purge "${SERVICE}" >/dev/null 2>&1 || true
+            deb-systemd-helper unmask "${SERVICE}" >/dev/null 2>&1 || true
+        fi
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        # Cached data is expendable and can be large; a purge should not leave
+        # it behind. The fastcached user is intentionally NOT deleted — files
+        # elsewhere may still be owned by it.
+        #
+        # Never recurse into something the package does not own. systemd's
+        # StateDirectory= creates this path, and an operator may well have
+        # bind-mounted a volume onto it or pointed storage_path at it; an
+        # unconditional `rm -rf` would then destroy data on an ordinary purge.
+        # Removing only an unmounted, non-symlinked directory keeps the cleanup
+        # while making that outcome impossible.
+        if [ -d /var/lib/fastcached ] && [ ! -L /var/lib/fastcached ] \
+           && ! mountpoint -q /var/lib/fastcached 2>/dev/null; then
+            rm -rf /var/lib/fastcached
+        fi
+        ;;
+esac
+
+exit 0

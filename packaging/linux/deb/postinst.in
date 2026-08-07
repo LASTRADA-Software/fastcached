@@ -1,0 +1,56 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Debian post-install: create the service account, its state directory, and
+# enable + start the unit.
+set -e
+
+SERVICE="@FASTCACHED_SERVICE_NAME@"
+
+case "$1" in
+    configure)
+        # Create the fastcached system user from the shipped sysusers.d entry.
+        # systemd-sysusers is idempotent, so an upgrade over an existing user
+        # is a no-op rather than an error.
+        if [ -x /usr/bin/systemd-sysusers ] || [ -x /bin/systemd-sysusers ]; then
+            systemd-sysusers "@FASTCACHED_SYSUSERS_FILE@" >/dev/null 2>&1 || true
+        fi
+        if [ -x /usr/bin/systemd-tmpfiles ] || [ -x /bin/systemd-tmpfiles ]; then
+            systemd-tmpfiles --create "@FASTCACHED_TMPFILES_FILE@" >/dev/null 2>&1 || true
+        fi
+
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+
+        # $2 holds the previously-configured version: empty means this is a
+        # fresh install, non-empty means an upgrade.
+        #
+        # On a fresh install the unit is enabled unconditionally. On an upgrade
+        # deb-systemd-helper decides, so a unit the operator deliberately
+        # disabled stays disabled — `was-enabled` reports the recorded choice
+        # rather than the current symlink state.
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper unmask "${SERVICE}" >/dev/null 2>&1 || true
+            if [ -z "$2" ] || deb-systemd-helper --quiet was-enabled "${SERVICE}"; then
+                deb-systemd-helper enable "${SERVICE}" >/dev/null 2>&1 || true
+            else
+                deb-systemd-helper update-state "${SERVICE}" >/dev/null 2>&1 || true
+            fi
+        elif [ -d /run/systemd/system ]; then
+            systemctl enable "${SERVICE}" >/dev/null 2>&1 || true
+        fi
+
+        if [ -d /run/systemd/system ]; then
+            if [ -n "$2" ]; then
+                # Upgrade: only bounce an already-running daemon.
+                systemctl try-restart "${SERVICE}" >/dev/null 2>&1 || true
+            else
+                # Fresh install: start it so the cache is up without a second
+                # manual step (this is what "auto-start" is expected to mean).
+                systemctl start "${SERVICE}" >/dev/null 2>&1 || true
+            fi
+        fi
+        ;;
+esac
+
+exit 0

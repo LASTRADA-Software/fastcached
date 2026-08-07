@@ -4,6 +4,94 @@ fastcached ships the pieces needed to run it beyond a trusted LAN:
 authentication, TLS, a Prometheus metrics endpoint, a health probe, and a
 container image. This page shows how they fit together.
 
+## systemd
+
+The `.deb` and `.rpm` packages install a unit that runs the daemon as a
+dedicated `fastcached` system user and starts it on boot. See
+[Install](../getting-started/install.md) for the package-level workflow;
+this section covers what the unit does and how to adapt it.
+
+The unit runs the daemon in the **foreground** under `Type=simple` and does
+not pass `--daemon`. That is deliberate: the POSIX daemonize path
+double-forks and redirects stdout/stderr to `/dev/null`, so journald would
+capture nothing, and its pidfile is written by the grandchild only after
+both parents exit, which races `Type=forking` with `PIDFile=`. Running in
+the foreground avoids both and gives journald the daemon's stderr directly.
+
+```sh
+journalctl -u fastcached -f
+```
+
+Leave `log_timestamps` off — journald timestamps every line already.
+
+### Reloading
+
+`systemctl reload fastcached` sends `SIGHUP`, which re-reads
+`/etc/fastcached/fastcached.yaml`. Only part of the configuration is
+reloadable:
+
+| Reloadable | Requires a restart |
+|---|---|
+| `log_level`, `max_memory`, `requirepass`, `auth_username`, `notify_keyspace_events` | `bind`, `port`, `listeners`, `storage_path`, `storage_shards`, `storage_durability`, `storage_max_value`, `threads` |
+
+The right-hand column is live-wired at startup — listeners are bound and the
+storage backend is constructed once — so a reload that changes any of it is
+rejected *in full*, the previous configuration is kept, and the reason is
+logged. Reload therefore either applies everything or nothing.
+
+### Hardening
+
+fastcached never drops privileges on its own, so every restriction comes
+from the unit: `User=`/`Group=`, `StateDirectory=`, and the usual
+`Protect*`/`Restrict*` set. Check it with:
+
+```sh
+systemd-analyze security fastcached.service
+```
+
+Two consequences worth knowing. `ProtectSystem=strict` and
+`ProtectHome=yes` mean TLS certificates must live somewhere the unit can
+still read — `/etc/fastcached/` is the natural place. And binding a port
+below 1024 needs capabilities the unit drops by default:
+
+```ini
+# systemctl edit fastcached
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
+### Persistent storage
+
+`StateDirectory=fastcached` provides `/var/lib/fastcached`, owned by the
+service user. Point `storage_path` at it to enable the on-disk tier:
+
+```yaml
+storage_path: /var/lib/fastcached/cache
+```
+
+The path's *shape* selects the layout: a path with no file extension (as
+above) becomes a sharded directory, while one with an extension
+(`cache.cow`) is a single file.
+
+## Windows service
+
+The MSI registers `fastcached` as an auto-start service. The same
+registration is available from the command line on any installation:
+
+```powershell
+fastcached.exe --install-service --config=C:\path\to\fastcached.yaml
+sc.exe start FastCached
+fastcached.exe --uninstall-service
+```
+
+`--install-service` records the flags it was given into the service's
+command line and makes path arguments absolute — a service starts with its
+working directory set to `C:\Windows\System32`, so a relative path captured
+at install time would resolve elsewhere at boot. It creates the service
+already set to auto-start but leaves it stopped, so the first start is
+explicit.
+
 ## Container
 
 A multi-stage [`Dockerfile`](../../Dockerfile) builds a Release binary with TLS

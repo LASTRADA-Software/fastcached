@@ -1,0 +1,25 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# RPM %postun — $1 is 0 on the final erase, >=1 during an upgrade.
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+if [ "$1" -eq 0 ]; then
+    # Final removal: cached data is expendable and can be large, so do not
+    # leave it behind. The fastcached user is intentionally kept — other files
+    # on the system may still be owned by it.
+    #
+    # Guarded exactly as the DEB postrm is: systemd's StateDirectory= owns this
+    # path, and an operator may have bind-mounted a volume onto it. Recursing
+    # into a mountpoint or a symlink on an ordinary erase would destroy data the
+    # package never installed.
+    if [ -d /var/lib/fastcached ] && [ ! -L /var/lib/fastcached ] \
+       && ! mountpoint -q /var/lib/fastcached 2>/dev/null; then
+        rm -rf /var/lib/fastcached
+    fi
+fi
+
+exit 0

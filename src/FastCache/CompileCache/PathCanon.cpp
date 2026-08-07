@@ -89,11 +89,46 @@ namespace
         return std::string { absolutePath };
     }
 
+    /// True when `root` is a Windows-shaped path root: backslash-separated, or
+    /// prefixed with a drive specifier (`C:` / `C:/...`).
+    ///
+    /// The drive test is deliberately narrow — an ASCII letter, a colon, and
+    /// then either end-of-string or a separator. Both halves matter:
+    ///
+    /// - Without the letter check, any root whose second byte is a colon reads
+    ///   as Windows.
+    /// - Without the separator check, a relative POSIX root like `a:b/proj`
+    ///   still reads as Windows, because `a` is a letter and `:` sits at index 1.
+    ///
+    /// Either mistake makes a POSIX layout look like Windows, which turns every
+    /// leading `/` into an "option" and leaves absolute paths — and so the
+    /// checkout location — baked into the cache key.
+    ///
+    /// @param root A layout root in native form.
+    /// @return True when the root uses Windows path conventions.
+    [[nodiscard]] constexpr bool IsWindowsRoot(std::string_view root) noexcept
+    {
+        if (root.contains('\\'))
+            return true;
+        // Compared directly rather than via std::isalpha, which is
+        // locale-dependent and would make the predicate environment-sensitive.
+        auto const isDriveLetter = [](char c) noexcept {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        };
+        if (root.size() < 2 || root[1] != ':' || !isDriveLetter(root[0]))
+            return false;
+        return root.size() == 2 || root[2] == '/' || root[2] == '\\';
+    }
+
     /// The separator a localized path should use. Taken from the consuming
     /// layout's own root rather than from the host OS: a cache is shared across
     /// machines, so a Windows consumer layout must localize to backslashes even
-    /// when this code runs on POSIX (and vice versa). A root with no separator
-    /// at all is treated as POSIX.
+    /// when this code runs on POSIX (and vice versa).
+    ///
+    /// This asks a narrower question than IsWindowsRoot: a `C:/src/proj` root is
+    /// Windows, yet it spells its separators with forward slashes and localized
+    /// paths must keep doing so. Only the actual separator in use decides here.
+    ///
     /// @param root A layout root in native form.
     /// @return '\\' when the root uses backslashes, else '/'.
     [[nodiscard]] char SeparatorOf(std::string_view root) noexcept
@@ -375,6 +410,11 @@ namespace
     }
 
 } // namespace
+
+bool IsWindowsLayout(Layout const& layout) noexcept
+{
+    return IsWindowsRoot(layout.sourceRoot) || IsWindowsRoot(layout.buildTree);
+}
 
 std::expected<std::string, CanonError> Canonicalize(std::string_view absolutePath, Layout const& layout)
 {

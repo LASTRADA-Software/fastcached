@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# System account the fastcached service runs as. Applied by systemd-sysusers
+# from the package's post-install scriptlet.
+#
+# Type User        ID  GECOS                  Home directory      Shell
+u      fastcached  -   "fastcached daemon"    /var/lib/fastcached -

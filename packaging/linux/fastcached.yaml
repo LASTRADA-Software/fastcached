@@ -1,0 +1,171 @@
+# fastcached configuration
+# SPDX-License-Identifier: Apache-2.0
+#
+# Every setting below is commented out and shows the built-in default, so an
+# untouched file behaves exactly like running `fastcached` with no flags.
+# Uncomment only what you actually want to change.
+#
+#   systemctl restart fastcached    apply any change
+#   systemctl reload fastcached     apply the reloadable subset only (see below)
+#
+# Reloadable on SIGHUP: log_level, max_memory, requirepass, auth_username,
+# notify_keyspace_events.
+#
+# NOT reloadable — changing any of these and running `systemctl reload` makes
+# the daemon REJECT the whole reload and keep its previous configuration
+# (the reason is logged to the journal). Use `systemctl restart` instead:
+# bind, port, listeners, storage_path, storage_shards, storage_durability,
+# storage_max_value, threads.
+#
+# Command-line flags override this file. Add them with a drop-in:
+#   systemctl edit fastcached
+
+# --- Network ----------------------------------------------------------------
+
+# Bind address. The default is IPv4 loopback, which is what you want for a
+# local cache. Use '::' for dual-stack (both IPv4 and IPv6) if the cache must
+# be reachable from other hosts — and read the warning under `requirepass`
+# before you do.
+#bind: 127.0.0.1
+
+# TCP port. 11211 is the memcached default; redis clients speak RESP on the
+# same port (the protocol is auto-detected per connection).
+#port: 11211
+
+# Depth of the kernel's accept queue. Raise it if bursts of parallel clients
+# (a `make -jN` driving fastcache-cc) see connection refusals. Clamped to the
+# kernel's own SOMAXCONN.
+#listen_backlog: 511
+
+# --- Memory -----------------------------------------------------------------
+
+# In-memory cache budget. Accepts k/m/g suffixes (KiB/MiB/GiB) or a percentage
+# of host RAM, e.g. `25%`. Values evict LRU-first once the budget is reached.
+#max_memory: 64m
+
+# In-memory LRU recency policy:
+#   approximate  reads run concurrently, eviction is approximately LRU (faster)
+#   strict       exact LRU order, but same-shard reads serialise
+#lru_mode: approximate
+
+# --- Concurrency ------------------------------------------------------------
+
+# Number of independent single-threaded reactors. Each is pinned to a core and
+# every connection stays on one reactor for its lifetime. Default (unset) uses
+# the host's hardware concurrency.
+#threads: 0
+
+# Reactor thread pinning: `per-core` or `none`. A no-op with a single reactor.
+#cpu_affinity: per-core
+
+# --- Persistence ------------------------------------------------------------
+#
+# Without storage_path the cache is purely in-memory and everything is lost on
+# restart. With it, an in-memory L1 sits over an on-disk CoW-B+tree L2.
+#
+# The path is interpreted by shape: a path WITHOUT a file extension is treated
+# as a directory and sharded into shard-NN.cow files inside it; a path WITH an
+# extension (e.g. cache.cow) is a single file. The path below is a directory.
+#
+# /var/lib/fastcached is created and owned by the service (StateDirectory=).
+#storage_path: /var/lib/fastcached/cache
+
+# Shard count for the on-disk tier. Default (unset) is min(16, CPU count) for a
+# directory-shaped storage_path, or 1 for a single file.
+#storage_shards: 0
+
+# Durability:
+#   batched  buffer writes, fsync at commit boundaries (default, recommended)
+#   fsync    fsync after every write — slowest, safest
+#   none     OS page cache only; fastest, loses data on power failure
+#storage_durability: batched
+
+# Cap the on-disk tier. 0 means unbounded — the cache grows to whatever it
+# needs. Set this to keep a build cache inside a fixed disk allotment; the
+# budget is split evenly across shards and each evicts its own LRU tail.
+#storage_max_disk: 0
+
+# Largest single value accepted, in bytes. Also raises the wire payload cap.
+#storage_max_value: 16m
+
+# --- Compression ------------------------------------------------------------
+
+# Codec for values written to disk: zstd, lz4, or none. Reads always return
+# plaintext and each record carries its own codec tag, so this can be changed
+# between runs with no migration.
+#compression: zstd
+#compression_level: 3
+#compression_min_bytes: 256
+
+# Codec for the IN-MEMORY tier, independent of the on-disk one above. Default
+# is none, which keeps reads allocation-free. Worth enabling when the working
+# set exceeds RAM — compile-cache objects with debug info compress ~4.5x — at
+# the cost of a decompress on every read.
+#memory_compression: none
+#memory_compression_level: 3
+#memory_compression_min_bytes: 4096
+
+# --- Authentication ---------------------------------------------------------
+#
+# WARNING: with no requirepass, anyone who can reach the port has full read and
+# write access to the cache. The default `bind: 127.0.0.1` is what keeps that
+# safe. If you change bind to a non-loopback address, set a secret here.
+#
+# The secret is compared in constant time and is never logged. Note that the
+# memcached TEXT protocol has no auth handshake, so once a secret is set it
+# rejects data commands outright — use the redis (RESP) or memcached binary
+# protocol instead.
+#requirepass: change-me
+
+# Username for the two-argument `AUTH <user> <pass>` and SASL PLAIN forms. The
+# one-argument redis form `AUTH <pass>` ignores it, matching redis semantics.
+#auth_username: default
+
+# --- TLS --------------------------------------------------------------------
+#
+# Requires a build with TLS support (-DFASTCACHED_ENABLE_TLS=ON); enabling it
+# on a build without OpenSSL is a startup error. Both paths must be readable by
+# the fastcached user — note ProtectHome=yes and ProtectSystem=strict in the
+# unit, so keep certificates somewhere like /etc/fastcached/.
+#tls: false
+#tls_cert: /etc/fastcached/server.crt
+#tls_key: /etc/fastcached/server.key
+
+# Multiple listeners in one process, e.g. plaintext on a private interface and
+# TLS on a public one. When `listeners` is set it supersedes bind/port above.
+# TLS listeners share the tls_cert/tls_key pair (no per-listener SNI).
+#listeners:
+#  - address: 127.0.0.1
+#    port: 11211
+#  - address: "::"
+#    port: 11212
+#    tls: true
+
+# --- Observability ----------------------------------------------------------
+
+# Prometheus /metrics and a /healthz liveness probe on a dedicated HTTP port.
+# Keep metrics_bind on loopback unless your scraper is remote — the endpoint is
+# unauthenticated.
+#metrics: false
+#metrics_bind: 127.0.0.1
+#metrics_port: 9259
+
+# Log threshold: trace, debug, info, warn, error, fatal.
+#log_level: info
+
+# Leave log_timestamps off under systemd — journald already timestamps every
+# line, so enabling it prints the time twice.
+#log_timestamps: false
+
+# Prefix connection-scoped log lines with the client IP.
+#log_source: false
+
+# At trace level, also log connection/keepalive/admin chatter (PING, HELLO,
+# AUTH, ...) instead of just keyspace data commands.
+#log_everything: false
+
+# Redis-style keyspace notifications. Empty disables them. Letters: K (keyspace
+# channels), E (keyevent channels), g (generic: del/expire/persist), $ (string:
+# set), A (alias for g$). At least one of K or E is required for any event to
+# be published.
+#notify_keyspace_events: ""

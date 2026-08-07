@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# System-wide fastcached unit.
+#
+# Type=simple and NOT --daemon: the daemon's POSIX daemonize path double-forks
+# and redirects stdout/stderr to /dev/null, which would silence journald
+# entirely. Run in the foreground and let systemd own the process; fastcached
+# logs to stderr, which journald captures as-is.
+#
+# Override anything here with a drop-in rather than editing this file (it is
+# replaced on upgrade):
+#
+#     systemctl edit fastcached
+
+[Unit]
+Description=fastcached — fast cache daemon
+Documentation=https://github.com/LASTRADA-Software/fastcached
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/fastcached --config=/etc/fastcached/fastcached.yaml
+
+# SIGHUP re-reads the config file. Note that only a subset of settings is
+# reloadable — bind/port/listeners/storage*/threads are validated as immutable
+# and cause the whole reload to be rejected (the daemon logs the reason and
+# keeps running with the previous config). Changing those needs a restart.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# SIGTERM triggers a graceful shutdown; the stop flag is polled at 100 ms, so
+# a clean stop takes well under a second plus connection drain.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=1
+
+User=fastcached
+Group=fastcached
+
+# Creates and owns /var/lib/fastcached (0750). This is where the example
+# config points `storage_path`, and it survives restarts but is cleaned up on
+# package purge.
+StateDirectory=fastcached
+StateDirectoryMode=0750
+
+# --- Hardening -------------------------------------------------------------
+# fastcached never drops privileges itself, so every restriction below has to
+# come from systemd. Keep this list in sync with `systemd-analyze security
+# fastcached.service` when adding features that need new access.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectProc=invisible
+# AF_UNIX and AF_NETLINK are not for listening — they are what glibc's
+# getaddrinfo needs to resolve a non-numeric `bind:` value, which the shipped
+# config explicitly invites. NSS reaches systemd-resolved over an AF_UNIX
+# socket and enumerates interfaces over AF_NETLINK; without both, `bind:
+# cache.internal` fails at startup with an opaque resolver error that does not
+# reproduce outside the unit.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# Binding a port below 1024 (the default 11211 is not) additionally needs:
+#     AmbientCapabilities=CAP_NET_BIND_SERVICE
+#     CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

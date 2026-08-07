@@ -124,15 +124,23 @@ namespace
         if (base.ends_with(".exe"))
             base.resize(base.size() - 4);
 
-        auto const* const match = std::ranges::find_if(NamePatterns, [&base](NamePattern const& pattern) {
+        // The match is consumed through a view rather than bound to a named
+        // iterator. An iterator variable cannot be spelled portably here:
+        // `auto const*` compiles only where std::array's iterator is a raw
+        // pointer (libstdc++, libc++) and fails on MSVC's class-type iterator,
+        // plain `auto const` trips readability-qualified-auto where it *is* a
+        // pointer, and naming the type trips modernize-use-auto.
+        for (NamePattern const& pattern: NamePatterns)
+        {
             if (!base.starts_with(pattern.stem))
-                return false;
+                continue;
             // Anything after the stem must be a version suffix ("-14", "-18"),
             // never more name — so "clanger" does not read as clang.
             auto const rest = std::string_view { base }.substr(pattern.stem.size());
-            return rest.empty() || rest.front() == '-';
-        });
-        return match != NamePatterns.end() ? match->flavor : Flavor::Unknown;
+            if (rest.empty() || rest.front() == '-')
+                return pattern.flavor;
+        }
+        return Flavor::Unknown;
     }
 
     /// True if `a` is an option (starts with one of the driver's introducers).
@@ -212,9 +220,12 @@ namespace
 
 DriverSpec const& DriverOf(Flavor flavor)
 {
-    auto const* const match =
-        std::ranges::find_if(Drivers, [flavor](DriverSpec const& spec) { return spec.flavor == flavor; });
-    return match != Drivers.end() ? *match : Drivers.front();
+    // Iterated rather than searched via a named iterator — see the note in
+    // ClassifyCompiler for why an iterator variable is not portable here.
+    for (DriverSpec const& spec: Drivers)
+        if (spec.flavor == flavor)
+            return spec;
+    return Drivers.front();
 }
 
 ParsedCommand ParseCommand(std::span<std::string const> argv)

@@ -52,7 +52,8 @@ if(FASTCACHED_STATIC_LAUNCHER AND MSVC)
 endif()
 
 install(TARGETS fastcache-cc
-    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    RUNTIME DESTINATION "${FASTCACHED_INSTALL_BINDIR}"
+    COMPONENT Runtime
 )
 
 # Unit tests for the reusable launcher pieces (parsing, keying, statistics, and

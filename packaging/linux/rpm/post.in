@@ -1,0 +1,29 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# RPM %post — argument is the number of package versions that will remain
+# installed: 1 on a fresh install, 2 or more during an upgrade.
+set -e
+
+SERVICE="@FASTCACHED_SERVICE_NAME@"
+
+if [ -x /usr/bin/systemd-sysusers ]; then
+    systemd-sysusers "@FASTCACHED_SYSUSERS_FILE@" >/dev/null 2>&1 || true
+fi
+if [ -x /usr/bin/systemd-tmpfiles ]; then
+    systemd-tmpfiles --create "@FASTCACHED_TMPFILES_FILE@" >/dev/null 2>&1 || true
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    if [ "$1" -eq 1 ]; then
+        # Fresh install: enable for boot and start now.
+        systemctl enable "${SERVICE}" >/dev/null 2>&1 || true
+        systemctl start "${SERVICE}" >/dev/null 2>&1 || true
+    else
+        # Upgrade: respect the operator's enable choice, bounce only if running.
+        systemctl try-restart "${SERVICE}" >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

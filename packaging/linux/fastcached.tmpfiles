@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# State directory for the persistent (CoW-tree) storage backend. The unit's
+# StateDirectory= already creates this on start; the entry here makes the
+# directory exist immediately after package install, so an operator can stage
+# a cache file before first start.
+#
+# Type Path                 Mode Owner      Group      Age Argument
+d      /var/lib/fastcached  0750 fastcached fastcached -   -

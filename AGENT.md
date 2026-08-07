@@ -62,6 +62,35 @@ src/apps/
                             OFF — test infrastructure, never installed)
 ```
 
+Platform service integration and OS packaging live under `packaging/`, which
+follows the same table idiom — one descriptor row per installed asset, so a
+new man page or logrotate snippet is a new row rather than a new
+`install()` call:
+
+```
+packaging/
+  CMakeLists.txt      the asset install table; exports the config-file list
+                      reused by the dpkg conffiles and rpm %config filelists
+  linux/              system + user systemd units, sysusers.d/tmpfiles.d,
+                      the commented /etc/fastcached/fastcached.yaml, and the
+                      DEB/RPM maintainer-script templates (*.in)
+  windows/            WiX fragment driving --install-service / --uninstall-service
+```
+
+`cmake/Packaging.cmake` turns that into `.deb`/`.rpm`/`.msi` via CPack. Three
+constraints there are load-bearing and have each already been a bug:
+
+- **The unit must not pass `--daemon`.** The POSIX daemonize path double-forks
+  and sends stdout/stderr to `/dev/null`, which silences journald; its pidfile
+  is also written after both parents exit, racing `Type=forking`.
+- **`ExecStart` must pass `--config`.** There is no default config search path,
+  so without it `ConfigReloader` has nothing to re-read and `systemctl reload`
+  is a silent no-op.
+- **The package payload is rooted at `/`, not `/usr`.** `/etc` cannot sit under
+  a `/usr` prefix, so `FASTCACHED_INSTALL_BINDIR`/`DOCDIR` spell their own
+  `usr/`. A relative destination for the units would put them where systemd
+  never looks.
+
 `fastcached` and `fastcache-cc` are both installed. Two things the launcher's
 cache key depends on, both of which have already caused silent hit-rate
 collapses and are now covered by regression tests:

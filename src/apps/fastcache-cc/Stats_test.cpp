@@ -36,8 +36,7 @@ class ScopedStateDir
   public:
     ScopedStateDir()
     {
-        auto const unique =
-            std::filesystem::temp_directory_path() / ("fastcache-cc-test-" + std::to_string(CounterNext()));
+        auto const unique = std::filesystem::temp_directory_path() / ("fastcache-cc-test-" + std::to_string(CounterNext()));
         std::filesystem::create_directories(unique);
         _dir = unique.string();
 

@@ -14,6 +14,34 @@ project(fastcached
 
 include(GNUInstallDirs)
 
+# Lay the install tree out for a distro package: the payload is rooted at /
+# instead of /usr, because the systemd units and the /etc config sit at fixed
+# absolute locations that cannot be rebased onto a /usr prefix (systemd does
+# not read config from /usr/etc). See cmake/Packaging.cmake.
+#
+# This is OFF by default, including on Linux, so that the ordinary
+# `cmake --install --prefix /usr/local` keeps putting the daemon at
+# /usr/local/bin/fastcached. Defaulting it ON rebased every developer install
+# onto <prefix>/usr/bin, which is on nobody's PATH — a successful install that
+# left `fastcached` reporting "command not found".
+#
+# Turn it ON only to build packages:
+#   cmake -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON ... && cpack -G "DEB;RPM"
+# The CI packaging job does exactly that; see .github/workflows/build.yml.
+option(FASTCACHED_PACKAGE_ROOT_PREFIX "Lay out the install tree for .deb/.rpm packaging" OFF)
+
+# Install destinations for the relocatable artifacts (binaries, docs). With the
+# prefix moved to /, the ordinary FHS paths have to spell `usr/` themselves, or
+# the binaries would land in /bin and the docs in /share/doc. Outside packaging
+# these stay the plain GNUInstallDirs values.
+if(FASTCACHED_PACKAGE_ROOT_PREFIX)
+    set(FASTCACHED_INSTALL_BINDIR "usr/${CMAKE_INSTALL_BINDIR}")
+    set(FASTCACHED_INSTALL_DOCDIR "usr/${CMAKE_INSTALL_DOCDIR}")
+else()
+    set(FASTCACHED_INSTALL_BINDIR "${CMAKE_INSTALL_BINDIR}")
+    set(FASTCACHED_INSTALL_DOCDIR "${CMAKE_INSTALL_DOCDIR}")
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -251,8 +279,21 @@ add_subdirectory(src/apps)
 install(FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
         "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
-    DESTINATION "${CMAKE_INSTALL_DOCDIR}"
+    DESTINATION "${FASTCACHED_INSTALL_DOCDIR}"
+    COMPONENT Runtime
 )
+
+# ----------------------------------------------------------------------------
+# Service-integration assets (systemd units, sysusers/tmpfiles declarations,
+# the example config, the WiX service fragment) and the CPack configuration
+# that wraps everything installed above into .deb / .rpm / .msi.
+#
+# Order matters twice over: packaging/ exports the variables Packaging.cmake
+# consumes, and CPack only sees install() rules declared before include(CPack)
+# — so this stays at the end, after every install() in the project.
+
+add_subdirectory(packaging)
+include(Packaging)
 
 # ----------------------------------------------------------------------------
 # Tests.

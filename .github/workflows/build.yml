@@ -389,10 +389,16 @@ jobs:
       # below exits 77 (skip) when its compiler is absent, and a skipped step
       # still reports green — so a missing compiler would silently mean the
       # clang driver was never exercised at all.
+      # g++-14 must also be put on PATH as plain `g++`: the gcc-release preset
+      # pins CMAKE_CXX_COMPILER to the bare name, which otherwise resolves to
+      # the runner's default GCC 13 — and that has no <print>, so main.cpp
+      # fails to compile. Same symlink the Linux build matrix installs.
       - name: "Install build tools"
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build libyaml-cpp-dev g++-14 clang
+          sudo ln -sf /usr/bin/gcc-14 /usr/local/bin/gcc
+          sudo ln -sf /usr/bin/g++-14 /usr/local/bin/g++
 
       - name: "Configure"
         run: cmake --preset gcc-release
@@ -469,3 +475,326 @@ jobs:
             exit 1
           }
           exit $code
+
+  # Distribution packages. These jobs assert the properties that unit tests
+  # cannot see and that only surface at install time: that the payload lands
+  # where systemd and the FHS require, that the shipped config is registered as
+  # a config file (so an upgrade never discards a local edit), that the unit
+  # actually parses, and that installing the package really does leave a
+  # running daemon serving traffic.
+
+  package-linux:
+    name: "Package (Linux .deb/.rpm)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Cache CPM packages"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-${{ runner.os }}-package-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-package-
+
+      - name: "ccache"
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-package
+          max-size: 256M
+
+      # rpm builds the .rpm on this Debian-family runner; systemd provides
+      # systemd-analyze for the unit check below. g++-14 is symlinked as plain
+      # `g++` because the gcc-release preset pins the bare name, which would
+      # otherwise resolve to the runner's GCC 13 — no <print>, no build.
+      - name: "Install build tools"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev rpm systemd g++-14
+          sudo ln -sf /usr/bin/gcc-14 /usr/local/bin/gcc
+          sudo ln -sf /usr/bin/g++-14 /usr/local/bin/g++
+
+      - name: "Configure"
+        # FASTCACHED_PACKAGE_ROOT_PREFIX is OFF by default so that a plain
+        # `cmake --install --prefix /usr/local` stays conventional; the package
+        # layout (payload rooted at /, units under usr/lib/systemd, config in
+        # /etc) is opt-in and this is the job that opts in.
+        run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON
+
+      - name: "Build"
+        run: cmake --build --preset gcc-release --target fastcached fastcache-cc
+
+      - name: "Package"
+        working-directory: out/build/gcc-release
+        run: cpack -G "DEB;RPM;TGZ"
+
+      # The units are validated from the source tree (not the installed
+      # system) so a typo or a bad directive fails here rather than at first
+      # boot on a user's machine.
+      - name: "Verify the systemd units parse"
+        run: |
+          set -euo pipefail
+          # systemd-analyze reports problems on stderr but still exits 0 for
+          # non-fatal findings, so grep for the ones that matter. The
+          # ExecStart-not-executable note is expected: fastcached is not
+          # installed at /usr/bin in this step.
+          for unit in packaging/linux/fastcached.service packaging/linux/fastcached-user.service; do
+            echo "== $unit"
+            out=$(systemd-analyze verify "$unit" 2>&1 || true)
+            echo "$out"
+            if echo "$out" | grep -Ev 'is not executable|Unit .* not found' | grep -qiE 'error|invalid|bad|unknown (lvalue|section)'; then
+              echo "::error::$unit failed verification"
+              exit 1
+            fi
+          done
+
+      - name: "Inspect the .deb payload"
+        working-directory: out/build/gcc-release
+        run: |
+          set -euo pipefail
+          deb=$(ls fastcached_*.deb)
+          echo "== contents"; dpkg -c "$deb"
+          echo "== control"; dpkg -I "$deb"
+
+          # Capture the listing once, then assert against the file: re-running
+          # the query inside the loop is both slower and needlessly fragile.
+          # Field 6 is the path; $NF would be wrong for any symlink entry,
+          # which dpkg renders as "path -> target".
+          dpkg -c "$deb" | awk '{print $6}' > /tmp/deb-paths.txt
+
+          # The binaries, the units and the config must each land in the one
+          # location that works; /usr/etc or /lib would silently never be read.
+          for path in ./usr/bin/fastcached ./usr/bin/fastcache-cc \
+                      ./usr/lib/systemd/system/fastcached.service \
+                      ./usr/lib/systemd/user/fastcached.service \
+                      ./usr/lib/sysusers.d/fastcached.conf \
+                      ./usr/lib/tmpfiles.d/fastcached.conf \
+                      ./etc/fastcached/fastcached.yaml; do
+            grep -qx "$path" /tmp/deb-paths.txt || { echo "::error::missing $path"; exit 1; }
+          done
+
+          # An empty Architecture produces a package dpkg refuses to install.
+          dpkg -I "$deb" | grep -qE '^ Architecture: [a-z0-9]+' \
+            || { echo "::error::empty Architecture field"; exit 1; }
+
+          # Without the conffiles entry an upgrade silently discards local edits.
+          dpkg -e "$deb" /tmp/debcontrol
+          grep -qx '/etc/fastcached/fastcached.yaml' /tmp/debcontrol/conffiles \
+            || { echo "::error::config not registered as a conffile"; exit 1; }
+
+      - name: "Inspect the .rpm payload"
+        working-directory: out/build/gcc-release
+        run: |
+          set -euo pipefail
+          rpmfile=$(ls fastcached-*.rpm)
+          echo "== contents"; rpm -qlp "$rpmfile"
+          echo "== metadata"; rpm -qip "$rpmfile"
+
+          rpm -qlp "$rpmfile" > /tmp/rpm-paths.txt
+          rpm -qcp "$rpmfile" > /tmp/rpm-config.txt
+
+          for path in /usr/bin/fastcached /usr/bin/fastcache-cc \
+                      /usr/lib/systemd/system/fastcached.service \
+                      /usr/lib/systemd/user/fastcached.service \
+                      /usr/lib/sysusers.d/fastcached.conf \
+                      /usr/lib/tmpfiles.d/fastcached.conf \
+                      /etc/fastcached/fastcached.yaml; do
+            grep -qx "$path" /tmp/rpm-paths.txt || { echo "::error::missing $path"; exit 1; }
+          done
+
+          grep -qx '/etc/fastcached/fastcached.yaml' /tmp/rpm-config.txt \
+            || { echo "::error::config not marked %config"; exit 1; }
+
+      # Install for real and drive traffic through it. The GitHub runner has a
+      # live systemd, so this exercises the actual unit — the service account,
+      # the hardening, journald capture and the SIGHUP path all included.
+      - name: "Install the .deb and exercise the service"
+        working-directory: out/build/gcc-release
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y ./$(ls fastcached_*.deb)
+
+          # The postinst enables and starts the unit; it must already be up.
+          sudo systemctl is-enabled fastcached
+          for _ in $(seq 1 30); do
+            systemctl is-active --quiet fastcached && break
+            sleep 1
+          done
+          systemctl is-active --quiet fastcached || {
+            echo "::error::service did not start"; sudo journalctl -u fastcached --no-pager; exit 1; }
+
+          # Proves the daemon is NOT daemonizing: journald only sees stderr
+          # from a foreground process.
+          sudo journalctl -u fastcached --no-pager | tee /tmp/fc-journal.txt
+          grep -q 'ready, accepting connections' /tmp/fc-journal.txt \
+            || { echo "::error::startup banner missing from the journal"; exit 1; }
+
+          # It must run as the packaged system account, not as root.
+          test "$(systemctl show -p User --value fastcached)" = fastcached
+
+          # End-to-end round trip against the packaged default config.
+          printf 'set k 0 0 5\r\nhello\r\nget k\r\nquit\r\n' | timeout 10 nc -q1 127.0.0.1 11211 | tee /tmp/fc-proto.txt
+          grep -q STORED /tmp/fc-proto.txt
+          grep -q hello  /tmp/fc-proto.txt
+
+          # Reload must apply a reloadable setting rather than restart or fail.
+          # Assert the edit actually landed: sed exits 0 when it matches
+          # nothing, so a reflow of the shipped comment would silently turn this
+          # into "reload an unchanged file", which passes without ever
+          # exercising the SIGHUP path.
+          grep -q '^#log_level: info' /etc/fastcached/fastcached.yaml \
+            || { echo "::error::the shipped yaml no longer contains '#log_level: info'; update this step"; exit 1; }
+          sudo sed -i 's/^#log_level: info/log_level: debug/' /etc/fastcached/fastcached.yaml
+          grep -q '^log_level: debug' /etc/fastcached/fastcached.yaml \
+            || { echo "::error::config edit did not apply"; exit 1; }
+          sudo systemctl reload fastcached
+          sleep 2
+          systemctl is-active --quiet fastcached \
+            || { echo "::error::service died on reload"; exit 1; }
+
+          # A clean SIGTERM stop: a non-zero exit here would mean the unit
+          # restart-loops in production.
+          sudo systemctl stop fastcached
+          test "$(systemctl show -p Result --value fastcached)" = success
+
+      - name: "Verify an upgrade keeps local config edits"
+        working-directory: out/build/gcc-release
+        run: |
+          set -euo pipefail
+          echo '# local edit that must survive' | sudo tee -a /etc/fastcached/fastcached.yaml >/dev/null
+          sudo apt-get install -y --reinstall ./$(ls fastcached_*.deb)
+          grep -q 'local edit that must survive' /etc/fastcached/fastcached.yaml \
+            || { echo "::error::upgrade discarded the local config edit"; exit 1; }
+          sudo systemctl stop fastcached || true
+
+      - name: "Verify removal deregisters the service"
+        run: |
+          set -euo pipefail
+          sudo apt-get purge -y fastcached
+          test ! -e /usr/lib/systemd/system/fastcached.service
+          # A leftover wants-symlink makes systemd log a failure on every boot.
+          test ! -e /etc/systemd/system/multi-user.target.wants/fastcached.service
+
+      - name: "Upload packages"
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastcached-linux-packages
+          path: |
+            out/build/gcc-release/fastcached_*.deb
+            out/build/gcc-release/fastcached-*.rpm
+            out/build/gcc-release/fastcached-*.tar.gz
+          if-no-files-found: error
+
+  package-windows:
+    name: "Package (Windows .msi)"
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Cache CPM packages"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-${{ runner.os }}-package-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-package-
+
+      - name: "sccache"
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: "Install ninja"
+        run: choco install ninja --no-progress
+
+      # CPack's WIX generator drives the WiX 4/5 `wix.exe`; the runner image
+      # ships only the unrelated WiX 3.14. WiX 4 also split the installer UI
+      # out into a separate extension package, and CPack always references it
+      # (WixUI_InstallDir) — without it wix.exe fails with
+      # "error WIX0144: The extension 'WixToolset.UI.wixext' could not be found".
+      - name: "Install WiX"
+        run: |
+          dotnet tool install --global wix --version 5.*
+          wix extension add --global WixToolset.UI.wixext/5.0.2
+
+      # Same toolset pin as the windows build matrix; see the comment there.
+      - name: "Setup MSVC dev environment"
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          toolset: "14.44"
+
+      - name: "Configure"
+        run: cmake --preset cl-release -DFASTCACHED_BUILD_TESTS=OFF
+
+      - name: "Build"
+        run: cmake --build --preset cl-release --target fastcached fastcache-cc
+
+      # On failure CPack only says "check wix.log", which lives in the build
+      # tree and is otherwise discarded with the runner — so the actual WiX
+      # diagnostic never reaches the job output. Dump it here.
+      - name: "Package"
+        shell: pwsh
+        working-directory: out/build/cl-release
+        run: |
+          cpack -G WIX
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $log = '_CPack_Packages/win64/WIX/wix.log'
+            if (Test-Path $log) {
+              Write-Host "===== wix.log ====="
+              Get-Content $log
+            } else {
+              Write-Host "no wix.log at $log"
+            }
+          }
+          exit $code
+
+      # Install silently, then assert the MSI really registered an auto-start
+      # service and started it — the behaviour the installer promises.
+      - name: "Install the MSI and verify the service"
+        shell: pwsh
+        working-directory: out/build/cl-release
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
+          Write-Host "Installing $msi"
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', "`"$msi`"", '/qn', '/l*v', 'install.log')
+
+          # A blind tail of a verbose MSI log is useless — the last 80 lines are
+          # just the property dump. Select the lines that name the failure: the
+          # action trace, custom-action returns, and error records.
+          function Show-InstallLog {
+            Write-Host "===== install.log (relevant lines) ====="
+            Select-String -Path install.log -Pattern `
+              'Action (start|ended)','CustomAction','FastCached','returned actual error','Note: 1: 1(4|7)[0-9][0-9]','Installation (success|failed)','error' `
+              | Select-Object -Last 60 | ForEach-Object { $_.Line }
+          }
+
+          if ($p.ExitCode -ne 0) {
+            Show-InstallLog
+            throw "msiexec failed with $($p.ExitCode)"
+          }
+
+          $svc = Get-Service -Name FastCached -ErrorAction SilentlyContinue
+          if (-not $svc) { Show-InstallLog; throw 'FastCached service was not registered' }
+
+          $start = (Get-CimInstance Win32_Service -Filter "Name='FastCached'").StartMode
+          if ($start -ne 'Auto') { throw "expected auto-start, got $start" }
+
+          for ($i = 0; $i -lt 30 -and (Get-Service FastCached).Status -ne 'Running'; $i++) { Start-Sleep 1 }
+          if ((Get-Service FastCached).Status -ne 'Running') { throw 'service did not start' }
+
+      - name: "Uninstall and verify the service is gone"
+        shell: pwsh
+        working-directory: out/build/cl-release
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/x', "`"$msi`"", '/qn')
+          if ($p.ExitCode -ne 0) { throw "uninstall failed with $($p.ExitCode)" }
+          if (Get-Service -Name FastCached -ErrorAction SilentlyContinue) {
+            throw 'FastCached service survived uninstall'
+          }
+
+      - name: "Upload the MSI"
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastcached-windows-msi
+          path: out/build/cl-release/*.msi
+          if-no-files-found: error
