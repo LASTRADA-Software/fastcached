@@ -124,7 +124,10 @@ namespace
         if (base.ends_with(".exe"))
             base.resize(base.size() - 4);
 
-        auto const* const match = std::ranges::find_if(NamePatterns, [&base](NamePattern const& pattern) {
+        // `auto const` and not `auto const*`: std::array's iterator is a raw
+        // pointer only on libstdc++/libc++. MSVC's STL returns a class-type
+        // iterator, which does not bind to a pointer declaration.
+        auto const match = std::ranges::find_if(NamePatterns, [&base](NamePattern const& pattern) {
             if (!base.starts_with(pattern.stem))
                 return false;
             // Anything after the stem must be a version suffix ("-14", "-18"),
