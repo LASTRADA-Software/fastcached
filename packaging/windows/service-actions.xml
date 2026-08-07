@@ -49,9 +49,12 @@
          which is what makes the relative form work. (fastcached itself then
          makes the config path absolute when it registers the service, since a
          service starts in C:\Windows\System32.) -->
+    <!-- Paths are relative to INSTALL_ROOT: the executables install under
+         bin\ (CMAKE_INSTALL_BINDIR) while the config sits at the install
+         root, so only the exe carries the bin\ prefix. -->
     <CustomAction Id="FastCachedInstallService"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="fastcached.exe --install-service --config=fastcached.yaml"
+                  ExeCommand="bin\fastcached.exe --install-service --config=fastcached.yaml"
                   Execute="deferred"
                   Impersonate="no"
                   Return="check" />
@@ -67,7 +70,7 @@
          hence Return="ignore". It best-effort stops before deleting. -->
     <CustomAction Id="FastCachedUninstallService"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="fastcached.exe --uninstall-service"
+                  ExeCommand="bin\fastcached.exe --uninstall-service"
                   Execute="deferred"
                   Impersonate="no"
                   Return="ignore" />
