@@ -144,9 +144,9 @@ cmake -S . -B build -G Ninja `
 ### 4. See how it did
 
 ```sh
-fastcache-cc --stats                    # totals, hit rate, latency distributions
-fastcache-cc --stats --cohort ci-main   # one cohort only
-fastcache-cc --clear-stats              # discard the log
+fastcache-cc --show-stats                    # totals, hit rate, latency distributions
+fastcache-cc --show-stats --cohort ci-main   # one cohort only
+fastcache-cc --zero-stats                    # discard the log
 ```
 
 ```

@@ -54,12 +54,22 @@ to an object file. Link steps, compile-and-link steps, preprocess-only runs
 ## Usage
 
 ```
-fastcache-cc <compiler> <args...>     Front a compile (as CMAKE_<LANG>_COMPILER_LAUNCHER)
-fastcache-cc --stats [--cohort <id>]  Report cache statistics for this machine
-fastcache-cc --clear-stats            Discard the statistics log (--reset is a synonym)
-fastcache-cc --help                   Flags and environment reference
-fastcache-cc --version                Launcher version
+fastcache-cc <compiler> <args...>               Front a compile (as CMAKE_<LANG>_COMPILER_LAUNCHER)
+fastcache-cc --show-stats | -s [--cohort <id>]  Report cache statistics for this machine
+fastcache-cc --zero-stats | -z                  Discard the statistics log
+fastcache-cc --help | -h | /?                   Flags and environment reference
+fastcache-cc --version                          Launcher version
 ```
+
+`--help` is generated from the same table the launcher dispatches on, so it
+always lists exactly what the binary accepts.
+
+**Renamed flags.** The statistics flags now use sccache's names: `--stats` is
+`--show-stats` and `--clear-stats` is `--zero-stats`. `--reset` is gone with no
+replacement — it read as if it reset the cache itself, when it only discarded
+this machine's statistics log. All three old spellings are now rejected with an
+"unknown option" diagnostic and exit 2, rather than being silently treated as a
+compiler to run.
 
 Wire it into CMake:
 
@@ -92,6 +102,18 @@ prefix. An empty value counts as unset.
 | `FASTCACHE_NO_STATS` | Do not record invocations to the statistics log. | unset (recording on) |
 | `FASTCACHE_NO_DIRECT` | Disable direct mode, always preprocessing to derive the key. | unset (direct on) |
 | `FASTCACHE_TIMEOUT_MS` | Per-call deadline, in milliseconds, for every send/recv to the daemon. `0` disables it. A daemon that accepts and then stalls mid-reply would otherwise block the compile forever. Bounds each call, not the whole invocation — see below. | `10000` |
+
+The statistics log is located from the usual per-user state variables rather than
+one of the launcher's own. These are read but never written:
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `LOCALAPPDATA` | (Windows) Base for the log directory, `%LOCALAPPDATA%\fastcache-cc`. | unset — **no statistics recorded** |
+| `XDG_STATE_HOME` | (POSIX) Base for the log directory, `$XDG_STATE_HOME/fastcache-cc`. Preferred over `HOME`. | unset — fall back to `HOME` |
+| `HOME` | (POSIX) Base for `$HOME/.local/state/fastcache-cc`, used when `XDG_STATE_HOME` is unset. | unset — **no statistics recorded** |
+
+With no usable state directory there is nowhere to append to, so statistics are
+silently disabled. Caching itself is unaffected.
 
 `ADDR`, `SRCROOT` and `BUILDTREE` must **all** be set. If any is missing every
 compile runs uncached — the build still succeeds, which is exactly why this is
@@ -134,7 +156,7 @@ concurrent compilers in one build interleave whole lines instead of shredding
 each other's. Recording failures are swallowed: statistics never break a build.
 
 ```
-$ fastcache-cc --stats
+$ fastcache-cc --show-stats
 
 all cohorts
   compiles     : 4
@@ -171,9 +193,9 @@ rejected STORE call for very different responses.
 | Cache hit | `0` |
 | Miss, fall-back, or non-cacheable line | the real compiler's exit code, verbatim |
 | Compiler could not be spawned | `1` |
-| `--help`, `--version`, `--stats` | `0` |
-| `--clear-stats` failed | `1` |
-| No arguments at all | `2` (usage printed to stderr) |
+| `--help`, `--version`, `--show-stats` | `0` |
+| `--zero-stats` failed | `1` |
+| No arguments at all, or an unknown option | `2` (diagnostic and usage printed to stderr) |
 
 ## Fall-back reasons
 

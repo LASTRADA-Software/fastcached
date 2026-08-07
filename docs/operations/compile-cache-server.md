@@ -91,7 +91,7 @@ signals are the hit ratio and the eviction rate: sustained evictions with a
 falling hit ratio mean the working set no longer fits and `--max-memory` (or
 `--storage-max-disk`) needs raising.
 
-The client side reports independently — `fastcache-cc --stats` gives the hit
+The client side reports independently — `fastcache-cc --show-stats` gives the hit
 rate as each builder sees it, which is what actually determines build times.
 
 ## A note on client configuration
@@ -99,5 +99,5 @@ rate as each builder sees it, which is what actually determines build times.
 If hit rates are low, check the client before tuning the server. Cache keys
 incorporate the compiler identity and the relativized command line, so mismatched
 compiler versions or differing flags between CI and developer machines produce
-different keys by design. `fastcache-cc --stats` distinguishes a genuine miss
+different keys by design. `fastcache-cc --show-stats` distinguishes a genuine miss
 from a cache that was never reached.
