@@ -16,7 +16,14 @@ namespace
 {
 
 /// Build an argv that runs `script` through the platform shell.
-/// @param script The shell command to run.
+///
+/// The script text itself must already be in that shell's dialect — see the
+/// helpers below. Selecting the interpreter here while writing POSIX-only
+/// script text at the call sites silently mis-ran these tests under cmd.exe,
+/// which does not treat `;` as a command separator and so folded both echoes
+/// into a single stdout line.
+///
+/// @param script The shell command to run, in the host shell's dialect.
 /// @return The full invocation.
 [[nodiscard]] std::vector<std::string> ShellCommand(std::string const& script)
 {
@@ -24,6 +31,38 @@ namespace
     return { "cmd.exe", "/c", script };
 #else
     return { "/bin/sh", "-c", script };
+#endif
+}
+
+/// A script that writes `outText` to stdout and `errText` to stderr.
+/// @param outText Text for stdout.
+/// @param errText Text for stderr.
+/// @return The invocation, in the host shell's dialect.
+[[nodiscard]] std::vector<std::string> EchoBothStreams(std::string const& outText, std::string const& errText)
+{
+#if defined(_WIN32)
+    // cmd.exe separates commands with '&', and `echo x 1>&2` needs no quoting.
+    return ShellCommand("echo " + outText + "& echo " + errText + " 1>&2");
+#else
+    return ShellCommand("echo " + outText + "; echo " + errText + " 1>&2");
+#endif
+}
+
+/// A script that writes `lines` lines to BOTH streams, enough to overflow the
+/// ~64 KiB pipe buffer on either one.
+/// @param lines Number of lines to emit per stream.
+/// @return The invocation, in the host shell's dialect.
+[[nodiscard]] std::vector<std::string> FloodBothStreams(int lines)
+{
+    auto const n = std::to_string(lines);
+#if defined(_WIN32)
+    // `for /L %i in (1,1,N)` is cmd.exe's counted loop; '%' needs no escaping
+    // because this runs via /c rather than from a batch file.
+    return ShellCommand("for /L %i in (1,1," + n + ") do @(echo " + std::string(80, 'o') + "& echo " + std::string(80, 'e')
+                        + " 1>&2)");
+#else
+    return ShellCommand("i=0; while [ $i -lt " + n + " ]; do echo " + std::string(80, 'o') + "; echo " + std::string(80, 'e')
+                        + " 1>&2; i=$((i+1)); done");
 #endif
 }
 
@@ -43,7 +82,7 @@ TEST_CASE("RunCaptureSplit reports the child's exit code")
 TEST_CASE("RunCaptureSplit keeps stdout and stderr apart")
 {
     auto const runner = MakeProcessRunner();
-    auto const run = runner->RunCaptureSplit(ShellCommand("echo to-out; echo to-err 1>&2"));
+    auto const run = runner->RunCaptureSplit(EchoBothStreams("to-out", "to-err"));
 
     CHECK(run.exitCode == 0);
     // The whole point of the split capture: a cache hit replays each stream on
@@ -57,7 +96,7 @@ TEST_CASE("RunCaptureSplit keeps stdout and stderr apart")
 TEST_CASE("RunCaptureCombined merges both streams into out")
 {
     auto const runner = MakeProcessRunner();
-    auto const run = runner->RunCaptureCombined(ShellCommand("echo to-out; echo to-err 1>&2"));
+    auto const run = runner->RunCaptureCombined(EchoBothStreams("to-out", "to-err"));
 
     CHECK(run.exitCode == 0);
     CHECK(run.out.contains("to-out"));
@@ -72,14 +111,10 @@ TEST_CASE("RunCaptureSplit does not deadlock when both streams exceed the pipe b
     // compiler output routinely exceeds that. A truncated capture would make
     // the cache key nondeterministic and silently defeat all caching, so this
     // is a correctness test, not a performance one.
-    constexpr int LineCount = 4000; // 41 bytes/line => ~160 KiB per stream
-    auto const script = std::string { "i=0; while [ $i -lt " } + std::to_string(LineCount)
-                        + " ]; do echo 0123456789012345678901234567890123456789; "
-                          "echo 0123456789012345678901234567890123456789 1>&2; "
-                          "i=$((i+1)); done";
+    constexpr int LineCount = 2000; // 81 bytes/line => ~160 KiB per stream
 
     auto const runner = MakeProcessRunner();
-    auto const run = runner->RunCaptureSplit(ShellCommand(script));
+    auto const run = runner->RunCaptureSplit(FloodBothStreams(LineCount));
 
     CHECK(run.exitCode == 0);
     // Assert we captured the bulk of BOTH streams rather than a truncated
