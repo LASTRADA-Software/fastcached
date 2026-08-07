@@ -514,7 +514,11 @@ jobs:
           sudo ln -sf /usr/bin/g++-14 /usr/local/bin/g++
 
       - name: "Configure"
-        run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF
+        # FASTCACHED_PACKAGE_ROOT_PREFIX is OFF by default so that a plain
+        # `cmake --install --prefix /usr/local` stays conventional; the package
+        # layout (payload rooted at /, units under usr/lib/systemd, config in
+        # /etc) is opt-in and this is the job that opts in.
+        run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON
 
       - name: "Build"
         run: cmake --build --preset gcc-release --target fastcached fastcache-cc
@@ -633,7 +637,15 @@ jobs:
           grep -q hello  /tmp/fc-proto.txt
 
           # Reload must apply a reloadable setting rather than restart or fail.
+          # Assert the edit actually landed: sed exits 0 when it matches
+          # nothing, so a reflow of the shipped comment would silently turn this
+          # into "reload an unchanged file", which passes without ever
+          # exercising the SIGHUP path.
+          grep -q '^#log_level: info' /etc/fastcached/fastcached.yaml \
+            || { echo "::error::the shipped yaml no longer contains '#log_level: info'; update this step"; exit 1; }
           sudo sed -i 's/^#log_level: info/log_level: debug/' /etc/fastcached/fastcached.yaml
+          grep -q '^log_level: debug' /etc/fastcached/fastcached.yaml \
+            || { echo "::error::config edit did not apply"; exit 1; }
           sudo systemctl reload fastcached
           sleep 2
           systemctl is-active --quiet fastcached \

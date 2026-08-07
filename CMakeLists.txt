@@ -19,14 +19,16 @@ include(GNUInstallDirs)
 # absolute locations that cannot be rebased onto a /usr prefix (systemd does
 # not read config from /usr/etc). See cmake/Packaging.cmake.
 #
-# On Linux this is the default, since that is where the packages are built and
-# where the service assets are meaningful. Turn it OFF for a conventional
-# `cmake --install --prefix /usr/local` developer install.
-if(UNIX AND NOT APPLE)
-    option(FASTCACHED_PACKAGE_ROOT_PREFIX "Lay out the install tree for .deb/.rpm packaging" ON)
-else()
-    option(FASTCACHED_PACKAGE_ROOT_PREFIX "Lay out the install tree for .deb/.rpm packaging" OFF)
-endif()
+# This is OFF by default, including on Linux, so that the ordinary
+# `cmake --install --prefix /usr/local` keeps putting the daemon at
+# /usr/local/bin/fastcached. Defaulting it ON rebased every developer install
+# onto <prefix>/usr/bin, which is on nobody's PATH — a successful install that
+# left `fastcached` reporting "command not found".
+#
+# Turn it ON only to build packages:
+#   cmake -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON ... && cpack -G "DEB;RPM"
+# The CI packaging job does exactly that; see .github/workflows/build.yml.
+option(FASTCACHED_PACKAGE_ROOT_PREFIX "Lay out the install tree for .deb/.rpm packaging" OFF)
 
 # Install destinations for the relocatable artifacts (binaries, docs). With the
 # prefix moved to /, the ordinary FHS paths have to spell `usr/` themselves, or

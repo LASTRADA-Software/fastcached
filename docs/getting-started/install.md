@@ -49,9 +49,17 @@ sudo systemctl edit fastcached
 For a personal compile cache, no root is involved:
 
 ```sh
+systemctl --user enable --now fastcached
+```
+
+The user unit runs on built-in defaults, so that is the whole setup. To
+customise it, drop a config in place and point the unit at it with
+`systemctl --user edit fastcached`:
+
+```sh
 mkdir -p ~/.config/fastcached
 cp /etc/fastcached/fastcached.yaml ~/.config/fastcached/fastcached.yaml
-systemctl --user enable --now fastcached
+systemctl --user edit fastcached     # add the ExecStart override shown in the unit
 ```
 
 State goes to `~/.local/state/fastcached`. Add `loginctl enable-linger
@@ -95,6 +103,26 @@ ctest --preset cl-debug
 ```
 
 Requires `VCPKG_ROOT` to be set in the environment.
+
+## Building the packages yourself
+
+An ordinary `cmake --install --prefix /usr/local` gives the conventional
+layout — `/usr/local/bin/fastcached`, and no service assets, since systemd
+does not read units from under a `/usr/local` prefix.
+
+Building a `.deb` or `.rpm` needs the package layout instead: the payload is
+rooted at `/` so the units land in `/usr/lib/systemd` and the config in
+`/etc`. That is opt-in:
+
+```sh
+cmake --preset gcc-release -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON
+cmake --build --preset gcc-release --target fastcached fastcache-cc
+cd out/build/gcc-release && cpack -G "DEB;RPM"
+```
+
+Do not install that build tree directly with `cmake --install` — with the
+option ON the binaries deliberately carry a `usr/` prefix of their own, which
+only makes sense inside a package.
 
 ## Other presets
 

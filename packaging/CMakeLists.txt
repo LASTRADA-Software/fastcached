@@ -33,9 +33,6 @@ set(FASTCACHED_SYSUSERS_DIR       "usr/lib/sysusers.d")
 set(FASTCACHED_TMPFILES_DIR       "usr/lib/tmpfiles.d")
 set(FASTCACHED_SYSCONF_DIR        "etc/fastcached")
 
-
-
-
 # The service assets only make sense in the root-rooted package layout: their
 # destinations (usr/lib/systemd, etc/) are written assuming the payload lands
 # at /. A conventional prefixed install would scatter them to
@@ -110,11 +107,35 @@ if(UNIX AND NOT APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
 
     set(FASTCACHED_SCRIPTLET_DIR "${CMAKE_CURRENT_BINARY_DIR}"
         CACHE INTERNAL "Directory holding the configured DEB/RPM maintainer scripts")
+else()
+    # Both exports must be written on EVERY configure, not only when the branch
+    # above runs. They are CACHE INTERNAL, so a value left over from an earlier
+    # configure survives a reconfigure that turns the branch off — and cpack
+    # would then emit conffiles/%config entries for a payload no longer
+    # installed, failing rpmbuild with "File not found" and shipping a DEB whose
+    # conffiles list names an absent path.
+    set(FASTCACHED_PACKAGE_CONFIG_FILES ""
+        CACHE INTERNAL "Package-manager config files (never replaced on upgrade)")
+    set(FASTCACHED_SCRIPTLET_DIR ""
+        CACHE INTERNAL "Directory holding the configured DEB/RPM maintainer scripts")
 endif()
 
 if(WIN32)
     # The MSI ships the same example config next to the executables; the
     # service command line registered by --install-service points at it.
+    #
+    # NOTE: unlike the DEB conffile and the RPM %config(noreplace), this file is
+    # a plain component-owned file, so a subsequent MSI OVERWRITES operator
+    # edits. That is why the shipped copy is entirely commented out — losing it
+    # costs nothing. Anyone customising it should keep the real settings in a
+    # separate file and point the service at it:
+    #
+    #     fastcached.exe --uninstall-service
+    #     fastcached.exe --install-service --config="C:\ProgramData\fastcached\fastcached.yaml"
+    #
+    # Making WiX preserve it instead needs a per-file component with a registry
+    # keypath and NeverOverwrite, which the CPack WiX generator does not expose
+    # through the patch fragment.
     install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/linux/fastcached.yaml"
         DESTINATION "."
         COMPONENT Runtime

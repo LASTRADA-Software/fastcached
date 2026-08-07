@@ -11,11 +11,18 @@
 # beyond the package itself.
 #
 # The config file is NOT shipped for user installs (a package cannot write into
-# a home directory). Create one first, or drop the --config flag via
-# `systemctl --user edit fastcached` to run on built-in defaults:
+# a home directory), so this unit starts on built-in defaults and works out of
+# the box. To customise it, drop a config in place and point the unit at it:
 #
 #     mkdir -p ~/.config/fastcached
 #     cp /etc/fastcached/fastcached.yaml ~/.config/fastcached/fastcached.yaml
+#     systemctl --user edit fastcached     # see the ExecStart note below
+#
+# ExecStart deliberately passes no --config: naming a file the package does not
+# ship made the very first `systemctl --user enable --now fastcached` fail with
+# FileNotFound, and Restart=on-failure then respawned it once a second until the
+# start limit tripped — an out-of-the-box restart loop instead of a working
+# daemon.
 
 [Unit]
 Description=fastcached — fast cache daemon (user instance)
@@ -25,8 +32,16 @@ After=network-online.target
 [Service]
 Type=simple
 
-# %E is $XDG_CONFIG_HOME (~/.config), %S is $XDG_STATE_HOME (~/.local/state).
-ExecStart=/usr/bin/fastcached --config=%E/fastcached/fastcached.yaml
+# %S is $XDG_STATE_HOME (~/.local/state); %E would be $XDG_CONFIG_HOME.
+#
+# To use a config file, override this line with `systemctl --user edit
+# fastcached`, which is also where a per-user bind address or storage path
+# belongs:
+#
+#     [Service]
+#     ExecStart=
+#     ExecStart=/usr/bin/fastcached --config=%E/fastcached/fastcached.yaml
+ExecStart=/usr/bin/fastcached
 ExecReload=/bin/kill -HUP $MAINPID
 
 KillSignal=SIGTERM
@@ -46,7 +61,9 @@ StateDirectoryMode=0750
 # and are left out rather than silently failing the unit.
 NoNewPrivileges=yes
 PrivateTmp=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+# AF_UNIX/AF_NETLINK are needed by glibc's resolver, not for listening — see
+# the system unit for the full rationale.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

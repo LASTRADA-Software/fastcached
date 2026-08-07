@@ -26,7 +26,17 @@ case "$1" in
         # Cached data is expendable and can be large; a purge should not leave
         # it behind. The fastcached user is intentionally NOT deleted — files
         # elsewhere may still be owned by it.
-        rm -rf /var/lib/fastcached
+        #
+        # Never recurse into something the package does not own. systemd's
+        # StateDirectory= creates this path, and an operator may well have
+        # bind-mounted a volume onto it or pointed storage_path at it; an
+        # unconditional `rm -rf` would then destroy data on an ordinary purge.
+        # Removing only an unmounted, non-symlinked directory keeps the cleanup
+        # while making that outcome impossible.
+        if [ -d /var/lib/fastcached ] && [ ! -L /var/lib/fastcached ] \
+           && ! mountpoint -q /var/lib/fastcached 2>/dev/null; then
+            rm -rf /var/lib/fastcached
+        fi
         ;;
 esac
 

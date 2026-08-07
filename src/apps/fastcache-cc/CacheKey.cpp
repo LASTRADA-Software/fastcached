@@ -16,8 +16,15 @@ namespace FastCache::Cc
 namespace
 {
 
-    /// Include-dir flag prefixes whose trailing value is a path we relativize.
-    /// Order matters: the longer `/external:I` must be tried before `/I`.
+    /// Include-dir flag prefixes whose trailing value is a path we relativize,
+    /// paired with the leading character that introduces them.
+    ///
+    /// Order matters: the longer `/external:I` must be tried before `/I`. The
+    /// `/`-led spellings are MSVC's and are only recognised under a Windows
+    /// layout — on POSIX a leading slash begins an absolute path, and matching
+    /// `/I` there would split a checkout rooted at `/Infra` into the prefix
+    /// `/I` plus the fragment `nfra/...`, which lies under neither root and so
+    /// comes back verbatim with the absolute path still embedded in the key.
     constexpr std::array<std::string_view, 4> IncludePrefixes { "/external:I", "-external:I", "/I", "-I" };
 
     /// True if `c` introduces a command-line option in the MSVC style, for the
@@ -31,24 +38,16 @@ namespace
     ///
     /// Keying off `_WIN32` instead would make a Windows-hosted launcher
     /// mis-handle POSIX paths, and it made the behaviour untestable from the
-    /// other platform. `PathCanon::SeparatorOf` derives separator style from
-    /// the layout for the same reason: a cache is shared across machines, so
-    /// path conventions are a property of the data, not of the running binary.
+    /// other platform. `PathCanon::IsWindowsLayout` is the one definition of
+    /// "is this a Windows layout", shared with the canonicalizer, so the two
+    /// cannot drift apart on a root such as `C:/src/proj`.
     ///
     /// @param c      The argument's first character.
     /// @param layout The layout whose path conventions apply.
     /// @return True when `c` introduces an option under that layout.
     [[nodiscard]] bool IsWindowsOptionPrefix(char c, PathCanon::Layout const& layout) noexcept
     {
-        if (c != '/')
-            return false;
-        // A Windows layout is recognised by a backslash separator or a drive
-        // letter ("C:..."); anything else is treated as POSIX, where `/` can
-        // only begin an absolute path.
-        auto const isWindowsRoot = [](std::string_view root) noexcept {
-            return root.contains('\\') || (root.size() >= 2 && root[1] == ':');
-        };
-        return isWindowsRoot(layout.sourceRoot) || isWindowsRoot(layout.buildTree);
+        return c == '/' && PathCanon::IsWindowsLayout(layout);
     }
 
     /// Relativize one argument against both roots: if it is a bare path or an
@@ -62,9 +61,15 @@ namespace
     [[nodiscard]] std::string RelativizeOne(std::string_view arg, PathCanon::Layout const& layout)
     {
 
-        // Include-dir forms: <prefix><path>.
+        // Include-dir forms: <prefix><path>. A `/`-led spelling is only an
+        // option under a Windows layout; under POSIX it is the head of an
+        // absolute path and must fall through to the bare-path branch below,
+        // or a checkout rooted at `/Infra` would be mis-split at `/I`.
         for (std::string_view const prefix: IncludePrefixes)
         {
+            if (prefix.starts_with('/') && !PathCanon::IsWindowsLayout(layout))
+                continue;
+
             if (arg.starts_with(prefix) && arg.size() > prefix.size())
             {
                 std::string_view const path = arg.substr(prefix.size());

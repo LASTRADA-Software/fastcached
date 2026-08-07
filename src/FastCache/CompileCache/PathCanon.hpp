@@ -39,6 +39,24 @@ enum class Grammar : std::uint8_t
     GccDepfile,      ///< GCC/Clang `-MF` depfile: `target: dep dep \` continuation.
 };
 
+/// True when `layout` describes a Windows build tree.
+///
+/// The answer comes from the layout's own roots, never from the host: a cache is
+/// shared across machines, so path conventions are a property of the data rather
+/// than of the running binary. A root is Windows-shaped when it uses backslash
+/// separators or begins with a drive-letter prefix (`C:`); anything else is
+/// POSIX. The drive-letter test requires an ASCII letter before the colon, so a
+/// relative POSIX root like `a:b/proj` is not mistaken for a drive.
+///
+/// This is the single definition of "is this a Windows layout". SeparatorOf and
+/// the launcher's option-prefix test both derive from it, so the two can never
+/// disagree about a root such as `C:/src/proj`, which uses forward slashes but
+/// is still Windows.
+///
+/// @param layout The layout whose path conventions apply.
+/// @return True when either root is Windows-shaped.
+[[nodiscard]] bool IsWindowsLayout(Layout const& layout) noexcept;
+
 /// Rewrite a single absolute path to its canonical token form.
 /// @param absolutePath Native-form absolute path (as the compiler emitted it).
 /// @param layout       The producing machine's roots.

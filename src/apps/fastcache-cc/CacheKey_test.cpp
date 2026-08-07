@@ -139,6 +139,54 @@ TEST_CASE("Under a Windows layout a leading slash still introduces an option")
     CHECK_FALSE(out[3].contains("C:"));
 }
 
+TEST_CASE("A POSIX checkout whose root starts with /I is not mis-split as an include flag")
+{
+    // Regression guard. The include-prefix table is scanned before the bare-path
+    // branch, so under a POSIX layout `/Infra/proj/a.cpp` used to match the MSVC
+    // spelling `/I` and be split into the prefix `/I` plus `nfra/proj/a.cpp` —
+    // a fragment under neither root, returned verbatim with the absolute
+    // checkout path still in the key. Any root whose first segment begins with
+    // a capital I (/Import, /Include) hits this.
+    std::vector<std::string> const args { "-c", "/Infra/proj/a.cpp", "-o", "/Infra/proj/build/a.o" };
+    auto const out = RelativizeArgs(args, "/Infra/proj", "/Infra/proj/build");
+
+    CHECK(out[1] == "<SRCROOT>/a.cpp");
+    CHECK(out[3] == "<BUILDTREE>/a.o");
+
+    // ...and therefore two such checkouts at different roots share a key.
+    std::vector<std::string> const other { "-c", "/Infra2/proj/a.cpp", "-o", "/Infra2/proj/build/a.o" };
+    CHECK(RelativizeArgs(other, "/Infra2/proj", "/Infra2/proj/build") == out);
+}
+
+TEST_CASE("A root whose second byte is a colon is not mistaken for a Windows drive")
+{
+    // The drive-letter test must require a LETTER before the colon. Keying only
+    // off `root[1] == ':'` classified a root like `a:b` as Windows, which turned
+    // every leading '/' into an "option" and left absolute paths — and so the
+    // checkout location — in the cache key. Only a root whose colon sits at
+    // index 1 hits this; a colon deeper in the path was always safe.
+    std::vector<std::string> const args { "-c", "/a:b/proj/a.cpp" };
+    auto const out = Relativize(args, "a:b", "/a:b/proj");
+
+    // The source path lies under neither root here, but it must still be
+    // considered a path rather than skipped as an option.
+    CHECK(out[1] == "<BUILDTREE>/a.cpp");
+}
+
+TEST_CASE("A drive-letter root spelled with forward slashes is still a Windows layout")
+{
+    // Pins existing behaviour rather than fixing a bug: this already held, and
+    // the point is that it must keep holding now that the predicate moved into
+    // PathCanon. CMake hands out `C:/src/proj`, which has no backslash, so a
+    // separator-only test would call it POSIX and start rewriting MSVC options
+    // as if they were absolute paths.
+    std::vector<std::string> const args { "/c", "C:/src/proj/a.cpp" };
+    auto const out = Relativize(args, "C:/src/proj");
+
+    CHECK(out[0] == "/c"); // an option, not a path
+    CHECK(out[1] == "<SRCROOT>/a.cpp");
+}
+
 TEST_CASE("Two POSIX checkouts at different depths relativize identically")
 {
     std::vector<std::string> const deep { "-c", "/ci/w/1/s/proj/a.cpp", "-o", "/ci/w/1/s/proj/build/a.o" };

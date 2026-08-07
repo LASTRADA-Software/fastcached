@@ -61,7 +61,13 @@ ProtectKernelTunables=yes
 ProtectHostname=yes
 ProtectClock=yes
 ProtectProc=invisible
-RestrictAddressFamilies=AF_INET AF_INET6
+# AF_UNIX and AF_NETLINK are not for listening — they are what glibc's
+# getaddrinfo needs to resolve a non-numeric `bind:` value, which the shipped
+# config explicitly invites. NSS reaches systemd-resolved over an AF_UNIX
+# socket and enumerates interfaces over AF_NETLINK; without both, `bind:
+# cache.internal` fails at startup with an opaque resolver error that does not
+# reproduce outside the unit.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
