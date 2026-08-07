@@ -29,7 +29,12 @@ set(CPACK_PACKAGE_HOMEPAGE_URL        "https://github.com/LASTRADA-Software/fast
 set(CPACK_PACKAGE_CONTACT             "Christian Parpart <christian@parpart.family>")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${PROJECT_DESCRIPTION}")
 set(CPACK_RESOURCE_FILE_README        "${CMAKE_SOURCE_DIR}/README.md")
-set(CPACK_RESOURCE_FILE_LICENSE       "${CMAKE_SOURCE_DIR}/LICENSE")
+# WiX only accepts a .txt or .rtf license and rejects an extensionless path
+# outright ("unsupported WiX License file extension ''"), so the repository's
+# LICENSE is copied to a .txt alongside the build rather than renamed in the
+# tree. Harmless for the archive/DEB/RPM generators, which take any path.
+configure_file("${CMAKE_SOURCE_DIR}/LICENSE" "${CMAKE_BINARY_DIR}/LICENSE.txt" COPYONLY)
+set(CPACK_RESOURCE_FILE_LICENSE       "${CMAKE_BINARY_DIR}/LICENSE.txt")
 set(CPACK_PACKAGE_INSTALL_DIRECTORY   "fastcached")
 set(CPACK_PACKAGE_FILE_NAME           "fastcached-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_VERBATIM_VARIABLES          ON)
