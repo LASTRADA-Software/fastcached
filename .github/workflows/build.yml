@@ -743,13 +743,24 @@ jobs:
           $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
           Write-Host "Installing $msi"
           $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', "`"$msi`"", '/qn', '/l*v', 'install.log')
+
+          # A blind tail of a verbose MSI log is useless — the last 80 lines are
+          # just the property dump. Select the lines that name the failure: the
+          # action trace, custom-action returns, and error records.
+          function Show-InstallLog {
+            Write-Host "===== install.log (relevant lines) ====="
+            Select-String -Path install.log -Pattern `
+              'Action (start|ended)','CustomAction','FastCached','returned actual error','Note: 1: 1(4|7)[0-9][0-9]','Installation (success|failed)','error' `
+              | Select-Object -Last 60 | ForEach-Object { $_.Line }
+          }
+
           if ($p.ExitCode -ne 0) {
-            Get-Content install.log -Tail 80
+            Show-InstallLog
             throw "msiexec failed with $($p.ExitCode)"
           }
 
           $svc = Get-Service -Name FastCached -ErrorAction SilentlyContinue
-          if (-not $svc) { Get-Content install.log -Tail 80; throw 'FastCached service was not registered' }
+          if (-not $svc) { Show-InstallLog; throw 'FastCached service was not registered' }
 
           $start = (Get-CimInstance Win32_Service -Filter "Name='FastCached'").StartMode
           if ($start -ne 'Auto') { throw "expected auto-start, got $start" }
