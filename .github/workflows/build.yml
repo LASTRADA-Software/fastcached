@@ -692,9 +692,14 @@ jobs:
         run: choco install ninja --no-progress
 
       # CPack's WIX generator drives the WiX 4/5 `wix.exe`; the runner image
-      # does not ship it.
+      # ships only the unrelated WiX 3.14. WiX 4 also split the installer UI
+      # out into a separate extension package, and CPack always references it
+      # (WixUI_InstallDir) — without it wix.exe fails with
+      # "error WIX0144: The extension 'WixToolset.UI.wixext' could not be found".
       - name: "Install WiX"
-        run: dotnet tool install --global wix --version 5.*
+        run: |
+          dotnet tool install --global wix --version 5.*
+          wix extension add --global WixToolset.UI.wixext/5.0.2
 
       # Same toolset pin as the windows build matrix; see the comment there.
       - name: "Setup MSVC dev environment"
