@@ -28,30 +28,36 @@
 -->
 <CPackWiXPatch>
 
-  <!-- INSTALLFOLDER is what CPack's WiX generator names the install root. -->
+  <!-- INSTALL_ROOT is what CPack's WiX generator names the install root
+       directory. It is NOT the WiX-default INSTALLFOLDER: referencing that
+       name yields an unrelated directory built from the vendor and product
+       ("C:\Program Files\LASTRADA Software fastcached\") rather than the
+       "C:\Program Files\fastcached\" the files actually land in, so the
+       action ran in a folder with no fastcached.exe in it and failed the
+       install with error 1721. -->
   <CPackWiXFragment Id="#PRODUCT">
 
     <!-- Checkbox state, surfaced in the UI (see the exit dialog below).
          1 = start the service when the installer finishes. -->
     <Property Id="FASTCACHED_START_SERVICE" Value="1" Secure="yes" />
 
-    <!-- The command line uses paths RELATIVE to Directory, never [INSTALLFOLDER]
-         references. A deferred action runs in its own context where session
-         properties are not available, so a bracketed property inside
-         ExeCommand expands to nothing and the action fails the install with
-         1603. Directory= still resolves at schedule time and becomes the
-         action's working directory, which is what makes the relative form
-         work. (fastcached itself then makes the config path absolute, since a
+    <!-- The command line uses paths RELATIVE to Directory, never bracketed
+         property references. A deferred action runs in its own context where
+         session properties are not available, so a property inside ExeCommand
+         expands to nothing and the action fails the install. Directory= still
+         resolves at schedule time and becomes the action's working directory,
+         which is what makes the relative form work. (fastcached itself then
+         makes the config path absolute when it registers the service, since a
          service starts in C:\Windows\System32.) -->
     <CustomAction Id="FastCachedInstallService"
-                  Directory="INSTALLFOLDER"
+                  Directory="INSTALL_ROOT"
                   ExeCommand="fastcached.exe --install-service --config=fastcached.yaml"
                   Execute="deferred"
                   Impersonate="no"
                   Return="check" />
 
     <CustomAction Id="FastCachedStartService"
-                  Directory="INSTALLFOLDER"
+                  Directory="INSTALL_ROOT"
                   ExeCommand="sc.exe start FastCached"
                   Execute="deferred"
                   Impersonate="no"
@@ -60,7 +66,7 @@
     <!-- Uninstall must not fail the removal if the service is already gone,
          hence Return="ignore". It best-effort stops before deleting. -->
     <CustomAction Id="FastCachedUninstallService"
-                  Directory="INSTALLFOLDER"
+                  Directory="INSTALL_ROOT"
                   ExeCommand="fastcached.exe --uninstall-service"
                   Execute="deferred"
                   Impersonate="no"
