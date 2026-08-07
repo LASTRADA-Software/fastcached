@@ -5,18 +5,22 @@
     CPack WiX patch fragment: registers fastcached as an auto-start Windows
     service at install time and removes it on uninstall.
 
-    Rather than declaring a WiX <ServiceInstall> element, this drives the
-    daemon's own `--install-service` / `--uninstall-service` code path
+    Rather than declaring a WiX ServiceInstall element, this drives the
+    daemon's own install-service / uninstall-service code path
     (FastCache/Platform/ServiceControl.cpp). That keeps one implementation of
     "how fastcached registers itself" shared with the command line, including
-    BuildServiceCommandLine's absolutization of --config — which matters
+    BuildServiceCommandLine's absolutization of the config path, which matters
     because a service starts with its working directory set to
     C:\Windows\System32, so a relative path captured at install time would
     resolve somewhere else entirely at boot.
 
-    --install-service deliberately leaves the new service STOPPED, so starting
-    it is a separate action, conditioned on FASTCACHED_START_SERVICE so the
-    user can opt out in the installer UI.
+    NOTE: XML forbids a double hyphen inside a comment, so the flag names are
+    spelled without their leading dashes here. CPack parses this file with a
+    strict reader that rejects the file outright otherwise.
+
+    Registration deliberately leaves the new service STOPPED, so starting it
+    is a separate action, conditioned on FASTCACHED_START_SERVICE so the user
+    can opt out in the installer UI.
 
     All actions are deferred with Impersonate="no": creating a service needs
     the elevated context, which is only available to a deferred action running
@@ -64,7 +68,7 @@
       <Custom Action="FastCachedStartService" After="FastCachedInstallService"
               Condition="NOT REMOVE AND FASTCACHED_START_SERVICE = &quot;1&quot;" />
 
-      <!-- Deregister before the files are removed — the action needs
+      <!-- Deregister before the files are removed: the action needs
            fastcached.exe to still exist. -->
       <Custom Action="FastCachedUninstallService" Before="RemoveFiles"
               Condition="REMOVE~=&quot;ALL&quot;" />
