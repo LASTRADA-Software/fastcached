@@ -336,10 +336,17 @@ namespace
     });
 
     /// The row describing @p scope.
+    ///
+    /// A table walk rather than std::ranges::find because the iterator type is
+    /// not portable here: std::array's iterator is a raw pointer in libc++ and
+    /// a class type in the MSVC STL, so no single spelling of the `auto`
+    /// satisfies both the Windows build and clang-tidy's readability-qualified-auto.
     [[nodiscard]] constexpr ScopeTraits const& TraitsOf(ServiceScope scope) noexcept
     {
-        auto const* const it = std::ranges::find(ScopeTable, scope, &ScopeTraits::scope);
-        return it != ScopeTable.end() ? *it : ScopeTable.front();
+        for (auto const& traits: ScopeTable)
+            if (traits.scope == scope)
+                return traits;
+        return ScopeTable.front();
     }
 
     /// XML-escape @p text for use as a plist text node.
@@ -381,9 +388,10 @@ namespace
 
 std::expected<ServiceScope, ConfigError> ParseServiceScope(std::string_view text)
 {
-    auto const* const it = std::ranges::find(ScopeTable, text, &ScopeTraits::name);
-    if (it != ScopeTable.end())
-        return it->scope;
+    // Walked rather than found, for the portability reason given at TraitsOf.
+    for (auto const& traits: ScopeTable)
+        if (traits.name == text)
+            return traits.scope;
 
     return std::unexpected(
         ConfigError { .code = ConfigErrorCode::ParseError,
