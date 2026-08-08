@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <algorithm>
@@ -337,19 +338,13 @@ namespace
 
     /// The row describing @p scope.
     ///
-    /// Iterating the table rather than std::ranges::find-ing it, because no
-    /// spelling of the iterator satisfies every consumer: std::array's iterator
-    /// is a raw pointer in libc++ but a class type in the MSVC STL, so
-    /// `auto const*` fails to compile on Windows, a plain `auto const` trips
-    /// clang-tidy's readability-qualified-auto, and naming the type outright
-    /// trips its modernize-use-auto. A range-based loop over a descriptor table
-    /// needs no iterator variable and states the intent directly.
+    /// FindOrNull rather than std::ranges::find because ScopeTable is a
+    /// std::array, whose iterator type is not portably nameable; see
+    /// FastCache/Core/Ranges.hpp.
     [[nodiscard]] constexpr ScopeTraits const& TraitsOf(ServiceScope scope) noexcept
     {
-        for (auto const& traits: ScopeTable)
-            if (traits.scope == scope)
-                return traits;
-        return ScopeTable.front();
+        auto const* const traits = FindOrNull(ScopeTable, scope, &ScopeTraits::scope);
+        return traits != nullptr ? *traits : ScopeTable.front();
     }
 
     /// XML-escape @p text for use as a plist text node.
@@ -391,10 +386,8 @@ namespace
 
 std::expected<ServiceScope, ConfigError> ParseServiceScope(std::string_view text)
 {
-    // Iterated rather than found, for the portability reason given at TraitsOf.
-    for (auto const& traits: ScopeTable)
-        if (traits.name == text)
-            return traits.scope;
+    if (auto const* const traits = FindOrNull(ScopeTable, text, &ScopeTraits::name))
+        return traits->scope;
 
     return std::unexpected(
         ConfigError { .code = ConfigErrorCode::ParseError,
