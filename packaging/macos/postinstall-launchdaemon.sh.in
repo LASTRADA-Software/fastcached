@@ -32,6 +32,19 @@ if ! /usr/bin/dscl . -read "/Users/${ACCOUNT}" >/dev/null 2>&1; then
     /usr/bin/dscl . -create "/Users/${ACCOUNT}" IsHidden 1 || true
 fi
 
+# dscl returns before the record is resolvable through getpwnam(3), which is
+# what launchd -- and fastcached's own pre-flight check -- actually use. Wait
+# for it instead of racing: an unresolvable UserName leaves launchd registering
+# the job and then never spawning it, with no error anywhere.
+ATTEMPT=0
+while [ "$ATTEMPT" -lt 50 ] && ! /usr/bin/id -u "$ACCOUNT" >/dev/null 2>&1; do
+    /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
+    /bin/sleep 0.1
+    ATTEMPT=$((ATTEMPT + 1))
+done
+/usr/bin/id -u "$ACCOUNT" >/dev/null 2>&1 \
+    || echo "fastcached: '${ACCOUNT}' is not resolvable via getpwnam after account creation" >&2
+
 mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" || true
 /usr/sbin/chown -R "${ACCOUNT}:${ACCOUNT}" "${PREFIX}/var" || true
 
@@ -64,12 +77,22 @@ esac
 # invite the operator to edit would be silently overridden forever, with the
 # daemon still filling the old directory and nothing reporting it. Everything
 # except the config path therefore comes from the config file.
-"${PREFIX}/bin/fastcached" --install-service --service-scope=system \
-    --config="${PREFIX}/etc/fastcached.yaml" || true
+#
+# Output is teed to a fixed path as well as the installer log. A postinstall
+# must exit 0 whatever happens, so the only trace of a refusal to register is
+# whatever it wrote — and `|| true` on its own turns a precise diagnostic into
+# a service that is simply absent, which is what happened here once already.
+REGISTER_LOG="/var/log/fastcached-install.log"
+{
+    echo "--- $(date -u '+%Y-%m-%dT%H:%M:%SZ') registering the system daemon"
+    "${PREFIX}/bin/fastcached" --install-service --service-scope=system \
+        --config="${PREFIX}/etc/fastcached.yaml" 2>&1
+    echo "--- exit=$?"
+} >>"$REGISTER_LOG" 2>&1 || true
 
 # Belt and braces: the label must be the one the uninstaller looks for.
 if ! /bin/launchctl print "system/${LABEL}" >/dev/null 2>&1; then
-    echo "fastcached: launchd job ${LABEL} did not register; see the installer log" >&2
+    echo "fastcached: launchd job ${LABEL} did not register; see ${REGISTER_LOG}" >&2
 fi
 
 exit 0

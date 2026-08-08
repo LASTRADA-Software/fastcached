@@ -79,7 +79,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-fail() { echo "macOS package E2E FAILED: $*" >&2; exit 1; }
+# On failure, dump what the postinstall scripts recorded before giving up. A
+# .pkg postinstall must exit 0 whatever happens, so its diagnostics are the only
+# evidence of a step that declined to run -- and without them a failure here
+# looks like "the service is just missing".
+fail() {
+    echo "macOS package E2E FAILED: $*" >&2
+    if [[ -r /var/log/fastcached-install.log ]]; then
+        echo "--- /var/log/fastcached-install.log ---" >&2
+        tail -40 /var/log/fastcached-install.log >&2
+    fi
+    sudo grep -i fastcached /var/log/install.log 2>/dev/null | tail -20 >&2 || true
+    exit 1
+}
 
 # --- 1. inspect the payload before touching the machine --------------------
 echo "== inspecting the payload"
