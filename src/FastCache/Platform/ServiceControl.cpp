@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <concepts>
 #include <filesystem>
@@ -57,6 +58,18 @@ namespace
         return "info";
     }
 
+    /// CLI spelling of an LruRecency, matching ParseLruRecency.
+    [[nodiscard]] constexpr std::string_view LruRecencyName(LruRecency recency) noexcept
+    {
+        return recency == LruRecency::Strict ? "strict" : "approximate";
+    }
+
+    /// CLI spelling of a CpuAffinity, matching ParseCpuAffinity.
+    [[nodiscard]] constexpr std::string_view CpuAffinityName(CpuAffinity affinity) noexcept
+    {
+        return affinity == CpuAffinity::PerCore ? "per-core" : "none";
+    }
+
     /// CLI spelling of a StorageDurability, matching ParseStorageDurability.
     [[nodiscard]] constexpr std::string_view DurabilityName(StorageDurability durability) noexcept
     {
@@ -107,6 +120,18 @@ namespace
     {
         return std::string { DurabilityName(value) };
     }
+    [[nodiscard]] std::string FlagValue(LruRecency value)
+    {
+        return std::string { LruRecencyName(value) };
+    }
+    [[nodiscard]] std::string FlagValue(CpuAffinity value)
+    {
+        return std::string { CpuAffinityName(value) };
+    }
+    [[nodiscard]] std::string FlagValue(CompressionCodec value)
+    {
+        return std::string { Compression::NameOf(value) };
+    }
 
     template <typename T>
         requires std::integral<T>
@@ -139,6 +164,13 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath, 
             argv.push_back(std::format("--{}={}", flag, AbsolutePathArg(value)));
     };
 
+    // Valueless switches: present or absent, never `--flag=true`, because that
+    // is not a spelling CliParser accepts.
+    auto const emitSwitchIfSet = [&argv](std::string_view flag, bool value, bool fallback) {
+        if (value != fallback)
+            argv.emplace_back(std::format("--{}", flag));
+    };
+
     if (daemonFlag == EmitDaemonFlag::Yes)
         argv.emplace_back("--daemon");
 
@@ -146,19 +178,77 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath, 
     // it is what LaunchdLabel derives the job label from.
     argv.push_back(std::format("--service-name={}", cfg.serviceName));
 
+    // Every Config field that has a CLI spelling appears below. The table is
+    // exhaustive on purpose: when it covered only a subset, an operator could
+    // run `--install-service --requirepass=… --tls …`, be told the service was
+    // installed, and get a daemon serving in plaintext with no authentication —
+    // the flags were dropped between the command line and the supervisor with
+    // nothing reporting it. The only CLI flags deliberately absent are the ones
+    // that are not Config state: --install-service / --uninstall-service (a
+    // service must never re-install itself), --service-scope (install-time
+    // only), --daemon (handled above) and --healthcheck / --help / --version.
+    //
     //        flag                    current value              emitted unless equal to
     emitIfSet("bind", cfg.bindAddress, defaults.bindAddress);
     emitIfSet("port", cfg.port, defaults.port);
     emitIfSet("max-memory", cfg.maxMemoryBytes, defaults.maxMemoryBytes);
     emitIfSet("log-level", cfg.logLevel, defaults.logLevel);
+    emitSwitchIfSet("log-timestamps", cfg.logTimestamps, defaults.logTimestamps);
+    emitSwitchIfSet("log-source", cfg.logSource, defaults.logSource);
+    emitSwitchIfSet("log-everything", cfg.logEverything, defaults.logEverything);
     emitPathIfSet("storage", cfg.storagePath);
     emitIfSet("storage-durability", cfg.storageDurability, defaults.storageDurability);
     emitIfSet("storage-max-value", cfg.storageMaxValueBytes, defaults.storageMaxValueBytes);
-    emitIfSet("threads", cfg.workerThreads, defaults.workerThreads);
+    emitIfSet("storage-max-disk", cfg.storageMaxDiskBytes, defaults.storageMaxDiskBytes);
     emitIfSet("storage-shards", cfg.storageShards, defaults.storageShards);
+    emitIfSet("threads", cfg.workerThreads, defaults.workerThreads);
+    emitIfSet("cpu-affinity", cfg.cpuAffinity, defaults.cpuAffinity);
+    emitIfSet("lru-mode", cfg.lruRecency, defaults.lruRecency);
+    emitIfSet("listen-backlog", cfg.listenBacklog, defaults.listenBacklog);
+    emitIfSet("compression", cfg.compression, defaults.compression);
+    emitIfSet("compression-level", cfg.compressionLevel, defaults.compressionLevel);
+    emitIfSet("compression-min-bytes", cfg.compressionMinBytes, defaults.compressionMinBytes);
+    emitIfSet("auth-username", cfg.authUsername, defaults.authUsername);
+    emitSwitchIfSet("tls", cfg.tlsEnabled, defaults.tlsEnabled);
+    emitPathIfSet("tls-cert", cfg.tlsCertPath);
+    emitPathIfSet("tls-key", cfg.tlsKeyPath);
+    emitSwitchIfSet("metrics", cfg.metricsEnabled, defaults.metricsEnabled);
+    emitIfSet("metrics-bind", cfg.metricsBindAddress, defaults.metricsBindAddress);
+    emitIfSet("metrics-port", cfg.metricsPort, defaults.metricsPort);
+    emitIfSet("notify-keyspace-events", cfg.notifyKeyspaceEvents, defaults.notifyKeyspaceEvents);
+    emitPathIfSet("pidfile", cfg.pidfile);
     emitPathIfSet("config", cfg.configPath);
 
+    // Repeated flags, one token per listener, so a multi-endpoint daemon comes
+    // back with the same listener set it was installed with.
+    for (auto const& bind: cfg.binds)
+        argv.push_back(std::format("--{}={}:{}", bind.tls ? "listen-tls" : "listen", bind.address, bind.port));
+
+    // requirePass is deliberately NOT here, and its omission is reported rather
+    // than silent: see RejectInlineCredential.
     return argv;
+}
+
+std::optional<std::string> InlineCredentialRejection(Config const& cfg)
+{
+    if (cfg.requirePass.empty())
+        return std::nullopt;
+
+    // A supervisor records its launch arguments in a file every local user can
+    // read (`/Library/LaunchDaemons/*.plist`, the SCM's ImagePath), so baking a
+    // shared secret into them would publish it to exactly the accounts
+    // --requirepass exists to keep out. The config file can be chmod 0600, so
+    // that is where the secret belongs; the daemon reads it at every start and
+    // on every reload. Refusing is the only honest option: emitting the flag
+    // leaks it, and dropping it silently installs an unauthenticated daemon
+    // while reporting success.
+    if (cfg.configPath.empty())
+        return "--requirepass cannot be baked into a service's launch arguments: they are world-readable. "
+               "Put `requirepass:` in a config file (chmod 0600) and install with --config=<path> instead.";
+
+    // With --config present the secret already reaches the daemon through the
+    // file, so there is nothing to drop and nothing to leak.
+    return std::nullopt;
 }
 
 std::string BuildServiceCommandLine(std::filesystem::path const& exePath, Config const& cfg)
@@ -206,10 +296,12 @@ namespace
         ServiceScope scope;
         std::string_view name;           ///< CLI spelling, for --service-scope.
         std::string_view plistDirectory; ///< Absolute, or relative to $HOME when @ref homeRelative.
-        std::string_view domain;         ///< launchctl domain target, `{}` filled with the uid.
-        bool homeRelative;               ///< plistDirectory is relative to the user's home.
-        bool alwaysKeepAlive;            ///< KeepAlive=<true/> vs {Crashed:true}; see below.
-        bool runsAsServiceAccount;       ///< Emit UserName/GroupName.
+        /// launchctl domain targets, most preferred first; `{}` is filled with
+        /// the uid and an empty entry means "no further candidate".
+        std::array<std::string_view, 2> domains;
+        bool homeRelative;         ///< plistDirectory is relative to the user's home.
+        bool alwaysKeepAlive;      ///< KeepAlive=<true/> vs {Crashed:true}; see below.
+        bool runsAsServiceAccount; ///< Emit UserName/GroupName.
     };
 
     constexpr auto ScopeTable = std::to_array<ScopeTraits>({
@@ -221,7 +313,14 @@ namespace
         ScopeTraits { .scope = ServiceScope::User,
                       .name = "user",
                       .plistDirectory = "Library/LaunchAgents",
-                      .domain = "gui/{}",
+                      // Two candidates, tried in order. `gui/<uid>` is the Aqua
+                      // session and is the right home for a desktop agent, but
+                      // it does not exist over SSH, at the login window, or on
+                      // a headless runner — where bootstrapping into it fails
+                      // with "Bootstrap failed: 5: Input/output error" and the
+                      // install has nowhere else to go. `user/<uid>` always
+                      // exists, so it is the fallback rather than the default.
+                      .domains = { "gui/{}", "user/{}" },
                       .homeRelative = true,
                       .alwaysKeepAlive = false,
                       .runsAsServiceAccount = false },
@@ -230,7 +329,7 @@ namespace
         ScopeTraits { .scope = ServiceScope::System,
                       .name = "system",
                       .plistDirectory = "/Library/LaunchDaemons",
-                      .domain = "system",
+                      .domains = { "system", "" },
                       .homeRelative = false,
                       .alwaysKeepAlive = true,
                       .runsAsServiceAccount = true },
@@ -410,6 +509,9 @@ namespace
 
 ServiceControlResult InstallService(Config const& cfg, ServiceScope /*scope*/)
 {
+    if (auto const rejection = InlineCredentialRejection(cfg))
+        return { .exitCode = 1, .message = *rejection };
+
     auto const exe = CurrentExecutablePath();
     if (exe.empty())
         return { .exitCode = 1, .message = "could not determine the fastcached executable path" };
@@ -534,12 +636,26 @@ namespace
         return {};
     }
 
+    /// Root of the macOS package payload, e.g. `/opt/fastcached`.
+    ///
+    /// Handed down from FASTCACHED_MACOS_PREFIX by src/FastCache/CMakeLists.txt
+    /// so the daemon's idea of its own install tree cannot drift from the one
+    /// the installer actually lays down. The fallback matters for builds that
+    /// compile this file outside the package configuration (a plain
+    /// `cmake --install --prefix /usr/local`, or the test binary on a
+    /// non-Apple CI toolchain), where no prefix has been chosen.
+    #if defined(FC_MACOS_PREFIX)
+    constexpr std::string_view MacOsPrefix = FC_MACOS_PREFIX;
+    #else
+    constexpr std::string_view MacOsPrefix = "/opt/fastcached";
+    #endif
+
     /// Where a job in @p scope writes its stdout/stderr.
     [[nodiscard]] std::filesystem::path DefaultLogDirectory(ServiceScope scope, std::filesystem::path const& home)
     {
         if (scope == ServiceScope::User)
             return home / "Library/Logs/fastcached";
-        return "/opt/fastcached/var/log";
+        return std::filesystem::path { MacOsPrefix } / "var/log";
     }
 
     /// Apply the scope's per-user path defaults to @p cfg.
@@ -549,15 +665,38 @@ namespace
     /// expands neither `~` nor `$HOME` in ProgramArguments, so the concrete path
     /// has to be resolved here, at install time, by the process that knows it.
     ///
+    /// System scope deliberately gets **no** storage default. Its config file is
+    /// the package's `<prefix>/etc/fastcached.yaml`, and a CLI value baked into
+    /// ProgramArguments outranks YAML in Merge — so injecting one here would
+    /// pin the cache to a directory the operator cannot move, silently ignoring
+    /// the `storage_path` the install docs invite them to edit.
+    ///
     /// @param cfg Configuration as parsed from the command line.
     /// @param scope Domain being installed into.
     /// @param home The invoking user's home directory.
     /// @return @p cfg with `storagePath` filled in when the caller left it unset.
     [[nodiscard]] Config WithScopeDefaults(Config cfg, ServiceScope scope, std::filesystem::path const& home)
     {
-        if (cfg.storagePath.empty())
-            cfg.storagePath = scope == ServiceScope::User ? (home / "Library/Caches/fastcached/cache").string()
-                                                          : "/opt/fastcached/var/cache";
+        if (scope == ServiceScope::User && cfg.storagePath.empty())
+            cfg.storagePath = (home / "Library/Caches/fastcached/cache").string();
+
+        // Without --config the job reads no YAML at all: there is no default
+        // search path, so an operator editing <prefix>/etc/fastcached.yaml and
+        // kickstarting the job would see nothing change, with no error anywhere.
+        // Only adopt the packaged file when it actually exists, so a
+        // build-from-source install does not point launchd at a missing path.
+        //
+        // System scope only: that file describes the machine-wide daemon (its
+        // cache lives under the package prefix, writable by the service account
+        // alone), so handing it to a per-user agent would point the agent at a
+        // directory it cannot write.
+        if (scope == ServiceScope::System && cfg.configPath.empty())
+        {
+            auto const packaged = std::filesystem::path { MacOsPrefix } / "etc/fastcached.yaml";
+            std::error_code ec;
+            if (std::filesystem::exists(packaged, ec) && !ec)
+                cfg.configPath = packaged.string();
+        }
         return cfg;
     }
 
@@ -612,13 +751,42 @@ namespace
         return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     }
 
+    /// Fill the `{}` placeholder of a domain pattern with the invoking uid.
+    /// @param pattern Row value from ScopeTraits::domains.
+    /// @return The concrete domain target, e.g. `gui/501`.
+    [[nodiscard]] std::string ExpandDomain(std::string_view pattern)
+    {
+        auto const placeholder = pattern.find("{}");
+        if (placeholder == std::string_view::npos)
+            return std::string { pattern };
+        return std::format("{}{}{}", pattern.substr(0, placeholder), ::getuid(), pattern.substr(placeholder + 2));
+    }
+
     /// The launchctl domain target for @p scope, e.g. `gui/501` or `system`.
+    ///
+    /// Walks the scope's candidates in preference order and returns the first
+    /// launchd actually knows about, so a user-scope install works both on a
+    /// desktop and over SSH. Falling back to the most-preferred candidate when
+    /// none probes clean keeps the failure message pointing at the domain the
+    /// caller most likely meant.
+    ///
+    /// @param scope Domain being installed into.
+    /// @return A concrete launchctl domain target.
     [[nodiscard]] std::string DomainTarget(ServiceScope scope)
     {
-        auto const& traits = TraitsOf(scope);
-        if (traits.domain.contains("{}"))
-            return std::format("gui/{}", ::getuid());
-        return std::string { traits.domain };
+        std::string preferred;
+        for (auto const& pattern: TraitsOf(scope).domains)
+        {
+            if (pattern.empty())
+                continue;
+
+            auto candidate = ExpandDomain(pattern);
+            if (preferred.empty())
+                preferred = candidate;
+            if (RunLaunchctl({ "print", candidate }, LaunchctlOutput::Silence) == 0)
+                return candidate;
+        }
+        return preferred;
     }
 
     /// Block until launchd no longer knows @p serviceTarget.
@@ -649,6 +817,9 @@ namespace
 
 ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
 {
+    if (auto const rejection = InlineCredentialRejection(cfg))
+        return { .exitCode = 1, .message = *rejection };
+
     auto const exe = CurrentExecutablePath();
     if (exe.empty())
         return { .exitCode = 1, .message = "could not determine the fastcached executable path" };
@@ -659,6 +830,19 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
 
     if (scope == ServiceScope::System && ::geteuid() != 0)
         return { .exitCode = 1, .message = "installing a system LaunchDaemon requires root; re-run with sudo" };
+
+    // A LaunchDaemon plist naming a UserName launchd cannot resolve is not
+    // rejected at bootstrap: the job registers, `launchctl bootstrap` and
+    // `kickstart` both return 0, and only the spawn fails — so without this
+    // check the tool prints "installed and started" while nothing ever listens.
+    // The account is created by the .pkg postinstall, which is the only thing
+    // that creates it, so a tarball or from-source install lands here.
+    if (scope == ServiceScope::System && ::getpwnam(std::string { ServiceAccount }.c_str()) == nullptr)
+        return { .exitCode = 1,
+                 .message = std::format("the '{}' service account does not exist. It is created by the macOS "
+                                        "installer package; for a manual install, create it first (see "
+                                        "docs/operations/deployment.md) or use --service-scope=user.",
+                                        ServiceAccount) };
 
     auto const effective = WithScopeDefaults(cfg, scope, home);
     auto const label = LaunchdLabel(effective);
@@ -674,6 +858,15 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
     std::filesystem::create_directories(logDirectory, ec);
     if (ec)
         return { .exitCode = 1, .message = std::format("could not create {}: {}", logDirectory.string(), ec.message()) };
+
+    // The daemon drops to ServiceAccount, so directories root created for it
+    // have to change hands or its first write fails with EACCES — which launchd
+    // surfaces only as a job that exits immediately, over and over.
+    if (scope == ServiceScope::System)
+        if (auto const* const pw = ::getpwnam(std::string { ServiceAccount }.c_str()); pw != nullptr)
+            for (auto const& owned: { logDirectory, std::filesystem::path { effective.storagePath }.parent_path() })
+                if (!owned.empty())
+                    (void) ::chown(owned.c_str(), pw->pw_uid, pw->pw_gid);
 
     {
         std::ofstream out { plistPath, std::ios::binary | std::ios::trunc };

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -66,6 +67,25 @@ enum class EmitDaemonFlag : std::uint8_t
 /// @param cfg Effective configuration to embed in the service command line.
 /// @return Fully-quoted command line string.
 [[nodiscard]] std::string BuildServiceCommandLine(std::filesystem::path const& exePath, Config const& cfg);
+
+/// Why @p cfg cannot be handed to a service supervisor, if it cannot.
+///
+/// The one Config field with no safe representation in launch arguments is
+/// `requirePass`: a supervisor records those arguments where every local
+/// account can read them, so the shared secret would be published to exactly
+/// the accounts it exists to keep out. BuildServiceArgv therefore never emits
+/// it, and this reports the omission instead of leaving it silent — an install
+/// that quietly drops the password would come up unauthenticated while telling
+/// the operator it succeeded.
+///
+/// Supplying the secret through `--config` is accepted: the file can be mode
+/// 0600 and the daemon re-reads it on every start and reload.
+///
+/// Pure, so the rule is unit-testable on every platform.
+///
+/// @param cfg Configuration about to be baked into a service registration.
+/// @return An explanatory message when the install must be refused, else nullopt.
+[[nodiscard]] std::optional<std::string> InlineCredentialRejection(Config const& cfg);
 
 /// Parse the `--service-scope` argument.
 /// @param text One of `user` or `system`, lowercase.

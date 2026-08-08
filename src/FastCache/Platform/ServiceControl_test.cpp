@@ -285,3 +285,85 @@ TEST_CASE("ServiceControl: an unknown service scope is rejected", "[platform][se
     REQUIRE(err.field == "service-scope");
     REQUIRE(err.context.contains("nope"));
 }
+
+TEST_CASE("ServiceControl: security-relevant flags reach the supervisor", "[platform][service]")
+{
+    // The table used to stop after nine fields, so `--install-service --tls
+    // --metrics ...` reported success and registered a plaintext, unmonitored
+    // daemon. Every flag an operator can type alongside --install-service has
+    // to survive the trip, or the success message is a lie.
+    FastCache::Config cfg {};
+    cfg.tlsEnabled = true;
+    cfg.tlsCertPath = "/etc/fastcached/server.crt";
+    cfg.tlsKeyPath = "/etc/fastcached/server.key";
+    cfg.metricsEnabled = true;
+    cfg.metricsBindAddress = "0.0.0.0";
+    cfg.metricsPort = 9999;
+    cfg.pidfile = "/var/run/fastcached.pid";
+    cfg.notifyKeyspaceEvents = "KEA";
+
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    auto const has = [&argv](std::string_view flag) {
+        return std::ranges::find(argv, flag) != argv.end();
+    };
+
+    REQUIRE(has("--tls-cert=/etc/fastcached/server.crt"));
+    REQUIRE(has("--tls-key=/etc/fastcached/server.key"));
+    REQUIRE(has("--metrics-bind=0.0.0.0"));
+    REQUIRE(has("--metrics-port=9999"));
+    REQUIRE(has("--pidfile=/var/run/fastcached.pid"));
+    REQUIRE(has("--notify-keyspace-events=KEA"));
+
+    // Valueless switches: `--tls=true` is not a spelling CliParser accepts, so
+    // emitting one would produce a service that refuses to start.
+    REQUIRE(has("--tls"));
+    REQUIRE(has("--metrics"));
+}
+
+TEST_CASE("ServiceControl: every listener is re-emitted", "[platform][service]")
+{
+    // One token per bind, TLS-tagged individually: a multi-endpoint daemon that
+    // came back listening on fewer ports than it was installed with would look
+    // like a network fault, not a packaging bug.
+    FastCache::Config cfg {};
+    cfg.binds = { { .address = "127.0.0.1", .port = 11211, .tls = false },
+                  { .address = "0.0.0.0", .port = 11212, .tls = true } };
+
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    REQUIRE(std::ranges::find(argv, "--listen=127.0.0.1:11211") != argv.end());
+    REQUIRE(std::ranges::find(argv, "--listen-tls=0.0.0.0:11212") != argv.end());
+}
+
+TEST_CASE("ServiceControl: a password is never written into the launch arguments", "[platform][service]")
+{
+    // Launch arguments land in a world-readable plist (or the SCM's ImagePath),
+    // so emitting the secret would publish it to the very accounts
+    // --requirepass exists to exclude.
+    FastCache::Config cfg {};
+    cfg.requirePass = "hunter2";
+
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    REQUIRE(std::ranges::none_of(argv, [](std::string const& a) { return a.contains("hunter2"); }));
+
+    auto const plist = PlistFor(cfg, ServiceScope::System);
+    REQUIRE(!plist.contains("hunter2"));
+}
+
+TEST_CASE("ServiceControl: dropping a password is reported, not silent", "[platform][service]")
+{
+    // The alternative to refusing is an install that comes up unauthenticated
+    // while printing "installed and started" — the failure mode this guards.
+    FastCache::Config cfg {};
+    cfg.requirePass = "hunter2";
+    auto const rejection = FastCache::InlineCredentialRejection(cfg);
+    REQUIRE(rejection.has_value());
+    REQUIRE(rejection.value_or("").contains("--config"));
+
+    // Routed through a config file the secret reaches the daemon intact, so
+    // there is nothing to drop and nothing to leak.
+    cfg.configPath = "/opt/fastcached/etc/fastcached.yaml";
+    REQUIRE(!FastCache::InlineCredentialRejection(cfg).has_value());
+
+    // And a config with no secret at all is never in the way.
+    REQUIRE(!FastCache::InlineCredentialRejection(FastCache::Config {}).has_value());
+}
