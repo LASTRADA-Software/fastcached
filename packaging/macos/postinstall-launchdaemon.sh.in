@@ -58,9 +58,14 @@ esac
 # plist shipped in the payload, so there is exactly one implementation of "how
 # fastcached describes itself to a supervisor" — the same reason the WiX
 # fragment drives --install-service instead of using a ServiceInstall element.
+#
+# Only --config is passed. A --storage here would land in ProgramArguments, and
+# a CLI value outranks YAML in Merge — so the storage_path the install docs
+# invite the operator to edit would be silently overridden forever, with the
+# daemon still filling the old directory and nothing reporting it. Everything
+# except the config path therefore comes from the config file.
 "${PREFIX}/bin/fastcached" --install-service --service-scope=system \
-    --config="${PREFIX}/etc/fastcached.yaml" \
-    --storage="${PREFIX}/var/cache" || true
+    --config="${PREFIX}/etc/fastcached.yaml" || true
 
 # Belt and braces: the label must be the one the uninstaller looks for.
 if ! /bin/launchctl print "system/${LABEL}" >/dev/null 2>&1; then

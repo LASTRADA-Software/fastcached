@@ -18,8 +18,24 @@ DEFAULT_CONFIG="${PREFIX}/etc/fastcached.yaml.default"
 # payload is written unconditionally on every install. So the live config is
 # deliberately NOT in the payload — it is seeded from the shipped .default here,
 # once, and an upgrade then leaves the operator's edits alone.
+#
+# The seed also gains the one setting that has to be live rather than commented
+# out: storage_path. The shipped .default is the annotated reference shared with
+# the Linux packages, where every key is commented and the example path is the
+# FHS /var/lib one. The system LaunchDaemon passes only --config, precisely so
+# that this file governs the cache location and the operator can move it — which
+# means the location has to actually be set here, or the daemon comes up
+# memory-only and loses the whole cache on every restart.
 if [ ! -e "$CONFIG" ] && [ -e "$DEFAULT_CONFIG" ]; then
-    cp "$DEFAULT_CONFIG" "$CONFIG" || true
+    if cp "$DEFAULT_CONFIG" "$CONFIG"; then
+        cat >> "$CONFIG" <<EOF || true
+
+# --- macOS package defaults -------------------------------------------------
+# Set by the installer. Edit freely: this file survives upgrades, and the
+# launchd job re-reads it on every start.
+storage_path: ${PREFIX}/var/cache
+EOF
+    fi
 fi
 
 # State directory for the system LaunchDaemon. Created here rather than shipped
