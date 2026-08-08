@@ -728,6 +728,241 @@ jobs:
             out/build/gcc-release/fastcached-*.tar.gz
           if-no-files-found: error
 
+  package-macos:
+    name: "Package (macOS .pkg)"
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Cache CPM packages"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-${{ runner.os }}-package-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-package-
+
+      - name: "ccache"
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-package
+          max-size: 256M
+
+      - name: "Install build tools"
+        # Note what is NOT installed: llvm. The plain `macos` job above builds
+        # with Homebrew's LLVM and bakes its libc++ rpath into the binary, which
+        # is fine for running tests on the runner and fatal for a package —
+        # every user would need Homebrew LLVM at that exact path. This job uses
+        # AppleClang and the system libc++ on purpose.
+        run: brew install ninja openssl@3
+
+      - name: "Decide whether this build can be signed"
+        id: signing
+        run: |
+          # Gate on whether the secrets are actually reachable, not on the branch
+          # name: GitHub withholds secrets from fork pull requests, which is the
+          # real precondition. A branch test breaks every fork PR (codesign asked
+          # for an identity in no keychain) *and* leaves the signing path
+          # unexercised until after a merge.
+          if [[ -n "$HAS_SIGNING_SECRETS" ]]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no signing secrets (fork PR?); building an unsigned package"
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          # Only its emptiness is observable here; the value never reaches the log.
+          HAS_SIGNING_SECRETS: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+
+      - name: "Install the Apple signing certificates"
+        if: steps.signing.outputs.sign == 'true'
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          INSTALLER_CERTIFICATE_BASE64: ${{ secrets.INSTALLER_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -eu
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Two different certificate types are needed and they are not
+          # interchangeable: "Developer ID Application" signs the Mach-O
+          # binaries and the .dmg, "Developer ID Installer" signs the .pkg.
+          #
+          # -T grants the tools access to the imported key and
+          # set-key-partition-list records that grant in the key's ACL. Without
+          # both, codesign blocks on a GUI confirmation that never arrives on a
+          # runner, and the job hangs until its timeout rather than reporting
+          # anything useful.
+          import_p12() {
+            path="$RUNNER_TEMP/$1.p12"
+            printf '%s' "$2" | base64 --decode -o "$path"
+            security import "$path" -P "$P12_PASSWORD" -A -t cert -f pkcs12 \
+                            -k "$KEYCHAIN_PATH" \
+                            -T /usr/bin/codesign -T /usr/bin/productbuild -T /usr/bin/pkgbuild
+            rm -f "$path"
+          }
+          import_p12 application "$BUILD_CERTIFICATE_BASE64"
+          import_p12 installer   "$INSTALLER_CERTIFICATE_BASE64"
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild: \
+                          -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          security find-identity -v "$KEYCHAIN_PATH"
+
+      - name: "Store the notarization credentials"
+        if: steps.signing.outputs.sign == 'true'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          # An App Store Connect API key rather than an Apple ID and
+          # app-specific password: it carries no personal account, can be scoped
+          # to the Developer role, and is revocable on its own.
+          set -eu
+          KEY_PATH=$RUNNER_TEMP/notary-key.p8
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode -o "$KEY_PATH"
+          xcrun notarytool store-credentials fastcached-notary \
+                --key "$KEY_PATH" \
+                --key-id "$APPLE_API_KEY_ID" \
+                --issuer "$APPLE_API_ISSUER_ID"
+          # Everything downstream refers to the profile name only, so the key
+          # material does not need to stay on disk.
+          rm -f "$KEY_PATH"
+
+      - name: "Configure"
+        # -DCPM_USE_LOCAL_PACKAGES=OFF is what makes the package
+        # redistributable: with it ON (the project default) CPM prefers
+        # Homebrew's shared yaml-cpp and the daemon ends up linking
+        # /opt/homebrew/opt/yaml-cpp/lib/libyaml-cpp.dylib, which exists on no
+        # user's machine. OPENSSL_USE_STATIC_LIBS does the same job for TLS.
+        run: |
+          IDENTITY_APP=""
+          IDENTITY_PKG=""
+          NOTARIZE=OFF
+          if [[ "${{ steps.signing.outputs.sign }}" == "true" ]]; then
+            IDENTITY_APP="Developer ID Application: Christian Parpart (6T525MU9UR)"
+            IDENTITY_PKG="Developer ID Installer: Christian Parpart (6T525MU9UR)"
+            NOTARIZE=ON
+          fi
+          cmake -S . -B out/build/macos-package -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=/usr/bin/clang \
+            -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DFASTCACHED_BUILD_TESTS=OFF \
+            -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON \
+            -DCPM_USE_LOCAL_PACKAGES=OFF \
+            -DFASTCACHED_ENABLE_TLS=ON \
+            -DOPENSSL_USE_STATIC_LIBS=ON \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+            -DFASTCACHED_MACOS_SIGN_IDENTITY_APP="$IDENTITY_APP" \
+            -DFASTCACHED_MACOS_SIGN_IDENTITY_PKG="$IDENTITY_PKG" \
+            -DFASTCACHED_MACOS_NOTARIZE="$NOTARIZE"
+
+      - name: "Build"
+        run: cmake --build out/build/macos-package --target fastcached fastcache-cc
+
+      - name: "Verify the binaries are redistributable"
+        # The regression that would otherwise ship silently: everything builds,
+        # every test passes, and the package refuses to launch on any machine
+        # without the build host's Homebrew prefix.
+        run: |
+          set -euo pipefail
+          for tool in fastcached fastcache-cc; do
+            binary="out/build/macos-package/target/$tool"
+            echo "== $tool"; otool -L "$binary"
+            strays="$(otool -L "$binary" | tail -n +2 | awk '{print $1}' | grep -v '^/usr/lib/' || true)"
+            if [[ -n "$strays" ]]; then
+              echo "::error::$tool links libraries outside /usr/lib:"; echo "$strays"; exit 1
+            fi
+            # The deployment target floor: 13.3 because std::format of a float
+            # calls std::to_chars, which the system libc++ only gained then.
+            otool -l "$binary" | grep -q 'minos 13.3' \
+              || { echo "::error::$tool was not built for the pinned deployment target"; exit 1; }
+          done
+
+      - name: "Package"
+        # Notarization waits on Apple, hence the generous timeout.
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          # hdiutil intermittently hangs on GitHub runners while XProtect scans
+          # the image being created; see actions/runner-images#7522.
+          sudo pkill -9 XProtect >/dev/null 2>&1 || true
+          while pgrep XProtect >/dev/null; do sleep 3; done
+          cd out/build/macos-package && cpack -G "productbuild;TGZ"
+
+      - name: "Inspect the .pkg payload"
+        working-directory: out/build/macos-package
+        run: |
+          set -euo pipefail
+          pkg=$(ls fastcached-*.pkg)
+          echo "== choices"
+          pkgutil --expand "$pkg" /tmp/pkgx
+          grep -E '<choice id=' /tmp/pkgx/Distribution
+          echo "== payload"
+          pkgutil --payload-files "$pkg" | sort
+
+          # The launchd registration must be offered as two separate, optional
+          # choices, with the per-user agent preselected and the system daemon
+          # not. A regression here silently changes what a click-through install
+          # does to a user's machine.
+          grep -q 'id="LaunchAgentChoice".*start_selected="true"' /tmp/pkgx/Distribution \
+            || { echo "::error::the per-user agent is not preselected"; exit 1; }
+          grep -q 'id="LaunchDaemonChoice".*start_selected="false"' /tmp/pkgx/Distribution \
+            || { echo "::error::the system daemon is not opt-in"; exit 1; }
+
+      - name: "Verify the signature and the notarization ticket"
+        if: steps.signing.outputs.sign == 'true'
+        working-directory: out/build/macos-package
+        run: |
+          set -euo pipefail
+          pkg=$(ls fastcached-*.pkg)
+          dmg=$(ls fastcached-*.dmg)
+          pkgutil --check-signature "$pkg"
+          # The exact decision Gatekeeper makes when the user double-clicks it.
+          spctl --assess --verbose=4 --type install "$pkg"
+          # Stapled separately from the image: a ticket on the .dmg does not
+          # travel with a .pkg dragged out of it, leaving an offline install
+          # dependent on Gatekeeper reaching Apple.
+          xcrun stapler validate "$pkg"
+          xcrun stapler validate "$dmg"
+
+      - name: "Exercise the launchd integration"
+        run: ./scripts/macos-service-e2e.sh --fastcached out/build/macos-package/target/fastcached
+
+      - name: "Install, exercise and remove the package"
+        # --scope daemon, not the installer's default: a runner has no console
+        # user with a GUI session, so the per-user agent's postinstall correctly
+        # does nothing and there would be no running service to assert against.
+        # A LaunchDaemon needs no login, so this variant verifies the whole chain
+        # non-interactively — service account created via dscl, job bootstrapped
+        # into the system domain, running as _fastcached, serving on the port,
+        # and every trace removed by the uninstaller. The agent's launchd path is
+        # covered by the macos-service-e2e.sh step above.
+        #
+        # The script skips (77 → a failed step) without passwordless sudo. That
+        # is deliberate: on a runner sudo is always available, so its absence
+        # means the test did not run and should not pass quietly.
+        run: |
+          sudo -n true || { echo "::error::passwordless sudo unavailable; the install test cannot run"; exit 1; }
+          ./scripts/macos-package-e2e.sh --scope daemon --pkg "$(ls out/build/macos-package/fastcached-*.pkg)"
+
+      - name: "Upload packages"
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastcached-macos-packages
+          path: |
+            out/build/macos-package/fastcached-*.pkg
+            out/build/macos-package/fastcached-*.dmg
+            out/build/macos-package/fastcached-*.tar.gz
+          if-no-files-found: error
+
   package-windows:
     name: "Package (Windows .msi)"
     runs-on: windows-2025
