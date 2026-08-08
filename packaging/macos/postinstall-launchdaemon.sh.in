@@ -1,0 +1,70 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# LaunchDaemon component postinstall. Runs as root, from the macOS Installer.
+#
+# Creates the service account and registers a system-wide launchd daemon that
+# starts at boot, before anyone logs in. Exits 0 on every path (see
+# postinstall-runtime.sh.in for why).
+set -u
+
+PREFIX="/@FASTCACHED_MACOS_PREFIX@"
+LABEL="@FASTCACHED_MACOS_BUNDLE_ID@"
+ACCOUNT="@FASTCACHED_MACOS_SERVICE_ACCOUNT@"
+
+# macOS has no sysusers.d, so the account that packaging/linux/fastcached.sysusers
+# declares in one line has to be built by hand here. The 200..400 band is the
+# convention for hidden system accounts; picking the next free id keeps this
+# from colliding with another package's.
+if ! /usr/bin/dscl . -read "/Users/${ACCOUNT}" >/dev/null 2>&1; then
+    NEXT_ID=$(/usr/bin/dscl . -list /Users UniqueID \
+        | /usr/bin/awk '$2 > 200 && $2 < 400 { print $2 }' \
+        | /usr/bin/sort -n | /usr/bin/tail -1)
+    NEXT_ID=$((${NEXT_ID:-200} + 1))
+
+    /usr/bin/dscl . -create "/Groups/${ACCOUNT}" PrimaryGroupID "$NEXT_ID" || true
+    /usr/bin/dscl . -create "/Users/${ACCOUNT}" UniqueID "$NEXT_ID" || true
+    /usr/bin/dscl . -create "/Users/${ACCOUNT}" PrimaryGroupID "$NEXT_ID" || true
+    /usr/bin/dscl . -create "/Users/${ACCOUNT}" UserShell /usr/bin/false || true
+    /usr/bin/dscl . -create "/Users/${ACCOUNT}" NFSHomeDirectory /var/empty || true
+    /usr/bin/dscl . -create "/Users/${ACCOUNT}" RealName "fastcached daemon" || true
+    # Without IsHidden the account appears in the login window's user list.
+    /usr/bin/dscl . -create "/Users/${ACCOUNT}" IsHidden 1 || true
+fi
+
+mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" || true
+/usr/sbin/chown -R "${ACCOUNT}:${ACCOUNT}" "${PREFIX}/var" || true
+
+# A per-user agent registered by an earlier install would fight this daemon for
+# 127.0.0.1:11211. The daemon wins (see postinstall-launchagent.sh.in), so tear
+# any agent down first.
+CONSOLE_USER=$(/usr/sbin/scutil <<'EOF' | /usr/bin/awk '/Name :/ && ! /loginwindow/ { print $3 }'
+show State:/Users/ConsoleUser
+EOF
+)
+case "${CONSOLE_USER:-}" in
+    "" | root | loginwindow | _mbsetupuser) ;;
+    *)
+        UID_OF_USER=$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null) || UID_OF_USER=""
+        if [ -n "$UID_OF_USER" ]; then
+            /bin/launchctl asuser "$UID_OF_USER" /usr/bin/sudo -u "$CONSOLE_USER" \
+                "${PREFIX}/bin/fastcached" --uninstall-service --service-scope=user \
+                >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+# Registration goes through the daemon's own --install-service rather than a
+# plist shipped in the payload, so there is exactly one implementation of "how
+# fastcached describes itself to a supervisor" — the same reason the WiX
+# fragment drives --install-service instead of using a ServiceInstall element.
+"${PREFIX}/bin/fastcached" --install-service --service-scope=system \
+    --config="${PREFIX}/etc/fastcached.yaml" \
+    --storage="${PREFIX}/var/cache" || true
+
+# Belt and braces: the label must be the one the uninstaller looks for.
+if ! /bin/launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+    echo "fastcached: launchd job ${LABEL} did not register; see the installer log" >&2
+fi
+
+exit 0

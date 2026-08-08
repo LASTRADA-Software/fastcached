@@ -1,0 +1,52 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# LaunchAgent component postinstall. Runs as root, from the macOS Installer.
+#
+# Registers a per-user launchd agent for the console user, so fastcached starts
+# at their login and runs as them. Exits 0 on every path (see
+# postinstall-runtime.sh.in for why).
+set -u
+
+PREFIX="/@FASTCACHED_MACOS_PREFIX@"
+LABEL="@FASTCACHED_MACOS_BUNDLE_ID@"
+
+# The system-wide daemon and a per-user agent would both bind 127.0.0.1:11211,
+# and fastcached has no unix-socket endpoint to fall back on. productbuild
+# cannot express a mutually exclusive pair of choices (CPack only generates
+# && / || dependency expressions), so the two components arbitrate here instead:
+# the system daemon wins, because it serves every user rather than one.
+if [ -e "/Library/LaunchDaemons/${LABEL}.plist" ]; then
+    echo "fastcached: system LaunchDaemon present; skipping the per-user agent" >&2
+    exit 0
+fi
+
+# scutil rather than `stat -f %Su /dev/console`: at the login window scutil
+# reports an empty name, whereas stat reports `root`, and during Setup Assistant
+# it reports `_mbsetupuser`. Testing one empty value beats testing three
+# sentinels, and getting it wrong means installing an agent for root.
+CONSOLE_USER=$(/usr/sbin/scutil <<'EOF' | /usr/bin/awk '/Name :/ && ! /loginwindow/ { print $3 }'
+show State:/Users/ConsoleUser
+EOF
+)
+
+case "${CONSOLE_USER:-}" in
+    "" | root | loginwindow | _mbsetupuser)
+        # No usable GUI session: a headless `installer -pkg`, an ssh install, or
+        # the login window. Nothing to register now, and nothing is broken —
+        # the user can run `fastcached --install-service` after logging in.
+        echo "fastcached: no console user; run 'fastcached --install-service' once logged in" >&2
+        exit 0
+        ;;
+esac
+
+UID_OF_USER=$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null) || exit 0
+
+# `launchctl asuser` adopts the target user's bootstrap namespace and audit
+# session but explicitly does NOT change credentials, so `sudo -u` is still
+# required for the process to actually run as them.
+/bin/launchctl asuser "$UID_OF_USER" /usr/bin/sudo -u "$CONSOLE_USER" \
+    "${PREFIX}/bin/fastcached" --install-service --service-scope=user \
+    --config="${PREFIX}/etc/fastcached.yaml" || true
+
+exit 0

@@ -1,0 +1,46 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html>
+<body style="font-family: -apple-system, sans-serif; font-size: 13px;">
+
+<h3>After installing</h3>
+
+<p><b>Open a new terminal window.</b> The installer adds
+<code>/opt/fastcached/bin</code> to the system <code>PATH</code> through
+<code>/etc/paths.d</code>, which macOS only reads when a login shell starts — a
+terminal that is already open will not see it. Both tools are also symlinked
+into <code>/usr/local/bin</code>, so in practice they are reachable straight
+away in most shells.</p>
+
+<p>Check that the daemon is running:</p>
+
+<pre>    launchctl print gui/$UID/software.lastrada.fastcached</pre>
+
+<p>or, for the system-wide service:</p>
+
+<pre>    sudo launchctl print system/software.lastrada.fastcached</pre>
+
+<h3>Configuration</h3>
+
+<p>The daemon reads <code>/opt/fastcached/etc/fastcached.yaml</code>. Every
+setting in it is commented out and shows its built-in default, so the file as
+shipped behaves exactly like no config at all. Your edits are preserved across
+upgrades — only <code>fastcached.yaml.default</code> beside it is replaced.</p>
+
+<p>After changing it, restart the service:</p>
+
+<pre>    launchctl kickstart -k gui/$UID/software.lastrada.fastcached</pre>
+
+<h3>Removing fastcached</h3>
+
+<p>macOS packages have no built-in uninstaller, so one ships with this
+package:</p>
+
+<pre>    sudo /opt/fastcached/bin/fastcached-uninstall</pre>
+
+<p>It stops and unregisters the launchd jobs, removes
+<code>/opt/fastcached</code>, the <code>PATH</code> entry and the symlinks, and
+forgets the package receipts. Your own cache and logs under
+<code>~/Library</code> are left in place.</p>
+
+</body>
+</html>
