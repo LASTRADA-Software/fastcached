@@ -78,14 +78,42 @@ enum class EmitDaemonFlag : std::uint8_t
 /// that quietly drops the password would come up unauthenticated while telling
 /// the operator it succeeded.
 ///
-/// Supplying the secret through `--config` is accepted: the file can be mode
-/// 0600 and the daemon re-reads it on every start and reload.
+/// `--config` does not make the combination acceptable: nothing can tell from
+/// here whether the named file actually carries `requirepass:`, so waving it
+/// through was the silent drop under another name — the operator was told their
+/// password had been registered and got an unauthenticated daemon. The secret
+/// belongs in the config file *instead of* on the command line.
 ///
 /// Pure, so the rule is unit-testable on every platform.
 ///
 /// @param cfg Configuration about to be baked into a service registration.
 /// @return An explanatory message when the install must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> InlineCredentialRejection(Config const& cfg);
+
+/// Why @p cfg's `serviceName` cannot name a service, if it cannot.
+///
+/// The name reaches the filesystem: LaunchdPlistPath concatenates it into the
+/// directory launchd scans, and the SCM keys its registry entry on it. A
+/// separator or a `..` therefore escapes that directory — writing a root-owned
+/// file somewhere no uninstall path knows about — and a merely misplaced
+/// character puts the plist where the supervisor never looks, while the install
+/// still reports success.
+///
+/// Pure, so the rule is unit-testable on every platform.
+///
+/// @param cfg Configuration whose `serviceName` is to be validated.
+/// @return An explanatory message when the name must be refused, else nullopt.
+[[nodiscard]] std::optional<std::string> ServiceNameRejection(Config const& cfg);
+
+/// Why @p cfg cannot be handed to a service supervisor at all, if it cannot.
+///
+/// Runs every registration rule in turn — currently ServiceNameRejection and
+/// InlineCredentialRejection — and reports the first that objects, so both
+/// platforms' InstallService share one gate and a new rule is a new table row.
+///
+/// @param cfg Configuration about to be registered.
+/// @return An explanatory message when the install must be refused, else nullopt.
+[[nodiscard]] std::optional<std::string> ServiceRegistrationRejection(Config const& cfg);
 
 /// Parse the `--service-scope` argument.
 /// @param text One of `user` or `system`, lowercase.

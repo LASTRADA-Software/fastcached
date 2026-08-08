@@ -369,11 +369,102 @@ TEST_CASE("ServiceControl: dropping a password is reported, not silent", "[platf
     REQUIRE(rejection.has_value());
     REQUIRE(rejection.value_or("").contains("--config"));
 
-    // Routed through a config file the secret reaches the daemon intact, so
-    // there is nothing to drop and nothing to leak.
+    // --config alongside it is refused too, and this is the case that matters:
+    // nothing here can tell whether the named file carries `requirepass:` — the
+    // installer-seeded YAML does not — so accepting the combination was the
+    // silent drop under another name. The operator was told their password had
+    // been registered and got a daemon serving with no authentication at all.
     cfg.configPath = "/opt/fastcached/etc/fastcached.yaml";
-    REQUIRE(!FastCache::InlineCredentialRejection(cfg).has_value());
+    auto const withConfig = FastCache::InlineCredentialRejection(cfg);
+    REQUIRE(withConfig.has_value());
+    REQUIRE(withConfig.value_or("").contains("/opt/fastcached/etc/fastcached.yaml"));
 
     // And a config with no secret at all is never in the way.
     REQUIRE(!FastCache::InlineCredentialRejection(FastCache::Config {}).has_value());
+}
+
+TEST_CASE("ServiceControl: an IPv6 listener round-trips through its own parser", "[platform][service]")
+{
+    // ParseListenSpec splits an unbracketed spec on its last ':' and rejects a
+    // literal outright, so `::` emitted bare came back as `--listen=:::11211` —
+    // a service that registered cleanly and then failed at every single start,
+    // restarted forever by KeepAlive.
+    FastCache::Config cfg {};
+    cfg.binds = { { .address = "::", .port = 11211, .tls = false },
+                  { .address = "2001:db8::1", .port = 11212, .tls = true } };
+
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    REQUIRE(std::ranges::find(argv, "--listen=[::]:11211") != argv.end());
+    REQUIRE(std::ranges::find(argv, "--listen-tls=[2001:db8::1]:11212") != argv.end());
+
+    // An IPv4 address has no brackets to gain, and adding them would be just as
+    // wrong: the bracketed grammar demands a literal.
+    cfg.binds = { { .address = "127.0.0.1", .port = 11211, .tls = false } };
+    auto const v4 = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    REQUIRE(std::ranges::find(v4, "--listen=127.0.0.1:11211") != v4.end());
+}
+
+TEST_CASE("ServiceControl: a value ending in a backslash survives quoting", "[platform][service]")
+{
+    // Inside quotes a backslash run immediately before the closing `"` is
+    // halved, so a lone trailing one escaped the quote instead of ending the
+    // token: the argument ran on and swallowed every later flag into itself.
+    // std::filesystem::absolute readily produces such a path for a directory.
+    FastCache::Config cfg {};
+    cfg.storagePath = R"(C:\Program Files\fastcached\cache\)";
+    cfg.pidfile = R"(C:\run\fastcached.pid)";
+
+    auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
+
+    // The pidfile flag must still be recognisable as its own token; if the
+    // storage value swallowed it, this is what would go missing.
+    REQUIRE(cmd.contains("--pidfile="));
+
+    // On POSIX the paths are relative (no drive letter), so absolute() rebases
+    // them on the working directory — assert the property that holds on both:
+    // the doubled trailing run, which is what the parser halves back to one.
+    if (cmd.contains(R"(cache\)"))
+        REQUIRE(cmd.contains(R"(cache\\")"));
+}
+
+TEST_CASE("ServiceControl: a service name that escapes its directory is refused", "[platform][service]")
+{
+    // The name is concatenated into the directory launchd scans, so a separator
+    // writes a root-owned plist somewhere no uninstall path knows about — after
+    // the install has printed success.
+    auto rejects = [](std::string_view name) {
+        FastCache::Config cfg {};
+        cfg.serviceName = name;
+        return FastCache::ServiceNameRejection(cfg).has_value();
+    };
+
+    REQUIRE(rejects("../../../../etc/periodic/daily/zz"));
+    REQUIRE(rejects("fast/cached"));
+    REQUIRE(rejects(R"(fast\cached)"));
+    REQUIRE(rejects(".."));
+    REQUIRE(rejects(".hidden")); // launchd's directory scan skips dotfiles.
+    REQUIRE(rejects("fast\ncached"));
+    REQUIRE(rejects(""));
+
+    // A deny-list, not an allow-list: the SCM has accepted spaces and
+    // punctuation since forever, and breaking those registrations to fix a
+    // traversal only separators can express would be a poor trade.
+    REQUIRE(!rejects("FastCached"));
+    REQUIRE(!rejects("My Cache"));
+    REQUIRE(!rejects("fastcached-2"));
+}
+
+TEST_CASE("ServiceControl: every registration rule gates an install", "[platform][service]")
+{
+    // One gate for both platforms' InstallService, so a rule cannot be enforced
+    // on one supervisor and forgotten on the other.
+    FastCache::Config named {};
+    named.serviceName = "../escape";
+    REQUIRE(FastCache::ServiceRegistrationRejection(named).has_value());
+
+    FastCache::Config secret {};
+    secret.requirePass = "hunter2";
+    REQUIRE(FastCache::ServiceRegistrationRejection(secret).has_value());
+
+    REQUIRE(!FastCache::ServiceRegistrationRejection(FastCache::Config {}).has_value());
 }

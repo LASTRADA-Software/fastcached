@@ -18,6 +18,7 @@
 #if defined(_WIN32)
     #include <windows.h>
 #elif defined(__APPLE__)
+    #include <sys/stat.h>
     #include <sys/wait.h>
 
     #include <cstring>
@@ -86,14 +87,57 @@ namespace
         return "batched";
     }
 
-    /// Wrap @p value in double quotes when it contains whitespace, so the SCM's
-    /// command-line tokenizer keeps it as a single argument. Quote-free values
-    /// pass through unchanged for a stable, readable command line.
+    /// Quote @p value for a Windows command line, by the rules the CRT startup
+    /// code and CommandLineToArgvW use to split one back into an argv array.
+    ///
+    /// Only a value containing a metacharacter is quoted, so ordinary ones still
+    /// read plainly in `services.msc`. Inside quotes a backslash is literal
+    /// *except* in a run immediately before a `"`, where the run is halved and
+    /// the quote is escaped by the odd one out. Testing for a space alone was
+    /// not enough: a path flag whose absolutized value ends in `\` — which
+    /// std::filesystem::absolute readily produces for a directory — put a
+    /// trailing `\"` at the end of the token, which the parser reads as an
+    /// escaped literal quote, so the argument ran on and swallowed every later
+    /// flag into itself.
     [[nodiscard]] std::string MaybeQuote(std::string_view value)
     {
-        if (value.contains(' '))
-            return std::format("\"{}\"", value);
-        return std::string { value };
+        if (value.find_first_of(" \t\"") == std::string_view::npos)
+            return std::string { value };
+
+        std::string out { '"' };
+        std::size_t backslashes = 0;
+        for (auto const ch: value)
+        {
+            if (ch == '\\')
+            {
+                ++backslashes;
+                continue;
+            }
+            // The pending run is literal unless this character is the quote it
+            // would otherwise escape, in which case it doubles and one more is
+            // added to escape the quote itself.
+            out.append(ch == '"' ? (backslashes * 2) + 1 : backslashes, '\\');
+            backslashes = 0;
+            out += ch;
+        }
+        // The closing quote follows a trailing run, so that run doubles too.
+        out.append(backslashes * 2, '\\');
+        out += '"';
+        return out;
+    }
+
+    /// Spell @p address the way ParseListenSpec reads it back.
+    ///
+    /// An IPv6 literal is the only address form containing a `:`, and the
+    /// unbracketed grammar splits on the last one — so `::` round-tripped as
+    /// `--listen=:::11211`, which the daemon's own parser rejects outright with
+    /// "IPv6 literal requires brackets". The service registered fine and then
+    /// failed at every start, restarted forever by KeepAlive.
+    [[nodiscard]] std::string FormatListenHost(std::string const& address)
+    {
+        if (address.contains(':'))
+            return std::format("[{}]", address);
+        return address;
     }
 
     /// Absolutize a captured path so it survives the fact that a service does
@@ -221,12 +265,15 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath, 
     emitPathIfSet("config", cfg.configPath);
 
     // Repeated flags, one token per listener, so a multi-endpoint daemon comes
-    // back with the same listener set it was installed with.
+    // back with the same listener set it was installed with. The address goes
+    // through FormatListenHost so what is emitted is what ParseListenSpec
+    // accepts — these tokens are re-parsed by the daemon at every start.
     for (auto const& bind: cfg.binds)
-        argv.push_back(std::format("--{}={}:{}", bind.tls ? "listen-tls" : "listen", bind.address, bind.port));
+        argv.push_back(
+            std::format("--{}={}:{}", bind.tls ? "listen-tls" : "listen", FormatListenHost(bind.address), bind.port));
 
     // requirePass is deliberately NOT here, and its omission is reported rather
-    // than silent: see RejectInlineCredential.
+    // than silent: see InlineCredentialRejection.
     return argv;
 }
 
@@ -238,17 +285,71 @@ std::optional<std::string> InlineCredentialRejection(Config const& cfg)
     // A supervisor records its launch arguments in a file every local user can
     // read (`/Library/LaunchDaemons/*.plist`, the SCM's ImagePath), so baking a
     // shared secret into them would publish it to exactly the accounts
-    // --requirepass exists to keep out. The config file can be chmod 0600, so
+    // --requirepass exists to keep out. The config file can be mode 0640, so
     // that is where the secret belongs; the daemon reads it at every start and
     // on every reload. Refusing is the only honest option: emitting the flag
     // leaks it, and dropping it silently installs an unauthenticated daemon
     // while reporting success.
-    if (cfg.configPath.empty())
-        return "--requirepass cannot be baked into a service's launch arguments: they are world-readable. "
-               "Put `requirepass:` in a config file (chmod 0600) and install with --config=<path> instead.";
+    constexpr std::string_view Preamble =
+        "--requirepass cannot be baked into a service's launch arguments: they are world-readable. "
+        "Put `requirepass:` in a config file (mode 0640, readable by the account the service runs as) "
+        "and install with --config=<path> instead.";
 
-    // With --config present the secret already reaches the daemon through the
-    // file, so there is nothing to drop and nothing to leak.
+    if (cfg.configPath.empty())
+        return std::string { Preamble };
+
+    // --config does not make the combination safe. Nothing here can tell
+    // whether the named file carries `requirepass:` — the installer-seeded YAML
+    // does not — so accepting it was the silent drop wearing a different hat:
+    // the daemon came up unauthenticated while the operator was told the
+    // password had been registered.
+    return std::format("{} You passed --config={}, so put it there and drop --requirepass from this command line.",
+                       Preamble,
+                       cfg.configPath);
+}
+
+std::optional<std::string> ServiceNameRejection(Config const& cfg)
+{
+    // The service name is not merely a label. LaunchdPlistPath concatenates it
+    // into `<LaunchAgents|LaunchDaemons>/<label>.plist`, and the SCM keys its
+    // registry entry on it — so a '/' or a ".." escapes the directory the
+    // supervisor scans, writing a root-owned file somewhere no uninstall path
+    // knows about. Even the benign case bites: one stray separator puts the
+    // plist where launchd's directory scan never looks, so the job never comes
+    // back after a reboot while the install reported success.
+    // A deny-list rather than an allow-list, deliberately: the SCM has accepted
+    // names with spaces and punctuation since forever, and tightening that here
+    // would break existing Windows registrations to fix a traversal that only
+    // separators and dots can express.
+    if (cfg.serviceName.empty())
+        return "--service-name must not be empty";
+
+    if (cfg.serviceName.find_first_of("/\\") != std::string::npos)
+        return std::format("--service-name must not contain a path separator: '{}'", cfg.serviceName);
+
+    // A leading dot covers `..` — the traversal that needs no separator — and a
+    // dotfile, which launchd's directory scan skips, so the job would silently
+    // never come back after a reboot.
+    if (cfg.serviceName.starts_with('.'))
+        return std::format("--service-name must not start with '.': '{}'", cfg.serviceName);
+
+    if (std::ranges::any_of(cfg.serviceName, [](unsigned char ch) { return std::iscntrl(ch) != 0; }))
+        return std::format("--service-name must not contain control characters: '{}'", cfg.serviceName);
+
+    return std::nullopt;
+}
+
+std::optional<std::string> ServiceRegistrationRejection(Config const& cfg)
+{
+    // A table, so a new rule is a new row rather than another `if` threaded
+    // through both platforms' InstallService.
+    using Validator = std::optional<std::string> (*)(Config const&);
+    constexpr auto Validators = std::to_array<Validator>({ &ServiceNameRejection, &InlineCredentialRejection });
+
+    for (auto const validator: Validators)
+        if (auto rejection = validator(cfg))
+            return rejection;
+
     return std::nullopt;
 }
 
@@ -513,7 +614,7 @@ namespace
 
 ServiceControlResult InstallService(Config const& cfg, ServiceScope /*scope*/)
 {
-    if (auto const rejection = InlineCredentialRejection(cfg))
+    if (auto const rejection = ServiceRegistrationRejection(cfg))
         return { .exitCode = 1, .message = *rejection };
 
     auto const exe = CurrentExecutablePath();
@@ -572,6 +673,11 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope /*scope*/)
 
 ServiceControlResult UninstallService(Config const& cfg, ServiceScope /*scope*/)
 {
+    // The name gates removal too: it selects which registration is addressed,
+    // and one that could never have been installed cannot be removed either.
+    if (auto const rejection = ServiceNameRejection(cfg))
+        return { .exitCode = 1, .message = *rejection };
+
     SC_HANDLE const manager = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (manager == nullptr)
     {
@@ -669,11 +775,16 @@ namespace
     /// expands neither `~` nor `$HOME` in ProgramArguments, so the concrete path
     /// has to be resolved here, at install time, by the process that knows it.
     ///
-    /// System scope deliberately gets **no** storage default. Its config file is
-    /// the package's `<prefix>/etc/fastcached.yaml`, and a CLI value baked into
-    /// ProgramArguments outranks YAML in Merge — so injecting one here would
-    /// pin the cache to a directory the operator cannot move, silently ignoring
-    /// the `storage_path` the install docs invite them to edit.
+    /// The default is applied only when the caller named **no** config file. A
+    /// CLI value baked into ProgramArguments outranks YAML in Merge, so
+    /// injecting one alongside `--config` would override the `storage_path` in
+    /// that very file for the life of the registration — the operator edits it,
+    /// kickstarts the job, and nothing changes, with no error anywhere. Whoever
+    /// passes a config file owns the storage path in it.
+    ///
+    /// System scope gets no storage default at all: its config file is always
+    /// the package's `<prefix>/etc/fastcached.yaml`, so there is nothing to
+    /// default.
     ///
     /// @param cfg Configuration as parsed from the command line.
     /// @param scope Domain being installed into.
@@ -681,7 +792,7 @@ namespace
     /// @return @p cfg with `storagePath` filled in when the caller left it unset.
     [[nodiscard]] Config WithScopeDefaults(Config cfg, ServiceScope scope, std::filesystem::path const& home)
     {
-        if (scope == ServiceScope::User && cfg.storagePath.empty())
+        if (scope == ServiceScope::User && cfg.storagePath.empty() && cfg.configPath.empty())
             cfg.storagePath = (home / "Library/Caches/fastcached/cache").string();
 
         // Without --config the job reads no YAML at all: there is no default
@@ -766,7 +877,20 @@ namespace
         return std::format("{}{}{}", pattern.substr(0, placeholder), ::getuid(), pattern.substr(placeholder + 2));
     }
 
-    /// The launchctl domain target for @p scope, e.g. `gui/501` or `system`.
+    /// Every launchctl domain target @p scope could hold a job in, most
+    /// preferred first.
+    /// @param scope Domain family to enumerate.
+    /// @return Concrete targets, e.g. `{"gui/501", "user/501"}`.
+    [[nodiscard]] std::vector<std::string> DomainTargets(ServiceScope scope)
+    {
+        std::vector<std::string> targets;
+        for (auto const& pattern: TraitsOf(scope).domains)
+            if (!pattern.empty())
+                targets.push_back(ExpandDomain(pattern));
+        return targets;
+    }
+
+    /// The launchctl domain target to bootstrap a new job into.
     ///
     /// Walks the scope's candidates in preference order and returns the first
     /// launchd actually knows about, so a user-scope install works both on a
@@ -774,23 +898,18 @@ namespace
     /// none probes clean keeps the failure message pointing at the domain the
     /// caller most likely meant.
     ///
+    /// Only ever used for *bootstrapping*. Teardown must not re-probe — see
+    /// BootOutEverywhere.
+    ///
     /// @param scope Domain being installed into.
     /// @return A concrete launchctl domain target.
     [[nodiscard]] std::string DomainTarget(ServiceScope scope)
     {
-        std::string preferred;
-        for (auto const& pattern: TraitsOf(scope).domains)
-        {
-            if (pattern.empty())
-                continue;
-
-            auto candidate = ExpandDomain(pattern);
-            if (preferred.empty())
-                preferred = candidate;
+        auto const candidates = DomainTargets(scope);
+        for (auto const& candidate: candidates)
             if (RunLaunchctl({ "print", candidate }, LaunchctlOutput::Silence) == 0)
                 return candidate;
-        }
-        return preferred;
+        return candidates.empty() ? std::string {} : candidates.front();
     }
 
     /// Block until launchd no longer knows @p serviceTarget.
@@ -817,23 +936,101 @@ namespace
             return false;
         });
     }
+
+    /// Boot @p label out of every domain @p scope could hold it in.
+    ///
+    /// Every candidate, never the one DomainTarget probes for now: which domain
+    /// a job landed in was decided when it was *installed*. An agent registered
+    /// over SSH lives in `user/<uid>` because `gui/<uid>` did not exist then, so
+    /// a later teardown from a desktop session would probe `gui/<uid>`, boot out
+    /// a job that was never there, see `launchctl print` fail for the same
+    /// reason, and report removal — while the real agent kept running and kept
+    /// holding the port, its plist now deleted so nothing could reach it again.
+    ///
+    /// @param scope Domain family the job belongs to.
+    /// @param label launchd job label.
+    /// @return A diagnostic if a job is still registered somewhere, else nullopt.
+    [[nodiscard]] std::optional<std::string> BootOutEverywhere(ServiceScope scope, std::string const& label)
+    {
+        for (auto const& domain: DomainTargets(scope))
+        {
+            auto const serviceTarget = std::format("{}/{}", domain, label);
+            // Silenced: "No such process" is the normal answer for every domain
+            // the job is not in, which is all but one of them.
+            (void) RunLaunchctl({ "bootout", serviceTarget }, LaunchctlOutput::Silence);
+            if (!WaitForJobGone(serviceTarget))
+                return std::format("'{}' is still registered after bootout; "
+                                   "run `launchctl bootout {}` manually and retry",
+                                   label,
+                                   serviceTarget);
+        }
+        return std::nullopt;
+    }
+
+    /// Why ServiceAccount could not read @p path, if it could not.
+    ///
+    /// A system daemon drops to ServiceAccount before it opens its config, so a
+    /// root-owned mode-0600 file — exactly what InlineCredentialRejection sends
+    /// the operator off to create — leaves launchd restarting a job that exits
+    /// at every start, with the EACCES visible nowhere. Checked here, where the
+    /// remedy can be named, rather than discovered from a restart loop.
+    ///
+    /// @param path Config file the job will be pointed at.
+    /// @return A diagnostic naming the fix, or nullopt when the file is readable.
+    [[nodiscard]] std::optional<std::string> ServiceAccountReadDenial(std::filesystem::path const& path)
+    {
+        auto const* const pw = ::getpwnam(std::string { ServiceAccount }.c_str());
+        if (pw == nullptr)
+            return std::nullopt; // Reported by its own guard; nothing to add.
+
+        struct stat info = {};
+        if (::stat(path.c_str(), &info) != 0)
+            return std::nullopt; // Absent or unreadable by root: not this check's business.
+
+        auto const readable = (info.st_mode & S_IROTH) != 0 || (info.st_uid == pw->pw_uid && (info.st_mode & S_IRUSR) != 0)
+                              || (info.st_gid == pw->pw_gid && (info.st_mode & S_IRGRP) != 0);
+        if (readable)
+            return std::nullopt;
+
+        return std::format("{} is not readable by '{}', the account the daemon runs as, so the job would exit at "
+                           "every start. Grant it access first: chown root:{} {} && chmod 0640 {}",
+                           path.string(),
+                           ServiceAccount,
+                           ServiceAccount,
+                           path.string(),
+                           path.string());
+    }
 } // namespace
 
 ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
 {
-    if (auto const rejection = InlineCredentialRejection(cfg))
+    if (auto const rejection = ServiceRegistrationRejection(cfg))
         return { .exitCode = 1, .message = *rejection };
 
     auto const exe = CurrentExecutablePath();
     if (exe.empty())
         return { .exitCode = 1, .message = "could not determine the fastcached executable path" };
 
+    if (scope == ServiceScope::System && ::geteuid() != 0)
+        return { .exitCode = 1, .message = "installing a system LaunchDaemon requires root; re-run with sudo" };
+
+    // The mirror guard, and not a nicety: a user agent is installed *for the
+    // invoking account*, and CurrentHomeDirectory reads the real uid, which
+    // sudo sets to 0. Without this, `sudo fastcached --install-service` — the
+    // natural reading of a command whose help mentions sudo — writes the plist
+    // to /var/root/Library/LaunchAgents and bootstraps it into root's domain.
+    // Nothing starts at the operator's own login, and an unprivileged
+    // --uninstall-service reports nothing installed, leaving a root-owned agent
+    // they can neither see nor remove. Which account they meant is genuinely
+    // ambiguous, so ask rather than guess.
+    if (scope == ServiceScope::User && ::geteuid() == 0)
+        return { .exitCode = 1,
+                 .message = "--service-scope=user installs an agent for the invoking account, so it must not run as "
+                            "root. Re-run without sudo, or pass --service-scope=system for a machine-wide daemon." };
+
     auto const home = CurrentHomeDirectory();
     if (scope == ServiceScope::User && home.empty())
         return { .exitCode = 1, .message = "could not determine the invoking user's home directory" };
-
-    if (scope == ServiceScope::System && ::geteuid() != 0)
-        return { .exitCode = 1, .message = "installing a system LaunchDaemon requires root; re-run with sudo" };
 
     // A LaunchDaemon plist naming a UserName launchd cannot resolve is not
     // rejected at bootstrap: the job registers, `launchctl bootstrap` and
@@ -853,6 +1050,10 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
     auto const plistPath = LaunchdPlistPath(effective, scope, home);
     auto const logDirectory = DefaultLogDirectory(scope, home);
 
+    if (scope == ServiceScope::System && !effective.configPath.empty())
+        if (auto const denial = ServiceAccountReadDenial(effective.configPath))
+            return { .exitCode = 1, .message = *denial };
+
     std::error_code ec;
     std::filesystem::create_directories(plistPath.parent_path(), ec);
     if (ec)
@@ -866,11 +1067,26 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
     // The daemon drops to ServiceAccount, so directories root created for it
     // have to change hands or its first write fails with EACCES — which launchd
     // surfaces only as a job that exits immediately, over and over.
+    //
+    // The storage directory itself, never its parent. Handing over the parent
+    // gave away a directory the operator never named: `--storage=/var/db/fc`
+    // reassigned /var/db, shared with other system services, to an unprivileged
+    // cache account, and `--storage=/tmp/cache` reassigned /private/tmp — both
+    // silently, under a message that said the service had been installed.
     if (scope == ServiceScope::System)
         if (auto const* const pw = ::getpwnam(std::string { ServiceAccount }.c_str()); pw != nullptr)
-            for (auto const& owned: { logDirectory, std::filesystem::path { effective.storagePath }.parent_path() })
-                if (!owned.empty())
-                    (void) ::chown(owned.c_str(), pw->pw_uid, pw->pw_gid);
+        {
+            std::vector<std::filesystem::path> owned { logDirectory };
+            if (!effective.storagePath.empty())
+            {
+                std::error_code storageEc;
+                std::filesystem::create_directories(effective.storagePath, storageEc);
+                if (!storageEc)
+                    owned.emplace_back(effective.storagePath);
+            }
+            for (auto const& path: owned)
+                (void) ::chown(path.c_str(), pw->pw_uid, pw->pw_gid);
+        }
 
     {
         std::ofstream out { plistPath, std::ios::binary | std::ios::trunc };
@@ -882,20 +1098,15 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
     }
 
     auto const domain = DomainTarget(scope);
-
     auto const serviceTarget = std::format("{}/{}", domain, label);
 
     // Boot out any previous incarnation first: launchd caches the job
     // description at bootstrap time, so re-registering without this leaves the
-    // old ProgramArguments running and the freshly written plist ignored.
-    // Silenced because "No such process" is the normal case on a first install.
-    (void) RunLaunchctl({ "bootout", serviceTarget }, LaunchctlOutput::Silence);
-    if (!WaitForJobGone(serviceTarget))
-        return { .exitCode = 1,
-                 .message = std::format("'{}' is still registered after bootout; "
-                                        "run `launchctl bootout {}` manually and retry",
-                                        label,
-                                        serviceTarget) };
+    // old ProgramArguments running and the freshly written plist ignored. Every
+    // domain, not just the one being bootstrapped into now — an earlier install
+    // may have landed in the other one, and that job still holds the port.
+    if (auto const stillRegistered = BootOutEverywhere(scope, label))
+        return { .exitCode = 1, .message = *stillRegistered };
 
     if (auto const rc = RunLaunchctl({ "bootstrap", domain, plistPath.string() }); rc != 0)
         return { .exitCode = 1,
@@ -923,12 +1134,23 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
 
 ServiceControlResult UninstallService(Config const& cfg, ServiceScope scope)
 {
-    auto const home = CurrentHomeDirectory();
-    if (scope == ServiceScope::User && home.empty())
-        return { .exitCode = 1, .message = "could not determine the invoking user's home directory" };
+    if (auto const rejection = ServiceNameRejection(cfg))
+        return { .exitCode = 1, .message = *rejection };
 
     if (scope == ServiceScope::System && ::geteuid() != 0)
         return { .exitCode = 1, .message = "removing a system LaunchDaemon requires root; re-run with sudo" };
+
+    // Symmetric with the install guard: under sudo the home directory resolves
+    // to root's, so this would look for an agent in /var/root and report the
+    // operator's own as absent while leaving it running.
+    if (scope == ServiceScope::User && ::geteuid() == 0)
+        return { .exitCode = 1,
+                 .message = "--service-scope=user removes the invoking account's agent, so it must not run as root. "
+                            "Re-run without sudo, or pass --service-scope=system." };
+
+    auto const home = CurrentHomeDirectory();
+    if (scope == ServiceScope::User && home.empty())
+        return { .exitCode = 1, .message = "could not determine the invoking user's home directory" };
 
     auto const label = LaunchdLabel(cfg);
     auto const plistPath = LaunchdPlistPath(cfg, scope, home);
@@ -938,14 +1160,8 @@ ServiceControlResult UninstallService(Config const& cfg, ServiceScope scope)
     // same reason as the install path: bootout returns while the job is still
     // winding down, and reporting removal before launchd has let go would make
     // "uninstalled" a claim the very next command could contradict.
-    auto const serviceTarget = std::format("{}/{}", DomainTarget(scope), label);
-    (void) RunLaunchctl({ "bootout", serviceTarget }, LaunchctlOutput::Silence);
-    if (!WaitForJobGone(serviceTarget))
-        return { .exitCode = 1,
-                 .message = std::format("'{}' is still registered after bootout; "
-                                        "run `launchctl bootout {}` manually and retry",
-                                        label,
-                                        serviceTarget) };
+    if (auto const stillRegistered = BootOutEverywhere(scope, label))
+        return { .exitCode = 1, .message = *stillRegistered };
 
     std::error_code ec;
     auto const removed = std::filesystem::remove(plistPath, ec);
