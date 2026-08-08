@@ -20,9 +20,30 @@ fi
 echo "Removing fastcached..."
 
 # --- launchd jobs --------------------------------------------------------
+# `launchctl bootout` returns before the teardown finishes: it signals the job
+# and leaves the label registered while the process winds down. Checking (or
+# reinstalling) immediately afterwards therefore still finds it -- the same
+# asynchrony WaitForJobGone handles in ServiceControl.cpp.
+wait_for_job_gone() {
+    _attempt=0
+    while [ "$_attempt" -lt 100 ] && /bin/launchctl print "$1" >/dev/null 2>&1; do
+        /bin/sleep 0.1
+        _attempt=$((_attempt + 1))
+    done
+}
+
+# Deregistration goes through the daemon's own --uninstall-service when the
+# binary is still there, so "how fastcached talks to launchd" keeps one
+# implementation -- the same reason the postinstall drives --install-service.
+# The raw bootout below is the fallback for a broken or already-removed binary.
+if [ -x "${PREFIX}/bin/fastcached" ]; then
+    "${PREFIX}/bin/fastcached" --uninstall-service --service-scope=system >/dev/null 2>&1 || true
+fi
+
 # The system daemon first, then any per-user agent. Both are best-effort: a
 # scope that was never installed is not an error.
 /bin/launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
+wait_for_job_gone "system/${LABEL}"
 rm -f "/Library/LaunchDaemons/${LABEL}.plist" || true
 
 # Agents are per-user, and the installing user is not necessarily the one
@@ -33,6 +54,7 @@ for plist in /Users/*/Library/LaunchAgents/"${LABEL}".plist; do
     owner_uid=$(/usr/bin/id -u "$owner" 2>/dev/null) || continue
     /bin/launchctl asuser "$owner_uid" /usr/bin/sudo -u "$owner" \
         /bin/launchctl bootout "gui/${owner_uid}/${LABEL}" >/dev/null 2>&1 || true
+    wait_for_job_gone "gui/${owner_uid}/${LABEL}"
     rm -f "$plist" || true
 done
 
