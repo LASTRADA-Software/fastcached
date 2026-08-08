@@ -156,6 +156,14 @@ install_log="$(sudo installer -pkg "$pkg" -applyChoiceChangesXML "$choices" -tar
 
 grep -qx "${PREFIX}/bin" "$PATHS_D" || fail "$PATHS_D does not name ${PREFIX}/bin"
 
+# The receipts must carry the bundle id as their prefix, because that is the
+# only thing the uninstaller has to find them by. Asserted positively here: the
+# step-6 check that no receipt survives passes vacuously if they were never
+# registered under this prefix in the first place, which is exactly what an
+# empty CPACK_PRODUCTBUILD_IDENTIFIER produced.
+pkgutil --pkgs | grep -q "^${LABEL}\." \
+    || fail "no package receipt starts with ${LABEL}; the uninstaller would never find them"
+
 # The symlinks are what make the tools reachable in a shell that is already
 # open, and in fish, which never reads /etc/paths.d.
 [[ -L /usr/local/bin/fastcached ]]   || fail "no /usr/local/bin/fastcached symlink"
@@ -182,6 +190,16 @@ if [[ "$scope" == "daemon" ]]; then
     # runner — which is the whole reason CI runs this variant.
     dscl . -read /Users/_fastcached >/dev/null 2>&1 \
         || fail "postinstall did not create the _fastcached service account"
+
+    # ProgramArguments must carry --config and nothing the config file also
+    # governs. A --storage baked in here outranks YAML for the life of the
+    # registration, so the operator's storage_path edit would be a silent no-op.
+    plist="/Library/LaunchDaemons/${LABEL}.plist"
+    [[ -f "$plist" ]] || fail "no $plist"
+    grep -q -- "--config=${PREFIX}/etc/fastcached.yaml" "$plist" \
+        || fail "the daemon plist does not pass --config; the config file would never be read"
+    ! grep -q -- "--storage" "$plist" \
+        || fail "the daemon plist bakes in --storage; storage_path in the config file would be ignored"
 
     # Polled: launchd reports a transient `xpcproxy` state while the stub execs
     # the real binary, so a single sample races the spawn.
