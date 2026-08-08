@@ -116,6 +116,11 @@ fastcached --install-service --service-scope=user
 sudo fastcached --install-service --service-scope=system
 ```
 
+Note which one takes `sudo`. The user scope installs an agent for *the
+invoking account*, so running it under `sudo` would register one for root —
+started by nobody's login and invisible to your own `--uninstall-service`.
+That combination is refused rather than guessed at.
+
 The system scope runs as the `_fastcached` account, which only the installer
 package creates — on a tarball or source install that command tells you so
 instead of registering a job that could never start.
@@ -127,9 +132,26 @@ terminal never sees it, and neither does fish, which does not read
 `/etc/profile`. Both tools are also symlinked into `/usr/local/bin`, which
 is on the stock `PATH` everywhere, so in practice they work straight away.
 
-The daemon reads `/opt/fastcached/etc/fastcached.yaml`. Your edits survive
-upgrades: only the `fastcached.yaml.default` beside it is replaced, and the
-live file is seeded from it just once, when it is absent.
+The **system daemon** reads `/opt/fastcached/etc/fastcached.yaml`. Your edits
+survive upgrades: only the `fastcached.yaml.default` beside it is replaced,
+and the live file is seeded from it just once, when it is absent. The
+installer sets it to mode `0640` owned `root:_fastcached`, so the daemon can
+read it and other accounts cannot — which is what makes it a safe home for
+`requirepass:`.
+
+The **per-user agent** does not read that file. It describes the system
+daemon, whose cache lives under the package prefix and is writable only by
+the service account, so an agent pointed at it would have nowhere to write.
+The agent uses per-user defaults instead, with its cache under
+`~/Library/Caches/fastcached`. To give it a config of your own:
+
+```sh
+fastcached --install-service --service-scope=user --config=~/my-fastcached.yaml
+```
+
+Whichever file you name governs `storage_path` too: the registration passes
+no `--storage` when you pass a `--config`, precisely so that editing the
+file and restarting the job actually changes where the cache lives.
 
 To remove everything:
 

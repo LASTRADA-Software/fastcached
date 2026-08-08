@@ -91,16 +91,36 @@ These constraints are load-bearing and have each already been a bug:
   `EmitDaemonFlag` rather than always emitting it.
 - **`ExecStart` must pass `--config`.** There is no default config search path,
   so without it `ConfigReloader` has nothing to re-read and `systemctl reload`
-  is a silent no-op. The launchd install applies the same rule: `--config` is
-  the only flag the macOS postinstall passes.
+  is a silent no-op. The launchd install applies the same rule for the *system*
+  daemon: `--config` is the only flag its postinstall passes. The per-user agent
+  passes none — the packaged config describes the daemon, whose cache only the
+  service account can write, so an agent pointed at it would have nowhere to
+  write; it takes the per-user defaults instead.
 - **`--install-service` registers the *command-line* config, not the merged
   one.** A flag in `ProgramArguments` outranks the same key in YAML for the life
   of the registration, so baking merged values in froze every configured key at
   install time and made later edits to that same file silent no-ops — and copied
-  `requirepass:` out of a mode-0600 file into a world-readable plist. Hence
+  `requirepass:` out of a mode-0640 file into a world-readable plist. Hence
   `main.cpp` hands `parsed->config` to `InstallService`, and
   `InlineCredentialRejection` refuses a `--requirepass` typed on the install
-  command line rather than dropping or publishing it.
+  command line rather than dropping or publishing it — *including* alongside
+  `--config`, since nothing there can tell whether the named file carries the
+  secret, and accepting it was the silent drop under another name.
+- **What reaches a supervisor must survive its own parser.** Every registration
+  flag is re-read by the daemon at the next start, so a value that cannot be
+  spelled back is a service that registers cleanly and then fails forever:
+  `--listen=[::]:11211` came back as `--listen=:::11211`, which the CLI rejects,
+  and a Windows path ending in `\` escaped its own closing quote and swallowed
+  the flags after it. `FormatListenHost` and `MaybeQuote` are where that round
+  trip is kept honest. `ServiceNameRejection` covers the other direction: the
+  name is concatenated into the directory launchd scans, so a separator writes a
+  root-owned plist nothing knows how to remove.
+- **Teardown must address every domain, not re-probe for one.** Which launchd
+  domain a user agent lives in is decided at install time — `gui/<uid>` needs an
+  Aqua session, so an SSH install lands in `user/<uid>`. Re-probing at uninstall
+  booted out a job that was never there and reported success while the real one
+  kept the port. `BootOutEverywhere` walks the whole `ScopeTraits::domains` row,
+  and `fastcached-uninstall` mirrors it.
 - **The package payload is rooted at `/`, not `/usr`.** `/etc` cannot sit under
   a `/usr` prefix, so `FASTCACHED_INSTALL_BINDIR`/`DOCDIR` spell their own
   `usr/` (and `opt/fastcached/` on macOS). A relative destination for the units

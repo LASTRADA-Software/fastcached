@@ -106,8 +106,23 @@ make a later `storage_path:` edit a no-op.
 
 `--requirepass` is the one flag that cannot be baked in, and the install is
 refused rather than silently dropping it: `ProgramArguments` lands in a
-world-readable plist, so the secret belongs in a mode-0600 config file
-passed with `--config`.
+world-readable plist, so the secret belongs in the config file passed with
+`--config`. Passing both is refused too — nothing can tell from the command
+line whether that file actually carries `requirepass:`, so accepting the
+combination would be the silent drop under another name.
+
+The package sets the system daemon's config to mode `0640`, owned
+`root:_fastcached`, so it is readable by the account the daemon drops to and
+by nobody else — which is the whole reason to keep the secret there rather
+than in the plist. If you point the daemon at a config of your own, the
+install checks that `_fastcached` can read it and tells you how to fix it if
+not; without that check an unreadable config shows up only as a job that
+exits at every start, with the `EACCES` visible nowhere.
+
+`--service-scope=user` must **not** run under `sudo`: the agent belongs to
+the invoking account, and sudo would resolve that to root — registering an
+agent under `/var/root` that your own login never starts and your own
+`--uninstall-service` cannot see. The install refuses rather than guess.
 
 | | `user` | `system` |
 |---|---|---|
