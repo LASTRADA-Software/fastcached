@@ -755,6 +755,36 @@ jobs:
         # AppleClang and the system libc++ on purpose.
         run: brew install ninja openssl@3
 
+      - name: "Select a modern Xcode"
+        # The image ships several Xcodes but *defaults* to 16.4, whose libc++
+        # predates std::jthread (LLVM 18) — the server loop then fails to
+        # compile with "no type named 'jthread' in namespace 'std'". The plain
+        # `macos` job dodges this with Homebrew's LLVM; this job cannot, because
+        # that would bake a Homebrew rpath into the shipped binary. Selecting a
+        # newer *Apple* toolchain fixes it with no source change and keeps the
+        # system libc++.
+        #
+        # Newest-installed rather than a pinned version, so an image refresh
+        # that retires one Xcode does not break the release path.
+        run: |
+          set -euo pipefail
+          XCODE=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "selecting $XCODE"
+          sudo xcode-select -s "$XCODE"
+          clang++ --version
+
+      - name: "Verify the toolchain has the library features we need"
+        # Asserted before the build so the failure names the cause. Otherwise a
+        # toolchain regression surfaces as a wall of template errors deep in
+        # ReactorServerLoop.cpp, which reads like a code bug rather than an
+        # image change.
+        run: |
+          set -euo pipefail
+          printf '#include <thread>\nint main(){ std::jthread t{[]{}}; }\n' > /tmp/probe.cpp
+          clang++ -std=c++23 -mmacosx-version-min=13.3 -c /tmp/probe.cpp -o /dev/null \
+            || { echo "::error::the selected Xcode's libc++ has no std::jthread (needs LLVM 18+)"; exit 1; }
+          echo "std::jthread available"
+
       - name: "Decide whether this build can be signed"
         id: signing
         run: |

@@ -337,10 +337,13 @@ namespace
 
     /// The row describing @p scope.
     ///
-    /// A table walk rather than std::ranges::find because the iterator type is
-    /// not portable here: std::array's iterator is a raw pointer in libc++ and
-    /// a class type in the MSVC STL, so no single spelling of the `auto`
-    /// satisfies both the Windows build and clang-tidy's readability-qualified-auto.
+    /// Iterating the table rather than std::ranges::find-ing it, because no
+    /// spelling of the iterator satisfies every consumer: std::array's iterator
+    /// is a raw pointer in libc++ but a class type in the MSVC STL, so
+    /// `auto const*` fails to compile on Windows, a plain `auto const` trips
+    /// clang-tidy's readability-qualified-auto, and naming the type outright
+    /// trips its modernize-use-auto. A range-based loop over a descriptor table
+    /// needs no iterator variable and states the intent directly.
     [[nodiscard]] constexpr ScopeTraits const& TraitsOf(ServiceScope scope) noexcept
     {
         for (auto const& traits: ScopeTable)
@@ -388,7 +391,7 @@ namespace
 
 std::expected<ServiceScope, ConfigError> ParseServiceScope(std::string_view text)
 {
-    // Walked rather than found, for the portability reason given at TraitsOf.
+    // Iterated rather than found, for the portability reason given at TraitsOf.
     for (auto const& traits: ScopeTable)
         if (traits.name == text)
             return traits.scope;
