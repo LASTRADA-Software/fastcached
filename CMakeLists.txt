@@ -178,12 +178,21 @@ endif()
 # and clang-tidy hooks never apply to their third-party sources. CPM tries a
 # system package first (CPM_USE_LOCAL_PACKAGES), otherwise fetches the source.
 # Both build static, programs/tests off, to keep the dependency footprint small.
+#
+# EXCLUDE_FROM_ALL is load-bearing, not tidiness: a fetched zstd brings its own
+# install() rules, and CMake honours those for every `cmake --install` of this
+# project. With the package payload rooted at / that put zstd.h, libzstd.a and a
+# zstdConfig.cmake at /include, /lib and /lib/cmake — third-party developer
+# files, installed system-wide, from a package that ships two executables.
+# add_subdirectory(EXCLUDE_FROM_ALL) drops those rules; the static libraries are
+# still built on demand because our targets link them.
 if(FASTCACHED_ENABLE_COMPRESSION)
     CPMAddPackage(
         NAME zstd
         GITHUB_REPOSITORY facebook/zstd
         VERSION 1.5.6
         SOURCE_SUBDIR build/cmake
+        EXCLUDE_FROM_ALL YES
         OPTIONS
             "ZSTD_BUILD_PROGRAMS OFF"
             "ZSTD_BUILD_TESTS OFF"
@@ -195,6 +204,7 @@ if(FASTCACHED_ENABLE_COMPRESSION)
         GITHUB_REPOSITORY lz4/lz4
         VERSION 1.10.0
         SOURCE_SUBDIR build/cmake
+        EXCLUDE_FROM_ALL YES
         OPTIONS
             "LZ4_BUILD_CLI OFF"
             "LZ4_BUILD_LEGACY_LZ4C OFF"
