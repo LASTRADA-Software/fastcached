@@ -52,6 +52,7 @@ struct CliResult
     bool storagePathExplicit { false };
     bool storageDurabilityExplicit { false };
     bool storageMaxValueBytesExplicit { false };
+    bool storageMaxDiskBytesExplicit { false };
     bool workerThreadsExplicit { false };
     bool storageShardsExplicit { false };
     bool listenBacklogExplicit { false };

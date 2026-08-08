@@ -413,7 +413,10 @@ namespace
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
+            {
+                result.storageMaxDiskBytesExplicit = true;
                 return ArgOutcome::Continue;
+            }
         }
         {
             auto const matched = ApplyParsedFlag(args, i, "--lru-mode", ParseLruRecency, cfg.lruRecency);
