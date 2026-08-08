@@ -4,8 +4,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cstddef>
 #include <filesystem>
 #include <string>
+#include <string_view>
 
 using FastCache::BuildServiceCommandLine;
 
@@ -82,15 +85,203 @@ TEST_CASE("ServiceControl: a relative storage path is absolutized", "[platform][
     REQUIRE(!cmd.contains("--storage=relative/cache.cow"));
 }
 
-TEST_CASE("ServiceControl: install/uninstall are unsupported off Windows", "[platform][service]")
+TEST_CASE("ServiceControl: install/uninstall are unsupported without a supervisor", "[platform][service]")
 {
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__APPLE__)
     FastCache::Config const cfg {};
-    auto const installed = FastCache::InstallWindowsService(cfg);
-    auto const removed = FastCache::UninstallWindowsService(cfg);
+    auto const installed = FastCache::InstallService(cfg);
+    auto const removed = FastCache::UninstallService(cfg);
     REQUIRE(installed.exitCode != 0);
     REQUIRE(removed.exitCode != 0);
 #else
-    SUCCEED("InstallWindowsService is exercised by the Windows end-to-end path");
+    // Deliberately not called here: on Windows and macOS these really do
+    // register a service, which a unit test must not do to the host. The
+    // scripts/macos-service-e2e.sh and the Windows MSI path cover them.
+    SUCCEED("InstallService is exercised by the platform end-to-end paths");
 #endif
+}
+
+// ----------------------------------------------------------------------------
+// launchd
+
+using FastCache::BuildLaunchdPlist;
+using FastCache::BuildServiceArgv;
+using FastCache::EmitDaemonFlag;
+using FastCache::ServiceScope;
+
+namespace
+{
+/// The plist a default config produces in @p scope, for the assertions below.
+[[nodiscard]] std::string PlistFor(FastCache::Config const& cfg, ServiceScope scope)
+{
+    return BuildLaunchdPlist(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, cfg, scope, "/tmp/logs");
+}
+} // namespace
+
+TEST_CASE("ServiceControl: launchd argv never carries --daemon", "[platform][service][launchd]")
+{
+    // The single most important property here. launchd supervises the process
+    // it spawned; a job that double-forks is reaped immediately as "exited",
+    // so the service silently never runs.
+    FastCache::Config const cfg {};
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    REQUIRE(std::ranges::find(argv, "--daemon") == argv.end());
+
+    auto const plist = PlistFor(cfg, ServiceScope::User);
+    REQUIRE(!plist.contains("--daemon"));
+}
+
+TEST_CASE("ServiceControl: argv keeps values unquoted", "[platform][service][launchd]")
+{
+    // A ProgramArguments element is a literal argument, so the quoting that the
+    // Windows command line needs would reach the daemon as part of the value.
+    FastCache::Config cfg {};
+    cfg.serviceName = "My Cache";
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    REQUIRE(std::ranges::find(argv, "--service-name=My Cache") != argv.end());
+}
+
+TEST_CASE("ServiceControl: argv element 0 is the executable", "[platform][service][launchd]")
+{
+    FastCache::Config const cfg {};
+    auto const argv = BuildServiceArgv(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, cfg, EmitDaemonFlag::No);
+    REQUIRE(argv.front() == "/opt/fastcached/bin/fastcached");
+}
+
+TEST_CASE("ServiceControl: an unset path flag is omitted rather than absolutized", "[platform][service][launchd]")
+{
+    // Absolutizing first would turn the empty default into the caller's working
+    // directory and pin the service to whatever shell registered it.
+    FastCache::Config const cfg {};
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    REQUIRE(std::ranges::none_of(argv, [](std::string const& a) { return a.starts_with("--storage="); }));
+    REQUIRE(std::ranges::none_of(argv, [](std::string const& a) { return a.starts_with("--config="); }));
+}
+
+TEST_CASE("ServiceControl: the launchd label is reverse-DNS and lowercased", "[platform][service][launchd]")
+{
+    FastCache::Config cfg {};
+    REQUIRE(FastCache::LaunchdLabel(cfg) == "software.lastrada.fastcached");
+
+    cfg.serviceName = "FastCachedSmoke";
+    REQUIRE(FastCache::LaunchdLabel(cfg) == "software.lastrada.fastcachedsmoke");
+}
+
+TEST_CASE("ServiceControl: the plist path follows the scope", "[platform][service][launchd]")
+{
+    FastCache::Config const cfg {};
+    auto const user = FastCache::LaunchdPlistPath(cfg, ServiceScope::User, "/Users/jo");
+    auto const system = FastCache::LaunchdPlistPath(cfg, ServiceScope::System, "/Users/jo");
+
+    REQUIRE(user == std::filesystem::path { "/Users/jo/Library/LaunchAgents/software.lastrada.fastcached.plist" });
+    REQUIRE(system == std::filesystem::path { "/Library/LaunchDaemons/software.lastrada.fastcached.plist" });
+    // The system daemon is machine-wide; a home directory must not leak into it.
+    REQUIRE(!system.string().contains("/Users/jo"));
+}
+
+TEST_CASE("ServiceControl: KeepAlive differs by scope", "[platform][service][launchd]")
+{
+    FastCache::Config const cfg {};
+
+    // A user agent that loses the race for the port exits cleanly, which
+    // KeepAlive=<true/> would treat as "restart" — a permanent crash loop.
+    auto const user = PlistFor(cfg, ServiceScope::User);
+    REQUIRE(user.contains("<key>KeepAlive</key>"));
+    REQUIRE(user.contains("<key>Crashed</key>"));
+
+    // The system daemon owns the port outright, so restart-always is right.
+    auto const system = PlistFor(cfg, ServiceScope::System);
+    REQUIRE(system.contains("<key>KeepAlive</key>"));
+    REQUIRE(!system.contains("<key>Crashed</key>"));
+}
+
+TEST_CASE("ServiceControl: only the system job runs as the service account", "[platform][service][launchd]")
+{
+    FastCache::Config const cfg {};
+    REQUIRE(PlistFor(cfg, ServiceScope::System).contains("<key>UserName</key>"));
+    REQUIRE(PlistFor(cfg, ServiceScope::System).contains("_fastcached"));
+    // A LaunchAgent already runs as the logged-in user; naming a UserName it
+    // cannot assume makes launchd refuse the job.
+    REQUIRE(!PlistFor(cfg, ServiceScope::User).contains("<key>UserName</key>"));
+}
+
+TEST_CASE("ServiceControl: resource policy keys are always present", "[platform][service][launchd]")
+{
+    FastCache::Config const cfg {};
+    for (auto const scope: { ServiceScope::User, ServiceScope::System })
+    {
+        auto const plist = PlistFor(cfg, scope);
+        // Without ProcessType launchd applies its "Background" band and throttles
+        // CPU and I/O; without the limit the job inherits a 256-descriptor soft
+        // cap, far below what a connection-per-client server needs.
+        REQUIRE(plist.contains("<key>ProcessType</key>"));
+        REQUIRE(plist.contains("<string>Interactive</string>"));
+        REQUIRE(plist.contains("<key>NumberOfFiles</key>"));
+        REQUIRE(plist.contains("<key>RunAtLoad</key>"));
+    }
+}
+
+TEST_CASE("ServiceControl: plist values are XML-escaped", "[platform][service][launchd]")
+{
+    // `&` is legal in a macOS path. Unescaped it produces a malformed document
+    // and launchd rejects the whole job without explaining why.
+    FastCache::Config cfg {};
+    cfg.storagePath = "/tmp/a&b<c>d/cache";
+    auto const plist = PlistFor(cfg, ServiceScope::User);
+
+    REQUIRE(plist.contains("a&amp;b&lt;c&gt;d"));
+    REQUIRE(!plist.contains("a&b<c>d"));
+}
+
+TEST_CASE("ServiceControl: non-default flags reach ProgramArguments", "[platform][service][launchd]")
+{
+    FastCache::Config cfg {};
+    cfg.port = 21987;
+    cfg.maxMemoryBytes = 128U * 1024U * 1024U;
+    auto const plist = PlistFor(cfg, ServiceScope::User);
+
+    REQUIRE(plist.contains("<string>--port=21987</string>"));
+    REQUIRE(plist.contains("<string>--max-memory=134217728</string>"));
+}
+
+TEST_CASE("ServiceControl: the plist is a well-formed document", "[platform][service][launchd]")
+{
+    FastCache::Config const cfg {};
+    auto const plist = PlistFor(cfg, ServiceScope::System);
+
+    REQUIRE(plist.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+    REQUIRE(plist.contains("<!DOCTYPE plist PUBLIC"));
+    REQUIRE(plist.contains("<plist version=\"1.0\">"));
+    REQUIRE(plist.ends_with("</plist>\n"));
+
+    // Every opened element is closed.
+    auto const count = [&plist](std::string_view needle) {
+        std::size_t n = 0;
+        for (std::size_t pos = plist.find(needle); pos != std::string::npos; pos = plist.find(needle, pos + 1))
+            ++n;
+        return n;
+    };
+    REQUIRE(count("<dict>") == count("</dict>"));
+    REQUIRE(count("<array>") == count("</array>"));
+}
+
+TEST_CASE("ServiceControl: service scope round-trips through its CLI spelling", "[platform][service][launchd]")
+{
+    REQUIRE(FastCache::ParseServiceScope("user").value() == ServiceScope::User);
+    REQUIRE(FastCache::ParseServiceScope("system").value() == ServiceScope::System);
+
+    REQUIRE(FastCache::ServiceScopeName(ServiceScope::User) == "user");
+    REQUIRE(FastCache::ServiceScopeName(ServiceScope::System) == "system");
+}
+
+TEST_CASE("ServiceControl: an unknown service scope is rejected", "[platform][service][launchd]")
+{
+    // Case-sensitive on purpose: every other enum flag in the CLI is, and
+    // accepting "System" here would make the parser inconsistent.
+    for (auto const* const bad: { "System", "", "root", "daemon", "agent" })
+        REQUIRE(!FastCache::ParseServiceScope(bad).has_value());
+
+    auto const err = FastCache::ParseServiceScope("nope").error();
+    REQUIRE(err.field == "service-scope");
+    REQUIRE(err.context.contains("nope"));
 }
