@@ -29,6 +29,15 @@ struct CliResult
     CliOutcome outcome { CliOutcome::Run };
     Config config {};
 
+    /// Which launchd domain `--install-service` / `--uninstall-service` act on.
+    ///
+    /// Deliberately outside Config and outside the explicit-tracker list below:
+    /// it configures the *installation*, not the daemon, so it takes no part in
+    /// the YAML merge. Keeping it in Config would additionally make
+    /// BuildServiceArgv bake a meaningless `--service-scope` into the job's own
+    /// recorded arguments. Ignored on Windows, which has a single SCM domain.
+    ServiceScope serviceScope { ServiceScope::User };
+
     /// Per-flag "user typed this on the CLI" trackers. Without these,
     /// a user-typed value that happens to equal the field's default
     /// (`--threads=0`, `--storage-shards=0`, `--storage-durability=batched`,

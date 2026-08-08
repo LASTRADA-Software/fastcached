@@ -2,6 +2,7 @@
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
+#include <FastCache/Platform/ServiceControl.hpp>
 
 #include <algorithm>
 #include <array>
@@ -304,120 +305,36 @@ namespace
         return true;
     }
 
-    /// Dispatch a single argument. Returns ArgOutcome on success or a
-    /// ConfigError if the argument matched a flag but parsing failed.
-    [[nodiscard]] std::expected<ArgOutcome, ConfigError> HandleOneArg(std::span<char const* const> args,
-                                                                      std::size_t& i,
-                                                                      CliResult& result)
+    /// Typed (parsed) flags: every one is `--flag=<value>` handled by a
+    /// dedicated parser writing into one target field.
+    ///
+    /// Split out of HandleOneArg rather than inlined: seventeen structurally
+    /// identical blocks pushed that function past the cognitive-complexity
+    /// limit the project builds with, and the split keeps each function about
+    /// one kind of argument.
+    ///
+    /// @param args Full argument span.
+    /// @param i Index of the argument under inspection; advanced past a
+    ///          consumed `--flag value` pair.
+    /// @param cfg Config being populated.
+    /// @param result CliResult carrying the per-flag explicit trackers.
+    /// @return ArgOutcome::Continue when a flag matched, ArgOutcome::Unknown
+    ///         when none did, or a ConfigError when a value failed to parse.
+    [[nodiscard]] std::expected<ArgOutcome, ConfigError> HandleTypedFlag(std::span<char const* const> args,
+                                                                         std::size_t& i,
+                                                                         Config& cfg,
+                                                                         CliResult& result)
     {
-        auto& cfg = result.config;
-        std::string_view const arg { args[i] };
-        if (arg == "--help" || arg == "-h")
-            return ArgOutcome::ShowHelp;
-        if (arg == "--version" || arg == "-V")
-            return ArgOutcome::ShowVersion;
-        if (arg == "--daemon")
         {
-            cfg.daemon = true;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--log-timestamps")
-        {
-            cfg.logTimestamps = true;
-            result.logTimestampsExplicit = true;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--log-source")
-        {
-            cfg.logSource = true;
-            result.logSourceExplicit = true;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--log-everything")
-        {
-            cfg.logEverything = true;
-            result.logEverythingExplicit = true;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--metrics")
-        {
-            cfg.metricsEnabled = true;
-            result.metricsEnabledExplicit = true;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--tls")
-        {
-            cfg.tlsEnabled = true;
-            result.tlsEnabledExplicit = true;
-            return ArgOutcome::Continue;
-        }
-        // Service-control requests record the desired outcome but keep parsing:
-        // the remaining flags (--service-name, --port, --storage, ...) are
-        // captured into the config that gets baked into the service command line.
-        if (arg == "--install-service")
-        {
-            result.outcome = CliOutcome::InstallService;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--uninstall-service")
-        {
-            result.outcome = CliOutcome::UninstallService;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--healthcheck")
-        {
-            result.outcome = CliOutcome::HealthCheck;
-            return ArgOutcome::Continue;
-        }
-
-        // Repeatable listen flags. `--listen` is plaintext, `--listen-tls`
-        // is TLS — separate flags rather than a `+tls` suffix so the intent
-        // is explicit at the call site. Each match appends to cfg.binds.
-        for (auto const& [flagName, isTls]: std::initializer_list<std::tuple<std::string_view, bool>> {
-                 { "--listen", false },
-                 { "--listen-tls", true },
-             })
-        {
-            if (!FlagMatches(arg, flagName))
-                continue;
-            auto const value = TakeValue(args, i, flagName);
-            if (!value.has_value())
-                return std::unexpected(value.error());
-            auto const parsed = ParseListenSpec(*value, isTls);
-            if (!parsed.has_value())
-                return std::unexpected(parsed.error());
-            cfg.binds.push_back(*parsed);
-            return ArgOutcome::Continue;
-        }
-
-        // String-valued flags. Each match flips an "explicit" bool so
-        // Merge can override YAML even when the typed value happens to
-        // equal the field's default.
-        for (auto const& [name, target, seenPtr]: std::initializer_list<std::tuple<std::string_view, std::string*, bool*>> {
-                 { "--config", &cfg.configPath, nullptr },
-                 { "--pidfile", &cfg.pidfile, nullptr },
-                 { "--service-name", &cfg.serviceName, &result.serviceNameExplicit },
-                 { "--storage", &cfg.storagePath, &result.storagePathExplicit },
-                 { "--requirepass", &cfg.requirePass, &result.requirePassExplicit },
-                 { "--auth-username", &cfg.authUsername, &result.authUsernameExplicit },
-                 { "--metrics-bind", &cfg.metricsBindAddress, &result.metricsBindAddressExplicit },
-                 { "--tls-cert", &cfg.tlsCertPath, &result.tlsCertPathExplicit },
-                 { "--tls-key", &cfg.tlsKeyPath, &result.tlsKeyPathExplicit },
-                 { "--notify-keyspace-events", &cfg.notifyKeyspaceEvents, &result.notifyKeyspaceEventsExplicit },
-             })
-        {
-            auto const matched = ApplyStringFlag(args, i, name, *target);
+            // Targets the CliResult, not the Config: the scope selects where the
+            // service is registered and has no meaning to a running daemon, so
+            // it takes no part in the YAML merge and carries no Explicit bit.
+            auto const matched = ApplyParsedFlag(args, i, "--service-scope", ParseServiceScope, result.serviceScope);
             if (!matched.has_value())
                 return std::unexpected(matched.error());
             if (*matched)
-            {
-                if (seenPtr != nullptr)
-                    *seenPtr = true;
                 return ArgOutcome::Continue;
-            }
         }
-
-        // Typed flags.
         {
             auto const matched = ApplyParsedFlag(args, i, "--bind", ParseBindAddress, cfg.bindAddress);
             if (!matched.has_value())
@@ -583,6 +500,129 @@ namespace
         return ArgOutcome::Unknown;
     }
 
+    /// Dispatch a single argument. Returns ArgOutcome on success or a
+    /// ConfigError if the argument matched a flag but parsing failed.
+    [[nodiscard]] std::expected<ArgOutcome, ConfigError> HandleOneArg(std::span<char const* const> args,
+                                                                      std::size_t& i,
+                                                                      CliResult& result)
+    {
+        auto& cfg = result.config;
+        std::string_view const arg { args[i] };
+        if (arg == "--help" || arg == "-h")
+            return ArgOutcome::ShowHelp;
+        if (arg == "--version" || arg == "-V")
+            return ArgOutcome::ShowVersion;
+        if (arg == "--daemon")
+        {
+            cfg.daemon = true;
+            return ArgOutcome::Continue;
+        }
+        if (arg == "--log-timestamps")
+        {
+            cfg.logTimestamps = true;
+            result.logTimestampsExplicit = true;
+            return ArgOutcome::Continue;
+        }
+        if (arg == "--log-source")
+        {
+            cfg.logSource = true;
+            result.logSourceExplicit = true;
+            return ArgOutcome::Continue;
+        }
+        if (arg == "--log-everything")
+        {
+            cfg.logEverything = true;
+            result.logEverythingExplicit = true;
+            return ArgOutcome::Continue;
+        }
+        if (arg == "--metrics")
+        {
+            cfg.metricsEnabled = true;
+            result.metricsEnabledExplicit = true;
+            return ArgOutcome::Continue;
+        }
+        if (arg == "--tls")
+        {
+            cfg.tlsEnabled = true;
+            result.tlsEnabledExplicit = true;
+            return ArgOutcome::Continue;
+        }
+        // Service-control requests record the desired outcome but keep parsing:
+        // the remaining flags (--service-name, --port, --storage, ...) are
+        // captured into the config that gets baked into the service command line.
+        if (arg == "--install-service")
+        {
+            result.outcome = CliOutcome::InstallService;
+            return ArgOutcome::Continue;
+        }
+        if (arg == "--uninstall-service")
+        {
+            result.outcome = CliOutcome::UninstallService;
+            return ArgOutcome::Continue;
+        }
+        if (arg == "--healthcheck")
+        {
+            result.outcome = CliOutcome::HealthCheck;
+            return ArgOutcome::Continue;
+        }
+
+        // Repeatable listen flags. `--listen` is plaintext, `--listen-tls`
+        // is TLS — separate flags rather than a `+tls` suffix so the intent
+        // is explicit at the call site. Each match appends to cfg.binds.
+        for (auto const& [flagName, isTls]: std::initializer_list<std::tuple<std::string_view, bool>> {
+                 { "--listen", false },
+                 { "--listen-tls", true },
+             })
+        {
+            if (!FlagMatches(arg, flagName))
+                continue;
+            auto const value = TakeValue(args, i, flagName);
+            if (!value.has_value())
+                return std::unexpected(value.error());
+            auto const parsed = ParseListenSpec(*value, isTls);
+            if (!parsed.has_value())
+                return std::unexpected(parsed.error());
+            cfg.binds.push_back(*parsed);
+            return ArgOutcome::Continue;
+        }
+
+        // String-valued flags. Each match flips an "explicit" bool so
+        // Merge can override YAML even when the typed value happens to
+        // equal the field's default.
+        for (auto const& [name, target, seenPtr]: std::initializer_list<std::tuple<std::string_view, std::string*, bool*>> {
+                 { "--config", &cfg.configPath, nullptr },
+                 { "--pidfile", &cfg.pidfile, nullptr },
+                 { "--service-name", &cfg.serviceName, &result.serviceNameExplicit },
+                 { "--storage", &cfg.storagePath, &result.storagePathExplicit },
+                 { "--requirepass", &cfg.requirePass, &result.requirePassExplicit },
+                 { "--auth-username", &cfg.authUsername, &result.authUsernameExplicit },
+                 { "--metrics-bind", &cfg.metricsBindAddress, &result.metricsBindAddressExplicit },
+                 { "--tls-cert", &cfg.tlsCertPath, &result.tlsCertPathExplicit },
+                 { "--tls-key", &cfg.tlsKeyPath, &result.tlsKeyPathExplicit },
+                 { "--notify-keyspace-events", &cfg.notifyKeyspaceEvents, &result.notifyKeyspaceEventsExplicit },
+             })
+        {
+            auto const matched = ApplyStringFlag(args, i, name, *target);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                if (seenPtr != nullptr)
+                    *seenPtr = true;
+                return ArgOutcome::Continue;
+            }
+        }
+
+        // Typed flags live in their own handler; see HandleTypedFlag.
+        auto const typed = HandleTypedFlag(args, i, cfg, result);
+        if (!typed.has_value())
+            return std::unexpected(typed.error());
+        if (*typed != ArgOutcome::Unknown)
+            return *typed;
+
+        return ArgOutcome::Unknown;
+    }
+
 } // namespace
 
 namespace
@@ -687,10 +727,16 @@ namespace
         { .flag = "--daemon",
           .description = "daemonize (POSIX) / run under the Windows SCM (used by the installed service)" },
         { .flag = "--install-service",
-          .description = "register fastcached as an auto-start Windows service (Windows only;\n"
-                         "needs an elevated prompt; other flags are baked into the service)" },
+          .description = "register fastcached to start automatically: a Windows SCM service, or a\n"
+                         "macOS launchd job (see --service-scope). Other flags are baked in.\n"
+                         "Windows needs an elevated prompt; --service-scope=system needs sudo" },
         { .flag = "--uninstall-service",
-          .description = "remove the fastcached Windows service (Windows only; needs elevation)" },
+          .description = "remove the registration made by --install-service (same privileges)" },
+        { .flag = "--service-scope=<user|system>",
+          .description = "macOS only: which launchd domain --install-service acts on.\n"
+                         "user (default) = a LaunchAgent in ~/Library/LaunchAgents, started at\n"
+                         "login as you; system = a LaunchDaemon in /Library/LaunchDaemons,\n"
+                         "started at boot as _fastcached (needs sudo)" },
         { .flag = "--healthcheck",
           .description = "probe http://127.0.0.1:<metrics-port>/healthz and exit 0 (healthy) or 1\n"
                          "(self-contained container HEALTHCHECK; needs --metrics on the daemon)" },

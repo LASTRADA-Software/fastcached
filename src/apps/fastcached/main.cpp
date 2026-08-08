@@ -827,8 +827,8 @@ int main(int argc, char const* const* argv)
         || parsed->outcome == FastCache::CliOutcome::UninstallService)
     {
         auto const result = parsed->outcome == FastCache::CliOutcome::InstallService
-                                ? FastCache::InstallWindowsService(effective)
-                                : FastCache::UninstallWindowsService(effective);
+                                ? FastCache::InstallService(effective, parsed->serviceScope)
+                                : FastCache::UninstallService(effective, parsed->serviceScope);
         if (result.exitCode == 0)
             std::println("fastcached: {}", result.message);
         else
