@@ -116,6 +116,10 @@ fastcached --install-service --service-scope=user
 sudo fastcached --install-service --service-scope=system
 ```
 
+The system scope runs as the `_fastcached` account, which only the installer
+package creates — on a tarball or source install that command tells you so
+instead of registering a job that could never start.
+
 **Open a new terminal window after installing.** The package adds
 `/opt/fastcached/bin` to the system `PATH` via `/etc/paths.d/fastcached`,
 and macOS only reads that when a *login* shell starts — an already-open

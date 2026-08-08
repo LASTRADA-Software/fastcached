@@ -85,14 +85,29 @@ fastcached --install-service --service-scope=user            # LaunchAgent
 sudo fastcached --install-service --service-scope=system      # LaunchDaemon
 ```
 
-Every flag passed alongside `--install-service` is baked into the job's
-`ProgramArguments`, exactly as on Windows:
+The system scope needs the `_fastcached` service account, which the `.pkg`
+creates; installing from a tarball or a source build fails with a message
+saying so rather than registering a job launchd cannot spawn.
+
+Every flag you pass **on the command line** alongside `--install-service` is
+baked into the job's `ProgramArguments`, exactly as on Windows. Values read
+from a `--config` file are not: they stay in the file, so editing it and
+restarting the job keeps working.
 
 ```sh
 sudo fastcached --install-service --service-scope=system \
-    --config=/opt/fastcached/etc/fastcached.yaml \
-    --storage=/opt/fastcached/var/cache --threads=4
+    --config=/opt/fastcached/etc/fastcached.yaml --threads=4
 ```
+
+Prefer the config file for anything you might want to change later. A flag
+on this command line outranks the same key in YAML for the life of the
+registration, so `--storage=…` here would quietly pin the cache location and
+make a later `storage_path:` edit a no-op.
+
+`--requirepass` is the one flag that cannot be baked in, and the install is
+refused rather than silently dropping it: `ProgramArguments` lands in a
+world-readable plist, so the secret belongs in a mode-0600 config file
+passed with `--config`.
 
 | | `user` | `system` |
 |---|---|---|
@@ -139,8 +154,9 @@ sc.exe start FastCached
 fastcached.exe --uninstall-service
 ```
 
-`--install-service` records the flags it was given into the service's
-command line and makes path arguments absolute — a service starts with its
+`--install-service` records the flags it was given on the command line into
+the service's command line (values from a `--config` file stay in the file)
+and makes path arguments absolute — a service starts with its
 working directory set to `C:\Windows\System32`, so a relative path captured
 at install time would resolve elsewhere at boot. It creates the service
 already set to auto-start but leaves it stopped, so the first start is

@@ -91,7 +91,16 @@ These constraints are load-bearing and have each already been a bug:
   `EmitDaemonFlag` rather than always emitting it.
 - **`ExecStart` must pass `--config`.** There is no default config search path,
   so without it `ConfigReloader` has nothing to re-read and `systemctl reload`
-  is a silent no-op.
+  is a silent no-op. The launchd install applies the same rule: `--config` is
+  the only flag the macOS postinstall passes.
+- **`--install-service` registers the *command-line* config, not the merged
+  one.** A flag in `ProgramArguments` outranks the same key in YAML for the life
+  of the registration, so baking merged values in froze every configured key at
+  install time and made later edits to that same file silent no-ops — and copied
+  `requirepass:` out of a mode-0600 file into a world-readable plist. Hence
+  `main.cpp` hands `parsed->config` to `InstallService`, and
+  `InlineCredentialRejection` refuses a `--requirepass` typed on the install
+  command line rather than dropping or publishing it.
 - **The package payload is rooted at `/`, not `/usr`.** `/etc` cannot sit under
   a `/usr` prefix, so `FASTCACHED_INSTALL_BINDIR`/`DOCDIR` spell their own
   `usr/` (and `opt/fastcached/` on macOS). A relative destination for the units
