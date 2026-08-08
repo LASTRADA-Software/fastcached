@@ -78,8 +78,13 @@ TEST_CASE("FindOrNull: is usable in a constant expression", "[core][ranges]")
 {
     // constexpr matters because TraitsOf in ServiceControl.cpp is constexpr;
     // a non-constexpr helper would have silently forced it to become runtime.
-    static_assert(FindOrNull(Table, 1, &Row::key) != nullptr);
-    static_assert(FindOrNull(Table, 42, &Row::key) == nullptr);
+    // The found case is asserted by dereferencing rather than by comparing
+    // against nullptr: GCC constant-folds the call, sees the address of a known
+    // array element, and rejects `!= nullptr` under -Waddress as a comparison
+    // that can never be false. Dereferencing proves non-null just as well —
+    // a null dereference is not a constant expression.
+    static_assert(FindOrNull(Table, 1, &Row::key)->key == 1);
     static_assert(FindOrNull(Table, 3, &Row::key)->name == "two");
+    static_assert(FindOrNull(Table, 42, &Row::key) == nullptr);
     SUCCEED();
 }
