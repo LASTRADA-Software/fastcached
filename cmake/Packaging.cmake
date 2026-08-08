@@ -278,8 +278,16 @@ endif()
 if(APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
     # Mint once, never change: macOS keys package receipts on this, and the
     # uninstaller finds what to `pkgutil --forget` by matching the prefix. Same
-    # discipline as CPACK_WIX_UPGRADE_GUID above. Defined in
-    # packaging/CMakeLists.txt alongside the scripts that also substitute it.
+    # discipline as CPACK_WIX_UPGRADE_GUID above. Defined in the top-level
+    # CMakeLists.txt, which is the only scope both this file and
+    # packaging/CMakeLists.txt can read it from.
+    if(NOT FASTCACHED_MACOS_BUNDLE_ID)
+        message(FATAL_ERROR
+            "FASTCACHED_MACOS_BUNDLE_ID is empty. CPACK_PRODUCTBUILD_IDENTIFIER would fall back to "
+            "a generated identifier, the package receipts would not carry the prefix the uninstaller "
+            "greps for, and `fastcached-uninstall` would silently leave macOS believing fastcached "
+            "is still installed.")
+    endif()
     set(CPACK_PRODUCTBUILD_IDENTIFIER "${FASTCACHED_MACOS_BUNDLE_ID}")
 
     # Which locations the installer offers. Stated explicitly because
@@ -325,6 +333,7 @@ if(APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
     # The two hook scripts run as `cmake -P`, which only sees CPACK_-prefixed
     # variables, so the knobs are re-exported under that prefix.
     set(CPACK_FASTCACHED_SIGN_IDENTITY_APP "${FASTCACHED_MACOS_SIGN_IDENTITY_APP}")
+    set(CPACK_FASTCACHED_MACOS_PREFIX      "${FASTCACHED_MACOS_PREFIX}")
     set(CPACK_FASTCACHED_NOTARIZE          "${FASTCACHED_MACOS_NOTARIZE}")
     set(CPACK_FASTCACHED_NOTARY_PROFILE    "${FASTCACHED_MACOS_NOTARY_PROFILE}")
     set(CPACK_FASTCACHED_BUILD_DMG         "${FASTCACHED_MACOS_BUILD_DMG}")

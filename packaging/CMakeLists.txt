@@ -43,19 +43,11 @@ set(FASTCACHED_SYSUSERS_DIR       "usr/lib/sysusers.d")
 set(FASTCACHED_TMPFILES_DIR       "usr/lib/tmpfiles.d")
 set(FASTCACHED_SYSCONF_DIR        "etc/fastcached")
 
-# macOS identity. All three are substituted into the installer scripts and the
-# uninstaller, and the bundle id is additionally the CPack productbuild
-# identifier — the prefix of every receipt the uninstaller forgets.
-#
-# The bundle id must match LaunchdLabelPrefix + the lowercased default service
-# name in src/FastCache/Platform/ServiceControl.cpp: the daemon derives its own
-# launchd label from its --service-name, and the scripts here look the job up by
-# that label. ServiceControl_test.cpp pins the derivation.
-#
-# Never change the bundle id once released: macOS keys package receipts and
-# upgrade detection on it, the same discipline as CPACK_WIX_UPGRADE_GUID.
-set(FASTCACHED_MACOS_BUNDLE_ID       "software.lastrada.fastcached")
-set(FASTCACHED_MACOS_SERVICE_ACCOUNT "_fastcached")
+# FASTCACHED_MACOS_PREFIX, FASTCACHED_MACOS_BUNDLE_ID and
+# FASTCACHED_MACOS_SERVICE_ACCOUNT are declared in the top-level CMakeLists.txt
+# and inherited here. They have to live there because cmake/Packaging.cmake is
+# include()d at that scope and reads them too — a set() in this subdirectory
+# would not propagate back up.
 
 # The service assets only make sense in the root-rooted package layout: their
 # destinations (usr/lib/systemd, etc/) are written assuming the payload lands

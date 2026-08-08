@@ -19,8 +19,12 @@ GetVersionInformation(FASTCACHED_VERSION FASTCACHED_VERSION_STRING)
 # "'to_chars' is unavailable: introduced in macOS 13.3" rather than degrading
 # gracefully, so this is a floor imposed by the standard library, not a choice.
 #
-# Only a default: an explicit -DCMAKE_OSX_DEPLOYMENT_TARGET still wins.
-if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+# Only a default: an explicit -DCMAKE_OSX_DEPLOYMENT_TARGET still wins, and so
+# does the MACOSX_DEPLOYMENT_TARGET environment variable. The environment check
+# has to be explicit: CMake initializes CMAKE_OSX_DEPLOYMENT_TARGET from that
+# variable inside project(), so seeding the cache beforehand would pre-empt it
+# and silently drop a target the caller had every reason to think was honoured.
+if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET AND NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
     set(CMAKE_OSX_DEPLOYMENT_TARGET "13.3" CACHE STRING "Minimum supported macOS version")
 endif()
 
@@ -64,6 +68,24 @@ option(FASTCACHED_PACKAGE_ROOT_PREFIX "Lay out the install tree for .deb/.rpm/.p
 # .pkg carries no removal mechanism of its own.
 set(FASTCACHED_MACOS_PREFIX "opt/fastcached"
     CACHE STRING "macOS package install prefix, relative to /")
+
+# macOS package identity. Declared here rather than in packaging/ because both
+# packaging/CMakeLists.txt (a subdirectory, which inherits this scope) and
+# cmake/Packaging.cmake (include()d at this scope) read them. A plain set() in
+# the subdirectory does not propagate back up, which left
+# CPACK_PRODUCTBUILD_IDENTIFIER empty: receipts then registered under CPack's
+# fallback identifier and the uninstaller's `pkgutil --pkgs | grep` matched
+# nothing, so macOS believed fastcached was still installed forever.
+#
+# The bundle id must match LaunchdLabelPrefix + the lowercased default service
+# name in src/FastCache/Platform/ServiceControl.cpp: the daemon derives its own
+# launchd label from its --service-name, and the installer scripts look the job
+# up by that label. ServiceControl_test.cpp pins the derivation.
+#
+# Never change the bundle id once released: macOS keys package receipts and
+# upgrade detection on it, the same discipline as CPACK_WIX_UPGRADE_GUID.
+set(FASTCACHED_MACOS_BUNDLE_ID       "software.lastrada.fastcached")
+set(FASTCACHED_MACOS_SERVICE_ACCOUNT "_fastcached")
 
 # Install destinations for the relocatable artifacts (binaries, docs). With the
 # prefix moved to /, the ordinary FHS paths have to spell `usr/` themselves, or
