@@ -12,6 +12,8 @@ PREFIX="/@FASTCACHED_MACOS_PREFIX@"
 LABEL="@FASTCACHED_MACOS_BUNDLE_ID@"
 ACCOUNT="@FASTCACHED_MACOS_SERVICE_ACCOUNT@"
 
+@FASTCACHED_MACOS_SEED_CONFIG@
+
 # macOS has no sysusers.d, so the account that packaging/linux/fastcached.sysusers
 # declares in one line has to be built by hand here. The 200..400 band is the
 # convention for hidden system accounts; picking the next free id keeps this

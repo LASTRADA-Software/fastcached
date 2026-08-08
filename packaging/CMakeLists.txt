@@ -171,6 +171,13 @@ elseif(FASTCACHED_PACKAGE_ROOT_PREFIX AND APPLE)
         "fastcached-uninstall"
     )
 
+    # Shared shell fragment, substituted into whichever scripts declare
+    # @FASTCACHED_MACOS_SEED_CONFIG@. Config seeding has to happen in more than
+    # one postinstall — macOS does not run them in component order — and this
+    # keeps that one implementation instead of a copy per component.
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/macos/seed-config.sh.inc"
+        FASTCACHED_MACOS_SEED_CONFIG)
+
     foreach(_script IN LISTS FASTCACHED_MACOS_SCRIPTS)
         set(_out "${CMAKE_CURRENT_BINARY_DIR}/macos/${_script}")
         configure_file("${CMAKE_CURRENT_SOURCE_DIR}/macos/${_script}.sh.in" "${_out}" @ONLY)
