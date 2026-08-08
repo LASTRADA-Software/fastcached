@@ -5,16 +5,22 @@
 #   - Windows: WIX (MSI) — installs fastcached.exe + fastcache-cc.exe and
 #              registers fastcached as an auto-start service
 #   - Linux  : TGZ + DEB + RPM — installs both binaries plus the systemd units
-#   - macOS  : TGZ (no service integration; launchd is not wired up)
+#   - macOS  : TGZ + productbuild (.pkg) — installs both binaries under
+#              /opt/fastcached, puts them on PATH, and offers the launchd
+#              registration as installer choices
 #
 # The service-integration assets themselves (units, sysusers.d, tmpfiles.d, the
-# example config, the WiX fragment) live under packaging/ and are installed by
-# packaging/CMakeLists.txt, which exports the variables consumed below. This
-# file only describes how the generators wrap what is already installed.
+# example config, the launchd installer scripts, the WiX fragment) live under
+# packaging/ and are installed by packaging/CMakeLists.txt, which exports the
+# variables consumed below. This file only describes how the generators wrap
+# what is already installed.
 #
-# Everything ships in a single Runtime component: the FastCache/CowTree static
-# libraries are deliberately not installed (see the comment in the top-level
-# CMakeLists.txt), so there is no SDK component to separate out.
+# Linux and Windows ship a single Runtime component: the FastCache/CowTree
+# static libraries are deliberately not installed (see the comment in the
+# top-level CMakeLists.txt), so there is no SDK component to separate out.
+# macOS additionally splits the two launchd registrations into their own
+# components, because CPack maps one component to one installer choice and the
+# two are alternatives rather than both-or-neither.
 
 include(GNUInstallDirs)
 
@@ -40,6 +46,35 @@ set(CPACK_PACKAGE_FILE_NAME           "fastcached-${CPACK_PACKAGE_VERSION}-${CMA
 set(CPACK_VERBATIM_VARIABLES          ON)
 set(CPACK_STRIP_FILES                 ON)
 
+# --- macOS signing / notarization knobs ------------------------------------
+# All empty by default: an unsigned package still builds and installs, so forks
+# and pull-request builds (which never receive the repository secrets) are not
+# broken by their absence. CI fills these in from secrets.
+#
+# The identity strings are the certificate common names as `security
+# find-identity -v` prints them, e.g.
+#   Developer ID Application: Christian Parpart (6T525MU9UR)
+#   Developer ID Installer: Christian Parpart (6T525MU9UR)
+set(FASTCACHED_MACOS_SIGN_IDENTITY_APP "" CACHE STRING
+    "Developer ID Application identity: signs the Mach-O binaries and the .dmg")
+set(FASTCACHED_MACOS_SIGN_IDENTITY_PKG "" CACHE STRING
+    "Developer ID Installer identity: signs the .pkg (a different certificate type)")
+set(FASTCACHED_MACOS_NOTARY_PROFILE "fastcached-notary" CACHE STRING
+    "notarytool keychain profile (see `xcrun notarytool store-credentials`)")
+option(FASTCACHED_MACOS_NOTARIZE "Submit the macOS artifacts to Apple's notary service" OFF)
+option(FASTCACHED_MACOS_BUILD_DMG "Also wrap the macOS .pkg in a .dmg" ON)
+
+# Apple rejects an unsigned or ad-hoc-signed submission — but only after the
+# multi-minute round trip to the notary service. Fail here instead, where the
+# mistake costs nothing.
+if(FASTCACHED_MACOS_NOTARIZE AND (NOT FASTCACHED_MACOS_SIGN_IDENTITY_APP OR NOT FASTCACHED_MACOS_SIGN_IDENTITY_PKG))
+    message(FATAL_ERROR
+        "FASTCACHED_MACOS_NOTARIZE needs both signing identities: "
+        "FASTCACHED_MACOS_SIGN_IDENTITY_APP (Developer ID Application, for the binaries and the .dmg) "
+        "and FASTCACHED_MACOS_SIGN_IDENTITY_PKG (Developer ID Installer, for the .pkg). "
+        "Apple rejects unsigned submissions.")
+endif()
+
 # --- Per-generator selection ----------------------------------------------
 
 if(WIN32)
@@ -57,13 +92,29 @@ elseif(UNIX AND NOT APPLE)
     # its own `usr/` — see FASTCACHED_INSTALL_* in the top-level CMakeLists.txt
     # and the asset table in packaging/CMakeLists.txt.
     set(CPACK_PACKAGING_INSTALL_PREFIX "/")
+elseif(APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
+    if(NOT CPACK_GENERATOR)
+        set(CPACK_GENERATOR "TGZ;productbuild")
+    endif()
+
+    # Same reasoning as Linux, plus a constraint of the generator: CPack always
+    # invokes `pkgbuild --install-location /`, so the only way to place a file is
+    # to spell its absolute path as a prefix-relative destination. Pointing this
+    # at /opt/fastcached instead would appear to work for the binaries and then
+    # write /etc/paths.d and /Library/LaunchDaemons straight onto the *build
+    # host*, since an absolute install(DESTINATION) escapes the staging tree.
+    set(CPACK_PACKAGING_INSTALL_PREFIX "/")
 else()
     if(NOT CPACK_GENERATOR)
         set(CPACK_GENERATOR "TGZ")
     endif()
 endif()
 
-set(CPACK_COMPONENTS_ALL Runtime)
+if(APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
+    set(CPACK_COMPONENTS_ALL Runtime LaunchAgent LaunchDaemon)
+else()
+    set(CPACK_COMPONENTS_ALL Runtime)
+endif()
 
 # --- DEB (Debian / Ubuntu) -------------------------------------------------
 
@@ -222,6 +273,72 @@ if(WIN32)
     include(InstallRequiredSystemLibraries)
 endif()
 
+# --- productbuild (macOS .pkg) ---------------------------------------------
+
+if(APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
+    # Mint once, never change: macOS keys package receipts on this, and the
+    # uninstaller finds what to `pkgutil --forget` by matching the prefix. Same
+    # discipline as CPACK_WIX_UPGRADE_GUID above. Defined in
+    # packaging/CMakeLists.txt alongside the scripts that also substitute it.
+    set(CPACK_PRODUCTBUILD_IDENTIFIER "${FASTCACHED_MACOS_BUNDLE_ID}")
+
+    # Which locations the installer offers. Stated explicitly because
+    # cmake_minimum_required(3.28) leaves CMP0161 unset, and CPack then warns.
+    #
+    # DOMAINS_USER stays FALSE deliberately: it is not merely unhelpful for a
+    # payload rooted at /, it makes the whole install run as the invoking user
+    # instead of root, so every postinstall assumption (writing /etc/paths.d,
+    # creating the service account, symlinking into /usr/local/bin) quietly
+    # fails while the installer still reports success.
+    set(CPACK_PRODUCTBUILD_DOMAINS          TRUE)
+    set(CPACK_PRODUCTBUILD_DOMAINS_ANYWHERE FALSE)
+    set(CPACK_PRODUCTBUILD_DOMAINS_USER     FALSE)
+    set(CPACK_PRODUCTBUILD_DOMAINS_ROOT     TRUE)
+
+    # Installer panes. productbuild rejects any resource that is not .rtfd,
+    # .rtf, .html or .txt, so the project's README.md — fine for every other
+    # generator — has to be replaced here rather than reused. These two also do
+    # real work: the welcome pane explains that the service choices are
+    # alternatives, and the read-me pane carries the "open a new terminal"
+    # caveat and the uninstaller invocation, both of which a user otherwise has
+    # no way to discover.
+    set(CPACK_RESOURCE_FILE_WELCOME "${CMAKE_SOURCE_DIR}/packaging/macos/welcome.html")
+    set(CPACK_RESOURCE_FILE_README  "${CMAKE_SOURCE_DIR}/packaging/macos/readme.html")
+
+    # <COMPONENT> in these variable names is the component name uppercased.
+    if(FASTCACHED_MACOS_SCRIPT_DIR)
+        set(CPACK_POSTFLIGHT_RUNTIME_SCRIPT      "${FASTCACHED_MACOS_SCRIPT_DIR}/postinstall-runtime")
+        set(CPACK_POSTFLIGHT_LAUNCHAGENT_SCRIPT  "${FASTCACHED_MACOS_SCRIPT_DIR}/postinstall-launchagent")
+        set(CPACK_POSTFLIGHT_LAUNCHDAEMON_SCRIPT "${FASTCACHED_MACOS_SCRIPT_DIR}/postinstall-launchdaemon")
+    endif()
+
+    # Signing. Two *different* certificate types are involved and mixing them up
+    # is the usual failure: a "Developer ID Application" certificate signs
+    # Mach-O binaries and disk images, while only a "Developer ID Installer"
+    # certificate can sign a .pkg. Empty by default so a fork or a PR build
+    # still produces an installable (if unsigned) package.
+    if(FASTCACHED_MACOS_SIGN_IDENTITY_PKG)
+        set(CPACK_PKGBUILD_IDENTITY_NAME     "${FASTCACHED_MACOS_SIGN_IDENTITY_PKG}")
+        set(CPACK_PRODUCTBUILD_IDENTITY_NAME "${FASTCACHED_MACOS_SIGN_IDENTITY_PKG}")
+    endif()
+
+    # The two hook scripts run as `cmake -P`, which only sees CPACK_-prefixed
+    # variables, so the knobs are re-exported under that prefix.
+    set(CPACK_FASTCACHED_SIGN_IDENTITY_APP "${FASTCACHED_MACOS_SIGN_IDENTITY_APP}")
+    set(CPACK_FASTCACHED_NOTARIZE          "${FASTCACHED_MACOS_NOTARIZE}")
+    set(CPACK_FASTCACHED_NOTARY_PROFILE    "${FASTCACHED_MACOS_NOTARY_PROFILE}")
+    set(CPACK_FASTCACHED_BUILD_DMG         "${FASTCACHED_MACOS_BUILD_DMG}")
+    # CPack builds packages in a staging directory and copies them back
+    # afterwards; a .dmg this hook creates is not part of that copy, so it must
+    # be written to its final home directly.
+    set(CPACK_FASTCACHED_OUTPUT_DIRECTORY  "${CMAKE_BINARY_DIR}")
+
+    # Signing must happen after CPACK_STRIP_FILES and before pkgbuild seals the
+    # payload — the pre-build hook is the only point that satisfies both.
+    set(CPACK_PRE_BUILD_SCRIPTS  "${CMAKE_SOURCE_DIR}/cmake/MacOSSignBinaries.cmake")
+    set(CPACK_POST_BUILD_SCRIPTS "${CMAKE_SOURCE_DIR}/cmake/MacOSNotarizePkg.cmake")
+endif()
+
 include(CPack)
 
 # Component declarations must come after include(CPack).
@@ -230,3 +347,23 @@ cpack_add_component(Runtime
     DESCRIPTION  "The fastcached daemon and the fastcache-cc compiler launcher."
     REQUIRED
 )
+
+if(APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
+    # The two launchd registrations are alternatives: both bind 127.0.0.1:11211
+    # and fastcached has no unix-socket endpoint to fall back on. productbuild
+    # cannot express mutual exclusion — CPack only ever generates && / ||
+    # dependency expressions for a choice's `selected` attribute — so the
+    # postinstall scripts arbitrate at install time (the daemon wins) and the
+    # descriptions below tell the user what the checkboxes really mean.
+    cpack_add_component(LaunchAgent
+        DISPLAY_NAME "Start at login (recommended)"
+        DESCRIPTION  "Run fastcached as you, starting at login. Best for a development machine. Ignored if the system-wide service below is also selected."
+    )
+    # DISABLED renders the choice unchecked (start_selected="false"), so a
+    # click-through install gets the per-user agent rather than a root daemon.
+    cpack_add_component(LaunchDaemon
+        DISPLAY_NAME "Start at boot, system-wide"
+        DESCRIPTION  "Run fastcached as a dedicated service account from boot, shared by every user. Creates the _fastcached account. Takes precedence over the per-user option above."
+        DISABLED
+    )
+endif()
