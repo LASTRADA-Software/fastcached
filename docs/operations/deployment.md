@@ -74,6 +74,60 @@ The path's *shape* selects the layout: a path with no file extension (as
 above) becomes a sharded directory, while one with an extension
 (`cache.cow`) is a single file.
 
+## launchd
+
+On macOS the `.pkg` registers a launchd job. The same registration is
+available from the command line on any installation, and `--service-scope`
+picks the domain:
+
+```sh
+fastcached --install-service --service-scope=user            # LaunchAgent
+sudo fastcached --install-service --service-scope=system      # LaunchDaemon
+```
+
+Every flag passed alongside `--install-service` is baked into the job's
+`ProgramArguments`, exactly as on Windows:
+
+```sh
+sudo fastcached --install-service --service-scope=system \
+    --config=/opt/fastcached/etc/fastcached.yaml \
+    --storage=/opt/fastcached/var/cache --threads=4
+```
+
+| | `user` | `system` |
+|---|---|---|
+| Plist | `~/Library/LaunchAgents/` | `/Library/LaunchDaemons/` |
+| Runs as | the invoking user | `_fastcached` |
+| Starts at | login | boot |
+| Privileges | none | root to install |
+| `KeepAlive` | on crash only | always |
+
+The generated plist deliberately does **not** pass `--daemon`. launchd, like
+systemd, supervises the process it started; a job that double-forks is
+reaped immediately as `exited` and the service silently never runs.
+
+The two scopes are alternatives — both bind the same address, and there is
+no unix-socket endpoint to separate them. A per-user agent uses
+`KeepAlive={Crashed:true}` rather than `true` for that reason: an agent that
+loses the race for the port exits cleanly, and restart-always would turn
+that into a permanent ten-second crash loop instead of one log line.
+
+Status, restart, logs:
+
+```sh
+launchctl print gui/$UID/software.lastrada.fastcached
+launchctl kickstart -k gui/$UID/software.lastrada.fastcached
+tail -f ~/Library/Logs/fastcached/software.lastrada.fastcached.err.log
+```
+
+The system daemon logs to `/opt/fastcached/var/log/` instead.
+
+There is no reload equivalent to `systemctl reload`: send `SIGHUP` to the
+pid `launchctl print` reports, or kickstart the job.
+
+To remove it: `fastcached --uninstall-service --service-scope=<scope>`, or
+`sudo /opt/fastcached/bin/fastcached-uninstall` to remove the whole install.
+
 ## Windows service
 
 The MSI registers `fastcached` as an auto-start service. The same

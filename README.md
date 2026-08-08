@@ -26,7 +26,12 @@ Full documentation: **<https://lastrada-software.github.io/fastcached/>**
 
 ## Install
 
-A build installs both executables into `bin/`:
+Released packages — `.deb`, `.rpm`, macOS `.pkg`/`.dmg`, Windows `.msi` —
+install both executables and register the daemon to start automatically.
+On macOS the installer offers the launchd job as a per-user agent (default)
+or a system-wide daemon, and ships `fastcached-uninstall` to remove it.
+
+Or build it yourself; a build installs both executables into `bin/`:
 
 ```sh
 cmake --preset clang-release

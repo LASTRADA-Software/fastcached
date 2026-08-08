@@ -69,27 +69,47 @@ new man page or logrotate snippet is a new row rather than a new
 
 ```
 packaging/
-  CMakeLists.txt      the asset install table; exports the config-file list
-                      reused by the dpkg conffiles and rpm %config filelists
+  CMakeLists.txt      the asset install table (source|destination|kind|name|
+                      component); exports the config-file list reused by the
+                      dpkg conffiles and rpm %config filelists
   linux/              system + user systemd units, sysusers.d/tmpfiles.d,
                       the commented /etc/fastcached/fastcached.yaml, and the
                       DEB/RPM maintainer-script templates (*.in)
+  macos/              /etc/paths.d entry, the per-component postinstall
+                      templates, the uninstaller, and the installer panes
   windows/            WiX fragment driving --install-service / --uninstall-service
 ```
 
-`cmake/Packaging.cmake` turns that into `.deb`/`.rpm`/`.msi` via CPack. Three
-constraints there are load-bearing and have each already been a bug:
+`cmake/Packaging.cmake` turns that into `.deb`/`.rpm`/`.pkg`/`.msi` via CPack.
+These constraints are load-bearing and have each already been a bug:
 
-- **The unit must not pass `--daemon`.** The POSIX daemonize path double-forks
-  and sends stdout/stderr to `/dev/null`, which silences journald; its pidfile
-  is also written after both parents exit, racing `Type=forking`.
+- **The supervisor's launch arguments must not pass `--daemon`.** The POSIX
+  daemonize path double-forks and sends stdout/stderr to `/dev/null`, which
+  silences journald; its pidfile is also written after both parents exit, racing
+  `Type=forking`. launchd has the identical problem — it reaps the forked job
+  instantly as "exited" — which is why `BuildServiceArgv` takes an
+  `EmitDaemonFlag` rather than always emitting it.
 - **`ExecStart` must pass `--config`.** There is no default config search path,
   so without it `ConfigReloader` has nothing to re-read and `systemctl reload`
   is a silent no-op.
 - **The package payload is rooted at `/`, not `/usr`.** `/etc` cannot sit under
   a `/usr` prefix, so `FASTCACHED_INSTALL_BINDIR`/`DOCDIR` spell their own
-  `usr/`. A relative destination for the units would put them where systemd
-  never looks.
+  `usr/` (and `opt/fastcached/` on macOS). A relative destination for the units
+  would put them where systemd never looks — and on macOS an *absolute*
+  `install(DESTINATION)` escapes CPack's staging tree and writes to the build
+  host's real filesystem.
+- **A macOS `.pkg` has no conffile mechanism.** It overwrites its payload on
+  every install, so the live `fastcached.yaml` is deliberately not payload: the
+  Runtime postinstall seeds it from a shipped `.default` only when absent.
+- **Third-party `install()` rules must be excluded.** A CPM-fetched zstd brings
+  its own, and with the payload rooted at `/` they put `zstd.h` and `libzstd.a`
+  into `/include` and `/lib` on the user's machine. Hence `EXCLUDE_FROM_ALL`.
+- **macOS binaries must link nothing outside `/usr/lib`.** `CPM_USE_LOCAL_PACKAGES`
+  defaults ON and makes CPM prefer Homebrew's shared yaml-cpp, so the package job
+  passes `-DCPM_USE_LOCAL_PACKAGES=OFF -DOPENSSL_USE_STATIC_LIBS=ON` and CI
+  asserts the result with `otool -L`. `CMAKE_OSX_DEPLOYMENT_TARGET` is pinned to
+  13.3 (the floor at which the system libc++ has floating-point `std::to_chars`,
+  which `std::format` needs) and must be set *before* `project()`.
 
 `fastcached` and `fastcache-cc` are both installed. Two things the launcher's
 cache key depends on, both of which have already caused silent hit-rate
