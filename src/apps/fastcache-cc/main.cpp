@@ -22,8 +22,12 @@
 //   FASTCACHE_NO_DIRECT  if set, disable direct mode (always preprocess)
 //   FASTCACHE_TIMEOUT_MS per-call socket deadline in ms (default 10000; 0 = none)
 //
+// The statistics log is located from the usual per-user state variables rather
+// than one of our own: LOCALAPPDATA on Windows, else XDG_STATE_HOME or HOME.
+//
 // Run `fastcache-cc --help` for the flag and environment reference, and
-// `--stats` for the recorded per-machine cache statistics.
+// `--show-stats` for the recorded per-machine cache statistics. The accepted
+// flags live in one table in LauncherCli.cpp, which also renders that help.
 //
 // Contains no project-specific data; it compiles whatever it is pointed at.
 
@@ -32,6 +36,7 @@
 #include "DirectManifest.hpp"
 #include "IProcessRunner.hpp"
 #include "ITcpClient.hpp"
+#include "LauncherCli.hpp"
 #include "Stats.hpp"
 
 #include <FastCache/CompileCache/CompileValue.hpp>
@@ -195,7 +200,7 @@ bool g_directHit = false;
 /// touching the recorded outcome. For diagnostics issued AFTER the outcome is
 /// already decided — a miss that compiled successfully but could not be stored
 /// is still a miss, and recording it as a cache failure would inflate the
-/// "unavailable" bucket in `--stats` and hide the real cause.
+/// "unavailable" bucket in `--show-stats` and hide the real cause.
 /// @param reason The diagnostic text.
 void Note(std::string_view reason)
 {
@@ -1007,57 +1012,6 @@ void RecordManifest(Config const& cfg,
 
 } // namespace
 
-/// Print usage to `stream`. Written out rather than generated so the wording can
-/// explain *why* a flag exists, which a flag table alone cannot.
-void PrintHelp(std::ostream& stream)
-{
-    stream << R"(fastcache-cc - a compiler launcher over the fastcached compile cache.
-
-USAGE
-  fastcache-cc <compiler> <args...>     Front a compile (as CMAKE_<LANG>_COMPILER_LAUNCHER).
-  fastcache-cc --stats [options]        Report cache statistics for this machine.
-  fastcache-cc --clear-stats            Discard the statistics log.
-  fastcache-cc --help | --version       This text / the launcher version.
-
-STATS OPTIONS
-  --cohort <id>     Report only this cohort (also --cohort=<id>).
-  --clear-stats     Discard the log instead of reporting (--reset is a synonym).
-
-ENVIRONMENT
-  FASTCACHE_ADDR        host:port of the fastcached daemon. Unset means every
-                        compile runs uncached -- the build still succeeds, so
-                        check this before concluding the cache is working.
-  FASTCACHE_SRCROOT     Checkout source root, for keying and path canonicalization.
-  FASTCACHE_BUILDTREE   Build output root.
-  FASTCACHE_COHORT      Prefetch grouping id (default "default"). Not part of the
-                        cache key, so it never partitions the cache.
-  FASTCACHE_VERBOSE     Print HIT/MISS and fall-back diagnostics to stderr.
-  FASTCACHE_NO_STATS    Do not record invocations to the statistics log.
-  FASTCACHE_NO_DIRECT   Disable direct mode (always preprocess to derive the key).
-                        Direct mode is on by default: it reaches a cached object by
-                        re-hashing the project headers a previous compile recorded,
-                        which is far cheaper than preprocessing the translation unit.
-  FASTCACHE_TIMEOUT_MS  Per-call deadline, in milliseconds, for every send/recv to
-                        the daemon (default 10000; 0 disables it). A daemon that
-                        accepts the connection and then stalls mid-reply would
-                        otherwise block the compile forever, which would make the
-                        cache load-bearing. On expiry the launcher gives up on the
-                        cache and compiles for real, like any other cache error.
-                        Raise it if a heavily loaded daemon is legitimately slow.
-                        This bounds each call, not the whole invocation: direct
-                        mode makes a separate manifest round-trip, so one compile
-                        against a wedged daemon can wait up to twice this before
-                        falling back.
-
-ADDR, SRCROOT and BUILDTREE must ALL be set to cache; any missing one makes the
-launcher run the real compiler and report "missing FASTCACHE_ADDR/SRCROOT/BUILDTREE"
-under FASTCACHE_VERBOSE.
-
-Any cache error falls back to a plain real compile: caching is an optimization
-and never breaks a build.
-)";
-}
-
 /// Delete the statistics log, reporting the outcome. @return Process exit code.
 [[nodiscard]] int ClearStats()
 {
@@ -1075,21 +1029,22 @@ and never breaks a build.
     return 1;
 }
 
-/// Print the statistics report (`--stats`) and return the process exit code.
-[[nodiscard]] int RunStatsReport(std::span<std::string const> args)
+/// Print the statistics report (`--show-stats`) and return the process exit code.
+/// @param cohortFilter Restrict the report to this cohort; empty reports all.
+[[nodiscard]] int RunStatsReport(std::string_view cohortFilter)
 {
-    std::string cohortFilter;
-    for (std::size_t i = 1; i < args.size(); ++i)
-    {
-        if (args[i] == "--cohort" && i + 1 < args.size())
-            cohortFilter = args[i + 1];
-        else if (args[i].starts_with("--cohort="))
-            cohortFilter = args[i].substr(std::string_view { "--cohort=" }.size());
-        else if (args[i] == "--reset" || args[i] == "--clear-stats")
-            return ClearStats();
-    }
     std::cout << Cc::FormatReport(cohortFilter);
     return 0;
+}
+
+/// Report a bad command line, then the usage text, on stderr.
+/// @param diagnostic What was wrong with the arguments.
+/// @return Process exit code.
+[[nodiscard]] int ReportUsageError(std::string_view diagnostic)
+{
+    std::cerr << "fastcache-cc: " << diagnostic << "\n\n";
+    Cc::PrintHelp(std::cerr);
+    return 2;
 }
 
 int main(int argc, char** argv)
@@ -1099,31 +1054,36 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; ++i) // argv[0] is fastcache-cc itself; drop it
         args.emplace_back(argv[i]);
 
-    // No arguments is a usage error (exit 2); an explicit --help is a successful
-    // query and prints to stdout so it can be paged or redirected.
-    if (args.empty())
+    // Dispatch is driven by the flag table in LauncherCli.cpp, which also renders
+    // the help text, so an accepted flag is necessarily a documented one.
+    auto const command = Cc::ParseTopLevel(std::span<std::string const> { args });
+    switch (command.action)
     {
-        PrintHelp(std::cerr);
-        return 2;
+        // No arguments is a usage error (exit 2); an explicit --help is a
+        // successful query and prints to stdout so it can be paged or redirected.
+        case Cc::Action::NoArguments:
+            Cc::PrintHelp(std::cerr);
+            return 2;
+        case Cc::Action::UsageError:
+            return ReportUsageError(command.diagnostic);
+        case Cc::Action::Help:
+            Cc::PrintHelp(std::cout);
+            return 0;
+        case Cc::Action::Version:
+            std::cout << "fastcache-cc " << FASTCACHE_CC_VERSION << '\n';
+            return 0;
+        case Cc::Action::ShowStats:
+            return RunStatsReport(command.cohortFilter);
+        case Cc::Action::ZeroStats:
+            return ClearStats();
+        // A stats sub-option, never returned as a top-level action. Handled
+        // explicitly so the switch stays exhaustive without silently treating
+        // "--cohort" as a compiler to spawn.
+        case Cc::Action::Cohort:
+            return ReportUsageError("--cohort is only valid after --show-stats");
+        case Cc::Action::Compile:
+            break;
     }
-
-    if (args[0] == "--help" || args[0] == "-h" || args[0] == "/?")
-    {
-        PrintHelp(std::cout);
-        return 0;
-    }
-
-    if (args[0] == "--version")
-    {
-        std::cout << "fastcache-cc " << FASTCACHE_CC_VERSION << '\n';
-        return 0;
-    }
-
-    if (args[0] == "--stats")
-        return RunStatsReport(std::span<std::string const> { args });
-
-    if (args[0] == "--clear-stats" || args[0] == "--reset")
-        return ClearStats();
 
     Config const cfg = LoadConfig();
     g_verbose = cfg.verbose;

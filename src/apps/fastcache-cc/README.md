@@ -19,7 +19,7 @@ unavailable — so it can never break a build.
 
 | File | Contents |
 |------|----------|
-| `main.cpp` | The launcher flow: config, key derivation, FETCH/replay, MISS/STORE, `--stats`. |
+| `main.cpp` | The launcher flow: config, key derivation, FETCH/replay, MISS/STORE, `--show-stats`. |
 | `CmdLine.*` | The driver descriptor table and command-line parsing. |
 | `CacheKey.*` | Key computation and argument relativization. |
 | `DirectManifest.*` | Direct mode: the header manifest that avoids preprocessing. |

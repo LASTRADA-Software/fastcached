@@ -53,7 +53,11 @@ set(CMAKE_COLOR_DIAGNOSTICS ON)
 # Project-wide options
 
 option(FASTCACHED_BUILD_TESTS "Build unit tests" ON)
-option(USE_COMPILER_CACHE "Use a compiler-cache launcher when one is available (fastcache-cc when configured, else sccache)" ON)
+
+# USE_COMPILER_CACHE is declared by cmake/CompileCache.cmake, next to the logic
+# that reads it: a module that consumed an option it did not declare would read
+# an undefined variable as "off" and silently disable caching if it were ever
+# included on its own.
 
 # TLS is opt-in and off by default so the standard build stays dependency-free
 # (mirroring TRACY_ENABLE). When on, the build links OpenSSL and our code keys
@@ -82,7 +86,8 @@ option(TRACY_ON_DEMAND "Tracy: only collect data while a profiler is connected" 
 # Compiler caching. Loaded before any compiler invocation so that CPM-fetched
 # dependencies also get cached. CompileCache.cmake prefers our own fastcache-cc
 # launcher (when installed and FASTCACHE_ADDR names a daemon), falls back to
-# sccache, and silently no-ops when neither is usable or USE_COMPILER_CACHE=OFF.
+# sccache and then ccache, and silently no-ops when none is usable or
+# USE_COMPILER_CACHE=OFF. It also declares the USE_COMPILER_CACHE option.
 
 include(CompileCache)
 

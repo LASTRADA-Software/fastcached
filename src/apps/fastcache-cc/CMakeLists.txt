@@ -18,6 +18,7 @@ set(_fc_cc_core
 # stays platform-free and testable against fakes on every host.
 set(_fc_cc_sources
     CmdLine.cpp
+    LauncherCli.cpp
     CacheKey.cpp
     DirectManifest.cpp
     Stats.cpp
@@ -64,6 +65,7 @@ if(FASTCACHED_BUILD_TESTS)
         test_main.cpp
         ${_fc_cc_sources}
         CmdLine_test.cpp
+        LauncherCli_test.cpp
         CacheKey_test.cpp
         DirectManifest_test.cpp
         ProcessRunner_test.cpp
