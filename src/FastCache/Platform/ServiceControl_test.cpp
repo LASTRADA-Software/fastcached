@@ -313,7 +313,9 @@ TEST_CASE("ServiceControl: security-relevant flags reach the supervisor", "[plat
     // letter, so on Windows it is *relative* and gets rebased onto the current
     // drive. Asserting the literal passes on macOS and fails on Windows for a
     // reason that has nothing to do with the flag being carried.
-    auto const absolute = [](std::string_view path) { return std::filesystem::absolute(path).string(); };
+    auto const absolute = [](std::string_view path) {
+        return std::filesystem::absolute(path).string();
+    };
 
     REQUIRE(has(std::format("--tls-cert={}", absolute("/etc/fastcached/server.crt"))));
     REQUIRE(has(std::format("--tls-key={}", absolute("/etc/fastcached/server.key"))));
