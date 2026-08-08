@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <filesystem>
+#include <format>
 #include <string>
 #include <string_view>
 
@@ -307,11 +308,18 @@ TEST_CASE("ServiceControl: security-relevant flags reach the supervisor", "[plat
         return std::ranges::find(argv, flag) != argv.end();
     };
 
-    REQUIRE(has("--tls-cert=/etc/fastcached/server.crt"));
-    REQUIRE(has("--tls-key=/etc/fastcached/server.key"));
+    // Path flags are compared against what absolute() makes of them, not
+    // against the literal spelling: a POSIX-looking path carries no drive
+    // letter, so on Windows it is *relative* and gets rebased onto the current
+    // drive. Asserting the literal passes on macOS and fails on Windows for a
+    // reason that has nothing to do with the flag being carried.
+    auto const absolute = [](std::string_view path) { return std::filesystem::absolute(path).string(); };
+
+    REQUIRE(has(std::format("--tls-cert={}", absolute("/etc/fastcached/server.crt"))));
+    REQUIRE(has(std::format("--tls-key={}", absolute("/etc/fastcached/server.key"))));
+    REQUIRE(has(std::format("--pidfile={}", absolute("/var/run/fastcached.pid"))));
     REQUIRE(has("--metrics-bind=0.0.0.0"));
     REQUIRE(has("--metrics-port=9999"));
-    REQUIRE(has("--pidfile=/var/run/fastcached.pid"));
     REQUIRE(has("--notify-keyspace-events=KEA"));
 
     // Valueless switches: `--tls=true` is not a spelling CliParser accepts, so
