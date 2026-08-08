@@ -6,6 +6,24 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(Version)
 GetVersionInformation(FASTCACHED_VERSION FASTCACHED_VERSION_STRING)
 
+# The oldest macOS the shipped binaries must run on. This has to precede
+# project(): CMake bakes the deployment target into the compile lines while
+# configuring the toolchain, so a value set afterwards is silently ignored and
+# every binary is stamped with the *builder's* OS version instead. A package
+# built that way installs fine and then refuses to launch on anything older —
+# `minos 26.0` on a machine whose users are on 13.x.
+#
+# 13.3 and not 13.0: std::format of a floating-point value calls std::to_chars,
+# whose floating-point overloads only appear in the libc++ dylib shipped with
+# macOS 13.3. Targeting anything older fails to compile outright with
+# "'to_chars' is unavailable: introduced in macOS 13.3" rather than degrading
+# gracefully, so this is a floor imposed by the standard library, not a choice.
+#
+# Only a default: an explicit -DCMAKE_OSX_DEPLOYMENT_TARGET still wins.
+if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.3" CACHE STRING "Minimum supported macOS version")
+endif()
+
 project(fastcached
     VERSION "${FASTCACHED_VERSION}"
     DESCRIPTION "Fast Cache Daemon — platform-independent memcached/Redis server"
@@ -19,6 +37,14 @@ include(GNUInstallDirs)
 # absolute locations that cannot be rebased onto a /usr prefix (systemd does
 # not read config from /usr/etc). See cmake/Packaging.cmake.
 #
+# The same reasoning applies to the macOS .pkg: `pkgbuild --install-location` is
+# hardcoded to / by CPack, and the launchd plists and /etc/paths.d entry sit at
+# fixed absolute locations outside any prefix. Note that this is why the prefix
+# must stay `/` there too — pointing CPACK_PACKAGING_INSTALL_PREFIX at
+# /opt/fastcached would work for the binaries, but an absolute install
+# DESTINATION for /Library/LaunchDaemons then escapes the staging tree and
+# writes to the build host's real filesystem.
+#
 # This is OFF by default, including on Linux, so that the ordinary
 # `cmake --install --prefix /usr/local` keeps putting the daemon at
 # /usr/local/bin/fastcached. Defaulting it ON rebased every developer install
@@ -28,15 +54,29 @@ include(GNUInstallDirs)
 # Turn it ON only to build packages:
 #   cmake -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON ... && cpack -G "DEB;RPM"
 # The CI packaging job does exactly that; see .github/workflows/build.yml.
-option(FASTCACHED_PACKAGE_ROOT_PREFIX "Lay out the install tree for .deb/.rpm packaging" OFF)
+option(FASTCACHED_PACKAGE_ROOT_PREFIX "Lay out the install tree for .deb/.rpm/.pkg packaging" OFF)
+
+# The macOS package prefix. Single source of truth: it is spelled into the
+# install destinations below, into /etc/paths.d/fastcached, into the launchd
+# plists, and into the uninstaller. macOS has no FHS to follow and /usr/local is
+# shared with Homebrew, so a private /opt subtree keeps the payload trivially
+# enumerable — which is what makes an uninstaller possible at all, given that a
+# .pkg carries no removal mechanism of its own.
+set(FASTCACHED_MACOS_PREFIX "opt/fastcached"
+    CACHE STRING "macOS package install prefix, relative to /")
 
 # Install destinations for the relocatable artifacts (binaries, docs). With the
 # prefix moved to /, the ordinary FHS paths have to spell `usr/` themselves, or
 # the binaries would land in /bin and the docs in /share/doc. Outside packaging
 # these stay the plain GNUInstallDirs values.
 if(FASTCACHED_PACKAGE_ROOT_PREFIX)
-    set(FASTCACHED_INSTALL_BINDIR "usr/${CMAKE_INSTALL_BINDIR}")
-    set(FASTCACHED_INSTALL_DOCDIR "usr/${CMAKE_INSTALL_DOCDIR}")
+    if(APPLE)
+        set(FASTCACHED_INSTALL_BINDIR "${FASTCACHED_MACOS_PREFIX}/bin")
+        set(FASTCACHED_INSTALL_DOCDIR "${FASTCACHED_MACOS_PREFIX}/share/doc/fastcached")
+    else()
+        set(FASTCACHED_INSTALL_BINDIR "usr/${CMAKE_INSTALL_BINDIR}")
+        set(FASTCACHED_INSTALL_DOCDIR "usr/${CMAKE_INSTALL_DOCDIR}")
+    endif()
 else()
     set(FASTCACHED_INSTALL_BINDIR "${CMAKE_INSTALL_BINDIR}")
     set(FASTCACHED_INSTALL_DOCDIR "${CMAKE_INSTALL_DOCDIR}")
