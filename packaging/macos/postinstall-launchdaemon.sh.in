@@ -41,21 +41,40 @@ if ! /usr/bin/dscl . -read "/Users/${ACCOUNT}" >/dev/null 2>&1; then
     /usr/bin/dscl . -create "/Users/${ACCOUNT}" IsHidden 1 || true
 fi
 
-# dscl returns before the record is resolvable through getpwnam(3), which is
-# what launchd -- and fastcached's own pre-flight check -- actually use. Wait
-# for it instead of racing: an unresolvable UserName leaves launchd registering
-# the job and then never spawning it, with no error anywhere.
+# dscl returns before the records are resolvable through getpwnam(3) and
+# getgrnam(3), which is what launchd -- and fastcached's own pre-flight check --
+# actually use. Wait instead of racing: an unresolvable UserName leaves launchd
+# registering the job and then never spawning it, with no error anywhere.
+#
+# The group is waited on too. Waiting for the user alone was not enough: a
+# `chown root:_fastcached` issued in the window where only the user had landed
+# fails outright with "illegal group name".
+account_resolvable() {
+    /usr/bin/id -u "$ACCOUNT" >/dev/null 2>&1 \
+        && /usr/bin/dscacheutil -q group -a name "$ACCOUNT" 2>/dev/null | /usr/bin/grep -q .
+}
+
 ATTEMPT=0
-while [ "$ATTEMPT" -lt 50 ] && ! /usr/bin/id -u "$ACCOUNT" >/dev/null 2>&1; do
+while [ "$ATTEMPT" -lt 50 ] && ! account_resolvable; do
     /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
     /bin/sleep 0.1
     ATTEMPT=$((ATTEMPT + 1))
 done
-/usr/bin/id -u "$ACCOUNT" >/dev/null 2>&1 \
-    || echo "fastcached: '${ACCOUNT}' is not resolvable via getpwnam after account creation" >&2
+account_resolvable \
+    || echo "fastcached: '${ACCOUNT}' is not fully resolvable after account creation" >&2
+
+# Numeric ids, read straight from the records just written. Name lookups go
+# through the DirectoryService cache, which lags dscl -- and a chown that names
+# the group does not degrade when that lookup misses, it fails. Reading the
+# directory node avoids the cache entirely, and works on a reinstall too, where
+# the account already exists and NEXT_ID above was never computed.
+ACCOUNT_UID=$(/usr/bin/dscl . -read "/Users/${ACCOUNT}" UniqueID 2>/dev/null | /usr/bin/awk '{print $2}')
+ACCOUNT_GID=$(/usr/bin/dscl . -read "/Groups/${ACCOUNT}" PrimaryGroupID 2>/dev/null | /usr/bin/awk '{print $2}')
 
 mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" || true
-/usr/sbin/chown -R "${ACCOUNT}:${ACCOUNT}" "${PREFIX}/var" || true
+if [ -n "${ACCOUNT_UID:-}" ] && [ -n "${ACCOUNT_GID:-}" ]; then
+    /usr/sbin/chown -R "${ACCOUNT_UID}:${ACCOUNT_GID}" "${PREFIX}/var" || true
+fi
 
 # The daemon drops to ${ACCOUNT} before it opens its config, so the file has to
 # be readable by that account -- and only by it. Group-read rather than
@@ -65,8 +84,19 @@ mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" || true
 # away just as surely as a plist would. Enforced on every install, not only when
 # the file is seeded, so an upgrade repairs a config left world-readable by an
 # earlier release.
-/usr/sbin/chown "root:${ACCOUNT}" "$CONFIG" 2>/dev/null || true
-/bin/chmod 0640 "$CONFIG" 2>/dev/null || true
+#
+# The chmod is conditional on the chown, and that ordering is the whole point:
+# tightening a file the service account does not own yet produces precisely the
+# state --install-service refuses -- mode 0640, group wheel, unreadable by the
+# daemon. Leaving the mode alone degrades to the status quo ante, which is
+# merely too permissive rather than broken, and says so.
+if [ -n "${ACCOUNT_GID:-}" ] && /usr/sbin/chown "0:${ACCOUNT_GID}" "$CONFIG" 2>/dev/null; then
+    /bin/chmod 0640 "$CONFIG" 2>/dev/null || true
+else
+    echo "fastcached: could not give '${ACCOUNT}' ownership of ${CONFIG};" \
+        "leaving its mode alone. Put no secrets in it until you have run:" \
+        "chown root:${ACCOUNT} ${CONFIG} && chmod 0640 ${CONFIG}" >&2
+fi
 
 # A per-user agent registered by an earlier install would fight this daemon for
 # 127.0.0.1:11211. The daemon wins (see postinstall-launchagent.sh.in), so tear
