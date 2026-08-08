@@ -42,11 +42,34 @@ esac
 
 UID_OF_USER=$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null) || exit 0
 
+# No --config, deliberately. The packaged ${PREFIX}/etc/fastcached.yaml
+# describes the *system* daemon: its cache lives under the package prefix and is
+# owned by the service account, which a per-user agent cannot write. Pointing
+# the agent at that file would either break its storage or, with a --storage
+# passed to compensate, make every later edit to storage_path a silent no-op,
+# because a flag in ProgramArguments outranks the same key in YAML. The agent
+# uses per-user defaults instead (a cache under ~/Library/Caches), and needs no
+# file to exist -- which also means it does not depend on the Runtime
+# component's postinstall having run first. macOS does not run component
+# postinstalls in declaration order, and that assumption has already cost one
+# release its system daemon.
+#
+# To give the agent a config, re-register it by hand:
+#   fastcached --install-service --service-scope=user --config=<your file>
+#
 # `launchctl asuser` adopts the target user's bootstrap namespace and audit
 # session but explicitly does NOT change credentials, so `sudo -u` is still
 # required for the process to actually run as them.
-/bin/launchctl asuser "$UID_OF_USER" /usr/bin/sudo -u "$CONSOLE_USER" \
-    "${PREFIX}/bin/fastcached" --install-service --service-scope=user \
-    --config="${PREFIX}/etc/fastcached.yaml" || true
+#
+# Output is kept, not discarded. A postinstall must exit 0 whatever happens, so
+# `|| true` on its own turns a precise diagnostic into an agent that is simply
+# absent -- which is what happened to the daemon component once already.
+REGISTER_LOG="/var/log/fastcached-install.log"
+{
+    echo "--- $(date -u '+%Y-%m-%dT%H:%M:%SZ') registering the ${CONSOLE_USER} agent"
+    /bin/launchctl asuser "$UID_OF_USER" /usr/bin/sudo -u "$CONSOLE_USER" \
+        "${PREFIX}/bin/fastcached" --install-service --service-scope=user 2>&1
+    echo "--- exit=$?"
+} >>"$REGISTER_LOG" 2>&1 || true
 
 exit 0

@@ -197,6 +197,20 @@ serves() {
     [[ "$reply" == *"STORED"* && "$reply" == *"hello"* ]] || fail "service did not serve: $reply"
 }
 
+# Echo the launchd domain holding this user's agent, if any. The candidate list
+# and its order mirror ScopeTraits::domains in ServiceControl.cpp -- assert
+# against every domain the installer could have chosen, not just the preferred
+# one, or an agent in the fallback domain is invisible to this script.
+registered_agent_domain() {
+    for domain in "gui/$(id -u)" "user/$(id -u)"; do
+        if launchctl print "${domain}/${LABEL}" >/dev/null 2>&1; then
+            echo "$domain"
+            return 0
+        fi
+    done
+    return 1
+}
+
 if [[ "$scope" == "daemon" ]]; then
     # No GUI session is involved, so every step here is assertable on a headless
     # runner — which is the whole reason CI runs this variant.
@@ -212,6 +226,17 @@ if [[ "$scope" == "daemon" ]]; then
         || fail "the daemon plist does not pass --config; the config file would never be read"
     ! grep -q -- "--storage" "$plist" \
         || fail "the daemon plist bakes in --storage; storage_path in the config file would be ignored"
+
+    # The daemon drops to _fastcached before opening that file, and the reason
+    # to keep `requirepass:` there rather than in the plist is that it need not
+    # be world-readable. Both halves are asserted: group-readable by the service
+    # account, and not readable by everyone else.
+    # That the daemon can in fact read it is proven functionally a few lines
+    # down, by the job reaching `running` and serving; this pins the mode, which
+    # a functional check cannot distinguish from 0644.
+    config_mode="$(stat -f '%Sp %Su %Sg' "${PREFIX}/etc/fastcached.yaml")"
+    [[ "$config_mode" == "-rw-r----- root _fastcached" ]] \
+        || fail "fastcached.yaml is '${config_mode}', expected '-rw-r----- root _fastcached'"
 
     # Polled: launchd reports a transient `xpcproxy` state while the stub execs
     # the real binary, so a single sample races the spawn.
@@ -235,10 +260,16 @@ else
     # The agent's postinstall deliberately does nothing without a console user,
     # which is the normal case on a runner. Assert whichever outcome applies
     # rather than demanding one that cannot happen here.
-    if launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then
+    #
+    # Both domains are probed, because which one an agent lands in is decided at
+    # install time: gui/<uid> needs an Aqua session, which a runner has not got,
+    # so a registration here falls back to user/<uid>. Probing only gui/<uid>
+    # made a real agent look absent — and made the uninstall assertion below
+    # pass without ever testing anything.
+    if agent_domain="$(registered_agent_domain)"; then
         wait_for_port || fail "nothing listening on 127.0.0.1:${port}"
         serves
-        echo "   agent registered and serving on ${port}"
+        echo "   agent registered in ${agent_domain} and serving on ${port}"
     else
         echo "   no per-user agent (no console session); payload assertions only"
     fi
@@ -252,7 +283,9 @@ echo "$MARKER" | sudo tee -a "${PREFIX}/etc/fastcached.yaml" >/dev/null
 reinstall_log="$(sudo installer -pkg "$pkg" -applyChoiceChangesXML "$choices" -target / 2>&1)" \
     || fail "reinstall failed: $reinstall_log"
 
-grep -qF "$MARKER" "${PREFIX}/etc/fastcached.yaml" \
+# Read as root: the daemon install tightens this file to 0640 root:_fastcached
+# so the `requirepass:` it is meant to hold is not readable by every account.
+sudo grep -qF "$MARKER" "${PREFIX}/etc/fastcached.yaml" \
     || fail "reinstall overwrote the operator's fastcached.yaml"
 
 # --- 6. uninstall must leave nothing ---------------------------------------
@@ -264,7 +297,7 @@ uninstall_log="$(sudo "${PREFIX}/bin/fastcached-uninstall" 2>&1)" \
 [[ ! -e "$PATHS_D" ]] || fail "$PATHS_D still present"
 [[ ! -e /usr/local/bin/fastcached ]]   || fail "/usr/local/bin/fastcached symlink left behind"
 [[ ! -e /usr/local/bin/fastcache-cc ]] || fail "/usr/local/bin/fastcache-cc symlink left behind"
-! launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1 || fail "user agent still registered"
+! registered_agent_domain >/dev/null || fail "user agent still registered in $(registered_agent_domain)"
 ! sudo launchctl print "system/${LABEL}" >/dev/null 2>&1 || fail "system daemon still registered"
 [[ ! -e "/Library/LaunchDaemons/${LABEL}.plist" ]] || fail "system plist left behind"
 [[ -z "$(pkgutil --pkgs | grep "^${LABEL}" || true)" ]] || fail "package receipts left behind"

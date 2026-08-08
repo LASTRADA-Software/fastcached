@@ -18,8 +18,15 @@ ACCOUNT="@FASTCACHED_MACOS_SERVICE_ACCOUNT@"
 # declares in one line has to be built by hand here. The 200..400 band is the
 # convention for hidden system accounts; picking the next free id keeps this
 # from colliding with another package's.
+#
+# Both namespaces are scanned, because the one number becomes the uid *and* the
+# gid below. dscl enforces no uniqueness of its own, and macOS packs system
+# users and groups into this band densely (_softwareupdate is uid 200 and gid
+# 200), so a uid-only scan can hand the new group a gid another group already
+# holds -- which would give that group's members read access to the daemon's
+# on-disk cache once ${PREFIX}/var is chowned.
 if ! /usr/bin/dscl . -read "/Users/${ACCOUNT}" >/dev/null 2>&1; then
-    NEXT_ID=$(/usr/bin/dscl . -list /Users UniqueID \
+    NEXT_ID=$({ /usr/bin/dscl . -list /Users UniqueID; /usr/bin/dscl . -list /Groups PrimaryGroupID; } \
         | /usr/bin/awk '$2 > 200 && $2 < 400 { print $2 }' \
         | /usr/bin/sort -n | /usr/bin/tail -1)
     NEXT_ID=$((${NEXT_ID:-200} + 1))
@@ -49,6 +56,17 @@ done
 
 mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" || true
 /usr/sbin/chown -R "${ACCOUNT}:${ACCOUNT}" "${PREFIX}/var" || true
+
+# The daemon drops to ${ACCOUNT} before it opens its config, so the file has to
+# be readable by that account -- and only by it. Group-read rather than
+# world-read is what makes the documented secure setup reachable: the whole
+# point of putting `requirepass:` in this file instead of on the command line is
+# that it need not be readable by every local user, and a 0644 file gives that
+# away just as surely as a plist would. Enforced on every install, not only when
+# the file is seeded, so an upgrade repairs a config left world-readable by an
+# earlier release.
+/usr/sbin/chown "root:${ACCOUNT}" "$CONFIG" 2>/dev/null || true
+/bin/chmod 0640 "$CONFIG" 2>/dev/null || true
 
 # A per-user agent registered by an earlier install would fight this daemon for
 # 127.0.0.1:11211. The daemon wins (see postinstall-launchagent.sh.in), so tear

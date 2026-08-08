@@ -48,13 +48,22 @@ rm -f "/Library/LaunchDaemons/${LABEL}.plist" || true
 
 # Agents are per-user, and the installing user is not necessarily the one
 # running this. Walk every home directory that has one.
+#
+# Both domains, in the same order ServiceControl's own teardown uses. Which one
+# an agent lives in was decided at install time: `gui/<uid>` needs an Aqua
+# session, so one registered over SSH or on a headless machine landed in
+# `user/<uid>` instead. Booting out only `gui/<uid>` left that job running --
+# and still holding 127.0.0.1:11211 -- while the plist below was deleted and
+# ${PREFIX} removed out from under its binary, with nothing left to reach it.
 for plist in /Users/*/Library/LaunchAgents/"${LABEL}".plist; do
     [ -e "$plist" ] || continue
     owner=$(/usr/bin/stat -f %Su "$plist" 2>/dev/null) || continue
     owner_uid=$(/usr/bin/id -u "$owner" 2>/dev/null) || continue
-    /bin/launchctl asuser "$owner_uid" /usr/bin/sudo -u "$owner" \
-        /bin/launchctl bootout "gui/${owner_uid}/${LABEL}" >/dev/null 2>&1 || true
-    wait_for_job_gone "gui/${owner_uid}/${LABEL}"
+    for domain in "gui/${owner_uid}" "user/${owner_uid}"; do
+        /bin/launchctl asuser "$owner_uid" /usr/bin/sudo -u "$owner" \
+            /bin/launchctl bootout "${domain}/${LABEL}" >/dev/null 2>&1 || true
+        wait_for_job_gone "${domain}/${LABEL}"
+    done
     rm -f "$plist" || true
 done
 

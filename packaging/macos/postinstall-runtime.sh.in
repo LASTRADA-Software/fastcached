@@ -23,9 +23,24 @@ mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" || true
 # fish (which does not read /etc/profile) all miss it. /usr/local/bin is in the
 # stock /etc/paths, so these symlinks make both tools reachable immediately, in
 # every shell, without waiting for a new login.
+#
+# Only an unused name or one already pointing into our prefix is claimed. `-f`
+# on its own unlinks whatever is there first, so a self-built or Homebrew
+# fastcache-cc was destroyed silently -- and the uninstaller, seeing a link that
+# now points into ${PREFIX}, would go on to remove the replacement too, leaving
+# the user with no fastcache-cc at all. The uninstaller has the mirror of this
+# guard; this is the half that went missing.
 mkdir -p /usr/local/bin || true
 for tool in fastcached fastcache-cc; do
-    ln -sfn "${PREFIX}/bin/${tool}" "/usr/local/bin/${tool}" || true
+    link="/usr/local/bin/${tool}"
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        if [ ! -L "$link" ] || [ "$(readlink "$link")" != "${PREFIX}/bin/${tool}" ]; then
+            echo "fastcached: ${link} exists and is not ours; leaving it alone." \
+                "${PREFIX}/bin is still on PATH via /etc/paths.d." >&2
+            continue
+        fi
+    fi
+    ln -sfn "${PREFIX}/bin/${tool}" "$link" || true
 done
 
 exit 0
