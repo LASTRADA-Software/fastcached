@@ -18,12 +18,12 @@
 #                           installed, and the *live* config is NOT payload (or
 #                           the seed-if-absent postinstall is dead code and an
 #                           upgrade eats the operator's edits).
-#   3. Panes are legible  — every installer pane declares the mime-type its
-#                           resource actually is. Installer.app renders a pane
-#                           by that attribute and not by the file extension, so
-#                           an .html pane without it is shown with its tags
-#                           visible — which is how the welcome and read-me panes
-#                           shipped once, while the .txt license looked fine.
+#   3. Panes are legible  — each HTML pane starts with a doctype and declares
+#                           utf-8. Installer.app sniffs the first bytes to decide
+#                           HTML from plain text, so a leading comment makes the
+#                           pane render with every tag visible — which is how the
+#                           welcome and read-me panes shipped once, while the
+#                           .txt license looked fine and disguised it.
 #   4. Service runs       — the selected launchd job is registered and serving.
 #   5. Config survives    — an edit made after install is still there after a
 #                           reinstall of the same package.
@@ -123,35 +123,38 @@ done
 ! grep -qE '^(include|lib)/' <<<"$payload" \
     || fail "payload contains dependency headers/libraries at the filesystem root"
 
-# Every installer pane must declare the mime-type of its resource. Installer.app
-# renders a pane according to that attribute, not according to the file's
-# extension, so an .html pane without it is displayed with its markup showing.
-# CMake's stock Distribution template emits no mime-type at all, which is how
-# this shipped: cmake/Packaging.cmake generates an override, and this is the
-# assertion that the override actually reached productbuild. The table mirrors
-# the one there — kept as rows rather than an associative array, because
-# /bin/bash on macOS is still 3.2.
+# Installer.app decides whether a pane is HTML or plain text by sniffing the
+# start of the resource, so an .html pane whose first bytes are a comment is
+# displayed with every tag visible. That is how the welcome and read-me panes
+# shipped, and the .txt licence rendering correctly is what disguised it. A
+# mime-type="text/html" in the Distribution XML does NOT override the sniff —
+# that was tried, and the panes stayed raw — so the assertion is on the file's
+# first token, which is what actually decides.
+#
+# The charset check covers the defect underneath: without it the em dashes in
+# both panes arrived as mojibake, which only became visible once the markup
+# stopped hiding it.
 echo "== checking the installer panes"
 distribution="${workdir}/expanded/Distribution"
 [[ -r "$distribution" ]] || fail "the expanded package has no Distribution file"
 
-pane_mime_types=(".txt=text/plain" ".html=text/html" ".rtf=text/rtf" ".rtfd=text/rtfd")
 for pane in welcome readme license; do
     element="$(grep -o "<${pane}[^>]*>" "$distribution" | head -1)"
     [[ -n "$element" ]] || fail "the Distribution file declares no <${pane}> pane"
 
     paneFile="$(sed -n 's/.*file="\([^"]*\)".*/\1/p' <<<"$element")"
-    paneMime="$(sed -n 's/.*mime-type="\([^"]*\)".*/\1/p' <<<"$element")"
     [[ -n "$paneFile" ]] || fail "<${pane}> names no resource file: ${element}"
 
-    expected=""
-    for row in "${pane_mime_types[@]}"; do
-        [[ "${row%%=*}" == ".${paneFile##*.}" ]] && expected="${row#*=}"
-    done
-    [[ -n "$expected" ]] \
-        || fail "<${pane}> names ${paneFile}, whose extension productbuild does not render"
-    [[ "$paneMime" == "$expected" ]] || fail \
-        "<${pane}> gives ${paneFile} mime-type='${paneMime:-<none>}', expected '${expected}'; Installer.app would render that pane as plain text"
+    resource="${workdir}/expanded/Resources/${paneFile}"
+    [[ -r "$resource" ]] || fail "<${pane}> names ${paneFile}, which is not in the package's Resources"
+
+    [[ "$paneFile" == *.html ]] || continue
+
+    firstToken="$(sed -n '/[^[:space:]]/{p;q;}' "$resource")"
+    grep -qiE '^<(!doctype|html)' <<<"$firstToken" || fail \
+        "${paneFile} starts with '${firstToken}' instead of a doctype or <html>; Installer.app would render that pane as raw markup"
+    grep -qi 'charset=[""]*utf-8' "$resource" || fail \
+        "${paneFile} declares no utf-8 charset; its non-ASCII characters would render as mojibake"
 done
 
 # --- 2. the shipped binaries must be redistributable -----------------------

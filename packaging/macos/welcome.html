@@ -1,5 +1,12 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: Apache-2.0
+     The doctype must come first and the comment after it. Installer.app decides
+     whether a pane is HTML or plain text by sniffing the start of the file, and
+     a leading comment defeats that sniff: the pane is then shown with its tags
+     visible. Declaring mime-type="text/html" in the Distribution XML does not
+     rescue it -- the sniff is what decides. -->
 <html>
+<head><meta charset="utf-8"></head>
 <body style="font-family: -apple-system, sans-serif; font-size: 13px;">
 
 <p>This installs <b>fastcached</b>, a fast cache daemon speaking the memcached
