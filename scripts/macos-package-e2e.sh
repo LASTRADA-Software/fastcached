@@ -234,9 +234,18 @@ if [[ "$scope" == "daemon" ]]; then
     # That the daemon can in fact read it is proven functionally a few lines
     # down, by the job reaching `running` and serving; this pins the mode, which
     # a functional check cannot distinguish from 0644.
-    config_mode="$(stat -f '%Sp %Su %Sg' "${PREFIX}/etc/fastcached.yaml")"
-    [[ "$config_mode" == "-rw-r----- root _fastcached" ]] \
-        || fail "fastcached.yaml is '${config_mode}', expected '-rw-r----- root _fastcached'"
+    config_mode="$(stat -f '%Sp %Su' "${PREFIX}/etc/fastcached.yaml")"
+    [[ "$config_mode" == "-rw-r----- root" ]] \
+        || fail "fastcached.yaml is '${config_mode}', expected '-rw-r----- root'"
+
+    # The group is compared numerically. %Sg would need a gid->name lookup,
+    # which is the very thing that has been unreliable right after account
+    # creation -- and the daemon compares numerically too, via getpwnam's
+    # pw_gid, so this asserts what actually governs access.
+    config_gid="$(stat -f '%g' "${PREFIX}/etc/fastcached.yaml")"
+    account_gid="$(dscl . -read /Users/_fastcached PrimaryGroupID | awk '{print $2}')"
+    [[ -n "$account_gid" && "$config_gid" == "$account_gid" ]] \
+        || fail "fastcached.yaml gid is '${config_gid}', expected _fastcached's '${account_gid:-<unset>}'"
 
     # Polled: launchd reports a transient `xpcproxy` state while the stub execs
     # the real binary, so a single sample races the spawn.

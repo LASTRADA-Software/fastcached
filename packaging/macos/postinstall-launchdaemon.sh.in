@@ -31,7 +31,12 @@ if ! /usr/bin/dscl . -read "/Users/${ACCOUNT}" >/dev/null 2>&1; then
         | /usr/bin/sort -n | /usr/bin/tail -1)
     NEXT_ID=$((${NEXT_ID:-200} + 1))
 
-    /usr/bin/dscl . -create "/Groups/${ACCOUNT}" PrimaryGroupID "$NEXT_ID" || true
+    # dseditgroup, not `dscl -create /Groups/...`: it is the supported interface
+    # for group records, and a group assembled attribute-by-attribute with dscl
+    # is reachable through the directory node but not reliably through
+    # getgrnam(3) -- which is exactly what `chown user:group` uses, and what
+    # failed here with "illegal group name".
+    /usr/sbin/dseditgroup -q -o create -r "fastcached daemon" -i "$NEXT_ID" "$ACCOUNT" || true
     /usr/bin/dscl . -create "/Users/${ACCOUNT}" UniqueID "$NEXT_ID" || true
     /usr/bin/dscl . -create "/Users/${ACCOUNT}" PrimaryGroupID "$NEXT_ID" || true
     /usr/bin/dscl . -create "/Users/${ACCOUNT}" UserShell /usr/bin/false || true
@@ -41,27 +46,28 @@ if ! /usr/bin/dscl . -read "/Users/${ACCOUNT}" >/dev/null 2>&1; then
     /usr/bin/dscl . -create "/Users/${ACCOUNT}" IsHidden 1 || true
 fi
 
-# dscl returns before the records are resolvable through getpwnam(3) and
-# getgrnam(3), which is what launchd -- and fastcached's own pre-flight check --
-# actually use. Wait instead of racing: an unresolvable UserName leaves launchd
-# registering the job and then never spawning it, with no error anywhere.
+# dscl returns before the record is resolvable through getpwnam(3), which is
+# what launchd -- and fastcached's own pre-flight check -- actually use. Wait
+# instead of racing: an unresolvable UserName leaves launchd registering the job
+# and then never spawning it, with no error anywhere.
 #
-# The group is waited on too. Waiting for the user alone was not enough: a
-# `chown root:_fastcached` issued in the window where only the user had landed
-# fails outright with "illegal group name".
-account_resolvable() {
-    /usr/bin/id -u "$ACCOUNT" >/dev/null 2>&1 \
-        && /usr/bin/dscacheutil -q group -a name "$ACCOUNT" 2>/dev/null | /usr/bin/grep -q .
-}
-
+# One flush, then poll. Flushing the whole DirectoryService cache on every
+# iteration is not free, and a loop that ran its full fifty rounds -- which is
+# what happens the moment the condition is something that never becomes true --
+# left opendirectoryd wedged badly enough that the --install-service after it
+# never returned and the installer killed the script ten minutes later.
+#
+# The group is deliberately *not* waited on. Nothing below needs it by name:
+# the chowns use numeric ids, so group-name resolution is launchd's problem
+# alone, and blocking the install on it buys nothing.
+/usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
 ATTEMPT=0
-while [ "$ATTEMPT" -lt 50 ] && ! account_resolvable; do
-    /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
+while [ "$ATTEMPT" -lt 50 ] && ! /usr/bin/id -u "$ACCOUNT" >/dev/null 2>&1; do
     /bin/sleep 0.1
     ATTEMPT=$((ATTEMPT + 1))
 done
-account_resolvable \
-    || echo "fastcached: '${ACCOUNT}' is not fully resolvable after account creation" >&2
+/usr/bin/id -u "$ACCOUNT" >/dev/null 2>&1 \
+    || echo "fastcached: '${ACCOUNT}' is not resolvable via getpwnam after account creation" >&2
 
 # Numeric ids, read straight from the records just written. Name lookups go
 # through the DirectoryService cache, which lags dscl -- and a chown that names
