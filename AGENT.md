@@ -130,6 +130,16 @@ These constraints are load-bearing and have each already been a bug:
 - **A macOS `.pkg` has no conffile mechanism.** It overwrites its payload on
   every install, so the live `fastcached.yaml` is deliberately not payload: the
   Runtime postinstall seeds it from a shipped `.default` only when absent.
+- **An installer pane is rendered by its `mime-type`, not its extension.** The
+  Distribution XML's `<welcome>`/`<readme>`/`<license>` elements carry that
+  attribute, CMake's stock `CPack.distribution.dist.in` emits none, and CPack has
+  no variable to add one — so the HTML welcome and read-me panes shipped with
+  their tags showing while the `.txt` license pane looked perfectly fine and
+  concealed it. `cmake/Packaging.cmake` generates an overriding template (found
+  via `CMAKE_MODULE_PATH`, which must be extended *before* `include(CPack)`
+  snapshots it into `CPACK_MODULE_PATH`) from whatever template the running CMake
+  ships, rather than committing a copy whose choices-outline placeholder would go
+  stale and silently produce a package offering no choices at all.
 - **Third-party `install()` rules must be excluded.** A CPM-fetched zstd brings
   its own, and with the payload rooted at `/` they put `zstd.h` and `libzstd.a`
   into `/include` and `/lib` on the user's machine. Hence `EXCLUDE_FROM_ALL`.

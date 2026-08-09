@@ -313,6 +313,100 @@ if(APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
     set(CPACK_RESOURCE_FILE_WELCOME "${CMAKE_SOURCE_DIR}/packaging/macos/welcome.html")
     set(CPACK_RESOURCE_FILE_README  "${CMAKE_SOURCE_DIR}/packaging/macos/readme.html")
 
+    # Installer.app decides how to render a pane from the `mime-type` attribute
+    # on the Distribution XML's <welcome>/<readme>/<license> element, *not* from
+    # the resource's file extension. Apple's schema marks the attribute optional
+    # and documents no default; in practice .txt and .rtf are sniffed correctly
+    # without it and .html is not — it is displayed with its tags showing. CMake's
+    # stock CPack.distribution.dist.in emits no mime-type at all, and CPack
+    # exposes no variable to add one (it has them only for the background
+    # images), so the two panes above shipped unreadable. The .txt license pane
+    # rendering correctly is what made it look as though nothing was wrong.
+    #
+    # The documented escape hatch is a project-supplied CPack.distribution.dist.in
+    # on CMAKE_MODULE_PATH, which cmCPackGenerator::FindTemplate prefers over its
+    # own copy. What follows *generates* that override from whatever template the
+    # running CMake ships rather than committing a copy of it: every other line in
+    # that file is CMake's own business and is version-specific — 4.x substitutes
+    # @CPACK_APPLE_PKG_INSTALLER_CONTENT@ for the choices outline where older
+    # releases used @CPACK_PACKAGEMAKER_CHOICES@ — so a stale copy would yield a
+    # package with no installer choices at all. That is worse than the bug being
+    # fixed here and just as invisible until someone double-clicks the result.
+
+    # One row per extension productbuild accepts. An extension that is not in the
+    # table is a hard error rather than an empty attribute: an empty mime-type is
+    # this same bug wearing a different hat.
+    set(FASTCACHED_PANE_MIME_TYPES
+        ".txt=text/plain"
+        ".html=text/html"
+        ".rtf=text/rtf"
+        ".rtfd=text/rtfd")
+
+    foreach(pane IN ITEMS WELCOME README LICENSE)
+        get_filename_component(paneExtension "${CPACK_RESOURCE_FILE_${pane}}" LAST_EXT)
+        string(TOLOWER "${paneExtension}" paneExtension)
+        set(paneMime "")
+        foreach(row IN LISTS FASTCACHED_PANE_MIME_TYPES)
+            string(REPLACE "=" ";" rowFields "${row}")
+            list(GET rowFields 0 rowExtension)
+            list(GET rowFields 1 rowMime)
+            if(paneExtension STREQUAL rowExtension)
+                set(paneMime "${rowMime}")
+                break()
+            endif()
+        endforeach()
+        if(NOT paneMime)
+            message(FATAL_ERROR
+                "CPACK_RESOURCE_FILE_${pane} is '${CPACK_RESOURCE_FILE_${pane}}', whose extension "
+                "'${paneExtension}' has no entry in FASTCACHED_PANE_MIME_TYPES. The installer would "
+                "render that pane as plain text. Add the extension to the table above, or point the "
+                "variable at a resource productbuild accepts.")
+        endif()
+        set(CPACK_RESOURCE_FILE_${pane}_MIME "${paneMime}")
+    endforeach()
+
+    # The template moved into Modules/Internal/CPack/ in CMake 3.19; both homes
+    # are probed so this is not pinned to one layout.
+    set(paneTemplate "")
+    foreach(candidate IN ITEMS
+            "${CMAKE_ROOT}/Modules/Internal/CPack/CPack.distribution.dist.in"
+            "${CMAKE_ROOT}/Modules/CPack.distribution.dist.in")
+        if(EXISTS "${candidate}")
+            set(paneTemplate "${candidate}")
+            break()
+        endif()
+    endforeach()
+    if(NOT paneTemplate)
+        message(FATAL_ERROR
+            "CPack's CPack.distribution.dist.in was not found under ${CMAKE_ROOT}/Modules. The "
+            "installer panes cannot be given a mime-type without it, and would ship rendering as "
+            "raw markup.")
+    endif()
+
+    file(READ "${paneTemplate}" paneDistribution)
+    foreach(pane IN ITEMS WELCOME README LICENSE)
+        set(paneFrom "file=\"@CPACK_RESOURCE_FILE_${pane}_NOPATH@\"")
+        set(paneTo   "${paneFrom} mime-type=\"@CPACK_RESOURCE_FILE_${pane}_MIME@\"")
+        string(REPLACE "${paneFrom}" "${paneTo}" panePatched "${paneDistribution}")
+        # An unchanged string means the template no longer looks the way this
+        # substitution expects. Failing here is the point: the alternative is
+        # silently shipping the panes as raw markup again.
+        if(panePatched STREQUAL paneDistribution)
+            message(FATAL_ERROR
+                "${paneTemplate} (CMake ${CMAKE_VERSION}) no longer spells the ${pane} pane as "
+                "${paneFrom}. Update the substitution in cmake/Packaging.cmake to match it.")
+        endif()
+        set(paneDistribution "${panePatched}")
+    endforeach()
+
+    # Written before include(CPack) on purpose: CPACK_MODULE_PATH is defaulted
+    # from CMAKE_MODULE_PATH at that moment and cpack then *replaces*
+    # CMAKE_MODULE_PATH with it, so a directory appended afterwards would never
+    # be searched and the override would be silently ignored.
+    set(FASTCACHED_CPACK_TEMPLATE_DIR "${CMAKE_BINARY_DIR}/cpack-templates")
+    file(WRITE "${FASTCACHED_CPACK_TEMPLATE_DIR}/CPack.distribution.dist.in" "${paneDistribution}")
+    list(APPEND CMAKE_MODULE_PATH "${FASTCACHED_CPACK_TEMPLATE_DIR}")
+
     # <COMPONENT> in these variable names is the component name uppercased.
     if(FASTCACHED_MACOS_SCRIPT_DIR)
         set(CPACK_POSTFLIGHT_RUNTIME_SCRIPT      "${FASTCACHED_MACOS_SCRIPT_DIR}/postinstall-runtime")

@@ -18,10 +18,16 @@
 #                           installed, and the *live* config is NOT payload (or
 #                           the seed-if-absent postinstall is dead code and an
 #                           upgrade eats the operator's edits).
-#   3. Service runs       — the selected launchd job is registered and serving.
-#   4. Config survives    — an edit made after install is still there after a
+#   3. Panes are legible  — every installer pane declares the mime-type its
+#                           resource actually is. Installer.app renders a pane
+#                           by that attribute and not by the file extension, so
+#                           an .html pane without it is shown with its tags
+#                           visible — which is how the welcome and read-me panes
+#                           shipped once, while the .txt license looked fine.
+#   4. Service runs       — the selected launchd job is registered and serving.
+#   5. Config survives    — an edit made after install is still there after a
 #                           reinstall of the same package.
-#   5. Uninstall is total — no files, no job, no PATH entry, no receipts.
+#   6. Uninstall is total — no files, no job, no PATH entry, no receipts.
 #
 # --scope selects which launchd choice the installer is driven with:
 #
@@ -116,6 +122,37 @@ done
 # Third-party build artefacts must not leak into a package rooted at /.
 ! grep -qE '^(include|lib)/' <<<"$payload" \
     || fail "payload contains dependency headers/libraries at the filesystem root"
+
+# Every installer pane must declare the mime-type of its resource. Installer.app
+# renders a pane according to that attribute, not according to the file's
+# extension, so an .html pane without it is displayed with its markup showing.
+# CMake's stock Distribution template emits no mime-type at all, which is how
+# this shipped: cmake/Packaging.cmake generates an override, and this is the
+# assertion that the override actually reached productbuild. The table mirrors
+# the one there — kept as rows rather than an associative array, because
+# /bin/bash on macOS is still 3.2.
+echo "== checking the installer panes"
+distribution="${workdir}/expanded/Distribution"
+[[ -r "$distribution" ]] || fail "the expanded package has no Distribution file"
+
+pane_mime_types=(".txt=text/plain" ".html=text/html" ".rtf=text/rtf" ".rtfd=text/rtfd")
+for pane in welcome readme license; do
+    element="$(grep -o "<${pane}[^>]*>" "$distribution" | head -1)"
+    [[ -n "$element" ]] || fail "the Distribution file declares no <${pane}> pane"
+
+    paneFile="$(sed -n 's/.*file="\([^"]*\)".*/\1/p' <<<"$element")"
+    paneMime="$(sed -n 's/.*mime-type="\([^"]*\)".*/\1/p' <<<"$element")"
+    [[ -n "$paneFile" ]] || fail "<${pane}> names no resource file: ${element}"
+
+    expected=""
+    for row in "${pane_mime_types[@]}"; do
+        [[ "${row%%=*}" == ".${paneFile##*.}" ]] && expected="${row#*=}"
+    done
+    [[ -n "$expected" ]] \
+        || fail "<${pane}> names ${paneFile}, whose extension productbuild does not render"
+    [[ "$paneMime" == "$expected" ]] || fail \
+        "<${pane}> gives ${paneFile} mime-type='${paneMime:-<none>}', expected '${expected}'; Installer.app would render that pane as plain text"
+done
 
 # --- 2. the shipped binaries must be redistributable -----------------------
 echo "== checking dynamic-library dependencies"
