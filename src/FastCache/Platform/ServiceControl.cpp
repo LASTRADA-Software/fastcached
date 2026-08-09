@@ -404,7 +404,7 @@ namespace
         std::array<std::string_view, 2> domains;
         bool homeRelative;         ///< plistDirectory is relative to the user's home.
         bool alwaysKeepAlive;      ///< KeepAlive=<true/> vs {Crashed:true}; see below.
-        bool runsAsServiceAccount; ///< Emit UserName/GroupName.
+        bool runsAsServiceAccount; ///< Emit UserName (the group follows from it).
     };
 
     constexpr auto ScopeTable = std::to_array<ScopeTraits>({
@@ -560,8 +560,14 @@ std::string BuildLaunchdPlist(std::filesystem::path const& exePath,
 
     if (traits.runsAsServiceAccount)
     {
+        // UserName only. launchd already runs the job under that account's
+        // primary group when GroupName is absent, so naming it adds nothing —
+        // except a second name to resolve, and a job whose group cannot be
+        // resolved does not fail: launchd parks it in "spawn scheduled"
+        // indefinitely, and the `kickstart` that waits for the spawn hangs with
+        // it until something kills the installer. One name to resolve is one
+        // failure mode, not two.
         out += std::format("    <key>UserName</key>\n    <string>{}</string>\n", ServiceAccount);
-        out += std::format("    <key>GroupName</key>\n    <string>{}</string>\n", ServiceAccount);
     }
 
     out += "    <key>ProcessType</key>\n    <string>Interactive</string>\n";

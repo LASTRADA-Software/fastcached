@@ -26,10 +26,21 @@ ACCOUNT="@FASTCACHED_MACOS_SERVICE_ACCOUNT@"
 # holds -- which would give that group's members read access to the daemon's
 # on-disk cache once ${PREFIX}/var is chowned.
 if ! /usr/bin/dscl . -read "/Users/${ACCOUNT}" >/dev/null 2>&1; then
+    # The first id in the band that no user and no group already holds, rather
+    # than max+1. max+1 produced exactly the collision it was meant to avoid:
+    # the scan excluded 400, so a highest-in-band of 399 (com.apple.access_ssh
+    # on a stock system) chose 400 -- which com.apple.access_remote_ae already
+    # had. Creating the group then failed, and a LaunchDaemon whose group does
+    # not exist never spawns.
+    #
+    # $NF, not $2: a record name may contain spaces, and the id is always last.
     NEXT_ID=$({ /usr/bin/dscl . -list /Users UniqueID; /usr/bin/dscl . -list /Groups PrimaryGroupID; } \
-        | /usr/bin/awk '$2 > 200 && $2 < 400 { print $2 }' \
-        | /usr/bin/sort -n | /usr/bin/tail -1)
-    NEXT_ID=$((${NEXT_ID:-200} + 1))
+        | /usr/bin/awk '{ used[$NF] = 1 }
+                        END { for (id = 200; id <= 400; id++) if (!(id in used)) { print id; exit } }')
+    if [ -z "${NEXT_ID:-}" ]; then
+        echo "fastcached: no free id in 200..400 for the '${ACCOUNT}' account" >&2
+        exit 0
+    fi
 
     # Both interfaces, because neither is reliable alone here: dseditgroup is
     # the supported one and produces a record getgrnam(3) can find, but it has

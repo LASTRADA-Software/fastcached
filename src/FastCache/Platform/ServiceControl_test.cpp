@@ -204,6 +204,13 @@ TEST_CASE("ServiceControl: only the system job runs as the service account", "[p
     // A LaunchAgent already runs as the logged-in user; naming a UserName it
     // cannot assume makes launchd refuse the job.
     REQUIRE(!PlistFor(cfg, ServiceScope::User).contains("<key>UserName</key>"));
+
+    // GroupName is deliberately absent even for the system job: launchd already
+    // uses the account's primary group when it is omitted, so it names a second
+    // thing to resolve for no gain. When that resolution failed, the job did not
+    // fail with it -- launchd left it in "spawn scheduled" forever and the
+    // kickstart waiting on the spawn hung until the installer killed the script.
+    REQUIRE(!PlistFor(cfg, ServiceScope::System).contains("<key>GroupName</key>"));
 }
 
 TEST_CASE("ServiceControl: resource policy keys are always present", "[platform][service][launchd]")
