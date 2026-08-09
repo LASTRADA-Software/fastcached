@@ -923,8 +923,19 @@ jobs:
           set -euo pipefail
           # hdiutil intermittently hangs on GitHub runners while XProtect scans
           # the image being created; see actions/runner-images#7522.
+          #
+          # Killing it once here is not enough on its own: XProtect is
+          # launchd-managed and relaunches on demand, and cpack signs two
+          # binaries and builds three component packages before it ever reaches
+          # hdiutil. So this keeps it down for as long as cpack runs, and
+          # MacOSNotarizePkg.cmake bounds the hdiutil call itself — belt and
+          # braces, because the failure mode is a wedge rather than an error and
+          # costs the job's whole 30 minutes.
           sudo pkill -9 XProtect >/dev/null 2>&1 || true
           while pgrep XProtect >/dev/null; do sleep 3; done
+          ( while :; do sudo pkill -9 XProtect >/dev/null 2>&1 || true; sleep 5; done ) &
+          reaper=$!
+          trap 'kill "$reaper" 2>/dev/null || true' EXIT
           cd out/build/macos-package && cpack -G "productbuild;TGZ"
 
       - name: "Inspect the .pkg payload"

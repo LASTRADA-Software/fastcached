@@ -74,13 +74,45 @@ foreach(_package IN LISTS CPACK_PACKAGE_FILES)
     file(MAKE_DIRECTORY "${_stage}")
     file(COPY "${_package}" DESTINATION "${_stage}")
 
-    file(REMOVE "${_dmg}")
-    message(STATUS "Creating ${_dmg}")
-    execute_process(
-        COMMAND hdiutil create -volname "fastcached ${CPACK_PACKAGE_VERSION}"
-                -srcfolder "${_stage}" -fs APFS -format UDZO -ov "${_dmg}"
-        COMMAND_ERROR_IS_FATAL ANY
-    )
+    # hdiutil intermittently wedges on GitHub's runners while a background
+    # scanner holds the image it has just written (actions/runner-images#7522).
+    # It does not fail, it waits — so an unbounded call turns a forty-second
+    # step into a job that burns its entire timeout and reports nothing but
+    # "The action 'Package' has timed out". The job kills XProtect before cpack,
+    # which is three component packages and a round of code signing too early
+    # for it to still be dead by the time we get here, and it is launchd-managed
+    # so it comes back on demand regardless.
+    #
+    # Bounding each attempt is what makes the failure legible: a transient hold
+    # clears on the retry, and a persistent one fails in minutes with a message
+    # naming hdiutil rather than the whole step.
+    set(_dmgAttempts 2)
+    set(_dmgTimeout 240)
+    set(_dmgResult "not attempted")
+
+    foreach(_attempt RANGE 1 ${_dmgAttempts})
+        # A wedged attempt can leave a partial image behind, and -ov alone does
+        # not always reclaim it.
+        file(REMOVE "${_dmg}")
+        message(STATUS "Creating ${_dmg} (attempt ${_attempt}/${_dmgAttempts})")
+        execute_process(
+            COMMAND hdiutil create -volname "fastcached ${CPACK_PACKAGE_VERSION}"
+                    -srcfolder "${_stage}" -fs APFS -format UDZO -ov "${_dmg}"
+            TIMEOUT ${_dmgTimeout}
+            RESULT_VARIABLE _dmgResult
+        )
+        if(_dmgResult STREQUAL "0")
+            break()
+        endif()
+        message(WARNING "hdiutil create did not finish (${_dmgResult}); retrying")
+    endforeach()
+
+    if(NOT _dmgResult STREQUAL "0")
+        message(FATAL_ERROR
+            "hdiutil create did not produce ${_dmg} within ${_dmgTimeout}s "
+            "across ${_dmgAttempts} attempts: ${_dmgResult}")
+    endif()
+
     file(REMOVE_RECURSE "${_stage}")
 
     if(CPACK_FASTCACHED_SIGN_IDENTITY_APP)
