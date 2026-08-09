@@ -21,6 +21,7 @@
     #include <sys/stat.h>
     #include <sys/wait.h>
 
+    #include <csignal>
     #include <cstring>
     #include <fstream>
 
@@ -822,7 +823,22 @@ namespace
         Silence, ///< Discard: this call is expected to fail in normal operation.
     };
 
-    /// Run `launchctl` with @p args, waiting for it to finish.
+    /// Returned by RunLaunchctl when the call had to be killed at its deadline.
+    constexpr int LaunchctlTimedOut = -2;
+
+    /// Returned by RunLaunchctl when launchctl could not be started at all.
+    constexpr int LaunchctlNotStarted = -1;
+
+    /// How long any single launchctl call may take before it is killed.
+    ///
+    /// An installer must never be able to hang. A launchctl subcommand that
+    /// blocks turns a postinstall into a script the macOS Installer kills
+    /// minutes later with "An error occurred while running scripts" — which
+    /// names no command, no argument and no reason. Bounding each call trades
+    /// an unfalsifiable stall for a message that says which one stopped.
+    constexpr int LaunchctlTimeoutSeconds = 60;
+
+    /// Run `launchctl` with @p args, waiting up to LaunchctlTimeoutSeconds.
     ///
     /// posix_spawn with an explicit argv rather than system(): every argument
     /// here is a path or a label that can contain shell metacharacters, and a
@@ -858,12 +874,48 @@ namespace
             ::posix_spawn_file_actions_destroy(actionsPtr);
 
         if (spawned != 0)
-            return -1;
+            return LaunchctlNotStarted;
 
-        int status = 0;
-        if (::waitpid(pid, &status, 0) < 0)
-            return -1;
-        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        // Polled rather than a blocking waitpid, so the deadline is enforceable.
+        auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds { LaunchctlTimeoutSeconds };
+        while (true)
+        {
+            int status = 0;
+            auto const reaped = ::waitpid(pid, &status, WNOHANG);
+            if (reaped == pid)
+                return WIFEXITED(status) ? WEXITSTATUS(status) : LaunchctlNotStarted;
+            if (reaped < 0)
+                return LaunchctlNotStarted;
+
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                (void) ::kill(pid, SIGKILL);
+                int discarded = 0;
+                (void) ::waitpid(pid, &discarded, 0);
+                return LaunchctlTimedOut;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds { 20 });
+        }
+    }
+
+    /// Human-readable form of a RunLaunchctl status.
+    ///
+    /// A killed or unstartable call must not surface as a bare negative number
+    /// in an operator-facing message; the whole point of bounding the call is
+    /// that the failure says what happened.
+    /// @param status Value returned by RunLaunchctl.
+    /// @return A phrase that reads correctly after "failed (".
+    [[nodiscard]] std::string LaunchctlStatusText(int status)
+    {
+        switch (status)
+        {
+            case LaunchctlTimedOut:
+                return std::format("killed after {}s with no result", LaunchctlTimeoutSeconds);
+            case LaunchctlNotStarted:
+                return "could not be started";
+            default:
+                return std::format("status {}", status);
+        }
     }
 
     /// Fill the `{}` placeholder of a domain pattern with the invoking uid.
@@ -1110,8 +1162,10 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
 
     if (auto const rc = RunLaunchctl({ "bootstrap", domain, plistPath.string() }); rc != 0)
         return { .exitCode = 1,
-                 .message = std::format(
-                     "wrote {} but `launchctl bootstrap {}` failed (status {})", plistPath.string(), domain, rc) };
+                 .message = std::format("wrote {} but `launchctl bootstrap {}` failed ({})",
+                                        plistPath.string(),
+                                        domain,
+                                        LaunchctlStatusText(rc)) };
 
     // bootstrap only *loads* the job. Despite RunAtLoad, launchd records the
     // spawn as "pended nondemand spawn = speculative" and can leave it unstarted
@@ -1120,10 +1174,10 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
     // forces the spawn, so the service really is up when this returns.
     if (auto const rc = RunLaunchctl({ "kickstart", "-k", serviceTarget }); rc != 0)
         return { .exitCode = 1,
-                 .message = std::format("registered '{}' but `launchctl kickstart` failed (status {}); "
+                 .message = std::format("registered '{}' but `launchctl kickstart` failed ({}); "
                                         "it will start at the next login or boot",
                                         label,
-                                        rc) };
+                                        LaunchctlStatusText(rc)) };
 
     return { .exitCode = 0,
              .message = std::format("installed and started launchd job '{}' ({} scope, {})",

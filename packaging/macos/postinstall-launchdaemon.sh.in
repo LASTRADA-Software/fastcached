@@ -31,12 +31,16 @@ if ! /usr/bin/dscl . -read "/Users/${ACCOUNT}" >/dev/null 2>&1; then
         | /usr/bin/sort -n | /usr/bin/tail -1)
     NEXT_ID=$((${NEXT_ID:-200} + 1))
 
-    # dseditgroup, not `dscl -create /Groups/...`: it is the supported interface
-    # for group records, and a group assembled attribute-by-attribute with dscl
-    # is reachable through the directory node but not reliably through
-    # getgrnam(3) -- which is exactly what `chown user:group` uses, and what
-    # failed here with "illegal group name".
+    # Both interfaces, because neither is reliable alone here: dseditgroup is
+    # the supported one and produces a record getgrnam(3) can find, but it has
+    # been observed to leave no record at all on a fresh runner; dscl always
+    # writes one, though a group assembled attribute-by-attribute is not always
+    # resolvable by name. Whichever lands first wins, and nothing below depends
+    # on the outcome -- the ids used for chown come from the *user* record.
     /usr/sbin/dseditgroup -q -o create -r "fastcached daemon" -i "$NEXT_ID" "$ACCOUNT" || true
+    if ! /usr/bin/dscl . -read "/Groups/${ACCOUNT}" PrimaryGroupID >/dev/null 2>&1; then
+        /usr/bin/dscl . -create "/Groups/${ACCOUNT}" PrimaryGroupID "$NEXT_ID" || true
+    fi
     /usr/bin/dscl . -create "/Users/${ACCOUNT}" UniqueID "$NEXT_ID" || true
     /usr/bin/dscl . -create "/Users/${ACCOUNT}" PrimaryGroupID "$NEXT_ID" || true
     /usr/bin/dscl . -create "/Users/${ACCOUNT}" UserShell /usr/bin/false || true
@@ -74,8 +78,19 @@ done
 # the group does not degrade when that lookup misses, it fails. Reading the
 # directory node avoids the cache entirely, and works on a reinstall too, where
 # the account already exists and NEXT_ID above was never computed.
+#
+# BOTH ids come from the *user* record. The gid there is the account's
+# PrimaryGroupID, which is exactly the pw_gid getpwnam(3) hands the daemon and
+# therefore exactly what its own readability check compares against. Reading it
+# from /Groups instead made the whole thing hostage to a group record that
+# turned out not to exist: the id came back empty, every chown was skipped, and
+# the config was left in a state the install then refused.
 ACCOUNT_UID=$(/usr/bin/dscl . -read "/Users/${ACCOUNT}" UniqueID 2>/dev/null | /usr/bin/awk '{print $2}')
-ACCOUNT_GID=$(/usr/bin/dscl . -read "/Groups/${ACCOUNT}" PrimaryGroupID 2>/dev/null | /usr/bin/awk '{print $2}')
+ACCOUNT_GID=$(/usr/bin/dscl . -read "/Users/${ACCOUNT}" PrimaryGroupID 2>/dev/null | /usr/bin/awk '{print $2}')
+
+# Recorded because two runs were lost to guessing at this from the outside.
+echo "fastcached: account ${ACCOUNT} uid=${ACCOUNT_UID:-<none>} gid=${ACCOUNT_GID:-<none>}" \
+    "group-record=$(/usr/bin/dscl . -read "/Groups/${ACCOUNT}" PrimaryGroupID 2>/dev/null | /usr/bin/awk '{print $2}' || true)" >&2
 
 mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" || true
 if [ -n "${ACCOUNT_UID:-}" ] && [ -n "${ACCOUNT_GID:-}" ]; then
