@@ -411,3 +411,30 @@ TEST_CASE("ConfigMerge: YAML compression survives when CLI did not pass the flag
     REQUIRE(merged.compression == FastCache::CompressionCodec::Lz4);
     REQUIRE(merged.compressionLevel == 9);
 }
+
+TEST_CASE("ConfigMerge: --storage-max-disk survives a config file", "[config][merge][storage]")
+{
+    // The flag had no `*Explicit` tracker and no merge row, so it was parsed
+    // into the CLI config and then discarded by every run that also passed
+    // --config. storageMaxDiskBytes == 0 means "unbounded" to BuildLayeredShard,
+    // so the disk tier never evicted and grew until the volume filled — while
+    // the same flag *without* --config worked, which is what made it look fine.
+    FastCache::Config fileCfg {};
+    fileCfg.storageMaxDiskBytes = 1024;
+
+    auto cli = EmptyCli();
+    cli.config.storageMaxDiskBytes = 10ULL * 1024 * 1024 * 1024;
+    cli.storageMaxDiskBytesExplicit = true;
+
+    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
+    REQUIRE(merged.storageMaxDiskBytes == 10ULL * 1024 * 1024 * 1024);
+}
+
+TEST_CASE("ConfigMerge: an unset --storage-max-disk leaves the config file alone", "[config][merge][storage]")
+{
+    FastCache::Config fileCfg {};
+    fileCfg.storageMaxDiskBytes = 4096;
+
+    auto const merged = FastCache::Merge(std::move(fileCfg), EmptyCli());
+    REQUIRE(merged.storageMaxDiskBytes == 4096U);
+}

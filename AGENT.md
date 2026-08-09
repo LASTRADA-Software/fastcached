@@ -69,27 +69,85 @@ new man page or logrotate snippet is a new row rather than a new
 
 ```
 packaging/
-  CMakeLists.txt      the asset install table; exports the config-file list
-                      reused by the dpkg conffiles and rpm %config filelists
+  CMakeLists.txt      the asset install table (source|destination|kind|name|
+                      component); exports the config-file list reused by the
+                      dpkg conffiles and rpm %config filelists
   linux/              system + user systemd units, sysusers.d/tmpfiles.d,
                       the commented /etc/fastcached/fastcached.yaml, and the
                       DEB/RPM maintainer-script templates (*.in)
+  macos/              /etc/paths.d entry, the per-component postinstall
+                      templates, the uninstaller, and the installer panes
   windows/            WiX fragment driving --install-service / --uninstall-service
 ```
 
-`cmake/Packaging.cmake` turns that into `.deb`/`.rpm`/`.msi` via CPack. Three
-constraints there are load-bearing and have each already been a bug:
+`cmake/Packaging.cmake` turns that into `.deb`/`.rpm`/`.pkg`/`.msi` via CPack.
+These constraints are load-bearing and have each already been a bug:
 
-- **The unit must not pass `--daemon`.** The POSIX daemonize path double-forks
-  and sends stdout/stderr to `/dev/null`, which silences journald; its pidfile
-  is also written after both parents exit, racing `Type=forking`.
+- **The supervisor's launch arguments must not pass `--daemon`.** The POSIX
+  daemonize path double-forks and sends stdout/stderr to `/dev/null`, which
+  silences journald; its pidfile is also written after both parents exit, racing
+  `Type=forking`. launchd has the identical problem — it reaps the forked job
+  instantly as "exited" — which is why `BuildServiceArgv` takes an
+  `EmitDaemonFlag` rather than always emitting it.
 - **`ExecStart` must pass `--config`.** There is no default config search path,
   so without it `ConfigReloader` has nothing to re-read and `systemctl reload`
-  is a silent no-op.
+  is a silent no-op. The launchd install applies the same rule for the *system*
+  daemon: `--config` is the only flag its postinstall passes. The per-user agent
+  passes none — the packaged config describes the daemon, whose cache only the
+  service account can write, so an agent pointed at it would have nowhere to
+  write; it takes the per-user defaults instead.
+- **`--install-service` registers the *command-line* config, not the merged
+  one.** A flag in `ProgramArguments` outranks the same key in YAML for the life
+  of the registration, so baking merged values in froze every configured key at
+  install time and made later edits to that same file silent no-ops — and copied
+  `requirepass:` out of a mode-0640 file into a world-readable plist. Hence
+  `main.cpp` hands `parsed->config` to `InstallService`, and
+  `InlineCredentialRejection` refuses a `--requirepass` typed on the install
+  command line rather than dropping or publishing it — *including* alongside
+  `--config`, since nothing there can tell whether the named file carries the
+  secret, and accepting it was the silent drop under another name.
+- **What reaches a supervisor must survive its own parser.** Every registration
+  flag is re-read by the daemon at the next start, so a value that cannot be
+  spelled back is a service that registers cleanly and then fails forever:
+  `--listen=[::]:11211` came back as `--listen=:::11211`, which the CLI rejects,
+  and a Windows path ending in `\` escaped its own closing quote and swallowed
+  the flags after it. `FormatListenHost` and `MaybeQuote` are where that round
+  trip is kept honest. `ServiceNameRejection` covers the other direction: the
+  name is concatenated into the directory launchd scans, so a separator writes a
+  root-owned plist nothing knows how to remove.
+- **Teardown must address every domain, not re-probe for one.** Which launchd
+  domain a user agent lives in is decided at install time — `gui/<uid>` needs an
+  Aqua session, so an SSH install lands in `user/<uid>`. Re-probing at uninstall
+  booted out a job that was never there and reported success while the real one
+  kept the port. `BootOutEverywhere` walks the whole `ScopeTraits::domains` row,
+  and `fastcached-uninstall` mirrors it.
 - **The package payload is rooted at `/`, not `/usr`.** `/etc` cannot sit under
   a `/usr` prefix, so `FASTCACHED_INSTALL_BINDIR`/`DOCDIR` spell their own
-  `usr/`. A relative destination for the units would put them where systemd
-  never looks.
+  `usr/` (and `opt/fastcached/` on macOS). A relative destination for the units
+  would put them where systemd never looks — and on macOS an *absolute*
+  `install(DESTINATION)` escapes CPack's staging tree and writes to the build
+  host's real filesystem.
+- **A macOS `.pkg` has no conffile mechanism.** It overwrites its payload on
+  every install, so the live `fastcached.yaml` is deliberately not payload: the
+  Runtime postinstall seeds it from a shipped `.default` only when absent.
+- **An HTML installer pane must begin with its doctype.** Installer.app decides
+  HTML from plain text by sniffing the first bytes of the resource, so the
+  `<!-- SPDX-License-Identifier -->` header that opens every other file in the
+  tree made the welcome and read-me panes render with every tag visible — the
+  `.txt` license pane looking right is what disguised it. `mime-type="text/html"`
+  on the Distribution XML element does *not* override the sniff (tried, and the
+  panes stayed raw), so the doctype goes first and the licence comment after it.
+  The same files need an explicit `<meta charset="utf-8">`: without it the em
+  dashes arrive as mojibake, a defect the raw markup was hiding.
+- **Third-party `install()` rules must be excluded.** A CPM-fetched zstd brings
+  its own, and with the payload rooted at `/` they put `zstd.h` and `libzstd.a`
+  into `/include` and `/lib` on the user's machine. Hence `EXCLUDE_FROM_ALL`.
+- **macOS binaries must link nothing outside `/usr/lib`.** `CPM_USE_LOCAL_PACKAGES`
+  defaults ON and makes CPM prefer Homebrew's shared yaml-cpp, so the package job
+  passes `-DCPM_USE_LOCAL_PACKAGES=OFF -DOPENSSL_USE_STATIC_LIBS=ON` and CI
+  asserts the result with `otool -L`. `CMAKE_OSX_DEPLOYMENT_TARGET` is pinned to
+  13.3 (the floor at which the system libc++ has floating-point `std::to_chars`,
+  which `std::format` needs) and must be set *before* `project()`.
 
 `fastcached` and `fastcache-cc` are both installed. Two things the launcher's
 cache key depends on, both of which have already caused silent hit-rate

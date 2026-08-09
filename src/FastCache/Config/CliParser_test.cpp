@@ -285,6 +285,15 @@ TEST_CASE("CliParser: --storage-max-disk parses byte-size suffixes; defaults to 
         auto const result = FastCache::ParseCli(std::span<char const* const> { args });
         REQUIRE(result.has_value());
         REQUIRE(result->config.storageMaxDiskBytes == 512ULL * 1024U * 1024U);
+        // Without this bit, Merge cannot tell the parsed value from the default
+        // and drops it whenever a config file is also loaded.
+        REQUIRE(result->storageMaxDiskBytesExplicit);
+    }
+    {
+        auto const args = std::array<char const*, 1> { "--storage=/tmp/x.cow" };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(result.has_value());
+        REQUIRE_FALSE(result->storageMaxDiskBytesExplicit);
     }
 }
 

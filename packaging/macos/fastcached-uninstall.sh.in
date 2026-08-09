@@ -1,0 +1,104 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# Remove everything the fastcached .pkg installed.
+#
+# macOS packages have no uninstall mechanism of their own: `pkgutil --forget`
+# deletes the receipt and not one file. So this script ships as part of the
+# payload and is the documented way back out.
+set -u
+
+PREFIX="/@FASTCACHED_MACOS_PREFIX@"
+LABEL="@FASTCACHED_MACOS_BUNDLE_ID@"
+ACCOUNT="@FASTCACHED_MACOS_SERVICE_ACCOUNT@"
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "fastcached-uninstall: must run as root; try: sudo $0" >&2
+    exit 1
+fi
+
+echo "Removing fastcached..."
+
+# --- launchd jobs --------------------------------------------------------
+# `launchctl bootout` returns before the teardown finishes: it signals the job
+# and leaves the label registered while the process winds down. Checking (or
+# reinstalling) immediately afterwards therefore still finds it -- the same
+# asynchrony WaitForJobGone handles in ServiceControl.cpp.
+wait_for_job_gone() {
+    _attempt=0
+    while [ "$_attempt" -lt 100 ] && /bin/launchctl print "$1" >/dev/null 2>&1; do
+        /bin/sleep 0.1
+        _attempt=$((_attempt + 1))
+    done
+}
+
+# Deregistration goes through the daemon's own --uninstall-service when the
+# binary is still there, so "how fastcached talks to launchd" keeps one
+# implementation -- the same reason the postinstall drives --install-service.
+# The raw bootout below is the fallback for a broken or already-removed binary.
+if [ -x "${PREFIX}/bin/fastcached" ]; then
+    "${PREFIX}/bin/fastcached" --uninstall-service --service-scope=system >/dev/null 2>&1 || true
+fi
+
+# The system daemon first, then any per-user agent. Both are best-effort: a
+# scope that was never installed is not an error.
+/bin/launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
+wait_for_job_gone "system/${LABEL}"
+rm -f "/Library/LaunchDaemons/${LABEL}.plist" || true
+
+# Agents are per-user, and the installing user is not necessarily the one
+# running this. Walk every home directory that has one.
+#
+# Both domains, in the same order ServiceControl's own teardown uses. Which one
+# an agent lives in was decided at install time: `gui/<uid>` needs an Aqua
+# session, so one registered over SSH or on a headless machine landed in
+# `user/<uid>` instead. Booting out only `gui/<uid>` left that job running --
+# and still holding 127.0.0.1:11211 -- while the plist below was deleted and
+# ${PREFIX} removed out from under its binary, with nothing left to reach it.
+for plist in /Users/*/Library/LaunchAgents/"${LABEL}".plist; do
+    [ -e "$plist" ] || continue
+    owner=$(/usr/bin/stat -f %Su "$plist" 2>/dev/null) || continue
+    owner_uid=$(/usr/bin/id -u "$owner" 2>/dev/null) || continue
+    for domain in "gui/${owner_uid}" "user/${owner_uid}"; do
+        /bin/launchctl asuser "$owner_uid" /usr/bin/sudo -u "$owner" \
+            /bin/launchctl bootout "${domain}/${LABEL}" >/dev/null 2>&1 || true
+        wait_for_job_gone "${domain}/${LABEL}"
+    done
+    rm -f "$plist" || true
+done
+
+# --- PATH integration ----------------------------------------------------
+rm -f /etc/paths.d/fastcached || true
+# Only remove the symlinks if they still point into our prefix: someone may have
+# replaced them with a Homebrew install, and deleting that would be rude.
+for tool in fastcached fastcache-cc; do
+    link="/usr/local/bin/${tool}"
+    if [ -L "$link" ] && [ "$(readlink "$link")" = "${PREFIX}/bin/${tool}" ]; then
+        rm -f "$link" || true
+    fi
+done
+
+# --- payload -------------------------------------------------------------
+# Explicit paths, never `pkgutil --files <id> | xargs rm`: with the package's
+# --install-location of /, that listing includes the bare directory entries
+# `etc`, `opt` and `Library`, and one missing --only-files would take the system
+# with it.
+if [ -d "$PREFIX" ] && [ ! -L "$PREFIX" ]; then
+    rm -rf "$PREFIX" || true
+fi
+
+# --- service account -----------------------------------------------------
+if /usr/bin/dscl . -read "/Users/${ACCOUNT}" >/dev/null 2>&1; then
+    /usr/bin/dscl . -delete "/Users/${ACCOUNT}" >/dev/null 2>&1 || true
+    /usr/bin/dscl . -delete "/Groups/${ACCOUNT}" >/dev/null 2>&1 || true
+fi
+
+# --- receipts ------------------------------------------------------------
+# Last, so a failure above still leaves the receipts to diagnose from.
+for receipt in $(/usr/sbin/pkgutil --pkgs | grep "^${LABEL}"); do
+    /usr/sbin/pkgutil --forget "$receipt" >/dev/null 2>&1 || true
+done
+
+echo "fastcached removed."
+echo "Note: your own config and cache under \$HOME/Library were left in place."
+exit 0

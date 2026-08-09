@@ -51,6 +51,7 @@ Config Merge(Config fileCfg, CliResult const& cli)
     MergeField(fileCfg, cli, &CliResult::storagePathExplicit, &Config::storagePath);
     MergeField(fileCfg, cli, &CliResult::storageDurabilityExplicit, &Config::storageDurability);
     MergeField(fileCfg, cli, &CliResult::storageMaxValueBytesExplicit, &Config::storageMaxValueBytes);
+    MergeField(fileCfg, cli, &CliResult::storageMaxDiskBytesExplicit, &Config::storageMaxDiskBytes);
     MergeField(fileCfg, cli, &CliResult::workerThreadsExplicit, &Config::workerThreads);
     MergeField(fileCfg, cli, &CliResult::storageShardsExplicit, &Config::storageShards);
     MergeField(fileCfg, cli, &CliResult::listenBacklogExplicit, &Config::listenBacklog);

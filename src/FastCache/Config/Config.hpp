@@ -44,6 +44,26 @@ enum class StorageDurability : std::uint8_t
     None = 2,    ///< OS page cache only; no fsync.
 };
 
+/// Which supervisor domain `--install-service` registers the daemon in.
+///
+/// Deliberately *not* a Config field, only a vocabulary type living beside the
+/// others: it configures the installation, not the running daemon. As a Config
+/// field it would also make BuildServiceArgv's "emit every field that differs
+/// from the default" rule bake a meaningless `--service-scope` into the
+/// registered job's own arguments. See CliResult::serviceScope.
+///
+/// Meaningful on macOS (launchd has two domains); ignored on Windows, whose SCM
+/// has only one.
+enum class ServiceScope : std::uint8_t
+{
+    /// A LaunchAgent in the invoking user's `~/Library/LaunchAgents`, running as
+    /// that user from their next login onwards. Needs no privileges.
+    User = 0,
+    /// A LaunchDaemon in `/Library/LaunchDaemons`, running as a dedicated
+    /// service account from boot, before anyone logs in. Requires root.
+    System = 1,
+};
+
 /// CPU-affinity policy for the reactor worker threads.
 enum class CpuAffinity : std::uint8_t
 {

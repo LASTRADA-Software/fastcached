@@ -820,15 +820,26 @@ int main(int argc, char const* const* argv)
     if (parsed->outcome == FastCache::CliOutcome::HealthCheck)
         return FastCache::HttpHealthProbe("127.0.0.1", effective.metricsPort, "/healthz") ? EXIT_SUCCESS : EXIT_FAILURE;
 
-    // Service-control requests act on the SCM and exit; they never run the
-    // daemon body. The effective config is reused so every flag passed
-    // alongside --install-service is baked into the service command line.
+    // Service-control requests act on the service manager and exit; they never
+    // run the daemon body.
+    //
+    // The *command-line* config is what gets registered, not the merged one:
+    // the launch arguments should hold what the operator typed, plus --config,
+    // and let the file govern everything else. Registering the merged config
+    // instead froze every YAML value into the supervisor's argument list at
+    // install time — and because a CLI value outranks YAML in Merge, later
+    // edits to that same file then had no effect, silently, for exactly the
+    // keys the operator had bothered to set. It also copied `requirepass:` out
+    // of a mode-0600 config file into a world-readable service registration.
+    // The YAML is still parsed above, so a broken config is still rejected here
+    // rather than at first start.
     if (parsed->outcome == FastCache::CliOutcome::InstallService
         || parsed->outcome == FastCache::CliOutcome::UninstallService)
     {
+        auto const& registered = parsed->config;
         auto const result = parsed->outcome == FastCache::CliOutcome::InstallService
-                                ? FastCache::InstallWindowsService(effective)
-                                : FastCache::UninstallWindowsService(effective);
+                                ? FastCache::InstallService(registered, parsed->serviceScope)
+                                : FastCache::UninstallService(registered, parsed->serviceScope);
         if (result.exitCode == 0)
             std::println("fastcached: {}", result.message);
         else

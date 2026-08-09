@@ -2,10 +2,10 @@
 
 ## Packages
 
-The release artifacts include a `.deb`, an `.rpm`, and a Windows `.msi`.
-All of them install both executables — `fastcached` (the daemon) and
-`fastcache-cc` (the compiler launcher) — and register the daemon as a
-service that starts on boot.
+The release artifacts include a `.deb`, an `.rpm`, a macOS `.pkg` (also
+offered inside a `.dmg`), and a Windows `.msi`. All of them install both
+executables — `fastcached` (the daemon) and `fastcache-cc` (the compiler
+launcher) — and register the daemon as a service that starts on boot.
 
 ### Debian / Ubuntu, Fedora / RHEL
 
@@ -78,6 +78,95 @@ sc.exe start FastCached
 
 The service reads `fastcached.yaml` from the installation directory.
 Uninstalling removes the service.
+
+### macOS
+
+Open the `.dmg` and run the `.pkg` inside it (the `.pkg` is also published
+on its own — the disk image is only a convenience). Both executables land
+in `/opt/fastcached/bin`.
+
+The installer asks how you want fastcached to start:
+
+| Choice | Runs as | Starts | Plist |
+|---|---|---|---|
+| **Start at login** (default) | you | your next login | `~/Library/LaunchAgents/software.lastrada.fastcached.plist` |
+| **Start at boot, system-wide** | `_fastcached` | boot | `/Library/LaunchDaemons/software.lastrada.fastcached.plist` |
+
+They are alternatives, not additions. Both would listen on the same
+address, and fastcached has no unix-socket endpoint to fall back on, so if
+you select the system-wide service it wins and the per-user agent is
+skipped. Selecting neither installs the tools without starting anything.
+
+```sh
+launchctl print gui/$UID/software.lastrada.fastcached      # per-user
+sudo launchctl print system/software.lastrada.fastcached   # system-wide
+```
+
+Restart it after editing the config:
+
+```sh
+launchctl kickstart -k gui/$UID/software.lastrada.fastcached
+```
+
+You can also register the service by hand at any time, which is how you
+set one up for a second user account:
+
+```sh
+fastcached --install-service --service-scope=user
+sudo fastcached --install-service --service-scope=system
+```
+
+Note which one takes `sudo`. The user scope installs an agent for *the
+invoking account*, so running it under `sudo` would register one for root —
+started by nobody's login and invisible to your own `--uninstall-service`.
+That combination is refused rather than guessed at.
+
+The system scope runs as the `_fastcached` account, which only the installer
+package creates — on a tarball or source install that command tells you so
+instead of registering a job that could never start.
+
+**Open a new terminal window after installing.** The package adds
+`/opt/fastcached/bin` to the system `PATH` via `/etc/paths.d/fastcached`,
+and macOS only reads that when a *login* shell starts — an already-open
+terminal never sees it, and neither does fish, which does not read
+`/etc/profile`. Both tools are also symlinked into `/usr/local/bin`, which
+is on the stock `PATH` everywhere, so in practice they work straight away.
+
+The **system daemon** reads `/opt/fastcached/etc/fastcached.yaml`. Your edits
+survive upgrades: only the `fastcached.yaml.default` beside it is replaced,
+and the live file is seeded from it just once, when it is absent. The
+installer sets it to mode `0640` owned `root:_fastcached`, so the daemon can
+read it and other accounts cannot — which is what makes it a safe home for
+`requirepass:`.
+
+The **per-user agent** does not read that file. It describes the system
+daemon, whose cache lives under the package prefix and is writable only by
+the service account, so an agent pointed at it would have nowhere to write.
+The agent uses per-user defaults instead, with its cache under
+`~/Library/Caches/fastcached`. To give it a config of your own:
+
+```sh
+fastcached --install-service --service-scope=user --config=~/my-fastcached.yaml
+```
+
+Whichever file you name governs `storage_path` too: the registration passes
+no `--storage` when you pass a `--config`, precisely so that editing the
+file and restarting the job actually changes where the cache lives.
+
+To remove everything:
+
+```sh
+sudo /opt/fastcached/bin/fastcached-uninstall
+```
+
+A `.pkg` has no built-in uninstaller — `pkgutil --forget` only drops the
+receipt and deletes nothing — so that script ships as part of the package.
+It stops and unregisters the launchd jobs, removes `/opt/fastcached`, the
+`PATH` entry and the symlinks, deletes the `_fastcached` account, and
+forgets the receipts. Your own cache and logs under `~/Library` are left
+alone.
+
+Apple Silicon only. On an Intel Mac, build from source.
 
 ## Building from source
 

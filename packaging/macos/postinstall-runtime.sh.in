@@ -1,0 +1,46 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# Runtime component postinstall. Runs as root, from the macOS Installer.
+#
+# Every path out of this script exits 0. A non-zero postinstall aborts the whole
+# installation and shows the user a dialog that names nothing actionable, so a
+# failure to set up a convenience (a symlink, a default config) must never cost
+# them the binaries that did install. Same discipline as Return="ignore" in
+# packaging/windows/service-actions.xml.
+set -u
+
+PREFIX="/@FASTCACHED_MACOS_PREFIX@"
+@FASTCACHED_MACOS_SEED_CONFIG@
+
+# State directory for the system LaunchDaemon. Created here rather than shipped
+# as an empty payload directory so its ownership is set by the component that
+# actually knows about the service account.
+mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" || true
+
+# /etc/paths.d only takes effect for *login* shells, because path_helper runs
+# from /etc/profile — an already-open terminal, a non-login `ssh host cmd`, and
+# fish (which does not read /etc/profile) all miss it. /usr/local/bin is in the
+# stock /etc/paths, so these symlinks make both tools reachable immediately, in
+# every shell, without waiting for a new login.
+#
+# Only an unused name or one already pointing into our prefix is claimed. `-f`
+# on its own unlinks whatever is there first, so a self-built or Homebrew
+# fastcache-cc was destroyed silently -- and the uninstaller, seeing a link that
+# now points into ${PREFIX}, would go on to remove the replacement too, leaving
+# the user with no fastcache-cc at all. The uninstaller has the mirror of this
+# guard; this is the half that went missing.
+mkdir -p /usr/local/bin || true
+for tool in fastcached fastcache-cc; do
+    link="/usr/local/bin/${tool}"
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        if [ ! -L "$link" ] || [ "$(readlink "$link")" != "${PREFIX}/bin/${tool}" ]; then
+            echo "fastcached: ${link} exists and is not ours; leaving it alone." \
+                "${PREFIX}/bin is still on PATH via /etc/paths.d." >&2
+            continue
+        fi
+    fi
+    ln -sfn "${PREFIX}/bin/${tool}" "$link" || true
+done
+
+exit 0

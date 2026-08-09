@@ -74,6 +74,90 @@ The path's *shape* selects the layout: a path with no file extension (as
 above) becomes a sharded directory, while one with an extension
 (`cache.cow`) is a single file.
 
+## launchd
+
+On macOS the `.pkg` registers a launchd job. The same registration is
+available from the command line on any installation, and `--service-scope`
+picks the domain:
+
+```sh
+fastcached --install-service --service-scope=user            # LaunchAgent
+sudo fastcached --install-service --service-scope=system      # LaunchDaemon
+```
+
+The system scope needs the `_fastcached` service account, which the `.pkg`
+creates; installing from a tarball or a source build fails with a message
+saying so rather than registering a job launchd cannot spawn.
+
+Every flag you pass **on the command line** alongside `--install-service` is
+baked into the job's `ProgramArguments`, exactly as on Windows. Values read
+from a `--config` file are not: they stay in the file, so editing it and
+restarting the job keeps working.
+
+```sh
+sudo fastcached --install-service --service-scope=system \
+    --config=/opt/fastcached/etc/fastcached.yaml --threads=4
+```
+
+Prefer the config file for anything you might want to change later. A flag
+on this command line outranks the same key in YAML for the life of the
+registration, so `--storage=…` here would quietly pin the cache location and
+make a later `storage_path:` edit a no-op.
+
+`--requirepass` is the one flag that cannot be baked in, and the install is
+refused rather than silently dropping it: `ProgramArguments` lands in a
+world-readable plist, so the secret belongs in the config file passed with
+`--config`. Passing both is refused too — nothing can tell from the command
+line whether that file actually carries `requirepass:`, so accepting the
+combination would be the silent drop under another name.
+
+The package sets the system daemon's config to mode `0640`, owned
+`root:_fastcached`, so it is readable by the account the daemon drops to and
+by nobody else — which is the whole reason to keep the secret there rather
+than in the plist. If you point the daemon at a config of your own, the
+install checks that `_fastcached` can read it and tells you how to fix it if
+not; without that check an unreadable config shows up only as a job that
+exits at every start, with the `EACCES` visible nowhere.
+
+`--service-scope=user` must **not** run under `sudo`: the agent belongs to
+the invoking account, and sudo would resolve that to root — registering an
+agent under `/var/root` that your own login never starts and your own
+`--uninstall-service` cannot see. The install refuses rather than guess.
+
+| | `user` | `system` |
+|---|---|---|
+| Plist | `~/Library/LaunchAgents/` | `/Library/LaunchDaemons/` |
+| Runs as | the invoking user | `_fastcached` |
+| Starts at | login | boot |
+| Privileges | none | root to install |
+| `KeepAlive` | on crash only | always |
+
+The generated plist deliberately does **not** pass `--daemon`. launchd, like
+systemd, supervises the process it started; a job that double-forks is
+reaped immediately as `exited` and the service silently never runs.
+
+The two scopes are alternatives — both bind the same address, and there is
+no unix-socket endpoint to separate them. A per-user agent uses
+`KeepAlive={Crashed:true}` rather than `true` for that reason: an agent that
+loses the race for the port exits cleanly, and restart-always would turn
+that into a permanent ten-second crash loop instead of one log line.
+
+Status, restart, logs:
+
+```sh
+launchctl print gui/$UID/software.lastrada.fastcached
+launchctl kickstart -k gui/$UID/software.lastrada.fastcached
+tail -f ~/Library/Logs/fastcached/software.lastrada.fastcached.err.log
+```
+
+The system daemon logs to `/opt/fastcached/var/log/` instead.
+
+There is no reload equivalent to `systemctl reload`: send `SIGHUP` to the
+pid `launchctl print` reports, or kickstart the job.
+
+To remove it: `fastcached --uninstall-service --service-scope=<scope>`, or
+`sudo /opt/fastcached/bin/fastcached-uninstall` to remove the whole install.
+
 ## Windows service
 
 The MSI registers `fastcached` as an auto-start service. The same
@@ -85,8 +169,9 @@ sc.exe start FastCached
 fastcached.exe --uninstall-service
 ```
 
-`--install-service` records the flags it was given into the service's
-command line and makes path arguments absolute — a service starts with its
+`--install-service` records the flags it was given on the command line into
+the service's command line (values from a `--config` file stay in the file)
+and makes path arguments absolute — a service starts with its
 working directory set to `C:\Windows\System32`, so a relative path captured
 at install time would resolve elsewhere at boot. It creates the service
 already set to auto-start but leaves it stopped, so the first start is

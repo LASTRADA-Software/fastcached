@@ -1,13 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # Platform service-integration assets: systemd units and their supporting
-# account/state declarations on Linux, the WiX service fragment on Windows.
+# account/state declarations on Linux, launchd plists and PATH wiring on macOS,
+# the WiX service fragment on Windows.
 #
-# Every installed asset is one row in the table below — source path, install
-# destination, and kind. Adding a man page, a logrotate snippet, or an AppArmor
-# profile is adding a row, not a new install() call. `kind` is what makes the
-# table more than a loop: `config` rows are additionally exported as the
-# package-manager config-file list, so "which files are configuration" is
-# stated exactly once and reused by both the DEB and RPM generators.
+# Every installed asset is one row in a table below — source path, install
+# destination, kind, installed name, and owning package component. Adding a man
+# page, a logrotate snippet, or an AppArmor profile is adding a row, not a new
+# install() call, and one loop installs whichever table the platform selected.
+#
+# `kind` is what makes the table more than a loop:
+#   config  -> also exported as the package-manager config-file list, so "which
+#              files are configuration" is stated once and reused by the DEB and
+#              RPM generators
+#   program -> installed with the executable bit set
+#   data    -> a plain installed file
+#
+# `component` is what makes it more than one package: on macOS the installer
+# offers the launchd registration as selectable choices, and CPack maps one
+# component to one choice.
 
 include(GNUInstallDirs)
 
@@ -33,41 +43,74 @@ set(FASTCACHED_SYSUSERS_DIR       "usr/lib/sysusers.d")
 set(FASTCACHED_TMPFILES_DIR       "usr/lib/tmpfiles.d")
 set(FASTCACHED_SYSCONF_DIR        "etc/fastcached")
 
+# FASTCACHED_MACOS_PREFIX, FASTCACHED_MACOS_BUNDLE_ID and
+# FASTCACHED_MACOS_SERVICE_ACCOUNT are declared in the top-level CMakeLists.txt
+# and inherited here. They have to live there because cmake/Packaging.cmake is
+# include()d at that scope and reads them too — a set() in this subdirectory
+# would not propagate back up.
+
 # The service assets only make sense in the root-rooted package layout: their
 # destinations (usr/lib/systemd, etc/) are written assuming the payload lands
 # at /. A conventional prefixed install would scatter them to
 # <prefix>/usr/lib/systemd, where systemd never looks, so skip them entirely.
-if(UNIX AND NOT APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
-    # source | destination | kind | installed-name
-    #
-    # kind:   config  -> shipped as a package config file (never clobbered on
-    #                    upgrade); also installed for the Windows MSI
-    #         data    -> plain installed file
+if(FASTCACHED_PACKAGE_ROOT_PREFIX AND UNIX AND NOT APPLE)
+    # source | destination | kind | installed-name | component
     #
     # The user unit is renamed on install: the source name disambiguates it in
     # the tree, but `systemctl --user start fastcached` requires it to land as
     # fastcached.service inside the user unit directory.
-    set(FASTCACHED_LINUX_ASSETS
-        "linux/fastcached.service|${FASTCACHED_SYSTEMD_SYSTEM_DIR}|data|fastcached.service"
-        "linux/fastcached-user.service|${FASTCACHED_SYSTEMD_USER_DIR}|data|fastcached.service"
-        "linux/fastcached.sysusers|${FASTCACHED_SYSUSERS_DIR}|data|fastcached.conf"
-        "linux/fastcached.tmpfiles|${FASTCACHED_TMPFILES_DIR}|data|fastcached.conf"
-        "linux/fastcached.yaml|${FASTCACHED_SYSCONF_DIR}|config|fastcached.yaml"
+    set(FASTCACHED_PLATFORM_ASSETS
+        "linux/fastcached.service|${FASTCACHED_SYSTEMD_SYSTEM_DIR}|data|fastcached.service|Runtime"
+        "linux/fastcached-user.service|${FASTCACHED_SYSTEMD_USER_DIR}|data|fastcached.service|Runtime"
+        "linux/fastcached.sysusers|${FASTCACHED_SYSUSERS_DIR}|data|fastcached.conf|Runtime"
+        "linux/fastcached.tmpfiles|${FASTCACHED_TMPFILES_DIR}|data|fastcached.conf|Runtime"
+        "linux/fastcached.yaml|${FASTCACHED_SYSCONF_DIR}|config|fastcached.yaml|Runtime"
     )
+elseif(FASTCACHED_PACKAGE_ROOT_PREFIX AND APPLE)
+    # The generated scripts are referenced from the build tree; see below.
+    set(FASTCACHED_PLATFORM_ASSETS
+        # The live fastcached.yaml is deliberately NOT here. A .pkg overwrites
+        # its payload unconditionally on every install — there is no conffile or
+        # %config(noreplace) equivalent — so shipping it would silently discard
+        # the operator's edits on upgrade. The Runtime postinstall seeds the real
+        # file from this .default copy only when it is absent.
+        "linux/fastcached.yaml|${FASTCACHED_MACOS_PREFIX}/etc|data|fastcached.yaml.default|Runtime"
+        "macos/paths.d.fastcached|etc/paths.d|data|fastcached|Runtime"
+        "${CMAKE_CURRENT_BINARY_DIR}/macos/fastcached-uninstall|${FASTCACHED_MACOS_PREFIX}/bin|program|fastcached-uninstall|Runtime"
+    )
+endif()
 
+# One loop installs whichever table the platform selected above. An empty table
+# (Windows, which has no asset rows of its own) simply installs nothing.
+if(FASTCACHED_PACKAGE_ROOT_PREFIX)
     set(_config_files "")
-    foreach(_asset IN LISTS FASTCACHED_LINUX_ASSETS)
+    foreach(_asset IN LISTS FASTCACHED_PLATFORM_ASSETS)
         string(REPLACE "|" ";" _fields "${_asset}")
         list(GET _fields 0 _source)
         list(GET _fields 1 _destination)
         list(GET _fields 2 _kind)
         list(GET _fields 3 _name)
+        list(GET _fields 4 _component)
 
-        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/${_source}"
-            DESTINATION "${_destination}"
-            RENAME "${_name}"
-            COMPONENT Runtime
-        )
+        # An absolute source is a generated file already in the build tree; a
+        # relative one is shipped from this directory.
+        if(NOT IS_ABSOLUTE "${_source}")
+            set(_source "${CMAKE_CURRENT_SOURCE_DIR}/${_source}")
+        endif()
+
+        if(_kind STREQUAL "program")
+            install(PROGRAMS "${_source}"
+                DESTINATION "${_destination}"
+                RENAME "${_name}"
+                COMPONENT "${_component}"
+            )
+        else()
+            install(FILES "${_source}"
+                DESTINATION "${_destination}"
+                RENAME "${_name}"
+                COMPONENT "${_component}"
+            )
+        endif()
 
         # The exported list names the file's absolute path on the installed
         # system (the packages mount the payload at /), which is the form dpkg
@@ -81,6 +124,9 @@ if(UNIX AND NOT APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
     # %config(noreplace) filelist.
     set(FASTCACHED_PACKAGE_CONFIG_FILES "${_config_files}"
         CACHE INTERNAL "Package-manager config files (never replaced on upgrade)")
+endif()
+
+if(FASTCACHED_PACKAGE_ROOT_PREFIX AND UNIX AND NOT APPLE)
 
     # --- Maintainer scripts -------------------------------------------------
     # Generated rather than shipped verbatim so the unit name and the
@@ -107,6 +153,48 @@ if(UNIX AND NOT APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
 
     set(FASTCACHED_SCRIPTLET_DIR "${CMAKE_CURRENT_BINARY_DIR}"
         CACHE INTERNAL "Directory holding the configured DEB/RPM maintainer scripts")
+elseif(FASTCACHED_PACKAGE_ROOT_PREFIX AND APPLE)
+    # --- Installer scripts --------------------------------------------------
+    # Generated, not shipped verbatim, so the prefix, bundle identifier and
+    # service-account name each have exactly one definition. The uninstaller in
+    # particular must agree with the installer about all three, or it silently
+    # removes nothing.
+    #
+    # One row per script: source stem | installed name (empty = keep the stem).
+    # The postinstall scripts are named by CPack convention and referenced from
+    # Packaging.cmake through CPACK_POSTFLIGHT_<COMPONENT>_SCRIPT; the
+    # uninstaller is payload and is installed by the asset table above.
+    set(FASTCACHED_MACOS_SCRIPTS
+        "postinstall-runtime"
+        "postinstall-launchagent"
+        "postinstall-launchdaemon"
+        "fastcached-uninstall"
+    )
+
+    # Shared shell fragment, substituted into whichever scripts declare
+    # @FASTCACHED_MACOS_SEED_CONFIG@. Config seeding has to happen in more than
+    # one postinstall — macOS does not run them in component order — and this
+    # keeps that one implementation instead of a copy per component.
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/macos/seed-config.sh.inc"
+        FASTCACHED_MACOS_SEED_CONFIG)
+
+    foreach(_script IN LISTS FASTCACHED_MACOS_SCRIPTS)
+        set(_out "${CMAKE_CURRENT_BINARY_DIR}/macos/${_script}")
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/macos/${_script}.sh.in" "${_out}" @ONLY)
+        # An installer script that is not executable is skipped silently by
+        # macOS Installer — the package appears to install and does nothing.
+        file(CHMOD "${_out}" PERMISSIONS
+            OWNER_READ OWNER_WRITE OWNER_EXECUTE
+            GROUP_READ GROUP_EXECUTE
+            WORLD_READ WORLD_EXECUTE)
+    endforeach()
+
+    set(FASTCACHED_MACOS_SCRIPT_DIR "${CMAKE_CURRENT_BINARY_DIR}/macos"
+        CACHE INTERNAL "Directory holding the configured macOS installer scripts")
+
+    # Reset the Linux-only exports; see the comment in the else() branch.
+    set(FASTCACHED_SCRIPTLET_DIR ""
+        CACHE INTERNAL "Directory holding the configured DEB/RPM maintainer scripts")
 else()
     # Both exports must be written on EVERY configure, not only when the branch
     # above runs. They are CACHE INTERNAL, so a value left over from an earlier
@@ -118,6 +206,11 @@ else()
         CACHE INTERNAL "Package-manager config files (never replaced on upgrade)")
     set(FASTCACHED_SCRIPTLET_DIR ""
         CACHE INTERNAL "Directory holding the configured DEB/RPM maintainer scripts")
+endif()
+
+if(NOT APPLE OR NOT FASTCACHED_PACKAGE_ROOT_PREFIX)
+    set(FASTCACHED_MACOS_SCRIPT_DIR ""
+        CACHE INTERNAL "Directory holding the configured macOS installer scripts")
 endif()
 
 if(WIN32)

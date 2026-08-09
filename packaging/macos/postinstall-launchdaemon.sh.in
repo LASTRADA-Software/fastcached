@@ -1,0 +1,180 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# LaunchDaemon component postinstall. Runs as root, from the macOS Installer.
+#
+# Creates the service account and registers a system-wide launchd daemon that
+# starts at boot, before anyone logs in. Exits 0 on every path (see
+# postinstall-runtime.sh.in for why).
+set -u
+
+PREFIX="/@FASTCACHED_MACOS_PREFIX@"
+LABEL="@FASTCACHED_MACOS_BUNDLE_ID@"
+ACCOUNT="@FASTCACHED_MACOS_SERVICE_ACCOUNT@"
+
+@FASTCACHED_MACOS_SEED_CONFIG@
+
+# macOS has no sysusers.d, so the account that packaging/linux/fastcached.sysusers
+# declares in one line has to be built by hand here. The 200..400 band is the
+# convention for hidden system accounts; picking the next free id keeps this
+# from colliding with another package's.
+#
+# Both namespaces are scanned, because the one number becomes the uid *and* the
+# gid below. dscl enforces no uniqueness of its own, and macOS packs system
+# users and groups into this band densely (_softwareupdate is uid 200 and gid
+# 200), so a uid-only scan can hand the new group a gid another group already
+# holds -- which would give that group's members read access to the daemon's
+# on-disk cache once ${PREFIX}/var is chowned.
+if ! /usr/bin/dscl . -read "/Users/${ACCOUNT}" >/dev/null 2>&1; then
+    # The first id in the band that no user and no group already holds, rather
+    # than max+1. max+1 produced exactly the collision it was meant to avoid:
+    # the scan excluded 400, so a highest-in-band of 399 (com.apple.access_ssh
+    # on a stock system) chose 400 -- which com.apple.access_remote_ae already
+    # had. Creating the group then failed, and a LaunchDaemon whose group does
+    # not exist never spawns.
+    #
+    # $NF, not $2: a record name may contain spaces, and the id is always last.
+    NEXT_ID=$({ /usr/bin/dscl . -list /Users UniqueID; /usr/bin/dscl . -list /Groups PrimaryGroupID; } \
+        | /usr/bin/awk '{ used[$NF] = 1 }
+                        END { for (id = 200; id <= 400; id++) if (!(id in used)) { print id; exit } }')
+    if [ -z "${NEXT_ID:-}" ]; then
+        echo "fastcached: no free id in 200..400 for the '${ACCOUNT}' account" >&2
+        exit 0
+    fi
+
+    # Both interfaces, because neither is reliable alone here: dseditgroup is
+    # the supported one and produces a record getgrnam(3) can find, but it has
+    # been observed to leave no record at all on a fresh runner; dscl always
+    # writes one, though a group assembled attribute-by-attribute is not always
+    # resolvable by name. Whichever lands first wins, and nothing below depends
+    # on the outcome -- the ids used for chown come from the *user* record.
+    /usr/sbin/dseditgroup -q -o create -r "fastcached daemon" -i "$NEXT_ID" "$ACCOUNT" || true
+    if ! /usr/bin/dscl . -read "/Groups/${ACCOUNT}" PrimaryGroupID >/dev/null 2>&1; then
+        /usr/bin/dscl . -create "/Groups/${ACCOUNT}" PrimaryGroupID "$NEXT_ID" || true
+    fi
+    /usr/bin/dscl . -create "/Users/${ACCOUNT}" UniqueID "$NEXT_ID" || true
+    /usr/bin/dscl . -create "/Users/${ACCOUNT}" PrimaryGroupID "$NEXT_ID" || true
+    /usr/bin/dscl . -create "/Users/${ACCOUNT}" UserShell /usr/bin/false || true
+    /usr/bin/dscl . -create "/Users/${ACCOUNT}" NFSHomeDirectory /var/empty || true
+    /usr/bin/dscl . -create "/Users/${ACCOUNT}" RealName "fastcached daemon" || true
+    # Without IsHidden the account appears in the login window's user list.
+    /usr/bin/dscl . -create "/Users/${ACCOUNT}" IsHidden 1 || true
+fi
+
+# dscl returns before the record is resolvable through getpwnam(3), which is
+# what launchd -- and fastcached's own pre-flight check -- actually use. Wait
+# instead of racing: an unresolvable UserName leaves launchd registering the job
+# and then never spawning it, with no error anywhere.
+#
+# One flush, then poll. Flushing the whole DirectoryService cache on every
+# iteration is not free, and a loop that ran its full fifty rounds -- which is
+# what happens the moment the condition is something that never becomes true --
+# left opendirectoryd wedged badly enough that the --install-service after it
+# never returned and the installer killed the script ten minutes later.
+#
+# The group is deliberately *not* waited on. Nothing below needs it by name:
+# the chowns use numeric ids, so group-name resolution is launchd's problem
+# alone, and blocking the install on it buys nothing.
+/usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
+ATTEMPT=0
+while [ "$ATTEMPT" -lt 50 ] && ! /usr/bin/id -u "$ACCOUNT" >/dev/null 2>&1; do
+    /bin/sleep 0.1
+    ATTEMPT=$((ATTEMPT + 1))
+done
+/usr/bin/id -u "$ACCOUNT" >/dev/null 2>&1 \
+    || echo "fastcached: '${ACCOUNT}' is not resolvable via getpwnam after account creation" >&2
+
+# Numeric ids, read straight from the records just written. Name lookups go
+# through the DirectoryService cache, which lags dscl -- and a chown that names
+# the group does not degrade when that lookup misses, it fails. Reading the
+# directory node avoids the cache entirely, and works on a reinstall too, where
+# the account already exists and NEXT_ID above was never computed.
+#
+# BOTH ids come from the *user* record. The gid there is the account's
+# PrimaryGroupID, which is exactly the pw_gid getpwnam(3) hands the daemon and
+# therefore exactly what its own readability check compares against. Reading it
+# from /Groups instead made the whole thing hostage to a group record that
+# turned out not to exist: the id came back empty, every chown was skipped, and
+# the config was left in a state the install then refused.
+ACCOUNT_UID=$(/usr/bin/dscl . -read "/Users/${ACCOUNT}" UniqueID 2>/dev/null | /usr/bin/awk '{print $2}')
+ACCOUNT_GID=$(/usr/bin/dscl . -read "/Users/${ACCOUNT}" PrimaryGroupID 2>/dev/null | /usr/bin/awk '{print $2}')
+
+# Recorded because two runs were lost to guessing at this from the outside.
+echo "fastcached: account ${ACCOUNT} uid=${ACCOUNT_UID:-<none>} gid=${ACCOUNT_GID:-<none>}" \
+    "group-record=$(/usr/bin/dscl . -read "/Groups/${ACCOUNT}" PrimaryGroupID 2>/dev/null | /usr/bin/awk '{print $2}' || true)" >&2
+
+mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" || true
+if [ -n "${ACCOUNT_UID:-}" ] && [ -n "${ACCOUNT_GID:-}" ]; then
+    /usr/sbin/chown -R "${ACCOUNT_UID}:${ACCOUNT_GID}" "${PREFIX}/var" || true
+fi
+
+# The daemon drops to ${ACCOUNT} before it opens its config, so the file has to
+# be readable by that account -- and only by it. Group-read rather than
+# world-read is what makes the documented secure setup reachable: the whole
+# point of putting `requirepass:` in this file instead of on the command line is
+# that it need not be readable by every local user, and a 0644 file gives that
+# away just as surely as a plist would. Enforced on every install, not only when
+# the file is seeded, so an upgrade repairs a config left world-readable by an
+# earlier release.
+#
+# The chmod is conditional on the chown, and that ordering is the whole point:
+# tightening a file the service account does not own yet produces precisely the
+# state --install-service refuses -- mode 0640, group wheel, unreadable by the
+# daemon. Leaving the mode alone degrades to the status quo ante, which is
+# merely too permissive rather than broken, and says so.
+if [ -n "${ACCOUNT_GID:-}" ] && /usr/sbin/chown "0:${ACCOUNT_GID}" "$CONFIG" 2>/dev/null; then
+    /bin/chmod 0640 "$CONFIG" 2>/dev/null || true
+else
+    echo "fastcached: could not give '${ACCOUNT}' ownership of ${CONFIG};" \
+        "leaving its mode alone. Put no secrets in it until you have run:" \
+        "chown root:${ACCOUNT} ${CONFIG} && chmod 0640 ${CONFIG}" >&2
+fi
+
+# A per-user agent registered by an earlier install would fight this daemon for
+# 127.0.0.1:11211. The daemon wins (see postinstall-launchagent.sh.in), so tear
+# any agent down first.
+CONSOLE_USER=$(/usr/sbin/scutil <<'EOF' | /usr/bin/awk '/Name :/ && ! /loginwindow/ { print $3 }'
+show State:/Users/ConsoleUser
+EOF
+)
+case "${CONSOLE_USER:-}" in
+    "" | root | loginwindow | _mbsetupuser) ;;
+    *)
+        UID_OF_USER=$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null) || UID_OF_USER=""
+        if [ -n "$UID_OF_USER" ]; then
+            /bin/launchctl asuser "$UID_OF_USER" /usr/bin/sudo -u "$CONSOLE_USER" \
+                "${PREFIX}/bin/fastcached" --uninstall-service --service-scope=user \
+                >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+# Registration goes through the daemon's own --install-service rather than a
+# plist shipped in the payload, so there is exactly one implementation of "how
+# fastcached describes itself to a supervisor" — the same reason the WiX
+# fragment drives --install-service instead of using a ServiceInstall element.
+#
+# Only --config is passed. A --storage here would land in ProgramArguments, and
+# a CLI value outranks YAML in Merge — so the storage_path the install docs
+# invite the operator to edit would be silently overridden forever, with the
+# daemon still filling the old directory and nothing reporting it. Everything
+# except the config path therefore comes from the config file.
+#
+# Output is teed to a fixed path as well as the installer log. A postinstall
+# must exit 0 whatever happens, so the only trace of a refusal to register is
+# whatever it wrote — and `|| true` on its own turns a precise diagnostic into
+# a service that is simply absent, which is what happened here once already.
+REGISTER_LOG="/var/log/fastcached-install.log"
+{
+    echo "--- $(date -u '+%Y-%m-%dT%H:%M:%SZ') registering the system daemon"
+    "${PREFIX}/bin/fastcached" --install-service --service-scope=system \
+        --config="${PREFIX}/etc/fastcached.yaml" 2>&1
+    echo "--- exit=$?"
+} >>"$REGISTER_LOG" 2>&1 || true
+
+# Belt and braces: the label must be the one the uninstaller looks for.
+if ! /bin/launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+    echo "fastcached: launchd job ${LABEL} did not register; see ${REGISTER_LOG}" >&2
+fi
+
+exit 0

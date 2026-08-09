@@ -61,6 +61,19 @@ target_sources(FastCache
         Server/Server.cpp
 )
 
+# The macOS package prefix, handed to the code that has to agree with it.
+# ServiceControl's launchd install picks the system job's storage and log
+# directories under this prefix, and the installer scripts lay the payload out
+# under the same one; when the two were spelled independently, a build with a
+# non-default FASTCACHED_MACOS_PREFIX produced a plist whose StandardOutPath
+# pointed into a directory the package never created, so launchd could not
+# spawn the job while the installer still reported success.
+#
+# PUBLIC so ServiceControl_test.cpp asserts against the same value.
+if(APPLE)
+    target_compile_definitions(FastCache PUBLIC FC_MACOS_PREFIX="/${FASTCACHED_MACOS_PREFIX}")
+endif()
+
 # Optional TLS support: compiled and linked only when FASTCACHED_ENABLE_TLS is
 # on, so the default build pulls in no OpenSSL header and links no OpenSSL
 # symbol. FC_TLS_ENABLED is PUBLIC so dependents (the test binary) can guard

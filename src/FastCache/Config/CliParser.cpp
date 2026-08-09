@@ -2,6 +2,7 @@
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
+#include <FastCache/Platform/ServiceControl.hpp>
 
 #include <algorithm>
 #include <array>
@@ -304,6 +305,204 @@ namespace
         return true;
     }
 
+    /// Typed (parsed) flags: every one is `--flag=<value>` handled by a
+    /// dedicated parser writing into one target field.
+    ///
+    /// Split out of HandleOneArg rather than inlined: seventeen structurally
+    /// identical blocks pushed that function past the cognitive-complexity
+    /// limit the project builds with, and the split keeps each function about
+    /// one kind of argument.
+    ///
+    /// @param args Full argument span.
+    /// @param i Index of the argument under inspection; advanced past a
+    ///          consumed `--flag value` pair.
+    /// @param cfg Config being populated.
+    /// @param result CliResult carrying the per-flag explicit trackers.
+    /// @return ArgOutcome::Continue when a flag matched, ArgOutcome::Unknown
+    ///         when none did, or a ConfigError when a value failed to parse.
+    [[nodiscard]] std::expected<ArgOutcome, ConfigError> HandleTypedFlag(std::span<char const* const> args,
+                                                                         std::size_t& i,
+                                                                         Config& cfg,
+                                                                         CliResult& result)
+    {
+        {
+            // Targets the CliResult, not the Config: the scope selects where the
+            // service is registered and has no meaning to a running daemon, so
+            // it takes no part in the YAML merge and carries no Explicit bit.
+            auto const matched = ApplyParsedFlag(args, i, "--service-scope", ParseServiceScope, result.serviceScope);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+                return ArgOutcome::Continue;
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--bind", ParseBindAddress, cfg.bindAddress);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.bindAddressExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--port", ParsePort, cfg.port);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.portExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--metrics-port", ParsePort, cfg.metricsPort);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.metricsPortExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--max-memory", ParseMaxMemory, cfg.maxMemoryBytes);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.maxMemoryBytesExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--log-level", ParseLogLevel, cfg.logLevel);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.logLevelExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched =
+                ApplyParsedFlag(args, i, "--storage-durability", ParseStorageDurability, cfg.storageDurability);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.storageDurabilityExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched =
+                ApplyParsedFlag(args, i, "--storage-max-value", ParseStorageMaxValue, cfg.storageMaxValueBytes);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.storageMaxValueBytesExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched =
+                ApplyParsedFlag(args, i, "--storage-max-disk", ParseStorageMaxDisk, cfg.storageMaxDiskBytes);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.storageMaxDiskBytesExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--lru-mode", ParseLruRecency, cfg.lruRecency);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.lruRecencyExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--cpu-affinity", ParseCpuAffinity, cfg.cpuAffinity);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.cpuAffinityExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--compression", ParseCompression, cfg.compression);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.compressionExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched =
+                ApplyParsedFlag(args, i, "--compression-level", ParseCompressionLevel, cfg.compressionLevel);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.compressionLevelExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched =
+                ApplyParsedFlag(args, i, "--compression-min-bytes", ParseCompressionMinBytes, cfg.compressionMinBytes);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.compressionMinBytesExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--threads", ParseThreads, cfg.workerThreads);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.workerThreadsExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--storage-shards", ParseStorageShards, cfg.storageShards);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.storageShardsExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        {
+            auto const matched = ApplyParsedFlag(args, i, "--listen-backlog", ParseListenBacklog, cfg.listenBacklog);
+            if (!matched.has_value())
+                return std::unexpected(matched.error());
+            if (*matched)
+            {
+                result.listenBacklogExplicit = true;
+                return ArgOutcome::Continue;
+            }
+        }
+        return ArgOutcome::Unknown;
+    }
+
     /// Dispatch a single argument. Returns ArgOutcome on success or a
     /// ConfigError if the argument matched a flag but parsing failed.
     [[nodiscard]] std::expected<ArgOutcome, ConfigError> HandleOneArg(std::span<char const* const> args,
@@ -417,169 +616,13 @@ namespace
             }
         }
 
-        // Typed flags.
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--bind", ParseBindAddress, cfg.bindAddress);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.bindAddressExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--port", ParsePort, cfg.port);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.portExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--metrics-port", ParsePort, cfg.metricsPort);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.metricsPortExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--max-memory", ParseMaxMemory, cfg.maxMemoryBytes);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.maxMemoryBytesExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--log-level", ParseLogLevel, cfg.logLevel);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.logLevelExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched =
-                ApplyParsedFlag(args, i, "--storage-durability", ParseStorageDurability, cfg.storageDurability);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.storageDurabilityExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched =
-                ApplyParsedFlag(args, i, "--storage-max-value", ParseStorageMaxValue, cfg.storageMaxValueBytes);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.storageMaxValueBytesExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched =
-                ApplyParsedFlag(args, i, "--storage-max-disk", ParseStorageMaxDisk, cfg.storageMaxDiskBytes);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-                return ArgOutcome::Continue;
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--lru-mode", ParseLruRecency, cfg.lruRecency);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.lruRecencyExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--cpu-affinity", ParseCpuAffinity, cfg.cpuAffinity);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.cpuAffinityExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--compression", ParseCompression, cfg.compression);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.compressionExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched =
-                ApplyParsedFlag(args, i, "--compression-level", ParseCompressionLevel, cfg.compressionLevel);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.compressionLevelExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched =
-                ApplyParsedFlag(args, i, "--compression-min-bytes", ParseCompressionMinBytes, cfg.compressionMinBytes);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.compressionMinBytesExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--threads", ParseThreads, cfg.workerThreads);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.workerThreadsExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--storage-shards", ParseStorageShards, cfg.storageShards);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.storageShardsExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--listen-backlog", ParseListenBacklog, cfg.listenBacklog);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.listenBacklogExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
+        // Typed flags live in their own handler; see HandleTypedFlag.
+        auto const typed = HandleTypedFlag(args, i, cfg, result);
+        if (!typed.has_value())
+            return std::unexpected(typed.error());
+        if (*typed != ArgOutcome::Unknown)
+            return *typed;
+
         return ArgOutcome::Unknown;
     }
 
@@ -687,10 +730,16 @@ namespace
         { .flag = "--daemon",
           .description = "daemonize (POSIX) / run under the Windows SCM (used by the installed service)" },
         { .flag = "--install-service",
-          .description = "register fastcached as an auto-start Windows service (Windows only;\n"
-                         "needs an elevated prompt; other flags are baked into the service)" },
+          .description = "register fastcached to start automatically: a Windows SCM service, or a\n"
+                         "macOS launchd job (see --service-scope). Other flags are baked in.\n"
+                         "Windows needs an elevated prompt; --service-scope=system needs sudo" },
         { .flag = "--uninstall-service",
-          .description = "remove the fastcached Windows service (Windows only; needs elevation)" },
+          .description = "remove the registration made by --install-service (same privileges)" },
+        { .flag = "--service-scope=<user|system>",
+          .description = "macOS only: which launchd domain --install-service acts on.\n"
+                         "user (default) = a LaunchAgent in ~/Library/LaunchAgents, started at\n"
+                         "login as you; system = a LaunchDaemon in /Library/LaunchDaemons,\n"
+                         "started at boot as _fastcached (needs sudo)" },
         { .flag = "--healthcheck",
           .description = "probe http://127.0.0.1:<metrics-port>/healthz and exit 0 (healthy) or 1\n"
                          "(self-contained container HEALTHCHECK; needs --metrics on the daemon)" },

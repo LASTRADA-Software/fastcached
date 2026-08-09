@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/KqueueReactor.hpp>
+#include <FastCache/Core/Ranges.hpp>
 
 #if defined(__APPLE__)
 
@@ -141,8 +142,10 @@ bool KqueueReactor::UpdateInterest(KqueueFdHandler* handler, bool read, bool wri
     return std::ranges::all_of(std::views::counted(results.begin(), applied), [&](struct kevent const& r) noexcept {
         if (r.data == 0)
             return true;
-        auto const* const row = std::ranges::find(interests, r.filter, &FilterInterest::filter);
-        return r.data == ENOENT && row != interests.end() && !row->wanted;
+        // FindOrNull, not std::ranges::find: `interests` is a std::array, whose
+        // iterator is a raw pointer only on libc++ (see Core/Ranges.hpp).
+        auto const* const row = FindOrNull(interests, r.filter, &FilterInterest::filter);
+        return r.data == ENOENT && row != nullptr && !row->wanted;
     });
 }
 
