@@ -31,6 +31,7 @@
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Net/HealthProbe.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
+#include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
@@ -68,41 +69,26 @@ namespace
 
 constexpr std::string_view ProgramVersion = FastCache::VersionString;
 
-/// Parse a 1..65535 TCP port from a NUL-terminated string, reusing the CLI's
-/// `FastCache::ParsePort` so the environment fallback accepts exactly the same
-/// syntax and range as the `--metrics-port` flag (single source of truth).
-/// @param raw Candidate string (may be null/empty).
-/// @return The port, or nullopt when null/empty/out-of-range/garbage.
-[[nodiscard]] std::optional<std::uint16_t> ParsePortString(char const* raw) noexcept
-{
-    if (raw == nullptr || *raw == '\0')
-        return std::nullopt;
-    auto const parsed = FastCache::ParsePort(std::string_view { raw });
-    if (!parsed.has_value())
-        return std::nullopt;
-    return *parsed;
-}
-
 /// Read the metrics port from the FASTCACHED_METRICS_PORT environment variable.
 /// This lets a container's daemon CMD and its separate `--healthcheck` probe
 /// agree on a custom port via a single `-e FASTCACHED_METRICS_PORT=...`, without
 /// the static image HEALTHCHECK having to learn the daemon's runtime args.
+///
+/// Reuses the CLI's `FastCache::ParsePort`, so the environment fallback accepts
+/// exactly the same syntax and range as the `--metrics-port` flag.
 /// @return The parsed port, or nullopt when unset/empty/invalid.
 [[nodiscard]] std::optional<std::uint16_t> MetricsPortFromEnv()
 {
-#if defined(_WIN32)
-    // Secure CRT getenv_s keeps the build warning-clean under /WX.
-    std::size_t size = 0;
-    if (::getenv_s(&size, nullptr, 0, "FASTCACHED_METRICS_PORT") != 0 || size == 0)
+    auto const raw = FastCache::ReadEnvironmentVariable("FASTCACHED_METRICS_PORT");
+    if (!raw.has_value())
         return std::nullopt;
-    std::string buffer(size, '\0');
-    if (::getenv_s(&size, buffer.data(), buffer.size(), "FASTCACHED_METRICS_PORT") != 0)
+
+    // ParsePort already rejects the empty string, so an unset and a blank
+    // variable land in the same place without a second emptiness rule here.
+    auto const parsed = FastCache::ParsePort(*raw);
+    if (!parsed.has_value())
         return std::nullopt;
-    buffer.resize(size > 0 ? size - 1 : 0); // drop the trailing NUL getenv_s wrote
-    return ParsePortString(buffer.c_str());
-#else
-    return ParsePortString(std::getenv("FASTCACHED_METRICS_PORT"));
-#endif
+    return *parsed;
 }
 
 extern "C" void HandleStopSignal(int /*signum*/)

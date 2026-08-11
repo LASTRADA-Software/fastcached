@@ -38,6 +38,7 @@ target_sources(FastCache
         Net/SocketAddress.cpp
         Platform/CpuAffinity.cpp
         Platform/DaemonControls.cpp
+        Platform/Environment.cpp
         Platform/HostMemory.cpp
         Platform/PosixDaemonHost.cpp
         Platform/ServiceControl.cpp

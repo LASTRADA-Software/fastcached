@@ -36,8 +36,10 @@ src/FastCache/
                 ReactorServerLoop (the server driver)
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
                 ISignalSource, DaemonControls (process-wide stop/reload flags),
-                CpuAffinity, HostMemory, ServiceControl, Terminal
-  Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader
+                CpuAffinity, HostMemory, ServiceControl, Terminal,
+                Environment (the one place the process environment is read)
+  Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader,
+                EnvExpand ($VAR/${VAR} in path settings)
   Metrics/      IMetricsSink + AtomicMetricsSink
 ```
 
