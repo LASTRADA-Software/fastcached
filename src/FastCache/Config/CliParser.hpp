@@ -22,6 +22,7 @@ enum class CliOutcome : std::uint8_t
     InstallService,   ///< --install-service was seen; register a Windows service.
     UninstallService, ///< --uninstall-service was seen; remove the Windows service.
     HealthCheck,      ///< --healthcheck was seen; probe /healthz and exit 0/1.
+    SeedConfig,       ///< --seed-config was seen; install the default config file and exit.
 };
 
 struct CliResult
@@ -37,6 +38,13 @@ struct CliResult
     /// BuildServiceArgv bake a meaningless `--service-scope` into the job's own
     /// recorded arguments. Ignored on Windows, which has a single SCM domain.
     ServiceScope serviceScope { ServiceScope::User };
+
+    /// Template `--seed-config` copies to the machine-wide config location.
+    ///
+    /// Outside Config for the same reason as serviceScope: it describes an
+    /// *installation* step, not the running daemon, so it takes no part in the
+    /// YAML merge and is never baked into a service command line.
+    std::string seedConfigTemplate;
 
     /// Per-flag "user typed this on the CLI" trackers. Without these,
     /// a user-typed value that happens to equal the field's default

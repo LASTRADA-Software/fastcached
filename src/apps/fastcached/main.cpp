@@ -2,7 +2,8 @@
 //
 // fastcached — Fast Cache Daemon entry point.
 //
-// Wiring: CLI -> optional YAML file -> ConfigReloader -> CacheEngine over
+// Wiring: CLI -> YAML file (named by --config, else discovered at the
+// platform's default location) -> ConfigReloader -> CacheEngine over
 // the storage backend -> RunReactorServer, hosted by the requested
 // IDaemonHost (foreground / POSIX daemon / Windows service).
 // SIGINT/SIGTERM and SCM stop trigger graceful shutdown;
@@ -22,6 +23,7 @@
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
+#include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -89,6 +91,28 @@ constexpr std::string_view ProgramVersion = FastCache::VersionString;
     if (!parsed.has_value())
         return std::nullopt;
     return *parsed;
+}
+
+/// Install `templatePath` at the machine-wide config location, unless a config
+/// is already there. The `--seed-config` action: how a packaging format with no
+/// conffile mechanism ships a default config that survives its own upgrades.
+/// @param templatePath The shipped template to copy.
+/// @return Process exit code.
+[[nodiscard]] int SeedDefaultConfig(std::string const& templatePath)
+{
+    FastCache::SystemConfigPathProbe const probe;
+    auto const destination = FastCache::SystemConfigPath(probe);
+    auto const seeded =
+        destination.and_then([&](auto const& dest) { return FastCache::SeedConfigFile(templatePath, dest); });
+    if (!seeded.has_value())
+    {
+        std::println(std::cerr, "fastcached: {}", seeded.error().ToString());
+        return EXIT_FAILURE;
+    }
+
+    std::println(
+        "fastcached: {} {}", *seeded == FastCache::SeedOutcome::Written ? "wrote" : "kept existing", destination->string());
+    return EXIT_SUCCESS;
 }
 
 extern "C" void HandleStopSignal(int /*signum*/)
@@ -725,6 +749,8 @@ int main(int argc, char const* const* argv)
                        FastCache::CliUsage(FastCache::StdoutSupportsColor() ? FastCache::UsageColor::Colored
                                                                             : FastCache::UsageColor::Plain));
             return EXIT_SUCCESS;
+        case FastCache::CliOutcome::SeedConfig:
+            return SeedDefaultConfig(parsed->seedConfigTemplate);
         case FastCache::CliOutcome::Run:
         case FastCache::CliOutcome::InstallService:
         case FastCache::CliOutcome::UninstallService:
@@ -734,15 +760,25 @@ int main(int argc, char const* const* argv)
             break;
     }
 
+    // The config file to read: the one the operator named, or else whichever
+    // platform default is actually there (EffectiveConfigPath owns that rule and
+    // the tests for it). Resolved into a LOCAL and never back into
+    // parsed->config, which is what --install-service registers: a discovered
+    // path baked into a service's launch arguments would outrank the file itself
+    // forever, and InlineCredentialRejection would start naming a path nobody
+    // typed.
+    auto const configPath =
+        FastCache::EffectiveConfigPath(parsed->config.configPath, FastCache::SystemConfigPathProbe {}).string();
+
     FastCache::Config effective;
     bool metricsPortYamlExplicit = false;
     // Aggregate "was the legacy single-bind triplet typed by the operator,
     // CLI or YAML?" so a downstream mix-with-`listeners:` check sees both
     // sources. Starts from the CLI explicit bits and ORs in YAML presence.
     auto bindShapeCli = *parsed;
-    if (!parsed->config.configPath.empty())
+    if (!configPath.empty())
     {
-        auto loaded = FastCache::ReadYamlConfigWithPresence(parsed->config.configPath);
+        auto loaded = FastCache::ReadYamlConfigWithPresence(configPath);
         if (!loaded.has_value())
         {
             std::println(std::cerr, "fastcached: {}", loaded.error().ToString());
@@ -753,7 +789,7 @@ int main(int argc, char const* const* argv)
         bindShapeCli.portExplicit = bindShapeCli.portExplicit || loaded->portExplicit;
         bindShapeCli.tlsEnabledExplicit = bindShapeCli.tlsEnabledExplicit || loaded->tlsEnabledExplicit;
         effective = FastCache::Merge(std::move(loaded->config), *parsed);
-        effective.configPath = parsed->config.configPath;
+        effective.configPath = configPath;
     }
     else
     {

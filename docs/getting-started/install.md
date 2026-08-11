@@ -23,7 +23,8 @@ systemctl status fastcached
 journalctl -u fastcached -f
 ```
 
-Configuration lives in `/etc/fastcached/fastcached.yaml`. It ships fully
+Configuration lives in `/etc/fastcached/fastcached.yaml`, which is where
+fastcached looks when it is started without `--config`. It ships fully
 commented with every setting at its default, and is marked as a package
 config file, so local edits survive upgrades.
 
@@ -54,14 +55,18 @@ systemctl --user enable --now fastcached
 ```
 
 The user unit runs on built-in defaults, so that is the whole setup. To
-customise it, drop a config in place and point the unit at it with
-`systemctl --user edit fastcached`:
+customise it, just drop a config where fastcached already looks — no unit
+override needed:
 
 ```sh
 mkdir -p ~/.config/fastcached
 cp /etc/fastcached/fastcached.yaml ~/.config/fastcached/fastcached.yaml
-systemctl --user edit fastcached     # add the ExecStart override shown in the unit
+systemctl --user restart fastcached
 ```
+
+That file also takes precedence over `/etc/fastcached/fastcached.yaml` for
+*any* fastcached you start yourself, which is how you keep a personal cache
+configured differently from the machine-wide service.
 
 State goes to `~/.local/state/fastcached`. Add `loginctl enable-linger
 $USER` if you want it running while you are not logged in.
@@ -77,8 +82,18 @@ sc.exe query FastCached
 sc.exe start FastCached
 ```
 
-The service reads `fastcached.yaml` from the installation directory.
-Uninstalling removes the service.
+Configuration lives in `C:\ProgramData\fastcached\fastcached.yaml`, which the
+service reads at every start. The installer seeds it from the
+`etc\fastcached.yaml.default` template beside the executables, but only when
+nothing is there yet — so an upgrade never discards your edits. Edit it from an
+elevated editor and restart:
+
+```powershell
+sc.exe stop FastCached
+sc.exe start FastCached
+```
+
+Uninstalling removes the service and leaves your configuration in place.
 
 ### macOS
 
@@ -140,11 +155,27 @@ installer sets it to mode `0640` owned `root:_fastcached`, so the daemon can
 read it and other accounts cannot — which is what makes it a safe home for
 `requirepass:`.
 
-The **per-user agent** does not read that file. It describes the system
-daemon, whose cache lives under the package prefix and is writable only by
-the service account, so an agent pointed at it would have nowhere to write.
-The agent uses per-user defaults instead, with its cache under
-`~/Library/Caches/fastcached`. To give it a config of your own:
+The **per-user agent** normally does not read that file. The installer sets it
+to `0640` owned `root:_fastcached`, so an agent running as you cannot read it
+and falls through to per-user defaults, with its cache under
+`~/Library/Caches/fastcached`. That is deliberate: the file describes the system
+daemon, whose cache lives under the package prefix and is writable only by the
+service account, so an agent pointed at it would have nowhere to write.
+
+Give the agent a configuration of its own by putting one where it looks first:
+
+```sh
+mkdir -p ~/.config/fastcached
+cp /opt/fastcached/etc/fastcached.yaml.default ~/.config/fastcached/fastcached.yaml
+launchctl kickstart -k gui/$UID/software.lastrada.fastcached
+```
+
+One exception: `storage_path:` in that file will *not* move the agent's cache.
+Registering a user agent with no `--config` bakes
+`--storage=~/Library/Caches/fastcached/cache` into its `ProgramArguments`, and a
+launch argument outranks the file for the life of the registration. Everything
+else in the file applies normally. To choose the cache location, name the file
+at registration time instead:
 
 ```sh
 fastcached --install-service --service-scope=user --config=~/my-fastcached.yaml

@@ -41,6 +41,22 @@
          1 = start the service when the installer finishes. -->
     <Property Id="FASTCACHED_START_SERVICE" Value="1" Secure="yes" />
 
+    <!-- Put a default configuration at the machine-wide location the daemon
+         looks in when it is started with no config flag, but only when nothing
+         is there yet, so an upgrade never discards operator edits. The payload
+         under [INSTALL_ROOT] is only the replaceable template; the live file
+         lives in %ProgramData% and is deliberately not payload at all.
+
+         The daemon does the copying itself rather than a cmd.exe copy, so the
+         destination is decided by the same table the startup lookup walks and
+         the two cannot drift apart. -->
+    <CustomAction Id="FastCachedSeedConfig"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcached.exe&quot; --seed-config=&quot;[INSTALL_ROOT]etc\fastcached.yaml.default&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
     <!-- Directory + ExeCommand is a type 34 custom action, whose Target must be
          the FULL path to the executable, quoted when it contains spaces (it
          does: "C:\Program Files\fastcached\"). Directory= is NOT a working
@@ -55,6 +71,13 @@
          the deferred action's own session that cannot read properties, which
          is a different thing.
 
+         No config flag is passed on purpose. A path baked into the service's
+         ImagePath outranks the file itself for the life of the registration,
+         and it would turn a seed that did not happen into a service that fails
+         at every start. Registering nothing lets the daemon resolve
+         %ProgramData%\fastcached\fastcached.yaml at each start, and fall back to
+         its built-in defaults if that file is genuinely absent.
+
          Return="ignore": registering the service must never fail the whole
          installation. It legitimately returns non-zero when the service is
          already present (a repair, or a reinstall over a previous version),
@@ -63,7 +86,7 @@
          simply re-run the install-service flag by hand. -->
     <CustomAction Id="FastCachedInstallService"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcached.exe&quot; --install-service --config=&quot;[INSTALL_ROOT]fastcached.yaml&quot;"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcached.exe&quot; --install-service"
                   Execute="deferred"
                   Impersonate="no"
                   Return="ignore" />
@@ -85,10 +108,16 @@
                   Return="ignore" />
 
     <InstallExecuteSequence>
+      <!-- Seed before registering, so the service finds its configuration the
+           first time it starts. Both run after the files are on disk
+           (InstallFiles), since they execute the installed binary. -->
+      <Custom Action="FastCachedSeedConfig" After="InstallFiles"
+              Condition="NOT REMOVE" />
+
       <!-- Register after the files are on disk (InstallFiles), since the
            action executes the installed binary. NOT REMOVE keeps it off the
            uninstall path; upgrades re-register with a refreshed command line. -->
-      <Custom Action="FastCachedInstallService" After="InstallFiles"
+      <Custom Action="FastCachedInstallService" After="FastCachedSeedConfig"
               Condition="NOT REMOVE" />
 
       <Custom Action="FastCachedStartService" After="FastCachedInstallService"

@@ -24,6 +24,7 @@ target_sources(FastCache
         Config/CliParser.cpp
         Config/ConfigMerge.cpp
         Config/ConfigReloader.cpp
+        Config/DefaultConfigPath.cpp
         Config/EnvExpand.cpp
         Config/YamlReader.cpp
         Core/Crc32c.cpp
@@ -74,6 +75,20 @@ target_sources(FastCache
 # PUBLIC so ServiceControl_test.cpp asserts against the same value.
 if(APPLE)
     target_compile_definitions(FastCache PUBLIC FC_MACOS_PREFIX="/${FASTCACHED_MACOS_PREFIX}")
+endif()
+
+# The machine-wide config directory the daemon probes when no --config is given,
+# taken from the same variable packaging/ installs the file into so the two
+# cannot drift. Defined regardless of FASTCACHED_PACKAGE_ROOT_PREFIX: a source
+# build should still find a config an operator placed in the conventional
+# location, and an absent file is a no-op. Windows resolves %ProgramData% at
+# runtime instead, so it gets no compiled-in path.
+#
+# PUBLIC so DefaultConfigPath_test.cpp asserts against the same value.
+if(APPLE)
+    target_compile_definitions(FastCache PUBLIC FC_SYSCONF_DIR="/${FASTCACHED_MACOS_PREFIX}/etc")
+elseif(UNIX)
+    target_compile_definitions(FastCache PUBLIC FC_SYSCONF_DIR="/${FASTCACHED_SYSCONF_DIR}")
 endif()
 
 # Optional TLS support: compiled and linked only when FASTCACHED_ENABLE_TLS is

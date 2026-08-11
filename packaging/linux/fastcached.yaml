@@ -19,6 +19,20 @@
 #
 # Command-line flags override this file. Add them with a drop-in:
 #   systemctl edit fastcached
+#
+# Started without --config, fastcached reads the first of these that exists and
+# it can read, so this file is found with no flag at all:
+#
+#   Linux    $XDG_CONFIG_HOME/fastcached/fastcached.yaml (else ~/.config/...)
+#            /etc/fastcached/fastcached.yaml
+#   macOS    $XDG_CONFIG_HOME/fastcached/fastcached.yaml (else ~/.config/...)
+#            /opt/fastcached/etc/fastcached.yaml
+#   Windows  %APPDATA%\fastcached\fastcached.yaml
+#            %ProgramData%\fastcached\fastcached.yaml
+#
+# The per-user file wins, so a personal cache can be configured without root
+# and without editing the machine-wide file. `fastcached --help` prints the
+# same list for the platform you are on.
 
 # --- Network ----------------------------------------------------------------
 
@@ -84,7 +98,7 @@
 #   Linux    /var/lib/fastcached/cache
 #            created and owned by the service (systemd StateDirectory=).
 #   Windows  $ProgramData/fastcached/cache
-#            beside the fastcached.yaml the installer places in the same
+#            beside the fastcached.yaml the installer seeds in the same
 #            directory, and writable by the service account.
 #   macOS    /opt/fastcached/var/cache
 #

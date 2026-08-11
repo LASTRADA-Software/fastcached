@@ -12,17 +12,21 @@
 #
 # The config file is NOT shipped for user installs (a package cannot write into
 # a home directory), so this unit starts on built-in defaults and works out of
-# the box. To customise it, drop a config in place and point the unit at it:
+# the box. To customise it, just put a file where fastcached already looks — no
+# unit override needed:
 #
 #     mkdir -p ~/.config/fastcached
 #     cp /etc/fastcached/fastcached.yaml ~/.config/fastcached/fastcached.yaml
-#     systemctl --user edit fastcached     # see the ExecStart note below
+#     systemctl --user restart fastcached
 #
-# ExecStart deliberately passes no --config: naming a file the package does not
-# ship made the very first `systemctl --user enable --now fastcached` fail with
-# FileNotFound, and Restart=on-failure then respawned it once a second until the
-# start limit tripped — an out-of-the-box restart loop instead of a working
-# daemon.
+# ExecStart deliberately passes no --config, and must not start doing so.
+# Naming a file the package does not ship made the very first
+# `systemctl --user enable --now fastcached` fail with FileNotFound, and
+# Restart=on-failure then respawned it once a second until the start limit
+# tripped — an out-of-the-box restart loop instead of a working daemon.
+# Leaving the flag off gets the same file when it exists, because the daemon's
+# own lookup probes $XDG_CONFIG_HOME/fastcached/fastcached.yaml (falling back to
+# ~/.config) before the machine-wide /etc copy, and simply skips what is absent.
 
 [Unit]
 Description=fastcached — fast cache daemon (user instance)
@@ -34,13 +38,13 @@ Type=simple
 
 # %S is $XDG_STATE_HOME (~/.local/state); %E would be $XDG_CONFIG_HOME.
 #
-# To use a config file, override this line with `systemctl --user edit
-# fastcached`, which is also where a per-user bind address or storage path
-# belongs:
+# A config at %E/fastcached/fastcached.yaml is picked up with no override at
+# all. Use `systemctl --user edit fastcached` only for settings that have to be
+# on the command line, or to name a config file somewhere else entirely:
 #
 #     [Service]
 #     ExecStart=
-#     ExecStart=/usr/bin/fastcached --config=%E/fastcached/fastcached.yaml
+#     ExecStart=/usr/bin/fastcached --config=%h/elsewhere/fastcached.yaml
 ExecStart=/usr/bin/fastcached
 ExecReload=/bin/kill -HUP $MAINPID
 

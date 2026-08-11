@@ -39,7 +39,8 @@ src/FastCache/
                 CpuAffinity, HostMemory, ServiceControl, Terminal,
                 Environment (the one place the process environment is read)
   Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader,
-                EnvExpand ($VAR/${VAR} in path settings)
+                EnvExpand ($VAR/${VAR} in path settings), DefaultConfigPath
+                (per-platform config lookup + --seed-config, behind IConfigPathProbe)
   Metrics/      IMetricsSink + AtomicMetricsSink
 ```
 
@@ -91,13 +92,30 @@ These constraints are load-bearing and have each already been a bug:
   `Type=forking`. launchd has the identical problem — it reaps the forked job
   instantly as "exited" — which is why `BuildServiceArgv` takes an
   `EmitDaemonFlag` rather than always emitting it.
-- **`ExecStart` must pass `--config`.** There is no default config search path,
-  so without it `ConfigReloader` has nothing to re-read and `systemctl reload`
-  is a silent no-op. The launchd install applies the same rule for the *system*
-  daemon: `--config` is the only flag its postinstall passes. The per-user agent
-  passes none — the packaged config describes the daemon, whose cache only the
-  service account can write, so an agent pointed at it would have nowhere to
-  write; it takes the per-user defaults instead.
+- **A config the operator named is strict; one the daemon found is not.**
+  Without `--config`, `DefaultConfigPath` walks a per-platform candidate table
+  (user location before machine-wide) and takes the first entry that exists *and
+  opens for reading* — `Config/DefaultConfigPath.cpp` is the single source of
+  truth for that order, for what `--help` lists, and for where `--seed-config`
+  writes. Readability, not mere existence, is the test: the macOS system config
+  is mode `0640 root:_fastcached`, so a per-user agent has to fall through it
+  rather than fail to start. A discovered file that is absent or unreadable is
+  skipped silently; one that parses badly is still fatal, as is a missing file
+  named with `--config`. The resolved path goes into a *local* in `main.cpp` and
+  never back into `parsed->config` — that object is what `InstallService`
+  registers, and a discovered path baked into `ProgramArguments` would outrank
+  the file itself forever (see the next bullet) and make
+  `InlineCredentialRejection` name a path nobody typed.
+- **`ExecStart` still passes `--config` on Linux and macOS — by choice, not
+  necessity.** It predates the lookup, where its absence made `ConfigReloader`
+  have nothing to re-read and `systemctl reload` a silent no-op; the lookup now
+  closes that hole for every daemon started without the flag. The packaged units
+  keep it because the path is unambiguous there and CI asserts it. Windows goes
+  the other way: its custom action registers *no* `--config`, so a seed that did
+  not happen degrades to built-in defaults instead of a service that fails at
+  every start. The per-user launchd agent and the systemd user unit pass none —
+  the packaged config describes the system daemon, whose cache only the service
+  account can write.
 - **`--install-service` registers the *command-line* config, not the merged
   one.** A flag in `ProgramArguments` outranks the same key in YAML for the life
   of the registration, so baking merged values in froze every configured key at
@@ -129,9 +147,15 @@ These constraints are load-bearing and have each already been a bug:
   would put them where systemd never looks — and on macOS an *absolute*
   `install(DESTINATION)` escapes CPack's staging tree and writes to the build
   host's real filesystem.
-- **A macOS `.pkg` has no conffile mechanism.** It overwrites its payload on
-  every install, so the live `fastcached.yaml` is deliberately not payload: the
-  Runtime postinstall seeds it from a shipped `.default` only when absent.
+- **Neither a macOS `.pkg` nor an MSI has a conffile mechanism.** Both overwrite
+  their payload on every install, so on both the live `fastcached.yaml` is
+  deliberately not payload: only a `.default` template ships, and it is copied to
+  the real location exactly once, when nothing is there. macOS does this in the
+  Runtime postinstall (`seed-config.sh.inc`), Windows in a custom action running
+  the daemon's own `--seed-config` — which takes its destination from
+  `SystemConfigPath`, so the seeded file and the startup lookup cannot disagree.
+  Only the DEB conffile and the RPM `%config(noreplace)` can ship the live file
+  directly. Uninstalling leaves the config behind on every platform.
 - **An HTML installer pane must begin with its doctype.** Installer.app decides
   HTML from plain text by sniffing the first bytes of the resource, so the
   `<!-- SPDX-License-Identifier -->` header that opens every other file in the
