@@ -84,6 +84,7 @@ re-groups prefetching without partitioning the cache or invalidating anything.
 
 ## Operational notes
 
-The per-value cap (`--storage-max-value`, default 16 MiB) also raises the wire
-frame-payload cap, and object files in a large codebase routinely exceed the
-default. See [running a compile cache](../operations/compile-cache-server.md).
+The per-value cap (`--storage-max-value`, default 256 MiB) also raises the wire
+frame-payload cap for this protocol, and the default is already sized for object
+files in a large codebase. See
+[running a compile cache](../operations/compile-cache-server.md).

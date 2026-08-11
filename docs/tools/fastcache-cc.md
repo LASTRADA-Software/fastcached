@@ -26,13 +26,13 @@ out, so the build tool records dependencies that exist on *this* machine.
 ## Requirements
 
 - A running `fastcached` daemon, reachable over TCP.
-- The daemon's value cap raised above your largest object file. The default is
-  16 MiB and real object files exceed it — a large C++ codebase was measured at
-  ~122 MB for its biggest. `--storage-max-value` raises both the per-value cap
-  and the wire frame-payload cap:
+- A daemon value cap above your largest object file. The 256 MiB default covers
+  the usual case — a large C++ codebase was measured at ~122 MB for its biggest
+  object — so this normally needs no flag. Past that, `--storage-max-value`
+  raises both the per-value cap and the wire frame-payload cap:
 
 ```sh
-fastcached --port=11211 --storage-max-value=256M
+fastcached --port=11211 --storage-max-value=512M
 ```
 
 ## Supported compilers

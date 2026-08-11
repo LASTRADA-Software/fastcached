@@ -3,6 +3,7 @@
 
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Platform/HostMemory.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -91,16 +92,26 @@ enum class LruRecency : std::uint8_t
 struct Config
 {
     /// In-memory storage byte budget. 0 = unbounded (testing/dev only).
-    std::size_t maxMemoryBytes { 64 * 1024 * 1024 };
+    /// Scales with the machine rather than being a fixed constant; see
+    /// DefaultMaxMemoryBytes() for the fraction and the bounds.
+    std::size_t maxMemoryBytes { DefaultMaxMemoryBytes() };
 
     /// Maximum size of a single cache value in bytes, enforced by every
-    /// storage backend (in-memory LRU and on-disk COW tree). Defaults to
-    /// 16 MiB, matching the protocol payload cap (`MaxPayloadBytes`), so
-    /// the default imposes no extra limit beyond what the wire layer
-    /// already rejects; lower it to enforce a stricter per-value cap.
+    /// storage backend (in-memory LRU and on-disk COW tree).
     /// Set/Add/Replace/CompareAndSwap/Append/Prepend that would exceed
     /// this return StorageErrorCode::ValueTooLarge.
-    std::size_t storageMaxValueBytes { 16 * 1024 * 1024 };
+    ///
+    /// Sized for the compile-cache workload this daemon exists to serve:
+    /// object files routinely pass 16 MiB, and the entries a cap rejects are
+    /// precisely the expensive-to-recompute ones it was worth caching. The
+    /// cap costs nothing until it is used -- a value does not need a page of
+    /// its own, it spills into an overflow-page chain over the fixed 16 KiB
+    /// store page size.
+    ///
+    /// It also raises the wire payload cap, but only for the protocols that
+    /// take it from the session: the compile-cache protocol and RESP. Both
+    /// memcached framings keep their own hardcoded 16 MiB ceiling.
+    std::size_t storageMaxValueBytes { 256 * 1024 * 1024 };
 
     /// Maximum bytes the on-disk (L2) tier may hold, across all shards
     /// (the `--storage-max-disk` flag). Only meaningful with `--storage`.

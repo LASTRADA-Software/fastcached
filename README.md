@@ -88,14 +88,14 @@ build down, never break it.
 
 ### 1. Start a daemon
 
-Raise the value cap: real object files routinely exceed the 16 MiB default (a
-large C++ codebase was measured at ~122 MB for its biggest object).
-
 ```sh
 fastcached --port=11211 \
-           --storage=$HOME/.cache/fastcached/cache.cow \
-           --storage-max-value=256M
+           --storage=$HOME/.cache/fastcached/cache.cow
 ```
+
+The 256 MiB default value cap already covers real object files, which routinely
+exceed 16 MiB — a large C++ codebase was measured at ~122 MB for its biggest.
+Pass `--storage-max-value` only to go beyond that, or to impose a smaller cap.
 
 Point every machine that should share the cache at that one daemon.
 
@@ -223,9 +223,9 @@ that matter most:
 | Flag | Purpose |
 |------|---------|
 | `--bind=<addr>` / `--port=<num>` | Where to listen (default `127.0.0.1:11211`). |
-| `--max-memory=<size>` | In-memory budget; `k`/`m`/`g` suffixes, or `N%` of host RAM (default 64 MiB). |
+| `--max-memory=<size>` | In-memory budget; `k`/`m`/`g` suffixes, or `N%` of host RAM. Defaults to a quarter of host RAM, bounded to [512 MiB, 8 GiB]; under a container memory limit that limit is used instead of the host's RAM. |
 | `--storage=<path>` | Persist to a crash-consistent copy-on-write B+tree; without it the cache is memory-only. |
-| `--storage-max-value=<size>` | Per-value cap, and the wire payload cap with it (default 16 MiB). Raise it for compile caches. |
+| `--storage-max-value=<size>` | Per-value cap, and the wire payload cap with it (default 256 MiB, sized for compile caches). The memcached framings keep a fixed 16 MiB ceiling. |
 | `--storage-durability=<mode>` | `fsync` / `batched` (default) / `none`. |
 | `--threads=<N>` | Independent pinned reactors; the server's across-core parallelism. |
 | `--requirepass=<secret>` | Require authentication (Redis `AUTH`, memcached SASL PLAIN). |
