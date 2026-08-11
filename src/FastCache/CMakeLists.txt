@@ -24,6 +24,7 @@ target_sources(FastCache
         Config/CliParser.cpp
         Config/ConfigMerge.cpp
         Config/ConfigReloader.cpp
+        Config/EnvExpand.cpp
         Config/YamlReader.cpp
         Core/Crc32c.cpp
         Core/Logger.cpp
