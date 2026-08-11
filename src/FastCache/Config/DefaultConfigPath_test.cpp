@@ -547,6 +547,52 @@ TEST_CASE("SeedConfigFile: AdministratorsOnly either secures the directory or re
 // ("readable", "only an administrator could have put this here") live in
 // SystemConfigPathProbe, and a fake cannot get them wrong on its behalf.
 
+TEST_CASE("SystemConfigPathProbe: readability means an ordinary file this account can open", "[config][probe]")
+{
+    FastCache::SystemConfigPathProbe const probe;
+    TempDir const dir { "readable" };
+
+    auto const file = dir / "fastcached.yaml";
+    WriteFile(file, "port: 6674\n");
+    REQUIRE(probe.IsReadableFile(file));
+
+    // Absent is the ordinary case for a candidate location, and the one that
+    // has to stay quiet rather than become an error.
+    REQUIRE_FALSE(probe.IsReadableFile(dir / "not-there.yaml"));
+
+    // A directory is not a config file, however openable it looks: fopen() on
+    // one succeeds on Linux, so opening alone would accept it and the lookup
+    // would settle on something that was never a candidate.
+    REQUIRE_FALSE(probe.IsReadableFile(dir.Path()));
+}
+
+#if !defined(_WIN32)
+TEST_CASE("SystemConfigPathProbe: a file this account may not read is not readable", "[config][probe]")
+{
+    if (::geteuid() == 0)
+    {
+        SUCCEED("running as root, for whom the permission bits are advisory");
+        return;
+    }
+
+    FastCache::SystemConfigPathProbe const probe;
+    TempDir const dir { "unreadable" };
+
+    // The macOS LaunchAgent case in miniature, and the whole reason the test is
+    // readability rather than existence: the system config is mode 0640
+    // root:_fastcached, so an agent running as the operator has to fall through
+    // it rather than fail to start.
+    auto const file = dir / "fastcached.yaml";
+    WriteFile(file, "port: 6674\n");
+    REQUIRE(::chmod(file.string().c_str(), 0) == 0);
+
+    REQUIRE_FALSE(probe.IsReadableFile(file));
+
+    // Restore, or TempDir cannot clean up after itself.
+    REQUIRE(::chmod(file.string().c_str(), 0600) == 0);
+}
+#endif
+
 TEST_CASE("SystemConfigPathProbe: a directory a standard account can write is not trusted", "[config][trust][probe]")
 {
     FastCache::SystemConfigPathProbe const probe;
