@@ -2,6 +2,7 @@
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/FileTrust.hpp>
 
 #include <algorithm>
 #include <array>
@@ -117,6 +118,11 @@ bool SystemConfigPathProbe::IsReadableFile(std::filesystem::path const& path) co
     return probe.is_open();
 }
 
+bool SystemConfigPathProbe::IsTrustedSystemLocation(std::filesystem::path const& path) const
+{
+    return IsAdministratorOnlyWritable(path);
+}
+
 std::span<ConfigCandidate const> DefaultConfigCandidates() noexcept
 {
     return Candidates;
@@ -138,21 +144,45 @@ std::optional<std::filesystem::path> ExpandConfigCandidate(ConfigCandidate const
     return std::filesystem::path { *base } / candidate.suffix;
 }
 
-std::optional<std::filesystem::path> ResolveDefaultConfigPath(IConfigPathProbe const& probe)
+ConfigLookup ResolveDefaultConfigPath(IConfigPathProbe const& probe)
 {
-    for (auto const& candidate: Candidates)
-        if (auto path = ExpandConfigCandidate(candidate, probe); path && probe.IsReadableFile(*path))
-            return path;
+    ConfigLookup lookup;
 
-    return std::nullopt;
+    for (auto const& candidate: Candidates)
+    {
+        auto const path = ExpandConfigCandidate(candidate, probe);
+        if (!path.has_value() || !probe.IsReadableFile(*path))
+            continue; // absent or not ours to read: ordinary, and silent
+
+        // A machine-wide file has to be one only an administrator could have
+        // placed, because it configures a process running as one. Per-user
+        // rows are exempt: that file belongs to the account already.
+        if (candidate.scope == ConfigScope::System && !probe.IsTrustedSystemLocation(*path))
+        {
+            auto const directory = path->parent_path();
+            lookup.rejected.push_back(
+                { .path = *path,
+                  .reason = std::format("ignored: {} can be written by accounts other than the administrative ones, "
+                                        "so this file is not necessarily an administrator's. Secure it with `{}`, or "
+                                        "name a config explicitly with --config.",
+                                        directory.string(),
+                                        SecureDirectoryHint(directory)) });
+            continue;
+        }
+
+        lookup.path = *path;
+        break;
+    }
+
+    return lookup;
 }
 
-std::filesystem::path EffectiveConfigPath(std::string_view named, IConfigPathProbe const& probe)
+ConfigLookup EffectiveConfigPath(std::string_view named, IConfigPathProbe const& probe)
 {
     if (!named.empty())
-        return std::filesystem::path { named };
+        return { .path = std::filesystem::path { named }, .rejected = {} };
 
-    return ResolveDefaultConfigPath(probe).value_or(std::filesystem::path {});
+    return ResolveDefaultConfigPath(probe);
 }
 
 std::expected<std::filesystem::path, ConfigError> SystemConfigPath(IConfigPathProbe const& probe)
@@ -168,7 +198,8 @@ std::expected<std::filesystem::path, ConfigError> SystemConfigPath(IConfigPathPr
 }
 
 std::expected<SeedOutcome, ConfigError> SeedConfigFile(std::filesystem::path const& templatePath,
-                                                       std::filesystem::path const& destination)
+                                                       std::filesystem::path const& destination,
+                                                       DirectoryPolicy policy)
 {
     // The error_code overloads report failure by returning false, so a probe
     // that cannot answer is treated as "not there" — which is the safe reading
@@ -182,10 +213,37 @@ std::expected<SeedOutcome, ConfigError> SeedConfigFile(std::filesystem::path con
 
     if (auto const parent = destination.parent_path(); !parent.empty())
     {
-        std::filesystem::create_directories(parent, ec);
+        auto const created = std::filesystem::create_directories(parent, ec);
         if (ec)
             return std::unexpected(MakeConfigPathError(
                 ConfigErrorCode::WriteFailed, parent, std::format("cannot create directory: {}", ec.message())));
+
+        // Establish the permissions BEFORE the config lands, so there is no
+        // moment at which it sits somewhere loose. Unconditionally rather than
+        // only for a directory just created: one that was already there may be
+        // a squatted one — a fresh %ProgramData% subdirectory can be made by
+        // any standard account — and a machine-wide config is not something to
+        // drop into a directory of unknown provenance. SecureDirectoryForAdmin-
+        // istrators reports the resulting property rather than the syscall, so
+        // this both sets and confirms it, and repairs a squat while it is at it.
+        if (policy == DirectoryPolicy::AdministratorsOnly && !SecureDirectoryForAdministrators(parent))
+        {
+            // Leave nothing squattable behind. A directory this call created and
+            // could not secure is one owned by whoever ran it, sitting at the
+            // machine-wide config location — the exact shape being defended
+            // against, authored by the defence itself.
+            if (created)
+                std::filesystem::remove(parent, ec);
+
+            return std::unexpected(
+                MakeConfigPathError(ConfigErrorCode::WriteFailed,
+                                    parent,
+                                    std::format("cannot restrict this directory to administrators, so a config "
+                                                "placed in it would not be trusted at startup. Seeding the "
+                                                "machine-wide config needs administrative rights; to repair a "
+                                                "directory that is already there, run: {}",
+                                                SecureDirectoryHint(parent))));
+        }
     }
 
     // copy_file rather than a rename: the template stays in place as package

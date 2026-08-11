@@ -10,6 +10,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache
 {
@@ -74,6 +75,15 @@ class IConfigPathProbe
     ///         system config is mode 0640 root:_fastcached, and a per-user
     ///         agent must fall through it rather than fail to start.
     [[nodiscard]] virtual bool IsReadableFile(std::filesystem::path const& path) const = 0;
+
+    /// @param path Candidate file, already known to be readable.
+    /// @return true when only an administrator could have put a file there.
+    ///         Asked of machine-wide candidates only, and for a specific
+    ///         attack: `%ProgramData%` subdirectories are user-creatable by
+    ///         default, so a standard account could plant the configuration a
+    ///         LocalSystem service then obeys. See Platform/FileTrust.hpp for
+    ///         why the test is the containing directory and not the owner.
+    [[nodiscard]] virtual bool IsTrustedSystemLocation(std::filesystem::path const& path) const = 0;
 };
 
 /// The production probe: the real process environment and the real filesystem.
@@ -82,6 +92,7 @@ class SystemConfigPathProbe final: public IConfigPathProbe
   public:
     [[nodiscard]] std::optional<std::string> GetEnv(std::string_view name) const override;
     [[nodiscard]] bool IsReadableFile(std::filesystem::path const& path) const override;
+    [[nodiscard]] bool IsTrustedSystemLocation(std::filesystem::path const& path) const override;
 };
 
 /// The platform's candidate locations, in priority order (user before system).
@@ -96,11 +107,41 @@ class SystemConfigPathProbe final: public IConfigPathProbe
 [[nodiscard]] std::optional<std::filesystem::path> ExpandConfigCandidate(ConfigCandidate const& candidate,
                                                                          IConfigPathProbe const& probe);
 
+/// A candidate the lookup passed over for a reason the operator has to hear.
+///
+/// Only *some* skips qualify. A location that does not exist, or that this
+/// account may not read, is ordinary and stays quiet — that silence is the
+/// documented rule which lets a per-user daemon start alongside a machine-wide
+/// config it has no access to. A machine-wide file rejected as untrusted is the
+/// opposite: the file is there, it is readable, and it is being ignored anyway,
+/// so saying nothing would be the silent no-op this codebase keeps paying for.
+struct RejectedCandidate
+{
+    std::filesystem::path path; ///< The candidate that was not used.
+    std::string reason;         ///< Why, phrased for an operator, with the remedy.
+};
+
+/// What a lookup decided, and what it wants said out loud.
+struct ConfigLookup
+{
+    /// The file to read; empty when none applies and the built-in defaults do.
+    std::filesystem::path path;
+
+    /// Candidates skipped for a reason worth reporting. Usually empty.
+    std::vector<RejectedCandidate> rejected;
+};
+
 /// Find the config file to use when no `--config` was given.
+///
+/// Machine-wide candidates carry one extra condition: only an administrator may
+/// be able to have put them there. Per-user ones do not — that file is the
+/// account's own by definition — so the rule is driven by each row's
+/// ConfigScope rather than by the platform.
+///
 /// @param probe Environment and filesystem source.
-/// @return The first candidate that expands and is readable, or nullopt when
-///         none is — in which case the daemon runs on its built-in defaults.
-[[nodiscard]] std::optional<std::filesystem::path> ResolveDefaultConfigPath(IConfigPathProbe const& probe);
+/// @return The first usable candidate, with an empty path when there is none,
+///         plus anything rejected along the way.
+[[nodiscard]] ConfigLookup ResolveDefaultConfigPath(IConfigPathProbe const& probe);
 
 /// The config file a run should actually read.
 ///
@@ -108,13 +149,16 @@ class SystemConfigPathProbe final: public IConfigPathProbe
 /// daemon *found* is not: `named` is returned verbatim, whether or not it
 /// exists, so a typo fails loudly downstream instead of silently falling back
 /// to different settings; a discovered path is returned only when it is
-/// readable. Lives here rather than at the call site so the rule is testable.
+/// readable, and a machine-wide one only when it is also trusted. A named path
+/// is never trust-checked — the operator asserted that file, which is their
+/// call to make. Lives here rather than at the call site so the rule is
+/// testable.
 ///
 /// @param named The `--config` value, empty when the operator gave none.
 /// @param probe Environment and filesystem source.
-/// @return The path to read, or an empty path when there is none and the
-///         built-in defaults apply.
-[[nodiscard]] std::filesystem::path EffectiveConfigPath(std::string_view named, IConfigPathProbe const& probe);
+/// @return The path to read — empty when there is none and the built-in
+///         defaults apply — plus anything rejected along the way.
+[[nodiscard]] ConfigLookup EffectiveConfigPath(std::string_view named, IConfigPathProbe const& probe);
 
 /// Where an installer should write the machine-wide config.
 ///
@@ -137,6 +181,20 @@ enum class SeedOutcome : std::uint8_t
     AlreadyPresent, ///< The destination existed and was left untouched.
 };
 
+/// What a directory SeedConfigFile has to create should end up permitting.
+enum class DirectoryPolicy : std::uint8_t
+{
+    /// Whatever the parent hands down. For a destination that is nobody's
+    /// machine-wide configuration — a scratch path under test, say.
+    Inherit,
+
+    /// Restricted so only administrators can write, before anything is put in
+    /// it. Required for the machine-wide config, because a fresh `%ProgramData%`
+    /// subdirectory inherits create-file for every standard account, and a
+    /// config sitting in one is a config the startup lookup will refuse.
+    AdministratorsOnly,
+};
+
 /// Copy `templatePath` to `destination` only when `destination` does not exist,
 /// creating parent directories as needed.
 ///
@@ -152,9 +210,15 @@ enum class SeedOutcome : std::uint8_t
 ///
 /// @param templatePath The shipped, replaceable copy.
 /// @param destination Where the live config belongs.
-/// @return What happened, or a ConfigError when the template is missing or the
-///         copy fails.
+/// @param policy What a directory created on the way should permit. With
+///        `AdministratorsOnly` the restriction is applied *before* the config is
+///        copied, so nothing ever sits in a loose directory — which also means a
+///        caller without administrative rights fails here rather than planting a
+///        machine-wide config it would still own.
+/// @return What happened, or a ConfigError when the template is missing, the
+///         directory cannot be restricted, or the copy fails.
 [[nodiscard]] std::expected<SeedOutcome, ConfigError> SeedConfigFile(std::filesystem::path const& templatePath,
-                                                                     std::filesystem::path const& destination);
+                                                                     std::filesystem::path const& destination,
+                                                                     DirectoryPolicy policy);
 
 } // namespace FastCache

@@ -1115,11 +1115,16 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
 
     // The two ambient inputs WithScopeDefaults decides from, both resolved here
     // rather than inside it: readability, not mere existence, is the test, for
-    // the reason DefaultConfigPath.hpp gives.
+    // the reason DefaultConfigPath.hpp gives — and trust on top of it, so a
+    // registration cannot hand launchd a file the daemon would refuse to obey
+    // at every start. Failing the same way in both places keeps the two from
+    // disagreeing about which configs count.
     SystemConfigPathProbe const probe;
     auto const packagedConfig = [&] {
         auto const path = SystemConfigPath(probe);
-        return path.has_value() && probe.IsReadableFile(*path) ? *path : std::filesystem::path {};
+        return path.has_value() && probe.IsReadableFile(*path) && probe.IsTrustedSystemLocation(*path)
+                   ? *path
+                   : std::filesystem::path {};
     }();
 
     auto const effective = WithScopeDefaults(cfg, scope, home, packagedConfig);

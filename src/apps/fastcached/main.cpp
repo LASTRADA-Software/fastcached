@@ -102,8 +102,9 @@ constexpr std::string_view ProgramVersion = FastCache::VersionString;
 {
     FastCache::SystemConfigPathProbe const probe;
     auto const destination = FastCache::SystemConfigPath(probe);
-    auto const seeded =
-        destination.and_then([&](auto const& dest) { return FastCache::SeedConfigFile(templatePath, dest); });
+    auto const seeded = destination.and_then([&](auto const& dest) {
+        return FastCache::SeedConfigFile(templatePath, dest, FastCache::DirectoryPolicy::AdministratorsOnly);
+    });
     if (!seeded.has_value())
     {
         std::println(std::cerr, "fastcached: {}", seeded.error().ToString());
@@ -767,8 +768,16 @@ int main(int argc, char const* const* argv)
     // path baked into a service's launch arguments would outrank the file itself
     // forever, and InlineCredentialRejection would start naming a path nobody
     // typed.
-    auto const configPath =
-        FastCache::EffectiveConfigPath(parsed->config.configPath, FastCache::SystemConfigPathProbe {}).string();
+    auto const lookup = FastCache::EffectiveConfigPath(parsed->config.configPath, FastCache::SystemConfigPathProbe {});
+    auto const configPath = lookup.path.string();
+
+    // A machine-wide config that exists and is readable but was passed over
+    // anyway has to say so, and to stderr rather than through the logger, which
+    // does not exist until DaemonBody. Silence here would mean an operator
+    // editing a file the daemon has quietly decided not to obey — and the
+    // reason it declined is a permission problem only they can fix.
+    for (auto const& [path, reason]: lookup.rejected)
+        std::println(std::cerr, "fastcached: {}: {}", path.string(), reason);
 
     FastCache::Config effective;
     bool metricsPortYamlExplicit = false;
