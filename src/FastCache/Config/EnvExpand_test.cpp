@@ -1,54 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/EnvExpand.hpp>
+#include <FastCache/Platform/EnvironmentTestUtils.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <cstdlib>
 #include <string>
 
 using FastCache::ConfigErrorCode;
 using FastCache::ExpandEnvironmentVariables;
-
-namespace
-{
-
-/// Set/clear an environment variable for the duration of a test.
-///
-/// Windows' _putenv_s and POSIX' setenv/unsetenv differ enough that the tests
-/// would otherwise repeat the #if in every case.
-class ScopedEnv
-{
-  public:
-    ScopedEnv(std::string name, std::string const& value):
-        _name { std::move(name) }
-    {
-#if defined(_WIN32)
-        ::_putenv_s(_name.c_str(), value.c_str());
-#else
-        ::setenv(_name.c_str(), value.c_str(), 1);
-#endif
-    }
-
-    ~ScopedEnv()
-    {
-#if defined(_WIN32)
-        // An empty value is how the Windows CRT removes a variable.
-        ::_putenv_s(_name.c_str(), "");
-#else
-        ::unsetenv(_name.c_str());
-#endif
-    }
-
-    ScopedEnv(ScopedEnv const&) = delete;
-    ScopedEnv& operator=(ScopedEnv const&) = delete;
-    ScopedEnv(ScopedEnv&&) = delete;
-    ScopedEnv& operator=(ScopedEnv&&) = delete;
-
-  private:
-    std::string _name;
-};
-
-} // namespace
+using FastCache::Testing::ScopedEnv;
 
 TEST_CASE("EnvExpand: input without references is returned unchanged", "[config][env]")
 {

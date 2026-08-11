@@ -19,8 +19,12 @@ std::optional<std::string> ReadEnvironmentVariable(std::string_view name)
     if (::getenv_s(&size, nullptr, 0, key.c_str()) != 0 || size == 0)
         return std::nullopt;
 
+    // The size check again, on the fetching call: getenv_s reports 0 for a
+    // variable it did not find, and between the two calls it can genuinely go
+    // missing. Without this, `size - 1` underflows and resize() is asked for
+    // the whole address space.
     std::string value(size, '\0');
-    if (::getenv_s(&size, value.data(), size, key.c_str()) != 0)
+    if (::getenv_s(&size, value.data(), size, key.c_str()) != 0 || size == 0)
         return std::nullopt;
     value.resize(size - 1);
     return value;
