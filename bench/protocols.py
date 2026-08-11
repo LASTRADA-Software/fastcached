@@ -8,7 +8,7 @@ benchmark portable and reproducible across Windows, Linux, and macOS.
 Every client exposes the same small surface so the load generator can drive any
 protocol uniformly::
 
-    client = make_client("redis", "127.0.0.1", 11211)
+    client = make_client("redis", "127.0.0.1", 6674)
     client.set(b"k", b"v")
     client.get(b"k")
     client.delete(b"k")

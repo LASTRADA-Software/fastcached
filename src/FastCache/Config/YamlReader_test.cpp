@@ -116,7 +116,9 @@ TEST_CASE("YamlReader: empty file produces defaults", "[config][yaml]")
     auto const cfg = FastCache::ReadYamlConfig(path);
     REQUIRE(cfg.has_value());
     REQUIRE(cfg->bindAddress == "127.0.0.1");
-    REQUIRE(cfg->port == 11211);
+    // Asserted against the constant, not a literal: a file with no `port:` key
+    // must fall through to the compiled default, whatever that default is.
+    REQUIRE(cfg->port == FastCache::DefaultPort);
 }
 
 TEST_CASE("YamlReader: max_memory accepts kibibyte suffix", "[config][yaml]")

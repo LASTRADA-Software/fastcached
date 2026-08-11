@@ -409,7 +409,7 @@ namespace
 
     constexpr auto ScopeTable = std::to_array<ScopeTraits>({
         // A user agent uses KeepAlive={Crashed:true} rather than <true/>: a second
-        // logged-in user's agent loses the race for 127.0.0.1:11211 and exits
+        // logged-in user's agent loses the race for 127.0.0.1:6674 and exits
         // cleanly with a non-zero status, which <true/> would treat as "restart
         // it", producing a permanent 10-second crash loop. {Crashed:true} restarts
         // only on a signal, so a lost port becomes one log line.

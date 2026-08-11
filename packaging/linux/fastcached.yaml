@@ -28,9 +28,11 @@
 # before you do.
 #bind: 127.0.0.1
 
-# TCP port. 11211 is the memcached default; redis clients speak RESP on the
-# same port (the protocol is auto-detected per connection).
-#port: 11211
+# TCP port. 6674 is fastcached's own — the gravitational constant, and a number
+# no other service has registered with IANA. It selects no protocol: memcached
+# text, memcached binary, redis RESP and the compile-cache protocol are all
+# auto-detected per connection, so every supported client works here.
+#port: 6674
 
 # Depth of the kernel's accept queue. Raise it if bursts of parallel clients
 # (a `make -jN` driving fastcache-cc) see connection refusals. Clamped to the
@@ -41,7 +43,10 @@
 
 # In-memory cache budget. Accepts k/m/g suffixes (KiB/MiB/GiB) or a percentage
 # of host RAM, e.g. `25%`. Values evict LRU-first once the budget is reached.
-#max_memory: 64m
+# Defaults to a quarter of the machine's memory, bounded to [512m, 8g]. In a
+# memory-capped container the cgroup limit is what that quarter is taken of,
+# not the host's RAM.
+#max_memory: 25%
 
 # In-memory LRU recency policy:
 #   approximate  reads run concurrently, eviction is approximately LRU (faster)
@@ -65,9 +70,24 @@
 #
 # The path is interpreted by shape: a path WITHOUT a file extension is treated
 # as a directory and sharded into shard-NN.cow files inside it; a path WITH an
-# extension (e.g. cache.cow) is a single file. The path below is a directory.
+# extension (e.g. cache.cow) is a single file. The paths below are directories.
 #
-# /var/lib/fastcached is created and owned by the service (StateDirectory=).
+# Path values understand $VAR and ${VAR} environment references; ${VAR} is the
+# form to use for names the bare one cannot spell, such as ProgramFiles(x86).
+# Write $$ for a literal dollar. A reference to a variable that is not set is
+# an error rather than an empty string, so a typo fails loudly instead of
+# quietly relocating the cache. Windows %VAR% is NOT expanded -- a bare % is
+# valid in a path.
+#
+# Per platform, the conventional location:
+#
+#   Linux    /var/lib/fastcached/cache
+#            created and owned by the service (systemd StateDirectory=).
+#   Windows  $ProgramData/fastcached/cache
+#            beside the fastcached.yaml the installer places in the same
+#            directory, and writable by the service account.
+#   macOS    /opt/fastcached/var/cache
+#
 #storage_path: /var/lib/fastcached/cache
 
 # Shard count for the on-disk tier. Default (unset) is min(16, CPU count) for a
@@ -85,8 +105,13 @@
 # budget is split evenly across shards and each evicts its own LRU tail.
 #storage_max_disk: 0
 
-# Largest single value accepted, in bytes. Also raises the wire payload cap.
-#storage_max_value: 16m
+# Largest single value accepted, in bytes. The default is sized for compile
+# caches, where object files routinely pass 16 MiB; it costs nothing until a
+# value actually uses it, since large values spill into an overflow-page chain
+# rather than needing a page of their own. Also raises the wire payload cap,
+# but only for the compile-cache and Redis protocols -- the two memcached
+# framings keep their own fixed 16 MiB ceiling.
+#storage_max_value: 256m
 
 # --- Compression ------------------------------------------------------------
 
@@ -136,10 +161,20 @@
 # TLS listeners share the tls_cert/tls_key pair (no per-listener SNI).
 #listeners:
 #  - address: 127.0.0.1
-#    port: 11211
+#    port: 6674
 #  - address: "::"
-#    port: 11212
+#    port: 6675
 #    tls: true
+
+# This is also how to keep serving clients you cannot re-point. Adding
+# memcached's 11211 (or redis's 6379) here serves them alongside 6674 from the
+# one process — and because the protocol is auto-detected, each of those ports
+# still speaks every protocol, not just its namesake:
+#listeners:
+#  - address: 127.0.0.1
+#    port: 6674
+#  - address: 127.0.0.1
+#    port: 11211
 
 # --- Observability ----------------------------------------------------------
 

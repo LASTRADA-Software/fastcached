@@ -5,7 +5,7 @@
 # just the binary and the shared libraries it needs.
 #
 #   docker build -t fastcached .
-#   docker run --rm -p 11211:11211 -p 9259:9259 fastcached \
+#   docker run --rm -p 6674:6674 -p 9259:9259 fastcached \
 #       --metrics --requirepass=secret
 #
 # The image binds 0.0.0.0 so it is reachable from outside the container — pair
@@ -46,8 +46,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /src/build/target/fastcached /usr/local/bin/fastcached
 
-# Cache on 11211, admin/metrics on 9259.
-EXPOSE 11211 9259
+# Cache on 6674 (fastcached's own port), admin/metrics on 9259.
+EXPOSE 6674 9259
 
 # Self-probe /healthz using the binary itself (no curl in the image). Requires
 # the daemon to be started with --metrics (see CMD).
@@ -56,5 +56,6 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 
 ENTRYPOINT ["fastcached"]
 # Default: listen on all interfaces with the metrics endpoint enabled. Override
-# at `docker run` to add --requirepass / --tls etc.
-CMD ["--bind=0.0.0.0", "--port=11211", "--metrics", "--metrics-bind=0.0.0.0"]
+# at `docker run` to add --requirepass / --tls etc. No --port: restating the
+# compiled default here is how EXPOSE and the daemon drift apart.
+CMD ["--bind=0.0.0.0", "--metrics", "--metrics-bind=0.0.0.0"]

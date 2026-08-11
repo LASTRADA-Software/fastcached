@@ -16,7 +16,7 @@ codebase peaked at ~122 MB for a single object. If your largest object goes past
 256 MiB, raise it:
 
 ```sh
-fastcached --port=11211 --storage-max-value=512M
+fastcached --storage-max-value=512M
 ```
 
 `--storage-max-value` also raises the wire frame-payload cap, so a single flag
@@ -35,8 +35,7 @@ Without `--storage` the cache is memory-only and evaporates on restart, which
 for a compile cache usually means throwing away hours of compiles.
 
 ```sh
-fastcached --port=11211 \
-           --storage=/var/lib/fastcached/cache.cow \
+fastcached --storage=/var/lib/fastcached/cache.cow \
            --max-memory=8g
 ```
 
@@ -52,7 +51,7 @@ tail to fit rather than growing without bound.
 For a shared cache serving many builders concurrently:
 
 ```sh
-fastcached --bind=0.0.0.0 --port=11211 \
+fastcached --bind=0.0.0.0 \
            --storage=/var/lib/fastcached/cache \
            --storage-shards=16 \
            --threads=16 \

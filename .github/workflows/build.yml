@@ -220,8 +220,8 @@ jobs:
 
       - name: "Smoke test the image"
         run: |
-          docker run -d --name fc -p 11211:11211 -p 9259:9259 fastcached:ci \
-            --bind=0.0.0.0 --port=11211 --metrics --metrics-bind=0.0.0.0
+          docker run -d --name fc -p 6674:6674 -p 9259:9259 fastcached:ci \
+            --bind=0.0.0.0 --metrics --metrics-bind=0.0.0.0
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:9259/healthz >/dev/null; then break; fi
             sleep 0.5
@@ -676,7 +676,7 @@ jobs:
           test "$(systemctl show -p User --value fastcached)" = fastcached
 
           # End-to-end round trip against the packaged default config.
-          printf 'set k 0 0 5\r\nhello\r\nget k\r\nquit\r\n' | timeout 10 nc -q1 127.0.0.1 11211 | tee /tmp/fc-proto.txt
+          printf 'set k 0 0 5\r\nhello\r\nget k\r\nquit\r\n' | timeout 10 nc -q1 127.0.0.1 6674 | tee /tmp/fc-proto.txt
           grep -q STORED /tmp/fc-proto.txt
           grep -q hello  /tmp/fc-proto.txt
 

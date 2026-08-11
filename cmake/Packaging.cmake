@@ -358,7 +358,7 @@ cpack_add_component(Runtime
 )
 
 if(APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
-    # The two launchd registrations are alternatives: both bind 127.0.0.1:11211
+    # The two launchd registrations are alternatives: both bind 127.0.0.1:6674
     # and fastcached has no unix-socket endpoint to fall back on. productbuild
     # cannot express mutual exclusion — CPack only ever generates && / ||
     # dependency expressions for a choice's `selected` attribute — so the

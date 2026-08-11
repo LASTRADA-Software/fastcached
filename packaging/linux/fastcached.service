@@ -78,7 +78,7 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 UMask=0077
 
-# Binding a port below 1024 (the default 11211 is not) additionally needs:
+# Binding a port below 1024 (the default 6674 is not) additionally needs:
 #     AmbientCapabilities=CAP_NET_BIND_SERVICE
 #     CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=

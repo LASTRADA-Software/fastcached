@@ -184,7 +184,7 @@ enabled and copies it onto a slim Debian runtime:
 
 ```sh
 docker build -t fastcached .
-docker run --rm -p 11211:11211 -p 9259:9259 fastcached \
+docker run --rm -p 6674:6674 -p 9259:9259 fastcached \
     --bind=0.0.0.0 --metrics --metrics-bind=0.0.0.0 --requirepass=secret
 ```
 
@@ -264,12 +264,12 @@ spec:
       containers:
         - name: fastcached
           image: fastcached:latest
-          args: ["--bind=0.0.0.0", "--port=11211", "--metrics", "--metrics-bind=0.0.0.0", "--requirepass=$(CACHE_SECRET)"]
+          args: ["--bind=0.0.0.0", "--metrics", "--metrics-bind=0.0.0.0", "--requirepass=$(CACHE_SECRET)"]
           env:
             - name: CACHE_SECRET
               valueFrom: { secretKeyRef: { name: fastcached, key: requirepass } }
           ports:
-            - { containerPort: 11211, name: cache }
+            - { containerPort: 6674, name: cache }
             - { containerPort: 9259, name: metrics }
           livenessProbe:
             httpGet: { path: /healthz, port: metrics }
@@ -284,6 +284,6 @@ spec:
 The original use case still works — point sccache at the cache port:
 
 ```sh
-export SCCACHE_REDIS=redis://:secret@host:11211   # with auth
-export SCCACHE_MEMCACHED=tcp://host:11211         # binary protocol, no auth
+export SCCACHE_REDIS=redis://:secret@host:6674   # with auth
+export SCCACHE_MEMCACHED=tcp://host:6674         # binary protocol, no auth
 ```

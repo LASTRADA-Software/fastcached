@@ -342,7 +342,7 @@ TEST_CASE("FormatBindSummary: two binds (plain + TLS) join with ', '", "[config]
 {
     // Regression test for the original banner bug: the daemon brought up
     // with `--listen a:1 --listen-tls b:2` used to log
-    // "bind=127.0.0.1:11211" — the defaults of the unused legacy fields.
+    // the defaults of the unused legacy fields instead of its real endpoints.
     std::vector<FastCache::BindConfig> binds {
         { .address = "10.0.0.1", .port = 11211, .tls = false },
         { .address = "10.0.0.1", .port = 6380, .tls = true },

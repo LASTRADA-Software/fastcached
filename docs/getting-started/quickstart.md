@@ -5,13 +5,17 @@ Start fastcached and round-trip a value via `telnet`.
 ## 1. Run the daemon
 
 ```sh
-./fastcached --port 11211
+./fastcached
 ```
+
+It listens on `127.0.0.1:6674` — fastcached's own port. The number selects no
+protocol: everything below reaches the same daemon on the same port, because
+the wire format is detected per connection.
 
 ## 2. Store and fetch a value (ASCII text protocol)
 
 ```text
-$ telnet 127.0.0.1 11211
+$ telnet 127.0.0.1 6674
 > set greeting 0 60 5
 > hello
 < STORED
@@ -43,10 +47,10 @@ The same connection accepts modern meta commands:
 fastcached's RESP2 handler is reachable on the same port:
 
 ```sh
-$ redis-cli -p 11211
-127.0.0.1:11211> SET greeting hello EX 60
+$ redis-cli -p 6674
+127.0.0.1:6674> SET greeting hello EX 60
 OK
-127.0.0.1:11211> GET greeting
+127.0.0.1:6674> GET greeting
 "hello"
 ```
 

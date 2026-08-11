@@ -43,7 +43,7 @@ Or run the daemon in a container, built from the included `Dockerfile`:
 
 ```sh
 docker build -t fastcached .
-docker run --rm -p 11211:11211 fastcached
+docker run --rm -p 6674:6674 fastcached
 ```
 
 Requires CMake 3.28+, a C++23 compiler, and Ninja. Full details — presets,
@@ -53,8 +53,13 @@ dependencies, and platform notes — in
 ## Quick start: the cache daemon
 
 ```sh
-fastcached --port=11211
+fastcached
 ```
+
+It listens on `127.0.0.1:6674` — fastcached's own port, unassigned by IANA
+(6.674×10⁻¹¹ is the gravitational constant). The number selects no protocol:
+every client below reaches the same daemon on the same port, because the wire
+format is detected per connection. See [Ports](#ports).
 
 Then talk to it with any memcached or Redis client. These transcripts are copied
 from the unit tests, so they reflect exactly what the server emits:
@@ -89,8 +94,7 @@ build down, never break it.
 ### 1. Start a daemon
 
 ```sh
-fastcached --port=11211 \
-           --storage=$HOME/.cache/fastcached/cache.cow
+fastcached --storage=$HOME/.cache/fastcached/cache.cow
 ```
 
 The 256 MiB default value cap already covers real object files, which routinely
@@ -104,7 +108,7 @@ Point every machine that should share the cache at that one daemon.
 Three variables must **all** be set, or every compile runs uncached:
 
 ```sh
-export FASTCACHE_ADDR=127.0.0.1:11211    # the daemon
+export FASTCACHE_ADDR=127.0.0.1:6674     # the daemon
 export FASTCACHE_SRCROOT=$PWD            # your checkout root
 export FASTCACHE_BUILDTREE=$PWD/build    # your build directory
 export FASTCACHE_COHORT=myproject-main   # optional: prefetch grouping
@@ -138,7 +142,7 @@ FASTCACHE_VERBOSE=1 fastcache-cc g++ -c src/a.cpp -o build/a.o
 With PowerShell and MSVC:
 
 ```powershell
-$env:FASTCACHE_ADDR      = '127.0.0.1:11211'
+$env:FASTCACHE_ADDR      = '127.0.0.1:6674'
 $env:FASTCACHE_SRCROOT   = $PWD
 $env:FASTCACHE_BUILDTREE = "$PWD\build"
 
@@ -177,8 +181,8 @@ limitations — is in the
 If you already use sccache, you can keep it and just point it at fastcached:
 
 ```sh
-fastcached --port=11211 &
-export SCCACHE_MEMCACHED=tcp://127.0.0.1:11211
+fastcached &
+export SCCACHE_MEMCACHED=tcp://127.0.0.1:6674
 
 sccache g++ -std=c++23 -c hello.cpp -o hello.o   # miss
 sccache g++ -std=c++23 -c hello.cpp -o hello.o   # hit
@@ -198,8 +202,8 @@ between checkouts at different paths — that is the reason `fastcache-cc` exist
 Run it authenticated, encrypted, and monitored:
 
 ```sh
-# Container: cache on 11211, Prometheus /metrics + /healthz on 9259.
-docker run --rm -p 11211:11211 -p 9259:9259 fastcached \
+# Container: cache on 6674, Prometheus /metrics + /healthz on 9259.
+docker run --rm -p 6674:6674 -p 9259:9259 fastcached \
     --bind=0.0.0.0 --metrics --metrics-bind=0.0.0.0 --requirepass=secret
 
 # With TLS (needs an OpenSSL build):
@@ -215,6 +219,28 @@ self-contained probe needing no `curl` in the image. Full guide, including a
 Kubernetes manifest with liveness/readiness probes, in the
 [deployment docs](https://lastrada-software.github.io/fastcached/operations/deployment/).
 
+## Ports
+
+fastcached's own port is **6674** — the leading digits of the gravitational
+constant, G = 6.674×10⁻¹¹. It is unassigned in the IANA service-name registry,
+needs no privileges to bind, and sits below the ephemeral range.
+
+**The port selects no protocol.** The wire format is detected per connection, so
+memcached text, memcached binary, memcached meta, Redis RESP2 and the compile-
+cache protocol are all served on 6674 — and on any other port you bind. Earlier
+releases defaulted to memcached's 11211, which implied a protocol the daemon
+never restricted itself to, and collided with a real memcached on the same host.
+
+Clients you cannot re-point keep working — bind their port *alongside* ours:
+
+```sh
+fastcached --listen=127.0.0.1:6674 --listen=127.0.0.1:11211
+```
+
+Both ports then speak every protocol, not just their namesake. The admin
+endpoint (`/metrics`, `/healthz`) is separate, defaults to **9259**, and only
+listens with `--metrics`.
+
 ## Configuration
 
 Run `fastcached --help` for the complete, always-current flag list. The ones
@@ -222,7 +248,8 @@ that matter most:
 
 | Flag | Purpose |
 |------|---------|
-| `--bind=<addr>` / `--port=<num>` | Where to listen (default `127.0.0.1:11211`). |
+| `--bind=<addr>` / `--port=<num>` | Where to listen (default `127.0.0.1:6674`). |
+| `--listen=<host:port>` | Additional listener; repeatable. How to serve a legacy port alongside 6674. |
 | `--max-memory=<size>` | In-memory budget; `k`/`m`/`g` suffixes, or `N%` of host RAM. Defaults to a quarter of host RAM, bounded to [512 MiB, 8 GiB]; under a container memory limit that limit is used instead of the host's RAM. |
 | `--storage=<path>` | Persist to a crash-consistent copy-on-write B+tree; without it the cache is memory-only. |
 | `--storage-max-value=<size>` | Per-value cap, and the wire payload cap with it (default 256 MiB, sized for compile caches). The memcached framings keep a fixed 16 MiB ceiling. |

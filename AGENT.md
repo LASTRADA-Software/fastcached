@@ -386,14 +386,14 @@ cmake --build /tmp/tracy-cap -j        # -> /tmp/tracy-cap/tracy-capture
 
 Workflow — the client listens on TCP **8086**:
 
-1. Start the daemon: `./out/build/clang-tracy/target/fastcached --bind 127.0.0.1:11211`.
+1. Start the daemon: `./out/build/clang-tracy/target/fastcached --bind 127.0.0.1`.
 2. Connect the profiler (GUI **Connect**, or `tracy-capture -o out.tracy -a 127.0.0.1`).
    On-demand mode records only from the moment of connection, so connect **before**
    driving load.
 3. Drive traffic through the hot path, e.g.
-   `memtier_benchmark -s 127.0.0.1 -p 11211 -P memcache_text --ratio=1:4 -n 50000`,
-   `redis-benchmark -p 11211 -t set,get -n 100000`, or a quick
-   `printf 'set foo 0 0 3\r\nbar\r\nget foo\r\nquit\r\n' | nc 127.0.0.1 11211`.
+   `memtier_benchmark -s 127.0.0.1 -p 6674 -P memcache_text --ratio=1:4 -n 50000`,
+   `redis-benchmark -p 6674 -t set,get -n 100000`, or a quick
+   `printf 'set foo 0 0 3\r\nbar\r\nget foo\r\nquit\r\n' | nc 127.0.0.1 6674`.
 
 What the instrumentation surfaces: thread rows named `fastcached-main` /
 `fc-worker-N` / `fc-reactor`; one frame per request; the nested zone breakdown

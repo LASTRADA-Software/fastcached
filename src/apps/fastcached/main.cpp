@@ -505,7 +505,7 @@ int DaemonBody(FastCache::Config const& effective)
     // The bind summary reflects what is actually being listened on. The
     // original banner formatted the legacy single-bind fields verbatim and
     // ignored `binds`, so a daemon brought up via `--listen` always logged
-    // "bind=127.0.0.1:11211" (the defaults of the unused legacy fields).
+    // the defaults of the unused legacy fields rather than its real endpoints.
     // We build the binds-shaped list from `effective` here so the banner
     // is computable before the equivalent `serverOpts.binds` is populated
     // a few dozen lines below; the synthesis rule is the same (prefer the
