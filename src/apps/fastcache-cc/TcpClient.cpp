@@ -125,7 +125,7 @@ namespace
     }
 
     /// Split "host:port" into its parts, honouring the bracketed IPv6 form
-    /// `[::1]:11211` — an unbracketed rfind(':') would split an IPv6 literal at
+    /// `[::1]:6674` — an unbracketed rfind(':') would split an IPv6 literal at
     /// its last group separator instead.
     /// @param hostPort The endpoint string.
     /// @return (host, port) or nullopt when no port is present.

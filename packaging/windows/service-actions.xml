@@ -102,4 +102,42 @@
 
   </CPackWiXFragment>
 
+  <!-- Put the install's bin directory on the system PATH.
+
+       Without this the MSI is the only one of the three platform packages that
+       leaves the executables unreachable by name: the .deb/.rpm land in
+       /usr/local/bin and the .pkg installs /etc/paths.d/fastcached, both already
+       on PATH, while a Windows install of fastcache-cc stays invisible to every
+       build system that looks it up as a bare command name.
+
+       The Environment element must live inside a Component, so this patches the
+       component CPack generates for bin\fastcached.exe rather than #PRODUCT.
+       Tying the entry to a component makes removal automatic: it is installed
+       and uninstalled with the file, needing no custom action.
+
+       CPack builds that Id as CM_CP_<cpack component>.<install path>, so the
+       "Runtime" segment is the CPack component these files install under and
+       NOT a directory. Characters WiX forbids in an Id become underscores,
+       which is why the sibling component is CM_CP_Runtime.bin.fastcache_cc.exe
+       with a hyphen-free spelling. A mismatched Id is caught rather than
+       silently ignored: CPack fails with "Some XML patch fragments did not have
+       matching IDs". The authoritative list is the generated
+       _CPack_Packages/win64/WIX/files.wxs.
+
+       Part="last" appends rather than replaces. Permanent="no" is what lets the
+       uninstall take the entry back out again. System="yes" writes the machine
+       PATH, which this per-machine MSI is already elevated for.
+
+       Note this only affects processes started AFTER the install; an already
+       open shell keeps the environment block it was launched with. -->
+  <CPackWiXFragment Id="CM_CP_Runtime.bin.fastcached.exe">
+    <Environment Id="FastCachedBinOnPath"
+                 Name="PATH"
+                 Value="[INSTALL_ROOT]bin"
+                 Action="set"
+                 Part="last"
+                 Permanent="no"
+                 System="yes" />
+  </CPackWiXFragment>
+
 </CPackWiXPatch>

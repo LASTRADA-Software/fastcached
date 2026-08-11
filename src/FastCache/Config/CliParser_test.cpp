@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstddef>
+#include <format>
 #include <initializer_list>
 #include <span>
 #include <string>
@@ -59,7 +60,7 @@ TEST_CASE("CliParser: --log-timestamps sets the value and the explicit-override 
 
 TEST_CASE("CliParser: --log-timestamps absent leaves the explicit-override flag clear", "[config][cli]")
 {
-    auto const args = std::array<char const*, 1> { "--port=11211" };
+    auto const args = std::array<char const*, 1> { "--port=6000" };
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE(result.has_value());
     REQUIRE_FALSE(result->logTimestampsExplicit);
@@ -77,7 +78,7 @@ TEST_CASE("CliParser: --log-source sets the value and the explicit-override flag
 
 TEST_CASE("CliParser: --log-source absent leaves the explicit-override flag clear", "[config][cli]")
 {
-    auto const args = std::array<char const*, 1> { "--port=11211" };
+    auto const args = std::array<char const*, 1> { "--port=6000" };
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE(result.has_value());
     REQUIRE_FALSE(result->logSourceExplicit);
@@ -95,7 +96,7 @@ TEST_CASE("CliParser: --log-everything sets the value and the explicit-override 
 
 TEST_CASE("CliParser: --log-everything absent leaves the explicit-override flag clear", "[config][cli]")
 {
-    auto const args = std::array<char const*, 1> { "--port=11211" };
+    auto const args = std::array<char const*, 1> { "--port=6000" };
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE(result.has_value());
     REQUIRE_FALSE(result->logEverythingExplicit);
@@ -445,6 +446,49 @@ TEST_CASE("CliParser: --help text does not mention the removed execution-model f
     auto const usage = std::string { FastCache::CliUsage() };
     REQUIRE(!usage.contains("--execution-model"));
     REQUIRE(!usage.contains("--threading-model"));
+}
+
+TEST_CASE("Config: the default port is fastcached's own, not a borrowed one", "[config][port]")
+{
+    // The point of the constant: the daemon answers on a number nobody else
+    // claims. Auto-detection means the port selects no protocol, so sitting on
+    // memcached's or redis's registered port only ever bought a collision with
+    // a real one on the same host.
+    REQUIRE(FastCache::DefaultPort != 11211); // memcached
+    REQUIRE(FastCache::DefaultPort != 6379);  // redis
+
+    // Bindable everywhere it needs to be: above the privileged floor (no
+    // CAP_NET_BIND_SERVICE) and below Linux's ephemeral range, whose default
+    // ip_local_port_range starts at 32768 and would otherwise let an outbound
+    // connection steal the port before the daemon binds it.
+    REQUIRE(FastCache::DefaultPort >= 1024);
+    REQUIRE(FastCache::DefaultPort < 32768);
+
+    // A default-constructed Config is what every unset path falls through to.
+    REQUIRE(FastCache::Config {}.port == FastCache::DefaultPort);
+    REQUIRE(FastCache::Config {}.metricsPort == FastCache::DefaultMetricsPort);
+
+    // The cache and the admin endpoint must never contend for one listener.
+    REQUIRE(FastCache::DefaultPort != FastCache::DefaultMetricsPort);
+}
+
+TEST_CASE("CliParser: --help quotes the compiled defaults rather than its own literals", "[config][cli][help]")
+{
+    auto const usage = FastCache::CliUsage();
+
+    // Every substitution token must have been expanded: an unexpanded "{port}"
+    // in shipped help means the table gained a row the renderer never saw.
+    REQUIRE(!usage.contains("{port}"));
+    REQUIRE(!usage.contains("{metrics-port}"));
+
+    // ...and expanded to the values the daemon actually uses.
+    REQUIRE(usage.contains(std::format("default {}", FastCache::DefaultPort)));
+    REQUIRE(usage.contains(std::format("default {}", FastCache::DefaultMetricsPort)));
+
+    // No stale borrowed port survives anywhere in the help text, including the
+    // sccache examples people copy verbatim.
+    REQUIRE(!usage.contains("11211"));
+    REQUIRE(!usage.contains("6379"));
 }
 
 namespace

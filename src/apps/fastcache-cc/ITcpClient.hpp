@@ -42,7 +42,7 @@ class ITcpClient
 /// Connect to `hostPort` ("host:port").
 ///
 /// The host may be a hostname, an IPv4 literal, or a bracketed IPv6 literal
-/// (`[::1]:11211`); resolution goes through getaddrinfo and every returned
+/// (`[::1]:6674`); resolution goes through getaddrinfo and every returned
 /// address is tried in turn.
 ///
 /// `ioTimeout` bounds each individual blocking send/recv on the returned
@@ -52,7 +52,7 @@ class ITcpClient
 /// peer that dribbles bytes slower than the timeout can still take longer. It
 /// bounds the failure mode that matters (a peer that stops entirely).
 ///
-/// @param hostPort The endpoint, e.g. "127.0.0.1:11211".
+/// @param hostPort The endpoint, e.g. "127.0.0.1:6674".
 /// @param ioTimeout Per-call send/recv deadline; zero or negative means no
 ///                  timeout (the OS default, i.e. block indefinitely).
 /// @return A connected client, or nullptr if the endpoint is malformed or

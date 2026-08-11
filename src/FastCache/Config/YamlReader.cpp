@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/ByteSize.hpp>
+#include <FastCache/Config/EnvExpand.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
 
 #include <yaml-cpp/yaml.h>
 
+#include <array>
 #include <exception>
 #include <expected>
 #include <filesystem>
@@ -30,6 +32,60 @@ namespace
             .field = std::move(field),
             .context = std::move(context),
         };
+    }
+
+    /// Expand `$VAR` / `${VAR}` in a path-valued setting, re-stamping the error
+    /// with this file and line so a bad reference points at the config line
+    /// carrying it rather than at nothing.
+    [[nodiscard]] std::expected<std::string, ConfigError> ExpandPathValue(std::string_view raw,
+                                                                          std::string_view field,
+                                                                          std::filesystem::path const& path,
+                                                                          unsigned line)
+    {
+        auto expanded = ExpandEnvironmentVariables(raw, field);
+        if (expanded.has_value())
+            return expanded;
+
+        auto err = std::move(expanded).error();
+        err.source = path.string();
+        err.line = line;
+        return std::unexpected(std::move(err));
+    }
+
+    /// One path-valued setting: a YAML key and the Config field it fills.
+    struct PathSetting
+    {
+        std::string_view key;         ///< YAML key naming this setting.
+        std::string Config::* member; ///< Field the expanded value lands in.
+    };
+
+    /// The settings that take `$VAR` / `${VAR}` expansion. All three share one
+    /// treatment — expand, propagate the error, assign — so they are a table
+    /// the dispatcher walks rather than three copies of the same block.
+    ///
+    /// Deliberately not every string-valued key: expanding `requirepass` would
+    /// turn a secret that merely contains a dollar sign into a different secret,
+    /// silently. A new path setting is a row here.
+    constexpr auto PathSettings = std::to_array<PathSetting>({
+        { .key = "storage_path", .member = &Config::storagePath },
+        { .key = "tls_cert", .member = &Config::tlsCertPath },
+        { .key = "tls_key", .member = &Config::tlsKeyPath },
+    });
+
+    /// The path setting a YAML key names, or nullptr if the key is not one.
+    ///
+    /// Returns a pointer rather than an iterator on purpose: `std::array`'s
+    /// iterator is a raw pointer in libstdc++ but a class type in MSVC's debug
+    /// STL, so a caller cannot spell the type portably.
+    ///
+    /// @param key YAML key to look up.
+    /// @return Pointer into PathSettings, or nullptr when `key` is not a path setting.
+    [[nodiscard]] PathSetting const* FindPathSetting(std::string_view key)
+    {
+        for (auto const& setting: PathSettings)
+            if (setting.key == key)
+                return &setting;
+        return nullptr;
     }
 
     [[nodiscard]] std::expected<StorageDurability, ConfigError> ParseStorageDurability(std::string_view sv,
@@ -376,10 +432,16 @@ namespace
             cfg.logEverything = valueNode.as<bool>();
             return {};
         }
-        /// `storage_path`: filesystem path of the CoW-tree backing file.
-        if (key == "storage_path")
+        /// The path-valued settings — `storage_path` (CoW-tree backing file),
+        /// `tls_cert` and `tls_key`. Each has `$VAR` / `${VAR}` expanded before
+        /// it is stored; see PathSettings for the table and EnvExpand.hpp for
+        /// the grammar.
+        if (auto const* const setting = FindPathSetting(key); setting != nullptr)
         {
-            cfg.storagePath = valueNode.as<std::string>();
+            auto expanded = ExpandPathValue(valueNode.as<std::string>(), setting->key, path, line);
+            if (!expanded.has_value())
+                return std::expected<void, ConfigError> { std::unexpect, std::move(expanded).error() };
+            cfg.*(setting->member) = *std::move(expanded);
             return {};
         }
         /// `requirepass`: shared authentication secret (redis-style). Empty or
@@ -424,18 +486,7 @@ namespace
             cfg.tlsEnabled = valueNode.as<bool>();
             return {};
         }
-        /// `tls_cert`: PEM certificate (chain) file for TLS.
-        if (key == "tls_cert")
-        {
-            cfg.tlsCertPath = valueNode.as<std::string>();
-            return {};
-        }
-        /// `tls_key`: PEM private key file for TLS.
-        if (key == "tls_key")
-        {
-            cfg.tlsKeyPath = valueNode.as<std::string>();
-            return {};
-        }
+        /// (`tls_cert` and `tls_key` are handled by the PathSettings branch above.)
         /// `notify_keyspace_events`: redis-style keyspace-event flag string
         /// (e.g. "AKE"). Default empty (off). Parsed (validated) at daemon
         /// startup; an unknown letter fails fast.

@@ -131,7 +131,7 @@ else
 fi
 
 # A per-user agent registered by an earlier install would fight this daemon for
-# 127.0.0.1:11211. The daemon wins (see postinstall-launchagent.sh.in), so tear
+# 127.0.0.1:6674. The daemon wins (see postinstall-launchagent.sh.in), so tear
 # any agent down first.
 CONSOLE_USER=$(/usr/sbin/scutil <<'EOF' | /usr/bin/awk '/Name :/ && ! /loginwindow/ { print $3 }'
 show State:/Users/ConsoleUser

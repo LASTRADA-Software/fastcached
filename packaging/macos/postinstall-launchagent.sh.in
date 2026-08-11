@@ -11,7 +11,7 @@ set -u
 PREFIX="/@FASTCACHED_MACOS_PREFIX@"
 LABEL="@FASTCACHED_MACOS_BUNDLE_ID@"
 
-# The system-wide daemon and a per-user agent would both bind 127.0.0.1:11211,
+# The system-wide daemon and a per-user agent would both bind 127.0.0.1:6674,
 # and fastcached has no unix-socket endpoint to fall back on. productbuild
 # cannot express a mutually exclusive pair of choices (CPack only generates
 # && / || dependency expressions), so the two components arbitrate here instead:

@@ -3,6 +3,7 @@
 
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Platform/HostMemory.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +12,26 @@
 
 namespace FastCache
 {
+
+/// fastcached's own TCP port: 6674, the leading digits of the gravitational
+/// constant G = 6.674e-11.
+///
+/// Deliberately *not* memcached's 11211 nor redis's 6379. The daemon detects
+/// the wire format per connection, so the port number selects no protocol —
+/// memcached text, memcached binary, RESP and the 0xFC compile-cache protocol
+/// are all served here. Borrowing another project's registered port only
+/// suggested otherwise, and collided with a real memcached on the same host.
+///
+/// Chosen so it stays bindable everywhere: unassigned in the IANA service-name
+/// registry, above the privileged floor (no CAP_NET_BIND_SERVICE), and below
+/// Linux's ephemeral range (`ip_local_port_range` starts at 32768) so it cannot
+/// lose a race against an outbound connection's source port.
+inline constexpr std::uint16_t DefaultPort { 6674 };
+
+/// TCP port for the admin HTTP endpoint (`/metrics`, `/healthz`). Separate from
+/// `DefaultPort` so the admin surface never shares a listener with the cache
+/// protocols.
+inline constexpr std::uint16_t DefaultMetricsPort { 9259 };
 
 /// One listening endpoint. Multiple `BindConfig` entries on a single daemon
 /// let an operator serve plaintext on one interface (e.g. a private LAN)
@@ -91,16 +112,26 @@ enum class LruRecency : std::uint8_t
 struct Config
 {
     /// In-memory storage byte budget. 0 = unbounded (testing/dev only).
-    std::size_t maxMemoryBytes { 64 * 1024 * 1024 };
+    /// Scales with the machine rather than being a fixed constant; see
+    /// DefaultMaxMemoryBytes() for the fraction and the bounds.
+    std::size_t maxMemoryBytes { DefaultMaxMemoryBytes() };
 
     /// Maximum size of a single cache value in bytes, enforced by every
-    /// storage backend (in-memory LRU and on-disk COW tree). Defaults to
-    /// 16 MiB, matching the protocol payload cap (`MaxPayloadBytes`), so
-    /// the default imposes no extra limit beyond what the wire layer
-    /// already rejects; lower it to enforce a stricter per-value cap.
+    /// storage backend (in-memory LRU and on-disk COW tree).
     /// Set/Add/Replace/CompareAndSwap/Append/Prepend that would exceed
     /// this return StorageErrorCode::ValueTooLarge.
-    std::size_t storageMaxValueBytes { 16 * 1024 * 1024 };
+    ///
+    /// Sized for the compile-cache workload this daemon exists to serve:
+    /// object files routinely pass 16 MiB, and the entries a cap rejects are
+    /// precisely the expensive-to-recompute ones it was worth caching. The
+    /// cap costs nothing until it is used -- a value does not need a page of
+    /// its own, it spills into an overflow-page chain over the fixed 16 KiB
+    /// store page size.
+    ///
+    /// It also raises the wire payload cap, but only for the protocols that
+    /// take it from the session: the compile-cache protocol and RESP. Both
+    /// memcached framings keep their own hardcoded 16 MiB ceiling.
+    std::size_t storageMaxValueBytes { 256 * 1024 * 1024 };
 
     /// Maximum bytes the on-disk (L2) tier may hold, across all shards
     /// (the `--storage-max-disk` flag). Only meaningful with `--storage`.
@@ -171,8 +202,9 @@ struct Config
     /// the cache is in-memory only.
     std::string storagePath {};
 
-    /// TCP port. memcached default is 11211; fastcached's MVP follows.
-    std::uint16_t port { 11211 };
+    /// TCP port. Defaults to fastcached's own `DefaultPort`; see the constant
+    /// for why the number is ours rather than memcached's or redis's.
+    std::uint16_t port { DefaultPort };
 
     /// Bind address for the admin HTTP endpoint (`/metrics`, `/healthz`).
     /// Defaults to loopback so metrics are not exposed to the world unless the
@@ -181,7 +213,7 @@ struct Config
 
     /// TCP port for the admin HTTP endpoint. Served on a dedicated port so it
     /// never collides with the cache protocols. Only used when `metricsEnabled`.
-    std::uint16_t metricsPort { 9259 };
+    std::uint16_t metricsPort { DefaultMetricsPort };
 
     /// Whether to start the admin HTTP endpoint (Prometheus `/metrics` plus a
     /// `/healthz` liveness probe). Off by default.

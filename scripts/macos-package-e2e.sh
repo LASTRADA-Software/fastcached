@@ -51,7 +51,7 @@
 set -euo pipefail
 
 pkg=""
-port="11211"
+port="6674"
 scope="daemon"
 
 while [[ $# -gt 0 ]]; do

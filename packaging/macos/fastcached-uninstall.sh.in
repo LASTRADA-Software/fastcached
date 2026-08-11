@@ -53,7 +53,7 @@ rm -f "/Library/LaunchDaemons/${LABEL}.plist" || true
 # an agent lives in was decided at install time: `gui/<uid>` needs an Aqua
 # session, so one registered over SSH or on a headless machine landed in
 # `user/<uid>` instead. Booting out only `gui/<uid>` left that job running --
-# and still holding 127.0.0.1:11211 -- while the plist below was deleted and
+# and still holding 127.0.0.1:6674 -- while the plist below was deleted and
 # ${PREFIX} removed out from under its binary, with nothing left to reach it.
 for plist in /Users/*/Library/LaunchAgents/"${LABEL}".plist; do
     [ -e "$plist" ] || continue

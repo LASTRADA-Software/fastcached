@@ -51,7 +51,7 @@ namespace FastCache
 /// Render the listener list for the startup banner. The original banner
 /// formatted `bind={bindAddress}:{port}` from the legacy single-bind
 /// fields and ignored `binds`, so a daemon brought up via `--listen` /
-/// YAML `listeners:` always logged "bind=127.0.0.1:11211" — the defaults
+/// YAML `listeners:` always logged the legacy single-bind fields — the defaults
 /// of the unused legacy fields. This helper renders every endpoint that
 /// will actually be listening, with a `[tls]` suffix per TLS bind.
 /// @param binds The active listener list (typically `serverOpts.binds`).

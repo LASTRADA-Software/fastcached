@@ -8,6 +8,7 @@
 #include <array>
 #include <charconv>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <format>
 #include <ranges>
@@ -654,13 +655,34 @@ namespace
         std::string_view description; ///< Help text; '\n' separates wrapped lines.
     };
 
+    /// A default value quoted in the help text, spliced in at render time.
+    ///
+    /// Without this the number lives twice — once in Config's NSDMI, once
+    /// re-typed as a string literal here — and the two drift apart silently:
+    /// help that advertises a port the daemon no longer binds is worse than no
+    /// help at all. Writing `{port}` in a description keeps the compiled
+    /// default the only place the number is spelled.
+    struct UsageSubstitution
+    {
+        std::string_view token; ///< Placeholder as written in a description or example body.
+        std::uint16_t value;    ///< Value spliced in its place.
+    };
+
+    /// The substitution table. A new default worth quoting in help is a new row
+    /// here plus a `{token}` in the text — no change to the renderer.
+    constexpr auto UsageSubstitutions = std::to_array<UsageSubstitution>({
+        { .token = "{port}", .value = DefaultPort },
+        { .token = "{metrics-port}", .value = DefaultMetricsPort },
+    });
+
     /// The option table — single source of truth for both the help text and its
-    /// alignment. Add a row here and it lines up automatically.
+    /// alignment. Add a row here and it lines up automatically. Descriptions may
+    /// reference a compiled default by its `UsageSubstitutions` token.
     constexpr auto UsageOptions = std::to_array<UsageOption>({
         { .flag = "--config=<path>", .description = "YAML config file; CLI flags override file values" },
         { .flag = "--bind=<addr>",
           .description = "bind address: IPv4/IPv6 literal or hostname; '::' is dual-stack (default 127.0.0.1)" },
-        { .flag = "--port=<num>", .description = "TCP port (default 11211)" },
+        { .flag = "--port=<num>", .description = "TCP port (default {port}); every protocol is auto-detected on it" },
         { .flag = "--max-memory=<size>",
           .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)" },
         { .flag = "--log-level=<level>", .description = "trace|debug|info|warn|error|fatal (default info)" },
@@ -672,15 +694,16 @@ namespace
         { .flag = "--metrics",
           .description = "serve Prometheus /metrics and /healthz on a dedicated HTTP port (default off)" },
         { .flag = "--metrics-bind=<addr>", .description = "bind address for the metrics endpoint (default 127.0.0.1)" },
-        { .flag = "--metrics-port=<num>", .description = "TCP port for the metrics endpoint (default 9259)" },
+        { .flag = "--metrics-port=<num>", .description = "TCP port for the metrics endpoint (default {metrics-port})" },
         { .flag = "--tls",
           .description = "terminate TLS on the cache port (default off; needs a build with OpenSSL\n"
                          "and both --tls-cert and --tls-key)" },
         { .flag = "--tls-cert=<path>", .description = "PEM certificate (chain) file for --tls / --listen-tls" },
         { .flag = "--tls-key=<path>", .description = "PEM private key file for --tls / --listen-tls" },
         { .flag = "--listen=<host:port>",
-          .description = "additional plaintext listener; repeatable. Use [::1]:11211 for IPv6 literals.\n"
-                         "When given, supersedes --bind/--port — every endpoint must be listed." },
+          .description = "additional plaintext listener; repeatable. Use [::1]:{port} for IPv6 literals.\n"
+                         "When given, supersedes --bind/--port — every endpoint must be listed.\n"
+                         "Also how to keep serving legacy clients: add their port here." },
         { .flag = "--listen-tls=<host:port>",
           .description = "additional TLS listener; repeatable. Shares --tls-cert / --tls-key.\n"
                          "Needs a build with OpenSSL (FC_TLS_ENABLED)" },
@@ -760,23 +783,41 @@ namespace
     constexpr auto UsageExamples = std::to_array<UsageExample>({
 #if defined(_WIN32)
         { .title = "Use with sccache (memcached protocol, PowerShell):",
-          .body = "  Start-Process fastcached -ArgumentList '--port=11211'\n"
-                  "  $env:SCCACHE_MEMCACHED = 'tcp://127.0.0.1:11211'\n"
+          .body = "  Start-Process fastcached\n"
+                  "  $env:SCCACHE_MEMCACHED = 'tcp://127.0.0.1:{port}'\n"
                   "  sccache <compiler> /c hello.cpp /Fo:hello.obj" },
         { .title = "Use with sccache (Redis protocol, PowerShell):",
-          .body = "  $env:SCCACHE_REDIS = 'redis://127.0.0.1:11211'" },
+          .body = "  $env:SCCACHE_REDIS = 'redis://127.0.0.1:{port}'" },
 #else
         { .title = "Use with sccache (memcached protocol):",
-          .body = "  fastcached --port=11211 &\n"
-                  "  export SCCACHE_MEMCACHED=tcp://127.0.0.1:11211\n"
+          .body = "  fastcached &\n"
+                  "  export SCCACHE_MEMCACHED=tcp://127.0.0.1:{port}\n"
                   "  sccache <compiler> -c hello.c -o hello.o" },
-        { .title = "Use with sccache (Redis protocol):", .body = "  export SCCACHE_REDIS=redis://127.0.0.1:11211" },
+        { .title = "Use with sccache (Redis protocol):", .body = "  export SCCACHE_REDIS=redis://127.0.0.1:{port}" },
 #endif
     });
 
     /// Closing note printed after the examples.
     constexpr std::string_view UsageFooter = "sccache <= 0.7 speaks memcached text; >= 0.8 speaks memcached binary;\n"
                                              "either works because fastcached auto-detects the wire format.\n";
+
+    /// Splice every `UsageSubstitutions` token in `text` with its compiled
+    /// value. Runs before the text is split into lines, so a token is free to
+    /// sit on any continuation line without disturbing the alignment.
+    /// @param text Help text possibly containing `{token}` placeholders.
+    /// @return `text` with every known token replaced; unknown braces are left
+    ///         verbatim, so ordinary prose needs no escaping.
+    [[nodiscard]] std::string ExpandDefaults(std::string_view text)
+    {
+        std::string out { text };
+        for (auto const& [token, value]: UsageSubstitutions)
+        {
+            auto const replacement = std::format("{}", value);
+            for (auto at = out.find(token); at != std::string::npos; at = out.find(token, at + replacement.size()))
+                out.replace(at, token.size(), replacement);
+        }
+        return out;
+    }
 
     /// Invoke `fn(line)` for each '\n'-separated segment of `text`. A trailing
     /// segment with no newline is still delivered, so a non-terminated string
@@ -817,7 +858,7 @@ namespace
         for (auto const& option: UsageOptions)
         {
             auto firstLine = true;
-            ForEachLine(option.description, [&](std::string_view line) {
+            ForEachLine(ExpandDefaults(option.description), [&](std::string_view line) {
                 if (firstLine)
                 {
                     auto const pad = descColumn - LeftIndent - option.flag.size();
@@ -841,7 +882,7 @@ namespace
         {
             out += '\n';
             out += std::format("{}{}{}\n", palette.heading, example.title, palette.reset);
-            ForEachLine(example.body, [&](std::string_view line) { out += std::format("{}\n", line); });
+            ForEachLine(ExpandDefaults(example.body), [&](std::string_view line) { out += std::format("{}\n", line); });
         }
 
         out += '\n';

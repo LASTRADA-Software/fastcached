@@ -79,7 +79,7 @@ struct CliResult
 /// Parse `argv[1..argc-1]` into a Config. Returns ConfigError on bad input.
 /// Recognised flags:
 ///   --bind <addr>            (default 127.0.0.1)
-///   --port <num>             (default 11211)
+///   --port <num>             (default `DefaultPort`; see Config.hpp)
 ///   --max-memory <size>      (default 64 MiB; integer with optional unit suffix
 ///                             k/K=1024, m/M=1024², g/G=1024³; plain int = bytes;
 ///                             trailing % = percentage of host total RAM, e.g. 50%)

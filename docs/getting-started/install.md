@@ -15,7 +15,8 @@ sudo dnf install ./fastcached-<version>.<arch>.rpm
 ```
 
 Installing creates a dedicated `fastcached` system user, enables the unit,
-and starts it. The daemon listens on `127.0.0.1:11211` out of the box:
+and starts it. The daemon listens on `127.0.0.1:6674` out of the box (see
+[Ports](#ports)):
 
 ```sh
 systemctl status fastcached
@@ -229,13 +230,43 @@ See `CMakePresets.json` for the complete list.
 
 The build produces two executables under the preset's `target/`
 directory: `fastcached` and `fastcache-cc`. The daemon runs in the
-foreground and listens on `127.0.0.1:11211` by default:
+foreground and listens on `127.0.0.1:6674` by default:
 
 ```sh
 ./fastcached
 ```
 
 A `--help` flag prints the full configuration surface.
+
+## Ports
+
+fastcached's own port is **6674** — the leading digits of the gravitational
+constant, G = 6.674×10⁻¹¹. It is unassigned in the IANA service-name registry,
+above the privileged floor (so it needs no `CAP_NET_BIND_SERVICE`), and below
+Linux's ephemeral range, so nothing else has a claim on it.
+
+**The port selects no protocol.** fastcached detects the wire format per
+connection, so memcached text, memcached binary, redis RESP and the compile-
+cache protocol are all served on 6674 — and on any other port you bind. Earlier
+releases defaulted to memcached's 11211, which implied a protocol the daemon
+never restricted itself to and collided with a real memcached on the same host.
+
+Clients that cannot be re-pointed keep working: bind their port alongside ours
+rather than instead of it. In `/etc/fastcached/fastcached.yaml`:
+
+```yaml
+listeners:
+  - address: 127.0.0.1
+    port: 6674
+  - address: 127.0.0.1
+    port: 11211
+```
+
+or on the command line, `--listen=127.0.0.1:6674 --listen=127.0.0.1:11211`.
+Both ports then speak every protocol, not just their namesake.
+
+The admin HTTP endpoint (`/metrics`, `/healthz`) is separate and defaults to
+port **9259**; it only listens when `--metrics` is given.
 
 ## Building the packages
 

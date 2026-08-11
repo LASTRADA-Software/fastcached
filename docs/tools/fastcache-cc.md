@@ -26,13 +26,13 @@ out, so the build tool records dependencies that exist on *this* machine.
 ## Requirements
 
 - A running `fastcached` daemon, reachable over TCP.
-- The daemon's value cap raised above your largest object file. The default is
-  16 MiB and real object files exceed it — a large C++ codebase was measured at
-  ~122 MB for its biggest. `--storage-max-value` raises both the per-value cap
-  and the wire frame-payload cap:
+- A daemon value cap above your largest object file. The 256 MiB default covers
+  the usual case — a large C++ codebase was measured at ~122 MB for its biggest
+  object — so this normally needs no flag. Past that, `--storage-max-value`
+  raises both the per-value cap and the wire frame-payload cap:
 
 ```sh
-fastcached --port=11211 --storage-max-value=256M
+fastcached --storage-max-value=512M
 ```
 
 ## Supported compilers
@@ -94,7 +94,7 @@ prefix. An empty value counts as unset.
 
 | Variable | Meaning | Default |
 |----------|---------|---------|
-| `FASTCACHE_ADDR` | `host:port` of the daemon. Hostnames, IPv4 literals, and bracketed IPv6 (`[::1]:11211`) all resolve. | unset — **no caching** |
+| `FASTCACHE_ADDR` | `host:port` of the daemon. Hostnames, IPv4 literals, and bracketed IPv6 (`[::1]:6674`) all resolve. | unset — **no caching** |
 | `FASTCACHE_SRCROOT` | Checkout source root, used for keying and path canonicalization. | unset — **no caching** |
 | `FASTCACHE_BUILDTREE` | Build output root. | unset — **no caching** |
 | `FASTCACHE_COHORT` | Prefetch grouping id. **Not** part of the cache key, so it never partitions the cache. | `default` |

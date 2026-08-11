@@ -2,24 +2,28 @@
 
 Serving [`fastcache-cc`](../tools/fastcache-cc.md) needs no special mode: the
 [compile-cache protocol](../protocols/compile-cache.md) is detected from the
-first byte, so any listener serves it. What does need attention is sizing —
-compile-cache values are far larger than the small values the defaults assume.
+first byte, so any listener serves it.
 
-## Raise the value cap
+## Check the value cap
 
-**This is the one setting you must change.** The default per-value cap is
-16 MiB. Object files in a large C++ codebase routinely exceed that; one
-measured codebase peaked at ~122 MB for a single object. Values above the cap
-are rejected, so those translation units silently never cache.
+The per-value cap defaults to 256 MiB, chosen for exactly this workload, so most
+deployments need no flag here. It matters because a value above the cap is
+rejected outright — that translation unit then silently never caches, which
+looks like a poor hit rate rather than an error.
+
+Object files in a large C++ codebase routinely exceed 16 MiB; one measured
+codebase peaked at ~122 MB for a single object. If your largest object goes past
+256 MiB, raise it:
 
 ```sh
-fastcached --port=11211 --storage-max-value=256M
+fastcached --storage-max-value=512M
 ```
 
 `--storage-max-value` also raises the wire frame-payload cap, so a single flag
-covers both limits. Set it above your largest expected object file.
+covers both limits — for the compile-cache and Redis protocols. The two
+memcached framings keep a fixed 16 MiB ceiling that this flag does not move.
 
-To find that number for your project:
+To find your largest object:
 
 ```sh
 find build -name '*.o' -printf '%s %p\n' | sort -rn | head -5
@@ -31,9 +35,7 @@ Without `--storage` the cache is memory-only and evaporates on restart, which
 for a compile cache usually means throwing away hours of compiles.
 
 ```sh
-fastcached --port=11211 \
-           --storage=/var/lib/fastcached/cache.cow \
-           --storage-max-value=256M \
+fastcached --storage=/var/lib/fastcached/cache.cow \
            --max-memory=8g
 ```
 
@@ -49,11 +51,10 @@ tail to fit rather than growing without bound.
 For a shared cache serving many builders concurrently:
 
 ```sh
-fastcached --bind=0.0.0.0 --port=11211 \
+fastcached --bind=0.0.0.0 \
            --storage=/var/lib/fastcached/cache \
            --storage-shards=16 \
            --threads=16 \
-           --storage-max-value=256M \
            --requirepass=<secret> \
            --metrics --metrics-bind=0.0.0.0
 ```
