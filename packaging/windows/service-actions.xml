@@ -41,6 +41,55 @@
          1 = start the service when the installer finishes. -->
     <Property Id="FASTCACHED_START_SERVICE" Value="1" Secure="yes" />
 
+    <!-- Create the machine-wide config directory, and give it an ACL of its
+         own, BEFORE anything writes into it.
+
+         This is not a nicety. C:\ProgramData grants BUILTIN\Users
+         (CI)(WD,AD,WEA,WA) — create files and folders — and that ACE is
+         inherited by every subdirectory. A directory left to inherit it lets
+         any standard user drop a fastcached.yaml into it, and that file
+         configures a service running as LocalSystem: storage_path alone makes
+         SYSTEM create directories and write files at a path the planter chose.
+         The previous machine-wide location was under C:\Program Files, where
+         only administrators can create files, so the exposure arrived with the
+         move to %ProgramData% and is closed here.
+
+         PermissionEx/@Sddl, not Permission/@User and not util:PermissionEx.
+         Permission and util:PermissionEx both take an account NAME, which is
+         resolved at install time and is therefore wrong on a non-English
+         Windows; util:PermissionEx additionally needs an extension package and
+         has no Sddl attribute at all (WIX0004 if you try). PermissionEx is
+         built in, writes MsiLockPermissionsEx (Windows Installer 5.0, i.e.
+         Windows 7 and later), and takes raw SDDL: SY / BA / BU are S-1-5-18,
+         S-1-5-32-544 and S-1-5-32-545, the same on every localisation. D:P
+         breaks inheritance — the entire point — and 0x1200a9 is
+         FILE_GENERIC_READ|FILE_GENERIC_EXECUTE.
+
+         CreateFolder runs in the CreateFolders standard action, which is
+         sequenced before InstallFiles and therefore before the seeding action
+         below: the directory is already locked down when the config lands in it.
+
+         The Guid is explicit because WiX refuses an automatic one for a
+         component whose keypath is a directory rather than a file. Minted once
+         for this component; NEVER regenerate it, for the reason spelled out at
+         CPACK_WIX_UPGRADE_GUID in cmake/Packaging.cmake.
+
+         Permanent="yes" because uninstalling deliberately leaves the
+         operator's config in place: a directory removed out from under a file
+         that survives it, or an ACL handed back to inheritance while the file
+         is still there, would both be worse than never having secured it. -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="FastCachedProgramData" Name="fastcached">
+        <Component Id="FastCachedProgramDataDir"
+                   Guid="84BE18BD-514D-4D51-B22C-5BCF34255AE0"
+                   Permanent="yes">
+          <CreateFolder>
+            <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
+          </CreateFolder>
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
     <!-- Put a default configuration at the machine-wide location the daemon
          looks in when it is started with no config flag, but only when nothing
          is there yet, so an upgrade never discards operator edits. The payload
@@ -129,6 +178,13 @@
               Condition="REMOVE~=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 
+  </CPackWiXFragment>
+
+  <!-- A component reaches the install only through a feature. #PRODUCTFEATURE
+       is CPack's name for the root one, which every other component of this
+       package already belongs to. -->
+  <CPackWiXFragment Id="#PRODUCTFEATURE">
+    <ComponentRef Id="FastCachedProgramDataDir" />
   </CPackWiXFragment>
 
   <!-- Put the install's bin directory on the system PATH.

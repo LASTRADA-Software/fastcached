@@ -1028,6 +1028,10 @@ jobs:
       # out into a separate extension package, and CPack always references it
       # (WixUI_InstallDir) — without it wix.exe fails with
       # "error WIX0144: The extension 'WixToolset.UI.wixext' could not be found".
+      #
+      # No Util extension: the ProgramData ACL uses the built-in PermissionEx
+      # element (MsiLockPermissionsEx), not util:PermissionEx, so the fragment
+      # needs nothing here beyond what CPack already requires.
       - name: "Install WiX"
         run: |
           dotnet tool install --global wix --version 5.*
