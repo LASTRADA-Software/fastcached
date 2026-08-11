@@ -23,9 +23,9 @@
 # Started without --config, fastcached reads the first of these that exists and
 # it can read, so this file is found with no flag at all:
 #
-#   Linux    $XDG_CONFIG_HOME/fastcached/fastcached.yaml (else ~/.config/...)
+#   Linux    $XDG_CONFIG_HOME/fastcached/fastcached.yaml (then ~/.config/...)
 #            /etc/fastcached/fastcached.yaml
-#   macOS    $XDG_CONFIG_HOME/fastcached/fastcached.yaml (else ~/.config/...)
+#   macOS    $XDG_CONFIG_HOME/fastcached/fastcached.yaml (then ~/.config/...)
 #            /opt/fastcached/etc/fastcached.yaml
 #   Windows  %APPDATA%\fastcached\fastcached.yaml
 #            %ProgramData%\fastcached\fastcached.yaml

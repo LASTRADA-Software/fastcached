@@ -31,8 +31,17 @@ namespace
     ///
     /// The user rows come first so an operator can shadow the machine-wide file
     /// without touching it (and without root). On POSIX the XDG pair is two
-    /// rows rather than one row with a fallback: an unset variable already
-    /// skips a row, so "$XDG_CONFIG_HOME, else ~/.config" needs no branch.
+    /// rows rather than one row with a fallback, which needs no branch: an
+    /// unset variable already skips its row.
+    ///
+    /// Note that two rows is "$XDG_CONFIG_HOME, **then** ~/.config" — the
+    /// fallback is per *file*, not per *variable*. The basedir specification
+    /// says the second location is what `$XDG_CONFIG_HOME` means when unset,
+    /// and so drops out of the search entirely when it is set; here, setting it
+    /// and leaving no file there still falls through to ~/.config. Probing both
+    /// is what most tools do and is the friendlier reading of a half-migrated
+    /// setup, but it is a deviation, and one an operator who moved their config
+    /// deliberately can see: the startup banner names the file that was chosen.
 #if defined(_WIN32)
     constexpr auto Candidates = std::to_array<ConfigCandidate>({
         { .display = "%APPDATA%\\fastcached\\fastcached.yaml",

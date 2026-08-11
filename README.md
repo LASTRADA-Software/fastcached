@@ -264,17 +264,19 @@ On Windows, `--install-service` registers the daemon with the Service Control
 Manager.
 
 You do not have to name that file. Started with no `--config`, fastcached reads
-the first of these that exists — which is where each installer puts it:
+the first of these that exists and it can read — which is where each installer
+puts it:
 
 | Platform | Per-user | Machine-wide |
 |---|---|---|
-| Linux | `$XDG_CONFIG_HOME/fastcached/fastcached.yaml`, else `~/.config/fastcached/fastcached.yaml` | `/etc/fastcached/fastcached.yaml` |
-| macOS | `$XDG_CONFIG_HOME/fastcached/fastcached.yaml`, else `~/.config/fastcached/fastcached.yaml` | `/opt/fastcached/etc/fastcached.yaml` |
+| Linux | `$XDG_CONFIG_HOME/fastcached/fastcached.yaml`, then `~/.config/fastcached/fastcached.yaml` | `/etc/fastcached/fastcached.yaml` |
+| macOS | `$XDG_CONFIG_HOME/fastcached/fastcached.yaml`, then `~/.config/fastcached/fastcached.yaml` | `/opt/fastcached/etc/fastcached.yaml` |
 | Windows | `%APPDATA%\fastcached\fastcached.yaml` | `%ProgramData%\fastcached\fastcached.yaml` |
 
 `--config=<path>` overrides the search entirely. The distinction matters for
 errors: a file you named must exist, while a default location that does not is
-simply skipped and the built-in defaults apply. See the
+simply skipped and the built-in defaults apply. A machine-wide location is also
+only used when only an administrator could have put a file there. See the
 [configuration docs](https://lastrada-software.github.io/fastcached/getting-started/configuration/).
 
 ### Persistence and scaling

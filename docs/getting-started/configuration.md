@@ -13,12 +13,22 @@ is exactly where each installer puts it:
 
 | Platform | Per-user | Machine-wide |
 |---|---|---|
-| Linux | `$XDG_CONFIG_HOME/fastcached/fastcached.yaml`, else `~/.config/fastcached/fastcached.yaml` | `/etc/fastcached/fastcached.yaml` |
-| macOS | `$XDG_CONFIG_HOME/fastcached/fastcached.yaml`, else `~/.config/fastcached/fastcached.yaml` | `/opt/fastcached/etc/fastcached.yaml` |
+| Linux | `$XDG_CONFIG_HOME/fastcached/fastcached.yaml`, then `~/.config/fastcached/fastcached.yaml` | `/etc/fastcached/fastcached.yaml` |
+| macOS | `$XDG_CONFIG_HOME/fastcached/fastcached.yaml`, then `~/.config/fastcached/fastcached.yaml` | `/opt/fastcached/etc/fastcached.yaml` |
 | Windows | `%APPDATA%\fastcached\fastcached.yaml` | `%ProgramData%\fastcached\fastcached.yaml` |
 
 The per-user file wins, so you can shadow a machine-wide configuration without
-touching it and without root. The startup banner reports which file was chosen:
+touching it and without root.
+
+**then**, not *else*: setting `$XDG_CONFIG_HOME` does not take `~/.config` out
+of the search, it only puts another location ahead of it. The basedir
+specification treats `~/.config` as what `$XDG_CONFIG_HOME` *means* when unset,
+so under a strict reading it would drop out entirely; fastcached probes both, on
+the grounds that a half-migrated setup is better served by finding the file than
+by ignoring it. If you have moved your config and left the old copy behind, the
+banner below is where you will notice.
+
+The startup banner reports which file was chosen:
 
 ```
 [INFO] fastcached 0.0.1 starting; bind=127.0.0.1:6674 ... config=/etc/fastcached/fastcached.yaml ...
@@ -38,6 +48,32 @@ effect — which is a perfectly good way to run fastcached.
     normally alongside a machine-wide config it has no access to. A default file
     that exists and *is* readable but does not parse is still a startup error:
     at that point it is plainly meant to be used.
+
+!!! warning "A machine-wide config must be one only an administrator could have written"
+
+    The machine-wide file configures a process running as `LocalSystem` or
+    `root`, so `storage_path:` in it decides where that process creates
+    directories and writes files. fastcached therefore uses a *discovered*
+    machine-wide config only when its directory is one no ordinary account can
+    add or replace a file in — owned by `Administrators`/`SYSTEM` (or `root`),
+    and not writable by anyone else.
+
+    This matters most on Windows, where `C:\ProgramData` lets every standard
+    account create files in a new subdirectory. The installer creates
+    `C:\ProgramData\fastcached` with an access list of its own, so a packaged
+    install already satisfies this; a directory somebody else made first does
+    not. When a config is skipped for this reason fastcached says so on stderr
+    and prints the exact command that repairs it:
+
+    ```
+    fastcached: C:\ProgramData\fastcached\fastcached.yaml: ignored: C:\ProgramData\fastcached
+    can be written by accounts other than the administrative ones, ...
+    Secure it with `icacls "C:\ProgramData\fastcached" /setowner *S-1-5-32-544 /inheritance:r ...`,
+    or name a config explicitly with --config.
+    ```
+
+    `--config=<path>` is never checked this way — you named that file, which is
+    your call to make.
 
 ## What the file looks like
 
@@ -92,9 +128,26 @@ logged. A reload therefore either applies everything or nothing.
 Keep `requirepass` in the config file, not on the command line: launch
 arguments are world-readable through the process table and through the service
 registration. `--install-service` refuses `--requirepass` outright for that
-reason. Give the file mode `0640` and make it readable by the account the
-service runs as — which is what the macOS installer does to
+reason.
+
+On **Linux and macOS**, give the file mode `0640` and make it readable by the
+account the service runs as — which is what the macOS installer does to
 `/opt/fastcached/etc/fastcached.yaml`.
+
+On **Windows** the shipped permissions are the other way round: the installer
+locks `C:\ProgramData\fastcached` so that only `SYSTEM` and `Administrators` can
+*write* it, but leaves `Users` able to read, which is the convention for
+`%ProgramData%` and what the daemon's own trust check requires. A `requirepass:`
+written there is therefore readable by every local account. If that matters,
+remove the read entry once the config is in place:
+
+```powershell
+icacls C:\ProgramData\fastcached\fastcached.yaml /inheritance:r `
+       /grant *S-1-5-18:F /grant *S-1-5-32-544:F
+```
+
+The daemon runs as `LocalSystem`, so it keeps its access; only the directory,
+not the file, has to stay readable for the trust check.
 
 ## Editing the installed file
 

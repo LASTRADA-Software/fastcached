@@ -37,7 +37,8 @@ src/FastCache/
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
                 ISignalSource, DaemonControls (process-wide stop/reload flags),
                 CpuAffinity, HostMemory, ServiceControl, Terminal,
-                Environment (the one place the process environment is read)
+                Environment (the one place the process environment is read),
+                FileTrust (could only an administrator have put a file here?)
   Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader,
                 EnvExpand ($VAR/${VAR} in path settings), DefaultConfigPath
                 (per-platform config lookup + --seed-config, behind IConfigPathProbe)
@@ -106,6 +107,30 @@ These constraints are load-bearing and have each already been a bug:
   registers, and a discovered path baked into `ProgramArguments` would outrank
   the file itself forever (see the next bullet) and make
   `InlineCredentialRejection` name a path nobody typed.
+- **A machine-wide config is only obeyed when only an administrator could have
+  written it.** `C:\ProgramData` grants `BUILTIN\Users` create-file on every
+  subdirectory it hands down to, so moving the Windows config there made the
+  configuration of a *LocalSystem* service plantable by any standard account —
+  `storage_path:` alone turns that into arbitrary directory creation and file
+  writes as SYSTEM. Two halves, and both are needed: the MSI owns
+  `%ProgramData%\fastcached` and gives it a protected access list of its own
+  (`PermissionEx`, not `Permission` or `util:PermissionEx` — those take an
+  account *name* and are wrong on a non-English Windows), and `DefaultConfigPath`
+  refuses a discovered `ConfigScope::System` candidate whose directory fails
+  `Platform/FileTrust`. The test there is the containing directory's owner and
+  entries, never the file's owner: on Windows a new object belongs to its
+  *creator*, so a config seeded by hand from an elevated shell is owned by that
+  administrator's own account, while a file planted by a standard account is
+  granted to that account's own SID through the inherited `CREATOR OWNER` entry
+  — an owner whitelist rejects the first and an entry scan misses the second.
+  Only `System` rows are checked, and never a path named with `--config`. A
+  rejection goes to stderr with the `icacls` line that repairs it, because a file
+  that is present, readable and ignored anyway is the silent no-op this list
+  exists to prevent. `--seed-config` carries the same rule rather than working
+  around it: it secures the directory *before* the config lands, repairs a
+  squatted one, refuses when it has the rights for neither, and deletes a
+  directory it created but could not secure — which would otherwise be the very
+  shape being defended against, authored by the defence.
 - **`ExecStart` still passes `--config` on Linux and macOS — by choice, not
   necessity.** It predates the lookup, where its absence made `ConfigReloader`
   have nothing to re-read and `systemctl reload` a silent no-op; the lookup now

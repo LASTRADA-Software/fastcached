@@ -40,8 +40,8 @@ struct ConfigCandidate
 
     /// Environment variable holding the base directory. Empty means `suffix`
     /// is already an absolute path. A variable that is unset (or set but
-    /// empty) skips the row entirely, which is what gives XDG's
-    /// "`$XDG_CONFIG_HOME`, else `~/.config`" rule with no special case.
+    /// empty) skips the row entirely, so `$XDG_CONFIG_HOME` needs no special
+    /// case to fall back to `~/.config`.
     std::string_view baseVar;
 
     /// Path appended to the resolved base (or used as-is when `baseVar` is empty).
