@@ -69,4 +69,19 @@ namespace FastCache::Testing
     return i;
 }
 
+/// The description column of the aligned row whose term is `term`.
+///
+/// Anchored on the row's indent rather than a bare search, so a term that also
+/// appears in the section's prose cannot be matched instead of its own row.
+/// @param text The rendered usage text.
+/// @param term The term to find, exactly as it appears after the indent.
+/// @return The description column; fails the calling test when no row matches.
+[[nodiscard]] inline std::size_t DescriptionColumnOf(std::string_view text, std::string_view term)
+{
+    for (auto const& line: UsageLines(text))
+        if (line.starts_with("  ") && std::string_view { line }.substr(2).starts_with(term))
+            return DescriptionColumn(line);
+    return std::string_view::npos;
+}
+
 } // namespace FastCache::Testing

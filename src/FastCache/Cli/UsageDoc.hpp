@@ -93,7 +93,7 @@ struct UsageBlock
 {
     std::span<UsageEntry const> entries {}; ///< Aligned rows; empty means this is a text block.
     std::string_view text {};               ///< Free-form body; used iff `entries` is empty.
-    std::size_t indent {};                  ///< Spaces prepended to each non-empty line of `text`.
+    std::size_t textIndent {};              ///< Spaces prepended to each non-empty line of `text`.
                                             ///< Nesting is the renderer's job: when it was not, every
                                             ///< caller that wanted an indented block rewrote its own
                                             ///< body inserting spaces after each newline.
@@ -134,8 +134,10 @@ struct UsageDocument
 /// arithmetic and a warning comment, and left a `push_back` in the wrong place
 /// dangling the document instead of failing to compile.
 ///
-/// Here the storage and the rows are one object: keep the UsageRows alive, which
-/// is ordinary object lifetime, and there is nothing else to get right.
+/// Here the storage and the rows are one object, so the terms cannot outlive
+/// their entries. One ordering rule survives and is not enforced: `Rows()`
+/// hands out a span over a vector `Add` still grows, so take the span after the
+/// last Add — as every assembler does, in the block initializer.
 class UsageRows
 {
   public:

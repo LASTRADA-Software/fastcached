@@ -18,7 +18,7 @@ namespace
     {
         std::vector<std::pair<std::string, std::string>> rows; ///< Term/description pairs; empty for a text block.
         std::string text;                                      ///< Free-form body; used iff `rows` is empty.
-        std::size_t indent {};                                 ///< Spaces before each non-empty line of `text`.
+        std::size_t textIndent {};                             ///< Spaces before each non-empty line of `text`.
     };
 
     /// Expand every string in `section` up front.
@@ -33,7 +33,7 @@ namespace
         for (auto const& block: section.blocks)
         {
             ExpandedBlock out;
-            out.indent = block.indent;
+            out.textIndent = block.textIndent;
             if (block.entries.empty())
                 out.text = ExpandUsageTokens(block.text, substitutions);
             else
@@ -152,7 +152,7 @@ std::string RenderUsage(UsageDocument const& document, UsageColor color, std::sp
                         // An empty line stays empty: indenting it would be
                         // trailing whitespace and nothing else.
                         if (!line.empty())
-                            out.append(block.indent, ' ');
+                            out.append(block.textIndent, ' ');
                         out += line;
                         out += '\n';
                     });

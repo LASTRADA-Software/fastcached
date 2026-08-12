@@ -183,7 +183,7 @@ TEST_CASE("a text block is nested by its indent, and empty lines stay empty", "[
     // an indented block rewrote its own body inserting spaces after each
     // newline -- and an empty line came back as trailing whitespace.
     static constexpr auto blocks =
-        std::to_array<UsageBlock>({ { .text = "title\n\nbody", .indent = 2 }, { .text = "flush" } });
+        std::to_array<UsageBlock>({ { .text = "title\n\nbody", .textIndent = 2 }, { .text = "flush" } });
     static constexpr auto sections = std::to_array<UsageSection>({ { .title = "T", .blocks = blocks } });
 
     auto const lines = UsageLines(RenderUsage({ .sections = sections }, UsageColor::Plain));

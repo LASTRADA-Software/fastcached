@@ -304,7 +304,7 @@ std::string HelpText(UsageColor color)
         { .entries = usageRows.Rows() },
         { .entries = statsRows.Rows() },
         { .entries = environmentRows.Rows() },
-        { .text = StateDirectoryNote, .indent = 2 },
+        { .text = StateDirectoryNote, .textIndent = 2 },
         { .entries = StateDirectoryRows },
         { .text = RequiredVariablesNote },
         { .text = FallbackNote },

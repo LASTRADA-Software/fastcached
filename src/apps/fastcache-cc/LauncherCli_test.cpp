@@ -269,13 +269,14 @@ TEST_CASE("the two ENVIRONMENT row groups share one column")
     // They sit in one section precisely so the prose between them cannot let
     // the halves drift apart; XDG_STATE_HOME, HOME is as wide as the widest
     // FASTCACHE_ name, so a regression here is visible immediately.
+    // Anchored on each row's own indent: FASTCACHE_ADDR is also named in the
+    // prose below the rows, and a bare search would find whichever came first.
     auto const help = HelpText();
-    auto const columnOf = [&help](std::string_view name) {
-        auto const at = help.find(name);
-        REQUIRE(at != std::string::npos);
-        return help.find_first_not_of(' ', at + name.size()) - help.rfind('\n', at) - 1;
-    };
-    CHECK(columnOf("FASTCACHE_ADDR") == columnOf("XDG_STATE_HOME, HOME"));
+    auto const first = FastCache::Testing::DescriptionColumnOf(help, "FASTCACHE_ADDR");
+    auto const second = FastCache::Testing::DescriptionColumnOf(help, "XDG_STATE_HOME, HOME");
+    REQUIRE(first != std::string_view::npos);
+    REQUIRE(second != std::string_view::npos);
+    CHECK(first == second);
 }
 
 TEST_CASE("the help text documents every environment variable the launcher reads")

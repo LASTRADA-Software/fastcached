@@ -13,17 +13,9 @@
 # exactly like `fastcached --help`; Platform/Terminal.cpp decides whether to,
 # and Platform/Environment.cpp is the one place the environment is read, so the
 # launcher no longer needs its own copy of that dance.
-#
-# Cli/Options.cpp belongs here even though the launcher keeps its own row type:
-# LauncherCli.hpp includes Cli/Options.hpp, so without this row that header's
-# free functions are declared but unlinkable, and the first call to one of them
-# fails at LINK time rather than at build time -- the failure mode this whole
-# compile-it-in arrangement exists to keep visible. It needs only <format> and
-# the header-only ConfigError, so it costs nothing to include.
 
 set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Cli/UsageDoc.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Cli/Options.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/PathCanon.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/CompileValue.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Crc32c.cpp"

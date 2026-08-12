@@ -7,6 +7,7 @@
 // a flag's spelling, its parser, its explicit tracker and its help text lived
 // in separate structures, so "every accepted flag is documented" and "parsing
 // one flag touches only its own tracker" could not be stated at all.
+#include <FastCache/Cli/UsageTestUtils.hpp>
 #include <FastCache/Config/CliParser.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -163,13 +164,12 @@ TEST_CASE("every documented flag is an accepted flag", "[config][cli][options][h
         forms.push_back(RenderFlagForms(spec));
 
     auto documented = std::size_t { 0 };
-    for (auto const& line: std::views::split(std::string_view { usage }, '\n'))
+    for (auto const& text: FastCache::Testing::UsageLines(usage))
     {
-        std::string_view const text { line.begin(), line.end() };
         if (!text.starts_with("  --"))
             continue;
         ++documented;
-        auto const term = text.substr(2, text.find("  ", 2) - 2);
+        auto const term = std::string_view { text }.substr(2, text.find("  ", 2) - 2);
         auto const known = std::ranges::contains(forms, term);
         INFO("documented term: " << term);
         CHECK(known);

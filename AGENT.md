@@ -66,14 +66,11 @@ src/apps/
                             through `CMAKE_<LANG>_COMPILER_LAUNCHER`. Platform
                             work sits behind `IProcessRunner` / `ITcpClient`,
                             so main.cpp's flow logic is platform-free. Compiles
-                            in `Cli/UsageDoc.cpp` and `Cli/Options.cpp` plus
-                            `Platform/Environment.cpp` and `Platform/Terminal.cpp`
-                            (see `_fc_cc_core`), so its help renders and
-                            colorizes exactly like the daemon's without linking
-                            the library. `Options.cpp` is there because
-                            `LauncherCli.hpp` includes its header: without the
-                            row those functions are declared but unlinkable, and
-                            the first call to one fails at link time.
+                            in `Cli/UsageDoc.cpp` plus `Platform/Environment.cpp`
+                            and `Platform/Terminal.cpp` (see `_fc_cc_core`), so
+                            its help renders and colorizes exactly like the
+                            daemon's without linking the library. `Cli/Options`
+                            is header-only, so including it costs no build row.
   compile-cache-testclient/ low-level `0xFC` protocol probe + cross-depth
                             validation (FASTCACHED_BUILD_TESTCLIENT, default
                             OFF — test infrastructure, never installed)

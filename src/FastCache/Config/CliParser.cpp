@@ -604,8 +604,9 @@ std::string CliUsage(UsageColor color)
     UsageRows optionRows;
     AddOptionRows(optionRows, CliOptions());
 
-    // An example is a title with its body one level further in; the renderer
-    // does the nesting, so these stay the literals they are written as.
+    // The renderer supplies the section indent every example line shares; the
+    // second level -- the body under its own title -- is still the two spaces
+    // each `body` literal carries.
     std::vector<std::string> exampleTexts;
     exampleTexts.reserve(UsageExamples.size());
     for (auto const& example: UsageExamples)
@@ -615,7 +616,7 @@ std::string CliUsage(UsageColor color)
     blocks.reserve(1 + exampleTexts.size() + 1);
     blocks.push_back({ .entries = optionRows.Rows() });
     for (auto const& text: exampleTexts)
-        blocks.push_back({ .text = text, .indent = 2 });
+        blocks.push_back({ .text = text, .textIndent = 2 });
     blocks.push_back({ .text = UsageFooter });
 
     std::span<UsageBlock const> const allBlocks { blocks };

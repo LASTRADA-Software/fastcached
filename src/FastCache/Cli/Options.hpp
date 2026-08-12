@@ -104,7 +104,12 @@ template <typename Result>
 /// @param field The flag or setting at fault.
 /// @param context Human-readable detail.
 /// @return The populated error, with `source` stamped "argv".
-[[nodiscard]] ConfigError ArgvError(ConfigErrorCode code, std::string field, std::string context);
+[[nodiscard]] inline ConfigError ArgvError(ConfigErrorCode code, std::string field, std::string context)
+{
+    return ConfigError {
+        .code = code, .source = "argv", .line = 0, .field = std::move(field), .context = std::move(context)
+    };
+}
 
 /// Whether `arg` names `flag`, either exactly or as the `flag=value` form.
 /// @param arg The command-line token.
@@ -139,7 +144,17 @@ template <typename Result>
 /// @param alias The synonym, or empty.
 /// @param operand The display-only value suffix, or empty.
 /// @return The flag column text.
-[[nodiscard]] std::string RenderFlagForms(std::string_view primary, std::string_view alias, std::string_view operand);
+[[nodiscard]] inline std::string RenderFlagForms(std::string_view primary, std::string_view alias, std::string_view operand)
+{
+    std::string forms { primary };
+    if (!alias.empty())
+    {
+        forms += ", ";
+        forms += alias;
+    }
+    forms += operand;
+    return forms;
+}
 
 /// Render one row's left help column.
 /// @param spec The row to render.
@@ -156,9 +171,18 @@ template <typename Result>
 /// @param i Index of the argument under inspection; advanced on the two-token form.
 /// @param flag The flag spelling, for the error message.
 /// @return The value text, or a ConfigError when the value is missing.
-[[nodiscard]] std::expected<std::string_view, ConfigError> TakeValue(std::span<char const* const> args,
-                                                                     std::size_t& i,
-                                                                     std::string_view flag);
+[[nodiscard]] inline std::expected<std::string_view, ConfigError> TakeValue(std::span<char const* const> args,
+                                                                            std::size_t& i,
+                                                                            std::string_view flag)
+{
+    auto const arg = std::string_view { args[i] };
+    if (auto const eq = arg.find('='); eq != std::string_view::npos)
+        return arg.substr(eq + 1);
+    if (i + 1 >= args.size())
+        return std::unexpected(ArgvError(ConfigErrorCode::ParseError, std::string { flag }, "missing value"));
+    ++i;
+    return std::string_view { args[i] };
+}
 
 /// Resolve the object a flag's target member pointer designates.
 ///
@@ -228,7 +252,10 @@ template <auto Field, auto Value>
 /// The identity parser, for flags whose value is taken verbatim.
 /// @param sv The value text.
 /// @return `sv` as an owned string; never fails.
-[[nodiscard]] std::expected<std::string, ConfigError> ParseText(std::string_view sv);
+[[nodiscard]] inline std::expected<std::string, ConfigError> ParseText(std::string_view sv)
+{
+    return std::string { sv };
+}
 
 /// Apply the one option named by `args[i]`.
 ///
