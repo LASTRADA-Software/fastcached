@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Cli/Options.hpp>
+#include <FastCache/Cli/UsageDoc.hpp>
+
 #include <cstdint>
-#include <iosfwd>
 #include <span>
 #include <string>
 #include <string_view>
@@ -24,13 +26,6 @@ enum class Action : std::uint8_t
     Cohort,      ///< Stats sub-option: restrict the report to one cohort.
     NoArguments, ///< Invoked with nothing at all — usage, to stderr.
     UsageError,  ///< Unknown option or a missing option value.
-};
-
-/// How many arguments a flag consumes beyond its own token.
-enum class Arity : std::uint8_t
-{
-    None,  ///< The flag stands alone.
-    Value, ///< The flag takes a value, either `--flag <v>` or `--flag=<v>`.
 };
 
 /// One accepted flag.
@@ -95,14 +90,32 @@ struct Command
 /// @return A `ShowStats` command, or a usage error.
 [[nodiscard]] Command ParseStatsOptions(std::span<std::string const> args, std::span<FlagSpec const> options);
 
-/// Write the usage text to `stream`.
+/// One environment variable the launcher reads.
 ///
-/// The USAGE and STATS OPTIONS sections are rendered from `TopLevelFlags()` and
-/// `StatsOptions()`; only the ENVIRONMENT prose is written out by hand, because
-/// its value is explaining *why* each variable matters rather than merely
-/// listing it.
-/// @param stream Destination — stdout for an explicit `--help`, stderr for a
-///        usage error.
-void PrintHelp(std::ostream& stream);
+/// The single source of truth for what `--help` documents under ENVIRONMENT.
+/// Before this table the names lived in three unlinked places — the reader in
+/// main.cpp, a hand-written block of help prose, and a file-header comment —
+/// so a variable could be read but undocumented, or documented but never read.
+struct EnvVarSpec
+{
+    std::string_view name;    ///< The variable, spelled exactly as it is read.
+    std::string_view summary; ///< Help text; '\n' starts a continuation line.
+};
+
+/// The `FASTCACHE_*` variables, in the order `--help` documents them.
+/// @return A view of the static table; never empty.
+[[nodiscard]] std::span<EnvVarSpec const> LauncherEnvironment() noexcept;
+
+/// Render the usage text.
+///
+/// Every section is generated from the tables above; only the prose explaining
+/// *why* a setting matters is written by hand, because a table cannot carry it.
+///
+/// Returns a string rather than writing to a stream so the caller picks both
+/// the destination and the color at one place, and so this module keeps the
+/// no-I/O promise `ParseTopLevel` above makes.
+/// @param color Whether to emit ANSI SGR escapes; see StdoutSupportsColor.
+/// @return The complete usage text, ending in a newline.
+[[nodiscard]] std::string HelpText(UsageColor color = UsageColor::Plain);
 
 } // namespace FastCache::Cc

@@ -102,26 +102,6 @@ namespace
         return forms;
     }
 
-    /// One rendered usage line.
-    struct UsageRow
-    {
-        std::string form;         ///< Invocation form (the left column).
-        std::string_view summary; ///< Its one-line description.
-    };
-
-    /// Write a titled, column-aligned block of usage lines.
-    /// @param stream Destination.
-    /// @param title Section heading.
-    /// @param rows The lines; must not be empty.
-    void EmitSection(std::ostream& stream, std::string_view title, std::span<UsageRow const> rows)
-    {
-        auto const width =
-            std::ranges::max(rows | std::views::transform([](UsageRow const& row) { return row.form.size(); }));
-        stream << title << '\n';
-        for (auto const& row: rows)
-            stream << std::format("  {:<{}}  {}\n", row.form, width, row.summary);
-    }
-
     /// A command that carries nothing beyond the action it selects.
     /// @param action The resolved action.
     /// @return The command.
@@ -138,53 +118,75 @@ namespace
         return { .action = Action::UsageError, .cohortFilter = {}, .diagnostic = std::move(diagnostic) };
     }
 
-    /// The parts of the usage text that describe *why* a setting matters, which a
-    /// table cannot carry. Kept as prose deliberately; the flag synopsis above it
-    /// is generated.
-    constexpr std::string_view EnvironmentHelp = R"(
-ENVIRONMENT
-  FASTCACHE_ADDR        host:port of the fastcached daemon. Unset means every
-                        compile runs uncached -- the build still succeeds, so
-                        check this before concluding the cache is working.
-  FASTCACHE_SRCROOT     Checkout source root, for keying and path canonicalization.
-  FASTCACHE_BUILDTREE   Build output root.
-  FASTCACHE_COHORT      Prefetch grouping id (default "default"). Not part of the
-                        cache key, so it never partitions the cache.
-  FASTCACHE_VERBOSE     Print HIT/MISS and fall-back diagnostics to stderr.
-  FASTCACHE_NO_STATS    Do not record invocations to the statistics log.
-  FASTCACHE_NO_DIRECT   Disable direct mode (always preprocess to derive the key).
-                        Direct mode is on by default: it reaches a cached object by
-                        re-hashing the project headers a previous compile recorded,
-                        which is far cheaper than preprocessing the translation unit.
-  FASTCACHE_TIMEOUT_MS  Per-call deadline, in milliseconds, for every send/recv to
-                        the daemon (default 10000; 0 disables it). A daemon that
-                        accepts the connection and then stalls mid-reply would
-                        otherwise block the compile forever, which would make the
-                        cache load-bearing. On expiry the launcher gives up on the
-                        cache and compiles for real, like any other cache error.
-                        Raise it if a heavily loaded daemon is legitimately slow.
-                        This bounds each call, not the whole invocation: direct
-                        mode makes a separate manifest round-trip, so one compile
-                        against a wedged daemon can wait up to twice this before
-                        falling back.
+    /// The `FASTCACHE_*` variables, in the order `--help` documents them.
+    ///
+    /// One row per variable, so the names cannot drift from what the launcher
+    /// actually reads. The prose below is what a table genuinely cannot carry:
+    /// it explains *why* a setting matters rather than merely listing it.
+    constexpr std::array EnvironmentTable {
+        EnvVarSpec { .name = "FASTCACHE_ADDR",
+                     .summary = "host:port of the fastcached daemon. Unset means every\n"
+                                "compile runs uncached -- the build still succeeds, so\n"
+                                "check this before concluding the cache is working." },
+        EnvVarSpec { .name = "FASTCACHE_SRCROOT", .summary = "Checkout source root, for keying and path canonicalization." },
+        EnvVarSpec { .name = "FASTCACHE_BUILDTREE", .summary = "Build output root." },
+        EnvVarSpec { .name = "FASTCACHE_COHORT",
+                     .summary = "Prefetch grouping id (default \"default\"). Not part of the\n"
+                                "cache key, so it never partitions the cache." },
+        EnvVarSpec { .name = "FASTCACHE_VERBOSE", .summary = "Print HIT/MISS and fall-back diagnostics to stderr." },
+        EnvVarSpec { .name = "FASTCACHE_NO_STATS", .summary = "Do not record invocations to the statistics log." },
+        EnvVarSpec { .name = "FASTCACHE_NO_DIRECT",
+                     .summary = "Disable direct mode (always preprocess to derive the key).\n"
+                                "Direct mode is on by default: it reaches a cached object by\n"
+                                "re-hashing the project headers a previous compile recorded,\n"
+                                "which is far cheaper than preprocessing the translation unit." },
+        EnvVarSpec { .name = "FASTCACHE_TIMEOUT_MS",
+                     .summary = "Per-call deadline, in milliseconds, for every send/recv to\n"
+                                "the daemon (default 10000; 0 disables it). A daemon that\n"
+                                "accepts the connection and then stalls mid-reply would\n"
+                                "otherwise block the compile forever, which would make the\n"
+                                "cache load-bearing. On expiry the launcher gives up on the\n"
+                                "cache and compiles for real, like any other cache error.\n"
+                                "Raise it if a heavily loaded daemon is legitimately slow.\n"
+                                "This bounds each call, not the whole invocation: direct\n"
+                                "mode makes a separate manifest round-trip, so one compile\n"
+                                "against a wedged daemon can wait up to twice this before\n"
+                                "falling back." },
+    };
 
-  The statistics log lives under a per-user state directory, located from the
-  usual platform variables rather than one of our own:
+    /// Where the statistics log goes.
+    ///
+    /// Deliberately UsageEntry rows rather than EnvVarSpec: one row documents
+    /// two variables, and Stats.cpp chooses between them behind a platform
+    /// `#if` that no flat list of names describes. These are also not ours —
+    /// they are the usual per-user state locations.
+    constexpr std::array StateDirectoryRows {
+        UsageEntry { .term = "LOCALAPPDATA",
+                     .description = "(Windows) Base for the log directory,\n"
+                                    "%LOCALAPPDATA%\\fastcache-cc." },
+        UsageEntry { .term = "XDG_STATE_HOME, HOME",
+                     .description = "(POSIX) Base for the log directory, in that order of\n"
+                                    "preference: $XDG_STATE_HOME/fastcache-cc, else\n"
+                                    "$HOME/.local/state/fastcache-cc. With neither set there is\n"
+                                    "nowhere to record, and statistics are silently disabled." },
+    };
 
-  LOCALAPPDATA          (Windows) Base for the log directory,
-                        %LOCALAPPDATA%\fastcache-cc.
-  XDG_STATE_HOME, HOME  (POSIX) Base for the log directory, in that order of
-                        preference: $XDG_STATE_HOME/fastcache-cc, else
-                        $HOME/.local/state/fastcache-cc. With neither set there is
-                        nowhere to record, and statistics are silently disabled.
+    /// Lead-in to the state-directory rows.
+    constexpr std::string_view StateDirectoryNote =
+        "  The statistics log lives under a per-user state directory, located from the\n"
+        "  usual platform variables rather than one of our own:";
 
-ADDR, SRCROOT and BUILDTREE must ALL be set to cache; any missing one makes the
-launcher run the real compiler and report "missing FASTCACHE_ADDR/SRCROOT/BUILDTREE"
-under FASTCACHE_VERBOSE.
+    /// The two closing paragraphs, each its own block so a blank line separates
+    /// them the same way one separates any other pair of blocks.
+    constexpr std::string_view RequiredVariablesNote =
+        "ADDR, SRCROOT and BUILDTREE must ALL be set to cache; any missing one makes the\n"
+        "launcher run the real compiler and report \"missing FASTCACHE_ADDR/SRCROOT/BUILDTREE\"\n"
+        "under FASTCACHE_VERBOSE.";
 
-Any cache error falls back to a plain real compile: caching is an optimization
-and never breaks a build.
-)";
+    /// The promise the whole launcher is built around.
+    constexpr std::string_view FallbackNote =
+        "Any cache error falls back to a plain real compile: caching is an optimization\n"
+        "and never breaks a build.";
 
 } // namespace
 
@@ -277,26 +279,64 @@ Command ParseTopLevel(std::span<std::string const> args)
     return Selected(Action::Compile);
 }
 
-void PrintHelp(std::ostream& stream)
+std::span<EnvVarSpec const> LauncherEnvironment() noexcept
 {
-    stream << "fastcache-cc - a compiler launcher over the fastcached compile cache.\n\n";
+    return EnvironmentTable;
+}
 
-    std::vector<UsageRow> usage;
-    usage.reserve(TopLevelFlags().size() + 1);
+std::string HelpText(UsageColor color)
+{
+    // Every owning container is filled to completion before any span or view
+    // over it is taken: a later push_back would reallocate and leave the
+    // document pointing at freed storage.
+    std::vector<std::string> forms;
+    forms.reserve(TopLevelFlags().size() + StatsOptions().size() + 1);
     // The compile form is the default rather than a flag, so it has no table row.
-    usage.emplace_back("fastcache-cc <compiler> <args...>", "Front a compile (as CMAKE_<LANG>_COMPILER_LAUNCHER).");
+    forms.emplace_back("fastcache-cc <compiler> <args...>");
     for (auto const& spec: TopLevelFlags())
-        usage.emplace_back(std::format("fastcache-cc {}", RenderForms(spec)), spec.summary);
-    EmitSection(stream, "USAGE", usage);
-
-    std::vector<UsageRow> options;
-    options.reserve(StatsOptions().size());
+        forms.push_back(std::format("fastcache-cc {}", RenderForms(spec)));
     for (auto const& spec: StatsOptions())
-        options.emplace_back(RenderForms(spec), spec.summary);
-    stream << '\n';
-    EmitSection(stream, "STATS OPTIONS", options);
+        forms.push_back(RenderForms(spec));
 
-    stream << EnvironmentHelp;
+    std::vector<UsageEntry> usageRows;
+    usageRows.reserve(TopLevelFlags().size() + 1);
+    usageRows.push_back({ .term = forms.front(), .description = "Front a compile (as CMAKE_<LANG>_COMPILER_LAUNCHER)." });
+    for (auto const index: std::views::iota(std::size_t { 0 }, TopLevelFlags().size()))
+        usageRows.push_back({ .term = forms[index + 1], .description = TopLevelFlags()[index].summary });
+
+    std::vector<UsageEntry> statsRows;
+    statsRows.reserve(StatsOptions().size());
+    for (auto const index: std::views::iota(std::size_t { 0 }, StatsOptions().size()))
+        statsRows.push_back(
+            { .term = forms[TopLevelFlags().size() + 1 + index], .description = StatsOptions()[index].summary });
+
+    std::vector<UsageEntry> environmentRows;
+    environmentRows.reserve(LauncherEnvironment().size());
+    for (auto const& spec: LauncherEnvironment())
+        environmentRows.push_back({ .term = spec.name, .description = spec.summary });
+
+    auto const blocks = std::to_array<UsageBlock>({
+        { .entries = usageRows },
+        { .entries = statsRows },
+        { .entries = environmentRows },
+        { .text = StateDirectoryNote },
+        { .entries = StateDirectoryRows },
+        { .text = RequiredVariablesNote },
+        { .text = FallbackNote },
+    });
+
+    std::span<UsageBlock const> const allBlocks { blocks };
+    auto const sections = std::to_array<UsageSection>({
+        { .subject = "fastcache-cc - a compiler launcher over the fastcached compile cache." },
+        { .title = "USAGE", .blocks = allBlocks.subspan(0, 1) },
+        { .title = "STATS OPTIONS", .blocks = allBlocks.subspan(1, 1) },
+        // The three ENVIRONMENT blocks share one section so its two runs of rows
+        // keep a common column even though prose sits between them.
+        { .title = "ENVIRONMENT", .blocks = allBlocks.subspan(2, 3) },
+        { .blocks = allBlocks.subspan(5, 2) },
+    });
+
+    return RenderUsage({ .sections = sections }, color);
 }
 
 } // namespace FastCache::Cc

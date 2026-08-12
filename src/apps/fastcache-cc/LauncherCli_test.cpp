@@ -5,12 +5,13 @@
 
 #include <array>
 #include <span>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 using namespace FastCache::Cc;
+using FastCache::Arity;
+using FastCache::UsageColor;
 
 namespace
 {
@@ -20,12 +21,24 @@ Command Parse(std::vector<std::string> const& argv)
     return ParseTopLevel(std::span<std::string const> { argv });
 }
 
-/// The help text as `--help` would print it.
-std::string HelpText()
+/// Remove every ANSI SGR escape, so colored output can be compared against
+/// plain output character for character.
+/// @param text Possibly-colored text.
+/// @return `text` with all escape sequences removed.
+[[nodiscard]] std::string StripAnsi(std::string_view text)
 {
-    std::ostringstream out;
-    PrintHelp(out);
-    return std::move(out).str();
+    std::string out;
+    for (std::size_t i = 0; i < text.size(); ++i)
+    {
+        if (text[i] != '\x1b')
+        {
+            out += text[i];
+            continue;
+        }
+        while (i < text.size() && text[i] != 'm')
+            ++i;
+    }
+    return out;
 }
 
 } // namespace
@@ -242,8 +255,51 @@ TEST_CASE("the help text renders the sections it promises")
     CHECK(help.contains("--cohort=<id>"));
 }
 
+TEST_CASE("every environment row is named and described")
+{
+    REQUIRE_FALSE(LauncherEnvironment().empty());
+    for (auto const& spec: LauncherEnvironment())
+    {
+        INFO("variable " << spec.name);
+        CHECK(spec.name.starts_with("FASTCACHE_"));
+        CHECK_FALSE(spec.summary.empty());
+    }
+}
+
+TEST_CASE("plain help carries no ANSI escapes")
+{
+    // Help on stderr and help through a pipe must stay plain: the e2e scripts
+    // grep this output, and a build log is no place for escapes.
+    CHECK_FALSE(HelpText(UsageColor::Plain).contains('\x1b'));
+}
+
+TEST_CASE("colorized help adds escapes but not one character of text")
+{
+    auto const plain = HelpText(UsageColor::Plain);
+    auto const colored = HelpText(UsageColor::Colored);
+    CHECK(colored.contains('\x1b'));
+    CHECK(StripAnsi(colored) == plain);
+}
+
+TEST_CASE("the two ENVIRONMENT row groups share one column")
+{
+    // They sit in one section precisely so the prose between them cannot let
+    // the halves drift apart; XDG_STATE_HOME, HOME is as wide as the widest
+    // FASTCACHE_ name, so a regression here is visible immediately.
+    auto const help = HelpText();
+    auto const columnOf = [&help](std::string_view name) {
+        auto const at = help.find(name);
+        REQUIRE(at != std::string::npos);
+        return help.find_first_not_of(' ', at + name.size()) - help.rfind('\n', at) - 1;
+    };
+    CHECK(columnOf("FASTCACHE_ADDR") == columnOf("XDG_STATE_HOME, HOME"));
+}
+
 TEST_CASE("the help text documents every environment variable the launcher reads")
 {
+    // The hardcoded list is a deliberate independent oracle: help is rendered
+    // from LauncherEnvironment(), so checking it against that table would be
+    // tautological, while this fails if a row is ever dropped.
     auto const help = HelpText();
     for (auto const* name: { "FASTCACHE_ADDR",
                              "FASTCACHE_SRCROOT",

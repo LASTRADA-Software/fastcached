@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "Stats.hpp"
 
+#include <FastCache/Platform/Environment.hpp>
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -40,24 +42,22 @@ namespace
     [[nodiscard]] std::filesystem::path StateDirectory()
     {
         std::error_code ec;
+        // The platform `#if` stays: these are genuinely different variables per
+        // platform, not a different way of reading them. The reading itself goes
+        // through the one seam that knows about getenv_s.
+        std::string base;
 #if defined(_WIN32)
-        std::size_t size = 0;
-        if (::getenv_s(&size, nullptr, 0, "LOCALAPPDATA") != 0 || size == 0)
-            return {};
-        std::string base(size, '\0');
-        if (::getenv_s(&size, base.data(), base.size(), "LOCALAPPDATA") != 0)
-            return {};
-        base.resize(size > 0 ? size - 1 : 0);
+        if (auto const local = FastCache::ReadEnvironmentVariable("LOCALAPPDATA"); local.has_value())
+            base = *local;
 #else
         // XDG_STATE_HOME wins when set; otherwise the spec's default location
         // under $HOME. Neither present means we have nowhere to record.
-        char const* const xdg = std::getenv("XDG_STATE_HOME");
-        char const* const home = std::getenv("HOME");
-        std::string base;
-        if (xdg != nullptr && xdg[0] != '\0')
-            base = std::string { xdg };
-        else if (home != nullptr)
-            base = std::string { home } + "/.local/state";
+        auto const xdg = FastCache::ReadEnvironmentVariable("XDG_STATE_HOME");
+        auto const home = FastCache::ReadEnvironmentVariable("HOME");
+        if (xdg.has_value() && !xdg->empty())
+            base = *xdg;
+        else if (home.has_value())
+            base = *home + "/.local/state";
 #endif
         if (base.empty())
             return {};
