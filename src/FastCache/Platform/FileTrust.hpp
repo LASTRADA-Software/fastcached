@@ -7,6 +7,26 @@
 namespace FastCache
 {
 
+/// Is this process running with the rights the machine-wide daemon has?
+///
+/// The question that decides whether a machine-wide configuration is *this*
+/// process's business at all. A file at `/etc/fastcached` or
+/// `%ProgramData%\fastcached` describes the system service — its cache lives
+/// where only the service account can write — so a per-user instance that
+/// adopted it would be configured for a daemon it is not: pointed at a state
+/// directory it cannot open, or at a port the real daemon already holds.
+///
+/// On Windows this asks whether `BUILTIN\Administrators` is *enabled* in the
+/// effective token, which is false for the unelevated half of an
+/// administrator's split token — correctly, since that process could not have
+/// written the machine-wide config either. LocalSystem, and therefore the
+/// service, answers true.
+///
+/// @return true when the caller is root (POSIX) or an elevated administrator
+///         or LocalSystem (Windows). False when it cannot be determined, which
+///         keeps an undecidable case out of the machine-wide config.
+[[nodiscard]] bool IsPrivilegedProcess();
+
 /// Can only an administrator have put the file that is at @p path there?
 ///
 /// The question a machine-wide configuration has to answer before it is

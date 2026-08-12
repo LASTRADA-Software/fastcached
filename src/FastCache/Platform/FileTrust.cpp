@@ -11,6 +11,7 @@
     #include <cstddef>
     #include <memory>
     #include <ranges>
+    #include <span>
 
     #include <windows.h>
     // After windows.h: both depend on its types, and WIN32_LEAN_AND_MEAN (set
@@ -19,6 +20,8 @@
     #include <sddl.h>
 #else
     #include <sys/stat.h>
+
+    #include <unistd.h>
 #endif
 
 namespace FastCache
@@ -240,6 +243,28 @@ namespace
     }
 
 } // namespace
+
+bool IsPrivilegedProcess()
+{
+#if defined(_WIN32)
+    std::array<std::byte, SECURITY_MAX_SID_SIZE> administrators {};
+    auto size = static_cast<DWORD>(administrators.size());
+    if (::CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administrators.data(), &size) == FALSE)
+        return false;
+
+    // A null token means the effective one. Membership here is *enabled*
+    // membership, so the unelevated half of a split administrator token answers
+    // false — which is the right answer: that process could not have written
+    // the machine-wide config either.
+    BOOL member = FALSE;
+    if (::CheckTokenMembership(nullptr, administrators.data(), &member) == FALSE)
+        return false;
+
+    return member == TRUE;
+#else
+    return ::geteuid() == 0;
+#endif
+}
 
 bool IsAdministratorOnlyWritable(std::filesystem::path const& path)
 {

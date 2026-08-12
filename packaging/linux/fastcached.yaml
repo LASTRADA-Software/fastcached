@@ -33,6 +33,12 @@
 # The per-user file wins, so a personal cache can be configured without root
 # and without editing the machine-wide file. `fastcached --help` prints the
 # same list for the platform you are on.
+#
+# The machine-wide entry is only read by a process that could be the system
+# daemon — root, or LocalSystem on Windows. Running fastcached as yourself
+# passes over this file entirely, so a `systemctl --user` instance keeps its own
+# defaults rather than inheriting a storage_path only the service account can
+# write. Name it with --config if you do want it.
 
 # --- Network ----------------------------------------------------------------
 

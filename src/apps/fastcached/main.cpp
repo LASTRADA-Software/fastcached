@@ -350,9 +350,17 @@ struct StorageBackendBundle
 /// Daemon body: holds the actual server lifecycle. Runs under whatever
 /// IDaemonHost was selected (Foreground / Posix double-fork / Windows
 /// service).
-int DaemonBody(FastCache::Config const& effective)
+int DaemonBody(FastCache::Config const& effective, std::span<FastCache::RejectedCandidate const> rejected)
 {
     FastCache::ConsoleLogger logger { std::cerr, effective.logLevel, effective.logTimestamps };
+
+    // Through the logger, not just the stderr line main() already printed: a
+    // service started by the SCM has no console for that to land on, and this
+    // is exactly the deployment where a rejected machine-wide config would
+    // otherwise be invisible — the daemon serving on built-in defaults while an
+    // operator edits a file it has declined to read.
+    for (auto const& [path, reason]: rejected)
+        logger.Logf(FastCache::LogLevel::Error, "{}: {}", path.string(), reason);
     FastCache::ConfigReloader reloader { effective, effective.configPath };
     FastCache::SteadyClock clock;
 
@@ -771,11 +779,13 @@ int main(int argc, char const* const* argv)
     auto const lookup = FastCache::EffectiveConfigPath(parsed->config.configPath, FastCache::SystemConfigPathProbe {});
     auto const configPath = lookup.path.string();
 
-    // A machine-wide config that exists and is readable but was passed over
-    // anyway has to say so, and to stderr rather than through the logger, which
-    // does not exist until DaemonBody. Silence here would mean an operator
-    // editing a file the daemon has quietly decided not to obey — and the
-    // reason it declined is a permission problem only they can fix.
+    // A config that exists and is readable but was passed over anyway has to say
+    // so: silence would mean an operator editing a file the daemon has quietly
+    // decided not to obey, over a permission problem only they can fix. Printed
+    // here for the commands that never reach the daemon body, and repeated
+    // through the logger once there is one — a Windows service has no console,
+    // so stderr alone would put the message nowhere in the one deployment where
+    // a machine-wide config is the norm.
     for (auto const& [path, reason]: lookup.rejected)
         std::println(std::cerr, "fastcached: {}: {}", path.string(), reason);
 
@@ -785,24 +795,38 @@ int main(int argc, char const* const* argv)
     // CLI or YAML?" so a downstream mix-with-`listeners:` check sees both
     // sources. Starts from the CLI explicit bits and ORs in YAML presence.
     auto bindShapeCli = *parsed;
+    effective = parsed->config;
     if (!configPath.empty())
     {
         auto loaded = FastCache::ReadYamlConfigWithPresence(configPath);
         if (!loaded.has_value())
         {
-            std::println(std::cerr, "fastcached: {}", loaded.error().ToString());
-            return EXIT_FAILURE;
+            // A file that does not parse is fatal for the command that *serves*,
+            // and for any file the operator named — but not for a discovered one
+            // on the way to some other action. Refusing to uninstall a service
+            // because the file at the default location has a typo blocks the very
+            // recovery the operator reached for, and fails a container health
+            // check whose daemon was started with explicit flags and is serving
+            // perfectly well.
+            if (!parsed->config.configPath.empty() || parsed->outcome == FastCache::CliOutcome::Run)
+            {
+                std::println(std::cerr, "fastcached: {}", loaded.error().ToString());
+                return EXIT_FAILURE;
+            }
+
+            // Ignored, and `effective.configPath` deliberately left empty with
+            // it: nothing later should re-read a file this run declined.
+            std::println(std::cerr, "fastcached: ignoring {}: {}", configPath, loaded.error().ToString());
         }
-        metricsPortYamlExplicit = loaded->metricsPortExplicit;
-        bindShapeCli.bindAddressExplicit = bindShapeCli.bindAddressExplicit || loaded->bindAddressExplicit;
-        bindShapeCli.portExplicit = bindShapeCli.portExplicit || loaded->portExplicit;
-        bindShapeCli.tlsEnabledExplicit = bindShapeCli.tlsEnabledExplicit || loaded->tlsEnabledExplicit;
-        effective = FastCache::Merge(std::move(loaded->config), *parsed);
-        effective.configPath = configPath;
-    }
-    else
-    {
-        effective = parsed->config;
+        else
+        {
+            metricsPortYamlExplicit = loaded->metricsPortExplicit;
+            bindShapeCli.bindAddressExplicit = bindShapeCli.bindAddressExplicit || loaded->bindAddressExplicit;
+            bindShapeCli.portExplicit = bindShapeCli.portExplicit || loaded->portExplicit;
+            bindShapeCli.tlsEnabledExplicit = bindShapeCli.tlsEnabledExplicit || loaded->tlsEnabledExplicit;
+            effective = FastCache::Merge(std::move(loaded->config), *parsed);
+            effective.configPath = configPath;
+        }
     }
 
     // Environment fallback for the metrics port: honour FASTCACHED_METRICS_PORT
@@ -890,5 +914,5 @@ int main(int argc, char const* const* argv)
     if (!host)
         host = std::make_unique<FastCache::ForegroundHost>();
 
-    return host->Run([&effective] { return DaemonBody(effective); });
+    return host->Run([&effective, &lookup] { return DaemonBody(effective, lookup.rejected); });
 }

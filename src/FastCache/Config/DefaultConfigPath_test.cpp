@@ -87,6 +87,13 @@ class FakeProbe: public IConfigPathProbe
         _untrusted.insert(path.string());
     }
 
+    /// Run as the machine-wide daemon would. The default is an unprivileged
+    /// process, so a test that says nothing gets the per-user half of the rule.
+    void MakePrivileged()
+    {
+        _privileged = true;
+    }
+
     [[nodiscard]] std::optional<std::string> GetEnv(std::string_view name) const override
     {
         auto const it = _env.find(name);
@@ -103,10 +110,16 @@ class FakeProbe: public IConfigPathProbe
         return !_untrusted.contains(path.string());
     }
 
+    [[nodiscard]] bool IsPrivilegedProcess() const override
+    {
+        return _privileged;
+    }
+
   private:
     std::map<std::string, std::string, std::less<>> _env;
     std::set<std::string> _readable;
     std::set<std::string> _untrusted;
+    bool _privileged { false };
 };
 
 /// Expand every candidate against a fully populated environment.
@@ -238,6 +251,7 @@ TEST_CASE("DefaultConfigPath: a candidate that exists but cannot be read is skip
 {
     FakeProbe probe;
     probe.SetAllBaseVars();
+    probe.MakePrivileged(); // the last row is the machine-wide one
     auto const paths = ExpandAll(probe);
     REQUIRE(paths.size() >= 2);
 
@@ -290,6 +304,7 @@ TEST_CASE("EffectiveConfigPath: with no named path it discovers, and only when r
 {
     FakeProbe probe;
     probe.SetAllBaseVars();
+    probe.MakePrivileged(); // so every row, including the last, is in play
 
     // Nothing readable: an empty path, meaning the built-in defaults apply.
     REQUIRE(EffectiveConfigPath("", probe).path.empty());
@@ -307,6 +322,7 @@ TEST_CASE("DefaultConfigPath: a machine-wide candidate a non-admin could have wr
 
     FakeProbe probe;
     probe.SetAllBaseVars();
+    probe.MakePrivileged();
 
     // value_or rather than a dereference after REQUIRE: Catch2's macros are
     // opaque to clang-tidy's optional analysis, so an empty path is the way to
@@ -333,7 +349,8 @@ TEST_CASE("DefaultConfigPath: a machine-wide candidate a non-admin could have wr
     REQUIRE(resolved.rejected.front().reason.contains(systemPath.parent_path().string()));
 }
 
-TEST_CASE("DefaultConfigPath: the trust rule applies to machine-wide rows only", "[config][defaultpath][trust]")
+TEST_CASE("DefaultConfigPath: an unprivileged process vouches for nothing, because everything is its own",
+          "[config][defaultpath][trust]")
 {
     auto const* const userRow = FindCandidateIf([](ConfigCandidate const& c) { return c.scope == ConfigScope::User; });
     REQUIRE(userRow != nullptr);
@@ -345,7 +362,8 @@ TEST_CASE("DefaultConfigPath: the trust rule applies to machine-wide rows only",
 
     // A per-user config lives in the account's own directory, so "someone other
     // than an administrator can write here" is its normal state, not a finding.
-    // Checking it would reject every per-user config on every platform.
+    // Checking it for an ordinary user would reject every per-user config on
+    // every platform.
     probe.MakeReadable(userPath);
     probe.MakeUntrusted(userPath);
 
@@ -354,10 +372,63 @@ TEST_CASE("DefaultConfigPath: the trust rule applies to machine-wide rows only",
     REQUIRE(resolved.rejected.empty());
 }
 
+TEST_CASE("DefaultConfigPath: an unprivileged process does not adopt the machine-wide config",
+          "[config][defaultpath][trust]")
+{
+    auto const* const systemRow = SystemCandidate();
+    REQUIRE(systemRow != nullptr);
+
+    FakeProbe probe;
+    probe.SetAllBaseVars();
+    auto const systemPath = ExpandConfigCandidate(*systemRow, probe).value_or(std::filesystem::path {});
+    REQUIRE_FALSE(systemPath.empty());
+
+    // Perfectly readable and perfectly trustworthy — the packaged /etc file is
+    // 0644 root:root — and still not this process's business. It describes the
+    // system daemon, whose cache only the service account can write, so a
+    // `systemctl --user` instance that adopted its `storage_path:` would fail to
+    // open the directory and be restarted until the start limit tripped. The
+    // packaged user unit passes no --config precisely to run on built-in
+    // defaults; the lookup must not undo that.
+    probe.MakeReadable(systemPath);
+
+    auto const resolved = ResolveDefaultConfigPath(probe);
+    REQUIRE(resolved.path.empty());
+
+    // Silently, too: nothing is wrong, the file simply belongs to another job.
+    REQUIRE(resolved.rejected.empty());
+}
+
+TEST_CASE("DefaultConfigPath: a privileged process vouches for the per-user rows too", "[config][defaultpath][trust]")
+{
+    auto const* const userRow = FindCandidateIf([](ConfigCandidate const& c) { return c.scope == ConfigScope::User; });
+    REQUIRE(userRow != nullptr);
+
+    FakeProbe probe;
+    probe.SetAllBaseVars();
+    probe.MakePrivileged();
+    auto const userPath = ExpandConfigCandidate(*userRow, probe).value_or(std::filesystem::path {});
+    REQUIRE_FALSE(userPath.empty());
+
+    // $HOME and $XDG_CONFIG_HOME are inputs an unprivileged account frequently
+    // controls, and sudo does not always reset them. Without this, a narrowly
+    // granted `sudo fastcached` would take root's storage_path from a file
+    // alice wrote — the machine-wide row is hardened against exactly that, and
+    // the per-user rows outrank it.
+    probe.MakeReadable(userPath);
+    probe.MakeUntrusted(userPath);
+
+    auto const resolved = ResolveDefaultConfigPath(probe);
+    REQUIRE(resolved.path.empty());
+    REQUIRE(resolved.rejected.size() == 1);
+    REQUIRE(resolved.rejected.front().path == userPath);
+}
+
 TEST_CASE("DefaultConfigPath: an untrusted machine-wide row does not shadow a good one", "[config][defaultpath][trust]")
 {
     FakeProbe probe;
     probe.SetAllBaseVars();
+    probe.MakePrivileged();
     auto const paths = ExpandAll(probe);
     REQUIRE(paths.size() >= 2);
 
@@ -555,6 +626,39 @@ TEST_CASE("SeedConfigFile: AdministratorsOnly either secures the directory or re
 // makes the decision logic testable — but the rules those decisions encode
 // ("readable", "only an administrator could have put this here") live in
 // SystemConfigPathProbe, and a fake cannot get them wrong on its behalf.
+
+TEST_CASE("SeedConfigFile: a config already sitting in a loose directory is reported, not adopted", "[config][seed][trust]")
+{
+    // The squat this whole defence exists for: something is *already* at the
+    // destination when seeding runs. Returning AlreadyPresent there would leave
+    // the directory owned by whoever made it — the installer cannot fix that on
+    // its own, because an access list can be replaced but an owner cannot — and
+    // would silently bless a file of unknown provenance as the machine-wide
+    // configuration of a fully privileged service.
+#if defined(_WIN32)
+    auto const programData = FastCache::ReadEnvironmentVariable("ProgramData").value_or(std::string {});
+    REQUIRE_FALSE(programData.empty());
+    TempDir const dir { "seed-squatted", std::filesystem::path { programData } };
+#else
+    TempDir const dir { "seed-squatted" };
+    REQUIRE(::chmod(dir.Path().string().c_str(), 0777) == 0);
+#endif
+
+    auto const source = dir / "fastcached.yaml.default";
+    auto const destination = dir / "fastcached.yaml";
+    WriteFile(source, "#port: 6674\n");
+    WriteFile(destination, "storage_path: /somewhere/an/attacker/chose\n");
+
+    auto const result = SeedConfigFile(source, destination, DirectoryPolicy::AdministratorsOnly);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == ConfigErrorCode::WriteFailed);
+
+    // The planted file is left on disk for a human to look at rather than
+    // deleted: seeding does not get to destroy something an operator may have
+    // written, it only declines to vouch for it.
+    REQUIRE(std::filesystem::exists(destination));
+    REQUIRE(ReadFile(destination) == "storage_path: /somewhere/an/attacker/chose\n");
+}
 
 TEST_CASE("SystemConfigPathProbe: readability means an ordinary file this account can open", "[config][probe]")
 {

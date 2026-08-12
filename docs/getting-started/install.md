@@ -64,9 +64,12 @@ cp /etc/fastcached/fastcached.yaml ~/.config/fastcached/fastcached.yaml
 systemctl --user restart fastcached
 ```
 
-That file also takes precedence over `/etc/fastcached/fastcached.yaml` for
-*any* fastcached you start yourself, which is how you keep a personal cache
-configured differently from the machine-wide service.
+That file is the *only* one any fastcached you start yourself will read:
+`/etc/fastcached/fastcached.yaml` describes the system service, whose cache only
+the service account can write, so an unprivileged instance passes over it
+entirely rather than inheriting settings it cannot act on. Your own copy is
+therefore the whole configuration of a personal cache, not an overlay on the
+machine-wide one.
 
 State goes to `~/.local/state/fastcached`. Add `loginctl enable-linger
 $USER` if you want it running while you are not logged in.

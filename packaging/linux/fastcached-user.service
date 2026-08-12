@@ -24,9 +24,12 @@
 # `systemctl --user enable --now fastcached` fail with FileNotFound, and
 # Restart=on-failure then respawned it once a second until the start limit
 # tripped — an out-of-the-box restart loop instead of a working daemon.
-# Leaving the flag off gets the same file when it exists, because the daemon's
-# own lookup probes $XDG_CONFIG_HOME/fastcached/fastcached.yaml (falling back to
-# ~/.config) before the machine-wide /etc copy, and simply skips what is absent.
+# Leaving the flag off gets the file above when it exists, because the daemon's
+# own lookup probes $XDG_CONFIG_HOME/fastcached/fastcached.yaml (then ~/.config)
+# and simply skips what is absent. It will NOT pick up /etc/fastcached: that one
+# describes the system daemon, and only a process running as root reads it — so
+# an admin configuring the system service cannot accidentally point every user
+# instance on the host at a cache directory it has no access to.
 
 [Unit]
 Description=fastcached — fast cache daemon (user instance)

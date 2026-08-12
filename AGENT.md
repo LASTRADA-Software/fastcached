@@ -107,6 +107,24 @@ These constraints are load-bearing and have each already been a bug:
   registers, and a discovered path baked into `ProgramArguments` would outrank
   the file itself forever (see the next bullet) and make
   `InlineCredentialRejection` name a path nobody typed.
+- **The lookup's two rules both turn on one question: is this process the
+  machine-wide daemon, or somebody's own?** `probe.IsPrivilegedProcess()` (root;
+  elevated administrator or LocalSystem on Windows, via `CheckTokenMembership`,
+  which is false for the unelevated half of a split token) decides both halves,
+  and neither is driven by the platform or by the row alone:
+  - **Unprivileged runs skip every `ConfigScope::System` row.** The machine-wide
+    file describes the system service, whose cache only the service account can
+    write, so a `systemctl --user` instance that adopted its `storage_path:`
+    would fail to open that directory and be respawned until the start limit
+    tripped — the out-of-the-box restart loop the user unit's header says it
+    exists to prevent. Readability is not enough of a filter here: the packaged
+    `/etc/fastcached/fastcached.yaml` is `0644 root:root` and readable by all.
+  - **Privileged runs trust-check *every* row, per-user ones included.** `$HOME`
+    and `$XDG_CONFIG_HOME` are inputs an unprivileged account often controls and
+    sudo does not always reset, so checking only `System` rows would leave
+    `sudo -E fastcached` taking root's `storage_path:` from a file that account
+    wrote. A path named with `--config` is never checked — that is the operator's
+    assertion to make, and it is the escape hatch when a location is refused.
 - **A machine-wide config is only obeyed when only an administrator could have
   written it.** `C:\ProgramData` grants `BUILTIN\Users` create-file on every
   subdirectory it hands down to, so moving the Windows config there made the
@@ -116,21 +134,30 @@ These constraints are load-bearing and have each already been a bug:
   `%ProgramData%\fastcached` and gives it a protected access list of its own
   (`PermissionEx`, not `Permission` or `util:PermissionEx` — those take an
   account *name* and are wrong on a non-English Windows), and `DefaultConfigPath`
-  refuses a discovered `ConfigScope::System` candidate whose directory fails
-  `Platform/FileTrust`. The test there is the containing directory's owner and
-  entries, never the file's owner: on Windows a new object belongs to its
-  *creator*, so a config seeded by hand from an elevated shell is owned by that
-  administrator's own account, while a file planted by a standard account is
-  granted to that account's own SID through the inherited `CREATOR OWNER` entry
-  — an owner whitelist rejects the first and an entry scan misses the second.
-  Only `System` rows are checked, and never a path named with `--config`. A
-  rejection goes to stderr with the `icacls` line that repairs it, because a file
-  that is present, readable and ignored anyway is the silent no-op this list
-  exists to prevent. `--seed-config` carries the same rule rather than working
-  around it: it secures the directory *before* the config lands, repairs a
-  squatted one, refuses when it has the rights for neither, and deletes a
-  directory it created but could not secure — which would otherwise be the very
-  shape being defended against, authored by the defence.
+  refuses a candidate whose directory fails `Platform/FileTrust`. The test there
+  is the containing directory's owner and entries, never the file's owner: on
+  Windows a new object belongs to its *creator*, so a config seeded by hand from
+  an elevated shell is owned by that administrator's own account, while a file
+  planted by a standard account is granted to that account's own SID through the
+  inherited `CREATOR OWNER` entry — an owner whitelist rejects the first and an
+  entry scan misses the second. A rejection goes to stderr *and* through the
+  logger once there is one: a service started by the SCM has no console, so
+  stderr alone would put the message nowhere in the one deployment where a
+  machine-wide config is the norm, and a file that is present, readable and
+  ignored anyway is the silent no-op this list exists to prevent.
+- **`--seed-config` secures the directory before it looks for the file, not
+  after.** The whole point of the repair is the case where something is *already*
+  there: any standard account can create a `%ProgramData%` subdirectory and drop
+  a config into it long before the installer runs, and the MSI cannot undo that
+  on its own — `PermissionEx` replaces the access list but not the owner, who
+  keeps `WRITE_DAC` regardless. So seeding secures the parent first (repairing a
+  squat), then decides what to do about the file: seed-once keeps an operator's
+  edits, but a file found in a directory that until that moment anybody could
+  write is not established to be an operator's, and is reported rather than
+  blessed by silence or destroyed by overwriting. Seeding refuses outright when
+  it has the rights for none of this, and deletes a directory it created but
+  could not secure — which would otherwise be the very shape being defended
+  against, authored by the defence.
 - **`ExecStart` still passes `--config` on Linux and macOS — by choice, not
   necessity.** It predates the lookup, where its absence made `ConfigReloader`
   have nothing to re-read and `systemctl reload` a silent no-op; the lookup now

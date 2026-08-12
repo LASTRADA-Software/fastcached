@@ -273,10 +273,14 @@ puts it:
 | macOS | `$XDG_CONFIG_HOME/fastcached/fastcached.yaml`, then `~/.config/fastcached/fastcached.yaml` | `/opt/fastcached/etc/fastcached.yaml` |
 | Windows | `%APPDATA%\fastcached\fastcached.yaml` | `%ProgramData%\fastcached\fastcached.yaml` |
 
+Which column applies depends on who you are: the machine-wide file describes the
+system service, so only a process that could *be* that service — root, an
+elevated administrator, `LocalSystem` — reads it, and a privileged run additionally
+requires that only an administrator could have put the file there.
+
 `--config=<path>` overrides the search entirely. The distinction matters for
 errors: a file you named must exist, while a default location that does not is
-simply skipped and the built-in defaults apply. A machine-wide location is also
-only used when only an administrator could have put a file there. See the
+simply skipped and the built-in defaults apply. See the
 [configuration docs](https://lastrada-software.github.io/fastcached/getting-started/configuration/).
 
 ### Persistence and scaling

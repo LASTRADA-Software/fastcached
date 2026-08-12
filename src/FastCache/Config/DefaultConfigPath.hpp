@@ -78,12 +78,19 @@ class IConfigPathProbe
 
     /// @param path Candidate file, already known to be readable.
     /// @return true when only an administrator could have put a file there.
-    ///         Asked of machine-wide candidates only, and for a specific
-    ///         attack: `%ProgramData%` subdirectories are user-creatable by
-    ///         default, so a standard account could plant the configuration a
-    ///         LocalSystem service then obeys. See Platform/FileTrust.hpp for
-    ///         why the test is the containing directory and not the owner.
+    ///         Asked of every candidate a *privileged* process would use, for a
+    ///         specific attack: `%ProgramData%` subdirectories are
+    ///         user-creatable by default, so a standard account could plant the
+    ///         configuration a LocalSystem service then obeys. See
+    ///         Platform/FileTrust.hpp for why the test is the containing
+    ///         directory and not the owner.
     [[nodiscard]] virtual bool IsTrustedSystemLocation(std::filesystem::path const& path) const = 0;
+
+    /// @return true when this process runs with the rights the machine-wide
+    ///         daemon has — root, or an elevated administrator / LocalSystem.
+    ///         Decides both halves of the rule below: which candidates apply,
+    ///         and which have to be vouched for.
+    [[nodiscard]] virtual bool IsPrivilegedProcess() const = 0;
 };
 
 /// The production probe: the real process environment and the real filesystem.
@@ -93,6 +100,7 @@ class SystemConfigPathProbe final: public IConfigPathProbe
     [[nodiscard]] std::optional<std::string> GetEnv(std::string_view name) const override;
     [[nodiscard]] bool IsReadableFile(std::filesystem::path const& path) const override;
     [[nodiscard]] bool IsTrustedSystemLocation(std::filesystem::path const& path) const override;
+    [[nodiscard]] bool IsPrivilegedProcess() const override;
 };
 
 /// The platform's candidate locations, in priority order (user before system).
@@ -133,12 +141,22 @@ struct ConfigLookup
 
 /// Find the config file to use when no `--config` was given.
 ///
-/// Machine-wide candidates carry one extra condition: only an administrator may
-/// be able to have put them there. Per-user ones do not — that file is the
-/// account's own by definition — so the rule is driven by each row's
-/// ConfigScope rather than by the platform.
+/// Which candidates apply, and which have to be vouched for, both follow from
+/// one question: is this process the machine-wide daemon or somebody's own?
 ///
-/// @param probe Environment and filesystem source.
+/// - **Unprivileged**: only the per-user rows apply, and none is trust-checked.
+///   The machine-wide file describes a daemon this process is not — its cache
+///   lives where only the service account can write — so adopting it would
+///   configure a per-user instance for the wrong job. That is also why the
+///   packaged systemd *user* unit passes no `--config` and expects built-in
+///   defaults.
+/// - **Privileged** (root, elevated administrator, LocalSystem): every row
+///   applies, and *every* row must be one only an administrator could have
+///   written — the per-user rows included. `$HOME` and `$XDG_CONFIG_HOME` are
+///   inputs an unprivileged account often controls, and `sudo -E fastcached`
+///   would otherwise take root's configuration from them.
+///
+/// @param probe Environment, filesystem and privilege source.
 /// @return The first usable candidate, with an empty path when there is none,
 ///         plus anything rejected along the way.
 [[nodiscard]] ConfigLookup ResolveDefaultConfigPath(IConfigPathProbe const& probe);

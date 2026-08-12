@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Platform/Environment.hpp>
+
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -29,7 +32,33 @@ class ScopedEnv
     /// @param name Variable to set for the lifetime of this object.
     /// @param value Value to set it to.
     ScopedEnv(std::string name, std::string const& value):
-        _name { std::move(name) }
+        _name { std::move(name) },
+        _previous { ReadEnvironmentVariable(_name) }
+    {
+        Assign(value);
+    }
+
+    /// Puts back whatever was there, rather than merely removing the variable.
+    /// The difference bites on exactly the variables worth scripting — `HOME`,
+    /// `ProgramData`, `XDG_CONFIG_HOME` — where deleting one for the rest of the
+    /// test binary strands every later case that reads it, as a failure whose
+    /// appearance depends on Catch2's ordering.
+    ~ScopedEnv()
+    {
+        if (_previous.has_value())
+            Assign(*_previous);
+        else
+            Remove();
+    }
+
+    ScopedEnv(ScopedEnv const&) = delete;
+    ScopedEnv& operator=(ScopedEnv const&) = delete;
+    ScopedEnv(ScopedEnv&&) = delete;
+    ScopedEnv& operator=(ScopedEnv&&) = delete;
+
+  private:
+    /// @param value Value to write.
+    void Assign(std::string const& value) const
     {
 #if defined(_WIN32)
         ::_putenv_s(_name.c_str(), value.c_str());
@@ -38,7 +67,7 @@ class ScopedEnv
 #endif
     }
 
-    ~ScopedEnv()
+    void Remove() const
     {
 #if defined(_WIN32)
         // An empty value is how the Windows CRT removes a variable.
@@ -48,13 +77,8 @@ class ScopedEnv
 #endif
     }
 
-    ScopedEnv(ScopedEnv const&) = delete;
-    ScopedEnv& operator=(ScopedEnv const&) = delete;
-    ScopedEnv(ScopedEnv&&) = delete;
-    ScopedEnv& operator=(ScopedEnv&&) = delete;
-
-  private:
     std::string _name;
+    std::optional<std::string> _previous;
 };
 
 } // namespace FastCache::Testing

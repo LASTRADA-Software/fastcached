@@ -132,6 +132,11 @@ bool SystemConfigPathProbe::IsTrustedSystemLocation(std::filesystem::path const&
     return IsAdministratorOnlyWritable(path);
 }
 
+bool SystemConfigPathProbe::IsPrivilegedProcess() const
+{
+    return FastCache::IsPrivilegedProcess();
+}
+
 std::span<ConfigCandidate const> DefaultConfigCandidates() noexcept
 {
     return Candidates;
@@ -157,16 +162,28 @@ ConfigLookup ResolveDefaultConfigPath(IConfigPathProbe const& probe)
 {
     ConfigLookup lookup;
 
+    // Both halves of the rule turn on this one question; see the header.
+    auto const privileged = probe.IsPrivilegedProcess();
+
     for (auto const& candidate: Candidates)
     {
+        // The machine-wide file describes the machine-wide daemon, whose cache
+        // only the service account can write. A per-user instance that adopted
+        // it would be configured for a job it cannot do — pointed at a state
+        // directory it has no access to, or at the port the real daemon holds.
+        if (candidate.scope == ConfigScope::System && !privileged)
+            continue;
+
         auto const path = ExpandConfigCandidate(candidate, probe);
         if (!path.has_value() || !probe.IsReadableFile(*path))
             continue; // absent or not ours to read: ordinary, and silent
 
-        // A machine-wide file has to be one only an administrator could have
-        // placed, because it configures a process running as one. Per-user
-        // rows are exempt: that file belongs to the account already.
-        if (candidate.scope == ConfigScope::System && !probe.IsTrustedSystemLocation(*path))
+        // Anything a privileged process obeys has to be something only an
+        // administrator could have written — the per-user rows included, since
+        // $HOME and $XDG_CONFIG_HOME are inputs an unprivileged account often
+        // controls. An unprivileged process is only ever offered its own files,
+        // so there is nothing there to vouch for.
+        if (privileged && !probe.IsTrustedSystemLocation(*path))
         {
             auto const directory = path->parent_path();
             lookup.rejected.push_back(
@@ -210,32 +227,34 @@ std::expected<SeedOutcome, ConfigError> SeedConfigFile(std::filesystem::path con
                                                        std::filesystem::path const& destination,
                                                        DirectoryPolicy policy)
 {
-    // The error_code overloads report failure by returning false, so a probe
-    // that cannot answer is treated as "not there" — which is the safe reading
-    // for the destination and is caught by copy_options::skip_existing below.
     std::error_code ec;
-    if (std::filesystem::exists(destination, ec))
-        return SeedOutcome::AlreadyPresent;
 
-    if (!std::filesystem::is_regular_file(templatePath, ec))
-        return std::unexpected(MakeConfigPathError(ConfigErrorCode::FileNotFound, templatePath, "no such config template"));
+    // The directory comes first, BEFORE the seed-once check — not only before
+    // the copy. A destination that is already there is exactly the case the
+    // repair exists for: any standard account can create a %ProgramData%
+    // subdirectory and drop a config into it long before the installer runs,
+    // and returning AlreadyPresent at that point would leave the squatter
+    // owning the directory of a LocalSystem service's configuration forever.
+    // The MSI cannot close it either — its PermissionEx replaces the access
+    // list but not the owner.
+    auto const parent = destination.parent_path();
+    auto const repair = policy == DirectoryPolicy::AdministratorsOnly && !parent.empty();
 
-    if (auto const parent = destination.parent_path(); !parent.empty())
+    // Whether the location could already have been written by somebody else.
+    // Asked before the repair, because afterwards the answer is always no — and
+    // what it decides is the standing of a file found sitting there.
+    auto const wasUnattributable = repair && std::filesystem::exists(parent, ec) && !IsAdministratorOnlyWritable(parent);
+
+    if (!parent.empty())
     {
         auto const created = std::filesystem::create_directories(parent, ec);
         if (ec)
             return std::unexpected(MakeConfigPathError(
                 ConfigErrorCode::WriteFailed, parent, std::format("cannot create directory: {}", ec.message())));
 
-        // Establish the permissions BEFORE the config lands, so there is no
-        // moment at which it sits somewhere loose. Unconditionally rather than
-        // only for a directory just created: one that was already there may be
-        // a squatted one — a fresh %ProgramData% subdirectory can be made by
-        // any standard account — and a machine-wide config is not something to
-        // drop into a directory of unknown provenance. SecureDirectoryForAdmin-
-        // istrators reports the resulting property rather than the syscall, so
-        // this both sets and confirms it, and repairs a squat while it is at it.
-        if (policy == DirectoryPolicy::AdministratorsOnly && !SecureDirectoryForAdministrators(parent))
+        // SecureDirectoryForAdministrators reports the resulting property
+        // rather than the syscall, so this both sets and confirms it.
+        if (repair && !SecureDirectoryForAdministrators(parent))
         {
             // Leave nothing squattable behind. A directory this call created and
             // could not secure is one owned by whoever ran it, sitting at the
@@ -254,6 +273,32 @@ std::expected<SeedOutcome, ConfigError> SeedConfigFile(std::filesystem::path con
                                                 SecureDirectoryHint(parent))));
         }
     }
+
+    // The error_code overloads report failure by returning false, so a probe
+    // that cannot answer is treated as "not there" — which is the safe reading
+    // for the destination and is caught by copy_options::skip_existing below.
+    if (std::filesystem::exists(destination, ec))
+    {
+        // Seed-once keeps an operator's edits, but a file that was sitting in a
+        // directory anybody could write is not established to be an operator's.
+        // Securing the directory has stopped it from changing further; whether
+        // to keep what is in it is a judgement only a human can make, so say so
+        // rather than bless it by silence or destroy it by overwriting.
+        if (wasUnattributable)
+            return std::unexpected(
+                MakeConfigPathError(ConfigErrorCode::WriteFailed,
+                                    destination,
+                                    std::format("a config was already here, in a directory that until now could be "
+                                                "written by accounts other than the administrative ones, so it "
+                                                "cannot be assumed to be an administrator's. {} has been secured; "
+                                                "review this file and delete it to seed a fresh one.",
+                                                parent.string())));
+
+        return SeedOutcome::AlreadyPresent;
+    }
+
+    if (!std::filesystem::is_regular_file(templatePath, ec))
+        return std::unexpected(MakeConfigPathError(ConfigErrorCode::FileNotFound, templatePath, "no such config template"));
 
     // copy_file rather than a rename: the template stays in place as package
     // payload, to be replaced wholesale by the next upgrade.

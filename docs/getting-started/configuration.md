@@ -20,6 +20,19 @@ is exactly where each installer puts it:
 The per-user file wins, so you can shadow a machine-wide configuration without
 touching it and without root.
 
+**Which column applies depends on who you are.** The machine-wide file describes
+the *system service* — its cache lives where only the service account can write
+— so only a process that could be that service reads it: root, or an elevated
+administrator, or `LocalSystem`. Run fastcached as yourself and the machine-wide
+row is passed over entirely, whatever its permissions; you get your own config,
+or the built-in defaults.
+
+That is deliberate, and it is why `systemctl --user start fastcached` works out
+of the box on a host whose `/etc/fastcached/fastcached.yaml` points the system
+daemon at `/var/lib/fastcached/cache`: your instance never sees that file, so it
+never tries to open a directory it has no access to. Name it with `--config` if
+you genuinely want it.
+
 **then**, not *else*: setting `$XDG_CONFIG_HOME` does not take `~/.config` out
 of the search, it only puts another location ahead of it. The basedir
 specification treats `~/.config` as what `$XDG_CONFIG_HOME` *means* when unset,
@@ -49,21 +62,27 @@ effect — which is a perfectly good way to run fastcached.
     that exists and *is* readable but does not parse is still a startup error:
     at that point it is plainly meant to be used.
 
-!!! warning "A machine-wide config must be one only an administrator could have written"
+!!! warning "A privileged daemon only obeys a config an administrator could have written"
 
-    The machine-wide file configures a process running as `LocalSystem` or
-    `root`, so `storage_path:` in it decides where that process creates
-    directories and writes files. fastcached therefore uses a *discovered*
-    machine-wide config only when its directory is one no ordinary account can
-    add or replace a file in — owned by `Administrators`/`SYSTEM` (or `root`),
-    and not writable by anyone else.
+    When fastcached runs as `root` or `LocalSystem`, `storage_path:` decides
+    where a fully privileged process creates directories and writes files. So a
+    privileged run uses a *discovered* config only when its directory is one no
+    ordinary account can add or replace a file in — owned by
+    `Administrators`/`SYSTEM` (or `root`), and not writable by anyone else.
 
-    This matters most on Windows, where `C:\ProgramData` lets every standard
+    This applies to **every** discovered location, per-user ones included. `$HOME`
+    and `$XDG_CONFIG_HOME` are inputs an unprivileged account often controls, and
+    `sudo -E fastcached` would otherwise take root's configuration from a file
+    that account wrote. An unprivileged run is offered only its own files, so
+    there is nothing there to vouch for and no check is applied.
+
+    It matters most on Windows, where `C:\ProgramData` lets every standard
     account create files in a new subdirectory. The installer creates
     `C:\ProgramData\fastcached` with an access list of its own, so a packaged
     install already satisfies this; a directory somebody else made first does
-    not. When a config is skipped for this reason fastcached says so on stderr
-    and prints the exact command that repairs it:
+    not. When a config is skipped for this reason fastcached says so — on stderr,
+    and in the log once the daemon has one — with the exact command that repairs
+    it:
 
     ```
     fastcached: C:\ProgramData\fastcached\fastcached.yaml: ignored: C:\ProgramData\fastcached
