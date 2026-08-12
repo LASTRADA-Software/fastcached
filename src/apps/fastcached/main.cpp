@@ -2,7 +2,8 @@
 //
 // fastcached — Fast Cache Daemon entry point.
 //
-// Wiring: CLI -> optional YAML file -> ConfigReloader -> CacheEngine over
+// Wiring: CLI -> YAML file (named by --config, else discovered at the
+// platform's default location) -> ConfigReloader -> CacheEngine over
 // the storage backend -> RunReactorServer, hosted by the requested
 // IDaemonHost (foreground / POSIX daemon / Windows service).
 // SIGINT/SIGTERM and SCM stop trigger graceful shutdown;
@@ -22,6 +23,7 @@
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
+#include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -31,6 +33,7 @@
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Net/HealthProbe.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
+#include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
@@ -68,41 +71,49 @@ namespace
 
 constexpr std::string_view ProgramVersion = FastCache::VersionString;
 
-/// Parse a 1..65535 TCP port from a NUL-terminated string, reusing the CLI's
-/// `FastCache::ParsePort` so the environment fallback accepts exactly the same
-/// syntax and range as the `--metrics-port` flag (single source of truth).
-/// @param raw Candidate string (may be null/empty).
-/// @return The port, or nullopt when null/empty/out-of-range/garbage.
-[[nodiscard]] std::optional<std::uint16_t> ParsePortString(char const* raw) noexcept
+/// Read the metrics port from the FASTCACHED_METRICS_PORT environment variable.
+/// This lets a container's daemon CMD and its separate `--healthcheck` probe
+/// agree on a custom port via a single `-e FASTCACHED_METRICS_PORT=...`, without
+/// the static image HEALTHCHECK having to learn the daemon's runtime args.
+///
+/// Reuses the CLI's `FastCache::ParsePort`, so the environment fallback accepts
+/// exactly the same syntax and range as the `--metrics-port` flag.
+/// @return The parsed port, or nullopt when unset/empty/invalid.
+[[nodiscard]] std::optional<std::uint16_t> MetricsPortFromEnv()
 {
-    if (raw == nullptr || *raw == '\0')
+    auto const raw = FastCache::ReadEnvironmentVariable("FASTCACHED_METRICS_PORT");
+    if (!raw.has_value())
         return std::nullopt;
-    auto const parsed = FastCache::ParsePort(std::string_view { raw });
+
+    // ParsePort already rejects the empty string, so an unset and a blank
+    // variable land in the same place without a second emptiness rule here.
+    auto const parsed = FastCache::ParsePort(*raw);
     if (!parsed.has_value())
         return std::nullopt;
     return *parsed;
 }
 
-/// Read the metrics port from the FASTCACHED_METRICS_PORT environment variable.
-/// This lets a container's daemon CMD and its separate `--healthcheck` probe
-/// agree on a custom port via a single `-e FASTCACHED_METRICS_PORT=...`, without
-/// the static image HEALTHCHECK having to learn the daemon's runtime args.
-/// @return The parsed port, or nullopt when unset/empty/invalid.
-[[nodiscard]] std::optional<std::uint16_t> MetricsPortFromEnv()
+/// Install `templatePath` at the machine-wide config location, unless a config
+/// is already there. The `--seed-config` action: how a packaging format with no
+/// conffile mechanism ships a default config that survives its own upgrades.
+/// @param templatePath The shipped template to copy.
+/// @return Process exit code.
+[[nodiscard]] int SeedDefaultConfig(std::string const& templatePath)
 {
-#if defined(_WIN32)
-    // Secure CRT getenv_s keeps the build warning-clean under /WX.
-    std::size_t size = 0;
-    if (::getenv_s(&size, nullptr, 0, "FASTCACHED_METRICS_PORT") != 0 || size == 0)
-        return std::nullopt;
-    std::string buffer(size, '\0');
-    if (::getenv_s(&size, buffer.data(), buffer.size(), "FASTCACHED_METRICS_PORT") != 0)
-        return std::nullopt;
-    buffer.resize(size > 0 ? size - 1 : 0); // drop the trailing NUL getenv_s wrote
-    return ParsePortString(buffer.c_str());
-#else
-    return ParsePortString(std::getenv("FASTCACHED_METRICS_PORT"));
-#endif
+    FastCache::SystemConfigPathProbe const probe;
+    auto const destination = FastCache::SystemConfigPath(probe);
+    auto const seeded = destination.and_then([&](auto const& dest) {
+        return FastCache::SeedConfigFile(templatePath, dest, FastCache::DirectoryPolicy::AdministratorsOnly);
+    });
+    if (!seeded.has_value())
+    {
+        std::println(std::cerr, "fastcached: {}", seeded.error().ToString());
+        return EXIT_FAILURE;
+    }
+
+    std::println(
+        "fastcached: {} {}", *seeded == FastCache::SeedOutcome::Written ? "wrote" : "kept existing", destination->string());
+    return EXIT_SUCCESS;
 }
 
 extern "C" void HandleStopSignal(int /*signum*/)
@@ -339,9 +350,17 @@ struct StorageBackendBundle
 /// Daemon body: holds the actual server lifecycle. Runs under whatever
 /// IDaemonHost was selected (Foreground / Posix double-fork / Windows
 /// service).
-int DaemonBody(FastCache::Config const& effective)
+int DaemonBody(FastCache::Config const& effective, std::span<FastCache::RejectedCandidate const> rejected)
 {
     FastCache::ConsoleLogger logger { std::cerr, effective.logLevel, effective.logTimestamps };
+
+    // Through the logger, not just the stderr line main() already printed: a
+    // service started by the SCM has no console for that to land on, and this
+    // is exactly the deployment where a rejected machine-wide config would
+    // otherwise be invisible — the daemon serving on built-in defaults while an
+    // operator edits a file it has declined to read.
+    for (auto const& [path, reason]: rejected)
+        logger.Logf(FastCache::LogLevel::Error, "{}: {}", path.string(), reason);
     FastCache::ConfigReloader reloader { effective, effective.configPath };
     FastCache::SteadyClock clock;
 
@@ -739,6 +758,8 @@ int main(int argc, char const* const* argv)
                        FastCache::CliUsage(FastCache::StdoutSupportsColor() ? FastCache::UsageColor::Colored
                                                                             : FastCache::UsageColor::Plain));
             return EXIT_SUCCESS;
+        case FastCache::CliOutcome::SeedConfig:
+            return SeedDefaultConfig(parsed->seedConfigTemplate);
         case FastCache::CliOutcome::Run:
         case FastCache::CliOutcome::InstallService:
         case FastCache::CliOutcome::UninstallService:
@@ -748,30 +769,64 @@ int main(int argc, char const* const* argv)
             break;
     }
 
+    // The config file to read: the one the operator named, or else whichever
+    // platform default is actually there (EffectiveConfigPath owns that rule and
+    // the tests for it). Resolved into a LOCAL and never back into
+    // parsed->config, which is what --install-service registers: a discovered
+    // path baked into a service's launch arguments would outrank the file itself
+    // forever, and InlineCredentialRejection would start naming a path nobody
+    // typed.
+    auto const lookup = FastCache::EffectiveConfigPath(parsed->config.configPath, FastCache::SystemConfigPathProbe {});
+    auto const configPath = lookup.path.string();
+
+    // A config that exists and is readable but was passed over anyway has to say
+    // so: silence would mean an operator editing a file the daemon has quietly
+    // decided not to obey, over a permission problem only they can fix. Printed
+    // here for the commands that never reach the daemon body, and repeated
+    // through the logger once there is one — a Windows service has no console,
+    // so stderr alone would put the message nowhere in the one deployment where
+    // a machine-wide config is the norm.
+    for (auto const& [path, reason]: lookup.rejected)
+        std::println(std::cerr, "fastcached: {}: {}", path.string(), reason);
+
     FastCache::Config effective;
     bool metricsPortYamlExplicit = false;
     // Aggregate "was the legacy single-bind triplet typed by the operator,
     // CLI or YAML?" so a downstream mix-with-`listeners:` check sees both
     // sources. Starts from the CLI explicit bits and ORs in YAML presence.
     auto bindShapeCli = *parsed;
-    if (!parsed->config.configPath.empty())
+    effective = parsed->config;
+    if (!configPath.empty())
     {
-        auto loaded = FastCache::ReadYamlConfigWithPresence(parsed->config.configPath);
+        auto loaded = FastCache::ReadYamlConfigWithPresence(configPath);
         if (!loaded.has_value())
         {
-            std::println(std::cerr, "fastcached: {}", loaded.error().ToString());
-            return EXIT_FAILURE;
+            // A file that does not parse is fatal for the command that *serves*,
+            // and for any file the operator named — but not for a discovered one
+            // on the way to some other action. Refusing to uninstall a service
+            // because the file at the default location has a typo blocks the very
+            // recovery the operator reached for, and fails a container health
+            // check whose daemon was started with explicit flags and is serving
+            // perfectly well.
+            if (!parsed->config.configPath.empty() || parsed->outcome == FastCache::CliOutcome::Run)
+            {
+                std::println(std::cerr, "fastcached: {}", loaded.error().ToString());
+                return EXIT_FAILURE;
+            }
+
+            // Ignored, and `effective.configPath` deliberately left empty with
+            // it: nothing later should re-read a file this run declined.
+            std::println(std::cerr, "fastcached: ignoring {}: {}", configPath, loaded.error().ToString());
         }
-        metricsPortYamlExplicit = loaded->metricsPortExplicit;
-        bindShapeCli.bindAddressExplicit = bindShapeCli.bindAddressExplicit || loaded->bindAddressExplicit;
-        bindShapeCli.portExplicit = bindShapeCli.portExplicit || loaded->portExplicit;
-        bindShapeCli.tlsEnabledExplicit = bindShapeCli.tlsEnabledExplicit || loaded->tlsEnabledExplicit;
-        effective = FastCache::Merge(std::move(loaded->config), *parsed);
-        effective.configPath = parsed->config.configPath;
-    }
-    else
-    {
-        effective = parsed->config;
+        else
+        {
+            metricsPortYamlExplicit = loaded->metricsPortExplicit;
+            bindShapeCli.bindAddressExplicit = bindShapeCli.bindAddressExplicit || loaded->bindAddressExplicit;
+            bindShapeCli.portExplicit = bindShapeCli.portExplicit || loaded->portExplicit;
+            bindShapeCli.tlsEnabledExplicit = bindShapeCli.tlsEnabledExplicit || loaded->tlsEnabledExplicit;
+            effective = FastCache::Merge(std::move(loaded->config), *parsed);
+            effective.configPath = configPath;
+        }
     }
 
     // Environment fallback for the metrics port: honour FASTCACHED_METRICS_PORT
@@ -859,5 +914,5 @@ int main(int argc, char const* const* argv)
     if (!host)
         host = std::make_unique<FastCache::ForegroundHost>();
 
-    return host->Run([&effective] { return DaemonBody(effective); });
+    return host->Run([&effective, &lookup] { return DaemonBody(effective, lookup.rejected); });
 }

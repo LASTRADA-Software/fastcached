@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
+#include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
@@ -17,6 +18,7 @@
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace FastCache
 {
@@ -504,6 +506,29 @@ namespace
         return ArgOutcome::Unknown;
     }
 
+    /// One flag that selects an alternative to running the daemon.
+    struct ActionFlag
+    {
+        std::string_view name; ///< Flag as typed, e.g. `--healthcheck`.
+        CliOutcome outcome;    ///< What the process should do instead of serving.
+
+        /// CliResult member the flag's argument lands in, or null when the flag
+        /// takes no value. Pointer-to-member rather than a raw `std::string*`
+        /// because the table is `constexpr`: there is no CliResult to point
+        /// into until one is being parsed.
+        std::string CliResult::* value;
+    };
+
+    /// The action-flag table. A fifth action is a row here plus an enumerator,
+    /// a `UsageOptions` entry, and an arm in main's switch — not a fourth
+    /// hand-written comparison in HandleOneArg.
+    constexpr auto ActionFlags = std::to_array<ActionFlag>({
+        { .name = "--install-service", .outcome = CliOutcome::InstallService, .value = nullptr },
+        { .name = "--uninstall-service", .outcome = CliOutcome::UninstallService, .value = nullptr },
+        { .name = "--healthcheck", .outcome = CliOutcome::HealthCheck, .value = nullptr },
+        { .name = "--seed-config", .outcome = CliOutcome::SeedConfig, .value = &CliResult::seedConfigTemplate },
+    });
+
     /// Dispatch a single argument. Returns ArgOutcome on success or a
     /// ConfigError if the argument matched a flag but parsing failed.
     [[nodiscard]] std::expected<ArgOutcome, ConfigError> HandleOneArg(std::span<char const* const> args,
@@ -551,22 +576,31 @@ namespace
             result.tlsEnabledExplicit = true;
             return ArgOutcome::Continue;
         }
-        // Service-control requests record the desired outcome but keep parsing:
-        // the remaining flags (--service-name, --port, --storage, ...) are
-        // captured into the config that gets baked into the service command line.
-        if (arg == "--install-service")
+        // Action flags: they select what the process will *do* instead of
+        // running the daemon, but keep parsing, because the remaining flags
+        // (--service-name, --port, --storage, ...) are captured into the config
+        // that gets baked into the service command line.
+        //
+        // `value` names the CliResult member a flag's argument lands in, or is
+        // null for the valueless majority. Those targets deliberately live in
+        // CliResult rather than Config: they describe an installer step, so they
+        // must not reach the YAML merge or a service command line.
+        for (auto const& [name, outcome, value]: ActionFlags)
         {
-            result.outcome = CliOutcome::InstallService;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--uninstall-service")
-        {
-            result.outcome = CliOutcome::UninstallService;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--healthcheck")
-        {
-            result.outcome = CliOutcome::HealthCheck;
+            if (value == nullptr)
+            {
+                if (arg != name)
+                    continue;
+            }
+            else
+            {
+                auto const matched = ApplyStringFlag(args, i, name, result.*value);
+                if (!matched.has_value())
+                    return std::unexpected(matched.error());
+                if (!*matched)
+                    continue;
+            }
+            result.outcome = outcome;
             return ArgOutcome::Continue;
         }
 
@@ -657,29 +691,56 @@ namespace
 
     /// A default value quoted in the help text, spliced in at render time.
     ///
-    /// Without this the number lives twice — once in Config's NSDMI, once
+    /// Without this the value lives twice — once where it is compiled in, once
     /// re-typed as a string literal here — and the two drift apart silently:
     /// help that advertises a port the daemon no longer binds is worse than no
     /// help at all. Writing `{port}` in a description keeps the compiled
-    /// default the only place the number is spelled.
+    /// default the only place the value is spelled.
     struct UsageSubstitution
     {
         std::string_view token; ///< Placeholder as written in a description or example body.
-        std::uint16_t value;    ///< Value spliced in its place.
+        std::string value;      ///< Value spliced in its place; may span several lines.
     };
+
+    /// The config locations `--help` lists, one per line, indented under the
+    /// description column. Read straight off the table the lookup itself walks,
+    /// so help cannot advertise a location the daemon would not actually read.
+    /// @return Newline-separated lines, no trailing newline.
+    [[nodiscard]] std::string FormatDefaultConfigLocations()
+    {
+        std::string out;
+        for (auto const& candidate: DefaultConfigCandidates())
+        {
+            if (!out.empty())
+                out += '\n';
+            out += std::format("  {}", candidate.display);
+        }
+        return out;
+    }
 
     /// The substitution table. A new default worth quoting in help is a new row
     /// here plus a `{token}` in the text — no change to the renderer.
-    constexpr auto UsageSubstitutions = std::to_array<UsageSubstitution>({
-        { .token = "{port}", .value = DefaultPort },
-        { .token = "{metrics-port}", .value = DefaultMetricsPort },
-    });
+    ///
+    /// Built rather than `constexpr` because not every compiled default is a
+    /// number: the config search path is assembled at runtime from the
+    /// candidate table.
+    [[nodiscard]] std::vector<UsageSubstitution> MakeUsageSubstitutions()
+    {
+        return {
+            { .token = "{port}", .value = std::format("{}", DefaultPort) },
+            { .token = "{metrics-port}", .value = std::format("{}", DefaultMetricsPort) },
+            { .token = "{config-defaults}", .value = FormatDefaultConfigLocations() },
+        };
+    }
 
     /// The option table — single source of truth for both the help text and its
     /// alignment. Add a row here and it lines up automatically. Descriptions may
     /// reference a compiled default by its `UsageSubstitutions` token.
     constexpr auto UsageOptions = std::to_array<UsageOption>({
-        { .flag = "--config=<path>", .description = "YAML config file; CLI flags override file values" },
+        { .flag = "--config=<path>",
+          .description = "YAML config file; CLI flags override file values.\n"
+                         "Without it, the first of these that exists and is readable is used:\n"
+                         "{config-defaults}" },
         { .flag = "--bind=<addr>",
           .description = "bind address: IPv4/IPv6 literal or hostname; '::' is dual-stack (default 127.0.0.1)" },
         { .flag = "--port=<num>", .description = "TCP port (default {port}); every protocol is auto-detected on it" },
@@ -766,6 +827,10 @@ namespace
         { .flag = "--healthcheck",
           .description = "probe http://127.0.0.1:<metrics-port>/healthz and exit 0 (healthy) or 1\n"
                          "(self-contained container HEALTHCHECK; needs --metrics on the daemon)" },
+        { .flag = "--seed-config=<path>",
+          .description = "copy <path> to the machine-wide config location, but only when no\n"
+                         "config is there yet, then exit (used by the installer; needs the\n"
+                         "same privileges as writing that location)" },
         { .flag = "--pidfile=<path>", .description = "POSIX daemon mode only" },
         { .flag = "--service-name=<name>", .description = "Windows service name (default FastCached)" },
         { .flag = "--help, -h", .description = "show this help and exit" },
@@ -807,15 +872,12 @@ namespace
     /// @param text Help text possibly containing `{token}` placeholders.
     /// @return `text` with every known token replaced; unknown braces are left
     ///         verbatim, so ordinary prose needs no escaping.
-    [[nodiscard]] std::string ExpandDefaults(std::string_view text)
+    [[nodiscard]] std::string ExpandDefaults(std::string_view text, std::span<UsageSubstitution const> substitutions)
     {
         std::string out { text };
-        for (auto const& [token, value]: UsageSubstitutions)
-        {
-            auto const replacement = std::format("{}", value);
-            for (auto at = out.find(token); at != std::string::npos; at = out.find(token, at + replacement.size()))
-                out.replace(at, token.size(), replacement);
-        }
+        for (auto const& [token, value]: substitutions)
+            for (auto at = out.find(token); at != std::string::npos; at = out.find(token, at + value.size()))
+                out.replace(at, token.size(), value);
         return out;
     }
 
@@ -852,13 +914,15 @@ namespace
             UsageOptions | std::views::transform([](UsageOption const& option) { return option.flag.size(); }));
         auto const descColumn = LeftIndent + flagWidth + ColumnGap;
 
+        auto const substitutions = MakeUsageSubstitutions();
+
         std::string out;
         out += std::format("{}usage:{} fastcached [options]\n", palette.heading, palette.reset);
 
         for (auto const& option: UsageOptions)
         {
             auto firstLine = true;
-            ForEachLine(ExpandDefaults(option.description), [&](std::string_view line) {
+            ForEachLine(ExpandDefaults(option.description, substitutions), [&](std::string_view line) {
                 if (firstLine)
                 {
                     auto const pad = descColumn - LeftIndent - option.flag.size();
@@ -882,7 +946,8 @@ namespace
         {
             out += '\n';
             out += std::format("{}{}{}\n", palette.heading, example.title, palette.reset);
-            ForEachLine(ExpandDefaults(example.body), [&](std::string_view line) { out += std::format("{}\n", line); });
+            ForEachLine(ExpandDefaults(example.body, substitutions),
+                        [&](std::string_view line) { out += std::format("{}\n", line); });
         }
 
         out += '\n';

@@ -1,42 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/EnvExpand.hpp>
+#include <FastCache/Platform/Environment.hpp>
 
-#include <cstdlib>
+#include <format>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace FastCache
 {
 
 namespace
 {
-
-    /// Look up an environment variable.
-    ///
-    /// @return The value, empty when the variable is set but empty, or nullopt
-    ///         when it is not set at all. The distinction is what lets an unset
-    ///         variable be reported rather than silently expanded away.
-    [[nodiscard]] std::optional<std::string> LookupEnvironment(std::string const& name)
-    {
-#if defined(_WIN32)
-        // The secure CRT form, so the build stays warning-clean under /WX.
-        // getenv_s reports the length INCLUDING the NUL: 0 means not present.
-        std::size_t size = 0;
-        if (::getenv_s(&size, nullptr, 0, name.c_str()) != 0 || size == 0)
-            return std::nullopt;
-
-        std::string value(size, '\0');
-        if (::getenv_s(&size, value.data(), size, name.c_str()) != 0)
-            return std::nullopt;
-        value.resize(size - 1);
-        return value;
-#else
-        char const* const value = std::getenv(name.c_str());
-        if (value == nullptr)
-            return std::nullopt;
-        return std::string { value };
-#endif
-    }
 
     [[nodiscard]] constexpr bool IsNameStart(char c) noexcept
     {
@@ -87,13 +62,15 @@ std::expected<std::string, ConfigError> ExpandEnvironmentVariables(std::string_v
             continue;
         }
 
-        std::string name;
+        // A view into `input`: ReadEnvironmentVariable owns the one
+        // NUL-terminating copy the platform APIs need.
+        std::string_view name;
         if (next == '{')
         {
             auto const close = input.find('}', i + 2);
             if (close == std::string_view::npos)
                 return std::unexpected(MakeError(ConfigErrorCode::ParseError, field, "unterminated '${'"));
-            name = std::string { input.substr(i + 2, close - (i + 2)) };
+            name = input.substr(i + 2, close - (i + 2));
             if (name.empty())
                 return std::unexpected(MakeError(ConfigErrorCode::ParseError, field, "empty '${}'"));
             i = close + 1;
@@ -103,7 +80,7 @@ std::expected<std::string, ConfigError> ExpandEnvironmentVariables(std::string_v
             auto end = i + 1;
             while (end < input.size() && IsNameChar(input[end]))
                 ++end;
-            name = std::string { input.substr(i + 1, end - (i + 1)) };
+            name = input.substr(i + 1, end - (i + 1));
             i = end;
         }
         else
@@ -113,10 +90,10 @@ std::expected<std::string, ConfigError> ExpandEnvironmentVariables(std::string_v
                                              std::string { "'$' followed by '" } + next + "'; write '$$' for a literal"));
         }
 
-        auto value = LookupEnvironment(name);
+        auto value = ReadEnvironmentVariable(name);
         if (!value)
-            return std::unexpected(
-                MakeError(ConfigErrorCode::UndefinedVariable, field, "environment variable is not set: " + name));
+            return std::unexpected(MakeError(
+                ConfigErrorCode::UndefinedVariable, field, std::format("environment variable is not set: {}", name)));
 
         out += *value;
     }

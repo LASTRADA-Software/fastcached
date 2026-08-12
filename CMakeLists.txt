@@ -87,6 +87,15 @@ set(FASTCACHED_MACOS_PREFIX "opt/fastcached"
 set(FASTCACHED_MACOS_BUNDLE_ID       "software.lastrada.fastcached")
 set(FASTCACHED_MACOS_SERVICE_ACCOUNT "_fastcached")
 
+# The machine-wide configuration directory. Declared here, not in packaging/,
+# for the same scoping reason as the macOS variables above: packaging/ installs
+# the file into it and src/FastCache/ compiles the very same path into the
+# daemon's default lookup, and two sibling subdirectories cannot see each
+# other's set(). Spelled without a leading slash to match the other install
+# destinations, which are relative to CMAKE_INSTALL_PREFIX.
+set(FASTCACHED_SYSCONF_DIR "etc/fastcached"
+    CACHE STRING "System configuration directory, relative to /")
+
 # Install destinations for the relocatable artifacts (binaries, docs). With the
 # prefix moved to /, the ordinary FHS paths have to spell `usr/` themselves, or
 # the binaries would land in /bin and the docs in /share/doc. Outside packaging

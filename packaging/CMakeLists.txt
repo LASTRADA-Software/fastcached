@@ -41,13 +41,15 @@ set(FASTCACHED_SYSTEMD_SYSTEM_DIR "usr/lib/systemd/system")
 set(FASTCACHED_SYSTEMD_USER_DIR   "usr/lib/systemd/user")
 set(FASTCACHED_SYSUSERS_DIR       "usr/lib/sysusers.d")
 set(FASTCACHED_TMPFILES_DIR       "usr/lib/tmpfiles.d")
-set(FASTCACHED_SYSCONF_DIR        "etc/fastcached")
 
-# FASTCACHED_MACOS_PREFIX, FASTCACHED_MACOS_BUNDLE_ID and
-# FASTCACHED_MACOS_SERVICE_ACCOUNT are declared in the top-level CMakeLists.txt
-# and inherited here. They have to live there because cmake/Packaging.cmake is
-# include()d at that scope and reads them too — a set() in this subdirectory
-# would not propagate back up.
+# FASTCACHED_SYSCONF_DIR, FASTCACHED_MACOS_PREFIX, FASTCACHED_MACOS_BUNDLE_ID
+# and FASTCACHED_MACOS_SERVICE_ACCOUNT are declared in the top-level
+# CMakeLists.txt and inherited here. They have to live there because
+# cmake/Packaging.cmake is include()d at that scope and reads them too — a
+# set() in this subdirectory would not propagate back up — and because
+# src/FastCache/ compiles FASTCACHED_SYSCONF_DIR into the daemon's default
+# config lookup, so the file this directory installs and the path the daemon
+# probes for are one value.
 
 # The service assets only make sense in the root-rooted package layout: their
 # destinations (usr/lib/systemd, etc/) are written assuming the payload lands
@@ -214,23 +216,22 @@ if(NOT APPLE OR NOT FASTCACHED_PACKAGE_ROOT_PREFIX)
 endif()
 
 if(WIN32)
-    # The MSI ships the same example config next to the executables; the
-    # service command line registered by --install-service points at it.
+    # The MSI ships the example config as a .default TEMPLATE, never as the live
+    # file. An MSI overwrites its own payload on every install — there is no
+    # conffile or %config(noreplace) equivalent, and making WiX preserve a file
+    # instead needs a per-file component with a registry keypath and
+    # NeverOverwrite, which the CPack WiX generator does not expose through the
+    # patch fragment. So the live config lives OUTSIDE the payload, at
+    # %ProgramData%\fastcached\fastcached.yaml, and a custom action seeds it from
+    # this template only when it is absent (see windows/service-actions.xml).
+    # That is the same seed-once rule the macOS .pkg uses, and it is what lets
+    # operator edits survive an upgrade.
     #
-    # NOTE: unlike the DEB conffile and the RPM %config(noreplace), this file is
-    # a plain component-owned file, so a subsequent MSI OVERWRITES operator
-    # edits. That is why the shipped copy is entirely commented out — losing it
-    # costs nothing. Anyone customising it should keep the real settings in a
-    # separate file and point the service at it:
-    #
-    #     fastcached.exe --uninstall-service
-    #     fastcached.exe --install-service --config="C:\ProgramData\fastcached\fastcached.yaml"
-    #
-    # Making WiX preserve it instead needs a per-file component with a registry
-    # keypath and NeverOverwrite, which the CPack WiX generator does not expose
-    # through the patch fragment.
+    # etc/ mirrors the macOS layout (<prefix>/etc/fastcached.yaml.default) so
+    # both packages spell the template's home the same way.
     install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/linux/fastcached.yaml"
-        DESTINATION "."
+        DESTINATION "etc"
+        RENAME "fastcached.yaml.default"
         COMPONENT Runtime
     )
 

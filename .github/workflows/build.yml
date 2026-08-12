@@ -1028,6 +1028,10 @@ jobs:
       # out into a separate extension package, and CPack always references it
       # (WixUI_InstallDir) — without it wix.exe fails with
       # "error WIX0144: The extension 'WixToolset.UI.wixext' could not be found".
+      #
+      # No Util extension: the ProgramData ACL uses the built-in PermissionEx
+      # element (MsiLockPermissionsEx), not util:PermissionEx, so the fragment
+      # needs nothing here beyond what CPack already requires.
       - name: "Install WiX"
         run: |
           dotnet tool install --global wix --version 5.*
@@ -1100,6 +1104,84 @@ jobs:
           for ($i = 0; $i -lt 30 -and (Get-Service FastCached).Status -ne 'Running'; $i++) { Start-Sleep 1 }
           if ((Get-Service FastCached).Status -ne 'Running') { throw 'service did not start' }
 
+      # The configuration half of the same promise, which nothing asserted
+      # before: the .deb/.rpm conffile and the .pkg postinstall are both checked
+      # end to end below and on macOS, while the MSI's seeding action is
+      # Return="ignore" and therefore fails in complete silence. A seed that did
+      # not happen leaves a service running on built-in defaults and an operator
+      # editing a file that is not there.
+      - name: "Verify the seeded configuration and its permissions"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = "$env:ProgramData\fastcached"
+          $cfg = "$dir\fastcached.yaml"
+
+          # Seeding happened at all. This is also the assertion that catches
+          # %ProgramData% being absent from the LocalSystem service environment,
+          # which would make both the seed and the daemon's own lookup no-ops.
+          if (-not (Test-Path $cfg)) { throw "installer did not seed $cfg" }
+          if (-not (Select-String -Path $cfg -Pattern '^#port:' -Quiet)) {
+            throw "$cfg does not look like the shipped template"
+          }
+
+          # The ACL, by SID rather than account name so the check is not itself
+          # wrong on a non-English runner. A standard account able to create
+          # files here owns the configuration of a LocalSystem service.
+          $acl = Get-Acl $dir
+          if (-not $acl.AreAccessRulesProtected) {
+            throw "$dir still inherits from C:\ProgramData, which grants BUILTIN\Users create-file"
+          }
+
+          $planting = [Security.AccessControl.FileSystemRights]::CreateFiles `
+                    -bor [Security.AccessControl.FileSystemRights]::CreateDirectories `
+                    -bor [Security.AccessControl.FileSystemRights]::Write `
+                    -bor [Security.AccessControl.FileSystemRights]::ChangePermissions `
+                    -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
+          $broad = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4', 'S-1-5-32-546')
+
+          # Ask for the rules as SIDs rather than translating names afterwards:
+          # entries like ALL APPLICATION PACKAGES have no account to resolve to,
+          # and Translate() throws on them rather than returning nothing, which
+          # would abort this check instead of passing it.
+          foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -ne 'Allow') { continue }
+            $sid = $rule.IdentityReference.Value
+            if ($broad -contains $sid -and ($rule.FileSystemRights -band $planting)) {
+              throw "$dir grants $sid $($rule.FileSystemRights); a standard account could plant a config there"
+            }
+          }
+
+          # An owner keeps ChangePermissions whatever the entries say.
+          $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+          if ($owner -notin @('S-1-5-18', 'S-1-5-32-544')) {
+            throw "$dir is owned by $owner, not by SYSTEM or Administrators"
+          }
+
+          Write-Host "seeded $cfg"
+          Write-Host "  owner: $owner  protected: $($acl.AreAccessRulesProtected)"
+
+      # Seed-once, the property the whole arrangement exists for: an MSI
+      # overwrites its payload on every install, so the live config is kept out
+      # of the payload and copied in only when absent. The .deb/.rpm equivalent
+      # is asserted the same way further up; macOS in macos-package-e2e.sh.
+      - name: "Verify a reinstall keeps operator edits"
+        shell: pwsh
+        working-directory: out/build/cl-release
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cfg = "$env:ProgramData\fastcached\fastcached.yaml"
+          $marker = '# local edit that must survive'
+          Add-Content -Path $cfg -Value $marker
+
+          $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', "`"$msi`"", '/qn', 'REINSTALL=ALL', 'REINSTALLMODE=vomus')
+          if ($p.ExitCode -ne 0) { throw "reinstall failed with $($p.ExitCode)" }
+
+          if (-not (Select-String -Path $cfg -Pattern ([regex]::Escape($marker)) -Quiet)) {
+            throw 'the reinstall overwrote the operator edit'
+          }
+
       - name: "Uninstall and verify the service is gone"
         shell: pwsh
         working-directory: out/build/cl-release
@@ -1110,6 +1192,12 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "uninstall failed with $($p.ExitCode)" }
           if (Get-Service -Name FastCached -ErrorAction SilentlyContinue) {
             throw 'FastCached service survived uninstall'
+          }
+
+          # Documented behaviour on every platform: the configuration is the
+          # operator's, not the package's, so it outlives the package.
+          if (-not (Test-Path "$env:ProgramData\fastcached\fastcached.yaml")) {
+            throw 'uninstall removed the configuration'
           }
 
       - name: "Upload the MSI"

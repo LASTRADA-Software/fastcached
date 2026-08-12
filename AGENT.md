@@ -36,8 +36,12 @@ src/FastCache/
                 ReactorServerLoop (the server driver)
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
                 ISignalSource, DaemonControls (process-wide stop/reload flags),
-                CpuAffinity, HostMemory, ServiceControl, Terminal
-  Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader
+                CpuAffinity, HostMemory, ServiceControl, Terminal,
+                Environment (the one place the process environment is read),
+                FileTrust (could only an administrator have put a file here?)
+  Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader,
+                EnvExpand ($VAR/${VAR} in path settings), DefaultConfigPath
+                (per-platform config lookup + --seed-config, behind IConfigPathProbe)
   Metrics/      IMetricsSink + AtomicMetricsSink
 ```
 
@@ -89,13 +93,81 @@ These constraints are load-bearing and have each already been a bug:
   `Type=forking`. launchd has the identical problem — it reaps the forked job
   instantly as "exited" — which is why `BuildServiceArgv` takes an
   `EmitDaemonFlag` rather than always emitting it.
-- **`ExecStart` must pass `--config`.** There is no default config search path,
-  so without it `ConfigReloader` has nothing to re-read and `systemctl reload`
-  is a silent no-op. The launchd install applies the same rule for the *system*
-  daemon: `--config` is the only flag its postinstall passes. The per-user agent
-  passes none — the packaged config describes the daemon, whose cache only the
-  service account can write, so an agent pointed at it would have nowhere to
-  write; it takes the per-user defaults instead.
+- **A config the operator named is strict; one the daemon found is not.**
+  Without `--config`, `DefaultConfigPath` walks a per-platform candidate table
+  (user location before machine-wide) and takes the first entry that exists *and
+  opens for reading* — `Config/DefaultConfigPath.cpp` is the single source of
+  truth for that order, for what `--help` lists, and for where `--seed-config`
+  writes. Readability, not mere existence, is the test: the macOS system config
+  is mode `0640 root:_fastcached`, so a per-user agent has to fall through it
+  rather than fail to start. A discovered file that is absent or unreadable is
+  skipped silently; one that parses badly is still fatal, as is a missing file
+  named with `--config`. The resolved path goes into a *local* in `main.cpp` and
+  never back into `parsed->config` — that object is what `InstallService`
+  registers, and a discovered path baked into `ProgramArguments` would outrank
+  the file itself forever (see the next bullet) and make
+  `InlineCredentialRejection` name a path nobody typed.
+- **The lookup's two rules both turn on one question: is this process the
+  machine-wide daemon, or somebody's own?** `probe.IsPrivilegedProcess()` (root;
+  elevated administrator or LocalSystem on Windows, via `CheckTokenMembership`,
+  which is false for the unelevated half of a split token) decides both halves,
+  and neither is driven by the platform or by the row alone:
+  - **Unprivileged runs skip every `ConfigScope::System` row.** The machine-wide
+    file describes the system service, whose cache only the service account can
+    write, so a `systemctl --user` instance that adopted its `storage_path:`
+    would fail to open that directory and be respawned until the start limit
+    tripped — the out-of-the-box restart loop the user unit's header says it
+    exists to prevent. Readability is not enough of a filter here: the packaged
+    `/etc/fastcached/fastcached.yaml` is `0644 root:root` and readable by all.
+  - **Privileged runs trust-check *every* row, per-user ones included.** `$HOME`
+    and `$XDG_CONFIG_HOME` are inputs an unprivileged account often controls and
+    sudo does not always reset, so checking only `System` rows would leave
+    `sudo -E fastcached` taking root's `storage_path:` from a file that account
+    wrote. A path named with `--config` is never checked — that is the operator's
+    assertion to make, and it is the escape hatch when a location is refused.
+- **A machine-wide config is only obeyed when only an administrator could have
+  written it.** `C:\ProgramData` grants `BUILTIN\Users` create-file on every
+  subdirectory it hands down to, so moving the Windows config there made the
+  configuration of a *LocalSystem* service plantable by any standard account —
+  `storage_path:` alone turns that into arbitrary directory creation and file
+  writes as SYSTEM. Two halves, and both are needed: the MSI owns
+  `%ProgramData%\fastcached` and gives it a protected access list of its own
+  (`PermissionEx`, not `Permission` or `util:PermissionEx` — those take an
+  account *name* and are wrong on a non-English Windows), and `DefaultConfigPath`
+  refuses a candidate whose directory fails `Platform/FileTrust`. The test there
+  is the containing directory's owner and entries, never the file's owner: on
+  Windows a new object belongs to its *creator*, so a config seeded by hand from
+  an elevated shell is owned by that administrator's own account, while a file
+  planted by a standard account is granted to that account's own SID through the
+  inherited `CREATOR OWNER` entry — an owner whitelist rejects the first and an
+  entry scan misses the second. A rejection goes to stderr *and* through the
+  logger once there is one: a service started by the SCM has no console, so
+  stderr alone would put the message nowhere in the one deployment where a
+  machine-wide config is the norm, and a file that is present, readable and
+  ignored anyway is the silent no-op this list exists to prevent.
+- **`--seed-config` secures the directory before it looks for the file, not
+  after.** The whole point of the repair is the case where something is *already*
+  there: any standard account can create a `%ProgramData%` subdirectory and drop
+  a config into it long before the installer runs, and the MSI cannot undo that
+  on its own — `PermissionEx` replaces the access list but not the owner, who
+  keeps `WRITE_DAC` regardless. So seeding secures the parent first (repairing a
+  squat), then decides what to do about the file: seed-once keeps an operator's
+  edits, but a file found in a directory that until that moment anybody could
+  write is not established to be an operator's, and is reported rather than
+  blessed by silence or destroyed by overwriting. Seeding refuses outright when
+  it has the rights for none of this, and deletes a directory it created but
+  could not secure — which would otherwise be the very shape being defended
+  against, authored by the defence.
+- **`ExecStart` still passes `--config` on Linux and macOS — by choice, not
+  necessity.** It predates the lookup, where its absence made `ConfigReloader`
+  have nothing to re-read and `systemctl reload` a silent no-op; the lookup now
+  closes that hole for every daemon started without the flag. The packaged units
+  keep it because the path is unambiguous there and CI asserts it. Windows goes
+  the other way: its custom action registers *no* `--config`, so a seed that did
+  not happen degrades to built-in defaults instead of a service that fails at
+  every start. The per-user launchd agent and the systemd user unit pass none —
+  the packaged config describes the system daemon, whose cache only the service
+  account can write.
 - **`--install-service` registers the *command-line* config, not the merged
   one.** A flag in `ProgramArguments` outranks the same key in YAML for the life
   of the registration, so baking merged values in froze every configured key at
@@ -127,9 +199,15 @@ These constraints are load-bearing and have each already been a bug:
   would put them where systemd never looks — and on macOS an *absolute*
   `install(DESTINATION)` escapes CPack's staging tree and writes to the build
   host's real filesystem.
-- **A macOS `.pkg` has no conffile mechanism.** It overwrites its payload on
-  every install, so the live `fastcached.yaml` is deliberately not payload: the
-  Runtime postinstall seeds it from a shipped `.default` only when absent.
+- **Neither a macOS `.pkg` nor an MSI has a conffile mechanism.** Both overwrite
+  their payload on every install, so on both the live `fastcached.yaml` is
+  deliberately not payload: only a `.default` template ships, and it is copied to
+  the real location exactly once, when nothing is there. macOS does this in the
+  Runtime postinstall (`seed-config.sh.inc`), Windows in a custom action running
+  the daemon's own `--seed-config` — which takes its destination from
+  `SystemConfigPath`, so the seeded file and the startup lookup cannot disagree.
+  Only the DEB conffile and the RPM `%config(noreplace)` can ship the live file
+  directly. Uninstalling leaves the config behind on every platform.
 - **An HTML installer pane must begin with its doctype.** Installer.app decides
   HTML from plain text by sniffing the first bytes of the resource, so the
   `<!-- SPDX-License-Identifier -->` header that opens every other file in the

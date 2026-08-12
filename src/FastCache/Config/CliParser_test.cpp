@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/CliParser.hpp>
+#include <FastCache/Config/DefaultConfigPath.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -480,6 +481,7 @@ TEST_CASE("CliParser: --help quotes the compiled defaults rather than its own li
     // in shipped help means the table gained a row the renderer never saw.
     REQUIRE(!usage.contains("{port}"));
     REQUIRE(!usage.contains("{metrics-port}"));
+    REQUIRE(!usage.contains("{config-defaults}"));
 
     // ...and expanded to the values the daemon actually uses.
     REQUIRE(usage.contains(std::format("default {}", FastCache::DefaultPort)));
@@ -489,6 +491,31 @@ TEST_CASE("CliParser: --help quotes the compiled defaults rather than its own li
     // sccache examples people copy verbatim.
     REQUIRE(!usage.contains("11211"));
     REQUIRE(!usage.contains("6379"));
+}
+
+TEST_CASE("CliParser: --help names every location the daemon would read a config from", "[config][cli][help]")
+{
+    auto const usage = FastCache::CliUsage();
+
+    // Documenting the lookup is half the feature: an operator has to be able to
+    // learn where to put the file without reading the source. Driven off the
+    // same table the lookup walks, so a new location cannot be added without
+    // showing up here.
+    for (auto const& candidate: FastCache::DefaultConfigCandidates())
+        REQUIRE(usage.contains(candidate.display));
+}
+
+TEST_CASE("CliParser: --seed-config parses and selects the seeding action", "[config][cli]")
+{
+    std::array<char const*, 1> const argv { "--seed-config=/tmp/fastcached.yaml.default" };
+    auto const parsed = FastCache::ParseCli(std::span<char const* const> { argv });
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->outcome == FastCache::CliOutcome::SeedConfig);
+    REQUIRE(parsed->seedConfigTemplate == "/tmp/fastcached.yaml.default");
+
+    // The template describes an installation step, not the daemon, so it must
+    // not leak into the config that a service registration bakes in.
+    REQUIRE(parsed->config.configPath.empty());
 }
 
 namespace

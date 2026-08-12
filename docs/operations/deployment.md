@@ -26,13 +26,11 @@ Leave `log_timestamps` off — journald timestamps every line already.
 
 ### Reloading
 
-`systemctl reload fastcached` sends `SIGHUP`, which re-reads
-`/etc/fastcached/fastcached.yaml`. Only part of the configuration is
-reloadable:
+`systemctl reload fastcached` sends `SIGHUP`, which re-reads the config file in
+use — `/etc/fastcached/fastcached.yaml` for the packaged unit. Only part of the
+configuration is reloadable:
 
-| Reloadable | Requires a restart |
-|---|---|
-| `log_level`, `max_memory`, `requirepass`, `auth_username`, `notify_keyspace_events` | `bind`, `port`, `listeners`, `storage_path`, `storage_shards`, `storage_durability`, `storage_max_value`, `threads` |
+--8<-- "reload-matrix.md"
 
 The right-hand column is live-wired at startup — listeners are bound and the
 storage backend is constructed once — so a reload that changes any of it is
@@ -160,14 +158,23 @@ To remove it: `fastcached --uninstall-service --service-scope=<scope>`, or
 
 ## Windows service
 
-The MSI registers `fastcached` as an auto-start service. The same
-registration is available from the command line on any installation:
+The MSI registers `fastcached` as an auto-start service and seeds
+`C:\ProgramData\fastcached\fastcached.yaml` from the template it ships, unless
+a config is already there. The registration passes **no** `--config`: the
+service resolves that path itself at every start, so editing the file is all it
+takes to reconfigure it, and a machine without one still starts on the built-in
+defaults rather than failing.
+
+The same registration is available from the command line on any installation:
 
 ```powershell
-fastcached.exe --install-service --config=C:\path\to\fastcached.yaml
+fastcached.exe --install-service
 sc.exe start FastCached
 fastcached.exe --uninstall-service
 ```
+
+Pass `--config=C:\path\to\fastcached.yaml` only to point the service at a file
+*other* than the default location.
 
 `--install-service` records the flags it was given on the command line into
 the service's command line (values from a `--config` file stay in the file)

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
@@ -796,29 +797,38 @@ namespace
     /// @param cfg Configuration as parsed from the command line.
     /// @param scope Domain being installed into.
     /// @param home The invoking user's home directory.
-    /// @return @p cfg with `storagePath` filled in when the caller left it unset.
-    [[nodiscard]] Config WithScopeDefaults(Config cfg, ServiceScope scope, std::filesystem::path const& home)
+    /// @param packagedConfig The machine-wide config file, empty when it is
+    ///        absent or unreadable. Resolved by the caller for the same reason
+    ///        @p home is: this function decides, the composition root probes.
+    /// @return @p cfg with `storagePath` and `configPath` filled in when the
+    ///         caller left them unset.
+    [[nodiscard]] Config WithScopeDefaults(Config cfg,
+                                           ServiceScope scope,
+                                           std::filesystem::path const& home,
+                                           std::filesystem::path const& packagedConfig)
     {
         if (scope == ServiceScope::User && cfg.storagePath.empty() && cfg.configPath.empty())
             cfg.storagePath = (home / "Library/Caches/fastcached/cache").string();
 
-        // Without --config the job reads no YAML at all: there is no default
-        // search path, so an operator editing <prefix>/etc/fastcached.yaml and
-        // kickstarting the job would see nothing change, with no error anywhere.
-        // Only adopt the packaged file when it actually exists, so a
-        // build-from-source install does not point launchd at a missing path.
+        // The daemon would find this file on its own — it is the machine-wide
+        // candidate its startup lookup probes — so registering it is a choice,
+        // not a necessity, and it is made for two reasons. ServiceAccountReadDenial
+        // below validates `configPath`, so leaving it empty would demote "the
+        // _fastcached account cannot read the config" from an install-time error
+        // to a silent fall-through to built-in defaults. And a system job whose
+        // HOME resolves somewhere real would otherwise prefer a per-user file
+        // over the machine-wide one, which is backwards for a daemon.
         //
         // System scope only: that file describes the machine-wide daemon (its
         // cache lives under the package prefix, writable by the service account
         // alone), so handing it to a per-user agent would point the agent at a
         // directory it cannot write.
+        //
+        // An empty packagedConfig means it is not actually there, so a
+        // build-from-source install does not point launchd at a missing path.
         if (scope == ServiceScope::System && cfg.configPath.empty())
-        {
-            auto const packaged = std::filesystem::path { MacOsPrefix } / "etc/fastcached.yaml";
-            std::error_code ec;
-            if (std::filesystem::exists(packaged, ec) && !ec)
-                cfg.configPath = packaged.string();
-        }
+            cfg.configPath = packagedConfig.string();
+
         return cfg;
     }
 
@@ -1103,7 +1113,21 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
                                         "docs/operations/deployment.md) or use --service-scope=user.",
                                         ServiceAccount) };
 
-    auto const effective = WithScopeDefaults(cfg, scope, home);
+    // The two ambient inputs WithScopeDefaults decides from, both resolved here
+    // rather than inside it: readability, not mere existence, is the test, for
+    // the reason DefaultConfigPath.hpp gives — and trust on top of it, so a
+    // registration cannot hand launchd a file the daemon would refuse to obey
+    // at every start. Failing the same way in both places keeps the two from
+    // disagreeing about which configs count.
+    SystemConfigPathProbe const probe;
+    auto const packagedConfig = [&] {
+        auto const path = SystemConfigPath(probe);
+        return path.has_value() && probe.IsReadableFile(*path) && probe.IsTrustedSystemLocation(*path)
+                   ? *path
+                   : std::filesystem::path {};
+    }();
+
+    auto const effective = WithScopeDefaults(cfg, scope, home, packagedConfig);
     auto const label = LaunchdLabel(effective);
     auto const plistPath = LaunchdPlistPath(effective, scope, home);
     auto const logDirectory = DefaultLogDirectory(scope, home);
