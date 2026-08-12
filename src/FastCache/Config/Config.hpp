@@ -333,6 +333,12 @@ struct Config
 
     /// Values smaller than this stay uncompressed in memory.
     std::size_t memoryCompressionMinBytes { 4096 };
+
+    /// Member-wise equality. Lets a test assert that two ways of spelling the
+    /// same thing — `--flag=value` and `--flag value`, or a CLI flag and its
+    /// YAML key — produce an identical configuration, rather than spot-checking
+    /// whichever fields the test author happened to think of.
+    friend bool operator==(Config const&, Config const&) = default;
 };
 
 } // namespace FastCache

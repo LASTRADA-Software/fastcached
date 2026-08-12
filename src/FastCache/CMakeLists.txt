@@ -17,6 +17,8 @@ target_sources(FastCache
         Cache/ShardedStorage.cpp
         Cache/TracingStorage.cpp
         Cache/WriteErrorReportingStorage.cpp
+        Cli/Options.cpp
+        Cli/UsageDoc.cpp
         CompileCache/CohortManifest.cpp
         CompileCache/CompileValue.cpp
         CompileCache/PathCanon.cpp
