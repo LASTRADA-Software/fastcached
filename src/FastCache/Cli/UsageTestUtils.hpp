@@ -41,15 +41,15 @@ namespace FastCache::Testing
 ///
 /// Owning strings, not views: the natural call is `UsageLines(RenderUsage(...))`,
 /// and views into that temporary would dangle at the end of the expression.
+/// The empty segment the final newline produces is dropped, so the result is
+/// one entry per printed line.
 /// @param text The rendered text.
-/// @param keepTrailing Whether to keep the empty segment a final newline
-///        produces. False suits "one entry per printed line".
 /// @return One entry per line.
-[[nodiscard]] inline std::vector<std::string> UsageLines(std::string_view text, bool keepTrailing = false)
+[[nodiscard]] inline std::vector<std::string> UsageLines(std::string_view text)
 {
     std::vector<std::string> lines;
     ForEachLine(text, [&](std::string_view line) { lines.emplace_back(line); });
-    if (!keepTrailing && !lines.empty() && lines.back().empty())
+    if (!lines.empty() && lines.back().empty())
         lines.pop_back();
     return lines;
 }
@@ -67,18 +67,6 @@ namespace FastCache::Testing
     while (i < line.size() && line[i] == ' ')
         ++i;
     return i;
-}
-
-/// The description column of the first line whose term begins with `term`.
-/// @param text The rendered usage text.
-/// @param term The term to find, as it appears after the indent.
-/// @return The description column, or `text.size()` when no line matches.
-[[nodiscard]] inline std::size_t DescriptionColumnOf(std::string_view text, std::string_view term)
-{
-    for (auto const& line: UsageLines(text))
-        if (line.starts_with("  ") && line.substr(2).starts_with(term))
-            return DescriptionColumn(line);
-    return text.size();
 }
 
 } // namespace FastCache::Testing

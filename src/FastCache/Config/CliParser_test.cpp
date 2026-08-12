@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cli/UsageTestUtils.hpp>
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
 
@@ -518,74 +519,17 @@ TEST_CASE("CliParser: --seed-config parses and selects the seeding action", "[co
     REQUIRE(parsed->config.configPath.empty());
 }
 
-namespace
-{
-/// Split `text` into '\n'-separated lines (the trailing segment is kept).
-[[nodiscard]] std::vector<std::string_view> SplitLines(std::string_view text)
-{
-    std::vector<std::string_view> lines;
-    while (true)
-    {
-        auto const newline = text.find('\n');
-        if (newline == std::string_view::npos)
-        {
-            lines.push_back(text);
-            return lines;
-        }
-        lines.push_back(text.substr(0, newline));
-        text.remove_prefix(newline + 1);
-    }
-}
-
-/// Column (0-based) at which the description text begins on an option line:
-/// the first non-space character following the run of 2+ gap spaces after
-/// the flag. Internal single spaces inside a flag (e.g. "--help, -h") do not
-/// count as the gap.
-[[nodiscard]] std::size_t DescriptionColumn(std::string_view line)
-{
-    auto i = std::size_t { 2 }; // past the leading "  " indent
-    while (i + 1 < line.size() && !(line[i] == ' ' && line[i + 1] == ' '))
-        ++i;
-    while (i < line.size() && line[i] == ' ')
-        ++i;
-    return i;
-}
-
-/// Remove ANSI SGR escape sequences ("\x1b[...m") from `text`.
-[[nodiscard]] std::string StripAnsi(std::string_view text)
-{
-    std::string out;
-    auto i = std::size_t { 0 };
-    while (i < text.size())
-    {
-        if (text[i] == '\x1b')
-        {
-            while (i < text.size() && text[i] != 'm')
-                ++i;
-            if (i < text.size())
-                ++i; // consume the terminating 'm'
-        }
-        else
-        {
-            out += text[i];
-            ++i;
-        }
-    }
-    return out;
-}
-} // namespace
-
 TEST_CASE("CliParser: --help option descriptions share one aligned column", "[config][cli][help]")
 {
     auto const usage = FastCache::CliUsage();
     auto expectedColumn = std::size_t { 0 };
     auto optionLines = std::size_t { 0 };
 
-    for (auto const line: SplitLines(usage))
+    for (auto const& line: FastCache::Testing::UsageLines(usage))
     {
         if (!line.starts_with("  --"))
             continue;
-        auto const column = DescriptionColumn(line);
+        auto const column = FastCache::Testing::DescriptionColumn(line);
         if (optionLines == 0)
             expectedColumn = column;
         else
@@ -601,15 +545,15 @@ TEST_CASE("CliParser: --help option descriptions share one aligned column", "[co
 TEST_CASE("CliParser: --help wraps continuation lines to the description column", "[config][cli][help]")
 {
     auto const usage = FastCache::CliUsage();
-    auto const lines = SplitLines(usage);
+    auto const lines = FastCache::Testing::UsageLines(usage);
 
     // Find the --lru-mode flag line and its continuation ("approximate: ...").
     auto flagColumn = std::size_t { 0 };
     auto continuationColumn = std::size_t { 0 };
-    for (auto const line: lines)
+    for (auto const& line: lines)
     {
         if (line.starts_with("  --lru-mode"))
-            flagColumn = DescriptionColumn(line);
+            flagColumn = FastCache::Testing::DescriptionColumn(line);
         else if (line.contains("approximate: same-shard reads run concurrently"))
             continuationColumn = line.find_first_not_of(' ');
     }
@@ -634,7 +578,7 @@ TEST_CASE("CliParser: colorized --help adds ANSI escapes but identical text", "[
     REQUIRE(colored.size() > plain.size());
     // ...and stripping them recovers exactly the plain layout (so color never
     // disturbs alignment).
-    REQUIRE(StripAnsi(colored) == plain);
+    REQUIRE(FastCache::Testing::StripAnsi(colored) == plain);
 }
 
 TEST_CASE("CliParser: --install-service selects the install outcome and keeps parsing flags", "[config][cli][service]")

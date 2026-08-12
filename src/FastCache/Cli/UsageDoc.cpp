@@ -76,28 +76,23 @@ namespace
     {
         auto const& [term, description] = row;
 
+        out.append(document.leftIndent, ' ');
+        out += std::format("{}{}{}", palette.term, term, palette.reset);
+
         // A row with no description is its term alone: padding it would leave
         // trailing whitespace on the line.
         if (description.empty())
         {
-            out.append(document.leftIndent, ' ');
-            out += std::format("{}{}{}\n", palette.term, term, palette.reset);
+            out += '\n';
             return;
         }
 
         auto firstLine = true;
         ForEachLine(description, [&](std::string_view line) {
-            if (firstLine)
-            {
-                firstLine = false;
-                out.append(document.leftIndent, ' ');
-                out += std::format("{}{}{}", palette.term, term, palette.reset);
-                // The pad is derived from the term's own width, never from the
-                // rendered string: escapes must not shift the column.
-                out.append(column - document.leftIndent - term.size(), ' ');
-            }
-            else
-                out.append(column, ' ');
+            // The first line's pad is derived from the term's own width, never
+            // from the rendered string: escapes must not shift the column.
+            out.append(firstLine ? column - document.leftIndent - term.size() : column, ' ');
+            firstLine = false;
             out += line;
             out += '\n';
         });
@@ -106,24 +101,11 @@ namespace
 
 void UsageRows::Add(std::string term, std::string_view description)
 {
-    _terms.push_back(std::move(term));
-    _descriptions.push_back(description);
+    _entries.push_back({ .term = _terms.emplace_back(std::move(term)), .description = description });
 }
 
-void UsageRows::Reserve(std::size_t count)
+std::span<UsageEntry const> UsageRows::Rows() const noexcept
 {
-    _terms.reserve(_terms.size() + count);
-    _descriptions.reserve(_descriptions.size() + count);
-}
-
-std::span<UsageEntry const> UsageRows::Rows()
-{
-    // Built here rather than in Add because a growing `_terms` reseats every
-    // string it holds; by now it is complete.
-    _entries.clear();
-    _entries.reserve(_terms.size());
-    for (auto const index: std::views::iota(std::size_t { 0 }, _terms.size()))
-        _entries.push_back({ .term = _terms[index], .description = _descriptions[index] });
     return _entries;
 }
 

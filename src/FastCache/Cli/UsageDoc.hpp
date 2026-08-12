@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <span>
 #include <string>
 #include <string_view>
@@ -145,19 +146,14 @@ class UsageRows
     void Add(std::string term, std::string_view description);
 
     /// The rows, as the document wants them.
-    ///
-    /// Recomputed per call, so adding after a call is still correct.
     /// @return Entries viewing this object's storage; valid while it lives and
     ///         until the next Add.
-    [[nodiscard]] std::span<UsageEntry const> Rows();
-
-    /// Reserve capacity for `count` further rows.
-    /// @param count Rows expected.
-    void Reserve(std::size_t count);
+    [[nodiscard]] std::span<UsageEntry const> Rows() const noexcept;
 
   private:
-    std::vector<std::string> _terms;
-    std::vector<std::string_view> _descriptions;
+    /// A deque, not a vector: growing it must not reseat the strings the
+    /// entries below already point at.
+    std::deque<std::string> _terms;
     std::vector<UsageEntry> _entries;
 };
 

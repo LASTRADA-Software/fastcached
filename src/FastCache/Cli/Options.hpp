@@ -308,7 +308,10 @@ template <typename Result>
                                                               std::span<char const* const> args)
 {
     Result result {};
-    return ParseOptionsInto(table, args, result).transform([&result](ParseFlow) { return std::move(result); });
+    auto const flow = ParseOptionsInto(table, args, result);
+    if (!flow.has_value())
+        return std::unexpected(flow.error());
+    return result;
 }
 
 /// Append one help row per option, deriving both columns from the row.
@@ -317,7 +320,6 @@ template <typename Result>
 template <typename Result>
 void AddOptionRows(UsageRows& rows, std::span<OptionSpec<Result> const> table)
 {
-    rows.Reserve(table.size());
     for (auto const& spec: table)
         rows.Add(RenderFlagForms(spec), spec.description);
 }
