@@ -51,9 +51,9 @@ inline constexpr UsagePalette PlainUsagePalette { .reset = "", .heading = "", .t
 /// keep those strings alive across the RenderUsage call.
 struct UsageEntry
 {
-    std::string_view term;        ///< Left column: a flag, an invocation form, an environment variable.
-    std::string_view description; ///< Right column; '\n' starts a continuation line re-indented
-                                  ///< to the same column. May be empty.
+    std::string_view term {};        ///< Left column: a flag, an invocation form, an environment variable.
+    std::string_view description {}; ///< Right column; '\n' starts a continuation line re-indented
+                                     ///< to the same column. May be empty.
 };
 
 /// One piece of a section: either a run of aligned rows, or free-form prose.
@@ -64,18 +64,18 @@ struct UsageEntry
 /// sections would let the halves drift apart the moment one gains a longer term.
 struct UsageBlock
 {
-    std::span<UsageEntry const> entries; ///< Aligned rows; empty means this is a text block.
-    std::string_view text;               ///< Free-form body emitted verbatim (it carries its own
-                                         ///< indentation); used iff `entries` is empty.
+    std::span<UsageEntry const> entries {}; ///< Aligned rows; empty means this is a text block.
+    std::string_view text {};               ///< Free-form body emitted verbatim (it carries its own
+                                            ///< indentation); used iff `entries` is empty.
 };
 
 /// One part of a usage document.
 struct UsageSection
 {
-    std::string_view title;             ///< Heading, colorized; empty for an untitled section.
-    std::string_view subject;           ///< Printed after `title` on the same line and never
-                                        ///< colorized, e.g. " fastcached [options]".
-    std::span<UsageBlock const> blocks; ///< The body; may be empty for a bare title line.
+    std::string_view title {};             ///< Heading, colorized; empty for an untitled section.
+    std::string_view subject {};           ///< Printed after `title` on the same line and never
+                                           ///< colorized, e.g. " fastcached [options]".
+    std::span<UsageBlock const> blocks {}; ///< The body; may be empty for a bare title line.
 };
 
 /// A complete usage/help text, as data.
