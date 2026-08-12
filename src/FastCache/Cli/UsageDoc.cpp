@@ -12,33 +12,13 @@ namespace FastCache
 
 namespace
 {
-    /// Invoke `fn(line)` for each '\n'-separated segment of `text`. A trailing
-    /// segment with no newline is still delivered, so a non-terminated string
-    /// yields exactly its visual lines.
-    /// @param text The text to split.
-    /// @param fn Callable invoked once per line.
-    template <typename Fn>
-    void ForEachLine(std::string_view text, Fn fn)
-    {
-        while (true)
-        {
-            auto const newline = text.find('\n');
-            if (newline == std::string_view::npos)
-            {
-                fn(text);
-                return;
-            }
-            fn(text.substr(0, newline));
-            text.remove_prefix(newline + 1);
-        }
-    }
-
     /// One block with every token already spliced, so the column can be
     /// measured from the text that will actually be printed.
     struct ExpandedBlock
     {
         std::vector<std::pair<std::string, std::string>> rows; ///< Term/description pairs; empty for a text block.
         std::string text;                                      ///< Free-form body; used iff `rows` is empty.
+        std::size_t indent {};                                 ///< Spaces before each non-empty line of `text`.
     };
 
     /// Expand every string in `section` up front.
@@ -53,6 +33,7 @@ namespace
         for (auto const& block: section.blocks)
         {
             ExpandedBlock out;
+            out.indent = block.indent;
             if (block.entries.empty())
                 out.text = ExpandUsageTokens(block.text, substitutions);
             else
@@ -94,13 +75,13 @@ namespace
                  UsagePalette const& palette)
     {
         auto const& [term, description] = row;
-        std::string const indent(document.leftIndent, ' ');
 
         // A row with no description is its term alone: padding it would leave
         // trailing whitespace on the line.
         if (description.empty())
         {
-            out += std::format("{}{}{}{}\n", indent, palette.term, term, palette.reset);
+            out.append(document.leftIndent, ' ');
+            out += std::format("{}{}{}\n", palette.term, term, palette.reset);
             return;
         }
 
@@ -109,21 +90,42 @@ namespace
             if (firstLine)
             {
                 firstLine = false;
+                out.append(document.leftIndent, ' ');
+                out += std::format("{}{}{}", palette.term, term, palette.reset);
                 // The pad is derived from the term's own width, never from the
                 // rendered string: escapes must not shift the column.
-                out += std::format("{}{}{}{}{}{}\n",
-                                   indent,
-                                   palette.term,
-                                   term,
-                                   palette.reset,
-                                   std::string(column - document.leftIndent - term.size(), ' '),
-                                   line);
+                out.append(column - document.leftIndent - term.size(), ' ');
             }
             else
-                out += std::format("{}{}\n", std::string(column, ' '), line);
+                out.append(column, ' ');
+            out += line;
+            out += '\n';
         });
     }
 } // namespace
+
+void UsageRows::Add(std::string term, std::string_view description)
+{
+    _terms.push_back(std::move(term));
+    _descriptions.push_back(description);
+}
+
+void UsageRows::Reserve(std::size_t count)
+{
+    _terms.reserve(_terms.size() + count);
+    _descriptions.reserve(_descriptions.size() + count);
+}
+
+std::span<UsageEntry const> UsageRows::Rows()
+{
+    // Built here rather than in Add because a growing `_terms` reseats every
+    // string it holds; by now it is complete.
+    _entries.clear();
+    _entries.reserve(_terms.size());
+    for (auto const index: std::views::iota(std::size_t { 0 }, _terms.size()))
+        _entries.push_back({ .term = _terms[index], .description = _descriptions[index] });
+    return _entries;
+}
 
 std::string ExpandUsageTokens(std::string_view text, std::span<UsageSubstitution const> substitutions)
 {
@@ -164,7 +166,14 @@ std::string RenderUsage(UsageDocument const& document, UsageColor color, std::sp
             if (block.rows.empty())
             {
                 if (!block.text.empty())
-                    ForEachLine(block.text, [&](std::string_view line) { out += std::format("{}\n", line); });
+                    ForEachLine(block.text, [&](std::string_view line) {
+                        // An empty line stays empty: indenting it would be
+                        // trailing whitespace and nothing else.
+                        if (!line.empty())
+                            out.append(block.indent, ' ');
+                        out += line;
+                        out += '\n';
+                    });
                 continue;
             }
 

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LauncherCli.hpp"
 
+#include <FastCache/Cli/UsageTestUtils.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
@@ -12,6 +14,7 @@
 using namespace FastCache::Cc;
 using FastCache::Arity;
 using FastCache::UsageColor;
+using FastCache::Testing::StripAnsi;
 
 namespace
 {
@@ -19,26 +22,6 @@ namespace
 Command Parse(std::vector<std::string> const& argv)
 {
     return ParseTopLevel(std::span<std::string const> { argv });
-}
-
-/// Remove every ANSI SGR escape, so colored output can be compared against
-/// plain output character for character.
-/// @param text Possibly-colored text.
-/// @return `text` with all escape sequences removed.
-[[nodiscard]] std::string StripAnsi(std::string_view text)
-{
-    std::string out;
-    for (std::size_t i = 0; i < text.size(); ++i)
-    {
-        if (text[i] != '\x1b')
-        {
-            out += text[i];
-            continue;
-        }
-        while (i < text.size() && text[i] != 'm')
-            ++i;
-    }
-    return out;
 }
 
 } // namespace

@@ -538,9 +538,10 @@ TEST_CASE("ServiceControl: every Config-backed flag reaches the service argv", "
         if (std::ranges::contains(NotConfigState, spec.primary))
             continue;
         INFO("flag: " << spec.primary);
-        auto const emitted = std::ranges::any_of(argv, [&spec](std::string const& arg) {
-            return arg == spec.primary || arg.starts_with(std::string { spec.primary } + "=");
-        });
+        // FlagMatches is the parser's own rule for "this token names that flag",
+        // so the guard cannot drift from what the daemon will accept back.
+        auto const emitted =
+            std::ranges::any_of(argv, [&spec](std::string const& arg) { return FastCache::FlagMatches(arg, spec.primary); });
         CHECK(emitted);
     }
 }

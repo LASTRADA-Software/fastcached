@@ -18,7 +18,10 @@ std::string RenderFlagForms(std::string_view primary, std::string_view alias, st
 {
     std::string forms { primary };
     if (!alias.empty())
-        forms += std::format(", {}", alias);
+    {
+        forms += ", ";
+        forms += alias;
+    }
     forms += operand;
     return forms;
 }

@@ -89,6 +89,10 @@ namespace
           .description = "show this help and exit" },
     });
 
+    static_assert(TableIsWellFormed<Args>(Options),
+                  "test client option table is malformed: a row is undocumented, a value flag has no operand, "
+                  "a row does nothing, or a spelling is claimed twice");
+
     /// Render one sub-command's invocation form.
     /// @param command The sub-command.
     /// @return The left column of its usage line.
@@ -109,9 +113,15 @@ std::expected<Args, ConfigError> ParseArgs(std::span<char const* const> argv)
         return std::unexpected(
             ArgvError(ConfigErrorCode::MissingRequired, "sub-command", "expected store|fetch (try --help)"));
 
-    // `--help` before any sub-command is a query, not a malformed store.
+    // A leading `--help` is a query, not a malformed store. Matched against the
+    // table rather than re-spelling "--help"/"-h" here, so the accepted
+    // spellings stay in one place; only a row that ends parsing (help) means
+    // anything before a sub-command has been chosen.
     std::string_view const head { argv.front() };
-    if (head == "--help" || head == "-h")
+    auto const query = std::ranges::find_if(TestClientOptions(), [head](OptionSpec<Args> const& spec) {
+        return spec.flow == ParseFlow::Stop && Matches(head, spec);
+    });
+    if (query != std::ranges::end(TestClientOptions()))
         return Args { .action = Action::ShowHelp };
 
     auto const command = std::ranges::find_if(SubCommands, [head](SubCommand const& c) { return c.name == head; });
@@ -120,15 +130,13 @@ std::expected<Args, ConfigError> ParseArgs(std::span<char const* const> argv)
             ArgvError(ConfigErrorCode::UnknownKey, std::string { head }, "unknown sub-command (expected store|fetch)"));
 
     Args parsed { .action = command->action };
-    auto const rest = argv.subspan(1);
-    for (std::size_t i = 0; i < rest.size(); ++i)
-    {
-        auto const flow = ApplyOneOption(TestClientOptions(), rest, i, parsed);
-        if (!flow.has_value())
-            return std::unexpected(flow.error());
-        if (*flow == ParseFlow::Stop)
-            return parsed;
-    }
+    auto const flow = ParseOptionsInto(TestClientOptions(), argv.subspan(1), parsed);
+    if (!flow.has_value())
+        return std::unexpected(flow.error());
+    // `--help` among the options ends parsing, and a help run has nothing left
+    // to satisfy.
+    if (*flow == ParseFlow::Stop)
+        return parsed;
 
     // Checked here rather than at the use site so a missing port is one clear
     // diagnostic instead of a connection to port 0.
@@ -139,28 +147,16 @@ std::expected<Args, ConfigError> ParseArgs(std::span<char const* const> argv)
 
 std::string HelpText(UsageColor color)
 {
-    // Every owning container is filled to completion before any span over it is
-    // taken: a later push_back would reallocate and dangle the document's views.
-    std::vector<std::string> forms;
-    forms.reserve(SubCommands.size() + Options.size());
+    UsageRows commandRows;
     for (auto const& command: SubCommands)
-        forms.push_back(RenderSubCommand(command));
-    for (auto const& spec: Options)
-        forms.push_back(RenderFlagForms(spec));
+        commandRows.Add(RenderSubCommand(command), command.summary);
 
-    std::vector<UsageEntry> commandRows;
-    commandRows.reserve(SubCommands.size());
-    for (auto const index: std::views::iota(std::size_t { 0 }, SubCommands.size()))
-        commandRows.push_back({ .term = forms[index], .description = SubCommands[index].summary });
-
-    std::vector<UsageEntry> optionRows;
-    optionRows.reserve(Options.size());
-    for (auto const index: std::views::iota(std::size_t { 0 }, Options.size()))
-        optionRows.push_back({ .term = forms[SubCommands.size() + index], .description = Options[index].description });
+    UsageRows optionRows;
+    AddOptionRows(optionRows, TestClientOptions());
 
     auto const blocks = std::to_array<UsageBlock>({
-        { .entries = commandRows },
-        { .entries = optionRows },
+        { .entries = commandRows.Rows() },
+        { .entries = optionRows.Rows() },
     });
 
     std::span<UsageBlock const> const allBlocks { blocks };

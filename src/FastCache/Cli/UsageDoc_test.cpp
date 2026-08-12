@@ -1,59 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cli/UsageDoc.hpp>
+#include <FastCache/Cli/UsageTestUtils.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <format>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 using namespace FastCache;
+using namespace FastCache::Testing;
 
 namespace
 {
-
-/// Remove every ANSI SGR escape, so colored output can be compared against
-/// plain output character for character.
-/// @param text Possibly-colored text.
-/// @return `text` with all escape sequences removed.
-[[nodiscard]] std::string StripAnsi(std::string_view text)
-{
-    std::string out;
-    for (std::size_t i = 0; i < text.size(); ++i)
-    {
-        if (text[i] != '\x1b')
-        {
-            out += text[i];
-            continue;
-        }
-        while (i < text.size() && text[i] != 'm')
-            ++i;
-    }
-    return out;
-}
-
-/// Split rendered output into lines, dropping the trailing empty segment the
-/// final newline produces.
-/// @param text The rendered text.
-/// @return One entry per visual line.
-[[nodiscard]] std::vector<std::string> Lines(std::string_view text)
-{
-    std::vector<std::string> lines;
-    while (!text.empty())
-    {
-        auto const newline = text.find('\n');
-        if (newline == std::string_view::npos)
-        {
-            lines.emplace_back(text);
-            break;
-        }
-        lines.emplace_back(text.substr(0, newline));
-        text.remove_prefix(newline + 1);
-    }
-    return lines;
-}
 
 } // namespace
 
@@ -71,7 +34,7 @@ TEST_CASE("descriptions align to one column per section", "[cli][usage]")
     static constexpr auto blocks = std::to_array<UsageBlock>({ { .entries = entries } });
     static constexpr auto sections = std::to_array<UsageSection>({ { .title = "OPTIONS", .blocks = blocks } });
 
-    auto const lines = Lines(RenderUsage({ .sections = sections }, UsageColor::Plain));
+    auto const lines = UsageLines(RenderUsage({ .sections = sections }, UsageColor::Plain));
     REQUIRE(lines.size() == 3);
     CHECK(lines[0] == "OPTIONS");
     // 2 indent + 20 (the widest term) + 2 gap == column 24.
@@ -93,14 +56,11 @@ TEST_CASE("rows separated by prose still share one column", "[cli][usage]")
     });
     static constexpr auto sections = std::to_array<UsageSection>({ { .title = "ENV", .blocks = blocks } });
 
-    auto const lines = Lines(RenderUsage({ .sections = sections }, UsageColor::Plain));
+    auto const lines = UsageLines(RenderUsage({ .sections = sections }, UsageColor::Plain));
+    REQUIRE(lines.size() == 6);
     // Where the description actually starts: past the run of padding that
     // follows the term, not merely where that run begins.
-    auto const columnOf = [](std::string const& line) {
-        return line.find_first_not_of(' ', line.find("  ", 2));
-    };
-    REQUIRE(lines.size() == 6);
-    CHECK(columnOf(lines[1]) == columnOf(lines[5]));
+    CHECK(DescriptionColumn(lines[1]) == DescriptionColumn(lines[5]));
 }
 
 TEST_CASE("continuation lines re-indent to the description column", "[cli][usage]")
@@ -109,7 +69,7 @@ TEST_CASE("continuation lines re-indent to the description column", "[cli][usage
     static constexpr auto blocks = std::to_array<UsageBlock>({ { .entries = entries } });
     static constexpr auto sections = std::to_array<UsageSection>({ { .blocks = blocks } });
 
-    auto const lines = Lines(RenderUsage({ .sections = sections }, UsageColor::Plain));
+    auto const lines = UsageLines(RenderUsage({ .sections = sections }, UsageColor::Plain));
     REQUIRE(lines.size() == 2);
     CHECK(lines[0] == "  --f  first");
     CHECK(lines[1] == "       second");
@@ -124,7 +84,7 @@ TEST_CASE("a row with no description carries no trailing whitespace", "[cli][usa
     static constexpr auto blocks = std::to_array<UsageBlock>({ { .entries = entries } });
     static constexpr auto sections = std::to_array<UsageSection>({ { .blocks = blocks } });
 
-    auto const lines = Lines(RenderUsage({ .sections = sections }, UsageColor::Plain));
+    auto const lines = UsageLines(RenderUsage({ .sections = sections }, UsageColor::Plain));
     CHECK(lines[0] == "  --bare");
 }
 
@@ -165,7 +125,7 @@ TEST_CASE("substitution runs before the column is measured", "[cli][usage]")
     static constexpr auto sections = std::to_array<UsageSection>({ { .blocks = blocks } });
     auto const substitutions = std::to_array<UsageSubstitution>({ { .token = "{port}", .value = "6674" } });
 
-    auto const lines = Lines(RenderUsage({ .sections = sections }, UsageColor::Plain, substitutions));
+    auto const lines = UsageLines(RenderUsage({ .sections = sections }, UsageColor::Plain, substitutions));
     REQUIRE(lines.size() == 2);
     CHECK(lines[0] == "  --port=6674  listens on 6674");
     CHECK(lines[1] == "  --x          other");
@@ -215,4 +175,44 @@ TEST_CASE("rendered text ends in exactly one newline", "[cli][usage]")
     REQUIRE(rendered.size() >= 2);
     CHECK(rendered.back() == '\n');
     CHECK(rendered[rendered.size() - 2] != '\n');
+}
+
+TEST_CASE("a text block is nested by its indent, and empty lines stay empty", "[cli][usage]")
+{
+    // Nesting is the renderer's job. When it was not, every caller that wanted
+    // an indented block rewrote its own body inserting spaces after each
+    // newline -- and an empty line came back as trailing whitespace.
+    static constexpr auto blocks =
+        std::to_array<UsageBlock>({ { .text = "title\n\nbody", .indent = 2 }, { .text = "flush" } });
+    static constexpr auto sections = std::to_array<UsageSection>({ { .title = "T", .blocks = blocks } });
+
+    auto const lines = UsageLines(RenderUsage({ .sections = sections }, UsageColor::Plain));
+    REQUIRE(lines.size() == 6);
+    CHECK(lines[1] == "  title");
+    CHECK(lines[2].empty());
+    CHECK(lines[3] == "  body");
+    CHECK(lines[5] == "flush");
+}
+
+TEST_CASE("UsageRows keeps computed terms alive and aligned", "[cli][usage]")
+{
+    // The point of the type: terms built at runtime outlive the call without
+    // the caller sequencing two parallel vectors by hand.
+    UsageRows rows;
+    for (auto const index: std::views::iota(0, 3))
+        rows.Add(std::format("--flag{}", index), "described");
+
+    static constexpr std::string_view Widest = "--widest-of-them-all";
+    rows.Add(std::string { Widest }, "last");
+
+    auto const blocks = std::to_array<UsageBlock>({ { .entries = rows.Rows() } });
+    auto const sections = std::to_array<UsageSection>({ { .title = "OPTIONS", .blocks = blocks } });
+
+    auto const lines = UsageLines(RenderUsage({ .sections = sections }, UsageColor::Plain));
+    REQUIRE(lines.size() == 5);
+    CHECK(lines[1].starts_with("  --flag0"));
+    CHECK(lines[4].starts_with("  " + std::string { Widest }));
+    // One column across every row, sized by the widest term.
+    CHECK(DescriptionColumn(lines[1]) == 2 + Widest.size() + 2);
+    CHECK(DescriptionColumn(lines[4]) == DescriptionColumn(lines[1]));
 }

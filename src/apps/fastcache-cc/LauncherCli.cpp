@@ -7,7 +7,6 @@
 #include <format>
 #include <iterator>
 #include <memory>
-#include <ostream>
 #include <ranges>
 #include <span>
 #include <string>
@@ -171,10 +170,11 @@ namespace
                                     "nowhere to record, and statistics are silently disabled." },
     };
 
-    /// Lead-in to the state-directory rows.
+    /// Lead-in to the state-directory rows. Its nesting is the block's `indent`,
+    /// not spaces baked into the literal.
     constexpr std::string_view StateDirectoryNote =
-        "  The statistics log lives under a per-user state directory, located from the\n"
-        "  usual platform variables rather than one of our own:";
+        "The statistics log lives under a per-user state directory, located from the\n"
+        "usual platform variables rather than one of our own:";
 
     /// The two closing paragraphs, each its own block so a blank line separates
     /// them the same way one separates any other pair of blocks.
@@ -286,40 +286,25 @@ std::span<EnvVarSpec const> LauncherEnvironment() noexcept
 
 std::string HelpText(UsageColor color)
 {
-    // Every owning container is filled to completion before any span or view
-    // over it is taken: a later push_back would reallocate and leave the
-    // document pointing at freed storage.
-    std::vector<std::string> forms;
-    forms.reserve(TopLevelFlags().size() + StatsOptions().size() + 1);
+    UsageRows usageRows;
     // The compile form is the default rather than a flag, so it has no table row.
-    forms.emplace_back("fastcache-cc <compiler> <args...>");
+    usageRows.Add("fastcache-cc <compiler> <args...>", "Front a compile (as CMAKE_<LANG>_COMPILER_LAUNCHER).");
     for (auto const& spec: TopLevelFlags())
-        forms.push_back(std::format("fastcache-cc {}", RenderForms(spec)));
+        usageRows.Add(std::format("fastcache-cc {}", RenderForms(spec)), spec.summary);
+
+    UsageRows statsRows;
     for (auto const& spec: StatsOptions())
-        forms.push_back(RenderForms(spec));
+        statsRows.Add(RenderForms(spec), spec.summary);
 
-    std::vector<UsageEntry> usageRows;
-    usageRows.reserve(TopLevelFlags().size() + 1);
-    usageRows.push_back({ .term = forms.front(), .description = "Front a compile (as CMAKE_<LANG>_COMPILER_LAUNCHER)." });
-    for (auto const index: std::views::iota(std::size_t { 0 }, TopLevelFlags().size()))
-        usageRows.push_back({ .term = forms[index + 1], .description = TopLevelFlags()[index].summary });
-
-    std::vector<UsageEntry> statsRows;
-    statsRows.reserve(StatsOptions().size());
-    for (auto const index: std::views::iota(std::size_t { 0 }, StatsOptions().size()))
-        statsRows.push_back(
-            { .term = forms[TopLevelFlags().size() + 1 + index], .description = StatsOptions()[index].summary });
-
-    std::vector<UsageEntry> environmentRows;
-    environmentRows.reserve(LauncherEnvironment().size());
+    UsageRows environmentRows;
     for (auto const& spec: LauncherEnvironment())
-        environmentRows.push_back({ .term = spec.name, .description = spec.summary });
+        environmentRows.Add(std::string { spec.name }, spec.summary);
 
     auto const blocks = std::to_array<UsageBlock>({
-        { .entries = usageRows },
-        { .entries = statsRows },
-        { .entries = environmentRows },
-        { .text = StateDirectoryNote },
+        { .entries = usageRows.Rows() },
+        { .entries = statsRows.Rows() },
+        { .entries = environmentRows.Rows() },
+        { .text = StateDirectoryNote, .indent = 2 },
         { .entries = StateDirectoryRows },
         { .text = RequiredVariablesNote },
         { .text = FallbackNote },

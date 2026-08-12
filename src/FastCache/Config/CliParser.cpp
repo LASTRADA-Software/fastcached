@@ -234,21 +234,16 @@ namespace
         return BindConfig { .address = *address, .port = *port, .tls = tls };
     }
 
-    /// `ParseListenSpec` bound to each listener kind, so the two repeatable
-    /// flags share one parser and differ only by the row that names them.
+    /// `ParseListenSpec` bound to one listener kind, so the two repeatable flags
+    /// share one parser and differ only by the row that names them — and by a
+    /// template argument rather than by a second copy of this body.
+    /// @tparam Tls Whether the listener terminates TLS.
     /// @param sv The flag's value text.
-    /// @return A plaintext BindConfig on success; ConfigError otherwise.
-    [[nodiscard]] std::expected<BindConfig, ConfigError> ParsePlainListen(std::string_view sv)
+    /// @return The BindConfig on success; ConfigError otherwise.
+    template <bool Tls>
+    [[nodiscard]] std::expected<BindConfig, ConfigError> ParseListen(std::string_view sv)
     {
-        return ParseListenSpec(sv, false);
-    }
-
-    /// The TLS counterpart of ParsePlainListen.
-    /// @param sv The flag's value text.
-    /// @return A TLS BindConfig on success; ConfigError otherwise.
-    [[nodiscard]] std::expected<BindConfig, ConfigError> ParseTlsListen(std::string_view sv)
-    {
-        return ParseListenSpec(sv, true);
+        return ParseListenSpec(sv, Tls);
     }
 
     /// Every accepted command-line option, in the order `--help` documents them.
@@ -344,14 +339,14 @@ namespace
         { .primary = "--listen",
           .arity = Arity::Value,
           .operand = "=<host:port>",
-          .apply = AppendFrom<&Config::binds, ParsePlainListen>(),
+          .apply = AppendFrom<&Config::binds, ParseListen<false>>(),
           .description = "additional plaintext listener; repeatable. Use [::1]:{port} for IPv6 literals.\n"
                          "When given, supersedes --bind/--port — every endpoint must be listed.\n"
                          "Also how to keep serving legacy clients: add their port here." },
         { .primary = "--listen-tls",
           .arity = Arity::Value,
           .operand = "=<host:port>",
-          .apply = AppendFrom<&Config::binds, ParseTlsListen>(),
+          .apply = AppendFrom<&Config::binds, ParseListen<true>>(),
           .description = "additional TLS listener; repeatable. Shares --tls-cert / --tls-key.\n"
                          "Needs a build with OpenSSL (FC_TLS_ENABLED)" },
         { .primary = "--notify-keyspace-events",
@@ -519,32 +514,9 @@ namespace
           .description = "show version and exit" },
     });
 
-    /// Check at compile time that the table says what it must: every row
-    /// documented, every value flag carrying an operand to display, and no
-    /// spelling claimed twice. A malformed row is a build error rather than a
-    /// flag that silently shadows another at runtime.
-    /// @return True when every row is well formed.
-    [[nodiscard]] consteval bool OptionsAreWellFormed()
-    {
-        auto const shapeOk = std::ranges::all_of(Options, [](OptionSpec<CliResult> const& spec) {
-            return spec.primary.starts_with("--") && !spec.description.empty()
-                   && (spec.arity == Arity::Value) == !spec.operand.empty();
-        });
-        if (!shapeOk)
-            return false;
-
-        auto const indices = std::views::iota(std::size_t { 0 }, Options.size());
-        return std::ranges::all_of(indices, [indices](std::size_t a) {
-            return std::ranges::all_of(indices | std::views::drop(a + 1), [a](std::size_t b) {
-                return Options[a].primary != Options[b].primary
-                       && (Options[a].alias.empty() || Options[a].alias != Options[b].alias);
-            });
-        });
-    }
-
-    static_assert(OptionsAreWellFormed(),
+    static_assert(TableIsWellFormed<CliResult>(Options),
                   "CLI option table is malformed: a row is undocumented, a value flag has no operand, "
-                  "or a spelling is claimed twice");
+                  "a row does nothing, or a spelling is claimed twice");
 
     /// The config locations `--help` lists, one per line, indented under the
     /// description column. Read straight off the table the lookup itself walks,
@@ -607,22 +579,6 @@ namespace
     constexpr std::string_view UsageFooter = "sccache <= 0.7 speaks memcached text; >= 0.8 speaks memcached binary;\n"
                                              "either works because fastcached auto-detects the wire format.";
 
-    /// Render one example as a text block nested under the EXAMPLES heading:
-    /// its title at the section indent, its body one level further in.
-    /// @param example The example to format.
-    /// @return The block text, without a trailing newline.
-    [[nodiscard]] std::string FormatExample(UsageExample const& example)
-    {
-        std::string out = std::format("  {}\n  ", example.title);
-        for (auto const character: example.body)
-        {
-            out += character;
-            if (character == '\n')
-                out += "  ";
-        }
-        return out;
-    }
-
 } // namespace
 
 std::span<OptionSpec<CliResult> const> CliOptions() noexcept
@@ -645,29 +601,21 @@ std::string CliUsage(UsageColor color)
 {
     auto const substitutions = MakeUsageSubstitutions();
 
-    // Every owning container is filled to completion before any span or view
-    // over it is taken: a later push_back would reallocate and leave the
-    // document pointing at freed storage.
-    std::vector<std::string> terms;
-    terms.reserve(CliOptions().size());
-    for (auto const& spec: CliOptions())
-        terms.push_back(RenderFlagForms(spec));
+    UsageRows optionRows;
+    AddOptionRows(optionRows, CliOptions());
 
-    std::vector<UsageEntry> optionRows;
-    optionRows.reserve(terms.size());
-    for (auto const index: std::views::iota(std::size_t { 0 }, terms.size()))
-        optionRows.push_back({ .term = terms[index], .description = CliOptions()[index].description });
-
+    // An example is a title with its body one level further in; the renderer
+    // does the nesting, so these stay the literals they are written as.
     std::vector<std::string> exampleTexts;
     exampleTexts.reserve(UsageExamples.size());
     for (auto const& example: UsageExamples)
-        exampleTexts.push_back(FormatExample(example));
+        exampleTexts.push_back(std::format("{}\n{}", example.title, example.body));
 
     std::vector<UsageBlock> blocks;
     blocks.reserve(1 + exampleTexts.size() + 1);
-    blocks.push_back({ .entries = optionRows });
+    blocks.push_back({ .entries = optionRows.Rows() });
     for (auto const& text: exampleTexts)
-        blocks.push_back({ .text = text });
+        blocks.push_back({ .text = text, .indent = 2 });
     blocks.push_back({ .text = UsageFooter });
 
     std::span<UsageBlock const> const allBlocks { blocks };

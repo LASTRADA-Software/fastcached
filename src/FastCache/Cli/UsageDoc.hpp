@@ -6,9 +6,35 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache
 {
+
+/// Invoke `fn(line)` for each '\n'-separated segment of `text`.
+///
+/// A trailing segment with no newline is still delivered, so a non-terminated
+/// string yields exactly its visual lines. Public because splitting rendered
+/// usage text is something its callers and tests need too, and every private
+/// re-spelling of this loop has been a chance to disagree about that trailing
+/// segment.
+/// @param text The text to split.
+/// @param fn Callable invoked once per line.
+template <typename Fn>
+void ForEachLine(std::string_view text, Fn fn)
+{
+    while (true)
+    {
+        auto const newline = text.find('\n');
+        if (newline == std::string_view::npos)
+        {
+            fn(text);
+            return;
+        }
+        fn(text.substr(0, newline));
+        text.remove_prefix(newline + 1);
+    }
+}
 
 /// Whether rendered usage text carries ANSI SGR color escapes.
 enum class UsageColor : std::uint8_t
@@ -65,8 +91,11 @@ struct UsageEntry
 struct UsageBlock
 {
     std::span<UsageEntry const> entries {}; ///< Aligned rows; empty means this is a text block.
-    std::string_view text {};               ///< Free-form body emitted verbatim (it carries its own
-                                            ///< indentation); used iff `entries` is empty.
+    std::string_view text {};               ///< Free-form body; used iff `entries` is empty.
+    std::size_t indent {};                  ///< Spaces prepended to each non-empty line of `text`.
+                                            ///< Nesting is the renderer's job: when it was not, every
+                                            ///< caller that wanted an indented block rewrote its own
+                                            ///< body inserting spaces after each newline.
 };
 
 /// One part of a usage document.
@@ -93,6 +122,43 @@ struct UsageDocument
     std::span<UsageSection const> sections; ///< The sections, in print order.
     std::size_t leftIndent { 2 };           ///< Spaces before each term.
     std::size_t columnGap { 2 };            ///< Spaces between the widest term and the descriptions.
+};
+
+/// Aligned rows whose terms are computed rather than spelled as literals.
+///
+/// A UsageEntry holds *views*, so a caller that formats its terms at runtime
+/// must keep them alive for the whole render. Every assembler used to do that by
+/// hand — fill one `vector<std::string>` to completion, then build a parallel
+/// `vector<UsageEntry>` indexing into it — which meant repeating both the index
+/// arithmetic and a warning comment, and left a `push_back` in the wrong place
+/// dangling the document instead of failing to compile.
+///
+/// Here the storage and the rows are one object: keep the UsageRows alive, which
+/// is ordinary object lifetime, and there is nothing else to get right.
+class UsageRows
+{
+  public:
+    /// Append one row.
+    /// @param term Left column; taken by value, and owned from here on.
+    /// @param description Right column; must outlive this object. Usually a
+    ///        literal or a view of a static table.
+    void Add(std::string term, std::string_view description);
+
+    /// The rows, as the document wants them.
+    ///
+    /// Recomputed per call, so adding after a call is still correct.
+    /// @return Entries viewing this object's storage; valid while it lives and
+    ///         until the next Add.
+    [[nodiscard]] std::span<UsageEntry const> Rows();
+
+    /// Reserve capacity for `count` further rows.
+    /// @param count Rows expected.
+    void Reserve(std::size_t count);
+
+  private:
+    std::vector<std::string> _terms;
+    std::vector<std::string_view> _descriptions;
+    std::vector<UsageEntry> _entries;
 };
 
 /// A value quoted in the text and spliced in at render time.

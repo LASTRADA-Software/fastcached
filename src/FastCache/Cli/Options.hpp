@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Cli/UsageDoc.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -67,6 +69,35 @@ struct OptionSpec
     ParseFlow flow { ParseFlow::Continue }; ///< Whether parsing continues after this flag.
     std::string_view description {};        ///< Help text; '\n' wraps, `{token}`s expand at render time.
 };
+
+/// Check at compile time that a table says what it must.
+///
+/// Every row documented, every value flag carrying an operand to display, every
+/// row doing *something*, and no spelling claimed twice — so a malformed row is
+/// a build error rather than a flag that silently shadows another at runtime.
+///
+/// Generic rather than written once per binary: the checks are a property of the
+/// row type, and a per-table copy is a table that quietly gets none. `consteval`
+/// so it cannot be called at runtime and mistaken for a test.
+/// @param table The rows to check.
+/// @return True when every row is well formed.
+template <typename Result>
+[[nodiscard]] consteval bool TableIsWellFormed(std::span<OptionSpec<Result> const> table)
+{
+    auto const shapeOk = std::ranges::all_of(table, [](OptionSpec<Result> const& spec) {
+        return spec.primary.starts_with("--") && !spec.description.empty()
+               && (spec.arity == Arity::Value) == !spec.operand.empty() && (spec.apply != nullptr || spec.select != nullptr);
+    });
+    if (!shapeOk)
+        return false;
+
+    auto const indices = std::views::iota(std::size_t { 0 }, table.size());
+    return std::ranges::all_of(indices, [table, indices](std::size_t a) {
+        return std::ranges::all_of(indices | std::views::drop(a + 1), [table, a](std::size_t b) {
+            return table[a].primary != table[b].primary && (table[a].alias.empty() || table[a].alias != table[b].alias);
+        });
+    });
+}
 
 /// Build a ConfigError attributed to the command line.
 /// @param code The error category.
@@ -134,6 +165,10 @@ template <typename Result>
 /// Accepts a pointer-to-member of the result itself or of a nested `config`
 /// member, so one set of factories serves both the settings that take part in a
 /// config merge and the install-time ones that must not.
+///
+/// The nested member must be spelled `config` — that name is part of the
+/// contract a `Result` signs up to, not a coincidence. A result type that calls
+/// its settings something else gets a hard error from inside a factory.
 /// @param result The result being populated.
 /// @return Reference to the field `Field` names.
 template <auto Field, typename Result>
@@ -237,6 +272,33 @@ template <typename Result>
     return match->flow;
 }
 
+/// Parse a whole argument vector into an already-constructed result.
+///
+/// Separate from ParseOptions because a caller that must seed its result first
+/// (a sub-command selecting the action, say) would otherwise re-spell this loop.
+/// The returned flow tells such a caller whether parsing stopped early, so it
+/// can skip the checks a `--help` run should not fail.
+/// @param table The rows to match against.
+/// @param args The arguments, with the program name already removed.
+/// @param result The result to populate; left partially applied on error.
+/// @return Stop when a row ended parsing, Continue when the arguments ran out,
+///         or the first ConfigError encountered.
+template <typename Result>
+[[nodiscard]] std::expected<ParseFlow, ConfigError> ParseOptionsInto(std::span<OptionSpec<Result> const> table,
+                                                                     std::span<char const* const> args,
+                                                                     Result& result)
+{
+    for (std::size_t i = 0; i < args.size(); ++i)
+    {
+        auto const flow = ApplyOneOption(table, args, i, result);
+        if (!flow.has_value())
+            return std::unexpected(flow.error());
+        if (*flow == ParseFlow::Stop)
+            return ParseFlow::Stop;
+    }
+    return ParseFlow::Continue;
+}
+
 /// Parse a whole argument vector against an option table.
 /// @param table The rows to match against.
 /// @param args The arguments, with the program name already removed.
@@ -246,15 +308,18 @@ template <typename Result>
                                                               std::span<char const* const> args)
 {
     Result result {};
-    for (std::size_t i = 0; i < args.size(); ++i)
-    {
-        auto const flow = ApplyOneOption(table, args, i, result);
-        if (!flow.has_value())
-            return std::unexpected(flow.error());
-        if (*flow == ParseFlow::Stop)
-            break;
-    }
-    return result;
+    return ParseOptionsInto(table, args, result).transform([&result](ParseFlow) { return std::move(result); });
+}
+
+/// Append one help row per option, deriving both columns from the row.
+/// @param rows Destination.
+/// @param table The options to document, in table order.
+template <typename Result>
+void AddOptionRows(UsageRows& rows, std::span<OptionSpec<Result> const> table)
+{
+    rows.Reserve(table.size());
+    for (auto const& spec: table)
+        rows.Add(RenderFlagForms(spec), spec.description);
 }
 
 } // namespace FastCache

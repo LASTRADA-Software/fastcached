@@ -154,6 +154,14 @@ TEST_CASE("every documented flag is an accepted flag", "[config][cli][options][h
     // Direction two: nothing in the option column is undocumented prose or a
     // flag the parser would reject.
     auto const usage = CliUsage();
+
+    // Rendered once: rebuilding every row's forms inside the scan would be a
+    // quadratic pile of throwaway strings.
+    std::vector<std::string> forms;
+    forms.reserve(CliOptions().size());
+    for (auto const& spec: CliOptions())
+        forms.push_back(RenderFlagForms(spec));
+
     auto documented = std::size_t { 0 };
     for (auto const& line: std::views::split(std::string_view { usage }, '\n'))
     {
@@ -162,8 +170,7 @@ TEST_CASE("every documented flag is an accepted flag", "[config][cli][options][h
             continue;
         ++documented;
         auto const term = text.substr(2, text.find("  ", 2) - 2);
-        auto const known =
-            std::ranges::any_of(CliOptions(), [term](auto const& spec) { return RenderFlagForms(spec) == term; });
+        auto const known = std::ranges::contains(forms, term);
         INFO("documented term: " << term);
         CHECK(known);
     }

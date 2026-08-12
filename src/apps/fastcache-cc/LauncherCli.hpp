@@ -31,9 +31,12 @@ enum class Action : std::uint8_t
 /// One accepted flag.
 ///
 /// This is the single source of truth for the CLI: `ParseTopLevel` matches
-/// against these rows and `PrintHelp` renders its synopsis from them, so a flag
+/// against these rows and `HelpText` renders its synopsis from them, so a flag
 /// cannot be accepted without also being documented. Adding a flag is adding a
 /// row.
+///
+/// Distinct from the shared `OptionSpec` because the launcher's flags carry
+/// several aliases each and select an `Action` rather than writing a field.
 struct FlagSpec
 {
     Action action;                             ///< What the flag selects.

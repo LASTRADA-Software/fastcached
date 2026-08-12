@@ -119,8 +119,8 @@ struct Config
 /// @return The value, or `fallback`.
 [[nodiscard]] std::string EnvOr(std::string_view name, std::string_view fallback)
 {
-    auto const value = FastCache::ReadEnvironmentVariable(name);
-    return value.has_value() && !value->empty() ? *value : std::string { fallback };
+    auto value = FastCache::ReadEnvironmentVariable(name);
+    return value.has_value() && !value->empty() ? std::move(*value) : std::string { fallback };
 }
 
 /// Whether an environment variable is set (to any non-empty value).
