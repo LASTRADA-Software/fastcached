@@ -154,7 +154,7 @@ TEST_CASE("every documented flag is an accepted flag", "[config][cli][options][h
     // Direction two: nothing in the option column is undocumented prose or a
     // flag the parser would reject.
     auto const usage = CliUsage();
-    auto documented = 0;
+    auto documented = std::size_t { 0 };
     for (auto const& line: std::views::split(std::string_view { usage }, '\n'))
     {
         std::string_view const text { line.begin(), line.end() };
@@ -167,7 +167,7 @@ TEST_CASE("every documented flag is an accepted flag", "[config][cli][options][h
         INFO("documented term: " << term);
         CHECK(known);
     }
-    CHECK(documented == static_cast<int>(CliOptions().size()));
+    CHECK(documented == CliOptions().size());
 }
 
 TEST_CASE("every row parses its sample value", "[config][cli][options]")
