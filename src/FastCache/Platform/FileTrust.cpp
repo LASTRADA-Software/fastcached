@@ -214,7 +214,7 @@ namespace
         if (::stat(path.c_str(), &info) != 0)
             return false;
 
-        return info.st_uid == 0 && (info.st_mode & (static_cast<::mode_t>(S_IWGRP) | S_IWOTH)) == 0;
+        return info.st_uid == 0 && (info.st_mode & static_cast<::mode_t>(S_IWGRP | S_IWOTH)) == 0;
     }
 
 #endif

@@ -73,12 +73,8 @@ struct ConfigError
     {
         // The name, not the number: an operator reading "code=9" out of a
         // startup failure learns nothing the enum already spells out.
-        return std::format("ConfigError(code={} source={}:{} field={} context={})",
-                           ToStringView(code),
-                           source,
-                           line,
-                           field,
-                           context);
+        return std::format(
+            "ConfigError(code={} source={}:{} field={} context={})", ToStringView(code), source, line, field, context);
     }
 };
 

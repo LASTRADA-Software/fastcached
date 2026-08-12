@@ -10,12 +10,12 @@
 #include <format>
 #include <fstream>
 #include <functional>
-#include <iterator>
 #include <map>
 #include <optional>
 #include <random>
 #include <ranges>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -200,8 +200,15 @@ void WriteFile(std::filesystem::path const& path, std::string_view text)
 /// @return Its full contents.
 [[nodiscard]] std::string ReadFile(std::filesystem::path const& path)
 {
+    // Via the stream buffer rather than istreambuf_iterator: GCC inlines the
+    // iterator's sbumpc() far enough to see a path where the buffer pointer
+    // could be null and rejects it under -Werror=null-dereference, which for an
+    // ifstream it never is. Inserting a streambuf* handles null by setting
+    // failbit, so there is nothing for it to complain about.
     std::ifstream in { path, std::ios::binary };
-    return std::string { std::istreambuf_iterator<char> { in }, std::istreambuf_iterator<char> {} };
+    std::ostringstream out;
+    out << in.rdbuf();
+    return std::move(out).str();
 }
 
 } // namespace
@@ -300,14 +307,18 @@ TEST_CASE("DefaultConfigPath: a machine-wide candidate a non-admin could have wr
 
     FakeProbe probe;
     probe.SetAllBaseVars();
-    auto const systemPath = ExpandConfigCandidate(*systemRow, probe);
-    REQUIRE(systemPath.has_value());
+
+    // value_or rather than a dereference after REQUIRE: Catch2's macros are
+    // opaque to clang-tidy's optional analysis, so an empty path is the way to
+    // say "expansion failed" in a form it can follow. Same everywhere below.
+    auto const systemPath = ExpandConfigCandidate(*systemRow, probe).value_or(std::filesystem::path {});
+    REQUIRE_FALSE(systemPath.empty());
 
     // Readable, and the only candidate there is — but in a directory anyone can
     // write, which is how a standard account plants the configuration that a
     // LocalSystem service would then obey.
-    probe.MakeReadable(*systemPath);
-    probe.MakeUntrusted(*systemPath);
+    probe.MakeReadable(systemPath);
+    probe.MakeUntrusted(systemPath);
 
     auto const resolved = ResolveDefaultConfigPath(probe);
     REQUIRE(resolved.path.empty()); // built-in defaults, not the planted file
@@ -315,11 +326,11 @@ TEST_CASE("DefaultConfigPath: a machine-wide candidate a non-admin could have wr
     // And loudly: this is the one skip the operator has to be told about, since
     // the file is sitting right there and being ignored.
     REQUIRE(resolved.rejected.size() == 1);
-    REQUIRE(resolved.rejected.front().path == *systemPath);
+    REQUIRE(resolved.rejected.front().path == systemPath);
     REQUIRE_FALSE(resolved.rejected.front().reason.empty());
 
     // The message has to be actionable, so it names the directory at fault.
-    REQUIRE(resolved.rejected.front().reason.find(systemPath->parent_path().string()) != std::string::npos);
+    REQUIRE(resolved.rejected.front().reason.contains(systemPath.parent_path().string()));
 }
 
 TEST_CASE("DefaultConfigPath: the trust rule applies to machine-wide rows only", "[config][defaultpath][trust]")
@@ -329,17 +340,17 @@ TEST_CASE("DefaultConfigPath: the trust rule applies to machine-wide rows only",
 
     FakeProbe probe;
     probe.SetAllBaseVars();
-    auto const userPath = ExpandConfigCandidate(*userRow, probe);
-    REQUIRE(userPath.has_value());
+    auto const userPath = ExpandConfigCandidate(*userRow, probe).value_or(std::filesystem::path {});
+    REQUIRE_FALSE(userPath.empty());
 
     // A per-user config lives in the account's own directory, so "someone other
     // than an administrator can write here" is its normal state, not a finding.
     // Checking it would reject every per-user config on every platform.
-    probe.MakeReadable(*userPath);
-    probe.MakeUntrusted(*userPath);
+    probe.MakeReadable(userPath);
+    probe.MakeUntrusted(userPath);
 
     auto const resolved = ResolveDefaultConfigPath(probe);
-    REQUIRE(resolved.path == *userPath);
+    REQUIRE(resolved.path == userPath);
     REQUIRE(resolved.rejected.empty());
 }
 
@@ -352,15 +363,15 @@ TEST_CASE("DefaultConfigPath: an untrusted machine-wide row does not shadow a go
 
     auto const* const systemRow = SystemCandidate();
     REQUIRE(systemRow != nullptr);
-    auto const systemPath = ExpandConfigCandidate(*systemRow, probe);
-    REQUIRE(systemPath.has_value());
+    auto const systemPath = ExpandConfigCandidate(*systemRow, probe).value_or(std::filesystem::path {});
+    REQUIRE_FALSE(systemPath.empty());
 
     // Every candidate readable, the machine-wide one untrusted. The user row
     // outranks it anyway, so the rejection must not be reported: nothing was
     // withheld from the operator, because that file was never going to be used.
     for (auto const& path: paths)
         probe.MakeReadable(path);
-    probe.MakeUntrusted(*systemPath);
+    probe.MakeUntrusted(systemPath);
 
     auto const resolved = ResolveDefaultConfigPath(probe);
     REQUIRE(resolved.path == paths.front());
@@ -399,9 +410,7 @@ TEST_CASE("DefaultConfigPath: a candidate with no base variable is used verbatim
     }
 
     FakeProbe const probe; // Deliberately empty: the row must not consult it.
-    auto const path = ExpandConfigCandidate(*absolute, probe);
-    REQUIRE(path.has_value());
-    REQUIRE(*path == std::filesystem::path { absolute->suffix });
+    REQUIRE(ExpandConfigCandidate(*absolute, probe) == std::optional { std::filesystem::path { absolute->suffix } });
 }
 
 TEST_CASE("DefaultConfigPath: SystemConfigPath names the machine-wide file even when absent", "[config][defaultpath]")
@@ -440,7 +449,7 @@ TEST_CASE("DefaultConfigPath: SystemConfigPath reports the variable it could not
     auto const system = SystemConfigPath(probe);
     REQUIRE(!system.has_value());
     REQUIRE(system.error().code == ConfigErrorCode::UndefinedVariable);
-    REQUIRE(system.error().context.find(systemRow->baseVar) != std::string::npos);
+    REQUIRE(system.error().context.contains(systemRow->baseVar));
 }
 
 TEST_CASE("DefaultConfigPath: the platform's locations are the ones the packaging installs", "[config][defaultpath]")
@@ -531,7 +540,7 @@ TEST_CASE("SeedConfigFile: AdministratorsOnly either secures the directory or re
         REQUIRE_FALSE(std::filesystem::exists(destination));
 
         // And the message has to say what to do about it.
-        REQUIRE(result.error().context.find("administrative rights") != std::string::npos);
+        REQUIRE(result.error().context.contains("administrative rights"));
         return;
     }
 
@@ -602,10 +611,9 @@ TEST_CASE("SystemConfigPathProbe: a directory a standard account can write is no
     // and create-folder, inherited by every subdirectory, so this test performs
     // the exact setup the check exists to refuse — and performs it with no
     // privileges at all, which is the reason it has to be refused.
-    auto const programData = FastCache::ReadEnvironmentVariable("ProgramData");
-    REQUIRE(programData.has_value());
-    REQUIRE(!programData->empty());
-    TempDir const squat { "trust-loose", std::filesystem::path { *programData } };
+    auto const programData = FastCache::ReadEnvironmentVariable("ProgramData").value_or(std::string {});
+    REQUIRE_FALSE(programData.empty());
+    TempDir const squat { "trust-loose", std::filesystem::path { programData } };
 #else
     // The POSIX shape of the same thing. 0777 rather than merely
     // non-root-owned, so the case still holds when the suite runs as root —
@@ -631,9 +639,9 @@ TEST_CASE("SystemConfigPathProbe: a file only administrators can replace is trus
     // If this ever stops being true the check has become useless, so asserting
     // against a real system path is the point rather than an inconvenience.
 #if defined(_WIN32)
-    auto const systemRoot = FastCache::ReadEnvironmentVariable("SystemRoot");
-    REQUIRE(systemRoot.has_value());
-    auto const wellKnown = std::filesystem::path { *systemRoot } / "System32/drivers/etc/hosts";
+    auto const systemRoot = FastCache::ReadEnvironmentVariable("SystemRoot").value_or(std::string {});
+    REQUIRE_FALSE(systemRoot.empty());
+    auto const wellKnown = std::filesystem::path { systemRoot } / "System32/drivers/etc/hosts";
 #else
     auto const wellKnown = std::filesystem::path { "/etc/hosts" };
 #endif
