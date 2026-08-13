@@ -22,7 +22,7 @@ ProtocolFlavor ClassifyFirstByte(std::byte first) noexcept
 {
     if (first == BinaryMagic)
         return ProtocolFlavor::MemcachedBinary;
-    if (first == CompileCacheMagic)
+    if (first == CompileCacheWire::Magic)
         return ProtocolFlavor::CompileCache;
     auto const c = static_cast<char>(first);
     switch (c)

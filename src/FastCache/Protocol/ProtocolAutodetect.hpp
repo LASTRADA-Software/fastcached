@@ -5,6 +5,7 @@
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Core/Errors/NetError.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -23,12 +24,8 @@ enum class ProtocolFlavor : std::uint8_t
     MemcachedText,
     MemcachedBinary, ///< Not yet implemented; recognised but currently treated like MemcachedText.
     RedisResp,       ///< Not yet implemented; recognised but currently treated like MemcachedText.
-    CompileCache,    ///< fastcached's own compile-cache binary protocol (magic 0xFC).
+    CompileCache,    ///< fastcached's own compile-cache binary protocol (CompileCacheWire::Magic).
 };
-
-/// First byte of the compile-cache protocol. Distinct from the memcached
-/// binary magic (0x80) and every RESP first byte, so autodetect can route it.
-inline constexpr std::byte CompileCacheMagic { 0xFC };
 
 /// Stable, lower-case name for a ProtocolFlavor, suitable for log output.
 /// @param flavor Flavor to translate.
