@@ -18,3 +18,11 @@ vcpkg_installed/
 callgrind.out.*
 perf.data*
 *.tracy
+
+# Local, untracked version override. The git tag is the single source of truth
+# for the version (cmake/Version.cmake); this file is ignored here so it cannot
+# be staged by accident, and `ctest -R repository-hygiene` fails outright if it
+# is ever tracked again — a committed version carrier is exactly what stopped the
+# tag being the source of truth once before. Ignoring it is the ergonomics; the
+# test is the enforcement.
+version.txt
