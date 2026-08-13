@@ -130,7 +130,17 @@ std::string ComputeKey(KeyInputs const& inputs)
 {
     // Serialise the inputs into one blob with unambiguous separators, then take
     // four independent CRC32C lanes over it for a 128-bit key.
+    //
+    // The leading schema tag is what makes a future format change safe. Nothing
+    // else in this key describes how the stored value is framed or canonicalized,
+    // so without it a change to either would leave old entries matching new keys
+    // and being served under rules they were not written by — a silent
+    // mis-serve, which presents as a mysterious hit-rate collapse rather than as
+    // a miss. Bumping the tag re-keys the cache instead, so stale entries simply
+    // miss and are rewritten. Mirrors ComputeManifestKey's "manifest-v1".
     std::string blob;
+    blob += "objkey-v1";
+    blob.push_back('\x00');
     blob += inputs.compilerId;
     blob.push_back('\x00');
     blob += inputs.preprocessed;
