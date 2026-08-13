@@ -33,6 +33,40 @@ include(Catch)
 catch_discover_tests(FastCacheTest)
 
 # ---------------------------------------------------------------------------
+# Repository hygiene. Fails when a path that must never be committed is tracked
+# by git. Today that is version.txt, whose committed presence outranked every git
+# tag and pinned every build, every wire banner and every package to whatever it
+# said. scripts/check-repository-hygiene.cmake carries the table of forbidden
+# paths and the reason each one is forbidden, and prints the reason on failure.
+#
+# Deliberately NOT labelled "smoke": it starts no daemon, opens no socket and
+# needs no compiler, so it belongs in the default `ctest` set and must survive
+# `ctest -LE smoke`. It finishes in milliseconds.
+#
+# GIT_EXECUTABLE is located by cmake/Version.cmake and passed in rather than
+# looked up again, so the check and the version resolution cannot disagree about
+# which git they mean.
+add_test(
+    NAME "repository-hygiene"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-repository-hygiene.cmake"
+)
+# An exported source tarball has no git index to inspect, and the script reports
+# that by printing `SKIP: ...` and exiting 0. SKIP_REGULAR_EXPRESSION and not the
+# SKIP_RETURN_CODE 77 the drivers below use, because a `cmake -P` script cannot
+# choose its own exit code before CMake 3.29 (cmake_language(EXIT)) while this
+# project supports 3.28 — a SKIP_RETURN_CODE it could never return would be
+# decoration. See the script header. TIMEOUT 60 rather than CTest's 1500s
+# default: a wedged git should report in a minute, not stall the suite.
+set_tests_properties("repository-hygiene" PROPERTIES
+    LABELS "hygiene"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # sccache smoke tests. Registered only when an sccache binary is present
 # (SCCACHE is the find_program result from cmake/CompileCache.cmake). Each test starts
 # the freshly-built fastcached, points sccache at it over one wire protocol,
