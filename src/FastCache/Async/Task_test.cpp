@@ -18,7 +18,9 @@ struct NeverCompletes
     {
         return false;
     }
-    void await_suspend(std::coroutine_handle<>) const noexcept {}
+    // The handle is deliberately dropped: nothing ever resumes this awaitable,
+    // which is the whole point of the fixture.
+    void await_suspend(std::coroutine_handle<> /*awaiting*/) const noexcept {}
     void await_resume() const noexcept {}
 };
 
