@@ -16,8 +16,7 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <tuple>
-#include <utility>
+#include <system_error>
 #include <vector>
 
 namespace FastCache
@@ -25,13 +24,6 @@ namespace FastCache
 
 namespace
 {
-
-    [[nodiscard]] ConfigError MakeError(ConfigErrorCode code, std::string field, std::string context)
-    {
-        return ConfigError {
-            .code = code, .source = "argv", .line = 0, .field = std::move(field), .context = std::move(context)
-        };
-    }
 
     /// Re-stamp the `source` of an error produced by a lower layer as "argv".
     [[nodiscard]] ConfigError WithArgvSource(ConfigError err)
@@ -49,10 +41,10 @@ namespace
     [[nodiscard]] std::expected<std::string, ConfigError> ParseBindAddress(std::string_view sv)
     {
         if (sv.empty())
-            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, "bind", "empty bind address"));
+            return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, "bind", "empty bind address"));
         if (std::ranges::any_of(sv, [](char c) { return c == ' ' || c == '\t' || static_cast<unsigned char>(c) < 0x20; }))
             return std::unexpected(
-                MakeError(ConfigErrorCode::TypeMismatch, "bind", std::format("invalid characters in bind address: {}", sv)));
+                ArgvError(ConfigErrorCode::TypeMismatch, "bind", std::format("invalid characters in bind address: {}", sv)));
         return std::string { sv };
     }
 
@@ -74,12 +66,12 @@ namespace
     [[nodiscard]] std::expected<std::size_t, ConfigError> ParsePositiveInt(std::string_view sv, std::string_view field)
     {
         if (sv.empty())
-            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, std::string { field }, "empty value"));
+            return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, std::string { field }, "empty value"));
         std::size_t value = 0;
         auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value);
         if (ec != std::errc {} || ptr != sv.data() + sv.size())
             return std::unexpected(
-                MakeError(ConfigErrorCode::TypeMismatch, std::string { field }, std::format("not a number: {}", sv)));
+                ArgvError(ConfigErrorCode::TypeMismatch, std::string { field }, std::format("not a number: {}", sv)));
         return value;
     }
 
@@ -99,7 +91,7 @@ namespace
         // against absurd or non-positive input; 1..65535 is plenty of headroom.
         return ParsePositiveInt(sv, "listen-backlog").and_then([](std::size_t value) -> std::expected<int, ConfigError> {
             if (value == 0 || value > 65535)
-                return std::unexpected(MakeError(
+                return std::unexpected(ArgvError(
                     ConfigErrorCode::OutOfRange, "listen-backlog", std::format("out of range (1..65535): {}", value)));
             return static_cast<int>(value);
         });
@@ -114,7 +106,7 @@ namespace
         if (sv == "none")
             return StorageDurability::None;
         return std::unexpected(
-            MakeError(ConfigErrorCode::OutOfRange, "storage-durability", std::format("unknown durability mode: {}", sv)));
+            ArgvError(ConfigErrorCode::OutOfRange, "storage-durability", std::format("unknown durability mode: {}", sv)));
     }
 
     [[nodiscard]] std::expected<LruRecency, ConfigError> ParseLruRecency(std::string_view sv)
@@ -123,7 +115,7 @@ namespace
             return LruRecency::Approximate;
         if (sv == "strict")
             return LruRecency::Strict;
-        return std::unexpected(MakeError(
+        return std::unexpected(ArgvError(
             ConfigErrorCode::OutOfRange, "lru-mode", std::format("unknown mode (expect approximate|strict): {}", sv)));
     }
 
@@ -133,7 +125,7 @@ namespace
             return CpuAffinity::None;
         if (sv == "per-core")
             return CpuAffinity::PerCore;
-        return std::unexpected(MakeError(
+        return std::unexpected(ArgvError(
             ConfigErrorCode::OutOfRange, "cpu-affinity", std::format("unknown mode (expect none|per-core): {}", sv)));
     }
 
@@ -141,11 +133,11 @@ namespace
     {
         auto const codec = Compression::CodecFromName(sv);
         if (!codec.has_value())
-            return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
+            return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange,
                                              "compression",
                                              std::format("unknown codec (expect {}): {}", Compression::NameList(), sv)));
         if (!Compression::IsAvailable(*codec))
-            return std::unexpected(MakeError(
+            return std::unexpected(ArgvError(
                 ConfigErrorCode::OutOfRange,
                 "compression",
                 std::format("codec '{}' is not available in this build (rebuild with FASTCACHED_ENABLE_COMPRESSION)", sv)));
@@ -158,7 +150,7 @@ namespace
         // guard so an absurd value is rejected up front.
         return ParsePositiveInt(sv, "compression-level").and_then([](std::size_t value) -> std::expected<int, ConfigError> {
             if (value == 0 || value > 22)
-                return std::unexpected(MakeError(
+                return std::unexpected(ArgvError(
                     ConfigErrorCode::OutOfRange, "compression-level", std::format("out of range (1..22): {}", value)));
             return static_cast<int>(value);
         });
@@ -183,7 +175,7 @@ namespace
             return LogLevel::Error;
         if (sv == "fatal")
             return LogLevel::Fatal;
-        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, "log-level", std::format("unknown level: {}", sv)));
+        return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "log-level", std::format("unknown level: {}", sv)));
     }
 
     /// Parse a `--listen` / `--listen-tls` argument into a `BindConfig`. The
@@ -197,7 +189,7 @@ namespace
     {
         if (sv.empty())
             return std::unexpected(
-                MakeError(ConfigErrorCode::TypeMismatch, tls ? "listen-tls" : "listen", "empty value (expected host:port)"));
+                ArgvError(ConfigErrorCode::TypeMismatch, tls ? "listen-tls" : "listen", "empty value (expected host:port)"));
         std::string_view host;
         std::string_view portText;
         if (sv.front() == '[')
@@ -206,7 +198,7 @@ namespace
             // a `:port` tail immediately after.
             auto const close = sv.find(']');
             if (close == std::string_view::npos || close + 1 >= sv.size() || sv[close + 1] != ':')
-                return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch,
+                return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch,
                                                  tls ? "listen-tls" : "listen",
                                                  std::format("malformed [ipv6]:port spec: {}", sv)));
             host = sv.substr(1, close - 1);
@@ -219,7 +211,7 @@ namespace
             // unbracketed IPv6 we reject (the standard requires brackets).
             auto const colon = sv.rfind(':');
             if (colon == std::string_view::npos)
-                return std::unexpected(MakeError(
+                return std::unexpected(ArgvError(
                     ConfigErrorCode::TypeMismatch, tls ? "listen-tls" : "listen", std::format("missing :port in: {}", sv)));
             host = sv.substr(0, colon);
             portText = sv.substr(colon + 1);
@@ -229,7 +221,7 @@ namespace
             // above promises rejection; the code now matches.
             if (host.contains(':'))
                 return std::unexpected(
-                    MakeError(ConfigErrorCode::TypeMismatch,
+                    ArgvError(ConfigErrorCode::TypeMismatch,
                               tls ? "listen-tls" : "listen",
                               std::format("IPv6 literal requires brackets: [{}]:port (got: {})", host, sv)));
         }
@@ -242,465 +234,289 @@ namespace
         return BindConfig { .address = *address, .port = *port, .tls = tls };
     }
 
-    [[nodiscard]] bool FlagMatches(std::string_view arg, std::string_view name) noexcept
+    /// `ParseListenSpec` bound to one listener kind, so the two repeatable flags
+    /// share one parser and differ only by the row that names them — and by a
+    /// template argument rather than by a second copy of this body.
+    /// @tparam Tls Whether the listener terminates TLS.
+    /// @param sv The flag's value text.
+    /// @return The BindConfig on success; ConfigError otherwise.
+    template <bool Tls>
+    [[nodiscard]] std::expected<BindConfig, ConfigError> ParseListen(std::string_view sv)
     {
-        if (arg == name)
-            return true;
-        return arg.starts_with(std::string { name } + "=");
+        return ParseListenSpec(sv, Tls);
     }
 
-    /// Pull the value out of `args[i]` for a `--flag=value` or `--flag value`
-    /// shape, advancing i past the value if it's a separate argv element.
-    [[nodiscard]] std::expected<std::string_view, ConfigError> TakeValue(std::span<char const* const> args,
-                                                                         std::size_t& i,
-                                                                         std::string_view flag)
-    {
-        auto const arg = std::string_view { args[i] };
-        if (auto const eq = arg.find('='); eq != std::string_view::npos)
-            return arg.substr(eq + 1);
-        if (i + 1 >= args.size())
-            return std::unexpected(MakeError(ConfigErrorCode::ParseError, std::string { flag }, "missing value"));
-        ++i;
-        return std::string_view { args[i] };
-    }
-
-    /// Per-arg dispatch outcome.
-    enum class ArgOutcome : std::uint8_t
-    {
-        Continue,    ///< Argument handled; loop continues.
-        ShowHelp,    ///< Caller should return CliOutcome::ShowHelp.
-        ShowVersion, ///< Caller should return CliOutcome::ShowVersion.
-        Unknown,     ///< Argument not recognised by any handler.
-    };
-
-    /// Apply a string-valued flag to a Config field if it matches. Returns
-    /// std::nullopt when the flag does not match (so the dispatcher can try
-    /// the next handler).
-    [[nodiscard]] std::expected<bool, ConfigError> ApplyStringFlag(std::span<char const* const> args,
-                                                                   std::size_t& i,
-                                                                   std::string_view flagName,
-                                                                   std::string& target)
-    {
-        if (!FlagMatches(std::string_view { args[i] }, flagName))
-            return false;
-        auto const value = TakeValue(args, i, flagName);
-        if (!value.has_value())
-            return std::unexpected(value.error());
-        target = std::string { *value };
-        return true;
-    }
-
-    /// Templated equivalent for typed (parsed) flags: --port, --max-memory,
-    /// --log-level.
-    template <typename Parser, typename Target>
-    [[nodiscard]] std::expected<bool, ConfigError> ApplyParsedFlag(
-        std::span<char const* const> args, std::size_t& i, std::string_view flagName, Parser parser, Target& target)
-    {
-        if (!FlagMatches(std::string_view { args[i] }, flagName))
-            return false;
-        auto const value = TakeValue(args, i, flagName);
-        if (!value.has_value())
-            return std::unexpected(value.error());
-        auto const parsed = parser(*value);
-        if (!parsed.has_value())
-            return std::unexpected(parsed.error());
-        target = *parsed;
-        return true;
-    }
-
-    /// Typed (parsed) flags: every one is `--flag=<value>` handled by a
-    /// dedicated parser writing into one target field.
+    /// Every accepted command-line option, in the order `--help` documents them.
     ///
-    /// Split out of HandleOneArg rather than inlined: seventeen structurally
-    /// identical blocks pushed that function past the cognitive-complexity
-    /// limit the project builds with, and the split keeps each function about
-    /// one kind of argument.
+    /// One row per flag, carrying its spelling, how it is parsed, which
+    /// "user typed this" tracker it flips, what it selects, and the help text
+    /// describing it. `ParseCli` interprets these rows and `CliUsage` renders
+    /// itself from the same ones, so the accepted spelling and the documented
+    /// spelling cannot drift apart.
     ///
-    /// @param args Full argument span.
-    /// @param i Index of the argument under inspection; advanced past a
-    ///          consumed `--flag value` pair.
-    /// @param cfg Config being populated.
-    /// @param result CliResult carrying the per-flag explicit trackers.
-    /// @return ArgOutcome::Continue when a flag matched, ArgOutcome::Unknown
-    ///         when none did, or a ConfigError when a value failed to parse.
-    [[nodiscard]] std::expected<ArgOutcome, ConfigError> HandleTypedFlag(std::span<char const* const> args,
-                                                                         std::size_t& i,
-                                                                         Config& cfg,
-                                                                         CliResult& result)
-    {
-        {
-            // Targets the CliResult, not the Config: the scope selects where the
-            // service is registered and has no meaning to a running daemon, so
-            // it takes no part in the YAML merge and carries no Explicit bit.
-            auto const matched = ApplyParsedFlag(args, i, "--service-scope", ParseServiceScope, result.serviceScope);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-                return ArgOutcome::Continue;
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--bind", ParseBindAddress, cfg.bindAddress);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.bindAddressExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--port", ParsePort, cfg.port);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.portExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--metrics-port", ParsePort, cfg.metricsPort);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.metricsPortExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--max-memory", ParseMaxMemory, cfg.maxMemoryBytes);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.maxMemoryBytesExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--log-level", ParseLogLevel, cfg.logLevel);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.logLevelExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched =
-                ApplyParsedFlag(args, i, "--storage-durability", ParseStorageDurability, cfg.storageDurability);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.storageDurabilityExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched =
-                ApplyParsedFlag(args, i, "--storage-max-value", ParseStorageMaxValue, cfg.storageMaxValueBytes);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.storageMaxValueBytesExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched =
-                ApplyParsedFlag(args, i, "--storage-max-disk", ParseStorageMaxDisk, cfg.storageMaxDiskBytes);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.storageMaxDiskBytesExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--lru-mode", ParseLruRecency, cfg.lruRecency);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.lruRecencyExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--cpu-affinity", ParseCpuAffinity, cfg.cpuAffinity);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.cpuAffinityExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--compression", ParseCompression, cfg.compression);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.compressionExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched =
-                ApplyParsedFlag(args, i, "--compression-level", ParseCompressionLevel, cfg.compressionLevel);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.compressionLevelExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched =
-                ApplyParsedFlag(args, i, "--compression-min-bytes", ParseCompressionMinBytes, cfg.compressionMinBytes);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.compressionMinBytesExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--threads", ParseThreads, cfg.workerThreads);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.workerThreadsExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--storage-shards", ParseStorageShards, cfg.storageShards);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.storageShardsExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        {
-            auto const matched = ApplyParsedFlag(args, i, "--listen-backlog", ParseListenBacklog, cfg.listenBacklog);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                result.listenBacklogExplicit = true;
-                return ArgOutcome::Continue;
-            }
-        }
-        return ArgOutcome::Unknown;
-    }
-
-    /// One flag that selects an alternative to running the daemon.
-    struct ActionFlag
-    {
-        std::string_view name; ///< Flag as typed, e.g. `--healthcheck`.
-        CliOutcome outcome;    ///< What the process should do instead of serving.
-
-        /// CliResult member the flag's argument lands in, or null when the flag
-        /// takes no value. Pointer-to-member rather than a raw `std::string*`
-        /// because the table is `constexpr`: there is no CliResult to point
-        /// into until one is being parsed.
-        std::string CliResult::* value;
-    };
-
-    /// The action-flag table. A fifth action is a row here plus an enumerator,
-    /// a `UsageOptions` entry, and an arm in main's switch — not a fourth
-    /// hand-written comparison in HandleOneArg.
-    constexpr auto ActionFlags = std::to_array<ActionFlag>({
-        { .name = "--install-service", .outcome = CliOutcome::InstallService, .value = nullptr },
-        { .name = "--uninstall-service", .outcome = CliOutcome::UninstallService, .value = nullptr },
-        { .name = "--healthcheck", .outcome = CliOutcome::HealthCheck, .value = nullptr },
-        { .name = "--seed-config", .outcome = CliOutcome::SeedConfig, .value = &CliResult::seedConfigTemplate },
+    /// Order is documentation order; it does not affect parsing. All primaries
+    /// are distinct, and a value flag only claims an argument that continues
+    /// with `=`, so a longer flag (`--listen-tls`) can never be swallowed by a
+    /// shorter prefix of it (`--listen`).
+    constexpr auto Options = std::to_array<OptionSpec<CliResult>>({
+        { .primary = "--config",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&Config::configPath, ParseText>(),
+          .description = "YAML config file; CLI flags override file values.\n"
+                         "Without it, the first of these that exists and is readable is used:\n"
+                         "{config-defaults}" },
+        { .primary = "--bind",
+          .arity = Arity::Value,
+          .operand = "=<addr>",
+          .apply = AssignFrom<&Config::bindAddress, ParseBindAddress>(),
+          .explicitBit = &CliResult::bindAddressExplicit,
+          .description = "bind address: IPv4/IPv6 literal or hostname; '::' is dual-stack (default 127.0.0.1)" },
+        { .primary = "--port",
+          .arity = Arity::Value,
+          .operand = "=<num>",
+          .apply = AssignFrom<&Config::port, ParsePort>(),
+          .explicitBit = &CliResult::portExplicit,
+          .description = "TCP port (default {port}); every protocol is auto-detected on it" },
+        { .primary = "--max-memory",
+          .arity = Arity::Value,
+          .operand = "=<size>",
+          .apply = AssignFrom<&Config::maxMemoryBytes, ParseMaxMemory>(),
+          .explicitBit = &CliResult::maxMemoryBytesExplicit,
+          .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)" },
+        { .primary = "--log-level",
+          .arity = Arity::Value,
+          .operand = "=<level>",
+          .apply = AssignFrom<&Config::logLevel, ParseLogLevel>(),
+          .explicitBit = &CliResult::logLevelExplicit,
+          .description = "trace|debug|info|warn|error|fatal (default info)" },
+        { .primary = "--requirepass",
+          .arity = Arity::Value,
+          .operand = "=<secret>",
+          .apply = AssignFrom<&Config::requirePass, ParseText>(),
+          .explicitBit = &CliResult::requirePassExplicit,
+          .description = "require clients to authenticate with this shared secret (default: no auth)\n"
+                         "redis: AUTH; memcached binary: SASL PLAIN; memcached text has no auth" },
+        { .primary = "--auth-username",
+          .arity = Arity::Value,
+          .operand = "=<name>",
+          .apply = AssignFrom<&Config::authUsername, ParseText>(),
+          .explicitBit = &CliResult::authUsernameExplicit,
+          .description = "username for the AUTH <user> <pass> / SASL PLAIN form (default 'default')" },
+        { .primary = "--metrics",
+          .apply = SetTrue<&Config::metricsEnabled>(),
+          .explicitBit = &CliResult::metricsEnabledExplicit,
+          .description = "serve Prometheus /metrics and /healthz on a dedicated HTTP port (default off)" },
+        { .primary = "--metrics-bind",
+          .arity = Arity::Value,
+          .operand = "=<addr>",
+          .apply = AssignFrom<&Config::metricsBindAddress, ParseText>(),
+          .explicitBit = &CliResult::metricsBindAddressExplicit,
+          .description = "bind address for the metrics endpoint (default 127.0.0.1)" },
+        { .primary = "--metrics-port",
+          .arity = Arity::Value,
+          .operand = "=<num>",
+          .apply = AssignFrom<&Config::metricsPort, ParsePort>(),
+          .explicitBit = &CliResult::metricsPortExplicit,
+          .description = "TCP port for the metrics endpoint (default {metrics-port})" },
+        { .primary = "--tls",
+          .apply = SetTrue<&Config::tlsEnabled>(),
+          .explicitBit = &CliResult::tlsEnabledExplicit,
+          .description = "terminate TLS on the cache port (default off; needs a build with OpenSSL\n"
+                         "and both --tls-cert and --tls-key)" },
+        { .primary = "--tls-cert",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&Config::tlsCertPath, ParseText>(),
+          .explicitBit = &CliResult::tlsCertPathExplicit,
+          .description = "PEM certificate (chain) file for --tls / --listen-tls" },
+        { .primary = "--tls-key",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&Config::tlsKeyPath, ParseText>(),
+          .explicitBit = &CliResult::tlsKeyPathExplicit,
+          .description = "PEM private key file for --tls / --listen-tls" },
+        { .primary = "--listen",
+          .arity = Arity::Value,
+          .operand = "=<host:port>",
+          .apply = AppendFrom<&Config::binds, ParseListen<false>>(),
+          .description = "additional plaintext listener; repeatable. Use [::1]:{port} for IPv6 literals.\n"
+                         "When given, supersedes --bind/--port — every endpoint must be listed.\n"
+                         "Also how to keep serving legacy clients: add their port here." },
+        { .primary = "--listen-tls",
+          .arity = Arity::Value,
+          .operand = "=<host:port>",
+          .apply = AppendFrom<&Config::binds, ParseListen<true>>(),
+          .description = "additional TLS listener; repeatable. Shares --tls-cert / --tls-key.\n"
+                         "Needs a build with OpenSSL (FC_TLS_ENABLED)" },
+        { .primary = "--notify-keyspace-events",
+          .arity = Arity::Value,
+          .operand = "=<flags>",
+          .apply = AssignFrom<&Config::notifyKeyspaceEvents, ParseText>(),
+          .explicitBit = &CliResult::notifyKeyspaceEventsExplicit,
+          .description = "redis-style keyspace-event flag string; empty = off (default).\n"
+                         "K=__keyspace, E=__keyevent, g=generic (del/expire/persist),\n"
+                         "$=string (set/incr*), A=alias for g$\n"
+                         "(x=expired is not yet wired — rejected pending storage callback)" },
+        { .primary = "--log-timestamps",
+          .apply = SetTrue<&Config::logTimestamps>(),
+          .explicitBit = &CliResult::logTimestampsExplicit,
+          .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)" },
+        { .primary = "--log-source",
+          .apply = SetTrue<&Config::logSource>(),
+          .explicitBit = &CliResult::logSourceExplicit,
+          .description = "prefix every connection log line with the client IP (default off)" },
+        { .primary = "--log-everything",
+          .apply = SetTrue<&Config::logEverything>(),
+          .explicitBit = &CliResult::logEverythingExplicit,
+          .description = "include keepalive/admin commands (PING, HELLO, ...) in the trace command log, not just "
+                         "keyspace data operations (default off)" },
+        { .primary = "--storage",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&Config::storagePath, ParseText>(),
+          .explicitBit = &CliResult::storagePathExplicit,
+          .description = "persist cache to a CoW-tree file (default: in-memory only)" },
+        { .primary = "--storage-durability",
+          .arity = Arity::Value,
+          .operand = "=<mode>",
+          .apply = AssignFrom<&Config::storageDurability, ParseStorageDurability>(),
+          .explicitBit = &CliResult::storageDurabilityExplicit,
+          .description = "fsync|batched|none for --storage (default batched)" },
+        { .primary = "--storage-max-value",
+          .arity = Arity::Value,
+          .operand = "=<size>",
+          .apply = AssignFrom<&Config::storageMaxValueBytes, ParseStorageMaxValue>(),
+          .explicitBit = &CliResult::storageMaxValueBytesExplicit,
+          .description = "per-value byte cap for --storage; k/m/g suffixes accepted (default 16m).\n"
+                         "also raises the wire frame-payload cap, so compile caches storing\n"
+                         "large object files need this set above their biggest object" },
+        { .primary = "--storage-max-disk",
+          .arity = Arity::Value,
+          .operand = "=<size>",
+          .apply = AssignFrom<&Config::storageMaxDiskBytes, ParseStorageMaxDisk>(),
+          .explicitBit = &CliResult::storageMaxDiskBytesExplicit,
+          .description = "cap the on-disk (L2) tier for --storage; the CoW tree evicts its LRU tail to fit "
+                         "(default 0 = unbounded). k/m/g suffixes accepted" },
+        { .primary = "--compression",
+          .arity = Arity::Value,
+          .operand = "=<codec>",
+          .apply = AssignFrom<&Config::compression, ParseCompression>(),
+          .explicitBit = &CliResult::compressionExplicit,
+          .description = "on-disk value codec for --storage: none|lz4|zstd (default zstd)\n"
+                         "reads always return plaintext; each record decodes by its own tag" },
+        { .primary = "--compression-level",
+          .arity = Arity::Value,
+          .operand = "=<N>",
+          .apply = AssignFrom<&Config::compressionLevel, ParseCompressionLevel>(),
+          .explicitBit = &CliResult::compressionLevelExplicit,
+          .description = "codec effort level for --compression (1..22; default 3, zstd)" },
+        { .primary = "--compression-min-bytes",
+          .arity = Arity::Value,
+          .operand = "=<size>",
+          .apply = AssignFrom<&Config::compressionMinBytes, ParseCompressionMinBytes>(),
+          .explicitBit = &CliResult::compressionMinBytesExplicit,
+          .description = "skip compression for values smaller than this; k/m/g accepted (default 256)" },
+        { .primary = "--lru-mode",
+          .arity = Arity::Value,
+          .operand = "=<mode>",
+          .apply = AssignFrom<&Config::lruRecency, ParseLruRecency>(),
+          .explicitBit = &CliResult::lruRecencyExplicit,
+          .description = "approximate|strict in-memory LRU recency (default approximate)\n"
+                         "approximate: same-shard reads run concurrently (faster);\n"
+                         "strict: exact LRU order, reads serialise per shard" },
+        { .primary = "--cpu-affinity",
+          .arity = Arity::Value,
+          .operand = "=<mode>",
+          .apply = AssignFrom<&Config::cpuAffinity, ParseCpuAffinity>(),
+          .explicitBit = &CliResult::cpuAffinityExplicit,
+          .description = "none|per-core reactor thread pinning (default per-core)\n"
+                         "per-core: pin each reactor to its own core (multi-reactor only)" },
+        { .primary = "--threads",
+          .arity = Arity::Value,
+          .operand = "=<N>",
+          .apply = AssignFrom<&Config::workerThreads, ParseThreads>(),
+          .explicitBit = &CliResult::workerThreadsExplicit,
+          .description = "number of independent pinned reactors to run (default hardware_concurrency);\n"
+                         "each is a single-threaded event loop, so this is the server's across-core parallelism" },
+        { .primary = "--listen-backlog",
+          .arity = Arity::Value,
+          .operand = "=<N>",
+          .apply = AssignFrom<&Config::listenBacklog, ParseListenBacklog>(),
+          .explicitBit = &CliResult::listenBacklogExplicit,
+          .description = "::listen() backlog depth (default 511; clamped to the kernel's SOMAXCONN)" },
+        { .primary = "--storage-shards",
+          .arity = Arity::Value,
+          .operand = "=<N>",
+          .apply = AssignFrom<&Config::storageShards, ParseStorageShards>(),
+          .explicitBit = &CliResult::storageShardsExplicit,
+          .description = "shard storage into N partitions for write parallelism\n"
+                         "default: 1 (single-file mode) when --storage names a regular file,\n"
+                         "min(16, hardware_concurrency) otherwise;\n"
+                         "when N>1 and --storage is set, --storage must be a directory" },
+        { .primary = "--daemon",
+          .apply = SetTrue<&Config::daemon>(),
+          .description = "daemonize (POSIX) / run under the Windows SCM (used by the installed service)" },
+        // Action flags select what the process does *instead* of running the
+        // daemon, but deliberately keep parsing: the remaining flags are
+        // captured into the config that gets baked into the service command line.
+        { .primary = "--install-service",
+          .select = SelectOutcome<&CliResult::outcome, CliOutcome::InstallService>(),
+          .description = "register fastcached to start automatically: a Windows SCM service, or a\n"
+                         "macOS launchd job (see --service-scope). Other flags are baked in.\n"
+                         "Windows needs an elevated prompt; --service-scope=system needs sudo" },
+        { .primary = "--uninstall-service",
+          .select = SelectOutcome<&CliResult::outcome, CliOutcome::UninstallService>(),
+          .description = "remove the registration made by --install-service (same privileges)" },
+        // Targets the CliResult, not the Config: the scope selects where the
+        // service is registered and has no meaning to a running daemon, so it
+        // takes no part in the YAML merge and carries no explicit bit.
+        { .primary = "--service-scope",
+          .arity = Arity::Value,
+          .operand = "=<user|system>",
+          .apply = AssignFrom<&CliResult::serviceScope, ParseServiceScope>(),
+          .description = "macOS only: which launchd domain --install-service acts on.\n"
+                         "user (default) = a LaunchAgent in ~/Library/LaunchAgents, started at\n"
+                         "login as you; system = a LaunchDaemon in /Library/LaunchDaemons,\n"
+                         "started at boot as _fastcached (needs sudo)" },
+        { .primary = "--healthcheck",
+          .select = SelectOutcome<&CliResult::outcome, CliOutcome::HealthCheck>(),
+          .description = "probe http://127.0.0.1:<metrics-port>/healthz and exit 0 (healthy) or 1\n"
+                         "(self-contained container HEALTHCHECK; needs --metrics on the daemon)" },
+        { .primary = "--seed-config",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&CliResult::seedConfigTemplate, ParseText>(),
+          .select = SelectOutcome<&CliResult::outcome, CliOutcome::SeedConfig>(),
+          .description = "copy <path> to the machine-wide config location, but only when no\n"
+                         "config is there yet, then exit (used by the installer; needs the\n"
+                         "same privileges as writing that location)" },
+        { .primary = "--pidfile",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&Config::pidfile, ParseText>(),
+          .description = "POSIX daemon mode only" },
+        { .primary = "--service-name",
+          .arity = Arity::Value,
+          .operand = "=<name>",
+          .apply = AssignFrom<&Config::serviceName, ParseText>(),
+          .explicitBit = &CliResult::serviceNameExplicit,
+          .description = "Windows service name (default FastCached)" },
+        { .primary = "--help",
+          .alias = "-h",
+          .select = SelectOutcome<&CliResult::outcome, CliOutcome::ShowHelp>(),
+          .flow = ParseFlow::Stop,
+          .description = "show this help and exit" },
+        { .primary = "--version",
+          .alias = "-V",
+          .select = SelectOutcome<&CliResult::outcome, CliOutcome::ShowVersion>(),
+          .flow = ParseFlow::Stop,
+          .description = "show version and exit" },
     });
 
-    /// Dispatch a single argument. Returns ArgOutcome on success or a
-    /// ConfigError if the argument matched a flag but parsing failed.
-    [[nodiscard]] std::expected<ArgOutcome, ConfigError> HandleOneArg(std::span<char const* const> args,
-                                                                      std::size_t& i,
-                                                                      CliResult& result)
-    {
-        auto& cfg = result.config;
-        std::string_view const arg { args[i] };
-        if (arg == "--help" || arg == "-h")
-            return ArgOutcome::ShowHelp;
-        if (arg == "--version" || arg == "-V")
-            return ArgOutcome::ShowVersion;
-        if (arg == "--daemon")
-        {
-            cfg.daemon = true;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--log-timestamps")
-        {
-            cfg.logTimestamps = true;
-            result.logTimestampsExplicit = true;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--log-source")
-        {
-            cfg.logSource = true;
-            result.logSourceExplicit = true;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--log-everything")
-        {
-            cfg.logEverything = true;
-            result.logEverythingExplicit = true;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--metrics")
-        {
-            cfg.metricsEnabled = true;
-            result.metricsEnabledExplicit = true;
-            return ArgOutcome::Continue;
-        }
-        if (arg == "--tls")
-        {
-            cfg.tlsEnabled = true;
-            result.tlsEnabledExplicit = true;
-            return ArgOutcome::Continue;
-        }
-        // Action flags: they select what the process will *do* instead of
-        // running the daemon, but keep parsing, because the remaining flags
-        // (--service-name, --port, --storage, ...) are captured into the config
-        // that gets baked into the service command line.
-        //
-        // `value` names the CliResult member a flag's argument lands in, or is
-        // null for the valueless majority. Those targets deliberately live in
-        // CliResult rather than Config: they describe an installer step, so they
-        // must not reach the YAML merge or a service command line.
-        for (auto const& [name, outcome, value]: ActionFlags)
-        {
-            if (value == nullptr)
-            {
-                if (arg != name)
-                    continue;
-            }
-            else
-            {
-                auto const matched = ApplyStringFlag(args, i, name, result.*value);
-                if (!matched.has_value())
-                    return std::unexpected(matched.error());
-                if (!*matched)
-                    continue;
-            }
-            result.outcome = outcome;
-            return ArgOutcome::Continue;
-        }
-
-        // Repeatable listen flags. `--listen` is plaintext, `--listen-tls`
-        // is TLS — separate flags rather than a `+tls` suffix so the intent
-        // is explicit at the call site. Each match appends to cfg.binds.
-        for (auto const& [flagName, isTls]: std::initializer_list<std::tuple<std::string_view, bool>> {
-                 { "--listen", false },
-                 { "--listen-tls", true },
-             })
-        {
-            if (!FlagMatches(arg, flagName))
-                continue;
-            auto const value = TakeValue(args, i, flagName);
-            if (!value.has_value())
-                return std::unexpected(value.error());
-            auto const parsed = ParseListenSpec(*value, isTls);
-            if (!parsed.has_value())
-                return std::unexpected(parsed.error());
-            cfg.binds.push_back(*parsed);
-            return ArgOutcome::Continue;
-        }
-
-        // String-valued flags. Each match flips an "explicit" bool so
-        // Merge can override YAML even when the typed value happens to
-        // equal the field's default.
-        for (auto const& [name, target, seenPtr]: std::initializer_list<std::tuple<std::string_view, std::string*, bool*>> {
-                 { "--config", &cfg.configPath, nullptr },
-                 { "--pidfile", &cfg.pidfile, nullptr },
-                 { "--service-name", &cfg.serviceName, &result.serviceNameExplicit },
-                 { "--storage", &cfg.storagePath, &result.storagePathExplicit },
-                 { "--requirepass", &cfg.requirePass, &result.requirePassExplicit },
-                 { "--auth-username", &cfg.authUsername, &result.authUsernameExplicit },
-                 { "--metrics-bind", &cfg.metricsBindAddress, &result.metricsBindAddressExplicit },
-                 { "--tls-cert", &cfg.tlsCertPath, &result.tlsCertPathExplicit },
-                 { "--tls-key", &cfg.tlsKeyPath, &result.tlsKeyPathExplicit },
-                 { "--notify-keyspace-events", &cfg.notifyKeyspaceEvents, &result.notifyKeyspaceEventsExplicit },
-             })
-        {
-            auto const matched = ApplyStringFlag(args, i, name, *target);
-            if (!matched.has_value())
-                return std::unexpected(matched.error());
-            if (*matched)
-            {
-                if (seenPtr != nullptr)
-                    *seenPtr = true;
-                return ArgOutcome::Continue;
-            }
-        }
-
-        // Typed flags live in their own handler; see HandleTypedFlag.
-        auto const typed = HandleTypedFlag(args, i, cfg, result);
-        if (!typed.has_value())
-            return std::unexpected(typed.error());
-        if (*typed != ArgOutcome::Unknown)
-            return *typed;
-
-        return ArgOutcome::Unknown;
-    }
-
-} // namespace
-
-namespace
-{
-    /// ANSI SGR escape sequences used to colorize help output. Every field is
-    /// an empty string in the plain palette so the exact same renderer drives
-    /// both colored (TTY) and plain (file/pipe/test) output.
-    struct UsagePalette
-    {
-        std::string_view reset;   ///< Reset all attributes.
-        std::string_view heading; ///< "usage:" prefix and example section titles.
-        std::string_view flag;    ///< Option flag names.
-    };
-
-    /// Bold-cyan headings, bold-green flags.
-    constexpr UsagePalette ColoredPalette { .reset = "\x1b[0m", .heading = "\x1b[1;36m", .flag = "\x1b[1;32m" };
-    /// No escapes — identical layout, just no color.
-    constexpr UsagePalette PlainPalette { .reset = "", .heading = "", .flag = "" };
-
-    /// One documented command-line option. `description` may embed '\n'; the
-    /// renderer re-indents every continuation line to the description column so
-    /// wrapped text stays aligned under the first line.
-    struct UsageOption
-    {
-        std::string_view flag;        ///< e.g. "--port=<num>".
-        std::string_view description; ///< Help text; '\n' separates wrapped lines.
-    };
-
-    /// A default value quoted in the help text, spliced in at render time.
-    ///
-    /// Without this the value lives twice — once where it is compiled in, once
-    /// re-typed as a string literal here — and the two drift apart silently:
-    /// help that advertises a port the daemon no longer binds is worse than no
-    /// help at all. Writing `{port}` in a description keeps the compiled
-    /// default the only place the value is spelled.
-    struct UsageSubstitution
-    {
-        std::string_view token; ///< Placeholder as written in a description or example body.
-        std::string value;      ///< Value spliced in its place; may span several lines.
-    };
+    static_assert(TableIsWellFormed<CliResult>(Options),
+                  "CLI option table is malformed: a row is undocumented, a value flag has no operand, "
+                  "a row does nothing, or a spelling is claimed twice");
 
     /// The config locations `--help` lists, one per line, indented under the
     /// description column. Read straight off the table the lookup itself walks,
@@ -724,6 +540,7 @@ namespace
     /// Built rather than `constexpr` because not every compiled default is a
     /// number: the config search path is assembled at runtime from the
     /// candidate table.
+    /// @return The tokens `--help` splices into its text.
     [[nodiscard]] std::vector<UsageSubstitution> MakeUsageSubstitutions()
     {
         return {
@@ -732,110 +549,6 @@ namespace
             { .token = "{config-defaults}", .value = FormatDefaultConfigLocations() },
         };
     }
-
-    /// The option table — single source of truth for both the help text and its
-    /// alignment. Add a row here and it lines up automatically. Descriptions may
-    /// reference a compiled default by its `UsageSubstitutions` token.
-    constexpr auto UsageOptions = std::to_array<UsageOption>({
-        { .flag = "--config=<path>",
-          .description = "YAML config file; CLI flags override file values.\n"
-                         "Without it, the first of these that exists and is readable is used:\n"
-                         "{config-defaults}" },
-        { .flag = "--bind=<addr>",
-          .description = "bind address: IPv4/IPv6 literal or hostname; '::' is dual-stack (default 127.0.0.1)" },
-        { .flag = "--port=<num>", .description = "TCP port (default {port}); every protocol is auto-detected on it" },
-        { .flag = "--max-memory=<size>",
-          .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)" },
-        { .flag = "--log-level=<level>", .description = "trace|debug|info|warn|error|fatal (default info)" },
-        { .flag = "--requirepass=<secret>",
-          .description = "require clients to authenticate with this shared secret (default: no auth)\n"
-                         "redis: AUTH; memcached binary: SASL PLAIN; memcached text has no auth" },
-        { .flag = "--auth-username=<name>",
-          .description = "username for the AUTH <user> <pass> / SASL PLAIN form (default 'default')" },
-        { .flag = "--metrics",
-          .description = "serve Prometheus /metrics and /healthz on a dedicated HTTP port (default off)" },
-        { .flag = "--metrics-bind=<addr>", .description = "bind address for the metrics endpoint (default 127.0.0.1)" },
-        { .flag = "--metrics-port=<num>", .description = "TCP port for the metrics endpoint (default {metrics-port})" },
-        { .flag = "--tls",
-          .description = "terminate TLS on the cache port (default off; needs a build with OpenSSL\n"
-                         "and both --tls-cert and --tls-key)" },
-        { .flag = "--tls-cert=<path>", .description = "PEM certificate (chain) file for --tls / --listen-tls" },
-        { .flag = "--tls-key=<path>", .description = "PEM private key file for --tls / --listen-tls" },
-        { .flag = "--listen=<host:port>",
-          .description = "additional plaintext listener; repeatable. Use [::1]:{port} for IPv6 literals.\n"
-                         "When given, supersedes --bind/--port — every endpoint must be listed.\n"
-                         "Also how to keep serving legacy clients: add their port here." },
-        { .flag = "--listen-tls=<host:port>",
-          .description = "additional TLS listener; repeatable. Shares --tls-cert / --tls-key.\n"
-                         "Needs a build with OpenSSL (FC_TLS_ENABLED)" },
-        { .flag = "--notify-keyspace-events=<flags>",
-          .description = "redis-style keyspace-event flag string; empty = off (default).\n"
-                         "K=__keyspace, E=__keyevent, g=generic (del/expire/persist),\n"
-                         "$=string (set/incr*), A=alias for g$\n"
-                         "(x=expired is not yet wired — rejected pending storage callback)" },
-        { .flag = "--log-timestamps", .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)" },
-        { .flag = "--log-source", .description = "prefix every connection log line with the client IP (default off)" },
-        { .flag = "--log-everything",
-          .description = "include keepalive/admin commands (PING, HELLO, ...) in the trace command log, not just "
-                         "keyspace data operations (default off)" },
-        { .flag = "--storage=<path>", .description = "persist cache to a CoW-tree file (default: in-memory only)" },
-        { .flag = "--storage-durability=<mode>", .description = "fsync|batched|none for --storage (default batched)" },
-        { .flag = "--storage-max-value=<size>",
-          .description = "per-value byte cap for --storage; k/m/g suffixes accepted (default 16m).\n"
-                         "also raises the wire frame-payload cap, so compile caches storing\n"
-                         "large object files need this set above their biggest object" },
-        { .flag = "--storage-max-disk=<size>",
-          .description = "cap the on-disk (L2) tier for --storage; the CoW tree evicts its LRU tail to fit "
-                         "(default 0 = unbounded). k/m/g suffixes accepted" },
-        { .flag = "--compression=<codec>",
-          .description = "on-disk value codec for --storage: none|lz4|zstd (default zstd)\n"
-                         "reads always return plaintext; each record decodes by its own tag" },
-        { .flag = "--compression-level=<N>",
-          .description = "codec effort level for --compression (1..22; default 3, zstd)" },
-        { .flag = "--compression-min-bytes=<size>",
-          .description = "skip compression for values smaller than this; k/m/g accepted (default 256)" },
-        { .flag = "--lru-mode=<mode>",
-          .description = "approximate|strict in-memory LRU recency (default approximate)\n"
-                         "approximate: same-shard reads run concurrently (faster);\n"
-                         "strict: exact LRU order, reads serialise per shard" },
-        { .flag = "--cpu-affinity=<mode>",
-          .description = "none|per-core reactor thread pinning (default per-core)\n"
-                         "per-core: pin each reactor to its own core (multi-reactor only)" },
-        { .flag = "--threads=<N>",
-          .description = "number of independent pinned reactors to run (default hardware_concurrency);\n"
-                         "each is a single-threaded event loop, so this is the server's across-core parallelism" },
-        { .flag = "--listen-backlog=<N>",
-          .description = "::listen() backlog depth (default 511; clamped to the kernel's SOMAXCONN)" },
-        { .flag = "--storage-shards=<N>",
-          .description = "shard storage into N partitions for write parallelism\n"
-                         "default: 1 (single-file mode) when --storage names a regular file,\n"
-                         "min(16, hardware_concurrency) otherwise;\n"
-                         "when N>1 and --storage is set, --storage must be a directory" },
-        { .flag = "--daemon",
-          .description = "daemonize (POSIX) / run under the Windows SCM (used by the installed service)" },
-        { .flag = "--install-service",
-          .description = "register fastcached to start automatically: a Windows SCM service, or a\n"
-                         "macOS launchd job (see --service-scope). Other flags are baked in.\n"
-                         "Windows needs an elevated prompt; --service-scope=system needs sudo" },
-        { .flag = "--uninstall-service",
-          .description = "remove the registration made by --install-service (same privileges)" },
-        { .flag = "--service-scope=<user|system>",
-          .description = "macOS only: which launchd domain --install-service acts on.\n"
-                         "user (default) = a LaunchAgent in ~/Library/LaunchAgents, started at\n"
-                         "login as you; system = a LaunchDaemon in /Library/LaunchDaemons,\n"
-                         "started at boot as _fastcached (needs sudo)" },
-        { .flag = "--healthcheck",
-          .description = "probe http://127.0.0.1:<metrics-port>/healthz and exit 0 (healthy) or 1\n"
-                         "(self-contained container HEALTHCHECK; needs --metrics on the daemon)" },
-        { .flag = "--seed-config=<path>",
-          .description = "copy <path> to the machine-wide config location, but only when no\n"
-                         "config is there yet, then exit (used by the installer; needs the\n"
-                         "same privileges as writing that location)" },
-        { .flag = "--pidfile=<path>", .description = "POSIX daemon mode only" },
-        { .flag = "--service-name=<name>", .description = "Windows service name (default FastCached)" },
-        { .flag = "--help, -h", .description = "show this help and exit" },
-        { .flag = "--version, -V", .description = "show version and exit" },
-    });
 
     /// A worked example block printed below the option table.
     struct UsageExample
@@ -864,138 +577,62 @@ namespace
 
     /// Closing note printed after the examples.
     constexpr std::string_view UsageFooter = "sccache <= 0.7 speaks memcached text; >= 0.8 speaks memcached binary;\n"
-                                             "either works because fastcached auto-detects the wire format.\n";
+                                             "either works because fastcached auto-detects the wire format.";
 
-    /// Splice every `UsageSubstitutions` token in `text` with its compiled
-    /// value. Runs before the text is split into lines, so a token is free to
-    /// sit on any continuation line without disturbing the alignment.
-    /// @param text Help text possibly containing `{token}` placeholders.
-    /// @return `text` with every known token replaced; unknown braces are left
-    ///         verbatim, so ordinary prose needs no escaping.
-    [[nodiscard]] std::string ExpandDefaults(std::string_view text, std::span<UsageSubstitution const> substitutions)
-    {
-        std::string out { text };
-        for (auto const& [token, value]: substitutions)
-            for (auto at = out.find(token); at != std::string::npos; at = out.find(token, at + value.size()))
-                out.replace(at, token.size(), value);
-        return out;
-    }
-
-    /// Invoke `fn(line)` for each '\n'-separated segment of `text`. A trailing
-    /// segment with no newline is still delivered, so a non-terminated string
-    /// yields exactly its visual lines.
-    template <typename Fn>
-    void ForEachLine(std::string_view text, Fn fn)
-    {
-        while (true)
-        {
-            auto const newline = text.find('\n');
-            if (newline == std::string_view::npos)
-            {
-                fn(text);
-                return;
-            }
-            fn(text.substr(0, newline));
-            text.remove_prefix(newline + 1);
-        }
-    }
-
-    /// Render the full usage text using the given color palette.
-    /// @param palette Color escapes (ColoredPalette or PlainPalette).
-    /// @return Column-aligned, optionally colored usage text.
-    [[nodiscard]] std::string RenderUsage(UsagePalette const& palette)
-    {
-        constexpr std::size_t LeftIndent = 2; ///< Spaces before each flag.
-        constexpr std::size_t ColumnGap = 2;  ///< Spaces between flag and description.
-
-        // Align all descriptions to a column derived from the widest flag, so
-        // the layout adapts automatically when options are added or renamed.
-        auto const flagWidth = std::ranges::max(
-            UsageOptions | std::views::transform([](UsageOption const& option) { return option.flag.size(); }));
-        auto const descColumn = LeftIndent + flagWidth + ColumnGap;
-
-        auto const substitutions = MakeUsageSubstitutions();
-
-        std::string out;
-        out += std::format("{}usage:{} fastcached [options]\n", palette.heading, palette.reset);
-
-        for (auto const& option: UsageOptions)
-        {
-            auto firstLine = true;
-            ForEachLine(ExpandDefaults(option.description, substitutions), [&](std::string_view line) {
-                if (firstLine)
-                {
-                    auto const pad = descColumn - LeftIndent - option.flag.size();
-                    out += std::format("{}{}{}{}{}{}\n",
-                                       std::string(LeftIndent, ' '),
-                                       palette.flag,
-                                       option.flag,
-                                       palette.reset,
-                                       std::string(pad, ' '),
-                                       line);
-                    firstLine = false;
-                }
-                else
-                {
-                    out += std::format("{}{}\n", std::string(descColumn, ' '), line);
-                }
-            });
-        }
-
-        for (auto const& example: UsageExamples)
-        {
-            out += '\n';
-            out += std::format("{}{}{}\n", palette.heading, example.title, palette.reset);
-            ForEachLine(ExpandDefaults(example.body, substitutions),
-                        [&](std::string_view line) { out += std::format("{}\n", line); });
-        }
-
-        out += '\n';
-        out += UsageFooter;
-        return out;
-    }
 } // namespace
+
+std::span<OptionSpec<CliResult> const> CliOptions() noexcept
+{
+    return Options;
+}
 
 std::expected<std::uint16_t, ConfigError> ParsePort(std::string_view sv)
 {
     std::uint32_t raw = 0;
     auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), raw);
     if (ec != std::errc {} || ptr != sv.data() + sv.size())
-        return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, "port", std::format("not a number: {}", sv)));
+        return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, "port", std::format("not a number: {}", sv)));
     if (raw == 0 || raw > 65535)
-        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, "port", std::format("out of range: {}", raw)));
+        return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "port", std::format("out of range: {}", raw)));
     return static_cast<std::uint16_t>(raw);
 }
 
 std::string CliUsage(UsageColor color)
 {
-    return RenderUsage(color == UsageColor::Colored ? ColoredPalette : PlainPalette);
+    auto const substitutions = MakeUsageSubstitutions();
+
+    UsageRows optionRows;
+    AddOptionRows(optionRows, CliOptions());
+
+    // The renderer supplies the section indent every example line shares; the
+    // second level -- the body under its own title -- is still the two spaces
+    // each `body` literal carries.
+    std::vector<std::string> exampleTexts;
+    exampleTexts.reserve(UsageExamples.size());
+    for (auto const& example: UsageExamples)
+        exampleTexts.push_back(std::format("{}\n{}", example.title, example.body));
+
+    std::vector<UsageBlock> blocks;
+    blocks.reserve(1 + exampleTexts.size() + 1);
+    blocks.push_back({ .entries = optionRows.Rows() });
+    for (auto const& text: exampleTexts)
+        blocks.push_back({ .text = text, .textIndent = 2 });
+    blocks.push_back({ .text = UsageFooter });
+
+    std::span<UsageBlock const> const allBlocks { blocks };
+    auto const sections = std::to_array<UsageSection>({
+        { .title = "usage:", .subject = " fastcached [options]" },
+        { .title = "OPTIONS", .blocks = allBlocks.subspan(0, 1) },
+        { .title = "EXAMPLES", .blocks = allBlocks.subspan(1, exampleTexts.size()) },
+        { .blocks = allBlocks.subspan(1 + exampleTexts.size(), 1) },
+    });
+
+    return RenderUsage({ .sections = sections }, color, substitutions);
 }
 
 std::expected<CliResult, ConfigError> ParseCli(std::span<char const* const> args)
 {
-    CliResult outcome;
-    for (std::size_t i = 0; i < args.size(); ++i)
-    {
-        auto const result = HandleOneArg(args, i, outcome);
-        if (!result.has_value())
-            return std::unexpected(result.error());
-        switch (*result)
-        {
-            case ArgOutcome::Continue:
-                continue;
-            case ArgOutcome::ShowHelp:
-                outcome.outcome = CliOutcome::ShowHelp;
-                return outcome;
-            case ArgOutcome::ShowVersion:
-                outcome.outcome = CliOutcome::ShowVersion;
-                return outcome;
-            case ArgOutcome::Unknown:
-                return std::unexpected(
-                    MakeError(ConfigErrorCode::UnknownKey, std::string { args[i] }, "unrecognised argument"));
-        }
-    }
-    return outcome;
+    return ParseOptions(CliOptions(), args);
 }
 
 } // namespace FastCache

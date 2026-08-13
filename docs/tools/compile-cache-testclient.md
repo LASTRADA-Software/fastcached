@@ -22,8 +22,13 @@ compile-cache-testclient <store|fetch> --port N [--key K] [--cohort C]
     --srcroot P --buildtree Q [--compiler cl|clang-cl] [--source F] [--out OBJ]
 ```
 
-Options take their value as the **next** argument; the `--name=value` form is
-not supported here (unlike the daemon's own parser).
+Run `compile-cache-testclient --help` for the generated reference; it is
+rendered from the same option table the parser matches against, so it cannot
+fall out of step with what the tool accepts.
+
+Options take their value either as the next argument or joined with `=`, the
+same as the daemon's own parser. An unrecognised option is an error rather than
+something silently ignored.
 
 | Flag | Default |
 |------|---------|

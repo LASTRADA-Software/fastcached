@@ -17,6 +17,11 @@ src/FastCache/
                 EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
                 InMemoryTransport (paired pipes + InMemoryListener),
                 Framing/ByteReader (line and length-prefixed)
+  Cli/          UsageDoc (usage text as data: sections of aligned rows and
+                prose, rendered with an ANSI palette) and Options (OptionSpec
+                row type, the matching rules, the one parse loop). Dependency-
+                free by design — std plus the header-only ConfigError — so
+                fastcache-cc can compile it in without linking the library
   Cache/        IStorage atomic primitives (incl. Prefetch — warm a tier with
                 no read side effect), CacheEntry, CacheEngine,
                 InMemoryLruStorage, CowTreeStorage (CoW B+tree, src/CowTree),
@@ -60,7 +65,12 @@ src/apps/
                             cache error. Config via `FASTCACHE_*` env, wired
                             through `CMAKE_<LANG>_COMPILER_LAUNCHER`. Platform
                             work sits behind `IProcessRunner` / `ITcpClient`,
-                            so main.cpp's flow logic is platform-free.
+                            so main.cpp's flow logic is platform-free. Compiles
+                            in `Cli/UsageDoc.cpp` plus `Platform/Environment.cpp`
+                            and `Platform/Terminal.cpp` (see `_fc_cc_core`), so
+                            its help renders and colorizes exactly like the
+                            daemon's without linking the library. `Cli/Options`
+                            is header-only, so including it costs no build row.
   compile-cache-testclient/ low-level `0xFC` protocol probe + cross-depth
                             validation (FASTCACHED_BUILD_TESTCLIENT, default
                             OFF — test infrastructure, never installed)
@@ -87,6 +97,21 @@ packaging/
 `cmake/Packaging.cmake` turns that into `.deb`/`.rpm`/`.pkg`/`.msi` via CPack.
 These constraints are load-bearing and have each already been a bug:
 
+- **A flag is one row, and every binary's row table drives both parsing and
+  help.** The daemon used to declare flags four ways — hand-written `if (arg ==
+  …)`, a descriptor array, two inline `initializer_list<tuple<…>>` tables, and
+  seventeen copy-pasted blocks in `HandleTypedFlag` — and then spell every name
+  again in a separate help table, so a flag could be accepted but undocumented
+  or documented but rejected. `CliOptions()` is now the single source of truth,
+  and the help column is *derived* from `primary`/`alias`/`operand` rather than
+  restated. Rendering lives in `Cli/UsageDoc`, which must stay dependency-free:
+  `fastcache-cc` compiles it in rather than linking `FastCache`, so an include
+  of anything from `Config/` there breaks the launcher's link, not just its
+  build. Two remaining hand-written spellings are guarded by tests rather than
+  generated: `BuildServiceArgv` (a `ServiceControl_test` case walks
+  `CliOptions()` and requires each non-excluded flag to be emitted — the
+  exclusions, `--requirepass` above all, are listed with their reasons) and the
+  launcher's `FASTCACHE_*` oracle list in `LauncherCli_test`.
 - **The supervisor's launch arguments must not pass `--daemon`.** The POSIX
   daemonize path double-forks and sends stdout/stderr to `/dev/null`, which
   silences journald; its pidfile is also written after both parents exit, racing

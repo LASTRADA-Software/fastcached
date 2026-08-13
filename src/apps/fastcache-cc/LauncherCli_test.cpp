@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LauncherCli.hpp"
 
+#include <FastCache/Cli/UsageTestUtils.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
 #include <span>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 using namespace FastCache::Cc;
+using FastCache::Arity;
+using FastCache::UsageColor;
+using FastCache::Testing::StripAnsi;
 
 namespace
 {
@@ -18,14 +22,6 @@ namespace
 Command Parse(std::vector<std::string> const& argv)
 {
     return ParseTopLevel(std::span<std::string const> { argv });
-}
-
-/// The help text as `--help` would print it.
-std::string HelpText()
-{
-    std::ostringstream out;
-    PrintHelp(out);
-    return std::move(out).str();
 }
 
 } // namespace
@@ -242,8 +238,52 @@ TEST_CASE("the help text renders the sections it promises")
     CHECK(help.contains("--cohort=<id>"));
 }
 
+TEST_CASE("every environment row is named and described")
+{
+    REQUIRE_FALSE(LauncherEnvironment().empty());
+    for (auto const& spec: LauncherEnvironment())
+    {
+        INFO("variable " << spec.name);
+        CHECK(spec.name.starts_with("FASTCACHE_"));
+        CHECK_FALSE(spec.summary.empty());
+    }
+}
+
+TEST_CASE("plain help carries no ANSI escapes")
+{
+    // Help on stderr and help through a pipe must stay plain: the e2e scripts
+    // grep this output, and a build log is no place for escapes.
+    CHECK_FALSE(HelpText(UsageColor::Plain).contains('\x1b'));
+}
+
+TEST_CASE("colorized help adds escapes but not one character of text")
+{
+    auto const plain = HelpText(UsageColor::Plain);
+    auto const colored = HelpText(UsageColor::Colored);
+    CHECK(colored.contains('\x1b'));
+    CHECK(StripAnsi(colored) == plain);
+}
+
+TEST_CASE("the two ENVIRONMENT row groups share one column")
+{
+    // They sit in one section precisely so the prose between them cannot let
+    // the halves drift apart; XDG_STATE_HOME, HOME is as wide as the widest
+    // FASTCACHE_ name, so a regression here is visible immediately.
+    // Anchored on each row's own indent: FASTCACHE_ADDR is also named in the
+    // prose below the rows, and a bare search would find whichever came first.
+    auto const help = HelpText();
+    auto const first = FastCache::Testing::DescriptionColumnOf(help, "FASTCACHE_ADDR");
+    auto const second = FastCache::Testing::DescriptionColumnOf(help, "XDG_STATE_HOME, HOME");
+    REQUIRE(first != std::string_view::npos);
+    REQUIRE(second != std::string_view::npos);
+    CHECK(first == second);
+}
+
 TEST_CASE("the help text documents every environment variable the launcher reads")
 {
+    // The hardcoded list is a deliberate independent oracle: help is rendered
+    // from LauncherEnvironment(), so checking it against that table would be
+    // tautological, while this fails if a row is ever dropped.
     auto const help = HelpText();
     for (auto const* name: { "FASTCACHE_ADDR",
                              "FASTCACHE_SRCROOT",

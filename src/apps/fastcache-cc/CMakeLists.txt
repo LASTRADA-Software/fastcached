@@ -2,16 +2,25 @@
 # fastcache-cc — the sccache-style compiler launcher, plus its unit tests.
 #
 # The launcher only needs the path-canonicalization + compile-value codec (and
-# CRC32C for the key), which have no third-party dependencies. We compile those
-# few FastCache sources directly into the tool rather than linking the whole
+# CRC32C for the key), the shared usage renderer, and the two leaf platform
+# probes -- none of which have third-party dependencies. We compile those few
+# FastCache sources directly into the tool rather than linking the whole
 # FastCache static library, so the launcher pulls in NO vcpkg deps (zstd, lz4,
 # yaml-cpp). That keeps it a small, self-contained binary and lets it link the
 # CRT statically without a runtime-library mismatch against vcpkg objects.
+#
+# Cli/UsageDoc.cpp is what makes `fastcache-cc --help` render and colorize
+# exactly like `fastcached --help`; Platform/Terminal.cpp decides whether to,
+# and Platform/Environment.cpp is the one place the environment is read, so the
+# launcher no longer needs its own copy of that dance.
 
 set(_fc_cc_core
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Cli/UsageDoc.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/PathCanon.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/CompileValue.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Crc32c.cpp")
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Crc32c.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
 
 # The launcher's own reusable pieces. Process spawning and the TCP client are
 # reached through interfaces (IProcessRunner / ITcpClient) so the flow logic

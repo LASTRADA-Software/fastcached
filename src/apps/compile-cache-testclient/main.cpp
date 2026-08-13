@@ -13,9 +13,12 @@
 // is pointed at and prints only synthetic counts/paths under the caller's
 // control.
 
+#include "TestClientCli.hpp"
+
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Platform/Terminal.hpp>
 
 #include <array>
 #include <cstddef>
@@ -202,32 +205,9 @@ void AppendField(std::vector<std::byte>& out, std::span<std::byte const> bytes)
     out.insert(out.end(), bytes.begin(), bytes.end());
 }
 
-/// A parsed command line for one sub-command.
-struct Args
-{
-    std::string host { "127.0.0.1" };
-    std::uint16_t port { 0 };
-    std::string key;
-    std::string cohort { "default" };
-    std::string srcRoot;
-    std::string buildTree;
-    std::string compiler { "cl" }; // or clang-cl
-    std::string source;
-    std::string object; // output object path (store) / expected-write path (fetch)
-};
-
-/// Pull a required string option `--name value`.
-[[nodiscard]] std::string_view Opt(std::span<char const* const> argv, std::string_view name)
-{
-    for (std::size_t i = 0; i + 1 < argv.size(); ++i)
-        if (name == argv[i])
-            return argv[i + 1];
-    return {};
-}
-
 // --- store: compile, frame, STORE -----------------------------------------
 
-int DoStore(Args const& a)
+int DoStore(TestClient::Args const& a)
 {
     // Compile with /showIncludes, capturing header lines. cl emits them on
     // stderr, so redirect 2>&1. Produce the object at a temp path we then read.
@@ -270,7 +250,7 @@ int DoStore(Args const& a)
 
 // --- fetch: FETCH, localize, verify ----------------------------------------
 
-int DoFetch(Args const& a)
+int DoFetch(TestClient::Args const& a)
 {
     std::vector<std::byte> frame;
     frame.push_back(CompileCacheMagic);
@@ -345,37 +325,27 @@ int DoFetch(Args const& a)
 
 int main(int argc, char** argv)
 {
-    std::span<char const* const> args { argv, static_cast<std::size_t>(argc) };
-    if (argc < 2)
+    // argv[0] is the program itself; the sub-command leads what remains.
+    std::span<char const* const> const args { argv + 1, argc > 0 ? static_cast<std::size_t>(argc - 1) : 0 };
+
+    auto const parsed = TestClient::ParseArgs(args);
+    if (!parsed.has_value())
     {
-        std::cerr << "usage: compile-cache-testclient <store|fetch> --port N [--key K] [--cohort C]\n"
-                     "         --srcroot P --buildtree Q [--compiler cl|clang-cl] [--source F] [--out OBJ]\n";
+        std::cerr << "compile-cache-testclient: " << parsed.error().ToString() << "\n\n" << TestClient::HelpText();
         return 2;
     }
 
-    Args a;
-    auto const s = [&](std::string_view name, std::string& dst) {
-        auto const v = Opt(args, name);
-        if (!v.empty())
-            dst = std::string { v };
-    };
-    s("--host", a.host);
-    s("--key", a.key);
-    s("--cohort", a.cohort);
-    s("--srcroot", a.srcRoot);
-    s("--buildtree", a.buildTree);
-    s("--compiler", a.compiler);
-    s("--source", a.source);
-    s("--out", a.object);
-    if (auto const p = Opt(args, "--port"); !p.empty())
-        a.port = static_cast<std::uint16_t>(std::stoi(std::string { p }));
-    if (a.port == 0)
-        Die("--port is required");
-
-    std::string_view const cmd = argv[1];
-    if (cmd == "store")
-        return DoStore(a);
-    if (cmd == "fetch")
-        return DoFetch(a);
-    Die("unknown sub-command (expected store|fetch)");
+    switch (parsed->action)
+    {
+        case TestClient::Action::ShowHelp:
+            // The color decision belongs at the call site; on Windows this call
+            // also enables virtual-terminal processing as a side effect.
+            std::cout << TestClient::HelpText(StdoutSupportsColor() ? UsageColor::Colored : UsageColor::Plain);
+            return 0;
+        case TestClient::Action::Store:
+            return DoStore(*parsed);
+        case TestClient::Action::Fetch:
+            return DoFetch(*parsed);
+    }
+    return 2;
 }

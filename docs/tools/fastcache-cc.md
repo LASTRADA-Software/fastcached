@@ -92,6 +92,10 @@ not be exported. Without an address it falls back to `sccache`;
 Configuration is entirely environmental, so a launcher invocation stays a drop-in
 prefix. An empty value counts as unset.
 
+`fastcache-cc --help` documents the same set, generated from the table in
+`LauncherCli.cpp` that is the launcher's single source of truth for these names.
+This page is the prose version; if the two ever disagree, `--help` is right.
+
 | Variable | Meaning | Default |
 |----------|---------|---------|
 | `FASTCACHE_ADDR` | `host:port` of the daemon. Hostnames, IPv4 literals, and bracketed IPv6 (`[::1]:6674`) all resolve. | unset — **no caching** |

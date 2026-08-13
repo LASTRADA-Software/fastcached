@@ -42,6 +42,8 @@
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/Terminal.hpp>
 
 #include <algorithm>
 #include <array>
@@ -107,27 +109,22 @@ struct Config
     std::chrono::milliseconds ioTimeout { DefaultIoTimeout };
 };
 
-/// Read an environment variable, or a fallback when unset/empty. Uses the
-/// secure CRT `getenv_s` on Windows so the build stays warning-clean under /WX.
-[[nodiscard]] std::string EnvOr(char const* name, std::string_view fallback)
+/// Read an environment variable, or a fallback when unset/empty.
+///
+/// A set-but-empty variable is treated as unset here: every setting below wants
+/// "the user gave me something usable", and an empty FASTCACHE_ADDR is not an
+/// address.
+/// @param name The variable to read.
+/// @param fallback Returned when the variable is unset or empty.
+/// @return The value, or `fallback`.
+[[nodiscard]] std::string EnvOr(std::string_view name, std::string_view fallback)
 {
-#if defined(_WIN32)
-    std::size_t size = 0;
-    if (::getenv_s(&size, nullptr, 0, name) != 0 || size == 0)
-        return std::string { fallback };
-    std::string buffer(size, '\0');
-    if (::getenv_s(&size, buffer.data(), buffer.size(), name) != 0)
-        return std::string { fallback };
-    buffer.resize(size > 0 ? size - 1 : 0); // drop the trailing NUL
-    return buffer.empty() ? std::string { fallback } : buffer;
-#else
-    char const* v = std::getenv(name);
-    return (v != nullptr && v[0] != '\0') ? std::string { v } : std::string { fallback };
-#endif
+    auto value = FastCache::ReadEnvironmentVariable(name);
+    return value.has_value() && !value->empty() ? std::move(*value) : std::string { fallback };
 }
 
 /// Whether an environment variable is set (to any non-empty value).
-[[nodiscard]] bool EnvSet(char const* name)
+[[nodiscard]] bool EnvSet(std::string_view name)
 {
     return !EnvOr(name, "").empty();
 }
@@ -141,7 +138,7 @@ struct Config
 /// @param name Variable to read.
 /// @param fallback Value to use when unset or malformed.
 /// @return The parsed duration, or `fallback`.
-[[nodiscard]] std::chrono::milliseconds EnvMillis(char const* name, std::chrono::milliseconds fallback)
+[[nodiscard]] std::chrono::milliseconds EnvMillis(std::string_view name, std::chrono::milliseconds fallback)
 {
     auto const raw = EnvOr(name, "");
     if (raw.empty())
@@ -1042,8 +1039,10 @@ void RecordManifest(Config const& cfg,
 /// @return Process exit code.
 [[nodiscard]] int ReportUsageError(std::string_view diagnostic)
 {
-    std::cerr << "fastcache-cc: " << diagnostic << "\n\n";
-    Cc::PrintHelp(std::cerr);
+    // Deliberately plain: StdoutSupportsColor() probes stdout, and help on
+    // stderr is usually captured by a build system, so colorizing it from
+    // stdout's state would write escapes into a log file.
+    std::cerr << "fastcache-cc: " << diagnostic << "\n\n" << Cc::HelpText();
     return 2;
 }
 
@@ -1062,12 +1061,17 @@ int main(int argc, char** argv)
         // No arguments is a usage error (exit 2); an explicit --help is a
         // successful query and prints to stdout so it can be paged or redirected.
         case Cc::Action::NoArguments:
-            Cc::PrintHelp(std::cerr);
+            std::cerr << Cc::HelpText();
             return 2;
         case Cc::Action::UsageError:
             return ReportUsageError(command.diagnostic);
         case Cc::Action::Help:
-            Cc::PrintHelp(std::cout);
+            // The color decision is made here rather than inside LauncherCli so
+            // the module stays free of ambient probes. On Windows the call also
+            // enables virtual-terminal processing as a side effect, so it has to
+            // happen before anything is written.
+            std::cout << Cc::HelpText(FastCache::StdoutSupportsColor() ? FastCache::UsageColor::Colored
+                                                                       : FastCache::UsageColor::Plain);
             return 0;
         case Cc::Action::Version:
             std::cout << "fastcache-cc " << FASTCACHE_CC_VERSION << '\n';

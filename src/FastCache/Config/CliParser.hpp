@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Cli/Options.hpp>
+#include <FastCache/Cli/UsageDoc.hpp>
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
@@ -84,17 +86,16 @@ struct CliResult
     bool compressionMinBytesExplicit { false };
 };
 
-/// Parse `argv[1..argc-1]` into a Config. Returns ConfigError on bad input.
-/// Recognised flags:
-///   --bind <addr>            (default 127.0.0.1)
-///   --port <num>             (default `DefaultPort`; see Config.hpp)
-///   --max-memory <size>      (default 64 MiB; integer with optional unit suffix
-///                             k/K=1024, m/M=1024², g/G=1024³; plain int = bytes;
-///                             trailing % = percentage of host total RAM, e.g. 50%)
-///   --log-level <level>      (trace|debug|info|warn|error|fatal; default info)
-///   --help, -h               print usage and exit
-///   --version, -V            print version and exit
+/// The accepted command-line options, in the order `--help` documents them.
 ///
+/// The single source of truth for the daemon's CLI: `ParseCli` matches these
+/// rows and `CliUsage` renders itself from them, so a flag cannot be accepted
+/// without being documented, nor documented without being accepted. Adding a
+/// flag is adding a row.
+/// @return A view of the static table; never empty.
+[[nodiscard]] std::span<OptionSpec<CliResult> const> CliOptions() noexcept;
+
+/// Parse `argv[1..argc-1]` into a Config, driven by `CliOptions()`.
 /// @param args argv slice excluding the program name itself.
 /// @return Parsed CliResult on success; ConfigError on failure.
 [[nodiscard]] std::expected<CliResult, ConfigError> ParseCli(std::span<char const* const> args);
@@ -106,13 +107,6 @@ struct CliResult
 /// @param sv Decimal port text (no surrounding whitespace).
 /// @return The port on success, or a ConfigError describing the rejection.
 [[nodiscard]] std::expected<std::uint16_t, ConfigError> ParsePort(std::string_view sv);
-
-/// Whether CliUsage should colorize its output.
-enum class UsageColor : std::uint8_t
-{
-    Plain,   ///< Plain text — for files, pipes, NO_COLOR, and tests.
-    Colored, ///< ANSI SGR color escapes — for interactive terminals.
-};
 
 /// Render the multi-line usage/help text with column-aligned option
 /// descriptions. Used by main when --help is requested.

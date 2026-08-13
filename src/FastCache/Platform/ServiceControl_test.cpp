@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <filesystem>
 #include <format>
+#include <ranges>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using FastCache::BuildServiceCommandLine;
 
@@ -459,6 +463,87 @@ TEST_CASE("ServiceControl: a service name that escapes its directory is refused"
     REQUIRE(!rejects("FastCached"));
     REQUIRE(!rejects("My Cache"));
     REQUIRE(!rejects("fastcached-2"));
+}
+
+TEST_CASE("ServiceControl: every Config-backed flag reaches the service argv", "[platform][service]")
+{
+    // BuildServiceArgv re-spells every flag name by hand, so it is a second
+    // place a CLI flag is written down. Until it is driven off CliOptions()
+    // directly, this walks that table and asserts the coverage the comment
+    // above emitIfSet only claims in prose: a new flag that forgets an
+    // emitIfSet line fails here rather than being silently dropped between the
+    // install command line and the supervisor.
+    //
+    // The exclusions are the flags that are not Config state, quoted from that
+    // same comment.
+    constexpr auto NotConfigState = std::to_array<std::string_view>({
+        "--install-service",   // a service must never re-install itself
+        "--uninstall-service", //
+        "--service-scope",     // install-time only
+        "--seed-config",       // an installer step, not daemon state
+        "--daemon",            // emitted unconditionally, not from Config
+        "--healthcheck",       //
+        "--help",              //
+        "--version",           //
+        "--config",            // the operator's own assertion; see main.cpp
+        "--service-name",      // emitted unconditionally, above the table
+        "--pidfile",           // POSIX daemon-mode only, never registered
+        // The one Config field with no safe representation in launch arguments:
+        // a supervisor records them where every local account can read them, so
+        // emitting the secret would publish it to exactly the accounts it exists
+        // to keep out. ServiceRegistrationRejection reports the omission instead,
+        // and the case below asserts that.
+        "--requirepass",
+        // Repeatable listeners are emitted as a group and asserted separately.
+        "--listen",
+        "--listen-tls",
+    });
+
+    // A configuration in which no field holds its default, so every emitIfSet
+    // fires.
+    FastCache::Config cfg {};
+    cfg.bindAddress = "0.0.0.0";
+    cfg.port = 12345;
+    cfg.maxMemoryBytes = 123456789;
+    cfg.logLevel = FastCache::LogLevel::Debug;
+    cfg.logTimestamps = true;
+    cfg.logSource = true;
+    cfg.logEverything = true;
+    cfg.storagePath = "cache.db";
+    cfg.storageDurability = FastCache::StorageDurability::Fsync;
+    cfg.storageMaxValueBytes = 4096;
+    cfg.storageMaxDiskBytes = 8192;
+    cfg.storageShards = 7;
+    cfg.workerThreads = 5;
+    cfg.listenBacklog = 64;
+    cfg.lruRecency = FastCache::LruRecency::Strict;
+    cfg.cpuAffinity = FastCache::CpuAffinity::None;
+    cfg.compression = FastCache::CompressionCodec::Identity;
+    cfg.compressionLevel = 9;
+    cfg.compressionMinBytes = 1024;
+    cfg.notifyKeyspaceEvents = "KEA";
+    cfg.authUsername = "operator";
+    cfg.metricsEnabled = true;
+    cfg.metricsBindAddress = "0.0.0.0";
+    cfg.metricsPort = 9999;
+    cfg.tlsEnabled = true;
+    cfg.tlsCertPath = "cert.pem";
+    cfg.tlsKeyPath = "key.pem";
+
+    auto const argv =
+        FastCache::BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, FastCache::EmitDaemonFlag::Yes);
+
+    for (auto const& spec: FastCache::CliOptions())
+    {
+        if (std::ranges::contains(NotConfigState, spec.primary))
+            continue;
+        INFO("flag: " << spec.primary);
+        // FlagMatches is the parser's own rule for "this token names that flag",
+        // so the guard cannot drift from what the daemon will accept back.
+        auto const emitted =
+            std::ranges::any_of(argv, [&spec](std::string const& arg) { return FastCache::FlagMatches(arg, spec.primary); });
+        CHECK(emitted);
+    }
 }
 
 TEST_CASE("ServiceControl: every registration rule gates an install", "[platform][service]")
