@@ -32,6 +32,7 @@
 // Contains no project-specific data; it compiles whatever it is pointed at.
 
 #include "CacheKey.hpp"
+#include "CacheProtocol.hpp"
 #include "CmdLine.hpp"
 #include "DirectManifest.hpp"
 #include "IProcessRunner.hpp"
@@ -41,9 +42,9 @@
 
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
-#include <FastCache/Core/Endian.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/Terminal.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
 #include <array>
@@ -84,10 +85,7 @@ using namespace FastCache;
     #define FASTCACHE_CC_VERSION "unknown"
 #endif
 
-constexpr std::byte CompileCacheMagic { 0xFC };
-constexpr std::byte OpStore { 0x01 };
-constexpr std::byte OpFetch { 0x02 };
-constexpr std::byte StatusOk { 0x01 };
+namespace Wire = FastCache::CompileCacheWire;
 
 // --- config ----------------------------------------------------------------
 
@@ -233,6 +231,23 @@ void TraceOutcome(std::string_view outcome, std::string_view key)
         std::cerr << "fastcache-cc: " << outcome << " key=" << key << '\n';
 }
 
+/// Report a daemon refusal on a best-effort side-channel operation.
+///
+/// Only a refusal is worth a line. A miss is the normal case, and a transport
+/// failure is already covered by the caller's own fall-back reason; a refusal is
+/// the one outcome meaning the daemon is reachable, answered, and declined —
+/// including the version mismatch that would otherwise leave the cache silently
+/// useless for an entire build with nothing at all to show for it.
+/// @param outcome The completed exchange.
+/// @param what Short label for the operation, e.g. "STORE (raw)".
+/// @param key The key involved.
+void WarnIfRejected(Cc::CacheOutcome const& outcome, std::string_view what, std::string_view key)
+{
+    if (outcome.kind != Cc::CacheOutcomeKind::Rejected)
+        return;
+    Note(std::format("{} key={} {}", what, key, Cc::DescribeOutcome(outcome)));
+}
+
 // --- process exec -----------------------------------------------------------
 
 /// The process runner used by every spawn in this file. Created once; the
@@ -363,6 +378,12 @@ class TcpClient
         return _impl->RecvExactly(count);
     }
 
+    /// The underlying seam, for the framing helpers in CacheProtocol.
+    [[nodiscard]] Cc::ITcpClient& Transport() noexcept
+    {
+        return *_impl;
+    }
+
   private:
     explicit TcpClient(std::unique_ptr<Cc::ITcpClient> impl):
         _impl { std::move(impl) }
@@ -371,28 +392,6 @@ class TcpClient
 
     std::unique_ptr<Cc::ITcpClient> _impl;
 };
-
-// --- protocol framing helpers ----------------------------------------------
-
-void AppendU32(std::vector<std::byte>& out, std::uint32_t n)
-{
-    std::array<std::byte, sizeof(std::uint32_t)> buf {};
-    WriteBigEndian<std::uint32_t>(buf, n);
-    out.insert(out.end(), buf.begin(), buf.end());
-}
-
-void AppendField(std::vector<std::byte>& out, std::string_view s)
-{
-    AppendU32(out, static_cast<std::uint32_t>(s.size()));
-    auto const* p = reinterpret_cast<std::byte const*>(s.data());
-    out.insert(out.end(), p, p + s.size());
-}
-
-void AppendField(std::vector<std::byte>& out, std::span<std::byte const> bytes)
-{
-    AppendU32(out, static_cast<std::uint32_t>(bytes.size()));
-    out.insert(out.end(), bytes.begin(), bytes.end());
-}
 
 /// The grammar to tag the include-bearing stream with, per compiler flavor.
 [[nodiscard]] PathCanon::Grammar IncludeGrammar()
@@ -534,21 +533,13 @@ constexpr std::size_t ReplayRegionCount = 2;
     if (!client.has_value())
         return std::nullopt;
 
-    std::vector<std::byte> frame;
-    frame.push_back(CompileCacheMagic);
-    frame.push_back(OpFetch);
-    AppendField(frame, key);
-    if (!client->SendAll(frame))
+    auto outcome = Cc::CacheFetch(client->Transport(), key);
+    if (!outcome.IsHit())
+    {
+        WarnIfRejected(outcome, "manifest fetch", key);
         return std::nullopt;
-
-    auto const status = client->RecvExactly(1);
-    if (!status.has_value() || (*status)[0] != StatusOk)
-        return std::nullopt;
-
-    auto const lenBytes = client->RecvExactly(sizeof(std::uint32_t));
-    if (!lenBytes.has_value())
-        return std::nullopt;
-    return client->RecvExactly(ReadBigEndian<std::uint32_t>(*lenBytes));
+    }
+    return std::move(outcome.value);
 }
 
 /// STORE bytes under `key`, best-effort. A manifest that fails to store only
@@ -569,22 +560,16 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
     if (!client.has_value())
         return;
 
-    std::vector<std::byte> frame;
-    frame.push_back(CompileCacheMagic);
-    frame.push_back(OpStore);
-    AppendField(frame, key);
-    AppendField(frame, cfg.cohort);
-    AppendField(frame, cfg.srcRoot);
-    AppendField(frame, cfg.buildTree);
-    AppendField(frame, std::span<std::byte const> { reinterpret_cast<std::byte const*>(body.data()), body.size() });
-    if (!client->SendAll(frame))
-        return;
-
-    // Check the ack rather than discarding it: a rejected STORE is silent otherwise,
-    // and a manifest that never lands makes direct mode look simply ineffective.
-    auto const ack = client->RecvExactly(1);
-    if (g_verbose && (!ack.has_value() || (*ack)[0] != StatusOk))
-        std::cerr << "fastcache-cc: STORE rejected (raw) key=" << key << " bytes=" << body.size() << '\n';
+    // Check the outcome rather than discarding it: a rejected STORE is silent
+    // otherwise, and a manifest that never lands makes direct mode look simply
+    // ineffective.
+    auto const outcome = Cc::CacheStore(client->Transport(),
+                                        Wire::StoreRequest { .key = key,
+                                                             .cohort = cfg.cohort,
+                                                             .srcRoot = cfg.srcRoot,
+                                                             .buildTree = cfg.buildTree,
+                                                             .value = Wire::AsBytes(body) });
+    WarnIfRejected(outcome, "STORE (raw)", key);
 }
 
 /// Fetch `key`, and if it holds a compile value, materialize it: write the object
@@ -829,36 +814,23 @@ void RecordManifest(Config const& cfg,
             Warn("connect failed");
             return std::nullopt;
         }
-        std::vector<std::byte> frame;
-        frame.push_back(CompileCacheMagic);
-        frame.push_back(OpFetch);
-        AppendField(frame, key);
-        if (!client->SendAll(frame))
+        auto const outcome = Cc::CacheFetch(client->Transport(), key);
+        if (outcome.kind == Cc::CacheOutcomeKind::Transport)
         {
-            Warn("fetch send failed");
+            Warn("fetch exchange failed");
             return std::nullopt;
         }
-        auto const status = client->RecvExactly(1);
-        if (!status.has_value())
+        if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
         {
-            Warn("fetch recv failed");
+            // The daemon answered and declined. Its own code and words go into
+            // the fall-back reason, so `--show-stats` names the cause instead of
+            // lumping a version mismatch in with an unreachable daemon.
+            Warn(Cc::DescribeOutcome(outcome));
             return std::nullopt;
         }
-        if ((*status)[0] == StatusOk)
+        if (outcome.IsHit())
         {
-            auto const lenBytes = client->RecvExactly(sizeof(std::uint32_t));
-            if (!lenBytes.has_value())
-            {
-                Warn("fetch length recv failed");
-                return std::nullopt;
-            }
-            auto const payload = client->RecvExactly(ReadBigEndian<std::uint32_t>(*lenBytes));
-            if (!payload.has_value())
-            {
-                Warn("fetch payload recv failed");
-                return std::nullopt;
-            }
-            auto decoded = DecodeCompileValue(*payload);
+            auto decoded = DecodeCompileValue(outcome.value);
             if (!decoded.has_value())
             {
                 Warn("fetch decoded malformed");
@@ -966,32 +938,23 @@ void RecordManifest(Config const& cfg,
         Note("connect failed for store");
         return code; // compile already succeeded; just skip caching
     }
-    std::vector<std::byte> frame;
-    frame.push_back(CompileCacheMagic);
-    frame.push_back(OpStore);
-    AppendField(frame, key);
-    AppendField(frame, cfg.cohort);
-    AppendField(frame, cfg.srcRoot);
-    AppendField(frame, cfg.buildTree);
-    AppendField(frame, std::span<std::byte const> { encoded.data(), encoded.size() });
     // Best-effort store: a failure here must never fail the build (the compile
     // already succeeded). Surface the outcome under verbose so store rejections
-    // (e.g. a value over the server's --storage-max-value) are diagnosable.
-    if (client->SendAll(frame))
-    {
-        auto const ack = client->RecvExactly(1);
-        if (g_verbose)
-        {
-            if (ack.has_value() && (*ack)[0] == StatusOk)
-                std::cerr << "fastcache-cc: STORED key=" << key << " bytes=" << encoded.size() << '\n';
-            else
-                std::cerr << "fastcache-cc: STORE rejected key=" << key << " bytes=" << encoded.size() << '\n';
-        }
-    }
-    else if (g_verbose)
-    {
-        std::cerr << "fastcache-cc: STORE send failed key=" << key << '\n';
-    }
+    // (e.g. a value over the server's --storage-max-value) are diagnosable — and
+    // now with the daemon's own reason, which the bare acknowledgement byte the
+    // old framing carried could never express.
+    auto const outcome = Cc::CacheStore(client->Transport(),
+                                        Wire::StoreRequest { .key = key,
+                                                             .cohort = cfg.cohort,
+                                                             .srcRoot = cfg.srcRoot,
+                                                             .buildTree = cfg.buildTree,
+                                                             .value = std::span<std::byte const> { encoded } });
+    if (outcome.IsHit())
+        Note(std::format("STORED key={} bytes={}", key, encoded.size()));
+    else if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
+        Note(std::format("STORE key={} bytes={} {}", key, encoded.size(), Cc::DescribeOutcome(outcome)));
+    else
+        Note(std::format("STORE exchange failed key={}", key));
 
     // Record the direct-mode manifest so the NEXT compile of this TU can reach the
     // object without preprocessing. The include set comes from the /showIncludes

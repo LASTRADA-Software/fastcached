@@ -25,10 +25,17 @@ set(_fc_cc_core
 # The launcher's own reusable pieces. Process spawning and the TCP client are
 # reached through interfaces (IProcessRunner / ITcpClient) so the flow logic
 # stays platform-free and testable against fakes on every host.
+# CacheProtocol.cpp is here rather than in main.cpp on purpose: main.cpp is in
+# no test target, so while the wire framing lived there it had no unit coverage
+# at all -- the only thing exercising it was the end-to-end script, which needs
+# a daemon and a compiler. As its own translation unit it can be driven against
+# a scripted ITcpClient, which is what lets "a rejected version is reported
+# distinctly from a miss" be a test rather than a hope.
 set(_fc_cc_sources
     CmdLine.cpp
     LauncherCli.cpp
     CacheKey.cpp
+    CacheProtocol.cpp
     DirectManifest.cpp
     Stats.cpp
     ProcessRunner.cpp
@@ -76,6 +83,7 @@ if(FASTCACHED_BUILD_TESTS)
         CmdLine_test.cpp
         LauncherCli_test.cpp
         CacheKey_test.cpp
+        CacheProtocol_test.cpp
         DirectManifest_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp
