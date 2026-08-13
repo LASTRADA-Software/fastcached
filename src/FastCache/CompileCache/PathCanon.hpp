@@ -9,11 +9,6 @@
 namespace FastCache::PathCanon
 {
 
-/// The canonicalization spec version this implementation targets. A stored
-/// canonical form is only interpretable by a localizer implementing the same
-/// version.
-inline constexpr std::uint32_t CanonSpecVersion = 1;
-
 /// A build's absolute roots on one machine. Both are native-form absolute
 /// paths (backslash separators on Windows).
 struct Layout
@@ -23,10 +18,17 @@ struct Layout
 };
 
 /// Failure modes of a canonicalize/localize call.
+///
+/// There is deliberately no version here. Canonical text only ever travels
+/// inside a CompileValue, whose container carries `CompileValueVersion` and is
+/// rejected on mismatch, so a change to the canonicalization spec is expressed
+/// by bumping that — and by the `objkey-v1` schema tag in the launcher's
+/// ComputeKey, which re-keys the cache so stale entries miss rather than being
+/// localized under rules they were not written by. A second version here was
+/// declared once and never referenced by anything, because it had no work to do.
 enum class CanonError : std::uint8_t
 {
-    UnknownVersion, ///< Token carries a spec version this implementation cannot interpret.
-    Malformed,      ///< Token/path is structurally invalid (e.g. an empty sentinel tail).
+    Malformed, ///< Token/path is structurally invalid (e.g. an empty sentinel tail).
 };
 
 /// The line grammars that locate path spans inside captured compiler text
