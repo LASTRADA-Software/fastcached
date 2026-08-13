@@ -79,9 +79,15 @@ std::string Exchange(TextFixture& fix, std::string_view request, FastCache::Sess
     fix.pair.client->ShutdownWrite();
 
     FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primingBytes*/ {}, session));
-    // The handler closed the server-side socket when its loop ended,
-    // which closed the server→client pipe's write side. The client can now
-    // read the buffered response and then observe EOF.
+    // Close the server side so ReadAvailable always observes EOF. The handler
+    // does NOT close its own write side when its loop ends, so without this the
+    // drain relies on the partial-read heuristic above and parks forever on a
+    // reply whose length is an exact multiple of the 256-byte chunk — see the
+    // identical note on Exchange in MemcachedMeta_test.cpp and DrainResponse in
+    // RedisResp_test.cpp. The handler has returned, so it has nothing left to
+    // write; the bytes already in the pipe survive CloseWrite and are drained
+    // before EOF is reported.
+    fix.pair.server->Close();
     return FastCache::SyncRun(ReadAvailable(fix.pair.client.get()));
 }
 

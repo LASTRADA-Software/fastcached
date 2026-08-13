@@ -1,6 +1,5 @@
 {
   "name": "fastcached",
-  "version-string": "0.0.0",
   "description": "Fast cache daemon (memcached + Redis RESP wire protocols).",
   "homepage": "https://github.com/LASTRADA-Software/fastcached",
   "dependencies": [],

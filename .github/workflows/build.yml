@@ -1,11 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
 name: Build
 
+# Every checkout that could configure the project passes `fetch-depth: 0`, and
+# that is load-bearing rather than habit: the version comes from `git describe`
+# (cmake/Version.cmake), and the default depth-1 checkout fetches no tags, so it
+# would silently yield the fallback version — and, in the packaging jobs, packages
+# named after a release nobody cut. Full history rather than `fetch-tags: true`
+# because a build off a branch has to describe against real history, and fetching
+# a tag into a depth-1 clone leaves the tagged commit as an unrelated shallow root
+# that describe cannot reach. YAML cannot factor a step input out, so the input is
+# repeated per job while the reason is stated once, here.
+#
+# Some of those checkouts are inert and deliberately kept uniform anyway, because
+# telling them apart at a glance is not possible and guessing wrong is silent:
+# `check-clang-format` only lists and formats files, `docker` builds the version
+# inside the image, where .dockerignore excludes .git/ so CMake always takes the
+# fallback path, and the smoke jobs download prebuilt binaries instead of
+# configuring anything.
+#
+# Two jobs are the stated exception and pass no fetch-depth at all —
+# `check-release-gate` and `release`. Both exist to read this file rather than to
+# build it, so history would buy them nothing, and a release must not be able to
+# fail on a clone parameter that cannot affect its outcome.
 on:
   push:
-    branches: [master, main, "fix-ci"]
+    branches: [master, "fix-ci"]
+    # A release is a numeric triple and nothing else: CMakeLists.txt feeds the tag
+    # straight into project(VERSION ...), which rejects anything that is not
+    # X.Y.Z — so v0.1.0-rc1 would fail configure in every job and burn a macOS
+    # notarization slot before saying so. Encoding the shape here means a mistyped
+    # or not-yet-supported tag costs nothing instead of an hour, and it is the one
+    # place that records why an rc tag cannot build yet.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   pull_request:
-    branches: [master, main]
+    branches: [master]
 
 concurrency:
   group: build-${{ github.ref }}
@@ -16,6 +44,14 @@ env:
   CLANG_TOOLS_VERSION: "22"
   GCC_VERSION: "14"
   CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/CPM
+  # Read by every packaging job's configure step. ON turns "no reachable tag"
+  # from a warning into a configure failure (cmake/Version.cmake), so a silently
+  # broken tag fetch fails in the job that would have built the artifact instead
+  # of shipping packages named after a release nobody cut. Hardcoding ON would
+  # fail every branch and pull-request run, where no tag is reachable by design —
+  # hence the expression, and hence it lives here: one value, three consumers,
+  # spelled once so they cannot drift apart.
+  FASTCACHED_REQUIRE_EXACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && 'ON' || 'OFF' }}
 
 jobs:
   check-clang-format:
@@ -23,6 +59,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: "Install clang-format"
         run: |
           wget https://apt.llvm.org/llvm.sh
@@ -34,6 +72,38 @@ jobs:
           git ls-files '*.h' '*.hpp' '*.cpp' \
             | xargs clang-format-${{ env.CLANG_TOOLS_VERSION }} --dry-run --Werror --style=file
 
+  # The release job gates on every other job in this workflow, and that list is
+  # hand-written. This is what keeps it honest — and it runs on every push and
+  # pull request, not only on a tag: the mistake it catches (adding a job and
+  # forgetting to gate the release on it) is made in a pull request, so a check
+  # that could only fail during a release would report it an hour late, after the
+  # tag was already pushed. `check-release-gate` is itself a row in
+  # `release.needs`, so this job's own failure stops a release too.
+  #
+  # No fetch-depth: 0 — this reads one file out of the checkout and configures
+  # nothing, so it needs no tags and no history.
+  check-release-gate:
+    name: "Check the release gate covers every job"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Assert every job in this workflow gates the release"
+        run: |
+          set -euo pipefail
+          # yq is preinstalled on the ubuntu-24.04 image. If it ever is not, that
+          # must fail here: a check that silently skips verifies nothing.
+          command -v yq >/dev/null || { echo "::error::yq is required to verify the release gate"; exit 1; }
+          workflow=.github/workflows/build.yml
+          yq '.jobs | keys | .[]' "$workflow" | grep -vx release | sort > "$RUNNER_TEMP/jobs.txt"
+          yq '.jobs.release.needs[]' "$workflow" | sort > "$RUNNER_TEMP/gates.txt"
+          missing="$(comm -23 "$RUNNER_TEMP/jobs.txt" "$RUNNER_TEMP/gates.txt")"
+          if [[ -n "$missing" ]]; then
+            echo "::error::these jobs do not gate the release; add them to release.needs:"
+            echo "$missing"
+            exit 1
+          fi
+          echo "all $(wc -l < "$RUNNER_TEMP/jobs.txt") sibling jobs gate this release"
+
   linux:
     name: "Linux-${{ matrix.preset }}"
     runs-on: ubuntu-24.04
@@ -43,6 +113,8 @@ jobs:
         preset: [clang-release, gcc-release]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: "Cache CPM packages"
         uses: actions/cache@v4
@@ -114,6 +186,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: "Cache CPM packages"
         uses: actions/cache@v4
@@ -158,6 +232,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: "Cache CPM packages"
         uses: actions/cache@v4
@@ -214,6 +290,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: "Build image"
         run: docker build -t fastcached:ci .
@@ -249,6 +327,8 @@ jobs:
     needs: linux
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: "Download fastcached binary"
         uses: actions/download-artifact@v4
         with:
@@ -269,6 +349,8 @@ jobs:
     needs: linux
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: "Download fastcached binary"
         uses: actions/download-artifact@v4
         with:
@@ -294,6 +376,8 @@ jobs:
     needs: linux
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: "Download fastcached binary"
         uses: actions/download-artifact@v4
         with:
@@ -321,6 +405,8 @@ jobs:
     needs: linux
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: "Download the fastcached + fastcache-cc binaries"
         uses: actions/download-artifact@v4
         with:
@@ -351,6 +437,8 @@ jobs:
         preset: [cl-release, clangcl-release]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: "Cache CPM packages"
         uses: actions/cache@v4
@@ -415,6 +503,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: "Cache CPM packages"
         uses: actions/cache@v4
@@ -475,6 +565,8 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: "Cache CPM packages"
         uses: actions/cache@v4
@@ -532,6 +624,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: "Cache CPM packages"
         uses: actions/cache@v4
@@ -562,7 +656,9 @@ jobs:
         # `cmake --install --prefix /usr/local` stays conventional; the package
         # layout (payload rooted at /, units under usr/lib/systemd, config in
         # /etc) is opt-in and this is the job that opts in.
-        run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON
+        # FASTCACHED_REQUIRE_EXACT_VERSION comes from the workflow-level env: block,
+        # which is where the "only on a tag run" reasoning is written down.
+        run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
         run: cmake --build --preset gcc-release --target fastcached fastcache-cc
@@ -733,6 +829,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: "Cache CPM packages"
         uses: actions/cache@v4
@@ -892,7 +990,8 @@ jobs:
             -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
             -DFASTCACHED_MACOS_SIGN_IDENTITY_APP="$IDENTITY_APP" \
             -DFASTCACHED_MACOS_SIGN_IDENTITY_PKG="$IDENTITY_PKG" \
-            -DFASTCACHED_MACOS_NOTARIZE="$NOTARIZE"
+            -DFASTCACHED_MACOS_NOTARIZE="$NOTARIZE" \
+            -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
         run: cmake --build out/build/macos-package --target fastcached fastcache-cc
@@ -1009,6 +1108,8 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: "Cache CPM packages"
         uses: actions/cache@v4
@@ -1044,7 +1145,9 @@ jobs:
           toolset: "14.44"
 
       - name: "Configure"
-        run: cmake --preset cl-release -DFASTCACHED_BUILD_TESTS=OFF
+        # FASTCACHED_REQUIRE_EXACT_VERSION comes from the workflow-level env: block,
+        # which is where the "only on a tag run" reasoning is written down.
+        run: cmake --preset cl-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
         run: cmake --build --preset cl-release --target fastcached fastcache-cc
@@ -1200,9 +1303,212 @@ jobs:
             throw 'uninstall removed the configuration'
           }
 
+      # Named fastcached-<platform>-packages like the Linux and macOS jobs, so the
+      # release job below collects all three with one pattern and a new platform
+      # is a new upload row rather than an edit there.
       - name: "Upload the MSI"
         uses: actions/upload-artifact@v4
         with:
-          name: fastcached-windows-msi
+          name: fastcached-windows-packages
           path: out/build/cl-release/*.msi
           if-no-files-found: error
+
+  # The release gate. Its contract is narrow and total: it runs only for a tag,
+  # only after every other job in this workflow is green, and it refuses to create
+  # anything unless every platform's package is present and named after the tag
+  # that triggered the build. What it creates is always a DRAFT — nothing here
+  # publishes a release automatically; /publish-release does that, by hand.
+  release:
+    name: "Draft GitHub release"
+    # The trigger already restricts tag runs to vX.Y.Z. This is what keeps the job
+    # off every branch and pull-request run; GitHub expressions have no regex, so
+    # the shape check stays in the `on:` filter and this stays a prefix test.
+    if: startsWith(github.ref, 'refs/tags/v')
+    # Every other job in this workflow. A job missing from this list is a job
+    # whose failure would not stop a release, so `check-release-gate` — itself a
+    # row here — asserts the list still covers the whole workflow, and does so on
+    # every push and pull request rather than only when a tag is already pushed.
+    needs:
+      - check-clang-format
+      - check-release-gate
+      - linux
+      - clang-tidy
+      - macos
+      - docker
+      - sccache-smoke-memcached-text
+      - sccache-smoke-memcached-binary
+      - sccache-smoke-redis
+      - fastcache-cc-smoke
+      - windows
+      - compile-cache-e2e-linux
+      - compile-cache-e2e-windows
+      - package-linux
+      - package-macos
+      - package-windows
+    runs-on: ubuntu-24.04
+    # The only job here needing more than the repository's default read-only
+    # token: creating a release writes `contents`. Without this the release step
+    # fails with a bare 403 rather than with anything that names the cause.
+    permissions:
+      contents: write
+    steps:
+      # Checked out for one reason: the asset list at the end of this job is the
+      # single source of truth for what a release consists of, and the assertion
+      # below reads it back rather than restating it. No history needed.
+      - uses: actions/checkout@v4
+
+      # Every packaging job uploads under fastcached-<platform>-packages. The
+      # archives do not collide in a flat directory: CPack stamps the system name
+      # into each (…-Linux-x86_64.tar.gz vs …-Darwin-arm64.tar.gz), which is also
+      # why the asset list below names them separately and so catches one going
+      # missing.
+      - name: "Download every platform's packages"
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fastcached-*-packages
+          merge-multiple: true
+          path: dist
+
+      # The version now comes from `git describe`, so a checkout that cannot see
+      # the tag produces a fallback version and packages named after a release
+      # nobody cut — a defect invisible in every green job above and observable
+      # only in the filenames. So the filenames are what gets asserted. The
+      # packaging jobs also configure with -DFASTCACHED_REQUIRE_EXACT_VERSION=ON
+      # on a tag run, which fails earlier and closer to the cause; this is the
+      # backstop that no packaging change can bypass.
+      #
+      # The expectation table is not restated here: it is read back out of this
+      # job's own asset list with the same extractor /publish-release uses, so
+      # there is exactly one such list in the repository.
+      - name: "Assert the package set is complete and named after the tag"
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          version="${TAG#v}"
+          [[ -n "$version" ]] || { echo "::error::empty tag name"; exit 1; }
+
+          mapfile -t patterns < <(awk '
+              /files:[[:space:]]*\|/ { collecting = 1; next }
+              collecting {
+                  if ($0 ~ /^[[:space:]]*#/) next
+                  if ($0 !~ /^[[:space:]]*[*a-zA-Z0-9._-]+/) { collecting = 0; next }
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+                  if (length($0)) print
+              }' .github/workflows/build.yml)
+
+          (( ${#patterns[@]} )) || { echo "::error::no asset globs found in this workflow"; exit 1; }
+
+          status=0
+          : > "$RUNNER_TEMP/attached.txt"
+          {
+            echo "### Release assets for \`$TAG\`"
+            echo
+            echo "| expected | asset | bytes |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for pattern in "${patterns[@]}"; do
+            # A glob is a filename pattern and nothing else. Whitespace or a colon
+            # means the extractor ran past the end of the asset list and swallowed
+            # a sibling key — see the warning above that list.
+            if [[ "$pattern" == *[[:space:]:]* ]]; then
+              echo "::error::'$pattern' is not a file glob: the asset list must stay the LAST key of the action's with: mapping"
+              status=1; continue
+            fi
+
+            hits=( $pattern )
+            if (( ${#hits[@]} != 1 )); then
+              echo "::error::$pattern matched ${#hits[@]} files, expected exactly 1: ${hits[*]-}"
+              echo "| \`$pattern\` | **${#hits[@]} matches** | |" >> "$GITHUB_STEP_SUMMARY"
+              status=1; continue
+            fi
+
+            file="${hits[0]}"
+            name="${file##*/}"
+
+            # `fastcached-<version>` followed by a separator, not a substring test:
+            # 0.1.1 would otherwise be satisfied by a 0.1.10 package.
+            case "$name" in
+              fastcached-"$version"[-_.]* | fastcached_"$version"[-_.]*) ;;
+              *)
+                echo "::error::$name does not carry the tag's version ($version): the build used a fallback version, so that checkout could not see the tag"
+                echo "| \`$pattern\` | $name | **wrong version** |" >> "$GITHUB_STEP_SUMMARY"
+                status=1; continue
+                ;;
+            esac
+
+            [[ -s "$file" ]] || { echo "::error::$name is empty"; status=1; continue; }
+
+            printf '%s\n' "$file" >> "$RUNNER_TEMP/attached.txt"
+            echo "| \`$pattern\` | $name | $(stat -c %s "$file") |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          # Nothing that was built may be left out. An artifact no glob attaches is
+          # a platform silently missing from the release page — the same defect as
+          # a missing package, wearing the opposite disguise.
+          find dist -type f | sort > "$RUNNER_TEMP/downloaded.txt"
+          sort -o "$RUNNER_TEMP/attached.txt" "$RUNNER_TEMP/attached.txt"
+          orphans="$(comm -23 "$RUNNER_TEMP/downloaded.txt" "$RUNNER_TEMP/attached.txt" || true)"
+          if [[ -n "$orphans" ]]; then
+            echo "::error::downloaded but attached by no glob:"
+            echo "$orphans"
+            status=1
+          fi
+
+          exit $status
+
+      # softprops/action-gh-release rather than `gh release upload`:
+      # /publish-release discovers what a release is *supposed* to contain by
+      # parsing the literal asset list below, and a runtime-built upload list
+      # would leave it with nothing to verify against.
+      #
+      # DO NOT ADD A KEY BELOW THE ASSET LIST, AND DO NOT REORDER THIS MAPPING.
+      # That verifier collects every line after the list header and stops at the
+      # first line that does not look like a filename — and `draft: true` looks
+      # exactly like one. A key moved below the list is collected as a glob that
+      # can never match, and verification then blocks forever on a phantom asset.
+      # The list stays last, terminated by the end of the file. The assertion step
+      # above fails the build if this is ever "tidied"; that is its second job.
+      - name: "Create the draft release"
+        # Pinned to a full commit SHA rather than the mutable @v2 tag, because this
+        # is the only step in the workflow holding a `contents: write` token: a tag
+        # is repointable by the action's owner or by anyone who takes that account,
+        # and the next tag push would run the new code with rights to write
+        # releases, tags and repository contents. The SHA below is v2.6.2, which is
+        # what @v2 resolved to when this was validated. Upgrading is a deliberate
+        # edit — read the changelog, bump the SHA and the version in this comment
+        # together. (Upstream has since moved to v3.x; that is a major bump whose
+        # input contract needs checking, so it is not taken here by default.)
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "fastcached ${{ github.ref_name }}"
+          # The whole point: CI assembles the release, a human publishes it with
+          # /publish-release once the assets have been verified.
+          draft: true
+          # No changelog file in this repository, so the body is GitHub's
+          # generated commit summary — which /publish-release requires to be
+          # non-empty.
+          generate_release_notes: true
+          # A glob matching nothing is a platform with no download. The assertion
+          # step catches that first; this makes the action itself refuse rather
+          # than warn, so neither path can leave a partial draft behind.
+          fail_on_unmatched_files: true
+          # One row per shipped artifact, each specific enough that a single
+          # platform dropping out breaks exactly one row: a shared
+          # `fastcached-*.tar.gz` would be satisfied by the Linux archive alone
+          # while macOS shipped nothing. macOS is arm64-only because the runner is
+          # Apple Silicon, so the day an x86_64 package appears this list gains a
+          # row. The version is deliberately a wildcard — it is pinned to the tag
+          # by the assertion step above, which can say so in its own words.
+          files: |
+            dist/fastcached_*_amd64.deb
+            dist/fastcached-*.x86_64.rpm
+            dist/fastcached-*-Linux-x86_64.tar.gz
+            dist/fastcached-*-Darwin-arm64.pkg
+            dist/fastcached-*-Darwin-arm64.dmg
+            dist/fastcached-*-Darwin-arm64.tar.gz
+            dist/fastcached-*-Windows-AMD64.msi

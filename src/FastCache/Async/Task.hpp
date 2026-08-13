@@ -4,6 +4,7 @@
 #include <atomic>
 #include <coroutine>
 #include <exception>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -372,14 +373,32 @@ struct DetachedTask
 /// top-level main() body before the reactor is in place. Spins suspending
 /// continuations are not supported — the task must be self-driving (i.e.,
 /// only await other already-ready awaiters).
+///
+/// That precondition is *checked*, and the check is load-bearing rather than
+/// defensive. A task still suspended when resume() returns has no result to
+/// read: `std::get<1>(promise.result)` names an alternative that was never
+/// engaged, and — far worse — `~Task()` then destroys a frame that whatever
+/// parked the coroutine is still pointing into. InMemorySocket records the
+/// awaitable living in that frame as its pending read, so the next Push or
+/// CloseWrite on the pipe dereferences freed memory: a SIGSEGV on Linux,
+/// heap corruption (0xC0000374) on Windows, an abort on macOS — none of them
+/// naming the test that caused it. Throwing here turns that whole class of
+/// bug (a drain loop that parks because a reply is an exact multiple of its
+/// chunk size, say) into one legible failure at the call site.
 /// @tparam T Result type of the task.
 /// @param task Task to drive; must not be empty.
 /// @return The task's result (or rethrows its exception).
+/// @throws std::logic_error if the task is still suspended after being
+///         resumed, i.e. it awaited something this function cannot complete.
 template <typename T>
 T SyncRun(Task<T> task)
 {
     auto handle = task.Native();
     handle.resume();
+    if (!handle.done())
+        throw std::logic_error { "SyncRun: the task is still suspended after resume(). It awaited something "
+                                 "SyncRun cannot complete (a socket read with no data and no closed peer, "
+                                 "typically). Reading its result would be undefined behaviour." };
     if constexpr (std::is_same_v<T, void>)
     {
         if (auto const& exc = handle.promise().exception; exc)

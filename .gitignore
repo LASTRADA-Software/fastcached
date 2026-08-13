@@ -18,3 +18,16 @@ vcpkg_installed/
 callgrind.out.*
 perf.data*
 *.tracy
+
+# Local, untracked version override. The git tag is the single source of truth
+# for the version (cmake/Version.cmake); this file is ignored here so it cannot
+# be staged by accident, and `ctest -R repository-hygiene` fails outright if it
+# is ever tracked again — a committed version carrier is exactly what stopped the
+# tag being the source of truth once before. Ignoring it is the ergonomics; the
+# test is the enforcement.
+#
+# Anchored with a leading slash so it names the repository root and nothing else,
+# matching the pathspec the hygiene check inspects. Unanchored, this would also
+# hide a `version.txt` anywhere below — a path the check does not look at, so the
+# ignore rule would be silently wider than the rule it exists to support.
+/version.txt

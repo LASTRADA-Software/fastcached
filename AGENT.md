@@ -251,6 +251,48 @@ These constraints are load-bearing and have each already been a bug:
   asserts the result with `otool -L`. `CMAKE_OSX_DEPLOYMENT_TARGET` is pinned to
   13.3 (the floor at which the system libc++ has floating-point `std::to_chars`,
   which `std::format` needs) and must be set *before* `project()`.
+- **The git tag is the only version source, and `version.txt` must never come
+  back.** There used to be a committed `version.txt`, and because
+  `cmake/Version.cmake` read it *first* it was the real source of truth: a second
+  version carrier that each release had to remember to bump in lock-step with the
+  tag, and that pinned every build, every wire banner and every package to `0.0.1`
+  for as long as it existed. `ctest -R repository-hygiene` now fails if it — or any
+  other row in `scripts/check-repository-hygiene.cmake`'s table — is ever *tracked*
+  again. The test asks the git **index**, not the filesystem, so it fails at
+  `git add` time rather than after a commit, and an untracked local `version.txt`
+  stays legitimate (it is in `.gitignore` and is read by nothing). A build that
+  cannot reach a tag states its version with `-DFASTCACHED_VERSION=1.2.3`.
+- **The resolved version triple must stay a bare numeric `X.Y.Z`, and the fallback
+  with it.** `CMakeLists.txt` feeds it to `project(VERSION ...)`, which rejects
+  anything else, and CPack carries it into the MSI `ProductVersion` (major/minor
+  < 256, patch < 65536), the RPM `Version:` field (where `-` is illegal) and the
+  Debian version (where `-` starts the package revision) — so `Version.cmake`
+  validates the fields against a table and the *string*, never the triple, carries
+  the `-12-gdeadbee`/`-dirty` suffixes. This is why the no-tag fallback is `0.0.0`
+  and not `0.0.0-unknown`: the `docker` job takes that path on **every** ref
+  regardless of clone depth, because `.dockerignore` excludes `.git/`, so a
+  non-numeric fallback would turn every push red. It is also why the release
+  trigger matches `v[0-9]+.[0-9]+.[0-9]+` rather than `v*` — a `v0.1.0-rc1` tag
+  cannot configure, and failing to *start* costs nothing where fifteen red jobs and
+  a burnt notarization slot would.
+- **Every checkout in `build.yml` that could configure the project passes
+  `fetch-depth: 0`, and the release job's asset list must stay the last key of its
+  `with:` mapping.** The default depth-1
+  checkout fetches no tags, so `git describe` finds nothing and the build silently
+  falls back — which in a packaging job means artifacts named after a release
+  nobody cut. Full history, not `fetch-tags: true`: fetching a tag into a depth-1
+  clone leaves the tagged commit as an unrelated shallow root `describe` cannot
+  reach. The two jobs that only *read* the workflow file — `check-release-gate`
+  and `release` — are the stated exception and pass no `fetch-depth`, because
+  history buys them nothing and a release must not be able to fail on a clone
+  parameter that cannot affect it. Separately, `/publish-release` learns what a release should contain by
+  parsing that literal asset list, and its extractor stops only at a line that does
+  not look like a filename — `draft: true` looks exactly like one, so a key moved
+  below the list is collected as a glob that can never match and publication blocks
+  forever on a phantom asset. The same reason forbids writing `files:` followed by
+  `|` anywhere else in that file, comments included. A step in the release job
+  re-reads the list with that same extractor and fails on any entry containing
+  whitespace or a colon, so the rule is enforced rather than merely documented.
 
 `fastcached` and `fastcache-cc` are both installed. Two things the launcher's
 cache key depends on, both of which have already caused silent hit-rate
@@ -424,6 +466,40 @@ PDB is a second artefact no hit can reproduce).
 ## Testing
 
 Catch2 tests live next to the implementation files, so `Foo.cpp` has a `Foo_test.cpp`. A `test_main.cpp` serves as the entry point.
+
+Not every test is a Catch2 case. Script-driven tests are registered in
+`src/tests/CMakeLists.txt`: the `smoke`-labelled ones start a real daemon or
+invoke a real compiler and report a missing prerequisite as skipped (exit 77 with
+`SKIP_RETURN_CODE`), while `repository-hygiene` runs
+`scripts/check-repository-hygiene.cmake` through `cmake -P` and is deliberately
+*not* labelled `smoke`, since it needs no daemon, socket or compiler and so belongs
+in the default `ctest` set. It reports "not a git work tree" by printing `SKIP: `
+and exiting 0, matched by `SKIP_REGULAR_EXPRESSION` — a `cmake -P` script cannot
+choose its own exit code before CMake 3.29 (`cmake_language(EXIT)`) and this
+project supports 3.28, so a `SKIP_RETURN_CODE` it could never return would be dead
+configuration.
+
+## Releasing
+
+The version is the git tag, so cutting a release is pushing one:
+
+```sh
+git tag -a v0.1.0 -m "fastcached 0.1.0"
+git push origin v0.1.0
+```
+
+That tag matches the trigger in `.github/workflows/build.yml`, which runs the
+**entire** suite against the tagged tree — nothing about a release path is
+exercised only at release time — and then the tag-gated `release` job collects the
+three packaging jobs' artifacts, asserts that the set is complete and that every
+filename carries the tag's version, and creates a **draft** GitHub release with
+them attached. Nothing publishes automatically; a human does that with
+`/publish-release` once the assets have been verified. `/draft-release` drives the
+tagging half.
+
+There is no changelog file: release notes are GitHub's generated commit summary
+(`generate_release_notes: true`), so commit subjects are what a reader of the
+release page sees.
 
 ## Profiling with Tracy
 

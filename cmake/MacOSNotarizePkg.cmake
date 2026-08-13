@@ -64,7 +64,7 @@ foreach(_package IN LISTS CPACK_PACKAGE_FILES)
     # one; the .pkg is copied rather than moved because CPack still owns it and
     # copies it back to the build tree afterwards.
     # NAME_WLE, not NAME_WE: the latter strips from the *first* dot, which turns
-    # fastcached-0.0.1-Darwin-arm64.pkg into "fastcached-0".
+    # fastcached-1.2.3-Darwin-arm64.pkg into "fastcached-1".
     get_filename_component(_name "${_package}" NAME_WLE)
     get_filename_component(_dir "${_package}" DIRECTORY)
     set(_stage "${_dir}/dmgroot")

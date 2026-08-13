@@ -3,10 +3,26 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <coroutine>
+#include <stdexcept>
 #include <string>
 
 namespace
 {
+
+/// Awaitable that suspends and is never resumed by anybody — the shape of a
+/// socket read with no data buffered and no closed peer to report EOF.
+struct NeverCompletes
+{
+    [[nodiscard]] bool await_ready() const noexcept
+    {
+        return false;
+    }
+    // The handle is deliberately dropped: nothing ever resumes this awaitable,
+    // which is the whole point of the fixture.
+    void await_suspend(std::coroutine_handle<> /*awaiting*/) const noexcept {}
+    void await_resume() const noexcept {}
+};
 
 FastCache::Task<int> ReturnFortyTwo()
 {
@@ -22,6 +38,22 @@ FastCache::Task<int> CallReturnFortyTwo()
 FastCache::Task<std::string> Greet(std::string name)
 {
     co_return "hello, " + name;
+}
+
+/// Value-returning task that parks before ever producing a result.
+FastCache::Task<int> ParksForever()
+{
+    co_await NeverCompletes {};
+    co_return 1;
+}
+
+/// void task that parks before its side effect, so a test can assert the body
+/// past the suspend point did not run.
+FastCache::Task<void> ParksForeverVoid(int* sideEffect)
+{
+    co_await NeverCompletes {};
+    *sideEffect = 1;
+    co_return;
 }
 
 FastCache::Task<void> JustReturn(int* sideEffect)
@@ -72,4 +104,19 @@ TEST_CASE("Task<void> runs the body for side effects", "[task]")
 TEST_CASE("Task propagates exceptions through co_await", "[task]")
 {
     REQUIRE_THROWS_AS(FastCache::SyncRun(CallsThrows()), std::runtime_error);
+}
+
+TEST_CASE("SyncRun refuses a task that is still suspended (regression)", "[task][regression]")
+{
+    // SyncRun used to read promise.result unconditionally. For a task still
+    // parked after resume() that names a variant alternative which was never
+    // engaged, and ~Task() then tears the frame down while whatever parked the
+    // coroutine still points into it — the drain loops in the protocol tests
+    // park exactly this way when a reply is an exact multiple of their chunk
+    // size, and it surfaced as a SIGSEGV / heap corruption / abort rather than
+    // as a named failure. It must be a diagnosable precondition violation.
+    REQUIRE_THROWS_AS(FastCache::SyncRun(ParksForever()), std::logic_error);
+    int sideEffect = 0;
+    REQUIRE_THROWS_AS(FastCache::SyncRun(ParksForeverVoid(&sideEffect)), std::logic_error);
+    REQUIRE(sideEffect == 0);
 }
