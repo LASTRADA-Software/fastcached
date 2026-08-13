@@ -35,6 +35,17 @@ FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view p
     co_return result.has_value();
 }
 
+/// Drain the socket until EOF, or until a partial read indicates the pipe is
+/// empty. The partial-read branch is a heuristic and parks forever when a reply
+/// is an exact multiple of `chunk.size()` and the peer is still open: every read
+/// returns a full chunk, so the loop goes round once more and the final Read has
+/// nothing to return and no closed peer to report EOF, leaving the coroutine
+/// suspended. SyncRun then reads a task that never completed, which is undefined
+/// behaviour — it surfaced as a SIGSEGV on Linux, a 0xC0000374 heap corruption on
+/// Windows and an abort on macOS. To make the loop deterministic regardless of
+/// length, the callers below close the server side once `handler.Run` returns, so
+/// this always sees EOF (`*r == 0`) on the next Read. See the identical note on
+/// DrainResponse in RedisResp_test.cpp.
 FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
 {
     std::string out;
@@ -57,6 +68,10 @@ std::string Exchange(MetaFixture& fix, std::string_view req)
     REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), req)));
     fix.pair.client->ShutdownWrite();
     FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*priming*/ {}, /*session*/ {}));
+    // Close the server side so ReadAvailable always observes EOF rather than
+    // parking on a reply whose length is an exact multiple of the chunk size.
+    // The handler has returned, so it has nothing left to write.
+    fix.pair.server->Close();
     return FastCache::SyncRun(ReadAvailable(fix.pair.client.get()));
 }
 
@@ -432,6 +447,9 @@ TEST_CASE("meta mg l reports seconds since the previous read (regression)", "[pr
         REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), req)));
         pair.client->ShutdownWrite();
         FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*priming*/ {}, /*session*/ {}));
+        // See Exchange above: close the server side so the drain sees EOF instead
+        // of parking on an exact-multiple-of-chunk-size reply.
+        pair.server->Close();
         return FastCache::SyncRun(ReadAvailable(pair.client.get()));
     };
 
