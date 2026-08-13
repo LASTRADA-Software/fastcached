@@ -11,6 +11,7 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -94,6 +95,21 @@ inline constexpr std::size_t RequestHeaderSize = 7;
 
 /// Size of the fixed reply header: status, payload length.
 inline constexpr std::size_t ReplyHeaderSize = 5;
+
+/// Largest payload a frame can describe, since the length field is a u32.
+///
+/// Enforced by the encoders rather than assumed. Casting an over-large size down
+/// to `std::uint32_t` would quietly emit a frame whose declared length disagrees
+/// with its contents — the exact desynchronisation the declared length exists to
+/// prevent, and undetectable by the peer.
+///
+/// A caller that exceeds it has misused the contract, so the encoders throw
+/// `std::length_error` rather than returning a sentinel. That keeps the
+/// post-condition simple — an encoder either returns a well-formed frame or does
+/// not return — which is what lets every caller index the result without first
+/// proving it non-empty. It is also unreachable in practice: the daemon caps
+/// values at `--storage-max-value` (256 MiB by default), far below this.
+inline constexpr std::uint64_t MaxFramePayload = 0xFFFFFFFFULL;
 
 /// Wire opcodes. One byte, third in the request header.
 enum class Op : std::uint8_t
@@ -338,11 +354,14 @@ namespace Detail
                                                               Op op,
                                                               std::initializer_list<std::span<std::byte const>> fields)
     {
-        std::size_t payloadSize = 0;
-        for (auto const& field: fields)
-            payloadSize += sizeof(std::uint32_t) + field.size();
+        std::uint64_t const payloadSize =
+            std::ranges::fold_left(fields, std::uint64_t { 0 }, [](std::uint64_t acc, std::span<std::byte const> field) {
+                return acc + sizeof(std::uint32_t) + std::uint64_t { field.size() };
+            });
+        if (payloadSize > MaxFramePayload)
+            throw std::length_error("compile-cache request payload exceeds the u32 wire length");
 
-        std::vector<std::byte> frame(RequestHeaderSize + payloadSize);
+        std::vector<std::byte> frame(RequestHeaderSize + static_cast<std::size_t>(payloadSize));
         std::span<std::byte> const out { frame };
         out[0] = Magic;
         out[1] = static_cast<std::byte>(version);
@@ -397,6 +416,9 @@ namespace Detail
 /// @return The framed reply.
 [[nodiscard]] inline std::vector<std::byte> EncodeReply(Status status, std::span<std::byte const> payload)
 {
+    if (payload.size() > MaxFramePayload)
+        throw std::length_error("compile-cache reply payload exceeds the u32 wire length");
+
     std::vector<std::byte> frame(ReplyHeaderSize + payload.size());
     std::span<std::byte> const out { frame };
     out[0] = static_cast<std::byte>(status);
@@ -414,6 +436,8 @@ namespace Detail
     if (message.empty())
         if (auto const* row = Describe(code); row != nullptr)
             message = row->defaultMessage;
+    if (message.size() >= MaxFramePayload)
+        throw std::length_error("compile-cache error message exceeds the u32 wire length");
 
     std::vector<std::byte> payload(1 + message.size());
     payload[0] = static_cast<std::byte>(code);
