@@ -1,6 +1,7 @@
 # Protocols overview
 
-fastcached speaks four wire protocols off the same storage engine:
+fastcached speaks five wire protocols off the same storage engine — four
+compatible with existing clients, plus one of its own:
 
 | Protocol             | Reference                                  | Status      |
 |----------------------|--------------------------------------------|-------------|
@@ -8,6 +9,13 @@ fastcached speaks four wire protocols off the same storage engine:
 | memcached (binary)   | [memcached protocol_binary.xml][mcb]       | Full        |
 | memcached (meta)     | [memcached protocol.txt §meta][mc]         | Full        |
 | Redis (RESP2)        | [Redis Serialization Protocol][resp]       | Key-value subset |
+| Compile cache (`0xFC`) | [Compile cache](compile-cache.md)        | fastcached's own |
+
+The compile cache is deliberately unlike the other four: they move opaque
+bytes, while it understands that a value is a compile result and rewrites
+the paths inside it. It is also the only one that is versioned, so it is
+excluded from the capability matrix below — see its own page for the
+framing, statuses, and error codes.
 
 [mc]: https://github.com/memcached/memcached/blob/master/doc/protocol.txt
 [mcb]: https://github.com/memcached/memcached/blob/master/doc/protocol-binary.xml
