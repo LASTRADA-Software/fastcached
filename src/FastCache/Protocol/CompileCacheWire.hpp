@@ -3,9 +3,11 @@
 
 #include <FastCache/Core/Endian.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -303,28 +305,31 @@ struct StoreRequest
 namespace Detail
 {
 
-    /// Append a big-endian u32 to a byte buffer.
-    /// @param out Destination buffer.
-    /// @param n Value to append.
-    inline void AppendU32(std::vector<std::byte>& out, std::uint32_t n)
+    /// Byte offset `n` into a buffer, as an iterator difference.
+    [[nodiscard]] constexpr std::ptrdiff_t Offset(std::size_t n) noexcept
     {
-        std::array<std::byte, sizeof(std::uint32_t)> buffer {};
-        WriteBigEndian<std::uint32_t>(buffer, n);
-        out.insert(out.end(), buffer.begin(), buffer.end());
+        return static_cast<std::ptrdiff_t>(n);
     }
 
-    /// Append one length-prefixed field.
-    /// @param out Destination buffer.
-    /// @param field The field bytes; may be empty.
-    inline void AppendField(std::vector<std::byte>& out, std::span<std::byte const> field)
+    /// Write a big-endian u32 at `offset` within `out`.
+    /// @param out Destination buffer, already sized to hold it.
+    /// @param offset Byte offset to write at.
+    /// @param n Value to write.
+    inline void PutU32(std::span<std::byte> out, std::size_t offset, std::uint32_t n)
     {
-        AppendU32(out, static_cast<std::uint32_t>(field.size()));
-        out.insert(out.end(), field.begin(), field.end());
+        WriteBigEndian<std::uint32_t>(out.subspan(offset, sizeof(std::uint32_t)), n);
     }
 
     /// Build a complete request frame. **The only place a request header is
     /// written** — every encoder funnels through here, so the layout has exactly
     /// one author.
+    ///
+    /// The frame is sized exactly once and then filled in place. Growing it with
+    /// `reserve` + `push_back` + `insert` would be the obvious spelling, but the
+    /// total is known up front, so one allocation and no reallocation is both
+    /// simpler and faster — and it keeps GCC's `-Wfree-nonheap-object` analysis
+    /// out of a false positive it reaches when a `reserve`d vector is fed from a
+    /// stack buffer at -O3.
     /// @param version Version to advertise.
     /// @param op The opcode.
     /// @param fields The length-prefixed fields, in wire order.
@@ -333,17 +338,25 @@ namespace Detail
                                                               Op op,
                                                               std::initializer_list<std::span<std::byte const>> fields)
     {
-        std::vector<std::byte> payload;
+        std::size_t payloadSize = 0;
         for (auto const& field: fields)
-            AppendField(payload, field);
+            payloadSize += sizeof(std::uint32_t) + field.size();
 
-        std::vector<std::byte> frame;
-        frame.reserve(RequestHeaderSize + payload.size());
-        frame.push_back(Magic);
-        frame.push_back(static_cast<std::byte>(version));
-        frame.push_back(static_cast<std::byte>(op));
-        AppendU32(frame, static_cast<std::uint32_t>(payload.size()));
-        frame.insert(frame.end(), payload.begin(), payload.end());
+        std::vector<std::byte> frame(RequestHeaderSize + payloadSize);
+        std::span<std::byte> const out { frame };
+        out[0] = Magic;
+        out[1] = static_cast<std::byte>(version);
+        out[2] = static_cast<std::byte>(op);
+        PutU32(out, 3, static_cast<std::uint32_t>(payloadSize));
+
+        std::size_t offset = RequestHeaderSize;
+        for (auto const& field: fields)
+        {
+            PutU32(out, offset, static_cast<std::uint32_t>(field.size()));
+            offset += sizeof(std::uint32_t);
+            std::ranges::copy(field, std::next(frame.begin(), Offset(offset)));
+            offset += field.size();
+        }
         return frame;
     }
 
@@ -384,11 +397,11 @@ namespace Detail
 /// @return The framed reply.
 [[nodiscard]] inline std::vector<std::byte> EncodeReply(Status status, std::span<std::byte const> payload)
 {
-    std::vector<std::byte> frame;
-    frame.reserve(ReplyHeaderSize + payload.size());
-    frame.push_back(static_cast<std::byte>(status));
-    Detail::AppendU32(frame, static_cast<std::uint32_t>(payload.size()));
-    frame.insert(frame.end(), payload.begin(), payload.end());
+    std::vector<std::byte> frame(ReplyHeaderSize + payload.size());
+    std::span<std::byte> const out { frame };
+    out[0] = static_cast<std::byte>(status);
+    Detail::PutU32(out, 1, static_cast<std::uint32_t>(payload.size()));
+    std::ranges::copy(payload, std::next(frame.begin(), Detail::Offset(ReplyHeaderSize)));
     return frame;
 }
 
@@ -402,11 +415,9 @@ namespace Detail
         if (auto const* row = Describe(code); row != nullptr)
             message = row->defaultMessage;
 
-    std::vector<std::byte> payload;
-    payload.reserve(1 + message.size());
-    payload.push_back(static_cast<std::byte>(code));
-    auto const text = AsBytes(message);
-    payload.insert(payload.end(), text.begin(), text.end());
+    std::vector<std::byte> payload(1 + message.size());
+    payload[0] = static_cast<std::byte>(code);
+    std::ranges::copy(AsBytes(message), std::next(payload.begin()));
     return EncodeReply(Status::Error, payload);
 }
 
