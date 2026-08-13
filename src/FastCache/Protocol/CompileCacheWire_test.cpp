@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -26,6 +27,20 @@ namespace
     for (auto const value: values)
         out.push_back(static_cast<std::byte>(value));
     return out;
+}
+
+/// Unwrap an optional for assertion, yielding a default-constructed value when
+/// empty.
+///
+/// clang-tidy's optional analysis cannot see a `has_value()` guard through
+/// Catch2's REQUIRE macro, so a direct `*x` or `x.value()` after one is reported
+/// as an unchecked access. Going through `value_or` is provably safe, and the
+/// preceding REQUIRE still fails the test first when the optional is empty — so
+/// the default is never actually observed.
+template <typename T>
+[[nodiscard]] T Unwrap(std::optional<T> const& value)
+{
+    return value.value_or(T {});
 }
 
 } // namespace
@@ -125,9 +140,9 @@ TEST_CASE("DecodeRequestHeader reads back what EncodeFetch wrote")
     auto const header = DecodeRequestHeader(std::span<std::byte const> { frame }.first(RequestHeaderSize));
 
     REQUIRE(header.has_value());
-    CHECK(header->version == CurrentVersion);
-    CHECK(header->opRaw == static_cast<std::uint8_t>(Op::Fetch));
-    CHECK(header->payloadLength == 6);
+    CHECK(Unwrap(header).version == CurrentVersion);
+    CHECK(Unwrap(header).opRaw == static_cast<std::uint8_t>(Op::Fetch));
+    CHECK(Unwrap(header).payloadLength == 6);
 }
 
 TEST_CASE("DecodeRequestHeader rejects a foreign magic but keeps an unknown opcode")
@@ -148,8 +163,8 @@ TEST_CASE("DecodeRequestHeader rejects a foreign magic but keeps an unknown opco
         frame[2] = std::byte { 0xEE };
         auto const header = DecodeRequestHeader(std::span<std::byte const> { frame }.first(RequestHeaderSize));
         REQUIRE(header.has_value());
-        CHECK(header->opRaw == 0xEE);
-        CHECK(FindOp(header->opRaw) == nullptr);
+        CHECK(Unwrap(header).opRaw == 0xEE);
+        CHECK(FindOp(Unwrap(header).opRaw) == nullptr);
     }
 
     SECTION("a short header is rejected")
@@ -165,8 +180,8 @@ TEST_CASE("DecodeReplyHeader round-trips and rejects an unknown status")
 
     auto const header = DecodeReplyHeader(std::span<std::byte const> { reply }.first(ReplyHeaderSize));
     REQUIRE(header.has_value());
-    CHECK(header->status == Status::Ok);
-    CHECK(header->payloadLength == 3);
+    CHECK(Unwrap(header).status == Status::Ok);
+    CHECK(Unwrap(header).payloadLength == 3);
 
     reply[0] = std::byte { 0x7F };
     CHECK_FALSE(DecodeReplyHeader(std::span<std::byte const> { reply }.first(ReplyHeaderSize)).has_value());
@@ -189,11 +204,11 @@ TEST_CASE("DecodeStorePayload round-trips every field, including an empty one")
     auto const view = DecodeStorePayload(payload);
 
     REQUIRE(view.has_value());
-    CHECK(AsStringView(view->key) == "the-key");
-    CHECK(view->cohort.empty());
-    CHECK(AsStringView(view->srcRoot) == "/src");
-    CHECK(AsStringView(view->buildTree) == "/build");
-    CHECK(std::ranges::equal(view->value, value));
+    CHECK(AsStringView(Unwrap(view).key) == "the-key");
+    CHECK(Unwrap(view).cohort.empty());
+    CHECK(AsStringView(Unwrap(view).srcRoot) == "/src");
+    CHECK(AsStringView(Unwrap(view).buildTree) == "/build");
+    CHECK(std::ranges::equal(Unwrap(view).value, value));
 }
 
 TEST_CASE("DecodeFetchPayload round-trips the key")
@@ -203,7 +218,7 @@ TEST_CASE("DecodeFetchPayload round-trips the key")
     auto const key = DecodeFetchPayload(payload);
 
     REQUIRE(key.has_value());
-    CHECK(AsStringView(*key) == "the-key");
+    CHECK(AsStringView(Unwrap(key)) == "the-key");
 }
 
 TEST_CASE("SplitFields rejects a payload that disagrees with its field lengths")
@@ -248,10 +263,12 @@ TEST_CASE("SplitFields rejects a payload that disagrees with its field lengths")
         // returns spans INTO it — handing it a temporary leaves every field
         // dangling the moment the call returns.
         auto const payload = Bytes({ 0x00, 0x00, 0x00, 0x02, 0x61, 0x62 });
-        auto const fields = SplitFields(payload, 1);
-        REQUIRE(fields.has_value());
-        REQUIRE(fields->size() == 1);
-        CHECK(AsStringView((*fields)[0]) == "ab");
+        auto const fields = Unwrap(SplitFields(payload, 1));
+        REQUIRE(fields.size() == 1);
+        // .at() rather than operator[]: bounds-checked, so it is safe to the
+        // reader and provably so to the optimizer, which cannot carry the
+        // REQUIRE above through Catch2's macro.
+        CHECK(AsStringView(fields.at(0)) == "ab");
     }
 }
 
@@ -262,8 +279,8 @@ TEST_CASE("DecodeErrorPayload splits the code from the message")
     auto const decoded = DecodeErrorPayload(payload);
 
     REQUIRE(decoded.has_value());
-    CHECK(decoded->first == ErrorCode::PayloadTooLarge);
-    CHECK(decoded->second == "too big");
+    CHECK(Unwrap(decoded).first == ErrorCode::PayloadTooLarge);
+    CHECK(Unwrap(decoded).second == "too big");
 
     CHECK_FALSE(DecodeErrorPayload({}).has_value());
 }
@@ -274,8 +291,8 @@ TEST_CASE("EncodeErrorReply falls back to the table's default message")
     auto const decoded = DecodeErrorPayload(std::span<std::byte const> { reply }.subspan(ReplyHeaderSize));
 
     REQUIRE(decoded.has_value());
-    CHECK(decoded->first == ErrorCode::StorageWriteFailed);
-    CHECK(decoded->second == "storage write failed");
+    CHECK(Unwrap(decoded).first == ErrorCode::StorageWriteFailed);
+    CHECK(Unwrap(decoded).second == "storage write failed");
 }
 
 // --- table integrity -------------------------------------------------------

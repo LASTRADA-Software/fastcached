@@ -34,6 +34,20 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 
+/// Unwrap an optional for assertion, yielding a default-constructed value when
+/// empty.
+///
+/// clang-tidy's optional analysis cannot see a `has_value()` guard through
+/// Catch2's REQUIRE macro, so a direct `*x` or `x.value()` after one is reported
+/// as an unchecked access. Going through `value_or` is provably safe, and the
+/// preceding REQUIRE still fails the test first when the optional is empty — so
+/// the default is never actually observed.
+template <typename T>
+[[nodiscard]] T Unwrap(std::optional<T> const& value)
+{
+    return value.value_or(T {});
+}
+
 /// Fixture: a paired in-memory socket, an engine over in-memory storage, and
 /// the compile-cache handler driving the server end.
 struct CcFixture
@@ -132,9 +146,16 @@ std::vector<std::byte> Concat(std::initializer_list<std::vector<std::byte>> fram
 }
 
 /// One decoded reply.
+///
+/// Carries its own validity rather than being wrapped in an optional. Catch2's
+/// REQUIRE is a macro that clang-tidy's optional analysis cannot see through, so
+/// every `REQUIRE(x.has_value())` followed by `x->…` reads as an unchecked
+/// access; a plain flag keeps these helpers assertable without a `value_or`
+/// dance at each of two dozen call sites.
 struct ReplyFrame
 {
-    Wire::Status status;
+    bool present { false };                     ///< False when no such reply was decoded.
+    Wire::Status status { Wire::Status::Miss }; ///< Meaningful only when `present`.
     std::vector<std::byte> payload;
 };
 
@@ -160,19 +181,22 @@ std::vector<ReplyFrame> SplitReplies(std::span<std::byte const> bytes)
         if (bytes.size() - offset < header->payloadLength)
             break;
         auto const payload = bytes.subspan(offset, header->payloadLength);
-        frames.push_back(ReplyFrame { .status = header->status, .payload = { payload.begin(), payload.end() } });
+        frames.push_back(
+            ReplyFrame { .present = true, .status = header->status, .payload = { payload.begin(), payload.end() } });
         offset += header->payloadLength;
     }
     return frames;
 }
 
 /// Decode the single reply expected from an exchange.
-std::optional<ReplyFrame> SoleReply(std::span<std::byte const> bytes)
+/// @param bytes The raw stream.
+/// @return The reply; `present` is false unless there was exactly one.
+ReplyFrame SoleReply(std::span<std::byte const> bytes)
 {
-    auto const frames = SplitReplies(bytes);
+    auto frames = SplitReplies(bytes);
     if (frames.size() != 1)
-        return std::nullopt;
-    return frames.front();
+        return ReplyFrame {};
+    return std::move(frames.front());
 }
 
 /// The four string fields of a STORE frame. Named rather than positional so the
@@ -208,26 +232,41 @@ std::vector<std::byte> FetchFrame(std::string_view key, Wire::WireVersion versio
 }
 
 /// Decode a FETCH hit reply into a CompileValue.
-std::optional<CompileValue> DecodeFetchHit(std::span<std::byte const> reply)
+/// @param reply The raw reply stream.
+/// @return The value; `present` is false unless the reply was a decodable hit.
+struct FetchedValue
+{
+    bool present { false };
+    CompileValue value;
+};
+
+FetchedValue DecodeFetchHit(std::span<std::byte const> reply)
 {
     auto const frame = SoleReply(reply);
-    if (!frame.has_value() || frame->status != Wire::Status::Ok)
-        return std::nullopt;
-    auto decoded = DecodeCompileValue(frame->payload);
+    if (!frame.present || frame.status != Wire::Status::Ok)
+        return {};
+    auto decoded = DecodeCompileValue(frame.payload);
     if (!decoded.has_value())
-        return std::nullopt;
-    return *decoded;
+        return {};
+    return FetchedValue { .present = true, .value = *std::move(decoded) };
 }
 
-/// The error code and message carried by an Error reply.
-std::optional<std::pair<Wire::ErrorCode, std::string>> ErrorOf(ReplyFrame const& frame)
+/// The code and message carried by an Error reply.
+struct DecodedError
 {
-    if (frame.status != Wire::Status::Error)
-        return std::nullopt;
+    bool present { false };
+    Wire::ErrorCode code { Wire::ErrorCode::MalformedFrame };
+    std::string message;
+};
+
+DecodedError ErrorOf(ReplyFrame const& frame)
+{
+    if (!frame.present || frame.status != Wire::Status::Error)
+        return {};
     auto const decoded = Wire::DecodeErrorPayload(frame.payload);
     if (!decoded.has_value())
-        return std::nullopt;
-    return std::pair { decoded->first, std::string { decoded->second } };
+        return {};
+    return DecodedError { .present = true, .code = decoded->first, .message = std::string { decoded->second } };
 }
 
 } // namespace
@@ -250,8 +289,8 @@ TEST_CASE("STORE canonicalizes showIncludes; FETCH returns the canonical form", 
             { .key = "obj-hash", .cohort = "envCI", .srcRoot = R"(C:\ci\deep\src)", .buildTree = R"(C:\ci\deep\build)" },
             v));
     auto const storeFrame = SoleReply(storeReply);
-    REQUIRE(storeFrame.has_value());
-    CHECK(storeFrame->status == Wire::Status::Ok);
+    REQUIRE(storeFrame.present);
+    CHECK(storeFrame.status == Wire::Status::Ok);
 
     // FETCH: the value must be canonical (no machine path), object blob intact.
     // The first handler consumed EOF and returned, so drive a fresh handler
@@ -264,11 +303,9 @@ TEST_CASE("STORE canonicalizes showIncludes; FETCH returns the canonical form", 
     SyncRun(handler2.Run(pair2.server.get(), &fix.engine, {}, session));
     auto const fetchReply = SyncRun(ReadAvailable(pair2.client.get()));
 
-    // value_or keeps the access unguarded-safe: static analysis cannot see a
-    // has_value() guard through Catch2's REQUIRE macro.
     auto const decoded = DecodeFetchHit(fetchReply);
-    REQUIRE(decoded.has_value());
-    auto const fetched = decoded.value_or(CompileValue {});
+    REQUIRE(decoded.present);
+    auto const& fetched = decoded.value;
     REQUIRE(fetched.textRegions.size() == 1);
     CHECK(fetched.textRegions[0].bytes.contains("<SRCROOT>/a.h"));
     CHECK_FALSE(fetched.textRegions[0].bytes.contains(R"(ci\deep)"));
@@ -303,8 +340,8 @@ TEST_CASE("STORE/FETCH round-trips an object blob larger than 1 MiB", "[compile-
         StoreFrame(
             { .key = "big-obj", .cohort = "envCI", .srcRoot = R"(C:\ci\deep\src)", .buildTree = R"(C:\ci\deep\build)" }, v));
     auto const storeFrame = SoleReply(storeReply);
-    REQUIRE(storeFrame.has_value());
-    REQUIRE(storeFrame->status == Wire::Status::Ok);
+    REQUIRE(storeFrame.present);
+    REQUIRE(storeFrame.status == Wire::Status::Ok);
 
     InMemorySocketPair pair2 = InMemorySocketPair::Create();
     CompileCacheHandler handler2;
@@ -320,13 +357,15 @@ TEST_CASE("STORE/FETCH round-trips an object blob larger than 1 MiB", "[compile-
     REQUIRE(headerBytes.size() == Wire::ReplyHeaderSize);
     auto const header = Wire::DecodeReplyHeader(headerBytes);
     REQUIRE(header.has_value());
-    REQUIRE(header->status == Wire::Status::Ok);
-    auto const declared = header->payloadLength;
+    REQUIRE(Unwrap(header).status == Wire::Status::Ok);
+    auto const declared = Unwrap(header).payloadLength;
     REQUIRE(declared > 1024U * 1024U);
 
     auto const payload = SyncRun(ReadExactlyN(pair2.client.get(), declared));
     REQUIRE(payload.size() == declared);
 
+    // value_or keeps the access unguarded-safe: static analysis cannot see a
+    // has_value() guard through Catch2's REQUIRE macro.
     auto const decoded = DecodeCompileValue(std::span<std::byte const> { payload });
     REQUIRE(decoded.has_value());
     auto const fetched = decoded.value_or(CompileValue {});
@@ -341,9 +380,9 @@ TEST_CASE("FETCH of an absent key replies miss", "[compile-cache][handler]")
     CcFixture fix;
     auto const reply = Exchange(fix, FetchFrame("nope"));
     auto const frame = SoleReply(reply);
-    REQUIRE(frame.has_value());
-    CHECK(frame->status == Wire::Status::Miss);
-    CHECK(frame->payload.empty());
+    REQUIRE(frame.present);
+    CHECK(frame.status == Wire::Status::Miss);
+    CHECK(frame.payload.empty());
 }
 
 // --- versioning and rejection ----------------------------------------------
@@ -361,16 +400,16 @@ TEST_CASE("A request at an unsupported wire version is rejected, not dropped", "
 
     auto const reply = Exchange(fix, FetchFrame("k", TooNew));
     auto const frame = SoleReply(reply);
-    REQUIRE(frame.has_value());
+    REQUIRE(frame.present);
 
-    auto const error = ErrorOf(*frame);
-    REQUIRE(error.has_value());
-    CHECK(error->first == Wire::ErrorCode::UnsupportedVersion);
+    auto const error = ErrorOf(frame);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::UnsupportedVersion);
 
     // A rejection that does not say what WOULD work cannot be acted on: this
     // message is the only thing an operator with a mismatched install sees.
-    CHECK(error->second.contains(std::to_string(static_cast<unsigned>(TooNew))));
-    CHECK(error->second.contains(std::to_string(static_cast<unsigned>(Wire::CurrentVersion))));
+    CHECK(error.message.contains(std::to_string(static_cast<unsigned>(TooNew))));
+    CHECK(error.message.contains(std::to_string(static_cast<unsigned>(Wire::CurrentVersion))));
 }
 
 TEST_CASE("An unknown opcode is rejected but the connection survives", "[compile-cache][handler][version]")
@@ -393,12 +432,12 @@ TEST_CASE("An unknown opcode is rejected but the connection survives", "[compile
 
     REQUIRE(replies.size() == 2);
 
-    auto const error = ErrorOf(replies[0]);
-    REQUIRE(error.has_value());
-    CHECK(error->first == Wire::ErrorCode::UnknownOpcode);
+    auto const error = ErrorOf(replies.at(0));
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::UnknownOpcode);
 
-    CHECK(replies[1].status == Wire::Status::Ok);
-    CHECK_FALSE(replies[1].payload.empty());
+    CHECK(replies.at(1).status == Wire::Status::Ok);
+    CHECK_FALSE(replies.at(1).payload.empty());
 }
 
 TEST_CASE("A FETCH miss and a rejected FETCH are distinguishable", "[compile-cache][handler][version]")
@@ -407,16 +446,16 @@ TEST_CASE("A FETCH miss and a rejected FETCH are distinguishable", "[compile-cac
     // version-rejected client saw an endlessly cold cache and no diagnostic.
     CcFixture missFixture;
     auto const miss = SoleReply(Exchange(missFixture, FetchFrame("absent")));
-    REQUIRE(miss.has_value());
-    CHECK(miss->status == Wire::Status::Miss);
+    REQUIRE(miss.present);
+    CHECK(miss.status == Wire::Status::Miss);
 
     CcFixture rejectedFixture;
     auto const rejected =
         SoleReply(Exchange(rejectedFixture, FetchFrame("absent", static_cast<Wire::WireVersion>(Wire::CurrentVersion + 1))));
-    REQUIRE(rejected.has_value());
-    CHECK(rejected->status == Wire::Status::Error);
+    REQUIRE(rejected.present);
+    CHECK(rejected.status == Wire::Status::Error);
 
-    CHECK(miss->status != rejected->status);
+    CHECK(miss.status != rejected.status);
 }
 
 TEST_CASE("A refused STORE is drainable without knowing the command", "[compile-cache][handler][version]")
@@ -434,10 +473,10 @@ TEST_CASE("A refused STORE is drainable without knowing the command", "[compile-
     auto const replies = SplitReplies(ExchangeWith(fix, Concat({ badStore, FetchFrame("anything") }), SessionContext {}));
 
     REQUIRE(replies.size() == 2);
-    auto const error = ErrorOf(replies[0]);
-    REQUIRE(error.has_value());
-    CHECK(error->first == Wire::ErrorCode::MalformedValue);
-    CHECK(replies[1].status == Wire::Status::Miss);
+    auto const error = ErrorOf(replies.at(0));
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::MalformedValue);
+    CHECK(replies.at(1).status == Wire::Status::Miss);
 }
 
 TEST_CASE("A wire version change mid-connection is rejected", "[compile-cache][handler][version]")
@@ -449,10 +488,10 @@ TEST_CASE("A wire version change mid-connection is rejected", "[compile-cache][h
     auto const replies = SplitReplies(ExchangeWith(fix, Concat({ first, second }), SessionContext {}));
 
     REQUIRE(replies.size() == 2);
-    CHECK(replies[0].status == Wire::Status::Miss);
-    auto const error = ErrorOf(replies[1]);
-    REQUIRE(error.has_value());
-    CHECK(error->first == Wire::ErrorCode::UnsupportedVersion);
+    CHECK(replies.at(0).status == Wire::Status::Miss);
+    auto const error = ErrorOf(replies.at(1));
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::UnsupportedVersion);
 }
 
 TEST_CASE("An oversize declared payload is rejected before it is read", "[compile-cache][handler][version]")
@@ -466,11 +505,11 @@ TEST_CASE("An oversize declared payload is rejected before it is read", "[compil
 
     auto const reply = ExchangeWith(fix, FetchFrame("a-key-longer-than-the-cap"), tinySession);
     auto const frame = SoleReply(reply);
-    REQUIRE(frame.has_value());
+    REQUIRE(frame.present);
 
-    auto const error = ErrorOf(*frame);
-    REQUIRE(error.has_value());
-    CHECK(error->first == Wire::ErrorCode::PayloadTooLarge);
+    auto const error = ErrorOf(frame);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::PayloadTooLarge);
 }
 
 TEST_CASE("A frame whose fields do not fill its declared payload is rejected", "[compile-cache][handler][version]")
@@ -487,10 +526,10 @@ TEST_CASE("A frame whose fields do not fill its declared payload is rejected", "
         frame[6] = static_cast<std::byte>(static_cast<unsigned>(frame[6]) + 1); // ...and a length that admits it
 
         auto const reply = SoleReply(Exchange(fix, frame));
-        REQUIRE(reply.has_value());
-        auto const error = ErrorOf(*reply);
-        REQUIRE(error.has_value());
-        CHECK(error->first == Wire::ErrorCode::MalformedFrame);
+        REQUIRE(reply.present);
+        auto const error = ErrorOf(reply);
+        REQUIRE(error.present);
+        CHECK(error.code == Wire::ErrorCode::MalformedFrame);
     }
 
     SECTION("field length overruns the declared payload")
@@ -500,10 +539,10 @@ TEST_CASE("A frame whose fields do not fill its declared payload is rejected", "
         frame[10] = static_cast<std::byte>(0xFF); // field claims 255 bytes, payload holds 2
 
         auto const reply = SoleReply(Exchange(fix, frame));
-        REQUIRE(reply.has_value());
-        auto const error = ErrorOf(*reply);
-        REQUIRE(error.has_value());
-        CHECK(error->first == Wire::ErrorCode::MalformedFrame);
+        REQUIRE(reply.present);
+        auto const error = ErrorOf(reply);
+        REQUIRE(error.present);
+        CHECK(error.code == Wire::ErrorCode::MalformedFrame);
     }
 }
 
@@ -530,11 +569,11 @@ TEST_CASE("Every op in the table is dispatched", "[compile-cache][handler][versi
         frame.insert(frame.end(), payload.begin(), payload.end());
 
         auto const reply = SoleReply(Exchange(fix, frame));
-        REQUIRE(reply.has_value());
+        REQUIRE(reply.present);
 
         // Whatever it answers, it must not be "I do not know this verb".
-        if (auto const error = ErrorOf(*reply); error.has_value())
-            CHECK(error->first != Wire::ErrorCode::UnknownOpcode);
+        if (auto const error = ErrorOf(reply); error.present)
+            CHECK(error.code != Wire::ErrorCode::UnknownOpcode);
     }
 }
 
@@ -577,8 +616,8 @@ TEST_CASE("Cross-depth: value stored from a deep layout localizes for a shallow 
                                                   .buildTree = R"(C:\ci\deep\runner\build)" },
                                                 v));
     auto const storeFrame = SoleReply(storeReply);
-    REQUIRE(storeFrame.has_value());
-    REQUIRE(storeFrame->status == Wire::Status::Ok);
+    REQUIRE(storeFrame.present);
+    REQUIRE(storeFrame.status == Wire::Status::Ok);
 
     // Fetch the canonical value and localize it as a SHALLOW consumer would.
     InMemorySocketPair pair2 = InMemorySocketPair::Create();
@@ -590,8 +629,8 @@ TEST_CASE("Cross-depth: value stored from a deep layout localizes for a shallow 
     auto const reply = SyncRun(ReadAvailable(pair2.client.get()));
 
     auto const decoded = DecodeFetchHit(reply);
-    REQUIRE(decoded.has_value());
-    auto const fetched = decoded.value_or(CompileValue {});
+    REQUIRE(decoded.present);
+    auto const& fetched = decoded.value;
     REQUIRE(fetched.textRegions.size() == 1);
 
     PathCanon::Layout const consumer { .sourceRoot = R"(D:\project)", .buildTree = R"(D:\project\build)" };
