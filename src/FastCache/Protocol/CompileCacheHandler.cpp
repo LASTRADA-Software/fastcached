@@ -2,13 +2,12 @@
 #include <FastCache/CompileCache/CohortManifest.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
-#include <FastCache/Core/Endian.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
-#include <FastCache/Protocol/ProtocolAutodetect.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
-#include <array>
 #include <cstddef>
+#include <format>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -24,44 +23,22 @@ namespace FastCache
 namespace
 {
 
+    namespace Wire = CompileCacheWire;
+
     /// Cap on a single framed line/field's length. The compile-cache protocol
     /// never uses line reads, but ByteReader requires a line cap; set it to the
     /// same generous bound the other handlers use.
     constexpr std::size_t MaxLineBytes = 65536;
 
-    /// Read a big-endian u32 length prefix, then that many bytes, from the
-    /// reader. Returns nullopt on any framing/read error (the caller aborts the
-    /// connection — a compile-cache client is trusted infrastructure, not an
-    /// arbitrary peer, so a malformed frame just ends the session).
-    /// @param reader Source reader (pointer, not a reference: a coroutine must not
-    ///               hold reference parameters across a suspend point).
-    /// @return The bytes, or nullopt on error.
-    [[nodiscard]] Task<std::optional<std::vector<std::byte>>> ReadLengthPrefixed(ByteReader* reader)
-    {
-        auto const lenBytes = co_await reader->ReadExactly(sizeof(std::uint32_t));
-        if (!lenBytes.has_value())
-            co_return std::nullopt;
-        auto const len = ReadBigEndian<std::uint32_t>(*lenBytes);
-        if (len == 0)
-            co_return std::vector<std::byte> {};
-        auto body = co_await reader->ReadExactly(len);
-        if (!body.has_value())
-            co_return std::nullopt;
-        co_return std::move(*body);
-    }
+    /// Protocol label for this handler's `LogFrameDrop` lines. Matches the name
+    /// `ProtocolFlavor::CompileCache` renders to, so a connection log and a frame
+    /// drop name the same thing.
+    constexpr std::string_view ProtocolLabel = "compile-cache";
 
-    /// Interpret a byte vector as a UTF-8/ASCII string_view (no copy).
-    [[nodiscard]] std::string BytesToString(std::vector<std::byte> const& bytes)
+    /// Interpret a byte span as a UTF-8/ASCII string (copying).
+    [[nodiscard]] std::string BytesToString(std::span<std::byte const> bytes)
     {
         return std::string { reinterpret_cast<char const*>(bytes.data()), bytes.size() };
-    }
-
-    /// Append a big-endian u32 to a byte buffer.
-    void AppendU32(std::vector<std::byte>& out, std::uint32_t n)
-    {
-        std::array<std::byte, sizeof(std::uint32_t)> buf {};
-        WriteBigEndian<std::uint32_t>(buf, n);
-        out.insert(out.end(), buf.begin(), buf.end());
     }
 
     /// Write all bytes of `payload` to the socket.
@@ -72,20 +49,31 @@ namespace
         // Verify the byte count, not merely that the call succeeded: ISocket::Write
         // is a write-all contract, so a short count is a backend bug that must
         // surface as a failed reply rather than a silently truncated one. A
-        // truncated FETCH reply is especially bad here — the frame declares its
-        // length up front, so the client blocks waiting for bytes that never come.
+        // truncated reply is especially bad here — the frame declares its length
+        // up front, so the client blocks waiting for bytes that never come.
         co_return r.has_value() && *r == payload.size();
     }
 
-    /// Build the STORE error reply `[0x00][u32 msgLen][msg]`.
-    [[nodiscard]] std::vector<std::byte> StoreError(std::string_view message)
+    /// Send one reply frame.
+    /// @param socket Client socket.
+    /// @param status The outcome.
+    /// @param payload Reply body, taken by value so it survives the suspend point.
+    /// @return true when the whole reply reached the socket.
+    [[nodiscard]] Task<bool> Reply(ISocket* socket, Wire::Status status, std::vector<std::byte> payload)
     {
-        std::vector<std::byte> out;
-        out.push_back(static_cast<std::byte>(CompileCacheHandler::Status::Err));
-        AppendU32(out, static_cast<std::uint32_t>(message.size()));
-        auto const* p = reinterpret_cast<std::byte const*>(message.data());
-        out.insert(out.end(), p, p + message.size());
-        return out;
+        auto const frame = Wire::EncodeReply(status, payload);
+        co_return co_await WriteAll(socket, frame);
+    }
+
+    /// Send one typed error reply.
+    /// @param socket Client socket.
+    /// @param code The refusal reason.
+    /// @param message Detail; the code's default message is used when empty.
+    /// @return true when the whole reply reached the socket.
+    [[nodiscard]] Task<bool> ReplyError(ISocket* socket, Wire::ErrorCode code, std::string message)
+    {
+        auto const frame = Wire::EncodeErrorReply(code, message);
+        co_return co_await WriteAll(socket, frame);
     }
 
     /// What the caller's command loop should do after one command is handled.
@@ -112,44 +100,51 @@ namespace
         return true;
     }
 
-    /// Handle one STORE command: read its frames, canonicalize with the producer's
-    /// layout, store the canonical value, and record cohort membership.
+    /// Handle one STORE command: canonicalize with the producer's layout, store
+    /// the canonical value, and record cohort membership.
+    ///
+    /// The payload arrives already read and is split synchronously, so this
+    /// coroutine has exactly one suspend point (the reply) rather than the five
+    /// the field-at-a-time reader used to need.
     /// @param socket   Client socket.
     /// @param engine   Cache engine.
-    /// @param reader   Source reader.
     /// @param manifest Cohort manifest.
+    /// @param payload  The request payload, by value: a coroutine must not hold a
+    ///                 reference parameter across a suspend point, and the field
+    ///                 views below point into it.
     /// @return Whether the command loop should continue or abort.
-    [[nodiscard]] Task<Next> HandleStore(ISocket* socket, CacheEngine* engine, ByteReader* reader, CohortManifest* manifest)
+    [[nodiscard]] Task<Next> HandleStore(ISocket* socket,
+                                         CacheEngine* engine,
+                                         CohortManifest* manifest,
+                                         std::vector<std::byte> payload)
     {
-        auto const key = co_await ReadLengthPrefixed(reader);
-        auto const cohort = co_await ReadLengthPrefixed(reader);
-        auto const srcRoot = co_await ReadLengthPrefixed(reader);
-        auto const buildTree = co_await ReadLengthPrefixed(reader);
-        auto const valueBytes = co_await ReadLengthPrefixed(reader);
-        if (!key || !cohort || !srcRoot || !buildTree || !valueBytes)
-            co_return Next::Abort;
+        auto const fields = Wire::DecodeStorePayload(payload);
+        if (!fields.has_value())
+            co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
 
-        auto decoded = DecodeCompileValue(*valueBytes);
+        auto decoded = DecodeCompileValue(fields->value);
         if (!decoded.has_value())
-            co_return co_await WriteAll(socket, StoreError("malformed compile-value frame")) ? Next::Continue : Next::Abort;
+            co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedValue, {}) ? Next::Continue : Next::Abort;
 
-        PathCanon::Layout const producer { .sourceRoot = BytesToString(*srcRoot), .buildTree = BytesToString(*buildTree) };
+        PathCanon::Layout const producer { .sourceRoot = BytesToString(fields->srcRoot),
+                                           .buildTree = BytesToString(fields->buildTree) };
         if (!CanonicalizeRegions(*decoded, producer))
-            co_return co_await WriteAll(socket, StoreError("path canonicalization failed")) ? Next::Continue : Next::Abort;
+            co_return co_await ReplyError(socket, Wire::ErrorCode::CanonicalizationFailed, {}) ? Next::Continue
+                                                                                               : Next::Abort;
 
         auto const canonicalBytes = EncodeCompileValue(*decoded);
-        auto const keyStr = BytesToString(*key);
+        auto const keyStr = BytesToString(fields->key);
+        auto const cohortStr = BytesToString(fields->cohort);
         auto const stored = engine->Set(keyStr, canonicalBytes, /*flags=*/0, /*exptime=*/0);
         if (!stored.has_value())
-            co_return co_await WriteAll(socket, StoreError("storage write failed")) ? Next::Continue : Next::Abort;
+            co_return co_await ReplyError(socket, Wire::ErrorCode::StorageWriteFailed, {}) ? Next::Continue : Next::Abort;
 
         // Record cohort membership (best-effort: a manifest failure must not fail
         // the STORE — the value is already safely stored).
-        if (!cohort->empty())
-            (void) manifest->AddKey(BytesToString(*cohort), keyStr, engine->Clock().Now());
+        if (!cohortStr.empty())
+            (void) manifest->AddKey(cohortStr, keyStr, engine->Clock().Now());
 
-        std::array<std::byte, 1> const okReply { static_cast<std::byte>(CompileCacheHandler::Status::Ok) };
-        co_return co_await WriteAll(socket, okReply) ? Next::Continue : Next::Abort;
+        co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
     }
 
     /// Claim the right to warm `cohort`, once per cache engine.
@@ -228,36 +223,35 @@ namespace
     /// rest of its cohort.
     /// @param socket        Client socket.
     /// @param engine        Cache engine.
-    /// @param reader        Source reader.
     /// @param manifest      Cohort manifest.
     /// @param primedCohorts [in,out] Cohorts already warmed on this connection
     ///                      (pointer: a coroutine must not hold reference params).
+    /// @param payload       The request payload, by value (see HandleStore).
     /// @return Whether the command loop should continue or abort.
     [[nodiscard]] Task<Next> HandleFetch(ISocket* socket,
                                          CacheEngine* engine,
-                                         ByteReader* reader,
                                          CohortManifest* manifest,
-                                         std::set<std::string, std::less<>>* primedCohorts)
+                                         std::set<std::string, std::less<>>* primedCohorts,
+                                         std::vector<std::byte> payload)
     {
-        auto const key = co_await ReadLengthPrefixed(reader);
-        if (!key)
-            co_return Next::Abort;
+        auto const key = Wire::DecodeFetchPayload(payload);
+        if (!key.has_value())
+            co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
 
         auto const keyStr = BytesToString(*key);
         auto const got = engine->Get(keyStr);
         if (!got.has_value() || !got->found)
         {
-            std::array<std::byte, 1> const missReply { static_cast<std::byte>(CompileCacheHandler::Status::Err) };
-            co_return co_await WriteAll(socket, missReply) ? Next::Continue : Next::Abort;
+            // A miss is a legitimate negative, distinct from a refusal: it carries
+            // Status::Miss and an empty payload, so a client can tell "not cached"
+            // from "your request was rejected" — which the pre-version format,
+            // where both were the byte 0x00, could not express.
+            co_return co_await Reply(socket, Wire::Status::Miss, {}) ? Next::Continue : Next::Abort;
         }
 
-        // Serve the canonical value verbatim: [0x01][u32 len][bytes].
+        // Serve the canonical value verbatim.
         auto const value = got->entry.ValueBytes();
-        std::vector<std::byte> reply;
-        reply.push_back(static_cast<std::byte>(CompileCacheHandler::Status::Ok));
-        AppendU32(reply, static_cast<std::uint32_t>(value.size()));
-        reply.insert(reply.end(), value.begin(), value.end());
-        if (!co_await WriteAll(socket, reply))
+        if (!co_await Reply(socket, Wire::Status::Ok, std::vector<std::byte> { value.begin(), value.end() }))
             co_return Next::Abort;
 
         // Leading-key cohort prefetch: this fetch is the demand signal that the
@@ -282,28 +276,98 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
     // same cohort does not re-warm the whole set.
     std::set<std::string, std::less<>> primedCohorts;
 
+    // The version the first command declared. Every later command on this
+    // connection must match: a stream that changes version mid-flight is
+    // nonsensical rather than merely unsupported, and rejecting it is cheaper
+    // than carrying two decoders.
+    std::optional<Wire::WireVersion> pinnedVersion;
+
     while (true)
     {
-        // Each command begins with [magic 0xFC][op]. Read the two header bytes.
-        auto const header = co_await reader.ReadExactly(2);
+        auto const headerBytes = co_await reader.ReadExactly(Wire::RequestHeaderSize);
+        if (!headerBytes.has_value())
+        {
+            // Routine at a command boundary — the launcher opens a fresh
+            // connection per operation — so FrameDropSeverity logs a clean
+            // disconnect at Debug and a genuine framing fault at Warn.
+            session.LogFrameDrop(ProtocolLabel, headerBytes.error());
+            co_return;
+        }
+
+        auto const header = Wire::DecodeRequestHeader(*headerBytes);
         if (!header.has_value())
-            co_return; // EOF or framing error — client disconnected.
-        auto const magic = (*header)[0];
-        auto const op = static_cast<Op>((*header)[1]);
-        if (magic != CompileCacheMagic)
-            co_return; // Not our protocol mid-stream — abort.
+        {
+            // Wrong magic: the peer is not speaking this protocol at all, so
+            // there is no framing in which a reply would be meaningful.
+            session.LogFrameDrop(
+                ProtocolLabel,
+                ProtocolError { .code = ProtocolErrorCode::MalformedFrame,
+                                .context = std::format("bad magic 0x{:02x}", static_cast<unsigned>((*headerBytes)[0])) });
+            co_return;
+        }
+
+        if (!Wire::IsSupported(header->version) || (pinnedVersion.has_value() && *pinnedVersion != header->version))
+        {
+            // Name the range as well as the offence: a rejection that does not
+            // say what would have worked cannot be acted on, and this is the one
+            // message an operator with a mismatched install will ever see.
+            auto message = std::format("unsupported wire version {}; this server speaks {}..{}",
+                                       static_cast<unsigned>(header->version),
+                                       static_cast<unsigned>(Wire::MinSupportedVersion),
+                                       static_cast<unsigned>(Wire::CurrentVersion));
+            session.LogFrameDrop(
+                ProtocolLabel,
+                ProtocolError { .code = ProtocolErrorCode::UnsupportedFeature, .context = std::string { message } });
+            (void) co_await ReplyError(socket, Wire::ErrorCode::UnsupportedVersion, std::move(message));
+            co_return;
+        }
+        pinnedVersion = header->version;
+
+        if (header->payloadLength > session.maxPayloadBytes)
+        {
+            // Rejected on the declared length, before a single payload byte is
+            // buffered. The pre-version format could only discover this
+            // field-by-field, after the reader had already taken the memory.
+            auto message =
+                std::format("declared payload {} bytes exceeds cap {}", header->payloadLength, session.maxPayloadBytes);
+            session.LogFrameDrop(
+                ProtocolLabel,
+                ProtocolError { .code = ProtocolErrorCode::PayloadTooLarge, .context = std::string { message } });
+            (void) co_await ReplyError(socket, Wire::ErrorCode::PayloadTooLarge, std::move(message));
+            co_return;
+        }
+
+        auto const* descriptor = Wire::FindOp(header->opRaw);
+        if (descriptor == nullptr)
+        {
+            // Recoverable, and deliberately so: the declared payload length lets
+            // us step over a verb we do not know and keep the connection usable,
+            // which is what allows a later version to add one without a flag day.
+            if (!(co_await reader.Skip(header->payloadLength)).has_value())
+                co_return;
+            if (!co_await ReplyError(socket,
+                                     Wire::ErrorCode::UnknownOpcode,
+                                     std::format("unknown opcode 0x{:02x}", static_cast<unsigned>(header->opRaw))))
+                co_return;
+            continue;
+        }
+
+        auto payload = co_await reader.ReadExactly(header->payloadLength);
+        if (!payload.has_value())
+        {
+            session.LogFrameDrop(ProtocolLabel, payload.error());
+            co_return;
+        }
 
         Next next = Next::Abort;
-        switch (op)
+        switch (descriptor->code)
         {
-            case Op::Store:
-                next = co_await HandleStore(socket, engine, &reader, &manifest);
+            case Wire::Op::Store:
+                next = co_await HandleStore(socket, engine, &manifest, std::move(*payload));
                 break;
-            case Op::Fetch:
-                next = co_await HandleFetch(socket, engine, &reader, &manifest, &primedCohorts);
+            case Wire::Op::Fetch:
+                next = co_await HandleFetch(socket, engine, &manifest, &primedCohorts, std::move(*payload));
                 break;
-            default:
-                co_return; // Unknown opcode — abort.
         }
 
         if (next == Next::Abort)
