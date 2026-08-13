@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 name: Build
 
-# Every checkout in this workflow passes `fetch-depth: 0`, and that is
-# load-bearing rather than habit: the version comes from `git describe`
+# Every checkout that could configure the project passes `fetch-depth: 0`, and
+# that is load-bearing rather than habit: the version comes from `git describe`
 # (cmake/Version.cmake), and the default depth-1 checkout fetches no tags, so it
 # would silently yield the fallback version — and, in the packaging jobs, packages
 # named after a release nobody cut. Full history rather than `fetch-tags: true`
@@ -11,10 +11,17 @@ name: Build
 # that describe cannot reach. YAML cannot factor a step input out, so the input is
 # repeated per job while the reason is stated once, here.
 #
-# Two of those checkouts are inert and deliberately kept uniform anyway: `docker`
-# builds the version inside the image, where .dockerignore excludes .git/ so CMake
-# always takes the fallback path, and the smoke jobs download prebuilt binaries
-# instead of configuring the project.
+# Some of those checkouts are inert and deliberately kept uniform anyway, because
+# telling them apart at a glance is not possible and guessing wrong is silent:
+# `check-clang-format` only lists and formats files, `docker` builds the version
+# inside the image, where .dockerignore excludes .git/ so CMake always takes the
+# fallback path, and the smoke jobs download prebuilt binaries instead of
+# configuring anything.
+#
+# Two jobs are the stated exception and pass no fetch-depth at all —
+# `check-release-gate` and `release`. Both exist to read this file rather than to
+# build it, so history would buy them nothing, and a release must not be able to
+# fail on a clone parameter that cannot affect its outcome.
 on:
   push:
     branches: [master, "fix-ci"]
@@ -37,6 +44,14 @@ env:
   CLANG_TOOLS_VERSION: "22"
   GCC_VERSION: "14"
   CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/CPM
+  # Read by every packaging job's configure step. ON turns "no reachable tag"
+  # from a warning into a configure failure (cmake/Version.cmake), so a silently
+  # broken tag fetch fails in the job that would have built the artifact instead
+  # of shipping packages named after a release nobody cut. Hardcoding ON would
+  # fail every branch and pull-request run, where no tag is reachable by design —
+  # hence the expression, and hence it lives here: one value, three consumers,
+  # spelled once so they cannot drift apart.
+  FASTCACHED_REQUIRE_EXACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && 'ON' || 'OFF' }}
 
 jobs:
   check-clang-format:
@@ -56,6 +71,38 @@ jobs:
         run: |
           git ls-files '*.h' '*.hpp' '*.cpp' \
             | xargs clang-format-${{ env.CLANG_TOOLS_VERSION }} --dry-run --Werror --style=file
+
+  # The release job gates on every other job in this workflow, and that list is
+  # hand-written. This is what keeps it honest — and it runs on every push and
+  # pull request, not only on a tag: the mistake it catches (adding a job and
+  # forgetting to gate the release on it) is made in a pull request, so a check
+  # that could only fail during a release would report it an hour late, after the
+  # tag was already pushed. `check-release-gate` is itself a row in
+  # `release.needs`, so this job's own failure stops a release too.
+  #
+  # No fetch-depth: 0 — this reads one file out of the checkout and configures
+  # nothing, so it needs no tags and no history.
+  check-release-gate:
+    name: "Check the release gate covers every job"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Assert every job in this workflow gates the release"
+        run: |
+          set -euo pipefail
+          # yq is preinstalled on the ubuntu-24.04 image. If it ever is not, that
+          # must fail here: a check that silently skips verifies nothing.
+          command -v yq >/dev/null || { echo "::error::yq is required to verify the release gate"; exit 1; }
+          workflow=.github/workflows/build.yml
+          yq '.jobs | keys | .[]' "$workflow" | grep -vx release | sort > "$RUNNER_TEMP/jobs.txt"
+          yq '.jobs.release.needs[]' "$workflow" | sort > "$RUNNER_TEMP/gates.txt"
+          missing="$(comm -23 "$RUNNER_TEMP/jobs.txt" "$RUNNER_TEMP/gates.txt")"
+          if [[ -n "$missing" ]]; then
+            echo "::error::these jobs do not gate the release; add them to release.needs:"
+            echo "$missing"
+            exit 1
+          fi
+          echo "all $(wc -l < "$RUNNER_TEMP/jobs.txt") sibling jobs gate this release"
 
   linux:
     name: "Linux-${{ matrix.preset }}"
@@ -609,12 +656,9 @@ jobs:
         # `cmake --install --prefix /usr/local` stays conventional; the package
         # layout (payload rooted at /, units under usr/lib/systemd, config in
         # /etc) is opt-in and this is the job that opts in.
-        # REQUIRE_EXACT_VERSION only on a tag run: it turns "no reachable tag" from
-        # a warning into a configure failure, so a silently broken tag fetch fails
-        # here instead of shipping packages named after a release nobody cut.
-        # Hardcoding ON would fail every branch and pull-request run, where no tag
-        # is reachable by design.
-        run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ startsWith(github.ref, 'refs/tags/') && 'ON' || 'OFF' }}
+        # FASTCACHED_REQUIRE_EXACT_VERSION comes from the workflow-level env: block,
+        # which is where the "only on a tag run" reasoning is written down.
+        run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
         run: cmake --build --preset gcc-release --target fastcached fastcache-cc
@@ -947,7 +991,7 @@ jobs:
             -DFASTCACHED_MACOS_SIGN_IDENTITY_APP="$IDENTITY_APP" \
             -DFASTCACHED_MACOS_SIGN_IDENTITY_PKG="$IDENTITY_PKG" \
             -DFASTCACHED_MACOS_NOTARIZE="$NOTARIZE" \
-            -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ startsWith(github.ref, 'refs/tags/') && 'ON' || 'OFF' }}
+            -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
         run: cmake --build out/build/macos-package --target fastcached fastcache-cc
@@ -1101,12 +1145,9 @@ jobs:
           toolset: "14.44"
 
       - name: "Configure"
-        # REQUIRE_EXACT_VERSION only on a tag run: it turns "no reachable tag" from
-        # a warning into a configure failure, so a silently broken tag fetch fails
-        # here instead of shipping an .msi named after a release nobody cut.
-        # Hardcoding ON would fail every branch and pull-request run, where no tag
-        # is reachable by design.
-        run: cmake --preset cl-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ startsWith(github.ref, 'refs/tags/') && 'ON' || 'OFF' }}
+        # FASTCACHED_REQUIRE_EXACT_VERSION comes from the workflow-level env: block,
+        # which is where the "only on a tag run" reasoning is written down.
+        run: cmake --preset cl-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
         run: cmake --build --preset cl-release --target fastcached fastcache-cc
@@ -1284,10 +1325,12 @@ jobs:
     # the shape check stays in the `on:` filter and this stays a prefix test.
     if: startsWith(github.ref, 'refs/tags/v')
     # Every other job in this workflow. A job missing from this list is a job
-    # whose failure would not stop a release, so the first step below asserts the
-    # list still covers the whole workflow.
+    # whose failure would not stop a release, so `check-release-gate` — itself a
+    # row here — asserts the list still covers the whole workflow, and does so on
+    # every push and pull request rather than only when a tag is already pushed.
     needs:
       - check-clang-format
+      - check-release-gate
       - linux
       - clang-tidy
       - macos
@@ -1310,26 +1353,9 @@ jobs:
       contents: write
     steps:
       # Checked out for one reason: the asset list at the end of this job is the
-      # single source of truth for what a release consists of, and the assertions
-      # below read it back rather than restating it. No history needed.
+      # single source of truth for what a release consists of, and the assertion
+      # below reads it back rather than restating it. No history needed.
       - uses: actions/checkout@v4
-
-      - name: "Assert every job in this workflow gates the release"
-        run: |
-          set -euo pipefail
-          # yq is preinstalled on the ubuntu-24.04 image. If it ever is not, that
-          # must fail here: a check that silently skips verifies nothing.
-          command -v yq >/dev/null || { echo "::error::yq is required to verify the release gate"; exit 1; }
-          workflow=.github/workflows/build.yml
-          yq '.jobs | keys | .[]' "$workflow" | grep -vx release | sort > "$RUNNER_TEMP/jobs.txt"
-          yq '.jobs.release.needs[]' "$workflow" | sort > "$RUNNER_TEMP/gates.txt"
-          missing="$(comm -23 "$RUNNER_TEMP/jobs.txt" "$RUNNER_TEMP/gates.txt")"
-          if [[ -n "$missing" ]]; then
-            echo "::error::these jobs do not gate the release; add them to release.needs:"
-            echo "$missing"
-            exit 1
-          fi
-          echo "all $(wc -l < "$RUNNER_TEMP/jobs.txt") sibling jobs gate this release"
 
       # Every packaging job uploads under fastcached-<platform>-packages. The
       # archives do not collide in a flat directory: CPack stamps the system name
@@ -1447,7 +1473,16 @@ jobs:
       # The list stays last, terminated by the end of the file. The assertion step
       # above fails the build if this is ever "tidied"; that is its second job.
       - name: "Create the draft release"
-        uses: softprops/action-gh-release@v2
+        # Pinned to a full commit SHA rather than the mutable @v2 tag, because this
+        # is the only step in the workflow holding a `contents: write` token: a tag
+        # is repointable by the action's owner or by anyone who takes that account,
+        # and the next tag push would run the new code with rights to write
+        # releases, tags and repository contents. The SHA below is v2.6.2, which is
+        # what @v2 resolved to when this was validated. Upgrading is a deliberate
+        # edit — read the changelog, bump the SHA and the version in this comment
+        # together. (Upstream has since moved to v3.x; that is a major bump whose
+        # input contract needs checking, so it is not taken here by default.)
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ github.ref_name }}
           name: "fastcached ${{ github.ref_name }}"
