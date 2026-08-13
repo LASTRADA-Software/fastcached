@@ -71,11 +71,11 @@ class ScriptedTcpClient final: public ITcpClient
 class FailingTcpClient final: public ITcpClient
 {
   public:
-    bool SendAll(std::span<std::byte const>) override
+    bool SendAll(std::span<std::byte const> /*bytes*/) override
     {
         return false;
     }
-    std::optional<std::vector<std::byte>> RecvExactly(std::size_t) override
+    std::optional<std::vector<std::byte>> RecvExactly(std::size_t /*count*/) override
     {
         return std::nullopt;
     }

@@ -210,32 +210,48 @@ TEST_CASE("SplitFields rejects a payload that disagrees with its field lengths")
 {
     // The declared total and the per-field lengths are redundant by design.
     // Disagreement must be a typed rejection, never a silent reinterpretation.
-    auto const frame = EncodeFetch("ab");
-    auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
+    //
+    // Each malformed payload is written out literally rather than derived by
+    // mutating an encoder's output: the point of the test is a specific broken
+    // byte sequence, and spelling it makes the case self-evident instead of
+    // something the reader has to reconstruct.
 
     SECTION("truncated before the length prefix")
     {
-        CHECK_FALSE(SplitFields(payload.first(2), 1).has_value());
+        CHECK_FALSE(SplitFields(Bytes({ 0x00, 0x00 }), 1).has_value());
     }
 
     SECTION("a field length that overruns the payload")
     {
-        auto overrun = std::vector<std::byte>(payload.begin(), payload.end());
-        overrun.back() = std::byte { 0x00 };
-        overrun.resize(overrun.size() - 1); // declares 2 bytes, supplies 1
-        CHECK_FALSE(SplitFields(overrun, 1).has_value());
+        // Declares two bytes, supplies one.
+        CHECK_FALSE(SplitFields(Bytes({ 0x00, 0x00, 0x00, 0x02, 0x61 }), 1).has_value());
     }
 
     SECTION("trailing bytes after the last field")
     {
-        auto trailing = std::vector<std::byte>(payload.begin(), payload.end());
-        trailing.push_back(std::byte { 0x00 });
-        CHECK_FALSE(SplitFields(trailing, 1).has_value());
+        // One well-formed 2-byte field, then a byte nothing accounts for.
+        CHECK_FALSE(SplitFields(Bytes({ 0x00, 0x00, 0x00, 0x02, 0x61, 0x62, 0x00 }), 1).has_value());
     }
 
     SECTION("a field count the payload cannot satisfy")
     {
-        CHECK_FALSE(SplitFields(payload, 2).has_value());
+        // One field present, two demanded.
+        CHECK_FALSE(SplitFields(Bytes({ 0x00, 0x00, 0x00, 0x02, 0x61, 0x62 }), 2).has_value());
+    }
+
+    SECTION("an exactly-filling payload is accepted")
+    {
+        // The positive control: without it the sections above could pass for the
+        // wrong reason.
+        //
+        // The payload is a named local, not a temporary, because SplitFields
+        // returns spans INTO it — handing it a temporary leaves every field
+        // dangling the moment the call returns.
+        auto const payload = Bytes({ 0x00, 0x00, 0x00, 0x02, 0x61, 0x62 });
+        auto const fields = SplitFields(payload, 1);
+        REQUIRE(fields.has_value());
+        REQUIRE(fields->size() == 1);
+        CHECK(AsStringView((*fields)[0]) == "ab");
     }
 }
 
