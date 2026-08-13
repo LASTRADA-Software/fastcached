@@ -25,4 +25,9 @@ perf.data*
 # is ever tracked again — a committed version carrier is exactly what stopped the
 # tag being the source of truth once before. Ignoring it is the ergonomics; the
 # test is the enforcement.
-version.txt
+#
+# Anchored with a leading slash so it names the repository root and nothing else,
+# matching the pathspec the hygiene check inspects. Unanchored, this would also
+# hide a `version.txt` anywhere below — a path the check does not look at, so the
+# ignore rule would be silently wider than the rule it exists to support.
+/version.txt

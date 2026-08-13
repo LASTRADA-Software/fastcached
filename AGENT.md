@@ -275,13 +275,17 @@ These constraints are load-bearing and have each already been a bug:
   trigger matches `v[0-9]+.[0-9]+.[0-9]+` rather than `v*` — a `v0.1.0-rc1` tag
   cannot configure, and failing to *start* costs nothing where fifteen red jobs and
   a burnt notarization slot would.
-- **Every checkout in `build.yml` passes `fetch-depth: 0`, and the release job's
-  asset list must stay the last key of its `with:` mapping.** The default depth-1
+- **Every checkout in `build.yml` that could configure the project passes
+  `fetch-depth: 0`, and the release job's asset list must stay the last key of its
+  `with:` mapping.** The default depth-1
   checkout fetches no tags, so `git describe` finds nothing and the build silently
   falls back — which in a packaging job means artifacts named after a release
   nobody cut. Full history, not `fetch-tags: true`: fetching a tag into a depth-1
   clone leaves the tagged commit as an unrelated shallow root `describe` cannot
-  reach. Separately, `/publish-release` learns what a release should contain by
+  reach. The two jobs that only *read* the workflow file — `check-release-gate`
+  and `release` — are the stated exception and pass no `fetch-depth`, because
+  history buys them nothing and a release must not be able to fail on a clone
+  parameter that cannot affect it. Separately, `/publish-release` learns what a release should contain by
   parsing that literal asset list, and its extractor stops only at a line that does
   not look like a filename — `draft: true` looks exactly like one, so a key moved
   below the list is collected as a glob that can never match and publication blocks

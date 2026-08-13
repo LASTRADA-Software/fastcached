@@ -17,6 +17,13 @@ inline constexpr std::string_view Version = "@FASTCACHED_VERSION@";
 /// Full version string. Equal to Version for a build of a tagged commit;
 /// otherwise it carries the git-describe distance and commit, plus a -dirty
 /// marker for an unclean tree — e.g. "1.2.3-12-gdeadbee".
+///
+/// Two provisional forms exist and are the ones a bug report is most likely to
+/// quote, so recognise them: "0.0.0-0-g<sha>" is a git work tree in which no
+/// release tag is reachable (a fresh fork, or a CI checkout whose tags were not
+/// fetched), and "0.0.0-unknown" is a build with neither a tag nor
+/// -DFASTCACHED_VERSION — an exported source tarball, or the Docker image, whose
+/// build context excludes .git/. Neither names a release.
 inline constexpr std::string_view VersionString = "@FASTCACHED_VERSION_STRING@";
 
 /// Full server-version banner emitted by `version` (memcached text) and
