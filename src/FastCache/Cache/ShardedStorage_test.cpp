@@ -267,14 +267,16 @@ TEST_CASE("ShardedStorage spreads keys evenly over every shard, including non-po
     // strand shards 4..6 and quietly cut capacity, and `--storage-shards`
     // accepts any count.
     //
-    // Balance is the property this reduction could plausibly regress and
-    // reachability would not catch, because a multiply-shift decides the shard
-    // from the *high* bits of the folded hash. That is the well-mixed end of
-    // libstdc++'s and libc++'s `std::hash<string_view>` but not obviously of
-    // MSVC's FNV-1a, and this test is the only thing that runs on all three. An
-    // unbalanced fan-out has no visible symptom — it silently cuts effective
-    // capacity and concentrates lock contention on the hot shards — so it needs
-    // an assertion rather than a benchmark.
+    // Balance is the property reachability would not catch, and it is not
+    // hypothetical: this assertion caught a real one. A multiply-shift decides
+    // the shard from the *high* bits of its input, `std::hash` promises nothing
+    // about those, and MSVC's FNV-1a avalanches into the low bits only — so the
+    // original xor-fold of the two halves put 1300 of 10k keys on one of 16
+    // shards against a mean of 625, on Windows and nowhere else. An unbalanced
+    // fan-out has no symptom that names itself; it silently cuts effective
+    // capacity and concentrates lock contention on the hot shards. Hence the
+    // multiplicative mix in ShardIndexFor, and hence this test, which is the
+    // only thing in the suite that runs against all three standard libraries.
     constexpr int KeyCount = 10'000;
     for (auto const shardCount: { std::size_t { 1 }, std::size_t { 3 }, std::size_t { 7 }, std::size_t { 16 } })
     {
@@ -289,12 +291,15 @@ TEST_CASE("ShardedStorage spreads keys evenly over every shard, including non-po
 
         auto const [least, most] = std::ranges::minmax_element(perShard);
         CHECK(*least > 0); // every shard reachable
-        // Generous by design: this is a smoke test for a broken reduction (a
-        // mask, a truncation, a hash whose high bits do not move), not a
-        // statistical test of the hash. Even 3 shards over 10k keys leaves ample
-        // room inside 2x the mean for ordinary variance.
+        // 1.5x is a smoke test for a broken reduction (a mask, a truncation, a
+        // hash whose high bits do not move), not a statistical test of the hash.
+        // It can be this tight because nothing here is random: fixed keys and a
+        // fixed hash make the result a constant per standard library. Measured
+        // worst case over these shard counts is 1.07x on both a murmur-style
+        // `std::hash` and MSVC's FNV-1a, so the margin is ample — while the 2.08x
+        // that the xor-fold produced would still be caught, as it was.
         auto const mean = static_cast<double>(KeyCount) / static_cast<double>(shardCount);
-        CHECK(static_cast<double>(*most) <= 2.0 * mean);
+        CHECK(static_cast<double>(*most) <= 1.5 * mean);
     }
 }
 
