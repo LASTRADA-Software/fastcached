@@ -35,11 +35,17 @@ class IClock
 
     /// Re-sample the underlying time source, if this clock caches one.
     ///
-    /// Called by whoever owns an event loop, once per iteration, right after
-    /// the blocking wait returns — that is the only place that knows time may
-    /// have passed. Implementations that read the OS clock on every `Now()`
-    /// (SteadyClock) and those driven by a test (ManualClock) ignore it, which
-    /// is why this defaults to a no-op rather than being pure virtual.
+    /// Called by whoever owns an event loop, which is the only place that knows
+    /// time may have passed: once right after the blocking wait returns, so
+    /// every handler and timer that iteration resumes sees the instant the wait
+    /// ended at, and once before the next wait's timeout is computed, so that
+    /// timeout is not overstated by however long the batch took to process.
+    /// Implementations that read the OS clock on every `Now()` (SteadyClock) and
+    /// those driven by a test (ManualClock) ignore it, which is why this
+    /// defaults to a no-op rather than being pure virtual.
+    ///
+    /// Must be safe to call from any thread and from several at once: reactors
+    /// share one clock.
     virtual void Refresh() noexcept {}
 };
 

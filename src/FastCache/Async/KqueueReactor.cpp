@@ -244,6 +244,15 @@ void KqueueReactor::Run()
             nextDeadline = _timers.empty() ? TimePoint::max() : _timers.front().deadline;
         }
 
+        // Re-sample before deciding how long to block. The previous iteration's
+        // handlers and timers ran after its refresh, so a cached clock is stale
+        // by however long that batch took — and computing the timeout from a
+        // stale `now` overshoots the deadline by exactly that much, making every
+        // timer fire a batch late. Both refreshes are needed and neither is
+        // redundant: this one bounds the sleep, the one below the wait is what
+        // makes the resumed handlers see the time the wait actually ended at.
+        _clock.Refresh();
+
         timespec ts {};
         timespec* tsPtr = nullptr;
         if (nextDeadline != TimePoint::max())
@@ -255,8 +264,8 @@ void KqueueReactor::Run()
         auto const n = ::kevent(_kq, nullptr, 0, events, Batch, tsPtr);
 
         // The wait above may have blocked for an arbitrary time, so this is the
-        // one point in the loop where a cached clock has to re-sample. Every
-        // handler and timer resumed below then reads it for free.
+        // point in the loop where a cached clock has to re-sample. Every handler
+        // and timer resumed below then reads it for free.
         _clock.Refresh();
 
         if (n < 0)
