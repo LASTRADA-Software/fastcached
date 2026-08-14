@@ -37,9 +37,22 @@ std::size_t ShardedStorage::ShardIndexFor(std::string_view key) const noexcept
     // Taking the top 32 bits of `hash32 * shardCount` is the standard
     // alternative (Lemire): one multiply and one shift, and unlike a mask it
     // needs no power-of-two shard count, so `--storage-shards` keeps accepting
-    // any value. The resulting partition differs from the modulo's, which is
-    // fine — which shard a key lands on is arbitrary, only its stability within
-    // a process matters, and that is preserved.
+    // any value.
+    //
+    // The resulting partition differs from the modulo's, and for the in-memory
+    // backend that costs nothing — which shard a key lands on is arbitrary and
+    // only its stability within a process matters. The *persistent* backend is
+    // where this has a price, and it is worth stating rather than discovering:
+    // with `--storage` and more than one shard, each shard is its own file
+    // (`shard-NN.cow`, see main.cpp), so this function decides which file a key
+    // lives in. Repartitioning therefore looks to a restarted daemon exactly
+    // like changing `--storage-shards` does: keys written by the old mapping are
+    // looked up in a different file and miss, and their bytes stay on disk,
+    // unreachable by Get and Delete alike, until the CoW tree evicts them — which
+    // it only does when `storage_max_disk_bytes` caps the tier at all. That is a
+    // one-time upgrade cost for a cache, not data loss, but it is a cost, so the
+    // reduction is a stable part of the on-disk contract and must not be changed
+    // casually a second time.
     auto const hash = static_cast<std::uint64_t>(std::hash<std::string_view> {}(key));
     auto const folded = (hash >> 32) ^ (hash & 0xFFFF'FFFFULL);
     return static_cast<std::size_t>((folded * _shards.size()) >> 32);
@@ -96,9 +109,42 @@ std::expected<GetResult, StorageError> ShardedStorage::Get(std::string_view key,
             // throughput peaked at 4 threads and then fell to half of what a
             // single thread managed. With try_lock the same benchmark scales to
             // 8 threads and holds ~3.3x the 16-thread figure.
+            //
+            // What a skipped promotion actually costs is wider than LRU order,
+            // because PromoteOnRead is also the only writer of `lastAccess` and
+            // `fetched` on this path (InMemoryLruStorage::Get's Approximate
+            // branch deliberately writes no node). So a skip also leaves the
+            // meta `l`/`h` flags and the `evicted_unfetched` / `expired_unfetched`
+            // counters reporting a read that happened as one that did not.
             std::unique_lock const lock { shard.mu, std::try_to_lock };
             if (lock.owns_lock())
                 shard.storage->PromoteOnRead(key, now);
+            else
+            {
+                // Contention is exactly when skipping hurts most: the LRU would
+                // drift toward insertion order, and those counters would go
+                // wrong, in the regime where both matter. Un-consume the sample
+                // so the *next* read retries rather than the one sixteen reads
+                // from now.
+                //
+                // This cannot spin and cannot convoy. It never blocks — a failed
+                // try_lock is a failed CAS, not a wait — and each retry is a
+                // whole further lookup away, so a shard under a sustained writer
+                // degrades to "promote when you can", not to a busy loop. The
+                // worst case is bounded by who reaches this branch at all: only
+                // `InMemoryLruStorage` in Approximate mode reports
+                // SupportsSharedRead(), so every exclusive hold competing with
+                // the retry is a short in-memory mutation. The persistent
+                // LayeredStorage takes the exclusive path above and never gets
+                // here, so no fsync can ever be what a retry is failing against.
+                //
+                // Measured rather than assumed: 9 interleaved reps of the
+                // `[scaling]` benchmark (16 shards, 1/2/4/8/16 threads) put the
+                // two variants within noise of each other at every thread count
+                // — median ratios 0.96-1.04 with overlapping ranges — so the
+                // retry buys the accuracy for nothing.
+                readSampler = 0;
+            }
         }
     }
     return result;

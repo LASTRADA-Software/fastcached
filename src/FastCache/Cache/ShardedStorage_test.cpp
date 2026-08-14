@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -19,7 +20,6 @@
 #include <mutex>
 #include <optional>
 #include <random>
-#include <set>
 #include <span>
 #include <string>
 #include <thread>
@@ -256,25 +256,45 @@ TEST_CASE("ShardedStorage hashes keys deterministically to one of N shards", "[s
     REQUIRE(idx1 < 4);
 }
 
-TEST_CASE("ShardedStorage reaches every shard, including non-power-of-two counts", "[sharded]")
+TEST_CASE("ShardedStorage spreads keys evenly over every shard, including non-power-of-two counts", "[sharded]")
 {
     // The index is a multiply-shift reduction, not a modulo — `%` compiled to a
-    // hardware divide on every storage operation. This pins the two properties
-    // that replacement has to keep: the index is always in range, and no shard
-    // is unreachable. The second is why a bit-mask was rejected: with 7 shards
-    // a mask would strand shards 4..6 and quietly cut capacity, and
-    // `--storage-shards` accepts any count.
+    // hardware divide on every storage operation. This pins the three properties
+    // that replacement has to keep: the index is always in range, no shard is
+    // unreachable, and the load is spread evenly.
+    //
+    // Reachability is why a bit-mask was rejected: with 7 shards a mask would
+    // strand shards 4..6 and quietly cut capacity, and `--storage-shards`
+    // accepts any count.
+    //
+    // Balance is the property this reduction could plausibly regress and
+    // reachability would not catch, because a multiply-shift decides the shard
+    // from the *high* bits of the folded hash. That is the well-mixed end of
+    // libstdc++'s and libc++'s `std::hash<string_view>` but not obviously of
+    // MSVC's FNV-1a, and this test is the only thing that runs on all three. An
+    // unbalanced fan-out has no visible symptom — it silently cuts effective
+    // capacity and concentrates lock contention on the hot shards — so it needs
+    // an assertion rather than a benchmark.
+    constexpr int KeyCount = 10'000;
     for (auto const shardCount: { std::size_t { 1 }, std::size_t { 3 }, std::size_t { 7 }, std::size_t { 16 } })
     {
         auto const storage = MakeSharded(shardCount);
-        std::set<std::size_t> reached;
-        for (int i = 0; i < 10'000; ++i)
+        std::vector<int> perShard(shardCount, 0);
+        for (int i = 0; i < KeyCount; ++i)
         {
             auto const index = storage->ShardIndexFor(std::format("key-{}", i));
             REQUIRE(index < shardCount);
-            reached.insert(index);
+            ++perShard[index];
         }
-        CHECK(reached.size() == shardCount);
+
+        auto const [least, most] = std::ranges::minmax_element(perShard);
+        CHECK(*least > 0); // every shard reachable
+        // Generous by design: this is a smoke test for a broken reduction (a
+        // mask, a truncation, a hash whose high bits do not move), not a
+        // statistical test of the hash. Even 3 shards over 10k keys leaves ample
+        // room inside 2x the mean for ordinary variance.
+        auto const mean = static_cast<double>(KeyCount) / static_cast<double>(shardCount);
+        CHECK(static_cast<double>(*most) <= 2.0 * mean);
     }
 }
 
