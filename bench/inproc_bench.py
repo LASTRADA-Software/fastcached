@@ -21,10 +21,16 @@ in-process cache map — by running both sides on the same machine:
 Both sides' benchmark bodies issue ``LOOKUPS_PER_ITERATION`` lookups, so both
 means are divided by it to reach nanoseconds per single operation.
 
+A third tier follows the head-to-head: read throughput across thread counts.
+Nothing in a single-threaded ns/op figure describes it, and it is the axis a
+sharded cache is actually built to win, so it is collected and reported here
+rather than being left as console output nobody reads.
+
 Typical use::
 
-    python bench/inproc_bench.py                  # build, run both, compare
+    python bench/inproc_bench.py                  # build, run everything, compare
     python bench/inproc_bench.py --no-jitbit      # ours only (no .NET SDK needed)
+    python bench/inproc_bench.py --no-scaling     # skip the thread-scaling tier
     python bench/inproc_bench.py --no-build --samples 200
 
 Requires a working CMake toolchain, as the rest of the suite does. The jitbit
@@ -122,6 +128,32 @@ def run_fastcached(binary: Path, samples: int) -> dict[str, float]:
     return results
 
 
+#: The line ``[scaling]`` prints per thread count. The C++ side emits these
+#: rather than asserting on them (a measurement is not a contract), so this
+#: pattern is the whole contract between the two — keep it in step with the
+#: ``std::format`` call in ``StorageBench.cpp``.
+SCALING_LINE = re.compile(r"^SCALING threads=(\d+) ops_per_sec=(\d+)", re.MULTILINE)
+
+
+def run_scaling(binary: Path) -> dict[int, float]:
+    """Run the thread-scaling benchmark and return {thread count: ops/sec}.
+
+    A separate invocation from :func:`run_fastcached` because this tier reports
+    through stdout rather than Catch2's timing harness: it measures aggregate
+    throughput over a fixed wall-clock window across N threads, which is not a
+    per-iteration mean and so has no ``<BenchmarkResults>`` to parse. Single
+    -threaded ns/op says nothing about how a sharded cache uses more cores, and
+    that axis is the one the storage layer is designed to win.
+    """
+    completed = subprocess.run(
+        [str(binary), "[scaling]"], capture_output=True, text=True, check=True,
+    )
+    results = {int(threads): float(ops) for threads, ops in SCALING_LINE.findall(completed.stdout)}
+    if not results:
+        raise RuntimeError("no SCALING lines found in fastcache-bench output")
+    return results
+
+
 # --- jitbit's side ------------------------------------------------------------
 
 def _parse_bdn_time(cell: str) -> float | None:
@@ -197,35 +229,28 @@ def collect_environment(preset: str) -> dict[str, str]:
     }
 
 
-def print_table(rows: list[tuple[str, float, str]], reference: float | None) -> None:
-    """Print the ns/op comparison, styled like the rest of the suite's tables."""
-    color = termviz.supports_color()
-    headers = ["Row", "ns/op", "vs jitbit", "What it adds"]
-    body: list[list[str]] = []
-    for name, nanoseconds, note in rows:
-        ratio = "-" if not reference else f"{nanoseconds / reference:.2f}x"
-        body.append([name, f"{nanoseconds:.2f}", ratio, note])
-
-    widths = [len(h) for h in headers]
-    for cells in body:
-        for index, cell in enumerate(cells):
-            widths[index] = max(widths[index], len(cell))
-
-    def render(cells: list[str]) -> str:
-        out = []
-        for index, cell in enumerate(cells):
-            out.append(cell.ljust(widths[index]) if index != 1 else cell.rjust(widths[index]))
-        return " | ".join(out)
-
-    header_line = render(headers)
-    print(termviz._colorize(header_line, termviz.BOLD, color))
-    print(termviz._colorize("-" * len(header_line), termviz.DIM, color))
-    for cells in body:
-        print(render(cells))
-    print()
+def print_lookup_table(rows: list[tuple[str, float, str]], reference: float | None) -> None:
+    """Print the ns/op comparison through the suite's shared table renderer."""
+    body = [
+        [name, f"{nanoseconds:.2f}", "-" if not reference else f"{nanoseconds / reference:.2f}x", note]
+        for name, nanoseconds, note in rows
+    ]
+    termviz.print_table(["Row", "ns/op", "vs jitbit", "What it adds"], body, separator=" | ", align="lrrl")
 
 
-def write_report(outdir: Path, environment: dict, ours: dict, theirs: dict) -> None:
+def print_scaling_table(scaling: dict[int, float]) -> None:
+    """Print aggregate throughput per thread count, with the speedup over one."""
+    single = scaling.get(1)
+    body = [
+        [str(threads), f"{ops:,.0f}", "-" if not single else f"{ops / single:.2f}x"]
+        for threads, ops in sorted(scaling.items())
+    ]
+    # Every column is a number here, so the house default of a left-aligned
+    # label column would leave the thread counts hanging under a wider heading.
+    termviz.print_table(["Threads", "ops/s", "vs 1 thread"], body, separator=" | ", align="rrr")
+
+
+def write_report(outdir: Path, environment: dict, ours: dict, theirs: dict, scaling: dict[int, float]) -> None:
     """Write ``report.md`` and ``summary.json`` next to the suite's other results."""
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "summary.json").write_text(
@@ -235,6 +260,7 @@ def write_report(outdir: Path, environment: dict, ours: dict, theirs: dict) -> N
                 "lookups_per_iteration": LOOKUPS_PER_ITERATION,
                 "fastcached_ns_per_op": {k: per_operation(k, v) for k, v in ours.items()},
                 "jitbit_ns_per_op": {k: per_operation(k, v) for k, v in theirs.items()},
+                "fastcached_scaling_ops_per_sec": {str(k): v for k, v in sorted(scaling.items())},
             },
             indent=2,
         ),
@@ -268,6 +294,23 @@ def write_report(outdir: Path, environment: dict, ours: dict, theirs: dict) -> N
         for name, body_ns in theirs.items():
             lines.append(f"| {name} | {per_operation(name, body_ns):.2f} |")
 
+    if scaling:
+        single = scaling.get(1)
+        lines += [
+            "",
+            "## Read scaling across threads (sharded, no engine)",
+            "",
+            "Aggregate throughput over a fixed window, not a per-operation mean —",
+            "the axis a single ns/op figure cannot describe and the one a sharded",
+            "cache is designed to win.",
+            "",
+            "| Threads | ops/s | vs 1 thread |",
+            "| ---: | ---: | ---: |",
+        ]
+        for threads, ops in sorted(scaling.items()):
+            ratio = "-" if not single else f"{ops / single:.2f}x"
+            lines.append(f"| {threads} | {ops:,.0f} | {ratio} |")
+
     (outdir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -277,6 +320,7 @@ def main() -> int:
     parser.add_argument("--no-build", action="store_true", help="skip configure/build")
     parser.add_argument("--samples", type=int, default=100, help="Catch2 samples per row")
     parser.add_argument("--no-jitbit", action="store_true", help="skip the jitbit baseline")
+    parser.add_argument("--no-scaling", action="store_true", help="skip the thread-scaling tier")
     parser.add_argument("--out", default=str(REPO_ROOT / "bench" / "results"), help="results directory")
     args = parser.parse_args()
 
@@ -289,6 +333,7 @@ def main() -> int:
         return 1
 
     ours = run_fastcached(binary, args.samples)
+    scaling = {} if args.no_scaling else run_scaling(binary)
 
     theirs: dict[str, float] = {}
     if not args.no_jitbit:
@@ -304,13 +349,16 @@ def main() -> int:
     if reference:
         print(f"jitbit FastCache lookup: {reference:.2f} ns/op (this machine)\n")
 
-    print_table(
+    print_lookup_table(
         [(name, per_operation(name, value), ROW_NOTES.get(name, "")) for name, value in ours.items()],
         reference,
     )
 
+    if scaling:
+        print_scaling_table(scaling)
+
     outdir = Path(args.out) / time.strftime("inproc-%Y%m%d-%H%M%S")
-    write_report(outdir, environment, ours, theirs)
+    write_report(outdir, environment, ours, theirs, scaling)
     print(f"wrote {outdir / 'report.md'}")
     return 0
 

@@ -109,6 +109,55 @@ def _colorize(text: str, color: str, enabled: bool) -> str:
     return f"{color}{text}{RESET}" if enabled else text
 
 
+def print_table(headers: list[str],
+                rows: list[list[str]],
+                plain_rows: list[list[str]] | None = None,
+                *,
+                separator: str = "  ",
+                align: str | None = None) -> None:
+    """Render an aligned, bold-headed table — the one table renderer in bench/.
+
+    Every table in the suite is the same shape (compute column widths, pad,
+    join, rule under the header), and it used to be written out once per table,
+    which is how a caller in another module ended up reaching in for the private
+    ``_colorize``. Callers now pass their cells and their separator.
+
+    ``rows`` may contain ANSI-colored cells, whose ``len()`` counts escape bytes
+    and would wreck the alignment; pass the uncolored equivalents as
+    ``plain_rows`` and widths are computed from those instead.
+
+    :param headers: Column headings, also the minimum column widths.
+    :param rows: Row cells, possibly colored.
+    :param plain_rows: Uncolored ``rows`` for width computation; defaults to
+        ``rows`` when no cell is colored.
+    :param separator: Column separator, e.g. ``"  "`` or ``" | "``.
+    :param align: One of ``l``/``r`` per column. Defaults to the house style:
+        a left-aligned label column followed by right-aligned numbers.
+    """
+    color = supports_color()
+    plain = plain_rows if plain_rows is not None else rows
+    alignment = align if align is not None else "l" + "r" * (len(headers) - 1)
+
+    widths = [len(header) for header in headers]
+    for cells in plain:
+        for index, cell in enumerate(cells):
+            widths[index] = max(widths[index], len(cell))
+
+    def render(cells: list[str], uncolored: list[str]) -> str:
+        out = []
+        for index, cell in enumerate(cells):
+            pad = " " * (widths[index] - len(uncolored[index]))
+            out.append(cell + pad if alignment[index] == "l" else pad + cell)
+        return separator.join(out)
+
+    header_line = render(headers, headers)
+    print(_colorize(header_line, BOLD, color))
+    print(_colorize("-" * len(header_line), DIM, color))
+    for cells, uncolored in zip(rows, plain):
+        print(render(cells, uncolored))
+    print()
+
+
 def _delta_cell(value: float | None, improvement_is_negative: bool, color_enabled: bool) -> str:
     if value is None:
         return "n/a"
@@ -167,24 +216,7 @@ def print_comparison_table(comparisons) -> None:
         rows.append(cells)
         plain_rows.append(plain)
 
-    widths = [len(h) for h in headers]
-    for plain in plain_rows:
-        for i, cell in enumerate(plain):
-            widths[i] = max(widths[i], len(cell))
-
-    def render(cells: list[str], plain: list[str]) -> str:
-        out = []
-        for i, cell in enumerate(cells):
-            pad = widths[i] - len(plain[i])
-            out.append(("{}" + " " * pad).format(cell) if i == 0 else (" " * pad + cell))
-        return f" {vbar} ".join(out)
-
-    header_line = render(headers, headers)
-    print(_colorize(header_line, BOLD, color))
-    print(_colorize("-" * len(header_line), DIM, color))
-    for cells, plain in zip(rows, plain_rows):
-        print(render(cells, plain))
-    print()
+    print_table(headers, rows, plain_rows, separator=f" {vbar} ")
 
 
 def print_multitarget_table(target_names: list[str], rows: list) -> None:
@@ -214,23 +246,7 @@ def print_multitarget_table(target_names: list[str], rows: list) -> None:
         table.append(cells)
         plain.append(plains)
 
-    widths = [len(h) for h in headers]
-    for prow in plain:
-        for i, cell in enumerate(prow):
-            widths[i] = max(widths[i], len(cell))
-
-    def render(cells: list[str], prow: list[str]) -> str:
-        out = []
-        for i, cell in enumerate(cells):
-            pad = widths[i] - len(prow[i])
-            out.append(("{}" + " " * pad).format(cell) if i == 0 else (" " * pad + cell))
-        return "  ".join(out)
-
-    print(_colorize(render(headers, headers), BOLD, color))
-    print(_colorize("-" * (sum(widths) + 2 * len(widths)), DIM, color))
-    for cells, prow in zip(table, plain):
-        print(render(cells, prow))
-    print()
+    print_table(headers, table, plain)
 
 
 def print_highlights(lines: list[str]) -> None:

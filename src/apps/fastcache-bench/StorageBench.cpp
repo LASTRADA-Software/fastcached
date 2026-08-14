@@ -274,7 +274,7 @@ TEST_CASE("storage lookup, jitbit-equivalent workload", "[bench][lookup]")
             std::uint32_t found = 0;
             for (auto const key: ProbeKeys)
             {
-                found += static_cast<std::uint32_t>(control.find(key) != control.end());
+                found += static_cast<std::uint32_t>(control.contains(key));
                 DenyHoisting();
             }
             return found;
@@ -389,8 +389,12 @@ TEST_CASE("storage lookup scaling across threads", "[bench][scaling]")
         auto const seconds = std::chrono::duration<double>(elapsed).count();
         auto const opsPerSecond = static_cast<double>(total.load()) / seconds;
 
-        // Printed, not asserted: this is a measurement, not a contract.
-        // bench/inproc_bench.py scrapes these lines from stdout.
+        // Printed, not asserted: this is a measurement, not a contract, and it
+        // has no per-iteration mean for Catch2's XML reporter to carry — so
+        // stdout is the channel. `bench/inproc_bench.py` runs this tag as a
+        // second invocation and parses exactly this line shape (SCALING_LINE
+        // there); the two spellings are the whole interface between them and
+        // have to move together.
         std::cout << std::format("SCALING threads={} ops_per_sec={:.0f}\n", threadCount, opsPerSecond);
     }
 }
