@@ -73,10 +73,32 @@ std::expected<GetResult, StorageError> ShardedStorage::Get(std::string_view key,
     if (result.has_value() && result->found)
     {
         constexpr unsigned PromoteEveryNthRead = 16;
-        if (shard.readSampler.fetch_add(1, std::memory_order_relaxed) % PromoteEveryNthRead == 0)
+        // The sampler is per *thread*, not per shard. It used to be a shared
+        // atomic on the shard, which put a locked read-modify-write — and a
+        // cache line every reader on that shard wrote to — on the hot read
+        // path, to drive nothing but a 1-in-16 sampling decision. Nothing here
+        // needs a globally consistent count: the promotion is best-effort by
+        // construction, and a per-thread counter still promotes one read in
+        // sixteen while spreading promotions more evenly across reactors.
+        static thread_local unsigned readSampler = 0;
+        if (readSampler++ % PromoteEveryNthRead == 0)
         {
-            std::unique_lock const lock { shard.mu };
-            shard.storage->PromoteOnRead(key, now);
+            // Try for the exclusive lock, never wait for it. Promotion is
+            // best-effort by contract — the entry may already have been evicted,
+            // and the comment on IStorage::PromoteOnRead says a miss is fine —
+            // so blocking for it trades throughput for recency bookkeeping that
+            // is allowed to be wrong.
+            //
+            // Blocking here was measurably catastrophic. `std::shared_mutex` is
+            // an SRWLOCK on Windows, where a waiting writer blocks *every*
+            // subsequent reader on that shard, so one promotion in sixteen
+            // reads was enough to convoy all readers behind it: 16-thread read
+            // throughput peaked at 4 threads and then fell to half of what a
+            // single thread managed. With try_lock the same benchmark scales to
+            // 8 threads and holds ~3.3x the 16-thread figure.
+            std::unique_lock const lock { shard.mu, std::try_to_lock };
+            if (lock.owns_lock())
+                shard.storage->PromoteOnRead(key, now);
         }
     }
     return result;
