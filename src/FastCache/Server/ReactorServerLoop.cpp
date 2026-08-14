@@ -88,7 +88,8 @@ namespace
         if (int const r = Detail::VerifyTlsContextForTlsBinds(options, logger); r != EXIT_SUCCESS)
             return r;
         FC_THREAD_NAME("fc-reactor");
-        SteadyClock clock;
+        SteadyClock ownClock;
+        IClock& clock = options.clock != nullptr ? *options.clock : ownClock;
         PlatformReactor reactor { clock };
 
         std::vector<std::unique_ptr<PlatformListener>> listeners;
@@ -211,7 +212,8 @@ namespace
     {
         if (int const r = Detail::VerifyTlsContextForTlsBinds(options, logger); r != EXIT_SUCCESS)
             return r;
-        SteadyClock clock;
+        SteadyClock ownClock;
+        IClock& clock = options.clock != nullptr ? *options.clock : ownClock;
         std::vector<std::unique_ptr<IocpReactor>> reactors;
         reactors.reserve(reactorCount);
         for (auto i = 0U; i < reactorCount; ++i)
@@ -370,7 +372,8 @@ namespace
     {
         if (int const r = Detail::VerifyTlsContextForTlsBinds(options, logger); r != EXIT_SUCCESS)
             return r;
-        SteadyClock clock;
+        SteadyClock ownClock;
+        IClock& clock = options.clock != nullptr ? *options.clock : ownClock;
         std::vector<std::unique_ptr<PlatformReactor>> reactors;
         // Listeners and servers are laid out as `[reactor * binds + bind]`
         // — a flat array indexed by `reactor * binds.size() + bindIdx`. This

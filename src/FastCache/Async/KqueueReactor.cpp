@@ -253,6 +253,12 @@ void KqueueReactor::Run()
         }
 
         auto const n = ::kevent(_kq, nullptr, 0, events, Batch, tsPtr);
+
+        // The wait above may have blocked for an arbitrary time, so this is the
+        // one point in the loop where a cached clock has to re-sample. Every
+        // handler and timer resumed below then reads it for free.
+        _clock.Refresh();
+
         if (n < 0)
         {
             if (errno == EINTR)

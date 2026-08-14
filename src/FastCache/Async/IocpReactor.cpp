@@ -137,6 +137,12 @@ void IocpReactor::Run()
         ULONG removed = 0;
         BOOL const ok = GetQueuedCompletionStatusEx(static_cast<HANDLE>(_iocp), entries, Batch, &removed, timeout, FALSE);
 
+        // The wait above may have blocked for an arbitrary time, so this is the
+        // one point in the loop where a cached clock has to re-sample. It comes
+        // before the timeout branch below deliberately: that branch fires
+        // timers, which must see the time the wait actually ended at.
+        _clock.Refresh();
+
         if (!ok)
         {
             // Timeout (WAIT_TIMEOUT) is the common case once a deadline

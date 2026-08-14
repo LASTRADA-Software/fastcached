@@ -179,6 +179,12 @@ void EpollReactor::Run()
         auto const timeout = DeadlineToMs(nextDeadline, _clock.Now());
 
         auto const n = ::epoll_wait(_epollFd, events, Batch, timeout);
+
+        // The wait above may have blocked for an arbitrary time, so this is the
+        // one point in the loop where a cached clock has to re-sample. Every
+        // handler and timer resumed below then reads it for free.
+        _clock.Refresh();
+
         if (n < 0)
         {
             if (errno == EINTR)
