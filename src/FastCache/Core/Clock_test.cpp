@@ -99,8 +99,10 @@ TEST_CASE("CachedClock concurrent refreshes converge on the newest sample", "[cl
 
     std::atomic<bool> go { false };
     std::atomic<bool> regressed { false };
+    constexpr int WorkerCount = 8;
     std::vector<std::jthread> workers;
-    for (int worker = 0; worker < 8; ++worker)
+    workers.reserve(WorkerCount);
+    for (int worker = 0; worker < WorkerCount; ++worker)
     {
         workers.emplace_back([&] {
             while (!go.load(std::memory_order_acquire))
