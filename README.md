@@ -305,27 +305,35 @@ fastcached and native `redis-server` / `memcached` through the same scenarios.
 
 ![Throughput: fastcached vs redis/memcached](docs/benchmarks/vs_real_throughput.png)
 
-In-memory GET throughput on an AMD Ryzen 9 9950X3D (16C/32T, 96 GB), median of
-3 reps, both competitors run as native binaries:
+In-memory GET throughput, median of 3 reps, all three servers run as native
+binaries on one host — Linux 7.1.3 (Fedora 44) on an AMD Ryzen 9 9950X3D
+(16C/32T, 96 GB), against redis 8.10.0 (built from source, `io-threads 1`,
+persistence off) and memcached 1.6.40:
 
-| Concurrency | fastcached  | vs native redis | vs native memcached |
-|------------:|------------:|----------------:|--------------------:|
-| 1           | ~120k ops/s | ~1.0× (tie)     | ~1.0× (tie)         |
-| 16          | ~900k ops/s | **2.5×**        | ~1.0× (tie)         |
-| 64          | ~1.4M ops/s | **3.7×**        | **1.6×**            |
-| 256         | ~1.2M ops/s | **4.7×**        | **1.5×**            |
+| Concurrency | fastcached   | vs native redis | vs native memcached |
+|------------:|-------------:|----------------:|--------------------:|
+| 1           | ~125k ops/s  | ~1.05× (tie)    | ~1.0× (tie)         |
+| 16          | ~1.06M ops/s | **3.0×**        | ~1.07× (tie)        |
+| 64          | ~1.45M ops/s | **4.5×**        | **1.6×**            |
+| 256         | ~1.32M ops/s | **4.4×**        | **1.6×**            |
 
-Geomean across the small-value in-memory scenarios is **~2.7× redis** and
-**~1.35× memcached**, with 0 errors and 0 timeouts across the sweep. At a single
-connection there is no parallelism to exploit and all three tie; fastcached's
-per-core reactors pull ahead of single-threaded redis from 16 connections up and
-overtake native memcached at 64+. The persistent backend sustains ~11k durable
-SET ops/s at one connection and ~67k at 16, p99 under 0.5 ms.
+Each row is the geometric mean over the four wire protocols, so the ratios
+compare like with like: redis serves the RESP2/RESP3 scenarios, memcached the
+text/binary ones. Geomean across the small-value in-memory scenarios — 24 head
+to head against each competitor — is **~2.8× redis** and **~1.4× memcached**,
+with 0 errors and 0 timeouts across the sweep. At a single connection there is
+no parallelism to exploit and all three tie; fastcached's per-core reactors pull
+ahead of single-threaded redis from 16 connections up and overtake native
+memcached at 64+. The persistent backend
+sustains ~11k durable SET ops/s at one connection and ~52k at 16, p99 under
+0.9 ms, and the 256-connection keepalive storm on persistent storage completes
+every connection at ~297k ops/s.
 
-These are honest but narrow numbers: one fast desktop CPU, single machine. The
-redis baseline is the native single-threaded build, so a modern `io-threads`
-redis would narrow the network gap — the multi-core architecture advantage is
-what stands. Reproduce with `python bench/fastcached_bench.py --vs redis,memcached`.
+These are honest but narrow numbers: one fast desktop CPU, single machine, and a
+Python load generator sharing that CPU with the server. The redis baseline runs
+at its default `io-threads 1`, so a redis tuned for multiple I/O threads would
+narrow the network gap — the multi-core architecture advantage is what stands.
+Reproduce with `python bench/fastcached_bench.py --vs redis,memcached`.
 
 ## Contributing
 
