@@ -29,7 +29,20 @@ ShardedStorage::ShardedStorage(std::vector<std::unique_ptr<IStorage>> shards)
 
 std::size_t ShardedStorage::ShardIndexFor(std::string_view key) const noexcept
 {
-    return std::hash<std::string_view> {}(key) % _shards.size();
+    // Map the hash onto [0, shardCount) with a multiply-shift rather than a
+    // modulo. `%` compiles to a hardware divide — ~14 cycles on this class of
+    // CPU, which is a measurable slice of a ~20 ns lookup and was being paid on
+    // every single storage operation.
+    //
+    // Taking the top 32 bits of `hash32 * shardCount` is the standard
+    // alternative (Lemire): one multiply and one shift, and unlike a mask it
+    // needs no power-of-two shard count, so `--storage-shards` keeps accepting
+    // any value. The resulting partition differs from the modulo's, which is
+    // fine — which shard a key lands on is arbitrary, only its stability within
+    // a process matters, and that is preserved.
+    auto const hash = static_cast<std::uint64_t>(std::hash<std::string_view> {}(key));
+    auto const folded = (hash >> 32) ^ (hash & 0xFFFF'FFFFULL);
+    return static_cast<std::size_t>((folded * _shards.size()) >> 32);
 }
 
 std::expected<GetResult, StorageError> ShardedStorage::Get(std::string_view key, TimePoint now)

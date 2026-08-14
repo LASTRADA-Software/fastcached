@@ -13,11 +13,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
+#include <set>
 #include <span>
 #include <string>
 #include <thread>
@@ -252,6 +254,28 @@ TEST_CASE("ShardedStorage hashes keys deterministically to one of N shards", "[s
     auto const idx2 = storage->ShardIndexFor("foo");
     REQUIRE(idx1 == idx2);
     REQUIRE(idx1 < 4);
+}
+
+TEST_CASE("ShardedStorage reaches every shard, including non-power-of-two counts", "[sharded]")
+{
+    // The index is a multiply-shift reduction, not a modulo — `%` compiled to a
+    // hardware divide on every storage operation. This pins the two properties
+    // that replacement has to keep: the index is always in range, and no shard
+    // is unreachable. The second is why a bit-mask was rejected: with 7 shards
+    // a mask would strand shards 4..6 and quietly cut capacity, and
+    // `--storage-shards` accepts any count.
+    for (auto const shardCount: { std::size_t { 1 }, std::size_t { 3 }, std::size_t { 7 }, std::size_t { 16 } })
+    {
+        auto const storage = MakeSharded(shardCount);
+        std::set<std::size_t> reached;
+        for (int i = 0; i < 10'000; ++i)
+        {
+            auto const index = storage->ShardIndexFor(std::format("key-{}", i));
+            REQUIRE(index < shardCount);
+            reached.insert(index);
+        }
+        CHECK(reached.size() == shardCount);
+    }
 }
 
 TEST_CASE("ShardedStorage Snapshot aggregates per-shard stats", "[sharded]")
