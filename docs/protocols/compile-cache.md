@@ -15,34 +15,136 @@ enable it: every `fastcached` listener serves it.
 
 ## Framing
 
-All lengths are unsigned 32-bit big-endian. A field is a length followed by that
-many bytes.
+All multi-byte integers are unsigned 32-bit big-endian. A *field* is a length
+followed by that many bytes.
+
+Every request carries a fixed 7-byte header and then exactly the payload it
+declares:
+
+| Offset | Size | Field | Meaning |
+|--------|------|-------|---------|
+| 0 | 1 | magic | Always `0xFC`. |
+| 1 | 1 | version | Protocol version. Current: **1**. |
+| 2 | 1 | op | `0x01` STORE, `0x02` FETCH. |
+| 3 | 4 | payloadLength | Bytes of payload following the header. |
+
+Every reply carries a fixed 5-byte header and then exactly the payload it
+declares — **uniformly for every status**, including a miss, which carries a
+zero-length payload rather than no payload at all:
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 1 | status |
+| 1 | 4 | payloadLength |
+
+Those two declared lengths are what make the protocol extensible. A receiver
+that does not recognise an opcode can skip exactly `payloadLength` bytes, answer
+with a typed error, and stay in sync — so adding a verb is not a breaking change,
+and a refusal is a *reply* rather than a dropped connection. Both sides frame
+through one shared module, `src/FastCache/Protocol/CompileCacheWire.hpp`, so the
+daemon, the launcher, and the test client cannot disagree about the layout.
+
+### Statuses
+
+| Byte | Status | Meaning |
+|------|--------|---------|
+| `0x00` | Miss | FETCH found nothing. Payload empty. A legitimate negative, not an error. |
+| `0x01` | Ok | Command succeeded; payload is the result, if any. |
+| `0x02` | Error | Command refused; payload is `[u8 errorCode][message]`. |
+
+Which statuses an op may be answered with is table data, not convention:
+
+| Op | Legal statuses |
+|----|----------------|
+| STORE | Ok, Error |
+| FETCH | Ok, Miss, Error |
+
+A miss and a refusal being distinct is the point. When both were the byte `0x00`,
+a client the daemon could not serve saw an endlessly cold cache and no
+diagnostic — the build merely got slower, forever, with nothing to show for it.
+
+### Error codes
+
+| Byte | Name | Raised when |
+|------|------|-------------|
+| `0x01` | unsupported-version | The request version is outside the server's range. |
+| `0x02` | unknown-opcode | The opcode is not one this build knows. |
+| `0x03` | malformed-frame | The fields do not exactly fill the declared payload. |
+| `0x04` | payload-too-large | The declared payload exceeds the session cap. |
+| `0x05` | malformed-value | A STORE payload is not a decodable compile-value. |
+| `0x06` | canonicalization-failed | A text region's paths could not be canonicalized. |
+| `0x07` | storage-write-failed | The cache engine refused the write. |
 
 ### STORE
 
 ```
-[0xFC][0x01][key][cohort][srcRoot][buildTree][value]
+[0xFC][ver][0x01][u32 len]  payload: [key][cohort][srcRoot][buildTree][value]
 ```
 
 The `srcRoot` and `buildTree` fields describe the *producer's* layout. The
 server uses them to rewrite absolute paths inside the value's text regions into
 canonical tokens before storing — so what lands in the cache is layout-neutral.
 
-Reply is a single status byte: `0x01` on success, `0x00` on failure followed by
-a typed error message.
-
 ### FETCH
 
 ```
-[0xFC][0x02][key]
+[0xFC][ver][0x02][u32 len]  payload: [key]
 ```
 
-On a hit the reply is `[0x01][u32 length][value bytes]`; on a miss it is the
-single byte `0x00`. The value is served in its **canonical** form — the client
-localizes it to its own layout.
+On a hit the reply payload is the stored value, in its **canonical** form — the
+client localizes it to its own layout.
 
-Any other opcode ends the session. A malformed frame is not negotiated: the
-connection is simply closed, since the peer is not a well-behaved client.
+## Versioning
+
+The version byte travels on every request, and the server pins it to the first
+command's for the life of the connection: a stream that changes version
+mid-flight is nonsensical rather than merely unsupported, and saying so is
+cheaper than carrying two decoders.
+
+Rejection policy, per command:
+
+| Condition | Reply | Connection |
+|-----------|-------|------------|
+| bad magic | none possible | closed |
+| version unsupported, or changed mid-connection | Error / unsupported-version | closed |
+| payload over the session cap | Error / payload-too-large | closed |
+| unknown opcode | Error / unknown-opcode | **stays open** |
+| fields ≠ declared payload | Error / malformed-frame | stays open |
+
+A wrong magic is the only case that still closes without a reply: the peer is
+not speaking this protocol, so there is no framing in which an answer would be
+meaningful. Every other refusal is a typed reply, and every one is also reported
+through the daemon's connection logger, so a rejection is visible to the
+operator as well as to the client.
+
+An `unsupported-version` message names the offered version *and* the supported
+range (`unsupported wire version 2; this server speaks 1..1`). A rejection that
+does not say what would have worked cannot be acted on, and this is the only
+message an operator with a mismatched install will ever see.
+
+### Why there is no handshake
+
+There is no HELLO and no negotiation round trip. `fastcache-cc` opens a **fresh
+connection per operation** — manifest fetch, object fetch, object store,
+manifest store — so a handshake would cost two to four extra round trips *per
+translation unit*, on the hot path where this project has already measured
+serious regressions. Instead the client optimistically sends its current version
+and learns the server's range from the rejection if it is wrong: zero cost in the
+common case, one wasted round trip in the case that is already broken.
+
+Because both binaries ship in one package, version skew is an operator error — a
+mixed install — so the goal here is a loud diagnostic, not automatic interop.
+
+### Two independent version axes
+
+The wire version describes the *framing*; `CompileValueVersion`, the first byte
+of a stored blob, describes the *value format*. They are separate because a
+stored blob outlives any connection: the wire version is agreed per request,
+while the blob's version is discovered when it is decoded, however long after it
+was written. The launcher's cache key additionally carries an `objkey-v1` schema
+tag, so a future change to the value format or the canonicalization spec re-keys
+the cache — stale entries then miss and are rewritten, rather than being served
+under rules they were not written by.
 
 ## The value format
 

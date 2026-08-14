@@ -8,8 +8,13 @@ first byte, so any listener serves it.
 
 The per-value cap defaults to 256 MiB, chosen for exactly this workload, so most
 deployments need no flag here. It matters because a value above the cap is
-rejected outright — that translation unit then silently never caches, which
-looks like a poor hit rate rather than an error.
+rejected outright — that translation unit then never caches, which looks like a
+poor hit rate rather than an error.
+
+The rejection is at least diagnosable: the daemon answers with a typed
+`payload-too-large` error naming the declared size and the cap, so it appears in
+`fastcache-cc --show-stats` under fall-back reasons and in the daemon log, rather
+than as a dropped connection.
 
 Object files in a large C++ codebase routinely exceed 16 MiB; one measured
 codebase peaked at ~122 MB for a single object. If your largest object goes past

@@ -1,17 +1,18 @@
 # Autodetection
 
 When a client connects, fastcached peeks the first byte and routes the
-connection to one of three protocol handlers — memcached binary,
-Redis RESP2, or memcached text. (The meta commands are dispatched from
-inside the text handler, so they need no first-byte rule of their own.)
-The rule set is small and unambiguous; mis-classification would mean a
-closed connection, not a wrong answer.
+connection to one of four protocol handlers — memcached binary, the
+compile cache, Redis RESP2, or memcached text. (The meta commands are
+dispatched from inside the text handler, so they need no first-byte rule
+of their own.) The rule set is small and unambiguous; mis-classification
+would mean a closed connection, not a wrong answer.
 
 ## Rules
 
 | First byte(s)     | Routed to                          |
 |-------------------|------------------------------------|
 | `0x80`            | memcached binary handler           |
+| `0xFC`            | [compile-cache handler](compile-cache.md) |
 | `*`               | Redis RESP2 handler (array form)   |
 | `+` `-` `:` `$`   | Redis RESP2 handler (inline form)  |
 | anything else     | memcached text handler (line-based) |
@@ -24,6 +25,9 @@ memcached text handler, so they don't need their own first-byte rule.
 - **`0x80`** is the request magic of the memcached binary protocol
   header. It's a non-printable byte, so no text-protocol command can
   start with it.
+- **`0xFC`** is the magic of fastcached's own compile-cache protocol.
+  Also non-printable, and distinct from `0x80`, so the two binary
+  protocols cannot be confused for each other or for a text command.
 - **`*`** opens a RESP array; **`+`/`-`/`:`/`$`** are the simple-string,
   error, integer, and bulk-string markers respectively. None can begin
   a memcached text command.
@@ -38,6 +42,13 @@ Switching mid-stream is not supported and would produce undefined
 behavior on the wire. The exception is meta commands, which share
 the text handler with the classic ASCII commands and can interleave
 freely.
+
+The compile-cache protocol applies the same rule one level down: its
+frames carry a version byte, and the first command's version is pinned
+for the connection. A later frame at a different version is refused with
+a typed error rather than decoded — the intra-protocol analogue of not
+switching flavor mid-stream. See
+[Versioning](compile-cache.md#versioning).
 
 ## What happens on an unparseable stream
 

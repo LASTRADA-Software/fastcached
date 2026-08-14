@@ -1,6 +1,11 @@
-# Binary status codes
+# memcached binary status codes
 
-Every status fastcached emits in the binary response header.
+Every status fastcached emits in the **memcached binary** response header.
+
+These codes are specific to that protocol and are not shared with any
+other. In particular the compile-cache protocol has its own, much smaller
+status and error spaces, where `0x00` means *miss* rather than *ok* — see
+[Compile cache](compile-cache.md#statuses).
 
 | Hex    | Name              | Meaning |
 |--------|-------------------|---------|

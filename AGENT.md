@@ -36,7 +36,10 @@ src/FastCache/
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
                 RedisResp (RESP2), CompileCacheHandler (the executor: custom
                 0xFC binary protocol, canonicalize-on-STORE / serve-canonical-
-                on-FETCH, leading-key cohort prefetch)
+                on-FETCH, leading-key cohort prefetch), CompileCacheWire
+                (header-only, dependency-free: the 0xFC magic/version/opcode/
+                status/error tables and their encoders, shared verbatim by the
+                daemon, fastcache-cc and the test client)
   Server/       Connection (per-client coroutine), Server,
                 ReactorServerLoop (the server driver)
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
@@ -112,6 +115,35 @@ These constraints are load-bearing and have each already been a bug:
   `CliOptions()` and requires each non-excluded flag to be emitted — the
   exclusions, `--requirepass` above all, are listed with their reasons) and the
   launcher's `FASTCACHE_*` oracle list in `LauncherCli_test`.
+- **A compile-cache frame declares its own length, so a rejection can be a reply
+  instead of a close.** The pre-1 header was `[magic][op]` with no length, and
+  that is what made every refusal — bad magic, unknown opcode, oversize field —
+  a silent `co_return`: with no declared length the server could not find where
+  the frame it was refusing ended, so it could not answer and resynchronize. A
+  client cannot tell that apart from a dead connection, so a mismatched install
+  presented as a flaky network and a cache that never warmed. The header is now
+  `[magic][version][op][u32 payloadLength]` and every reply is
+  `[status][u32 payloadLength][payload]` — uniformly, including a miss, which is
+  a zero-length payload rather than no payload. `MemcachedBinary` already proved
+  the pattern: it can refuse-and-continue precisely because its header declares
+  `totalBodyLen`. Consequences that are each load-bearing: `Miss` is distinct
+  from `Error` (both were `0x00`, so a rejected client saw an endlessly cold
+  cache); an `UnsupportedVersion` message names the supported *range*, since a
+  rejection that cannot say what would have worked cannot be acted on; and there
+  is deliberately **no handshake**, because the launcher opens a fresh connection
+  per *operation* and a HELLO would cost 2–4 round trips per translation unit on
+  the exact path this list already records regressions on.
+- **`Protocol/CompileCacheWire.hpp` must stay header-only and dependency-free.**
+  Same constraint as `Cli/UsageDoc`, same reason: `fastcache-cc` does not link
+  the `FastCache` library, so an include of anything from `Net/`, `Cache/`,
+  `Async/` or `Config/` there breaks the launcher's **link**, not merely its
+  build. Being header-only is also what keeps it free — it costs no row in
+  `_fc_cc_core`. The dependency runs *out* of `ProtocolAutodetect.hpp` (which
+  pulls in `Task`, `CacheEngine` and `ISocket`, and so can never be included by a
+  client) into the wire header, never the other way. The launcher's own framing
+  lives in `apps/fastcache-cc/CacheProtocol.cpp` rather than `main.cpp` for a
+  related reason: `main.cpp` is in no test target, so while the framing sat there
+  it had *no* unit coverage at all.
 - **The supervisor's launch arguments must not pass `--daemon`.** The POSIX
   daemonize path double-forks and sends stdout/stderr to `/dev/null`, which
   silences journald; its pidfile is also written after both parents exit, racing

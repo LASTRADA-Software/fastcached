@@ -17,8 +17,8 @@
 
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
-#include <FastCache/Core/Endian.hpp>
 #include <FastCache/Platform/Terminal.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <array>
 #include <cstddef>
@@ -32,6 +32,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -46,10 +47,7 @@ namespace
 
 using namespace FastCache;
 
-constexpr std::byte CompileCacheMagic { 0xFC };
-constexpr std::byte OpStore { 0x01 };
-constexpr std::byte OpFetch { 0x02 };
-constexpr std::byte StatusOk { 0x01 };
+namespace Wire = FastCache::CompileCacheWire;
 
 /// Print an error and exit non-zero.
 [[noreturn]] void Die(std::string_view message)
@@ -184,25 +182,30 @@ class TcpClient
 #endif
 };
 
-/// Append a big-endian u32.
-void AppendU32(std::vector<std::byte>& out, std::uint32_t n)
+/// Read one whole reply frame: the fixed header, then exactly the payload it
+/// declares. Every status is drained the same way, so a refusal leaves the
+/// connection in the same state a hit does.
+/// @param client Connected client.
+/// @return The decoded status and its payload.
+[[nodiscard]] std::pair<Wire::Status, std::vector<std::byte>> RecvReply(TcpClient& client)
 {
-    std::array<std::byte, sizeof(std::uint32_t)> buf {};
-    WriteBigEndian<std::uint32_t>(buf, n);
-    out.insert(out.end(), buf.begin(), buf.end());
+    auto const headerBytes = client.RecvExactly(Wire::ReplyHeaderSize);
+    auto const header = Wire::DecodeReplyHeader(headerBytes);
+    if (!header.has_value())
+        Die("server sent a reply this build cannot parse");
+    auto payload = header->payloadLength > 0 ? client.RecvExactly(header->payloadLength) : std::vector<std::byte> {};
+    return { header->status, std::move(payload) };
 }
 
-/// Append a length-prefixed field.
-void AppendField(std::vector<std::byte>& out, std::string_view s)
+/// Turn a refusal into a diagnosable message naming the server's own code.
+[[nodiscard]] std::string DescribeRefusal(std::span<std::byte const> payload)
 {
-    AppendU32(out, static_cast<std::uint32_t>(s.size()));
-    auto const* p = reinterpret_cast<std::byte const*>(s.data());
-    out.insert(out.end(), p, p + s.size());
-}
-void AppendField(std::vector<std::byte>& out, std::span<std::byte const> bytes)
-{
-    AppendU32(out, static_cast<std::uint32_t>(bytes.size()));
-    out.insert(out.end(), bytes.begin(), bytes.end());
+    auto const decoded = Wire::DecodeErrorPayload(payload);
+    if (!decoded.has_value())
+        return "rejected (no reason given)";
+    auto const* descriptor = Wire::Describe(decoded->first);
+    auto const name = descriptor != nullptr ? descriptor->name : std::string_view { "unknown" };
+    return std::string { "rejected (" } + std::string { name } + "): " + std::string { decoded->second };
 }
 
 // --- store: compile, frame, STORE -----------------------------------------
@@ -229,20 +232,17 @@ int DoStore(TestClient::Args const& a)
 
     auto const encoded = EncodeCompileValue(value);
 
-    std::vector<std::byte> frame;
-    frame.push_back(CompileCacheMagic);
-    frame.push_back(OpStore);
-    AppendField(frame, a.key);
-    AppendField(frame, a.cohort);
-    AppendField(frame, a.srcRoot);
-    AppendField(frame, a.buildTree);
-    AppendField(frame, std::span<std::byte const> { encoded.data(), encoded.size() });
+    auto const frame = Wire::EncodeStore(Wire::StoreRequest { .key = a.key,
+                                                              .cohort = a.cohort,
+                                                              .srcRoot = a.srcRoot,
+                                                              .buildTree = a.buildTree,
+                                                              .value = std::span<std::byte const> { encoded } });
 
     TcpClient client { a.host, a.port };
     client.SendAll(frame);
-    auto const reply = client.RecvExactly(1);
-    if (reply[0] != StatusOk)
-        Die("STORE rejected by server");
+    auto const [status, payload] = RecvReply(client);
+    if (status != Wire::Status::Ok)
+        Die("STORE " + DescribeRefusal(payload));
 
     std::cout << "STORE ok key=" << a.key << " objectBytes=" << value.objectBlob.size() << '\n';
     return 0;
@@ -252,23 +252,17 @@ int DoStore(TestClient::Args const& a)
 
 int DoFetch(TestClient::Args const& a)
 {
-    std::vector<std::byte> frame;
-    frame.push_back(CompileCacheMagic);
-    frame.push_back(OpFetch);
-    AppendField(frame, a.key);
-
     TcpClient client { a.host, a.port };
-    client.SendAll(frame);
+    client.SendAll(Wire::EncodeFetch(a.key));
 
-    auto const status = client.RecvExactly(1);
-    if (status[0] != StatusOk)
+    auto const [status, payload] = RecvReply(client);
+    if (status == Wire::Status::Error)
+        Die("FETCH " + DescribeRefusal(payload));
+    if (status != Wire::Status::Ok)
     {
         std::cout << "FETCH miss key=" << a.key << '\n';
         return 4;
     }
-    auto const lenBytes = client.RecvExactly(sizeof(std::uint32_t));
-    auto const len = ReadBigEndian<std::uint32_t>(lenBytes);
-    auto const payload = client.RecvExactly(len);
 
     auto decoded = DecodeCompileValue(payload);
     if (!decoded.has_value())
