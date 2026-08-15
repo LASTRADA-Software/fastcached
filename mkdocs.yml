@@ -165,6 +165,7 @@ nav:
   - Internals:
     - Architecture: internals/architecture.md
     - Storage primitives: internals/storage-primitives.md
+    - Performance: internals/performance.md
     - macOS code signing: internals/macos-code-signing.md
   - About:
     - License: about/license.md

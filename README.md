@@ -335,6 +335,15 @@ at its default `io-threads 1`, so a redis tuned for multiple I/O threads would
 narrow the network gap — the multi-core architecture advantage is what stands.
 Reproduce with `python bench/fastcached_bench.py --vs redis,memcached`.
 
+A second, much finer suite measures the storage stack *inside* the process —
+one cached lookup decomposed layer by layer, plus read scaling across cores —
+because a TCP round trip costs microseconds and hides everything the cache
+itself does. A shipped `GET` costs **~32 ns** there, against ~1.9 µs of server
+CPU for the same operation once a socket is involved. Reproduce with `python
+bench/inproc_bench.py`; the decomposition, the scaling curve and what they imply
+for tuning are on the
+[performance page](https://lastrada-software.github.io/fastcached/internals/performance/).
+
 ## Contributing
 
 See [`AGENT.md`](AGENT.md) for the architecture, error taxonomy, coding

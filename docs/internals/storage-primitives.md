@@ -43,11 +43,33 @@ public:
 
 | Class                | Purpose |
 |----------------------|---------|
-| `InMemoryLruStorage` | In-memory LRU with a soft byte budget. Single-threaded by contract. |
+| `InMemoryLruStorage` | In-memory LRU with a soft byte budget. Carries no lock of its own; the caller serialises it (`ShardedStorage` does), except that `LruMode::Approximate` declares `SupportsSharedRead()` so reads may run concurrently under a shared lock. |
 | `CowTreeStorage`     | Persistent copy-on-write B-tree backing with an in-memory LRU mirror for eviction accounting. |
 | `LayeredStorage`     | Two-tier composition: L1 = `InMemoryLruStorage`, L2 = any `IStorage`. Reads hit L1 first, writes are write-through. |
 | `ShardedStorage`     | Hash-based sharding across N inner storages. Each shard holds a `std::shared_mutex` for concurrency. |
 | `TracingStorage`     | Decorator that emits one Trace log line per call. |
+
+### How `ShardedStorage` serves a read
+
+Two details of the read path are observable and worth stating, because both
+trade exactness for concurrency:
+
+- **Reads take the shared lock** when the inner storage reports
+  `SupportsSharedRead()` — which `InMemoryLruStorage` does in `LruMode::Approximate`
+  (the default) and not in `LruMode::Strict`. Several reactors can therefore be
+  inside one shard at once, and the read itself mutates nothing.
+- **LRU recency is sampled, and skippable.** One read in sixteen (per thread)
+  tries the exclusive lock to call `PromoteOnRead`; a failed `try_lock` skips
+  the promotion rather than waiting for it, and un-consumes the sample so the
+  *next* read retries. Under sustained write contention a hot shard's order
+  therefore drifts toward insertion order.
+
+`PromoteOnRead` is also the only writer of `lastAccess` and `fetched` on this
+path, so a skipped promotion is visible beyond LRU order: the meta `l` and `h`
+flags and the `evicted_unfetched` / `expired_unfetched` counters can report a
+read that happened as one that did not. `LruMode::Strict` gives up shared reads
+to make all of that exact. See [Performance](performance.md) for what the
+choice costs and buys.
 
 ## Wire → primitive mapping
 
@@ -83,7 +105,7 @@ Each stored value has the metadata recorded in `CacheEntry`:
 | `cas`         | 64-bit monotonically increasing CAS token |
 | `expiry`      | Absolute steady-clock deadline (or `TimePoint::max`) |
 | `generation`  | For `flush_all` — entries older than the storage's live generation are invisible |
-| `lastAccess`  | Updated on every successful `Get`; surfaced via meta `l` flag |
+| `lastAccess`  | Surfaced via the meta `l` flag. Written on every successful `Get` in `LruMode::Strict`; in `Approximate` it advances only when a sampled `PromoteOnRead` gets the lock (see above) |
 | `stale`       | Set by meta `md I` / `ms I`; surfaced via meta `X` response flag |
 | `fetched`     | Set once the entry has been returned by a successful `Get`. Drives the `evicted_unfetched` / `expired_unfetched` stats (entries discarded before any client read them). Reset on insertion and on every value-rewriting mutation. |
 
