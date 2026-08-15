@@ -48,3 +48,5 @@ list.
 - Looking up a command? Browse the [commands index](commands/index.md).
 - Comparing to upstream? See
   [Compatibility with upstream](protocols/compatibility-with-upstream.md).
+- Wondering how fast it is, and what the number means? Read
+  [Performance](internals/performance.md).

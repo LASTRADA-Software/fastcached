@@ -46,6 +46,13 @@ Baseline discovery (optional; each is skipped with a notice if absent):
   started with persistence disabled.
 - **memcached**: a native `memcached` binary on `PATH`.
 
+Check what `redis-server` on `PATH` actually is before trusting a run labelled
+"redis": several distributions (Fedora 42+ among them) ship Valkey and provide
+`redis-server` as a compatibility symlink to `valkey-server`, so discovery
+succeeds and the results are charted under the wrong name. `redis-server
+--version` names the real server; point `--redis-server` at a genuine redis
+build when it does not say `Redis`.
+
 Each server runs on its own high port (some low ports are blocked). Both
 competitors run as native binaries (no Docker port-forwarding in the path), so
 the throughput numbers are directly comparable.

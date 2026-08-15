@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 
@@ -31,6 +32,21 @@ class IClock
 
     /// @return Current steady-clock time. Must be monotonic and thread-safe.
     [[nodiscard]] virtual TimePoint Now() const noexcept = 0;
+
+    /// Re-sample the underlying time source, if this clock caches one.
+    ///
+    /// Called by whoever owns an event loop, which is the only place that knows
+    /// time may have passed: once right after the blocking wait returns, so
+    /// every handler and timer that iteration resumes sees the instant the wait
+    /// ended at, and once before the next wait's timeout is computed, so that
+    /// timeout is not overstated by however long the batch took to process.
+    /// Implementations that read the OS clock on every `Now()` (SteadyClock) and
+    /// those driven by a test (ManualClock) ignore it, which is why this
+    /// defaults to a no-op rather than being pure virtual.
+    ///
+    /// Must be safe to call from any thread and from several at once: reactors
+    /// share one clock.
+    virtual void Refresh() noexcept {}
 };
 
 /// Default IClock implementation wrapping std::chrono::steady_clock::now().
@@ -41,6 +57,63 @@ class SteadyClock final: public IClock
     {
         return std::chrono::steady_clock::now();
     }
+};
+
+/// IClock that serves a value sampled once per event-loop iteration instead of
+/// reading the OS clock on every call.
+///
+/// Reading the clock is not free: on Windows `steady_clock::now()` is a
+/// `QueryPerformanceCounter`, measured at ~16 ns on a Ryzen 9 9950X3D. Because
+/// `CacheEngine` reads the clock once per command, that single call was ~32% of
+/// the cost of serving a cached GET — more than the hash, the lock and the
+/// lookup put together, and none of it cache work.
+///
+/// A request cannot observe a difference: every operation in one loop iteration
+/// is answered with the time at which that iteration's I/O became ready, and
+/// TTLs are expressed in seconds. The staleness is bounded by the time the
+/// reactor spends processing one batch, not by how long it sleeps — the refresh
+/// happens *after* the blocking wait returns, so an idle daemon's clock is
+/// current the moment work arrives.
+///
+/// Thread-safe: several reactors may share one instance. Publication is a
+/// compare-and-swap that only ever moves the value forward, so `Now()` stays
+/// monotonic as `IClock` requires even when reactors refresh out of order.
+class CachedClock final: public IClock
+{
+  public:
+    /// Wrap `source`, taking an initial sample so `Now()` is valid before any
+    /// event loop has started (config reload, startup logging, a test).
+    /// @param source Upstream clock to sample; must outlive this object.
+    explicit CachedClock(IClock& source) noexcept:
+        _source { source }
+    {
+        Refresh();
+    }
+
+    [[nodiscard]] TimePoint Now() const noexcept override
+    {
+        return TimePoint { Duration { _ticks.load(std::memory_order_relaxed) } };
+    }
+
+    /// Sample the upstream clock and publish it if it is newer than what is
+    /// already there.
+    void Refresh() noexcept override
+    {
+        auto const sampled = _source.Now().time_since_epoch().count();
+        auto current = _ticks.load(std::memory_order_relaxed);
+        while (sampled > current)
+        {
+            // On success the value moved forward; on failure `current` is
+            // reloaded and the loop re-tests, so a concurrent refresh that
+            // published something newer simply wins and this one gives up.
+            if (_ticks.compare_exchange_weak(current, sampled, std::memory_order_relaxed, std::memory_order_relaxed))
+                return;
+        }
+    }
+
+  private:
+    IClock& _source;
+    std::atomic<Duration::rep> _ticks { 0 };
 };
 
 /// Test IClock whose value only advances when a test explicitly calls Advance

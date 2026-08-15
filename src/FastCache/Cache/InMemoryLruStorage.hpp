@@ -263,13 +263,31 @@ class InMemoryLruStorage final: public IStorage
 
     mutable StorageStats _stats;
 
-    /// Read-path counters bumped by the shared-locked `Get` (`cmd_get`,
-    /// `get_hits`, `get_misses`). Atomic so concurrent reads on one shard don't
-    /// race; folded into `_stats` (relaxed) by `Snapshot`. Kept separate from
-    /// `_stats` because `StorageStats` is a plain, copyable value type.
-    mutable std::atomic<std::uint64_t> _readCmdGet { 0 };
-    mutable std::atomic<std::uint64_t> _readGetHits { 0 };
-    mutable std::atomic<std::uint64_t> _readGetMisses { 0 };
+    /// Cache-line stride used to keep independently-bumped counters apart.
+    /// Spelled as a constant rather than `std::hardware_destructive_-
+    /// interference_size` because that constant makes GCC emit
+    /// `-Winterference-size` unless the build pins `-mtune`, and this project
+    /// builds with warnings as errors.
+    static constexpr std::size_t CacheLineBytes = 64;
+
+    /// Read-path counters bumped by the shared-locked `Get`; folded into
+    /// `_stats` (relaxed) by `Snapshot`. Atomic because `Approximate` mode
+    /// serves `Get` under a *shared* lock, so several threads may be inside it
+    /// on one shard at once. Kept out of `_stats` because `StorageStats` is a
+    /// plain, copyable value type.
+    ///
+    /// Only hits and misses are stored — `cmd_get` is their sum. Counting it
+    /// separately meant a second locked read-modify-write on every lookup for a
+    /// number that was already derivable, and that cost was measurable: with
+    /// the third counter in place the `Approximate` read path benchmarked
+    /// *slower* than the `Strict` one, which does strictly more work (it splices
+    /// the LRU on every read) but bumps plain non-atomic members.
+    ///
+    /// A lookup is either a hit or a miss, never both, so the two counters sit
+    /// on separate cache lines: sharing one would make concurrent readers on a
+    /// single shard contend for that line on any mixed workload.
+    alignas(CacheLineBytes) mutable std::atomic<std::uint64_t> _readGetHits { 0 };
+    alignas(CacheLineBytes) mutable std::atomic<std::uint64_t> _readGetMisses { 0 };
 };
 
 } // namespace FastCache

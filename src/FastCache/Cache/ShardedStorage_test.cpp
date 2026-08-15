@@ -7,12 +7,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -252,6 +254,53 @@ TEST_CASE("ShardedStorage hashes keys deterministically to one of N shards", "[s
     auto const idx2 = storage->ShardIndexFor("foo");
     REQUIRE(idx1 == idx2);
     REQUIRE(idx1 < 4);
+}
+
+TEST_CASE("ShardedStorage spreads keys evenly over every shard, including non-power-of-two counts", "[sharded]")
+{
+    // The index is a multiply-shift reduction, not a modulo — `%` compiled to a
+    // hardware divide on every storage operation. This pins the three properties
+    // that replacement has to keep: the index is always in range, no shard is
+    // unreachable, and the load is spread evenly.
+    //
+    // Reachability is why a bit-mask was rejected: with 7 shards a mask would
+    // strand shards 4..6 and quietly cut capacity, and `--storage-shards`
+    // accepts any count.
+    //
+    // Balance is the property reachability would not catch, and it is not
+    // hypothetical: this assertion caught a real one. A multiply-shift decides
+    // the shard from the *high* bits of its input, `std::hash` promises nothing
+    // about those, and MSVC's FNV-1a avalanches into the low bits only — so the
+    // original xor-fold of the two halves put 1300 of 10k keys on one of 16
+    // shards against a mean of 625, on Windows and nowhere else. An unbalanced
+    // fan-out has no symptom that names itself; it silently cuts effective
+    // capacity and concentrates lock contention on the hot shards. Hence the
+    // multiplicative mix in ShardIndexFor, and hence this test, which is the
+    // only thing in the suite that runs against all three standard libraries.
+    constexpr int KeyCount = 10'000;
+    for (auto const shardCount: { std::size_t { 1 }, std::size_t { 3 }, std::size_t { 7 }, std::size_t { 16 } })
+    {
+        auto const storage = MakeSharded(shardCount);
+        std::vector<int> perShard(shardCount, 0);
+        for (int i = 0; i < KeyCount; ++i)
+        {
+            auto const index = storage->ShardIndexFor(std::format("key-{}", i));
+            REQUIRE(index < shardCount);
+            ++perShard[index];
+        }
+
+        auto const [least, most] = std::ranges::minmax_element(perShard);
+        CHECK(*least > 0); // every shard reachable
+        // 1.5x is a smoke test for a broken reduction (a mask, a truncation, a
+        // hash whose high bits do not move), not a statistical test of the hash.
+        // It can be this tight because nothing here is random: fixed keys and a
+        // fixed hash make the result a constant per standard library. Measured
+        // worst case over these shard counts is 1.07x on both a murmur-style
+        // `std::hash` and MSVC's FNV-1a, so the margin is ample — while the 2.08x
+        // that the xor-fold produced would still be caught, as it was.
+        auto const mean = static_cast<double>(KeyCount) / static_cast<double>(shardCount);
+        CHECK(static_cast<double>(*most) <= 1.5 * mean);
+    }
 }
 
 TEST_CASE("ShardedStorage Snapshot aggregates per-shard stats", "[sharded]")

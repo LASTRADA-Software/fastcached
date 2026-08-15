@@ -29,7 +29,49 @@ ShardedStorage::ShardedStorage(std::vector<std::unique_ptr<IStorage>> shards)
 
 std::size_t ShardedStorage::ShardIndexFor(std::string_view key) const noexcept
 {
-    return std::hash<std::string_view> {}(key) % _shards.size();
+    // Map the hash onto [0, shardCount) with a multiply-shift rather than a
+    // modulo. `%` compiles to a hardware divide — ~14 cycles on this class of
+    // CPU, which is a measurable slice of a ~20 ns lookup and was being paid on
+    // every single storage operation.
+    //
+    // Taking the top 32 bits of `hash32 * shardCount` is the standard
+    // alternative (Lemire): one multiply and one shift, and unlike a mask it
+    // needs no power-of-two shard count, so `--storage-shards` keeps accepting
+    // any value.
+    //
+    // What it *does* require is that the top bits of its input be well mixed,
+    // because those are the only bits that survive the shift — and `std::hash`
+    // makes no such promise. libstdc++ and libc++ hash strings with a murmur
+    // variant whose whole word is mixed; MSVC uses FNV-1a, which avalanches into
+    // the low bits and leaves the high ones correlated. Xor-folding the halves
+    // together was not enough to repair that: over 10k keys across 16 shards it
+    // put 1300 keys on the busiest shard against a mean of 625 — a 2.08x
+    // imbalance on Windows only, which is lost capacity and concentrated lock
+    // contention with no symptom that names itself. So mix first. Multiplying by
+    // an odd constant is a bijection whose high half depends on every input bit
+    // (Fibonacci hashing, the constant being 2^64 / phi), which brings MSVC to
+    // 1.03x and leaves libstdc++ unchanged at 1.05x. It costs one more multiply
+    // — still nothing beside the divide this replaced — and it buys independence
+    // from a hash quality the standard does not specify.
+    //
+    // The resulting partition differs from the modulo's, and for the in-memory
+    // backend that costs nothing — which shard a key lands on is arbitrary and
+    // only its stability within a process matters. The *persistent* backend is
+    // where this has a price, and it is worth stating rather than discovering:
+    // with `--storage` and more than one shard, each shard is its own file
+    // (`shard-NN.cow`, see main.cpp), so this function decides which file a key
+    // lives in. Repartitioning therefore looks to a restarted daemon exactly
+    // like changing `--storage-shards` does: keys written by the old mapping are
+    // looked up in a different file and miss, and their bytes stay on disk,
+    // unreachable by Get and Delete alike, until the CoW tree evicts them — which
+    // it only does when `storage_max_disk_bytes` caps the tier at all. That is a
+    // one-time upgrade cost for a cache, not data loss, but it is a cost, so the
+    // reduction is a stable part of the on-disk contract and must not be changed
+    // casually a second time.
+    constexpr std::uint64_t GoldenRatio64 = 0x9E37'79B9'7F4A'7C15ULL;
+    auto const hash = static_cast<std::uint64_t>(std::hash<std::string_view> {}(key));
+    auto const mixed = (hash * GoldenRatio64) >> 32;
+    return static_cast<std::size_t>((mixed * _shards.size()) >> 32);
 }
 
 std::expected<GetResult, StorageError> ShardedStorage::Get(std::string_view key, TimePoint now)
@@ -60,10 +102,65 @@ std::expected<GetResult, StorageError> ShardedStorage::Get(std::string_view key,
     if (result.has_value() && result->found)
     {
         constexpr unsigned PromoteEveryNthRead = 16;
-        if (shard.readSampler.fetch_add(1, std::memory_order_relaxed) % PromoteEveryNthRead == 0)
+        // The sampler is per *thread*, not per shard. It used to be a shared
+        // atomic on the shard, which put a locked read-modify-write — and a
+        // cache line every reader on that shard wrote to — on the hot read
+        // path, to drive nothing but a 1-in-16 sampling decision. Nothing here
+        // needs a globally consistent count: the promotion is best-effort by
+        // construction, and a per-thread counter still promotes one read in
+        // sixteen while spreading promotions more evenly across reactors.
+        static thread_local unsigned readSampler = 0;
+        if (readSampler++ % PromoteEveryNthRead == 0)
         {
-            std::unique_lock const lock { shard.mu };
-            shard.storage->PromoteOnRead(key, now);
+            // Try for the exclusive lock, never wait for it. Promotion is
+            // best-effort by contract — the entry may already have been evicted,
+            // and the comment on IStorage::PromoteOnRead says a miss is fine —
+            // so blocking for it trades throughput for recency bookkeeping that
+            // is allowed to be wrong.
+            //
+            // Blocking here was measurably catastrophic. `std::shared_mutex` is
+            // an SRWLOCK on Windows, where a waiting writer blocks *every*
+            // subsequent reader on that shard, so one promotion in sixteen
+            // reads was enough to convoy all readers behind it: 16-thread read
+            // throughput peaked at 4 threads and then fell to half of what a
+            // single thread managed. With try_lock the same benchmark scales to
+            // 8 threads and holds ~3.3x the 16-thread figure.
+            //
+            // What a skipped promotion actually costs is wider than LRU order,
+            // because PromoteOnRead is also the only writer of `lastAccess` and
+            // `fetched` on this path (InMemoryLruStorage::Get's Approximate
+            // branch deliberately writes no node). So a skip also leaves the
+            // meta `l`/`h` flags and the `evicted_unfetched` / `expired_unfetched`
+            // counters reporting a read that happened as one that did not.
+            std::unique_lock const lock { shard.mu, std::try_to_lock };
+            if (lock.owns_lock())
+                shard.storage->PromoteOnRead(key, now);
+            else
+            {
+                // Contention is exactly when skipping hurts most: the LRU would
+                // drift toward insertion order, and those counters would go
+                // wrong, in the regime where both matter. Un-consume the sample
+                // so the *next* read retries rather than the one sixteen reads
+                // from now.
+                //
+                // This cannot spin and cannot convoy. It never blocks — a failed
+                // try_lock is a failed CAS, not a wait — and each retry is a
+                // whole further lookup away, so a shard under a sustained writer
+                // degrades to "promote when you can", not to a busy loop. The
+                // worst case is bounded by who reaches this branch at all: only
+                // `InMemoryLruStorage` in Approximate mode reports
+                // SupportsSharedRead(), so every exclusive hold competing with
+                // the retry is a short in-memory mutation. The persistent
+                // LayeredStorage takes the exclusive path above and never gets
+                // here, so no fsync can ever be what a retry is failing against.
+                //
+                // Measured rather than assumed: 9 interleaved reps of the
+                // `[scaling]` benchmark (16 shards, 1/2/4/8/16 threads) put the
+                // two variants within noise of each other at every thread count
+                // — median ratios 0.96-1.04 with overlapping ranges — so the
+                // retry buys the accuracy for nothing.
+                readSampler = 0;
+            }
         }
     }
     return result;

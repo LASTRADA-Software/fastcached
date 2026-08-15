@@ -246,7 +246,10 @@ std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view 
         // lock, so it must not mutate `_lru`/`_index` or write the node.
         // Counters are atomic; promotion + lastAccess/fetched advance are
         // deferred to the sampled, exclusively-locked PromoteOnRead.
-        _readCmdGet.fetch_add(1, std::memory_order_relaxed);
+        //
+        // Exactly one counter is bumped per lookup — the hit or the miss, never
+        // both, and never a separate `cmd_get`, which Snapshot derives as their
+        // sum. Each locked read-modify-write here is ~2 ns of a ~20 ns lookup.
         auto const* node = FindNodeReadOnly(key, now);
         if (node == nullptr)
         {
@@ -555,9 +558,15 @@ StorageStats InMemoryLruStorage::Snapshot() const noexcept
     // exclusive lock, so the structure reads are stable; the atomics are read
     // relaxed.
     auto stats = _stats;
-    stats.cmdGet += _readCmdGet.load(std::memory_order_relaxed);
-    stats.getHits += _readGetHits.load(std::memory_order_relaxed);
-    stats.getMisses += _readGetMisses.load(std::memory_order_relaxed);
+    auto const readHits = _readGetHits.load(std::memory_order_relaxed);
+    auto const readMisses = _readGetMisses.load(std::memory_order_relaxed);
+    // `cmd_get` is hits + misses by construction: the read path bumps exactly
+    // one of the two per lookup, and the Strict path bumps `_stats` members in
+    // the same pairing. Deriving it here is what lets the hot path carry one
+    // atomic instead of two.
+    stats.cmdGet += readHits + readMisses;
+    stats.getHits += readHits;
+    stats.getMisses += readMisses;
     return stats;
 }
 

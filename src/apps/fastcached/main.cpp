@@ -362,7 +362,14 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
     for (auto const& [path, reason]: rejected)
         logger.Logf(FastCache::LogLevel::Error, "{}: {}", path.string(), reason);
     FastCache::ConfigReloader reloader { effective, effective.configPath };
-    FastCache::SteadyClock clock;
+    FastCache::SteadyClock steadyClock;
+    // The engine reads the clock once per command, and on Windows that is a
+    // QueryPerformanceCounter — ~16 ns, which measured as roughly a third of the
+    // cost of serving a cached GET. Serving a value sampled once per reactor
+    // iteration removes it from the per-command path entirely. The same object
+    // goes to the server loop below (`serverOpts.clock`), because only whoever
+    // owns the event loop can refresh it.
+    FastCache::CachedClock clock { steadyClock };
 
     auto const usingPersistent = !effective.storagePath.empty();
 
@@ -573,6 +580,9 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
     // them ahead of the thread guarantees the thread joins BEFORE these
     // objects are torn down.
     FastCache::ReactorServerOptions serverOpts;
+    // Hand the reactors the very clock the engine reads, so their per-iteration
+    // refresh is what keeps it current.
+    serverOpts.clock = &clock;
     // Listener endpoints: prefer the explicit list when given, otherwise
     // synthesise one from the legacy single-bind fields. This keeps the
     // common single-port case working without an explicit --listen, and
@@ -702,14 +712,19 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
             // wedge the single-threaded admin endpoint (slowloris).
             adminListener->SetTimeouts(std::chrono::milliseconds { 500 }, std::chrono::seconds { 2 });
 
-            auto const adminStartedAt = clock.Now();
+            // Uptime reads `steadyClock`, not the cached one the engine uses.
+            // The cached clock only advances when a reactor completes a loop
+            // iteration, so a daemon sitting idle would report a frozen uptime
+            // until the next request arrived. This runs on the admin thread at
+            // scrape rate, where a real clock read costs nothing worth saving.
+            auto const adminStartedAt = steadyClock.Now();
             adminServer = std::make_unique<FastCache::AdminHttpServer>(
                 *adminListener,
                 metrics,
-                [&engine, &clock, adminStartedAt] {
+                [&engine, &steadyClock, adminStartedAt] {
                     return FastCache::MetricsSnapshot {
                         .storage = engine.Snapshot(),
-                        .uptime = FastCache::Uptime { std::chrono::duration_cast<std::chrono::seconds>(clock.Now()
+                        .uptime = FastCache::Uptime { std::chrono::duration_cast<std::chrono::seconds>(steadyClock.Now()
                                                                                                        - adminStartedAt) },
                     };
                 },

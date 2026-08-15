@@ -55,6 +55,19 @@ struct ReactorServerOptions
     /// TLS context for terminating TLS on accepted connections, or nullptr for
     /// plaintext. Only honoured in TLS-enabled builds; must outlive the run.
     TlsContext* tlsContext { nullptr };
+
+    /// Clock the reactors drive and read, or nullptr to let the loop own a
+    /// plain `SteadyClock`.
+    ///
+    /// Pass the same clock the `CacheEngine` was built with to make it a
+    /// `CachedClock`: the reactor refreshes it once per loop iteration, and
+    /// every command served in between reads a stored value instead of calling
+    /// `QueryPerformanceCounter`. Only the loop iterates, so only the loop can
+    /// refresh it — which is why the two have to be the same object rather than
+    /// two `SteadyClock` instances as they were before.
+    ///
+    /// Must outlive the run.
+    IClock* clock { nullptr };
 };
 
 /// Run the reactor-driven server loop using the platform's native

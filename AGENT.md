@@ -77,6 +77,15 @@ src/apps/
   compile-cache-testclient/ low-level `0xFC` protocol probe + cross-depth
                             validation (FASTCACHED_BUILD_TESTCLIENT, default
                             OFF — test infrastructure, never installed)
+  fastcache-bench/          in-process storage micro-benchmarks
+                            (FASTCACHED_BUILD_BENCHMARKS, default OFF — test
+                            infrastructure, never installed). Catch2 benchmarks
+                            decomposing a lookup layer by layer, plus a
+                            thread-scaling tier; driven by `bench/inproc_bench.py`,
+                            which compares them against jitbit/FastCache's own
+                            suite run on the same machine. Default OFF but built
+                            by the `linux` and `clang-tidy` CI jobs, because a
+                            target nothing compiles is a target that rots.
 ```
 
 Platform service integration and OS packaging live under `packaging/`, which

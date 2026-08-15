@@ -8,7 +8,7 @@ thing testable end-to-end against an in-memory transport.
 
 ```
 src/FastCache/
-  Core/         Errors taxonomy, Clock (steady + wall), Logger, BufferPool,
+  Core/         Errors taxonomy, Clock (steady + wall + reactor-cached), Logger, BufferPool,
                 Bytes, Endian, Crc32c, StringHash, Owner, Profiling (Tracy)
   Async/        Task<T>, DetachedTask, ResumeOn, SleepUntil/SleepFor,
                 Cancellation, IReactor + TestReactor and the platform reactors
@@ -190,8 +190,30 @@ rule is: **suspend for I/O, run straight through for compute.**
 
 One reactor per thread. `Submit` and `Schedule` are safe to call from any
 thread (production reactors wake the loop via an eventfd/pipe/IOCP post). The
-clock is injected: production uses `SteadyClock`, tests downcast to
-`ManualClock` and `Advance()` to drive timers deterministically.
+clock is injected: tests downcast to `ManualClock` and `Advance()` to drive
+timers deterministically.
+
+Production injects a `CachedClock` — a `SteadyClock` wrapper serving a value
+the loop re-samples, rather than a time source read per call. `IClock::Refresh()`
+is that seam, and only whoever owns an event loop can drive it, which is why the
+daemon hands the *same* clock object to `CacheEngine` and to
+`ReactorServerOptions::clock` instead of letting each build its own. Each
+iteration refreshes twice, and neither call is redundant:
+
+- **After the blocking wait returns**, so every handler and timer resumed by
+  that iteration sees the instant the wait actually ended at. Refreshing only at
+  the top of the loop would freeze an idle daemon's clock for the length of its
+  sleep.
+- **Before the next wait's timeout is computed**, so the timeout is not
+  overstated by however long the previous batch took to process — which would
+  make every timer fire a batch late.
+
+A command therefore reads a time that is stale by at most one batch's processing
+time, never by a sleep, and TTLs are expressed in seconds. What that buys is on
+the [Performance](performance.md) page: a clock read costs about half a sharded
+lookup, and the engine performs one per command. Readers outside the loop —
+uptime for `/metrics`, startup logging — keep the real `SteadyClock`, because a
+cached value stops advancing exactly when the daemon has nothing to do.
 
 #### Readiness vs completion
 

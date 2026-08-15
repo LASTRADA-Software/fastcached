@@ -153,8 +153,12 @@ jobs:
           sudo ln -sf /usr/bin/gcc-${{ env.GCC_VERSION }} /usr/local/bin/gcc
           sudo ln -sf /usr/bin/g++-${{ env.GCC_VERSION }} /usr/local/bin/g++
 
+      # Benchmarks on so fastcache-bench is compiled rather than only ever built
+      # by hand from bench/inproc_bench.py. It is not installed and runs no test
+      # — this is purely so a refactor of CacheEngine, LruMode or
+      # InMemoryLruStorage cannot silently rot a target nothing else compiles.
       - name: "Configure"
-        run: cmake --preset ${{ matrix.preset }} -DFASTCACHED_ENABLE_TLS=ON
+        run: cmake --preset ${{ matrix.preset }} -DFASTCACHED_ENABLE_TLS=ON -DFASTCACHED_BUILD_BENCHMARKS=ON
 
       - name: "Build"
         run: cmake --build --preset ${{ matrix.preset }}
@@ -217,9 +221,12 @@ jobs:
           sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
           sudo ln -sf /usr/bin/clang-tidy-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang-tidy
 
-      # TLS on so the TlsSocket/TlsContext sources are also clang-tidy-checked.
+      # TLS on so the TlsSocket/TlsContext sources are also clang-tidy-checked,
+      # and benchmarks on for the same reason: fastcache-bench is first-party
+      # source, so "fix clang-tidy at the source" has to apply to it too, and
+      # this is the only job that runs clang-tidy at all.
       - name: "Configure"
-        run: cmake --preset clang-debug -DFASTCACHED_ENABLE_TLS=ON
+        run: cmake --preset clang-debug -DFASTCACHED_ENABLE_TLS=ON -DFASTCACHED_BUILD_BENCHMARKS=ON
 
       - name: "Build (runs clang-tidy via CMAKE_CXX_CLANG_TIDY)"
         run: cmake --build --preset clang-debug

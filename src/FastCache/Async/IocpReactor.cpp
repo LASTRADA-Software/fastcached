@@ -131,11 +131,25 @@ void IocpReactor::Run()
             std::scoped_lock const lock { _timerMutex };
             nextDeadline = _timers.empty() ? TimePoint::max() : _timers.front().deadline;
         }
+        // Re-sample before deciding how long to block. The previous iteration's
+        // handlers and timers ran after its refresh, so a cached clock is stale
+        // by however long that batch took — and computing the timeout from a
+        // stale `now` overshoots the deadline by exactly that much, making every
+        // timer fire a batch late. Both refreshes are needed and neither is
+        // redundant: this one bounds the sleep, the one below the wait is what
+        // makes the resumed handlers see the time the wait actually ended at.
+        _clock.Refresh();
         auto const now = _clock.Now();
         auto const timeout = nextDeadline == TimePoint::max() ? INFINITE : DeadlineToTimeout(nextDeadline, now);
 
         ULONG removed = 0;
         BOOL const ok = GetQueuedCompletionStatusEx(static_cast<HANDLE>(_iocp), entries, Batch, &removed, timeout, FALSE);
+
+        // The wait above may have blocked for an arbitrary time, so this is the
+        // point in the loop where a cached clock has to re-sample. It comes
+        // before the timeout branch below deliberately: that branch fires
+        // timers, which must see the time the wait actually ended at.
+        _clock.Refresh();
 
         if (!ok)
         {
