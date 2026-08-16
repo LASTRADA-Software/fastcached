@@ -156,9 +156,10 @@ option(TRACY_ON_DEMAND "Tracy: only collect data while a profiler is connected" 
 # ----------------------------------------------------------------------------
 # Compiler caching. Loaded before any compiler invocation so that CPM-fetched
 # dependencies also get cached. CompileCache.cmake prefers our own fastcache-cc
-# launcher (when installed and FASTCACHE_ADDR names a daemon), falls back to
-# sccache and then ccache, and silently no-ops when none is usable or
-# USE_COMPILER_CACHE=OFF. It also declares the USE_COMPILER_CACHE option.
+# launcher (when installed and a daemon answers, at 127.0.0.1:6674 unless
+# FASTCACHE_ADDR says otherwise), falls back to sccache and then ccache, and
+# silently no-ops when none is usable or USE_COMPILER_CACHE=OFF. It also declares
+# the USE_COMPILER_CACHE option.
 
 include(CompileCache)
 

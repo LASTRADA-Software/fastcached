@@ -81,10 +81,18 @@ cmake -S . -B build -G Ninja \
 
 The fastcached build does this for itself: `cmake/CompileCache.cmake` picks
 `fastcache-cc` up automatically whenever the binary is on `PATH` and a daemon
-address is known — exported as `FASTCACHE_ADDR` or passed as
-`-DFASTCACHE_ADDR=host:port` — and injects `FASTCACHE_SRCROOT` /
-`FASTCACHE_BUILDTREE` from the source and binary directories, so those two need
-not be exported. Without an address it falls back to `sccache`;
+answers at `127.0.0.1:6674` — elsewhere if `FASTCACHE_ADDR` is exported or
+`-DFASTCACHE_ADDR=host:port` passed, nowhere if it is set empty — and injects
+`FASTCACHE_SRCROOT` / `FASTCACHE_BUILDTREE` from the source and binary
+directories, so those two need not be exported.
+
+"Answers" is checked, not assumed: configure compiles one tiny translation unit
+through the launcher with `FASTCACHE_VERBOSE=1` and accepts only a reported
+`HIT`/`MISS`, since a launcher whose daemon is down still compiles fine and would
+otherwise leave every TU paying a failed connect with nothing to show for it.
+That costs about 0.1 s, runs on every configure so that starting the daemon and
+reconfiguring is enough, and any other outcome — `connect failed`, a version
+mismatch, no daemon at all — falls back to `sccache`;
 `-DUSE_COMPILER_CACHE=OFF` disables both.
 
 ## Environment
