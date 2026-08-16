@@ -81,19 +81,26 @@ cmake -S . -B build -G Ninja \
 
 The fastcached build does this for itself: `cmake/CompileCache.cmake` picks
 `fastcache-cc` up automatically whenever the binary is on `PATH` and a daemon
-answers at `127.0.0.1:6674` — elsewhere if `FASTCACHE_ADDR` is exported or
-`-DFASTCACHE_ADDR=host:port` passed, nowhere if it is set empty — and injects
-`FASTCACHE_SRCROOT` / `FASTCACHE_BUILDTREE` from the source and binary
-directories, so those two need not be exported.
+answers at `127.0.0.1:6674` — at any other daemon, local or remote, when
+`FASTCACHE_ADDR` is exported, at `-DFASTCACHE_ADDR=host:port` ahead of even that,
+nowhere if it is set empty — and injects `FASTCACHE_SRCROOT` /
+`FASTCACHE_BUILDTREE` from the source and binary directories, so those two need
+not be exported.
 
 "Answers" is checked, not assumed: configure compiles one tiny translation unit
 through the launcher with `FASTCACHE_VERBOSE=1` and accepts only a reported
 `HIT`/`MISS`, since a launcher whose daemon is down still compiles fine and would
 otherwise leave every TU paying a failed connect with nothing to show for it.
-That costs about 0.1 s, runs on every configure so that starting the daemon and
-reconfiguring is enough, and any other outcome — `connect failed`, a version
-mismatch, no daemon at all — falls back to `sccache`;
-`-DUSE_COMPILER_CACHE=OFF` disables both.
+That costs about 0.1 s against a daemon that answers, runs on every configure so
+that starting the daemon and reconfiguring is enough, and any other outcome —
+`connect failed`, a version mismatch, no daemon at all — falls back to `sccache`
+naming the address it tried; `-DUSE_COMPILER_CACHE=OFF` disables both.
+
+The probe carries its own ten-second cap, which is what bounds a remote address
+that drops packets rather than refusing them: `FASTCACHE_TIMEOUT_MS` bounds each
+send and receive, not the TCP `connect()`, so a firewalled or vanished host
+otherwise takes the kernel's connect timeout to fail (measured at 2m30s on
+macOS) — once per configure here, but once per translation unit in a build.
 
 ## Environment
 
