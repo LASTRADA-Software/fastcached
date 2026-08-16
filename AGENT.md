@@ -496,9 +496,13 @@ cmake --build --preset clangcl-debug
 `PEDANTIC_COMPILER_WERROR=ON` is the default for Windows presets — warnings break the build, fix them at the source.
 
 `USE_COMPILER_CACHE` (default ON, `cmake/CompileCache.cmake`) fronts the compiler
-with our own `fastcache-cc` when it is on `PATH` and `FASTCACHE_ADDR=host:port`
-names a daemon — `FASTCACHE_SRCROOT`/`FASTCACHE_BUILDTREE` are injected from the
-source and build trees — and otherwise falls back to `sccache`. A cache hit
+with our own `fastcache-cc` when it is on `PATH` and a daemon answers — at
+`127.0.0.1:6674` by default, or wherever `FASTCACHE_ADDR=host:port` points;
+`FASTCACHE_SRCROOT`/`FASTCACHE_BUILDTREE` are injected from the source and build
+trees. Configure proves the cache works by compiling one tiny file through the
+launcher (~0.1 s) and requiring a `HIT`/`MISS`, because a launcher that cannot
+reach its daemon still compiles fine and would otherwise cost every TU a failed
+connect in silence. When nothing answers it falls back to `sccache`. A cache hit
 reproduces only the object file, so with either launcher active the module scan
 and precompiled headers are turned off and MSVC debug info is forced to `/Z7`
 (a modmap flag makes the launcher's preprocess step fail, and a PCH or shared
