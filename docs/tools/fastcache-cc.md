@@ -87,6 +87,12 @@ nowhere if it is set empty — and injects `FASTCACHE_SRCROOT` /
 `FASTCACHE_BUILDTREE` from the source and binary directories, so those two need
 not be exported.
 
+Exporting `FASTCACHE_ADDR` retargets an existing build tree on its next
+configure, rather than being frozen at whatever the first configure saw, which is
+what ordinary cache semantics would do to it. A `-DFASTCACHE_ADDR=` passed on the
+current run still wins over the environment — including the empty value that opts
+out — since it is the more deliberate of the two.
+
 "Answers" is checked, not assumed: configure compiles one tiny translation unit
 through the launcher with `FASTCACHE_VERBOSE=1` and accepts only a reported
 `HIT`/`MISS`, since a launcher whose daemon is down still compiles fine and would
