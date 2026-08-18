@@ -14,16 +14,20 @@ namespace FastCache::Cc
 
 /// What the launcher was asked to do.
 ///
-/// Every value except `Cohort` is a possible `Command::action`; `Cohort` names a
-/// `--show-stats` sub-option and is only ever seen inside `StatsOptions()`.
+/// Every value except `Cohort` and `OutputPath` is a possible
+/// `Command::action`; those two name sub-options (`--show-stats`'s and
+/// `--html-stats`'s respectively) and are only ever seen inside
+/// `StatsOptions()`/`HtmlStatsOptions()`.
 enum class Action : std::uint8_t
 {
     Compile,     ///< The default: front a real compile.
     Help,        ///< Print the usage text.
     Version,     ///< Print the launcher version.
-    ShowStats,   ///< Report the recorded statistics.
+    ShowStats,   ///< Report the recorded statistics as plain text.
+    HtmlStats,   ///< Render the recorded statistics as a self-contained HTML dashboard.
     ZeroStats,   ///< Discard the statistics log.
     Cohort,      ///< Stats sub-option: restrict the report to one cohort.
+    OutputPath,  ///< `--html-stats` sub-option: where to write the dashboard.
     NoArguments, ///< Invoked with nothing at all — usage, to stderr.
     UsageError,  ///< Unknown option or a missing option value.
 };
@@ -55,6 +59,15 @@ struct FlagSpec
 /// @return A view of the static table; never empty.
 [[nodiscard]] std::span<FlagSpec const> StatsOptions() noexcept;
 
+/// The sub-options accepted after `--html-stats`.
+///
+/// A separate table from `StatsOptions()` rather than a superset: `--out`
+/// means nothing after `--show-stats` (it writes to stdout, always), so
+/// accepting it there would silently ignore a flag the caller thought did
+/// something.
+/// @return A view of the static table; never empty.
+[[nodiscard]] std::span<FlagSpec const> HtmlStatsOptions() noexcept;
+
 /// Look a token up in a flag table, matching the primary spelling or any alias.
 /// @param table The table to search.
 /// @param token The command-line token to match.
@@ -67,6 +80,7 @@ struct Command
 {
     Action action { Action::Compile }; ///< The selected action.
     std::string cohortFilter;          ///< From `--cohort`; empty means no filtering.
+    std::string outputPath;            ///< From `--html-stats`'s `--out`; empty means the default path.
     std::string diagnostic;            ///< Why parsing failed; set iff `action == UsageError`.
 };
 
@@ -83,15 +97,19 @@ struct Command
 /// @return The resolved command.
 [[nodiscard]] Command ParseTopLevel(std::span<std::string const> args);
 
-/// Parse the sub-options that may follow `--show-stats`.
+/// Parse the sub-options that may follow `--show-stats` or `--html-stats`.
 ///
 /// The option table is a parameter rather than a lookup so the generic
 /// table-driven paths stay exercisable independently of which options happen to
-/// exist today; `ParseTopLevel` passes `StatsOptions()`.
-/// @param args The arguments after the `--show-stats` token itself.
+/// exist today; `ParseTopLevel` passes `StatsOptions()` or `HtmlStatsOptions()`.
+/// @param args The arguments after the `--show-stats`/`--html-stats` token itself.
 /// @param options The table to match each token against.
-/// @return A `ShowStats` command, or a usage error.
-[[nodiscard]] Command ParseStatsOptions(std::span<std::string const> args, std::span<FlagSpec const> options);
+/// @param baseAction The action the returned command carries on success —
+///        `ShowStats` for `--show-stats`, `HtmlStats` for `--html-stats`.
+/// @return A command with the given action, or a usage error.
+[[nodiscard]] Command ParseStatsOptions(std::span<std::string const> args,
+                                        std::span<FlagSpec const> options,
+                                        Action baseAction = Action::ShowStats);
 
 /// One environment variable the launcher reads.
 ///

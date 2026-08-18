@@ -32,6 +32,12 @@ namespace
                    .arity = Arity::None,
                    .operands = " [options]",
                    .summary = "Report cache statistics for this machine." },
+        FlagSpec { .action = Action::HtmlStats,
+                   .primary = "--html-stats",
+                   .aliases = NoAliases,
+                   .arity = Arity::None,
+                   .operands = " [options]",
+                   .summary = "Render cache statistics as a self-contained HTML dashboard." },
         FlagSpec { .action = Action::ZeroStats,
                    .primary = "--zero-stats",
                    .aliases = ZeroStatsAliases,
@@ -60,6 +66,22 @@ namespace
                    .arity = Arity::Value,
                    .operands = " <id>",
                    .summary = "Report only this cohort." },
+    };
+
+    /// The sub-options accepted after `--html-stats`.
+    constexpr std::array HtmlStatsOptionTable {
+        FlagSpec { .action = Action::Cohort,
+                   .primary = "--cohort",
+                   .aliases = NoAliases,
+                   .arity = Arity::Value,
+                   .operands = " <id>",
+                   .summary = "Report only this cohort." },
+        FlagSpec { .action = Action::OutputPath,
+                   .primary = "--out",
+                   .aliases = NoAliases,
+                   .arity = Arity::Value,
+                   .operands = " <path>",
+                   .summary = "Write the dashboard here instead of the default report path." },
     };
 
     /// True when `token` was meant as a launcher option rather than as the
@@ -106,7 +128,7 @@ namespace
     /// @return The command.
     [[nodiscard]] Command Selected(Action action)
     {
-        return { .action = action, .cohortFilter = {}, .diagnostic = {} };
+        return { .action = action, .cohortFilter = {}, .outputPath = {}, .diagnostic = {} };
     }
 
     /// A rejected command line.
@@ -114,7 +136,7 @@ namespace
     /// @return A `UsageError` command carrying `diagnostic`.
     [[nodiscard]] Command Rejected(std::string diagnostic)
     {
-        return { .action = Action::UsageError, .cohortFilter = {}, .diagnostic = std::move(diagnostic) };
+        return { .action = Action::UsageError, .cohortFilter = {}, .outputPath = {}, .diagnostic = std::move(diagnostic) };
     }
 
     /// The `FASTCACHE_*` variables, in the order `--help` documents them.
@@ -190,9 +212,9 @@ namespace
 
 } // namespace
 
-Command ParseStatsOptions(std::span<std::string const> args, std::span<FlagSpec const> options)
+Command ParseStatsOptions(std::span<std::string const> args, std::span<FlagSpec const> options, Action baseAction)
 {
-    Command cmd = Selected(Action::ShowStats);
+    Command cmd = Selected(baseAction);
 
     // Walk a shrinking span rather than an index so consuming a flag's value
     // is an explicit step; a value that is never consumed has already been a
@@ -235,6 +257,8 @@ Command ParseStatsOptions(std::span<std::string const> args, std::span<FlagSpec 
 
         if (option->action == Action::Cohort)
             cmd.cohortFilter = value;
+        else if (option->action == Action::OutputPath)
+            cmd.outputPath = value;
     }
     return cmd;
 }
@@ -242,6 +266,11 @@ Command ParseStatsOptions(std::span<std::string const> args, std::span<FlagSpec 
 std::span<FlagSpec const> TopLevelFlags() noexcept
 {
     return TopLevelTable;
+}
+
+std::span<FlagSpec const> HtmlStatsOptions() noexcept
+{
+    return HtmlStatsOptionTable;
 }
 
 std::span<FlagSpec const> StatsOptions() noexcept
@@ -267,6 +296,8 @@ Command ParseTopLevel(std::span<std::string const> args)
     {
         if (flag->action == Action::ShowStats)
             return ParseStatsOptions(args.subspan(1), StatsOptions());
+        if (flag->action == Action::HtmlStats)
+            return ParseStatsOptions(args.subspan(1), HtmlStatsOptions(), Action::HtmlStats);
         return Selected(flag->action);
     }
 
@@ -296,6 +327,10 @@ std::string HelpText(UsageColor color)
     for (auto const& spec: StatsOptions())
         statsRows.Add(RenderForms(spec), spec.summary);
 
+    UsageRows htmlStatsRows;
+    for (auto const& spec: HtmlStatsOptions())
+        htmlStatsRows.Add(RenderForms(spec), spec.summary);
+
     UsageRows environmentRows;
     for (auto const& spec: LauncherEnvironment())
         environmentRows.Add(std::string { spec.name }, spec.summary);
@@ -303,6 +338,7 @@ std::string HelpText(UsageColor color)
     auto const blocks = std::to_array<UsageBlock>({
         { .entries = usageRows.Rows() },
         { .entries = statsRows.Rows() },
+        { .entries = htmlStatsRows.Rows() },
         { .entries = environmentRows.Rows() },
         { .text = StateDirectoryNote, .textIndent = 2 },
         { .entries = StateDirectoryRows },
@@ -315,10 +351,11 @@ std::string HelpText(UsageColor color)
         { .subject = "fastcache-cc - a compiler launcher over the fastcached compile cache." },
         { .title = "USAGE", .blocks = allBlocks.subspan(0, 1) },
         { .title = "STATS OPTIONS", .blocks = allBlocks.subspan(1, 1) },
+        { .title = "HTML STATS OPTIONS", .blocks = allBlocks.subspan(2, 1) },
         // The three ENVIRONMENT blocks share one section so its two runs of rows
         // keep a common column even though prose sits between them.
-        { .title = "ENVIRONMENT", .blocks = allBlocks.subspan(2, 3) },
-        { .blocks = allBlocks.subspan(5, 2) },
+        { .title = "ENVIRONMENT", .blocks = allBlocks.subspan(3, 3) },
+        { .blocks = allBlocks.subspan(6, 2) },
     });
 
     return RenderUsage({ .sections = sections }, color);
