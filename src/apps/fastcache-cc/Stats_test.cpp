@@ -13,16 +13,45 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <format>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <system_error>
+
+#if defined(_WIN32)
+    #include <windows.h>
+#else
+    #include <unistd.h>
+#endif
 
 using namespace FastCache::Cc;
 
 namespace
 {
 
-/// Monotonic counter so no two tests share a state directory.
+/// This process's id, so two test *processes* racing under a parallel test
+/// runner (`ctest -j`) can never compute the same directory name.
+///
+/// `catch_discover_tests` registers one CTest test per TEST_CASE, each its own
+/// process invocation of this binary — so a monotonic counter starting at 1 in
+/// every process is not actually monotonic across the run: two concurrently
+/// running single-test processes both take their first ScopedStateDir at
+/// counter value 1 and collide on the same directory, one deleting or
+/// overwriting the log the other is mid-write on. This was a real, reproduced
+/// flake (`ctest -R FormatReport -j8` fails a run in a small majority of
+/// tries), not a hypothetical.
+[[nodiscard]] unsigned long ProcessId() noexcept
+{
+#if defined(_WIN32)
+    return ::GetCurrentProcessId();
+#else
+    return static_cast<unsigned long>(::getpid());
+#endif
+}
+
+/// Monotonic counter so no two ScopedStateDir instances *within this process*
+/// share a directory; combined with the process id for cross-process safety.
 [[nodiscard]] int CounterNext()
 {
     static int counter = 0;
@@ -36,7 +65,8 @@ class ScopedStateDir
   public:
     ScopedStateDir()
     {
-        auto const unique = std::filesystem::temp_directory_path() / ("fastcache-cc-test-" + std::to_string(CounterNext()));
+        auto const unique =
+            std::filesystem::temp_directory_path() / std::format("fastcache-cc-test-{}-{}", ProcessId(), CounterNext());
         std::filesystem::create_directories(unique);
         _dir = unique.string();
 
@@ -210,10 +240,149 @@ TEST_CASE("ResetLog empties the recorded statistics")
     CHECK(FormatReport("").contains("no statistics recorded yet"));
 }
 
+TEST_CASE("FormatHtmlReport explains an empty log instead of an empty document")
+{
+    ScopedStateDir const scoped;
+    auto const report = FormatHtmlReport("");
+    CHECK(report.contains("no statistics recorded yet"));
+    // Explicitly NOT html in the empty case: mirrors FormatReport's plain-text
+    // explanation, and a caller piping this to a browser or a log sees a
+    // one-line message either way, not a broken half-page.
+    CHECK_FALSE(report.contains("<html"));
+}
+
+TEST_CASE("FormatHtmlReport is a self-contained HTML document")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+
+    auto const report = FormatHtmlReport("");
+    CHECK(report.starts_with("<!doctype html>"));
+    CHECK(report.contains("<html"));
+    CHECK(report.contains("</html>"));
+    // No external network dependency: everything the page needs travels in
+    // the file, so it opens correctly from a detached copy (attached to a CI
+    // run, emailed, opened offline).
+    CHECK_FALSE(report.contains("http://"));
+    CHECK_FALSE(report.contains("https://"));
+}
+
+TEST_CASE("FormatHtmlReport surfaces the headline hit rate and tallies")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "b.cpp", 12));
+    AppendRecord(MakeRecord(Outcome::Miss, "main", "c.cpp", 200));
+
+    auto const report = FormatHtmlReport("");
+    CHECK(report.contains("66.7%")); // 2 hits of 3 cacheable
+    CHECK(report.contains(">2<"));   // hits tally
+    CHECK(report.contains(">1<"));   // misses tally
+}
+
+TEST_CASE("FormatHtmlReport lists every cohort in the comparison table")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "alpha", "a.cpp", 10));
+    AppendRecord(MakeRecord(Outcome::Miss, "beta", "b.cpp", 20));
+
+    auto const report = FormatHtmlReport("");
+    CHECK(report.contains("alpha"));
+    CHECK(report.contains("beta"));
+}
+
+TEST_CASE("FormatHtmlReport lists the fall-back reasons and never-cached files")
+{
+    ScopedStateDir const scoped;
+    auto record = MakeRecord(Outcome::Unavailable, "main", "a.cpp", 5);
+    record.detail = "connect failed";
+    AppendRecord(record);
+    AppendRecord(MakeRecord(Outcome::Uncacheable, "main", "volatile.cpp", 40));
+
+    auto const report = FormatHtmlReport("");
+    CHECK(report.contains("connect failed"));
+    CHECK(report.contains("volatile.cpp"));
+}
+
+TEST_CASE("FormatHtmlReport restricts the fold to one cohort when filtered")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "alpha", "a.cpp", 10));
+    AppendRecord(MakeRecord(Outcome::Miss, "beta", "b.cpp", 20));
+
+    auto const alpha = FormatHtmlReport("alpha");
+    CHECK(alpha.contains("alpha"));
+    CHECK_FALSE(alpha.contains(">beta<"));
+
+    CHECK(FormatHtmlReport("gamma").contains("no records for cohort 'gamma'"));
+}
+
 TEST_CASE("LogPath points inside the configured state directory")
 {
     ScopedStateDir const scoped;
     auto const path = LogPath();
     CHECK_FALSE(path.empty());
     CHECK(path.contains("fastcache-cc"));
+}
+
+TEST_CASE("AppendRecord round-trips the timestamp through ParseLog")
+{
+    ScopedStateDir const scoped;
+    auto record = MakeRecord(Outcome::Hit, "main", "a.cpp", 10);
+    record.timestampUnixSeconds = 1'700'000'000;
+    AppendRecord(record);
+
+    auto const entries = ParseLog("");
+    REQUIRE(entries.size() == 1);
+    CHECK(entries.front().timestampUnixSeconds == 1'700'000'000);
+}
+
+TEST_CASE("FormatReport emits no ANSI escapes when plain")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+
+    auto const report = FormatReport("", FastCache::UsageColor::Plain);
+    CHECK_FALSE(report.contains("\x1b["));
+}
+
+TEST_CASE("FormatReport colors the hit count when colored")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+
+    auto const report = FormatReport("", FastCache::UsageColor::Colored);
+    CHECK(report.contains("\x1b["));
+    // The colored count still contains the plain digits, so a caller stripping
+    // ANSI escapes recovers byte-identical text to the plain report.
+    CHECK(report.contains("1"));
+}
+
+TEST_CASE("FormatReport colors the unavailable count as a warning")
+{
+    ScopedStateDir const scoped;
+    auto record = MakeRecord(Outcome::Unavailable, "main", "a.cpp", 5);
+    record.detail = "connect failed";
+    AppendRecord(record);
+
+    auto const report = FormatReport("", FastCache::UsageColor::Colored);
+    CHECK(report.contains("CACHE NOT REACHED"));
+    CHECK(report.contains("\x1b["));
+}
+
+TEST_CASE("ParseLog defaults the timestamp to zero for pre-upgrade lines")
+{
+    ScopedStateDir const scoped;
+    // Nine tab-separated fields: the shape written before the timestamp column
+    // existed. The parser must not misread a missing trailing field as 0 being
+    // a real recorded time — it is simply absent.
+    auto const path = LogPath();
+    {
+        std::ofstream out { path, std::ios::binary | std::ios::app };
+        out << "HIT\tmain\t0\t10\ta.cpp\t\t0\t0\t0\t0\n";
+    }
+
+    auto const entries = ParseLog("");
+    REQUIRE(entries.size() == 1);
+    CHECK(entries.front().timestampUnixSeconds == 0);
 }

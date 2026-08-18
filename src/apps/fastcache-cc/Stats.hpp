@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Cli/UsageDoc.hpp>
+
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache::Cc
 {
@@ -36,11 +39,24 @@ struct Record
     std::uint64_t preprocessMs {}; ///< Deriving the key (preprocess + compiler id).
     std::uint64_t cacheMs {};      ///< Talking to the daemon (connect + transfer).
 
+    /// Whether `preprocessMs`/`cacheMs` were actually recorded, as opposed to
+    /// defaulted to zero because this record came from a log line written
+    /// before those columns existed. Without this, a pre-upgrade hit would
+    /// plot as a real zero-millisecond preprocess/cache sample rather than
+    /// being left out of that histogram entirely.
+    bool hasPhaseColumns {};
+
     /// Direct mode: validating the header manifest instead of preprocessing. When
     /// `directHit` is set, `preprocessMs` is zero because no preprocess ran — that
     /// substitution is the whole point, so the report separates the two.
     std::uint64_t directMs {};
     bool directHit {};
+
+    /// Wall-clock time the invocation was recorded, as seconds since the Unix
+    /// epoch. Zero means "unknown" — either a pre-upgrade log line (the column
+    /// did not exist yet) or a caller that never set it — and is excluded from
+    /// any time-bucketed view rather than plotted as an epoch-zero data point.
+    std::uint64_t timestampUnixSeconds {};
 };
 
 /// Append one record to the per-user log, creating it on first use.
@@ -60,8 +76,30 @@ void AppendRecord(Record const& record);
 /// breakdown, hit rate, latency distributions, the fall-back reasons, and the
 /// translation units that never hit.
 /// @param cohortFilter When non-empty, report only this cohort.
+/// @param color Whether to emit ANSI SGR escapes; see StdoutSupportsColor.
 /// @return The formatted report, or an explanatory line when the log is absent.
-[[nodiscard]] std::string FormatReport(std::string_view cohortFilter);
+[[nodiscard]] std::string FormatReport(std::string_view cohortFilter, UsageColor color = UsageColor::Plain);
+
+/// Read every record from the log, applying the same cohort filter and
+/// tolerance for short (pre-upgrade) lines that `FormatReport` does.
+///
+/// Exposed separately from `FormatReport` so a caller that wants the raw
+/// records — the HTML report's trend chart, or a test — does not have to
+/// scrape them back out of formatted text.
+/// @param cohortFilter When non-empty, return only this cohort's records.
+/// @return The parsed records, in file order. Empty when the log is absent
+///         or empty.
+[[nodiscard]] std::vector<Record> ParseLog(std::string_view cohortFilter);
+
+/// Render the same data as `FormatReport`, as a self-contained HTML dashboard
+/// (inline CSS/JS, no network dependency): headline hit rate, per-outcome
+/// tallies, a hit-rate-over-time trend, latency histograms, ranked fall-back
+/// reasons, a per-cohort comparison table, and the translation units that
+/// never hit.
+/// @param cohortFilter When non-empty, report only this cohort.
+/// @return The complete HTML document, or an explanatory plain-text line when
+///         the log is absent (mirroring `FormatReport`'s empty-log message).
+[[nodiscard]] std::string FormatHtmlReport(std::string_view cohortFilter);
 
 /// Delete the log. @return True when the log is gone afterwards.
 [[nodiscard]] bool ResetLog();
