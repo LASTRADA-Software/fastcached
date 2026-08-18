@@ -993,7 +993,69 @@ void RecordManifest(Config const& cfg,
 /// @param cohortFilter Restrict the report to this cohort; empty reports all.
 [[nodiscard]] int RunStatsReport(std::string_view cohortFilter)
 {
-    std::cout << Cc::FormatReport(cohortFilter);
+    // The color decision is made here, not inside Stats.cpp, so that module
+    // stays free of ambient probes -- the same split --help already uses.
+    std::cout << Cc::FormatReport(
+        cohortFilter, FastCache::StdoutSupportsColor() ? FastCache::UsageColor::Colored : FastCache::UsageColor::Plain);
+    return 0;
+}
+
+/// Default location for `--html-stats`'s dashboard when `--out` names none:
+/// alongside the statistics log itself, so both live under the same per-user
+/// state directory rather than the current working directory (which for a
+/// launcher invoked from inside a build could be anywhere).
+/// @return The default report path, or empty when there is no state directory.
+[[nodiscard]] std::string DefaultHtmlReportPath()
+{
+    auto const logPath = Cc::LogPath();
+    if (logPath.empty())
+        return {};
+    return (std::filesystem::path { logPath }.parent_path() / "report.html").string();
+}
+
+/// Render the HTML dashboard (`--html-stats`) and write it to disk.
+/// @param cohortFilter Restrict the report to this cohort; empty reports all.
+/// @param outputPath Where to write it; empty means DefaultHtmlReportPath().
+/// @return Process exit code.
+[[nodiscard]] int RunHtmlStatsReport(std::string_view cohortFilter, std::string_view outputPath)
+{
+    auto const report = Cc::FormatHtmlReport(cohortFilter);
+
+    // The empty-log/empty-cohort case returns the same short plain-text
+    // message FormatReport does (see FormatHtmlReport's doc comment) --
+    // printed rather than written to a file, matching --show-stats's own
+    // behaviour for the same condition.
+    if (!report.starts_with("<!doctype html>"))
+    {
+        std::cout << report;
+        return 0;
+    }
+
+    std::string const destination { !outputPath.empty() ? std::string { outputPath } : DefaultHtmlReportPath() };
+    if (destination.empty())
+    {
+        std::cerr << "fastcache-cc: no state directory available to write the dashboard to; pass --out.\n";
+        return 1;
+    }
+
+    std::error_code ec;
+    if (auto const parent = std::filesystem::path { destination }.parent_path(); !parent.empty())
+        std::filesystem::create_directories(parent, ec);
+
+    std::ofstream out { destination, std::ios::binary | std::ios::trunc };
+    if (!out)
+    {
+        std::cerr << "fastcache-cc: could not write dashboard to '" << destination << "'.\n";
+        return 1;
+    }
+    out << report;
+    if (!out)
+    {
+        std::cerr << "fastcache-cc: could not write dashboard to '" << destination << "'.\n";
+        return 1;
+    }
+
+    std::cout << "fastcache-cc: dashboard written to " << destination << '\n';
     return 0;
 }
 
@@ -1041,13 +1103,17 @@ int main(int argc, char** argv)
             return 0;
         case Cc::Action::ShowStats:
             return RunStatsReport(command.cohortFilter);
+        case Cc::Action::HtmlStats:
+            return RunHtmlStatsReport(command.cohortFilter, command.outputPath);
         case Cc::Action::ZeroStats:
             return ClearStats();
-        // A stats sub-option, never returned as a top-level action. Handled
+        // Stats sub-options, never returned as a top-level action. Handled
         // explicitly so the switch stays exhaustive without silently treating
-        // "--cohort" as a compiler to spawn.
+        // "--cohort"/"--out" as a compiler to spawn.
         case Cc::Action::Cohort:
-            return ReportUsageError("--cohort is only valid after --show-stats");
+            return ReportUsageError("--cohort is only valid after --show-stats or --html-stats");
+        case Cc::Action::OutputPath:
+            return ReportUsageError("--out is only valid after --html-stats");
         case Cc::Action::Compile:
             break;
     }

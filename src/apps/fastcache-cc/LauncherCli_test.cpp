@@ -35,7 +35,7 @@ Command Parse(std::vector<std::string> const& argv)
 TEST_CASE("every accepted flag and alias appears in the help text")
 {
     auto const help = HelpText();
-    for (auto const& table: { TopLevelFlags(), StatsOptions() })
+    for (auto const& table: { TopLevelFlags(), StatsOptions(), HtmlStatsOptions() })
     {
         for (auto const& spec: table)
         {
@@ -72,6 +72,25 @@ TEST_CASE("the short stats aliases match their long forms")
     CHECK(Parse({ "--show-stats" }).action == Action::ShowStats);
     CHECK(Parse({ "-z" }).action == Action::ZeroStats);
     CHECK(Parse({ "--zero-stats" }).action == Action::ZeroStats);
+}
+
+TEST_CASE("the html-stats flag dispatches with no options set")
+{
+    auto const cmd = Parse({ "--html-stats" });
+    CHECK(cmd.action == Action::HtmlStats);
+    CHECK(cmd.cohortFilter.empty());
+    CHECK(cmd.outputPath.empty());
+}
+
+TEST_CASE("html-stats accepts --out and --cohort like --show-stats does")
+{
+    auto const cmd = Parse({ "--html-stats", "--out", "report.html", "--cohort", "ci-main" });
+    CHECK(cmd.action == Action::HtmlStats);
+    CHECK(cmd.outputPath == "report.html");
+    CHECK(cmd.cohortFilter == "ci-main");
+
+    auto const joined = Parse({ "--html-stats", "--out=report.html" });
+    CHECK(joined.outputPath == "report.html");
 }
 
 TEST_CASE("help is reachable by all three spellings")
