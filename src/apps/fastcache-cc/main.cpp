@@ -667,8 +667,16 @@ void RecordManifest(Config const& cfg,
         if (auto const depText = ReadDepFile(cmd))
             includes = Cc::ParseDepFilePaths(*depText);
 
-    if (includes.empty())
-        return;
+    // The TU itself must be part of what a direct hit revalidates, not only the
+    // headers it includes. /showIncludes never names the primary source (it only
+    // emits "Note: including file:" for #include targets), and a GNU depfile's
+    // rule deliberately excludes its own target from its dependency list — so
+    // without this, editing a .cpp's own body while leaving every header
+    // untouched is invisible to ValidateManifest and a stale object is replayed
+    // forever (issue #49 / issue #51). BuildManifest already canonicalizes,
+    // hashes, and dedupes every path handed to it, so adding the source here is
+    // enough; no format change is needed.
+    includes.push_back(cmd.source);
 
     // The manifest points at the object's ordinary key rather than causing a second
     // copy to be stored: L1 keeps values uncompressed, so duplicating objects would

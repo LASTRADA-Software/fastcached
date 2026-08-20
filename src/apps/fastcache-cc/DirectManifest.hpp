@@ -136,11 +136,22 @@ enum class DirectError : std::uint8_t
 /// Toolchain headers are dropped (the stamp covers them); project headers are
 /// canonicalized and hashed. Entries are deduplicated and sorted by canonical
 /// path, so the same build state yields byte-identical manifests on any machine.
-/// @param includePaths   Absolute include paths, as emitted by the compiler.
+///
+/// `includePaths` must also contain the translation unit's own source path, not
+/// only the files it `#include`s: neither `/showIncludes` nor a GNU depfile ever
+/// names the primary TU (a depfile rule's target is explicitly excluded from its
+/// own dependency list), so a manifest built from headers alone has no entry
+/// that changes when the TU's own body is edited, and ValidateManifest would
+/// keep validating a stale object forever (issue #49 / issue #51). The caller
+/// (RecordManifest) adds it before calling this function; there is nothing
+/// source-specific about the handling here — it is canonicalized, hashed, and
+/// deduplicated exactly like any header.
+/// @param includePaths   Absolute paths the compile depends on: every `#include`d
+///                       header plus the translation unit's own source path.
 /// @param layout         This build's roots.
 /// @param toolchainStamp Identity standing in for the toolchain headers.
 /// @param objectKey      Key the compiled object is already stored under.
-/// @return The manifest, or DirectError when a project header cannot be canonicalized.
+/// @return The manifest, or DirectError when an entry cannot be canonicalized.
 [[nodiscard]] std::expected<DirectManifest, DirectError> BuildManifest(std::vector<std::string> const& includePaths,
                                                                        PathCanon::Layout const& layout,
                                                                        std::string_view toolchainStamp,
