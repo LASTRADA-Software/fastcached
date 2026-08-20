@@ -319,6 +319,54 @@ TEST_CASE("Build then validate a manifest against real files on disk")
     std::filesystem::remove_all(root);
 }
 
+TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC-style")
+{
+    // /showIncludes (and therefore ParseIncludePaths) never names the primary
+    // translation unit -- only the headers it pulls in. RecordManifest (main.cpp)
+    // compensates by adding the TU's own source path to the list it hands to
+    // BuildManifest, alongside the headers /showIncludes reported. Without that,
+    // editing a .cpp's own body while leaving every header untouched is invisible
+    // to ValidateManifest, and a direct-mode hit replays a stale object forever
+    // (see issue #49 / issue #51).
+    auto const root = std::filesystem::temp_directory_path() / "fc-direct-source-edit";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "src");
+
+    auto const headerPath = root / "src" / "header.hpp";
+    {
+        std::ofstream out { headerPath, std::ios::binary };
+        out << "#pragma once\nint helper();\n";
+    }
+
+    auto const sourcePath = root / "src" / "a.cpp";
+    {
+        std::ofstream out { sourcePath, std::ios::binary };
+        out << "#include \"header.hpp\"\nint main() { return 0; }\n";
+    }
+
+    FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
+    constexpr std::string_view stamp = "cl-test-1";
+
+    // MSVC's /showIncludes lists only the header; RecordManifest appends the
+    // source path itself before calling BuildManifest, which this mirrors.
+    auto built = BuildManifest({ headerPath.string(), sourcePath.string() }, layout, stamp, "objkey-1");
+    REQUIRE(built.has_value());
+    REQUIRE(built->entries.size() == 2);
+    CHECK(ValidateManifest(*built, layout, stamp));
+
+    // Edit the .cpp body itself -- no header touched.
+    {
+        std::ofstream out { sourcePath, std::ios::binary };
+        out << "#include \"header.hpp\"\nint main() { return 1; }\n";
+    }
+
+    // The manifest must no longer validate: the TU itself is part of what a hit
+    // reproduces, so its own content has to be covered too.
+    CHECK_FALSE(ValidateManifest(*built, layout, stamp));
+
+    std::filesystem::remove_all(root);
+}
+
 TEST_CASE("BuildManifest normalizes '..' segments and mixed separators to one token")
 {
     // Real /showIncludes output echoes the resolved-but-unnormalized path, e.g.
