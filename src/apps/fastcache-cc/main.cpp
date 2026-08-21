@@ -184,8 +184,16 @@ struct Config
     // Clamped, not merely cast: the reader is 64-bit and `std::size_t` need not
     // be, and a truncating cast turns a ceiling somebody raised into a tiny one
     // that silently stops caching almost everything.
-    c.maxStoreBytes = static_cast<std::size_t>(std::min<std::uint64_t>(
-        EnvUnsigned(Cc::EnvName::MaxStoreBytes, Cc::DefaultMaxStoreBytes), std::numeric_limits<std::size_t>::max()));
+    //
+    // `max` is parenthesized to defeat windows.h's function-style max() macro,
+    // for the same reason Stats.cpp is: this target deliberately does not link
+    // the FastCache library, and NOMINMAX is defined on that library's target.
+    // `std::min<...>` needs no such guard -- the explicit template argument puts
+    // a `<` where the macro would need a `(` -- but it is spelled the same way
+    // so that dropping the argument later cannot quietly reintroduce this.
+    constexpr auto SizeMax = (std::numeric_limits<std::size_t>::max)();
+    c.maxStoreBytes = static_cast<std::size_t>(
+        (std::min<std::uint64_t>) (EnvUnsigned(Cc::EnvName::MaxStoreBytes, Cc::DefaultMaxStoreBytes), SizeMax));
     return c;
 }
 

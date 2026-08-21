@@ -52,16 +52,61 @@ void CloseSocket(NativeSocket fd)
 using AddrLen = ::socklen_t;
 #endif
 
-/// A listener that accepts one connection and then says nothing at all.
+/// Make raw sockets usable in this process.
+///
+/// On Windows a socket call before WSAStartup fails with WSANOTINITIALISED, and
+/// the peers below would report themselves unusable and every case here would
+/// take its "could not bind" skip. That is what was happening: these tests
+/// reported Passed in 0.01s on Windows, faster than the 300 ms timeout one of
+/// them measures, because none of them ran. ConnectTcp starts Winsock for its
+/// own sockets, but it is called from the test bodies -- after the peer has
+/// already tried to bind.
+///
+/// Idempotent, and deliberately a second WSAStartup rather than a hook into
+/// TcpClient.cpp's: startup is reference-counted, the test binary never cleans
+/// up (it is as short-lived as the launcher), and reaching into the production
+/// TU's internals to share one would couple the test to a detail that exists
+/// only for the launcher's own lifetime.
+/// @return True when raw sockets can be created.
+[[nodiscard]] bool EnsureSocketsUsable()
+{
+#if defined(_WIN32)
+    static bool const ready = [] {
+        WSADATA wsa {};
+        return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+    }();
+    return ready;
+#else
+    return true;
+#endif
+}
+
+/// What a LoopbackPeer does with the connection it accepts.
+///
+/// The two cases are opposites and both are needed: a peer that holds the
+/// connection open is the one that hung a build, and a peer that hangs up is the
+/// one that killed the launcher outright.
+enum class PeerBehavior : std::uint8_t
+{
+    HoldOpen, ///< Accept, then say nothing at all and keep the socket open.
+    HangUp,   ///< Accept, then immediately close without reading or writing.
+};
+
+/// A loopback listener that accepts exactly one connection and then behaves as
+/// its PeerBehavior says.
 ///
 /// Deliberately raw sockets rather than FastCache::BlockingListener: the
 /// launcher's test binary does not link the FastCache library (see the comment
 /// in this directory's CMakeLists.txt), so it cannot reach that helper.
-class SilentPeer
+///
+/// One class parameterized by behaviour rather than one class per behaviour --
+/// the bind/listen/getsockname dance is identical and only the acceptor body
+/// differs, which is a table entry rather than a second copy of the setup.
+class LoopbackPeer
 {
   public:
-    SilentPeer():
-        _listenFd { ::socket(AF_INET, SOCK_STREAM, 0) }
+    explicit LoopbackPeer(PeerBehavior behavior):
+        _listenFd { EnsureSocketsUsable() ? ::socket(AF_INET, SOCK_STREAM, 0) : InvalidSocket }
     {
         if (_listenFd == InvalidSocket)
             return;
@@ -84,19 +129,22 @@ class SilentPeer
         }
         _port = ntohs(addr.sin_port);
 
-        // Accept on a worker and then just hold the connection open. Holding it
-        // is the point: a closed socket would surface as a clean EOF, which the
-        // client already handled correctly. Silence is the case that hung.
-        _acceptor = std::jthread { [this](std::stop_token const& stop) {
+        _acceptor = std::jthread { [this, behavior](std::stop_token const& stop) {
             auto const accepted = ::accept(_listenFd, nullptr, nullptr);
-            while (!stop.stop_requested())
-                std::this_thread::sleep_for(std::chrono::milliseconds { 20 });
+            if (behavior == PeerBehavior::HoldOpen)
+            {
+                // Holding it is the point: a closed socket surfaces as a clean
+                // EOF, which the client already handled correctly. Silence is
+                // the case that hung.
+                while (!stop.stop_requested())
+                    std::this_thread::sleep_for(std::chrono::milliseconds { 20 });
+            }
             if (accepted != InvalidSocket)
                 CloseSocket(accepted);
         } };
     }
 
-    ~SilentPeer()
+    ~LoopbackPeer()
     {
         _acceptor.request_stop();
         _acceptor = {};
@@ -104,81 +152,10 @@ class SilentPeer
             CloseSocket(_listenFd);
     }
 
-    SilentPeer(SilentPeer const&) = delete;
-    SilentPeer& operator=(SilentPeer const&) = delete;
-    SilentPeer(SilentPeer&&) = delete;
-    SilentPeer& operator=(SilentPeer&&) = delete;
-
-    /// @return True if the listener bound and is usable.
-    [[nodiscard]] bool Ready() const noexcept
-    {
-        return _listenFd != InvalidSocket;
-    }
-
-    /// @return "127.0.0.1:<port>" for ConnectTcp.
-    [[nodiscard]] std::string Endpoint() const
-    {
-        return "127.0.0.1:" + std::to_string(_port);
-    }
-
-  private:
-    NativeSocket _listenFd { InvalidSocket };
-    std::uint16_t _port { 0 };
-    std::jthread _acceptor;
-};
-
-/// A listener that accepts one connection and immediately hangs up.
-///
-/// The mirror image of SilentPeer, and the shape that actually broke a build:
-/// the daemon answers an over-cap STORE with a typed refusal and then closes,
-/// while the launcher is still streaming a several-hundred-megabyte object into
-/// it. Every write after that hangs up raises SIGPIPE, whose default disposition
-/// terminates the process.
-class HangUpPeer
-{
-  public:
-    HangUpPeer():
-        _listenFd { ::socket(AF_INET, SOCK_STREAM, 0) }
-    {
-        if (_listenFd == InvalidSocket)
-            return;
-        sockaddr_in addr {};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0; // ephemeral
-        if (::bind(_listenFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(_listenFd, 1) != 0)
-        {
-            CloseSocket(_listenFd);
-            _listenFd = InvalidSocket;
-            return;
-        }
-        AddrLen len = sizeof(addr);
-        if (::getsockname(_listenFd, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
-        {
-            CloseSocket(_listenFd);
-            _listenFd = InvalidSocket;
-            return;
-        }
-        _port = ntohs(addr.sin_port);
-
-        _acceptor = std::jthread { [this] {
-            auto const accepted = ::accept(_listenFd, nullptr, nullptr);
-            if (accepted != InvalidSocket)
-                CloseSocket(accepted); // read nothing, say nothing, go away
-        } };
-    }
-
-    ~HangUpPeer()
-    {
-        _acceptor = {};
-        if (_listenFd != InvalidSocket)
-            CloseSocket(_listenFd);
-    }
-
-    HangUpPeer(HangUpPeer const&) = delete;
-    HangUpPeer& operator=(HangUpPeer const&) = delete;
-    HangUpPeer(HangUpPeer&&) = delete;
-    HangUpPeer& operator=(HangUpPeer&&) = delete;
+    LoopbackPeer(LoopbackPeer const&) = delete;
+    LoopbackPeer& operator=(LoopbackPeer const&) = delete;
+    LoopbackPeer(LoopbackPeer&&) = delete;
+    LoopbackPeer& operator=(LoopbackPeer&&) = delete;
 
     /// @return True if the listener bound and is usable.
     [[nodiscard]] bool Ready() const noexcept
@@ -210,7 +187,7 @@ TEST_CASE("SendAll to a peer that hung up fails instead of killing the process")
     // The assertion is therefore doubled: reaching the CHECK at all proves no
     // signal was raised, and the CHECK proves the error was reported through the
     // return value the caching flow already treats as "cache unavailable".
-    HangUpPeer peer;
+    LoopbackPeer peer { PeerBehavior::HangUp };
     if (!peer.Ready())
     {
         SUCCEED("could not bind a loopback test port; skipping");
@@ -240,7 +217,7 @@ TEST_CASE("SendAll to a peer that hung up fails instead of killing the process")
 
 TEST_CASE("RecvExactly gives up on a peer that accepts and then goes silent")
 {
-    SilentPeer peer;
+    LoopbackPeer peer { PeerBehavior::HoldOpen };
     if (!peer.Ready())
     {
         SUCCEED("could not bind a loopback test port; skipping");
@@ -268,7 +245,7 @@ TEST_CASE("A connected client still round-trips bytes with a timeout armed")
     // Guards the obvious over-correction: a timeout that is somehow applied as
     // an immediate deadline would make every fetch fail and silently disable
     // caching everywhere, which no other test would notice.
-    SilentPeer peer;
+    LoopbackPeer peer { PeerBehavior::HoldOpen };
     if (!peer.Ready())
     {
         SUCCEED("could not bind a loopback test port; skipping");

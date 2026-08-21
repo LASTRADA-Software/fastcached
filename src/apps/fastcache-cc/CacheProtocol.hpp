@@ -71,7 +71,9 @@ struct CacheOutcome
 /// processes that never negotiate -- the wire has no handshake by design -- so
 /// this agreement is a chosen default, not a derived one, and either side can be
 /// retuned without the other noticing.
-inline constexpr std::size_t DefaultMaxStoreBytes = 256UL * 1024UL * 1024UL;
+// `ULL`, not `UL`: `unsigned long` is 32 bits on Win64 (LLP64), so a future
+// edit raising this past 4 GiB would silently wrap there and nowhere else.
+inline constexpr std::size_t DefaultMaxStoreBytes = 256ULL * 1024ULL * 1024ULL;
 
 /// Whether a value of `valueBytes` is worth offering to the daemon at all.
 ///
