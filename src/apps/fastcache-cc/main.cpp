@@ -767,13 +767,16 @@ struct MaterializedHit
 /// guard examine precisely the bytes that are about to be written; it also leaves
 /// exactly one copy of a loop that used to exist twice.
 ///
-/// @param cmd     The parsed compile command (object path, depfile path).
-/// @param decoded The decoded cached value.
-/// @param layout  This machine's roots.
+/// @param cmd              The parsed compile command (object path, depfile path).
+/// @param decoded          The decoded cached value.
+/// @param layout           This machine's roots.
+/// @param workingDirectory The directory this compile runs in, for resolving the
+///                         relative dependency paths the value replays.
 /// @return What happened, plus the localized streams for the manifest backfill.
 [[nodiscard]] MaterializedHit MaterializeHit(Cc::ParsedCommand const& cmd,
                                              CompileValue const& decoded,
-                                             PathCanon::Layout const& layout)
+                                             PathCanon::Layout const& layout,
+                                             std::filesystem::path const& workingDirectory)
 {
     // Localize everything the value carries. Region 2 is the depfile and is a
     // file, not a stream; regions beyond ReplayRegionCount must never be replayed,
@@ -792,14 +795,6 @@ struct MaterializedHit
     auto assertions = std::span<TextRegion const> { localized };
     if (cmd.depPath.empty() && assertions.size() > DepFileRegionIndex)
         assertions = assertions.first(DepFileRegionIndex);
-
-    // current_path() through its error_code overload, and "." when even that
-    // fails: the throwing overload would abort the launcher, and "." resolves a
-    // relative dependency exactly as the compiler's own working directory would.
-    std::error_code cwdError;
-    auto workingDirectory = std::filesystem::current_path(cwdError);
-    if (cwdError)
-        workingDirectory = ".";
 
     if (auto const missing = Cc::MissingReplayedDependency(assertions, layout, workingDirectory); missing.has_value())
     {
@@ -831,15 +826,17 @@ struct MaterializedHit
 
 /// Fetch `key`, and if it holds a compile value, materialize it: write the object
 /// and replay the captured streams with paths localized to this machine.
-/// @param cfg    Launcher config.
-/// @param cmd    The parsed compile command (object path, source).
-/// @param key    The object key to serve.
-/// @param layout This machine's roots, for localizing the replayed text.
+/// @param cfg              Launcher config.
+/// @param cmd              The parsed compile command (object path, source).
+/// @param key              The object key to serve.
+/// @param layout           This machine's roots, for localizing the replayed text.
+/// @param workingDirectory The directory this compile runs in.
 /// @return The exit code to return on a hit, or nullopt when not served.
 [[nodiscard]] std::optional<int> TryServeFromCache(Config const& cfg,
                                                    Cc::ParsedCommand const& cmd,
                                                    std::string const& key,
-                                                   PathCanon::Layout const& layout)
+                                                   PathCanon::Layout const& layout,
+                                                   std::filesystem::path const& workingDirectory)
 {
     auto const payload = FetchRaw(cfg, key);
     if (!payload.has_value())
@@ -853,7 +850,7 @@ struct MaterializedHit
     // check and, if it also finds the value stale, recompiles and re-stores it.
     // Direct mode only ever declines to shortcut; repairing the entry is not its
     // job, and doing it here would duplicate the miss path.
-    if (MaterializeHit(cmd, *decoded, layout).disposition != HitDisposition::Served)
+    if (MaterializeHit(cmd, *decoded, layout, workingDirectory).disposition != HitDisposition::Served)
         return std::nullopt;
 
     invocation.valueBytes = decoded->objectBlob.size();
@@ -872,9 +869,11 @@ struct MaterializedHit
 /// DirectManifest::objectKey for why duplicating it is not affordable.
 /// @param cfg             Launcher config.
 /// @param cmd             The parsed compile command.
-/// @param layout          This machine's roots.
-/// @param relativizedArgs The relativized compile arguments.
-/// @param toolchainStamp  The toolchain identity.
+/// @param layout              This machine's roots.
+/// @param workingDirectory    The directory this compile runs in; every relative
+///                            path the driver reported resolves against it.
+/// @param relativizedArgs     The relativized compile arguments.
+/// @param toolchainStamp      The toolchain identity.
 /// @param includeTextOut      Captured stdout (may carry the include notes).
 /// @param includeTextErr      Captured stderr (cl puts include notes here).
 /// @param objectKeyForPointer Key the object is already stored under; recorded in
@@ -882,13 +881,15 @@ struct MaterializedHit
 void RecordManifest(Config const& cfg,
                     Cc::ParsedCommand const& cmd,
                     PathCanon::Layout const& layout,
+                    std::filesystem::path const& workingDirectory,
                     std::vector<std::string> const& relativizedArgs,
                     std::string const& toolchainStamp,
                     std::string_view includeTextOut,
                     std::string_view includeTextErr,
                     std::string_view objectKeyForPointer)
 {
-    auto const canonicalSource = PathCanon::Canonicalize(cmd.source, layout);
+    auto const workingDirectoryText = workingDirectory.string();
+    auto const canonicalSource = Cc::CanonicalSourceToken(cmd.source, layout, workingDirectoryText);
     if (!canonicalSource.has_value())
         return;
 
@@ -919,27 +920,37 @@ void RecordManifest(Config const& cfg,
         return;
     }
 
-    // The TU itself must be part of what a direct hit revalidates, not only the
-    // headers it includes. /showIncludes never names the primary source (it only
-    // emits "Note: including file:" for #include targets), and a GNU depfile's
-    // rule deliberately excludes its own target from its dependency list — so
-    // without this, editing a .cpp's own body while leaving every header
-    // untouched is invisible to ValidateManifest and a stale object is replayed
-    // forever (issue #49 / issue #51). BuildManifest already canonicalizes,
-    // hashes, and dedupes every path handed to it, so adding the source here is
-    // enough; no format change is needed.
-    includes.push_back(cmd.source);
-
     // The manifest points at the object's ordinary key rather than causing a second
     // copy to be stored: L1 keeps values uncompressed, so duplicating objects would
     // double RAM pressure (27 GB -> 54 GB measured) where compression cannot help.
-    auto const manifest = Cc::BuildManifest(includes, layout, toolchainStamp, objectKeyForPointer);
+    //
+    // The TU's own source is a field of its own rather than another element of the
+    // include list: /showIncludes never names the primary source, and a GNU
+    // depfile's rule deliberately excludes its own target, so a manifest without it
+    // revalidates every header and not the file being compiled (issue #49 /
+    // issue #51). BuildManifest refuses outright when it cannot record the TU,
+    // which is what makes that a precondition rather than a comment here.
+    auto const reported = includes.size();
+    auto const manifest = Cc::BuildManifest({ .sourcePath = cmd.source,
+                                              .includePaths = std::move(includes),
+                                              .workingDirectory = workingDirectoryText,
+                                              .toolchainStamp = toolchainStamp,
+                                              .objectKey = std::string { objectKeyForPointer } },
+                                            layout);
     if (!manifest.has_value())
     {
         if (invocation.verbose)
-            std::cerr << "fastcache-cc: manifest not built (uncanonicalizable include)\n";
+            std::cerr << "fastcache-cc: manifest not built (uncanonicalizable source or include)\n";
         return;
     }
+
+    // Both counts, for the reason the key's dependency-set note gives them: the
+    // pair is what distinguishes "this TU only includes toolchain headers" (fine,
+    // the stamp covers them) from "every path the driver reported was filtered
+    // out" — which is the shape of a misconfigured root, and which the recorded
+    // manifest cannot report on its own because it still validates.
+    Note(std::format(
+        "manifest: {} entries from {} reported dependency path(s) plus the source", manifest->entries.size(), reported));
 
     auto const manifestKey = Cc::ComputeManifestKey(*canonicalSource, relativizedArgs, toolchainStamp);
 
@@ -966,15 +977,18 @@ void RecordManifest(Config const& cfg,
 /// Any failure here just means we preprocess as before: direct mode never
 /// decides a compile is uncacheable, only that it cannot shortcut.
 ///
-/// @param cfg Launcher config.
-/// @param cmd The parsed compile command.
-/// @param layout This machine's source-root / build-tree layout.
-/// @param relativizedArgs The command line with checkout-rooted paths tokenized.
-/// @param toolchainStamp The compiler identity folded into the manifest key.
+/// @param cfg              Launcher config.
+/// @param cmd              The parsed compile command.
+/// @param layout           This machine's source-root / build-tree layout.
+/// @param workingDirectory The directory this compile runs in; the source path is
+///                         resolved against it before it becomes a key input.
+/// @param relativizedArgs  The command line with checkout-rooted paths tokenized.
+/// @param toolchainStamp   The compiler identity folded into the manifest key.
 /// @return The exit code if the object was served, nullopt to keep going.
 [[nodiscard]] std::optional<int> TryDirectMode(Config const& cfg,
                                                Cc::ParsedCommand const& cmd,
                                                PathCanon::Layout const& layout,
+                                               std::filesystem::path const& workingDirectory,
                                                std::vector<std::string> const& relativizedArgs,
                                                std::string const& toolchainStamp)
 {
@@ -986,7 +1000,10 @@ void RecordManifest(Config const& cfg,
         return std::nullopt;
     };
 
-    auto const canonicalSource = PathCanon::Canonicalize(cmd.source, layout);
+    // The same derivation RecordManifest uses, so the lookup and the recording
+    // sides cannot spell this token differently — which for a relatively-named
+    // source they did, one resolving it and the other not.
+    auto const canonicalSource = Cc::CanonicalSourceToken(cmd.source, layout, workingDirectory.string());
     if (!canonicalSource.has_value())
         return giveUp();
 
@@ -1007,7 +1024,7 @@ void RecordManifest(Config const& cfg,
     invocation.directMs = MsSince(directStarted);
     // Follow the manifest's pointer to the object, which is stored exactly once
     // under its ordinary preprocessed key.
-    auto served = TryServeFromCache(cfg, cmd, manifest->objectKey, layout);
+    auto served = TryServeFromCache(cfg, cmd, manifest->objectKey, layout, workingDirectory);
     if (served.has_value())
         invocation.directHit = true;
     return served;
@@ -1030,8 +1047,29 @@ void RecordManifest(Config const& cfg,
     auto const relativizedArgs = Cc::RelativizeArgs(argv.subspan(1), cfg.srcRoot, cfg.buildTree);
     auto const toolchainStamp = CompilerId(cmd.compiler);
 
+    // Read once here rather than wherever a relative path needs placing. Three
+    // consumers need exactly this value — the replay guard, the manifest's own
+    // recording, and the manifest key's source token — and reading it three times
+    // is three chances for them to disagree about what a relative path means.
+    //
+    // current_path() through its error_code overload, and "." when even that
+    // fails: the throwing overload would abort a launcher whose whole contract is
+    // that a cache problem never breaks a build, and "." resolves a relative
+    // dependency exactly as the compiler's own working directory would.
+    //
+    // Then re-spelled in the layout's vocabulary. getcwd(3) answers with the
+    // kernel's RESOLVED path, so a build under a symlinked prefix (macOS `/tmp`,
+    // any symlinked `/home`) reports a working directory that shares no string
+    // prefix with the roots it is actually inside — and every root test here is a
+    // prefix comparison. See AnchorWorkingDirectory.
+    std::error_code cwdError;
+    auto workingDirectory = std::filesystem::current_path(cwdError);
+    if (cwdError)
+        workingDirectory = ".";
+    workingDirectory = Cc::AnchorWorkingDirectory(workingDirectory.string(), layout);
+
     if (cfg.direct && !SourceReferencesVolatileMacro(cmd.source))
-        if (auto served = TryDirectMode(cfg, cmd, layout, relativizedArgs, toolchainStamp))
+        if (auto served = TryDirectMode(cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp))
             return served;
 
     auto const preprocessStarted = std::chrono::steady_clock::now();
@@ -1127,7 +1165,7 @@ void RecordManifest(Config const& cfg,
             // Reproducing the depfile is not optional: skipping it silently breaks
             // incremental builds, because Ninja/Make would see no header
             // dependencies for this TU and stop rebuilding it when they change.
-            auto const materialized = MaterializeHit(cmd, *decoded, layout);
+            auto const materialized = MaterializeHit(cmd, *decoded, layout, workingDirectory);
             if (materialized.disposition == HitDisposition::Unusable)
             {
                 Warn("could not write object on hit");
@@ -1149,6 +1187,7 @@ void RecordManifest(Config const& cfg,
                     RecordManifest(cfg,
                                    cmd,
                                    layout,
+                                   workingDirectory,
                                    relativizedArgs,
                                    toolchainStamp,
                                    materialized.replayOut,
@@ -1257,7 +1296,7 @@ void RecordManifest(Config const& cfg,
     // lands on RAM where compression cannot help. A direct hit therefore costs one
     // extra fetch to follow the pointer — see DirectManifest::objectKey.
     if (cfg.direct)
-        RecordManifest(cfg, cmd, layout, relativizedArgs, toolchainStamp, run.out, run.err, key);
+        RecordManifest(cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, run.out, run.err, key);
     return code;
 }
 

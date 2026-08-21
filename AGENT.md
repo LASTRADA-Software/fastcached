@@ -188,11 +188,11 @@ These constraints are load-bearing and have each already been a bug:
     cache entry records. `PathCanon::AnchorForLayout` therefore returns an `Anchor` —
     `WorkingDirectory`, `Absolute`, `DriveRelative` — where it used to return a `bool
     IsAbsoluteForLayout` whose drive test stopped at the colon and so reported all three
-    Windows shapes as absolute (issue #65). Both callers switch on it with no `default:`, so
-    a fourth state is a compile error at each rather than a silent fall-through. What neither
-    may do is treat it as `WorkingDirectory`: hashing it as relative would let two machines
-    whose `C:` cwd differs key **identically for different headers**, the same silent
-    cross-TU mis-serve #63 closed by a different route. **Past that the two callers part, and
+    Windows shapes as absolute (issue #65). Every caller switches on it with no `default:`, so
+    a fourth state is a compile error at each rather than a silent fall-through. What none of
+    them may do is treat it as `WorkingDirectory`: hashing it as relative would let two
+    machines whose `C:` cwd differs key **identically for different headers**, the same silent
+    cross-TU mis-serve #63 closed by a different route. **Past that the callers part, and
     the asymmetry is the substance of the fix.** The key filter needs a portable *spelling*,
     so it leaves the path to the root tests — root membership is the stronger question, and
     under a drive-relative *root* (`C:src\proj`, a Windows root by its separators) the path
@@ -204,7 +204,13 @@ These constraints are load-bearing and have each already been a bug:
     the join names nothing that exists, on Windows it resolves against the *process* cwd — so
     it skips, under the existing rule that a path which cannot be examined counts as present.
     For a drive-relative root that arm is a behaviour *change*: such a path used to be probed
-    against the wrong anchor and discarded every hit carrying it. The residual, recorded
+    against the wrong anchor and discarded every hit carrying it. The **manifest** is the
+    third caller and sides with the key filter, on the same reasoning read through its own
+    failure mode: it *opens* a path rather than probing one, and an unreadable entry refuses
+    the manifest while recording (`HashFileContents` yields nothing) and fails to validate
+    while reading — safe in both directions — so the stronger root question is worth asking,
+    and dropping on the anchor alone would silently un-cover a project header, which is the
+    defect its own bullet below exists to close. The residual, recorded
     deliberately: a drive-relative path under no root is then neither keyed nor guarded, so a
     moved one would replay a stale depfile — reachable only when a build passes a
     drive-relative `-I` *and* the driver echoes it unresolved (`cl` resolves through the
@@ -266,6 +272,91 @@ These constraints are load-bearing and have each already been a bug:
     the one shape where recording nothing is strictly better than recording something. The
     launcher never injects those flags itself — the compile runs the build system's own argv,
     so what it can revalidate is bounded by what the build asked the compiler to report.
+  - **A manifest classifies a path's anchor before asking whether it is toolchain content,
+    and the working directory is what makes that answerable.** `IsToolchainHeader` reports
+    every path outside both roots as toolchain, and a *relative* path lies under no root, so
+    asking it first reported every relative path as toolchain and dropped it. A GNU build
+    whose depfile carried relative header paths — a relative `-I`, or a compile run from the
+    source directory, which is also how the CMake Ninja generator spells its sources —
+    therefore recorded a manifest of its absolute entries alone, and an empty manifest
+    validates against anything: edit a dropped header, leave the `.cpp` untouched, and the
+    direct hit serves the previous object under a zero exit code, *permanently*, because a
+    direct hit never reaches `RecordManifest` to repair the manifest that let it through.
+    `Cc::IsCheckable` and `Cc::PortableForm` are the other two consumers of that classifier
+    and both already ordered it this way, in as many words; this was the third and did not
+    (issue #57 is the same defect reaching the TU source rather than a header). The
+    classification is now three-valued — `Project` / `Toolchain` / `Unanchored` — for the same
+    reason `PathCanon::Anchor` is, and built on it: "outside both roots" and "not placeable at
+    all" are different facts with opposite consequences, and collapsing them to two is
+    precisely what went wrong. `PathRole` is not a second spelling of `Anchor` — `Anchor`
+    describes the path, `PathRole` decides what the manifest does about it — and the mapping
+    between them is the switch, which carries no `default:` for the reason the other two
+    callers' do not.
+    - **A resolved relative path is recorded as a canonical token, not kept relative** —
+      the opposite of what `KeyDependencySet` does with the same input, deliberately. A key
+      input is only ever *digested*; a manifest entry has to be *localized back to a file*
+      on the validating machine, which a relative entry can only do against that machine's
+      working directory. `cc -c ../src/t.cpp` run from `build/` and from `build/sub/`
+      relativizes to the same argument list and so shares a manifest key while naming
+      different files — resolving before canonicalizing is what removes that, and it is why
+      `CanonicalSourceToken` is one function both `TryDirectMode` and `RecordManifest` call
+      rather than two spellings of `PathCanon::Canonicalize(cmd.source, …)`.
+    - **An unanchored path refuses the manifest rather than being dropped.** Reachable only
+      when the working directory itself is unavailable, so it costs essentially nothing —
+      and dropping is the silent stale serve this whole classification exists to prevent,
+      while refusing merely costs one compile direct mode.
+    - **`current_path()` must be re-spelled in the layout's vocabulary before anything
+      compares it against a root.** `getcwd(3)` answers with the kernel's *resolved* path,
+      so a build under a symlinked prefix (macOS `/tmp` → `/private/tmp`, any symlinked
+      `/home` or `/mnt`) reports a working directory sharing no string prefix with the root
+      it is actually inside — and every root test here and in `PathCanon` is a string prefix
+      comparison. `AnchorWorkingDirectory` matches by filesystem *identity*
+      (`weakly_canonical` on both sides, longest root first as `CanonicalizeOne` does) and
+      hands back the **root's own spelling** with the tail appended, so the one value that
+      comes from the environment speaks the same language as the ones that come from
+      configuration. Found by `compile-cache-e2e.sh` on macOS, where `mktemp -d` returns a
+      `/var/…` path and `getcwd` reports `/private/var/…`; it silently cost direct mode
+      rather than failing, which is why it is asserted end-to-end. This is *not* a fix for
+      issue #66 — that is about the paths a **driver emits**, where both sides would have to
+      move together; here only the cwd is re-spelled, and against roots that are already the
+      layout's own.
+    - **The "normalize, then put the layout's separators back" rule is spelled once,
+      in `NormalizeForLayout`.** `std::filesystem` answers with the **host's** preferred
+      separator while every root and absoluteness test is the **layout's**, so on a
+      Windows host `/w/src/a.hpp` comes back backslash-separated and
+      `IsAbsoluteForLayout` — which for a POSIX layout asks only about a leading `/` —
+      reads an absolute path as relative. `PortableForm` had the only copy, inline, and
+      the manifest side turned out not to have it; Windows CI is what said so, on this
+      very change. The correction runs **one way only, deliberately**: a Windows layout
+      keeps whatever separators it arrived with, because `PathCanon` spells a Windows
+      root either way (`C:/src/proj` is a Windows layout) and every prefix test unifies
+      separators before comparing — only the POSIX direction can mislead, since there a
+      backslash is an ordinary filename character rather than a separator spelled
+      differently. `ResolveAgainst`'s *join* stays the host's path arithmetic on
+      purpose, and its contract says so: it resolves against a directory on this machine
+      and its result is handed straight to `HashFileContents`, so it only ever runs
+      where the layout and the host agree.
+    - **`manifest-v4` moved alone, and the lock-step with `objkey-v*` is one-way.** An
+      `objkey` bump must drag the manifest tag with it (a manifest points at an object key by
+      value); the reverse costs nothing, since an unreachable manifest is re-recorded next
+      compile and points at the same still-valid objects. The bump is *required* here because
+      the defect is invisible to the key: a build with an absolute TU source but relative
+      header paths keeps the same `canonicalSource` and args across this fix, so its
+      under-recorded manifest keeps the same key, keeps being found, and keeps validating.
+      Re-keying is the only thing that retires those entries.
+    - **The emptiness guard did not move to a count, and that was the decision.**
+      `RecordManifest` still refuses on `includes.empty()` — "did the compile report a
+      dependency record at all?", which is the right question and `includes` is the right
+      thing to ask it of. A count over `manifest.entries` cannot replace it: after the fix a
+      one-entry manifest is *legitimate* (a TU whose every header is toolchain content is
+      completely covered by that entry plus the stamp), so a threshold would refuse correct
+      manifests while still not catching a misconfigured root. The zero-entry case it was
+      standing in for is closed a layer down instead — `BuildManifest` takes the TU as its
+      own `sourcePath` field and refuses when it cannot record it, which turns the invariant
+      its doc-comment used to *state* into one it *enforces*. What the caller adds is a
+      diagnostic, not a veto: `manifest: N entries from M reported dependency path(s) plus
+      the source`, for the same reason the key's `dependency set: N of M` line exists — the
+      recorded manifest cannot report this itself, because it still validates.
   - **`Cc::MissingReplayedDependency` stays as the backstop**, and still runs before a hit
     writes anything; a stale hit falls through to the real compile, whose STORE repairs the
     entry. Its filter is load-bearing in both directions: probing a depfile's rule target

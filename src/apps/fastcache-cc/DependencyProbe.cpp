@@ -48,16 +48,16 @@ namespace
         // entries for one header — and, across two machines whose generators spell
         // an include directory differently, two keys for identical content.
         //
-        // std::filesystem normalizes to the HOST's preferred separator, but every
-        // test below is the LAYOUT's, so the layout's own convention is put back
-        // first: on a Windows host a POSIX path returns backslash-separated, and
+        // Through NormalizeForLayout, which also puts the layout's separator
+        // convention back after std::filesystem answered with the host's: on a
+        // Windows host a POSIX path returns backslash-separated, and
         // `AnchorForLayout` — which for a POSIX layout asks only about a leading
-        // `/` — would then read an absolute toolchain path as relative and hash
-        // it. That is the host coupling PathCanon.hpp forbids in as many
-        // words ("Derived from the LAYOUT, never from the host").
-        auto path = NormalizePath(raw);
-        if (!PathCanon::IsWindowsLayout(layout))
-            std::ranges::replace(path, '\\', '/');
+        // `/` — would then read an absolute toolchain path as relative and hash it.
+        // That is the host coupling PathCanon.hpp forbids in as many words
+        // ("Derived from the LAYOUT, never from the host"). The rule lived here,
+        // inline, and the manifest side turned out not to have it — so it is now
+        // spelled once, where all three callers reach it.
+        auto path = NormalizeForLayout(raw, layout);
 
         // Classified before the toolchain test, because that test reports every
         // path outside the roots as toolchain — a relative one included.
