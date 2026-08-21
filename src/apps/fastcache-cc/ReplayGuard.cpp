@@ -51,10 +51,36 @@ namespace
         // A surviving canonical token means LocalizeRegion left this span alone.
         if (path.front() == '<')
             return false;
-        // Relative first: IsToolchainHeader reports every relative path as outside
-        // the roots, so asking it first would silently skip all of them.
-        if (!PathCanon::IsAbsoluteForLayout(path, layout))
-            return true;
+        // Classified first: IsToolchainHeader reports every path outside the roots
+        // as toolchain, a relative one included, so asking it first would silently
+        // skip all of them.
+        switch (PathCanon::AnchorForLayout(path, layout))
+        {
+            case PathCanon::Anchor::WorkingDirectory:
+                // Checked: it resolves against the compile's working directory,
+                // which is also the launcher's, so it is this machine's path.
+                return true;
+            case PathCanon::Anchor::DriveRelative:
+                // Not checked, because the check cannot be made truthfully. `C:foo`
+                // resolves against drive C's own current directory, and
+                // std::filesystem::operator/ reaches neither: on a POSIX host
+                // `wd / "C:foo"` is a name that exists nowhere, so every hit
+                // carrying such a path would be discarded forever; on Windows it
+                // either replaces the left operand or appends against the PROCESS
+                // cwd. This is the policy the header already states for a path that
+                // cannot be examined at all — it counts as present. See issue #65.
+                //
+                // Deliberately NOT deferred to the root tests, unlike the key
+                // filter's matching branch: what that one needs is a portable
+                // spelling, which a drive-relative root can still supply, whereas
+                // what this one needs is a path to stat, which it cannot. So for a
+                // drive-relative root this arm is a behaviour *change* — such a
+                // path used to be probed, against a working directory that is not
+                // the one it is anchored to, which discarded every hit carrying it.
+                return false;
+            case PathCanon::Anchor::Absolute:
+                break;
+        }
         return !IsToolchainHeader(path, layout);
     }
 } // namespace

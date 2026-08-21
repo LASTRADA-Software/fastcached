@@ -55,6 +55,15 @@ namespace FastCache::Cc
 ///   which is also the launcher's, so it is always this machine's path. Note this must
 ///   be decided before the toolchain test, which reports every relative path as
 ///   outside the roots.
+/// - A Windows **drive-relative** path (`C:foo`) is skipped — not because it is
+///   someone else's content, but because the probe cannot be made truthfully. It
+///   resolves against drive C's own current directory, and `std::filesystem::operator/`
+///   reaches neither that nor anything equivalent: on a POSIX host `wd / "C:foo"` is a
+///   name that exists nowhere, which would discard every hit carrying such a path
+///   forever, and on Windows it either replaces the left operand or appends against the
+///   *process* cwd. So it falls under the rule below rather than the ones above: a path
+///   that cannot be examined counts as present. `PathCanon::Anchor` is what separates it
+///   from a relative path (issue #65).
 ///
 /// Pure: touches no filesystem.
 ///

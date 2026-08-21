@@ -13,14 +13,6 @@ namespace
     constexpr std::string_view SrcRootSentinel = "<SRCROOT>";
     constexpr std::string_view BuildTreeSentinel = "<BUILDTREE>";
 
-    /// Lower-case an ASCII byte (path comparison is case-insensitive on Windows).
-    /// @param c Input byte.
-    /// @return The lower-case form for A-Z, else the byte unchanged.
-    [[nodiscard]] char AsciiLower(char c) noexcept
-    {
-        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-    }
-
     /// Build the comparison form of a path: separators normalized to '/' and,
     /// on Windows, lower-cased. Used only for prefix matching, never emitted.
     /// @param path Native-form path.
@@ -89,6 +81,26 @@ namespace
         return std::string { absolutePath };
     }
 
+    /// True when `path` opens with a drive specifier (`C:`), whatever follows it.
+    /// @param path A path or layout root in native form.
+    /// @return True when bytes 0 and 1 are a drive letter and a colon.
+    [[nodiscard]] constexpr bool HasDriveSpecifier(std::string_view path) noexcept
+    {
+        return path.size() >= 2 && path[1] == ':' && IsDriveLetter(path.front());
+    }
+
+    /// True when a separator follows the drive specifier — the byte that decides
+    /// whether `C:...` is rooted at the drive (`C:\x`) or at the drive's own
+    /// current directory (`C:x`). Asked separately by both callers because they
+    /// treat a specifier with *no* tail at all (a bare `C:`) differently.
+    ///
+    /// @param path A path or layout root already known to carry a specifier.
+    /// @return True when byte 2 exists and is `/` or `\`.
+    [[nodiscard]] constexpr bool DriveTailIsSeparator(std::string_view path) noexcept
+    {
+        return path.size() > 2 && (path[2] == '/' || path[2] == '\\');
+    }
+
     /// True when `root` is a Windows-shaped path root: backslash-separated, or
     /// prefixed with a drive specifier (`C:` / `C:/...`).
     ///
@@ -104,20 +116,19 @@ namespace
     /// leading `/` into an "option" and leaves absolute paths — and so the
     /// checkout location — baked into the cache key.
     ///
+    /// A bare `C:` is accepted, unlike in AnchorForLayout: as a layout ROOT that
+    /// is the degenerate spelling of the drive root, while as a PATH the same
+    /// bytes name the drive's current directory. Same rule, different question.
+    ///
     /// @param root A layout root in native form.
     /// @return True when the root uses Windows path conventions.
     [[nodiscard]] constexpr bool IsWindowsRoot(std::string_view root) noexcept
     {
         if (root.contains('\\'))
             return true;
-        // Compared directly rather than via std::isalpha, which is
-        // locale-dependent and would make the predicate environment-sensitive.
-        auto const isDriveLetter = [](char c) noexcept {
-            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-        };
-        if (root.size() < 2 || root[1] != ':' || !isDriveLetter(root[0]))
+        if (!HasDriveSpecifier(root))
             return false;
-        return root.size() == 2 || root[2] == '/' || root[2] == '\\';
+        return root.size() == 2 || DriveTailIsSeparator(root);
     }
 
     /// The separator a localized path should use. Taken from the consuming
@@ -344,7 +355,13 @@ namespace
 
             // A ':' separates target from dependencies — unless it is a Windows
             // drive letter, which is part of the path itself ("C:\src\a.cpp").
-            if (c == ':' && !(token.size() == 1 && std::isalpha(static_cast<unsigned char>(token.front())) != 0))
+            //
+            // Only the letter rule is shared with the drive tests above; this
+            // deliberately does not ask what follows the colon. The question here
+            // is where a rule ends, and a drive-relative "C:foo" is still one
+            // token — splitting it would hand the transform two fragments, neither
+            // of which is a path.
+            if (c == ':' && !(token.size() == 1 && IsDriveLetter(token.front())))
             {
                 flush();
                 out.push_back(c);
@@ -416,24 +433,25 @@ bool IsWindowsLayout(Layout const& layout) noexcept
     return IsWindowsRoot(layout.sourceRoot) || IsWindowsRoot(layout.buildTree);
 }
 
-bool IsAbsoluteForLayout(std::string_view path, Layout const& layout) noexcept
+Anchor AnchorForLayout(std::string_view path, Layout const& layout) noexcept
 {
     if (path.empty())
-        return false;
+        return Anchor::WorkingDirectory;
     if (!IsWindowsLayout(layout))
-        return path.front() == '/';
+        return path.front() == '/' ? Anchor::Absolute : Anchor::WorkingDirectory;
 
-    // Compared directly rather than via std::isalpha, which is locale-dependent
-    // and would make the predicate environment-sensitive (as IsWindowsRoot notes).
-    auto const isDriveLetter = [](char c) noexcept {
-        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-    };
-    if (path.size() >= 2 && path[1] == ':' && isDriveLetter(path.front()))
-        return true;
+    // Past the specifier, the separator is the whole distinction: `C:\x` names a
+    // location, `C:x` names an offset from wherever drive C happens to be
+    // pointing. A bare `C:` has no tail and is the latter — it *is* "the current
+    // directory of drive C". Before issue #65 this test stopped at the colon, so
+    // all three shapes were reported as absolute.
+    if (HasDriveSpecifier(path))
+        return DriveTailIsSeparator(path) ? Anchor::Absolute : Anchor::DriveRelative;
+
     // A leading separator is root-relative on Windows, and a UNC share (`\\host`)
     // begins with one too; both name a fixed location rather than a cwd-relative
     // one, so neither may be resolved against the working directory.
-    return path.front() == '\\' || path.front() == '/';
+    return (path.front() == '\\' || path.front() == '/') ? Anchor::Absolute : Anchor::WorkingDirectory;
 }
 
 std::expected<std::string, CanonError> Canonicalize(std::string_view absolutePath, Layout const& layout)

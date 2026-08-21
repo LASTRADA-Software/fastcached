@@ -78,7 +78,20 @@ struct ProbeText
 /// - A *relative* path is kept, normalized to forward slashes. It resolves
 ///   against the compile's working directory, so it names the same file on any
 ///   machine that runs the same build. Note this must be decided before the
-///   absolute test rather than after it.
+///   toolchain test rather than after it, since that test reports every path
+///   outside the roots as toolchain.
+/// - A Windows **drive-relative** path (`C:foo`) is emphatically *not* treated as
+///   relative. It resolves against drive C's own current directory — per-process
+///   state on the producing machine that no cache entry records — so hashing it
+///   alongside the genuinely relative paths would let two machines whose C: cwd
+///   differs produce the *same* key for *different* headers. `PathCanon::Anchor`
+///   is what separates the two; before issue #65 the classifier stopped at the
+///   colon and called it absolute, reaching the same outcome by an answer that
+///   was not true. It is then left to the root tests rather than dropped outright,
+///   because root membership is the stronger question: under no root it cannot
+///   prefix-match a rooted root and is dropped as toolchain regardless, while
+///   under a drive-relative *root* it canonicalizes to a token that is portable
+///   exactly because the consumer substitutes its own root.
 /// - **Toolchain content is dropped**, judged by DirectManifest's
 ///   `IsToolchainHeader` so that this filter, the manifest's and the replay
 ///   guard's cannot disagree: an absolute path under neither root, *and* a vcpkg

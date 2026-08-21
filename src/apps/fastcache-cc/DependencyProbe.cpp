@@ -51,19 +51,42 @@ namespace
         // std::filesystem normalizes to the HOST's preferred separator, but every
         // test below is the LAYOUT's, so the layout's own convention is put back
         // first: on a Windows host a POSIX path returns backslash-separated, and
-        // `IsAbsoluteForLayout` — which for a POSIX layout asks only about a
-        // leading `/` — would then read an absolute toolchain path as relative and
-        // hash it. That is the host coupling PathCanon.hpp forbids in as many
+        // `AnchorForLayout` — which for a POSIX layout asks only about a leading
+        // `/` — would then read an absolute toolchain path as relative and hash
+        // it. That is the host coupling PathCanon.hpp forbids in as many
         // words ("Derived from the LAYOUT, never from the host").
         auto path = NormalizePath(raw);
         if (!PathCanon::IsWindowsLayout(layout))
             std::ranges::replace(path, '\\', '/');
 
-        // Relative before absolute: a relative path lies under no root either, and
-        // asking the absolute test second is what keeps it from being dropped with
-        // the toolchain headers.
-        if (!PathCanon::IsAbsoluteForLayout(path, layout))
-            return WithPosixSeparators(path);
+        // Classified before the toolchain test, because that test reports every
+        // path outside the roots as toolchain — a relative one included.
+        switch (PathCanon::AnchorForLayout(path, layout))
+        {
+            case PathCanon::Anchor::WorkingDirectory:
+                // Kept: it resolves against the compile's working directory, so it
+                // names the same file on any machine running the same build.
+                return WithPosixSeparators(path);
+            case PathCanon::Anchor::DriveRelative:
+            case PathCanon::Anchor::Absolute:
+                // Both fall through to the root tests below, and for a
+                // drive-relative path that is a decision rather than an oversight.
+                // What must never happen is the branch above: `C:foo` resolves
+                // against drive C's current directory — per-process state on the
+                // producing machine that no cache entry records — so hashing it as
+                // though it were relative would let two machines whose C: cwd
+                // differs key IDENTICALLY for DIFFERENT headers, the silent
+                // cross-TU mis-serve this key input exists to close.
+                //
+                // Beyond that, root membership is the stronger test and is left to
+                // decide: a drive-relative path under no root cannot prefix-match a
+                // rooted root (`c:foo/...` against `c:/src`), so it is dropped as
+                // toolchain anyway — while one under a *drive-relative* root
+                // canonicalizes to a token that is portable precisely because the
+                // consumer substitutes its own root. Returning early here would
+                // silently drop that second case, which was kept before issue #65.
+                break;
+        }
 
         // The classifier the manifest and the replay guard already use, so all
         // three agree on what "toolchain" means — including a vcpkg tree nested

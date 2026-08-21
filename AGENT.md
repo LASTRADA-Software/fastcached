@@ -182,6 +182,60 @@ These constraints are load-bearing and have each already been a bug:
     headers are toolchain, and a manifest naming them would be machine-specific. The set is
     sorted and deduplicated because `/showIncludes` repeats a header once per inclusion site
     and emission order is a property of the driver.
+  - **"Absolute or relative" is the wrong question on Windows, because there are three
+    answers.** `C:foo` carries a drive specifier and is still not rooted: it resolves against
+    *that drive's* current directory, per-process state on the producing machine that no
+    cache entry records. `PathCanon::AnchorForLayout` therefore returns an `Anchor` —
+    `WorkingDirectory`, `Absolute`, `DriveRelative` — where it used to return a `bool
+    IsAbsoluteForLayout` whose drive test stopped at the colon and so reported all three
+    Windows shapes as absolute (issue #65). Both callers switch on it with no `default:`, so
+    a fourth state is a compile error at each rather than a silent fall-through. What neither
+    may do is treat it as `WorkingDirectory`: hashing it as relative would let two machines
+    whose `C:` cwd differs key **identically for different headers**, the same silent
+    cross-TU mis-serve #63 closed by a different route. **Past that the two callers part, and
+    the asymmetry is the substance of the fix.** The key filter needs a portable *spelling*,
+    so it leaves the path to the root tests — root membership is the stronger question, and
+    under a drive-relative *root* (`C:src\proj`, a Windows root by its separators) the path
+    canonicalizes to a token that is portable precisely because the consumer substitutes its
+    own root. Dropping on the anchor alone would have silently un-keyed that whole layout,
+    and it is what the first cut of this change did. The replay guard needs something to
+    *stat*, which a drive-relative path is not under any working directory it could be handed
+    — `std::filesystem::operator/` reaches a drive's current directory by no route: on POSIX
+    the join names nothing that exists, on Windows it resolves against the *process* cwd — so
+    it skips, under the existing rule that a path which cannot be examined counts as present.
+    For a drive-relative root that arm is a behaviour *change*: such a path used to be probed
+    against the wrong anchor and discarded every hit carrying it. The residual, recorded
+    deliberately: a drive-relative path under no root is then neither keyed nor guarded, so a
+    moved one would replay a stale depfile — reachable only when a build passes a
+    drive-relative `-I` *and* the driver echoes it unresolved (`cl` resolves through the
+    filesystem; clang-cl echoes what it was handed), and closing it would mean recording the
+    producing machine's per-drive cwd in the value, which is exactly the machine-specific
+    state the key exists to keep out. One diagnostic consequence: such a path dropping out of
+    the key makes the launcher's `dependency set: 0 of M reported path(s) keyed` line
+    reachable for a second reason, so that fingerprint no longer identifies the #66 short-name
+    mismatch on its own — the two are told apart by whether the *root* is short-name spelled,
+    and separating them in the counter itself is left as the follow-up it is.
+    - **The ASCII rules are one rule each, and the drive-letter one had drifted into four.**
+      Two of the four spellings tested it with `std::isalpha`, which is **locale-dependent** — in a codebase
+      whose whole premise is that two machines derive the same key from the same content, a
+      classification that varies with the running process's locale is a classification they
+      can disagree about. `PathCanon::IsDriveLetter` is now the single definition and every
+      site takes the letter test from it. What each site adds on top deliberately differs and
+      that is not drift: `AnchorForLayout` and `IsWindowsRoot` also ask what *follows* the
+      colon, while the two depfile rule-splitters do not — they are deciding where a rule
+      ends, and `C:foo` is one token there however it is anchored. The one place the two
+      root-shaped tests genuinely part is a bare `C:`: as a layout **root** it is the
+      degenerate spelling of the drive root and `IsWindowsRoot` accepts it, while as a
+      **path** the same bytes name the drive's current directory and `AnchorForLayout` calls
+      it `DriveRelative`. Both halves are pinned against the *same layout* in one test, so
+      the shared helpers cannot quietly merge them in either direction. The same reasoning
+      moved `PathCanon::AsciiLower` into the header beside it: `IsToolchainHeader`'s
+      comparison form was folding case through `std::tolower`, and under a Turkish locale
+      `std::tolower('I')` is not `i` — so a root spelled `D:\PROJECT\Inc` folds one way on
+      one machine and another way on the next, and the two derive different manifests and
+      different dependency sets from byte-identical content. A locale-sensitive
+      classification is the same defect as a host-sensitive one, and this layer exists to
+      have neither.
   - **A stream driver's notes must not reach the hashed text, and which stream carries them
     is not the driver table's answer to give.** `DriverSpec::includeStream` describes the
     *compile* run; the probe is a different command line and clang moves the notes off

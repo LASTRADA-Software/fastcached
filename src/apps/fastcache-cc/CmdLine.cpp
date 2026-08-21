@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CmdLine.hpp"
 
+#include <FastCache/CompileCache/PathCanon.hpp>
+
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <ranges>
 
 namespace FastCache::Cc
@@ -12,10 +13,17 @@ namespace
 {
 
     /// Lower-case an ASCII string copy (for case-insensitive suffix/basename match).
+    ///
+    /// Folds through PathCanon's byte rule rather than std::tolower, which is
+    /// locale-dependent: what this decides is which argument is the source file
+    /// and which driver is in use, both of which reach the cache key. Under a
+    /// Turkish locale `std::tolower('I')` is not `i`, so a `.I` suffix or a
+    /// compiler basename carrying an `I` folds differently there — the function
+    /// was named for a guarantee it did not provide.
     [[nodiscard]] std::string AsciiLower(std::string_view s)
     {
         std::string out { s };
-        std::ranges::transform(out, out.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::ranges::transform(out, out.begin(), [](char c) { return PathCanon::AsciiLower(c); });
         return out;
     }
 
