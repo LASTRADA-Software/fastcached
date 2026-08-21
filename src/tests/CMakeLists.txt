@@ -67,8 +67,67 @@ set_tests_properties("repository-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Compiler-cache auto-install fallback. Configures the tiny fixture project in
+# compile-cache-fixture/ once per way the fetch can be declined, and requires
+# each one to end in a status message and a clean fall-through.
+#
+# What it defends is the property that makes cmake/portable/CompileCache.cmake safe to
+# vendor: it is copied into repositories that never asked for fastcached, so a
+# cache it cannot download has to cost them a slower build and nothing else. A
+# configure that aborts because GitHub was unreachable would be a far worse
+# failure than the missing cache it is reporting.
+#
+# Not labelled "smoke" for the same reason as repository-hygiene: it starts no
+# daemon and opens no listening socket, so it belongs in the default `ctest`
+# set. It does invoke the compiler (a project has to configure), which is why
+# it is given more than that test's minute.
+#
+# The compiler, generator and make program are passed in rather than rediscovered
+# so the fixture is configured the same way this build was, and the script's
+# sandbox is the only thing that differs.
+add_test(
+    NAME "compile-cache-autoinstall"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/compile-cache-autoinstall"
+        "-DFASTCACHED_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        "-DFASTCACHED_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DFASTCACHED_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-autoinstall.cmake"
+)
+# Windows and a host without uname both report by printing `SKIP: ` and exiting
+# 0 — see the script header for why the sandbox it needs is POSIX-only, and
+# repository-hygiene above for why a `cmake -P` script cannot return 77.
+set_tests_properties("compile-cache-autoinstall" PROPERTIES
+    LABELS "hygiene"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    TIMEOUT 600
+)
+
+# The other half: that it can actually install one. Serves a synthetic release
+# over file:// through FASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE — the same seam an
+# organisation uses to install from an internal mirror — so the happy path is
+# covered without the network, and without spending the GitHub API budget that
+# a fleet of CI runners behind one address has to share.
+add_test(
+    NAME "compile-cache-install"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/compile-cache-install"
+        "-DFASTCACHED_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        "-DFASTCACHED_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DFASTCACHED_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-install.cmake"
+)
+set_tests_properties("compile-cache-install" PROPERTIES
+    LABELS "hygiene"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    TIMEOUT 600
+)
+
+# ---------------------------------------------------------------------------
 # sccache smoke tests. Registered only when an sccache binary is present
-# (SCCACHE is the find_program result from cmake/CompileCache.cmake). Each test starts
+# (SCCACHE is the find_program result from cmake/portable/CompileCache.cmake). Each test
 # the freshly-built fastcached, points sccache at it over one wire protocol,
 # and asserts a cache hit — the same compile-twice check the CI smoke jobs run,
 # via the same scripts/sccache-smoke driver.

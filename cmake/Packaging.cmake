@@ -79,7 +79,12 @@ endif()
 
 if(WIN32)
     if(NOT CPACK_GENERATOR)
-        set(CPACK_GENERATOR "WIX")
+        # The MSI installs; the ZIP is what a machine can unpack. cmake's
+        # portable/CompileCache.cmake fetches a prebuilt fastcache-cc out of the
+        # archives, and an .msi is not something it — or anyone without
+        # Windows — can open. Linux and macOS already ship a TGZ for the same
+        # reason, so this is Windows catching up rather than a new idea.
+        set(CPACK_GENERATOR "WIX;ZIP")
     endif()
 elseif(UNIX AND NOT APPLE)
     if(NOT CPACK_GENERATOR)
