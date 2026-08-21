@@ -663,6 +663,196 @@ grep -qE "MISS|HIT" "${workdir}/coverage.log" \
     || fail "compile with -coverage was not a cache candidate"
 echo "   -coverage survived the preprocess line"
 
+# --- 9: a root spelled differently from what the driver emits ----------------
+# Every root test in the launcher is a string prefix comparison, so a root whose
+# spelling differs from the one the compiler echoes back matches NOTHING it emits.
+# Three mechanisms then fail at once and hide each other: the keyed dependency set
+# is empty (a moved header keys identically), the replay guard classifies every
+# path as toolchain and probes none of them, and the stored value keeps this
+# machine's absolute paths. The launcher reports ordinary hits throughout
+# (issue #66).
+#
+# A symlinked directory is the portable stand-in for the 8.3 short name measured
+# on a Windows runner: one directory, two spellings, and a compiler that echoes
+# whichever one it was handed.
+#
+# Two distinct properties are asserted here, and the second is easy to break while
+# fixing the first:
+#
+#   a) The two spellings must key TOGETHER, so a compile driven through the link
+#      shares its entry with one driven through the real path.
+#   b) A replayed depfile must keep the spelling THIS BUILD uses. Its rule target
+#      has to be byte-identical to the `-o` path the build passed, or Ninja fails
+#      outright ("expected depfile ... to mention ...") and make matches no rule at
+#      all and silently drops every header dependency. Reconciling the ROOTS to
+#      their resolved form satisfies (a) and breaks (b); reconciling the emitted
+#      paths INTO the build's own spelling satisfies both.
+#
+# Direct mode is off because this is about the PREPROCESSED key: `KeyDependencySet`
+# and the "dependency set: N of M reported path(s) keyed" line only exist on that
+# path, and a direct hit would reach the object without ever computing them.
+echo "== an aliased root must canonicalize, and must not respell the depfile =="
+aliasroot="${workdir}/aliasroot"
+mkdir -p "${aliasroot}/real/src/inc" "${aliasroot}/real/build"
+cat > "${aliasroot}/real/src/inc/h1.h" <<'HDR'
+#pragma once
+inline int h1() { return 9; }
+HDR
+cat > "${aliasroot}/real/src/a.cpp" <<'SRC'
+#include "inc/h1.h"
+char const* alias_marker = "aliased-root-case";
+int main() { return h1(); }
+SRC
+if ! ln -s "${aliasroot}/real" "${aliasroot}/link" 2>/dev/null; then
+    echo "   this filesystem does not support symlinks; nothing to compare"
+else
+    # The roots and the OUTPUT paths are the link spelling; the source and include
+    # paths are the real one. That split is the whole point, and it mimics what
+    # `cl` does: a build system spells everything one way, and the compiler reports
+    # its dependencies resolved through the filesystem the other way. Spelling the
+    # output paths the same way as the roots is not a convenience — it is what a
+    # real build does, since `-o` and FASTCACHE_BINARY_DIR come from one generator,
+    # and it is what makes property (b) below testable at all.
+    linkobj="${aliasroot}/link/build/alias.o"
+    linkdep="${aliasroot}/link/build/alias.d"
+    realsrc="${aliasroot}/real/src/a.cpp"
+    realinc="${aliasroot}/real/src/inc"
+    export FASTCACHE_SOURCE_DIR="${aliasroot}/link/src" FASTCACHE_BINARY_DIR="${aliasroot}/link/build"
+
+    run_alias_leg() {
+        local log="$1" src="$2" inc="$3" obj="$4" dep="$5"
+        # -MP as well as -MD: it emits a phony `header:` rule per dependency, whose
+        # TARGET is a path the compiler reported rather than one the build system
+        # named. Those must be reconciled like any other dependency, so the legs
+        # below can tell a rule keyed on position from one keyed on value.
+        FASTCACHE_NO_DIRECT=1 "$launcher" "$compiler" -std=c++23 -MD -MP -MF "$dep" \
+            -I"$inc" -c "$src" -o "$obj" 2> "${workdir}/${log}" \
+            || { cat "${workdir}/${log}" >&2; fail "aliased-root: compile (${log}) returned non-zero"; }
+        cat "${workdir}/${log}"
+    }
+
+    # Every phony rule target (`<path>:` with nothing after it) must name a file
+    # that exists here. A reconciler that exempted them by position would leave the
+    # producing machine's spelling in the stored value, and a consumer's replayed
+    # depfile would point -MP's deleted-header protection at paths it cannot stat.
+    require_phony_targets_resolve() {
+        local label="$1" depfile="$2" line target found=0
+        while IFS= read -r line; do
+            case "$line" in
+                *:) target="${line%:}" ;;
+                *) continue ;;
+            esac
+            [[ -n "$target" ]] || continue
+            found=$((found + 1))
+            [[ -e "$target" ]] \
+                || fail "${label}: a phony depfile rule names a file that does not exist: ${target}"
+        done < "$depfile"
+        [[ "$found" -gt 0 ]] || fail "${label}: expected -MP phony rules in the depfile, found none"
+    }
+
+    # Leg A — populate through the aliased spelling. This is the leg that fails
+    # before the fix, and it fails silently.
+    run_alias_leg "alias-a.log" "$realsrc" "$realinc" "$linkobj" "$linkdep"
+    grep -q "fastcache-cc: MISS" "${workdir}/alias-a.log" \
+        || fail "aliased-root: first compile was not a MISS"
+
+    # The signature of the bug, and it is a distinct failure from a driver that
+    # reports nothing: "0 of M" means every reported path was filtered out.
+    if grep -qE "dependency set: 0 of [1-9]" "${workdir}/alias-a.log"; then
+        fail "aliased-root: the dependency set is empty; the root did not reconcile (issue #66)"
+    fi
+    grep -qE "dependency set: [1-9][0-9]* of [1-9]" "${workdir}/alias-a.log" \
+        || fail "aliased-root: no dependency path reached the key"
+
+    # The depfile the COMPILER wrote, for comparison with the one the cache
+    # reproduces. Its rule target is what the build system will look for.
+    compiled_target="$(head -n 1 "$linkdep" | sed 's/:.*//')"
+    [[ -n "$compiled_target" ]] || fail "aliased-root: the compile wrote no depfile rule"
+
+    # Leg B — the same compile again, so the cache has to reproduce both artifacts.
+    rm -f "$linkobj" "$linkdep"
+    run_alias_leg "alias-b.log" "$realsrc" "$realinc" "$linkobj" "$linkdep"
+    grep -q "fastcache-cc: HIT" "${workdir}/alias-b.log" \
+        || fail "aliased-root: the repeated compile was not a HIT"
+    [[ -f "$linkdep" ]] || fail "aliased-root: the hit reproduced no depfile"
+
+    replayed_target="$(head -n 1 "$linkdep" | sed 's/:.*//')"
+    if [[ "$replayed_target" != "$compiled_target" ]]; then
+        fail "aliased-root: the replayed depfile respelled its rule target;" \
+             "the build asked for '${compiled_target}' and the cache produced '${replayed_target}'" \
+             "-- Ninja rejects this outright and make silently drops every header dependency"
+    fi
+    require_depfile_resolves "aliased-root" "$linkdep"
+
+    # Leg C — through the REAL spelling, with roots to match: same content, same
+    # relative layout, so it must reach leg A's entry. Before the fix the two
+    # spellings keyed apart and this MISSed.
+    rm -f "${aliasroot}/real/build/alias.o"
+    export FASTCACHE_SOURCE_DIR="${aliasroot}/real/src" FASTCACHE_BINARY_DIR="${aliasroot}/real/build"
+    run_alias_leg "alias-c.log" "$realsrc" "$realinc" \
+        "${aliasroot}/real/build/alias.o" "${aliasroot}/real/build/alias.d"
+    # Anchored: the launcher prints "STALE HIT (...); recompiling" on its way to a
+    # MISS, so a bare `grep HIT` is satisfied by exactly the collapse this case
+    # exists to reject -- the same trap the moved-header case records above.
+    grep -q "fastcache-cc: HIT" "${workdir}/alias-c.log" \
+        || fail "aliased-root: the two spellings of one tree did not share a cache entry"
+    [[ -f "${aliasroot}/real/build/alias.o" ]] || fail "aliased-root: the hit produced no object"
+    echo "   two spellings share a key, and the replayed depfile kept the build's own: OK"
+
+    # Leg D — the same tree with roots that carry a TRAILING SEPARATOR, which a
+    # build system is free to export and `PathCanon::Layout` does not accept:
+    # IsSegmentPrefix wants a separator AFTER the root, so `/x/build/` matches
+    # nothing under `/x/build`. Untrimmed, the path gets a second chance through
+    # the resolved root (which comes back without the separator) and JoinLocalized
+    # then adds one of its own, so the replayed rule target reads `/x/build//a.o`
+    # -- rejected by Ninja, matched against no rule by make.
+    rm -f "$linkobj" "$linkdep"
+    export FASTCACHE_SOURCE_DIR="${aliasroot}/link/src/" FASTCACHE_BINARY_DIR="${aliasroot}/link/build/"
+    run_alias_leg "alias-d.log" "$realsrc" "$realinc" "$linkobj" "$linkdep"
+    # Asserted BEFORE the target comparison, and not merely for completeness: a
+    # trimmed root keys identically to leg A, so this must HIT. If it ever misses,
+    # the real compiler writes the depfile and the comparison below passes without
+    # the cache having reproduced anything at all.
+    grep -q "fastcache-cc: HIT" "${workdir}/alias-d.log" \
+        || fail "aliased-root: a trailing separator on a root changed the key"
+    trailing_target="$(head -n 1 "$linkdep" | sed 's/:.*//')"
+    if [[ "$trailing_target" != "$compiled_target" ]]; then
+        fail "aliased-root: a trailing separator on a root respelled the depfile rule target;" \
+             "the build asked for '${compiled_target}' and the cache produced '${trailing_target}'"
+    fi
+    require_depfile_resolves "aliased-root (trailing separator)" "$linkdep"
+    echo "   a trailing separator on a root left the depfile alone: OK"
+
+    # Leg E — the OUTPUT paths spelled differently from the roots, which is the
+    # one shape where the depfile's rule target and its dependencies have
+    # different authors: the target is the `-o` path the build system named, the
+    # dependencies are what the compiler reported. Reconciliation must translate
+    # the second and not the first. Every other leg deliberately spells the
+    # outputs the same way as the roots (a real build does), which makes this the
+    # only leg that can catch a reconciler reaching into the target.
+    realobj="${aliasroot}/real/build/alias-e.o"
+    realdep="${aliasroot}/real/build/alias-e.d"
+    rm -f "$realobj" "$realdep"
+    export FASTCACHE_SOURCE_DIR="${aliasroot}/link/src" FASTCACHE_BINARY_DIR="${aliasroot}/link/build"
+    run_alias_leg "alias-e1.log" "$realsrc" "$realinc" "$realobj" "$realdep"
+    e_compiled_target="$(head -n 1 "$realdep" | sed 's/:.*//')"
+    [[ -n "$e_compiled_target" ]] || fail "aliased-root: leg E compile wrote no depfile rule"
+
+    rm -f "$realobj" "$realdep"
+    run_alias_leg "alias-e2.log" "$realsrc" "$realinc" "$realobj" "$realdep"
+    grep -q "fastcache-cc: HIT" "${workdir}/alias-e2.log" \
+        || fail "aliased-root: leg E did not reach its own entry"
+    e_replayed_target="$(head -n 1 "$realdep" | sed 's/:.*//')"
+    if [[ "$e_replayed_target" != "$e_compiled_target" ]]; then
+        fail "aliased-root: an output path spelled unlike the roots was respelled in the replayed depfile;" \
+             "the build asked for '${e_compiled_target}' and the cache produced '${e_replayed_target}'"
+    fi
+    require_depfile_resolves "aliased-root (output outside the build root spelling)" "$realdep"
+    require_phony_targets_resolve "aliased-root (phony rules)" "$realdep"
+    echo "   an output spelled unlike the roots kept its own rule target: OK"
+    echo "   -MP phony rule targets were reconciled like dependencies: OK"
+fi
+
 # --- statistics -------------------------------------------------------------
 echo "== statistics =="
 "$launcher" --show-stats || fail "--show-stats returned non-zero"

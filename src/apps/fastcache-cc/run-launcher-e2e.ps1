@@ -50,7 +50,8 @@ param(
     [string]$DeepTemp,
     [string]$ShallowTemp,
     [string]$MoveTemp,
-    [string]$EditTemp
+    [string]$EditTemp,
+    [string]$AliasTemp
 )
 
 $ErrorActionPreference = "Stop"
@@ -74,14 +75,21 @@ if (-not (Test-Path $Launcher))   { Write-Host "fastcache-cc not found: $Launche
 # headers as outside both roots, which empties the keyed dependency set AND makes
 # the replay guard skip the very paths it exists to check. A moved header then
 # keys identically and nothing reports it (measured: "dependency set: 0 of 1
-# reported path(s) keyed"). That is a launcher limitation — issue #66, see
-# AGENT.md — and not what these cases are here to measure.
+# reported path(s) keyed"). That was a launcher limitation — issue #66, since
+# fixed by resolving both the roots and every emitted path through the filesystem
+# — and it is still not what these cases are here to measure.
 #
-# The build tree is the fix rather than expanding the short name, because there is
-# no dependable way to expand one: Resolve-Path, Get-Item and
-# [IO.Path]::GetFullPath all preserve it, and Scripting.FileSystemObject was tried
-# and echoed it back unchanged. No checkout reached through a short name would
-# have built here in the first place.
+# So the roots stay unambiguous here even though the launcher now reconciles them:
+# every case above would otherwise be testing the reconciliation as well as its own
+# property, and a regression in either would present as a failure of the other. The
+# reconciliation has a case of its own instead ("aliased source root"), which
+# creates the second spelling deliberately with `subst`.
+#
+# The build tree is used rather than an expanded short name because there is no
+# dependable way to expand one: Resolve-Path, Get-Item and [IO.Path]::GetFullPath
+# all preserve it, and Scripting.FileSystemObject was tried and echoed it back
+# unchanged. That is also why the aliased-root case substitutes a drive rather than
+# asking for an 8.3 name it cannot be sure exists.
 
 # Start-Process resolves a relative -FilePath against the PROCESS working
 # directory, not PowerShell's, so a caller passing "out/build/..." would get a
@@ -100,13 +108,14 @@ if (-not $PSBoundParameters.ContainsKey('DeepTemp'))    { $DeepTemp    = Join-Pa
 if (-not $PSBoundParameters.ContainsKey('ShallowTemp')) { $ShallowTemp = Join-Path $scratch "shallow" }
 if (-not $PSBoundParameters.ContainsKey('MoveTemp'))    { $MoveTemp    = Join-Path $scratch "move" }
 if (-not $PSBoundParameters.ContainsKey('EditTemp'))    { $EditTemp    = Join-Path $scratch "edit" }
+if (-not $PSBoundParameters.ContainsKey('AliasTemp'))   { $AliasTemp   = Join-Path $scratch "alias" }
 
 # Belt and braces, and it covers the caller too: a root passed explicitly is
 # honoured verbatim, so `-MoveTemp scratch/move` would reintroduce exactly the
 # split above. Rooting every one of them here means the cases cannot silently
 # degrade into testing clang-cl only — the failure mode this guard exists for is
 # a PASS on one driver and a meaningless comparison on the other.
-foreach ($name in 'DeepTemp', 'ShallowTemp', 'MoveTemp', 'EditTemp') {
+foreach ($name in 'DeepTemp', 'ShallowTemp', 'MoveTemp', 'EditTemp', 'AliasTemp') {
     $value = Get-Variable -Name $name -ValueOnly
     if (-not [System.IO.Path]::IsPathRooted($value)) {
         Set-Variable -Name $name -Value (Join-Path (Get-Location).Path $value)
@@ -196,6 +205,44 @@ function Invoke-LauncherWithEnv([string]$compiler, [string]$srcRoot, [string]$bu
     Set-Item -Path "env:$name" -Value $value
     try   { return Invoke-Launcher $compiler $srcRoot $buildTree $obj }
     finally { Remove-Item -Path "env:$name" -ErrorAction SilentlyContinue }
+}
+
+# Map a free drive letter onto $target, giving one directory a SECOND spelling.
+#
+# `subst` is used rather than an 8.3 short name because a short name cannot be
+# produced on demand: 8.3 creation is disabled on many volumes, and no PowerShell
+# API dependably returns one (Resolve-Path, Get-Item and [IO.Path]::GetFullPath
+# all preserve whatever they were given; Scripting.FileSystemObject was tried and
+# echoed the input back). A substituted drive reproduces the same condition — one
+# directory, two spellings, and `cl` resolving an include through the filesystem
+# while clang-cl echoes the spelling it was handed.
+#
+# Returns the drive letter with its colon (e.g. "X:"), or $null when no letter is
+# free or `subst` is unavailable, which is a skip rather than a failure.
+function New-SubstDrive([string]$target) {
+    # Probed rather than invoked blind: $ErrorActionPreference is "Stop", so a
+    # missing subst.exe would be a TERMINATING error and would take the whole
+    # script down instead of skipping one case.
+    if (-not (Get-Command subst -ErrorAction SilentlyContinue)) { return $null }
+    $used = @((Get-PSDrive -PSProvider FileSystem).Name)
+    foreach ($letter in 'X','Y','W','V','U','T') {
+        if ($used -contains $letter) { continue }
+        # Guarded, and the $LASTEXITCODE check below is why: from PowerShell 7.4
+        # $PSNativeCommandUseErrorActionPreference defaults to $true, so a native
+        # command's non-zero exit is a TERMINATING error under the
+        # $ErrorActionPreference = "Stop" set at the top of this file. Unguarded,
+        # a drive letter subst declines would abort the whole script — there is no
+        # catch on the outer try/finally — instead of skipping one case.
+        try { & subst "${letter}:" $target 2>&1 | Out-Null } catch { continue }
+        if ($LASTEXITCODE -eq 0) { return "${letter}:" }
+    }
+    return $null
+}
+
+function Remove-SubstDrive([string]$drive) {
+    # Same guard, and it matters more here: this runs from a `finally`, where a
+    # throw would replace whatever the case was actually reporting.
+    if ($drive) { try { & subst /D $drive 2>&1 | Out-Null } catch { } }
 }
 
 function Get-Outcome([string]$stderr) {
@@ -519,6 +566,95 @@ try {
             }
             $exit = 1
         }
+
+        # --- a root spelled differently from what the driver emits -----------
+        # Every root test in the launcher is a string prefix comparison, so a root
+        # whose spelling differs from the one the compiler echoes back matches
+        # NOTHING it emits. Three mechanisms then fail at once and conceal each
+        # other: the keyed dependency set is empty (so a moved header keys
+        # identically, and the case above passes for the wrong reason), the replay
+        # guard classifies every path as toolchain and probes none of them, and the
+        # stored value keeps this machine's absolute paths. The launcher reports
+        # ordinary hits throughout — issue #66, measured on a GitHub runner where
+        # %TEMP% carries an 8.3 short component.
+        #
+        # The ROOTS are the substituted spelling and the compile is driven entirely
+        # through it, which is the measured shape: `cl` resolves an include through
+        # the filesystem and reports the real path, so a subst-spelled root matches
+        # nothing it emits, while clang-cl echoes what it was handed and matches
+        # everything. Both drivers run, and the case only means something because
+        # they disagree.
+        #
+        # Direct mode is off because this is about the PREPROCESSED key:
+        # KeyDependencySet and the "dependency set: N of M reported path(s) keyed"
+        # line exist only on that path, and a direct hit reaches the object without
+        # ever computing them.
+        Write-Host "=== launcher aliased source root ($cc) ==="
+        Remove-Item -Recurse -Force $AliasTemp -ErrorAction SilentlyContinue
+        $aliasSrc = New-Tree $AliasTemp
+        $aliasBuild = Join-Path $AliasTemp "build"
+        New-Item -ItemType Directory -Force $aliasBuild | Out-Null
+        $drive = New-SubstDrive $AliasTemp
+        if (-not $drive) {
+            Write-Host "  subst unavailable or no free drive letter; skipping ($cc)" -ForegroundColor Yellow
+        } else {
+            $env:FASTCACHE_NO_DIRECT = "1"
+            try {
+                $substSrc = Join-Path "$drive\" "src"
+                $substBuild = Join-Path "$drive\" "build"
+                $aliasObj = Join-Path $aliasBuild "u.obj"
+
+                # Leg 1, through the substituted spelling: this is the leg that
+                # fails before the fix, and it fails silently.
+                #
+                # Both legs name the object by its REAL path, and that is not
+                # incidental: a fused `/Fo<path>` is treated as an option and left
+                # verbatim in the key (`RelativizeOne` splits only the include-dir
+                # prefixes), so spelling it two ways would key the legs apart for a
+                # reason that has nothing to do with root reconciliation and would
+                # make this case fail whether or not the fix works. Everything the
+                # case does measure — the source argument, the include path, and
+                # every path `/showIncludes` reports — still differs between them.
+                $rAlias = Invoke-Launcher $cc $substSrc $substBuild $aliasObj
+                $oAlias = Get-Outcome $rAlias.stderr
+
+                # "0 of M" is the signature, and it is a DIFFERENT fault from
+                # "0 of 0" (a driver that reported nothing on the preprocess line).
+                $emptySet = $rAlias.stderr -match "dependency set: 0 of [1-9]"
+                $keyedSet = $rAlias.stderr -match "dependency set: [1-9]\d* of [1-9]"
+                # Matched against the launcher's actual wording. A pattern that
+                # matches nothing makes the `-not $warned` half of the pass
+                # condition vacuously true, which is a check that cannot fail.
+                $warned   = $rAlias.stderr -match "do not contain this translation unit"
+
+                # Leg 2, through the real spelling: same tree, same relative
+                # layout, so it must reach leg 1's entry. Before the fix the two
+                # legs keyed apart on `cl` and this MISSed.
+                Remove-Item $aliasObj -Force -ErrorAction SilentlyContinue
+                $rReal = Invoke-Launcher $cc $aliasSrc $aliasBuild $aliasObj
+                $oReal = Get-Outcome $rReal.stderr
+
+                if ($rAlias.code -eq 0 -and $oAlias -eq "MISS" -and $keyedSet -and -not $emptySet `
+                    -and -not $warned -and $oReal -eq "HIT" -and (Test-Path $aliasObj)) {
+                    Write-Host "  two spellings of one source root share a key: OK ($cc)" -ForegroundColor Green
+                } else {
+                    $why = "  ALIASED-ROOT FAIL ($cc): alias=$oAlias keyed=$keyedSet empty=$emptySet" `
+                         + " warned=$warned real=$oReal"
+                    Write-Host $why -ForegroundColor Red
+                    # The launcher's own trace: this case can only fail in ways
+                    # invisible from outside, exactly like the moved-header one.
+                    Write-Host "  subst root: $substSrc  real root: $aliasSrc"
+                    foreach ($leg in @(@{n="alias"; r=$rAlias}, @{n="real"; r=$rReal})) {
+                        Write-Host "  --- $($leg.n) ---" -ForegroundColor Yellow
+                        if ($leg.r) { Write-Host $leg.r.stderr }
+                    }
+                    $exit = 1
+                }
+            } finally {
+                Remove-Item Env:\FASTCACHE_NO_DIRECT -ErrorAction SilentlyContinue
+                Remove-SubstDrive $drive
+            }
+        }
     }
 
     # --- CLI surface --------------------------------------------------------
@@ -553,7 +689,7 @@ try {
 }
 finally {
     $server | Stop-Process -Force -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force $DeepTemp,$ShallowTemp,$MoveTemp,$EditTemp -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $DeepTemp,$ShallowTemp,$MoveTemp,$EditTemp,$AliasTemp -ErrorAction SilentlyContinue
     Remove-Item Env:\FASTCACHE_ADDR,Env:\FASTCACHE_SOURCE_DIR,Env:\FASTCACHE_BINARY_DIR,Env:\FASTCACHE_VERBOSE -ErrorAction SilentlyContinue
 }
 
