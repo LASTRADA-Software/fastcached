@@ -44,6 +44,12 @@ fastcached --storage-max-value=512M
 | `cl` | MSVC | `/Fo` | `/showIncludes` on **stderr** |
 | `clang-cl` | MSVC | `/Fo` | `/showIncludes` on **stdout** |
 
+The stream column describes a *compile* run, which is what the replay path
+reproduces. It does not describe the key probe, and nothing keys off it: a
+preprocess-only run moves the notes (clang-cl puts them on stderr under `/EP`,
+so that they do not corrupt the preprocessed stdout), so the probe splits stdout
+unconditionally and reads notes from both streams rather than guessing.
+
 Version-suffixed (`g++-14`, `clang-18`) and `.exe` forms are recognised. Any
 other `argv[0]` is treated as unknown and passed straight through uncached.
 

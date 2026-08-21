@@ -47,9 +47,12 @@ struct ProbeText
 /// exactly as PathCanon's region walkers preserve non-matching lines: the result
 /// is hashed, so a normalization here would be a silent re-keying.
 ///
-/// Recognises a note exactly as ParseIncludePaths does — both read
-/// `IncludeNoteMarker`, and anywhere in the line rather than only at its start,
-/// because `cl` indents by nesting depth.
+/// Recognises a note exactly as ParseIncludePaths does, because both call
+/// `IncludeNotePath` — the *rule*, not merely the marker, is what the two have
+/// to share. It is anchored after leading blanks (`cl` indents by nesting depth)
+/// and nowhere else: a rule matching the marker mid-line would delete an ordinary
+/// source line that merely contains the text from the hashed bytes, so two
+/// revisions differing only in such a string literal would key identically.
 ///
 /// Pure: touches no filesystem.
 ///
@@ -64,6 +67,11 @@ struct ProbeText
 /// a key must be free of machine-specific detail, or two checkouts of the same
 /// content stop sharing entries:
 ///
+/// Every path is put through DirectManifest's `NormalizePath` first, so a `..`
+/// segment or a mixed separator cannot make one header into two entries — or, on
+/// two machines whose generators spell an include directory differently, into two
+/// keys for identical content. Then:
+///
 /// - A path under either root canonicalizes to a `<SRCROOT>/...` or
 ///   `<BUILDTREE>/...` token and is kept. These are the project's own headers —
 ///   the ones that move, and the whole reason this set exists.
@@ -71,10 +79,13 @@ struct ProbeText
 ///   against the compile's working directory, so it names the same file on any
 ///   machine that runs the same build. Note this must be decided before the
 ///   absolute test rather than after it.
-/// - An **absolute path under neither root is dropped**. It is toolchain or system
-///   content, and it is covered collectively by the compiler identity already in
-///   the key. Hashing it would mean two machines with the same compiler but
-///   different install prefixes (`/usr/include/c++/16` against
+/// - **Toolchain content is dropped**, judged by DirectManifest's
+///   `IsToolchainHeader` so that this filter, the manifest's and the replay
+///   guard's cannot disagree: an absolute path under neither root, *and* a vcpkg
+///   tree nested under the build tree, which canonicalizes but is still the
+///   producing machine's. It is covered collectively by the compiler identity
+///   already in the key, and hashing it would mean two machines with the same
+///   compiler but different install prefixes (`/usr/include/c++/16` against
 ///   `/opt/gcc-16/include`) share *nothing at all* — a full duplicate entry set
 ///   for every translation unit. This is the same split DirectManifest makes for
 ///   the same reason (see its header: 476 of a real TU's 635 headers are

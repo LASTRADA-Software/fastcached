@@ -25,15 +25,6 @@ enum class Flavor : std::uint8_t
     Clang,   ///< clang / clang++ — GNU driver, depfile via -MD -MF.
 };
 
-/// Which stream a driver reports header dependencies on, when it reports them
-/// inline rather than into a depfile.
-enum class IncludeStream : std::uint8_t
-{
-    None,   ///< Dependencies go to a depfile, not a stream.
-    Stdout, ///< Notes are printed on stdout (clang-cl).
-    Stderr, ///< Notes are printed on stderr (cl).
-};
-
 /// How one compiler driver spells the options the launcher needs.
 ///
 /// This is the data behind the parser: adding a driver is adding a row to the
@@ -62,12 +53,20 @@ struct DriverSpec
     /// is what makes that affordable: measured at +1.5% on a 45 ms preprocess,
     /// because the compiler has already opened every one of those files.
     ///
-    /// When `usesDepfile`, the probe's depfile path is appended after these; the
-    /// stream drivers report on `includeStream` instead and need no path.
+    /// When `usesDepfile`, the probe's depfile path is appended after these; a
+    /// stream driver reports inline and needs no path.
     std::span<std::string_view const> dependencyProbeFlags;
-    /// Where inline dependency notes appear, if anywhere.
-    IncludeStream includeStream { IncludeStream::None };
     /// True when dependencies are emitted into a depfile (`-MF <path>`).
+    ///
+    /// There is deliberately no companion field naming *which* stream an inline
+    /// reporter uses. There was, and nothing could safely interpret it: a
+    /// per-driver stream is a property of the COMPILE run, while the launcher's
+    /// two consumers of notes read a different command line each — the key probe
+    /// (`/EP`, where clang-cl moves its notes to stderr so they do not corrupt the
+    /// preprocessed stdout) and the replay path (which tags both captured streams
+    /// with the ShowIncludes grammar rather than choosing). Both therefore read
+    /// both streams, and a descriptor row nothing interprets is how the two drifted
+    /// apart in the first place.
     bool usesDepfile { false };
 };
 
@@ -122,8 +121,8 @@ struct ParsedCommand
 /// @param dependencyProbePath Where a depfile driver writes the probe's
 ///                            dependencies, and the request for the probe itself:
 ///                            empty asks for no dependency reporting at all. A
-///                            stream driver reports on `includeStream` and reads
-///                            nothing out of this but the request.
+///                            stream driver reports inline and reads nothing out
+///                            of this but the request.
 /// @return The preprocess invocation, argv[0] being the compiler.
 [[nodiscard]] std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
                                                          std::span<std::string const> argv,

@@ -59,6 +59,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -577,15 +578,20 @@ struct SourceProbe
         return probe;
     }
 
-    // A stream driver reports on stdout (clang-cl) or stderr (cl). Splitting the
-    // one that ALSO carries the preprocessed text is what keeps a note — which
-    // names an absolute path — from being hashed into the key as if it were source.
-    if (driver.includeStream == Cc::IncludeStream::Stdout)
-    {
-        auto split = Cc::SplitIncludeNotes(run.out);
-        return SourceProbe { .preprocessed = std::move(split.preprocessed), .dependencyPaths = std::move(split.notePaths) };
-    }
-    return SourceProbe { .preprocessed = run.out, .dependencyPaths = Cc::ParseIncludePaths(run.err) };
+    // A stream driver's notes are taken from BOTH streams, and stdout is split
+    // unconditionally — `DriverSpec::includeStream` describes the COMPILE run and
+    // must not be trusted here. Measured: `clang-cl /c /showIncludes` puts notes
+    // on stdout, but `clang-cl /EP /showIncludes` — the probe's own line — puts
+    // them on STDERR, because clang deliberately moves them off the stream the
+    // preprocessed text is using (LLVM D46394). Routing by the table therefore
+    // read an empty set on clang-cl and made this whole key input a no-op there.
+    // Guessing is what RecordManifest already refuses to do for the same question,
+    // and the split is a byte-exact no-op on a stream that carries no notes.
+    auto split = Cc::SplitIncludeNotes(run.out);
+    auto errorNotes = Cc::ParseIncludePaths(run.err);
+    split.notePaths.insert(
+        split.notePaths.end(), std::make_move_iterator(errorNotes.begin()), std::make_move_iterator(errorNotes.end()));
+    return SourceProbe { .preprocessed = std::move(split.preprocessed), .dependencyPaths = std::move(split.notePaths) };
 }
 
 /// A stable-ish compiler identity: its version banner. cl prints it on /? or on

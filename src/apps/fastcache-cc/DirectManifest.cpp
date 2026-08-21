@@ -9,9 +9,11 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -33,25 +35,6 @@ namespace
         R"(\vcpkg_installed\)",
         R"(\vcpkg\installed\)",
     };
-
-    /// Collapse a compiler-emitted include path to one stable form.
-    ///
-    /// `/showIncludes` echoes the path as *resolved*, which preserves whatever the
-    /// `#include` spelling contained: `D:\src\AppCore\../applib/Widget.hpp`, mixed
-    /// separators, and doubled slashes all occur in real output. Two spellings of
-    /// the same header must produce one canonical token, or a manifest entry
-    /// recorded via one spelling would never validate against the other.
-    ///
-    /// Deliberately LEXICAL, not `weakly_canonical`: touching the filesystem also
-    /// rewrites 8.3 short components to their long form (`SOMEUS~1.PRO` becomes
-    /// `some.user.profile`), and a path so rewritten no longer shares a prefix with
-    /// a source root spelled the other way — which silently drops every project
-    /// header from the manifest. Lexical normalization removes `..` and unifies
-    /// separators without altering the path's identity.
-    [[nodiscard]] std::string NormalizePath(std::string_view rawPath)
-    {
-        return std::filesystem::path { rawPath }.lexically_normal().make_preferred().string();
-    }
 
     /// Fold a path to a comparable form: lowercased, with every separator unified.
     ///
@@ -266,13 +249,37 @@ std::string HashFileContents(std::string_view absolutePath)
     return std::format("{:08x}{:016x}", Crc32c::Finalise(state), length);
 }
 
+std::string NormalizePath(std::string_view rawPath)
+{
+    return std::filesystem::path { rawPath }.lexically_normal().make_preferred().string();
+}
+
+std::optional<std::string_view> IncludeNotePath(std::string_view line) noexcept
+{
+    if (!line.empty() && line.back() == '\r')
+        line.remove_suffix(1);
+
+    auto const start = line.find_first_not_of(" \t");
+    if (start == std::string_view::npos)
+        return std::nullopt;
+
+    auto path = line.substr(start);
+    if (!path.starts_with(IncludeNoteMarker))
+        return std::nullopt;
+
+    path.remove_prefix(IncludeNoteMarker.size());
+    while (!path.empty() && (path.front() == ' ' || path.front() == '\t'))
+        path.remove_prefix(1);
+    while (!path.empty() && (path.back() == ' ' || path.back() == '\t'))
+        path.remove_suffix(1);
+    return path;
+}
+
 std::vector<std::string> ParseIncludePaths(std::string_view showIncludesText)
 {
-    // The remainder of the line after the marker is the path, indented by
-    // nesting depth. The marker itself lives in the header — SplitIncludeNotes
-    // must recognise exactly the lines this collects.
-    constexpr std::string_view Marker = IncludeNoteMarker;
-
+    // Recognition lives in IncludeNotePath, not here: SplitIncludeNotes removes
+    // exactly the lines this collects, and a rule spelled twice is a rule the two
+    // can drift apart on — which for the splitter means a note hashed as source.
     std::vector<std::string> paths;
     std::size_t offset = 0;
     while (offset < showIncludesText.size())
@@ -280,23 +287,11 @@ std::vector<std::string> ParseIncludePaths(std::string_view showIncludesText)
         auto lineEnd = showIncludesText.find('\n', offset);
         if (lineEnd == std::string_view::npos)
             lineEnd = showIncludesText.size();
-        auto line = showIncludesText.substr(offset, lineEnd - offset);
+        auto const line = showIncludesText.substr(offset, lineEnd - offset);
         offset = lineEnd + 1;
 
-        if (!line.empty() && line.back() == '\r')
-            line.remove_suffix(1);
-
-        auto const marker = line.find(Marker);
-        if (marker == std::string_view::npos)
-            continue;
-
-        auto path = line.substr(marker + Marker.size());
-        while (!path.empty() && (path.front() == ' ' || path.front() == '\t'))
-            path.remove_prefix(1);
-        while (!path.empty() && (path.back() == ' ' || path.back() == '\t'))
-            path.remove_suffix(1);
-        if (!path.empty())
-            paths.emplace_back(path);
+        if (auto const path = IncludeNotePath(line); path.has_value() && !path->empty())
+            paths.emplace_back(*path);
     }
     return paths;
 }
@@ -453,7 +448,18 @@ std::string ComputeManifestKey(std::string_view canonicalSource,
                                std::string_view toolchainStamp)
 {
     std::string blob;
-    blob += "manifest-v1";
+    // v2 tracks `objkey-v2` and MUST be bumped with it, even though nothing about
+    // the manifest's own shape changed. A manifest stores the object key BY
+    // VALUE, and its own key is a function of (canonical source, relativized
+    // args, toolchain stamp) — none of which the object-key schema touches — so a
+    // manifest written by a v1 launcher is still found, still validates, and
+    // still points at a v1 object. Direct mode is on by default and short-circuits
+    // before the preprocessed path, so without this bump the re-key that
+    // `objkey-v2` exists to force never happens on the default path: on Windows
+    // that means the entries written while `/EP /P` sent the preprocessed text to
+    // a file — the ones carrying no content from the source at all — keep being
+    // served indefinitely.
+    blob += "manifest-v2";
     blob.push_back('\x00');
     blob += toolchainStamp;
     blob.push_back('\x00');

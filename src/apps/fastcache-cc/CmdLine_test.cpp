@@ -278,13 +278,12 @@ TEST_CASE("ParseCommand refuses a compile with no explicit object output")
     CHECK(Parse({ "cl.exe", "/c", "a.cpp", "/Foa.obj" }).parsedOk);
 }
 
-TEST_CASE("DriverOf reports where each driver reports its dependencies")
+TEST_CASE("DriverOf reports how each driver reports its dependencies")
 {
-    // cl prints /showIncludes notes on stderr, clang-cl on stdout; the GNU
-    // drivers do not print them at all and use a depfile instead.
-    CHECK(DriverOf(Flavor::Cl).includeStream == IncludeStream::Stderr);
-    CHECK(DriverOf(Flavor::ClangCl).includeStream == IncludeStream::Stdout);
-    CHECK(DriverOf(Flavor::Gcc).includeStream == IncludeStream::None);
+    // The GNU drivers write a depfile; the MSVC ones print notes inline. WHICH
+    // stream an inline reporter uses is deliberately not in the table: it differs
+    // between a compile run and a preprocess-only run, so both readers take both
+    // streams rather than choosing (see DriverSpec::usesDepfile).
     CHECK(DriverOf(Flavor::Gcc).usesDepfile);
     CHECK(DriverOf(Flavor::Clang).usesDepfile);
     CHECK_FALSE(DriverOf(Flavor::Cl).usesDepfile);

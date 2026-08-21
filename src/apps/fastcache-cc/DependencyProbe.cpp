@@ -3,6 +3,8 @@
 #include "DirectManifest.hpp"
 
 #include <algorithm>
+#include <cstddef>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -14,28 +16,6 @@ namespace FastCache::Cc
 
 namespace
 {
-    /// Strip a trailing `\r` so a note is recognised on either line ending.
-    /// @param line One line, without its `\n`.
-    /// @return The line without a CR terminator.
-    [[nodiscard]] std::string_view WithoutCarriageReturn(std::string_view line) noexcept
-    {
-        if (!line.empty() && line.back() == '\r')
-            line.remove_suffix(1);
-        return line;
-    }
-
-    /// Trim ASCII blanks from both ends of a note's path span.
-    /// @param path The text following the note marker.
-    /// @return The path proper.
-    [[nodiscard]] std::string_view TrimBlanks(std::string_view path) noexcept
-    {
-        while (!path.empty() && (path.front() == ' ' || path.front() == '\t'))
-            path.remove_prefix(1);
-        while (!path.empty() && (path.back() == ' ' || path.back() == '\t'))
-            path.remove_suffix(1);
-        return path;
-    }
-
     /// Rewrite backslash separators to forward slashes.
     ///
     /// Only ever applied to a relative path being folded into the key. Canonical
@@ -46,10 +26,8 @@ namespace
     /// @return The path with `/` separators.
     [[nodiscard]] std::string WithPosixSeparators(std::string_view path)
     {
-        std::string out;
-        out.reserve(path.size());
-        for (char const c: path)
-            out.push_back(c == '\\' ? '/' : c);
+        std::string out { path };
+        std::ranges::replace(out, '\\', '/');
         return out;
     }
 
@@ -63,17 +41,42 @@ namespace
         if (raw.empty())
             return {};
 
-        auto canon = PathCanon::Canonicalize(raw, layout);
-        // Canonicalize returns its input verbatim for a path under neither root,
-        // so a sentinel is what says the path was actually rewritten.
-        if (canon.has_value() && canon->starts_with('<'))
-            return *std::move(canon);
+        // Normalized BEFORE anything is decided, exactly as BuildManifest does and
+        // for the reason NormalizePath states: a driver echoes a path as resolved,
+        // so `.`/`..` segments and mixed separators arrive verbatim. Skipping this
+        // makes `<BUILDTREE>/../inc/a.hpp` and `<SRCROOT>/inc/a.hpp` two key
+        // entries for one header — and, across two machines whose generators spell
+        // an include directory differently, two keys for identical content.
+        //
+        // std::filesystem normalizes to the HOST's preferred separator, but every
+        // test below is the LAYOUT's, so the layout's own convention is put back
+        // first: on a Windows host a POSIX path returns backslash-separated, and
+        // `IsAbsoluteForLayout` — which for a POSIX layout asks only about a
+        // leading `/` — would then read an absolute toolchain path as relative and
+        // hash it. That is the host coupling PathCanon.hpp forbids in as many
+        // words ("Derived from the LAYOUT, never from the host").
+        auto path = NormalizePath(raw);
+        if (!PathCanon::IsWindowsLayout(layout))
+            std::ranges::replace(path, '\\', '/');
 
         // Relative before absolute: a relative path lies under no root either, and
         // asking the absolute test second is what keeps it from being dropped with
         // the toolchain headers.
-        if (!PathCanon::IsAbsoluteForLayout(raw, layout))
-            return WithPosixSeparators(raw);
+        if (!PathCanon::IsAbsoluteForLayout(path, layout))
+            return WithPosixSeparators(path);
+
+        // The classifier the manifest and the replay guard already use, so all
+        // three agree on what "toolchain" means — including a vcpkg tree nested
+        // under the build tree, which canonicalizes but is still the producing
+        // machine's spelling of content the compiler identity already covers.
+        if (IsToolchainHeader(path, layout))
+            return {};
+
+        // Canonicalize returns its input verbatim for a path it did not rewrite,
+        // so inequality — not the spelling of a sentinel PathCanon keeps private —
+        // is what says a token was produced.
+        if (auto canon = PathCanon::Canonicalize(path, layout); canon.has_value() && *canon != path)
+            return *std::move(canon);
         return {};
     }
 } // namespace
@@ -93,18 +96,22 @@ ProbeText SplitIncludeNotes(std::string_view text)
 
         // The line WITH its terminator, so a non-note is reproduced byte-for-byte.
         auto const whole = text.substr(offset, (terminated ? lineEnd + 1 : lineEnd) - offset);
-        auto const line = WithoutCarriageReturn(text.substr(offset, lineEnd - offset));
+        auto const line = text.substr(offset, lineEnd - offset);
         offset = terminated ? lineEnd + 1 : text.size();
 
-        auto const marker = line.find(IncludeNoteMarker);
-        if (marker == std::string_view::npos)
+        // Recognition is IncludeNotePath's, shared with ParseIncludePaths, and it
+        // is anchored: this stream also carries preprocessed SOURCE, so a rule
+        // that matched the marker mid-line would delete an ordinary line holding
+        // that text from the bytes the key is computed over.
+        auto const path = IncludeNotePath(line);
+        if (!path.has_value())
         {
             out.preprocessed += whole;
             continue;
         }
 
-        if (auto const path = TrimBlanks(line.substr(marker + IncludeNoteMarker.size())); !path.empty())
-            out.notePaths.emplace_back(path);
+        if (!path->empty())
+            out.notePaths.emplace_back(*path);
     }
     return out;
 }

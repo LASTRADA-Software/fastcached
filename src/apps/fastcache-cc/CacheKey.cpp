@@ -4,12 +4,14 @@
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Crc32c.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <format>
 #include <ranges>
 #include <string>
+#include <vector>
 
 namespace FastCache::Cc
 {
@@ -144,6 +146,16 @@ std::string ComputeKey(KeyInputs const& inputs)
     // KeyInputs::dependencyPaths). Every entry written by a v1 launcher therefore
     // misses once and is rewritten — the one-time cost the tag exists to make safe.
     std::string blob;
+    // Sized up front. The preprocessed text alone runs to megabytes, and without
+    // this the single `push_back` that follows it reallocates a buffer that had
+    // just been grown to fit it exactly — one extra full-length copy per
+    // translation unit, on the launcher's hot path, to append one byte.
+    auto const argBytes = [](std::vector<std::string> const& list) {
+        return std::ranges::fold_left(
+            list, std::size_t { 0 }, [](std::size_t n, std::string const& s) { return n + s.size() + 1; });
+    };
+    blob.reserve(inputs.compilerId.size() + inputs.preprocessed.size() + argBytes(inputs.relativizedArgs)
+                 + argBytes(inputs.dependencyPaths) + 32);
     blob += "objkey-v2";
     blob.push_back('\x00');
     blob += inputs.compilerId;

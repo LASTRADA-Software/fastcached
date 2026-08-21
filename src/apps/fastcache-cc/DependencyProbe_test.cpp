@@ -149,3 +149,53 @@ TEST_CASE("SplitIncludeNotes leaves a stream that carries no notes alone")
     CHECK(out.preprocessed == "#pragma once\nint x = 1;\n");
     CHECK(out.notePaths.empty());
 }
+
+TEST_CASE("SplitIncludeNotes keeps a source line that merely contains the marker")
+{
+    // The input is preprocessed SOURCE, not a pure note stream, and a rule that
+    // matched the marker anywhere in the line deleted the whole line from the
+    // bytes the key is computed over. Two revisions of a file differing only in
+    // such a literal then key identically and the second is served the first's
+    // object — a silent wrong build. This repository's own sources contain the
+    // literal, so it was reachable while building fastcached itself.
+    constexpr std::string_view First = "char const* s = \"Note: including file: /usr/include/aaa.h\";\n";
+    constexpr std::string_view Second = "char const* s = \"Note: including file: /usr/include/bbb.h\";\n";
+
+    auto const first = SplitIncludeNotes(First);
+    auto const second = SplitIncludeNotes(Second);
+
+    CHECK(first.preprocessed == First);
+    CHECK(second.preprocessed == Second);
+    CHECK(first.preprocessed != second.preprocessed);
+    CHECK(first.notePaths.empty());
+    CHECK(second.notePaths.empty());
+}
+
+TEST_CASE("KeyDependencySet collapses two spellings of one header into one entry")
+{
+    // A driver echoes a dependency path as RESOLVED, so `.`/`..` segments from the
+    // include search path reach us verbatim. Without normalizing first, one header
+    // reached two ways is two key entries — and two machines whose generators spell
+    // an include directory differently compute two different keys for identical
+    // content, which is a permanent cross-machine miss.
+    auto const out = KeySet({ "/home/dev/proj/build/../inc/a.hpp", "/home/dev/proj/./inc/a.hpp" }, PosixLayout());
+
+    REQUIRE(out.size() == 1);
+    CHECK(out[0] == "<SRCROOT>/inc/a.hpp");
+}
+
+TEST_CASE("KeyDependencySet drops a toolchain tree nested under the build tree")
+{
+    // A vcpkg tree under the build tree canonicalizes, so a root test alone keeps
+    // it — but it is the producing machine's spelling of content the compiler
+    // identity already covers, and both DirectManifest and the replay guard
+    // classify it as toolchain. All three have to agree, or a vcpkg relocation
+    // re-keys every preprocessed entry while direct mode keeps hitting.
+    PathCanon::Layout const windows { .sourceRoot = R"(D:\Project)", .buildTree = R"(D:\Project\out\build\win64)" };
+    auto const out = KeySet({ R"(D:\Project\out\build\win64\vcpkg_installed\x64-windows\include\zlib.h)",
+                              R"(D:\Project\out\build\win64\generated\config.hpp)" },
+                            windows);
+
+    REQUIRE(out.size() == 1);
+    CHECK(out[0] == "<BUILDTREE>/generated/config.hpp");
+}
