@@ -252,6 +252,46 @@ These constraints are load-bearing and have each already been a bug:
     launcher itself does not normalize, which is issue #66: the fix has to normalize *both*
     sides or neither, since expanding only the emitted paths breaks clang-cl exactly as
     spelling only the root long breaks `cl`.
+- **A flag's value is relativized off one table, or it is relativized in one spelling
+  only.** A path-valued flag can be written two ways — `/Fo <path>` and `/Fo<path>` —
+  and the separated form needs no table at all: the value is a bare argument, so it
+  reaches the source-path branch on its own. Only the *fused* form has to be split, and
+  the table that split it listed the include-dir prefixes and nothing else. So the object
+  output was relativized in the spelling nobody uses and left absolute in the spelling
+  **every** build system driving MSVC writes, which put the producing machine's object
+  path into every Windows key: two checkouts at different roots could never share an
+  entry, and the launcher's whole reason for existing was off on that platform. It passed
+  unnoticed because the unit test asserting `/`-still-introduces-an-option happened to use
+  the separated form, and because the Windows cross-depth e2e case was hitting an entry an
+  earlier case had stored from the same directory with the same `/Fo` path — a spurious
+  pass that would have survived cross-depth sharing being broken outright (fixed by giving
+  each case its own string literal, the device `check_header_move` already used). The three
+  tables are now one, `CmdLine`'s `PathValueFlags()`: it answers whether a bare occurrence
+  consumes the next argument, which flag names the object output, which flags the preprocess
+  line must drop, and whose fused value the key relativizes. Consequences that are each
+  load-bearing: a row carries a **driver family**, because the family is *not* derivable
+  from the introducer — MSVC drivers accept `-` for every option, and `-MT` names a
+  dependency target for a GNU driver while selecting the static multithreaded runtime for
+  an MSVC one, so a row matched on `-` alone would make `cl -MT` swallow the source file.
+  Which *introducers* may match is still decided by the **layout**, not the host and not
+  the driver, for the reason recorded above: on POSIX a leading `/` starts an absolute
+  path, and matching `/I` there splits a checkout rooted at `/Infra`. And the drop list no
+  longer spells `/Fo` or `-MF` itself — it drops every row whose role is not `IncludeDir`,
+  so a spelling added to the table is dropped by construction rather than by someone
+  remembering the fourth place.
+  - **This did not bump `objkey-v3` / `manifest-v3`, and that is the deliberate half.**
+    The tag versions the key *construction* and the rules the stored value is written
+    under; both are unmoved, and `ComputeKey`'s golden vector is unchanged. What changed
+    is one *input*, for exactly the builds whose command line carried a machine-specific
+    string it should never have carried. Old entries stay correct in their own terms and
+    simply stop being addressed — they miss and are rewritten. The mis-serve a tag exists
+    to prevent is unreachable here: an old key could only become a new key if a build
+    literally passed the text `<BUILDTREE>`, and a `/Fo` path that was already relative
+    canonicalizes to itself and does not move at all. A bump would meanwhile invalidate
+    every POSIX entry, where nothing changed. Direct mode needs no bump either, and not by
+    luck: `ComputeManifestKey` takes the relativized args too, so a manifest key moves
+    exactly where an object key does, in lock-step, for exactly the affected builds — the
+    property whose *absence* is what forced the `manifest-v2`/`v3` bumps.
 - **A key that is 128 bits wide is not a key with 128 bits of strength, and four
   lanes of one polynomial are one lane.** The object key was four CRC32C digests of
   the same blob, distinguished only by a leading salt byte. CRC is affine over
