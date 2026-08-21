@@ -1,16 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CacheKey.hpp"
 #include "DirectManifest.hpp"
+#include "KeyDigest.hpp"
+#include "KeyDigestTestSupport.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <ranges>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
 
 using namespace FastCache::Cc;
+using FastCache::Cc::Test::DigestQuarters;
+using FastCache::Cc::Test::SplitMix64;
 
 namespace
 {
@@ -204,7 +214,7 @@ TEST_CASE("ComputeManifestKey is stable and separates differing inputs")
     std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };
     auto const base = ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51");
 
-    CHECK(base.size() == 32);
+    CHECK(base.size() == KeyDigest::HexLength);
     CHECK(base == ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51"));
 
     // Each input must participate: changing any one changes the key.
@@ -217,7 +227,7 @@ TEST_CASE("ComputeHeaderStateDigest changes when any header hash changes")
 {
     auto manifest = SampleManifest();
     auto const base = ComputeHeaderStateDigest("mkey", manifest);
-    CHECK(base.size() == 32);
+    CHECK(base.size() == KeyDigest::HexLength);
 
     // The whole point of direct mode: an edited header must yield a different
     // object key, so the stale object is never served.
@@ -569,4 +579,141 @@ TEST_CASE("A GNU depfile drives a manifest exactly as showIncludes notes do")
     CHECK_FALSE(ValidateManifest(*built, layout, "gcc-test-1"));
 
     std::filesystem::remove_all(root);
+}
+
+// --- issue #63: the manifest key must be as wide as it looks -----------------
+//
+// The mirror of the guard in CacheKey_test.cpp, and deliberately a separate CASE
+// rather than one case covering both: these were two independently copy-pasted
+// salted-CRC constructions (this file's `Lane`/`WideDigest` and CacheKey.cpp's
+// `Lane`), and the point of consolidating them onto one digest is that a future
+// divergence is caught on both sides rather than on whichever one a test
+// happened to reach. Direct mode is on by default, so this key space is the one
+// most builds actually use. The generator and the quarter split are shared
+// (`KeyDigestTestSupport.hpp`) precisely because they must NOT diverge — two
+// copies of a "deterministic" sequence are two sequences the moment one is
+// touched, and the sample counts here are chosen against a measured collision
+// index.
+
+TEST_CASE("The quarters of a manifest key vary independently for equal-length inputs")
+{
+    // Under the salted-CRC construction each of the six pairwise XORs took
+    // exactly one value here. EQUAL LENGTH IS THE POINT: the broken construction
+    // varies freely once the lengths differ, so varying-width sources would leave
+    // a test that passes against the bug it exists to catch.
+    constexpr std::size_t Samples = 64;
+
+    SplitMix64 source { 63 };
+    std::vector<std::string> const args { "/O2" };
+    std::array<std::set<std::uint32_t>, 6> pairwiseXors;
+    for ([[maybe_unused]] auto const sample: std::views::iota(std::size_t { 0 }, Samples))
+    {
+        auto const quarters = DigestQuarters(ComputeManifestKey(source.NextFixedWidthText(), args, "cl-19.51"));
+
+        std::size_t pair = 0;
+        for (auto const i: std::views::iota(std::size_t { 0 }, quarters.size()))
+            for (auto const j: std::views::iota(i + 1, quarters.size()))
+                pairwiseXors[pair++].insert(quarters[i] ^ quarters[j]);
+    }
+
+    for (auto const index: std::views::iota(std::size_t { 0 }, pairwiseXors.size()))
+    {
+        INFO("quarter pair index " << index);
+        CHECK(pairwiseXors[index].size() == Samples);
+    }
+}
+
+TEST_CASE("The three launcher key spaces are separated by their schema tag")
+{
+    // With the salts gone, the leading schema tag is the whole of the domain
+    // separation — and it is a stronger guarantee than the salts were. A tag is
+    // NUL-free and NUL-terminated, so tag+NUL is a prefix-free code: "objkey-v3",
+    // "manifest-v3" and "header-state-v1" differ in their first byte, which makes
+    // the hashed blobs unequal by construction. A salt only made a cross-domain
+    // collision improbable; disjoint inputs make it an ordinary collision, now at
+    // 2^-128 rather than 2^-32.
+    //
+    // The inputs below are arranged so that everything after the tag is as alike
+    // as the three signatures allow, which is the case a shared digest would fail
+    // if the tags were ever dropped. All THREE are compared: the object key is the
+    // space the other two exist to point at, so leaving it out would name the
+    // property in the title and assert two thirds of it.
+    std::vector<std::string> const args {};
+    DirectManifest const manifest;
+
+    // objkey folds compilerId then preprocessed as two `Field`s, exactly as the
+    // manifest key folds toolchainStamp then canonicalSource -- so with the tags
+    // stripped these two blobs would be byte-identical.
+    auto const objectKey =
+        ComputeKey(KeyInputs { .compilerId = "same", .preprocessed = "same", .relativizedArgs = {}, .dependencyPaths = {} });
+    auto const manifestKey = ComputeManifestKey("same", args, "same");
+    auto const headerState = ComputeHeaderStateDigest("same", manifest);
+
+    CHECK(objectKey != manifestKey);
+    CHECK(objectKey != headerState);
+    CHECK(manifestKey != headerState);
+}
+
+TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
+{
+    // See the note on the matching case in CacheKey_test.cpp for what to do when
+    // this fails. The manifest key is half of a lock-step pair: it must be bumped
+    // whenever `objkey-v*` is, because a manifest stores the object key by value
+    // and its own key never sees the object-key schema.
+    std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };
+    CHECK(ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51") == "76b19c2b7caf3e0db4dcc1efcecb76aa");
+
+    // The header-state digest is deliberately NOT part of that pair: nothing is
+    // stored under it, so it has no stale entries to re-key and its tag stays at
+    // v1 while the other two move. Pinned all the same, because it is still a
+    // value two runs have to agree on.
+    DirectManifest manifest;
+    manifest.toolchainStamp = "cl 19.51.36231 x64";
+    manifest.objectKey = "0123456789abcdef0123456789abcdef";
+    manifest.entries.push_back({ .canonicalPath = "<SRCROOT>/inc/a.hpp", .contentHash = "aaaa" });
+    manifest.entries.push_back({ .canonicalPath = "<SRCROOT>/inc/b.hpp", .contentHash = "bbbb" });
+
+    CHECK(ComputeHeaderStateDigest("mkey", manifest) == "6937b8627813a98102e756fa21856149");
+}
+
+TEST_CASE("HashFileContents separates equal-length contents and reports unreadable files")
+{
+    // The direct-mode revalidation hash. It used to be one CRC32C paired with the
+    // byte count, which left 32 bits against exactly the case that matters: a
+    // header edit preserving length. A collision there does not miss -- it decides
+    // an edited header is unchanged and serves the stale object under a zero exit
+    // code (issue #63, same defect as the key itself).
+    // Cleared before it is populated, like every other filesystem case in this
+    // file. The teardown at the end does not cover a run that crashed or was
+    // interrupted, and this case asserts that `absent.hpp` is ABSENT -- so a
+    // leftover of that name would make it fail for a reason that has nothing to
+    // do with hashing.
+    auto const dir = std::filesystem::temp_directory_path() / "fc-direct-hashfile";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    auto const write = [&](std::string_view name, std::string_view contents) {
+        auto const path = dir / name;
+        std::ofstream out { path, std::ios::binary };
+        out << contents;
+        out.close();
+        return path.string();
+    };
+
+    auto const a = write("a.hpp", "static int value = 1;\n");
+    auto const b = write("b.hpp", "static int value = 2;\n");
+    auto const empty = write("empty.hpp", "");
+
+    CHECK(HashFileContents(a).size() == KeyDigest::HexLength);
+    CHECK(HashFileContents(a) == HashFileContents(a));
+    CHECK(HashFileContents(a) != HashFileContents(b));
+
+    // An unreadable file reports the empty string, and that must stay distinct
+    // from every real digest: ValidateManifest compares this value for equality,
+    // so an unreadable header must not compare equal to anything -- including a
+    // readable one that happens to be empty.
+    CHECK(HashFileContents((dir / "absent.hpp").string()).empty());
+    CHECK_FALSE(HashFileContents(empty).empty());
+
+    std::filesystem::remove_all(dir);
 }

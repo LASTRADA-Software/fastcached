@@ -120,6 +120,12 @@ enum class DirectError : std::uint8_t
 /// Hash a file's contents for manifest entry comparison. A missing or unreadable
 /// file yields an empty string, which never equals a recorded hash and so forces
 /// the safe outcome (treat the manifest as stale).
+///
+/// The same 128-bit digest the keys use. It was one CRC32C paired with the byte
+/// count, which left 32 bits against precisely the case that matters here — a
+/// header edit that preserves length — and this value is what a direct hit
+/// revalidates against, so a collision does not miss: it decides an edited header
+/// is unchanged and serves the stale object (issue #63).
 /// @param absolutePath The file to hash.
 /// @return The hash as hex, or empty on any read failure.
 [[nodiscard]] std::string HashFileContents(std::string_view absolutePath);
@@ -226,10 +232,15 @@ inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
 /// Deliberately independent of header contents: this key must be computable
 /// *before* the headers are known, from only the things available up front. The
 /// manifest it retrieves then supplies the header hashes.
+///
+/// Shares one implementation with ComputeKey (`KeyDigest`), which is what keeps
+/// the two key spaces the same shape without keeping two copies of the digest;
+/// they are separated by their leading schema tag, not by the salt bytes that
+/// used to distinguish them.
 /// @param canonicalSource Canonical token for the translation unit's path.
 /// @param relativizedArgs The compile arguments, already relativized.
 /// @param toolchainStamp  The toolchain identity.
-/// @return A stable hex digest.
+/// @return A stable 32-hex-char digest.
 [[nodiscard]] std::string ComputeManifestKey(std::string_view canonicalSource,
                                              std::vector<std::string> const& relativizedArgs,
                                              std::string_view toolchainStamp);
@@ -242,7 +253,7 @@ inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
 /// the same information into one comparable value for tests and diagnostics.
 /// @param manifestKey The key the manifest was found under.
 /// @param manifest    The manifest to digest.
-/// @return A stable hex digest over the manifest key plus every entry.
+/// @return A stable 32-hex-char digest over the manifest key plus every entry.
 [[nodiscard]] std::string ComputeHeaderStateDigest(std::string_view manifestKey, DirectManifest const& manifest);
 
 } // namespace FastCache::Cc

@@ -9,7 +9,8 @@ in-memory transport.
 ```
 src/FastCache/
   Core/         Errors taxonomy, Clock, Logger, BufferPool, Bytes, Endian,
-                Crc32c, StringHash, Owner, Profiling (Tracy wrappers)
+                Crc32c, MurmurHash3 (128-bit key digest), StringHash, Owner,
+                Profiling (Tracy wrappers)
   Async/        Task<T>, Cancellation, ResumeOn, IReactor + TestReactor and the
                 platform reactors (EpollReactor / IocpReactor / KqueueReactor)
   Net/          ISocket, IListener, IoAwaitable, IAdmissionControl, SocketAddress,
@@ -150,17 +151,18 @@ These constraints are load-bearing and have each already been a bug:
   paths, named a file that is gone. That is worse than a miss, because Ninja records the
   dependency, cannot stat it, rebuilds, hits the same value, and never converges — with a
   successful exit code every time. The dependency path set is therefore part of the key
-  (`objkey-v2`, `KeyInputs::dependencyPaths`), captured on the preprocess run the launcher
+  (`objkey-v3`, `KeyInputs::dependencyPaths`), captured on the preprocess run the launcher
   already makes rather than in a second probe: measured at **+1.5% on a 45 ms preprocess**,
   because the compiler has already opened every one of those files. A move is a different
   key by construction, so the *pre-move* entry survives the move rather than being
   overwritten — which is the property `check_header_move` asserts by moving the header
   back and requiring a HIT. Anchored as `fastcache-cc: HIT`: the launcher prints
   `STALE HIT (...); recompiling` on its way to a MISS, so a bare `grep HIT` is satisfied by
-  exactly the collapse the case exists to reject. `ComputeManifestKey`'s `manifest-v2` tag is
-  bumped in lock-step with `objkey-v2` for a related reason — a manifest stores the object key
-  *by value* and its own key never sees the object-key schema, so a v1 manifest keeps resolving
-  to a v1 object; direct mode is on by default and short-circuits before the preprocessed path,
+  exactly the collapse the case exists to reject. `ComputeManifestKey`'s `manifest-v3` tag is
+  bumped in lock-step with `objkey-v3` for a related reason — a manifest stores the object key
+  *by value* and its own key never sees the object-key schema, so a manifest written by an
+  older launcher keeps resolving to an older object; direct mode is on by default and
+  short-circuits before the preprocessed path,
   so without the second bump the re-key never happens where it matters most.
   - **Which paths are hashed is the whole subtlety, and the exclusion cuts the opposite
     way from the inclusion.** `KeyDependencySet` normalizes each path through
@@ -250,6 +252,71 @@ These constraints are load-bearing and have each already been a bug:
     launcher itself does not normalize, which is issue #66: the fix has to normalize *both*
     sides or neither, since expanding only the emitted paths breaks clang-cl exactly as
     spelling only the root long breaks `cl`.
+- **A key that is 128 bits wide is not a key with 128 bits of strength, and four
+  lanes of one polynomial are one lane.** The object key was four CRC32C digests of
+  the same blob, distinguished only by a leading salt byte. CRC is affine over
+  GF(2), so with `A` the per-byte state-update operator and `S_i` the state after
+  salt `i`, `quarter_i XOR quarter_j` is `A^len(blob) * (S_i XOR S_j)` — a value
+  that depends on the blob's *length* and on nothing else about it. Matching one
+  quarter therefore forced all four and the key carried **32 bits**. Measured
+  before the fix: one distinct XOR value across 2000 random equal-length 512-byte
+  blobs, and a full 32-hex-char collision after 86,125 equal-length inputs — the
+  birthday bound for 32 bits, against the ~10^5 entries a shared team cache
+  reaches. Equal length is not an exotic condition, it is the ordinary shape of a
+  source edit (`return 1;` → `return 2;`) and the blob is dominated by preprocessed
+  text; and the consequence is not a miss but an unrelated translation unit's object
+  file served under a **zero exit code**. Two dead ends worth not re-walking:
+  varying the salt *length* per lane does not help (still one distinct XOR value —
+  the salt only changes `S_i`), and four CRC lanes with *distinct* polynomials do
+  work but cap out below 128: three of the four best-studied CRC-32 polynomials
+  (Castagnoli, Koopman, Koopman-K/2) carry the factor `(x+1)` and only IEEE 802.3
+  does not, so the least common multiple of the four has degree 126, not 128. The
+  digest is now MurmurHash3 x64_128 in `Core/MurmurHash3.hpp` — an existing,
+  published algorithm rather than a bespoke construction, which is the whole point: its conformance is checkable
+  against SMHasher's verification value `0x6384BA69`, and a construction assembled
+  here would have nothing to be checked against. Consequences that are each
+  load-bearing: `objkey-v3` and `manifest-v3` moved together because this is one
+  invalidation event, and `HashFileContents` moved with them — it paired one CRC32C
+  with the byte count, which is 32 bits against exactly the same-length case, and it
+  is what a *direct hit* revalidates against, so a collision there does not miss, it
+  decides an edited header is unchanged. `header-state-v1` deliberately did **not**
+  move, because nothing is stored under it and a version with no work to do is the
+  mistake `PathCanon::CanonError` already records. Domain separation between the
+  three key spaces is now the leading schema tag rather than the salts, and each piece
+  of a key is **length-prefixed** (`kind`, big-endian `u64` length, bytes) rather than
+  terminated by a separator byte. That second half is not cosmetic, and it was found
+  in review of this very change: terminating a value with a byte that can occur
+  *inside* a value is not a framing at all, so `{compilerId="cc\0d", preprocessed="x"}`
+  and `{compilerId="cc", preprocessed="d\0x"}` digested identically — the same silent
+  cross-TU mis-serve, reached by a different route, and reachable rather than
+  theoretical because preprocessed text can carry a raw NUL and a build system can
+  pass an argument containing `0x01`. Fixed here rather than filed for the reason
+  `HashFileContents` was: `v3` re-keys the whole cache once, so finding it later would
+  have cost a `v4` invalidation for a defect of the class this change exists to close.
+  The length must be big-endian for the same reason the digest's block loads must be
+  little-endian — a *host*-order length makes the key differ between machines.
+  The residual, recorded deliberately: MurmurHash3 is not collision-resistant against
+  an **adversary**, and that is accepted because the key is not a security boundary —
+  anyone who can STORE can already write a wrong object under a correct key. Closing
+  it would mean a keyed or cryptographic hash *and* a trust model for STORE, which is
+  a different change from this one.
+  - **The digest must be bit-identical on every machine that shares the cache, and
+    the `x64` in its name is a variant, not a target.** MurmurHash3 defines `x86_128`
+    (four 32-bit lanes) and `x64_128` (two 64-bit lanes); they produce *different*
+    digests, so the variant is part of the format. Nothing in the implementation is
+    architecture-specific, and four hazards that would have made it so are closed by
+    construction: `char` is signed on x86-64 Linux and **unsigned on aarch64**, so a
+    byte widened through a plain `char` sign-extends differently and would have split
+    Apple Silicon from everything else — everything is `std::byte`/`std::uint8_t`;
+    block loads go through `ReadLittleEndian` rather than a native-order read; that
+    same read would be unaligned and therefore UB whatever the hardware tolerates,
+    which is also what `-fsanitize=alignment` traps under `clang-debug`; and rotation
+    uses `std::rotl` rather than a shift pair that is UB at zero. A divergence here
+    would not fail, it would silently split the cache in two with every machine
+    missing on every entry the others wrote — so the SMHasher vector is checked on
+    the arm64 `macos-14` job as well as x86-64 Linux and Windows, and it sweeps all
+    256 tail lengths, which is where such a slip surfaces first.
+
 - **`Protocol/CompileCacheWire.hpp` must stay header-only and dependency-free.**
   Same constraint as `Cli/UsageDoc`, same reason: `fastcache-cc` does not link
   the `FastCache` library, so an include of anything from `Net/`, `Cache/`,

@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheKey.hpp"
+#include "KeyDigest.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
-#include <FastCache/Core/Crc32c.hpp>
 
-#include <algorithm>
 #include <array>
-#include <cstddef>
-#include <cstdint>
-#include <format>
-#include <ranges>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace FastCache::Cc
@@ -100,20 +97,6 @@ namespace
         return std::string { arg };
     }
 
-    /// One CRC32C "lane": digest `data` prefixed with a distinct salt byte so the
-    /// four lanes are independent, widening the effective key to 128 bits.
-    /// @param salt Lane discriminator.
-    /// @param data Bytes to digest.
-    /// @return The finalised 32-bit lane value.
-    [[nodiscard]] std::uint32_t Lane(std::uint8_t salt, std::string_view data)
-    {
-        std::uint32_t state = Crc32c::Seed;
-        std::array<std::byte, 1> const saltByte { static_cast<std::byte>(salt) };
-        Crc32c::Update(state, saltByte);
-        Crc32c::Update(state, std::span<std::byte const> { reinterpret_cast<std::byte const*>(data.data()), data.size() });
-        return Crc32c::Finalise(state);
-    }
-
 } // namespace
 
 std::vector<std::string> RelativizeArgs(std::span<std::string const> args,
@@ -130,62 +113,40 @@ std::vector<std::string> RelativizeArgs(std::span<std::string const> args,
 
 std::string ComputeKey(KeyInputs const& inputs)
 {
-    // Serialise the inputs into one blob with unambiguous separators, then take
-    // four independent CRC32C lanes over it for a 128-bit key.
+    // The schema tag comes first, and bumping it is what makes a format change
+    // safe. Nothing else in this key describes how the stored value is framed or
+    // canonicalized, so without it a change to either would leave old entries
+    // matching new keys and being served under rules they were not written by --
+    // a silent mis-serve, which presents as a mysterious hit-rate collapse rather
+    // than as a miss. Bumping re-keys the cache instead, so stale entries simply
+    // miss and are rewritten. ComputeManifestKey's tag moves in lock-step; see
+    // the reason recorded there.
     //
-    // The leading schema tag is what makes a future format change safe. Nothing
-    // else in this key describes how the stored value is framed or canonicalized,
-    // so without it a change to either would leave old entries matching new keys
-    // and being served under rules they were not written by — a silent
-    // mis-serve, which presents as a mysterious hit-rate collapse rather than as
-    // a miss. Bumping the tag re-keys the cache instead, so stale entries simply
-    // miss and are rewritten. Mirrors ComputeManifestKey's "manifest-v1".
-    //
-    // v2 adds the dependency path set, which is what makes a moved header a
+    // v2 added the dependency path set, which is what makes a moved header a
     // different key rather than a hit whose depfile has to be re-checked (see
-    // KeyInputs::dependencyPaths). Every entry written by a v1 launcher therefore
-    // misses once and is rewritten — the one-time cost the tag exists to make safe.
-    std::string blob;
-    // Sized up front. The preprocessed text alone runs to megabytes, and without
-    // this the single `push_back` that follows it reallocates a buffer that had
-    // just been grown to fit it exactly — one extra full-length copy per
-    // translation unit, on the launcher's hot path, to append one byte.
-    auto const argBytes = [](std::vector<std::string> const& list) {
-        return std::ranges::fold_left(
-            list, std::size_t { 0 }, [](std::size_t n, std::string const& s) { return n + s.size() + 1; });
-    };
-    blob.reserve(inputs.compilerId.size() + inputs.preprocessed.size() + argBytes(inputs.relativizedArgs)
-                 + argBytes(inputs.dependencyPaths) + 32);
-    blob += "objkey-v2";
-    blob.push_back('\x00');
-    blob += inputs.compilerId;
-    blob.push_back('\x00');
-    blob += inputs.preprocessed;
-    blob.push_back('\x00');
+    // KeyInputs::dependencyPaths).
+    //
+    // v3 is the digest itself (issue #63). Until it, this was four CRC32C runs
+    // over one blob distinguished only by a leading salt byte. CRC is affine over
+    // GF(2): with `A` the per-byte state-update operator and `S_i` the state
+    // after salt `i`, quarter_i XOR quarter_j is `A^len(blob) * (S_i XOR S_j)` --
+    // a function of the blob's LENGTH and of nothing else about it. So matching
+    // one quarter forced all four, and a key that was 128 bits wide carried 32
+    // bits of strength. Equal length is not an exotic condition, it is the
+    // ordinary shape of a source edit (`return 1;` -> `return 2;`), and the
+    // consequence was not a miss but an unrelated translation unit's object file
+    // served under a zero exit code. Measured before the fix: one distinct XOR
+    // value across 2000 random equal-length blobs, and a full 32-hex-char
+    // collision after 86,125 of them -- the birthday bound for the 32 bits it
+    // really had, against ~10^5 entries a shared team cache reaches.
+    KeyDigest digest { "objkey-v3" };
+    digest.Field(inputs.compilerId);
+    digest.Field(inputs.preprocessed);
     for (auto const& arg: inputs.relativizedArgs)
-    {
-        blob += arg;
-        blob.push_back('\x01');
-    }
-    // A separator of its own, so a dependency path can never be read as a trailing
-    // argument: the two lists are adjacent and both hold path-shaped strings.
+        digest.Item(arg);
     for (auto const& path: inputs.dependencyPaths)
-    {
-        blob += path;
-        blob.push_back('\x02');
-    }
-
-    std::array<std::uint32_t, 4> const lanes {
-        Lane(0xA1, blob),
-        Lane(0xB2, blob),
-        Lane(0xC3, blob),
-        Lane(0xD4, blob),
-    };
-    std::string key;
-    key.reserve(32);
-    for (auto const lane: lanes)
-        key += std::format("{:08x}", lane);
-    return key;
+        digest.Path(path);
+    return digest.ToHex();
 }
 
 } // namespace FastCache::Cc

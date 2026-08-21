@@ -1,13 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheKey.hpp"
+#include "KeyDigest.hpp"
+#include "KeyDigestTestSupport.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <ranges>
+#include <set>
 #include <span>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace FastCache::Cc;
+using FastCache::Cc::Test::DigestQuarters;
+using FastCache::Cc::Test::SplitMix64;
 
 namespace
 {
@@ -105,7 +115,7 @@ TEST_CASE("ComputeKey is a stable 32-hex-char string")
 {
     KeyInputs a { .compilerId = "cl", .preprocessed = "hello", .relativizedArgs = { "/c" }, .dependencyPaths = {} };
     auto const k = ComputeKey(a);
-    CHECK(k.size() == 32);
+    CHECK(k.size() == KeyDigest::HexLength);
     CHECK(k == ComputeKey(a)); // deterministic
 }
 
@@ -252,5 +262,162 @@ TEST_CASE("An empty dependency set still keys stably")
                              .dependencyPaths = {} };
 
     CHECK(ComputeKey(inputs) == ComputeKey(inputs));
-    CHECK(ComputeKey(inputs).size() == 32);
+    CHECK(ComputeKey(inputs).size() == KeyDigest::HexLength);
+}
+
+// --- issue #63: the key must actually be as wide as it looks -----------------
+//
+// The two cases below are the regression cover for a construction that produced
+// a 32-hex-char key carrying 32 bits of strength. It took four CRC32C digests of
+// one blob, distinguished only by a leading salt byte. CRC is affine over GF(2),
+// so with `A` the per-byte state-update operator and `S_i` the state after salt
+// `i`, quarter_i XOR quarter_j is `A^len(blob) * (S_i XOR S_j)` — a value that
+// depends on the blob's LENGTH and on nothing else about it. Matching one quarter
+// therefore forced all four, and a collision served an unrelated translation
+// unit's object file under a zero exit code.
+
+TEST_CASE("The quarters of a key vary independently for equal-length inputs")
+{
+    // The direct expression of the defect, and deterministic: no seed luck, no
+    // birthday search. Under the salted-CRC construction every one of the six
+    // pairwise XORs took exactly ONE value across any number of equal-length
+    // inputs.
+    //
+    // EQUAL LENGTH IS THE WHOLE POINT OF THIS CASE. The broken construction's
+    // XOR does vary once the lengths differ — that is precisely what `A^len`
+    // means — so relaxing these inputs to varying-length text would leave a test
+    // that passes against the bug it exists to catch.
+    constexpr std::size_t Samples = 64;
+
+    SplitMix64 source { 63 };
+    std::array<std::set<std::uint32_t>, 6> pairwiseXors;
+    for ([[maybe_unused]] auto const sample: std::views::iota(std::size_t { 0 }, Samples))
+    {
+        KeyInputs const inputs {
+            .compilerId = "cc-1.0", .preprocessed = source.NextFixedWidthText(), .relativizedArgs = {}, .dependencyPaths = {}
+        };
+        auto const quarters = DigestQuarters(ComputeKey(inputs));
+
+        std::size_t pair = 0;
+        for (auto const i: std::views::iota(std::size_t { 0 }, quarters.size()))
+            for (auto const j: std::views::iota(i + 1, quarters.size()))
+                pairwiseXors[pair++].insert(quarters[i] ^ quarters[j]);
+    }
+
+    for (auto const index: std::views::iota(std::size_t { 0 }, pairwiseXors.size()))
+    {
+        INFO("quarter pair index " << index);
+        CHECK(pairwiseXors[index].size() == Samples);
+    }
+}
+
+TEST_CASE("Equal-length key inputs survive a birthday-sized collision search")
+{
+    // What the defect actually cost: a full 32-hex-char key collision between two
+    // unrelated translation units, which is a wrong object served with a zero
+    // exit code rather than a miss.
+    //
+    // The sample count is measured, not guessed. With this seed and this input
+    // shape the salted-CRC construction produced its first full-key collision at
+    // sample index 86,125 — the birthday bound for the 32 bits it really had —
+    // so 100,000 makes the pre-fix failure deterministic rather than likely.
+    // Against a real 128-bit digest this can never fire: the same bound sits at
+    // ~2^64 samples.
+    constexpr std::size_t Samples = 100'000;
+
+    SplitMix64 source { 63 };
+    std::unordered_set<std::string> keys;
+    keys.reserve(Samples);
+    for ([[maybe_unused]] auto const sample: std::views::iota(std::size_t { 0 }, Samples))
+    {
+        KeyInputs const inputs {
+            .compilerId = "cc-1.0", .preprocessed = source.NextFixedWidthText(), .relativizedArgs = {}, .dependencyPaths = {}
+        };
+        keys.insert(ComputeKey(inputs));
+    }
+
+    CHECK(keys.size() == Samples);
+}
+
+TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliberate")
+{
+    // A pin. Correctness of the digest underneath is what MurmurHash3_test.cpp's
+    // SMHasher verification value covers; what this adds is that the value has
+    // not moved since the construction was reviewed.
+    //
+    // It is a little stronger than the usual golden, which can only ever say
+    // "unchanged since someone pasted it": this vector was independently
+    // reproduced from the MurmurHash3 specification and the grammar below --
+    // kind byte, big-endian u64 length, bytes, per piece -- by a separate
+    // implementation. So it pins the whole chain, tag placement and field order
+    // and separator kinds and rendering included, not just the digest.
+    //
+    // That is exactly the job. Every input to this key -- the schema tag, the
+    // field order, the separator bytes, the digest, its rendering -- is a thing
+    // whose change re-keys every cached object on every machine sharing the
+    // cache, and none of them announces itself.
+    //
+    // IF THIS FAILS, the key construction changed. That is a schema change:
+    //   1. bump `objkey-v*` in CacheKey.cpp AND `manifest-v*` in
+    //      DirectManifest.cpp, in lock-step -- a manifest stores the object key
+    //      by value and its own key never sees the object-key schema, so direct
+    //      mode would keep resolving to entries written under the old rules;
+    //   2. only then update this vector.
+    // Updating the vector alone leaves old entries matching new keys and being
+    // served under rules they were not written by, which is the silent mis-serve
+    // the tag exists to prevent -- it presents as a hit-rate collapse, not a miss.
+    KeyInputs const inputs { .compilerId = "g++ (GCC) 16.0.0",
+                             .preprocessed = "int main() { return 0; }\n",
+                             .relativizedArgs = { "-c", "-O2", "<SRCROOT>/src/main.cpp" },
+                             .dependencyPaths = { "<SRCROOT>/inc/a.hpp", "<SRCROOT>/inc/b.hpp" } };
+
+    CHECK(ComputeKey(inputs) == "65a330c5e6541bf33b2682d642717669");
+}
+
+TEST_CASE("Field contents cannot be shifted across a field boundary")
+{
+    // The framing had to be length-prefixed rather than separator-terminated,
+    // and this is the case that forces it. Terminating a value with a byte that
+    // can occur INSIDE a value is not a framing at all: while `Field` wrote
+    // `value` followed by NUL, these two inputs produced byte-identical blobs
+    // and therefore the same key.
+    //
+    // That is the same silent mis-serve as issue #63 -- two unrelated
+    // translation units sharing a cache entry, served with a zero exit code --
+    // reached by a different route, and it was reachable rather than
+    // theoretical: preprocessed text can carry a raw NUL, and a build system can
+    // pass an argument containing 0x01.
+    //
+    // It is fixed here rather than filed because v3 re-keys the whole cache
+    // anyway, so the invalidation is already paid; discovering it later would
+    // have cost a v4 for a defect of the class this very change exists to close.
+    KeyInputs const shifted {
+        .compilerId = std::string { "cc\0d", 4 }, .preprocessed = "x", .relativizedArgs = {}, .dependencyPaths = {}
+    };
+    KeyInputs const other {
+        .compilerId = "cc", .preprocessed = std::string { "d\0x", 3 }, .relativizedArgs = {}, .dependencyPaths = {}
+    };
+
+    CHECK(ComputeKey(shifted) != ComputeKey(other));
+
+    // The same shift across the argument and dependency lists, whose separators
+    // were 0x01 and 0x02.
+    KeyInputs const argSplit {
+        .compilerId = "cc", .preprocessed = "x", .relativizedArgs = { std::string { "-a\x01-b", 5 } }, .dependencyPaths = {}
+    };
+    KeyInputs const argWhole {
+        .compilerId = "cc", .preprocessed = "x", .relativizedArgs = { "-a", "-b" }, .dependencyPaths = {}
+    };
+    CHECK(ComputeKey(argSplit) != ComputeKey(argWhole));
+
+    // And a value must not digest the same when it is fed as a different KIND of
+    // piece: an argument and a dependency path are adjacent lists of
+    // path-shaped strings.
+    KeyInputs const asArg {
+        .compilerId = "cc", .preprocessed = "x", .relativizedArgs = { "<SRCROOT>/a.hpp" }, .dependencyPaths = {}
+    };
+    KeyInputs const asPath {
+        .compilerId = "cc", .preprocessed = "x", .relativizedArgs = {}, .dependencyPaths = { "<SRCROOT>/a.hpp" }
+    };
+    CHECK(ComputeKey(asArg) != ComputeKey(asPath));
 }

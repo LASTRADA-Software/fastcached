@@ -43,6 +43,41 @@ template <WireInteger T>
         return std::byteswap(value);
 }
 
+/// Convert a wire-integer from little-endian to host order.
+///
+/// The little-endian direction exists for digests rather than for the wire: a
+/// hash that reads its input as native-order words computes a different value on
+/// a big-endian host, and a compile-cache key that differs by architecture stops
+/// two machines sharing a cache without either of them being able to tell. See
+/// Core/MurmurHash3.hpp, whose block loads are the only caller.
+/// @param value Little-endian integer.
+/// @return Host-order integer.
+template <WireInteger T>
+[[nodiscard]] constexpr T LittleEndianToHost(T value) noexcept
+{
+    if constexpr (std::endian::native == std::endian::little)
+        return value;
+    else
+        return std::byteswap(value);
+}
+
+/// Read a little-endian integer from the front of a byte span.
+///
+/// `std::memcpy` rather than a `reinterpret_cast` to `T const*`: the span's data
+/// is not guaranteed to be suitably aligned for T, and the cast would be
+/// undefined behaviour regardless of what the host tolerates — which the
+/// `clang-debug` preset's `-fsanitize=alignment` traps. Every compiler folds this
+/// back into a single load.
+/// @param bytes Source span; must contain at least sizeof(T) bytes.
+/// @return Decoded host-order integer.
+template <WireInteger T>
+[[nodiscard]] T ReadLittleEndian(std::span<std::byte const> bytes) noexcept
+{
+    T raw {};
+    std::memcpy(&raw, bytes.data(), sizeof(T));
+    return LittleEndianToHost(raw);
+}
+
 /// Read a big-endian wire integer from the front of a byte span.
 /// @param bytes Source span; must contain at least sizeof(T) bytes.
 /// @return Decoded host-order integer.
