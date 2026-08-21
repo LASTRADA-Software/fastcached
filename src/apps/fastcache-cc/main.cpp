@@ -1129,9 +1129,11 @@ void RecordManifest(Config const& cfg,
     // One layout, and it is the build system's own spelling — every consumer of it
     // below either tokenizes against it or emits from it, and both want that form.
     // The reconciler holds the resolved spellings and is the only thing that sees
-    // them; nothing downstream needs to know they exist.
-    PathCanon::Layout const layout { .sourceRoot = cfg.srcRoot, .buildTree = cfg.buildTree };
+    // them; nothing downstream needs to know they exist. Taken FROM the reconciler
+    // rather than built beside it, so the two cannot come to disagree about a
+    // trailing separator or anything else the constructor normalizes.
     Cc::RootReconciler reconciler { cfg.srcRoot, cfg.buildTree, PathResolver() };
+    PathCanon::Layout const& layout = reconciler.Layout();
 
     // Directory-flavoured, because an argument's own last component can be the
     // aliased one — an `-I` pointing at a symlinked include directory is the

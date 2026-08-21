@@ -55,8 +55,19 @@ std::string RootReconciler::Region(std::string_view text, PathCanon::Grammar gra
 
 bool RootReconciler::IsInTree(std::string_view path)
 {
-    if (!PathCanon::IsAbsoluteForLayout(path, _asGiven))
-        return !path.empty();
+    // The same three-way classification PortableForm applies, and the same
+    // disposition: a working-directory-relative path names the same file on any
+    // machine running the same build, so it is keyed and counts as in-tree, while
+    // a drive-relative one resolves against per-process state no cache entry
+    // records and has to face the root tests like an absolute one (issue #65).
+    switch (PathCanon::AnchorForLayout(path, _asGiven))
+    {
+        case PathCanon::Anchor::WorkingDirectory:
+            return !path.empty();
+        case PathCanon::Anchor::DriveRelative:
+        case PathCanon::Anchor::Absolute:
+            break;
+    }
     auto const reconciled = Directory(path);
     auto const token = PathCanon::Canonicalize(reconciled, _asGiven);
     return token.has_value() && *token != reconciled;
