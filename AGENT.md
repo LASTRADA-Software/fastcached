@@ -411,6 +411,58 @@ These constraints are load-bearing and have each already been a bug:
     the arm64 `macos-14` job as well as x86-64 Linux and Windows, and it sweeps all
     256 tail lengths, which is where such a slip surfaces first.
 
+- **A cache that can fail a build is not optional, and a refusal nobody can read
+  is not a refusal.** The launcher STOREs an object by streaming one frame, and the
+  daemon refused an over-cap frame by replying and then closing — while the sender
+  was still writing. Two independent defects met there. Nothing in `fastcache-cc`
+  suppressed SIGPIPE (the daemon does, in `Net/BlockingSocket`, but the launcher
+  deliberately does not link the library), so the write that met the closed peer
+  **killed the launcher with signal 13**; the build system saw a compile die of a
+  signal even though the object file it asked for was already complete and correct
+  on disk, and no retry could ever converge because the outcome was deterministic.
+  Measured on a 356 MB object (C++23 templates plus `-g`) against the 256 MiB
+  default cap, and reproduced here at 80 MB against the 64 MiB floor
+  `SessionContext` keeps regardless of `--storage-max-value`. The launcher had
+  correct fall-back logic for every store failure and reached none of it: a signal
+  is not a return value. Three consequences, each load-bearing and each at a
+  different layer, because any one alone leaves a hole the others do not cover:
+  - **Suppression is per socket, not process-wide.** `SO_NOSIGPIPE` on macOS/BSD,
+    `MSG_NOSIGNAL` on Linux, with `::signal(SIGPIPE, SIG_IGN)` only as a last
+    resort for a platform with neither. The daemon can take the process-wide
+    ignore; the launcher cannot, because an ignored disposition is **inherited
+    across exec** and the launcher spawns the preprocessor and the real compiler —
+    a process-wide ignore here silently changes how every compiler it fronts
+    behaves. On macOS the socket option is also preferred over the newer
+    `MSG_NOSIGNAL` *even though the SDK declares it*: the macro comes from the SDK
+    while `CMAKE_OSX_DEPLOYMENT_TARGET` lets the binary run on an older kernel,
+    and a flag the kernel does not know fails the send rather than the signal.
+  - **The daemon drains an over-cap frame before refusing it**, exactly as it
+    already does for an unknown opcode, so the sender's write completes and it
+    can read the typed `payload-too-large` naming *both* numbers — the one message
+    that tells an operator which way to move `--storage-max-value`. This is the
+    "a rejection can be a reply instead of a close" rule two bullets up, applied to
+    the one path that was still closing. `ByteReader::Skip` discards in chunks, so
+    the memory the cap protects is still never taken. Bounded at a small multiple
+    of the cap rather than by a knob of its own, because the cap is already the
+    operator's statement of the largest thing this server will handle.
+  - **The launcher declines the store before connecting**, at
+    `FASTCACHE_MAX_STORE_BYTES` (256 MiB by default, `0` disables). Surviving the
+    refusal is not enough: without a ceiling every rebuild of that translation
+    unit pays the full transfer to be told no, and one 356 MB entry would dominate
+    a cache sized for thousands of ordinary objects. The default matching the
+    daemon's `--storage-max-value` default is a *chosen coincidence*, not a
+    negotiation — there is deliberately no handshake, so raising one and not the
+    other leaves the other refusing.
+
+  The residual, recorded deliberately: the 64 MiB floor in `SessionContext` means
+  a cap *below* it cannot be tested end-to-end without a genuinely large fixture,
+  so the e2e drives the client ceiling and `TcpClient_test` pins the socket half
+  (its `HangUpPeer` case terminated the test binary with signal 13 before the fix —
+  verified by re-neutering it, since a regression test for a fatal signal that
+  cannot be seen to fail is worth nothing). Separately, `--storage-max-value`'s
+  help text still said `default 16m` long after the default became 256 MiB: the
+  one knob this failure sends an operator to, misreporting itself.
+
 - **`Protocol/CompileCacheWire.hpp` must stay header-only and dependency-free.**
   Same constraint as `Cli/UsageDoc`, same reason: `fastcache-cc` does not link
   the `FastCache` library, so an include of anything from `Net/`, `Cache/`,

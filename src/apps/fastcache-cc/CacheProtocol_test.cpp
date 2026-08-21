@@ -198,3 +198,33 @@ TEST_CASE("A transport failure is not mistaken for a miss or a refusal")
         CHECK(CacheFetch(client, "k").kind == CacheOutcomeKind::Transport);
     }
 }
+
+TEST_CASE("The store-size limit declines the pathological value and nothing else")
+{
+    // A compiler cache must never fail a build, so the ceiling's job is to skip
+    // one cache write, not to become a new way to break: everything at or under
+    // it stores, and a zero limit disables the check rather than rejecting
+    // everything -- the reading that would silently turn caching off wholesale.
+    SECTION("under, at, and over the limit")
+    {
+        CHECK(IsStorableSize(0, 1024));
+        CHECK(IsStorableSize(1023, 1024));
+        CHECK(IsStorableSize(1024, 1024)); // the limit is inclusive
+        CHECK_FALSE(IsStorableSize(1025, 1024));
+    }
+
+    SECTION("zero means no limit, not zero bytes")
+    {
+        CHECK(IsStorableSize(0, 0));
+        CHECK(IsStorableSize(1, 0));
+        CHECK(IsStorableSize(DefaultMaxStoreBytes * 4, 0));
+    }
+
+    SECTION("the default admits an ordinary object and declines the reported one")
+    {
+        // 356 MB of C++23 templates plus -g debug info is what issue #68 was
+        // reported against; a few MB is what an ordinary translation unit emits.
+        CHECK(IsStorableSize(4UL * 1024UL * 1024UL, DefaultMaxStoreBytes));
+        CHECK_FALSE(IsStorableSize(356UL * 1000UL * 1000UL, DefaultMaxStoreBytes));
+    }
+}

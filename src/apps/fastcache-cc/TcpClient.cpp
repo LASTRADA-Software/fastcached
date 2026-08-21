@@ -25,6 +25,8 @@
     #include <sys/socket.h>
     #include <sys/time.h>
 
+    #include <csignal>
+
     #include <netdb.h>
     #include <unistd.h>
 #endif
@@ -49,6 +51,13 @@ namespace
     {
         ::closesocket(fd);
     }
+
+    /// Extra `::send` flags needed to keep a write to a broken pipe from
+    /// raising a signal. Windows has no SIGPIPE, so there is nothing to add.
+    constexpr int SendFlags = 0;
+
+    /// Suppress SIGPIPE for one socket. Nothing to do on Windows.
+    void ArmNoSigPipe(NativeSocket /*fd*/) noexcept {}
 
     /// Initialise Winsock once per process. The matching WSACleanup is deliberately
     /// omitted: the launcher is a short-lived process that exits right after, and
@@ -77,6 +86,59 @@ namespace
     {
         ::close(fd);
     }
+
+    // Writing to a socket whose peer has closed raises SIGPIPE, and SIGPIPE's
+    // default disposition terminates the process. That is not a theoretical
+    // hazard here: the daemon refuses an over-cap STORE with a typed error and
+    // then closes, so a launcher streaming a large object is *routinely* still
+    // sending when the peer goes away. Unsuppressed, that killed the launcher
+    // mid-store — with the object file already compiled and correct on disk —
+    // and the build system saw a command that died of signal 13 (issue #68).
+    //
+    // Suppressed per socket rather than process-wide with
+    // `::signal(SIGPIPE, SIG_IGN)`, which is what `Net/BlockingSocket` does for
+    // the daemon. The launcher is not a daemon: it spawns the preprocessor and
+    // the real compiler, and an ignored disposition is *inherited across exec*,
+    // so a process-wide ignore here would silently change how every compiler
+    // this launcher fronts behaves. The suppression belongs to the socket that
+    // needs it.
+    //
+    // Which mechanism, in order of preference:
+    //   * `SO_NOSIGPIPE` (macOS, the BSDs) — a socket option set once, so every
+    //     later send is covered without threading a flag through. Present since
+    //     macOS 10.2, so it is the safe choice there even on an SDK new enough
+    //     to also declare MSG_NOSIGNAL: that macro comes from the SDK headers
+    //     while `CMAKE_OSX_DEPLOYMENT_TARGET` lets the binary run on an older
+    //     kernel, and a flag the kernel does not know fails the send.
+    //   * `MSG_NOSIGNAL` (Linux, Solaris, AIX) — a per-send flag; there is no
+    //     socket option to set.
+    //   * neither: fall back to the process-wide ignore. No platform this
+    //     builds on lands here; losing the compiler's own SIGPIPE disposition
+    //     is still better than losing the build.
+    #if defined(SO_NOSIGPIPE)
+    constexpr int SendFlags = 0;
+
+    /// Suppress SIGPIPE for one socket, for the life of that socket.
+    /// @param fd The connected socket to tune.
+    void ArmNoSigPipe(NativeSocket fd) noexcept
+    {
+        int const on = 1;
+        std::ignore = ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+    }
+    #elif defined(MSG_NOSIGNAL)
+    constexpr int SendFlags = MSG_NOSIGNAL;
+
+    /// Nothing to arm: the suppression rides on each `::send` instead.
+    void ArmNoSigPipe(NativeSocket /*fd*/) noexcept {}
+    #else
+    constexpr int SendFlags = 0;
+
+    /// Last resort: ignore SIGPIPE for the whole process. Idempotent.
+    void ArmNoSigPipe(NativeSocket /*fd*/) noexcept
+    {
+        ::signal(SIGPIPE, SIG_IGN);
+    }
+    #endif
 
     /// No initialisation is needed for BSD sockets.
     /// @return Always true.
@@ -171,8 +233,14 @@ namespace
             while (sent < bytes.size())
             {
                 auto const remaining = bytes.subspan(sent);
-                auto const n =
-                    ::send(_fd, reinterpret_cast<char const*>(remaining.data()), static_cast<SendSize>(remaining.size()), 0);
+                // A peer that closed mid-transfer surfaces here as EPIPE and a
+                // -1 return, which is exactly the "give up on the cache" signal
+                // the caller already handles -- but only because SendFlags /
+                // ArmNoSigPipe kept it from being a fatal signal first.
+                auto const n = ::send(_fd,
+                                      reinterpret_cast<char const*>(remaining.data()),
+                                      static_cast<SendSize>(remaining.size()),
+                                      SendFlags);
                 if (n <= 0)
                     return false;
                 sent += static_cast<std::size_t>(n);
@@ -230,9 +298,11 @@ std::unique_ptr<ITcpClient> ConnectTcp(std::string_view hostPort, std::chrono::m
             continue;
         if (::connect(fd, candidate->ai_addr, static_cast<ConnectLen>(candidate->ai_addrlen)) == 0)
         {
-            // Arm the deadline before the first send: from here on every
-            // blocking call on this socket is bounded.
+            // Arm both guards before the first send: from here on every
+            // blocking call on this socket is bounded, and no write on it can
+            // raise a signal.
             SetIoTimeouts(fd, ioTimeout);
+            ArmNoSigPipe(fd);
             ::freeaddrinfo(resolved);
             return std::make_unique<TcpClient>(fd);
         }

@@ -174,6 +174,16 @@ namespace
                                 "mode makes a separate manifest round-trip, so one compile\n"
                                 "against a wedged daemon can wait up to twice this before\n"
                                 "falling back." },
+        EnvVarSpec { .name = EnvName::MaxStoreBytes,
+                     .summary = "Largest compiled result, in bytes, the launcher will offer\n"
+                                "to the daemon (default 268435456 = 256 MiB; 0 means no\n"
+                                "limit). A bigger result is left uncached: the compile still\n"
+                                "succeeds and nothing is sent. The default matches the\n"
+                                "daemon's own --storage-max-value default, which is a\n"
+                                "deliberate coincidence and not a negotiation -- there is no\n"
+                                "handshake, so a launcher cannot ask. Raise BOTH to cache a\n"
+                                "result larger than this; raising only one leaves the other\n"
+                                "refusing." },
     };
 
     /// Where the statistics log goes.

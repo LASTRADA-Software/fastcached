@@ -6,17 +6,22 @@
 #   1. First compile of a file is a MISS (real compiler runs, result stored).
 #   2. Second compile of the same content is a HIT (served from cache, correct
 #      object produced) — even after the object is deleted.
-#   3. Cross-depth: content compiled/stored with a DEEP srcroot is a HIT when
+#   3. A result past FASTCACHE_MAX_STORE_BYTES is skipped, and the compile still
+#      succeeds — a compiler cache must never be able to fail a build. On POSIX
+#      the launcher used to stream such an object at a daemon that refuses an
+#      over-cap frame and closes, then die of SIGPIPE mid-store with the object
+#      already correct on disk (issue #68).
+#   4. Cross-depth: content compiled/stored with a DEEP srcroot is a HIT when
 #      compiled from a SHALLOW srcroot (different checkout), with showIncludes
 #      localized so the deps resolve.
-#   4. An EDITED source is a MISS, and yields a different object. The preprocessed
+#   5. An EDITED source is a MISS, and yields a different object. The preprocessed
 #      text is the only key input carrying the source's content, so a probe that
 #      captures none of it answers an edit with the previous revision's object — a
 #      wrong build, silently, every time. Checked with direct mode off, because the
 #      manifest hashes the source's own bytes and would otherwise mask it. This is
 #      the property `/EP` plus `/P` broke: the pair writes the preprocessed text to
 #      a FILE, leaving the launcher hashing an empty stdout.
-#   5. Moved header: a header that moves with its contents unchanged is a MISS by
+#   6. Moved header: a header that moves with its contents unchanged is a MISS by
 #      construction, and the entry stored before the move is still there when it
 #      comes back. Preprocessing suppresses line markers, so the token stream and
 #      the object are identical after such a move and only the paths differ; the
@@ -184,6 +189,15 @@ function Invoke-Launcher([string]$compiler, [string]$srcRoot, [string]$buildTree
     return @{ code = $p.ExitCode; stderr = $err }
 }
 
+# Like Invoke-Launcher but with one extra environment variable set for the run,
+# and cleared again afterwards so it cannot leak into the cases that follow.
+function Invoke-LauncherWithEnv([string]$compiler, [string]$srcRoot, [string]$buildTree,
+                                [string]$obj, [string]$name, [string]$value) {
+    Set-Item -Path "env:$name" -Value $value
+    try   { return Invoke-Launcher $compiler $srcRoot $buildTree $obj }
+    finally { Remove-Item -Path "env:$name" -ErrorAction SilentlyContinue }
+}
+
 function Get-Outcome([string]$stderr) {
     if ($stderr -match "fastcache-cc: HIT")  { return "HIT" }
     if ($stderr -match "fastcache-cc: MISS") { return "MISS" }
@@ -259,6 +273,48 @@ try {
             Write-Host "  MISS then HIT, object reproduced identically: OK ($cc)" -ForegroundColor Green
         } else {
             Write-Host "  FAIL ($cc): run1=$o1 run2=$o2 objMatch=$($hash2 -eq $hash1)" -ForegroundColor Red
+            $exit = 1
+        }
+
+        # A result too large to be worth caching must cost the build nothing. On
+        # POSIX this is where the launcher used to die: it streamed the object at
+        # a daemon that refuses an over-cap frame and closes, and took SIGPIPE
+        # mid-store with the object already correct on disk (issue #68). Windows
+        # has no SIGPIPE and so cannot reproduce that half, but the ceiling that
+        # keeps the transfer from happening at all is the same code on both, and
+        # a launcher that mishandled it here would fail a build just as surely.
+        Write-Host "=== launcher store ceiling ($cc) ==="
+        Remove-Item -Recurse -Force $ShallowTemp -ErrorAction SilentlyContinue
+        $ceilSrc = New-Tree $ShallowTemp
+        # Re-key off the miss/hit fixture: New-Tree writes byte-identical content
+        # every time, so without this the first compile here would be served from
+        # the store the first case made and never reach the store path at all.
+        Set-EditedSource $ceilSrc 3
+        $ceilBuild = Join-Path $ShallowTemp "build"; New-Item -ItemType Directory -Force $ceilBuild | Out-Null
+        $ceilObj = Join-Path $ceilBuild "u.obj"
+
+        # 1 byte, so every real object clears it without assuming a size.
+        $rCeil = Invoke-LauncherWithEnv $cc $ceilSrc $ceilBuild $ceilObj "FASTCACHE_MAX_STORE_BYTES" "1"
+        $oCeil = Get-Outcome $rCeil.stderr
+        $ceilExplained = $rCeil.stderr -match "FASTCACHE_MAX_STORE_BYTES"
+        $ceilStored = $rCeil.stderr -match "STORED"
+
+        # Nothing was written, so the next compile must MISS again. That is what
+        # separates "declined the store" from "stored it and said otherwise".
+        Remove-Item $ceilObj -Force -ErrorAction SilentlyContinue
+        $oCeil2 = Get-Outcome (Invoke-LauncherWithEnv $cc $ceilSrc $ceilBuild $ceilObj "FASTCACHE_MAX_STORE_BYTES" "1").stderr
+
+        # And the ceiling is opt-out, so a regression leaving it permanently on
+        # would surface as a TU that can never be cached.
+        Remove-Item $ceilObj -Force -ErrorAction SilentlyContinue
+        $rCeilOff = Invoke-LauncherWithEnv $cc $ceilSrc $ceilBuild $ceilObj "FASTCACHE_MAX_STORE_BYTES" "0"
+
+        if ($rCeil.code -eq 0 -and $oCeil -eq "MISS" -and $ceilExplained -and -not $ceilStored `
+            -and $oCeil2 -eq "MISS" -and $rCeilOff.stderr -match "STORED") {
+            Write-Host "  over-ceiling store declined, compile succeeded, 0 disables: OK ($cc)" -ForegroundColor Green
+        } else {
+            Write-Host ("  CEILING FAIL ($cc): code=$($rCeil.code) run1=$oCeil explained=$ceilExplained " +
+                        "stored=$ceilStored run2=$oCeil2 disabled=$($rCeilOff.stderr -match 'STORED')") -ForegroundColor Red
             $exit = 1
         }
 

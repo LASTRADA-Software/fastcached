@@ -388,7 +388,7 @@ namespace
           .operand = "=<size>",
           .apply = AssignFrom<&Config::storageMaxValueBytes, ParseStorageMaxValue>(),
           .explicitBit = &CliResult::storageMaxValueBytesExplicit,
-          .description = "per-value byte cap for --storage; k/m/g suffixes accepted (default 16m).\n"
+          .description = "per-value byte cap for --storage; k/m/g suffixes accepted (default 256m).\n"
                          "also raises the wire frame-payload cap, so compile caches storing\n"
                          "large object files need this set above their biggest object" },
         { .primary = "--storage-max-disk",
