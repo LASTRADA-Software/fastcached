@@ -226,6 +226,25 @@ These constraints are load-bearing and have each already been a bug:
     paths, i.e. giving up cross-machine sharing wholesale for the population it affects, so
     the guard above is what covers it and the trade is left where `DirectManifest` already
     put it.
+  - **A root must be spelled the way the driver spells what it emits, and on Windows the
+    drivers disagree.** Every root test is a string prefix comparison
+    (`IsToolchainHeader`, `PathCanon::CanonicalizeOne`), so a root carrying an 8.3 short
+    component matches nothing `cl` reports: `cl` resolves an include through the filesystem
+    and prints `C:\Users\runneradmin\...`, while clang-cl echoes the spelling it was handed
+    and prints `C:\Users\RUNNER~1\...`. Measured on a GitHub runner, where `%TEMP%` is the
+    short form. Two failures follow from the one mismatch and they hide each other: every
+    path is classified as outside both roots, so the keyed dependency set is **empty** (the
+    two layouts of a moved header key together) *and* `ReplayGuard` skips every path it
+    would have checked (so nothing reports it) — and the stored `/showIncludes` region is
+    never canonicalized either, so the value carries the producing machine's absolute paths.
+    Symptom to recognise: a replayed note that kept the driver's mixed separators
+    (`...\src\inc/h1.h`) was never tokenized; a localized one is uniformly native
+    (`...\src\inc\h1.h`). `run-launcher-e2e.ps1` expands its scratch roots with
+    `Scripting.FileSystemObject` — the only API that does; `Resolve-Path`, `Get-Item` and
+    `[IO.Path]::GetFullPath` all preserve the short form — so its cases measure what they
+    are named for. The launcher itself does not normalize, which is issue #66: the fix has
+    to normalize *both* sides or neither, since expanding only the emitted paths breaks
+    clang-cl exactly as spelling only the root long breaks `cl`.
 - **`Protocol/CompileCacheWire.hpp` must stay header-only and dependency-free.**
   Same constraint as `Cli/UsageDoc`, same reason: `fastcache-cc` does not link
   the `FastCache` library, so an include of anything from `Net/`, `Cache/`,

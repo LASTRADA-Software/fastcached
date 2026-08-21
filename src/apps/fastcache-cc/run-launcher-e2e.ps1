@@ -47,6 +47,37 @@ param(
 
 $ErrorActionPreference = "Stop"
 $exit = 0
+
+# Expand 8.3 short components in the scratch roots before anything is compiled.
+#
+# $env:TEMP is `C:\Users\RUNNER~1\...` on a GitHub Windows runner, and the two
+# drivers disagree about what to do with that: `cl` resolves an include through
+# the filesystem and reports the LONG name, while clang-cl echoes the spelling it
+# was handed. A root spelled the short way therefore matches nothing `cl` emits,
+# and PathCanon classifies every one of its headers as outside both roots — which
+# silently empties the keyed dependency set AND makes the replay guard skip the
+# very paths it exists to check, so a moved header keys identically and nothing
+# reports it. That is a real launcher limitation (see AGENT.md) and not what this
+# harness is here to measure, so the roots are normalized once and the cases below
+# test what they are named for.
+#
+# Only Scripting.FileSystemObject expands 8.3 — Resolve-Path, Get-Item and
+# [IO.Path]::GetFullPath all preserve the short form. The directory must exist
+# first, and a failure falls back to the path as given rather than aborting: on a
+# volume with 8.3 generation disabled there is nothing to expand.
+function Get-LongPath([string]$path) {
+    if (-not (Test-Path $path)) { New-Item -ItemType Directory -Force -Path $path | Out-Null }
+    # Absolute and backslash-separated before FSO sees it: the defaults above are
+    # built with "/" and this COM object predates forward-slash tolerance.
+    $native = (Resolve-Path -LiteralPath $path).Path
+    try {
+        $fso = New-Object -ComObject Scripting.FileSystemObject
+        return $fso.GetFolder($native).Path
+    } catch {
+        return $native
+    }
+}
+
 # CTest's SKIP_RETURN_CODE. A missing binary or compiler is a missing runtime
 # prerequisite, not a failure, so it must be distinguishable from a real fault.
 $SKIP = 77
@@ -54,6 +85,13 @@ $ranAnyCompiler = $false
 
 if (-not (Test-Path $Fastcached)) { Write-Host "fastcached not found: $Fastcached; skipping"; exit $SKIP }
 if (-not (Test-Path $Launcher))   { Write-Host "fastcache-cc not found: $Launcher; skipping"; exit $SKIP }
+
+# After the skip checks, because Get-LongPath has to create a directory to resolve
+# it and a run that verifies nothing should leave nothing behind.
+$DeepTemp = Get-LongPath $DeepTemp
+$ShallowTemp = Get-LongPath $ShallowTemp
+$MoveTemp = Get-LongPath $MoveTemp
+$EditTemp = Get-LongPath $EditTemp
 
 # Start-Process resolves a relative -FilePath against the PROCESS working
 # directory, not PowerShell's, so a caller passing "out/build/..." would get a
