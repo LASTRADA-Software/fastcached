@@ -108,6 +108,36 @@ send and receive, not the TCP `connect()`, so a firewalled or vanished host
 otherwise takes the kernel's connect timeout to fail (measured at 2m30s on
 macOS) — once per configure here, but once per translation unit in a build.
 
+### Installing it automatically
+
+All of the above assumes `fastcache-cc` is already on `PATH`, which on a new
+repository or a fresh machine is a manual step someone has to remember.
+`-DFASTCACHE_AUTO_INSTALL=ON` removes it: when *no* launcher is installed —
+neither `fastcache-cc` nor `sccache` nor `ccache` — the module downloads a
+prebuilt `fastcache-cc` for the host's OS and architecture from the latest
+stable release, checks the SHA-256 the release publishes, confirms the binary
+runs here, and uses it.
+
+It is off by default, because reaching out to the network during `cmake` is a
+different thing from using what is installed. It fires only when nothing else is
+available: a launcher you installed is a decision already made. And it cannot
+fail a configure — an unreachable network, an unpublished platform, a download
+that arrives corrupt each end in one status line and the same fall-through to
+`sccache`, `ccache` or plain compilation that a missing launcher has always
+produced.
+
+The binary is staged per user, under version and platform, so every repository
+and build tree on the machine shares one copy and later configures neither
+download nor ask. The release lookup is cached for a day, and honours
+`GITHUB_TOKEN` / `GH_TOKEN` where the unauthenticated limit of 60 requests an
+hour per address would otherwise be shared out among CI runners. Pinning
+`FASTCACHE_AUTO_INSTALL_VERSION` skips the lookup altogether, and pointing
+`FASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE` at a mirror installs without reaching
+GitHub at all.
+
+`cmake/README.md` documents the full option set, and is written for projects
+vendoring the module rather than building this one.
+
 ## Environment
 
 Configuration is entirely environmental, so a launcher invocation stays a drop-in

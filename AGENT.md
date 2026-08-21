@@ -316,6 +316,22 @@ These constraints are load-bearing and have each already been a bug:
   trigger matches `v[0-9]+.[0-9]+.[0-9]+` rather than `v*` — a `v0.1.0-rc1` tag
   cannot configure, and failing to *start* costs nothing where fifteen red jobs and
   a burnt notarization slot would.
+- **`cmake/CompileCache.cmake` must stay stock-CMake-only, and must never fail a
+  configure.** Same constraint as `Cli/UsageDoc` and `Protocol/CompileCacheWire`,
+  for the same reason: the file is *meant* to be copied verbatim into other
+  projects, so a dependency on anything else here breaks it where nobody in this
+  repository would notice. It is also included at `CMakeLists.txt:164`, before CPM
+  is bootstrapped at `:183`, so `CPMAddPackage`/`FetchContent` are not available to
+  it even locally — the `FASTCACHE_AUTO_INSTALL` fetch therefore uses bare
+  `file(DOWNLOAD)`. Not with `EXPECTED_HASH`, which aborts the configure on a
+  mismatch *even when `STATUS` is captured* (measured); the SHA-256 the release
+  publishes is compared by hand instead, which is the same guarantee without the
+  abort. Every other way the fetch can fail — unpublished platform, no network, a
+  binary that will not run here — ends the same way, in one `message(STATUS)` and a
+  fall-through, because a project that vendored this file to get a *faster* build
+  must not lose the ability to build at all when GitHub is unreachable.
+  `ctest -R compile-cache` covers both halves offline, the decline paths through a
+  sandbox and the install path through a `file://` mirror.
 - **Every checkout in `build.yml` that could configure the project passes
   `fetch-depth: 0`, and the release job's asset list must stay the last key of its
   `with:` mapping.** The default depth-1
@@ -502,9 +518,13 @@ with our own `fastcache-cc` when it is on `PATH` and a daemon answers — at
 trees. Configure proves the cache works by compiling one tiny file through the
 launcher (~0.1 s) and requiring a `HIT`/`MISS`, because a launcher that cannot
 reach its daemon still compiles fine and would otherwise cost every TU a failed
-connect in silence. When nothing answers it falls back to `sccache`. A cache hit
-reproduces only the object file, so with either launcher active the module scan
-and precompiled headers are turned off and MSVC debug info is forced to `/Z7`
+connect in silence. When nothing answers it falls back to `sccache`. When
+*nothing* is installed, `-DFASTCACHE_AUTO_INSTALL=ON` (default OFF) fetches a
+prebuilt `fastcache-cc` for the host from the latest stable release instead,
+staged per user so a machine downloads it once; `cmake/README.md` is the note
+for projects vendoring the module. A cache hit reproduces only the object file,
+so with either launcher active the module scan and precompiled headers are
+turned off and MSVC debug info is forced to `/Z7`
 (a modmap flag makes the launcher's preprocess step fail, and a PCH or shared
 PDB is a second artefact no hit can reproduce).
 
