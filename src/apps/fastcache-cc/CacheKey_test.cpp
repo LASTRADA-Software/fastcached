@@ -389,3 +389,32 @@ TEST_CASE("Equal-length key inputs survive a birthday-sized collision search")
 
     CHECK(keys.size() == Samples);
 }
+
+TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliberate")
+{
+    // A pin, not a correctness proof. Correctness of the digest underneath is
+    // what MurmurHash3_test.cpp's SMHasher verification value covers; this vector
+    // was read out of the implementation, so all it can prove is that the value
+    // has not moved since a human reviewed the construction.
+    //
+    // That is exactly the job. Every input to this key -- the schema tag, the
+    // field order, the separator bytes, the digest, its rendering -- is a thing
+    // whose change re-keys every cached object on every machine sharing the
+    // cache, and none of them announces itself.
+    //
+    // IF THIS FAILS, the key construction changed. That is a schema change:
+    //   1. bump `objkey-v*` in CacheKey.cpp AND `manifest-v*` in
+    //      DirectManifest.cpp, in lock-step -- a manifest stores the object key
+    //      by value and its own key never sees the object-key schema, so direct
+    //      mode would keep resolving to entries written under the old rules;
+    //   2. only then update this vector.
+    // Updating the vector alone leaves old entries matching new keys and being
+    // served under rules they were not written by, which is the silent mis-serve
+    // the tag exists to prevent -- it presents as a hit-rate collapse, not a miss.
+    KeyInputs const inputs { .compilerId = "g++ (GCC) 16.0.0",
+                             .preprocessed = "int main() { return 0; }\n",
+                             .relativizedArgs = { "-c", "-O2", "<SRCROOT>/src/main.cpp" },
+                             .dependencyPaths = { "<SRCROOT>/inc/a.hpp", "<SRCROOT>/inc/b.hpp" } };
+
+    CHECK(ComputeKey(inputs) == "c555e22cc49a05fabcfbeb6986e85069");
+}

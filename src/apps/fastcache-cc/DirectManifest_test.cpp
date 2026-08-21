@@ -681,3 +681,61 @@ TEST_CASE("The three launcher key spaces are separated by their schema tag")
 
     CHECK(manifestKey != headerState);
 }
+
+TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
+{
+    // See the note on the matching case in CacheKey_test.cpp for what to do when
+    // this fails. The manifest key is half of a lock-step pair: it must be bumped
+    // whenever `objkey-v*` is, because a manifest stores the object key by value
+    // and its own key never sees the object-key schema.
+    std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };
+    CHECK(ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51") == "d175bf7095d072ad7d2d55455de71c6d");
+
+    // The header-state digest is deliberately NOT part of that pair: nothing is
+    // stored under it, so it has no stale entries to re-key and its tag stays at
+    // v1 while the other two move. Pinned all the same, because it is still a
+    // value two runs have to agree on.
+    DirectManifest manifest;
+    manifest.toolchainStamp = "cl 19.51.36231 x64";
+    manifest.objectKey = "0123456789abcdef0123456789abcdef";
+    manifest.entries.push_back({ .canonicalPath = "<SRCROOT>/inc/a.hpp", .contentHash = "aaaa" });
+    manifest.entries.push_back({ .canonicalPath = "<SRCROOT>/inc/b.hpp", .contentHash = "bbbb" });
+
+    CHECK(ComputeHeaderStateDigest("mkey", manifest) == "d325ccb5dcd226898bea865425b96a56");
+}
+
+TEST_CASE("HashFileContents separates equal-length contents and reports unreadable files")
+{
+    // The direct-mode revalidation hash. It used to be one CRC32C paired with the
+    // byte count, which left 32 bits against exactly the case that matters: a
+    // header edit preserving length. A collision there does not miss -- it decides
+    // an edited header is unchanged and serves the stale object under a zero exit
+    // code (issue #63, same defect as the key itself).
+    auto const dir = std::filesystem::temp_directory_path() / "fastcache-hashfile-test";
+    std::filesystem::create_directories(dir);
+
+    auto const write = [&](std::string_view name, std::string_view contents) {
+        auto const path = dir / name;
+        std::ofstream out { path, std::ios::binary };
+        out << contents;
+        out.close();
+        return path.string();
+    };
+
+    auto const a = write("a.hpp", "static int value = 1;\n");
+    auto const b = write("b.hpp", "static int value = 2;\n");
+    auto const empty = write("empty.hpp", "");
+
+    CHECK(HashFileContents(a).size() == KeyDigest::HexLength);
+    CHECK(HashFileContents(a) == HashFileContents(a));
+    CHECK(HashFileContents(a) != HashFileContents(b));
+
+    // An unreadable file reports the empty string, and that must stay distinct
+    // from every real digest: ValidateManifest compares this value for equality,
+    // so an unreadable header must not compare equal to anything -- including a
+    // readable one that happens to be empty.
+    CHECK(HashFileContents((dir / "absent.hpp").string()).empty());
+    CHECK_FALSE(HashFileContents(empty).empty());
+
+    std::filesystem::remove_all(dir);
+}
