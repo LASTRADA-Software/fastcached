@@ -36,7 +36,7 @@ TEST_CASE("a sub-command and a port is the minimum accepted line", "[testclient]
     CHECK(parsed->action == Action::Store);
     CHECK(parsed->port == 1234);
     CHECK(parsed->host == "127.0.0.1");
-    CHECK(parsed->cohort == "default");
+    CHECK(parsed->prefetchGroup == "default");
     CHECK(parsed->compiler == "cl");
 }
 

@@ -148,10 +148,12 @@ TEST_CASE("CacheStore drains a refusal by its declared length")
 
     ScriptedTcpClient client { reply };
     auto const value = std::vector<std::byte> { std::byte { 0x01 } };
-    auto const outcome = CacheStore(
-        client,
-        Wire::StoreRequest {
-            .key = "k", .cohort = "c", .srcRoot = "/s", .buildTree = "/b", .value = std::span<std::byte const> { value } });
+    auto const outcome = CacheStore(client,
+                                    Wire::StoreRequest { .key = "k",
+                                                         .prefetchGroup = "c",
+                                                         .srcRoot = "/s",
+                                                         .buildTree = "/b",
+                                                         .value = std::span<std::byte const> { value } });
 
     CHECK(outcome.kind == CacheOutcomeKind::Rejected);
     CHECK(outcome.code == Wire::ErrorCode::StorageWriteFailed);
@@ -162,7 +164,7 @@ TEST_CASE("CacheStore sends exactly what the wire module specifies")
 {
     auto const value = std::vector<std::byte> { std::byte { 0x77 } };
     Wire::StoreRequest const request {
-        .key = "k", .cohort = "c", .srcRoot = "/s", .buildTree = "/b", .value = std::span<std::byte const> { value }
+        .key = "k", .prefetchGroup = "c", .srcRoot = "/s", .buildTree = "/b", .value = std::span<std::byte const> { value }
     };
 
     ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Ok, {}) };

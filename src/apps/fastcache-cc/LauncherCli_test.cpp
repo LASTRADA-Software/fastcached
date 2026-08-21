@@ -78,16 +78,16 @@ TEST_CASE("the html-stats flag dispatches with no options set")
 {
     auto const cmd = Parse({ "--html-stats" });
     CHECK(cmd.action == Action::HtmlStats);
-    CHECK(cmd.cohortFilter.empty());
+    CHECK(cmd.groupFilter.empty());
     CHECK(cmd.outputPath.empty());
 }
 
-TEST_CASE("html-stats accepts --out and --cohort like --show-stats does")
+TEST_CASE("html-stats accepts --out and --prefetch-group like --show-stats does")
 {
-    auto const cmd = Parse({ "--html-stats", "--out", "report.html", "--cohort", "ci-main" });
+    auto const cmd = Parse({ "--html-stats", "--out", "report.html", "--prefetch-group", "ci-main" });
     CHECK(cmd.action == Action::HtmlStats);
     CHECK(cmd.outputPath == "report.html");
-    CHECK(cmd.cohortFilter == "ci-main");
+    CHECK(cmd.groupFilter == "ci-main");
 
     auto const joined = Parse({ "--html-stats", "--out=report.html" });
     CHECK(joined.outputPath == "report.html");
@@ -152,49 +152,49 @@ TEST_CASE("a leading slash is an absolute path, not an option")
 
 // --- stats sub-options ------------------------------------------------------
 
-TEST_CASE("the cohort filter accepts both the separated and the joined form")
+TEST_CASE("the prefetch group filter accepts both the separated and the joined form")
 {
-    auto const separated = Parse({ "--show-stats", "--cohort", "ci-main" });
+    auto const separated = Parse({ "--show-stats", "--prefetch-group", "ci-main" });
     CHECK(separated.action == Action::ShowStats);
-    CHECK(separated.cohortFilter == "ci-main");
+    CHECK(separated.groupFilter == "ci-main");
 
-    auto const joined = Parse({ "--show-stats", "--cohort=ci-main" });
+    auto const joined = Parse({ "--show-stats", "--prefetch-group=ci-main" });
     CHECK(joined.action == Action::ShowStats);
-    CHECK(joined.cohortFilter == "ci-main");
+    CHECK(joined.groupFilter == "ci-main");
 
-    CHECK(Parse({ "-s", "--cohort", "ci-main" }).cohortFilter == "ci-main");
+    CHECK(Parse({ "-s", "--prefetch-group", "ci-main" }).groupFilter == "ci-main");
 }
 
-TEST_CASE("a stats report with no options reports every cohort")
+TEST_CASE("a stats report with no options reports every prefetch group")
 {
     auto const cmd = Parse({ "--show-stats" });
     CHECK(cmd.action == Action::ShowStats);
-    CHECK(cmd.cohortFilter.empty());
+    CHECK(cmd.groupFilter.empty());
 }
 
-TEST_CASE("the cohort filter consumes its value")
+TEST_CASE("the prefetch group filter consumes its value")
 {
     // Regression: the value used to be read without being consumed, so the next
     // iteration saw it again. With the old zero-stats spelling in that position
     // this both filtered on the flag name and wiped the log.
-    auto const cmd = Parse({ "--show-stats", "--cohort", "--zero-stats" });
+    auto const cmd = Parse({ "--show-stats", "--prefetch-group", "--zero-stats" });
     CHECK(cmd.action == Action::ShowStats);
-    CHECK(cmd.cohortFilter == "--zero-stats");
+    CHECK(cmd.groupFilter == "--zero-stats");
 }
 
-TEST_CASE("a cohort filter without a value is an error rather than a silent no-op")
+TEST_CASE("a prefetch group filter without a value is an error rather than a silent no-op")
 {
-    auto const cmd = Parse({ "--show-stats", "--cohort" });
+    auto const cmd = Parse({ "--show-stats", "--prefetch-group" });
     CHECK(cmd.action == Action::UsageError);
-    CHECK(cmd.diagnostic.contains("--cohort"));
+    CHECK(cmd.diagnostic.contains("--prefetch-group"));
 }
 
-TEST_CASE("a cohort filter with an empty value is an error")
+TEST_CASE("a prefetch group filter with an empty value is an error")
 {
-    // An empty filter means "every cohort", so accepting it would answer a
+    // An empty filter means "every prefetch group", so accepting it would answer a
     // different question than the one asked.
-    CHECK(Parse({ "--show-stats", "--cohort=" }).action == Action::UsageError);
-    CHECK(Parse({ "--show-stats", "--cohort", "" }).action == Action::UsageError);
+    CHECK(Parse({ "--show-stats", "--prefetch-group=" }).action == Action::UsageError);
+    CHECK(Parse({ "--show-stats", "--prefetch-group", "" }).action == Action::UsageError);
 }
 
 TEST_CASE("an unknown stats sub-option is diagnosed")
@@ -215,7 +215,7 @@ TEST_CASE("a valueless stats option is accepted, and rejects a joined value")
     // a valueless row to exercise the generic path a future option would use.
     static constexpr std::array<std::string_view, 0> NoAliases {};
     static constexpr std::array Options {
-        FlagSpec { .action = Action::Cohort,
+        FlagSpec { .action = Action::PrefetchGroup,
                    .primary = "--verbose",
                    .aliases = NoAliases,
                    .arity = Arity::None,
@@ -226,7 +226,7 @@ TEST_CASE("a valueless stats option is accepted, and rejects a joined value")
     std::vector<std::string> const bare { "--verbose" };
     auto const accepted = ParseStatsOptions(bare, Options);
     CHECK(accepted.action == Action::ShowStats);
-    CHECK(accepted.cohortFilter.empty());
+    CHECK(accepted.groupFilter.empty());
 
     std::vector<std::string> const withValue { "--verbose=1" };
     auto const rejected = ParseStatsOptions(withValue, Options);
@@ -240,8 +240,8 @@ TEST_CASE("FindFlag matches primaries and aliases only")
 {
     CHECK(FindFlag(TopLevelFlags(), "--show-stats") != nullptr);
     CHECK(FindFlag(TopLevelFlags(), "-s") != nullptr);
-    CHECK(FindFlag(TopLevelFlags(), "--cohort") == nullptr);
-    CHECK(FindFlag(StatsOptions(), "--cohort") != nullptr);
+    CHECK(FindFlag(TopLevelFlags(), "--prefetch-group") == nullptr);
+    CHECK(FindFlag(StatsOptions(), "--prefetch-group") != nullptr);
     CHECK(FindFlag(StatsOptions(), "--show-stats") == nullptr);
     CHECK(FindFlag(TopLevelFlags(), "") == nullptr);
 }
@@ -254,7 +254,7 @@ TEST_CASE("the help text renders the sections it promises")
     CHECK(help.contains("ENVIRONMENT"));
     CHECK(help.contains("fastcache-cc <compiler> <args...>"));
     // The joined form is documented from the arity, not per row.
-    CHECK(help.contains("--cohort=<id>"));
+    CHECK(help.contains("--prefetch-group=<id>"));
 }
 
 TEST_CASE("every environment row is named and described")
@@ -305,9 +305,9 @@ TEST_CASE("the help text documents every environment variable the launcher reads
     // tautological, while this fails if a row is ever dropped.
     auto const help = HelpText();
     for (auto const* name: { "FASTCACHE_ADDR",
-                             "FASTCACHE_SRCROOT",
-                             "FASTCACHE_BUILDTREE",
-                             "FASTCACHE_COHORT",
+                             "FASTCACHE_SOURCE_DIR",
+                             "FASTCACHE_BINARY_DIR",
+                             "FASTCACHE_PREFETCH_GROUP",
                              "FASTCACHE_VERBOSE",
                              "FASTCACHE_NO_STATS",
                              "FASTCACHE_NO_DIRECT",

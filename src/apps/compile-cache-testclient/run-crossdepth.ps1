@@ -56,7 +56,7 @@ int f() { return alpha() + beta(); }
     return $src
 }
 
-function Invoke-CrossDepth([string]$compiler, [string]$deepSrc, [string]$shallowSrc, [string]$key, [string]$cohort) {
+function Invoke-CrossDepth([string]$compiler, [string]$deepSrc, [string]$shallowSrc, [string]$key, [string]$prefetchGroup) {
     $deepBuild    = Join-Path (Split-Path $deepSrc -Parent) "build"
     $shallowBuild = Join-Path (Split-Path $shallowSrc -Parent) "build"
     New-Item -ItemType Directory -Force -Path $deepBuild,$shallowBuild | Out-Null
@@ -65,7 +65,7 @@ function Invoke-CrossDepth([string]$compiler, [string]$deepSrc, [string]$shallow
     Push-Location $deepBuild
     try {
         Write-Host "[$compiler] STORE from deep:  $deepSrc"
-        & $Client store --port $Port --key $key --cohort $cohort `
+        & $Client store --port $Port --key $key --prefetch-group $prefetchGroup `
             --srcroot $deepSrc --buildtree $deepBuild --compiler $compiler `
             --source $source --out (Join-Path $deepBuild "unit.obj")
         if ($LASTEXITCODE -ne 0) { throw "store failed ($compiler)" }

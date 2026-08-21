@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/CompileCache/CohortManifest.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
+#include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -101,21 +101,21 @@ namespace
     }
 
     /// Handle one STORE command: canonicalize with the producer's layout, store
-    /// the canonical value, and record cohort membership.
+    /// the canonical value, and record prefetch group membership.
     ///
     /// The payload arrives already read and is split synchronously, so this
     /// coroutine has exactly one suspend point (the reply) rather than the five
     /// the field-at-a-time reader used to need.
     /// @param socket   Client socket.
     /// @param engine   Cache engine.
-    /// @param manifest Cohort manifest.
+    /// @param manifest Prefetch group manifest.
     /// @param payload  The request payload, by value: a coroutine must not hold a
     ///                 reference parameter across a suspend point, and the field
     ///                 views below point into it.
     /// @return Whether the command loop should continue or abort.
     [[nodiscard]] Task<Next> HandleStore(ISocket* socket,
                                          CacheEngine* engine,
-                                         CohortManifest* manifest,
+                                         PrefetchGroupManifest* manifest,
                                          std::vector<std::byte> payload)
     {
         auto const fields = Wire::DecodeStorePayload(payload);
@@ -134,24 +134,24 @@ namespace
 
         auto const canonicalBytes = EncodeCompileValue(*decoded);
         auto const keyStr = BytesToString(fields->key);
-        auto const cohortStr = BytesToString(fields->cohort);
+        auto const groupStr = BytesToString(fields->prefetchGroup);
         auto const stored = engine->Set(keyStr, canonicalBytes, /*flags=*/0, /*exptime=*/0);
         if (!stored.has_value())
             co_return co_await ReplyError(socket, Wire::ErrorCode::StorageWriteFailed, {}) ? Next::Continue : Next::Abort;
 
-        // Record cohort membership (best-effort: a manifest failure must not fail
+        // Record prefetch group membership (best-effort: a manifest failure must not fail
         // the STORE — the value is already safely stored).
-        if (!cohortStr.empty())
-            (void) manifest->AddKey(cohortStr, keyStr, engine->Clock().Now());
+        if (!groupStr.empty())
+            (void) manifest->AddKey(groupStr, keyStr, engine->Clock().Now());
 
         co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
     }
 
-    /// Claim the right to warm `cohort`, once per cache engine.
+    /// Claim the right to warm `prefetch group`, once per cache engine.
     ///
     /// A per-connection set cannot bound this work: a compiler launcher opens a fresh
     /// connection per translation unit, so every one of a build's thousands of fetches
-    /// arrived with an empty set and re-warmed the whole cohort — a measured 60-hit
+    /// arrived with an empty set and re-warmed the whole prefetch group — a measured 60-hit
     /// build issued 27022 prefetches and 13969 disk reads that way.
     ///
     /// The claim is therefore shared across connections, but keyed on the ENGINE
@@ -160,16 +160,16 @@ namespace
     /// next test case) would inherit "already warmed" for a cache that is in fact
     /// cold and would never prefetch. Entries are keyed by engine address and dropped
     /// when that engine is gone.
-    /// @param engine The engine the cohort belongs to.
-    /// @param cohort The cohort id to claim.
+    /// @param engine        The engine the prefetch group belongs to.
+    /// @param prefetchGroup The group id to claim.
     /// @return True when this call claimed it (the caller should warm it).
-    [[nodiscard]] bool ClaimCohortForWarming(CacheEngine const* engine, std::string const& cohort)
+    [[nodiscard]] bool ClaimGroupForWarming(CacheEngine const* engine, std::string const& prefetchGroup)
     {
         // Bounded so a long-lived process cannot accumulate state for engines that no
-        // longer exist. Cohort ids are few (one per build ref), so the cap is generous;
-        // overflowing it merely re-warms a cohort, never returns a wrong value.
+        // longer exist. Group ids are few (one per build ref), so the cap is generous;
+        // overflowing it merely re-warms a group, never returns a wrong value.
         constexpr std::size_t MaxTrackedEngines = 8;
-        constexpr std::size_t MaxCohortsPerEngine = 256;
+        constexpr std::size_t MaxGroupsPerEngine = 256;
 
         static std::mutex warmedMutex;
         static std::map<CacheEngine const*, std::set<std::string, std::less<>>> warmedByEngine;
@@ -182,36 +182,36 @@ namespace
         if (!warmedByEngine.contains(engine) && warmedByEngine.size() >= MaxTrackedEngines)
             warmedByEngine.clear();
 
-        auto& cohorts = warmedByEngine[engine];
-        if (cohorts.size() >= MaxCohortsPerEngine)
-            cohorts.clear();
-        return cohorts.insert(cohort).second;
+        auto& prefetchGroups = warmedByEngine[engine];
+        if (prefetchGroups.size() >= MaxGroupsPerEngine)
+            prefetchGroups.clear();
+        return prefetchGroups.insert(prefetchGroup).second;
     }
 
-    /// Warm the rest of `keyStr`'s cohort into L1. Called *after* the reply is
+    /// Warm the rest of `keyStr`'s prefetch group into L1. Called *after* the reply is
     /// sent, so the current fetch is never slowed. Warming is idempotent and cheap
-    /// for already-warm keys; `primedCohorts` avoids re-warming within a session.
+    /// for already-warm keys; `primedGroups` avoids re-warming within a session.
     /// @param engine        Cache engine.
-    /// @param manifest      Cohort manifest.
+    /// @param manifest      Prefetch group manifest.
     /// @param keyStr        The key just served (the demand signal).
-    /// @param primedCohorts [in,out] Cohorts already warmed on this connection.
-    void PrefetchCohort(CacheEngine* engine,
-                        CohortManifest* manifest,
-                        std::string const& keyStr,
-                        std::set<std::string, std::less<>>& primedCohorts)
+    /// @param primedGroups [in,out] Prefetch groups already warmed on this connection.
+    void PrefetchGroup(CacheEngine* engine,
+                       PrefetchGroupManifest* manifest,
+                       std::string const& keyStr,
+                       std::set<std::string, std::less<>>& primedGroups)
     {
         auto const now = engine->Clock().Now();
-        auto const cohort = manifest->CohortOf(keyStr, now);
-        if (!cohort.has_value() || !cohort->has_value() || primedCohorts.contains(**cohort))
+        auto const prefetchGroup = manifest->GroupOf(keyStr, now);
+        if (!prefetchGroup.has_value() || !prefetchGroup->has_value() || primedGroups.contains(**prefetchGroup))
             return;
 
-        primedCohorts.insert(**cohort);
+        primedGroups.insert(**prefetchGroup);
         // Cheap connection-local check first; the per-engine claim is what actually
-        // bounds the work to one warm per cohort.
-        if (!ClaimCohortForWarming(engine, **cohort))
+        // bounds the work to one warm per prefetch group.
+        if (!ClaimGroupForWarming(engine, **prefetchGroup))
             return;
 
-        auto const members = manifest->Keys(**cohort, now);
+        auto const members = manifest->Keys(**prefetchGroup, now);
         if (!members.has_value())
             return;
         for (auto const& member: *members)
@@ -220,18 +220,18 @@ namespace
     }
 
     /// Handle one FETCH command: serve the canonical value verbatim, then warm the
-    /// rest of its cohort.
+    /// rest of its prefetch group.
     /// @param socket        Client socket.
     /// @param engine        Cache engine.
-    /// @param manifest      Cohort manifest.
-    /// @param primedCohorts [in,out] Cohorts already warmed on this connection
+    /// @param manifest      Prefetch group manifest.
+    /// @param primedGroups [in,out] Prefetch groups already warmed on this connection
     ///                      (pointer: a coroutine must not hold reference params).
     /// @param payload       The request payload, by value (see HandleStore).
     /// @return Whether the command loop should continue or abort.
     [[nodiscard]] Task<Next> HandleFetch(ISocket* socket,
                                          CacheEngine* engine,
-                                         CohortManifest* manifest,
-                                         std::set<std::string, std::less<>>* primedCohorts,
+                                         PrefetchGroupManifest* manifest,
+                                         std::set<std::string, std::less<>>* primedGroups,
                                          std::vector<std::byte> payload)
     {
         auto const key = Wire::DecodeFetchPayload(payload);
@@ -254,9 +254,9 @@ namespace
         if (!co_await Reply(socket, Wire::Status::Ok, std::vector<std::byte> { value.begin(), value.end() }))
             co_return Next::Abort;
 
-        // Leading-key cohort prefetch: this fetch is the demand signal that the
-        // rest of the build cohort is about to be requested.
-        PrefetchCohort(engine, manifest, keyStr, *primedCohorts);
+        // Leading-key group prefetch: this fetch is the demand signal that the
+        // rest of the build group is about to be requested.
+        PrefetchGroup(engine, manifest, keyStr, *primedGroups);
         co_return Next::Continue;
     }
 
@@ -270,11 +270,11 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
     ByteReader reader { *socket, MaxLineBytes, session.maxPayloadBytes };
     reader.PrimeWith(primingBytes);
 
-    CohortManifest manifest { engine->Storage() };
+    PrefetchGroupManifest manifest { engine->Storage() };
 
-    // Cohorts already prefetched on this connection, so a second fetch from the
-    // same cohort does not re-warm the whole set.
-    std::set<std::string, std::less<>> primedCohorts;
+    // Prefetch groups already prefetched on this connection, so a second fetch from the
+    // same prefetch group does not re-warm the whole set.
+    std::set<std::string, std::less<>> primedGroups;
 
     // The version the first command declared. Every later command on this
     // connection must match: a stream that changes version mid-flight is
@@ -366,7 +366,7 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
                 next = co_await HandleStore(socket, engine, &manifest, std::move(*payload));
                 break;
             case Wire::Op::Fetch:
-                next = co_await HandleFetch(socket, engine, &manifest, &primedCohorts, std::move(*payload));
+                next = co_await HandleFetch(socket, engine, &manifest, &primedGroups, std::move(*payload));
                 break;
         }
 

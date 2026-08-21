@@ -146,7 +146,7 @@ TEST_CASE("IsToolchainHeader is case-insensitive on Windows paths")
 
 TEST_CASE("IsToolchainHeader matches a root spelled with forward slashes")
 {
-    // CMake exports FASTCACHE_SRCROOT in its own native form (`D:/Lastrada`) while
+    // CMake exports FASTCACHE_SOURCE_DIR in its own native form (`D:/Lastrada`) while
     // cl emits includes with backslashes. A separator-sensitive prefix test makes
     // every project header look external, which classifies the whole manifest as
     // toolchain content and produces an empty manifest — direct mode then never

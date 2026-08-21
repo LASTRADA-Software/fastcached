@@ -67,10 +67,10 @@ function New-Tree([string]$root) {
 # Run the launcher once; return @{ code; stderr } and capture whether it was a
 # HIT or MISS from the verbose trace.
 function Invoke-Launcher([string]$compiler, [string]$srcRoot, [string]$buildTree, [string]$obj) {
-    $env:FASTCACHE_ADDR      = "127.0.0.1:$Port"
-    $env:FASTCACHE_SRCROOT   = $srcRoot
-    $env:FASTCACHE_BUILDTREE = $buildTree
-    $env:FASTCACHE_VERBOSE   = "1"
+    $env:FASTCACHE_ADDR       = "127.0.0.1:$Port"
+    $env:FASTCACHE_SOURCE_DIR = $srcRoot
+    $env:FASTCACHE_BINARY_DIR = $buildTree
+    $env:FASTCACHE_VERBOSE    = "1"
     $source = Join-Path $srcRoot "u.cpp"
     $errFile = New-TemporaryFile
     $p = Start-Process -FilePath $Launcher `
@@ -110,10 +110,10 @@ function New-BigTree([string]$root) {
 # would hang the CI job instead of reporting a regression.
 function Invoke-LauncherBounded([string]$compiler, [string]$srcRoot, [string]$buildTree,
                                 [string]$obj, [string]$sourceName, [int]$timeoutSec) {
-    $env:FASTCACHE_ADDR      = "127.0.0.1:$Port"
-    $env:FASTCACHE_SRCROOT   = $srcRoot
-    $env:FASTCACHE_BUILDTREE = $buildTree
-    $env:FASTCACHE_VERBOSE   = "1"
+    $env:FASTCACHE_ADDR       = "127.0.0.1:$Port"
+    $env:FASTCACHE_SOURCE_DIR = $srcRoot
+    $env:FASTCACHE_BINARY_DIR = $buildTree
+    $env:FASTCACHE_VERBOSE    = "1"
     $source = Join-Path $srcRoot $sourceName
     $errFile = New-TemporaryFile
     $p = Start-Process -FilePath $Launcher `
@@ -222,7 +222,7 @@ try {
     # repeats the unit-level guard against the shipped launcher, and it is the
     # only place the Windows-only "/?" spelling gets exercised.
     $help = (& $Launcher --help | Out-String)
-    foreach ($flag in @('--show-stats','-s','--zero-stats','-z','--help','-h','/?','--version','--cohort')) {
+    foreach ($flag in @('--show-stats','-s','--zero-stats','-z','--help','-h','/?','--version','--prefetch-group')) {
         if ($help -notmatch [regex]::Escape($flag)) {
             Write-Host "  HELP DRIFT: --help does not document $flag" -ForegroundColor Red
             $exit = 1
@@ -250,7 +250,7 @@ try {
 finally {
     $server | Stop-Process -Force -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $DeepTemp,$ShallowTemp -ErrorAction SilentlyContinue
-    Remove-Item Env:\FASTCACHE_ADDR,Env:\FASTCACHE_SRCROOT,Env:\FASTCACHE_BUILDTREE,Env:\FASTCACHE_VERBOSE -ErrorAction SilentlyContinue
+    Remove-Item Env:\FASTCACHE_ADDR,Env:\FASTCACHE_SOURCE_DIR,Env:\FASTCACHE_BINARY_DIR,Env:\FASTCACHE_VERBOSE -ErrorAction SilentlyContinue
 }
 
 if (-not $ranAnyCompiler) {

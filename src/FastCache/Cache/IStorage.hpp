@@ -411,7 +411,7 @@ class IStorage
     /// fronts, **without** treating the access as a client read: no LRU
     /// promotion counted as a hit, no hit/miss statistic change, no
     /// `lastAccess`/`fetched` stamping. Used by the compile-cache executor to
-    /// pre-load a build cohort disk→memory ahead of demand, so the cohort's
+    /// pre-load a build prefetch group disk→memory ahead of demand, so the prefetch group's
     /// FETCHes are served from L1.
     ///
     /// The default is correct for single-tier backends (there is no lower tier

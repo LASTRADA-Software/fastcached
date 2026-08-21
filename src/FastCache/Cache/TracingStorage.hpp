@@ -83,7 +83,7 @@ class TracingStorage final: public IStorage
 
     [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
 
-    /// Prefetch override so the trace surfaces cohort-warm operations under
+    /// Prefetch override so the trace surfaces prefetch group-warm operations under
     /// a PREFETCH verb and the inner tiered storage's real warm is used
     /// (the base default would only Peek).
     [[nodiscard]] std::expected<bool, StorageError> Prefetch(std::string_view key, TimePoint now) override;

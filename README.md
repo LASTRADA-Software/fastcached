@@ -108,14 +108,14 @@ Point every machine that should share the cache at that one daemon.
 Three variables must **all** be set, or every compile runs uncached:
 
 ```sh
-export FASTCACHE_ADDR=127.0.0.1:6674     # the daemon
-export FASTCACHE_SRCROOT=$PWD            # your checkout root
-export FASTCACHE_BUILDTREE=$PWD/build    # your build directory
-export FASTCACHE_COHORT=myproject-main   # optional: prefetch grouping
+export FASTCACHE_ADDR=127.0.0.1:6674       # the daemon
+export FASTCACHE_SOURCE_DIR=$PWD           # your checkout root
+export FASTCACHE_BINARY_DIR=$PWD/build     # your build directory
+export FASTCACHE_PREFETCH_GROUP=myproject-main     # optional: prefetch grouping
 ```
 
-`SRCROOT` and `BUILDTREE` are what make entries portable: paths under them are
-rewritten to tokens before hashing, so the same source at
+`SOURCE_DIR` and `BINARY_DIR` are what make entries portable: paths under
+them are rewritten to tokens before hashing, so the same source at
 `/home/alice/proj` and `/ci/runner/w/1/s/proj` produces the *same* cache key.
 
 ### 3. Wire it into the build
@@ -142,9 +142,9 @@ FASTCACHE_VERBOSE=1 fastcache-cc g++ -c src/a.cpp -o build/a.o
 With PowerShell and MSVC:
 
 ```powershell
-$env:FASTCACHE_ADDR      = '127.0.0.1:6674'
-$env:FASTCACHE_SRCROOT   = $PWD
-$env:FASTCACHE_BUILDTREE = "$PWD\build"
+$env:FASTCACHE_ADDR       = '127.0.0.1:6674'
+$env:FASTCACHE_SOURCE_DIR = $PWD
+$env:FASTCACHE_BINARY_DIR = "$PWD\build"
 
 cmake -S . -B build -G Ninja `
   -DCMAKE_CXX_COMPILER_LAUNCHER=fastcache-cc.exe
@@ -153,9 +153,9 @@ cmake -S . -B build -G Ninja `
 ### 4. See how it did
 
 ```sh
-fastcache-cc --show-stats                    # totals, hit rate, latency distributions
-fastcache-cc --show-stats --cohort ci-main   # one cohort only
-fastcache-cc --zero-stats                    # discard the log
+fastcache-cc --show-stats                            # totals, hit rate, latency distributions
+fastcache-cc --show-stats --prefetch-group ci-main   # one prefetch group only
+fastcache-cc --zero-stats                            # discard the log
 ```
 
 ```

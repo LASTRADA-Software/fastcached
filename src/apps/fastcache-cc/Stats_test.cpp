@@ -126,11 +126,11 @@ class ScopedStateDir
 };
 
 /// Build a record with the fields these tests care about.
-[[nodiscard]] Record MakeRecord(Outcome outcome, std::string cohort, std::string source, std::uint64_t elapsedMs)
+[[nodiscard]] Record MakeRecord(Outcome outcome, std::string prefetchGroup, std::string source, std::uint64_t elapsedMs)
 {
     Record record;
     record.outcome = outcome;
-    record.cohort = std::move(cohort);
+    record.prefetchGroup = std::move(prefetchGroup);
     record.source = std::move(source);
     record.elapsedMs = elapsedMs;
     return record;
@@ -188,7 +188,7 @@ TEST_CASE("FormatReport ranks the fall-back reasons")
     CHECK(report.contains("1x  preprocess failed"));
 }
 
-TEST_CASE("FormatReport restricts the fold to one cohort when filtered")
+TEST_CASE("FormatReport restricts the fold to one prefetch group when filtered")
 {
     ScopedStateDir const scoped;
     AppendRecord(MakeRecord(Outcome::Hit, "alpha", "a.cpp", 10));
@@ -201,8 +201,8 @@ TEST_CASE("FormatReport restricts the fold to one cohort when filtered")
     auto const beta = FormatReport("beta");
     CHECK(beta.contains("compiles     : 2"));
 
-    // A cohort with no records says so rather than reporting an empty fold.
-    CHECK(FormatReport("gamma").contains("no records for cohort 'gamma'"));
+    // A prefetch group with no records says so rather than reporting an empty fold.
+    CHECK(FormatReport("gamma").contains("no records for prefetch group 'gamma'"));
 }
 
 TEST_CASE("FormatReport separates a direct-mode hit from a preprocessed one")
@@ -280,7 +280,7 @@ TEST_CASE("FormatHtmlReport surfaces the headline hit rate and tallies")
     CHECK(report.contains(">1<"));   // misses tally
 }
 
-TEST_CASE("FormatHtmlReport lists every cohort in the comparison table")
+TEST_CASE("FormatHtmlReport lists every prefetch group in the comparison table")
 {
     ScopedStateDir const scoped;
     AppendRecord(MakeRecord(Outcome::Hit, "alpha", "a.cpp", 10));
@@ -304,7 +304,7 @@ TEST_CASE("FormatHtmlReport lists the fall-back reasons and never-cached files")
     CHECK(report.contains("volatile.cpp"));
 }
 
-TEST_CASE("FormatHtmlReport restricts the fold to one cohort when filtered")
+TEST_CASE("FormatHtmlReport restricts the fold to one prefetch group when filtered")
 {
     ScopedStateDir const scoped;
     AppendRecord(MakeRecord(Outcome::Hit, "alpha", "a.cpp", 10));
@@ -314,7 +314,7 @@ TEST_CASE("FormatHtmlReport restricts the fold to one cohort when filtered")
     CHECK(alpha.contains("alpha"));
     CHECK_FALSE(alpha.contains(">beta<"));
 
-    CHECK(FormatHtmlReport("gamma").contains("no records for cohort 'gamma'"));
+    CHECK(FormatHtmlReport("gamma").contains("no records for prefetch group 'gamma'"));
 }
 
 TEST_CASE("LogPath points inside the configured state directory")

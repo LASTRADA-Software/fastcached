@@ -204,7 +204,7 @@ ReplyFrame SoleReply(std::span<std::byte const> bytes)
 struct StoreFields
 {
     std::string_view key;
-    std::string_view cohort;
+    std::string_view prefetchGroup;
     std::string_view srcRoot;
     std::string_view buildTree;
 };
@@ -218,7 +218,7 @@ std::vector<std::byte> StoreFrame(StoreFields const& fields,
 {
     auto const encoded = EncodeCompileValue(value);
     return Wire::EncodeStore(Wire::StoreRequest { .key = fields.key,
-                                                  .cohort = fields.cohort,
+                                                  .prefetchGroup = fields.prefetchGroup,
                                                   .srcRoot = fields.srcRoot,
                                                   .buildTree = fields.buildTree,
                                                   .value = std::span<std::byte const> { encoded } },
@@ -283,11 +283,12 @@ TEST_CASE("STORE canonicalizes showIncludes; FETCH returns the canonical form", 
                                        "\r\n" });
 
     // STORE from a deep "CI" layout.
-    auto const storeReply = Exchange(
-        fix,
-        StoreFrame(
-            { .key = "obj-hash", .cohort = "envCI", .srcRoot = R"(C:\ci\deep\src)", .buildTree = R"(C:\ci\deep\build)" },
-            v));
+    auto const storeReply = Exchange(fix,
+                                     StoreFrame({ .key = "obj-hash",
+                                                  .prefetchGroup = "envCI",
+                                                  .srcRoot = R"(C:\ci\deep\src)",
+                                                  .buildTree = R"(C:\ci\deep\build)" },
+                                                v));
     auto const storeFrame = SoleReply(storeReply);
     REQUIRE(storeFrame.present);
     CHECK(storeFrame.status == Wire::Status::Ok);
@@ -335,10 +336,12 @@ TEST_CASE("STORE/FETCH round-trips an object blob larger than 1 MiB", "[compile-
                                        R"(C:\ci\deep\src\big.h)"
                                        "\r\n" });
 
-    auto const storeReply = Exchange(
-        fix,
-        StoreFrame(
-            { .key = "big-obj", .cohort = "envCI", .srcRoot = R"(C:\ci\deep\src)", .buildTree = R"(C:\ci\deep\build)" }, v));
+    auto const storeReply = Exchange(fix,
+                                     StoreFrame({ .key = "big-obj",
+                                                  .prefetchGroup = "envCI",
+                                                  .srcRoot = R"(C:\ci\deep\src)",
+                                                  .buildTree = R"(C:\ci\deep\build)" },
+                                                v));
     auto const storeFrame = SoleReply(storeReply);
     REQUIRE(storeFrame.present);
     REQUIRE(storeFrame.status == Wire::Status::Ok);
@@ -468,7 +471,7 @@ TEST_CASE("A refused STORE is drainable without knowing the command", "[compile-
     // A STORE whose value is not a decodable compile-value.
     auto const junk = std::vector<std::byte> { std::byte { 0xEE }, std::byte { 0xEE } };
     auto const badStore = Wire::EncodeStore(Wire::StoreRequest {
-        .key = "k", .cohort = "", .srcRoot = "", .buildTree = "", .value = std::span<std::byte const> { junk } });
+        .key = "k", .prefetchGroup = "", .srcRoot = "", .buildTree = "", .value = std::span<std::byte const> { junk } });
 
     auto const replies = SplitReplies(ExchangeWith(fix, Concat({ badStore, FetchFrame("anything") }), SessionContext {}));
 
@@ -611,7 +614,7 @@ TEST_CASE("Cross-depth: value stored from a deep layout localizes for a shallow 
     // Produced at a deep path (CI runner nested deeper).
     auto const storeReply = Exchange(fix,
                                      StoreFrame({ .key = "k",
-                                                  .cohort = "envCI",
+                                                  .prefetchGroup = "envCI",
                                                   .srcRoot = R"(C:\ci\deep\runner\src)",
                                                   .buildTree = R"(C:\ci\deep\runner\build)" },
                                                 v));
@@ -643,7 +646,7 @@ TEST_CASE("Cross-depth: value stored from a deep layout localizes for a shallow 
 namespace
 {
 
-/// A single valid compile value for cohort tests.
+/// A single valid compile value for prefetch group tests.
 CompileValue SampleValue()
 {
     CompileValue v;
@@ -655,13 +658,13 @@ CompileValue SampleValue()
     return v;
 }
 
-/// Store `key` under `cohort` via a fresh handler over `engine`.
-void StoreVia(CacheEngine& engine, std::string_view key, std::string_view cohort)
+/// Store `key` under `prefetch group` via a fresh handler over `engine`.
+void StoreVia(CacheEngine& engine, std::string_view key, std::string_view prefetchGroup)
 {
     InMemorySocketPair pair = InMemorySocketPair::Create();
     CompileCacheHandler handler;
-    auto const frame =
-        StoreFrame({ .key = key, .cohort = cohort, .srcRoot = R"(C:\src)", .buildTree = R"(C:\build)" }, SampleValue());
+    auto const frame = StoreFrame(
+        { .key = key, .prefetchGroup = prefetchGroup, .srcRoot = R"(C:\src)", .buildTree = R"(C:\build)" }, SampleValue());
     REQUIRE(SyncRun(WriteBytes(pair.client.get(), frame)));
     pair.client->ShutdownWrite();
     SessionContext session {};
@@ -671,7 +674,8 @@ void StoreVia(CacheEngine& engine, std::string_view key, std::string_view cohort
 
 } // namespace
 
-TEST_CASE("FETCH of a cohort member warms the rest of the cohort into L1", "[compile-cache][handler][prefetch]")
+TEST_CASE("FETCH of a prefetch group member warms the rest of the prefetch group into L1",
+          "[compile-cache][handler][prefetch]")
 {
     ManualClock clock;
     auto l1 = std::make_unique<InMemoryLruStorage>(0);
@@ -679,7 +683,7 @@ TEST_CASE("FETCH of a cohort member warms the rest of the cohort into L1", "[com
     LayeredStorage layered { std::move(l1), std::move(l2) };
     CacheEngine engine { layered, clock };
 
-    // Store three cohort members.
+    // Store three prefetch group members.
     StoreVia(engine, "k1", "envCI");
     StoreVia(engine, "k2", "envCI");
     StoreVia(engine, "k3", "envCI");
@@ -691,7 +695,7 @@ TEST_CASE("FETCH of a cohort member warms the rest of the cohort into L1", "[com
     REQUIRE_FALSE(layered.L1().Peek("k2", clock.Now())->found);
     REQUIRE_FALSE(layered.L1().Peek("k3", clock.Now())->found);
 
-    // Fetch the leading key: triggers a cohort prefetch of k2/k3 into L1.
+    // Fetch the leading key: triggers a group prefetch of k2/k3 into L1.
     InMemorySocketPair pair = InMemorySocketPair::Create();
     CompileCacheHandler handler;
     REQUIRE(SyncRun(WriteBytes(pair.client.get(), FetchFrame("k1"))));

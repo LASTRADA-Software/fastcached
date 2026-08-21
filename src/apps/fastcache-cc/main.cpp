@@ -14,9 +14,9 @@
 //
 // Config (environment):
 //   FASTCACHE_ADDR       host:port of fastcached (required to use the cache)
-//   FASTCACHE_SRCROOT    checkout source root (for keying + canonicalization)
-//   FASTCACHE_BUILDTREE  build output root
-//   FASTCACHE_COHORT     optional cohort id (default "default")
+//   FASTCACHE_SOURCE_DIR checkout source root (for keying + canonicalization)
+//   FASTCACHE_BINARY_DIR build output root
+//   FASTCACHE_PREFETCH_GROUP     optional prefetch group id (default "default")
 //   FASTCACHE_VERBOSE    if set, print fall-back diagnostics to stderr
 //   FASTCACHE_NO_STATS   if set, do not record invocations to the statistics log
 //   FASTCACHE_NO_DIRECT  if set, disable direct mode (always preprocess)
@@ -97,7 +97,7 @@ struct Config
     std::string addr;
     std::string srcRoot;
     std::string buildTree;
-    std::string cohort { "default" };
+    std::string prefetchGroup { "default" };
     bool verbose { false };
     bool stats { true };  ///< Record each invocation to the per-user log.
     bool direct { true }; ///< Try the manifest shortcut before preprocessing.
@@ -153,14 +153,14 @@ struct Config
 [[nodiscard]] Config LoadConfig()
 {
     Config c;
-    c.addr = EnvOr("FASTCACHE_ADDR", "");
-    c.srcRoot = EnvOr("FASTCACHE_SRCROOT", "");
-    c.buildTree = EnvOr("FASTCACHE_BUILDTREE", "");
-    c.cohort = EnvOr("FASTCACHE_COHORT", "default");
-    c.verbose = EnvSet("FASTCACHE_VERBOSE");
-    c.stats = !EnvSet("FASTCACHE_NO_STATS");
-    c.direct = !EnvSet("FASTCACHE_NO_DIRECT");
-    c.ioTimeout = EnvMillis("FASTCACHE_TIMEOUT_MS", DefaultIoTimeout);
+    c.addr = EnvOr(Cc::EnvName::Addr, "");
+    c.srcRoot = EnvOr(Cc::EnvName::SourceDir, "");
+    c.buildTree = EnvOr(Cc::EnvName::BinaryDir, "");
+    c.prefetchGroup = EnvOr(Cc::EnvName::PrefetchGroup, "default");
+    c.verbose = EnvSet(Cc::EnvName::Verbose);
+    c.stats = !EnvSet(Cc::EnvName::NoStats);
+    c.direct = !EnvSet(Cc::EnvName::NoDirect);
+    c.ioTimeout = EnvMillis(Cc::EnvName::TimeoutMs, DefaultIoTimeout);
     return c;
 }
 
@@ -551,7 +551,7 @@ constexpr std::size_t ReplayRegionCount = 2;
 /// and whose text-region list is empty — nothing to canonicalize, and no protocol
 /// change needed.
 /// @param addr Daemon address.
-/// @param cfg  Launcher config (cohort and layout travel with the store).
+/// @param cfg  Launcher config (prefetch group and layout travel with the store).
 /// @param key  The key to store under.
 /// @param body The bytes to store.
 void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key, std::string_view body)
@@ -565,7 +565,7 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
     // ineffective.
     auto const outcome = Cc::CacheStore(client->Transport(),
                                         Wire::StoreRequest { .key = key,
-                                                             .cohort = cfg.cohort,
+                                                             .prefetchGroup = cfg.prefetchGroup,
                                                              .srcRoot = cfg.srcRoot,
                                                              .buildTree = cfg.buildTree,
                                                              .value = Wire::AsBytes(body) });
@@ -770,7 +770,7 @@ void RecordManifest(Config const& cfg,
 {
     if (cfg.addr.empty() || cfg.srcRoot.empty() || cfg.buildTree.empty())
     {
-        Warn("missing FASTCACHE_ADDR/SRCROOT/BUILDTREE");
+        Warn("missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
         return std::nullopt;
     }
 
@@ -953,7 +953,7 @@ void RecordManifest(Config const& cfg,
     // old framing carried could never express.
     auto const outcome = Cc::CacheStore(client->Transport(),
                                         Wire::StoreRequest { .key = key,
-                                                             .cohort = cfg.cohort,
+                                                             .prefetchGroup = cfg.prefetchGroup,
                                                              .srcRoot = cfg.srcRoot,
                                                              .buildTree = cfg.buildTree,
                                                              .value = std::span<std::byte const> { encoded } });
@@ -998,13 +998,13 @@ void RecordManifest(Config const& cfg,
 }
 
 /// Print the statistics report (`--show-stats`) and return the process exit code.
-/// @param cohortFilter Restrict the report to this cohort; empty reports all.
-[[nodiscard]] int RunStatsReport(std::string_view cohortFilter)
+/// @param groupFilter Restrict the report to this prefetch group; empty reports all.
+[[nodiscard]] int RunStatsReport(std::string_view groupFilter)
 {
     // The color decision is made here, not inside Stats.cpp, so that module
     // stays free of ambient probes -- the same split --help already uses.
     std::cout << Cc::FormatReport(
-        cohortFilter, FastCache::StdoutSupportsColor() ? FastCache::UsageColor::Colored : FastCache::UsageColor::Plain);
+        groupFilter, FastCache::StdoutSupportsColor() ? FastCache::UsageColor::Colored : FastCache::UsageColor::Plain);
     return 0;
 }
 
@@ -1022,14 +1022,14 @@ void RecordManifest(Config const& cfg,
 }
 
 /// Render the HTML dashboard (`--html-stats`) and write it to disk.
-/// @param cohortFilter Restrict the report to this cohort; empty reports all.
+/// @param groupFilter Restrict the report to this prefetch group; empty reports all.
 /// @param outputPath Where to write it; empty means DefaultHtmlReportPath().
 /// @return Process exit code.
-[[nodiscard]] int RunHtmlStatsReport(std::string_view cohortFilter, std::string_view outputPath)
+[[nodiscard]] int RunHtmlStatsReport(std::string_view groupFilter, std::string_view outputPath)
 {
-    auto const report = Cc::FormatHtmlReport(cohortFilter);
+    auto const report = Cc::FormatHtmlReport(groupFilter);
 
-    // The empty-log/empty-cohort case returns the same short plain-text
+    // The empty-log/empty-prefetch group case returns the same short plain-text
     // message FormatReport does (see FormatHtmlReport's doc comment) --
     // printed rather than written to a file, matching --show-stats's own
     // behaviour for the same condition.
@@ -1110,16 +1110,16 @@ int main(int argc, char** argv)
             std::cout << "fastcache-cc " << FASTCACHE_CC_VERSION << '\n';
             return 0;
         case Cc::Action::ShowStats:
-            return RunStatsReport(command.cohortFilter);
+            return RunStatsReport(command.groupFilter);
         case Cc::Action::HtmlStats:
-            return RunHtmlStatsReport(command.cohortFilter, command.outputPath);
+            return RunHtmlStatsReport(command.groupFilter, command.outputPath);
         case Cc::Action::ZeroStats:
             return ClearStats();
         // Stats sub-options, never returned as a top-level action. Handled
         // explicitly so the switch stays exhaustive without silently treating
-        // "--cohort"/"--out" as a compiler to spawn.
-        case Cc::Action::Cohort:
-            return ReportUsageError("--cohort is only valid after --show-stats or --html-stats");
+        // "--prefetch-group"/"--out" as a compiler to spawn.
+        case Cc::Action::PrefetchGroup:
+            return ReportUsageError("--prefetch-group is only valid after --show-stats or --html-stats");
         case Cc::Action::OutputPath:
             return ReportUsageError("--out is only valid after --html-stats");
         case Cc::Action::Compile:
@@ -1146,7 +1146,7 @@ int main(int argc, char** argv)
         auto const elapsed = std::chrono::steady_clock::now() - started;
         Cc::AppendRecord({
             .outcome = g_outcome,
-            .cohort = cfg.cohort,
+            .prefetchGroup = cfg.prefetchGroup,
             .source = cmd.source,
             .valueBytes = g_valueBytes,
             .elapsedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()),
