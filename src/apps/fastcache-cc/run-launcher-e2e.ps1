@@ -75,20 +75,38 @@ if (-not (Test-Path $Launcher))   { Write-Host "fastcache-cc not found: $Launche
 # The build tree is the fix rather than expanding the short name, because there is
 # no dependable way to expand one: Resolve-Path, Get-Item and
 # [IO.Path]::GetFullPath all preserve it, and Scripting.FileSystemObject was tried
-# and echoed it back unchanged. A build directory is derived from the launcher
-# path the caller passed, so it is spelled however they spelled it — and no
-# checkout reached through a short name would have built here in the first place.
-$scratch = Join-Path (Split-Path (Split-Path $Launcher -Parent) -Parent) "cc-l-e2e"
-if (-not $PSBoundParameters.ContainsKey('DeepTemp'))    { $DeepTemp    = Join-Path $scratch "deep" }
-if (-not $PSBoundParameters.ContainsKey('ShallowTemp')) { $ShallowTemp = Join-Path $scratch "shallow" }
-if (-not $PSBoundParameters.ContainsKey('MoveTemp'))    { $MoveTemp    = Join-Path $scratch "move" }
-if (-not $PSBoundParameters.ContainsKey('EditTemp'))    { $EditTemp    = Join-Path $scratch "edit" }
+# and echoed it back unchanged. No checkout reached through a short name would
+# have built here in the first place.
 
 # Start-Process resolves a relative -FilePath against the PROCESS working
 # directory, not PowerShell's, so a caller passing "out/build/..." would get a
 # spurious "file not found". Resolve both up front.
 $Fastcached = (Resolve-Path $Fastcached).Path
 $Launcher   = (Resolve-Path $Launcher).Path
+
+# AFTER the resolution above, and that ordering is the whole point: both callers
+# pass a RELATIVE launcher path, and a relative root is the same defect as a short
+# one wearing different clothes. `cl` reports an include as an absolute path no
+# matter how it was reached, while clang-cl echoes the spelling it was handed — so
+# a relative root matches everything clang-cl emits and nothing `cl` does, which is
+# exactly the split that produced "dependency set: 0 of 1" here once before.
+$scratch = Join-Path (Split-Path (Split-Path $Launcher -Parent) -Parent) "cc-l-e2e"
+if (-not $PSBoundParameters.ContainsKey('DeepTemp'))    { $DeepTemp    = Join-Path $scratch "deep" }
+if (-not $PSBoundParameters.ContainsKey('ShallowTemp')) { $ShallowTemp = Join-Path $scratch "shallow" }
+if (-not $PSBoundParameters.ContainsKey('MoveTemp'))    { $MoveTemp    = Join-Path $scratch "move" }
+if (-not $PSBoundParameters.ContainsKey('EditTemp'))    { $EditTemp    = Join-Path $scratch "edit" }
+
+# Belt and braces, and it covers the caller too: a root passed explicitly is
+# honoured verbatim, so `-MoveTemp scratch/move` would reintroduce exactly the
+# split above. Rooting every one of them here means the cases cannot silently
+# degrade into testing clang-cl only — the failure mode this guard exists for is
+# a PASS on one driver and a meaningless comparison on the other.
+foreach ($name in 'DeepTemp', 'ShallowTemp', 'MoveTemp', 'EditTemp') {
+    $value = Get-Variable -Name $name -ValueOnly
+    if (-not [System.IO.Path]::IsPathRooted($value)) {
+        Set-Variable -Name $name -Value (Join-Path (Get-Location).Path $value)
+    }
+}
 
 function Start-Fastcached {
     # --storage-max-value raises the wire payload cap along with the value cap;
