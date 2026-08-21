@@ -127,7 +127,116 @@ class SilentPeer
     std::jthread _acceptor;
 };
 
+/// A listener that accepts one connection and immediately hangs up.
+///
+/// The mirror image of SilentPeer, and the shape that actually broke a build:
+/// the daemon answers an over-cap STORE with a typed refusal and then closes,
+/// while the launcher is still streaming a several-hundred-megabyte object into
+/// it. Every write after that hangs up raises SIGPIPE, whose default disposition
+/// terminates the process.
+class HangUpPeer
+{
+  public:
+    HangUpPeer():
+        _listenFd { ::socket(AF_INET, SOCK_STREAM, 0) }
+    {
+        if (_listenFd == InvalidSocket)
+            return;
+        sockaddr_in addr {};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0; // ephemeral
+        if (::bind(_listenFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(_listenFd, 1) != 0)
+        {
+            CloseSocket(_listenFd);
+            _listenFd = InvalidSocket;
+            return;
+        }
+        AddrLen len = sizeof(addr);
+        if (::getsockname(_listenFd, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
+        {
+            CloseSocket(_listenFd);
+            _listenFd = InvalidSocket;
+            return;
+        }
+        _port = ntohs(addr.sin_port);
+
+        _acceptor = std::jthread { [this] {
+            auto const accepted = ::accept(_listenFd, nullptr, nullptr);
+            if (accepted != InvalidSocket)
+                CloseSocket(accepted); // read nothing, say nothing, go away
+        } };
+    }
+
+    ~HangUpPeer()
+    {
+        _acceptor = {};
+        if (_listenFd != InvalidSocket)
+            CloseSocket(_listenFd);
+    }
+
+    HangUpPeer(HangUpPeer const&) = delete;
+    HangUpPeer& operator=(HangUpPeer const&) = delete;
+    HangUpPeer(HangUpPeer&&) = delete;
+    HangUpPeer& operator=(HangUpPeer&&) = delete;
+
+    /// @return True if the listener bound and is usable.
+    [[nodiscard]] bool Ready() const noexcept
+    {
+        return _listenFd != InvalidSocket;
+    }
+
+    /// @return "127.0.0.1:<port>" for ConnectTcp.
+    [[nodiscard]] std::string Endpoint() const
+    {
+        return "127.0.0.1:" + std::to_string(_port);
+    }
+
+  private:
+    NativeSocket _listenFd { InvalidSocket };
+    std::uint16_t _port { 0 };
+    std::jthread _acceptor;
+};
+
 } // namespace
+
+TEST_CASE("SendAll to a peer that hung up fails instead of killing the process")
+{
+    // The regression test for issue #68. Before the fix this did not fail an
+    // assertion -- it terminated the test binary with signal 13, exactly as it
+    // terminated fastcache-cc mid-STORE and failed a build whose object file was
+    // already compiled, correct, and on disk.
+    //
+    // The assertion is therefore doubled: reaching the CHECK at all proves no
+    // signal was raised, and the CHECK proves the error was reported through the
+    // return value the caching flow already treats as "cache unavailable".
+    HangUpPeer peer;
+    if (!peer.Ready())
+    {
+        SUCCEED("could not bind a loopback test port; skipping");
+        return;
+    }
+
+    // Generous, because a timeout here would report false for the wrong reason
+    // and pass the test vacuously; EPIPE against a hung-up loopback peer is
+    // immediate, so this bound is never reached in a healthy run.
+    auto client = FastCache::Cc::ConnectTcp(peer.Endpoint(), std::chrono::milliseconds { 30000 });
+    REQUIRE(client != nullptr);
+
+    // Chunked rather than one enormous buffer: the first write after a hang-up
+    // is routinely accepted (it is the peer's RST, arriving in response, that
+    // breaks the pipe), so the failure needs a second write to surface. A real
+    // object file supplies thousands.
+    constexpr std::size_t ChunkBytes = 256UL * 1024UL;
+    constexpr int MaxChunks = 64; // 16 MiB is far past any loopback send buffer
+    std::vector<std::byte> const chunk(ChunkBytes, std::byte { 0xAB });
+
+    bool reported = false;
+    for (int i = 0; i < MaxChunks && !reported; ++i)
+        reported = !client->SendAll(std::span<std::byte const> { chunk });
+
+    CHECK(reported);
+}
 
 TEST_CASE("RecvExactly gives up on a peer that accepts and then goes silent")
 {
