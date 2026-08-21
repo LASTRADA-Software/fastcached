@@ -29,9 +29,22 @@
 #                           previous revision's object: a wrong build, silently.
 #                           Asserted with direct mode OFF, since its manifest hashes
 #                           the source's own bytes and would mask exactly that.
+#   7. Relative paths     — a build whose driver reports relative dependency paths
+#                           must still record a manifest naming them. They lie under
+#                           no root, so a classifier that asked "is this toolchain
+#                           content?" before "is this anchored anywhere?" dropped
+#                           every one of them, and an empty manifest validates
+#                           against anything: an edited header served the previous
+#                           object under a zero exit code, permanently.
 #
 # The PowerShell counterpart (src/apps/fastcache-cc/run-launcher-e2e.ps1) asserts
-# the same contract against cl / clang-cl on Windows.
+# the same contract against cl / clang-cl on Windows — except case 7, which has no
+# Windows twin on purpose: `cl` resolves every `/showIncludes` note through the
+# filesystem and reports an absolute path whatever the `/I` spelling, so the case's
+# own premise ("the driver reported a relative path") cannot hold there, and a case
+# that silently degrades to a tautology is worse than an absent one. clang-cl does
+# echo the spelling it was handed, so a clang-cl-only variant would be meaningful;
+# the classification itself is pinned by DirectManifest_test on every platform.
 #
 # Usage:
 #   compile-cache-e2e.sh --fastcached <path> --launcher <path>
@@ -457,7 +470,96 @@ if cmp -s "${workdir}/edited-1.o" "${edited}/build/e.o"; then
 fi
 echo "   an edit re-keys, and the object follows the source"
 
-# --- 7: the cache is never load-bearing -------------------------------------
+# --- 7: a relatively-spelled build must still populate a usable manifest -----
+# Direct mode revalidates a translation unit by re-hashing the files its manifest
+# names, and BuildManifest decided what to name by asking IsToolchainHeader — which
+# reports every path outside both roots as toolchain, and a RELATIVE path lies under
+# no root at all. So a build whose driver reported relative paths (a relative `-I`,
+# or a compile run from the source directory, which is how the CMake Ninja generator
+# spells its sources) recorded a manifest with those entries silently missing, and an
+# empty manifest validates against anything. Edit a dropped header, leave the .cpp
+# alone, and the direct hit fires on a stale object with a zero exit code — forever,
+# because a direct hit never re-records the manifest that let it through.
+#
+# Unit tests pin the classification; only this can show that the driver really does
+# report relative paths and that the whole flow survives them, which is the same
+# reason the three key properties above are asserted here rather than in isolation.
+reldir="${workdir}/relative"
+mkdir -p "${reldir}/inc" "${reldir}/src" "${reldir}/build"
+cat > "${reldir}/inc/h.hpp" <<'HDR'
+#pragma once
+inline int answer() { return 42; }
+HDR
+# The tag keeps this sequence off every other section's key: paths under
+# SOURCE_DIR are tokenized before hashing, so two trees holding the same bytes
+# key identically and this would open on another case's entry.
+cat > "${reldir}/src/r.cpp" <<'SRC'
+#include <h.hpp>
+inline char const* variant() { return "relative-paths"; }
+int main() { return answer() - 42; }
+SRC
+
+export FASTCACHE_SOURCE_DIR="$reldir" FASTCACHE_BINARY_DIR="${reldir}/build"
+
+# Absolute before the cd, because either may have been passed as a relative path.
+rel_launcher="$(cd "$(dirname "$launcher")" && pwd)/$(basename "$launcher")"
+rel_compiler="$compiler"
+[[ "$rel_compiler" == */* ]] \
+    && rel_compiler="$(cd "$(dirname "$compiler")" && pwd)/$(basename "$compiler")"
+
+# Everything relative: the source, the include directory, the object and the
+# depfile. Run from the source root, as a hand-driven or in-source build does.
+run_relative() {
+    local log="$1"
+    ( cd "$reldir" \
+        && "$rel_launcher" "$rel_compiler" -std=c++23 -Iinc \
+               -MD -MF build/r.d -c src/r.cpp -o build/r.o ) 2> "$log"
+}
+
+echo "== relative paths: populate (expect MISS) =="
+run_relative "${workdir}/relative-1.log" || fail "relative: first compile returned non-zero"
+cat "${workdir}/relative-1.log"
+grep -q "MISS" "${workdir}/relative-1.log" || fail "relative: first compile was not a MISS"
+grep -q "STORED" "${workdir}/relative-1.log" \
+    || fail "relative: first compile did not store, so nothing below proves anything"
+# The premise, asserted rather than assumed: if this driver reported ABSOLUTE
+# paths the whole section would pass without ever exercising the defect.
+grep -qE '(^|[[:space:]])inc/h\.hpp([[:space:]]|$)' "${reldir}/build/r.d" \
+    || fail "relative: the driver reported no relative dependency path, so this case proves nothing"
+# The manifest must name the TU and its header, not just whatever was absolute.
+grep -q "manifest: 2 entries" "${workdir}/relative-1.log" \
+    || fail "relative: the manifest did not record both the source and its header"
+cp "${reldir}/build/r.o" "${workdir}/relative-1.o"
+
+echo "== relative paths: unchanged tree must HIT =="
+rm -f "${reldir}/build/r.o" "${reldir}/build/r.d"
+run_relative "${workdir}/relative-2.log" || fail "relative: second compile returned non-zero"
+cat "${workdir}/relative-2.log"
+# Anchored, for the reason check_header_move records: the launcher prints
+# "STALE HIT (...); recompiling" on its way to a MISS, so a bare grep for HIT is
+# satisfied by exactly the collapse these assertions exist to reject.
+grep -q "fastcache-cc: HIT" "${workdir}/relative-2.log" \
+    || fail "relative: an unchanged tree did not hit, so direct mode never populated"
+
+# The property this case exists for. Only the header changes; the .cpp is not
+# touched. Before the fix the manifest named neither, so it validated and the
+# previous revision's object was replayed.
+cat > "${reldir}/inc/h.hpp" <<'HDR'
+#pragma once
+inline int answer() { return 43; }
+HDR
+rm -f "${reldir}/build/r.o" "${reldir}/build/r.d"
+echo "== relative paths: an edited header must not be served the old object =="
+run_relative "${workdir}/relative-3.log" || fail "relative: third compile returned non-zero"
+cat "${workdir}/relative-3.log"
+grep -q "MISS" "${workdir}/relative-3.log" \
+    || fail "relative: an edited header was served from a manifest that never named it"
+if cmp -s "${workdir}/relative-1.o" "${reldir}/build/r.o"; then
+    fail "relative: the edited header produced the previous revision's object"
+fi
+echo "   relative paths reach the manifest, and an edit to one re-keys"
+
+# --- 8: the cache is never load-bearing -------------------------------------
 # With no daemon reachable the build must still succeed, uncached.
 #
 # The layout is re-exported first: every section above exports its own, so
@@ -471,7 +573,7 @@ FASTCACHE_ADDR="127.0.0.1:1" "$launcher" "$compiler" -std=c++23 -c "${proj}/a.cp
 cat "${workdir}/fallback.log"
 [[ -f "${proj}/build/fb.o" ]] || fail "fallback compile produced no object"
 
-# --- 8: forms the launcher must decline to cache ----------------------------
+# --- 9: forms the launcher must decline to cache ----------------------------
 # A compile with no -o defaults its output to ./a.o, a path the launcher cannot
 # reconstruct. It must pass straight through rather than claim the compile and
 # then fail to store it on every single invocation.

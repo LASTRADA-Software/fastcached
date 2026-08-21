@@ -106,6 +106,25 @@ enum class DirectError : std::uint8_t
 /// @return The normalized, native-separator form.
 [[nodiscard]] std::string NormalizePath(std::string_view rawPath);
 
+/// Normalize a path and put the LAYOUT's separator convention back.
+///
+/// `std::filesystem` normalizes to the **host's** preferred separator, but every
+/// root and absoluteness test here is the layout's. On a Windows host a POSIX path
+/// comes back backslash-separated, and `PathCanon::AnchorForLayout` — which for a
+/// POSIX layout asks only about a leading `/` — then reports an absolute path as
+/// `Anchor::WorkingDirectory`. That is the host coupling PathCanon.hpp forbids in as many words
+/// ("Derived from the LAYOUT, never from the host").
+///
+/// Spelled once because three callers need exactly this correction and must agree:
+/// `ResolveAgainst`, `AnchorWorkingDirectory`, and DependencyProbe's `PortableForm`
+/// (which had the only copy, inline, until a Windows CI run showed the manifest
+/// side was missing it).
+///
+/// @param rawPath A path as the compiler or the environment spelled it.
+/// @param layout  The layout whose path conventions apply.
+/// @return The normalized path, separated the way `layout` separates its roots.
+[[nodiscard]] std::string NormalizeForLayout(std::string_view rawPath, PathCanon::Layout const& layout);
+
 /// Classify whether an absolute include path belongs to the immutable toolchain
 /// (and is therefore covered by the toolchain stamp rather than hashed).
 ///
@@ -188,31 +207,164 @@ inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
 /// @return Every dependency path, in emission order, with duplicates preserved.
 [[nodiscard]] std::vector<std::string> ParseDepFilePaths(std::string_view depFileText);
 
-/// Build a manifest from one compile's include set.
+/// Everything one compile contributes to its manifest.
 ///
-/// Toolchain headers are dropped (the stamp covers them); project headers are
-/// canonicalized and hashed. Entries are deduplicated and sorted by canonical
-/// path, so the same build state yields byte-identical manifests on any machine.
+/// A struct rather than six positional arguments, for the reason `Cc::KeyInputs`
+/// is one: the fields are strings that no compiler would stop you from swapping,
+/// and the set grows as the recording rules do.
+struct ManifestInputs
+{
+    /// The translation unit's own source path, exactly as the command line spelled
+    /// it — relative or absolute.
+    ///
+    /// Separate from `includePaths`, and mandatory, because a manifest that does
+    /// not name its TU revalidates everything except the file being compiled:
+    /// neither `/showIncludes` nor a GNU depfile's rule target names the primary
+    /// source, so editing a `.cpp` body while leaving every header untouched would
+    /// be invisible to ValidateManifest and a stale object replayed forever
+    /// (issue #49 / issue #51). It used to be appended to `includePaths` by the
+    /// caller, which made the invariant a comment rather than something
+    /// BuildManifest could enforce — and left it to be silently dropped when it was
+    /// spelled relatively (issue #57).
+    std::string sourcePath;
+
+    /// The dependency paths the compile reported, as the driver spelled them:
+    /// `/showIncludes` notes or a GNU depfile's dependency list.
+    std::vector<std::string> includePaths;
+
+    /// The directory the compile ran in, used to resolve every relative path above.
+    ///
+    /// Injected rather than read from the process: `HashFileContents` on a relative
+    /// path would silently resolve it against whatever the ambient working
+    /// directory happened to be, which is the coupling the project's DI rule exists
+    /// to remove — and which no test could exercise without mutating it.
+    std::string workingDirectory;
+
+    /// Identity standing in for every toolchain header, which are not listed
+    /// individually.
+    std::string toolchainStamp;
+
+    /// Key the compiled object is already stored under; recorded by value so the
+    /// object is never stored twice.
+    std::string objectKey;
+};
+
+/// Resolve a compiler-reported path to this machine's absolute, normalized form.
 ///
-/// `includePaths` must also contain the translation unit's own source path, not
-/// only the files it `#include`s: neither `/showIncludes` nor a GNU depfile ever
-/// names the primary TU (a depfile rule's target is explicitly excluded from its
-/// own dependency list), so a manifest built from headers alone has no entry
-/// that changes when the TU's own body is edited, and ValidateManifest would
-/// keep validating a stale object forever (issue #49 / issue #51). The caller
-/// (RecordManifest) adds it before calling this function; there is nothing
-/// source-specific about the handling here — it is canonicalized, hashed, and
-/// deduplicated exactly like any header.
-/// @param includePaths   Absolute paths the compile depends on: every `#include`d
-///                       header plus the translation unit's own source path.
-/// @param layout         This build's roots.
-/// @param toolchainStamp Identity standing in for the toolchain headers.
-/// @param objectKey      Key the compiled object is already stored under.
-/// @return The manifest, or DirectError when an entry cannot be canonicalized.
-[[nodiscard]] std::expected<DirectManifest, DirectError> BuildManifest(std::vector<std::string> const& includePaths,
-                                                                       PathCanon::Layout const& layout,
-                                                                       std::string_view toolchainStamp,
-                                                                       std::string_view objectKey);
+/// Normalization happens first and unconditionally, through `NormalizeForLayout`
+/// so the separator convention is the layout's; a path the layout already calls
+/// absolute is then returned as is, and anything else is joined onto
+/// `workingDirectory`.
+///
+/// The anchor is decided by `PathCanon::AnchorForLayout`, never by the host:
+/// `std::filesystem::path::is_absolute()` reads `D:\src\a.hpp` as relative
+/// everywhere but Windows, and would then glue a working directory in front of it.
+/// Only `Anchor::WorkingDirectory` is joined — a **drive-relative** path (`C:foo`)
+/// is returned unresolved, because it is anchored to that drive's own current
+/// directory and joining it would be a different wrong answer rather than a
+/// resolution (issue #65).
+///
+/// The *join* itself is the host's path arithmetic, deliberately and unlike the
+/// decision above: this function resolves against a directory on this machine and
+/// its result is handed straight to `HashFileContents`, so it only ever runs where
+/// the layout and the host agree. A relative path under a foreign layout (a Windows
+/// layout on a POSIX host) is therefore outside its contract — collapsing `..`
+/// across foreign separators would need a whole path arithmetic of its own, for a
+/// case that cannot arise where the result is a file to open.
+///
+/// @param rawPath          A path as the compiler spelled it.
+/// @param workingDirectory The directory the compile ran in; when empty, or when
+///                         the join still does not produce an absolute path, the
+///                         result stays relative and the caller must treat it as
+///                         unanchored rather than as toolchain content.
+/// @param layout           The layout whose path conventions apply.
+/// @return The normalized path, absolute whenever it could be made so.
+[[nodiscard]] std::string ResolveAgainst(std::string_view rawPath,
+                                         std::string_view workingDirectory,
+                                         PathCanon::Layout const& layout);
+
+/// Re-spell a directory in the vocabulary the layout's roots use.
+///
+/// `std::filesystem::current_path()` answers with the kernel's *resolved* path —
+/// `getcwd(3)` follows every symlink — while a layout's roots are spelled however
+/// the build system was configured. On macOS a build under `/tmp` has a working
+/// directory of `/private/tmp/...` against a root of `/tmp/...`; a checkout reached
+/// through any symlinked `/home` or `/mnt` prefix has the same shape; and on
+/// Windows a root carrying an 8.3 short component never matches a long-form cwd.
+///
+/// Every root test in this file and in PathCanon is a string prefix comparison, so
+/// a working directory spelled the other way lies under no root — and a relative
+/// path resolved against it then canonicalizes to nothing, which silently costs the
+/// build direct mode. Matching by filesystem *identity* and handing back the root's
+/// own spelling is what keeps the one value that comes from the environment
+/// speaking the same language as the ones that come from configuration.
+///
+/// Falls back to the directory as given whenever the filesystem cannot answer, and
+/// resolves the longest matching root first, as PathCanon::Canonicalize does, so a
+/// build tree nested inside the source root anchors to the build tree.
+///
+/// @param directory The directory to re-spell, typically the process's cwd.
+/// @param layout    This build's roots.
+/// @return The directory spelled under a root when it lies within one, else the
+///         normalized input.
+[[nodiscard]] std::string AnchorWorkingDirectory(std::string_view directory, PathCanon::Layout const& layout);
+
+/// Reduce a compile's source path to the canonical token that identifies it.
+///
+/// The single source of truth for that token: it is both the TU's own manifest
+/// entry and the `canonicalSource` field of `ComputeManifestKey`, so the recording
+/// and lookup sides cannot spell it differently. Deriving it from the *resolved*
+/// path is also what keeps the manifest key unambiguous — `cc -c ../src/t.cpp` run
+/// from `build/` and from `build/sub/` relativizes to the same argument list, so
+/// without resolution the two would share a manifest key while naming different
+/// files.
+///
+/// @param sourcePath       The TU's source path as the command line spelled it.
+/// @param layout           This build's roots.
+/// @param workingDirectory The directory the compile ran in.
+/// @return The `<SRCROOT>`/`<BUILDTREE>` token, or NotCanonical when the source
+///         lies under neither root (direct mode is then unavailable for this TU,
+///         which is the safe outcome — the ordinary preprocessed key still works).
+[[nodiscard]] std::expected<std::string, DirectError> CanonicalSourceToken(std::string_view sourcePath,
+                                                                           PathCanon::Layout const& layout,
+                                                                           std::string_view workingDirectory);
+
+/// Build a manifest from one compile's source and include set.
+///
+/// Every path is resolved against `inputs.workingDirectory` first, then
+/// classified: project content is canonicalized and hashed, toolchain content is
+/// dropped (the stamp covers it), and a path that could not be made absolute at
+/// all refuses the whole manifest rather than being dropped. Entries are
+/// deduplicated and sorted by canonical path, so the same build state yields
+/// byte-identical manifests on any machine.
+///
+/// **The anchor is classified before the toolchain test, and that order is the
+/// whole subtlety.** `IsToolchainHeader` reports every path outside both roots as
+/// toolchain, and a relative path lies under no root — so asking it first reports
+/// *every* relative path as toolchain and silently drops it. A GNU build whose
+/// depfile carries relative header paths (a relative `-I`, or a compile run from
+/// the source directory) then recorded a manifest of its absolute entries alone;
+/// edit one of the dropped headers, leave the `.cpp` untouched, and the direct hit
+/// fires against a manifest that never named the edited file, serving a stale
+/// object under a zero exit code. `Cc::IsCheckable` and `Cc::PortableForm` are the
+/// two other consumers of that classifier and both already order it this way.
+///
+/// A resolved relative path is recorded as a *canonical token*, not kept relative.
+/// `KeyDependencySet` keeps its relative paths, and the difference is what the two
+/// values are for: a key input is only ever digested, while a manifest entry has
+/// to be localized back to a file on the validating machine. A relative entry
+/// could only be resolved against that machine's working directory, which is
+/// exactly the ambiguity CanonicalSourceToken records — and it would also
+/// introduce a second kind of entry into a format whose portability rests on every
+/// path in it being a token.
+///
+/// @param inputs This compile's source, dependencies, working directory, stamp and
+///               object key.
+/// @param layout This build's roots.
+/// @return The manifest, or DirectError when the source or an entry cannot be
+///         canonicalized, or when a file could not be read.
+[[nodiscard]] std::expected<DirectManifest, DirectError> BuildManifest(ManifestInputs const& inputs,
+                                                                       PathCanon::Layout const& layout);
 
 /// Re-check every entry against the filesystem.
 ///

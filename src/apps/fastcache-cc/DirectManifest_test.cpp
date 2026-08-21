@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -309,13 +310,27 @@ TEST_CASE("Build then validate a manifest against real files on disk")
         out << "#pragma once\nint original();\n";
     }
 
+    auto const sourcePath = root / "src" / "a.cpp";
+    {
+        std::ofstream out { sourcePath, std::ios::binary };
+        out << "#include \"header.hpp\"\n";
+    }
+
     FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
     constexpr std::string_view stamp = "cl-test-1";
 
-    auto built = BuildManifest({ headerPath.string() }, layout, stamp, "objkey-1");
+    auto const inputs = [&](std::string_view objectKey) {
+        return ManifestInputs { .sourcePath = sourcePath.string(),
+                                .includePaths = { headerPath.string() },
+                                .workingDirectory = root.string(),
+                                .toolchainStamp = std::string { stamp },
+                                .objectKey = std::string { objectKey } };
+    };
+
+    auto built = BuildManifest(inputs("objkey-1"), layout);
     REQUIRE(built.has_value());
-    REQUIRE(built->entries.size() == 1);
-    CHECK(built->entries[0].canonicalPath.starts_with("<SRCROOT>/"));
+    REQUIRE(built->entries.size() == 2); // the header, plus the TU BuildManifest always records
+    CHECK(std::ranges::all_of(built->entries, [](auto const& e) { return e.canonicalPath.starts_with("<SRCROOT>/"); }));
 
     CHECK(ValidateManifest(*built, layout, stamp));
 
@@ -328,7 +343,7 @@ TEST_CASE("Build then validate a manifest against real files on disk")
     }
     CHECK_FALSE(ValidateManifest(*built, layout, stamp));
 
-    auto const rebuilt = BuildManifest({ headerPath.string() }, layout, stamp, "objkey-1");
+    auto const rebuilt = BuildManifest(inputs("objkey-1"), layout);
     REQUIRE(rebuilt.has_value());
     CHECK(ComputeHeaderStateDigest("mkey", *rebuilt) != keyBefore);
 
@@ -367,9 +382,14 @@ TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC
     FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
     constexpr std::string_view stamp = "cl-test-1";
 
-    // MSVC's /showIncludes lists only the header; RecordManifest appends the
-    // source path itself before calling BuildManifest, which this mirrors.
-    auto built = BuildManifest({ headerPath.string(), sourcePath.string() }, layout, stamp, "objkey-1");
+    // MSVC's /showIncludes lists only the header; the TU reaches BuildManifest as
+    // its own `sourcePath` field, which is why a manifest can never omit it.
+    auto built = BuildManifest({ .sourcePath = sourcePath.string(),
+                                 .includePaths = { headerPath.string() },
+                                 .workingDirectory = root.string(),
+                                 .toolchainStamp = std::string { stamp },
+                                 .objectKey = "objkey-1" },
+                               layout);
     REQUIRE(built.has_value());
     REQUIRE(built->entries.size() == 2);
     CHECK(ValidateManifest(*built, layout, stamp));
@@ -385,6 +405,278 @@ TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC
     CHECK_FALSE(ValidateManifest(*built, layout, stamp));
 
     std::filesystem::remove_all(root);
+}
+
+TEST_CASE("BuildManifest records a relative dependency path instead of dropping it")
+{
+    // The regression this case exists for. BuildManifest asked IsToolchainHeader
+    // before classifying the anchor, and IsToolchainHeader reports EVERY path
+    // outside both roots as toolchain -- which a relative path always is, since it
+    // lies under no root at all. So a GNU build whose depfile carries relative
+    // header paths (a relative `-I`, or a compile run from the source directory)
+    // recorded a manifest of its absolute entries alone, silently. Edit one of the
+    // dropped headers, leave the .cpp untouched, and the direct hit fires against a
+    // manifest that never named the edited file: a stale object under a zero exit
+    // code, which is the whole failure class direct mode's revalidation exists to
+    // prevent. Cc::IsCheckable and Cc::PortableForm both order this correctly and
+    // say so in comments; this was the third consumer and did not.
+    auto const root = std::filesystem::temp_directory_path() / "fc-direct-relative";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "src");
+
+    auto const headerPath = root / "src" / "header.hpp";
+    {
+        std::ofstream out { headerPath, std::ios::binary };
+        out << "#pragma once\nint helper();\n";
+    }
+
+    auto const sourcePath = root / "src" / "a.cpp";
+    {
+        std::ofstream out { sourcePath, std::ios::binary };
+        out << "#include \"header.hpp\"\nint main() { return 0; }\n";
+    }
+
+    FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
+    constexpr std::string_view stamp = "cc-test-1";
+
+    // Both the source and the header spelled relatively, as `cc -c src/a.cpp` run
+    // from the checkout root reports them. The working directory is passed in
+    // rather than taken from the process, so this asserts the real resolution rule
+    // instead of whatever directory the test binary happens to run in.
+    auto const inputs = ManifestInputs { .sourcePath = "src/a.cpp",
+                                         .includePaths = { "src/header.hpp" },
+                                         .workingDirectory = root.string(),
+                                         .toolchainStamp = std::string { stamp },
+                                         .objectKey = "objkey-rel" };
+
+    auto const built = BuildManifest(inputs, layout);
+    REQUIRE(built.has_value());
+    REQUIRE(built->entries.size() == 2);
+
+    // Recorded as canonical tokens, not kept relative: a manifest entry has to be
+    // localized back to a file on the validating machine, and a relative entry
+    // could only be resolved against that machine's working directory.
+    CHECK(built->entries[0].canonicalPath == "<SRCROOT>/src/a.cpp");
+    CHECK(built->entries[1].canonicalPath == "<SRCROOT>/src/header.hpp");
+    CHECK(ValidateManifest(*built, layout, stamp));
+
+    // The property that matters: editing the relatively-named header must stop the
+    // manifest validating. Before the fix it stayed valid forever, because the
+    // header was never an entry.
+    {
+        std::ofstream out { headerPath, std::ios::binary };
+        out << "#pragma once\nint helper(int);\n";
+    }
+    CHECK_FALSE(ValidateManifest(*built, layout, stamp));
+
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("BuildManifest records a relatively-named translation unit (issue #57)")
+{
+    // The same defect reaching the TU rather than a header, and the reason the
+    // source is BuildManifest's own field: the CMake Ninja generator spells sources
+    // relative to the build directory, so `cmd.source` arrived relative, was
+    // classified as toolchain, and was dropped -- reopening issues #49/#51, whose
+    // whole fix was to make the TU part of what a manifest revalidates.
+    auto const root = std::filesystem::temp_directory_path() / "fc-direct-relative-tu";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "src");
+    std::filesystem::create_directories(root / "out");
+
+    auto const headerPath = root / "src" / "header.hpp";
+    {
+        std::ofstream out { headerPath, std::ios::binary };
+        out << "#pragma once\n";
+    }
+
+    auto const sourcePath = root / "src" / "t.cpp";
+    {
+        std::ofstream out { sourcePath, std::ios::binary };
+        out << "#include \"header.hpp\"\nint main() { return 0; }\n";
+    }
+
+    FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
+    constexpr std::string_view stamp = "cc-test-1";
+
+    // Run from the build tree, as Ninja does: `../src/t.cpp`.
+    auto const inputs = ManifestInputs { .sourcePath = "../src/t.cpp",
+                                         .includePaths = { headerPath.string() },
+                                         .workingDirectory = (root / "out").string(),
+                                         .toolchainStamp = std::string { stamp },
+                                         .objectKey = "objkey-tu" };
+
+    auto const built = BuildManifest(inputs, layout);
+    REQUIRE(built.has_value());
+    REQUIRE(built->entries.size() == 2);
+    CHECK(built->entries[0].canonicalPath == "<SRCROOT>/src/header.hpp");
+    CHECK(built->entries[1].canonicalPath == "<SRCROOT>/src/t.cpp");
+    CHECK(ValidateManifest(*built, layout, stamp));
+
+    // Edit the .cpp body only. Before the fix this validated forever.
+    {
+        std::ofstream out { sourcePath, std::ios::binary };
+        out << "#include \"header.hpp\"\nint main() { return 1; }\n";
+    }
+    CHECK_FALSE(ValidateManifest(*built, layout, stamp));
+
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("CanonicalSourceToken agrees whichever way the source is spelled")
+{
+    // One derivation for both sides. The lookup (TryDirectMode) and the recording
+    // (RecordManifest) each build the manifest key from this token, so if they
+    // disagreed about a relatively-named source they would key the same compile two
+    // ways and direct mode could never hit. It is also what removes an ambiguity
+    // that predates the relative-path bug: `cc -c ../src/t.cpp` run from `build/`
+    // and from `build/sub/` relativizes to the SAME argument list, so a key derived
+    // from the unresolved spelling names two different files.
+    FastCache::PathCanon::Layout const layout { .sourceRoot = "/w/src", .buildTree = "/w/build" };
+
+    auto const fromAbsolute = CanonicalSourceToken("/w/src/t.cpp", layout, "/w/build");
+    auto const fromRelative = CanonicalSourceToken("../src/t.cpp", layout, "/w/build");
+    REQUIRE(fromAbsolute.has_value());
+    REQUIRE(fromRelative.has_value());
+    CHECK(*fromAbsolute == "<SRCROOT>/t.cpp");
+    CHECK(*fromRelative == *fromAbsolute);
+
+    // Two depths that relativize identically must not collapse to one token.
+    auto const fromDeeper = CanonicalSourceToken("../src/t.cpp", layout, "/w/build/sub");
+    REQUIRE(fromDeeper.has_value());
+    CHECK(*fromDeeper != *fromRelative);
+
+    // A source under neither root has no portable form. Refusing costs the compile
+    // direct mode; the ordinary preprocessed key still serves it.
+    CHECK_FALSE(CanonicalSourceToken("/elsewhere/t.cpp", layout, "/w/build").has_value());
+}
+
+TEST_CASE("BuildManifest refuses rather than drops when a path cannot be anchored")
+{
+    // The other half of the ordering. A path that is still relative after
+    // resolution names a file this build cannot identify, so recording a manifest
+    // without it would be the same silent stale serve by a different route --
+    // whereas refusing merely costs this compile direct mode. Reachable only when
+    // the working directory itself is unavailable, which is why it is a refusal and
+    // not a fallback.
+    FastCache::PathCanon::Layout const layout { .sourceRoot = "/w/src", .buildTree = "/w/build" };
+
+    auto const built = BuildManifest({ .sourcePath = "src/t.cpp",
+                                       .includePaths = { "src/header.hpp" },
+                                       .workingDirectory = "",
+                                       .toolchainStamp = "cc-test-1",
+                                       .objectKey = "objkey-1" },
+                                     layout);
+    REQUIRE_FALSE(built.has_value());
+    CHECK(built.error() == DirectError::NotCanonical);
+}
+
+TEST_CASE("AnchorWorkingDirectory re-spells a symlinked cwd in the layout's vocabulary")
+{
+    // getcwd(3) answers with the kernel's RESOLVED path, while a layout's roots are
+    // spelled however the build system was configured. Every root test here is a
+    // string prefix comparison, so a build under a symlinked prefix (macOS `/tmp`,
+    // any symlinked `/home` or `/mnt`) reports a working directory that shares no
+    // prefix with the root it is actually inside -- and a relative path resolved
+    // against it then canonicalizes to nothing, silently costing the build direct
+    // mode. Found by the end-to-end test on macOS, whose `/var` is a symlink.
+    auto const base = std::filesystem::temp_directory_path() / "fc-direct-anchor";
+    std::filesystem::remove_all(base);
+    std::filesystem::create_directories(base / "real" / "sub");
+
+    std::error_code ec;
+    std::filesystem::create_directory_symlink(base / "real", base / "link", ec);
+    if (ec)
+    {
+        // Symlink creation needs a privilege or developer mode on Windows. The rule
+        // is unconditional; only this way of demonstrating it is not.
+        std::filesystem::remove_all(base);
+        SUCCEED("symlinks unavailable on this host");
+        return;
+    }
+
+    // The layout names the root through the symlink; the cwd arrives resolved.
+    FastCache::PathCanon::Layout const layout { .sourceRoot = (base / "link").string(),
+                                                .buildTree = (base / "link" / "out").string() };
+    auto const anchored = AnchorWorkingDirectory((base / "real" / "sub").string(), layout);
+    CHECK(anchored == (base / "link" / "sub").string());
+
+    // And the point of doing it: a relative path now resolves under the root.
+    CHECK(CanonicalSourceToken("t.cpp", layout, anchored) == "<SRCROOT>/sub/t.cpp");
+
+    std::filesystem::remove_all(base);
+}
+
+TEST_CASE("AnchorWorkingDirectory prefers the longest root and passes through the rest")
+{
+    // The same rule CanonicalizeOne applies: a build tree nested inside the source
+    // root must anchor to the build tree, or the tail spliced back on would be
+    // relative to the wrong one.
+    auto const base = std::filesystem::temp_directory_path() / "fc-direct-anchor-longest";
+    std::filesystem::remove_all(base);
+    std::filesystem::create_directories(base / "proj" / "out" / "build");
+    std::filesystem::create_directories(base / "elsewhere");
+
+    FastCache::PathCanon::Layout const layout { .sourceRoot = (base / "proj").string(),
+                                                .buildTree = (base / "proj" / "out").string() };
+
+    CHECK(AnchorWorkingDirectory((base / "proj" / "out" / "build").string(), layout)
+          == (base / "proj" / "out" / "build").string());
+
+    // Under neither root: handed back normalized, and the caller then finds it
+    // anchors nothing -- which is a refusal, not a silent drop.
+    auto const outside = AnchorWorkingDirectory((base / "elsewhere").string(), layout);
+    CHECK_FALSE(CanonicalSourceToken("t.cpp", layout, outside).has_value());
+
+    std::filesystem::remove_all(base);
+}
+
+TEST_CASE("ResolveAgainst anchors by the layout's conventions, not the host's")
+{
+    // std::filesystem::path::is_absolute() reads `D:\src\a.hpp` as relative on every
+    // host but Windows, and would then glue a working directory in front of it --
+    // producing a path under no root, which is the classification this whole change
+    // is about getting right. PathCanon::AnchorForLayout is the single definition,
+    // and it answers from the layout.
+    FastCache::PathCanon::Layout const windows { .sourceRoot = R"(D:\Project)", .buildTree = R"(D:\Project\out)" };
+    FastCache::PathCanon::Layout const posix { .sourceRoot = "/w/src", .buildTree = "/w/build" };
+
+    // The correction itself, both ways round, so neither host can pass by accident.
+    // std::filesystem answers with the HOST's preferred separator, so on a Windows
+    // host `/w/src/a.hpp` comes back backslash-separated and AnchorForLayout --
+    // which for a POSIX layout asks only about a leading `/` -- then reads it as
+    // relative. DependencyProbe's PortableForm had the only copy of this rule and
+    // the manifest side did not; Windows CI is what said so.
+    CHECK(NormalizeForLayout("/w/src/a.hpp", posix) == "/w/src/a.hpp");
+    CHECK(NormalizeForLayout(R"(D:\Project\src\a.hpp)", windows) == R"(D:\Project\src\a.hpp)");
+    // A mixed spelling, which fails on EITHER host without the correction -- so this
+    // one assertion covers the rule wherever the suite happens to run.
+    CHECK(NormalizeForLayout(R"(/w/src\a.hpp)", posix) == "/w/src/a.hpp");
+    // The correction runs one way only, deliberately, exactly as PortableForm's copy
+    // did: it forces the POSIX layout's `/` and leaves a Windows layout alone.
+    //
+    // So for a Windows layout there is no output SPELLING to assert -- and that is
+    // the substance rather than a gap in the test. `make_preferred()` answers `\` on
+    // a Windows host and leaves `/` alone on a POSIX one, so pinning either string
+    // pins a host; an earlier revision of this case pinned the POSIX one and CI on
+    // Windows rejected it. Nothing downstream needs a spelling here: PathCanon calls
+    // `C:/src/proj` a Windows layout too, and every prefix test unifies separators
+    // before comparing. What must hold is the PROPERTY, and it holds either way.
+    //
+    // Only the POSIX direction can mislead, which is why only it is forced: there a
+    // backslash is an ordinary filename character rather than a separator spelled
+    // differently, so `AnchorForLayout` reads a backslash-separated path as relative
+    // instead of as the absolute path it is.
+    CHECK(FastCache::PathCanon::AnchorForLayout(NormalizeForLayout("D:/Project/src/a.hpp", windows), windows)
+          == FastCache::PathCanon::Anchor::Absolute);
+
+    CHECK(ResolveAgainst(R"(D:\Project\src\a.hpp)", R"(D:\Project\out)", windows) == R"(D:\Project\src\a.hpp)");
+    CHECK(ResolveAgainst("/w/src/a.hpp", "/w/build", posix) == "/w/src/a.hpp");
+    CHECK(ResolveAgainst("../src/a.hpp", "/w/build", posix) == "/w/src/a.hpp");
+    // Normalized on both sides of the join, so one header cannot become two entries.
+    CHECK(ResolveAgainst("./sub/../a.hpp", "/w/build", posix) == "/w/build/a.hpp");
+    // No working directory means no anchoring; the caller decides what that means.
+    CHECK(ResolveAgainst("src/a.hpp", "", posix) == "src/a.hpp");
 }
 
 TEST_CASE("BuildManifest normalizes '..' segments and mixed separators to one token")
@@ -405,18 +697,35 @@ TEST_CASE("BuildManifest normalizes '..' segments and mixed separators to one to
         out << "#pragma once\n";
     }
 
+    auto const sourcePath = root / "src" / "a" / "a.cpp";
+    {
+        std::ofstream out { sourcePath, std::ios::binary };
+        out << "#include \"../b/shared.hpp\"\n";
+    }
+
     FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
 
-    // The same file named directly, via a `..` hop, and with forward slashes.
+    // The same file named directly, via a `..` hop, with forward slashes, and once
+    // more relative to the working directory -- four spellings, one entry.
     std::vector<std::string> const includes {
         headerPath.string(),
         (root / "src" / "a" / ".." / "b" / "shared.hpp").string(),
         root.string() + "/src/b/shared.hpp",
+        "src/a/../b/shared.hpp",
     };
 
-    auto const built = BuildManifest(includes, layout, "cl-test-1", "objkey-1");
+    auto const built = BuildManifest({ .sourcePath = sourcePath.string(),
+                                       .includePaths = includes,
+                                       .workingDirectory = root.string(),
+                                       .toolchainStamp = "cl-test-1",
+                                       .objectKey = "objkey-1" },
+                                     layout);
     REQUIRE(built.has_value());
-    CHECK(built->entries.size() == 1);
+    // The header once, plus the TU.
+    CHECK(built->entries.size() == 2);
+    CHECK(std::ranges::count(
+              built->entries, std::string { "<SRCROOT>/src/b/shared.hpp" }, &DirectManifest::Entry::canonicalPath)
+          == 1);
     CHECK(ValidateManifest(*built, layout, "cl-test-1"));
 
     std::filesystem::remove_all(root);
@@ -434,6 +743,12 @@ TEST_CASE("BuildManifest drops toolchain headers and deduplicates project header
         out << "#pragma once\n";
     }
 
+    auto const sourcePath = root / "src" / "a.cpp";
+    {
+        std::ofstream out { sourcePath, std::ios::binary };
+        out << "#include \"shared.hpp\"\n";
+    }
+
     FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
 
     // The same project header included three times, plus toolchain headers that must
@@ -446,9 +761,15 @@ TEST_CASE("BuildManifest drops toolchain headers and deduplicates project header
         headerPath.string(),
     };
 
-    auto const built = BuildManifest(includes, layout, "cl-test-1", "objkey-1");
+    auto const built = BuildManifest({ .sourcePath = sourcePath.string(),
+                                       .includePaths = includes,
+                                       .workingDirectory = root.string(),
+                                       .toolchainStamp = "cl-test-1",
+                                       .objectKey = "objkey-1" },
+                                     layout);
     REQUIRE(built.has_value());
-    CHECK(built->entries.size() == 1);
+    // The project header once, plus the TU; neither toolchain header appears.
+    CHECK(built->entries.size() == 2);
 
     std::filesystem::remove_all(root);
 }
@@ -565,7 +886,14 @@ TEST_CASE("A GNU depfile drives a manifest exactly as showIncludes notes do")
     auto const paths = ParseDepFilePaths(depFile);
     REQUIRE(paths.size() == 2);
 
-    auto const built = BuildManifest(paths, layout, "gcc-test-1", "objkey-dep");
+    // The depfile names the source among its own dependencies, so this also covers
+    // the source field deduplicating against the include list.
+    auto const built = BuildManifest({ .sourcePath = sourcePath.string(),
+                                       .includePaths = paths,
+                                       .workingDirectory = root.string(),
+                                       .toolchainStamp = "gcc-test-1",
+                                       .objectKey = "objkey-dep" },
+                                     layout);
     REQUIRE(built.has_value());
     CHECK(built->entries.size() == 2); // the source and its header, both under the root
     CHECK(ValidateManifest(*built, layout, "gcc-test-1"));
@@ -657,11 +985,14 @@ TEST_CASE("The three launcher key spaces are separated by their schema tag")
 TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
 {
     // See the note on the matching case in CacheKey_test.cpp for what to do when
-    // this fails. The manifest key is half of a lock-step pair: it must be bumped
-    // whenever `objkey-v*` is, because a manifest stores the object key by value
-    // and its own key never sees the object-key schema.
+    // this fails. The manifest key is half of a lock-step pair, and the coupling is
+    // ONE-WAY: it must be bumped whenever `objkey-v*` is, because a manifest stores
+    // the object key by value and its own key never sees the object-key schema. The
+    // reverse is free -- v4 moved this tag alone, to retire the manifests recorded
+    // while every relative dependency path was silently dropped, which no change to
+    // the object key was needed for.
     std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };
-    CHECK(ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51") == "76b19c2b7caf3e0db4dcc1efcecb76aa");
+    CHECK(ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51") == "8221eaeac6f3f8e52e523507780ed186");
 
     // The header-state digest is deliberately NOT part of that pair: nothing is
     // stored under it, so it has no stale entries to re-key and its tag stays at

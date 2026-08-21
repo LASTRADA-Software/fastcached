@@ -122,6 +122,85 @@ namespace
         std::size_t _offset { 0 };
     };
 
+    /// What a resolved dependency path is to a manifest.
+    ///
+    /// A three-way answer rather than IsToolchainHeader's two, because "outside
+    /// both roots" and "not anchored anywhere" are different facts with opposite
+    /// consequences: the first is toolchain content the stamp already covers, the
+    /// second is a path this build could not place at all, and conflating them is
+    /// what silently dropped every relative path from a manifest.
+    enum class PathRole : std::uint8_t
+    {
+        Project,    ///< Under a root: canonicalizes to a token and is hashed.
+        Toolchain,  ///< Covered collectively by the toolchain stamp; dropped.
+        Unanchored, ///< Neither absolute nor resolvable: has no portable form.
+    };
+
+    /// Classify a path that ResolveAgainst has already resolved.
+    ///
+    /// The anchor is decided FIRST, and that order is load-bearing:
+    /// IsToolchainHeader reports every path outside both roots as toolchain, and a
+    /// relative path lies under no root, so asking it first answers "toolchain" for
+    /// every unanchored path and drops it silently. Cc::IsCheckable and
+    /// Cc::PortableForm are the two other callers of that classifier and both
+    /// already order it this way.
+    ///
+    /// Switches without a `default:`, as those two do, so a fourth Anchor state is
+    /// a compile error here rather than a silent fall-through.
+    ///
+    /// @param resolved A path as ResolveAgainst returned it.
+    /// @param layout   This build's roots.
+    /// @return What the manifest should do with it.
+    [[nodiscard]] PathRole ClassifyResolved(std::string_view resolved, PathCanon::Layout const& layout)
+    {
+        if (resolved.empty())
+            return PathRole::Unanchored;
+
+        switch (PathCanon::AnchorForLayout(resolved, layout))
+        {
+            case PathCanon::Anchor::WorkingDirectory:
+                // Still relative after ResolveAgainst, so the working directory could
+                // not place it and the file it names is unknown.
+                return PathRole::Unanchored;
+            case PathCanon::Anchor::DriveRelative:
+            case PathCanon::Anchor::Absolute:
+                // Both fall through to the root tests, siding with the KEY FILTER
+                // rather than with the replay guard, which skips a drive-relative
+                // path outright. The two differ by what each needs and by what being
+                // wrong costs: the guard needs a path to STAT and answers "present"
+                // when it cannot, so probing `C:foo` against the wrong anchor would
+                // discard every hit carrying it. A manifest entry is OPENED rather
+                // than probed, and an unreadable one is a refusal on the recording
+                // side (HashFileContents yields nothing -> Malformed) and a
+                // non-validation on the reading side -- safe both ways. So the
+                // stronger question is worth asking: under a drive-relative root
+                // (`C:src\proj`) such a path canonicalizes to a token that is
+                // portable precisely because the consumer substitutes its own root,
+                // and dropping it on the anchor alone would silently un-cover a
+                // project header, which is the defect this classification exists to
+                // close. What must never happen is the branch above -- resolving
+                // `C:foo` against the compile's working directory, which is not the
+                // directory it is anchored to (issue #65).
+                break;
+        }
+        return IsToolchainHeader(resolved, layout) ? PathRole::Toolchain : PathRole::Project;
+    }
+
+    /// Canonicalize a path already classified as Project.
+    /// @param resolved An absolute, normalized path under one of the roots.
+    /// @param layout   This build's roots.
+    /// @return The token, or nullopt when Canonicalize declined to rewrite it.
+    [[nodiscard]] std::optional<std::string> ProjectToken(std::string const& resolved, PathCanon::Layout const& layout)
+    {
+        auto canonical = PathCanon::Canonicalize(resolved, layout);
+        // Canonicalize returns its input verbatim for a path it did not rewrite, so
+        // inequality -- not a sentinel PathCanon keeps private -- is what says a
+        // token was produced.
+        if (!canonical.has_value() || *canonical == resolved)
+            return std::nullopt;
+        return *std::move(canonical);
+    }
+
 } // namespace
 
 std::string EncodeManifest(DirectManifest const& manifest)
@@ -236,6 +315,16 @@ std::string HashFileContents(std::string_view absolutePath)
 std::string NormalizePath(std::string_view rawPath)
 {
     return std::filesystem::path { rawPath }.lexically_normal().make_preferred().string();
+}
+
+std::string NormalizeForLayout(std::string_view rawPath, PathCanon::Layout const& layout)
+{
+    auto path = NormalizePath(rawPath);
+    // make_preferred() above answered with the HOST's separator; every test that
+    // follows is the LAYOUT's. See the header for the failure this closes.
+    if (!PathCanon::IsWindowsLayout(layout))
+        std::ranges::replace(path, '\\', '/');
+    return path;
 }
 
 std::optional<std::string_view> IncludeNotePath(std::string_view line) noexcept
@@ -374,40 +463,142 @@ std::vector<std::string> ParseDepFilePaths(std::string_view depFileText)
     return paths;
 }
 
-std::expected<DirectManifest, DirectError> BuildManifest(std::vector<std::string> const& includePaths,
-                                                         PathCanon::Layout const& layout,
-                                                         std::string_view toolchainStamp,
-                                                         std::string_view objectKey)
+std::string ResolveAgainst(std::string_view rawPath, std::string_view workingDirectory, PathCanon::Layout const& layout)
 {
-    DirectManifest manifest { .toolchainStamp = std::string { toolchainStamp },
-                              .objectKey = std::string { objectKey },
-                              .entries = {} };
+    // Normalized before anything is decided, for the reason NormalizePath states:
+    // a driver echoes a path as resolved, so `..` segments and mixed separators
+    // arrive verbatim and unnormalized spellings become distinct entries. Through
+    // NormalizeForLayout, so the anchor test below reads the layout's separators
+    // rather than this host's.
+    auto normalized = NormalizeForLayout(rawPath, layout);
+    if (normalized.empty() || workingDirectory.empty())
+        return normalized;
 
-    for (auto const& rawPath: includePaths)
+    switch (PathCanon::AnchorForLayout(normalized, layout))
     {
-        auto const path = NormalizePath(rawPath);
+        case PathCanon::Anchor::Absolute:
+            return normalized;
+        case PathCanon::Anchor::DriveRelative:
+            // Returned unresolved, deliberately: `C:foo` is anchored to drive C's
+            // own current directory, so gluing the compile's working directory in
+            // front of it is not a resolution but a different wrong answer
+            // (issue #65). ClassifyResolved then puts it to the root tests, exactly
+            // as the key filter does.
+            return normalized;
+        case PathCanon::Anchor::WorkingDirectory:
+            break;
+    }
 
-        if (IsToolchainHeader(path, layout))
+    // Joined and normalized again: the join is what collapses a leading `..`
+    // against the working directory's last component.
+    return NormalizeForLayout((std::filesystem::path { workingDirectory } / std::filesystem::path { normalized }).string(),
+                              layout);
+}
+
+std::string AnchorWorkingDirectory(std::string_view directory, PathCanon::Layout const& layout)
+{
+    auto normalized = NormalizeForLayout(directory, layout);
+    std::error_code ec;
+    auto const canonicalDirectory = std::filesystem::weakly_canonical(std::filesystem::path { normalized }, ec);
+    if (ec)
+        return normalized;
+
+    // Longest root first, matching CanonicalizeOne's rule: a build tree nested
+    // inside the source root must anchor to the build tree, or the tail spliced
+    // back below would be relative to the wrong one.
+    std::array<std::string const*, 2> roots { &layout.buildTree, &layout.sourceRoot };
+    if (layout.buildTree.size() < layout.sourceRoot.size())
+        std::ranges::reverse(roots);
+
+    for (auto const* root: roots)
+    {
+        if (root->empty())
+            continue;
+        auto const canonicalRoot = std::filesystem::weakly_canonical(std::filesystem::path { *root }, ec);
+        if (ec)
             continue;
 
-        auto canonical = PathCanon::Canonicalize(path, layout);
-        if (!canonical.has_value())
-            return std::unexpected(DirectError::NotCanonical);
+        // lexically_relative, not a string prefix: both sides are now filesystem
+        // identities, and this is what says "inside" without another spelling test.
+        auto const tail = canonicalDirectory.lexically_relative(canonicalRoot);
+        if (tail.empty() || *tail.begin() == "..")
+            continue;
+        // The ROOT's spelling with the tail appended, never the canonical form: the
+        // point is to speak the layout's language, not the filesystem's.
+        return NormalizeForLayout((std::filesystem::path { *root } / tail).string(), layout);
+    }
+    return normalized;
+}
 
-        // A project header that canonicalizes to itself lies under no root, so it
-        // has no portable form; refuse rather than store a machine-specific path.
-        if (*canonical == path)
-            return std::unexpected(DirectError::NotCanonical);
+std::expected<std::string, DirectError> CanonicalSourceToken(std::string_view sourcePath,
+                                                             PathCanon::Layout const& layout,
+                                                             std::string_view workingDirectory)
+{
+    auto const resolved = ResolveAgainst(sourcePath, workingDirectory, layout);
+    if (ClassifyResolved(resolved, layout) != PathRole::Project)
+        return std::unexpected(DirectError::NotCanonical);
 
-        auto hash = HashFileContents(path);
+    auto token = ProjectToken(resolved, layout);
+    if (!token.has_value())
+        return std::unexpected(DirectError::NotCanonical);
+    return *std::move(token);
+}
+
+std::expected<DirectManifest, DirectError> BuildManifest(ManifestInputs const& inputs, PathCanon::Layout const& layout)
+{
+    DirectManifest manifest { .toolchainStamp = inputs.toolchainStamp, .objectKey = inputs.objectKey, .entries = {} };
+
+    // The TU first, and its absence is fatal rather than merely thin. A manifest
+    // that does not name the file being compiled revalidates everything except it,
+    // so editing a `.cpp` body while leaving every header untouched replays a stale
+    // object forever (issue #49 / issue #51). This used to be the caller's job and
+    // therefore a comment; here it is the function's own precondition.
+    auto const resolvedSource = ResolveAgainst(inputs.sourcePath, inputs.workingDirectory, layout);
+    auto const sourceToken = CanonicalSourceToken(inputs.sourcePath, layout, inputs.workingDirectory);
+    if (!sourceToken.has_value())
+        return std::unexpected(sourceToken.error());
+
+    auto const record = [&manifest](std::string token, std::string const& resolved) -> std::expected<void, DirectError> {
+        auto hash = HashFileContents(resolved);
         if (hash.empty())
             return std::unexpected(DirectError::Malformed);
+        manifest.entries.push_back({ .canonicalPath = std::move(token), .contentHash = std::move(hash) });
+        return {};
+    };
 
-        manifest.entries.push_back({ .canonicalPath = std::move(*canonical), .contentHash = std::move(hash) });
+    if (auto const stored = record(*sourceToken, resolvedSource); !stored.has_value())
+        return std::unexpected(stored.error());
+
+    for (auto const& rawPath: inputs.includePaths)
+    {
+        auto const resolved = ResolveAgainst(rawPath, inputs.workingDirectory, layout);
+        switch (ClassifyResolved(resolved, layout))
+        {
+            case PathRole::Toolchain:
+                // Covered by the stamp; listing it would make the manifest
+                // machine-specific for no gain in what a hit revalidates.
+                continue;
+            case PathRole::Unanchored:
+                // Refused, not dropped. Reaching here means the path is relative and
+                // the working directory could not place it, so the file it names is
+                // unknown -- and a dropped project header is the silent stale serve
+                // this whole classification exists to prevent. Refusing costs this
+                // compile direct mode; the ordinary preprocessed key still serves it.
+                return std::unexpected(DirectError::NotCanonical);
+            case PathRole::Project: {
+                auto token = ProjectToken(resolved, layout);
+                if (!token.has_value())
+                    return std::unexpected(DirectError::NotCanonical);
+                if (auto const stored = record(*std::move(token), resolved); !stored.has_value())
+                    return std::unexpected(stored.error());
+                break;
+            }
+        }
     }
 
     // Deduplicate then sort: `/showIncludes` repeats a header once per inclusion
-    // site, and two machines must agree on the order for the derived key to match.
+    // site, a GNU depfile names the TU among its own dependencies, and two machines
+    // must agree on the order for the derived key to match.
     std::ranges::sort(manifest.entries, [](auto const& a, auto const& b) { return a.canonicalPath < b.canonicalPath; });
     auto const duplicates = std::ranges::unique(
         manifest.entries, [](auto const& a, auto const& b) { return a.canonicalPath == b.canonicalPath; });
@@ -452,7 +643,26 @@ std::string ComputeManifestKey(std::string_view canonicalSource,
     // blob, which carried 32 bits rather than 128, to a real 128-bit digest). A v2
     // manifest is therefore not merely pointing at a v2 object; its key is not
     // reachable by this build at all.
-    KeyDigest digest { "manifest-v3" };
+    //
+    // v4 moves this tag ALONE, which the lock-step above permits: the coupling is
+    // one-way. An `objkey` bump must drag this tag with it, because a manifest
+    // points at an object key BY VALUE and would otherwise keep resolving to a
+    // pre-bump object. The reverse costs nothing — an unreachable manifest is
+    // re-recorded on the next compile and points at the same, still-valid v3
+    // objects — so nothing about the object key changed here.
+    //
+    // The bump is required because the defect it retires is invisible to the key.
+    // A build whose TU source was absolute but whose header paths were relative
+    // (a relative `-I`, or a compile run from the source directory) recorded a
+    // manifest naming the TU and nothing else: BuildManifest asked
+    // IsToolchainHeader before classifying the anchor, and every relative path
+    // lies under no root, so every one of them was dropped as toolchain content.
+    // This fix changes neither `canonicalSource` nor the args for such a build, so
+    // those manifests keep the same key, keep being found, and keep validating —
+    // and a direct hit never reaches RecordManifest, so nothing would ever
+    // overwrite one. Edit a dropped header and the stale object is served under a
+    // zero exit code, indefinitely. Re-keying is the only thing that retires them.
+    KeyDigest digest { "manifest-v4" };
     digest.Field(toolchainStamp);
     digest.Field(canonicalSource);
     for (auto const& arg: relativizedArgs)

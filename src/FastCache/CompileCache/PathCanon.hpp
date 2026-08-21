@@ -139,16 +139,17 @@ enum class Anchor : std::uint8_t
 /// The drive test requires a separator (or end of string) after `C:`, exactly as
 /// IsWindowsRoot's does and for a related reason: without it every drive-relative
 /// path reads as absolute. This used to be a `bool IsAbsoluteForLayout`, and it
-/// did precisely that — both callers still reached a safe outcome, but by way of
-/// an answer that was not true, which is not a property a third caller inherits
-/// (issue #65).
+/// did precisely that — the two callers of the day still reached a safe outcome, but
+/// by way of an answer that was not true, which is not a property a later caller
+/// inherits (issue #65; the manifest became that third caller immediately after).
 ///
-/// Lives here rather than in a caller because two of them need exactly this
-/// question answered exactly this way — the replay guard, deciding which
-/// replayed dependencies this machine is answerable for, and the launcher's key
-/// dependency filter, deciding which of them are portable enough to hash. Both
-/// switch on the result without a `default:`, so a fourth state added here is a
-/// compile error at each of them rather than a silent fall-through.
+/// Lives here rather than in a caller because several of them need exactly this
+/// question answered exactly this way — the replay guard, deciding which replayed
+/// dependencies this machine is answerable for; the launcher's key dependency
+/// filter, deciding which of them are portable enough to hash; and the direct-mode
+/// manifest, deciding which it may record and re-hash. Each switches on the result
+/// without a `default:`, so a fourth state added here is a compile error at every
+/// one of them rather than a silent fall-through.
 ///
 /// @param path   A path as a compiler spelled it. Empty reads as
 ///               Anchor::WorkingDirectory; both callers reject empty before this.
