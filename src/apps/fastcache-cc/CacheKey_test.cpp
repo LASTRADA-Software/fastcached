@@ -57,8 +57,8 @@ TEST_CASE("ComputeKey matches across roots when build-tree includes are present 
         { R"(D:\ci\deep\src\x.cpp)", R"(/external:ID:\ci\deep\src\out\build\vcpkg\include)", R"(/ID:\ci\deep\src\inc)" },
         R"(D:\ci\deep\src)",
         R"(D:\ci\deep\src\out\build)");
-    KeyInputs const a { .compilerId = "cl", .preprocessed = "int f();", .relativizedArgs = dev };
-    KeyInputs const b { .compilerId = "cl", .preprocessed = "int f();", .relativizedArgs = ci };
+    KeyInputs const a { .compilerId = "cl", .preprocessed = "int f();", .relativizedArgs = dev, .dependencyPaths = {} };
+    KeyInputs const b { .compilerId = "cl", .preprocessed = "int f();", .relativizedArgs = ci, .dependencyPaths = {} };
     CHECK(ComputeKey(a) == ComputeKey(b));
 }
 
@@ -75,33 +75,35 @@ TEST_CASE("ComputeKey is identical for the same content relativized from differe
         .compilerId = "cl 19.51",
         .preprocessed = "int f(){return 1;}",
         .relativizedArgs = Relativize({ R"(C:\dev\src\x.cpp)", R"(/IC:\dev\src\inc)" }, R"(C:\dev\src)"),
+        .dependencyPaths = {},
     };
     KeyInputs const fromCi {
         .compilerId = "cl 19.51",
         .preprocessed = "int f(){return 1;}",
         .relativizedArgs = Relativize({ R"(D:\ci\deep\checkout\src\x.cpp)", R"(/ID:\ci\deep\checkout\src\inc)" },
                                       R"(D:\ci\deep\checkout\src)"),
+        .dependencyPaths = {},
     };
     CHECK(ComputeKey(fromDev) == ComputeKey(fromCi));
 }
 
 TEST_CASE("ComputeKey differs when the preprocessed content differs")
 {
-    KeyInputs a { .compilerId = "cl", .preprocessed = "int f(){return 1;}", .relativizedArgs = {} };
-    KeyInputs b { .compilerId = "cl", .preprocessed = "int f(){return 2;}", .relativizedArgs = {} };
+    KeyInputs a { .compilerId = "cl", .preprocessed = "int f(){return 1;}", .relativizedArgs = {}, .dependencyPaths = {} };
+    KeyInputs b { .compilerId = "cl", .preprocessed = "int f(){return 2;}", .relativizedArgs = {}, .dependencyPaths = {} };
     CHECK(ComputeKey(a) != ComputeKey(b));
 }
 
 TEST_CASE("ComputeKey differs when the compiler identity differs")
 {
-    KeyInputs a { .compilerId = "cl 19.51", .preprocessed = "x", .relativizedArgs = {} };
-    KeyInputs b { .compilerId = "clang-cl 18", .preprocessed = "x", .relativizedArgs = {} };
+    KeyInputs a { .compilerId = "cl 19.51", .preprocessed = "x", .relativizedArgs = {}, .dependencyPaths = {} };
+    KeyInputs b { .compilerId = "clang-cl 18", .preprocessed = "x", .relativizedArgs = {}, .dependencyPaths = {} };
     CHECK(ComputeKey(a) != ComputeKey(b));
 }
 
 TEST_CASE("ComputeKey is a stable 32-hex-char string")
 {
-    KeyInputs a { .compilerId = "cl", .preprocessed = "hello", .relativizedArgs = { "/c" } };
+    KeyInputs a { .compilerId = "cl", .preprocessed = "hello", .relativizedArgs = { "/c" }, .dependencyPaths = {} };
     auto const k = ComputeKey(a);
     CHECK(k.size() == 32);
     CHECK(k == ComputeKey(a)); // deterministic
@@ -197,7 +199,58 @@ TEST_CASE("Two POSIX checkouts at different depths relativize identically")
     CHECK(fromDeep == fromShallow);
 
     // ...and therefore produce the same key for identical content.
-    KeyInputs const a { .compilerId = "g++ 14", .preprocessed = "int main(){}", .relativizedArgs = fromDeep };
-    KeyInputs const b { .compilerId = "g++ 14", .preprocessed = "int main(){}", .relativizedArgs = fromShallow };
+    KeyInputs const a {
+        .compilerId = "g++ 14", .preprocessed = "int main(){}", .relativizedArgs = fromDeep, .dependencyPaths = {}
+    };
+    KeyInputs const b {
+        .compilerId = "g++ 14", .preprocessed = "int main(){}", .relativizedArgs = fromShallow, .dependencyPaths = {}
+    };
     CHECK(ComputeKey(a) == ComputeKey(b));
+}
+
+TEST_CASE("A different dependency path set is a different key")
+{
+    // The whole point of issue #56. A header that MOVES without changing a byte
+    // leaves the preprocessed text and the arguments identical — line markers are
+    // suppressed, so no path reaches either — and until the dependency set was
+    // folded in, the key was identical too. The object was still correct and still
+    // served; the depfile it came with named a file that no longer exists, and the
+    // build never converged.
+    KeyInputs before { .compilerId = "g++ 16",
+                       .preprocessed = "inline int answer(){return 42;}",
+                       .relativizedArgs = { "-c", "<SRCROOT>/t.cpp" },
+                       .dependencyPaths = { "<SRCROOT>/inc/old/Hdr.hpp" } };
+    KeyInputs after = before;
+    after.dependencyPaths = { "<SRCROOT>/inc/new/Hdr.hpp" };
+
+    CHECK(ComputeKey(before) != ComputeKey(after));
+}
+
+TEST_CASE("The dependency set is hashed as a list, not concatenated into the args")
+{
+    // The two lists are adjacent and both hold path-shaped strings, so without a
+    // separator of its own a dependency could be read as a trailing argument and
+    // two genuinely different compiles would collide.
+    KeyInputs const asArg {
+        .compilerId = "g++ 16", .preprocessed = "x", .relativizedArgs = { "-c", "<SRCROOT>/a.hpp" }, .dependencyPaths = {}
+    };
+    KeyInputs const asDependency {
+        .compilerId = "g++ 16", .preprocessed = "x", .relativizedArgs = { "-c" }, .dependencyPaths = { "<SRCROOT>/a.hpp" }
+    };
+
+    CHECK(ComputeKey(asArg) != ComputeKey(asDependency));
+}
+
+TEST_CASE("An empty dependency set still keys stably")
+{
+    // A probe that reports nothing must not be fatal: the launcher keys with an
+    // empty set rather than refusing to cache, so a driver we cannot get
+    // dependencies out of still gets a working (if move-blind) cache.
+    KeyInputs const inputs { .compilerId = "g++ 16",
+                             .preprocessed = "int main(){}",
+                             .relativizedArgs = { "-c", "<SRCROOT>/a.cpp" },
+                             .dependencyPaths = {} };
+
+    CHECK(ComputeKey(inputs) == ComputeKey(inputs));
+    CHECK(ComputeKey(inputs).size() == 32);
 }

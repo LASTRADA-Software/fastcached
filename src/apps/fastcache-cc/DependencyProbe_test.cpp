@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: Apache-2.0
+#include "DependencyProbe.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+using namespace FastCache;
+using namespace FastCache::Cc;
+
+namespace
+{
+/// The POSIX layout the filter cases are judged against.
+PathCanon::Layout PosixLayout()
+{
+    return { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
+}
+
+std::vector<std::string> KeySet(std::vector<std::string> const& raw, PathCanon::Layout const& layout)
+{
+    return KeyDependencySet(std::span<std::string const> { raw }, layout);
+}
+} // namespace
+
+TEST_CASE("KeyDependencySet keeps the paths under either root as canonical tokens")
+{
+    // The point of the whole exercise: these are the project's own headers, the
+    // ones that move, and their token form is what makes the key differ after a
+    // move while staying identical across two checkouts at different roots.
+    auto const out = KeySet({ "/home/dev/proj/inc/new/Hdr.hpp", "/home/dev/proj/build/gen/Config.hpp" }, PosixLayout());
+
+    REQUIRE(out.size() == 2);
+    CHECK(out[0] == "<BUILDTREE>/gen/Config.hpp");
+    CHECK(out[1] == "<SRCROOT>/inc/new/Hdr.hpp");
+}
+
+TEST_CASE("KeyDependencySet drops an absolute path under neither root")
+{
+    // Load-bearing exclusion. A toolchain header's absolute path is this machine's
+    // alone, and the compiler identity in the key already covers the toolchain as a
+    // whole. Hashing it would mean two machines with the same compiler at different
+    // install prefixes share NOTHING — a duplicate entry set for every TU, to fix a
+    // defect that only ever affects the depfile.
+    auto const out = KeySet({ "/usr/include/c++/16/vector", "/opt/gcc-16/include/vector" }, PosixLayout());
+
+    CHECK(out.empty());
+}
+
+TEST_CASE("KeyDependencySet keeps a relative path")
+{
+    // A relative path resolves against the compile's working directory, so it names
+    // the same file on any machine running the same build. It lies under no root
+    // either, so it must be classified BEFORE the absolute test or it would be
+    // dropped along with the toolchain headers.
+    auto const out = KeySet({ "inc/Local.hpp", "../shared/Util.hpp" }, PosixLayout());
+
+    REQUIRE(out.size() == 2);
+    CHECK(out[0] == "../shared/Util.hpp");
+    CHECK(out[1] == "inc/Local.hpp");
+}
+
+TEST_CASE("KeyDependencySet normalizes a relative path's separators")
+{
+    // Canonical tokens already arrive with forward slashes, so without this the
+    // same file reached through two spellings would key as two dependencies.
+    PathCanon::Layout const windows { .sourceRoot = R"(C:\src\proj)", .buildTree = R"(C:\src\proj\build)" };
+    auto const out = KeySet({ R"(inc\a.hpp)", "inc/a.hpp" }, windows);
+
+    REQUIRE(out.size() == 1);
+    CHECK(out[0] == "inc/a.hpp");
+}
+
+TEST_CASE("KeyDependencySet sorts and deduplicates")
+{
+    // /showIncludes repeats a header once per inclusion site — hundreds of notes
+    // for a few dozen files — and sorting makes the key insensitive to an emission
+    // order that is a property of the driver rather than of what was compiled.
+    auto const first = KeySet({ "/home/dev/proj/b.hpp", "/home/dev/proj/a.hpp", "/home/dev/proj/b.hpp" }, PosixLayout());
+    auto const second = KeySet({ "/home/dev/proj/a.hpp", "/home/dev/proj/b.hpp" }, PosixLayout());
+
+    REQUIRE(first.size() == 2);
+    CHECK(first[0] == "<SRCROOT>/a.hpp");
+    CHECK(first[1] == "<SRCROOT>/b.hpp");
+    CHECK(first == second);
+}
+
+TEST_CASE("KeyDependencySet classifies a Windows path by the layout, not by the host")
+{
+    // A cache is shared across machines, so `C:\...` must read as absolute even
+    // when this binary runs on POSIX. std::filesystem::path::is_absolute() answers
+    // from the host and would send every Windows path down the relative branch,
+    // where a toolchain path would then be kept and baked into the key.
+    PathCanon::Layout const windows { .sourceRoot = R"(C:\src\proj)", .buildTree = R"(C:\src\proj\build)" };
+    auto const out = KeySet({ R"(C:\src\proj\inc\a.hpp)", R"(C:\Program Files\MSVC\include\vector)" }, windows);
+
+    REQUIRE(out.size() == 1);
+    CHECK(out[0] == "<SRCROOT>/inc/a.hpp");
+}
+
+TEST_CASE("SplitIncludeNotes removes every note line from the hashed text")
+{
+    // clang-cl reports on STDOUT, the same stream the preprocessed text uses. A
+    // note that survived here would be hashed into the cache key as though it were
+    // source — and it carries an absolute path, which is exactly what suppressing
+    // line markers exists to keep out of a key.
+    auto const out = SplitIncludeNotes("int a;\n"
+                                       "Note: including file: /home/dev/proj/a.hpp\n"
+                                       "int b;\n"
+                                       "Note: including file:  /home/dev/proj/b.hpp\n");
+
+    CHECK(out.preprocessed == "int a;\nint b;\n");
+    REQUIRE(out.notePaths.size() == 2);
+    CHECK(out.notePaths[0] == "/home/dev/proj/a.hpp");
+    CHECK(out.notePaths[1] == "/home/dev/proj/b.hpp");
+}
+
+TEST_CASE("SplitIncludeNotes recognises an indented note and CRLF endings")
+{
+    // `cl` indents a note by inclusion depth, so the marker is matched anywhere in
+    // the line rather than at its start — exactly as ParseIncludePaths matches it.
+    auto const out = SplitIncludeNotes("int a;\r\n"
+                                       "  Note: including file:  C:\\src\\proj\\a.hpp\r\n");
+
+    CHECK(out.preprocessed == "int a;\r\n");
+    REQUIRE(out.notePaths.size() == 1);
+    CHECK(out.notePaths[0] == R"(C:\src\proj\a.hpp)");
+}
+
+TEST_CASE("SplitIncludeNotes preserves non-note text byte-for-byte")
+{
+    // The remainder is hashed, so any normalization here would silently re-key the
+    // cache. A final line without a terminator must come back without one too.
+    constexpr std::string_view Text = "line one\r\n\nline three";
+    auto const out = SplitIncludeNotes(Text);
+
+    CHECK(out.preprocessed == Text);
+    CHECK(out.notePaths.empty());
+}
+
+TEST_CASE("SplitIncludeNotes leaves a stream that carries no notes alone")
+{
+    // The GNU drivers report into a depfile and print nothing on either stream, so
+    // this is the ordinary POSIX case: the split must be a no-op, not a rewrite.
+    auto const out = SplitIncludeNotes("#pragma once\nint x = 1;\n");
+
+    CHECK(out.preprocessed == "#pragma once\nint x = 1;\n");
+    CHECK(out.notePaths.empty());
+}

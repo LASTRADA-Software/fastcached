@@ -106,6 +106,15 @@ enum class DirectError : std::uint8_t
 /// @return The hash as hex, or empty on any read failure.
 [[nodiscard]] std::string HashFileContents(std::string_view absolutePath);
 
+/// The text `cl` and `clang-cl` prefix every `/showIncludes` note with.
+///
+/// Spelled once because two readers need it and they must agree exactly:
+/// ParseIncludePaths, which collects the paths, and DependencyProbe's
+/// SplitIncludeNotes, which removes those same lines from a stream that is also
+/// carrying preprocessed text. A note the splitter failed to recognise would be
+/// hashed into the cache key as if it were source.
+inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
+
 /// Extract the include paths from captured `/showIncludes` text.
 ///
 /// Reads the *localized* form the compiler emitted (absolute native paths), not

@@ -34,6 +34,7 @@
 #include "CacheKey.hpp"
 #include "CacheProtocol.hpp"
 #include "CmdLine.hpp"
+#include "DependencyProbe.hpp"
 #include "DirectManifest.hpp"
 #include "IProcessRunner.hpp"
 #include "ITcpClient.hpp"
@@ -482,27 +483,109 @@ constexpr std::size_t ReplayRegionCount = 2;
 
 // --- preprocess + compiler identity ----------------------------------------
 
-/// Preprocess the source (compiler-native, no line markers) for the cache key.
+/// Remove a file when the enclosing scope ends.
+///
+/// The probe's depfile is an artefact of asking a question, not something the
+/// build asked for, so it must not outlive the question — including on the paths
+/// that return early. RAII rather than a delete at each exit, for the reason
+/// every other resource here is owned by a wrapper.
+class ScopedFile
+{
+  public:
+    /// @param path The file to remove on destruction.
+    explicit ScopedFile(std::filesystem::path path):
+        _path { std::move(path) }
+    {
+    }
+    ScopedFile(ScopedFile const&) = delete;
+    ScopedFile(ScopedFile&&) = delete;
+    ScopedFile& operator=(ScopedFile const&) = delete;
+    ScopedFile& operator=(ScopedFile&&) = delete;
+
+    ~ScopedFile()
+    {
+        // The error_code overload, never the throwing one: a launcher whose whole
+        // contract is that a cache problem cannot break a build must not throw out
+        // of a destructor because a temporary file was already gone.
+        std::error_code ec;
+        std::filesystem::remove(_path, ec);
+    }
+
+  private:
+    std::filesystem::path _path;
+};
+
+/// What one preprocess probe yields: the text the key hashes, and the paths the
+/// compile depends on.
+struct SourceProbe
+{
+    std::string preprocessed;                 ///< Preprocessor output, no line markers.
+    std::vector<std::string> dependencyPaths; ///< Dependencies as the compiler spelled them.
+};
+
+/// Preprocess the source (compiler-native, no line markers) AND collect the
+/// dependency paths, in one compiler run, for the cache key.
 ///
 /// The per-driver spelling lives in the CmdLine driver table: MSVC drivers use
-/// `/EP` (preprocess to stdout with no `#line` directives), GNU drivers `-E`.
-/// Either way the compile action and any dependency-writing flags are dropped.
+/// `/EP` (preprocess to stdout with no `#line` directives) and report dependencies
+/// as `/showIncludes` notes on a stream; GNU drivers use `-E` and write a depfile.
+/// Either way the compile action and the build's own dependency flags are dropped
+/// and the probe's own appended in their place.
+///
+/// One run rather than two: the compiler has already opened every one of those
+/// files, so naming them measured at +1.5% on a 45 ms preprocess. The probe's
+/// depfile goes to a path of its own — writing the build's `-MF` would leave a
+/// probe's depfile behind for a hit that is then discarded, which is the very
+/// state the hit path exists to avoid.
+///
+/// Failing to obtain dependencies is not a failure of the probe. The key is then
+/// computed over an empty set, which costs this translation unit the protection
+/// against a moved header and nothing else; refusing to cache would be the larger
+/// harm.
 ///
 /// @param cmd The parsed compile command.
 /// @param originalArgs The original full invocation.
-/// @return The preprocessed text, or nullopt when the probe failed.
-[[nodiscard]] std::optional<std::string> Preprocess(Cc::ParsedCommand const& cmd, std::span<std::string const> originalArgs)
+/// @return The preprocessed text and dependency paths, or nullopt when the probe
+///         itself failed.
+[[nodiscard]] std::optional<SourceProbe> Preprocess(Cc::ParsedCommand const& cmd, std::span<std::string const> originalArgs)
 {
-    auto const pp = Cc::PreprocessCommand(cmd, originalArgs);
-    // Capture stdout ONLY. Merging stderr (2>&1) would fold the compiler's
-    // diagnostic lines into the hashed text, and the interleave point of two
-    // independently-buffered streams is not stable run-to-run — which would
-    // make the key nondeterministic and defeat all caching. The preprocessed
-    // source is on stdout; stderr (warnings) is irrelevant to the key.
+    // Derived from the object path, which is unique per translation unit, so
+    // parallel compiles in one build tree cannot collide — and it sits in a
+    // directory the compile already writes to. A stream driver never creates it;
+    // the guard below simply has nothing to remove there.
+    std::string const probeDepPath = cmd.objPath + ".fcdep";
+    ScopedFile const probeDepFile { std::filesystem::path { probeDepPath } };
+
+    auto const pp = Cc::PreprocessCommand(cmd, originalArgs, probeDepPath);
+    // Capture stdout and stderr SEPARATELY. Merging them (2>&1) would fold the
+    // compiler's diagnostic lines into the hashed text, and the interleave point
+    // of two independently-buffered streams is not stable run-to-run — which would
+    // make the key nondeterministic and defeat all caching.
     auto const run = RunCaptureSplit(pp);
     if (run.exitCode != 0)
         return std::nullopt;
-    return run.out;
+
+    auto const& driver = Cc::DriverOf(cmd.flavor);
+    if (driver.usesDepfile)
+    {
+        SourceProbe probe { .preprocessed = run.out, .dependencyPaths = {} };
+        if (auto const bytes = ReadFileBytes(std::filesystem::path { probeDepPath }); bytes.has_value())
+            probe.dependencyPaths =
+                Cc::ParseDepFilePaths(std::string_view { reinterpret_cast<char const*>(bytes->data()), bytes->size() });
+        else
+            Note("dependency probe wrote no depfile; keying without the dependency set");
+        return probe;
+    }
+
+    // A stream driver reports on stdout (clang-cl) or stderr (cl). Splitting the
+    // one that ALSO carries the preprocessed text is what keeps a note — which
+    // names an absolute path — from being hashed into the key as if it were source.
+    if (driver.includeStream == Cc::IncludeStream::Stdout)
+    {
+        auto split = Cc::SplitIncludeNotes(run.out);
+        return SourceProbe { .preprocessed = std::move(split.preprocessed), .dependencyPaths = std::move(split.notePaths) };
+    }
+    return SourceProbe { .preprocessed = run.out, .dependencyPaths = Cc::ParseIncludePaths(run.err) };
 }
 
 /// A stable-ish compiler identity: its version banner. cl prints it on /? or on
@@ -874,8 +957,8 @@ void RecordManifest(Config const& cfg,
             return served;
 
     auto const preprocessStarted = std::chrono::steady_clock::now();
-    auto const preprocessed = Preprocess(cmd, argv);
-    if (!preprocessed.has_value())
+    auto const probe = Preprocess(cmd, argv);
+    if (!probe.has_value())
     {
         Warn("preprocess failed");
         return std::nullopt;
@@ -895,10 +978,16 @@ void RecordManifest(Config const& cfg,
         return std::nullopt;
     }
 
+    // The dependency set is reduced to its portable form before it reaches the
+    // key: canonical tokens and relative paths only, sorted and deduplicated, with
+    // toolchain absolutes dropped because the compiler identity above already
+    // covers them and hashing them would end cross-machine sharing outright. See
+    // DependencyProbe.hpp, where each half of that filter is justified.
     Cc::KeyInputs const inputs {
         .compilerId = toolchainStamp,
-        .preprocessed = *preprocessed,
+        .preprocessed = probe->preprocessed,
         .relativizedArgs = relativizedArgs,
+        .dependencyPaths = Cc::KeyDependencySet(probe->dependencyPaths, layout),
     };
     std::string const key = Cc::ComputeKey(inputs);
     invocation.preprocessMs = MsSince(preprocessStarted);

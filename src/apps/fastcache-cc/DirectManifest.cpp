@@ -268,9 +268,10 @@ std::string HashFileContents(std::string_view absolutePath)
 
 std::vector<std::string> ParseIncludePaths(std::string_view showIncludesText)
 {
-    // cl and clang-cl both prefix include notes with this text; the remainder of
-    // the line is the path, indented by nesting depth.
-    constexpr std::string_view Marker = "Note: including file:";
+    // The remainder of the line after the marker is the path, indented by
+    // nesting depth. The marker itself lives in the header — SplitIncludeNotes
+    // must recognise exactly the lines this collects.
+    constexpr std::string_view Marker = IncludeNoteMarker;
 
     std::vector<std::string> paths;
     std::size_t offset = 0;

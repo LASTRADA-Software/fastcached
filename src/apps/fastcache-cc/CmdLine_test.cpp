@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -288,4 +289,54 @@ TEST_CASE("DriverOf reports where each driver reports its dependencies")
     CHECK(DriverOf(Flavor::Clang).usesDepfile);
     CHECK_FALSE(DriverOf(Flavor::Cl).usesDepfile);
     CHECK(DriverOf(Flavor::Unknown).flavor == Flavor::Unknown);
+}
+
+TEST_CASE("PreprocessCommand asks each driver for its dependencies in one spelling")
+{
+    // The cache key must be a function of BOTH artefacts a hit reproduces. The
+    // dependency set is captured on the preprocess run the launcher already makes
+    // — measured at +1.5% on a 45 ms preprocess — rather than in a second probe.
+    //
+    // The build's own spelling is dropped and ours appended in its place, so the
+    // set does not depend on whether the compile asked for `-MD`, `-MMD`, or for
+    // no dependencies at all. There must be exactly one of each flag on the line:
+    // a surviving `-MF` would send the probe's dependencies to the build's real
+    // depfile, which a hit that is then discarded must not have touched.
+    std::vector<std::string> const gnu { "g++", "-c", "a.cpp", "-o", "a.o", "-MMD", "-MF", "dep/a.d" };
+    auto const gnuProbe = PreprocessCommand(Parse(gnu), gnu, "build/a.o.fcdep");
+
+    CHECK(std::ranges::count(gnuProbe, "-MD") == 1);
+    CHECK(std::ranges::count(gnuProbe, "-MF") == 1);
+    CHECK_FALSE(std::ranges::contains(gnuProbe, "-MMD"));
+    CHECK_FALSE(std::ranges::contains(gnuProbe, "dep/a.d"));
+    // The destination must FOLLOW its flag, or the driver reads the next argument
+    // as the depfile and the probe path as a second input file.
+    auto const flag = std::ranges::find(gnuProbe, "-MF");
+    REQUIRE(flag != gnuProbe.end());
+    REQUIRE(std::next(flag) != gnuProbe.end());
+    CHECK(*std::next(flag) == "build/a.o.fcdep");
+
+    // MSVC drivers report on a stream instead, so they take the request but no
+    // path — /showIncludes with a trailing path would be a stray input file.
+    std::vector<std::string> const msvc { "cl.exe", "/c", "/showIncludes", "/Foout.obj", "a.cpp" };
+    auto const msvcProbe = PreprocessCommand(Parse(msvc), msvc, "out.obj.fcdep");
+
+    CHECK(std::ranges::count(msvcProbe, "/showIncludes") == 1);
+    CHECK_FALSE(std::ranges::contains(msvcProbe, "out.obj.fcdep"));
+    CHECK_FALSE(std::ranges::contains(msvcProbe, "-MF"));
+}
+
+TEST_CASE("PreprocessCommand omits the dependency probe when no path is given")
+{
+    // The path is what requests the probe. Without one the line is exactly what
+    // it was before dependency capture existed, which is what lets the callers
+    // that only want text (and every older test above) keep asking for it.
+    std::vector<std::string> const gnu { "g++", "-c", "a.cpp", "-o", "a.o" };
+    auto const pp = PreprocessCommand(Parse(gnu), gnu);
+
+    CHECK_FALSE(std::ranges::contains(pp, "-MD"));
+    CHECK_FALSE(std::ranges::contains(pp, "-MF"));
+
+    std::vector<std::string> const msvc { "cl.exe", "/c", "/Foout.obj", "a.cpp" };
+    CHECK_FALSE(std::ranges::contains(PreprocessCommand(Parse(msvc), msvc), "/showIncludes"));
 }

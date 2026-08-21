@@ -16,11 +16,13 @@
 #                           exists instead of ccache/sccache.
 #   5. Convergence        — after a header MOVES with its contents unchanged, the
 #                           replayed depfile names the new path. Preprocessing
-#                           suppresses line markers, so the object and its key are
-#                           invariant under such a move; a hit would otherwise
-#                           replay a depfile naming a file that no longer exists,
-#                           and Ninja would rebuild that TU on every build,
-#                           forever (issue #53).
+#                           suppresses line markers, so the object is invariant
+#                           under such a move; a hit would otherwise replay a
+#                           depfile naming a file that no longer exists, and Ninja
+#                           would rebuild that TU on every build, forever
+#                           (issue #53). The dependency set is part of the key, so
+#                           the two layouts are two keys and the pre-move entry
+#                           survives the move (issue #56).
 #
 # The PowerShell counterpart (src/apps/fastcache-cc/run-launcher-e2e.ps1) asserts
 # the same contract against cl / clang-cl on Windows.
@@ -245,10 +247,15 @@ echo "   depfile localized to the consuming checkout"
 
 # --- 5: a moved header must not replay a depfile naming its old path ---------
 # The header's CONTENTS do not change, so the preprocessed text is byte-identical
-# (line markers are suppressed) and the key is unchanged — the object is still
-# correct and the cache still hits. The depfile is nothing but paths, and the one
-# on record names a file that no longer exists. Ninja records that dependency,
-# cannot stat it, rebuilds the TU, hits the cache again, and never converges.
+# (line markers are suppressed). The depfile is nothing but paths, and the one on
+# record names a file that no longer exists. Ninja records that dependency, cannot
+# stat it, rebuilds the TU, hits the cache again, and never converges.
+#
+# The dependency path set is folded into the key, so the two layouts are two
+# different keys and the move is a MISS by construction rather than a hit some
+# guard had to catch and discard. Both properties are asserted below, because they
+# are distinguishable and only the second one holds: the move must produce no
+# "STALE HIT", and the PRE-MOVE entry must still be there afterwards.
 
 # The property Ninja actually needs: every dependency a depfile lists must exist.
 # Splices `\`-continuations, drops each rule's target (an output, and here one we
@@ -276,11 +283,27 @@ require_depfile_resolves() {
 
 # Run twice: once in the default configuration and once with direct mode off,
 # because the two reach the value by different routes and only the preprocessed
-# one produced the reported failure. Each variant gets its own project directory
-# — and because paths under SOURCE_DIR are tokenized before hashing, the two
-# trees key identically, so the second variant additionally arrives at an entry
-# some OTHER checkout stored. Its first compile is therefore expected to discard
-# that entry too, which is the cross-checkout form of the same property.
+# one produced the reported failure.
+#
+# Each variant gets its own project directory AND its own content. The directory
+# alone is not enough: paths under SOURCE_DIR are tokenized before hashing, so two
+# trees holding the same bytes key identically and the second variant would open on
+# a HIT against the first variant's entry rather than populating. That HIT is
+# correct — it is the cross-checkout sharing test 4 exists for — but it is not what
+# this test is about, and the string literal below (which survives preprocessing,
+# unlike a comment) is what keeps the two sequences independent.
+#
+# The tag lives in the SOURCE, never in the header: the header's bytes must stay
+# identical across the move, since a move that changed them would prove nothing.
+write_move_source() {
+    local root="$1" name="$2" include="$3"
+    cat > "${root}/t.cpp" <<SRC
+#include <${include}>
+inline char const* variant() { return "${name}"; }
+int main() { return answer() - 42; }
+SRC
+}
+
 check_header_move() {
     local label="$1" name="$2"
     shift 2
@@ -291,10 +314,7 @@ check_header_move() {
 #pragma once
 inline int answer() { return 42; }
 HDR
-    cat > "${root}/t.cpp" <<'SRC'
-#include <inc/old/Hdr.hpp>
-int main() { return answer() - 42; }
-SRC
+    write_move_source "$root" "$name" "inc/old/Hdr.hpp"
 
     export FASTCACHE_SOURCE_DIR="$root" FASTCACHE_BINARY_DIR="${root}/build"
 
@@ -308,17 +328,14 @@ SRC
     grep -q "MISS" "${workdir}/${name}-1.log" || fail "${label}: first compile was not a MISS"
     grep -q "inc/old/Hdr.hpp" "${root}/build/t.d" || fail "${label}: depfile does not name the header"
 
-    # Move it. Same bytes, new path — and update the include that finds it.
-    # Rewritten wholesale rather than edited in place: `sed -i` takes a backup
-    # suffix on BSD sed and none on GNU sed, so no single spelling works on both
-    # macOS and Linux, and this script runs on both.
+    # Move it. Same bytes, new path — and update the include that finds it. The
+    # source is rewritten wholesale rather than edited in place: `sed -i` takes a
+    # backup suffix on BSD sed and none on GNU sed, so no single spelling works on
+    # both macOS and Linux, and this script runs on both.
     mkdir -p "${root}/inc/new"
     mv "${root}/inc/old/Hdr.hpp" "${root}/inc/new/Hdr.hpp"
     rmdir "${root}/inc/old"
-    cat > "${root}/t.cpp" <<'MOVED'
-#include <inc/new/Hdr.hpp>
-int main() { return answer() - 42; }
-MOVED
+    write_move_source "$root" "$name" "inc/new/Hdr.hpp"
     rm -f "${root}/build/t.o" "${root}/build/t.d"
 
     echo "== ${label}: after the move (expect MISS, not a stale HIT) =="
@@ -328,6 +345,16 @@ MOVED
     cat "${workdir}/${name}-2.log"
     grep -q "MISS" "${workdir}/${name}-2.log" \
         || fail "${label}: a moved header still served a HIT, so the depfile is the producer's"
+    # The dependency set is part of the key, so the move is a different key and the
+    # value under the old one is never fetched at all. A "STALE HIT" here would mean
+    # the two layouts still collide and the replay guard is carrying the property on
+    # its own — true today, and exactly what issue #56 removed.
+    # `if grep`, not `grep && fail`: under `set -e` an AND-list whose left side
+    # fails takes the whole list's non-zero status, so the passing case would abort
+    # the script.
+    if grep -q "STALE HIT" "${workdir}/${name}-2.log"; then
+        fail "${label}: the moved header still keyed identically and had to be discarded on replay"
+    fi
     require_depfile_resolves "$label" "${root}/build/t.d"
     grep -q "inc/new/Hdr.hpp" "${root}/build/t.d" || fail "${label}: depfile does not name the moved header"
 
@@ -343,7 +370,34 @@ MOVED
         || fail "${label}: the repaired entry did not hit, so every build recompiles this TU"
     require_depfile_resolves "$label" "${root}/build/t.d"
     grep -q "inc/new/Hdr.hpp" "${root}/build/t.d" || fail "${label}: the hit replayed the old path again"
-    echo "   moved header: MISS, repaired, then HIT with the new path"
+
+    # Fourth compile: move the header BACK and the ORIGINAL entry must still be
+    # there. This is what separates "a different key" from "a hit that was caught
+    # and discarded": a guard-only fix re-stores the moved layout under the one
+    # shared key, destroying the entry the old layout needs, so this compile would
+    # MISS. Two keys means both layouts keep their own value.
+    mkdir -p "${root}/inc/old"
+    mv "${root}/inc/new/Hdr.hpp" "${root}/inc/old/Hdr.hpp"
+    rmdir "${root}/inc/new"
+    write_move_source "$root" "$name" "inc/old/Hdr.hpp"
+    rm -f "${root}/build/t.o" "${root}/build/t.d"
+    echo "== ${label}: moved back (the pre-move entry must have survived) =="
+    "$@" "$launcher" "$compiler" -std=c++23 -I"$root" \
+        -MD -MF "${root}/build/t.d" -c "${root}/t.cpp" -o "${root}/build/t.o" \
+        2> "${workdir}/${name}-4.log" || fail "${label}: fourth compile returned non-zero"
+    cat "${workdir}/${name}-4.log"
+    grep -q "HIT" "${workdir}/${name}-4.log" \
+        || fail "${label}: the pre-move entry was destroyed, so the two layouts share one key"
+    require_depfile_resolves "$label" "${root}/build/t.d"
+    grep -q "inc/old/Hdr.hpp" "${root}/build/t.d" || fail "${label}: the restored hit names the wrong path"
+
+    # Nothing of the probe's own may outlive it. The dependency capture writes a
+    # depfile beside the object, and a stray one would be an artefact no build
+    # system asked for — in a directory a build system does clean and compare.
+    [[ -z "$(find "${root}/build" -name '*.fcdep' -print -quit)" ]] \
+        || fail "${label}: the dependency probe left its depfile behind"
+
+    echo "   moved header: MISS, repaired, HIT, and the pre-move entry survived"
 }
 
 check_header_move "moved header" "movedhdr"
@@ -425,5 +479,5 @@ echo "   retired flags exit 2 with a diagnostic"
 "$launcher" --zero-stats >/dev/null || fail "--zero-stats returned non-zero"
 
 echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, cross-depth," \
-     "moved-header convergence, and safe fallback"
+     "moved-header convergence (both layouts keyed apart), and safe fallback"
 exit 0

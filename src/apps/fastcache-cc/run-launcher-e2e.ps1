@@ -9,6 +9,12 @@
 #   3. Cross-depth: content compiled/stored with a DEEP srcroot is a HIT when
 #      compiled from a SHALLOW srcroot (different checkout), with showIncludes
 #      localized so the deps resolve.
+#   4. Moved header: a header that moves with its contents unchanged is a MISS by
+#      construction, and the entry stored before the move is still there when it
+#      comes back. Preprocessing suppresses line markers, so the token stream and
+#      the object are identical after such a move and only the paths differ; the
+#      dependency set is part of the key so that the two layouts are two keys
+#      rather than one key a replay guard has to catch (issues #53 and #56).
 #
 # The POSIX counterpart (scripts/compile-cache-e2e.sh) additionally asserts that
 # a hit restores the GNU depfile, localized to the consuming checkout. That has
@@ -25,7 +31,8 @@ param(
     [string]$Launcher    = "$PSScriptRoot/../../out/build/clangcl-debug/target/fastcache-cc.exe",
     [int]$Port           = 21714,
     [string]$DeepTemp    = "$env:TEMP/cc-l-deep",
-    [string]$ShallowTemp = "$env:TEMP/cc-l-shallow"
+    [string]$ShallowTemp = "$env:TEMP/cc-l-shallow",
+    [string]$MoveTemp    = "$env:TEMP/cc-l-move"
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,6 +68,23 @@ function New-Tree([string]$root) {
     New-Item -ItemType Directory -Force -Path $inc | Out-Null
     Set-Content -Path (Join-Path $inc "h1.h") -Value "#pragma once`nint one();`n"
     Set-Content -Path (Join-Path $src "u.cpp") -Value "#include `"inc/h1.h`"`nint g(){return one();}`n"
+    return $src
+}
+
+# Point the fixture's translation unit at a header, wherever it currently lives.
+# The include is the ONLY thing that changes across a move: the header's own bytes
+# must stay identical, since a move that rewrote them would prove nothing.
+function Set-MoveSource([string]$src, [string]$include) {
+    Set-Content -Path (Join-Path $src "u.cpp") `
+                -Value "#include `"$include`"`nint g(){return answer()-42;}`n"
+}
+
+# A tree whose header sits at inc/old, ready to be moved to inc/new.
+function New-MoveTree([string]$root) {
+    $src = Join-Path $root "src"
+    New-Item -ItemType Directory -Force -Path (Join-Path $src "inc/old") | Out-Null
+    Set-Content -Path (Join-Path $src "inc/old/h1.h") -Value "#pragma once`ninline int answer(){return 42;}`n"
+    Set-MoveSource $src "inc/old/h1.h"
     return $src
 }
 
@@ -215,6 +239,52 @@ try {
             Write-Host "  CROSS-DEPTH FAIL ($cc): deep=$oDeep shallow=$oShallow obj=$(Test-Path $obj2)" -ForegroundColor Red
             $exit = 1
         }
+
+        Write-Host "=== moved header ($cc) ==="
+        # The header's CONTENTS do not change, so the preprocessed text is
+        # byte-identical and the object stays correct; only the paths move. Before
+        # the dependency set reached the key the two layouts collided, the cached
+        # /showIncludes notes named a file that no longer existed, and Ninja (which
+        # reads them as deps = msvc) rebuilt that TU on every build, forever.
+        Remove-Item -Recurse -Force $MoveTemp -ErrorAction SilentlyContinue
+        $moveSrc = New-MoveTree $MoveTemp
+        $moveBuild = Join-Path $MoveTemp "build"; New-Item -ItemType Directory -Force $moveBuild | Out-Null
+        $moveObj = Join-Path $moveBuild "u.obj"
+
+        $oBefore = Get-Outcome (Invoke-Launcher $cc $moveSrc $moveBuild $moveObj).stderr
+
+        New-Item -ItemType Directory -Force -Path (Join-Path $moveSrc "inc/new") | Out-Null
+        Move-Item (Join-Path $moveSrc "inc/old/h1.h") (Join-Path $moveSrc "inc/new/h1.h")
+        Remove-Item -Force (Join-Path $moveSrc "inc/old")
+        Set-MoveSource $moveSrc "inc/new/h1.h"
+        Remove-Item -Force $moveObj -ErrorAction SilentlyContinue
+
+        $rMoved = Invoke-Launcher $cc $moveSrc $moveBuild $moveObj
+        $oMoved = Get-Outcome $rMoved.stderr
+        # A "STALE HIT" here would mean the move still keyed identically and the
+        # replay guard had to catch and discard the value — true before issue #56,
+        # and the difference between detecting the collision and not having one.
+        $staleHit = [bool]($rMoved.stderr -match "STALE HIT")
+
+        # Move it back. The entry stored BEFORE the move must never have been
+        # overwritten, which is what separates two keys from one key plus a guard:
+        # a guard-only fix re-stores the moved layout under the shared key and
+        # destroys the value the original layout needs.
+        New-Item -ItemType Directory -Force -Path (Join-Path $moveSrc "inc/old") | Out-Null
+        Move-Item (Join-Path $moveSrc "inc/new/h1.h") (Join-Path $moveSrc "inc/old/h1.h")
+        Remove-Item -Force (Join-Path $moveSrc "inc/new")
+        Set-MoveSource $moveSrc "inc/old/h1.h"
+        Remove-Item -Force $moveObj -ErrorAction SilentlyContinue
+
+        $oBack = Get-Outcome (Invoke-Launcher $cc $moveSrc $moveBuild $moveObj).stderr
+
+        if ($oBefore -eq "MISS" -and $oMoved -eq "MISS" -and -not $staleHit -and $oBack -eq "HIT") {
+            Write-Host "  moved header keyed apart, pre-move entry survived: OK ($cc)" -ForegroundColor Green
+        } else {
+            Write-Host "  MOVED-HEADER FAIL ($cc): before=$oBefore moved=$oMoved stale=$staleHit back=$oBack" `
+                -ForegroundColor Red
+            $exit = 1
+        }
     }
 
     # --- CLI surface --------------------------------------------------------
@@ -249,7 +319,7 @@ try {
 }
 finally {
     $server | Stop-Process -Force -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force $DeepTemp,$ShallowTemp -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $DeepTemp,$ShallowTemp,$MoveTemp -ErrorAction SilentlyContinue
     Remove-Item Env:\FASTCACHE_ADDR,Env:\FASTCACHE_SOURCE_DIR,Env:\FASTCACHE_BINARY_DIR,Env:\FASTCACHE_VERBOSE -ErrorAction SilentlyContinue
 }
 

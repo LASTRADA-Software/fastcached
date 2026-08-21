@@ -52,6 +52,19 @@ struct DriverSpec
     /// Flags dropped when building the preprocess command line (compile-only,
     /// object output, and dependency options that would write stray files).
     std::span<std::string_view const> preprocessDropFlags;
+    /// Flags appended to the preprocess line so the same probe ALSO reports the
+    /// translation unit's dependencies, which are folded into the cache key.
+    ///
+    /// The key must be a function of both artefacts a hit reproduces. Without the
+    /// dependency set it determines only the object, and a header that moves
+    /// without changing a byte keys identically while its depfile no longer does
+    /// (issue #53 / issue #56). Capturing them here rather than in a second probe
+    /// is what makes that affordable: measured at +1.5% on a 45 ms preprocess,
+    /// because the compiler has already opened every one of those files.
+    ///
+    /// When `usesDepfile`, the probe's depfile path is appended after these; the
+    /// stream drivers report on `includeStream` instead and need no path.
+    std::span<std::string_view const> dependencyProbeFlags;
     /// Where inline dependency notes appear, if anywhere.
     IncludeStream includeStream { IncludeStream::None };
     /// True when dependencies are emitted into a depfile (`-MF <path>`).
@@ -97,9 +110,23 @@ struct ParsedCommand
 /// Drops the compile-only, object-output and dependency flags (which would
 /// otherwise write stray files) and appends the driver's preprocess flags.
 ///
+/// The caller's own dependency flags are dropped and the driver's
+/// `dependencyProbeFlags` appended in their place, so the probe reports
+/// dependencies in exactly one spelling regardless of what the build asked for —
+/// `-MD` even when the compile said `-MMD`, and a `-MF` naming
+/// `dependencyProbePath` rather than the build's own depfile, which a discarded
+/// hit must not have touched.
+///
 /// @param cmd The parsed command.
 /// @param argv The original full invocation.
+/// @param dependencyProbePath Where a depfile driver writes the probe's
+///                            dependencies, and the request for the probe itself:
+///                            empty asks for no dependency reporting at all. A
+///                            stream driver reports on `includeStream` and reads
+///                            nothing out of this but the request.
 /// @return The preprocess invocation, argv[0] being the compiler.
-[[nodiscard]] std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd, std::span<std::string const> argv);
+[[nodiscard]] std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
+                                                         std::span<std::string const> argv,
+                                                         std::string_view dependencyProbePath = {});
 
 } // namespace FastCache::Cc

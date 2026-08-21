@@ -182,8 +182,11 @@ this is worth checking before concluding the cache does not help. With
    recorded and look up a manifest — far cheaper than preprocessing (~18 ms
    versus ~1.4 s on a large translation unit). If that misses, preprocess the
    TU, relativize checkout-rooted arguments against `SOURCE_DIR`/`BINARY_DIR`,
-   and hash `(compiler id + preprocessed text + relativized args)` into a
-   128-bit key.
+   and hash `(compiler id + preprocessed text + relativized args + dependency
+   paths)` into a 128-bit key. The dependency set comes from that same
+   preprocess run — `-MD` into a scratch depfile for GNU drivers,
+   `/showIncludes` for MSVC ones — which costs about 1.5% of it, because the
+   compiler has already opened every one of those files.
 2. **FETCH.** On a hit, write the object to the requested output path and replay
    the cached stdout and stderr on their own channels, with header paths
    localized to this machine so the build tool's dependency records stay valid.
@@ -198,16 +201,29 @@ object, so a direct hit follows one extra fetch instead of doubling the cached
 volume (which, since the memory tier keeps values uncompressed, would land on
 RAM where compression cannot help).
 
-A hit also has to be *honourable*: before writing anything it checks that the
-dependency paths the cached value records — a GNU depfile, or the
-`/showIncludes` notes Ninja reads as `deps = msvc` — still exist here. A header
-that moves without changing its contents leaves the object and its key
-identical but the recorded paths wrong, and replaying them would make the build
-system rebuild that translation unit on every build forever. Such a hit is
-discarded and the compile runs for real, which re-stores the entry with a
-correct record. Toolchain and system paths are exempt: they are the producer's
-spelling, covered by the compiler identity in the key, and requiring them would
-make two machines with different system prefixes miss on every compile.
+### Why the dependency paths are in the key
+
+A hit reproduces two things: the object file, and the build system's dependency
+record — a GNU depfile, or the `/showIncludes` notes Ninja reads as
+`deps = msvc`. Suppressing line markers keeps every path out of the hashed text,
+which is what makes a key portable across checkouts, and equally what once made
+it identical after a header **moved**: same bytes, new path, so the object was
+still correct and still served while the recorded paths were not. Replaying
+those makes the build system rebuild that translation unit on every build,
+forever, with a successful exit code each time.
+
+Naming the dependencies in the key makes a move a different key, so the two
+layouts hold two entries and moving a header back finds the original one intact.
+Only machine-independent paths are hashed — those under the source root or build
+tree, plus relative ones. Toolchain and system paths are left out on purpose:
+they are the producing machine's spelling, the compiler identity in the key
+already covers them, and hashing them would stop two machines with the same
+compiler at different install prefixes from sharing anything at all.
+
+That last exemption leaves one case open, so a hit is still checked before it is
+written: every dependency path it records that this machine is answerable for
+must exist. A hit that fails the check is discarded and the compile runs for
+real, which re-stores the entry with a correct record.
 
 ## Statistics
 
@@ -287,19 +303,17 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
   text. Direct use is caught; use reached only *through a header* is not, so
   such a TU stays a permanent miss. Never incorrect — just never cached.
 - Diagnostics-stream paths outside the include grammar are not yet localized.
-- The check that a hit's recorded dependency paths still exist covers only the
-  paths under `FASTCACHE_SOURCE_DIR` / `FASTCACHE_BINARY_DIR`, plus relative
-  ones. Toolchain and system paths are exempt by design: they are the producing
-  machine's spelling, the compiler identity in the key already covers them, and
-  requiring them would make two machines with different system include prefixes
-  miss on every compile, each re-storing the other's record. So a cache shared
-  between machines whose toolchains live at *different* prefixes can still
-  replay a dependency record naming a path the consumer lacks. Existence is
-  also not identity: if another file has come to occupy a vacated path, the
-  check passes. Both are closed by folding the dependency set into the key
-  itself — see issue #56.
-- The cache key normalization is deliberately v1. Tune it against real
-  developer↔CI hit rates before relying on it broadly.
+- Toolchain and system dependency paths are in neither the key nor the
+  existence check, by design: they are the producing machine's spelling, the
+  compiler identity in the key already covers them, and including them would
+  make two machines with different system include prefixes share nothing. So a
+  cache shared between machines whose compilers print the *same* `--version`
+  banner from *different* prefixes can still replay a dependency record naming a
+  path the consumer lacks. Project headers — the ones that actually move — are
+  covered by the key, so this is now confined to the toolchain.
+- The cache key normalization is deliberately young (`objkey-v2`). Tune it
+  against real developer↔CI hit rates before relying on it broadly. Bumping the
+  schema re-keys the cache: existing entries miss once and are rewritten.
 - Localized path separators may be normalized to `/` in some segments. Ninja
   matches dependencies separator-insensitively, so this is cosmetic.
 - Non-C/C++ inputs (for example Windows `.rc` resource files) are correctly

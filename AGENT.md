@@ -142,27 +142,54 @@ These constraints are load-bearing and have each already been a bug:
   is deliberately **no handshake**, because the launcher opens a fresh connection
   per *operation* and a HELLO would cost 2–4 round trips per translation unit on
   the exact path this list already records regressions on.
-- **A cache key that determines the object does not determine the depfile, so a hit
-  must re-check the dependency paths it is about to replay.** Preprocessing suppresses
-  line markers (`-E -P`, `/EP`) so a checkout path never reaches the key — which is
-  what makes a key portable, and equally what makes it *invariant under a header move*.
-  Move a header without changing a byte of it and the token stream is identical: the
-  object is still correct and is served, while the depfile, which is nothing but paths,
-  names a file that is gone. That is worse than a miss, because Ninja records the
-  dependency, cannot stat it, rebuilds, hits the same value, and never converges — with
-  a successful exit code every time. `Cc::MissingReplayedDependency` therefore runs
-  before a hit writes anything, and a stale hit falls through to the real compile, whose
-  STORE overwrites that key and *repairs* the entry rather than leaving it to poison
-  every later build. Its filter is where the subtlety is, and the two halves are
-  load-bearing in opposite directions: probing a depfile's rule target would make every
-  hit a miss, because the target is the object file and it does not exist yet (hence
-  `ParseDepFilePaths`, which excludes it, rather than a whitespace split); probing an
-  absolute path outside both roots would make two machines with different system include
-  prefixes miss on *every* compile forever, each re-storing the other's record. A
-  relative path is kept and must be classified before the toolchain test, which reports
-  every relative path as outside the roots. `/showIncludes` is covered alongside the
-  depfile because Ninja reads it as `deps = msvc`; `MsvcDiagnostics` is not, because a
-  diagnostic quotes a path rather than declaring a dependency on it.
+- **A key determines two artefacts, so it must be a function of both.** Preprocessing
+  suppresses line markers (`-E -P`, `/EP`) so a checkout path never reaches the key —
+  which is what makes a key portable, and equally what made it *invariant under a header
+  move*. Move a header without changing a byte of it and the token stream is identical:
+  the object is still correct and was served, while the depfile, which is nothing but
+  paths, named a file that is gone. That is worse than a miss, because Ninja records the
+  dependency, cannot stat it, rebuilds, hits the same value, and never converges — with a
+  successful exit code every time. The dependency path set is therefore part of the key
+  (`objkey-v2`, `KeyInputs::dependencyPaths`), captured on the preprocess run the launcher
+  already makes rather than in a second probe: measured at **+1.5% on a 45 ms preprocess**,
+  because the compiler has already opened every one of those files. A move is a different
+  key by construction, so the *pre-move* entry survives the move rather than being
+  overwritten — which is the property `check_header_move` asserts by moving the header
+  back and requiring a HIT.
+  - **Which paths are hashed is the whole subtlety, and the exclusion cuts the opposite
+    way from the inclusion.** `KeyDependencySet` keeps a path that canonicalizes to a
+    `<SRCROOT>`/`<BUILDTREE>` token, and keeps a *relative* path (it resolves against the
+    compile's working directory, so it is machine-independent) — which must be decided
+    before the absolute test, since a relative path lies under no root either. It **drops**
+    an absolute path under neither root: that is toolchain content, already covered
+    collectively by the compiler identity in the key, and hashing it would mean two
+    machines with the same compiler at different install prefixes share *nothing at all*.
+    This is the same split `DirectManifest` makes, for the reason its header states — 476
+    of a real TU's 635 headers are toolchain, and a manifest naming them would be
+    machine-specific. The set is sorted and deduplicated because `/showIncludes` repeats a
+    header once per inclusion site and emission order is a property of the driver.
+  - **A stream driver's notes must not reach the hashed text.** clang-cl reports
+    `/showIncludes` on **stdout**, the same stream the preprocessed text uses, so
+    `SplitIncludeNotes` removes those lines before the rest is hashed — otherwise a note,
+    which carries an absolute path, would be keyed as if it were source, which is precisely
+    what suppressing line markers exists to prevent. It and `ParseIncludePaths` read one
+    `IncludeNoteMarker`, because a note the splitter failed to recognise is a hashed path.
+  - **`Cc::MissingReplayedDependency` stays as the backstop**, and still runs before a hit
+    writes anything; a stale hit falls through to the real compile, whose STORE repairs the
+    entry. Its filter is load-bearing in both directions: probing a depfile's rule target
+    would make every hit a miss, because the target is the object file and it does not exist
+    yet (hence `ParseDepFilePaths`, which excludes it, rather than a whitespace split);
+    probing an absolute path outside both roots would make two machines with different system
+    include prefixes miss on *every* compile forever, each re-storing the other's record.
+    `/showIncludes` is covered alongside the depfile because Ninja reads it as `deps = msvc`;
+    `MsvcDiagnostics` is not, because a diagnostic quotes a path rather than declaring a
+    dependency on it.
+  - **The residual, recorded deliberately:** two machines whose compilers print the *same*
+    `--version` banner from *different* install prefixes still share a key and can still
+    replay each other's toolchain paths. Closing that would mean hashing those absolute
+    paths, i.e. giving up cross-machine sharing wholesale for the population it affects, so
+    the guard above is what covers it and the trade is left where `DirectManifest` already
+    put it.
 - **`Protocol/CompileCacheWire.hpp` must stay header-only and dependency-free.**
   Same constraint as `Cli/UsageDoc`, same reason: `fastcache-cc` does not link
   the `FastCache` library, so an include of anything from `Net/`, `Cache/`,
@@ -372,18 +399,23 @@ These constraints are load-bearing and have each already been a bug:
   re-reads the list with that same extractor and fails on any entry containing
   whitespace or a colon, so the rule is enforced rather than merely documented.
 
-`fastcached` and `fastcache-cc` are both installed. Two things the launcher's
-cache key depends on, both of which have already caused silent hit-rate
-collapses and are now covered by regression tests:
+`fastcached` and `fastcache-cc` are both installed. Three things the launcher's
+cache key depends on, each of which has already caused a silent hit-rate
+collapse or a mis-serve and is now covered by regression tests:
 
 - **Preprocessing must suppress line markers** (`/EP` on MSVC, `-E -P` on GNU).
   A `# 1 "/abs/path.cpp"` marker embeds the checkout path in the hashed text.
 - **`/` introduces an option only on Windows.** On POSIX it starts an absolute
   path, and treating it as an option leaves absolute paths unrelativized.
+- **Only machine-independent dependency paths may be hashed.** The dependency set
+  is part of the key so a moved header re-keys; hashing a toolchain path along
+  with it would re-key on the *machine* instead, and two boxes with the same
+  compiler at different prefixes would stop sharing every entry they have.
 
-Both break cross-checkout sharing while every unit test still passes, so
+The first two break cross-checkout sharing while every unit test still passes,
+and the third breaks it the moment two machines differ, so
 `scripts/compile-cache-e2e.sh` (POSIX) and `run-launcher-e2e.ps1` (Windows)
-assert the property end-to-end in CI on both platforms.
+assert all of them end-to-end in CI on both platforms.
 
 Production flow: `main()` -> CLI -> optional YAML -> `ConfigReloader` ->
 `CacheEngine` over `InMemoryLruStorage` (or, when `--storage` is set, a

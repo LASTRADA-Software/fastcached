@@ -39,38 +39,6 @@ namespace
         { .grammar = PathCanon::Grammar::ShowIncludes, .extract = &ParseIncludePaths },
     } };
 
-    /// Whether `path` is absolute under the conventions `layout` describes.
-    ///
-    /// Derived from the layout, never from the host: a cache is shared across
-    /// machines, so `D:\src\a.hpp` must read as absolute even when this binary runs
-    /// on POSIX — std::filesystem::path::is_absolute() would say otherwise and send
-    /// every Windows path down the relative branch. PathCanon::IsWindowsLayout is the
-    /// single definition of "is this a Windows layout"; this derives from it for the
-    /// same reason the launcher's option-prefix test does.
-    ///
-    /// @param path   A dependency path as the compiler spelled it.
-    /// @param layout The layout whose path conventions apply.
-    /// @return True when the path is absolute.
-    [[nodiscard]] bool IsAbsoluteForLayout(std::string_view path, PathCanon::Layout const& layout)
-    {
-        if (path.empty())
-            return false;
-        if (!PathCanon::IsWindowsLayout(layout))
-            return path.front() == '/';
-
-        // Compared directly rather than via std::isalpha, which is locale-dependent
-        // and would make the predicate environment-sensitive (as PathCanon notes).
-        auto const isDriveLetter = [](char c) noexcept {
-            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-        };
-        if (path.size() >= 2 && path[1] == ':' && isDriveLetter(path.front()))
-            return true;
-        // A leading separator is root-relative on Windows, and a UNC share (`\\host`)
-        // begins with one too; both name a fixed location rather than a cwd-relative
-        // one, so neither may be resolved against the working directory.
-        return path.front() == '\\' || path.front() == '/';
-    }
-
     /// Whether this machine is answerable for `path` existing. See the header for
     /// why each exclusion is load-bearing; the order is not incidental.
     /// @param path   An extracted dependency path.
@@ -85,7 +53,7 @@ namespace
             return false;
         // Relative first: IsToolchainHeader reports every relative path as outside
         // the roots, so asking it first would silently skip all of them.
-        if (!IsAbsoluteForLayout(path, layout))
+        if (!PathCanon::IsAbsoluteForLayout(path, layout))
             return true;
         return !IsToolchainHeader(path, layout);
     }

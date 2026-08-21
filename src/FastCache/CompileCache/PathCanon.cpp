@@ -416,6 +416,26 @@ bool IsWindowsLayout(Layout const& layout) noexcept
     return IsWindowsRoot(layout.sourceRoot) || IsWindowsRoot(layout.buildTree);
 }
 
+bool IsAbsoluteForLayout(std::string_view path, Layout const& layout) noexcept
+{
+    if (path.empty())
+        return false;
+    if (!IsWindowsLayout(layout))
+        return path.front() == '/';
+
+    // Compared directly rather than via std::isalpha, which is locale-dependent
+    // and would make the predicate environment-sensitive (as IsWindowsRoot notes).
+    auto const isDriveLetter = [](char c) noexcept {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    };
+    if (path.size() >= 2 && path[1] == ':' && isDriveLetter(path.front()))
+        return true;
+    // A leading separator is root-relative on Windows, and a UNC share (`\\host`)
+    // begins with one too; both name a fixed location rather than a cwd-relative
+    // one, so neither may be resolved against the working directory.
+    return path.front() == '\\' || path.front() == '/';
+}
+
 std::expected<std::string, CanonError> Canonicalize(std::string_view absolutePath, Layout const& layout)
 {
     return CanonicalizeOne(absolutePath, layout);
