@@ -340,3 +340,24 @@ TEST_CASE("PreprocessCommand omits the dependency probe when no path is given")
     std::vector<std::string> const msvc { "cl.exe", "/c", "/Foout.obj", "a.cpp" };
     CHECK_FALSE(std::ranges::contains(PreprocessCommand(Parse(msvc), msvc), "/showIncludes"));
 }
+
+TEST_CASE("PreprocessCommand sends MSVC preprocessed text to stdout, never to a file")
+{
+    // Regression guard, and the sharpest kind: a probe line carrying BOTH /EP and
+    // /P is accepted by the compiler, exits 0, and writes the preprocessed text to
+    // `<base>.i` — so the launcher hashed an empty stdout and every Windows key
+    // carried no content from the source at all. An edited file then re-fetched the
+    // object built from the old text. Direct mode masked it (its manifest hashes
+    // the source's own bytes), so nothing failed until FASTCACHE_NO_DIRECT=1.
+    //
+    // /EP and /P are alternatives, not modifiers: /EP preprocesses to stdout, /P to
+    // a file, and MSVC documents the pair as "to the file, without #line".
+    for (auto const& compiler: { "cl.exe", "clang-cl.exe" })
+    {
+        std::vector<std::string> const argv { compiler, "/c", "/Foout.obj", "a.cpp" };
+        auto const pp = PreprocessCommand(Parse(argv), argv);
+
+        CHECK(std::ranges::contains(pp, "/EP"));
+        CHECK_FALSE(std::ranges::contains(pp, "/P"));
+    }
+}

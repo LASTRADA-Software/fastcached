@@ -44,7 +44,17 @@ namespace
     // and therefore the cache key — differ between two checkouts of the same
     // content at different paths, defeating cross-machine sharing entirely.
     // MSVC: /EP writes to stdout without #line. GNU: -P suppresses markers.
-    constexpr std::array<std::string_view, 2> MsvcPreprocess { "/EP", "/P" };
+    //
+    // `/EP` ALONE, and the absence of `/P` here is the whole point. The two are
+    // not additive: `/EP` preprocesses to stdout, `/P` preprocesses to a FILE, and
+    // MSVC documents the pair as "write the file without #line directives". So
+    // passing both sent the preprocessed text to `<base>.i` and left the launcher
+    // hashing an essentially empty stdout — a key with no content in it at all,
+    // under which an edited source re-fetches the object built from the OLD text.
+    // Direct mode hides it (its manifest hashes the source's bytes), so it showed
+    // up only with FASTCACHE_NO_DIRECT=1, and it dropped a stray `.i` in the
+    // working directory on every probe besides.
+    constexpr std::array<std::string_view, 1> MsvcPreprocess { "/EP" };
     constexpr std::array<std::string_view, 2> GnuPreprocess { "-E", "-P" };
 
     /// Flags dropped when preprocessing: compile-only and object-output flags

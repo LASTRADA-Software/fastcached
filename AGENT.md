@@ -405,6 +405,14 @@ collapse or a mis-serve and is now covered by regression tests:
 
 - **Preprocessing must suppress line markers** (`/EP` on MSVC, `-E -P` on GNU).
   A `# 1 "/abs/path.cpp"` marker embeds the checkout path in the hashed text.
+  On MSVC that is `/EP` **alone**: `/EP` and `/P` are alternatives, not modifiers
+  — `/EP` preprocesses to stdout, `/P` to a `<base>.i` file, and MSVC documents
+  the pair as "to the file, without `#line`". Passing both left the launcher
+  hashing an empty stdout, so a Windows key carried nothing from the source and
+  an edited file was answered with the object built from the previous revision.
+  That is a wrong build rather than a cold cache, and direct mode hid it, since
+  its manifest hashes the source's own bytes — hence the e2e case that edits a
+  source with `FASTCACHE_NO_DIRECT=1` and requires a MISS.
 - **`/` introduces an option only on Windows.** On POSIX it starts an absolute
   path, and treating it as an option leaves absolute paths unrelativized.
 - **Only machine-independent dependency paths may be hashed.** The dependency set

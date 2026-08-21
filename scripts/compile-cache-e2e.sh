@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # End-to-end test of the compile cache (POSIX). Starts fastcached, drives real
-# compiles through fastcache-cc, and asserts the three properties the launcher
-# actually promises:
+# compiles through fastcache-cc, and asserts the properties the launcher actually
+# promises:
 #
 #   1. MISS then HIT      — a repeated compile is served from the cache.
 #   2. Byte-identical     — the cached object equals the compiled one.
@@ -23,6 +23,12 @@
 #                           (issue #53). The dependency set is part of the key, so
 #                           the two layouts are two keys and the pre-move entry
 #                           survives the move (issue #56).
+#   6. Content in the key — an edited source must MISS. The preprocessed text is
+#                           the only key input carrying the source's content, so a
+#                           probe that captures none of it answers an edit with the
+#                           previous revision's object: a wrong build, silently.
+#                           Asserted with direct mode OFF, since its manifest hashes
+#                           the source's own bytes and would mask exactly that.
 #
 # The PowerShell counterpart (src/apps/fastcache-cc/run-launcher-e2e.ps1) asserts
 # the same contract against cl / clang-cl on Windows.
@@ -403,7 +409,43 @@ HDR
 check_header_move "moved header" "movedhdr"
 check_header_move "moved header (no direct mode)" "movedhdr-nodirect" env FASTCACHE_NO_DIRECT=1
 
-# --- 6: the cache is never load-bearing -------------------------------------
+# --- 6: an edited source must not be served the old object -------------------
+# The preprocessed text is the only key input that carries the source's CONTENT,
+# so a probe that fails to capture it produces a key that cannot tell two
+# revisions of a file apart — and the cache then answers an edited source with
+# the object built from the previous one. That is not a hit-rate problem, it is a
+# WRONG BUILD, and it is silent: the compile succeeds every time.
+#
+# Direct mode is switched off deliberately. Its manifest hashes the source file's
+# own bytes, so it catches an edit regardless of what the preprocessed text
+# contains — which is exactly how a probe capturing nothing stayed invisible.
+edited="${workdir}/edited"
+mkdir -p "${edited}/build"
+export FASTCACHE_SOURCE_DIR="$edited" FASTCACHE_BINARY_DIR="${edited}/build"
+cat > "${edited}/e.cpp" <<'SRC'
+int value() { return 1; }
+SRC
+echo "== edited source: first revision =="
+FASTCACHE_NO_DIRECT=1 "$launcher" "$compiler" -std=c++23 -c "${edited}/e.cpp" -o "${edited}/build/e.o" \
+    2> "${workdir}/edited-1.log" || fail "first revision returned non-zero"
+cat "${workdir}/edited-1.log"
+cp "${edited}/build/e.o" "${workdir}/edited-1.o"
+
+cat > "${edited}/e.cpp" <<'SRC'
+int value() { return 2; }
+SRC
+echo "== edited source: second revision (expect MISS and a different object) =="
+FASTCACHE_NO_DIRECT=1 "$launcher" "$compiler" -std=c++23 -c "${edited}/e.cpp" -o "${edited}/build/e.o" \
+    2> "${workdir}/edited-2.log" || fail "second revision returned non-zero"
+cat "${workdir}/edited-2.log"
+grep -q "MISS" "${workdir}/edited-2.log" \
+    || fail "an edited source keyed identically to its previous revision"
+if cmp -s "${workdir}/edited-1.o" "${edited}/build/e.o"; then
+    fail "the edited source produced the previous revision's object"
+fi
+echo "   an edit re-keys, and the object follows the source"
+
+# --- 7: the cache is never load-bearing -------------------------------------
 # With no daemon reachable the build must still succeed, uncached.
 echo "== unreachable daemon must still compile =="
 FASTCACHE_ADDR="127.0.0.1:1" "$launcher" "$compiler" -std=c++23 -c "${proj}/a.cpp" -o "${proj}/build/fb.o" \
@@ -411,7 +453,7 @@ FASTCACHE_ADDR="127.0.0.1:1" "$launcher" "$compiler" -std=c++23 -c "${proj}/a.cp
 cat "${workdir}/fallback.log"
 [[ -f "${proj}/build/fb.o" ]] || fail "fallback compile produced no object"
 
-# --- 7: forms the launcher must decline to cache ----------------------------
+# --- 8: forms the launcher must decline to cache ----------------------------
 # A compile with no -o defaults its output to ./a.o, a path the launcher cannot
 # reconstruct. It must pass straight through rather than claim the compile and
 # then fail to store it on every single invocation.
@@ -479,5 +521,6 @@ echo "   retired flags exit 2 with a diagnostic"
 "$launcher" --zero-stats >/dev/null || fail "--zero-stats returned non-zero"
 
 echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, cross-depth," \
-     "moved-header convergence (both layouts keyed apart), and safe fallback"
+     "moved-header convergence (both layouts keyed apart), an edit re-keying," \
+     "and safe fallback"
 exit 0

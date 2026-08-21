@@ -9,7 +9,14 @@
 #   3. Cross-depth: content compiled/stored with a DEEP srcroot is a HIT when
 #      compiled from a SHALLOW srcroot (different checkout), with showIncludes
 #      localized so the deps resolve.
-#   4. Moved header: a header that moves with its contents unchanged is a MISS by
+#   4. An EDITED source is a MISS, and yields a different object. The preprocessed
+#      text is the only key input carrying the source's content, so a probe that
+#      captures none of it answers an edit with the previous revision's object — a
+#      wrong build, silently, every time. Checked with direct mode off, because the
+#      manifest hashes the source's own bytes and would otherwise mask it. This is
+#      the property `/EP` plus `/P` broke: the pair writes the preprocessed text to
+#      a FILE, leaving the launcher hashing an empty stdout.
+#   5. Moved header: a header that moves with its contents unchanged is a MISS by
 #      construction, and the entry stored before the move is still there when it
 #      comes back. Preprocessing suppresses line markers, so the token stream and
 #      the object are identical after such a move and only the paths differ; the
@@ -32,7 +39,8 @@ param(
     [int]$Port           = 21714,
     [string]$DeepTemp    = "$env:TEMP/cc-l-deep",
     [string]$ShallowTemp = "$env:TEMP/cc-l-shallow",
-    [string]$MoveTemp    = "$env:TEMP/cc-l-move"
+    [string]$MoveTemp    = "$env:TEMP/cc-l-move",
+    [string]$EditTemp    = "$env:TEMP/cc-l-edit"
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,6 +77,12 @@ function New-Tree([string]$root) {
     Set-Content -Path (Join-Path $inc "h1.h") -Value "#pragma once`nint one();`n"
     Set-Content -Path (Join-Path $src "u.cpp") -Value "#include `"inc/h1.h`"`nint g(){return one();}`n"
     return $src
+}
+
+# A single-file fixture whose body can be rewritten between compiles, so an edit
+# to the SOURCE (not to a header) is what the cache has to notice.
+function Set-EditedSource([string]$src, [int]$value) {
+    Set-Content -Path (Join-Path $src "u.cpp") -Value "int value(){return $value;}`n"
 }
 
 # Point the fixture's translation unit at a header, wherever it currently lives.
@@ -240,6 +254,36 @@ try {
             $exit = 1
         }
 
+        Write-Host "=== edited source ($cc) ==="
+        # Direct mode OFF on purpose: its manifest hashes the source file's own
+        # bytes, so it catches an edit no matter what the preprocessed text holds —
+        # which is precisely how a probe that captured none of it stayed invisible.
+        Remove-Item -Recurse -Force $EditTemp -ErrorAction SilentlyContinue
+        $editSrc = Join-Path $EditTemp "src"
+        New-Item -ItemType Directory -Force -Path $editSrc | Out-Null
+        $editBuild = Join-Path $EditTemp "build"; New-Item -ItemType Directory -Force $editBuild | Out-Null
+        $editObj = Join-Path $editBuild "u.obj"
+        $env:FASTCACHE_NO_DIRECT = "1"
+        try {
+            Set-EditedSource $editSrc 1
+            $null = Invoke-Launcher $cc $editSrc $editBuild $editObj
+            $firstHash = (Get-FileHash $editObj -Algorithm SHA256).Hash
+
+            Set-EditedSource $editSrc 2
+            $oEdited = Get-Outcome (Invoke-Launcher $cc $editSrc $editBuild $editObj).stderr
+            $secondHash = (Get-FileHash $editObj -Algorithm SHA256).Hash
+        } finally {
+            Remove-Item Env:\FASTCACHE_NO_DIRECT -ErrorAction SilentlyContinue
+        }
+
+        if ($oEdited -eq "MISS" -and $firstHash -ne $secondHash) {
+            Write-Host "  an edit re-keys and the object follows the source: OK ($cc)" -ForegroundColor Green
+        } else {
+            Write-Host "  EDITED-SOURCE FAIL ($cc): outcome=$oEdited objectChanged=$($firstHash -ne $secondHash)" `
+                -ForegroundColor Red
+            $exit = 1
+        }
+
         Write-Host "=== moved header ($cc) ==="
         # The header's CONTENTS do not change, so the preprocessed text is
         # byte-identical and the object stays correct; only the paths move. Before
@@ -319,7 +363,7 @@ try {
 }
 finally {
     $server | Stop-Process -Force -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force $DeepTemp,$ShallowTemp,$MoveTemp -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $DeepTemp,$ShallowTemp,$MoveTemp,$EditTemp -ErrorAction SilentlyContinue
     Remove-Item Env:\FASTCACHE_ADDR,Env:\FASTCACHE_SOURCE_DIR,Env:\FASTCACHE_BINARY_DIR,Env:\FASTCACHE_VERBOSE -ErrorAction SilentlyContinue
 }
 
