@@ -591,7 +591,7 @@ try {
         # ever computing them.
         Write-Host "=== launcher aliased source root ($cc) ==="
         Remove-Item -Recurse -Force $AliasTemp -ErrorAction SilentlyContinue
-        $aliasSrc = New-Tree $AliasTemp
+        $aliasSrc = New-Tree $AliasTemp "aliasedroot"
         $aliasBuild = Join-Path $AliasTemp "build"
         New-Item -ItemType Directory -Force $aliasBuild | Out-Null
         $drive = New-SubstDrive $AliasTemp

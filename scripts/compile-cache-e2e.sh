@@ -851,6 +851,40 @@ else
     require_phony_targets_resolve "aliased-root (phony rules)" "$realdep"
     echo "   an output spelled unlike the roots kept its own rule target: OK"
     echo "   -MP phony rule targets were reconciled like dependencies: OK"
+
+    # Leg F — DIRECT MODE, which every leg above turns off because it reaches the
+    # object without computing the dependency set they assert on. It has to be
+    # covered here too: direct mode is on by default, and its manifest names the
+    # translation unit by a token derived from the source path. If the reconciled
+    # spelling reaches the manifest KEY but the raw one reaches the manifest
+    # BUILDER, the builder refuses (the source lies under neither root as written)
+    # and direct mode is permanently, silently dead on exactly the hosts this
+    # section exists for -- reported only under FASTCACHE_VERBOSE, which a build
+    # does not set.
+    directsrc="${aliasroot}/real/src/a.cpp"
+    directobj="${aliasroot}/link/build/direct.o"
+    directdep="${aliasroot}/link/build/direct.d"
+    rm -f "$directobj" "$directdep"
+    export FASTCACHE_SOURCE_DIR="${aliasroot}/link/src" FASTCACHE_BINARY_DIR="${aliasroot}/link/build"
+
+    run_direct_leg() {
+        local log="$1"
+        "$launcher" "$compiler" -std=c++23 -MD -MP -MF "$directdep" \
+            -I"$realinc" -c "$directsrc" -o "$directobj" 2> "${workdir}/${log}" \
+            || { cat "${workdir}/${log}" >&2; fail "aliased-root: direct-mode compile (${log}) returned non-zero"; }
+        cat "${workdir}/${log}"
+    }
+
+    run_direct_leg "alias-f1.log"
+    grep -q "fastcache-cc: MANIFEST stored" "${workdir}/alias-f1.log" \
+        || fail "aliased-root: no manifest was recorded, so direct mode is dead on an aliased root"
+
+    rm -f "$directobj" "$directdep"
+    run_direct_leg "alias-f2.log"
+    grep -q "fastcache-cc: HIT" "${workdir}/alias-f2.log" \
+        || fail "aliased-root: the manifest recorded on an aliased root did not serve the next compile"
+    [[ -f "$directobj" ]] || fail "aliased-root: the direct hit produced no object"
+    echo "   direct mode records and serves a manifest on an aliased root: OK"
 fi
 
 # --- statistics -------------------------------------------------------------

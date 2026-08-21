@@ -1009,7 +1009,7 @@ void RecordManifest(Config const& cfg,
     // issue #51). BuildManifest refuses outright when it cannot record the TU,
     // which is what makes that a precondition rather than a comment here.
     auto const reported = includes.size();
-    auto const manifest = Cc::BuildManifest({ .sourcePath = cmd.source,
+    auto const manifest = Cc::BuildManifest({ .sourcePath = resolvedSource,
                                               .includePaths = std::move(includes),
                                               .workingDirectory = workingDirectoryText,
                                               .toolchainStamp = toolchainStamp,
