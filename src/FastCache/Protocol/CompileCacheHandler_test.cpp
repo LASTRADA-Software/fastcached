@@ -513,6 +513,57 @@ TEST_CASE("An oversize declared payload is rejected before it is read", "[compil
     auto const error = ErrorOf(frame);
     REQUIRE(error.present);
     CHECK(error.code == Wire::ErrorCode::PayloadTooLarge);
+    // Naming both numbers is the point of the message: it is the only thing that
+    // tells an operator which way to move --storage-max-value.
+    CHECK(error.message.contains("exceeds cap 8"));
+}
+
+TEST_CASE("An oversize frame is refused but the connection survives", "[compile-cache][handler][version]")
+{
+    // The half that broke a build. Refusing an over-cap frame *without* reading
+    // its body leaves the sender writing into a socket the server has stopped
+    // reading and then closed, so it never sees the refusal it was answered
+    // with -- it sees its own write fail, and before issue #68 died of SIGPIPE
+    // doing so. Stepping over the body is what turns a dropped connection into
+    // an answer, exactly as it does for an unknown opcode.
+    CcFixture fix;
+    SessionContext tinySession {};
+    tinySession.maxPayloadBytes = 8;
+
+    auto const replies =
+        SplitReplies(ExchangeWith(fix, Concat({ FetchFrame("a-key-longer-than-the-cap"), FetchFrame("k") }), tinySession));
+    REQUIRE(replies.size() == 2);
+
+    auto const error = ErrorOf(replies[0]);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::PayloadTooLarge);
+    // The second command was read from the right offset, which is only possible
+    // if the first frame's body was consumed in full.
+    CHECK(replies[1].status == Wire::Status::Miss);
+}
+
+TEST_CASE("A frame too large even to discard is still answered, then closed", "[compile-cache][handler][version]")
+{
+    // The drain is bounded, so past the bound the server goes back to replying
+    // and closing. The reply still goes out first: a sender that has already
+    // finished writing can read it, and one that has not loses nothing it would
+    // have had before.
+    // Same cap as the case above, and a key long enough that its frame lands on
+    // the far side of the drain allowance -- which is what makes the bound
+    // itself observable rather than merely written down. The cap cannot go
+    // lower to get there: a cap under the 7-byte request header would fail the
+    // header read instead, before there is a frame to have an opinion about.
+    CcFixture fix;
+    SessionContext tinySession {};
+    tinySession.maxPayloadBytes = 8; // drain allowance is a small multiple of this
+
+    auto const replies = SplitReplies(
+        ExchangeWith(fix, Concat({ FetchFrame("a-key-far-past-the-drain-bound"), FetchFrame("k") }), tinySession));
+    REQUIRE(replies.size() == 1);
+
+    auto const error = ErrorOf(replies[0]);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::PayloadTooLarge);
 }
 
 TEST_CASE("A frame whose fields do not fill its declared payload is rejected", "[compile-cache][handler][version]")
