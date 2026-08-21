@@ -312,10 +312,15 @@ try {
         $moveSrc = New-MoveTree $MoveTemp
         $moveBuild = Join-Path $MoveTemp "build"; New-Item -ItemType Directory -Force $moveBuild | Out-Null
         $moveObj = Join-Path $moveBuild "u.obj"
+        # Reset per compiler, the captured runs included: without that a failure in
+        # the second pass would dump the first pass's trace and misdirect the
+        # diagnosis it exists to serve.
         $oBefore = "UNKNOWN"; $oMoved = "UNKNOWN"; $oBack = "UNKNOWN"; $staleHit = $false
+        $rBefore = $null; $rMoved = $null; $rBack = $null
         $env:FASTCACHE_NO_DIRECT = "1"
         try {
-            $oBefore = Get-Outcome (Invoke-Launcher $cc $moveSrc $moveBuild $moveObj).stderr
+            $rBefore = Invoke-Launcher $cc $moveSrc $moveBuild $moveObj
+            $oBefore = Get-Outcome $rBefore.stderr
 
             # -Recurse on the directory removals: without it PowerShell's contract for
             # a non-empty directory is a prompt (interactive) or, under
@@ -359,6 +364,24 @@ try {
         } else {
             Write-Host "  MOVED-HEADER FAIL ($cc): before=$oBefore moved=$oMoved stale=$staleHit back=$oBack" `
                 -ForegroundColor Red
+            # The launcher's own verbose trace, not just the verdict. This case can
+            # only fail in ways that are invisible from outside — an empty dependency
+            # set keys the two layouts together, and the "N of M reported path(s)
+            # keyed" line separates "the driver reported nothing on the preprocess
+            # line" from "every reported path was filtered out". Without this, each
+            # diagnosis costs a full CI round trip, and this harness runs on a
+            # platform that cannot be reproduced locally.
+            # The root as the launcher was given it, next to the paths the driver
+            # emitted: a root that does not share a spelling with them (an 8.3 short
+            # component, a substituted drive) canonicalizes nothing, which empties
+            # the set and silences the replay guard at the same time — and looks
+            # exactly like a driver that reported nothing.
+            Write-Host "  source root: $moveSrc"
+            Write-Host "  tree now: $((Get-ChildItem -Recurse -File $moveSrc | ForEach-Object FullName) -join ', ')"
+            foreach ($leg in @(@{n="before"; r=$rBefore}, @{n="moved"; r=$rMoved}, @{n="back"; r=$rBack})) {
+                Write-Host "  --- $($leg.n) ---" -ForegroundColor Yellow
+                if ($leg.r) { Write-Host $leg.r.stderr }
+            }
             $exit = 1
         }
     }

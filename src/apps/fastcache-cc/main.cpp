@@ -1045,6 +1045,16 @@ void RecordManifest(Config const& cfg,
             .relativizedArgs = relativizedArgs,
             .dependencyPaths = Cc::KeyDependencySet(probe->dependencyPaths, layout),
         };
+        // Both counts, because they answer different questions and only the pair
+        // is diagnostic. An empty set means a moved header cannot re-key — the
+        // property this whole input exists for, failing silently — and "the probe
+        // reported nothing" (a driver that does not report on the preprocess line)
+        // is a different defect from "every reported path was filtered out" (paths
+        // the layout does not recognise as its own). Named for the same reason the
+        // STALE HIT note names its path: otherwise this is a whole investigation.
+        Note(std::format("dependency set: {} of {} reported path(s) keyed",
+                         inputs.dependencyPaths.size(),
+                         probe->dependencyPaths.size()));
         key = Cc::ComputeKey(inputs);
     }
     invocation.preprocessMs = MsSince(preprocessStarted);
