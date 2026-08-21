@@ -142,6 +142,27 @@ These constraints are load-bearing and have each already been a bug:
   is deliberately **no handshake**, because the launcher opens a fresh connection
   per *operation* and a HELLO would cost 2–4 round trips per translation unit on
   the exact path this list already records regressions on.
+- **A cache key that determines the object does not determine the depfile, so a hit
+  must re-check the dependency paths it is about to replay.** Preprocessing suppresses
+  line markers (`-E -P`, `/EP`) so a checkout path never reaches the key — which is
+  what makes a key portable, and equally what makes it *invariant under a header move*.
+  Move a header without changing a byte of it and the token stream is identical: the
+  object is still correct and is served, while the depfile, which is nothing but paths,
+  names a file that is gone. That is worse than a miss, because Ninja records the
+  dependency, cannot stat it, rebuilds, hits the same value, and never converges — with
+  a successful exit code every time. `Cc::MissingReplayedDependency` therefore runs
+  before a hit writes anything, and a stale hit falls through to the real compile, whose
+  STORE overwrites that key and *repairs* the entry rather than leaving it to poison
+  every later build. Its filter is where the subtlety is, and the two halves are
+  load-bearing in opposite directions: probing a depfile's rule target would make every
+  hit a miss, because the target is the object file and it does not exist yet (hence
+  `ParseDepFilePaths`, which excludes it, rather than a whitespace split); probing an
+  absolute path outside both roots would make two machines with different system include
+  prefixes miss on *every* compile forever, each re-storing the other's record. A
+  relative path is kept and must be classified before the toolchain test, which reports
+  every relative path as outside the roots. `/showIncludes` is covered alongside the
+  depfile because Ninja reads it as `deps = msvc`; `MsvcDiagnostics` is not, because a
+  diagnostic quotes a path rather than declaring a dependency on it.
 - **`Protocol/CompileCacheWire.hpp` must stay header-only and dependency-free.**
   Same constraint as `Cli/UsageDoc`, same reason: `fastcache-cc` does not link
   the `FastCache` library, so an include of anything from `Net/`, `Cache/`,

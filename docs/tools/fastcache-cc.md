@@ -192,9 +192,22 @@ this is worth checking before concluding the cache does not help. With
    streams.
 4. **Any error.** Fall back to a plain real compile.
 
-A compile that fails is never cached. Objects are stored under both the
-preprocessed key and the manifest-derived key, so the direct path never depends
-on the preprocessed path having run on this machine.
+A compile that fails is never cached. The object is stored once, under the
+preprocessed key; a manifest records that key rather than a second copy of the
+object, so a direct hit follows one extra fetch instead of doubling the cached
+volume (which, since the memory tier keeps values uncompressed, would land on
+RAM where compression cannot help).
+
+A hit also has to be *honourable*: before writing anything it checks that the
+dependency paths the cached value records — a GNU depfile, or the
+`/showIncludes` notes Ninja reads as `deps = msvc` — still exist here. A header
+that moves without changing its contents leaves the object and its key
+identical but the recorded paths wrong, and replaying them would make the build
+system rebuild that translation unit on every build forever. Such a hit is
+discarded and the compile runs for real, which re-stores the entry with a
+correct record. Toolchain and system paths are exempt: they are the producer's
+spelling, covered by the compiler identity in the key, and requiring them would
+make two machines with different system prefixes miss on every compile.
 
 ## Statistics
 

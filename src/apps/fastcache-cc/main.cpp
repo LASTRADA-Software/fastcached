@@ -712,9 +712,9 @@ struct MaterializedHit
 /// Called from BOTH the hit and the miss path. On a miss the include text comes
 /// from the compiler that just ran; on a hit it comes from the cached value's
 /// replayed streams — either way it names the same headers, and neither requires
-/// an extra compiler invocation. The object is stored a second time under the
-/// manifest-derived key so the direct path resolves without depending on the
-/// preprocessed key existing.
+/// an extra compiler invocation. The manifest records the object's ordinary key
+/// rather than causing a second copy of the object to be stored: see
+/// DirectManifest::objectKey for why duplicating it is not affordable.
 /// @param cfg             Launcher config.
 /// @param cmd             The parsed compile command.
 /// @param layout          This machine's roots.
@@ -1046,11 +1046,12 @@ void RecordManifest(Config const& cfg,
     // object without preprocessing. The include set comes from the /showIncludes
     // output the compile just produced, so this costs no extra compiler run.
     //
-    // The object is stored a second time under the manifest-derived key. That
-    // duplication is deliberate: the two keys answer different questions (one from
-    // preprocessed text, one from header hashes) and both must resolve to the
-    // object, so the direct path never depends on the preprocessed path having run
-    // on this machine.
+    // The manifest holds a POINTER to the object's ordinary key, not a second copy
+    // of the object: the two keys answer different questions (one from preprocessed
+    // text, one from header hashes), but storing the bytes under both would double
+    // the cached volume, and because L1 keeps values uncompressed that doubling
+    // lands on RAM where compression cannot help. A direct hit therefore costs one
+    // extra fetch to follow the pointer — see DirectManifest::objectKey.
     if (cfg.direct)
         RecordManifest(cfg, cmd, layout, relativizedArgs, toolchainStamp, run.out, run.err, key);
     return code;
