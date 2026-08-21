@@ -287,6 +287,17 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
   text. Direct use is caught; use reached only *through a header* is not, so
   such a TU stays a permanent miss. Never incorrect — just never cached.
 - Diagnostics-stream paths outside the include grammar are not yet localized.
+- The check that a hit's recorded dependency paths still exist covers only the
+  paths under `FASTCACHE_SOURCE_DIR` / `FASTCACHE_BINARY_DIR`, plus relative
+  ones. Toolchain and system paths are exempt by design: they are the producing
+  machine's spelling, the compiler identity in the key already covers them, and
+  requiring them would make two machines with different system include prefixes
+  miss on every compile, each re-storing the other's record. So a cache shared
+  between machines whose toolchains live at *different* prefixes can still
+  replay a dependency record naming a path the consumer lacks. Existence is
+  also not identity: if another file has come to occupy a vacated path, the
+  check passes. Both are closed by folding the dependency set into the key
+  itself — see issue #56.
 - The cache key normalization is deliberately v1. Tune it against real
   developer↔CI hit rates before relying on it broadly.
 - Localized path separators may be normalized to `/` in some segments. Ninja
