@@ -142,6 +142,27 @@ These constraints are load-bearing and have each already been a bug:
   is deliberately **no handshake**, because the launcher opens a fresh connection
   per *operation* and a HELLO would cost 2–4 round trips per translation unit on
   the exact path this list already records regressions on.
+- **A cache key that determines the object does not determine the depfile, so a hit
+  must re-check the dependency paths it is about to replay.** Preprocessing suppresses
+  line markers (`-E -P`, `/EP`) so a checkout path never reaches the key — which is
+  what makes a key portable, and equally what makes it *invariant under a header move*.
+  Move a header without changing a byte of it and the token stream is identical: the
+  object is still correct and is served, while the depfile, which is nothing but paths,
+  names a file that is gone. That is worse than a miss, because Ninja records the
+  dependency, cannot stat it, rebuilds, hits the same value, and never converges — with
+  a successful exit code every time. `Cc::MissingReplayedDependency` therefore runs
+  before a hit writes anything, and a stale hit falls through to the real compile, whose
+  STORE overwrites that key and *repairs* the entry rather than leaving it to poison
+  every later build. Its filter is where the subtlety is, and the two halves are
+  load-bearing in opposite directions: probing a depfile's rule target would make every
+  hit a miss, because the target is the object file and it does not exist yet (hence
+  `ParseDepFilePaths`, which excludes it, rather than a whitespace split); probing an
+  absolute path outside both roots would make two machines with different system include
+  prefixes miss on *every* compile forever, each re-storing the other's record. A
+  relative path is kept and must be classified before the toolchain test, which reports
+  every relative path as outside the roots. `/showIncludes` is covered alongside the
+  depfile because Ninja reads it as `deps = msvc`; `MsvcDiagnostics` is not, because a
+  diagnostic quotes a path rather than declaring a dependency on it.
 - **`Protocol/CompileCacheWire.hpp` must stay header-only and dependency-free.**
   Same constraint as `Cli/UsageDoc`, same reason: `fastcache-cc` does not link
   the `FastCache` library, so an include of anything from `Net/`, `Cache/`,
@@ -464,6 +485,7 @@ down across a suspend point.
 - **`auto` type deduction** for readability; **structured bindings** for tuple-like returns.
 - **`clang-format` after every change** — use the project `.clang-format`.
 - **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT` — address the underlying issue. The `clang-debug` preset enables `clang-tidy` automatically.
+- **No `g_`-prefix on globals either — and the rule lives in `.clang-tidy`, not only here.** A file-scope or `thread_local` name is spelled like any other name of its kind: `CamelCase` if it is a constant, `camelBack` if it is mutable. There is no "forbid this prefix" option in `readability-identifier-naming` (its `...Prefix` keys only ever *require* one), so the `GlobalVariableCase`/`GlobalConstantCase`/`StaticVariableCase` rows are what reject `g_foo` — and with `WarningsAsErrors: "*"` that is a build failure rather than a review comment. A function-local `static` is `camelBack` whether or not it is `const`: `StaticConstantCase` is left unset precisely so a local constant falls back to that, which keeps `g_` rejected there without demanding PascalCase for locals that are `static` only for their lifetime. The prefix is a substitute for a naming convention rather than one, and it makes ambient state read as normal; if a bare name looks wrong at the call site, that is the "inject it" rule above telling you something.
 - **No `k`-prefix on identifiers.** Do not use the Google-style `kFoo` prefix for constants, enumerators, or any other symbol — it violates the project `.clang-tidy` naming convention. Use `Foo` (PascalCase) for constants/enumerators and `foo`/`fooBar` for locals and members instead.
 - **All changes covered by unit tests.** Aim to **increase** coverage with every PR.
 - **No raw owning pointers.** Use `std::unique_ptr` / `std::shared_ptr` for ownership; RAII for resources.

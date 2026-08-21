@@ -29,25 +29,25 @@ namespace
 
     /// Globals used by the SCM bridge. The dispatcher is process-wide, so
     /// at most one Windows service body runs per process.
-    SERVICE_STATUS_HANDLE g_serviceStatus { nullptr };
-    SERVICE_STATUS g_currentStatus {};
-    IDaemonHost::Body g_body;
-    std::atomic<int> g_exitCode { 0 };
+    SERVICE_STATUS_HANDLE serviceStatus { nullptr };
+    SERVICE_STATUS currentStatus {};
+    IDaemonHost::Body serviceBody;
+    std::atomic<int> exitCode { 0 };
     /// Service name the SCM dispatcher was started with; used by ServiceMain so
     /// a custom --service-name matches what was registered at install time.
-    std::string g_serviceName { "FastCached" };
+    std::string registeredServiceName { "FastCached" };
 
     void ReportStatus(DWORD state, DWORD waitHintMs = 0)
     {
-        g_currentStatus.dwCurrentState = state;
-        g_currentStatus.dwWin32ExitCode = NO_ERROR;
-        g_currentStatus.dwWaitHint = waitHintMs;
+        currentStatus.dwCurrentState = state;
+        currentStatus.dwWin32ExitCode = NO_ERROR;
+        currentStatus.dwWaitHint = waitHintMs;
         if (state == SERVICE_RUNNING)
-            g_currentStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PARAMCHANGE;
+            currentStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PARAMCHANGE;
         else
-            g_currentStatus.dwControlsAccepted = 0;
-        if (g_serviceStatus)
-            SetServiceStatus(g_serviceStatus, &g_currentStatus);
+            currentStatus.dwControlsAccepted = 0;
+        if (serviceStatus)
+            SetServiceStatus(serviceStatus, &currentStatus);
     }
 
     DWORD WINAPI ServiceCtrlHandlerEx(DWORD ctrl, DWORD /*evt*/, LPVOID /*evtData*/, LPVOID /*ctx*/)
@@ -71,15 +71,15 @@ namespace
 
     void WINAPI ServiceMain(DWORD /*argc*/, LPSTR* /*argv*/)
     {
-        g_serviceStatus = RegisterServiceCtrlHandlerExA(g_serviceName.c_str(), &ServiceCtrlHandlerEx, nullptr);
-        if (!g_serviceStatus)
+        serviceStatus = RegisterServiceCtrlHandlerExA(registeredServiceName.c_str(), &ServiceCtrlHandlerEx, nullptr);
+        if (!serviceStatus)
             return;
-        g_currentStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+        currentStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
         ReportStatus(SERVICE_START_PENDING, 5000);
         ReportStatus(SERVICE_RUNNING);
 
-        if (g_body)
-            g_exitCode.store(g_body(), std::memory_order_release);
+        if (serviceBody)
+            exitCode.store(serviceBody(), std::memory_order_release);
 
         ReportStatus(SERVICE_STOPPED);
     }
@@ -94,8 +94,8 @@ namespace
 
         int Run(Body body) override
         {
-            g_body = std::move(body);
-            g_serviceName = _name;
+            serviceBody = std::move(body);
+            registeredServiceName = _name;
             // SERVICE_TABLE_ENTRYA takes a mutable char*; the SCM does not
             // modify the name but the API signature requires non-const.
             SERVICE_TABLE_ENTRYA table[] = {
@@ -104,7 +104,7 @@ namespace
             };
             if (!StartServiceCtrlDispatcherA(table))
                 return 1;
-            return g_exitCode.load(std::memory_order_acquire);
+            return exitCode.load(std::memory_order_acquire);
         }
 
       private:

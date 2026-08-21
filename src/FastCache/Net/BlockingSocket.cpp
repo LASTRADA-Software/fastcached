@@ -55,8 +55,8 @@ namespace Detail
 
     namespace
     {
-        std::atomic<bool> g_winsockInitialised { false };
-        std::atomic<bool> g_winsockInitialising { false };
+        std::atomic<bool> winsockInitialised { false };
+        std::atomic<bool> winsockInitialising { false };
 
         [[nodiscard]] int LastNetworkError() noexcept
         {
@@ -101,27 +101,27 @@ namespace Detail
 
     void EnsureNetworkInitialised()
     {
-        if (g_winsockInitialised.load(std::memory_order_acquire))
+        if (winsockInitialised.load(std::memory_order_acquire))
             return;
         bool expected = false;
-        if (!g_winsockInitialising.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        if (!winsockInitialising.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
         {
             // Another thread is busy initialising; spin briefly.
-            while (!g_winsockInitialised.load(std::memory_order_acquire))
+            while (!winsockInitialised.load(std::memory_order_acquire))
             {
             }
             return;
         }
         WSADATA data {};
         WSAStartup(MAKEWORD(2, 2), &data);
-        g_winsockInitialised.store(true, std::memory_order_release);
+        winsockInitialised.store(true, std::memory_order_release);
     }
 
 #else
 
     namespace
     {
-        std::atomic<bool> g_posixInitialised { false };
+        std::atomic<bool> posixInitialised { false };
 
         [[nodiscard]] int LastNetworkError() noexcept
         {
@@ -169,12 +169,12 @@ namespace Detail
 
     void EnsureNetworkInitialised()
     {
-        if (g_posixInitialised.load(std::memory_order_acquire))
+        if (posixInitialised.load(std::memory_order_acquire))
             return;
         // Ignore SIGPIPE — broken-pipe writes should surface as EPIPE, not
         // kill the process.
         ::signal(SIGPIPE, SIG_IGN);
-        g_posixInitialised.store(true, std::memory_order_release);
+        posixInitialised.store(true, std::memory_order_release);
     }
 
 #endif

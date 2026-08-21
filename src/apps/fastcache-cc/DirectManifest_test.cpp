@@ -16,7 +16,7 @@ namespace
 {
 FastCache::PathCanon::Layout WindowsLayout()
 {
-    return { .sourceRoot = R"(D:\Lastrada)", .buildTree = R"(D:\Lastrada\out\build\win64)" };
+    return { .sourceRoot = R"(D:\Project)", .buildTree = R"(D:\Project\out\build\win64)" };
 }
 
 DirectManifest SampleManifest()
@@ -25,7 +25,7 @@ DirectManifest SampleManifest()
         .toolchainStamp = "cl 19.51.36231 x64",
         .objectKey = "0123456789abcdef0123456789abcdef",
         .entries = {
-            { .canonicalPath = "<SRCROOT>/src/LabBase/LabBase.hpp", .contentHash = "aabb1122" },
+            { .canonicalPath = "<SRCROOT>/src/AppCore/AppCore.hpp", .contentHash = "aabb1122" },
             { .canonicalPath = "<SRCROOT>/src/Toolbox/unicode.hpp", .contentHash = "ccdd3344" },
         },
     };
@@ -121,8 +121,8 @@ TEST_CASE("IsToolchainHeader classifies the Windows SDK and MSVC as toolchain")
 TEST_CASE("IsToolchainHeader classifies project headers under the roots as project")
 {
     auto const layout = WindowsLayout();
-    CHECK_FALSE(IsToolchainHeader(R"(D:\Lastrada\src\LabBase\LabBase.hpp)", layout));
-    CHECK_FALSE(IsToolchainHeader(R"(D:\Lastrada\out\build\win64\generated\config.hpp)", layout));
+    CHECK_FALSE(IsToolchainHeader(R"(D:\Project\src\AppCore\AppCore.hpp)", layout));
+    CHECK_FALSE(IsToolchainHeader(R"(D:\Project\out\build\win64\generated\config.hpp)", layout));
 }
 
 TEST_CASE("IsToolchainHeader treats a vcpkg tree inside the build tree as toolchain")
@@ -131,7 +131,7 @@ TEST_CASE("IsToolchainHeader treats a vcpkg tree inside the build tree as toolch
     // third-party and immutable, so they belong to the stamp rather than to the
     // hashed set — otherwise every build would hash thousands of vendored headers.
     auto const layout = WindowsLayout();
-    CHECK(IsToolchainHeader(R"(D:\Lastrada\out\build\win64\vcpkg_installed\x64-windows\include\zlib.h)", layout));
+    CHECK(IsToolchainHeader(R"(D:\Project\out\build\win64\vcpkg_installed\x64-windows\include\zlib.h)", layout));
 }
 
 TEST_CASE("IsToolchainHeader is case-insensitive on Windows paths")
@@ -141,24 +141,23 @@ TEST_CASE("IsToolchainHeader is case-insensitive on Windows paths")
     // fail to canonicalize it.
     auto const layout = WindowsLayout();
     CHECK(IsToolchainHeader(R"(C:\PROGRAM FILES (X86)\WINDOWS KITS\10\include\um\windows.h)", layout));
-    CHECK_FALSE(IsToolchainHeader(R"(d:\lastrada\src\LabBase\LabBase.hpp)", layout));
+    CHECK_FALSE(IsToolchainHeader(R"(d:\project\src\AppCore\AppCore.hpp)", layout));
 }
 
 TEST_CASE("IsToolchainHeader matches a root spelled with forward slashes")
 {
-    // CMake exports FASTCACHE_SOURCE_DIR in its own native form (`D:/Lastrada`) while
+    // CMake exports FASTCACHE_SOURCE_DIR in its own native form (`D:/Project`) while
     // cl emits includes with backslashes. A separator-sensitive prefix test makes
     // every project header look external, which classifies the whole manifest as
     // toolchain content and produces an empty manifest — direct mode then never
     // engages, silently.
-    FastCache::PathCanon::Layout const cmakeStyle { .sourceRoot = "D:/Lastrada",
-                                                    .buildTree = "D:/Lastrada/out/build/win64" };
-    CHECK_FALSE(IsToolchainHeader(R"(D:\Lastrada\src\LabBase\LabBase.hpp)", cmakeStyle));
-    CHECK_FALSE(IsToolchainHeader(R"(D:\Lastrada\out\build\win64\generated\config.hpp)", cmakeStyle));
+    FastCache::PathCanon::Layout const cmakeStyle { .sourceRoot = "D:/Project", .buildTree = "D:/Project/out/build/win64" };
+    CHECK_FALSE(IsToolchainHeader(R"(D:\Project\src\AppCore\AppCore.hpp)", cmakeStyle));
+    CHECK_FALSE(IsToolchainHeader(R"(D:\Project\out\build\win64\generated\config.hpp)", cmakeStyle));
 
     // And the reverse spelling must work too.
-    FastCache::PathCanon::Layout const winStyle { .sourceRoot = R"(D:\Lastrada)", .buildTree = R"(D:\Lastrada\out)" };
-    CHECK_FALSE(IsToolchainHeader("D:/Lastrada/src/LabBase/LabBase.hpp", winStyle));
+    FastCache::PathCanon::Layout const winStyle { .sourceRoot = R"(D:\Project)", .buildTree = R"(D:\Project\out)" };
+    CHECK_FALSE(IsToolchainHeader("D:/Project/src/AppCore/AppCore.hpp", winStyle));
 }
 
 TEST_CASE("IsToolchainHeader treats a path under no known root as toolchain")
@@ -370,7 +369,7 @@ TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC
 TEST_CASE("BuildManifest normalizes '..' segments and mixed separators to one token")
 {
     // Real /showIncludes output echoes the resolved-but-unnormalized path, e.g.
-    // `D:\src\LabBase\../ctrllib/ListOb.hpp`. Two spellings of the same header must
+    // `D:\src\AppCore\../applib/Widget.hpp`. Two spellings of the same header must
     // collapse to a single canonical token, or an entry recorded through one
     // spelling would never validate against the other — which is exactly what made
     // manifests come out empty before this was handled.

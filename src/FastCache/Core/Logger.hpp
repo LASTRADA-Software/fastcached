@@ -64,7 +64,7 @@ namespace Detail
     /// referenced string lives in the connection's coroutine frame and outlives
     /// the storage call. Empty means "no source" — the line is logged unprefixed.
     /// Each command assigns it afresh, so a connection never inherits another's.
-    inline thread_local std::string_view StorageSourceTag {};
+    inline thread_local std::string_view storageSourceTag {};
 } // namespace Detail
 
 /// Logger abstraction. Implementations are expected to be O(memcpy) on the

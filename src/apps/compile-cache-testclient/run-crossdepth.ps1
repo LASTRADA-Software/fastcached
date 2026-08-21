@@ -10,10 +10,10 @@
 #
 # Two modes:
 #   -Synthetic         : generate a throwaway source tree (no project source).
-#   -LastradaRoots ... : use a real translation unit from a LASTRADA checkout,
+#   -CheckoutRoots ... : use a real translation unit from a private checkout,
 #                        compiled at a deep temp path, fetched to each real root.
 #                        Prints ONLY counts + generic status — never absolute
-#                        LASTRADA paths or source — so nothing private leaks.
+#                        checkout paths or source — so nothing private leaks.
 #
 # Nothing this script produces is committed; outputs go to the console and to
 # temp directories only.
@@ -24,7 +24,7 @@ param(
     [string]$Client      = "$PSScriptRoot/../../out/build/clangcl-debug/target/compile-cache-testclient.exe",
     [int]$Port           = 21713,
     [switch]$Synthetic,
-    [string[]]$LastradaRoots = @(),
+    [string[]]$CheckoutRoots = @(),
     [string]$DeepTemp    = "$env:TEMP/cc-deep",
     [string]$ShallowTemp = "$env:TEMP/cc-shallow"
 )
@@ -85,7 +85,7 @@ function Invoke-CrossDepth([string]$compiler, [string]$deepSrc, [string]$shallow
 
 $server = Start-Fastcached
 try {
-    if ($Synthetic -or $LastradaRoots.Count -eq 0) {
+    if ($Synthetic -or $CheckoutRoots.Count -eq 0) {
         Write-Host "=== synthetic cross-depth (generated source, no project files) ==="
         # Deep tree nested several levels; shallow tree at a shorter path. Both
         # carry the IDENTICAL source so localized <SRCROOT> paths resolve.
@@ -104,7 +104,7 @@ try {
     }
 
     $rootIndex = 0
-    foreach ($root in $LastradaRoots) {
+    foreach ($root in $CheckoutRoots) {
         if (-not (Test-Path $root)) { Write-Host "skip: a supplied root is missing"; continue }
         Write-Host "=== real-checkout cross-depth (rooted at an actual checkout; counts only) ==="
         # Validate cross-depth correctness AGAINST THE REAL CHECKOUT PATHS — the

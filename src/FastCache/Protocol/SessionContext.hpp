@@ -77,7 +77,7 @@ struct SessionContext
     ILogger* logger { nullptr };
 
     /// Source tag (bracketed client IP, e.g. "[203.0.113.7]", or empty) that
-    /// handlers publish to `Detail::StorageSourceTag` before each storage call
+    /// handlers publish to `Detail::storageSourceTag` before each storage call
     /// so the `storage:` trace line names the client. Set by Connection; a view
     /// into the connection frame, valid for the session's lifetime.
     std::string_view sourceTag {};

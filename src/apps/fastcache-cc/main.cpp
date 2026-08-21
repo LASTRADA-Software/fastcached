@@ -38,6 +38,7 @@
 #include "IProcessRunner.hpp"
 #include "ITcpClient.hpp"
 #include "LauncherCli.hpp"
+#include "ReplayGuard.hpp"
 #include "Stats.hpp"
 
 #include <FastCache/CompileCache/CompileValue.hpp>
@@ -63,6 +64,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -164,25 +166,32 @@ struct Config
     return c;
 }
 
-bool g_verbose = false;
+/// What this invocation ended up doing, for the statistics log.
+///
+/// Accumulated as the flow proceeds rather than returned through the call chain,
+/// so the cache flow keeps its "exit code or fall back" shape; main() writes the
+/// record once, at the end. One process handles exactly one compile, so this is
+/// per-invocation state rather than shared state — but it is still reached by
+/// name instead of passed, so it lives in a single object where every write to
+/// the eventual record is visible in one declaration.
+struct InvocationRecord
+{
+    bool verbose = false; ///< FASTCACHE_VERBOSE; gates every diagnostic here.
 
-/// What this invocation ended up doing, for the statistics log. Collected here
-/// rather than returned through the call chain so the cache flow keeps its
-/// "exit code or fall back" shape; main() writes the record once, at the end.
-Cc::Outcome g_outcome = Cc::Outcome::Unavailable;
-std::string g_outcomeDetail;
-std::uint64_t g_valueBytes = 0;
+    Cc::Outcome outcome = Cc::Outcome::Unavailable; ///< Hit / Miss / Uncacheable / Unavailable.
+    std::string outcomeDetail;                      ///< Fall-back reason; empty on hit and miss.
+    std::uint64_t valueBytes = 0;                   ///< Cached payload size; 0 when nothing moved.
 
-/// Phase timings for the statistics record, accumulated as the flow proceeds.
-/// Same rationale as the outcome globals above: keeps the cache flow's signature
-/// unchanged while letting main() write one complete record at the end.
-std::uint64_t g_preprocessMs = 0;
-std::uint64_t g_cacheMs = 0;
+    std::uint64_t preprocessMs = 0; ///< Deriving the key (preprocess + compiler id).
+    std::uint64_t cacheMs = 0;      ///< Talking to the daemon (connect + transfer).
 
-/// Direct-mode accounting: how long the manifest shortcut took, and whether it
-/// succeeded (so the report can separate a direct hit from a preprocessed one).
-std::uint64_t g_directMs = 0;
-bool g_directHit = false;
+    /// Direct-mode accounting: how long the manifest shortcut took, and whether it
+    /// succeeded (so the report can separate a direct hit from a preprocessed one).
+    std::uint64_t directMs = 0;
+    bool directHit = false;
+};
+
+InvocationRecord invocation;
 
 /// Milliseconds elapsed since `start`, for the phase counters above.
 [[nodiscard]] std::uint64_t MsSince(std::chrono::steady_clock::time_point start)
@@ -199,7 +208,7 @@ bool g_directHit = false;
 /// @param reason The diagnostic text.
 void Note(std::string_view reason)
 {
-    if (g_verbose)
+    if (invocation.verbose)
         std::cerr << "fastcache-cc: " << reason << '\n';
 }
 
@@ -215,9 +224,9 @@ void Warn(std::string_view reason)
     // cache let us down" — the two need different responses, so the statistics
     // report separates them.
     bool const deliberate = reason.starts_with("uses __TIME__");
-    g_outcome = deliberate ? Cc::Outcome::Uncacheable : Cc::Outcome::Unavailable;
-    g_outcomeDetail = reason;
-    if (g_verbose)
+    invocation.outcome = deliberate ? Cc::Outcome::Uncacheable : Cc::Outcome::Unavailable;
+    invocation.outcomeDetail = reason;
+    if (invocation.verbose)
         std::cerr << "fastcache-cc: cache unavailable (" << reason << "); running real compiler\n";
 }
 
@@ -225,9 +234,9 @@ void Warn(std::string_view reason)
 /// real use to see the cache working, and the signal the E2E harness asserts on.
 void TraceOutcome(std::string_view outcome, std::string_view key)
 {
-    g_outcome = (outcome == "HIT") ? Cc::Outcome::Hit : Cc::Outcome::Miss;
-    g_outcomeDetail.clear();
-    if (g_verbose)
+    invocation.outcome = (outcome == "HIT") ? Cc::Outcome::Hit : Cc::Outcome::Miss;
+    invocation.outcomeDetail.clear();
+    if (invocation.verbose)
         std::cerr << "fastcache-cc: " << outcome << " key=" << key << '\n';
 }
 
@@ -431,29 +440,23 @@ constexpr std::size_t ReplayRegionCount = 2;
     return std::string { reinterpret_cast<char const*>(bytes->data()), bytes->size() };
 }
 
-/// Write the cached depfile back, localized to this machine's layout.
+/// Write the cached depfile back.
 ///
 /// Called on every hit. A miss wrote its own depfile as a side effect of running
 /// the real compiler; a hit runs no compiler, so without this the file the build
 /// system depends on would simply be absent (or, worse, left stale from an
 /// earlier build).
 ///
-/// @param cmd     The parsed compile command (its depPath is the destination).
-/// @param regions The decoded value's text regions.
-/// @param layout  This machine's roots, for localizing the recorded paths.
-/// @return True when there was nothing to do or the write succeeded.
-[[nodiscard]] bool RestoreDepFile(Cc::ParsedCommand const& cmd,
-                                  std::vector<TextRegion> const& regions,
-                                  PathCanon::Layout const& layout)
+/// Takes text that is already localized rather than localizing here: the hit path
+/// localizes every region once up front, because the same localized text is what
+/// the replay guard examines before any of it is written.
+///
+/// @param depPath The destination, from the compile command's -MF.
+/// @param text    The localized depfile bytes.
+/// @return True when the write succeeded.
+[[nodiscard]] bool WriteDepFile(std::string const& depPath, std::string_view text)
 {
-    if (cmd.depPath.empty() || regions.size() <= DepFileRegionIndex)
-        return true; // nothing requested, or a value stored before depfile support
-
-    auto const& region = regions[DepFileRegionIndex];
-    auto localized = PathCanon::LocalizeRegion(region.bytes, region.grammar, layout);
-    std::string const& text = localized.has_value() ? *localized : region.bytes;
-
-    std::ofstream out { std::filesystem::path { cmd.depPath }, std::ios::binary };
+    std::ofstream out { std::filesystem::path { depPath }, std::ios::binary };
     if (!out)
         return false;
     out.write(text.data(), static_cast<std::streamsize>(text.size()));
@@ -572,6 +575,113 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
     WarnIfRejected(outcome, "STORE (raw)", key);
 }
 
+/// What became of a cache hit we tried to honour.
+///
+/// Three outcomes rather than a bool, because the two failures want opposite
+/// responses: a value whose dependency record no longer holds must be RECOMPILED
+/// AND RE-STORED (which repairs the entry), while a value we simply could not
+/// write to disk means the cache is not usable here and the compile should run
+/// plainly, uncached.
+enum class HitDisposition : std::uint8_t
+{
+    Served,   ///< Object and depfile written, streams replayed.
+    Stale,    ///< A replayed dependency is missing here; recompile and re-store.
+    Unusable, ///< The object or depfile could not be written; abandon the cache.
+};
+
+/// A hit after it has been examined and, if it held up, materialized.
+struct MaterializedHit
+{
+    HitDisposition disposition { HitDisposition::Unusable };
+    std::string replayOut; ///< Localized region 0, kept for the manifest backfill.
+    std::string replayErr; ///< Localized region 1, same.
+};
+
+/// A hit that was not materialized, so carries no streams. A named factory rather
+/// than a brace-init at each site: the streams then have exactly one place that
+/// says they are deliberately empty.
+/// @param disposition Why it was not materialized.
+/// @return The outcome, with empty replay text.
+[[nodiscard]] MaterializedHit NotMaterialized(HitDisposition disposition)
+{
+    return { .disposition = disposition, .replayOut = {}, .replayErr = {} };
+}
+
+/// Localize a hit's regions, check that this machine can honour what they assert,
+/// and only then write the object, the depfile, and the replayed streams.
+///
+/// The check comes before every write on purpose. A hit we are going to discard
+/// must leave the tree exactly as an uncached build would, so that the compile
+/// running next writes the object itself — and so that a compile which then fails
+/// has not left a cached object and depfile behind for a build that never
+/// succeeded.
+///
+/// Localizing every region once here, rather than per consumer, is what lets the
+/// guard examine precisely the bytes that are about to be written; it also leaves
+/// exactly one copy of a loop that used to exist twice.
+///
+/// @param cmd     The parsed compile command (object path, depfile path).
+/// @param decoded The decoded cached value.
+/// @param layout  This machine's roots.
+/// @return What happened, plus the localized streams for the manifest backfill.
+[[nodiscard]] MaterializedHit MaterializeHit(Cc::ParsedCommand const& cmd,
+                                             CompileValue const& decoded,
+                                             PathCanon::Layout const& layout)
+{
+    // Localize everything the value carries. Region 2 is the depfile and is a
+    // file, not a stream; regions beyond ReplayRegionCount must never be replayed,
+    // which is why the positional contract stays explicit here.
+    std::vector<TextRegion> localized;
+    localized.reserve(decoded.textRegions.size());
+    for (auto const& region: decoded.textRegions)
+    {
+        auto rewritten = PathCanon::LocalizeRegion(region.bytes, region.grammar, layout);
+        localized.push_back(
+            { .grammar = region.grammar, .bytes = rewritten.has_value() ? *std::move(rewritten) : region.bytes });
+    }
+
+    // A depfile the compile did not ask for is not going to be written, so it must
+    // not be able to veto the hit either.
+    auto assertions = std::span<TextRegion const> { localized };
+    if (cmd.depPath.empty() && assertions.size() > DepFileRegionIndex)
+        assertions = assertions.first(DepFileRegionIndex);
+
+    // current_path() through its error_code overload, and "." when even that
+    // fails: the throwing overload would abort the launcher, and "." resolves a
+    // relative dependency exactly as the compiler's own working directory would.
+    std::error_code cwdError;
+    auto workingDirectory = std::filesystem::current_path(cwdError);
+    if (cwdError)
+        workingDirectory = ".";
+
+    if (auto const missing = Cc::MissingReplayedDependency(assertions, layout, workingDirectory); missing.has_value())
+    {
+        // Named rather than merely counted: "why does this TU never cache" is
+        // otherwise a whole investigation, and the answer is one path.
+        Note(std::format("STALE HIT (replayed dependency missing: {}); recompiling", *missing));
+        return NotMaterialized(HitDisposition::Stale);
+    }
+
+    if (!WriteFileBytes(cmd.objPath, decoded.objectBlob))
+        return NotMaterialized(HitDisposition::Unusable);
+
+    // The depfile is a file, not a stream: restore it before replaying, so a
+    // failure to write it is not reported after the build has already seen the
+    // compiler's output.
+    if (!cmd.depPath.empty() && localized.size() > DepFileRegionIndex
+        && !WriteDepFile(cmd.depPath, localized[DepFileRegionIndex].bytes))
+        return NotMaterialized(HitDisposition::Unusable);
+
+    // Only the first ReplayRegionCount regions are streams; the rest are files and
+    // must never reach stdout or stderr.
+    MaterializedHit result = NotMaterialized(HitDisposition::Served);
+    std::array<std::string*, ReplayRegionCount> const streams { &result.replayOut, &result.replayErr };
+    for (std::size_t idx = 0; idx < localized.size() && idx < streams.size(); ++idx)
+        *streams[idx] = localized[idx].bytes;
+    ReplayStreams(result.replayOut, result.replayErr);
+    return result;
+}
+
 /// Fetch `key`, and if it holds a compile value, materialize it: write the object
 /// and replay the captured streams with paths localized to this machine.
 /// @param cfg    Launcher config.
@@ -591,34 +701,15 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
     auto decoded = DecodeCompileValue(*payload);
     if (!decoded.has_value())
         return std::nullopt;
-    if (!WriteFileBytes(cmd.objPath, decoded->objectBlob))
+
+    // Anything short of Served falls back to preprocessing, which re-runs the same
+    // check and, if it also finds the value stale, recompiles and re-stores it.
+    // Direct mode only ever declines to shortcut; repairing the entry is not its
+    // job, and doing it here would duplicate the miss path.
+    if (MaterializeHit(cmd, *decoded, layout).disposition != HitDisposition::Served)
         return std::nullopt;
 
-    // The depfile is a file, not a stream: restore it before replaying, so a
-    // failure to write it is not reported after the build has already seen the
-    // compiler's output.
-    if (!RestoreDepFile(cmd, decoded->textRegions, layout))
-        return std::nullopt;
-
-    // Region 0 = stdout, region 1 = stderr, per the STORE ordering.
-    std::string_view replayOut;
-    std::string_view replayErr;
-    std::array<std::string, ReplayRegionCount> localizedText;
-    for (std::size_t idx = 0; idx < decoded->textRegions.size() && idx < localizedText.size(); ++idx)
-    {
-        auto const& region = decoded->textRegions[idx];
-        auto localized = PathCanon::LocalizeRegion(region.bytes, region.grammar, layout);
-        if (localized.has_value())
-            localizedText[idx] = *std::move(localized);
-        else
-            localizedText[idx] = region.bytes;
-        if (idx == 0)
-            replayOut = localizedText[idx];
-        else
-            replayErr = localizedText[idx];
-    }
-    ReplayStreams(replayOut, replayErr);
-    g_valueBytes = decoded->objectBlob.size();
+    invocation.valueBytes = decoded->objectBlob.size();
     TraceOutcome("HIT", key);
     return 0;
 }
@@ -629,9 +720,9 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
 /// Called from BOTH the hit and the miss path. On a miss the include text comes
 /// from the compiler that just ran; on a hit it comes from the cached value's
 /// replayed streams — either way it names the same headers, and neither requires
-/// an extra compiler invocation. The object is stored a second time under the
-/// manifest-derived key so the direct path resolves without depending on the
-/// preprocessed key existing.
+/// an extra compiler invocation. The manifest records the object's ordinary key
+/// rather than causing a second copy of the object to be stored: see
+/// DirectManifest::objectKey for why duplicating it is not affordable.
 /// @param cfg             Launcher config.
 /// @param cmd             The parsed compile command.
 /// @param layout          This machine's roots.
@@ -684,7 +775,7 @@ void RecordManifest(Config const& cfg,
     auto const manifest = Cc::BuildManifest(includes, layout, toolchainStamp, objectKeyForPointer);
     if (!manifest.has_value())
     {
-        if (g_verbose)
+        if (invocation.verbose)
             std::cerr << "fastcache-cc: manifest not built (uncanonicalizable include)\n";
         return;
     }
@@ -702,7 +793,7 @@ void RecordManifest(Config const& cfg,
              cfg,
              manifestKey,
              std::string_view { reinterpret_cast<char const*>(manifestFrame.data()), manifestFrame.size() });
-    if (g_verbose)
+    if (invocation.verbose)
         std::cerr << "fastcache-cc: MANIFEST stored key=" << manifestKey << " entries=" << manifest->entries.size() << '\n';
 }
 
@@ -730,7 +821,7 @@ void RecordManifest(Config const& cfg,
     // Every early return records how long the attempt took, so the statistics
     // show the cost of a direct-mode miss as well as a direct-mode hit.
     auto const giveUp = [directStarted]() -> std::optional<int> {
-        g_directMs = MsSince(directStarted);
+        invocation.directMs = MsSince(directStarted);
         return std::nullopt;
     };
 
@@ -752,12 +843,12 @@ void RecordManifest(Config const& cfg,
     if (!manifest.has_value() || manifest->objectKey.empty() || !Cc::ValidateManifest(*manifest, layout, toolchainStamp))
         return giveUp();
 
-    g_directMs = MsSince(directStarted);
+    invocation.directMs = MsSince(directStarted);
     // Follow the manifest's pointer to the object, which is stored exactly once
     // under its ordinary preprocessed key.
     auto served = TryServeFromCache(cfg, cmd, manifest->objectKey, layout);
     if (served.has_value())
-        g_directHit = true;
+        invocation.directHit = true;
     return served;
 }
 
@@ -810,7 +901,7 @@ void RecordManifest(Config const& cfg,
         .relativizedArgs = relativizedArgs,
     };
     std::string const key = Cc::ComputeKey(inputs);
-    g_preprocessMs = MsSince(preprocessStarted);
+    invocation.preprocessMs = MsSince(preprocessStarted);
 
     auto const cacheStarted = std::chrono::steady_clock::now();
 
@@ -845,60 +936,55 @@ void RecordManifest(Config const& cfg,
                 return std::nullopt;
             }
 
-            // HIT: write the object, replay the streams (localizing paths).
-            if (!WriteFileBytes(cmd.objPath, decoded->objectBlob))
+            // HIT: check what the value asserts, then write the object, reproduce
+            // the depfile, and replay the streams (all with paths localized).
+            //
+            // Reproducing the depfile is not optional: skipping it silently breaks
+            // incremental builds, because Ninja/Make would see no header
+            // dependencies for this TU and stop rebuilding it when they change.
+            auto const materialized = MaterializeHit(cmd, *decoded, layout);
+            if (materialized.disposition == HitDisposition::Unusable)
             {
                 Warn("could not write object on hit");
                 return std::nullopt;
             }
-            PathCanon::Layout const consumer { .sourceRoot = cfg.srcRoot, .buildTree = cfg.buildTree };
-
-            // Reproduce the depfile the compiler would have written. Skipping it
-            // silently breaks incremental builds: Ninja/Make would see no header
-            // dependencies for this TU and stop rebuilding it when they change.
-            if (!RestoreDepFile(cmd, decoded->textRegions, consumer))
+            if (materialized.disposition == HitDisposition::Served)
             {
-                Warn("could not write depfile on hit");
-                return std::nullopt;
-            }
+                invocation.valueBytes = decoded->objectBlob.size();
+                invocation.cacheMs = MsSince(cacheStarted);
 
-            // Region 0 = stdout, region 1 = stderr (see STORE below).
-            std::string_view replayOut;
-            std::string_view replayErr;
-            std::array<std::string, ReplayRegionCount> localizedText;
-            for (std::size_t idx = 0; idx < decoded->textRegions.size() && idx < localizedText.size(); ++idx)
-            {
-                auto const& region = decoded->textRegions[idx];
-                auto localized = PathCanon::LocalizeRegion(region.bytes, region.grammar, consumer);
-                if (localized.has_value())
-                    localizedText[idx] = *std::move(localized);
-                else
-                    localizedText[idx] = region.bytes;
-                if (idx == 0)
-                    replayOut = localizedText[idx];
-                else
-                    replayErr = localizedText[idx];
-            }
-            ReplayStreams(replayOut, replayErr);
-            g_valueBytes = decoded->objectBlob.size();
-            g_cacheMs = MsSince(cacheStarted);
+                // Backfill the direct-mode manifest from the hit we just served.
+                //
+                // Without this, direct mode could never populate on a cache that already
+                // holds preprocessed-key entries: manifests would only ever be written by
+                // the miss path, so a warm cache would preprocess forever. The localized
+                // /showIncludes text names exactly the headers this object depends on, so
+                // no compiler run is needed to record them.
+                if (cfg.direct)
+                    RecordManifest(cfg,
+                                   cmd,
+                                   layout,
+                                   relativizedArgs,
+                                   toolchainStamp,
+                                   materialized.replayOut,
+                                   materialized.replayErr,
+                                   key);
 
-            // Backfill the direct-mode manifest from the hit we just served.
+                TraceOutcome("HIT", key);
+                return 0;
+            }
+            // Stale: the object is fine but the dependency record it carries is not
+            // true here, so fall through and compile for real. The STORE that follows
+            // overwrites this very key with a correct one, which is what repairs the
+            // entry rather than leaving it to poison every later build.
             //
-            // Without this, direct mode could never populate on a cache that already
-            // holds preprocessed-key entries: manifests would only ever be written by
-            // the miss path, so a warm cache would preprocess forever. The localized
-            // /showIncludes text names exactly the headers this object depends on, so
-            // no compiler run is needed to record them.
-            if (cfg.direct)
-                RecordManifest(cfg, cmd, layout, relativizedArgs, toolchainStamp, replayOut, replayErr, key);
-
-            TraceOutcome("HIT", key);
-            return 0;
+            // And if that STORE is refused for any reason, the build still converges:
+            // the real compiler ran, so a correct depfile is on disk regardless, and
+            // the cost degrades to a permanent miss for this key.
         }
         // MISS — fall through to compile.
     }
-    g_cacheMs = MsSince(cacheStarted);
+    invocation.cacheMs = MsSince(cacheStarted);
     TraceOutcome("MISS", key);
 
     // MISS: run the real compiler with SEPARATE stdout/stderr capture, then STORE.
@@ -968,11 +1054,12 @@ void RecordManifest(Config const& cfg,
     // object without preprocessing. The include set comes from the /showIncludes
     // output the compile just produced, so this costs no extra compiler run.
     //
-    // The object is stored a second time under the manifest-derived key. That
-    // duplication is deliberate: the two keys answer different questions (one from
-    // preprocessed text, one from header hashes) and both must resolve to the
-    // object, so the direct path never depends on the preprocessed path having run
-    // on this machine.
+    // The manifest holds a POINTER to the object's ordinary key, not a second copy
+    // of the object: the two keys answer different questions (one from preprocessed
+    // text, one from header hashes), but storing the bytes under both would double
+    // the cached volume, and because L1 keeps values uncompressed that doubling
+    // lands on RAM where compression cannot help. A direct hit therefore costs one
+    // extra fetch to follow the pointer — see DirectManifest::objectKey.
     if (cfg.direct)
         RecordManifest(cfg, cmd, layout, relativizedArgs, toolchainStamp, run.out, run.err, key);
     return code;
@@ -1127,7 +1214,7 @@ int main(int argc, char** argv)
     }
 
     Config const cfg = LoadConfig();
-    g_verbose = cfg.verbose;
+    invocation.verbose = cfg.verbose;
 
     auto const cmd = Cc::ParseCommand(std::span<std::string const> { args });
     if (!cmd.parsedOk)
@@ -1145,16 +1232,16 @@ int main(int argc, char** argv)
     {
         auto const elapsed = std::chrono::steady_clock::now() - started;
         Cc::AppendRecord({
-            .outcome = g_outcome,
+            .outcome = invocation.outcome,
             .prefetchGroup = cfg.prefetchGroup,
             .source = cmd.source,
-            .valueBytes = g_valueBytes,
+            .valueBytes = invocation.valueBytes,
             .elapsedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()),
-            .detail = g_outcomeDetail,
-            .preprocessMs = g_preprocessMs,
-            .cacheMs = g_cacheMs,
-            .directMs = g_directMs,
-            .directHit = g_directHit,
+            .detail = invocation.outcomeDetail,
+            .preprocessMs = invocation.preprocessMs,
+            .cacheMs = invocation.cacheMs,
+            .directMs = invocation.directMs,
+            .directHit = invocation.directHit,
         });
     }
     return code;
