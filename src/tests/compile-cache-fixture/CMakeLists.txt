@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# The smallest project that exercises cmake/CompileCache.cmake.
+# The smallest project that exercises cmake/portable/CompileCache.cmake.
 #
 # The module decides what it decides during configure and leaves nothing behind
 # to assert on afterwards, so the only way to test it is to configure something

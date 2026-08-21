@@ -316,7 +316,7 @@ These constraints are load-bearing and have each already been a bug:
   trigger matches `v[0-9]+.[0-9]+.[0-9]+` rather than `v*` — a `v0.1.0-rc1` tag
   cannot configure, and failing to *start* costs nothing where fifteen red jobs and
   a burnt notarization slot would.
-- **`cmake/CompileCache.cmake` must stay stock-CMake-only, and must never fail a
+- **`cmake/portable/CompileCache.cmake` must stay stock-CMake-only, and must never fail a
   configure.** Same constraint as `Cli/UsageDoc` and `Protocol/CompileCacheWire`,
   for the same reason: the file is *meant* to be copied verbatim into other
   projects, so a dependency on anything else here breaks it where nobody in this
@@ -511,7 +511,7 @@ cmake --build --preset clangcl-debug
 
 `PEDANTIC_COMPILER_WERROR=ON` is the default for Windows presets — warnings break the build, fix them at the source.
 
-`USE_COMPILER_CACHE` (default ON, `cmake/CompileCache.cmake`) fronts the compiler
+`USE_COMPILER_CACHE` (default ON, `cmake/portable/CompileCache.cmake`) fronts the compiler
 with our own `fastcache-cc` when it is on `PATH` and a daemon answers — at
 `127.0.0.1:6674` by default, or wherever `FASTCACHE_ADDR=host:port` points;
 `FASTCACHE_SRCROOT`/`FASTCACHE_BUILDTREE` are injected from the source and build

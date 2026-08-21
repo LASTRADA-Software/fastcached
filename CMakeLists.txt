@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.28)
 
+# cmake/portable holds the modules written to be copied into other projects
+# verbatim — they depend on nothing else here. cmake/ holds the ones that only
+# make sense while building this. Both are on the module path; the split says
+# which is which, and cmake/portable/README.md is the note for anyone vendoring
+# one.
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/portable")
 
 include(Version)
 GetVersionInformation(FASTCACHED_VERSION FASTCACHED_VERSION_STRING)
@@ -125,7 +131,7 @@ set(CMAKE_COLOR_DIAGNOSTICS ON)
 
 option(FASTCACHED_BUILD_TESTS "Build unit tests" ON)
 
-# USE_COMPILER_CACHE is declared by cmake/CompileCache.cmake, next to the logic
+# USE_COMPILER_CACHE is declared by cmake/portable/CompileCache.cmake, next to the logic
 # that reads it: a module that consumed an option it did not declare would read
 # an undefined variable as "off" and silently disable caching if it were ever
 # included on its own.

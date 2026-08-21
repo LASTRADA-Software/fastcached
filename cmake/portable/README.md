@@ -1,14 +1,24 @@
-# `CompileCache.cmake` as a drop-in
+# Portable CMake modules
 
-`CompileCache.cmake` is written to be copied. It uses nothing but stock CMake,
-names no target of the project it sits in, and depends on no other file here —
-so a project that wants the same compiler-cache behaviour can vendor that one
-file and get it, whether or not it has ever heard of fastcached.
+Everything in this directory is written to be copied. Each module uses nothing
+but stock CMake, names no target of the project it sits in, and depends on no
+other file here — so another project can vendor one and have it work, whether or
+not it has ever heard of fastcached. That is the whole reason the directory
+exists: `../` holds the modules that only make sense while building fastcached,
+and this holds the ones that travel.
 
-The other modules in this directory are specific to building fastcached and are
-not meant to travel.
+Anything added here has to keep that property. Nothing checks it automatically —
+a module here that quietly grew a dependency on `../Version.cmake` would still
+build fine in this repository and break in every other one, so it is worth
+looking for when reviewing a change to this directory.
 
-## Using it
+## `CompileCache.cmake`
+
+Picks a compiler-cache launcher — `fastcache-cc`, `sccache` or `ccache` — and,
+when asked, installs one that is missing. Its behaviour is covered by
+`ctest -R compile-cache`.
+
+### Using it
 
 Drop the file into your own `cmake/` directory and include it once, before
 anything is compiled:
@@ -35,7 +45,7 @@ one small file through the launcher and accepts only a reported cache outcome.
 A launcher whose daemon is down still compiles fine, so without that check every
 translation unit would pay a failed connection attempt in silence.
 
-## Installing the launcher automatically
+### Installing the launcher automatically
 
 By default the module uses what is already installed. `FASTCACHE_AUTO_INSTALL`
 lets it fetch `fastcache-cc` instead of leaving the build uncached:
@@ -55,7 +65,7 @@ build.
 It only does this when **none** of the three launchers is installed. A launcher
 you installed yourself is a decision already made, and this will not override it.
 
-### Options
+#### Options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -69,7 +79,7 @@ you installed yourself is a decision already made, and this will not override it
 | `FASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE` | `https://github.com` | Where release archives are downloaded from. |
 | `FASTCACHE_AUTO_INSTALL_TTL_HOURS` | `24` | How long a resolved "latest" is reused before asking again. |
 
-### What it will not do
+#### What it will not do
 
 **It will not fail your configure.** No published binary for your platform, no
 network, a corrupt download, a binary that will not run on this host — each ends
@@ -86,7 +96,7 @@ version is staged.
 already set — by a preset, a toolchain file, or `-D` — the module says so and
 leaves it alone.
 
-### Behind a proxy, or offline
+#### Behind a proxy, or offline
 
 Set `GITHUB_TOKEN` or `GH_TOKEN` and it will be used for the API call, which
 raises GitHub's unauthenticated rate limit of 60 requests per hour per address —
@@ -105,7 +115,7 @@ The archive is then expected at
 `<base>/<repo>/releases/download/v<version>/fastcached-<version>-<platform>.tar.gz`,
 laid out exactly as the release archive is.
 
-## Caveats worth knowing
+### Caveats worth knowing
 
 - A cache hit reproduces the object file and nothing else, so while a launcher is
   active the module turns off precompiled headers and C++20 module scanning, and

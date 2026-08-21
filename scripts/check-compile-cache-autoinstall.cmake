@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Assert that cmake/CompileCache.cmake declines to auto-install fastcache-cc
+# Assert that cmake/portable/CompileCache.cmake declines to auto-install
 # gracefully — and above all *without failing the configure* — whenever it
 # cannot install one.
 #
@@ -65,7 +65,7 @@ foreach(required FASTCACHED_SOURCE_DIR FASTCACHED_WORK_DIR FASTCACHED_CXX_COMPIL
 endforeach()
 
 set(fixtureDir "${FASTCACHED_SOURCE_DIR}/src/tests/compile-cache-fixture")
-set(moduleDir "${FASTCACHED_SOURCE_DIR}/cmake")
+set(moduleDir "${FASTCACHED_SOURCE_DIR}/cmake/portable")
 if(NOT IS_DIRECTORY "${fixtureDir}")
     message(FATAL_ERROR "no fixture project at ${fixtureDir}")
 endif()

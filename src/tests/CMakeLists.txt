@@ -71,7 +71,7 @@ set_tests_properties("repository-hygiene" PROPERTIES
 # compile-cache-fixture/ once per way the fetch can be declined, and requires
 # each one to end in a status message and a clean fall-through.
 #
-# What it defends is the property that makes cmake/CompileCache.cmake safe to
+# What it defends is the property that makes cmake/portable/CompileCache.cmake safe to
 # vendor: it is copied into repositories that never asked for fastcached, so a
 # cache it cannot download has to cost them a slower build and nothing else. A
 # configure that aborts because GitHub was unreachable would be a far worse
@@ -127,7 +127,7 @@ set_tests_properties("compile-cache-install" PROPERTIES
 
 # ---------------------------------------------------------------------------
 # sccache smoke tests. Registered only when an sccache binary is present
-# (SCCACHE is the find_program result from cmake/CompileCache.cmake). Each test starts
+# (SCCACHE is the find_program result from cmake/portable/CompileCache.cmake). Each test
 # the freshly-built fastcached, points sccache at it over one wire protocol,
 # and asserts a cache hit — the same compile-twice check the CI smoke jobs run,
 # via the same scripts/sccache-smoke driver.

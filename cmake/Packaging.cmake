@@ -80,7 +80,7 @@ endif()
 if(WIN32)
     if(NOT CPACK_GENERATOR)
         # The MSI installs; the ZIP is what a machine can unpack. cmake's
-        # CompileCache.cmake fetches a prebuilt fastcache-cc out of the release
+        # portable/CompileCache.cmake fetches a prebuilt fastcache-cc out of the
         # archives, and an .msi is not something it — or anyone without
         # Windows — can open. Linux and macOS already ship a TGZ for the same
         # reason, so this is Windows catching up rather than a new idea.

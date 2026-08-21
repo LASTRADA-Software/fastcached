@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Assert that cmake/CompileCache.cmake can actually install a launcher — the
+# Assert that cmake/portable/CompileCache.cmake can actually install a launcher
 # other half of check-compile-cache-autoinstall.cmake, which only proves it
 # declines gracefully. A module that declined every time would pass that one
 # perfectly.
@@ -57,7 +57,7 @@ foreach(required FASTCACHED_SOURCE_DIR FASTCACHED_WORK_DIR FASTCACHED_CXX_COMPIL
 endforeach()
 
 set(fixtureDir "${FASTCACHED_SOURCE_DIR}/src/tests/compile-cache-fixture")
-set(moduleDir "${FASTCACHED_SOURCE_DIR}/cmake")
+set(moduleDir "${FASTCACHED_SOURCE_DIR}/cmake/portable")
 if(NOT IS_DIRECTORY "${fixtureDir}")
     message(FATAL_ERROR "no fixture project at ${fixtureDir}")
 endif()

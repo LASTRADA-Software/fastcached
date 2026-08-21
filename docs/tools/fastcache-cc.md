@@ -79,7 +79,7 @@ cmake -S . -B build -G Ninja \
   -DCMAKE_CXX_COMPILER_LAUNCHER=fastcache-cc
 ```
 
-The fastcached build does this for itself: `cmake/CompileCache.cmake` picks
+The fastcached build does this for itself: `cmake/portable/CompileCache.cmake` picks
 `fastcache-cc` up automatically whenever the binary is on `PATH` and a daemon
 answers at `127.0.0.1:6674` — at any other daemon, local or remote, when
 `FASTCACHE_ADDR` is exported, at `-DFASTCACHE_ADDR=host:port` ahead of even that,
@@ -135,7 +135,7 @@ hour per address would otherwise be shared out among CI runners. Pinning
 `FASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE` at a mirror installs without reaching
 GitHub at all.
 
-`cmake/README.md` documents the full option set, and is written for projects
+`cmake/portable/README.md` documents the full option set, and is written for projects
 vendoring the module rather than building this one.
 
 ## Environment
