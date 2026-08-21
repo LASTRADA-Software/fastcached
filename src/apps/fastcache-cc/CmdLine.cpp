@@ -44,14 +44,40 @@ namespace
     // and therefore the cache key — differ between two checkouts of the same
     // content at different paths, defeating cross-machine sharing entirely.
     // MSVC: /EP writes to stdout without #line. GNU: -P suppresses markers.
-    constexpr std::array<std::string_view, 2> MsvcPreprocess { "/EP", "/P" };
+    //
+    // `/EP` ALONE, and the absence of `/P` here is the whole point. The two are
+    // not additive: `/EP` preprocesses to stdout, `/P` preprocesses to a FILE, and
+    // MSVC documents the pair as "write the file without #line directives". So
+    // passing both sent the preprocessed text to `<base>.i` and left the launcher
+    // hashing an essentially empty stdout — a key with no content in it at all,
+    // under which an edited source re-fetches the object built from the OLD text.
+    // Direct mode hides it (its manifest hashes the source's bytes), so it showed
+    // up only with FASTCACHE_NO_DIRECT=1, and it dropped a stray `.i` in the
+    // working directory on every probe besides.
+    constexpr std::array<std::string_view, 1> MsvcPreprocess { "/EP" };
     constexpr std::array<std::string_view, 2> GnuPreprocess { "-E", "-P" };
 
     /// Flags dropped when preprocessing: compile-only and object-output flags
     /// (we want text on stdout, not an object), plus dependency flags, which
     /// would otherwise overwrite the real depfile during the key probe.
-    constexpr std::array<std::string_view, 4> MsvcDrop { "/c", "/showIncludes", "/Fo", "-o" };
+    ///
+    /// Every spelling of `/showIncludes` the drivers accept has to be here, not
+    /// just the one the parser looks for: the probe appends its own, the drivers
+    /// resolve repeats last-wins, and `/showIncludes:user` suppresses the system
+    /// headers. A surviving one would therefore make the key's dependency set
+    /// depend on which spelling the build happened to use — the exact invariant
+    /// MsvcDependencyProbe exists to establish.
+    constexpr std::array<std::string_view, 7> MsvcDrop {
+        "/c", "/showIncludes", "/showIncludes:user", "-showIncludes", "-showIncludes:user", "/Fo", "-o",
+    };
     constexpr std::array<std::string_view, 8> GnuDrop { "-c", "-o", "-MD", "-MMD", "-MF", "-MT", "-MQ", "-MP" };
+
+    /// How each driver is asked to report dependencies during the preprocess
+    /// probe. `-MD` rather than `-MMD` on purpose: the key's dependency set must
+    /// not depend on which of the two the build happened to ask for, or on whether
+    /// it asked at all. The GNU spelling is followed by the probe's depfile path.
+    constexpr std::array<std::string_view, 1> MsvcDependencyProbe { "/showIncludes" };
+    constexpr std::array<std::string_view, 2> GnuDependencyProbe { "-MD", "-MF" };
 
     constexpr std::array<DriverSpec, 5> Drivers { {
         { .flavor = Flavor::Unknown,
@@ -59,35 +85,35 @@ namespace
           .objectFlag = "",
           .preprocessFlags = {},
           .preprocessDropFlags = {},
-          .includeStream = IncludeStream::None,
+          .dependencyProbeFlags = {},
           .usesDepfile = false },
         { .flavor = Flavor::Cl,
           .optionPrefixes = "/-",
           .objectFlag = "/Fo",
           .preprocessFlags = MsvcPreprocess,
           .preprocessDropFlags = MsvcDrop,
-          .includeStream = IncludeStream::Stderr,
+          .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false },
         { .flavor = Flavor::ClangCl,
           .optionPrefixes = "/-",
           .objectFlag = "/Fo",
           .preprocessFlags = MsvcPreprocess,
           .preprocessDropFlags = MsvcDrop,
-          .includeStream = IncludeStream::Stdout,
+          .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false },
         { .flavor = Flavor::Gcc,
           .optionPrefixes = "-",
           .objectFlag = "-o",
           .preprocessFlags = GnuPreprocess,
           .preprocessDropFlags = GnuDrop,
-          .includeStream = IncludeStream::None,
+          .dependencyProbeFlags = GnuDependencyProbe,
           .usesDepfile = true },
         { .flavor = Flavor::Clang,
           .optionPrefixes = "-",
           .objectFlag = "-o",
           .preprocessFlags = GnuPreprocess,
           .preprocessDropFlags = GnuDrop,
-          .includeStream = IncludeStream::None,
+          .dependencyProbeFlags = GnuDependencyProbe,
           .usesDepfile = true },
     } };
 
@@ -335,15 +361,31 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
     return out;
 }
 
-std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd, std::span<std::string const> argv)
+std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
+                                           std::span<std::string const> argv,
+                                           std::string_view dependencyProbePath)
 {
     auto const& driver = DriverOf(cmd.flavor);
 
     std::vector<std::string> out;
-    out.reserve(argv.size() + driver.preprocessFlags.size());
+    out.reserve(argv.size() + driver.preprocessFlags.size() + driver.dependencyProbeFlags.size() + 1);
     out.emplace_back(cmd.compiler);
     for (auto const& flag: driver.preprocessFlags)
         out.emplace_back(flag);
+
+    // The dependency probe rides on this same run, and the path is what requests
+    // it. A depfile driver needs the destination anyway: writing to the build's
+    // own `-MF` would leave a probe's depfile behind for a hit that is then
+    // discarded, and letting `-MD` default its name would drop a stray `.d` in
+    // the working directory. A stream driver reports inline and reads nothing but
+    // the request out of it.
+    if (!dependencyProbePath.empty())
+    {
+        for (auto const& flag: driver.dependencyProbeFlags)
+            out.emplace_back(flag);
+        if (driver.usesDepfile)
+            out.emplace_back(dependencyProbePath);
+    }
 
     std::size_t skipUntil = 1; // argv[0] is the compiler, already emitted
     for (auto const i: std::views::iota(std::size_t { 1 }, argv.size()))

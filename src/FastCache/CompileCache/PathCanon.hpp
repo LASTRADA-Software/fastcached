@@ -59,6 +59,25 @@ enum class Grammar : std::uint8_t
 /// @return True when either root is Windows-shaped.
 [[nodiscard]] bool IsWindowsLayout(Layout const& layout) noexcept;
 
+/// True when `path` is absolute under the conventions `layout` describes.
+///
+/// Derived from the LAYOUT, never from the host: a cache is shared across
+/// machines, so `D:\src\a.hpp` must read as absolute even when this binary runs
+/// on POSIX — std::filesystem::path::is_absolute() would say otherwise and send
+/// every Windows path down the relative branch. IsWindowsLayout is the single
+/// definition of "is this a Windows layout"; this derives from it for the same
+/// reason the launcher's option-prefix test does.
+///
+/// Lives here rather than in a caller because two of them need exactly this
+/// question answered exactly this way — the replay guard, deciding which
+/// replayed dependencies this machine is answerable for, and the launcher's key
+/// dependency filter, deciding which of them are portable enough to hash.
+///
+/// @param path   A path as a compiler spelled it.
+/// @param layout The layout whose path conventions apply.
+/// @return True when the path is absolute.
+[[nodiscard]] bool IsAbsoluteForLayout(std::string_view path, Layout const& layout) noexcept;
+
 /// Rewrite a single absolute path to its canonical token form.
 /// @param absolutePath Native-form absolute path (as the compiler emitted it).
 /// @param layout       The producing machine's roots.

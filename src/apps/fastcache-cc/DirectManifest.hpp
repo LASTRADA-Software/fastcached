@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -88,6 +89,23 @@ enum class DirectError : std::uint8_t
 ///         beyond this implementation.
 [[nodiscard]] std::expected<DirectManifest, DirectError> DecodeManifest(std::string_view bytes);
 
+/// Collapse a compiler-emitted dependency path to one stable spelling.
+///
+/// A driver echoes the path as *resolved*, which preserves whatever the
+/// `#include` spelling and the `-I` search path contained: `D:\src\A\..\b\W.hpp`,
+/// mixed separators and doubled slashes all occur in real output. Two spellings
+/// of one header must collapse to one string, or the same file is recorded (and,
+/// since issue #56, *keyed*) twice — and two machines whose generators spell an
+/// include directory differently stop sharing entries entirely.
+///
+/// Deliberately LEXICAL, not `weakly_canonical`: touching the filesystem also
+/// rewrites 8.3 short components to their long form, and a path so rewritten no
+/// longer shares a prefix with a root spelled the other way.
+///
+/// @param rawPath A path as the compiler spelled it.
+/// @return The normalized, native-separator form.
+[[nodiscard]] std::string NormalizePath(std::string_view rawPath);
+
 /// Classify whether an absolute include path belongs to the immutable toolchain
 /// (and is therefore covered by the toolchain stamp rather than hashed).
 ///
@@ -105,6 +123,39 @@ enum class DirectError : std::uint8_t
 /// @param absolutePath The file to hash.
 /// @return The hash as hex, or empty on any read failure.
 [[nodiscard]] std::string HashFileContents(std::string_view absolutePath);
+
+/// The text `cl` and `clang-cl` prefix every `/showIncludes` note with.
+///
+/// Spelled once because two readers need it and they must agree exactly:
+/// ParseIncludePaths, which collects the paths, and DependencyProbe's
+/// SplitIncludeNotes, which removes those same lines from a stream that is also
+/// carrying preprocessed text. A note the splitter failed to recognise would be
+/// hashed into the cache key as if it were source.
+inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
+
+/// The path one line names, when that line is a `/showIncludes` note.
+///
+/// The *recognition rule*, not just the marker, is what the two readers have to
+/// share — and it is anchored to the start of the line, after leading blanks
+/// only. Both halves of that are load-bearing:
+///
+/// - Blanks are skipped because `cl` indents a note by inclusion depth, so the
+///   marker is not at column 0 for anything a header pulls in transitively.
+/// - Nothing else may precede it, because SplitIncludeNotes applies this to a
+///   stream that *also* carries preprocessed SOURCE. A rule that matched the
+///   marker anywhere in the line deletes an ordinary source line that merely
+///   contains the text — `char const* s = "Note: including file: x";` — from the
+///   bytes the cache key is computed over, so two revisions differing only in
+///   that literal key identically and the second is served the first's object.
+///   That is a silent wrong build, and this repository's own sources contain the
+///   literal, so it is not a hypothetical.
+///
+/// A trailing `\r` is stripped, so a note is recognised on either line ending.
+///
+/// @param line One line, with or without its `\r` terminator.
+/// @return The path the note names (possibly empty), or nullopt when `line` is
+///         not a note at all.
+[[nodiscard]] std::optional<std::string_view> IncludeNotePath(std::string_view line) noexcept;
 
 /// Extract the include paths from captured `/showIncludes` text.
 ///

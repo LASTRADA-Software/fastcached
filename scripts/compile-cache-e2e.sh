@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # End-to-end test of the compile cache (POSIX). Starts fastcached, drives real
-# compiles through fastcache-cc, and asserts the three properties the launcher
-# actually promises:
+# compiles through fastcache-cc, and asserts the properties the launcher actually
+# promises:
 #
 #   1. MISS then HIT      — a repeated compile is served from the cache.
 #   2. Byte-identical     — the cached object equals the compiled one.
@@ -16,11 +16,19 @@
 #                           exists instead of ccache/sccache.
 #   5. Convergence        — after a header MOVES with its contents unchanged, the
 #                           replayed depfile names the new path. Preprocessing
-#                           suppresses line markers, so the object and its key are
-#                           invariant under such a move; a hit would otherwise
-#                           replay a depfile naming a file that no longer exists,
-#                           and Ninja would rebuild that TU on every build,
-#                           forever (issue #53).
+#                           suppresses line markers, so the object is invariant
+#                           under such a move; a hit would otherwise replay a
+#                           depfile naming a file that no longer exists, and Ninja
+#                           would rebuild that TU on every build, forever
+#                           (issue #53). The dependency set is part of the key, so
+#                           the two layouts are two keys and the pre-move entry
+#                           survives the move (issue #56).
+#   6. Content in the key — an edited source must MISS. The preprocessed text is
+#                           the only key input carrying the source's content, so a
+#                           probe that captures none of it answers an edit with the
+#                           previous revision's object: a wrong build, silently.
+#                           Asserted with direct mode OFF, since its manifest hashes
+#                           the source's own bytes and would mask exactly that.
 #
 # The PowerShell counterpart (src/apps/fastcache-cc/run-launcher-e2e.ps1) asserts
 # the same contract against cl / clang-cl on Windows.
@@ -129,7 +137,7 @@ echo "== compile 2 (expect HIT) =="
 "$launcher" "$compiler" -std=c++23 -MD -MF "${proj}/build/a.d" -c "${proj}/a.cpp" -o "${proj}/build/a.o" \
     2> "${workdir}/hit.log" || fail "second compile returned non-zero"
 cat "${workdir}/hit.log"
-grep -q "HIT" "${workdir}/hit.log" || fail "second compile was not served from the cache"
+grep -q "fastcache-cc: HIT" "${workdir}/hit.log" || fail "second compile was not served from the cache"
 [[ -f "${proj}/build/a.o" ]] || fail "cache hit did not write the object"
 cmp "${workdir}/expected.o" "${proj}/build/a.o" || fail "cached object differs from the compiled one"
 echo "   object reproduced byte-identically"
@@ -192,7 +200,7 @@ while kill -0 "$big_pid" 2>/dev/null; do
 done
 wait "$big_pid" || fail "large-object second compile returned non-zero"
 cat "${workdir}/big-hit.log"
-grep -q "HIT" "${workdir}/big-hit.log" || fail "large object was not served from the cache"
+grep -q "fastcache-cc: HIT" "${workdir}/big-hit.log" || fail "large object was not served from the cache"
 cmp "${workdir}/big-expected.o" "${big}/build/big.o" || fail "large cached object differs from the compiled one"
 echo "   large object reproduced byte-identically"
 
@@ -225,7 +233,7 @@ export FASTCACHE_SOURCE_DIR="$shallow" FASTCACHE_BINARY_DIR="${shallow}/build"
 "$launcher" "$compiler" -std=c++23 -MD -MF "${shallow}/build/t.d" -c "${shallow}/t.cpp" -o "${shallow}/build/t.o" \
     2> "${workdir}/shallow.log" || fail "shallow compile returned non-zero"
 cat "${workdir}/shallow.log"
-grep -q "HIT" "${workdir}/shallow.log" \
+grep -q "fastcache-cc: HIT" "${workdir}/shallow.log" \
     || fail "cross-depth portability broken: content stored from a deep checkout did not hit from a shallow one"
 cmp "${deep}/build/t.o" "${shallow}/build/t.o" || fail "cross-depth object differs"
 echo "   cross-depth hit reproduced the object byte-identically"
@@ -245,10 +253,15 @@ echo "   depfile localized to the consuming checkout"
 
 # --- 5: a moved header must not replay a depfile naming its old path ---------
 # The header's CONTENTS do not change, so the preprocessed text is byte-identical
-# (line markers are suppressed) and the key is unchanged — the object is still
-# correct and the cache still hits. The depfile is nothing but paths, and the one
-# on record names a file that no longer exists. Ninja records that dependency,
-# cannot stat it, rebuilds the TU, hits the cache again, and never converges.
+# (line markers are suppressed). The depfile is nothing but paths, and the one on
+# record names a file that no longer exists. Ninja records that dependency, cannot
+# stat it, rebuilds the TU, hits the cache again, and never converges.
+#
+# The dependency path set is folded into the key, so the two layouts are two
+# different keys and the move is a MISS by construction rather than a hit some
+# guard had to catch and discard. Both properties are asserted below, because they
+# are distinguishable and only the second one holds: the move must produce no
+# "STALE HIT", and the PRE-MOVE entry must still be there afterwards.
 
 # The property Ninja actually needs: every dependency a depfile lists must exist.
 # Splices `\`-continuations, drops each rule's target (an output, and here one we
@@ -276,11 +289,27 @@ require_depfile_resolves() {
 
 # Run twice: once in the default configuration and once with direct mode off,
 # because the two reach the value by different routes and only the preprocessed
-# one produced the reported failure. Each variant gets its own project directory
-# — and because paths under SOURCE_DIR are tokenized before hashing, the two
-# trees key identically, so the second variant additionally arrives at an entry
-# some OTHER checkout stored. Its first compile is therefore expected to discard
-# that entry too, which is the cross-checkout form of the same property.
+# one produced the reported failure.
+#
+# Each variant gets its own project directory AND its own content. The directory
+# alone is not enough: paths under SOURCE_DIR are tokenized before hashing, so two
+# trees holding the same bytes key identically and the second variant would open on
+# a HIT against the first variant's entry rather than populating. That HIT is
+# correct — it is the cross-checkout sharing test 4 exists for — but it is not what
+# this test is about, and the string literal below (which survives preprocessing,
+# unlike a comment) is what keeps the two sequences independent.
+#
+# The tag lives in the SOURCE, never in the header: the header's bytes must stay
+# identical across the move, since a move that changed them would prove nothing.
+write_move_source() {
+    local root="$1" name="$2" include="$3"
+    cat > "${root}/t.cpp" <<SRC
+#include <${include}>
+inline char const* variant() { return "${name}"; }
+int main() { return answer() - 42; }
+SRC
+}
+
 check_header_move() {
     local label="$1" name="$2"
     shift 2
@@ -291,10 +320,7 @@ check_header_move() {
 #pragma once
 inline int answer() { return 42; }
 HDR
-    cat > "${root}/t.cpp" <<'SRC'
-#include <inc/old/Hdr.hpp>
-int main() { return answer() - 42; }
-SRC
+    write_move_source "$root" "$name" "inc/old/Hdr.hpp"
 
     export FASTCACHE_SOURCE_DIR="$root" FASTCACHE_BINARY_DIR="${root}/build"
 
@@ -308,17 +334,14 @@ SRC
     grep -q "MISS" "${workdir}/${name}-1.log" || fail "${label}: first compile was not a MISS"
     grep -q "inc/old/Hdr.hpp" "${root}/build/t.d" || fail "${label}: depfile does not name the header"
 
-    # Move it. Same bytes, new path — and update the include that finds it.
-    # Rewritten wholesale rather than edited in place: `sed -i` takes a backup
-    # suffix on BSD sed and none on GNU sed, so no single spelling works on both
-    # macOS and Linux, and this script runs on both.
+    # Move it. Same bytes, new path — and update the include that finds it. The
+    # source is rewritten wholesale rather than edited in place: `sed -i` takes a
+    # backup suffix on BSD sed and none on GNU sed, so no single spelling works on
+    # both macOS and Linux, and this script runs on both.
     mkdir -p "${root}/inc/new"
     mv "${root}/inc/old/Hdr.hpp" "${root}/inc/new/Hdr.hpp"
     rmdir "${root}/inc/old"
-    cat > "${root}/t.cpp" <<'MOVED'
-#include <inc/new/Hdr.hpp>
-int main() { return answer() - 42; }
-MOVED
+    write_move_source "$root" "$name" "inc/new/Hdr.hpp"
     rm -f "${root}/build/t.o" "${root}/build/t.d"
 
     echo "== ${label}: after the move (expect MISS, not a stale HIT) =="
@@ -328,6 +351,16 @@ MOVED
     cat "${workdir}/${name}-2.log"
     grep -q "MISS" "${workdir}/${name}-2.log" \
         || fail "${label}: a moved header still served a HIT, so the depfile is the producer's"
+    # The dependency set is part of the key, so the move is a different key and the
+    # value under the old one is never fetched at all. A "STALE HIT" here would mean
+    # the two layouts still collide and the replay guard is carrying the property on
+    # its own — true today, and exactly what issue #56 removed.
+    # `if grep`, not `grep && fail`: under `set -e` an AND-list whose left side
+    # fails takes the whole list's non-zero status, so the passing case would abort
+    # the script.
+    if grep -q "STALE HIT" "${workdir}/${name}-2.log"; then
+        fail "${label}: the moved header still keyed identically and had to be discarded on replay"
+    fi
     require_depfile_resolves "$label" "${root}/build/t.d"
     grep -q "inc/new/Hdr.hpp" "${root}/build/t.d" || fail "${label}: depfile does not name the moved header"
 
@@ -339,25 +372,106 @@ MOVED
         -MD -MF "${root}/build/t.d" -c "${root}/t.cpp" -o "${root}/build/t.o" \
         2> "${workdir}/${name}-3.log" || fail "${label}: third compile returned non-zero"
     cat "${workdir}/${name}-3.log"
-    grep -q "HIT" "${workdir}/${name}-3.log" \
+    # Anchored: the launcher also prints "fastcache-cc: STALE HIT (...); recompiling"
+    # immediately BEFORE falling through to a MISS, so a bare `grep "HIT"` is
+    # satisfied by the very state these assertions exist to reject.
+    grep -q "fastcache-cc: HIT" "${workdir}/${name}-3.log" \
         || fail "${label}: the repaired entry did not hit, so every build recompiles this TU"
     require_depfile_resolves "$label" "${root}/build/t.d"
     grep -q "inc/new/Hdr.hpp" "${root}/build/t.d" || fail "${label}: the hit replayed the old path again"
-    echo "   moved header: MISS, repaired, then HIT with the new path"
+
+    # Fourth compile: move the header BACK and the ORIGINAL entry must still be
+    # there. This is what separates "a different key" from "a hit that was caught
+    # and discarded": a guard-only fix re-stores the moved layout under the one
+    # shared key, destroying the entry the old layout needs, so this compile would
+    # MISS. Two keys means both layouts keep their own value.
+    mkdir -p "${root}/inc/old"
+    mv "${root}/inc/new/Hdr.hpp" "${root}/inc/old/Hdr.hpp"
+    rmdir "${root}/inc/new"
+    write_move_source "$root" "$name" "inc/old/Hdr.hpp"
+    rm -f "${root}/build/t.o" "${root}/build/t.d"
+    echo "== ${label}: moved back (the pre-move entry must have survived) =="
+    "$@" "$launcher" "$compiler" -std=c++23 -I"$root" \
+        -MD -MF "${root}/build/t.d" -c "${root}/t.cpp" -o "${root}/build/t.o" \
+        2> "${workdir}/${name}-4.log" || fail "${label}: fourth compile returned non-zero"
+    cat "${workdir}/${name}-4.log"
+    grep -q "fastcache-cc: HIT" "${workdir}/${name}-4.log" \
+        || fail "${label}: the pre-move entry was destroyed, so the two layouts share one key"
+    if grep -q "STALE HIT" "${workdir}/${name}-4.log"; then
+        fail "${label}: the restored layout still keyed onto the moved entry"
+    fi
+    require_depfile_resolves "$label" "${root}/build/t.d"
+    grep -q "inc/old/Hdr.hpp" "${root}/build/t.d" || fail "${label}: the restored hit names the wrong path"
+
+    # Nothing of the probe's own may outlive it. The dependency capture writes a
+    # depfile beside the object, and a stray one would be an artefact no build
+    # system asked for — in a directory a build system does clean and compare.
+    [[ -z "$(find "${root}/build" -name '*.fcdep' -print -quit)" ]] \
+        || fail "${label}: the dependency probe left its depfile behind"
+
+    echo "   moved header: MISS, repaired, HIT, and the pre-move entry survived"
 }
 
 check_header_move "moved header" "movedhdr"
 check_header_move "moved header (no direct mode)" "movedhdr-nodirect" env FASTCACHE_NO_DIRECT=1
 
-# --- 6: the cache is never load-bearing -------------------------------------
+# --- 6: an edited source must not be served the old object -------------------
+# The preprocessed text is the only key input that carries the source's CONTENT,
+# so a probe that fails to capture it produces a key that cannot tell two
+# revisions of a file apart — and the cache then answers an edited source with
+# the object built from the previous one. That is not a hit-rate problem, it is a
+# WRONG BUILD, and it is silent: the compile succeeds every time.
+#
+# Direct mode is switched off deliberately. Its manifest hashes the source file's
+# own bytes, so it catches an edit regardless of what the preprocessed text
+# contains — which is exactly how a probe capturing nothing stayed invisible.
+edited="${workdir}/edited"
+mkdir -p "${edited}/build"
+export FASTCACHE_SOURCE_DIR="$edited" FASTCACHE_BINARY_DIR="${edited}/build"
+cat > "${edited}/e.cpp" <<'SRC'
+int value() { return 1; }
+SRC
+echo "== edited source: first revision =="
+FASTCACHE_NO_DIRECT=1 "$launcher" "$compiler" -std=c++23 -c "${edited}/e.cpp" -o "${edited}/build/e.o" \
+    2> "${workdir}/edited-1.log" || fail "first revision returned non-zero"
+cat "${workdir}/edited-1.log"
+# The first revision must actually POPULATE. Without this the second revision's
+# MISS is satisfied by an empty cache rather than by a changed key, and the whole
+# section — the one written for the class of bug where the key carries no content
+# from the source at all — proves nothing.
+grep -q "STORED" "${workdir}/edited-1.log" || fail "first revision did not store, so the next MISS proves nothing"
+[[ -f "${edited}/build/e.o" ]] || fail "first revision produced no object"
+cp "${edited}/build/e.o" "${workdir}/edited-1.o"
+
+cat > "${edited}/e.cpp" <<'SRC'
+int value() { return 2; }
+SRC
+echo "== edited source: second revision (expect MISS and a different object) =="
+FASTCACHE_NO_DIRECT=1 "$launcher" "$compiler" -std=c++23 -c "${edited}/e.cpp" -o "${edited}/build/e.o" \
+    2> "${workdir}/edited-2.log" || fail "second revision returned non-zero"
+cat "${workdir}/edited-2.log"
+grep -q "MISS" "${workdir}/edited-2.log" \
+    || fail "an edited source keyed identically to its previous revision"
+if cmp -s "${workdir}/edited-1.o" "${edited}/build/e.o"; then
+    fail "the edited source produced the previous revision's object"
+fi
+echo "   an edit re-keys, and the object follows the source"
+
+# --- 7: the cache is never load-bearing -------------------------------------
 # With no daemon reachable the build must still succeed, uncached.
+#
+# The layout is re-exported first: every section above exports its own, so
+# without this the compile below runs `${proj}/a.cpp` under roots pointing at an
+# unrelated tree and passes for reasons that have nothing to do with the daemon
+# being unreachable.
+export FASTCACHE_SOURCE_DIR="$proj" FASTCACHE_BINARY_DIR="${proj}/build"
 echo "== unreachable daemon must still compile =="
 FASTCACHE_ADDR="127.0.0.1:1" "$launcher" "$compiler" -std=c++23 -c "${proj}/a.cpp" -o "${proj}/build/fb.o" \
     2> "${workdir}/fallback.log" || fail "compile failed when the cache was unreachable"
 cat "${workdir}/fallback.log"
 [[ -f "${proj}/build/fb.o" ]] || fail "fallback compile produced no object"
 
-# --- 7: forms the launcher must decline to cache ----------------------------
+# --- 8: forms the launcher must decline to cache ----------------------------
 # A compile with no -o defaults its output to ./a.o, a path the launcher cannot
 # reconstruct. It must pass straight through rather than claim the compile and
 # then fail to store it on every single invocation.
@@ -425,5 +539,6 @@ echo "   retired flags exit 2 with a diagnostic"
 "$launcher" --zero-stats >/dev/null || fail "--zero-stats returned non-zero"
 
 echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, cross-depth," \
-     "moved-header convergence, and safe fallback"
+     "moved-header convergence (both layouts keyed apart), an edit re-keying," \
+     "and safe fallback"
 exit 0

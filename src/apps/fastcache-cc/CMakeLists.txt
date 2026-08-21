@@ -36,6 +36,7 @@ set(_fc_cc_sources
     LauncherCli.cpp
     CacheKey.cpp
     CacheProtocol.cpp
+    DependencyProbe.cpp
     DirectManifest.cpp
     ReplayGuard.cpp
     Stats.cpp
@@ -85,6 +86,7 @@ if(FASTCACHED_BUILD_TESTS)
         LauncherCli_test.cpp
         CacheKey_test.cpp
         CacheProtocol_test.cpp
+        DependencyProbe_test.cpp
         DirectManifest_test.cpp
         ReplayGuard_test.cpp
         ProcessRunner_test.cpp

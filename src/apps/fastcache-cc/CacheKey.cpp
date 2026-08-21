@@ -4,12 +4,14 @@
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Crc32c.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <format>
 #include <ranges>
 #include <string>
+#include <vector>
 
 namespace FastCache::Cc
 {
@@ -138,8 +140,23 @@ std::string ComputeKey(KeyInputs const& inputs)
     // mis-serve, which presents as a mysterious hit-rate collapse rather than as
     // a miss. Bumping the tag re-keys the cache instead, so stale entries simply
     // miss and are rewritten. Mirrors ComputeManifestKey's "manifest-v1".
+    //
+    // v2 adds the dependency path set, which is what makes a moved header a
+    // different key rather than a hit whose depfile has to be re-checked (see
+    // KeyInputs::dependencyPaths). Every entry written by a v1 launcher therefore
+    // misses once and is rewritten — the one-time cost the tag exists to make safe.
     std::string blob;
-    blob += "objkey-v1";
+    // Sized up front. The preprocessed text alone runs to megabytes, and without
+    // this the single `push_back` that follows it reallocates a buffer that had
+    // just been grown to fit it exactly — one extra full-length copy per
+    // translation unit, on the launcher's hot path, to append one byte.
+    auto const argBytes = [](std::vector<std::string> const& list) {
+        return std::ranges::fold_left(
+            list, std::size_t { 0 }, [](std::size_t n, std::string const& s) { return n + s.size() + 1; });
+    };
+    blob.reserve(inputs.compilerId.size() + inputs.preprocessed.size() + argBytes(inputs.relativizedArgs)
+                 + argBytes(inputs.dependencyPaths) + 32);
+    blob += "objkey-v2";
     blob.push_back('\x00');
     blob += inputs.compilerId;
     blob.push_back('\x00');
@@ -149,6 +166,13 @@ std::string ComputeKey(KeyInputs const& inputs)
     {
         blob += arg;
         blob.push_back('\x01');
+    }
+    // A separator of its own, so a dependency path can never be read as a trailing
+    // argument: the two lists are adjacent and both hold path-shaped strings.
+    for (auto const& path: inputs.dependencyPaths)
+    {
+        blob += path;
+        blob.push_back('\x02');
     }
 
     std::array<std::uint32_t, 4> const lanes {

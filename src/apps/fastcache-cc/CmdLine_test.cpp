@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -277,15 +278,85 @@ TEST_CASE("ParseCommand refuses a compile with no explicit object output")
     CHECK(Parse({ "cl.exe", "/c", "a.cpp", "/Foa.obj" }).parsedOk);
 }
 
-TEST_CASE("DriverOf reports where each driver reports its dependencies")
+TEST_CASE("DriverOf reports how each driver reports its dependencies")
 {
-    // cl prints /showIncludes notes on stderr, clang-cl on stdout; the GNU
-    // drivers do not print them at all and use a depfile instead.
-    CHECK(DriverOf(Flavor::Cl).includeStream == IncludeStream::Stderr);
-    CHECK(DriverOf(Flavor::ClangCl).includeStream == IncludeStream::Stdout);
-    CHECK(DriverOf(Flavor::Gcc).includeStream == IncludeStream::None);
+    // The GNU drivers write a depfile; the MSVC ones print notes inline. WHICH
+    // stream an inline reporter uses is deliberately not in the table: it differs
+    // between a compile run and a preprocess-only run, so both readers take both
+    // streams rather than choosing (see DriverSpec::usesDepfile).
     CHECK(DriverOf(Flavor::Gcc).usesDepfile);
     CHECK(DriverOf(Flavor::Clang).usesDepfile);
     CHECK_FALSE(DriverOf(Flavor::Cl).usesDepfile);
     CHECK(DriverOf(Flavor::Unknown).flavor == Flavor::Unknown);
+}
+
+TEST_CASE("PreprocessCommand asks each driver for its dependencies in one spelling")
+{
+    // The cache key must be a function of BOTH artefacts a hit reproduces. The
+    // dependency set is captured on the preprocess run the launcher already makes
+    // — measured at +1.5% on a 45 ms preprocess — rather than in a second probe.
+    //
+    // The build's own spelling is dropped and ours appended in its place, so the
+    // set does not depend on whether the compile asked for `-MD`, `-MMD`, or for
+    // no dependencies at all. There must be exactly one of each flag on the line:
+    // a surviving `-MF` would send the probe's dependencies to the build's real
+    // depfile, which a hit that is then discarded must not have touched.
+    std::vector<std::string> const gnu { "g++", "-c", "a.cpp", "-o", "a.o", "-MMD", "-MF", "dep/a.d" };
+    auto const gnuProbe = PreprocessCommand(Parse(gnu), gnu, "build/a.o.fcdep");
+
+    CHECK(std::ranges::count(gnuProbe, "-MD") == 1);
+    CHECK(std::ranges::count(gnuProbe, "-MF") == 1);
+    CHECK_FALSE(std::ranges::contains(gnuProbe, "-MMD"));
+    CHECK_FALSE(std::ranges::contains(gnuProbe, "dep/a.d"));
+    // The destination must FOLLOW its flag, or the driver reads the next argument
+    // as the depfile and the probe path as a second input file.
+    auto const flag = std::ranges::find(gnuProbe, "-MF");
+    REQUIRE(flag != gnuProbe.end());
+    REQUIRE(std::next(flag) != gnuProbe.end());
+    CHECK(*std::next(flag) == "build/a.o.fcdep");
+
+    // MSVC drivers report on a stream instead, so they take the request but no
+    // path — /showIncludes with a trailing path would be a stray input file.
+    std::vector<std::string> const msvc { "cl.exe", "/c", "/showIncludes", "/Foout.obj", "a.cpp" };
+    auto const msvcProbe = PreprocessCommand(Parse(msvc), msvc, "out.obj.fcdep");
+
+    CHECK(std::ranges::count(msvcProbe, "/showIncludes") == 1);
+    CHECK_FALSE(std::ranges::contains(msvcProbe, "out.obj.fcdep"));
+    CHECK_FALSE(std::ranges::contains(msvcProbe, "-MF"));
+}
+
+TEST_CASE("PreprocessCommand omits the dependency probe when no path is given")
+{
+    // The path is what requests the probe. Without one the line is exactly what
+    // it was before dependency capture existed, which is what lets the callers
+    // that only want text (and every older test above) keep asking for it.
+    std::vector<std::string> const gnu { "g++", "-c", "a.cpp", "-o", "a.o" };
+    auto const pp = PreprocessCommand(Parse(gnu), gnu);
+
+    CHECK_FALSE(std::ranges::contains(pp, "-MD"));
+    CHECK_FALSE(std::ranges::contains(pp, "-MF"));
+
+    std::vector<std::string> const msvc { "cl.exe", "/c", "/Foout.obj", "a.cpp" };
+    CHECK_FALSE(std::ranges::contains(PreprocessCommand(Parse(msvc), msvc), "/showIncludes"));
+}
+
+TEST_CASE("PreprocessCommand sends MSVC preprocessed text to stdout, never to a file")
+{
+    // Regression guard, and the sharpest kind: a probe line carrying BOTH /EP and
+    // /P is accepted by the compiler, exits 0, and writes the preprocessed text to
+    // `<base>.i` — so the launcher hashed an empty stdout and every Windows key
+    // carried no content from the source at all. An edited file then re-fetched the
+    // object built from the old text. Direct mode masked it (its manifest hashes
+    // the source's own bytes), so nothing failed until FASTCACHE_NO_DIRECT=1.
+    //
+    // /EP and /P are alternatives, not modifiers: /EP preprocesses to stdout, /P to
+    // a file, and MSVC documents the pair as "to the file, without #line".
+    for (auto const& compiler: { "cl.exe", "clang-cl.exe" })
+    {
+        std::vector<std::string> const argv { compiler, "/c", "/Foout.obj", "a.cpp" };
+        auto const pp = PreprocessCommand(Parse(argv), argv);
+
+        CHECK(std::ranges::contains(pp, "/EP"));
+        CHECK_FALSE(std::ranges::contains(pp, "/P"));
+    }
 }

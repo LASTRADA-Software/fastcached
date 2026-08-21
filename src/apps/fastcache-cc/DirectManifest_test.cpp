@@ -188,6 +188,17 @@ TEST_CASE("ParseIncludePaths returns nothing for text with no include notes")
     CHECK(ParseIncludePaths("").empty());
 }
 
+TEST_CASE("ParseIncludePaths ignores a marker that is not the start of the line")
+{
+    // The recognition rule is shared with SplitIncludeNotes, which applies it to a
+    // stream that also carries preprocessed source. Anchoring it after leading
+    // blanks (cl indents by nesting depth) and nowhere else is what keeps an
+    // ordinary line quoting the marker from being read as a dependency — and, on
+    // the splitter's side, from being deleted out of the hashed text.
+    CHECK(ParseIncludePaths("warning: Note: including file: C:\\x.h\r\n").empty());
+    CHECK(ParseIncludePaths("char const* s = \"Note: including file: /usr/include/a.h\";\n").empty());
+}
+
 TEST_CASE("ComputeManifestKey is stable and separates differing inputs")
 {
     std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };

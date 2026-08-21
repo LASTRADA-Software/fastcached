@@ -9,6 +9,21 @@
 #   3. Cross-depth: content compiled/stored with a DEEP srcroot is a HIT when
 #      compiled from a SHALLOW srcroot (different checkout), with showIncludes
 #      localized so the deps resolve.
+#   4. An EDITED source is a MISS, and yields a different object. The preprocessed
+#      text is the only key input carrying the source's content, so a probe that
+#      captures none of it answers an edit with the previous revision's object — a
+#      wrong build, silently, every time. Checked with direct mode off, because the
+#      manifest hashes the source's own bytes and would otherwise mask it. This is
+#      the property `/EP` plus `/P` broke: the pair writes the preprocessed text to
+#      a FILE, leaving the launcher hashing an empty stdout.
+#   5. Moved header: a header that moves with its contents unchanged is a MISS by
+#      construction, and the entry stored before the move is still there when it
+#      comes back. Preprocessing suppresses line markers, so the token stream and
+#      the object are identical after such a move and only the paths differ; the
+#      dependency set is part of the key so that the two layouts are two keys
+#      rather than one key a replay guard has to catch (issues #53 and #56).
+#      Also checked with direct mode off, because the manifest keys on the
+#      source's own bytes and would answer the move-back on its own.
 #
 # The POSIX counterpart (scripts/compile-cache-e2e.sh) additionally asserts that
 # a hit restores the GNU depfile, localized to the consuming checkout. That has
@@ -24,12 +39,18 @@ param(
     [string]$Fastcached  = "$PSScriptRoot/../../out/build/clangcl-debug/target/fastcached.exe",
     [string]$Launcher    = "$PSScriptRoot/../../out/build/clangcl-debug/target/fastcache-cc.exe",
     [int]$Port           = 21714,
-    [string]$DeepTemp    = "$env:TEMP/cc-l-deep",
-    [string]$ShallowTemp = "$env:TEMP/cc-l-shallow"
+    # Left empty on purpose: these default to a directory beside the build tree,
+    # computed once the launcher path is resolved. See the note there for why not
+    # %TEMP%. Passing one explicitly still works and is honoured verbatim.
+    [string]$DeepTemp,
+    [string]$ShallowTemp,
+    [string]$MoveTemp,
+    [string]$EditTemp
 )
 
 $ErrorActionPreference = "Stop"
 $exit = 0
+
 # CTest's SKIP_RETURN_CODE. A missing binary or compiler is a missing runtime
 # prerequisite, not a failure, so it must be distinguishable from a real fault.
 $SKIP = 77
@@ -38,11 +59,54 @@ $ranAnyCompiler = $false
 if (-not (Test-Path $Fastcached)) { Write-Host "fastcached not found: $Fastcached; skipping"; exit $SKIP }
 if (-not (Test-Path $Launcher))   { Write-Host "fastcache-cc not found: $Launcher; skipping"; exit $SKIP }
 
+# Scratch trees live beside the build tree, not under %TEMP%.
+#
+# On a GitHub Windows runner %TEMP% is `C:\Users\RUNNER~1\...` — an 8.3 short
+# name — and the two drivers disagree about it: `cl` resolves an include through
+# the filesystem and reports the LONG name, while clang-cl echoes the spelling it
+# was handed. Every root test in the launcher is a string prefix comparison, so a
+# short-spelled root matches nothing `cl` emits: PathCanon classifies all of its
+# headers as outside both roots, which empties the keyed dependency set AND makes
+# the replay guard skip the very paths it exists to check. A moved header then
+# keys identically and nothing reports it (measured: "dependency set: 0 of 1
+# reported path(s) keyed"). That is a launcher limitation — issue #66, see
+# AGENT.md — and not what these cases are here to measure.
+#
+# The build tree is the fix rather than expanding the short name, because there is
+# no dependable way to expand one: Resolve-Path, Get-Item and
+# [IO.Path]::GetFullPath all preserve it, and Scripting.FileSystemObject was tried
+# and echoed it back unchanged. No checkout reached through a short name would
+# have built here in the first place.
+
 # Start-Process resolves a relative -FilePath against the PROCESS working
 # directory, not PowerShell's, so a caller passing "out/build/..." would get a
 # spurious "file not found". Resolve both up front.
 $Fastcached = (Resolve-Path $Fastcached).Path
 $Launcher   = (Resolve-Path $Launcher).Path
+
+# AFTER the resolution above, and that ordering is the whole point: both callers
+# pass a RELATIVE launcher path, and a relative root is the same defect as a short
+# one wearing different clothes. `cl` reports an include as an absolute path no
+# matter how it was reached, while clang-cl echoes the spelling it was handed — so
+# a relative root matches everything clang-cl emits and nothing `cl` does, which is
+# exactly the split that produced "dependency set: 0 of 1" here once before.
+$scratch = Join-Path (Split-Path (Split-Path $Launcher -Parent) -Parent) "cc-l-e2e"
+if (-not $PSBoundParameters.ContainsKey('DeepTemp'))    { $DeepTemp    = Join-Path $scratch "deep" }
+if (-not $PSBoundParameters.ContainsKey('ShallowTemp')) { $ShallowTemp = Join-Path $scratch "shallow" }
+if (-not $PSBoundParameters.ContainsKey('MoveTemp'))    { $MoveTemp    = Join-Path $scratch "move" }
+if (-not $PSBoundParameters.ContainsKey('EditTemp'))    { $EditTemp    = Join-Path $scratch "edit" }
+
+# Belt and braces, and it covers the caller too: a root passed explicitly is
+# honoured verbatim, so `-MoveTemp scratch/move` would reintroduce exactly the
+# split above. Rooting every one of them here means the cases cannot silently
+# degrade into testing clang-cl only — the failure mode this guard exists for is
+# a PASS on one driver and a meaningless comparison on the other.
+foreach ($name in 'DeepTemp', 'ShallowTemp', 'MoveTemp', 'EditTemp') {
+    $value = Get-Variable -Name $name -ValueOnly
+    if (-not [System.IO.Path]::IsPathRooted($value)) {
+        Set-Variable -Name $name -Value (Join-Path (Get-Location).Path $value)
+    }
+}
 
 function Start-Fastcached {
     # --storage-max-value raises the wire payload cap along with the value cap;
@@ -61,6 +125,29 @@ function New-Tree([string]$root) {
     New-Item -ItemType Directory -Force -Path $inc | Out-Null
     Set-Content -Path (Join-Path $inc "h1.h") -Value "#pragma once`nint one();`n"
     Set-Content -Path (Join-Path $src "u.cpp") -Value "#include `"inc/h1.h`"`nint g(){return one();}`n"
+    return $src
+}
+
+# A single-file fixture whose body can be rewritten between compiles, so an edit
+# to the SOURCE (not to a header) is what the cache has to notice.
+function Set-EditedSource([string]$src, [int]$value) {
+    Set-Content -Path (Join-Path $src "u.cpp") -Value "int value(){return $value;}`n"
+}
+
+# Point the fixture's translation unit at a header, wherever it currently lives.
+# The include is the ONLY thing that changes across a move: the header's own bytes
+# must stay identical, since a move that rewrote them would prove nothing.
+function Set-MoveSource([string]$src, [string]$include) {
+    Set-Content -Path (Join-Path $src "u.cpp") `
+                -Value "#include `"$include`"`nint g(){return answer()-42;}`n"
+}
+
+# A tree whose header sits at inc/old, ready to be moved to inc/new.
+function New-MoveTree([string]$root) {
+    $src = Join-Path $root "src"
+    New-Item -ItemType Directory -Force -Path (Join-Path $src "inc/old") | Out-Null
+    Set-Content -Path (Join-Path $src "inc/old/h1.h") -Value "#pragma once`ninline int answer(){return 42;}`n"
+    Set-MoveSource $src "inc/old/h1.h"
     return $src
 }
 
@@ -215,6 +302,135 @@ try {
             Write-Host "  CROSS-DEPTH FAIL ($cc): deep=$oDeep shallow=$oShallow obj=$(Test-Path $obj2)" -ForegroundColor Red
             $exit = 1
         }
+
+        Write-Host "=== edited source ($cc) ==="
+        # Direct mode OFF on purpose: its manifest hashes the source file's own
+        # bytes, so it catches an edit no matter what the preprocessed text holds —
+        # which is precisely how a probe that captured none of it stayed invisible.
+        Remove-Item -Recurse -Force $EditTemp -ErrorAction SilentlyContinue
+        $editSrc = Join-Path $EditTemp "src"
+        New-Item -ItemType Directory -Force -Path $editSrc | Out-Null
+        $editBuild = Join-Path $EditTemp "build"; New-Item -ItemType Directory -Force $editBuild | Out-Null
+        $editObj = Join-Path $editBuild "u.obj"
+        # Reset per compiler: a throw in the `cl` pass would otherwise leave its
+        # values in scope and let the `clang-cl` pass assert against them.
+        $oEdited = "UNKNOWN"; $firstHash = "<none>"; $secondHash = "<none>"
+        $env:FASTCACHE_NO_DIRECT = "1"
+        try {
+            Set-EditedSource $editSrc 1
+            $rFirst = Invoke-Launcher $cc $editSrc $editBuild $editObj
+            # Checked, and Test-Path before Get-FileHash: with $ErrorActionPreference
+            # = "Stop" a missing object is a terminating error that unwinds past both
+            # finallys and kills the run, so a first-compile failure would be reported
+            # as an opaque PowerShell exception instead of an EDITED-SOURCE FAIL.
+            if ($rFirst.code -eq 0 -and (Test-Path $editObj)) {
+                $firstHash = (Get-FileHash $editObj -Algorithm SHA256).Hash
+
+                Set-EditedSource $editSrc 2
+                $oEdited = Get-Outcome (Invoke-Launcher $cc $editSrc $editBuild $editObj).stderr
+                if (Test-Path $editObj) { $secondHash = (Get-FileHash $editObj -Algorithm SHA256).Hash }
+            }
+        } finally {
+            Remove-Item Env:\FASTCACHE_NO_DIRECT -ErrorAction SilentlyContinue
+        }
+
+        if ($oEdited -eq "MISS" -and $firstHash -ne $secondHash) {
+            Write-Host "  an edit re-keys and the object follows the source: OK ($cc)" -ForegroundColor Green
+        } else {
+            Write-Host "  EDITED-SOURCE FAIL ($cc): outcome=$oEdited objectChanged=$($firstHash -ne $secondHash)" `
+                -ForegroundColor Red
+            $exit = 1
+        }
+
+        Write-Host "=== moved header ($cc) ==="
+        # The header's CONTENTS do not change, so the preprocessed text is
+        # byte-identical and the object stays correct; only the paths move. Before
+        # the dependency set reached the key the two layouts collided, the cached
+        # /showIncludes notes named a file that no longer existed, and Ninja (which
+        # reads them as deps = msvc) rebuilt that TU on every build, forever.
+        #
+        # Direct mode OFF, for the same reason the edited-source case above turns it
+        # off: moving the header back restores u.cpp byte-for-byte, so the MANIFEST
+        # key is restored too and the final HIT would arrive through direct mode
+        # without the object key ever being computed. The assertion would then pass
+        # in exactly the state it exists to reject — including the one where the
+        # dependency set is silently empty on this driver.
+        Remove-Item -Recurse -Force $MoveTemp -ErrorAction SilentlyContinue
+        $moveSrc = New-MoveTree $MoveTemp
+        $moveBuild = Join-Path $MoveTemp "build"; New-Item -ItemType Directory -Force $moveBuild | Out-Null
+        $moveObj = Join-Path $moveBuild "u.obj"
+        # Reset per compiler, the captured runs included: without that a failure in
+        # the second pass would dump the first pass's trace and misdirect the
+        # diagnosis it exists to serve.
+        $oBefore = "UNKNOWN"; $oMoved = "UNKNOWN"; $oBack = "UNKNOWN"; $staleHit = $false
+        $rBefore = $null; $rMoved = $null; $rBack = $null
+        $env:FASTCACHE_NO_DIRECT = "1"
+        try {
+            $rBefore = Invoke-Launcher $cc $moveSrc $moveBuild $moveObj
+            $oBefore = Get-Outcome $rBefore.stderr
+
+            # -Recurse on the directory removals: without it PowerShell's contract for
+            # a non-empty directory is a prompt (interactive) or, under
+            # $ErrorActionPreference = "Stop", a terminating error — so any stray
+            # artefact a scanner or the compiler leaves behind aborts the run instead
+            # of reporting MOVED-HEADER FAIL.
+            New-Item -ItemType Directory -Force -Path (Join-Path $moveSrc "inc/new") | Out-Null
+            Move-Item (Join-Path $moveSrc "inc/old/h1.h") (Join-Path $moveSrc "inc/new/h1.h")
+            Remove-Item -Recurse -Force (Join-Path $moveSrc "inc/old") -ErrorAction SilentlyContinue
+            Set-MoveSource $moveSrc "inc/new/h1.h"
+            Remove-Item -Force $moveObj -ErrorAction SilentlyContinue
+
+            $rMoved = Invoke-Launcher $cc $moveSrc $moveBuild $moveObj
+            $oMoved = Get-Outcome $rMoved.stderr
+            # A "STALE HIT" here would mean the move still keyed identically and the
+            # replay guard had to catch and discard the value — true before issue #56,
+            # and the difference between detecting the collision and not having one.
+            $staleHit = [bool]($rMoved.stderr -match "STALE HIT")
+
+            # Move it back. The entry stored BEFORE the move must never have been
+            # overwritten, which is what separates two keys from one key plus a guard:
+            # a guard-only fix re-stores the moved layout under the shared key and
+            # destroys the value the original layout needs.
+            New-Item -ItemType Directory -Force -Path (Join-Path $moveSrc "inc/old") | Out-Null
+            Move-Item (Join-Path $moveSrc "inc/new/h1.h") (Join-Path $moveSrc "inc/old/h1.h")
+            Remove-Item -Recurse -Force (Join-Path $moveSrc "inc/new") -ErrorAction SilentlyContinue
+            Set-MoveSource $moveSrc "inc/old/h1.h"
+            Remove-Item -Force $moveObj -ErrorAction SilentlyContinue
+
+            $rBack = Invoke-Launcher $cc $moveSrc $moveBuild $moveObj
+            $oBack = Get-Outcome $rBack.stderr
+            # A restored layout that has to discard what it fetched is the collapse
+            # this case is named for, and it reports HIT on its way to a MISS.
+            if ($rBack.stderr -match "STALE HIT") { $staleHit = $true }
+        } finally {
+            Remove-Item Env:\FASTCACHE_NO_DIRECT -ErrorAction SilentlyContinue
+        }
+
+        if ($oBefore -eq "MISS" -and $oMoved -eq "MISS" -and -not $staleHit -and $oBack -eq "HIT") {
+            Write-Host "  moved header keyed apart, pre-move entry survived: OK ($cc)" -ForegroundColor Green
+        } else {
+            Write-Host "  MOVED-HEADER FAIL ($cc): before=$oBefore moved=$oMoved stale=$staleHit back=$oBack" `
+                -ForegroundColor Red
+            # The launcher's own verbose trace, not just the verdict. This case can
+            # only fail in ways that are invisible from outside — an empty dependency
+            # set keys the two layouts together, and the "N of M reported path(s)
+            # keyed" line separates "the driver reported nothing on the preprocess
+            # line" from "every reported path was filtered out". Without this, each
+            # diagnosis costs a full CI round trip, and this harness runs on a
+            # platform that cannot be reproduced locally.
+            # The root as the launcher was given it, next to the paths the driver
+            # emitted: a root that does not share a spelling with them (an 8.3 short
+            # component, a substituted drive) canonicalizes nothing, which empties
+            # the set and silences the replay guard at the same time — and looks
+            # exactly like a driver that reported nothing.
+            Write-Host "  source root: $moveSrc"
+            Write-Host "  tree now: $((Get-ChildItem -Recurse -File $moveSrc | ForEach-Object FullName) -join ', ')"
+            foreach ($leg in @(@{n="before"; r=$rBefore}, @{n="moved"; r=$rMoved}, @{n="back"; r=$rBack})) {
+                Write-Host "  --- $($leg.n) ---" -ForegroundColor Yellow
+                if ($leg.r) { Write-Host $leg.r.stderr }
+            }
+            $exit = 1
+        }
     }
 
     # --- CLI surface --------------------------------------------------------
@@ -249,7 +465,7 @@ try {
 }
 finally {
     $server | Stop-Process -Force -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force $DeepTemp,$ShallowTemp -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $DeepTemp,$ShallowTemp,$MoveTemp,$EditTemp -ErrorAction SilentlyContinue
     Remove-Item Env:\FASTCACHE_ADDR,Env:\FASTCACHE_SOURCE_DIR,Env:\FASTCACHE_BINARY_DIR,Env:\FASTCACHE_VERBOSE -ErrorAction SilentlyContinue
 }
 
