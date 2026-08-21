@@ -421,3 +421,88 @@ TEST_CASE("Field contents cannot be shifted across a field boundary")
     };
     CHECK(ComputeKey(asArg) != ComputeKey(asPath));
 }
+
+// --- the object output must be relativized in EITHER spelling ----------------
+
+TEST_CASE("RelativizeArgs tokenizes a fused object-output path on both drivers")
+{
+    // Regression guard. The separated spellings (`/Fo <path>`, `-o <path>`) reach
+    // the bare-path branch, because the value is then an argument of its own — so
+    // they were relativized, and the case above ("a leading slash still introduces
+    // an option") passed while the fused form was broken. The fused ones went
+    // through the flag table, which listed the include-dir prefixes and nothing
+    // else, so `/Fo<abs>` came back verbatim with the producing machine's object
+    // path still in it.
+    //
+    // Every build system that drives MSVC writes the fused form, so on Windows
+    // this was not an edge case: it was the shape of every compile, and two
+    // checkouts at different roots could never share an entry.
+    auto const msvc = Relativize({ R"(/FoD:\s\deep\a\b\build\u.obj)" }, R"(D:\s\deep\a\b\src)", R"(D:\s\deep\a\b\build)");
+    CHECK(msvc[0] == "/Fo<BUILDTREE>/u.obj");
+
+    auto const gnu = Relativize({ "-o/home/dev/proj/build/u.o" }, "/home/dev/proj", "/home/dev/proj/build");
+    CHECK(gnu[0] == "-o<BUILDTREE>/u.o");
+}
+
+TEST_CASE("The fused and separated object-output spellings relativize to the same value")
+{
+    // The property the two tables could not keep: which spelling the build system
+    // chose is not a fact about the compilation, so it must not change what the
+    // key sees of the object path.
+    auto const fused = Relativize({ R"(/FoC:\src\proj\build\a.obj)" }, R"(C:\src\proj)", R"(C:\src\proj\build)");
+    auto const separated = Relativize({ "/Fo", R"(C:\src\proj\build\a.obj)" }, R"(C:\src\proj)", R"(C:\src\proj\build)");
+
+    REQUIRE(separated.size() == 2);
+    CHECK(fused[0] == "/Fo" + separated[1]);
+}
+
+TEST_CASE("A fused object output does not keep two Windows checkouts from sharing a key")
+{
+    // What the defect actually cost, stated as the property the launcher exists
+    // to provide. This is the MSVC mirror of "Two POSIX checkouts at different
+    // depths relativize identically", and it failed on every Windows build:
+    // `/Fo` carries an absolute path under the build tree, so the deep and the
+    // shallow checkout hashed different argument lists for identical content.
+    std::vector<std::string> const deep { "/nologo",
+                                          "/c",
+                                          "/showIncludes",
+                                          R"(/FoD:\s\deep\a\b\build\u.obj)",
+                                          R"(/ID:\s\deep\a\b\src\inc)",
+                                          R"(D:\s\deep\a\b\src\u.cpp)" };
+    std::vector<std::string> const shallow { "/nologo",           "/c",
+                                             "/showIncludes",     R"(/FoC:\w\build\u.obj)",
+                                             R"(/IC:\w\src\inc)", R"(C:\w\src\u.cpp)" };
+
+    auto const fromDeep = RelativizeArgs(deep, R"(D:\s\deep\a\b\src)", R"(D:\s\deep\a\b\build)");
+    auto const fromShallow = RelativizeArgs(shallow, R"(C:\w\src)", R"(C:\w\build)");
+    CHECK(fromDeep == fromShallow);
+
+    KeyInputs const a {
+        .compilerId = "cl 19.51", .preprocessed = "int g(){return 1;}", .relativizedArgs = fromDeep, .dependencyPaths = {}
+    };
+    KeyInputs const b {
+        .compilerId = "cl 19.51", .preprocessed = "int g(){return 1;}", .relativizedArgs = fromShallow, .dependencyPaths = {}
+    };
+    CHECK(ComputeKey(a) == ComputeKey(b));
+}
+
+TEST_CASE("A fused value joined through a separator keeps its separator")
+{
+    // `-MF=dep.d` is the same flag as `-MFdep.d`; the separator belongs to the
+    // flag, not to the path, so it must survive the rewrite rather than be
+    // canonicalized as part of the value or dropped from the argument.
+    auto const out = Relativize({ "-MF=/home/dev/proj/build/a.d" }, "/home/dev/proj", "/home/dev/proj/build");
+    CHECK(out[0] == "-MF=<BUILDTREE>/a.d");
+}
+
+TEST_CASE("A relative object output is left exactly as the build system spelled it")
+{
+    // The complement, and the reason this change re-keys only the builds it has
+    // to: a path under neither root canonicalizes to itself, so the argument
+    // comes back byte-for-byte and its key does not move.
+    auto const msvc = Relativize({ R"(/Fobuild\u.obj)" }, R"(C:\src\proj)", R"(C:\src\proj\build)");
+    CHECK(msvc[0] == R"(/Fobuild\u.obj)");
+
+    auto const gnu = Relativize({ "-obuild/u.o" }, "/home/dev/proj", "/home/dev/proj/build");
+    CHECK(gnu[0] == "-obuild/u.o");
+}

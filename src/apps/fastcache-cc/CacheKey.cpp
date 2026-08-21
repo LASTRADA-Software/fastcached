@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheKey.hpp"
+#include "CmdLine.hpp"
 #include "KeyDigest.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 
-#include <array>
 #include <span>
 #include <string>
 #include <string_view>
@@ -15,68 +15,70 @@ namespace FastCache::Cc
 namespace
 {
 
-    /// Include-dir flag prefixes whose trailing value is a path we relativize,
-    /// paired with the leading character that introduces them.
-    ///
-    /// Order matters: the longer `/external:I` must be tried before `/I`. The
-    /// `/`-led spellings are MSVC's and are only recognised under a Windows
-    /// layout — on POSIX a leading slash begins an absolute path, and matching
-    /// `/I` there would split a checkout rooted at `/Infra` into the prefix
-    /// `/I` plus the fragment `nfra/...`, which lies under neither root and so
-    /// comes back verbatim with the absolute path still embedded in the key.
-    constexpr std::array<std::string_view, 4> IncludePrefixes { "/external:I", "-external:I", "/I", "-I" };
-
-    /// True if `c` introduces a command-line option in the MSVC style, for the
-    /// layout being relativized against.
+    /// The characters that introduce a command-line option under `layout`, which
+    /// is the one question behind both halves of RelativizeOne: which spellings
+    /// of a path-valued flag may match, and which arguments are bare paths.
     ///
     /// The answer comes from the LAYOUT, not from the compiling host. A leading
-    /// `/` introduces an option under a Windows layout, but on POSIX it starts
-    /// an absolute path; treating it as an option there would leave absolute
-    /// paths unrelativized and bake the checkout location into the cache key —
-    /// the exact failure that breaks cross-checkout sharing.
+    /// `/` introduces an option under a Windows layout, but on POSIX it starts an
+    /// absolute path; treating it as an option there would leave absolute paths
+    /// unrelativized and bake the checkout location into the cache key — the
+    /// exact failure that breaks cross-checkout sharing. Matching `/I` there
+    /// would split a checkout rooted at `/Infra` into the prefix `/I` plus the
+    /// fragment `nfra/...`, which lies under neither root and so comes back
+    /// verbatim with the absolute path still embedded in the key.
     ///
     /// Keying off `_WIN32` instead would make a Windows-hosted launcher
     /// mis-handle POSIX paths, and it made the behaviour untestable from the
     /// other platform. `PathCanon::IsWindowsLayout` is the one definition of
     /// "is this a Windows layout", shared with the canonicalizer, so the two
-    /// cannot drift apart on a root such as `C:/src/proj`.
+    /// cannot drift apart on a root such as `C:/src/proj`; `IntroducersOf` is
+    /// the one definition of what each family's options start with, shared with
+    /// the parser.
     ///
-    /// @param c      The argument's first character.
     /// @param layout The layout whose path conventions apply.
-    /// @return True when `c` introduces an option under that layout.
-    [[nodiscard]] bool IsWindowsOptionPrefix(char c, PathCanon::Layout const& layout) noexcept
+    /// @return The introducer characters recognised for it.
+    [[nodiscard]] std::string_view IntroducersFor(PathCanon::Layout const& layout) noexcept
     {
-        return c == '/' && PathCanon::IsWindowsLayout(layout);
+        return IntroducersOf(PathCanon::IsWindowsLayout(layout) ? DriverFamily::Any : DriverFamily::Gnu);
     }
 
-    /// Relativize one argument against both roots: if it is a bare path or an
-    /// include-dir flag whose path lies under the source root or the build tree,
-    /// replace the path portion with its canonical token; otherwise return it
-    /// unchanged. PathCanon prefers the longer-matching root, so a build tree
+    /// Relativize one argument against both roots: if it is a bare path or a
+    /// path-valued flag whose fused value lies under the source root or the build
+    /// tree, replace the path portion with its canonical token; otherwise return
+    /// it unchanged. PathCanon prefers the longer-matching root, so a build tree
     /// nested under the source root tokenizes to `<BUILDTREE>`.
     /// @param arg    The raw argument.
     /// @param layout The source-root / build-tree layout to relativize against.
     /// @return The (possibly) relativized argument.
     [[nodiscard]] std::string RelativizeOne(std::string_view arg, PathCanon::Layout const& layout)
     {
-
-        // Include-dir forms: <prefix><path>. A `/`-led spelling is only an
-        // option under a Windows layout; under POSIX it is the head of an
-        // absolute path and must fall through to the bare-path branch below,
-        // or a checkout rooted at `/Infra` would be mis-split at `/I`.
-        for (std::string_view const prefix: IncludePrefixes)
+        // Fused path-valued flags: <flag><path>, e.g. `/IC:\src\inc` and
+        // `/FoC:\src\build\u.obj`. Every role is relativized, because every one
+        // of these values is a path on the producing machine and the key must
+        // carry none of them; the object output is the one that used to be
+        // missed, since only its SEPARATED spelling reached the bare-path branch
+        // below and a `/Fo<abs>` line therefore keyed per checkout.
+        //
+        // These args are used for the KEY only and never to run a compiler, and
+        // the layout does not say which driver produced them, so every family's
+        // rows are offered. A row matched against another family's flag costs
+        // nothing — MSVC's `-MTd` (the static multithreaded runtime) against the
+        // GNU `-MT` row is the case to have in mind: the tail is not a path under
+        // either root, canonicalization is a no-op, and the argument comes back
+        // byte-for-byte.
+        //
+        // What the LAYOUT does decide is which introducers may match — see
+        // IntroducersFor. A `/`-led spelling under a POSIX layout must fall
+        // through to the bare-path branch below, or a checkout rooted at
+        // `/Infra` is mis-split at `/I`.
+        if (auto const match = MatchPathValueFlag(arg, IntroducersFor(layout), DriverFamily::Any);
+            match.has_value() && !match->value.empty())
         {
-            if (prefix.starts_with('/') && !PathCanon::IsWindowsLayout(layout))
-                continue;
-
-            if (arg.starts_with(prefix) && arg.size() > prefix.size())
-            {
-                std::string_view const path = arg.substr(prefix.size());
-                auto const canon = PathCanon::Canonicalize(path, layout);
-                if (canon.has_value() && *canon != path)
-                    return std::string { prefix } + *canon;
-                return std::string { arg };
-            }
+            auto const canon = PathCanon::Canonicalize(match->value, layout);
+            if (canon.has_value() && *canon != match->value)
+                return std::string { match->prefix } + *canon;
+            return std::string { arg };
         }
 
         // Bare path argument (a source file or a response path). Only rewrite when
@@ -88,7 +90,7 @@ namespace
         // those would leave the checkout path in the key — which is exactly
         // what breaks cross-machine sharing, since two checkouts at different
         // paths would then key differently despite identical content.
-        if (!arg.empty() && arg.front() != '-' && !IsWindowsOptionPrefix(arg.front(), layout))
+        if (!arg.empty() && !IntroducersFor(layout).contains(arg.front()))
         {
             auto const canon = PathCanon::Canonicalize(arg, layout);
             if (canon.has_value())
@@ -139,6 +141,23 @@ std::string ComputeKey(KeyInputs const& inputs)
     // value across 2000 random equal-length blobs, and a full 32-hex-char
     // collision after 86,125 of them -- the birthday bound for the 32 bits it
     // really had, against ~10^5 entries a shared team cache reaches.
+    //
+    // v3 deliberately did NOT move when RelativizeArgs learned to tokenize a
+    // FUSED object-output path, even though that changes the key of every
+    // Windows build. The tag versions this CONSTRUCTION and the rules the stored
+    // value is written under, and neither moved: the golden vector below is
+    // unchanged, and so is the value's framing and canonicalization. What
+    // changed is one input, for the builds whose command line carried a
+    // machine-specific string it should never have carried. Old entries stay
+    // correct in their own terms; they simply stop being addressed, miss, and
+    // are rewritten. A bump cannot be reached from there -- an old key can only
+    // become a new key by a build literally passing the text `<BUILDTREE>`, and
+    // a `/Fo` path that was already relative canonicalizes to itself and does
+    // not move at all -- while it WOULD invalidate every POSIX entry, where
+    // nothing changed. Direct mode needs no bump for the same reason and not by
+    // luck: ComputeManifestKey takes the relativized args too, so a manifest
+    // key moves exactly where an object key does, in lock-step, for exactly the
+    // builds affected.
     KeyDigest digest { "objkey-v3" };
     digest.Field(inputs.compilerId);
     digest.Field(inputs.preprocessed);
