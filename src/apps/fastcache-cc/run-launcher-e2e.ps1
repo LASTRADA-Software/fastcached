@@ -39,44 +39,17 @@ param(
     [string]$Fastcached  = "$PSScriptRoot/../../out/build/clangcl-debug/target/fastcached.exe",
     [string]$Launcher    = "$PSScriptRoot/../../out/build/clangcl-debug/target/fastcache-cc.exe",
     [int]$Port           = 21714,
-    [string]$DeepTemp    = "$env:TEMP/cc-l-deep",
-    [string]$ShallowTemp = "$env:TEMP/cc-l-shallow",
-    [string]$MoveTemp    = "$env:TEMP/cc-l-move",
-    [string]$EditTemp    = "$env:TEMP/cc-l-edit"
+    # Left empty on purpose: these default to a directory beside the build tree,
+    # computed once the launcher path is resolved. See the note there for why not
+    # %TEMP%. Passing one explicitly still works and is honoured verbatim.
+    [string]$DeepTemp,
+    [string]$ShallowTemp,
+    [string]$MoveTemp,
+    [string]$EditTemp
 )
 
 $ErrorActionPreference = "Stop"
 $exit = 0
-
-# Expand 8.3 short components in the scratch roots before anything is compiled.
-#
-# $env:TEMP is `C:\Users\RUNNER~1\...` on a GitHub Windows runner, and the two
-# drivers disagree about what to do with that: `cl` resolves an include through
-# the filesystem and reports the LONG name, while clang-cl echoes the spelling it
-# was handed. A root spelled the short way therefore matches nothing `cl` emits,
-# and PathCanon classifies every one of its headers as outside both roots — which
-# silently empties the keyed dependency set AND makes the replay guard skip the
-# very paths it exists to check, so a moved header keys identically and nothing
-# reports it. That is a real launcher limitation (see AGENT.md) and not what this
-# harness is here to measure, so the roots are normalized once and the cases below
-# test what they are named for.
-#
-# Only Scripting.FileSystemObject expands 8.3 — Resolve-Path, Get-Item and
-# [IO.Path]::GetFullPath all preserve the short form. The directory must exist
-# first, and a failure falls back to the path as given rather than aborting: on a
-# volume with 8.3 generation disabled there is nothing to expand.
-function Get-LongPath([string]$path) {
-    if (-not (Test-Path $path)) { New-Item -ItemType Directory -Force -Path $path | Out-Null }
-    # Absolute and backslash-separated before FSO sees it: the defaults above are
-    # built with "/" and this COM object predates forward-slash tolerance.
-    $native = (Resolve-Path -LiteralPath $path).Path
-    try {
-        $fso = New-Object -ComObject Scripting.FileSystemObject
-        return $fso.GetFolder($native).Path
-    } catch {
-        return $native
-    }
-}
 
 # CTest's SKIP_RETURN_CODE. A missing binary or compiler is a missing runtime
 # prerequisite, not a failure, so it must be distinguishable from a real fault.
@@ -86,12 +59,30 @@ $ranAnyCompiler = $false
 if (-not (Test-Path $Fastcached)) { Write-Host "fastcached not found: $Fastcached; skipping"; exit $SKIP }
 if (-not (Test-Path $Launcher))   { Write-Host "fastcache-cc not found: $Launcher; skipping"; exit $SKIP }
 
-# After the skip checks, because Get-LongPath has to create a directory to resolve
-# it and a run that verifies nothing should leave nothing behind.
-$DeepTemp = Get-LongPath $DeepTemp
-$ShallowTemp = Get-LongPath $ShallowTemp
-$MoveTemp = Get-LongPath $MoveTemp
-$EditTemp = Get-LongPath $EditTemp
+# Scratch trees live beside the build tree, not under %TEMP%.
+#
+# On a GitHub Windows runner %TEMP% is `C:\Users\RUNNER~1\...` — an 8.3 short
+# name — and the two drivers disagree about it: `cl` resolves an include through
+# the filesystem and reports the LONG name, while clang-cl echoes the spelling it
+# was handed. Every root test in the launcher is a string prefix comparison, so a
+# short-spelled root matches nothing `cl` emits: PathCanon classifies all of its
+# headers as outside both roots, which empties the keyed dependency set AND makes
+# the replay guard skip the very paths it exists to check. A moved header then
+# keys identically and nothing reports it (measured: "dependency set: 0 of 1
+# reported path(s) keyed"). That is a launcher limitation — issue #66, see
+# AGENT.md — and not what these cases are here to measure.
+#
+# The build tree is the fix rather than expanding the short name, because there is
+# no dependable way to expand one: Resolve-Path, Get-Item and
+# [IO.Path]::GetFullPath all preserve it, and Scripting.FileSystemObject was tried
+# and echoed it back unchanged. A build directory is derived from the launcher
+# path the caller passed, so it is spelled however they spelled it — and no
+# checkout reached through a short name would have built here in the first place.
+$scratch = Join-Path (Split-Path (Split-Path $Launcher -Parent) -Parent) "cc-l-e2e"
+if (-not $PSBoundParameters.ContainsKey('DeepTemp'))    { $DeepTemp    = Join-Path $scratch "deep" }
+if (-not $PSBoundParameters.ContainsKey('ShallowTemp')) { $ShallowTemp = Join-Path $scratch "shallow" }
+if (-not $PSBoundParameters.ContainsKey('MoveTemp'))    { $MoveTemp    = Join-Path $scratch "move" }
+if (-not $PSBoundParameters.ContainsKey('EditTemp'))    { $EditTemp    = Join-Path $scratch "edit" }
 
 # Start-Process resolves a relative -FilePath against the PROCESS working
 # directory, not PowerShell's, so a caller passing "out/build/..." would get a

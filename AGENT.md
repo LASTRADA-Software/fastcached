@@ -237,14 +237,19 @@ These constraints are load-bearing and have each already been a bug:
     two layouts of a moved header key together) *and* `ReplayGuard` skips every path it
     would have checked (so nothing reports it) — and the stored `/showIncludes` region is
     never canonicalized either, so the value carries the producing machine's absolute paths.
-    Symptom to recognise: a replayed note that kept the driver's mixed separators
-    (`...\src\inc/h1.h`) was never tokenized; a localized one is uniformly native
-    (`...\src\inc\h1.h`). `run-launcher-e2e.ps1` expands its scratch roots with
-    `Scripting.FileSystemObject` — the only API that does; `Resolve-Path`, `Get-Item` and
-    `[IO.Path]::GetFullPath` all preserve the short form — so its cases measure what they
-    are named for. The launcher itself does not normalize, which is issue #66: the fix has
-    to normalize *both* sides or neither, since expanding only the emitted paths breaks
-    clang-cl exactly as spelling only the root long breaks `cl`.
+    Two symptoms to recognise it by, since neither the key nor the guard will say a word:
+    a replayed note that kept the driver's mixed separators (`...\src\inc/h1.h`) was never
+    tokenized, where a localized one is uniformly native (`...\src\inc\h1.h`); and the
+    launcher's `dependency set: N of M reported path(s) keyed` line reads `0 of M` with M
+    non-zero — the probe reported paths and every one was filtered out, which is a
+    different fault from `0 of 0` (a driver that reports nothing on the preprocess line).
+    `run-launcher-e2e.ps1` therefore puts its scratch trees beside the **build tree**
+    rather than under `%TEMP%`; it does not try to expand a short name, because nothing
+    dependably does — `Resolve-Path`, `Get-Item` and `[IO.Path]::GetFullPath` all preserve
+    it, and `Scripting.FileSystemObject` was tried and echoed it back unchanged. The
+    launcher itself does not normalize, which is issue #66: the fix has to normalize *both*
+    sides or neither, since expanding only the emitted paths breaks clang-cl exactly as
+    spelling only the root long breaks `cl`.
 - **`Protocol/CompileCacheWire.hpp` must stay header-only and dependency-free.**
   Same constraint as `Cli/UsageDoc`, same reason: `fastcache-cc` does not link
   the `FastCache` library, so an include of anything from `Net/`, `Cache/`,
