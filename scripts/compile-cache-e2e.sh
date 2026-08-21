@@ -252,7 +252,9 @@ echo "   depfile localized to the consuming checkout"
 
 # The property Ninja actually needs: every dependency a depfile lists must exist.
 # Splices `\`-continuations, drops each rule's target (an output, and here one we
-# deliberately deleted), and stats what remains.
+# deliberately deleted), and stats what remains. The field separator is a string
+# rather than a /regex/ literal: as split()'s third argument a literal evaluates
+# to 0 or 1 in a strictly-POSIX awk, and this runs on the BSD awk macOS ships.
 require_depfile_resolves() {
     local label="$1" depfile="$2"
     local dep
@@ -263,7 +265,7 @@ require_depfile_resolves() {
         sub(/\\$/, "", line) { next }
         {
             sub(/^[^:]*:/, "", line)
-            n = split(line, parts, /[ \t]+/)
+            n = split(line, parts, "[ \t]+")
             for (i = 1; i <= n; i++)
                 if (parts[i] != "")
                     print parts[i]
@@ -307,10 +309,16 @@ SRC
     grep -q "inc/old/Hdr.hpp" "${root}/build/t.d" || fail "${label}: depfile does not name the header"
 
     # Move it. Same bytes, new path — and update the include that finds it.
+    # Rewritten wholesale rather than edited in place: `sed -i` takes a backup
+    # suffix on BSD sed and none on GNU sed, so no single spelling works on both
+    # macOS and Linux, and this script runs on both.
     mkdir -p "${root}/inc/new"
     mv "${root}/inc/old/Hdr.hpp" "${root}/inc/new/Hdr.hpp"
     rmdir "${root}/inc/old"
-    sed -i 's|inc/old/Hdr.hpp|inc/new/Hdr.hpp|' "${root}/t.cpp"
+    cat > "${root}/t.cpp" <<'MOVED'
+#include <inc/new/Hdr.hpp>
+int main() { return answer() - 42; }
+MOVED
     rm -f "${root}/build/t.o" "${root}/build/t.d"
 
     echo "== ${label}: after the move (expect MISS, not a stale HIT) =="
