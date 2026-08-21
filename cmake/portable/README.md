@@ -12,11 +12,23 @@ a module here that quietly grew a dependency on `../Version.cmake` would still
 build fine in this repository and break in every other one, so it is worth
 looking for when reviewing a change to this directory.
 
+| Module | What it does |
+| --- | --- |
+| [`CompileCache.cmake`](#compilecachecmake) | Selects a compiler-cache launcher, and can install one. |
+| `ClangTidy.cmake` | `-DENABLE_TIDY=ON` runs clang-tidy as part of the C++ compile. |
+| `PedanticCompiler.cmake` | Turns on a wide warning set, each flag probed for support first, and optionally makes warnings errors. |
+| `Sanitizers.cmake` | `-DENABLE_SANITIZER_{ADDRESS,UNDEFINED,THREAD}=ON` wires up the matching sanitizer. |
+
+`CompileCache.cmake` is the one written *as* a drop-in: it is documented below
+and covered by `ctest -R compile-cache`. The other three are ordinary build
+configuration that happens to have no tie to this project — they are here
+because they are copyable, not because anything about them is promised to stay
+still.
+
 ## `CompileCache.cmake`
 
 Picks a compiler-cache launcher — `fastcache-cc`, `sccache` or `ccache` — and,
-when asked, installs one that is missing. Its behaviour is covered by
-`ctest -R compile-cache`.
+when asked, installs one that is missing.
 
 ### Using it
 
