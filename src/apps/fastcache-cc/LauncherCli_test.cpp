@@ -312,6 +312,7 @@ TEST_CASE("the help text documents every environment variable the launcher reads
                              "FASTCACHE_NO_STATS",
                              "FASTCACHE_NO_DIRECT",
                              "FASTCACHE_TIMEOUT_MS",
+                             "FASTCACHE_MAX_STORE_BYTES",
                              "LOCALAPPDATA",
                              "XDG_STATE_HOME",
                              "HOME" })

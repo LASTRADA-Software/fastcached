@@ -60,6 +60,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -109,6 +110,9 @@ struct Config
     /// default keeps a wedged daemon from hanging a build while staying far
     /// above any healthy round-trip, including multi-megabyte objects.
     std::chrono::milliseconds ioTimeout { DefaultIoTimeout };
+    /// Largest encoded value the launcher will offer to the daemon; 0 = no
+    /// limit. See Cc::IsStorableSize for why this is a client-side policy.
+    std::size_t maxStoreBytes { Cc::DefaultMaxStoreBytes };
 };
 
 /// Read an environment variable, or a fallback when unset/empty.
@@ -131,16 +135,17 @@ struct Config
     return !EnvOr(name, "").empty();
 }
 
-/// Read a non-negative millisecond count from the environment.
+/// Read a non-negative integer from the environment.
 ///
-/// Anything unparseable, negative, or trailing junk falls back to `fallback`
-/// rather than failing the compile: a typo in a build-system variable must not
-/// break the build, which is the same principle as every other cache fall-back.
-/// An explicit `0` is honoured and means "no timeout".
+/// Anything unparseable, negative, or carrying trailing junk falls back to
+/// `fallback` rather than failing the compile: a typo in a build-system variable
+/// must not break the build, which is the same principle as every other cache
+/// fall-back. An explicit `0` is honoured, and each caller documents what it
+/// means for that setting.
 /// @param name Variable to read.
 /// @param fallback Value to use when unset or malformed.
-/// @return The parsed duration, or `fallback`.
-[[nodiscard]] std::chrono::milliseconds EnvMillis(std::string_view name, std::chrono::milliseconds fallback)
+/// @return The parsed number, or `fallback`.
+[[nodiscard]] std::uint64_t EnvUnsigned(std::string_view name, std::uint64_t fallback)
 {
     auto const raw = EnvOr(name, "");
     if (raw.empty())
@@ -151,7 +156,18 @@ struct Config
     auto const [ptr, ec] = std::from_chars(begin, end, value);
     if (ec != std::errc {} || ptr != end || value < 0)
         return fallback;
-    return std::chrono::milliseconds { value };
+    return static_cast<std::uint64_t>(value);
+}
+
+/// Read a non-negative millisecond count from the environment. `0` means "no
+/// timeout".
+/// @param name Variable to read.
+/// @param fallback Value to use when unset or malformed.
+/// @return The parsed duration, or `fallback`.
+[[nodiscard]] std::chrono::milliseconds EnvMillis(std::string_view name, std::chrono::milliseconds fallback)
+{
+    auto const count = static_cast<std::uint64_t>(fallback.count());
+    return std::chrono::milliseconds { static_cast<std::int64_t>(EnvUnsigned(name, count)) };
 }
 
 [[nodiscard]] Config LoadConfig()
@@ -165,6 +181,11 @@ struct Config
     c.stats = !EnvSet(Cc::EnvName::NoStats);
     c.direct = !EnvSet(Cc::EnvName::NoDirect);
     c.ioTimeout = EnvMillis(Cc::EnvName::TimeoutMs, DefaultIoTimeout);
+    // Clamped, not merely cast: the reader is 64-bit and `std::size_t` need not
+    // be, and a truncating cast turns a ceiling somebody raised into a tiny one
+    // that silently stops caching almost everything.
+    c.maxStoreBytes = static_cast<std::size_t>(std::min<std::uint64_t>(
+        EnvUnsigned(Cc::EnvName::MaxStoreBytes, Cc::DefaultMaxStoreBytes), std::numeric_limits<std::size_t>::max()));
     return c;
 }
 
@@ -1181,6 +1202,17 @@ void RecordManifest(Config const& cfg,
         value.textRegions.push_back({ .grammar = PathCanon::Grammar::GccDepfile, .bytes = *depText });
 
     auto const encoded = EncodeCompileValue(value);
+    if (!Cc::IsStorableSize(encoded.size(), cfg.maxStoreBytes))
+    {
+        // Still a MISS, and still a successful compile: the object on disk is
+        // the real one. Only the caching of it is declined, and declined here
+        // rather than by the daemon so the build does not spend the transfer to
+        // be refused on every rebuild of this translation unit.
+        Note(std::format(
+            "value {} bytes exceeds {}={}; not caching", encoded.size(), Cc::EnvName::MaxStoreBytes, cfg.maxStoreBytes));
+        return code;
+    }
+
     auto client = TcpClient::Connect(cfg.addr, cfg.ioTimeout);
     if (!client.has_value())
     {

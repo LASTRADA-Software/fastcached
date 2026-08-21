@@ -493,6 +493,58 @@ if grep -qE "MISS|HIT" "${workdir}/noout.log"; then
 fi
 echo "   passed through uncached, object still produced"
 
+# A result too large to be worth caching is another form the launcher declines,
+# and the one that proved a decline could be fatal: it used to stream the object
+# at a daemon that refuses an over-cap frame and closes, and die of SIGPIPE
+# mid-store -- so the build saw a command killed by signal 13 while the object
+# file it asked for sat complete and correct on disk (issue #68). The ceiling
+# declines before a byte moves; what must survive is the compile.
+#
+# Driven through FASTCACHE_MAX_STORE_BYTES rather than a genuinely over-cap
+# object, which would mean generating and pushing 64+ MiB of fixture on every CI
+# run to assert what the ceiling asserts here in milliseconds. The socket-level
+# half -- a write to a peer that hung up reports an error instead of raising a
+# signal -- is pinned in TcpClient_test.
+echo "== a value over FASTCACHE_MAX_STORE_BYTES is skipped, and the build still succeeds =="
+ceiling="${workdir}/ceilproj"
+mkdir -p "${ceiling}/build"
+cat > "${ceiling}/c.cpp" <<'EOF'
+#include <string>
+int main() { return static_cast<int>(std::string{"ceiling"}.size()); }
+EOF
+
+export FASTCACHE_SOURCE_DIR="$ceiling" FASTCACHE_BINARY_DIR="${ceiling}/build"
+
+# 1 byte: every real object clears it, so this needs no assumption about what
+# the compiler emitted.
+FASTCACHE_MAX_STORE_BYTES=1 "$launcher" "$compiler" -std=c++23 -c "${ceiling}/c.cpp" -o "${ceiling}/build/c.o" \
+    2> "${workdir}/ceiling-1.log" \
+    || fail "compile past the store ceiling returned non-zero (the cache broke the build)"
+cat "${workdir}/ceiling-1.log"
+[[ -f "${ceiling}/build/c.o" ]] || fail "compile past the store ceiling produced no object"
+grep -q "MISS" "${workdir}/ceiling-1.log" || fail "compile past the store ceiling was not reported as a MISS"
+grep -q "FASTCACHE_MAX_STORE_BYTES" "${workdir}/ceiling-1.log" \
+    || fail "the skipped store was not explained; an operator cannot act on a silent one"
+grep -q "STORED" "${workdir}/ceiling-1.log" \
+    && fail "a value over the ceiling was stored anyway"
+
+# Nothing was written, so the next compile must MISS again rather than HIT. This
+# is what separates "declined the store" from "stored it and said otherwise".
+rm -f "${ceiling}/build/c.o"
+FASTCACHE_MAX_STORE_BYTES=1 "$launcher" "$compiler" -std=c++23 -c "${ceiling}/c.cpp" -o "${ceiling}/build/c.o" \
+    2> "${workdir}/ceiling-2.log" || fail "second compile past the store ceiling returned non-zero"
+grep -q "MISS" "${workdir}/ceiling-2.log" || fail "a value over the ceiling was cached after all"
+echo "   store declined, compile succeeded, nothing cached"
+
+# The ceiling is opt-out: with it disabled the same TU caches normally, so a
+# regression that left the check permanently on would surface here.
+rm -f "${ceiling}/build/c.o"
+FASTCACHE_MAX_STORE_BYTES=0 "$launcher" "$compiler" -std=c++23 -c "${ceiling}/c.cpp" -o "${ceiling}/build/c.o" \
+    2> "${workdir}/ceiling-3.log" || fail "compile with the store ceiling disabled returned non-zero"
+grep -q "STORED" "${workdir}/ceiling-3.log" \
+    || fail "FASTCACHE_MAX_STORE_BYTES=0 did not disable the ceiling"
+echo "   ceiling disabled by 0, as documented"
+
 # A flag that merely starts like a dropped one must not be dropped: -coverage
 # begins with -c, and eating it used to break preprocessing and force a
 # permanent, silent fallback to uncached compiles.
@@ -538,7 +590,7 @@ echo "   retired flags exit 2 with a diagnostic"
 "$launcher" -z >/dev/null || fail "-z returned non-zero"
 "$launcher" --zero-stats >/dev/null || fail "--zero-stats returned non-zero"
 
-echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, cross-depth," \
+echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, store ceiling, cross-depth," \
      "moved-header convergence (both layouts keyed apart), an edit re-keying," \
      "and safe fallback"
 exit 0

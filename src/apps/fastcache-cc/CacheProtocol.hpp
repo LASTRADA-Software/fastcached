@@ -63,4 +63,33 @@ struct CacheOutcome
 /// @return The outcome; `kind == Hit` means the daemon acknowledged the write.
 [[nodiscard]] CacheOutcome CacheStore(ITcpClient& client, CompileCacheWire::StoreRequest const& request);
 
+/// Default ceiling on a value the launcher will offer to the daemon.
+///
+/// 256 MiB, matching the daemon's own `--storage-max-value` default, so that out
+/// of the box the launcher does not spend a build's time pushing something the
+/// other side is certain to refuse. The two are separate settings on separate
+/// processes that never negotiate -- the wire has no handshake by design -- so
+/// this agreement is a chosen default, not a derived one, and either side can be
+/// retuned without the other noticing.
+inline constexpr std::size_t DefaultMaxStoreBytes = 256UL * 1024UL * 1024UL;
+
+/// Whether a value of `valueBytes` is worth offering to the daemon at all.
+///
+/// A single object file can be enormous -- a C++23 translation unit built with
+/// `-g` reached 356 MB in the report that prompted this -- and one entry that
+/// size would dominate a cache sized for thousands of ordinary objects. Past the
+/// limit the launcher stores nothing: the compile has already succeeded, so the
+/// build is unaffected and only this one result stays uncached.
+///
+/// This is a *client* policy, deliberately checked before connecting rather than
+/// left for the daemon to refuse. Sending it anyway costs the transfer on every
+/// rebuild of that translation unit, and pays it to be told no.
+/// @param valueBytes Size of the encoded value.
+/// @param limitBytes The ceiling; **0 means no limit**, not "store nothing".
+/// @return True when the value may be sent.
+[[nodiscard]] constexpr bool IsStorableSize(std::size_t valueBytes, std::size_t limitBytes) noexcept
+{
+    return limitBytes == 0 || valueBytes <= limitBytes;
+}
+
 } // namespace FastCache::Cc
