@@ -119,6 +119,22 @@ CheckOptions:
     value:           'NULL'
   - key:             modernize-use-default-member-init.UseAssignment
     value:           '1'
+  # Variable naming, and the reason it is spelled as a *Case* rule. There is no
+  # "forbid this prefix" option -- readability-identifier-naming's ...Prefix keys
+  # only ever REQUIRE a prefix -- so a case rule is how a Hungarian prefix is
+  # rejected: `g_verbose` is neither camelBack nor CamelCase, and WarningsAsErrors
+  # is "*", so it fails the build rather than a review. A `g_` is a substitute for
+  # a naming convention rather than one; a file-scope name is spelled like any
+  # other name of its kind, and if that reads badly at the call site, that is the
+  # design saying it should have been injected rather than reached for.
+  - key:             readability-identifier-naming.GlobalVariableCase
+    value:           camelBack
+  - key:             readability-identifier-naming.GlobalConstantCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.StaticVariableCase
+    value:           camelBack
+  - key:             readability-identifier-naming.StaticConstantCase
+    value:           CamelCase
   - key:             readability-identifier-naming.FunctionCase
     value:           CamelCase
   # await_ready et al. are coroutine customization points whose names are

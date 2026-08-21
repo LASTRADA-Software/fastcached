@@ -869,7 +869,7 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket,
         // tag. The full body was read above, so this is co_await-free through
         // the engine calls in the switch below. Set every command so no
         // connection inherits another's; empty when --log-source is off.
-        Detail::StorageSourceTag = session.sourceTag;
+        Detail::storageSourceTag = session.sourceTag;
         // Non-data opcodes (Quit/Flush/NoOp/Version/Stat/Verbosity/Sasl*) never
         // touch storage; log them at the connection level only under
         // --log-everything.

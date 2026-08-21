@@ -320,7 +320,7 @@ namespace
             // co_await that may have let another connection run and overwrite
             // the thread-local. This block is co_await-free, so the tag stays
             // valid through the engine call TracingStorage logs.
-            Detail::StorageSourceTag = session.sourceTag;
+            Detail::storageSourceTag = session.sourceTag;
             if (commandName == "set")
                 result = engine->Set(parsed.key, std::move(*payload), parsed.flags, parsed.exptime);
             else if (commandName == "add")
@@ -704,7 +704,7 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket,
         // verbs (get/set/...) surface on the TracingStorage `storage:` line,
         // which reads this tag. Set every command so a connection never inherits
         // another's; empty when --log-source is off.
-        Detail::StorageSourceTag = session.sourceTag;
+        Detail::storageSourceTag = session.sourceTag;
         // Non-data verbs (version, stats, quit, meta debug/no-op, ...) never
         // reach storage, so log them at the connection level — only under
         // --log-everything, and only when trace logging is active.

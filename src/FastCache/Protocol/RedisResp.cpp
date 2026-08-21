@@ -4818,7 +4818,7 @@ namespace
         // commands (GET/SET/DEL/...) surface on the TracingStorage `storage:`
         // line, which reads this tag. Set on every command so a connection
         // never inherits another's; empty when --log-source is off.
-        Detail::StorageSourceTag = session.sourceTag;
+        Detail::storageSourceTag = session.sourceTag;
         // Keyless commands (firstKey == 0: PING, HELLO, COMMAND, CLIENT,
         // SUBSCRIBE, ...) never touch storage, so log them at the connection
         // level — only under --log-everything, and only when trace is active.

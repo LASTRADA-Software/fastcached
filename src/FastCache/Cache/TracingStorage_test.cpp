@@ -57,9 +57,9 @@ TEST_CASE("TracingStorage prefixes the line with the published source tag", "[tr
 
     // A handler publishes the client tag immediately before the (synchronous)
     // storage call; the trace line carries it. Restore to empty afterwards.
-    FastCache::Detail::StorageSourceTag = "[203.0.113.7]";
+    FastCache::Detail::storageSourceTag = "[203.0.113.7]";
     auto const got = tracer.Get("foo", clock.Now());
-    FastCache::Detail::StorageSourceTag = {};
+    FastCache::Detail::storageSourceTag = {};
     REQUIRE(got.has_value());
 
     auto const records = logger.Snapshot();
@@ -74,7 +74,7 @@ TEST_CASE("TracingStorage omits the prefix when no source tag is published", "[t
     FastCache::ManualClock clock;
     FastCache::TracingStorage tracer { inner, logger, clock };
 
-    FastCache::Detail::StorageSourceTag = {}; // no source
+    FastCache::Detail::storageSourceTag = {}; // no source
     REQUIRE(tracer.Get("foo", clock.Now()).has_value());
 
     auto const records = logger.Snapshot();

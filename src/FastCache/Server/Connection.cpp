@@ -44,7 +44,7 @@ Task<void> Connection::Run()
 
     // Wire the session collaborators for trace logging:
     //  - `logger`   : connection-level lines (accept line, non-data commands).
-    //  - `sourceTag`: published to Detail::StorageSourceTag by handlers so the
+    //  - `sourceTag`: published to Detail::storageSourceTag by handlers so the
     //                 TracingStorage `storage:` line carries the same client IP.
     // Data operations are logged once, on the storage line — not here.
     _session.logger = &log;

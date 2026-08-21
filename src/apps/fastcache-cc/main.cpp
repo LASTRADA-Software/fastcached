@@ -164,25 +164,32 @@ struct Config
     return c;
 }
 
-bool g_verbose = false;
+/// What this invocation ended up doing, for the statistics log.
+///
+/// Accumulated as the flow proceeds rather than returned through the call chain,
+/// so the cache flow keeps its "exit code or fall back" shape; main() writes the
+/// record once, at the end. One process handles exactly one compile, so this is
+/// per-invocation state rather than shared state — but it is still reached by
+/// name instead of passed, so it lives in a single object where every write to
+/// the eventual record is visible in one declaration.
+struct InvocationRecord
+{
+    bool verbose = false; ///< FASTCACHE_VERBOSE; gates every diagnostic here.
 
-/// What this invocation ended up doing, for the statistics log. Collected here
-/// rather than returned through the call chain so the cache flow keeps its
-/// "exit code or fall back" shape; main() writes the record once, at the end.
-Cc::Outcome g_outcome = Cc::Outcome::Unavailable;
-std::string g_outcomeDetail;
-std::uint64_t g_valueBytes = 0;
+    Cc::Outcome outcome = Cc::Outcome::Unavailable; ///< Hit / Miss / Uncacheable / Unavailable.
+    std::string outcomeDetail;                      ///< Fall-back reason; empty on hit and miss.
+    std::uint64_t valueBytes = 0;                   ///< Cached payload size; 0 when nothing moved.
 
-/// Phase timings for the statistics record, accumulated as the flow proceeds.
-/// Same rationale as the outcome globals above: keeps the cache flow's signature
-/// unchanged while letting main() write one complete record at the end.
-std::uint64_t g_preprocessMs = 0;
-std::uint64_t g_cacheMs = 0;
+    std::uint64_t preprocessMs = 0; ///< Deriving the key (preprocess + compiler id).
+    std::uint64_t cacheMs = 0;      ///< Talking to the daemon (connect + transfer).
 
-/// Direct-mode accounting: how long the manifest shortcut took, and whether it
-/// succeeded (so the report can separate a direct hit from a preprocessed one).
-std::uint64_t g_directMs = 0;
-bool g_directHit = false;
+    /// Direct-mode accounting: how long the manifest shortcut took, and whether it
+    /// succeeded (so the report can separate a direct hit from a preprocessed one).
+    std::uint64_t directMs = 0;
+    bool directHit = false;
+};
+
+InvocationRecord invocation;
 
 /// Milliseconds elapsed since `start`, for the phase counters above.
 [[nodiscard]] std::uint64_t MsSince(std::chrono::steady_clock::time_point start)
@@ -199,7 +206,7 @@ bool g_directHit = false;
 /// @param reason The diagnostic text.
 void Note(std::string_view reason)
 {
-    if (g_verbose)
+    if (invocation.verbose)
         std::cerr << "fastcache-cc: " << reason << '\n';
 }
 
@@ -215,9 +222,9 @@ void Warn(std::string_view reason)
     // cache let us down" — the two need different responses, so the statistics
     // report separates them.
     bool const deliberate = reason.starts_with("uses __TIME__");
-    g_outcome = deliberate ? Cc::Outcome::Uncacheable : Cc::Outcome::Unavailable;
-    g_outcomeDetail = reason;
-    if (g_verbose)
+    invocation.outcome = deliberate ? Cc::Outcome::Uncacheable : Cc::Outcome::Unavailable;
+    invocation.outcomeDetail = reason;
+    if (invocation.verbose)
         std::cerr << "fastcache-cc: cache unavailable (" << reason << "); running real compiler\n";
 }
 
@@ -225,9 +232,9 @@ void Warn(std::string_view reason)
 /// real use to see the cache working, and the signal the E2E harness asserts on.
 void TraceOutcome(std::string_view outcome, std::string_view key)
 {
-    g_outcome = (outcome == "HIT") ? Cc::Outcome::Hit : Cc::Outcome::Miss;
-    g_outcomeDetail.clear();
-    if (g_verbose)
+    invocation.outcome = (outcome == "HIT") ? Cc::Outcome::Hit : Cc::Outcome::Miss;
+    invocation.outcomeDetail.clear();
+    if (invocation.verbose)
         std::cerr << "fastcache-cc: " << outcome << " key=" << key << '\n';
 }
 
@@ -255,8 +262,8 @@ void WarnIfRejected(Cc::CacheOutcome const& outcome, std::string_view what, std:
 /// is chosen behind the IProcessRunner seam.
 [[nodiscard]] Cc::IProcessRunner& ProcessRunner()
 {
-    static std::unique_ptr<Cc::IProcessRunner> const runner = Cc::MakeProcessRunner();
-    return *runner;
+    static std::unique_ptr<Cc::IProcessRunner> const Runner = Cc::MakeProcessRunner();
+    return *Runner;
 }
 
 using Cc::CompileRun;
@@ -618,7 +625,7 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
             replayErr = localizedText[idx];
     }
     ReplayStreams(replayOut, replayErr);
-    g_valueBytes = decoded->objectBlob.size();
+    invocation.valueBytes = decoded->objectBlob.size();
     TraceOutcome("HIT", key);
     return 0;
 }
@@ -684,7 +691,7 @@ void RecordManifest(Config const& cfg,
     auto const manifest = Cc::BuildManifest(includes, layout, toolchainStamp, objectKeyForPointer);
     if (!manifest.has_value())
     {
-        if (g_verbose)
+        if (invocation.verbose)
             std::cerr << "fastcache-cc: manifest not built (uncanonicalizable include)\n";
         return;
     }
@@ -702,7 +709,7 @@ void RecordManifest(Config const& cfg,
              cfg,
              manifestKey,
              std::string_view { reinterpret_cast<char const*>(manifestFrame.data()), manifestFrame.size() });
-    if (g_verbose)
+    if (invocation.verbose)
         std::cerr << "fastcache-cc: MANIFEST stored key=" << manifestKey << " entries=" << manifest->entries.size() << '\n';
 }
 
@@ -730,7 +737,7 @@ void RecordManifest(Config const& cfg,
     // Every early return records how long the attempt took, so the statistics
     // show the cost of a direct-mode miss as well as a direct-mode hit.
     auto const giveUp = [directStarted]() -> std::optional<int> {
-        g_directMs = MsSince(directStarted);
+        invocation.directMs = MsSince(directStarted);
         return std::nullopt;
     };
 
@@ -752,12 +759,12 @@ void RecordManifest(Config const& cfg,
     if (!manifest.has_value() || manifest->objectKey.empty() || !Cc::ValidateManifest(*manifest, layout, toolchainStamp))
         return giveUp();
 
-    g_directMs = MsSince(directStarted);
+    invocation.directMs = MsSince(directStarted);
     // Follow the manifest's pointer to the object, which is stored exactly once
     // under its ordinary preprocessed key.
     auto served = TryServeFromCache(cfg, cmd, manifest->objectKey, layout);
     if (served.has_value())
-        g_directHit = true;
+        invocation.directHit = true;
     return served;
 }
 
@@ -810,7 +817,7 @@ void RecordManifest(Config const& cfg,
         .relativizedArgs = relativizedArgs,
     };
     std::string const key = Cc::ComputeKey(inputs);
-    g_preprocessMs = MsSince(preprocessStarted);
+    invocation.preprocessMs = MsSince(preprocessStarted);
 
     auto const cacheStarted = std::chrono::steady_clock::now();
 
@@ -880,8 +887,8 @@ void RecordManifest(Config const& cfg,
                     replayErr = localizedText[idx];
             }
             ReplayStreams(replayOut, replayErr);
-            g_valueBytes = decoded->objectBlob.size();
-            g_cacheMs = MsSince(cacheStarted);
+            invocation.valueBytes = decoded->objectBlob.size();
+            invocation.cacheMs = MsSince(cacheStarted);
 
             // Backfill the direct-mode manifest from the hit we just served.
             //
@@ -898,7 +905,7 @@ void RecordManifest(Config const& cfg,
         }
         // MISS — fall through to compile.
     }
-    g_cacheMs = MsSince(cacheStarted);
+    invocation.cacheMs = MsSince(cacheStarted);
     TraceOutcome("MISS", key);
 
     // MISS: run the real compiler with SEPARATE stdout/stderr capture, then STORE.
@@ -1127,7 +1134,7 @@ int main(int argc, char** argv)
     }
 
     Config const cfg = LoadConfig();
-    g_verbose = cfg.verbose;
+    invocation.verbose = cfg.verbose;
 
     auto const cmd = Cc::ParseCommand(std::span<std::string const> { args });
     if (!cmd.parsedOk)
@@ -1145,16 +1152,16 @@ int main(int argc, char** argv)
     {
         auto const elapsed = std::chrono::steady_clock::now() - started;
         Cc::AppendRecord({
-            .outcome = g_outcome,
+            .outcome = invocation.outcome,
             .prefetchGroup = cfg.prefetchGroup,
             .source = cmd.source,
-            .valueBytes = g_valueBytes,
+            .valueBytes = invocation.valueBytes,
             .elapsedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()),
-            .detail = g_outcomeDetail,
-            .preprocessMs = g_preprocessMs,
-            .cacheMs = g_cacheMs,
-            .directMs = g_directMs,
-            .directHit = g_directHit,
+            .detail = invocation.outcomeDetail,
+            .preprocessMs = invocation.preprocessMs,
+            .cacheMs = invocation.cacheMs,
+            .directMs = invocation.directMs,
+            .directHit = invocation.directHit,
         });
     }
     return code;
