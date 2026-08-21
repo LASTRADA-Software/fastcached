@@ -1166,7 +1166,7 @@ jobs:
         shell: pwsh
         working-directory: out/build/cl-release
         run: |
-          cpack -G WIX
+          cpack -G "WIX;ZIP"
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             $log = '_CPack_Packages/win64/WIX/wix.log'
@@ -1313,11 +1313,13 @@ jobs:
       # Named fastcached-<platform>-packages like the Linux and macOS jobs, so the
       # release job below collects all three with one pattern and a new platform
       # is a new upload row rather than an edit there.
-      - name: "Upload the MSI"
+      - name: "Upload the MSI and the ZIP"
         uses: actions/upload-artifact@v4
         with:
           name: fastcached-windows-packages
-          path: out/build/cl-release/*.msi
+          path: |
+            out/build/cl-release/*.msi
+            out/build/cl-release/*.zip
           if-no-files-found: error
 
   # The release gate. Its contract is narrow and total: it runs only for a tag,
@@ -1519,3 +1521,4 @@ jobs:
             dist/fastcached-*-Darwin-arm64.dmg
             dist/fastcached-*-Darwin-arm64.tar.gz
             dist/fastcached-*-Windows-AMD64.msi
+            dist/fastcached-*-Windows-AMD64.zip

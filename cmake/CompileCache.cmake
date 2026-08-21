@@ -196,7 +196,7 @@ endif()
 #                            directory, which differs per platform because the
 #                            packages install to different prefixes
 #   _fc_asset_<id>_exe       staged executable's filename
-set(_fc_asset_rows linux_x86_64 darwin_arm64)
+set(_fc_asset_rows linux_x86_64 darwin_arm64 windows_amd64)
 
 set(_fc_asset_linux_x86_64_system "Linux")
 set(_fc_asset_linux_x86_64_arch x86_64 amd64 AMD64)
@@ -211,6 +211,18 @@ set(_fc_asset_darwin_arm64_platform "Darwin-arm64")
 set(_fc_asset_darwin_arm64_ext "tar.gz")
 set(_fc_asset_darwin_arm64_member "opt/fastcached/bin/fastcache-cc")
 set(_fc_asset_darwin_arm64_exe "fastcache-cc")
+
+# The Windows archive is a plain ZIP rather than the MSI beside it: an installer
+# is not something this can open, and the launcher is one self-contained file
+# with no VC++ redistributable behind it. Its interior differs from the two
+# above because the Windows package is the only one not rooted at /, so its
+# binaries sit at the conventional bin/ rather than usr/bin or opt/fastcached.
+set(_fc_asset_windows_amd64_system "Windows")
+set(_fc_asset_windows_amd64_arch AMD64 x86_64 x64)
+set(_fc_asset_windows_amd64_platform "Windows-AMD64")
+set(_fc_asset_windows_amd64_ext "zip")
+set(_fc_asset_windows_amd64_member "bin/fastcache-cc.exe")
+set(_fc_asset_windows_amd64_exe "fastcache-cc.exe")
 
 # Pick the row serving this host.
 # @param outVar Receives the row id, or empty when no binary is published for it.
