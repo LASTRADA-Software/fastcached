@@ -43,6 +43,7 @@ set(_fc_cc_sources
     CacheProtocol.cpp
     DependencyProbe.cpp
     DirectManifest.cpp
+    PathResolve.cpp
     ReplayGuard.cpp
     Stats.cpp
     ProcessRunner.cpp
@@ -93,6 +94,7 @@ if(FASTCACHED_BUILD_TESTS)
         CacheProtocol_test.cpp
         DependencyProbe_test.cpp
         DirectManifest_test.cpp
+        PathResolve_test.cpp
         ReplayGuard_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp
