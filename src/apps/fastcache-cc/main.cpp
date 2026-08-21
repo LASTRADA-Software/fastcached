@@ -64,6 +64,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -645,8 +646,15 @@ struct MaterializedHit
     if (cmd.depPath.empty() && assertions.size() > DepFileRegionIndex)
         assertions = assertions.first(DepFileRegionIndex);
 
-    if (auto const missing = Cc::MissingReplayedDependency(assertions, layout, std::filesystem::current_path());
-        missing.has_value())
+    // current_path() through its error_code overload, and "." when even that
+    // fails: the throwing overload would abort the launcher, and "." resolves a
+    // relative dependency exactly as the compiler's own working directory would.
+    std::error_code cwdError;
+    auto workingDirectory = std::filesystem::current_path(cwdError);
+    if (cwdError)
+        workingDirectory = ".";
+
+    if (auto const missing = Cc::MissingReplayedDependency(assertions, layout, workingDirectory); missing.has_value())
     {
         // Named rather than merely counted: "why does this TU never cache" is
         // otherwise a whole investigation, and the answer is one path.
