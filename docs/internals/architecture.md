@@ -9,7 +9,7 @@ thing testable end-to-end against an in-memory transport.
 ```
 src/FastCache/
   Core/         Errors taxonomy, Clock (steady + wall + reactor-cached), Logger, BufferPool,
-                Bytes, Endian, Crc32c, StringHash, Owner, Profiling (Tracy)
+                Bytes, Endian, Crc32c, MurmurHash3, StringHash, Owner, Profiling (Tracy)
   Async/        Task<T>, DetachedTask, ResumeOn, SleepUntil/SleepFor,
                 Cancellation, IReactor + TestReactor and the platform reactors
                 (EpollReactor / IocpReactor / KqueueReactor)

@@ -189,8 +189,10 @@ this is worth checking before concluding the cache does not help. With
    versus ~1.4 s on a large translation unit). If that misses, preprocess the
    TU, relativize checkout-rooted arguments against `SOURCE_DIR`/`BINARY_DIR`,
    and hash `(compiler id + preprocessed text + relativized args + dependency
-   paths)` into a 128-bit key. The dependency set comes from that same
-   preprocess run — `-MD` into a scratch depfile for GNU drivers,
+   paths)` into a 128-bit key — MurmurHash3 x64_128, which is 128 bits of
+   *strength* and not merely 128 bits wide; see the note in `AGENT.md` on why
+   the four-CRC construction it replaced was not. The dependency set comes from
+   that same preprocess run — `-MD` into a scratch depfile for GNU drivers,
    `/showIncludes` for MSVC ones — which costs about 1.5% of it, because the
    compiler has already opened every one of those files.
 2. **FETCH.** On a hit, write the object to the requested output path and replay
@@ -317,7 +319,7 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
   banner from *different* prefixes can still replay a dependency record naming a
   path the consumer lacks. Project headers — the ones that actually move — are
   covered by the key, so this is now confined to the toolchain.
-- The cache key normalization is deliberately young (`objkey-v2`). Tune it
+- The cache key normalization is deliberately young (`objkey-v3`). Tune it
   against real developer↔CI hit rates before relying on it broadly. Bumping the
   schema re-keys the cache: existing entries miss once and are rewritten.
 - Localized path separators may be normalized to `/` in some segments. Ninja

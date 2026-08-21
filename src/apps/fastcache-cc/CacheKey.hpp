@@ -37,9 +37,17 @@ struct KeyInputs
 
 /// Compute the shared cache key as a wide hex digest. Isolated here so the key
 /// derivation can be tuned against real cross-machine hits without touching the
-/// launcher flow. v1 uses a 128-bit multi-lane CRC32C digest over the joined
-/// inputs — not cryptographic, but collision-negligible for a compile cache and
-/// dependency-free.
+/// launcher flow.
+///
+/// A 128-bit MurmurHash3 x64_128 digest (`Core/MurmurHash3.hpp`) over the joined
+/// inputs, reached through `KeyDigest`'s grammar: not cryptographic, but
+/// collision-negligible for a compile cache and dependency-free. It genuinely is
+/// 128 bits — the construction this replaced was four CRC32C runs over one blob
+/// differing only by a salt byte, which carried 32 (issue #63).
+///
+/// The schema version deliberately does not appear here. It is spelled once, in
+/// ComputeKey, next to the construction it versions; naming it in prose as well
+/// gave two places to update and they had already drifted apart.
 /// @param inputs The machine-independent key inputs.
 /// @return A 32-hex-char key string.
 [[nodiscard]] std::string ComputeKey(KeyInputs const& inputs);
