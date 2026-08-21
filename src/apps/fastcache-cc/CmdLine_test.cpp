@@ -360,3 +360,71 @@ TEST_CASE("PreprocessCommand sends MSVC preprocessed text to stdout, never to a 
         CHECK_FALSE(std::ranges::contains(pp, "/P"));
     }
 }
+
+// --- the one path-valued flag table ------------------------------------------
+
+TEST_CASE("A path-valued flag's family is honoured, so /MT's dash spelling is not a depfile target")
+{
+    // The reason a flag row carries a driver family rather than being matched by
+    // its introducer alone. `-MT` names a dependency target for a GNU driver and
+    // selects the static multithreaded runtime for an MSVC one, and MSVC drivers
+    // accept both introducers — so a row matched on `-` would make `cl -MT`
+    // consume the next argument. Here that argument is the source file, and the
+    // line would silently stop being cacheable.
+    auto const msvc = Parse({ "cl.exe", "/c", "-MT", "a.cpp", "/Foa.obj" });
+    CHECK(msvc.source == "a.cpp");
+    CHECK(msvc.objPath == "a.obj");
+    CHECK(msvc.parsedOk);
+    CHECK(msvc.depPath.empty());
+
+    // ...while the GNU driver, whose family the row does belong to, still reads it.
+    CHECK(Parse({ "g++", "-c", "a.cpp", "-o", "a.o", "-MF", "dep/a.d" }).depPath == "dep/a.d");
+}
+
+TEST_CASE("An MSVC driver reads the object output in every spelling it accepts")
+{
+    // `/Fo` and `-o` were two hand-written branches, and `-Fo` — which cl and
+    // clang-cl both accept — was neither, so such a line parsed with no object
+    // path and fell back to an uncached compile. All three are rows of one table
+    // now, matched joined or separated by the same code.
+    CHECK(Parse({ "cl.exe", "/c", R"(/Fob\a.obj)", "a.cpp" }).objPath == R"(b\a.obj)");
+    CHECK(Parse({ "cl.exe", "/c", R"(-Fob\a.obj)", "a.cpp" }).objPath == R"(b\a.obj)");
+    CHECK(Parse({ "cl.exe", "/c", "-o", R"(b\a.obj)", "a.cpp" }).objPath == R"(b\a.obj)");
+    CHECK(Parse({ "clang-cl", "/c", R"(-Fo)", R"(b\a.obj)", "a.cpp" }).objPath == R"(b\a.obj)");
+}
+
+TEST_CASE("PreprocessCommand drops the object output in every spelling, from the shared table")
+{
+    // The drop list no longer spells `/Fo` or `-MF` itself; it drops every
+    // path-valued flag whose role has no business on a preprocess line. So a
+    // spelling added to that table is dropped by construction rather than by
+    // someone remembering to add it here too — which is how `-Fo` used to reach
+    // the probe line and ask a `/EP` run to write an object.
+    for (auto const& flag: { R"(/Fob\a.obj)", R"(-Fob\a.obj)" })
+    {
+        INFO("flag: " << flag);
+        std::vector<std::string> const argv { "cl.exe", "/c", flag, "a.cpp" };
+        auto const pp = PreprocessCommand(Parse(argv), argv);
+        CHECK_FALSE(std::ranges::contains(pp, flag));
+        CHECK(std::ranges::contains(pp, "a.cpp"));
+    }
+
+    // An include directory is the one role that stays: the preprocessor needs it.
+    std::vector<std::string> const gnu { "g++", "-c", "a.cpp", "-o", "a.o", "-Iinc", "-MF", "dep.d" };
+    auto const pp = PreprocessCommand(Parse(gnu), gnu);
+    CHECK(std::ranges::contains(pp, "-Iinc"));
+    CHECK_FALSE(std::ranges::contains(pp, "dep.d"));
+}
+
+TEST_CASE("Every path-valued flag row is spelled with a known introducer")
+{
+    // The table drives matching by introducer, so a row whose spelling begins
+    // with anything else could never match and would be dead configuration —
+    // the mistake PathCanon::CanonError already records.
+    for (PathValueFlag const& row: PathValueFlags())
+    {
+        INFO("row: " << row.spelling);
+        REQUIRE_FALSE(row.spelling.empty());
+        CHECK(IntroducersOf(row.families).contains(row.spelling.front()));
+    }
+}

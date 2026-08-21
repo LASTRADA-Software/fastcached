@@ -57,9 +57,14 @@ namespace
     constexpr std::array<std::string_view, 1> MsvcPreprocess { "/EP" };
     constexpr std::array<std::string_view, 2> GnuPreprocess { "-E", "-P" };
 
-    /// Flags dropped when preprocessing: compile-only and object-output flags
-    /// (we want text on stdout, not an object), plus dependency flags, which
-    /// would otherwise overwrite the real depfile during the key probe.
+    /// Flags dropped when preprocessing that carry no path value of their own:
+    /// the compile-only marker (we want text on stdout, not an object) and the
+    /// dependency-reporting switches, which would otherwise make the probe
+    /// overwrite the build's real depfile.
+    ///
+    /// The object-output and depfile flags are NOT here. They are dropped by
+    /// role, off PathValueFlags(), so `/Fo` and `-MF` are spelled once for the
+    /// whole launcher rather than once per table — see DroppedFromPreprocess.
     ///
     /// Every spelling of `/showIncludes` the drivers accept has to be here, not
     /// just the one the parser looks for: the probe appends its own, the drivers
@@ -67,10 +72,10 @@ namespace
     /// headers. A surviving one would therefore make the key's dependency set
     /// depend on which spelling the build happened to use — the exact invariant
     /// MsvcDependencyProbe exists to establish.
-    constexpr std::array<std::string_view, 7> MsvcDrop {
-        "/c", "/showIncludes", "/showIncludes:user", "-showIncludes", "-showIncludes:user", "/Fo", "-o",
+    constexpr std::array<std::string_view, 5> MsvcDrop {
+        "/c", "/showIncludes", "/showIncludes:user", "-showIncludes", "-showIncludes:user",
     };
-    constexpr std::array<std::string_view, 8> GnuDrop { "-c", "-o", "-MD", "-MMD", "-MF", "-MT", "-MQ", "-MP" };
+    constexpr std::array<std::string_view, 4> GnuDrop { "-c", "-MD", "-MMD", "-MP" };
 
     /// How each driver is asked to report dependencies during the preprocess
     /// probe. `-MD` rather than `-MMD` on purpose: the key's dependency set must
@@ -81,41 +86,80 @@ namespace
 
     constexpr std::array<DriverSpec, 5> Drivers { {
         { .flavor = Flavor::Unknown,
-          .optionPrefixes = "",
-          .objectFlag = "",
+          .family = DriverFamily::None,
           .preprocessFlags = {},
           .preprocessDropFlags = {},
           .dependencyProbeFlags = {},
           .usesDepfile = false },
         { .flavor = Flavor::Cl,
-          .optionPrefixes = "/-",
-          .objectFlag = "/Fo",
+          .family = DriverFamily::Msvc,
           .preprocessFlags = MsvcPreprocess,
           .preprocessDropFlags = MsvcDrop,
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false },
         { .flavor = Flavor::ClangCl,
-          .optionPrefixes = "/-",
-          .objectFlag = "/Fo",
+          .family = DriverFamily::Msvc,
           .preprocessFlags = MsvcPreprocess,
           .preprocessDropFlags = MsvcDrop,
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false },
         { .flavor = Flavor::Gcc,
-          .optionPrefixes = "-",
-          .objectFlag = "-o",
+          .family = DriverFamily::Gnu,
           .preprocessFlags = GnuPreprocess,
           .preprocessDropFlags = GnuDrop,
           .dependencyProbeFlags = GnuDependencyProbe,
           .usesDepfile = true },
         { .flavor = Flavor::Clang,
-          .optionPrefixes = "-",
-          .objectFlag = "-o",
+          .family = DriverFamily::Gnu,
           .preprocessFlags = GnuPreprocess,
           .preprocessDropFlags = GnuDrop,
           .dependencyProbeFlags = GnuDependencyProbe,
           .usesDepfile = true },
     } };
+
+    // --- path-valued flags --------------------------------------------------
+    //
+    // The one table behind three consumers: the parser (which captures the
+    // object output and the depfile), the preprocess line (which drops every
+    // role but IncludeDir), and the cache key (which rewrites every value it can
+    // to a canonical token). See PathValueFlags() in the header for why they must
+    // not be three tables — while they were, the object output was relativized in
+    // its separated spelling and not in its fused one, so a `/Fo<abs>` build baked
+    // the producing machine's object path into every Windows key and two checkouts
+    // at different roots could never share an entry.
+
+    constexpr std::array<PathValueFlag, 10> PathValues { {
+        { .spelling = "/external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
+        { .spelling = "-external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
+        { .spelling = "/Fo", .role = PathValueRole::ObjectOutput, .families = DriverFamily::Msvc },
+        { .spelling = "-Fo", .role = PathValueRole::ObjectOutput, .families = DriverFamily::Msvc },
+        { .spelling = "-MF", .role = PathValueRole::DepFile, .families = DriverFamily::Gnu },
+        { .spelling = "-MT", .role = PathValueRole::DepTarget, .families = DriverFamily::Gnu },
+        { .spelling = "-MQ", .role = PathValueRole::DepTarget, .families = DriverFamily::Gnu },
+        { .spelling = "/I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
+        { .spelling = "-I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Any },
+        { .spelling = "-o", .role = PathValueRole::ObjectOutput, .families = DriverFamily::Any },
+    } };
+
+    /// Which introducer characters each family's options start with.
+    constexpr std::array<std::pair<DriverFamily, std::string_view>, 4> FamilyIntroducers { {
+        { DriverFamily::None, "" },
+        { DriverFamily::Msvc, "/-" },
+        { DriverFamily::Gnu, "-" },
+        { DriverFamily::Any, "/-" },
+    } };
+
+    /// True when a path-valued flag of this role must not reach the preprocess
+    /// line. An object output would make the probe write an object instead of
+    /// text on stdout, and a dependency flag would overwrite the build's own
+    /// depfile with the probe's; an include directory is exactly what the
+    /// preprocessor needs and stays.
+    /// @param role The role to test.
+    /// @return True when the flag (and its value) is dropped.
+    [[nodiscard]] constexpr bool DroppedFromPreprocess(PathValueRole role) noexcept
+    {
+        return role != PathValueRole::IncludeDir;
+    }
 
     /// How a driver's basename is recognised. Order matters: the first match
     /// wins, so longer, more specific stems precede their prefixes
@@ -172,19 +216,21 @@ namespace
     /// True if `a` is an option (starts with one of the driver's introducers).
     [[nodiscard]] bool IsOption(std::string_view a, DriverSpec const& driver)
     {
-        return !a.empty() && driver.optionPrefixes.contains(a.front());
+        return !a.empty() && IntroducersOf(driver.family).contains(a.front());
     }
 
-    /// Flags that carry their value as the NEXT argument when given bare, so
-    /// dropping the flag must drop the value with it.
-    constexpr std::array<std::string_view, 5> ValueFlags { "-o", "/Fo", "-MF", "-MT", "-MQ" };
-
     /// True if `flag`, given bare, consumes the following argument as its value.
+    ///
+    /// Every path-valued flag does, and nothing else the launcher knows about
+    /// does — which is why this is a lookup in the shared table rather than a
+    /// list of its own. It used to be one, and the object output ended up
+    /// relativized in the spelling that table happened to cover.
+    ///
     /// @param flag The flag as it appeared on the command line.
     /// @return True when the next argument belongs to it.
     [[nodiscard]] bool TakesValue(std::string_view flag)
     {
-        return std::ranges::contains(ValueFlags, flag);
+        return std::ranges::any_of(PathValues, [flag](PathValueFlag const& row) { return row.spelling == flag; });
     }
 
     /// Characters that may separate a flag from a value fused onto it.
@@ -242,7 +288,86 @@ namespace
         return arg == flag || IsJoinedValue(arg, flag);
     }
 
+    /// The ParsedCommand field a path-valued flag's value belongs in.
+    ///
+    /// A pointer-to-member rather than a branch per role, so the fused and
+    /// separated forms are unpacked once for every flag the parser captures.
+    /// @param role The matched flag's role.
+    /// @return The field to write, or nullptr for a role the parser does not capture.
+    [[nodiscard]] constexpr std::string ParsedCommand::* DestinationFor(PathValueRole role) noexcept
+    {
+        switch (role)
+        {
+            case PathValueRole::ObjectOutput:
+                return &ParsedCommand::objPath;
+            case PathValueRole::DepFile:
+                return &ParsedCommand::depPath;
+            case PathValueRole::IncludeDir:
+            case PathValueRole::DepTarget:
+                break;
+        }
+        return nullptr;
+    }
+
+    /// Find the flag `arg` must be dropped as, if any: one of the driver's own
+    /// drop flags, or a path-valued flag whose role has no business on a
+    /// preprocess line.
+    /// @param arg    The argument as it appeared on the command line.
+    /// @param driver The driver whose line is being built.
+    /// @return The matched flag spelling, or nullopt to keep the argument.
+    [[nodiscard]] std::optional<std::string_view> MatchDroppedFlag(std::string_view arg, DriverSpec const& driver)
+    {
+        for (std::string_view const flag: driver.preprocessDropFlags)
+            if (MatchesFlag(arg, flag))
+                return flag;
+
+        if (auto const match = MatchPathValueFlag(arg, IntroducersOf(driver.family), driver.family);
+            match.has_value() && DroppedFromPreprocess(match->flag.role))
+            return match->flag.spelling;
+
+        return std::nullopt;
+    }
+
 } // namespace
+
+std::span<PathValueFlag const> PathValueFlags()
+{
+    return PathValues;
+}
+
+std::string_view IntroducersOf(DriverFamily family) noexcept
+{
+    for (auto const& [candidate, introducers]: FamilyIntroducers)
+        if (candidate == family)
+            return introducers;
+    return {};
+}
+
+std::optional<PathValueMatch> MatchPathValueFlag(std::string_view arg, std::string_view introducers, DriverFamily families)
+{
+    if (arg.empty() || !introducers.contains(arg.front()))
+        return std::nullopt;
+
+    for (PathValueFlag const& row: PathValues)
+    {
+        // A row whose introducer this context does not recognise cannot match:
+        // under a POSIX layout `/I` is the head of an absolute path, not a flag.
+        if (!introducers.contains(row.spelling.front()) || !Overlaps(row.families, families))
+            continue;
+        if (!MatchesFlag(arg, row.spelling))
+            continue;
+
+        // A fused value is never empty — IsJoinedValue rejects a bare separator —
+        // so an empty `value` unambiguously means "the value is the next argument".
+        if (arg.size() == row.spelling.size())
+            return PathValueMatch { .flag = row, .prefix = {}, .value = {} };
+
+        auto const tail = arg.substr(row.spelling.size());
+        auto const value = StripJoinSeparator(tail);
+        return PathValueMatch { .flag = row, .prefix = arg.substr(0, arg.size() - value.size()), .value = value };
+    }
+    return std::nullopt;
+}
 
 DriverSpec const& DriverOf(Flavor flavor)
 {
@@ -296,42 +421,30 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
             continue;
         }
 
-        // Object output, joined (`/Fo<path>`) or separated (`/Fo <path>`, `-o <path>`).
-        if (!driver.objectFlag.empty() && MatchesFlag(a, driver.objectFlag))
+        // Path-valued flags, in any spelling this driver accepts, joined
+        // (`/Fo<path>`, `-MFdep.d`) or separated (`/Fo <path>`, `-o <path>`).
+        // Which of them the parser captures is decided by the row's role, so a
+        // driver that spells the object output differently is a table row rather
+        // than a branch here — as `-o`, which every MSVC driver takes alongside
+        // `/Fo`, used to be.
+        if (auto const match = MatchPathValueFlag(a, IntroducersOf(driver.family), driver.family))
         {
-            if (a.size() > driver.objectFlag.size())
-            {
-                out.objPath = std::string { StripJoinSeparator(a.substr(driver.objectFlag.size())) };
+            auto const destination = DestinationFor(match->flag.role);
+            // An include directory or a dependency target goes nowhere, and its
+            // separated value is deliberately left to be scanned rather than
+            // consumed: it is not a source path, so nothing downstream reads it.
+            if (destination == nullptr)
                 continue;
-            }
-            if (i + 1 < args.size())
-            {
-                out.objPath = args[i + 1];
-                skipUntil = i + 2; // consume the value argument
-            }
-            continue;
-        }
-        // MSVC drivers also accept `-o <path>`; GNU drivers never see `/Fo`.
-        if (a == "-o" && i + 1 < args.size())
-        {
-            out.objPath = args[i + 1];
-            skipUntil = i + 2;
-            continue;
-        }
 
-        // Depfile destination (GNU drivers): -MF <path> or -MF<path>.
-        constexpr std::string_view DepFileFlag = "-MF";
-        if (driver.usesDepfile && MatchesFlag(a, DepFileFlag))
-        {
-            if (a.size() > DepFileFlag.size())
+            if (!match->value.empty())
             {
-                out.depPath = std::string { StripJoinSeparator(a.substr(DepFileFlag.size())) };
+                out.*destination = std::string { match->value };
                 continue;
             }
             if (i + 1 < args.size())
             {
-                out.depPath = args[i + 1];
-                skipUntil = i + 2;
+                out.*destination = args[i + 1];
+                skipUntil = i + 2; // consume the value argument
             }
             continue;
         }
@@ -398,9 +511,7 @@ std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
         // pair never leaves a stray "dep.d" argument behind. Matching is exact or
         // joined-with-a-value only — see IsJoinedValue: a prefix match would drop
         // `-coverage` for `-c` and `/clr` for `/c`.
-        auto const dropped =
-            std::ranges::find_if(driver.preprocessDropFlags, [a](std::string_view flag) { return MatchesFlag(a, flag); });
-        if (dropped != driver.preprocessDropFlags.end())
+        if (auto const dropped = MatchDroppedFlag(a, driver))
         {
             // Only the bare form takes the NEXT argument; a joined form already
             // carries its value, so consuming the successor would eat a real flag.

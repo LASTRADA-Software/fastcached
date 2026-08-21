@@ -2,9 +2,11 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace FastCache::Cc
@@ -25,6 +27,105 @@ enum class Flavor : std::uint8_t
     Clang,   ///< clang / clang++ — GNU driver, depfile via -MD -MF.
 };
 
+/// The families of command-line spelling the launcher understands, as a SET.
+///
+/// A set rather than a single value because a spelling can belong to both
+/// families: every MSVC driver accepts `-o` alongside `/Fo`, and `-I` is
+/// universal. It is carried per flag row and per driver, and it is NOT derivable
+/// from a flag's introducer character — `-MT` names a dependency target on a GNU
+/// driver and selects the static multithreaded runtime on an MSVC one, so a row
+/// matched by introducer alone would make `cl -MT` consume the next argument,
+/// which is usually the source file.
+enum class DriverFamily : std::uint8_t
+{
+    None = 0, ///< No recognised spelling (an unknown driver).
+    Msvc = 1, ///< cl, clang-cl.
+    Gnu = 2,  ///< gcc, g++, clang, clang++.
+    Any = 3,  ///< Msvc | Gnu — a spelling every driver accepts.
+};
+
+/// True when two family sets overlap.
+///
+/// A membership test when one side is a single family (a driver's), and a
+/// genuine intersection when it is not — the cache key asks with
+/// DriverFamily::Any, because it relativizes a command line without knowing
+/// which driver produced it.
+///
+/// @param left  One family set (typically a flag row's).
+/// @param right The other (typically a driver's).
+/// @return True when they have a family in common.
+[[nodiscard]] constexpr bool Overlaps(DriverFamily left, DriverFamily right) noexcept
+{
+    return (std::to_underlying(left) & std::to_underlying(right)) != 0;
+}
+
+/// What a path-valued flag's value names.
+///
+/// The role is what each consumer filters on, so a new flag never grows a
+/// branch: the preprocess line drops every role but IncludeDir, the parser
+/// captures ObjectOutput and DepFile, and the cache key relativizes them all.
+enum class PathValueRole : std::uint8_t
+{
+    ObjectOutput, ///< The compiled object file (`/Fo`, `-o`).
+    IncludeDir,   ///< A header search directory (`-I`, `/I`, `/external:I`).
+    DepFile,      ///< The Makefile dependency file the compile writes (`-MF`).
+    DepTarget,    ///< The rule target named inside that depfile (`-MT`, `-MQ`).
+};
+
+/// One spelling of a flag whose value is a filesystem path.
+struct PathValueFlag
+{
+    std::string_view spelling;                        ///< The flag text, without its value.
+    PathValueRole role { PathValueRole::IncludeDir }; ///< What the value names.
+    DriverFamily families { DriverFamily::None };     ///< Which drivers accept this spelling.
+};
+
+/// Every flag whose value is a filesystem path, in one table.
+///
+/// The single source of truth for three questions that used to be answered by
+/// three separate tables, which is how the object output came to be relativized
+/// in its separated form and not in its fused one: whether a bare occurrence
+/// consumes the NEXT argument (CmdLine's own `ValueFlags`), which flag names the
+/// object output (`DriverSpec::objectFlag`), and whose fused value the cache key
+/// must rewrite to a canonical token (CacheKey's `IncludePrefixes`). Adding a
+/// flag is adding a row here.
+///
+/// Rows are ordered longest spelling first, so a scan cannot match a shorter row
+/// that prefixes a longer one before reaching it.
+///
+/// @return The table, in match order.
+[[nodiscard]] std::span<PathValueFlag const> PathValueFlags();
+
+/// A path-valued flag recognised on a command line.
+struct PathValueMatch
+{
+    PathValueFlag flag;      ///< The table row that matched.
+    std::string_view prefix; ///< The argument up to the fused value (flag plus any `=`/`:` separator).
+    std::string_view value;  ///< The fused value; EMPTY when the value is the next argument instead.
+};
+
+/// Recognise the path-valued flag an argument names, bare or with a fused value.
+///
+/// `introducers` is what makes this usable from both consumers: the parser passes
+/// the driver's own option introducers, while the cache key passes the ones that
+/// apply to the LAYOUT it is relativizing against — a leading `/` introduces an
+/// option under a Windows layout, but on POSIX it starts an absolute path, and
+/// matching `/I` there splits a checkout rooted at `/Infra` into a fragment that
+/// lies under no root and keeps its absolute path in the key.
+///
+/// @param arg         The argument as it appeared on the command line.
+/// @param introducers The characters that introduce an option in this context.
+/// @param families    Which families' spellings may match.
+/// @return The match, or nullopt when `arg` names no path-valued flag.
+[[nodiscard]] std::optional<PathValueMatch> MatchPathValueFlag(std::string_view arg,
+                                                               std::string_view introducers,
+                                                               DriverFamily families);
+
+/// The option-introducer characters a driver family uses.
+/// @param family The family (or family set) to describe.
+/// @return Its introducers; empty for DriverFamily::None.
+[[nodiscard]] std::string_view IntroducersOf(DriverFamily family) noexcept;
+
 /// How one compiler driver spells the options the launcher needs.
 ///
 /// This is the data behind the parser: adding a driver is adding a row to the
@@ -32,16 +133,22 @@ enum class Flavor : std::uint8_t
 struct DriverSpec
 {
     Flavor flavor { Flavor::Unknown };
-    /// Option introducer characters. MSVC drivers accept both `/` and `-`;
-    /// GNU drivers only `-`, so a bare `/usr/lib/x.c` stays a source path.
-    std::string_view optionPrefixes;
-    /// Flag that names the object output, in its joined form (`/Fo<path>` or
-    /// `-o <path>`). Matched both joined and separated.
-    std::string_view objectFlag;
+    /// Which family's spellings this driver accepts. Decides both its option
+    /// introducers (via IntroducersOf — MSVC drivers take `/` and `-`, GNU
+    /// drivers only `-`, so a bare `/usr/lib/x.c` stays a source path) and which
+    /// rows of PathValueFlags() apply to it. One field rather than two, because a
+    /// second spelling of "this is an MSVC driver" is a second thing to keep in
+    /// step.
+    DriverFamily family { DriverFamily::None };
     /// Flags that request preprocess-to-stdout, appended for the key probe.
     std::span<std::string_view const> preprocessFlags;
-    /// Flags dropped when building the preprocess command line (compile-only,
-    /// object output, and dependency options that would write stray files).
+    /// The driver's own flags dropped when building the preprocess command line
+    /// (the compile-only marker and the dependency-reporting switches).
+    ///
+    /// Path-valued flags are deliberately absent here: the preprocess line drops
+    /// every PathValueFlags() row whose role is not IncludeDir, so the object
+    /// output and the depfile options go without being spelled a second time.
+    /// This list is only what has no path value to speak of.
     std::span<std::string_view const> preprocessDropFlags;
     /// Flags appended to the preprocess line so the same probe ALSO reports the
     /// translation unit's dependencies, which are folded into the cache key.

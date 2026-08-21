@@ -55,8 +55,17 @@ struct KeyInputs
 /// Rewrite every argument whose path lies under `sourceRoot` or `buildTree` to
 /// a checkout-independent token form (via PathCanon), leaving other arguments
 /// untouched. This is what makes the key identical across checkouts at
-/// different absolute roots. Handles bare source paths and the `-I` / `/I` /
-/// `/external:I` include-dir forms (fused or separate value).
+/// different absolute roots. Handles bare source paths and every flag in
+/// `CmdLine`'s PathValueFlags() table — the object output, the include dirs and
+/// the depfile options — in both the fused and the separate spelling.
+///
+/// BOTH spellings, off one table, because the two used to be answered by two:
+/// a separated value is an argument of its own and reached the bare-path branch,
+/// while a fused one went through a table that listed the include-dir prefixes
+/// and nothing else. So `/Fo<abs>` — what every build system driving MSVC
+/// writes — kept the producing machine's object path, and two Windows checkouts
+/// at different roots could never share an entry, while the separated form used
+/// by the unit tests worked and hid it.
 ///
 /// Both roots matter: a checkout commonly nests its build tree *inside* the
 /// source root (e.g. `<src>/out/build/...`), and include args frequently point
