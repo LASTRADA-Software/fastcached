@@ -14,6 +14,13 @@
 #   4. Cross-depth        — content stored from a DEEP checkout path HITs from a
 #                           SHALLOW one, which is the whole reason this launcher
 #                           exists instead of ccache/sccache.
+#   5. Convergence        — after a header MOVES with its contents unchanged, the
+#                           replayed depfile names the new path. Preprocessing
+#                           suppresses line markers, so the object and its key are
+#                           invariant under such a move; a hit would otherwise
+#                           replay a depfile naming a file that no longer exists,
+#                           and Ninja would rebuild that TU on every build,
+#                           forever (issue #53).
 #
 # The PowerShell counterpart (src/apps/fastcache-cc/run-launcher-e2e.ps1) asserts
 # the same contract against cl / clang-cl on Windows.
@@ -236,7 +243,105 @@ if grep -q "${deep}" "${shallow}/build/t.d"; then
 fi
 echo "   depfile localized to the consuming checkout"
 
-# --- 5: the cache is never load-bearing -------------------------------------
+# --- 5: a moved header must not replay a depfile naming its old path ---------
+# The header's CONTENTS do not change, so the preprocessed text is byte-identical
+# (line markers are suppressed) and the key is unchanged — the object is still
+# correct and the cache still hits. The depfile is nothing but paths, and the one
+# on record names a file that no longer exists. Ninja records that dependency,
+# cannot stat it, rebuilds the TU, hits the cache again, and never converges.
+
+# The property Ninja actually needs: every dependency a depfile lists must exist.
+# Splices `\`-continuations, drops each rule's target (an output, and here one we
+# deliberately deleted), and stats what remains.
+require_depfile_resolves() {
+    local label="$1" depfile="$2"
+    local dep
+    while read -r dep; do
+        [[ -e "$dep" ]] || fail "${label}: depfile lists a dependency that does not exist: ${dep}"
+    done < <(awk '
+        { line = line $0 }
+        sub(/\\$/, "", line) { next }
+        {
+            sub(/^[^:]*:/, "", line)
+            n = split(line, parts, /[ \t]+/)
+            for (i = 1; i <= n; i++)
+                if (parts[i] != "")
+                    print parts[i]
+            line = ""
+        }
+    ' "$depfile")
+}
+
+# Run twice: once in the default configuration and once with direct mode off,
+# because the two reach the value by different routes and only the preprocessed
+# one produced the reported failure. Each variant gets its own project directory
+# — and because paths under SOURCE_DIR are tokenized before hashing, the two
+# trees key identically, so the second variant additionally arrives at an entry
+# some OTHER checkout stored. Its first compile is therefore expected to discard
+# that entry too, which is the cross-checkout form of the same property.
+check_header_move() {
+    local label="$1" name="$2"
+    shift 2
+
+    local root="${workdir}/${name}"
+    mkdir -p "${root}/inc/old" "${root}/build"
+    cat > "${root}/inc/old/Hdr.hpp" <<'HDR'
+#pragma once
+inline int answer() { return 42; }
+HDR
+    cat > "${root}/t.cpp" <<'SRC'
+#include <inc/old/Hdr.hpp>
+int main() { return answer() - 42; }
+SRC
+
+    export FASTCACHE_SOURCE_DIR="$root" FASTCACHE_BINARY_DIR="${root}/build"
+
+    # "MISS", not "not a HIT": a discarded stale hit reports MISS as well, and the
+    # variants share a key, so this asserts the outcome rather than the route.
+    echo "== ${label}: populate (expect MISS) =="
+    "$@" "$launcher" "$compiler" -std=c++23 -I"$root" \
+        -MD -MF "${root}/build/t.d" -c "${root}/t.cpp" -o "${root}/build/t.o" \
+        2> "${workdir}/${name}-1.log" || fail "${label}: first compile returned non-zero"
+    cat "${workdir}/${name}-1.log"
+    grep -q "MISS" "${workdir}/${name}-1.log" || fail "${label}: first compile was not a MISS"
+    grep -q "inc/old/Hdr.hpp" "${root}/build/t.d" || fail "${label}: depfile does not name the header"
+
+    # Move it. Same bytes, new path — and update the include that finds it.
+    mkdir -p "${root}/inc/new"
+    mv "${root}/inc/old/Hdr.hpp" "${root}/inc/new/Hdr.hpp"
+    rmdir "${root}/inc/old"
+    sed -i 's|inc/old/Hdr.hpp|inc/new/Hdr.hpp|' "${root}/t.cpp"
+    rm -f "${root}/build/t.o" "${root}/build/t.d"
+
+    echo "== ${label}: after the move (expect MISS, not a stale HIT) =="
+    "$@" "$launcher" "$compiler" -std=c++23 -I"$root" \
+        -MD -MF "${root}/build/t.d" -c "${root}/t.cpp" -o "${root}/build/t.o" \
+        2> "${workdir}/${name}-2.log" || fail "${label}: second compile returned non-zero"
+    cat "${workdir}/${name}-2.log"
+    grep -q "MISS" "${workdir}/${name}-2.log" \
+        || fail "${label}: a moved header still served a HIT, so the depfile is the producer's"
+    require_depfile_resolves "$label" "${root}/build/t.d"
+    grep -q "inc/new/Hdr.hpp" "${root}/build/t.d" || fail "${label}: depfile does not name the moved header"
+
+    # Third compile: the repaired entry must now hit, and keep naming the new
+    # path. Without this the guard could "pass" by simply never hitting again.
+    rm -f "${root}/build/t.o" "${root}/build/t.d"
+    echo "== ${label}: repaired entry must HIT (convergence) =="
+    "$@" "$launcher" "$compiler" -std=c++23 -I"$root" \
+        -MD -MF "${root}/build/t.d" -c "${root}/t.cpp" -o "${root}/build/t.o" \
+        2> "${workdir}/${name}-3.log" || fail "${label}: third compile returned non-zero"
+    cat "${workdir}/${name}-3.log"
+    grep -q "HIT" "${workdir}/${name}-3.log" \
+        || fail "${label}: the repaired entry did not hit, so every build recompiles this TU"
+    require_depfile_resolves "$label" "${root}/build/t.d"
+    grep -q "inc/new/Hdr.hpp" "${root}/build/t.d" || fail "${label}: the hit replayed the old path again"
+    echo "   moved header: MISS, repaired, then HIT with the new path"
+}
+
+check_header_move "moved header" "movedhdr"
+check_header_move "moved header (no direct mode)" "movedhdr-nodirect" env FASTCACHE_NO_DIRECT=1
+
+# --- 6: the cache is never load-bearing -------------------------------------
 # With no daemon reachable the build must still succeed, uncached.
 echo "== unreachable daemon must still compile =="
 FASTCACHE_ADDR="127.0.0.1:1" "$launcher" "$compiler" -std=c++23 -c "${proj}/a.cpp" -o "${proj}/build/fb.o" \
@@ -244,7 +349,7 @@ FASTCACHE_ADDR="127.0.0.1:1" "$launcher" "$compiler" -std=c++23 -c "${proj}/a.cp
 cat "${workdir}/fallback.log"
 [[ -f "${proj}/build/fb.o" ]] || fail "fallback compile produced no object"
 
-# --- 6: forms the launcher must decline to cache ----------------------------
+# --- 7: forms the launcher must decline to cache ----------------------------
 # A compile with no -o defaults its output to ./a.o, a path the launcher cannot
 # reconstruct. It must pass straight through rather than claim the compile and
 # then fail to store it on every single invocation.
@@ -311,5 +416,6 @@ echo "   retired flags exit 2 with a diagnostic"
 "$launcher" -z >/dev/null || fail "-z returned non-zero"
 "$launcher" --zero-stats >/dev/null || fail "--zero-stats returned non-zero"
 
-echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, cross-depth, and safe fallback"
+echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, cross-depth," \
+     "moved-header convergence, and safe fallback"
 exit 0

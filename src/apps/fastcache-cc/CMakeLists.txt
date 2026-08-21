@@ -37,6 +37,7 @@ set(_fc_cc_sources
     CacheKey.cpp
     CacheProtocol.cpp
     DirectManifest.cpp
+    ReplayGuard.cpp
     Stats.cpp
     ProcessRunner.cpp
     TcpClient.cpp)
@@ -85,6 +86,7 @@ if(FASTCACHED_BUILD_TESTS)
         CacheKey_test.cpp
         CacheProtocol_test.cpp
         DirectManifest_test.cpp
+        ReplayGuard_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp
         TcpClient_test.cpp

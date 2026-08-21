@@ -38,6 +38,7 @@
 #include "IProcessRunner.hpp"
 #include "ITcpClient.hpp"
 #include "LauncherCli.hpp"
+#include "ReplayGuard.hpp"
 #include "Stats.hpp"
 
 #include <FastCache/CompileCache/CompileValue.hpp>
@@ -438,29 +439,23 @@ constexpr std::size_t ReplayRegionCount = 2;
     return std::string { reinterpret_cast<char const*>(bytes->data()), bytes->size() };
 }
 
-/// Write the cached depfile back, localized to this machine's layout.
+/// Write the cached depfile back.
 ///
 /// Called on every hit. A miss wrote its own depfile as a side effect of running
 /// the real compiler; a hit runs no compiler, so without this the file the build
 /// system depends on would simply be absent (or, worse, left stale from an
 /// earlier build).
 ///
-/// @param cmd     The parsed compile command (its depPath is the destination).
-/// @param regions The decoded value's text regions.
-/// @param layout  This machine's roots, for localizing the recorded paths.
-/// @return True when there was nothing to do or the write succeeded.
-[[nodiscard]] bool RestoreDepFile(Cc::ParsedCommand const& cmd,
-                                  std::vector<TextRegion> const& regions,
-                                  PathCanon::Layout const& layout)
+/// Takes text that is already localized rather than localizing here: the hit path
+/// localizes every region once up front, because the same localized text is what
+/// the replay guard examines before any of it is written.
+///
+/// @param depPath The destination, from the compile command's -MF.
+/// @param text    The localized depfile bytes.
+/// @return True when the write succeeded.
+[[nodiscard]] bool WriteDepFile(std::string const& depPath, std::string_view text)
 {
-    if (cmd.depPath.empty() || regions.size() <= DepFileRegionIndex)
-        return true; // nothing requested, or a value stored before depfile support
-
-    auto const& region = regions[DepFileRegionIndex];
-    auto localized = PathCanon::LocalizeRegion(region.bytes, region.grammar, layout);
-    std::string const& text = localized.has_value() ? *localized : region.bytes;
-
-    std::ofstream out { std::filesystem::path { cmd.depPath }, std::ios::binary };
+    std::ofstream out { std::filesystem::path { depPath }, std::ios::binary };
     if (!out)
         return false;
     out.write(text.data(), static_cast<std::streamsize>(text.size()));
@@ -579,6 +574,106 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
     WarnIfRejected(outcome, "STORE (raw)", key);
 }
 
+/// What became of a cache hit we tried to honour.
+///
+/// Three outcomes rather than a bool, because the two failures want opposite
+/// responses: a value whose dependency record no longer holds must be RECOMPILED
+/// AND RE-STORED (which repairs the entry), while a value we simply could not
+/// write to disk means the cache is not usable here and the compile should run
+/// plainly, uncached.
+enum class HitDisposition : std::uint8_t
+{
+    Served,   ///< Object and depfile written, streams replayed.
+    Stale,    ///< A replayed dependency is missing here; recompile and re-store.
+    Unusable, ///< The object or depfile could not be written; abandon the cache.
+};
+
+/// A hit after it has been examined and, if it held up, materialized.
+struct MaterializedHit
+{
+    HitDisposition disposition { HitDisposition::Unusable };
+    std::string replayOut; ///< Localized region 0, kept for the manifest backfill.
+    std::string replayErr; ///< Localized region 1, same.
+};
+
+/// A hit that was not materialized, so carries no streams. A named factory rather
+/// than a brace-init at each site: the streams then have exactly one place that
+/// says they are deliberately empty.
+/// @param disposition Why it was not materialized.
+/// @return The outcome, with empty replay text.
+[[nodiscard]] MaterializedHit NotMaterialized(HitDisposition disposition)
+{
+    return { .disposition = disposition, .replayOut = {}, .replayErr = {} };
+}
+
+/// Localize a hit's regions, check that this machine can honour what they assert,
+/// and only then write the object, the depfile, and the replayed streams.
+///
+/// The check comes before every write on purpose. A hit we are going to discard
+/// must leave the tree exactly as an uncached build would, so that the compile
+/// running next writes the object itself — and so that a compile which then fails
+/// has not left a cached object and depfile behind for a build that never
+/// succeeded.
+///
+/// Localizing every region once here, rather than per consumer, is what lets the
+/// guard examine precisely the bytes that are about to be written; it also leaves
+/// exactly one copy of a loop that used to exist twice.
+///
+/// @param cmd     The parsed compile command (object path, depfile path).
+/// @param decoded The decoded cached value.
+/// @param layout  This machine's roots.
+/// @return What happened, plus the localized streams for the manifest backfill.
+[[nodiscard]] MaterializedHit MaterializeHit(Cc::ParsedCommand const& cmd,
+                                             CompileValue const& decoded,
+                                             PathCanon::Layout const& layout)
+{
+    // Localize everything the value carries. Region 2 is the depfile and is a
+    // file, not a stream; regions beyond ReplayRegionCount must never be replayed,
+    // which is why the positional contract stays explicit here.
+    std::vector<TextRegion> localized;
+    localized.reserve(decoded.textRegions.size());
+    for (auto const& region: decoded.textRegions)
+    {
+        auto rewritten = PathCanon::LocalizeRegion(region.bytes, region.grammar, layout);
+        localized.push_back(
+            { .grammar = region.grammar, .bytes = rewritten.has_value() ? *std::move(rewritten) : region.bytes });
+    }
+
+    // A depfile the compile did not ask for is not going to be written, so it must
+    // not be able to veto the hit either.
+    auto assertions = std::span<TextRegion const> { localized };
+    if (cmd.depPath.empty() && assertions.size() > DepFileRegionIndex)
+        assertions = assertions.first(DepFileRegionIndex);
+
+    if (auto const missing = Cc::MissingReplayedDependency(assertions, layout, std::filesystem::current_path());
+        missing.has_value())
+    {
+        // Named rather than merely counted: "why does this TU never cache" is
+        // otherwise a whole investigation, and the answer is one path.
+        Note(std::format("STALE HIT (replayed dependency missing: {}); recompiling", *missing));
+        return NotMaterialized(HitDisposition::Stale);
+    }
+
+    if (!WriteFileBytes(cmd.objPath, decoded.objectBlob))
+        return NotMaterialized(HitDisposition::Unusable);
+
+    // The depfile is a file, not a stream: restore it before replaying, so a
+    // failure to write it is not reported after the build has already seen the
+    // compiler's output.
+    if (!cmd.depPath.empty() && localized.size() > DepFileRegionIndex
+        && !WriteDepFile(cmd.depPath, localized[DepFileRegionIndex].bytes))
+        return NotMaterialized(HitDisposition::Unusable);
+
+    // Only the first ReplayRegionCount regions are streams; the rest are files and
+    // must never reach stdout or stderr.
+    MaterializedHit result = NotMaterialized(HitDisposition::Served);
+    std::array<std::string*, ReplayRegionCount> const streams { &result.replayOut, &result.replayErr };
+    for (std::size_t idx = 0; idx < localized.size() && idx < streams.size(); ++idx)
+        *streams[idx] = localized[idx].bytes;
+    ReplayStreams(result.replayOut, result.replayErr);
+    return result;
+}
+
 /// Fetch `key`, and if it holds a compile value, materialize it: write the object
 /// and replay the captured streams with paths localized to this machine.
 /// @param cfg    Launcher config.
@@ -598,33 +693,14 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
     auto decoded = DecodeCompileValue(*payload);
     if (!decoded.has_value())
         return std::nullopt;
-    if (!WriteFileBytes(cmd.objPath, decoded->objectBlob))
+
+    // Anything short of Served falls back to preprocessing, which re-runs the same
+    // check and, if it also finds the value stale, recompiles and re-stores it.
+    // Direct mode only ever declines to shortcut; repairing the entry is not its
+    // job, and doing it here would duplicate the miss path.
+    if (MaterializeHit(cmd, *decoded, layout).disposition != HitDisposition::Served)
         return std::nullopt;
 
-    // The depfile is a file, not a stream: restore it before replaying, so a
-    // failure to write it is not reported after the build has already seen the
-    // compiler's output.
-    if (!RestoreDepFile(cmd, decoded->textRegions, layout))
-        return std::nullopt;
-
-    // Region 0 = stdout, region 1 = stderr, per the STORE ordering.
-    std::string_view replayOut;
-    std::string_view replayErr;
-    std::array<std::string, ReplayRegionCount> localizedText;
-    for (std::size_t idx = 0; idx < decoded->textRegions.size() && idx < localizedText.size(); ++idx)
-    {
-        auto const& region = decoded->textRegions[idx];
-        auto localized = PathCanon::LocalizeRegion(region.bytes, region.grammar, layout);
-        if (localized.has_value())
-            localizedText[idx] = *std::move(localized);
-        else
-            localizedText[idx] = region.bytes;
-        if (idx == 0)
-            replayOut = localizedText[idx];
-        else
-            replayErr = localizedText[idx];
-    }
-    ReplayStreams(replayOut, replayErr);
     invocation.valueBytes = decoded->objectBlob.size();
     TraceOutcome("HIT", key);
     return 0;
@@ -852,56 +928,51 @@ void RecordManifest(Config const& cfg,
                 return std::nullopt;
             }
 
-            // HIT: write the object, replay the streams (localizing paths).
-            if (!WriteFileBytes(cmd.objPath, decoded->objectBlob))
+            // HIT: check what the value asserts, then write the object, reproduce
+            // the depfile, and replay the streams (all with paths localized).
+            //
+            // Reproducing the depfile is not optional: skipping it silently breaks
+            // incremental builds, because Ninja/Make would see no header
+            // dependencies for this TU and stop rebuilding it when they change.
+            auto const materialized = MaterializeHit(cmd, *decoded, layout);
+            if (materialized.disposition == HitDisposition::Unusable)
             {
                 Warn("could not write object on hit");
                 return std::nullopt;
             }
-            PathCanon::Layout const consumer { .sourceRoot = cfg.srcRoot, .buildTree = cfg.buildTree };
-
-            // Reproduce the depfile the compiler would have written. Skipping it
-            // silently breaks incremental builds: Ninja/Make would see no header
-            // dependencies for this TU and stop rebuilding it when they change.
-            if (!RestoreDepFile(cmd, decoded->textRegions, consumer))
+            if (materialized.disposition == HitDisposition::Served)
             {
-                Warn("could not write depfile on hit");
-                return std::nullopt;
-            }
+                invocation.valueBytes = decoded->objectBlob.size();
+                invocation.cacheMs = MsSince(cacheStarted);
 
-            // Region 0 = stdout, region 1 = stderr (see STORE below).
-            std::string_view replayOut;
-            std::string_view replayErr;
-            std::array<std::string, ReplayRegionCount> localizedText;
-            for (std::size_t idx = 0; idx < decoded->textRegions.size() && idx < localizedText.size(); ++idx)
-            {
-                auto const& region = decoded->textRegions[idx];
-                auto localized = PathCanon::LocalizeRegion(region.bytes, region.grammar, consumer);
-                if (localized.has_value())
-                    localizedText[idx] = *std::move(localized);
-                else
-                    localizedText[idx] = region.bytes;
-                if (idx == 0)
-                    replayOut = localizedText[idx];
-                else
-                    replayErr = localizedText[idx];
-            }
-            ReplayStreams(replayOut, replayErr);
-            invocation.valueBytes = decoded->objectBlob.size();
-            invocation.cacheMs = MsSince(cacheStarted);
+                // Backfill the direct-mode manifest from the hit we just served.
+                //
+                // Without this, direct mode could never populate on a cache that already
+                // holds preprocessed-key entries: manifests would only ever be written by
+                // the miss path, so a warm cache would preprocess forever. The localized
+                // /showIncludes text names exactly the headers this object depends on, so
+                // no compiler run is needed to record them.
+                if (cfg.direct)
+                    RecordManifest(cfg,
+                                   cmd,
+                                   layout,
+                                   relativizedArgs,
+                                   toolchainStamp,
+                                   materialized.replayOut,
+                                   materialized.replayErr,
+                                   key);
 
-            // Backfill the direct-mode manifest from the hit we just served.
+                TraceOutcome("HIT", key);
+                return 0;
+            }
+            // Stale: the object is fine but the dependency record it carries is not
+            // true here, so fall through and compile for real. The STORE that follows
+            // overwrites this very key with a correct one, which is what repairs the
+            // entry rather than leaving it to poison every later build.
             //
-            // Without this, direct mode could never populate on a cache that already
-            // holds preprocessed-key entries: manifests would only ever be written by
-            // the miss path, so a warm cache would preprocess forever. The localized
-            // /showIncludes text names exactly the headers this object depends on, so
-            // no compiler run is needed to record them.
-            if (cfg.direct)
-                RecordManifest(cfg, cmd, layout, relativizedArgs, toolchainStamp, replayOut, replayErr, key);
-
-            TraceOutcome("HIT", key);
-            return 0;
+            // And if that STORE is refused for any reason, the build still converges:
+            // the real compiler ran, so a correct depfile is on disk regardless, and
+            // the cost degrades to a permanent miss for this key.
         }
         // MISS — fall through to compile.
     }
