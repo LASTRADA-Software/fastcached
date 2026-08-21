@@ -83,7 +83,7 @@ pwsh src/apps/compile-cache-testclient/run-crossdepth.ps1 -Synthetic
 # compiling or reading any project source: a generated tree is laid under a
 # throwaway subfolder of each root and removed afterwards.
 pwsh src/apps/compile-cache-testclient/run-crossdepth.ps1 `
-    -LastradaRoots "D:\proj","D:\repo\proj"
+    -CheckoutRoots "D:\proj","D:\repo\proj"
 ```
 
 ## Privacy rule

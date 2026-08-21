@@ -37,14 +37,14 @@ namespace
     /// Collapse a compiler-emitted include path to one stable form.
     ///
     /// `/showIncludes` echoes the path as *resolved*, which preserves whatever the
-    /// `#include` spelling contained: `D:\src\LabBase\../ctrllib/ListOb.hpp`, mixed
+    /// `#include` spelling contained: `D:\src\AppCore\../applib/Widget.hpp`, mixed
     /// separators, and doubled slashes all occur in real output. Two spellings of
     /// the same header must produce one canonical token, or a manifest entry
     /// recorded via one spelling would never validate against the other.
     ///
     /// Deliberately LEXICAL, not `weakly_canonical`: touching the filesystem also
-    /// rewrites 8.3 short components to their long form (`YTAMAS~1.JPS` becomes
-    /// `y.tamashevich.JPSC`), and a path so rewritten no longer shares a prefix with
+    /// rewrites 8.3 short components to their long form (`SOMEUS~1.PRO` becomes
+    /// `some.user.profile`), and a path so rewritten no longer shares a prefix with
     /// a source root spelled the other way — which silently drops every project
     /// header from the manifest. Lexical normalization removes `..` and unifies
     /// separators without altering the path's identity.
@@ -56,8 +56,8 @@ namespace
     /// Fold a path to a comparable form: lowercased, with every separator unified.
     ///
     /// The two sides of a prefix test arrive in different spellings — CMake exports
-    /// `FASTCACHE_SOURCE_DIR` as `D:/Lastrada` (forward slashes) while `cl` emits
-    /// includes as `D:\Lastrada\...` (backslashes). Comparing them raw makes every
+    /// `FASTCACHE_SOURCE_DIR` as `D:/Project` (forward slashes) while `cl` emits
+    /// includes as `D:\Project\...` (backslashes). Comparing them raw makes every
     /// project header look like it lies outside the root, which silently classifies
     /// the whole manifest as toolchain content and yields an empty manifest.
     [[nodiscard]] std::string ToComparable(std::string_view text)
