@@ -119,12 +119,28 @@ function Start-Fastcached {
     return $p
 }
 
-function New-Tree([string]$root) {
+# The shared fixture, tagged with the name of the case that built it.
+#
+# The tag is load-bearing, and it is the same device scripts/compile-cache-e2e.sh
+# uses for check_header_move. Paths under SOURCE_DIR are tokenized before hashing,
+# which is the whole point of this launcher — so two cases whose trees hold the
+# same bytes key IDENTICALLY, and the second one opens on a HIT against the first
+# one's entry instead of populating its own. That HIT is correct; it is simply not
+# what the second case is about, and it made "launcher cross-depth" pass for a
+# reason unrelated to cross-depth sharing: the shallow leg re-created $ShallowTemp
+# with content the miss/hit case had already stored from that very directory, down
+# to the same /Fo path, so it hit its own earlier entry and would have reported OK
+# with cross-depth sharing completely broken.
+#
+# The tag goes in a string LITERAL rather than a comment: comments do not survive
+# preprocessing, and the preprocessed text is what the key is taken over.
+function New-Tree([string]$root, [string]$variant) {
     $src = Join-Path $root "src"
     $inc = Join-Path $src "inc"
     New-Item -ItemType Directory -Force -Path $inc | Out-Null
     Set-Content -Path (Join-Path $inc "h1.h") -Value "#pragma once`nint one();`n"
-    Set-Content -Path (Join-Path $src "u.cpp") -Value "#include `"inc/h1.h`"`nint g(){return one();}`n"
+    Set-Content -Path (Join-Path $src "u.cpp") `
+                -Value "#include `"inc/h1.h`"`nchar const* variant(){return `"$variant`";}`nint g(){return one();}`n"
     return $src
 }
 
@@ -224,7 +240,7 @@ try {
         $ranAnyCompiler = $true
         Write-Host "=== launcher miss/hit ($cc) ==="
         Remove-Item -Recurse -Force $ShallowTemp -ErrorAction SilentlyContinue
-        $src = New-Tree $ShallowTemp
+        $src = New-Tree $ShallowTemp "misshit"
         $build = Join-Path $ShallowTemp "build"; New-Item -ItemType Directory -Force $build | Out-Null
         $obj = Join-Path $build "u.obj"
 
@@ -282,24 +298,40 @@ try {
         Write-Host "=== launcher cross-depth ($cc) ==="
         # Store from a DEEP root, then compile identical content from a SHALLOW
         # root: the second must be a HIT and produce a correct object.
+        #
+        # Both legs use the "crossdepth" variant, so they share a key with each
+        # other and with NOTHING ELSE in this script — see New-Tree. The deep leg
+        # is therefore required to be a MISS, which is what makes the shallow HIT
+        # mean that the deep entry was found rather than some earlier case's.
+        #
+        # The two legs differ in exactly what the launcher must not key on: the
+        # checkout depth, and with it the absolute path each passes to /Fo. That
+        # was folded into every Windows key until the object output was
+        # relativized in its fused spelling as well as its separated one.
         Remove-Item -Recurse -Force $DeepTemp -ErrorAction SilentlyContinue
-        $deepSrc = New-Tree (Join-Path $DeepTemp "a/b/c/d")
+        $deepSrc = New-Tree (Join-Path $DeepTemp "a/b/c/d") "crossdepth"
         $deepBuild = Join-Path (Split-Path $deepSrc -Parent) "build"; New-Item -ItemType Directory -Force $deepBuild | Out-Null
-        $rDeep = Invoke-Launcher $cc $deepSrc $deepBuild (Join-Path $deepBuild "u.obj")
+        $deepObj = Join-Path $deepBuild "u.obj"
+        $rDeep = Invoke-Launcher $cc $deepSrc $deepBuild $deepObj
         $oDeep = Get-Outcome $rDeep.stderr
+        $deepHash = if (Test-Path $deepObj) { (Get-FileHash $deepObj -Algorithm SHA256).Hash } else { "<none>" }
 
         # New shallow checkout of identical content.
         Remove-Item -Recurse -Force $ShallowTemp -ErrorAction SilentlyContinue
-        $src2 = New-Tree $ShallowTemp
+        $src2 = New-Tree $ShallowTemp "crossdepth"
         $build2 = Join-Path $ShallowTemp "build"; New-Item -ItemType Directory -Force $build2 | Out-Null
         $obj2 = Join-Path $build2 "u.obj"
         $rShallow = Invoke-Launcher $cc $src2 $build2 $obj2
         $oShallow = Get-Outcome $rShallow.stderr
+        $shallowHash = if (Test-Path $obj2) { (Get-FileHash $obj2 -Algorithm SHA256).Hash } else { "<none>" }
 
-        if ($oDeep -eq "MISS" -and $oShallow -eq "HIT" -and (Test-Path $obj2)) {
-            Write-Host "  deep store -> shallow HIT, object produced: OK ($cc)" -ForegroundColor Green
+        # The object must be the DEEP one, byte for byte. A hit that merely
+        # produced some correct object would also be satisfied by a fresh
+        # compile, which is the outcome this case exists to distinguish.
+        if ($oDeep -eq "MISS" -and $oShallow -eq "HIT" -and $shallowHash -eq $deepHash -and $deepHash -ne "<none>") {
+            Write-Host "  deep store -> shallow HIT, deep object reproduced: OK ($cc)" -ForegroundColor Green
         } else {
-            Write-Host "  CROSS-DEPTH FAIL ($cc): deep=$oDeep shallow=$oShallow obj=$(Test-Path $obj2)" -ForegroundColor Red
+            Write-Host "  CROSS-DEPTH FAIL ($cc): deep=$oDeep shallow=$oShallow objMatch=$($shallowHash -eq $deepHash)" -ForegroundColor Red
             $exit = 1
         }
 
