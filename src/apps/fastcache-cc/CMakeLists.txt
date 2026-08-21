@@ -45,6 +45,7 @@ set(_fc_cc_sources
     DirectManifest.cpp
     PathResolve.cpp
     ReplayGuard.cpp
+    RootReconciler.cpp
     Stats.cpp
     ProcessRunner.cpp
     TcpClient.cpp)
@@ -96,6 +97,7 @@ if(FASTCACHED_BUILD_TESTS)
         DirectManifest_test.cpp
         PathResolve_test.cpp
         ReplayGuard_test.cpp
+        RootReconciler_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp
         TcpClient_test.cpp

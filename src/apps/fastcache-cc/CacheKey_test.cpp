@@ -29,6 +29,48 @@ std::vector<std::string> Relativize(std::vector<std::string> const& args,
 }
 } // namespace
 
+TEST_CASE("RelativizeArgs reconciles an argument's spelling before testing the roots")
+{
+    // The argument half of issue #66. A generator can spell an include directory
+    // in a form nothing else in the build uses — an 8.3 short component, a `subst`
+    // drive — and the launcher's roots are resolved, so without reconciliation the
+    // path lies under neither and the checkout location stays in the key.
+    auto const dealias = [](std::string_view path) -> std::string {
+        constexpr std::string_view Aliased = R"(C:\Users\RUNNER~1\src)";
+        constexpr std::string_view Real = R"(C:\Users\runneradmin\src)";
+        if (!path.starts_with(Aliased))
+            return std::string { path };
+        return std::string { Real } + std::string { path.substr(Aliased.size()) };
+    };
+    std::vector<std::string> const args { R"(/IC:\Users\RUNNER~1\src\inc)", R"(C:\Users\RUNNER~1\src\x.cpp)" };
+    std::string_view const root = R"(C:\Users\runneradmin\src)";
+
+    // Without it, both come back exactly as written and neither is portable.
+    auto const raw = RelativizeArgs(std::span<std::string const> { args }, root, {});
+    CHECK(raw[0] == args[0]);
+    CHECK(raw[1] == args[1]);
+
+    auto const out = RelativizeArgs(std::span<std::string const> { args }, root, {}, dealias);
+    REQUIRE(out.size() == 2);
+    CHECK(out[0] == "/I<SRCROOT>/inc");
+    CHECK(out[1] == "<SRCROOT>/x.cpp");
+}
+
+TEST_CASE("RelativizeArgs keeps an argument's own spelling when reconciling did not help")
+{
+    // Reconciliation exists to make the ROOT TEST succeed. An argument it did not
+    // place under a root must come back as WRITTEN, not in its reconciled form —
+    // otherwise a path the cache has no opinion about changes the key.
+    auto const rewriteEverything = [](std::string_view) -> std::string {
+        return R"(D:\somewhere\else\x.cpp)";
+    };
+    std::vector<std::string> const args { R"(C:\elsewhere\x.cpp)", "-DFOO=bar" };
+    auto const out = RelativizeArgs(std::span<std::string const> { args }, R"(C:\a\b\src)", {}, rewriteEverything);
+    REQUIRE(out.size() == 2);
+    CHECK(out[0] == args[0]);
+    CHECK(out[1] == "-DFOO=bar"); // an option never reaches the transform at all
+}
+
 TEST_CASE("RelativizeArgs tokenizes a source path under the source root")
 {
     auto const out = Relativize({ R"(C:\a\b\src\x.cpp)" }, R"(C:\a\b\src)");

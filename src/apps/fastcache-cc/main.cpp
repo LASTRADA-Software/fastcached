@@ -39,7 +39,9 @@
 #include "IProcessRunner.hpp"
 #include "ITcpClient.hpp"
 #include "LauncherCli.hpp"
+#include "PathResolve.hpp"
 #include "ReplayGuard.hpp"
+#include "RootReconciler.hpp"
 #include "Stats.hpp"
 
 #include <FastCache/CompileCache/CompileValue.hpp>
@@ -170,12 +172,28 @@ struct Config
     return std::chrono::milliseconds { static_cast<std::int64_t>(EnvUnsigned(name, count)) };
 }
 
+/// The path-identity seam every root comparison in this file depends on.
+///
+/// Created once and memoized, so the per-directory cost the resolver documents is
+/// paid once per compile rather than once per lookup.
+[[nodiscard]] Cc::IPathResolver& PathResolver()
+{
+    static std::unique_ptr<Cc::IPathResolver> const resolver = Cc::MakePathResolver();
+    return *resolver;
+}
+
 [[nodiscard]] Config LoadConfig()
 {
     Config c;
     c.addr = EnvOr(Cc::EnvName::Addr, "");
-    c.srcRoot = EnvOr(Cc::EnvName::SourceDir, "");
-    c.buildTree = EnvOr(Cc::EnvName::BinaryDir, "");
+    // Deliberately NOT resolved here. These are the spelling the build system
+    // exported, and they stay that way: they are the roots that go on the wire,
+    // that the key tokenizes against, and that a hit's replayed paths are built
+    // from. RootReconciler holds the resolved forms and uses them only to
+    // translate INTO these — see the class comment for why emitting anything else
+    // breaks the depfile a build system reads back.
+    c.srcRoot = Cc::WithoutTrailingSeparator(EnvOr(Cc::EnvName::SourceDir, ""));
+    c.buildTree = Cc::WithoutTrailingSeparator(EnvOr(Cc::EnvName::BinaryDir, ""));
     c.prefetchGroup = EnvOr(Cc::EnvName::PrefetchGroup, "default");
     c.verbose = EnvSet(Cc::EnvName::Verbose);
     c.stats = !EnvSet(Cc::EnvName::NoStats);
@@ -286,6 +304,51 @@ void WarnIfRejected(Cc::CacheOutcome const& outcome, std::string_view what, std:
     if (outcome.kind != Cc::CacheOutcomeKind::Rejected)
         return;
     Note(std::format("{} key={} {}", what, key, Cc::DescribeOutcome(outcome)));
+}
+
+/// Report a compile whose roots do not describe it at all.
+///
+/// Gated on FASTCACHE_VERBOSE like every other launcher diagnostic, and that is a
+/// deliberate reversal: this started ungated, on the reasoning that issue #66's
+/// defect is invisible and a diagnostic nobody enables is as silent as none. Two
+/// rounds of narrowing failed to find a condition that means "broken" reliably
+/// enough to justify four unsilenceable lines on the compiler's stderr for every
+/// translation unit. A source outside both roots is an ordinary CMake layout —
+/// `add_subdirectory(../shared shared)`, a superbuild, ExternalProject — not a
+/// misconfiguration, and a message that cries wolf on a healthy build is the one
+/// that gets ignored when it is right. What tipped it: `RootReconciler` now
+/// REPAIRS the mismatch rather than merely detecting it, so this is a backstop for
+/// a spelling the resolver could not reconcile, not the mechanism.
+///
+/// The condition is still narrower than "nothing was keyed", and the difference is
+/// the SOURCE. `/showIncludes` never names the primary source, so on MSVC a
+/// translation unit including only third-party headers outside the roots reports
+/// paths and keys none of them while being perfectly healthy; `0 of 0` is a driver
+/// that reported nothing on the preprocess line, a different fault this message
+/// would misdescribe.
+///
+/// @param cfg        Launcher config, for the roots to name.
+/// @param sourcePath The translation unit, as the build system spelled it.
+/// @param keyed      How many reported paths reached the key.
+/// @param reported   The paths the probe reported, already reconciled.
+/// @param reconciler Decides whether the source has a portable form at all.
+void NoteIfRootsDoNotDescribeCompile(Config const& cfg,
+                                     std::string_view sourcePath,
+                                     std::size_t keyed,
+                                     std::vector<std::string> const& reported,
+                                     Cc::RootReconciler& reconciler)
+{
+    if (keyed != 0 || reported.empty() || reconciler.IsInTree(sourcePath))
+        return;
+
+    // The roots next to the source they fail to contain: the mismatch is only
+    // visible as a pair, and a list of every reported path would bury it.
+    Note(std::format("the configured roots do not contain this translation unit, so nothing about this compile is"
+                     " portable -- the checkout path stays in the key, a moved header cannot re-key, and the replay"
+                     " guard is checking nothing (source root: {}, build tree: {}, source: {})",
+                     cfg.srcRoot,
+                     cfg.buildTree,
+                     sourcePath));
 }
 
 // --- process exec -----------------------------------------------------------
@@ -579,7 +642,9 @@ struct SourceProbe
 /// @param originalArgs The original full invocation.
 /// @return The preprocessed text and dependency paths, or nullopt when the probe
 ///         itself failed.
-[[nodiscard]] std::optional<SourceProbe> Preprocess(Cc::ParsedCommand const& cmd, std::span<std::string const> originalArgs)
+[[nodiscard]] std::optional<SourceProbe> Preprocess(Cc::ParsedCommand const& cmd,
+                                                    std::span<std::string const> originalArgs,
+                                                    Cc::RootReconciler& reconciler)
 {
     auto const& driver = Cc::DriverOf(cmd.flavor);
 
@@ -633,6 +698,9 @@ struct SourceProbe
                 Cc::ParseDepFilePaths(std::string_view { reinterpret_cast<char const*>(bytes->data()), bytes->size() });
         else
             Note("dependency probe wrote no depfile; keying without the dependency set");
+        // Reconciled at the boundary, so KeyDependencySet and everything after it
+        // stay pure string work over paths spelled the way this host spells them.
+        reconciler.All(probe.dependencyPaths);
         return probe;
     }
 
@@ -649,6 +717,7 @@ struct SourceProbe
     auto errorNotes = Cc::ParseIncludePaths(run.err);
     split.notePaths.insert(
         split.notePaths.end(), std::make_move_iterator(errorNotes.begin()), std::make_move_iterator(errorNotes.end()));
+    reconciler.All(split.notePaths);
     return SourceProbe { .preprocessed = std::move(split.preprocessed), .dependencyPaths = std::move(split.notePaths) };
 }
 
@@ -878,6 +947,7 @@ struct MaterializedHit
 /// @param includeTextErr      Captured stderr (cl puts include notes here).
 /// @param objectKeyForPointer Key the object is already stored under; recorded in
 ///                            the manifest so the object is never stored twice.
+/// @param reconciler      Translates a driver's spelling into this build's.
 void RecordManifest(Config const& cfg,
                     Cc::ParsedCommand const& cmd,
                     PathCanon::Layout const& layout,
@@ -886,10 +956,12 @@ void RecordManifest(Config const& cfg,
                     std::string const& toolchainStamp,
                     std::string_view includeTextOut,
                     std::string_view includeTextErr,
-                    std::string_view objectKeyForPointer)
+                    std::string_view objectKeyForPointer,
+                    Cc::RootReconciler& reconciler)
 {
     auto const workingDirectoryText = workingDirectory.string();
-    auto const canonicalSource = Cc::CanonicalSourceToken(cmd.source, layout, workingDirectoryText);
+    auto const resolvedSource = reconciler.Directory(cmd.source);
+    auto const canonicalSource = Cc::CanonicalSourceToken(resolvedSource, layout, workingDirectoryText);
     if (!canonicalSource.has_value())
         return;
 
@@ -919,6 +991,12 @@ void RecordManifest(Config const& cfg,
         Note("compile reported no dependencies; not recording a direct-mode manifest");
         return;
     }
+
+    // Reconciled here rather than trusted from the caller. The captured streams
+    // arrive already reconciled, but the depfile read above comes straight off
+    // disk — and resolution is memoized and idempotent, so guaranteeing this
+    // function's own inputs costs a hash lookup per path.
+    reconciler.All(includes);
 
     // The manifest points at the object's ordinary key rather than causing a second
     // copy to be stored: L1 keeps values uncompressed, so duplicating objects would
@@ -984,13 +1062,15 @@ void RecordManifest(Config const& cfg,
 ///                         resolved against it before it becomes a key input.
 /// @param relativizedArgs  The command line with checkout-rooted paths tokenized.
 /// @param toolchainStamp   The compiler identity folded into the manifest key.
+/// @param reconciler       Translates a driver's spelling into this build's.
 /// @return The exit code if the object was served, nullopt to keep going.
 [[nodiscard]] std::optional<int> TryDirectMode(Config const& cfg,
                                                Cc::ParsedCommand const& cmd,
                                                PathCanon::Layout const& layout,
                                                std::filesystem::path const& workingDirectory,
                                                std::vector<std::string> const& relativizedArgs,
-                                               std::string const& toolchainStamp)
+                                               std::string const& toolchainStamp,
+                                               Cc::RootReconciler& reconciler)
 {
     auto const directStarted = std::chrono::steady_clock::now();
     // Every early return records how long the attempt took, so the statistics
@@ -1002,8 +1082,11 @@ void RecordManifest(Config const& cfg,
 
     // The same derivation RecordManifest uses, so the lookup and the recording
     // sides cannot spell this token differently — which for a relatively-named
-    // source they did, one resolving it and the other not.
-    auto const canonicalSource = Cc::CanonicalSourceToken(cmd.source, layout, workingDirectory.string());
+    // source they did, one resolving it and the other not. The reconciliation is
+    // part of that derivation: a driver's spelling has to collapse to the build's
+    // on both sides, or the two tokens differ again by another route.
+    auto const canonicalSource =
+        Cc::CanonicalSourceToken(reconciler.Directory(cmd.source), layout, workingDirectory.string());
     if (!canonicalSource.has_value())
         return giveUp();
 
@@ -1043,8 +1126,21 @@ void RecordManifest(Config const& cfg,
         return std::nullopt;
     }
 
+    // One layout, and it is the build system's own spelling — every consumer of it
+    // below either tokenizes against it or emits from it, and both want that form.
+    // The reconciler holds the resolved spellings and is the only thing that sees
+    // them; nothing downstream needs to know they exist.
     PathCanon::Layout const layout { .sourceRoot = cfg.srcRoot, .buildTree = cfg.buildTree };
-    auto const relativizedArgs = Cc::RelativizeArgs(argv.subspan(1), cfg.srcRoot, cfg.buildTree);
+    Cc::RootReconciler reconciler { cfg.srcRoot, cfg.buildTree, PathResolver() };
+
+    // Directory-flavoured, because an argument's own last component can be the
+    // aliased one — an `-I` pointing at a symlinked include directory is the
+    // ordinary case — and there are few enough arguments that resolving each
+    // completely costs nothing measurable.
+    auto const relativizedArgs =
+        Cc::RelativizeArgs(argv.subspan(1), cfg.srcRoot, cfg.buildTree, [&reconciler](std::string_view path) {
+            return reconciler.Directory(path);
+        });
     auto const toolchainStamp = CompilerId(cmd.compiler);
 
     // Read once here rather than wherever a relative path needs placing. Three
@@ -1069,7 +1165,7 @@ void RecordManifest(Config const& cfg,
     workingDirectory = Cc::AnchorWorkingDirectory(workingDirectory.string(), layout);
 
     if (cfg.direct && !SourceReferencesVolatileMacro(cmd.source))
-        if (auto served = TryDirectMode(cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp))
+        if (auto served = TryDirectMode(cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, reconciler))
             return served;
 
     auto const preprocessStarted = std::chrono::steady_clock::now();
@@ -1080,7 +1176,7 @@ void RecordManifest(Config const& cfg,
     // much dead memory resident for exactly as long as the machine is busiest.
     std::string key;
     {
-        auto probe = Preprocess(cmd, argv);
+        auto probe = Preprocess(cmd, argv, reconciler);
         if (!probe.has_value())
         {
             Warn("preprocess failed");
@@ -1121,9 +1217,11 @@ void RecordManifest(Config const& cfg,
         // is a different defect from "every reported path was filtered out" (paths
         // the layout does not recognise as its own). Named for the same reason the
         // STALE HIT note names its path: otherwise this is a whole investigation.
-        Note(std::format("dependency set: {} of {} reported path(s) keyed",
+        Note(std::format("dependency set: {} of {} reported path(s) keyed ({} filesystem call(s))",
                          inputs.dependencyPaths.size(),
-                         probe->dependencyPaths.size()));
+                         probe->dependencyPaths.size(),
+                         PathResolver().FilesystemCalls()));
+        NoteIfRootsDoNotDescribeCompile(cfg, cmd.source, inputs.dependencyPaths.size(), probe->dependencyPaths, reconciler);
         key = Cc::ComputeKey(inputs);
     }
     invocation.preprocessMs = MsSince(preprocessStarted);
@@ -1194,7 +1292,8 @@ void RecordManifest(Config const& cfg,
                                    toolchainStamp,
                                    materialized.replayOut,
                                    materialized.replayErr,
-                                   key);
+                                   key,
+                                   reconciler);
 
                 TraceOutcome("HIT", key);
                 return 0;
@@ -1240,15 +1339,27 @@ void RecordManifest(Config const& cfg,
     // /showIncludes on stdout, cl on stderr — we tag BOTH with the ShowIncludes
     // grammar so whichever stream carries include notes gets canonicalized; a
     // non-matching line in either region is preserved verbatim.
-    value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = run.out });
-    value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = run.err });
+    //
+    // Both are reconciled first, and only the STORED copy is: ReplayStreams above
+    // has already passed the compiler's own bytes through untouched. The daemon
+    // canonicalizes a STORE against the roots this launcher sends, which are the
+    // AS-GIVEN ones — so a region still carrying a spelling the driver resolved
+    // some other way would match neither root and be stored with this machine's
+    // absolute paths in it. Reconciling here is what puts the two in one spelling;
+    // sending the resolved roots instead would be the other way to do it, and it
+    // is the way that breaks the replayed depfile (see RootReconciler).
+    auto const includeTextOut = reconciler.Region(run.out, IncludeGrammar());
+    auto const includeTextErr = reconciler.Region(run.err, IncludeGrammar());
+    value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = includeTextOut });
+    value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = includeTextErr });
 
     // Region 2, when present, is the GNU depfile the compile just wrote. It is
     // tagged with the depfile grammar so the daemon canonicalizes the header
     // paths inside it — a depfile full of this machine's absolute paths would be
     // useless (and wrong) when replayed on another checkout.
     if (auto const depText = ReadDepFile(cmd))
-        value.textRegions.push_back({ .grammar = PathCanon::Grammar::GccDepfile, .bytes = *depText });
+        value.textRegions.push_back({ .grammar = PathCanon::Grammar::GccDepfile,
+                                      .bytes = reconciler.Region(*depText, PathCanon::Grammar::GccDepfile, cmd.objPath) });
 
     auto const encoded = EncodeCompileValue(value);
     if (!Cc::IsStorableSize(encoded.size(), cfg.maxStoreBytes))
@@ -1298,7 +1409,16 @@ void RecordManifest(Config const& cfg,
     // lands on RAM where compression cannot help. A direct hit therefore costs one
     // extra fetch to follow the pointer — see DirectManifest::objectKey.
     if (cfg.direct)
-        RecordManifest(cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, run.out, run.err, key);
+        RecordManifest(cfg,
+                       cmd,
+                       layout,
+                       workingDirectory,
+                       relativizedArgs,
+                       toolchainStamp,
+                       includeTextOut,
+                       includeTextErr,
+                       key,
+                       reconciler);
     return code;
 }
 
