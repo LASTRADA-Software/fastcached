@@ -49,6 +49,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -537,11 +538,18 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
     // a few dozen lines below; the synthesis rule is the same (prefer the
     // explicit list, otherwise fold the legacy single-bind triplet into a
     // synthetic BindConfig).
-    auto const bannerBinds =
-        !effective.binds.empty()
-            ? effective.binds
-            : std::vector<FastCache::BindConfig> { FastCache::BindConfig {
-                  .address = effective.bindAddress, .port = effective.port, .tls = effective.tlsEnabled } };
+    //
+    // The fallback is a NAMED object and the choice is made between two spans,
+    // not between two vectors. Spelling it as a conditional over the vectors
+    // themselves gave the operator a prvalue common type, so the configured list
+    // was COPIED wholesale — every bind, on every start — just to render one line,
+    // and the discarded temporary is what GCC 16 reports as a dangling pointer
+    // through the span this is about to be read as. An array rather than a vector
+    // because the synthetic case is exactly one bind and needs no allocation.
+    std::array<FastCache::BindConfig, 1> const legacyBind { FastCache::BindConfig {
+        .address = effective.bindAddress, .port = effective.port, .tls = effective.tlsEnabled } };
+    auto const bannerBinds = !effective.binds.empty() ? std::span<FastCache::BindConfig const> { effective.binds }
+                                                      : std::span<FastCache::BindConfig const> { legacyBind };
     auto const bindSummary = FastCache::FormatBindSummary(bannerBinds);
     // `anyTlsBind` was computed up-top against `effective.binds`; under the
     // current ordering `serverOpts.binds` is either `effective.binds` (when
