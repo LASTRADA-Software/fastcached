@@ -222,7 +222,7 @@ try {
     # repeats the unit-level guard against the shipped launcher, and it is the
     # only place the Windows-only "/?" spelling gets exercised.
     $help = (& $Launcher --help | Out-String)
-    foreach ($flag in @('--show-stats','-s','--zero-stats','-z','--help','-h','/?','--version','--cohort')) {
+    foreach ($flag in @('--show-stats','-s','--zero-stats','-z','--help','-h','/?','--version','--prefetch-group')) {
         if ($help -notmatch [regex]::Escape($flag)) {
             Write-Host "  HELP DRIFT: --help does not document $flag" -ForegroundColor Red
             $exit = 1

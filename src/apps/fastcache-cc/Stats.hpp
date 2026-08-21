@@ -28,7 +28,7 @@ enum class Outcome : std::uint8_t
 struct Record
 {
     Outcome outcome { Outcome::Unavailable };
-    std::string cohort;          ///< FASTCACHE_COHORT at the time of the compile.
+    std::string prefetchGroup;   ///< FASTCACHE_PREFETCH_GROUP at the time of the compile.
     std::string source;          ///< Translation-unit path, for per-TU attribution.
     std::uint64_t valueBytes {}; ///< Cached payload size (0 when nothing moved).
     std::uint64_t elapsedMs {};  ///< Wall time this invocation took.
@@ -72,34 +72,34 @@ void AppendRecord(Record const& record);
 /// no suitable directory can be resolved.
 [[nodiscard]] std::string LogPath();
 
-/// Fold the log into a human-readable report: totals plus a per-cohort
+/// Fold the log into a human-readable report: totals plus a per-group
 /// breakdown, hit rate, latency distributions, the fall-back reasons, and the
 /// translation units that never hit.
-/// @param cohortFilter When non-empty, report only this cohort.
+/// @param groupFilter When non-empty, report only this prefetch group.
 /// @param color Whether to emit ANSI SGR escapes; see StdoutSupportsColor.
 /// @return The formatted report, or an explanatory line when the log is absent.
-[[nodiscard]] std::string FormatReport(std::string_view cohortFilter, UsageColor color = UsageColor::Plain);
+[[nodiscard]] std::string FormatReport(std::string_view groupFilter, UsageColor color = UsageColor::Plain);
 
-/// Read every record from the log, applying the same cohort filter and
+/// Read every record from the log, applying the same prefetch group filter and
 /// tolerance for short (pre-upgrade) lines that `FormatReport` does.
 ///
 /// Exposed separately from `FormatReport` so a caller that wants the raw
 /// records — the HTML report's trend chart, or a test — does not have to
 /// scrape them back out of formatted text.
-/// @param cohortFilter When non-empty, return only this cohort's records.
+/// @param groupFilter When non-empty, return only this prefetch group's records.
 /// @return The parsed records, in file order. Empty when the log is absent
 ///         or empty.
-[[nodiscard]] std::vector<Record> ParseLog(std::string_view cohortFilter);
+[[nodiscard]] std::vector<Record> ParseLog(std::string_view groupFilter);
 
 /// Render the same data as `FormatReport`, as a self-contained HTML dashboard
 /// (inline CSS/JS, no network dependency): headline hit rate, per-outcome
 /// tallies, a hit-rate-over-time trend, latency histograms, ranked fall-back
-/// reasons, a per-cohort comparison table, and the translation units that
+/// reasons, a per-group comparison table, and the translation units that
 /// never hit.
-/// @param cohortFilter When non-empty, report only this cohort.
+/// @param groupFilter When non-empty, report only this prefetch group.
 /// @return The complete HTML document, or an explanatory plain-text line when
 ///         the log is absent (mirroring `FormatReport`'s empty-log message).
-[[nodiscard]] std::string FormatHtmlReport(std::string_view cohortFilter);
+[[nodiscard]] std::string FormatHtmlReport(std::string_view groupFilter);
 
 /// Delete the log. @return True when the log is gone afterwards.
 [[nodiscard]] bool ResetLog();

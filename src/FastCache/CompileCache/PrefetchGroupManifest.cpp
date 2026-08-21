@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/CompileCache/CohortManifest.hpp>
+#include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
 #include <FastCache/Core/Endian.hpp>
 
 #include <algorithm>
@@ -73,24 +73,31 @@ namespace
 
 } // namespace
 
-CohortManifest::CohortManifest(IStorage& storage) noexcept:
+PrefetchGroupManifest::PrefetchGroupManifest(IStorage& storage) noexcept:
     _storage { storage }
 {
 }
 
-std::string CohortManifest::ManifestKey(std::string_view cohortId)
+std::string PrefetchGroupManifest::ManifestKey(std::string_view groupId)
 {
     // Control-byte prefix keeps the manifest out of the user keyspace (no user
     // key begins with 0x01 in the compile-cache / redis / memcached protocols).
+    //
+    // The "cohort:" infix is deliberately *not* renamed with the rest of the
+    // vocabulary: it is part of the on-disk key, so respelling it would orphan
+    // every manifest a warm cache already holds. That degrades rather than
+    // corrupts -- a manifest that cannot be found simply means no prefetch, and
+    // the next STORE writes it back under the same name -- but it is a cold
+    // prefetch window bought for a string no user and no caller ever sees.
     std::string key;
-    key.reserve(cohortId.size() + 8);
+    key.reserve(groupId.size() + 8);
     key.push_back('\x01');
     key += "cohort:";
-    key += cohortId;
+    key += groupId;
     return key;
 }
 
-std::string CohortManifest::ReverseKey(std::string_view key)
+std::string PrefetchGroupManifest::ReverseKey(std::string_view key)
 {
     // A distinct control byte (0x02) separates the reverse index from both
     // user keys and forward manifest keys.
@@ -102,9 +109,11 @@ std::string CohortManifest::ReverseKey(std::string_view key)
     return out;
 }
 
-std::expected<bool, StorageError> CohortManifest::AddKey(std::string_view cohortId, std::string_view key, TimePoint now)
+std::expected<bool, StorageError> PrefetchGroupManifest::AddKey(std::string_view groupId,
+                                                                std::string_view key,
+                                                                TimePoint now)
 {
-    std::string const manifestKey = ManifestKey(cohortId);
+    std::string const manifestKey = ManifestKey(groupId);
     bool added = false;
 
     auto const result = _storage.Update(
@@ -117,10 +126,10 @@ std::expected<bool, StorageError> CohortManifest::AddKey(std::string_view cohort
             // Idempotent: do not duplicate a key already recorded.
             if (std::ranges::find(keys, key) != keys.end())
             {
-                added = true; // Already present counts as "in the cohort".
+                added = true; // Already present counts as "in the prefetch group".
                 return IStorage::UpdateOutcome { .value = {}, .action = IStorage::UpdateAction::Unchanged };
             }
-            if (keys.size() >= MaxKeysPerCohort)
+            if (keys.size() >= MaxKeysPerGroup)
             {
                 added = false; // At cap — drop; caller logs.
                 return IStorage::UpdateOutcome { .value = {}, .action = IStorage::UpdateAction::Unchanged };
@@ -137,21 +146,21 @@ std::expected<bool, StorageError> CohortManifest::AddKey(std::string_view cohort
     if (!result.has_value())
         return std::unexpected(result.error());
 
-    // Maintain the reverse (key→cohort) index so a FETCH can discover which
-    // cohort to prefetch. Store the cohort id as the value. Best-effort: a
+    // Maintain the reverse (key→prefetch group) index so a FETCH can discover which
+    // prefetch group to prefetch. Store the prefetch group id as the value. Best-effort: a
     // reverse-index write failure does not fail AddKey (the forward manifest,
     // which drives correctness, already succeeded).
     if (added)
     {
-        std::vector<std::byte> cohortBytes;
-        auto const* p = reinterpret_cast<std::byte const*>(cohortId.data());
-        cohortBytes.assign(p, p + cohortId.size());
-        (void) _storage.Set(ReverseKey(key), std::move(cohortBytes), /*flags=*/0, TimePoint::max());
+        std::vector<std::byte> groupBytes;
+        auto const* p = reinterpret_cast<std::byte const*>(groupId.data());
+        groupBytes.assign(p, p + groupId.size());
+        (void) _storage.Set(ReverseKey(key), std::move(groupBytes), /*flags=*/0, TimePoint::max());
     }
     return added;
 }
 
-std::expected<std::optional<std::string>, StorageError> CohortManifest::CohortOf(std::string_view key, TimePoint now)
+std::expected<std::optional<std::string>, StorageError> PrefetchGroupManifest::GroupOf(std::string_view key, TimePoint now)
 {
     auto const got = _storage.Peek(ReverseKey(key), now);
     if (!got.has_value())
@@ -162,9 +171,9 @@ std::expected<std::optional<std::string>, StorageError> CohortManifest::CohortOf
     return std::optional<std::string> { std::string { reinterpret_cast<char const*>(bytes.data()), bytes.size() } };
 }
 
-std::expected<std::vector<std::string>, StorageError> CohortManifest::Keys(std::string_view cohortId, TimePoint now)
+std::expected<std::vector<std::string>, StorageError> PrefetchGroupManifest::Keys(std::string_view groupId, TimePoint now)
 {
-    auto const got = _storage.Peek(ManifestKey(cohortId), now);
+    auto const got = _storage.Peek(ManifestKey(groupId), now);
     if (!got.has_value())
         return std::unexpected(got.error());
     if (!got->found)

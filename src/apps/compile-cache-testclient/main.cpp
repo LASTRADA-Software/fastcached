@@ -233,7 +233,7 @@ int DoStore(TestClient::Args const& a)
     auto const encoded = EncodeCompileValue(value);
 
     auto const frame = Wire::EncodeStore(Wire::StoreRequest { .key = a.key,
-                                                              .cohort = a.cohort,
+                                                              .prefetchGroup = a.prefetchGroup,
                                                               .srcRoot = a.srcRoot,
                                                               .buildTree = a.buildTree,
                                                               .value = std::span<std::byte const> { encoded } });

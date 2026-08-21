@@ -23,16 +23,16 @@ enum class Action : std::uint8_t
 /// A parsed command line.
 struct Args
 {
-    Action action { Action::Store };  ///< The sub-command.
-    std::string host { "127.0.0.1" }; ///< Daemon host.
-    std::uint16_t port { 0 };         ///< Daemon port; required.
-    std::string key {};               ///< Cache key.
-    std::string cohort { "default" }; ///< Prefetch cohort id.
-    std::string srcRoot {};           ///< Checkout source root.
-    std::string buildTree {};         ///< Build output root.
-    std::string compiler { "cl" };    ///< Compiler to drive (cl or clang-cl).
-    std::string source {};            ///< Source file to compile.
-    std::string object {};            ///< Object path: output for store, expected-write for fetch.
+    Action action { Action::Store };         ///< The sub-command.
+    std::string host { "127.0.0.1" };        ///< Daemon host.
+    std::uint16_t port { 0 };                ///< Daemon port; required.
+    std::string key {};                      ///< Cache key.
+    std::string prefetchGroup { "default" }; ///< Prefetch group id.
+    std::string srcRoot {};                  ///< Checkout source root.
+    std::string buildTree {};                ///< Build output root.
+    std::string compiler { "cl" };           ///< Compiler to drive (cl or clang-cl).
+    std::string source {};                   ///< Source file to compile.
+    std::string object {};                   ///< Object path: output for store, expected-write for fetch.
 };
 
 /// The accepted options, in the order `--help` documents them.

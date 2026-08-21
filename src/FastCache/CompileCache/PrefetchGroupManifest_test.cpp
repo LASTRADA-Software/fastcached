@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
-#include <FastCache/CompileCache/CohortManifest.hpp>
+#include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
 #include <FastCache/Core/Clock.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -12,10 +12,10 @@
 
 using namespace FastCache;
 
-TEST_CASE("CohortManifest accumulates keys per cohort id")
+TEST_CASE("PrefetchGroupManifest accumulates keys per prefetch group id")
 {
     InMemoryLruStorage storage { 0 };
-    CohortManifest manifest { storage };
+    PrefetchGroupManifest manifest { storage };
     ManualClock clock;
     auto const now = clock.Now();
 
@@ -35,10 +35,10 @@ TEST_CASE("CohortManifest accumulates keys per cohort id")
     CHECK((*b)[0] == "objkey3");
 }
 
-TEST_CASE("CohortManifest AddKey is idempotent")
+TEST_CASE("PrefetchGroupManifest AddKey is idempotent")
 {
     InMemoryLruStorage storage { 0 };
-    CohortManifest manifest { storage };
+    PrefetchGroupManifest manifest { storage };
     ManualClock clock;
     auto const now = clock.Now();
 
@@ -49,36 +49,36 @@ TEST_CASE("CohortManifest AddKey is idempotent")
     CHECK(keys->size() == 1);
 }
 
-TEST_CASE("CohortManifest CohortOf reverse-maps a key to its cohort")
+TEST_CASE("PrefetchGroupManifest GroupOf reverse-maps a key to its prefetch group")
 {
     InMemoryLruStorage storage { 0 };
-    CohortManifest manifest { storage };
+    PrefetchGroupManifest manifest { storage };
     ManualClock clock;
     auto const now = clock.Now();
 
     REQUIRE(manifest.AddKey("envA", "k1", now).has_value());
     REQUIRE(manifest.AddKey("envB", "k2", now).has_value());
 
-    // Compare through value_or: an absent cohort fails the comparison rather than
+    // Compare through value_or: an absent prefetch group fails the comparison rather than
     // dereferencing an empty optional. Static analysis cannot see a has_value()
     // guard through Catch2's REQUIRE macro, so avoid needing one.
-    auto const c1 = manifest.CohortOf("k1", now);
+    auto const c1 = manifest.GroupOf("k1", now);
     REQUIRE(c1.has_value());
     CHECK(c1->value_or("") == "envA");
 
-    auto const c2 = manifest.CohortOf("k2", now);
+    auto const c2 = manifest.GroupOf("k2", now);
     REQUIRE(c2.has_value());
     CHECK(c2->value_or("") == "envB");
 
-    auto const unknown = manifest.CohortOf("never", now);
+    auto const unknown = manifest.GroupOf("never", now);
     REQUIRE(unknown.has_value());
     CHECK_FALSE(unknown->has_value());
 }
 
-TEST_CASE("CohortManifest reports empty for an unknown cohort")
+TEST_CASE("PrefetchGroupManifest reports empty for an unknown prefetch group")
 {
     InMemoryLruStorage storage { 0 };
-    CohortManifest manifest { storage };
+    PrefetchGroupManifest manifest { storage };
     ManualClock clock;
 
     auto const keys = manifest.Keys("never-seen", clock.Now());
@@ -86,10 +86,10 @@ TEST_CASE("CohortManifest reports empty for an unknown cohort")
     CHECK(keys->empty());
 }
 
-TEST_CASE("CohortManifest preserves insertion order across many keys")
+TEST_CASE("PrefetchGroupManifest preserves insertion order across many keys")
 {
     InMemoryLruStorage storage { 0 };
-    CohortManifest manifest { storage };
+    PrefetchGroupManifest manifest { storage };
     ManualClock clock;
     auto const now = clock.Now();
 

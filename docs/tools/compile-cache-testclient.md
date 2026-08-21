@@ -18,7 +18,7 @@ cmake --build --preset clang-debug --target compile-cache-testclient
 ## Usage
 
 ```
-compile-cache-testclient <store|fetch> --port N [--key K] [--cohort C]
+compile-cache-testclient <store|fetch> --port N [--key K] [--prefetch-group C]
     --srcroot P --buildtree Q [--compiler cl|clang-cl] [--source F] [--out OBJ]
 ```
 
@@ -35,7 +35,7 @@ something silently ignored.
 | `--host` | `127.0.0.1` |
 | `--port` | none — **required** |
 | `--key` | empty |
-| `--cohort` | `default` |
+| `--prefetch-group` | `default` |
 | `--srcroot`, `--buildtree` | empty |
 | `--compiler` | `cl` |
 | `--source` | empty |

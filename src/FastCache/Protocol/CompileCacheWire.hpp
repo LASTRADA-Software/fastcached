@@ -176,7 +176,7 @@ struct OpDescriptor
 inline constexpr std::array<OpDescriptor, 2> OpTable {
     OpDescriptor { .code = Op::Store,
                    .name = "store",
-                   .fieldCount = 5, // key, cohort, srcRoot, buildTree, value
+                   .fieldCount = 5, // key, prefetchGroup, srcRoot, buildTree, value
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)) },
     OpDescriptor { .code = Op::Fetch,
                    .name = "fetch",
@@ -301,18 +301,18 @@ struct ReplyHeader
 /// coroutine frame and so survives suspension.
 struct StoreView
 {
-    std::span<std::byte const> key;       ///< Cache key.
-    std::span<std::byte const> cohort;    ///< Cohort id, may be empty.
-    std::span<std::byte const> srcRoot;   ///< Producer's source root.
-    std::span<std::byte const> buildTree; ///< Producer's build tree.
-    std::span<std::byte const> value;     ///< Encoded compile-value.
+    std::span<std::byte const> key;           ///< Cache key.
+    std::span<std::byte const> prefetchGroup; ///< Prefetch group id, may be empty.
+    std::span<std::byte const> srcRoot;       ///< Producer's source root.
+    std::span<std::byte const> buildTree;     ///< Producer's build tree.
+    std::span<std::byte const> value;         ///< Encoded compile-value.
 };
 
 /// The fields of a STORE request, as owning views for encoding.
 struct StoreRequest
 {
     std::string_view key;             ///< Cache key.
-    std::string_view cohort;          ///< Cohort id, may be empty.
+    std::string_view prefetchGroup;   ///< Prefetch group id, may be empty.
     std::string_view srcRoot;         ///< This machine's source root.
     std::string_view buildTree;       ///< This machine's build tree.
     std::span<std::byte const> value; ///< Encoded compile-value.
@@ -391,7 +391,7 @@ namespace Detail
     return Detail::EncodeRequest(version,
                                  Op::Store,
                                  { AsBytes(request.key),
-                                   AsBytes(request.cohort),
+                                   AsBytes(request.prefetchGroup),
                                    AsBytes(request.srcRoot),
                                    AsBytes(request.buildTree),
                                    request.value });
@@ -525,7 +525,7 @@ namespace Detail
     if (!fields.has_value())
         return std::nullopt;
     return StoreView { .key = (*fields)[0],
-                       .cohort = (*fields)[1],
+                       .prefetchGroup = (*fields)[1],
                        .srcRoot = (*fields)[2],
                        .buildTree = (*fields)[3],
                        .value = (*fields)[4] };

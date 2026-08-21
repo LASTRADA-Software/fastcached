@@ -18,7 +18,7 @@ target_sources(FastCache
         Cache/TracingStorage.cpp
         Cache/WriteErrorReportingStorage.cpp
         Cli/UsageDoc.cpp
-        CompileCache/CohortManifest.cpp
+        CompileCache/PrefetchGroupManifest.cpp
         CompileCache/CompileValue.cpp
         CompileCache/PathCanon.cpp
         Config/ByteSize.cpp

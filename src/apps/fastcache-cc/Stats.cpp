@@ -108,7 +108,7 @@ namespace
         return ec ? std::filesystem::path {} : dir;
     }
 
-    /// Per-cohort tallies folded from the log.
+    /// Per-group tallies folded from the log.
     struct Tally
     {
         std::uint64_t hits {};
@@ -172,7 +172,7 @@ namespace
     {
         Record record;
         record.outcome = ParseOutcome(fields[0]);
-        record.cohort = std::string { fields[1] };
+        record.prefetchGroup = std::string { fields[1] };
         record.valueBytes = ParseUnsigned(fields[2]);
         record.elapsedMs = ParseUnsigned(fields[3]);
         if (fields.size() >= 5)
@@ -407,7 +407,7 @@ void AppendRecord(Record const& record)
     std::string line;
     line += ToStringView(record.outcome);
     line += FieldSeparator;
-    line += Sanitize(record.cohort);
+    line += Sanitize(record.prefetchGroup);
     line += FieldSeparator;
     line += std::to_string(record.valueBytes);
     line += FieldSeparator;
@@ -459,7 +459,7 @@ void AppendRecord(Record const& record)
 #endif
 }
 
-std::vector<Record> ParseLog(std::string_view cohortFilter)
+std::vector<Record> ParseLog(std::string_view groupFilter)
 {
     auto const path = LogPath();
     if (path.empty())
@@ -482,7 +482,7 @@ std::vector<Record> ParseLog(std::string_view cohortFilter)
         if (fields.size() < 4)
             continue;
 
-        if (!cohortFilter.empty() && fields[1] != cohortFilter)
+        if (!groupFilter.empty() && fields[1] != groupFilter)
             continue;
 
         records.push_back(DecodeFields(fields));
@@ -492,12 +492,12 @@ std::vector<Record> ParseLog(std::string_view cohortFilter)
 
 namespace
 {
-    /// Fold parsed records into the overall tally, the per-cohort tallies, and
+    /// Fold parsed records into the overall tally, the per-group tallies, and
     /// the never-cached attribution — the three views every report renders.
     struct FoldedLog
     {
         Tally overall;
-        std::map<std::string, Tally> byCohort;
+        std::map<std::string, Tally> byGroup;
         std::map<std::string, std::uint64_t> neverCached;
     };
 
@@ -506,7 +506,7 @@ namespace
         FoldedLog folded;
         for (auto const& record: records)
         {
-            for (Tally* tally: { &folded.overall, &folded.byCohort[record.cohort] })
+            for (Tally* tally: { &folded.overall, &folded.byGroup[record.prefetchGroup] })
             {
                 switch (record.outcome)
                 {
@@ -551,7 +551,7 @@ namespace
     }
 } // namespace
 
-std::string FormatReport(std::string_view cohortFilter, UsageColor color)
+std::string FormatReport(std::string_view groupFilter, UsageColor color)
 {
     auto const path = LogPath();
     if (path.empty())
@@ -561,31 +561,31 @@ std::string FormatReport(std::string_view cohortFilter, UsageColor color)
     if (!probe)
         return "fastcache-cc: no statistics recorded yet (" + path + ").\n";
 
-    auto const records = ParseLog(cohortFilter);
-    auto const [overall, byCohort, neverCached] = FoldRecords(records);
+    auto const records = ParseLog(groupFilter);
+    auto const [overall, byGroup, neverCached] = FoldRecords(records);
 
     if (overall.Total() == 0)
     {
-        if (cohortFilter.empty())
+        if (groupFilter.empty())
             return "fastcache-cc: no statistics recorded yet (" + path + ").\n";
-        return "fastcache-cc: no records for cohort '" + std::string { cohortFilter } + "'.\n";
+        return "fastcache-cc: no records for prefetch group '" + std::string { groupFilter } + "'.\n";
     }
 
     auto const& palette = StatsPaletteFor(color);
     std::ostringstream out;
     out << "fastcache-cc statistics (" << path << ")\n\n";
-    if (cohortFilter.empty())
-        out << "all cohorts\n";
+    if (groupFilter.empty())
+        out << "all prefetch groups\n";
     else
-        out << "cohort " << cohortFilter << '\n';
+        out << "prefetch group " << groupFilter << '\n';
     AppendTallyLines(out, overall, palette);
 
-    if (cohortFilter.empty() && byCohort.size() > 1)
+    if (groupFilter.empty() && byGroup.size() > 1)
     {
-        out << "\nper cohort\n";
-        for (auto const& [cohort, tally]: byCohort)
+        out << "\nper prefetch group\n";
+        for (auto const& [prefetchGroup, tally]: byGroup)
         {
-            out << "\n  " << (cohort.empty() ? "(unset)" : cohort) << '\n';
+            out << "\n  " << (prefetchGroup.empty() ? "(unset)" : prefetchGroup) << '\n';
             std::ostringstream nested;
             AppendTallyLines(nested, tally, palette);
             std::istringstream lines { nested.str() };
@@ -628,7 +628,7 @@ bool ResetLog()
 namespace
 {
     /// Escape the five characters HTML gives meaning to. Every value folded
-    /// into the dashboard — a cohort name, a fall-back reason, a translation
+    /// into the dashboard — a prefetch group name, a fall-back reason, a translation
     /// unit path — comes from the invocations log, which a compile can steer
     /// (a path or a fallback detail string), so nothing is trusted verbatim.
     [[nodiscard]] std::string EscapeHtml(std::string_view text)
@@ -875,7 +875,7 @@ namespace
 
     /// The dashboard's embedded stylesheet: terminal-native dark palette,
     /// matching the approved design (headline hit rate, tally cards, trend
-    /// chart, histograms, cohort table, never-cached list). Kept as one
+    /// chart, histograms, prefetch group table, never-cached list). Kept as one
     /// literal here rather than templated piece by piece, since none of it
     /// varies per report.
     constexpr std::string_view DashboardStyle = R"CSS(
@@ -931,7 +931,7 @@ td{padding:12px 14px 12px 0;border-bottom:1px solid var(--border-soft);font-fami
 
 } // namespace
 
-std::string FormatHtmlReport(std::string_view cohortFilter)
+std::string FormatHtmlReport(std::string_view groupFilter)
 {
     auto const path = LogPath();
     if (path.empty())
@@ -941,14 +941,14 @@ std::string FormatHtmlReport(std::string_view cohortFilter)
     if (!probe)
         return "fastcache-cc: no statistics recorded yet (" + path + ").\n";
 
-    auto const records = ParseLog(cohortFilter);
-    auto const [overall, byCohort, neverCached] = FoldRecords(records);
+    auto const records = ParseLog(groupFilter);
+    auto const [overall, byGroup, neverCached] = FoldRecords(records);
 
     if (overall.Total() == 0)
     {
-        if (cohortFilter.empty())
+        if (groupFilter.empty())
             return "fastcache-cc: no statistics recorded yet (" + path + ").\n";
-        return "fastcache-cc: no records for cohort '" + std::string { cohortFilter } + "'.\n";
+        return "fastcache-cc: no records for prefetch group '" + std::string { groupFilter } + "'.\n";
     }
 
     auto const servable = overall.hits + overall.misses;
@@ -994,22 +994,23 @@ std::string FormatHtmlReport(std::string_view cohortFilter)
     }
     out << "</div></div></div>";
 
-    if (byCohort.size() > 1 || (byCohort.size() == 1 && !cohortFilter.empty()))
+    if (byGroup.size() > 1 || (byGroup.size() == 1 && !groupFilter.empty()))
     {
-        out << R"(<div class="panel"><div class="panel-title">per-cohort comparison</div>)"
-            << R"(<table><thead><tr><th>cohort</th><th>compiles</th><th>hit rate</th><th></th><th>unavailable</th>)"
+        out << R"(<div class="panel"><div class="panel-title">per-group comparison</div>)"
+            << R"(<table><thead><tr><th>prefetch group</th><th>compiles</th><th>hit rate</th><th></th><th>unavailable</th>)"
                "</tr></thead><tbody>";
-        for (auto const& [cohort, tally]: byCohort)
+        for (auto const& [prefetchGroup, tally]: byGroup)
         {
-            auto const cohortServable = tally.hits + tally.misses;
-            auto const cohortRate = Percent(tally.hits, cohortServable);
+            auto const groupServable = tally.hits + tally.misses;
+            auto const groupRate = Percent(tally.hits, groupServable);
             auto const ratePct =
-                cohortServable == 0 ? 0.0 : (100.0 * static_cast<double>(tally.hits)) / static_cast<double>(cohortServable);
+                groupServable == 0 ? 0.0 : (100.0 * static_cast<double>(tally.hits)) / static_cast<double>(groupServable);
             // Custom delimiter (html(...)html): the attribute value contains a
             // literal `)"` (CSS var(--hit) followed by the closing quote),
             // which would otherwise terminate a plain R"(...)" early.
-            out << "<tr><td>" << EscapeHtml(cohort.empty() ? "(unset)" : cohort) << "</td><td>" << tally.Total()
-                << R"html(</td><td style="color:var(--hit)">)html" << cohortRate << R"(</td><td class="bar-cell">)"
+            out << "<tr><td>" << EscapeHtml(prefetchGroup.empty() ? "(unset)" : prefetchGroup) << "</td><td>"
+                << tally.Total() << R"html(</td><td style="color:var(--hit)">)html" << groupRate
+                << R"(</td><td class="bar-cell">)"
                 << R"(<div class="bar-track"><div class="bar-fill" style="width:)" << FormatCoord(ratePct)
                 << R"(%"></div></div></td><td>)" << tally.unavailable << "</td></tr>";
         }

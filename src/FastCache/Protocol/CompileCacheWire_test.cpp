@@ -89,7 +89,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
 {
     auto const value = Bytes({ 0xAA, 0xBB });
     auto const frame = EncodeStore(StoreRequest {
-        .key = "k", .cohort = "", .srcRoot = "s", .buildTree = "b", .value = std::span<std::byte const> { value } });
+        .key = "k", .prefetchGroup = "", .srcRoot = "s", .buildTree = "b", .value = std::span<std::byte const> { value } });
 
     auto const expected = Bytes({
         0xFC,                               // magic
@@ -97,7 +97,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
         0x01,                               // op = Store
         0x00, 0x00, 0x00, 0x19,             // payloadLength = 25 = (4+1) + (4+0) + (4+1) + (4+1) + (4+2)
         0x00, 0x00, 0x00, 0x01, 0x6B,       // key       = "k"
-        0x00, 0x00, 0x00, 0x00,             // cohort    = "" (empty, still length-prefixed)
+        0x00, 0x00, 0x00, 0x00,             // prefetch group    = "" (empty, still length-prefixed)
         0x00, 0x00, 0x00, 0x01, 0x73,       // srcRoot   = "s"
         0x00, 0x00, 0x00, 0x01, 0x62,       // buildTree = "b"
         0x00, 0x00, 0x00, 0x02, 0xAA, 0xBB, // value
@@ -191,11 +191,11 @@ TEST_CASE("DecodeReplyHeader round-trips and rejects an unknown status")
 
 TEST_CASE("DecodeStorePayload round-trips every field, including an empty one")
 {
-    // An empty cohort is the routine case, not an edge one: the launcher stores
-    // with no cohort whenever grouping is off, and the handler branches on it.
+    // An empty prefetch group is the routine case, not an edge one: the launcher stores
+    // with no prefetch group whenever grouping is off, and the handler branches on it.
     auto const value = Bytes({ 0xDE, 0xAD, 0xBE, 0xEF });
     auto const frame = EncodeStore(StoreRequest { .key = "the-key",
-                                                  .cohort = "",
+                                                  .prefetchGroup = "",
                                                   .srcRoot = "/src",
                                                   .buildTree = "/build",
                                                   .value = std::span<std::byte const> { value } });
@@ -205,7 +205,7 @@ TEST_CASE("DecodeStorePayload round-trips every field, including an empty one")
 
     REQUIRE(view.has_value());
     CHECK(AsStringView(Unwrap(view).key) == "the-key");
-    CHECK(Unwrap(view).cohort.empty());
+    CHECK(Unwrap(view).prefetchGroup.empty());
     CHECK(AsStringView(Unwrap(view).srcRoot) == "/src");
     CHECK(AsStringView(Unwrap(view).buildTree) == "/build");
     CHECK(std::ranges::equal(Unwrap(view).value, value));

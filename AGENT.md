@@ -29,14 +29,14 @@ src/FastCache/
                 (key-hash fan-out), TracingStorage (Tracy zones)
   CompileCache/ PathCanon (absolute<->canonical-token path rewriting +
                 showIncludes/depfile region grammar), CompileValue (object-blob
-                + tagged-text-region framing), CohortManifest (cohort-id ->
-                key-set + reverse index) — the compile-cache executor's domain
-                logic
+                + tagged-text-region framing), PrefetchGroupManifest
+                (prefetch-group id -> key-set + reverse index) — the
+                compile-cache executor's domain logic
   Protocol/     IProtocolHandler, ProtocolAutodetect, MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
                 RedisResp (RESP2), CompileCacheHandler (the executor: custom
                 0xFC binary protocol, canonicalize-on-STORE / serve-canonical-
-                on-FETCH, leading-key cohort prefetch), CompileCacheWire
+                on-FETCH, leading-key group prefetch), CompileCacheWire
                 (header-only, dependency-free: the 0xFC magic/version/opcode/
                 status/error tables and their encoders, shared verbatim by the
                 daemon, fastcache-cc and the test client)

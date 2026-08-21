@@ -78,7 +78,7 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 ### STORE
 
 ```
-[0xFC][ver][0x01][u32 len]  payload: [key][cohort][srcRoot][buildTree][value]
+[0xFC][ver][0x01][u32 len]  payload: [key][prefetchGroup][srcRoot][buildTree][value]
 ```
 
 The `srcRoot` and `buildTree` fields describe the *producer's* layout. The
@@ -168,20 +168,20 @@ This asymmetry is the whole design: canonicalize on STORE, serve canonical on
 FETCH, localize on the client. The server stores exactly one representation of
 an entry no matter how many differently-rooted machines produce it.
 
-## Cohort prefetch
+## Prefetch groups
 
-The `cohort` field on a STORE groups keys that tend to be needed together — in
-practice, one build of one project. The server records the mapping, and when a
-FETCH hits a key belonging to a cohort it warms the rest of that cohort into the
+The `prefetchGroup` field on a STORE groups keys that tend to be needed together
+— in practice, one build of one project. The server records the mapping, and when
+a FETCH hits a key belonging to a group it warms the rest of that group into the
 in-memory tier in the background.
 
 This is automatic and has no CLI flag. It is debounced at two levels: per
-connection, and per `(engine, cohort)` pair. Both are necessary because a
+connection, and per `(engine, group)` pair. Both are necessary because a
 launcher opens a fresh connection per translation unit — with only per-connection
 debouncing, one 60-hit build was measured issuing 27022 prefetches and 13969
-disk reads. A cohort holds at most 100 000 keys.
+disk reads. A group holds at most 100 000 keys.
 
-Cohort membership never affects the cache key, so changing `FASTCACHE_COHORT`
+Prefetch group membership never affects the cache key, so changing `FASTCACHE_PREFETCH_GROUP`
 re-groups prefetching without partitioning the cache or invalidating anything.
 
 ## Operational notes

@@ -14,22 +14,22 @@ namespace FastCache::Cc
 
 /// What the launcher was asked to do.
 ///
-/// Every value except `Cohort` and `OutputPath` is a possible
+/// Every value except `Prefetch group` and `OutputPath` is a possible
 /// `Command::action`; those two name sub-options (`--show-stats`'s and
 /// `--html-stats`'s respectively) and are only ever seen inside
 /// `StatsOptions()`/`HtmlStatsOptions()`.
 enum class Action : std::uint8_t
 {
-    Compile,     ///< The default: front a real compile.
-    Help,        ///< Print the usage text.
-    Version,     ///< Print the launcher version.
-    ShowStats,   ///< Report the recorded statistics as plain text.
-    HtmlStats,   ///< Render the recorded statistics as a self-contained HTML dashboard.
-    ZeroStats,   ///< Discard the statistics log.
-    Cohort,      ///< Stats sub-option: restrict the report to one cohort.
-    OutputPath,  ///< `--html-stats` sub-option: where to write the dashboard.
-    NoArguments, ///< Invoked with nothing at all — usage, to stderr.
-    UsageError,  ///< Unknown option or a missing option value.
+    Compile,       ///< The default: front a real compile.
+    Help,          ///< Print the usage text.
+    Version,       ///< Print the launcher version.
+    ShowStats,     ///< Report the recorded statistics as plain text.
+    HtmlStats,     ///< Render the recorded statistics as a self-contained HTML dashboard.
+    ZeroStats,     ///< Discard the statistics log.
+    PrefetchGroup, ///< Stats sub-option: restrict the report to one prefetch group.
+    OutputPath,    ///< `--html-stats` sub-option: where to write the dashboard.
+    NoArguments,   ///< Invoked with nothing at all — usage, to stderr.
+    UsageError,    ///< Unknown option or a missing option value.
 };
 
 /// One accepted flag.
@@ -79,7 +79,7 @@ struct FlagSpec
 struct Command
 {
     Action action { Action::Compile }; ///< The selected action.
-    std::string cohortFilter;          ///< From `--cohort`; empty means no filtering.
+    std::string groupFilter;           ///< From `--prefetch-group`; empty means no filtering.
     std::string outputPath;            ///< From `--html-stats`'s `--out`; empty means the default path.
     std::string diagnostic;            ///< Why parsing failed; set iff `action == UsageError`.
 };
@@ -125,7 +125,7 @@ namespace EnvName
     constexpr std::string_view Addr = "FASTCACHE_ADDR";
     constexpr std::string_view SourceDir = "FASTCACHE_SOURCE_DIR";
     constexpr std::string_view BinaryDir = "FASTCACHE_BINARY_DIR";
-    constexpr std::string_view Cohort = "FASTCACHE_COHORT";
+    constexpr std::string_view PrefetchGroup = "FASTCACHE_PREFETCH_GROUP";
     constexpr std::string_view Verbose = "FASTCACHE_VERBOSE";
     constexpr std::string_view NoStats = "FASTCACHE_NO_STATS";
     constexpr std::string_view NoDirect = "FASTCACHE_NO_DIRECT";

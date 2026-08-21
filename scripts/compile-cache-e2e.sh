@@ -61,7 +61,7 @@ trap cleanup EXIT
 # Statistics are per-user state; keep this run out of the developer's real log.
 export XDG_STATE_HOME="${workdir}/state"
 export FASTCACHE_VERBOSE=1
-export FASTCACHE_COHORT="e2e"
+export FASTCACHE_PREFETCH_GROUP="e2e"
 
 fail() { echo "compile-cache E2E FAILED: $*" >&2; exit 1; }
 
@@ -286,13 +286,13 @@ echo "   -coverage survived the preprocess line"
 echo "== statistics =="
 "$launcher" --show-stats || fail "--show-stats returned non-zero"
 "$launcher" -s >/dev/null || fail "-s returned non-zero"
-"$launcher" --show-stats --cohort "e2e" >/dev/null || fail "--show-stats --cohort returned non-zero"
+"$launcher" --show-stats --prefetch-group "e2e" >/dev/null || fail "--show-stats --prefetch-group returned non-zero"
 
 # The launcher's help must describe the flags it actually accepts; a drift here
 # is exactly what the unit-level guard in LauncherCli_test.cpp protects, and this
 # repeats it against the shipped binary.
 help="$("$launcher" --help)" || fail "--help returned non-zero"
-for flag in --show-stats -s --zero-stats -z --help -h --version --cohort; do
+for flag in --show-stats -s --zero-stats -z --help -h --version --prefetch-group; do
     case "$help" in
         *"$flag"*) ;;
         *) fail "--help does not document ${flag}" ;;

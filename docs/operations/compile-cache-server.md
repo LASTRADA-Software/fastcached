@@ -79,13 +79,13 @@ plaintext because each record decodes by its own tag. Lower
 
 Note this applies to the L2 disk tier only — L1 holds values uncompressed.
 
-## Cohort prefetch
+## Prefetch group prefetch
 
 Prefetching is automatic and needs no configuration. When a FETCH hits a key
-that belongs to a cohort, the rest of that cohort is warmed into memory in the
+that belongs to a prefetch group, the rest of that prefetch group is warmed into memory in the
 background, so the compiles that follow in the same build are served from RAM.
 
-Clients control the grouping with `FASTCACHE_COHORT`. Since it is not part of
+Clients control the grouping with `FASTCACHE_PREFETCH_GROUP`. Since it is not part of
 the cache key, regrouping never invalidates anything — set it per project and
 branch (`myproject-main`) for the tightest prefetch locality.
 

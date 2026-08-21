@@ -54,11 +54,11 @@ to an object file. Link steps, compile-and-link steps, preprocess-only runs
 ## Usage
 
 ```
-fastcache-cc <compiler> <args...>               Front a compile (as CMAKE_<LANG>_COMPILER_LAUNCHER)
-fastcache-cc --show-stats | -s [--cohort <id>]  Report cache statistics for this machine
-fastcache-cc --zero-stats | -z                  Discard the statistics log
-fastcache-cc --help | -h | /?                   Flags and environment reference
-fastcache-cc --version                          Launcher version
+fastcache-cc <compiler> <args...>                       Front a compile (as CMAKE_<LANG>_COMPILER_LAUNCHER)
+fastcache-cc --show-stats | -s [--prefetch-group <id>]  Report cache statistics for this machine
+fastcache-cc --zero-stats | -z                          Discard the statistics log
+fastcache-cc --help | -h | /?                           Flags and environment reference
+fastcache-cc --version                                  Launcher version
 ```
 
 `--help` is generated from the same table the launcher dispatches on, so it
@@ -152,7 +152,7 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | `FASTCACHE_ADDR` | `host:port` of the daemon. Hostnames, IPv4 literals, and bracketed IPv6 (`[::1]:6674`) all resolve. | unset — **no caching** |
 | `FASTCACHE_SOURCE_DIR` | Checkout source root, used for keying and path canonicalization. | unset — **no caching** |
 | `FASTCACHE_BINARY_DIR` | Build output root. | unset — **no caching** |
-| `FASTCACHE_COHORT` | Prefetch grouping id. **Not** part of the cache key, so it never partitions the cache. | `default` |
+| `FASTCACHE_PREFETCH_GROUP` | Prefetch grouping id. **Not** part of the cache key, so it never partitions the cache. | `default` |
 | `FASTCACHE_VERBOSE` | Print `HIT`/`MISS` and fall-back diagnostics to stderr. | unset (quiet) |
 | `FASTCACHE_NO_STATS` | Do not record invocations to the statistics log. | unset (recording on) |
 | `FASTCACHE_NO_DIRECT` | Disable direct mode, always preprocessing to derive the key. | unset (direct on) |
@@ -213,7 +213,7 @@ each other's. Recording failures are swallowed: statistics never break a build.
 ```
 $ fastcache-cc --show-stats
 
-all cohorts
+all prefetch groups
   compiles     : 4
   hits         : 2  (66.7% of 3 cacheable)
     via direct : 1

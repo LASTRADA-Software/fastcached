@@ -60,22 +60,22 @@ namespace
 
     /// The sub-options accepted after `--show-stats`.
     constexpr std::array StatsOptionTable {
-        FlagSpec { .action = Action::Cohort,
-                   .primary = "--cohort",
+        FlagSpec { .action = Action::PrefetchGroup,
+                   .primary = "--prefetch-group",
                    .aliases = NoAliases,
                    .arity = Arity::Value,
                    .operands = " <id>",
-                   .summary = "Report only this cohort." },
+                   .summary = "Report only this prefetch group." },
     };
 
     /// The sub-options accepted after `--html-stats`.
     constexpr std::array HtmlStatsOptionTable {
-        FlagSpec { .action = Action::Cohort,
-                   .primary = "--cohort",
+        FlagSpec { .action = Action::PrefetchGroup,
+                   .primary = "--prefetch-group",
                    .aliases = NoAliases,
                    .arity = Arity::Value,
                    .operands = " <id>",
-                   .summary = "Report only this cohort." },
+                   .summary = "Report only this prefetch group." },
         FlagSpec { .action = Action::OutputPath,
                    .primary = "--out",
                    .aliases = NoAliases,
@@ -128,7 +128,7 @@ namespace
     /// @return The command.
     [[nodiscard]] Command Selected(Action action)
     {
-        return { .action = action, .cohortFilter = {}, .outputPath = {}, .diagnostic = {} };
+        return { .action = action, .groupFilter = {}, .outputPath = {}, .diagnostic = {} };
     }
 
     /// A rejected command line.
@@ -136,7 +136,7 @@ namespace
     /// @return A `UsageError` command carrying `diagnostic`.
     [[nodiscard]] Command Rejected(std::string diagnostic)
     {
-        return { .action = Action::UsageError, .cohortFilter = {}, .outputPath = {}, .diagnostic = std::move(diagnostic) };
+        return { .action = Action::UsageError, .groupFilter = {}, .outputPath = {}, .diagnostic = std::move(diagnostic) };
     }
 
     /// The `FASTCACHE_*` variables, in the order `--help` documents them.
@@ -152,7 +152,7 @@ namespace
                                 "check this before concluding the cache is working." },
         EnvVarSpec { .name = EnvName::SourceDir, .summary = "Checkout source root, for keying and path canonicalization." },
         EnvVarSpec { .name = EnvName::BinaryDir, .summary = "Build output root." },
-        EnvVarSpec { .name = EnvName::Cohort,
+        EnvVarSpec { .name = EnvName::PrefetchGroup,
                      .summary = "Prefetch grouping id (default \"default\"). Not part of the\n"
                                 "cache key, so it never partitions the cache." },
         EnvVarSpec { .name = EnvName::Verbose, .summary = "Print HIT/MISS and fall-back diagnostics to stderr." },
@@ -219,7 +219,7 @@ Command ParseStatsOptions(std::span<std::string const> args, std::span<FlagSpec 
 
     // Walk a shrinking span rather than an index so consuming a flag's value
     // is an explicit step; a value that is never consumed has already been a
-    // bug (`--show-stats --cohort --zero-stats` used to both filter on
+    // bug (`--show-stats --prefetch-group --zero-stats` used to both filter on
     // "--zero-stats" and wipe the log).
     auto rest = args;
     while (!rest.empty())
@@ -251,13 +251,13 @@ Command ParseStatsOptions(std::span<std::string const> args, std::span<FlagSpec 
         else
             return Rejected(std::format("option '{}' requires a value", option->primary));
 
-        // An empty filter means "every cohort", so accepting one here would
+        // An empty filter means "every prefetch group", so accepting one here would
         // silently answer a different question than the one asked.
         if (value.empty())
             return Rejected(std::format("option '{}' requires a non-empty value", option->primary));
 
-        if (option->action == Action::Cohort)
-            cmd.cohortFilter = value;
+        if (option->action == Action::PrefetchGroup)
+            cmd.groupFilter = value;
         else if (option->action == Action::OutputPath)
             cmd.outputPath = value;
     }
