@@ -264,8 +264,8 @@ void WarnIfRejected(Cc::CacheOutcome const& outcome, std::string_view what, std:
 /// is chosen behind the IProcessRunner seam.
 [[nodiscard]] Cc::IProcessRunner& ProcessRunner()
 {
-    static std::unique_ptr<Cc::IProcessRunner> const Runner = Cc::MakeProcessRunner();
-    return *Runner;
+    static std::unique_ptr<Cc::IProcessRunner> const runner = Cc::MakeProcessRunner();
+    return *runner;
 }
 
 using Cc::CompileRun;

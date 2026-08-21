@@ -381,7 +381,7 @@ namespace
             StorageVerb verb;
             bool quiet;
         };
-        static constexpr std::array<StorageOpcode, 10> StorageOpcodes { {
+        static constexpr std::array<StorageOpcode, 10> storageOpcodes { {
             { .opcode = Opcode::Set, .verb = StorageVerb::Set, .quiet = false },
             { .opcode = Opcode::SetQ, .verb = StorageVerb::Set, .quiet = true },
             { .opcode = Opcode::Add, .verb = StorageVerb::Add, .quiet = false },
@@ -399,7 +399,7 @@ namespace
         // readability-qualified-auto and MSVC's type deduction disagree. A
         // range-based scan into an explicit pointer is portable across both.
         StorageOpcode const* descriptor = nullptr;
-        for (StorageOpcode const& candidate: StorageOpcodes)
+        for (StorageOpcode const& candidate: storageOpcodes)
         {
             if (candidate.opcode == opcode)
             {

@@ -1,4 +1,4 @@
-# fastcached - Fast Cache Daemon
+#fastcached - Fast Cache Daemon
 
 ## Project Architecture
 
@@ -54,114 +54,112 @@ src/FastCache/
 ```
 
 Every executable lives under `src/apps/<name>/` and declares its own target and
-install rule there; `src/apps/CMakeLists.txt` holds the app table that gates
-each one, so adding an executable is adding a row:
+install rule there;
+`src / apps / CMakeLists.txt` holds the app table that gates each one,
+    so adding an executable is adding a row:
 
-```
-src/apps/
-  fastcached/               the daemon (FASTCACHED_BUILD_DAEMON, default ON)
-  fastcache-cc/             the compiler launcher (FASTCACHED_BUILD_LAUNCHER,
-                            default ON) — a drop-in sccache-style launcher that
-                            keys on preprocess+relativized-args, FETCHes and
-                            hit-replays with include paths localized,
-                            misses→compile→STORE, and falls back safely on any
-                            cache error. Config via `FASTCACHE_*` env, wired
-                            through `CMAKE_<LANG>_COMPILER_LAUNCHER`. Platform
-                            work sits behind `IProcessRunner` / `ITcpClient`,
-                            so main.cpp's flow logic is platform-free. Compiles
-                            in `Cli/UsageDoc.cpp` plus `Platform/Environment.cpp`
-                            and `Platform/Terminal.cpp` (see `_fc_cc_core`), so
-                            its help renders and colorizes exactly like the
-                            daemon's without linking the library. `Cli/Options`
-                            is header-only, so including it costs no build row.
-  compile-cache-testclient/ low-level `0xFC` protocol probe + cross-depth
-                            validation (FASTCACHED_BUILD_TESTCLIENT, default
-                            OFF — test infrastructure, never installed)
-  fastcache-bench/          in-process storage micro-benchmarks
-                            (FASTCACHED_BUILD_BENCHMARKS, default OFF — test
-                            infrastructure, never installed). Catch2 benchmarks
-                            decomposing a lookup layer by layer, plus a
-                            thread-scaling tier; driven by `bench/inproc_bench.py`,
-                            which compares them against jitbit/FastCache's own
-                            suite run on the same machine. Default OFF but built
-                            by the `linux` and `clang-tidy` CI jobs, because a
-                            target nothing compiles is a target that rots.
+``` src / apps / fastcached / the daemon(FASTCACHED_BUILD_DAEMON, default ON) fastcache
+        - cc / the compiler launcher(FASTCACHED_BUILD_LAUNCHER, default ON) — a drop - in sccache
+        - style launcher that keys on preprocess + relativized - args,
+    FETCHes and hit - replays with include paths localized, misses→compile→STORE,
+    and falls back safely on any cache error.Config via `FASTCACHE_ *` env,
+    wired through `CMAKE_<LANG> _COMPILER_LAUNCHER`.Platform work sits behind `IProcessRunner` / `ITcpClient`,
+    so main.cpp's flow logic is platform-free. Compiles in `Cli / UsageDoc.cpp` plus `Platform
+        / Environment.cpp` and `Platform / Terminal.cpp` (see `_fc_cc_core`),
+    so its help renders and colorizes exactly like the daemon's without linking the library. `Cli/Options` is header - only,
+    so including it costs no build row.compile - cache - testclient / low - level `0xFC` protocol probe + cross
+        - depth validation(FASTCACHED_BUILD_TESTCLIENT, default OFF — test infrastructure, never installed) fastcache
+        - bench / in - process storage micro
+        - benchmarks(FASTCACHED_BUILD_BENCHMARKS, default OFF — test infrastructure, never installed)
+              .Catch2 benchmarks decomposing a lookup layer by layer,
+    plus a thread - scaling tier;
+driven by `bench / inproc_bench.py`,
+    which compares them against jitbit
+            / FastCache's own suite run on the same machine.Default OFF but built by the `linux` and `clang
+        - tidy` CI jobs,
+    because a target nothing compiles is a target that rots.
 ```
 
-Platform service integration and OS packaging live under `packaging/`, which
-follows the same table idiom — one descriptor row per installed asset, so a
-new man page or logrotate snippet is a new row rather than a new
+        Platform service integration and OS packaging live under `packaging
+        /`,
+    which follows the same table idiom — one descriptor row per installed asset,
+    so a new man page
+        or logrotate snippet is a new row rather than a new
 `install()` call:
 
-```
-packaging/
-  CMakeLists.txt      the asset install table (source|destination|kind|name|
-                      component); exports the config-file list reused by the
-                      dpkg conffiles and rpm %config filelists
-  linux/              system + user systemd units, sysusers.d/tmpfiles.d,
-                      the commented /etc/fastcached/fastcached.yaml, and the
-                      DEB/RPM maintainer-script templates (*.in)
-  macos/              /etc/paths.d entry, the per-component postinstall
-                      templates, the uninstaller, and the installer panes
-  windows/            WiX fragment driving --install-service / --uninstall-service
+``` packaging / CMakeLists.txt the asset install table(source | destination | kind | name | component);
+exports the config - file list reused by the dpkg conffiles and rpm % config filelists linux / system + user systemd units,
+    sysusers.d / tmpfiles.d, the commented / etc / fastcached / fastcached.yaml,
+    and the DEB / RPM maintainer - script templates(*.in) macos / / etc / paths.d entry,
+    the per - component postinstall templates, the uninstaller,
+    and the installer panes windows / WiX fragment driving-- install - service / --uninstall
+        - service
 ```
 
-`cmake/Packaging.cmake` turns that into `.deb`/`.rpm`/`.pkg`/`.msi` via CPack.
-These constraints are load-bearing and have each already been a bug:
+`cmake / Packaging.cmake` turns that into `.deb`/`.rpm`/`.pkg`/`.msi` via CPack.These constraints are load
+        - bearing and have each already been a bug:
 
-- **A flag is one row, and every binary's row table drives both parsing and
-  help.** The daemon used to declare flags four ways — hand-written `if (arg ==
-  …)`, a descriptor array, two inline `initializer_list<tuple<…>>` tables, and
-  seventeen copy-pasted blocks in `HandleTypedFlag` — and then spell every name
-  again in a separate help table, so a flag could be accepted but undocumented
-  or documented but rejected. `CliOptions()` is now the single source of truth,
-  and the help column is *derived* from `primary`/`alias`/`operand` rather than
-  restated. Rendering lives in `Cli/UsageDoc`, which must stay dependency-free:
-  `fastcache-cc` compiles it in rather than linking `FastCache`, so an include
-  of anything from `Config/` there breaks the launcher's link, not just its
-  build. Two remaining hand-written spellings are guarded by tests rather than
-  generated: `BuildServiceArgv` (a `ServiceControl_test` case walks
-  `CliOptions()` and requires each non-excluded flag to be emitted — the
-  exclusions, `--requirepass` above all, are listed with their reasons) and the
-  launcher's `FASTCACHE_*` oracle list in `LauncherCli_test`.
-- **A compile-cache frame declares its own length, so a rejection can be a reply
-  instead of a close.** The pre-1 header was `[magic][op]` with no length, and
-  that is what made every refusal — bad magic, unknown opcode, oversize field —
-  a silent `co_return`: with no declared length the server could not find where
-  the frame it was refusing ended, so it could not answer and resynchronize. A
-  client cannot tell that apart from a dead connection, so a mismatched install
-  presented as a flaky network and a cache that never warmed. The header is now
+    -**A flag is one row,
+    and every binary's row table drives both parsing and help.**The daemon used to declare flags four ways — hand
+        - written `if (arg ==
+  …)`,
+    a descriptor array, two inline `initializer_list<tuple<…>>` tables,
+    and seventeen copy - pasted blocks in `HandleTypedFlag` — and then spell every name again in a separate help table,
+    so a flag could be accepted but undocumented or documented but rejected. `CliOptions()` is now the single source of truth
+    ,
+    and the help column is * derived * from `primary`/`alias`/`operand` rather than restated.Rendering lives in `Cli
+        / UsageDoc`,
+    which must stay dependency - free:
+  `fastcache - cc` compiles it in rather than linking `FastCache`,
+    so an include of anything from `Config /` there breaks the launcher's link, not just its build.Two remaining hand
+            - written spellings are guarded by tests rather than generated: `BuildServiceArgv` (
+                a `ServiceControl_test` case walks
+  `CliOptions()` and requires each non - excluded flag to be emitted — the exclusions, `--requirepass` above all,
+                are listed with their reasons)
+        and the launcher's `FASTCACHE_*` oracle list in `LauncherCli_test`. - **A compile
+                - cache frame declares its own length,
+    so a rejection can be a reply instead of a close.**The pre - 1 header was `[magic][op]` with no length,
+    and that is what made every refusal — bad magic, unknown opcode,
+    oversize field — a silent `co_return`:
+    with no declared length the server could not find where the frame it was refusing ended,
+    so it could not answer and resynchronize.A client cannot tell that apart from a dead connection,
+    so a mismatched install presented as a flaky network and a cache that never warmed.The header is now
   `[magic][version][op][u32 payloadLength]` and every reply is
-  `[status][u32 payloadLength][payload]` — uniformly, including a miss, which is
-  a zero-length payload rather than no payload. `MemcachedBinary` already proved
-  the pattern: it can refuse-and-continue precisely because its header declares
-  `totalBodyLen`. Consequences that are each load-bearing: `Miss` is distinct
-  from `Error` (both were `0x00`, so a rejected client saw an endlessly cold
-  cache); an `UnsupportedVersion` message names the supported *range*, since a
-  rejection that cannot say what would have worked cannot be acted on; and there
-  is deliberately **no handshake**, because the launcher opens a fresh connection
-  per *operation* and a HELLO would cost 2–4 round trips per translation unit on
-  the exact path this list already records regressions on.
-- **A cache key that determines the object does not determine the depfile, so a hit
-  must re-check the dependency paths it is about to replay.** Preprocessing suppresses
-  line markers (`-E -P`, `/EP`) so a checkout path never reaches the key — which is
-  what makes a key portable, and equally what makes it *invariant under a header move*.
-  Move a header without changing a byte of it and the token stream is identical: the
-  object is still correct and is served, while the depfile, which is nothing but paths,
-  names a file that is gone. That is worse than a miss, because Ninja records the
-  dependency, cannot stat it, rebuilds, hits the same value, and never converges — with
-  a successful exit code every time. `Cc::MissingReplayedDependency` therefore runs
-  before a hit writes anything, and a stale hit falls through to the real compile, whose
-  STORE overwrites that key and *repairs* the entry rather than leaving it to poison
-  every later build. Its filter is where the subtlety is, and the two halves are
-  load-bearing in opposite directions: probing a depfile's rule target would make every
-  hit a miss, because the target is the object file and it does not exist yet (hence
-  `ParseDepFilePaths`, which excludes it, rather than a whitespace split); probing an
-  absolute path outside both roots would make two machines with different system include
-  prefixes miss on *every* compile forever, each re-storing the other's record. A
-  relative path is kept and must be classified before the toolchain test, which reports
-  every relative path as outside the roots. `/showIncludes` is covered alongside the
-  depfile because Ninja reads it as `deps = msvc`; `MsvcDiagnostics` is not, because a
+  `[status][u32 payloadLength][payload]` — uniformly,
+    including a miss,
+    which is a zero - length payload rather than no payload. `MemcachedBinary` already proved the pattern: it can refuse
+        - and-continue precisely because its header declares
+  `totalBodyLen`.Consequences that are each load
+        - bearing: `Miss` is distinct from `Error` (both were `0x00`, so a rejected client saw an endlessly cold cache);
+an `UnsupportedVersion` message names the supported * range *,
+    since a rejection that cannot say what would have worked cannot be acted on;
+and there is deliberately **no handshake **,
+    because the launcher opens a fresh connection per * operation
+            * and a HELLO would cost 2–4 round trips per translation unit on the exact path this list already records
+                      regressions on.
+        - **A cache key that determines the object does not determine the depfile,
+    so a hit must re
+        - check the dependency paths it is about to replay
+              .**Preprocessing suppresses line
+                    markers(`- E - P`, `/ EP`) so a checkout path never reaches the key — which is what makes a key portable,
+    and equally what makes it *invariant under a header move *.Move a header without changing a byte of it and the token
+        stream is identical: the object is still correct and is served,
+    while the depfile, which is nothing but paths, names a file that is gone.That is worse than a miss,
+    because Ninja records the dependency, cannot stat it, rebuilds, hits the same value,
+    and never converges — with a
+        successful exit code every time. `Cc::MissingReplayedDependency` therefore runs before a hit writes anything,
+    and a stale hit falls through to the real compile,
+    whose STORE overwrites that key
+        and *repairs *the entry rather than leaving it to poison every later build.Its filter is where the subtlety is,
+    and the two halves are load - bearing in opposite directions: probing a depfile's rule target would make every hit a miss
+    ,
+    because the target is the object file and it does not exist yet(hence
+  `ParseDepFilePaths`, which excludes it, rather than a whitespace split);
+probing an absolute path outside both roots would make two machines with different system include prefixes miss on * every
+    * compile forever,
+    each re - storing the other's record. A relative path is kept and must be classified before the toolchain test,
+    which reports every relative path as outside the roots. `
+        / showIncludes` is covered alongside the depfile because Ninja reads it as `deps = msvc`; `MsvcDiagnostics` is not, because a
   diagnostic quotes a path rather than declaring a dependency on it.
 - **`Protocol/CompileCacheWire.hpp` must stay header-only and dependency-free.**
   Same constraint as `Cli/UsageDoc`, same reason: `fastcache-cc` does not link
@@ -176,11 +174,11 @@ These constraints are load-bearing and have each already been a bug:
   it had *no* unit coverage at all.
 - **The supervisor's launch arguments must not pass `--daemon`.** The POSIX
   daemonize path double-forks and sends stdout/stderr to `/dev/null`, which
-  silences journald; its pidfile is also written after both parents exit, racing
-  `Type=forking`. launchd has the identical problem — it reaps the forked job
-  instantly as "exited" — which is why `BuildServiceArgv` takes an
-  `EmitDaemonFlag` rather than always emitting it.
-- **A config the operator named is strict; one the daemon found is not.**
+  silences journald;
+its pidfile is also written after both parents exit, racing
+  `Type = forking`.launchd has the identical problem — it reaps the forked job instantly as
+                                                     "exited" — which is why `BuildServiceArgv` takes an
+  `EmitDaemonFlag` rather than always emitting it.- **A config the operator named is strict; one the daemon found is not.**
   Without `--config`, `DefaultConfigPath` walks a per-platform candidate table
   (user location before machine-wide) and takes the first entry that exists *and
   opens for reading* — `Config/DefaultConfigPath.cpp` is the single source of
@@ -234,20 +232,18 @@ These constraints are load-bearing and have each already been a bug:
   ignored anyway is the silent no-op this list exists to prevent.
 - **`--seed-config` secures the directory before it looks for the file, not
   after.** The whole point of the repair is the case where something is *already*
-  there: any standard account can create a `%ProgramData%` subdirectory and drop
-  a config into it long before the installer runs, and the MSI cannot undo that
-  on its own — `PermissionEx` replaces the access list but not the owner, who
-  keeps `WRITE_DAC` regardless. So seeding secures the parent first (repairing a
-  squat), then decides what to do about the file: seed-once keeps an operator's
-  edits, but a file found in a directory that until that moment anybody could
-  write is not established to be an operator's, and is reported rather than
-  blessed by silence or destroyed by overwriting. Seeding refuses outright when
-  it has the rights for none of this, and deletes a directory it created but
-  could not secure — which would otherwise be the very shape being defended
-  against, authored by the defence.
-- **`ExecStart` still passes `--config` on Linux and macOS — by choice, not
-  necessity.** It predates the lookup, where its absence made `ConfigReloader`
-  have nothing to re-read and `systemctl reload` a silent no-op; the lookup now
+  there:
+any standard account can create a `% ProgramData %` subdirectory and drop a config into it long before the installer runs,
+    and the MSI cannot undo that on its own — `PermissionEx` replaces the access list but not the owner,
+    who keeps `WRITE_DAC` regardless.So seeding secures the parent first(repairing a squat),
+    then decides what to do about the file: seed - once keeps an operator's edits,
+    but a file found in a directory that until that moment anybody could write is
+    not established to be an operator's, and is reported rather than blessed by silence or destroyed by
+    overwriting.Seeding refuses outright when it has the rights for none of this,
+    and deletes a directory it created but could not secure — which would otherwise be the very shape being defended against,
+    authored by the defence.- **`ExecStart` still passes `--config` on Linux and macOS — by choice,
+    not necessity.**It predates the lookup,
+    where its absence made `ConfigReloader` have nothing to re - read and `systemctl reload` a silent no - op; the lookup now
   closes that hole for every daemon started without the flag. The packaged units
   keep it because the path is unambiguous there and CI asserts it. Windows goes
   the other way: its custom action registers *no* `--config`, so a seed that did
@@ -427,18 +423,19 @@ concrete type directly. If you find yourself wanting a global, a `static`
 mutable, or a direct `::time()`/`::read()`/`new ConcreteThing` call in
 business logic, that is the signal to introduce (or reuse) a seam instead.
 Deviate from this only with a *strong, explicitly stated* reason (e.g. a
-genuinely pure leaf computation with no environment coupling); the default
-answer is "inject it".
+genuinely pure leaf computation with no environment coupling);
+the default answer is "inject it".
 
-### Data-driven design
-**Behaviour is described by data; code interprets that data.** This is
-equally load-bearing and goes well beyond "no magic numbers". The aim is
-that adding a flag, a protocol verb, a storage backend, or an error code
-is a matter of *adding a row to a table*, not editing logic scattered
-across the codebase. Concretely:
+    ## #Data
+    - driven design** Behaviour is described by data;
+code interprets that data.**This is equally load
+    - bearing and goes well beyond "no magic numbers".The aim is that adding a flag,
+    a protocol verb, a storage backend, or an error code is a matter of *adding a row to a table *,
+    not editing logic scattered across the codebase.Concretely:
 
-- **One source of truth per concept.** The CLI flag table is data; the
-  storage-record layout is documented and derived in one place; the
+    -**One source of truth per concept
+        .**The CLI flag table is data;
+the storage - record layout is documented and derived in one place; the
   per-DBMS / per-protocol dispatch lives in a single switch each. There is
   exactly one place to change when the concept changes.
 - **No naive, hand-rolled repetition.** If two branches differ only by a
@@ -456,22 +453,37 @@ across the codebase. Concretely:
   range-based loop or `std::ranges` pipeline.
 
 As with DI, **adhere to this unless there is a very strong, explicitly
-justified reason not to.** When in doubt, ask: "if a sixth case showed up
-tomorrow, how many places would I edit?" If the answer is more than one,
-the design is not data-driven enough yet.
+justified reason not to.** When in doubt, ask:
+"if a sixth case showed up
+    tomorrow,
+    how many places would I edit ? " If the answer is more than one,
+                                       the design is not data
+                                       - driven enough yet.
 
-### RAII for resource handles
-Sockets, listeners, log files, coroutine handles — every resource is
-owned by an RAII wrapper. `PooledBuffer` returns to its `BufferPool` on
-destruction; `Task<T>`'s `Awaiter` takes ownership of the coroutine
-handle on construction so the temporary `Task` cannot tear the coroutine
-down across a suspend point.
+                                         ## #RAII for resource handles Sockets,
+    listeners, log files,
+    coroutine handles — every resource is owned by an RAII wrapper. `PooledBuffer` returns to
+        its `BufferPool` on destruction;
+`Task<T>`'s `Awaiter` takes ownership of the coroutine handle on construction so the temporary `Task` cannot tear the
+        coroutine down across a suspend point.
 
-## C++ Coding Guidelines (self-contained — no external `cpp.md` required)
+    ##C++ Coding
+    Guidelines(self - contained — no external `cpp.md` required)
 
-### Baseline (general C++23)
-- **Data-driven design (non-negotiable)** — describe behaviour as data and let code interpret it. No hard-coded magic values; no copy-pasted branches that differ only by a constant/name/type; new cases should be a new table row or descriptor, not a new hand-written `if`. Prefer tables/descriptors and `std::ranges` over conditional ladders. See the "Data-driven design" principle above; deviate only with a strong, stated reason.
-- **Dependency injection (non-negotiable)** — reach every I/O / time / randomness / filesystem / environment dependency through an injected interface, never a singleton, global, or direct concrete call. Define the seam first, then inject it. See the "Dependency injection" principle above; deviate only with a strong, stated reason.
+        ## #Baseline(general C++ 23)
+    - **Data - driven design(non - negotiable) * * — describe behaviour as data and let code interpret it.No hard
+    - coded magic values;
+no copy - pasted branches that differ only by a constant / name / type;
+new cases should be a new table row or descriptor,
+    not a new hand
+        - written `if `.Prefer tables
+              / descriptors and `std::ranges` over conditional ladders.See the "Data-driven design" principle above;
+deviate only with a strong,
+    stated reason.
+        - **Dependency injection(non - negotiable) * * — reach every I / O / time / randomness / filesystem
+              / environment dependency through an injected interface,
+    never a singleton, global,
+    or direct concrete call.Define the seam first, then inject it.See the "Dependency injection" principle above; deviate only with a strong, stated reason.
 - **Doxygen** on every new public function (params, return), class, struct, and member:
   ```cpp
   /// Short description.
@@ -485,7 +497,8 @@ down across a suspend point.
 - **`auto` type deduction** for readability; **structured bindings** for tuple-like returns.
 - **`clang-format` after every change** — use the project `.clang-format`.
 - **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT` — address the underlying issue. The `clang-debug` preset enables `clang-tidy` automatically.
-- **No `g_`-prefix on globals either — and the rule lives in `.clang-tidy`, not only here.** A file-scope or `thread_local` name is spelled like any other name of its kind: `CamelCase` if it is a constant, `camelBack` if it is mutable. There is no "forbid this prefix" option in `readability-identifier-naming` (its `...Prefix` keys only ever *require* one), so the `GlobalVariableCase`/`GlobalConstantCase`/`StaticVariableCase`/`StaticConstantCase` rows are what reject `g_foo` — and with `WarningsAsErrors: "*"` that is a build failure rather than a review comment. The prefix is a substitute for a naming convention rather than one, and it makes ambient state read as normal; if a bare name looks wrong at the call site, that is the "inject it" rule above telling you something.
+- **No `g_`-prefix on globals either — and the rule lives in `.clang-tidy`, not only here.** A file-scope or `thread_local` name is spelled like any other name of its kind: `CamelCase` if it is a constant, `camelBack` if it is mutable. There is no "forbid this prefix" option in `readability-identifier-naming` (its `...Prefix` keys only ever *require* one), so the `GlobalVariableCase`/`GlobalConstantCase`/`StaticVariableCase` rows are what reject `g_foo` — and with `WarningsAsErrors: "*"` that is a build failure rather than a review comment. A function-local `static` is `camelBack` whether or not it is `const` — `StaticConstantCase` is left unset precisely so it falls back to that, which keeps `g_` rejected there without demanding PascalCase for locals that are `static` only for their lifetime. The prefix is a substitute for a naming convention rather than one, and it makes ambient state read as normal;
+if a bare name looks wrong at the call site, that is the "inject it" rule above telling you something.
 - **No `k`-prefix on identifiers.** Do not use the Google-style `kFoo` prefix for constants, enumerators, or any other symbol — it violates the project `.clang-tidy` naming convention. Use `Foo` (PascalCase) for constants/enumerators and `foo`/`fooBar` for locals and members instead.
 - **All changes covered by unit tests.** Aim to **increase** coverage with every PR.
 - **No raw owning pointers.** Use `std::unique_ptr` / `std::shared_ptr` for ownership; RAII for resources.
@@ -502,31 +515,31 @@ down across a suspend point.
 CMake presets live in `CMakePresets.json`. Common entry points:
 
 ```sh
-# Clang Debug with PEDANTIC + ASan + UBSan + clang-tidy (the default agent preset; Linux + macOS)
+#Clang Debug with PEDANTIC + ASan + UBSan + clang - tidy(the default agent preset; Linux + macOS)
 cmake --preset clang-debug
 cmake --build --preset clang-debug
 ctest --preset clang-debug
 
-# Linux — GCC Debug
+#Linux — GCC Debug
 cmake --preset gcc-debug && cmake --build --preset gcc-debug
 
-# Linux — Coverage (HTML in out/build/clang-coverage/)
+#Linux — Coverage(HTML in out / build / clang - coverage /)
 cmake --preset clang-coverage
 cmake --build --preset clang-coverage
 
-# Linux — sanitizer-only presets
+#Linux — sanitizer - only presets
 cmake --preset clang-asan-ubsan
 cmake --preset clang-tsan
 
-# Linux/macOS — RelWithDebInfo + Tracy profiler (see "Profiling with Tracy")
+#Linux / macOS — RelWithDebInfo + Tracy profiler(see "Profiling with Tracy")
 cmake --preset clang-tracy
 cmake --build --preset clang-tracy
 
-# Windows — MSVC CL Debug (requires VCPKG_ROOT in env)
+#Windows — MSVC CL Debug(requires VCPKG_ROOT in env)
 cmake --preset cl-debug
 cmake --build --preset cl-debug
 
-# Windows — clang-cl Debug
+#Windows — clang - cl Debug
 cmake --preset clangcl-debug
 cmake --build --preset clangcl-debug
 ```
@@ -555,32 +568,38 @@ PDB is a second artefact no hit can reproduce).
 Catch2 tests live next to the implementation files, so `Foo.cpp` has a `Foo_test.cpp`. A `test_main.cpp` serves as the entry point.
 
 Not every test is a Catch2 case. Script-driven tests are registered in
-`src/tests/CMakeLists.txt`: the `smoke`-labelled ones start a real daemon or
-invoke a real compiler and report a missing prerequisite as skipped (exit 77 with
-`SKIP_RETURN_CODE`), while `repository-hygiene` runs
-`scripts/check-repository-hygiene.cmake` through `cmake -P` and is deliberately
-*not* labelled `smoke`, since it needs no daemon, socket or compiler and so belongs
-in the default `ctest` set. It reports "not a git work tree" by printing `SKIP: `
-and exiting 0, matched by `SKIP_REGULAR_EXPRESSION` — a `cmake -P` script cannot
-choose its own exit code before CMake 3.29 (`cmake_language(EXIT)`) and this
-project supports 3.28, so a `SKIP_RETURN_CODE` it could never return would be dead
-configuration.
+`src/tests/CMakeLists.txt`:
+the `smoke`- labelled ones start a real daemon
+    or invoke a real compiler and report a missing prerequisite as skipped(exit 77 with
+`SKIP_RETURN_CODE`),
+    while `repository - hygiene` runs
+`scripts / check - repository - hygiene.cmake` through `cmake - P` and is deliberately * not *labelled `smoke`,
+    since it needs no daemon,
+    socket
+        or compiler and so belongs in the default `ctest` set.It reports
+           "not a git work tree" by printing `SKIP: ` and exiting 0,
+    matched by `SKIP_REGULAR_EXPRESSION` — a `cmake
+            - P` script cannot choose its own exit code before CMake 3.29(`cmake_language(EXIT)`)
+        and this project supports 3.28,
+    so a `SKIP_RETURN_CODE` it could never return would be dead configuration.
 
-## Releasing
+    ##Releasing
 
-The version is the git tag, so cutting a release is pushing one:
+    The version is the git tag,
+    so cutting a release is pushing one:
 
-```sh
-git tag -a v0.1.0 -m "fastcached 0.1.0"
-git push origin v0.1.0
+```sh git tag - a v0.1.0
+    - m "fastcached 0.1.0" git push origin v0.1.0
 ```
 
-That tag matches the trigger in `.github/workflows/build.yml`, which runs the
-**entire** suite against the tagged tree — nothing about a release path is
-exercised only at release time — and then the tag-gated `release` job collects the
-three packaging jobs' artifacts, asserts that the set is complete and that every
-filename carries the tag's version, and creates a **draft** GitHub release with
-them attached. Nothing publishes automatically; a human does that with
+          That tag matches the trigger in `.github
+          / workflows / build.yml`,
+    which runs the * * entire
+            * *suite against the tagged tree — nothing about a release path is exercised only at release time — and then the
+              tag
+        - gated `release` job collects the three packaging
+          jobs' artifacts, asserts that the set is complete and that every filename carries the
+          tag's version, and creates a **draft** GitHub release with them attached.Nothing publishes automatically; a human does that with
 `/publish-release` once the assets have been verified. `/draft-release` drives the
 tagging half.
 
@@ -602,7 +621,7 @@ and link zero Tracy symbols.
 ```sh
 cmake --preset clang-tracy        # RelWithDebInfo, TRACY_ENABLE=ON, TRACY_ON_DEMAND=ON
 cmake --build --preset clang-tracy
-# -> out/build/clang-tracy/target/fastcached
+#->out / build / clang - tracy / target / fastcached
 ```
 
 `TRACY_ON_DEMAND=ON` means the daemon buffers nothing until a profiler
@@ -641,11 +660,11 @@ Build a Tracy viewer once (sources are fetched into the build tree under
 from the Tracy releases — the client and viewer protocol is version-locked.
 
 ```sh
-# Interactive GUI (needs glfw/freetype/capstone/gtk3/dbus dev packages):
+#Interactive GUI(needs glfw / freetype / capstone / gtk3 / dbus dev packages):
 cmake -S out/build/clang-tracy/_deps/tracy-src/profiler -B /tmp/tracy-gui -DCMAKE_BUILD_TYPE=Release
 cmake --build /tmp/tracy-gui -j        # -> /tmp/tracy-gui/tracy-profiler
 
-# Headless capture (no GUI deps; writes a .tracy file to open later):
+#Headless capture(no GUI deps; writes a.tracy file to open later):
 cmake -S out/build/clang-tracy/_deps/tracy-src/capture -B /tmp/tracy-cap -DCMAKE_BUILD_TYPE=Release
 cmake --build /tmp/tracy-cap -j        # -> /tmp/tracy-cap/tracy-capture
 ```
@@ -668,4 +687,3 @@ CacheEngine::* → ShardedStorage::* → LruStorage::* / EvictToFit → socket.w
 and the `lru.bytesUsed` plot for memory pressure. Use the **Statistics** window
 sorted by self-time to find hotspots; a gap between a `ShardedStorage::*` zone
 and its inner `LruStorage::*` zone is shard-mutex wait time.
-

@@ -213,23 +213,23 @@ TEST_CASE("a valueless stats option is accepted, and rejects a joined value")
 {
     // Every stats option that exists today takes a value, so inject a table with
     // a valueless row to exercise the generic path a future option would use.
-    static constexpr std::array<std::string_view, 0> NoAliases {};
-    static constexpr std::array Options {
+    static constexpr std::array<std::string_view, 0> noAliases {};
+    static constexpr std::array options {
         FlagSpec { .action = Action::PrefetchGroup,
                    .primary = "--verbose",
-                   .aliases = NoAliases,
+                   .aliases = noAliases,
                    .arity = Arity::None,
                    .operands = "",
                    .summary = "Test-only valueless option." },
     };
 
     std::vector<std::string> const bare { "--verbose" };
-    auto const accepted = ParseStatsOptions(bare, Options);
+    auto const accepted = ParseStatsOptions(bare, options);
     CHECK(accepted.action == Action::ShowStats);
     CHECK(accepted.groupFilter.empty());
 
     std::vector<std::string> const withValue { "--verbose=1" };
-    auto const rejected = ParseStatsOptions(withValue, Options);
+    auto const rejected = ParseStatsOptions(withValue, options);
     CHECK(rejected.action == Action::UsageError);
     CHECK(rejected.diagnostic.contains("takes no value"));
 }

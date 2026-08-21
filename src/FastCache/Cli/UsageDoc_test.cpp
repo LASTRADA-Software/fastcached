@@ -202,8 +202,8 @@ TEST_CASE("UsageRows keeps computed terms alive and aligned", "[cli][usage]")
     for (auto const index: std::views::iota(0, 3))
         rows.Add(std::format("--flag{}", index), "described");
 
-    static constexpr std::string_view Widest = "--widest-of-them-all";
-    rows.Add(std::string { Widest }, "last");
+    static constexpr std::string_view widest = "--widest-of-them-all";
+    rows.Add(std::string { widest }, "last");
 
     auto const blocks = std::to_array<UsageBlock>({ { .entries = rows.Rows() } });
     auto const sections = std::to_array<UsageSection>({ { .title = "OPTIONS", .blocks = blocks } });
@@ -211,8 +211,8 @@ TEST_CASE("UsageRows keeps computed terms alive and aligned", "[cli][usage]")
     auto const lines = UsageLines(RenderUsage({ .sections = sections }, UsageColor::Plain));
     REQUIRE(lines.size() == 5);
     CHECK(lines[1].starts_with("  --flag0"));
-    CHECK(lines[4].starts_with("  " + std::string { Widest }));
+    CHECK(lines[4].starts_with("  " + std::string { widest }));
     // One column across every row, sized by the widest term.
-    CHECK(DescriptionColumn(lines[1]) == 2 + Widest.size() + 2);
+    CHECK(DescriptionColumn(lines[1]) == 2 + widest.size() + 2);
     CHECK(DescriptionColumn(lines[4]) == DescriptionColumn(lines[1]));
 }

@@ -87,7 +87,13 @@ namespace
     ///
     /// FindOrNull rather than `std::ranges::find` because Candidates is a
     /// `std::array`, whose iterator has no portable spelling; see Ranges.hpp.
-    constexpr ConfigCandidate const& SystemRow = *FindOrNull(Candidates, ConfigScope::System, &ConfigCandidate::scope);
+    ///
+    /// A copy rather than a `constexpr` reference: the row is four `string_view`s
+    /// and an enum, so copying it costs nothing at compile time, and
+    /// readability-identifier-naming classifies a reference as a *variable*
+    /// whatever its constness — which would demand a name that says this is
+    /// mutable state when it is a constant.
+    constexpr ConfigCandidate SystemRow = *FindOrNull(Candidates, ConfigScope::System, &ConfigCandidate::scope);
 
     /// Build a ConfigError for a failure in this module.
     /// @param code Error category.
