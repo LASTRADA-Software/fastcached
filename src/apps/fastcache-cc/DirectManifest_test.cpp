@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DirectManifest.hpp"
+#include "KeyDigest.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <ranges>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -204,7 +209,7 @@ TEST_CASE("ComputeManifestKey is stable and separates differing inputs")
     std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };
     auto const base = ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51");
 
-    CHECK(base.size() == 32);
+    CHECK(base.size() == KeyDigest::HexLength);
     CHECK(base == ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51"));
 
     // Each input must participate: changing any one changes the key.
@@ -217,7 +222,7 @@ TEST_CASE("ComputeHeaderStateDigest changes when any header hash changes")
 {
     auto manifest = SampleManifest();
     auto const base = ComputeHeaderStateDigest("mkey", manifest);
-    CHECK(base.size() == 32);
+    CHECK(base.size() == KeyDigest::HexLength);
 
     // The whole point of direct mode: an edited header must yield a different
     // object key, so the stale object is never served.
@@ -569,4 +574,110 @@ TEST_CASE("A GNU depfile drives a manifest exactly as showIncludes notes do")
     CHECK_FALSE(ValidateManifest(*built, layout, "gcc-test-1"));
 
     std::filesystem::remove_all(root);
+}
+
+// --- issue #63: the manifest key must be as wide as it looks -----------------
+//
+// The mirror of the guard in CacheKey_test.cpp, and deliberately a separate case
+// rather than a shared helper: these were two independently copy-pasted salted-
+// CRC constructions (this file's `Lane`/`WideDigest` and CacheKey.cpp's `Lane`),
+// and the point of consolidating them onto one digest is that a future
+// divergence is caught on both sides rather than on whichever one a test
+// happened to reach. Direct mode is on by default, so this key space is the one
+// most builds actually use.
+
+namespace
+{
+/// Split a 32-hex-char digest into its four 32-bit quarters.
+/// @param key A digest as ComputeManifestKey renders it.
+/// @return The four quarters, most significant first.
+std::array<std::uint32_t, 4> DigestQuarters(std::string const& key)
+{
+    REQUIRE(key.size() == KeyDigest::HexLength);
+    std::array<std::uint32_t, 4> out {};
+    for (auto const index: std::views::iota(std::size_t { 0 }, out.size()))
+        out[index] = static_cast<std::uint32_t>(std::stoul(key.substr(index * 8, 8), nullptr, 16));
+    return out;
+}
+
+/// A deterministic byte source; see the note in CacheKey_test.cpp for why this
+/// is hand-rolled rather than `std::mt19937` plus a distribution.
+class SplitMix64
+{
+  public:
+    explicit SplitMix64(std::uint64_t seed) noexcept: _state { seed } {}
+
+    /// @return The next 64 pseudorandom bits.
+    [[nodiscard]] std::uint64_t Next() noexcept
+    {
+        _state += 0x9E37'79B9'7F4A'7C15ULL;
+        auto z = _state;
+        z = (z ^ (z >> 30)) * 0xBF58'476D'1CE4'E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D0'49BB'1331'11EBULL;
+        return z ^ (z >> 31);
+    }
+
+    /// @return A distinct 64-character text of fixed width.
+    [[nodiscard]] std::string NextFixedWidthText()
+    {
+        std::string out;
+        for ([[maybe_unused]] auto const word: std::views::iota(0, 4))
+            out += std::format("{:016x}", Next());
+        return out;
+    }
+
+  private:
+    std::uint64_t _state;
+};
+} // namespace
+
+TEST_CASE("The quarters of a manifest key vary independently for equal-length inputs")
+{
+    // Under the salted-CRC construction each of the six pairwise XORs took
+    // exactly one value here. EQUAL LENGTH IS THE POINT: the broken construction
+    // varies freely once the lengths differ, so varying-width sources would leave
+    // a test that passes against the bug it exists to catch.
+    constexpr std::size_t Samples = 64;
+
+    SplitMix64 source { 63 };
+    std::vector<std::string> const args { "/O2" };
+    std::array<std::set<std::uint32_t>, 6> pairwiseXors;
+    for ([[maybe_unused]] auto const sample: std::views::iota(std::size_t { 0 }, Samples))
+    {
+        auto const quarters = DigestQuarters(ComputeManifestKey(source.NextFixedWidthText(), args, "cl-19.51"));
+
+        std::size_t pair = 0;
+        for (auto const i: std::views::iota(std::size_t { 0 }, quarters.size()))
+            for (auto const j: std::views::iota(i + 1, quarters.size()))
+                pairwiseXors[pair++].insert(quarters[i] ^ quarters[j]);
+    }
+
+    for (auto const index: std::views::iota(std::size_t { 0 }, pairwiseXors.size()))
+    {
+        INFO("quarter pair index " << index);
+        CHECK(pairwiseXors[index].size() == Samples);
+    }
+}
+
+TEST_CASE("The three launcher key spaces are separated by their schema tag")
+{
+    // With the salts gone, the leading schema tag is the whole of the domain
+    // separation — and it is a stronger guarantee than the salts were. A tag is
+    // NUL-free and NUL-terminated, so tag+NUL is a prefix-free code: "objkey-v3",
+    // "manifest-v3" and "header-state-v1" differ in their first byte, which makes
+    // the hashed blobs unequal by construction. A salt only made a cross-domain
+    // collision improbable; disjoint inputs make it an ordinary collision, now at
+    // 2^-128 rather than 2^-32.
+    //
+    // The inputs below are arranged so that everything after the tag is as alike
+    // as the three signatures allow, which is the case a shared digest would fail
+    // if the tags were ever dropped.
+    std::vector<std::string> const args {};
+    DirectManifest manifest;
+    manifest.toolchainStamp = "same";
+
+    auto const manifestKey = ComputeManifestKey("same", args, "same");
+    auto const headerState = ComputeHeaderStateDigest("same", manifest);
+
+    CHECK(manifestKey != headerState);
 }

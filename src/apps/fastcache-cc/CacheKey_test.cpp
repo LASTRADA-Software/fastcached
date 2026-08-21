@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheKey.hpp"
+#include "KeyDigest.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cstdint>
+#include <format>
+#include <ranges>
+#include <set>
 #include <span>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace FastCache::Cc;
@@ -105,7 +112,7 @@ TEST_CASE("ComputeKey is a stable 32-hex-char string")
 {
     KeyInputs a { .compilerId = "cl", .preprocessed = "hello", .relativizedArgs = { "/c" }, .dependencyPaths = {} };
     auto const k = ComputeKey(a);
-    CHECK(k.size() == 32);
+    CHECK(k.size() == KeyDigest::HexLength);
     CHECK(k == ComputeKey(a)); // deterministic
 }
 
@@ -252,5 +259,133 @@ TEST_CASE("An empty dependency set still keys stably")
                              .dependencyPaths = {} };
 
     CHECK(ComputeKey(inputs) == ComputeKey(inputs));
-    CHECK(ComputeKey(inputs).size() == 32);
+    CHECK(ComputeKey(inputs).size() == KeyDigest::HexLength);
+}
+
+// --- issue #63: the key must actually be as wide as it looks -----------------
+//
+// The two cases below are the regression cover for a construction that produced
+// a 32-hex-char key carrying 32 bits of strength. It took four CRC32C digests of
+// one blob, distinguished only by a leading salt byte. CRC is affine over GF(2),
+// so with `A` the per-byte state-update operator and `S_i` the state after salt
+// `i`, quarter_i XOR quarter_j is `A^len(blob) * (S_i XOR S_j)` — a value that
+// depends on the blob's LENGTH and on nothing else about it. Matching one quarter
+// therefore forced all four, and a collision served an unrelated translation
+// unit's object file under a zero exit code.
+
+namespace
+{
+/// Split a 32-hex-char key into its four 32-bit quarters.
+/// @param key A key as ComputeKey renders it.
+/// @return The four quarters, most significant first.
+std::array<std::uint32_t, 4> Quarters(std::string const& key)
+{
+    REQUIRE(key.size() == KeyDigest::HexLength);
+    std::array<std::uint32_t, 4> out {};
+    for (auto const index: std::views::iota(std::size_t { 0 }, out.size()))
+        out[index] = static_cast<std::uint32_t>(std::stoul(key.substr(index * 8, 8), nullptr, 16));
+    return out;
+}
+
+/// A deterministic byte source.
+///
+/// Hand-rolled rather than `std::mt19937` plus a distribution, because the
+/// standard leaves a distribution's mapping from engine output to values
+/// unspecified: "fixed seed" would not mean the same inputs on libstdc++, libc++
+/// and MSVC's STL, and the sample count below is chosen against a specific
+/// observed collision index. It has to be the same sequence everywhere.
+class SplitMix64
+{
+  public:
+    explicit SplitMix64(std::uint64_t seed) noexcept: _state { seed } {}
+
+    /// @return The next 64 pseudorandom bits.
+    [[nodiscard]] std::uint64_t Next() noexcept
+    {
+        _state += 0x9E37'79B9'7F4A'7C15ULL;
+        auto z = _state;
+        z = (z ^ (z >> 30)) * 0xBF58'476D'1CE4'E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D0'49BB'1331'11EBULL;
+        return z ^ (z >> 31);
+    }
+
+    /// Produce a distinct 64-character text. The width is fixed on purpose: see
+    /// the equal-length note in the cases below.
+    /// @return 64 hex characters of fresh pseudorandom state.
+    [[nodiscard]] std::string NextFixedWidthText()
+    {
+        std::string out;
+        for ([[maybe_unused]] auto const word: std::views::iota(0, 4))
+            out += std::format("{:016x}", Next());
+        return out;
+    }
+
+  private:
+    std::uint64_t _state;
+};
+} // namespace
+
+TEST_CASE("The quarters of a key vary independently for equal-length inputs")
+{
+    // The direct expression of the defect, and deterministic: no seed luck, no
+    // birthday search. Under the salted-CRC construction every one of the six
+    // pairwise XORs took exactly ONE value across any number of equal-length
+    // inputs.
+    //
+    // EQUAL LENGTH IS THE WHOLE POINT OF THIS CASE. The broken construction's
+    // XOR does vary once the lengths differ — that is precisely what `A^len`
+    // means — so relaxing these inputs to varying-length text would leave a test
+    // that passes against the bug it exists to catch.
+    constexpr std::size_t Samples = 64;
+
+    SplitMix64 source { 63 };
+    std::array<std::set<std::uint32_t>, 6> pairwiseXors;
+    for ([[maybe_unused]] auto const sample: std::views::iota(std::size_t { 0 }, Samples))
+    {
+        KeyInputs const inputs { .compilerId = "cc-1.0",
+                                 .preprocessed = source.NextFixedWidthText(),
+                                 .relativizedArgs = {},
+                                 .dependencyPaths = {} };
+        auto const quarters = Quarters(ComputeKey(inputs));
+
+        std::size_t pair = 0;
+        for (auto const i: std::views::iota(std::size_t { 0 }, quarters.size()))
+            for (auto const j: std::views::iota(i + 1, quarters.size()))
+                pairwiseXors[pair++].insert(quarters[i] ^ quarters[j]);
+    }
+
+    for (auto const index: std::views::iota(std::size_t { 0 }, pairwiseXors.size()))
+    {
+        INFO("quarter pair index " << index);
+        CHECK(pairwiseXors[index].size() == Samples);
+    }
+}
+
+TEST_CASE("Equal-length key inputs survive a birthday-sized collision search")
+{
+    // What the defect actually cost: a full 32-hex-char key collision between two
+    // unrelated translation units, which is a wrong object served with a zero
+    // exit code rather than a miss.
+    //
+    // The sample count is measured, not guessed. With this seed and this input
+    // shape the salted-CRC construction produced its first full-key collision at
+    // sample index 86,125 — the birthday bound for the 32 bits it really had —
+    // so 100,000 makes the pre-fix failure deterministic rather than likely.
+    // Against a real 128-bit digest this can never fire: the same bound sits at
+    // ~2^64 samples.
+    constexpr std::size_t Samples = 100'000;
+
+    SplitMix64 source { 63 };
+    std::unordered_set<std::string> keys;
+    keys.reserve(Samples);
+    for ([[maybe_unused]] auto const sample: std::views::iota(std::size_t { 0 }, Samples))
+    {
+        KeyInputs const inputs { .compilerId = "cc-1.0",
+                                 .preprocessed = source.NextFixedWidthText(),
+                                 .relativizedArgs = {},
+                                 .dependencyPaths = {} };
+        keys.insert(ComputeKey(inputs));
+    }
+
+    CHECK(keys.size() == Samples);
 }

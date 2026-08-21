@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DirectManifest.hpp"
-
-#include <FastCache/Core/Crc32c.hpp>
+#include "KeyDigest.hpp"
 
 #include <algorithm>
 #include <array>
@@ -51,34 +50,6 @@ namespace
             return lowered == '/' ? '\\' : lowered;
         });
         return out;
-    }
-
-    /// One CRC32C lane over `data`, salted so lanes are independent. Mirrors
-    /// CacheKey.cpp's construction so both key spaces are the same shape.
-    [[nodiscard]] std::uint32_t Lane(std::uint8_t salt, std::string_view data)
-    {
-        std::uint32_t state = Crc32c::Seed;
-        std::array<std::byte, 1> const saltByte { static_cast<std::byte>(salt) };
-        Crc32c::Update(state, saltByte);
-        Crc32c::Update(state, std::span<std::byte const> { reinterpret_cast<std::byte const*>(data.data()), data.size() });
-        return Crc32c::Finalise(state);
-    }
-
-    /// Four independent lanes over one blob, rendered as 32 hex chars — a 128-bit
-    /// key, wide enough that an accidental collision across a build is negligible.
-    [[nodiscard]] std::string WideDigest(std::string_view blob)
-    {
-        std::array<std::uint32_t, 4> const lanes {
-            Lane(0xE5, blob),
-            Lane(0xF6, blob),
-            Lane(0x17, blob),
-            Lane(0x28, blob),
-        };
-        std::string key;
-        key.reserve(32);
-        for (auto const lane: lanes)
-            key += std::format("{:08x}", lane);
-        return key;
     }
 
     void AppendU32(std::string& out, std::uint32_t value)
@@ -228,8 +199,7 @@ std::string HashFileContents(std::string_view absolutePath)
     if (!file)
         return {};
 
-    std::uint32_t state = Crc32c::Seed;
-    std::uint64_t length = 0;
+    MurmurHash3 digest;
     std::array<std::byte, 64 * 1024> buffer {};
     while (file)
     {
@@ -237,16 +207,28 @@ std::string HashFileContents(std::string_view absolutePath)
         auto const read = static_cast<std::size_t>(file.gcount());
         if (read == 0)
             break;
-        length += read;
-        Crc32c::Update(state, std::span<std::byte const> { buffer.data(), read });
+        digest.Update(std::span<std::byte const> { buffer.data(), read });
     }
     if (file.bad())
         return {};
 
-    // Length is folded in alongside the digest: CRC32C is not collision-resistant
-    // by design, and pairing it with the exact byte count makes an accidental
-    // same-length collision the only way to mistake two headers for each other.
-    return std::format("{:08x}{:016x}", Crc32c::Finalise(state), length);
+    // A 128-bit digest, and the byte count no longer has to be carried beside it.
+    //
+    // This used to be one CRC32C paired with the exact length, on the reasoning
+    // that the pairing made "an accidental same-length collision the only way to
+    // mistake two headers for each other". True, and still only 32 bits against
+    // exactly that case -- which is the one that matters, because a header edit
+    // that preserves length is ordinary. This value is what a direct hit
+    // revalidates against, so a collision here does not miss: it decides an
+    // edited header is unchanged and serves the stale object under a zero exit
+    // code. Same defect as issue #63 on the key itself, and fixed with the same
+    // digest, which mixes the length in during finalisation anyway.
+    //
+    // Deliberately distinct from the empty string returned above for a file that
+    // could not be read: ValidateManifest compares this value for equality, and
+    // an unreadable header must not compare equal to anything, including another
+    // unreadable one.
+    return digest.ToHex();
 }
 
 std::string NormalizePath(std::string_view rawPath)
@@ -447,47 +429,47 @@ std::string ComputeManifestKey(std::string_view canonicalSource,
                                std::vector<std::string> const& relativizedArgs,
                                std::string_view toolchainStamp)
 {
-    std::string blob;
-    // v2 tracks `objkey-v2` and MUST be bumped with it, even though nothing about
-    // the manifest's own shape changed. A manifest stores the object key BY
+    // The tag tracks `objkey-v*` and MUST be bumped with it, even when nothing
+    // about the manifest's own shape changed. A manifest stores the object key BY
     // VALUE, and its own key is a function of (canonical source, relativized
     // args, toolchain stamp) — none of which the object-key schema touches — so a
-    // manifest written by a v1 launcher is still found, still validates, and
-    // still points at a v1 object. Direct mode is on by default and short-circuits
-    // before the preprocessed path, so without this bump the re-key that
-    // `objkey-v2` exists to force never happens on the default path: on Windows
-    // that means the entries written while `/EP /P` sent the preprocessed text to
-    // a file — the ones carrying no content from the source at all — keep being
-    // served indefinitely.
-    blob += "manifest-v2";
-    blob.push_back('\x00');
-    blob += toolchainStamp;
-    blob.push_back('\x00');
-    blob += canonicalSource;
-    blob.push_back('\x00');
+    // manifest written by an older launcher is still found, still validates, and
+    // still points at an older object. Direct mode is on by default and
+    // short-circuits before the preprocessed path, so without this bump the
+    // re-key that `objkey-v*` exists to force never happens on the default path:
+    // for v2 that meant the Windows entries written while `/EP /P` sent the
+    // preprocessed text to a file — the ones carrying no content from the source
+    // at all — kept being served indefinitely.
+    //
+    // v3 has a second, independent reason, and either alone would require it: the
+    // key's own construction changed (issue #63 — four salted CRC32C runs over one
+    // blob, which carried 32 bits rather than 128, to a real 128-bit digest). A v2
+    // manifest is therefore not merely pointing at a v2 object; its key is not
+    // reachable by this build at all.
+    KeyDigest digest { "manifest-v3" };
+    digest.Field(toolchainStamp);
+    digest.Field(canonicalSource);
     for (auto const& arg: relativizedArgs)
-    {
-        blob += arg;
-        blob.push_back('\x01');
-    }
-    return WideDigest(blob);
+        digest.Item(arg);
+    return digest.ToHex();
 }
 
 std::string ComputeHeaderStateDigest(std::string_view manifestKey, DirectManifest const& manifest)
 {
-    std::string blob;
-    blob += "header-state-v1";
-    blob.push_back('\x00');
-    blob += manifestKey;
-    blob.push_back('\x00');
+    // The tag stays at v1 while `objkey`/`manifest` move to v3, deliberately.
+    // Those two move in lock-step because each names entries that outlive the
+    // other's schema; nothing is stored under this digest at all, so there is no
+    // stale entry for a bump to fix and it would be a version with no work to do.
+    // The trigger to revisit: the day anything is persisted or sent under this
+    // value, it joins the lock-step group.
+    KeyDigest digest { "header-state-v1" };
+    digest.Field(manifestKey);
     for (auto const& entry: manifest.entries)
     {
-        blob += entry.canonicalPath;
-        blob.push_back('\x02');
-        blob += entry.contentHash;
-        blob.push_back('\x01');
+        digest.Path(entry.canonicalPath);
+        digest.Item(entry.contentHash);
     }
-    return WideDigest(blob);
+    return digest.ToHex();
 }
 
 } // namespace FastCache::Cc
