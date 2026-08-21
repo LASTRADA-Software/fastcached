@@ -114,7 +114,11 @@ class MurmurHash3
     /// key spaces are separated by their leading schema tag, which is inside the
     /// hashed bytes and prefix-free, not by a seed sitting outside them.
     /// @param seed Initial state for both words; 0 unless conformance-testing.
-    explicit MurmurHash3(std::uint32_t seed = 0) noexcept: _h1 { seed }, _h2 { seed } {}
+    explicit MurmurHash3(std::uint32_t seed = 0) noexcept:
+        _h1 { seed },
+        _h2 { seed }
+    {
+    }
 
     /// Fold a byte range into the digest.
     ///

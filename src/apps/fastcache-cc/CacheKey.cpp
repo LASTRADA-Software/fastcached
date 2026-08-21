@@ -4,10 +4,10 @@
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 
-#include <algorithm>
-#include <cstddef>
-#include <ranges>
+#include <array>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace FastCache::Cc

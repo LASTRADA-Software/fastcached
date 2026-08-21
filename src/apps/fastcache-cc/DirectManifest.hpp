@@ -232,13 +232,13 @@ inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
 /// Deliberately independent of header contents: this key must be computable
 /// *before* the headers are known, from only the things available up front. The
 /// manifest it retrieves then supplies the header hashes.
-/// @param canonicalSource Canonical token for the translation unit's path.
-/// @param relativizedArgs The compile arguments, already relativized.
 ///
 /// Shares one implementation with ComputeKey (`KeyDigest`), which is what keeps
 /// the two key spaces the same shape without keeping two copies of the digest;
 /// they are separated by their leading schema tag, not by the salt bytes that
 /// used to distinguish them.
+/// @param canonicalSource Canonical token for the translation unit's path.
+/// @param relativizedArgs The compile arguments, already relativized.
 /// @param toolchainStamp  The toolchain identity.
 /// @return A stable 32-hex-char digest.
 [[nodiscard]] std::string ComputeManifestKey(std::string_view canonicalSource,

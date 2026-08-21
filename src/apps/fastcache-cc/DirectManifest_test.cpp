@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CacheKey.hpp"
 #include "DirectManifest.hpp"
 #include "KeyDigest.hpp"
+#include "KeyDigestTestSupport.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <format>
@@ -16,6 +19,8 @@
 #include <vector>
 
 using namespace FastCache::Cc;
+using FastCache::Cc::Test::DigestQuarters;
+using FastCache::Cc::Test::SplitMix64;
 
 namespace
 {
@@ -578,58 +583,17 @@ TEST_CASE("A GNU depfile drives a manifest exactly as showIncludes notes do")
 
 // --- issue #63: the manifest key must be as wide as it looks -----------------
 //
-// The mirror of the guard in CacheKey_test.cpp, and deliberately a separate case
-// rather than a shared helper: these were two independently copy-pasted salted-
-// CRC constructions (this file's `Lane`/`WideDigest` and CacheKey.cpp's `Lane`),
-// and the point of consolidating them onto one digest is that a future
+// The mirror of the guard in CacheKey_test.cpp, and deliberately a separate CASE
+// rather than one case covering both: these were two independently copy-pasted
+// salted-CRC constructions (this file's `Lane`/`WideDigest` and CacheKey.cpp's
+// `Lane`), and the point of consolidating them onto one digest is that a future
 // divergence is caught on both sides rather than on whichever one a test
 // happened to reach. Direct mode is on by default, so this key space is the one
-// most builds actually use.
-
-namespace
-{
-/// Split a 32-hex-char digest into its four 32-bit quarters.
-/// @param key A digest as ComputeManifestKey renders it.
-/// @return The four quarters, most significant first.
-std::array<std::uint32_t, 4> DigestQuarters(std::string const& key)
-{
-    REQUIRE(key.size() == KeyDigest::HexLength);
-    std::array<std::uint32_t, 4> out {};
-    for (auto const index: std::views::iota(std::size_t { 0 }, out.size()))
-        out[index] = static_cast<std::uint32_t>(std::stoul(key.substr(index * 8, 8), nullptr, 16));
-    return out;
-}
-
-/// A deterministic byte source; see the note in CacheKey_test.cpp for why this
-/// is hand-rolled rather than `std::mt19937` plus a distribution.
-class SplitMix64
-{
-  public:
-    explicit SplitMix64(std::uint64_t seed) noexcept: _state { seed } {}
-
-    /// @return The next 64 pseudorandom bits.
-    [[nodiscard]] std::uint64_t Next() noexcept
-    {
-        _state += 0x9E37'79B9'7F4A'7C15ULL;
-        auto z = _state;
-        z = (z ^ (z >> 30)) * 0xBF58'476D'1CE4'E5B9ULL;
-        z = (z ^ (z >> 27)) * 0x94D0'49BB'1331'11EBULL;
-        return z ^ (z >> 31);
-    }
-
-    /// @return A distinct 64-character text of fixed width.
-    [[nodiscard]] std::string NextFixedWidthText()
-    {
-        std::string out;
-        for ([[maybe_unused]] auto const word: std::views::iota(0, 4))
-            out += std::format("{:016x}", Next());
-        return out;
-    }
-
-  private:
-    std::uint64_t _state;
-};
-} // namespace
+// most builds actually use. The generator and the quarter split are shared
+// (`KeyDigestTestSupport.hpp`) precisely because they must NOT diverge — two
+// copies of a "deterministic" sequence are two sequences the moment one is
+// touched, and the sample counts here are chosen against a measured collision
+// index.
 
 TEST_CASE("The quarters of a manifest key vary independently for equal-length inputs")
 {
@@ -671,14 +635,22 @@ TEST_CASE("The three launcher key spaces are separated by their schema tag")
     //
     // The inputs below are arranged so that everything after the tag is as alike
     // as the three signatures allow, which is the case a shared digest would fail
-    // if the tags were ever dropped.
+    // if the tags were ever dropped. All THREE are compared: the object key is the
+    // space the other two exist to point at, so leaving it out would name the
+    // property in the title and assert two thirds of it.
     std::vector<std::string> const args {};
-    DirectManifest manifest;
-    manifest.toolchainStamp = "same";
+    DirectManifest const manifest;
 
+    // objkey folds compilerId then preprocessed as two `Field`s, exactly as the
+    // manifest key folds toolchainStamp then canonicalSource -- so with the tags
+    // stripped these two blobs would be byte-identical.
+    auto const objectKey =
+        ComputeKey(KeyInputs { .compilerId = "same", .preprocessed = "same", .relativizedArgs = {}, .dependencyPaths = {} });
     auto const manifestKey = ComputeManifestKey("same", args, "same");
     auto const headerState = ComputeHeaderStateDigest("same", manifest);
 
+    CHECK(objectKey != manifestKey);
+    CHECK(objectKey != headerState);
     CHECK(manifestKey != headerState);
 }
 
@@ -689,7 +661,7 @@ TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
     // whenever `objkey-v*` is, because a manifest stores the object key by value
     // and its own key never sees the object-key schema.
     std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };
-    CHECK(ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51") == "d175bf7095d072ad7d2d55455de71c6d");
+    CHECK(ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51") == "76b19c2b7caf3e0db4dcc1efcecb76aa");
 
     // The header-state digest is deliberately NOT part of that pair: nothing is
     // stored under it, so it has no stale entries to re-key and its tag stays at
@@ -701,7 +673,7 @@ TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
     manifest.entries.push_back({ .canonicalPath = "<SRCROOT>/inc/a.hpp", .contentHash = "aaaa" });
     manifest.entries.push_back({ .canonicalPath = "<SRCROOT>/inc/b.hpp", .contentHash = "bbbb" });
 
-    CHECK(ComputeHeaderStateDigest("mkey", manifest) == "d325ccb5dcd226898bea865425b96a56");
+    CHECK(ComputeHeaderStateDigest("mkey", manifest) == "6937b8627813a98102e756fa21856149");
 }
 
 TEST_CASE("HashFileContents separates equal-length contents and reports unreadable files")
@@ -711,7 +683,13 @@ TEST_CASE("HashFileContents separates equal-length contents and reports unreadab
     // header edit preserving length. A collision there does not miss -- it decides
     // an edited header is unchanged and serves the stale object under a zero exit
     // code (issue #63, same defect as the key itself).
-    auto const dir = std::filesystem::temp_directory_path() / "fastcache-hashfile-test";
+    // Cleared before it is populated, like every other filesystem case in this
+    // file. The teardown at the end does not cover a run that crashed or was
+    // interrupted, and this case asserts that `absent.hpp` is ABSENT -- so a
+    // leftover of that name would make it fail for a reason that has nothing to
+    // do with hashing.
+    auto const dir = std::filesystem::temp_directory_path() / "fc-direct-hashfile";
+    std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
 
     auto const write = [&](std::string_view name, std::string_view contents) {

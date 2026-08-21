@@ -5,8 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdint>
 #include <filesystem>
-#include <format>
 #include <fstream>
 #include <optional>
 #include <ranges>

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheKey.hpp"
 #include "KeyDigest.hpp"
+#include "KeyDigestTestSupport.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
-#include <format>
 #include <ranges>
 #include <set>
 #include <span>
@@ -15,6 +16,8 @@
 #include <vector>
 
 using namespace FastCache::Cc;
+using FastCache::Cc::Test::DigestQuarters;
+using FastCache::Cc::Test::SplitMix64;
 
 namespace
 {
@@ -273,58 +276,6 @@ TEST_CASE("An empty dependency set still keys stably")
 // therefore forced all four, and a collision served an unrelated translation
 // unit's object file under a zero exit code.
 
-namespace
-{
-/// Split a 32-hex-char key into its four 32-bit quarters.
-/// @param key A key as ComputeKey renders it.
-/// @return The four quarters, most significant first.
-std::array<std::uint32_t, 4> Quarters(std::string const& key)
-{
-    REQUIRE(key.size() == KeyDigest::HexLength);
-    std::array<std::uint32_t, 4> out {};
-    for (auto const index: std::views::iota(std::size_t { 0 }, out.size()))
-        out[index] = static_cast<std::uint32_t>(std::stoul(key.substr(index * 8, 8), nullptr, 16));
-    return out;
-}
-
-/// A deterministic byte source.
-///
-/// Hand-rolled rather than `std::mt19937` plus a distribution, because the
-/// standard leaves a distribution's mapping from engine output to values
-/// unspecified: "fixed seed" would not mean the same inputs on libstdc++, libc++
-/// and MSVC's STL, and the sample count below is chosen against a specific
-/// observed collision index. It has to be the same sequence everywhere.
-class SplitMix64
-{
-  public:
-    explicit SplitMix64(std::uint64_t seed) noexcept: _state { seed } {}
-
-    /// @return The next 64 pseudorandom bits.
-    [[nodiscard]] std::uint64_t Next() noexcept
-    {
-        _state += 0x9E37'79B9'7F4A'7C15ULL;
-        auto z = _state;
-        z = (z ^ (z >> 30)) * 0xBF58'476D'1CE4'E5B9ULL;
-        z = (z ^ (z >> 27)) * 0x94D0'49BB'1331'11EBULL;
-        return z ^ (z >> 31);
-    }
-
-    /// Produce a distinct 64-character text. The width is fixed on purpose: see
-    /// the equal-length note in the cases below.
-    /// @return 64 hex characters of fresh pseudorandom state.
-    [[nodiscard]] std::string NextFixedWidthText()
-    {
-        std::string out;
-        for ([[maybe_unused]] auto const word: std::views::iota(0, 4))
-            out += std::format("{:016x}", Next());
-        return out;
-    }
-
-  private:
-    std::uint64_t _state;
-};
-} // namespace
-
 TEST_CASE("The quarters of a key vary independently for equal-length inputs")
 {
     // The direct expression of the defect, and deterministic: no seed luck, no
@@ -342,11 +293,10 @@ TEST_CASE("The quarters of a key vary independently for equal-length inputs")
     std::array<std::set<std::uint32_t>, 6> pairwiseXors;
     for ([[maybe_unused]] auto const sample: std::views::iota(std::size_t { 0 }, Samples))
     {
-        KeyInputs const inputs { .compilerId = "cc-1.0",
-                                 .preprocessed = source.NextFixedWidthText(),
-                                 .relativizedArgs = {},
-                                 .dependencyPaths = {} };
-        auto const quarters = Quarters(ComputeKey(inputs));
+        KeyInputs const inputs {
+            .compilerId = "cc-1.0", .preprocessed = source.NextFixedWidthText(), .relativizedArgs = {}, .dependencyPaths = {}
+        };
+        auto const quarters = DigestQuarters(ComputeKey(inputs));
 
         std::size_t pair = 0;
         for (auto const i: std::views::iota(std::size_t { 0 }, quarters.size()))
@@ -380,10 +330,9 @@ TEST_CASE("Equal-length key inputs survive a birthday-sized collision search")
     keys.reserve(Samples);
     for ([[maybe_unused]] auto const sample: std::views::iota(std::size_t { 0 }, Samples))
     {
-        KeyInputs const inputs { .compilerId = "cc-1.0",
-                                 .preprocessed = source.NextFixedWidthText(),
-                                 .relativizedArgs = {},
-                                 .dependencyPaths = {} };
+        KeyInputs const inputs {
+            .compilerId = "cc-1.0", .preprocessed = source.NextFixedWidthText(), .relativizedArgs = {}, .dependencyPaths = {}
+        };
         keys.insert(ComputeKey(inputs));
     }
 
@@ -392,10 +341,16 @@ TEST_CASE("Equal-length key inputs survive a birthday-sized collision search")
 
 TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliberate")
 {
-    // A pin, not a correctness proof. Correctness of the digest underneath is
-    // what MurmurHash3_test.cpp's SMHasher verification value covers; this vector
-    // was read out of the implementation, so all it can prove is that the value
-    // has not moved since a human reviewed the construction.
+    // A pin. Correctness of the digest underneath is what MurmurHash3_test.cpp's
+    // SMHasher verification value covers; what this adds is that the value has
+    // not moved since the construction was reviewed.
+    //
+    // It is a little stronger than the usual golden, which can only ever say
+    // "unchanged since someone pasted it": this vector was independently
+    // reproduced from the MurmurHash3 specification and the grammar below --
+    // kind byte, big-endian u64 length, bytes, per piece -- by a separate
+    // implementation. So it pins the whole chain, tag placement and field order
+    // and separator kinds and rendering included, not just the digest.
     //
     // That is exactly the job. Every input to this key -- the schema tag, the
     // field order, the separator bytes, the digest, its rendering -- is a thing
@@ -416,5 +371,53 @@ TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliber
                              .relativizedArgs = { "-c", "-O2", "<SRCROOT>/src/main.cpp" },
                              .dependencyPaths = { "<SRCROOT>/inc/a.hpp", "<SRCROOT>/inc/b.hpp" } };
 
-    CHECK(ComputeKey(inputs) == "c555e22cc49a05fabcfbeb6986e85069");
+    CHECK(ComputeKey(inputs) == "65a330c5e6541bf33b2682d642717669");
+}
+
+TEST_CASE("Field contents cannot be shifted across a field boundary")
+{
+    // The framing had to be length-prefixed rather than separator-terminated,
+    // and this is the case that forces it. Terminating a value with a byte that
+    // can occur INSIDE a value is not a framing at all: while `Field` wrote
+    // `value` followed by NUL, these two inputs produced byte-identical blobs
+    // and therefore the same key.
+    //
+    // That is the same silent mis-serve as issue #63 -- two unrelated
+    // translation units sharing a cache entry, served with a zero exit code --
+    // reached by a different route, and it was reachable rather than
+    // theoretical: preprocessed text can carry a raw NUL, and a build system can
+    // pass an argument containing 0x01.
+    //
+    // It is fixed here rather than filed because v3 re-keys the whole cache
+    // anyway, so the invalidation is already paid; discovering it later would
+    // have cost a v4 for a defect of the class this very change exists to close.
+    KeyInputs const shifted {
+        .compilerId = std::string { "cc\0d", 4 }, .preprocessed = "x", .relativizedArgs = {}, .dependencyPaths = {}
+    };
+    KeyInputs const other {
+        .compilerId = "cc", .preprocessed = std::string { "d\0x", 3 }, .relativizedArgs = {}, .dependencyPaths = {}
+    };
+
+    CHECK(ComputeKey(shifted) != ComputeKey(other));
+
+    // The same shift across the argument and dependency lists, whose separators
+    // were 0x01 and 0x02.
+    KeyInputs const argSplit {
+        .compilerId = "cc", .preprocessed = "x", .relativizedArgs = { std::string { "-a\x01-b", 5 } }, .dependencyPaths = {}
+    };
+    KeyInputs const argWhole {
+        .compilerId = "cc", .preprocessed = "x", .relativizedArgs = { "-a", "-b" }, .dependencyPaths = {}
+    };
+    CHECK(ComputeKey(argSplit) != ComputeKey(argWhole));
+
+    // And a value must not digest the same when it is fed as a different KIND of
+    // piece: an argument and a dependency path are adjacent lists of
+    // path-shaped strings.
+    KeyInputs const asArg {
+        .compilerId = "cc", .preprocessed = "x", .relativizedArgs = { "<SRCROOT>/a.hpp" }, .dependencyPaths = {}
+    };
+    KeyInputs const asPath {
+        .compilerId = "cc", .preprocessed = "x", .relativizedArgs = {}, .dependencyPaths = { "<SRCROOT>/a.hpp" }
+    };
+    CHECK(ComputeKey(asArg) != ComputeKey(asPath));
 }

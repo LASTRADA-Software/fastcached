@@ -160,8 +160,9 @@ These constraints are load-bearing and have each already been a bug:
   `STALE HIT (...); recompiling` on its way to a MISS, so a bare `grep HIT` is satisfied by
   exactly the collapse the case exists to reject. `ComputeManifestKey`'s `manifest-v3` tag is
   bumped in lock-step with `objkey-v3` for a related reason — a manifest stores the object key
-  *by value* and its own key never sees the object-key schema, so a v1 manifest keeps resolving
-  to a v1 object; direct mode is on by default and short-circuits before the preprocessed path,
+  *by value* and its own key never sees the object-key schema, so a manifest written by an
+  older launcher keeps resolving to an older object; direct mode is on by default and
+  short-circuits before the preprocessed path,
   so without the second bump the re-key never happens where it matters most.
   - **Which paths are hashed is the whole subtlety, and the exclusion cuts the opposite
     way from the inclusion.** `KeyDependencySet` normalizes each path through
@@ -267,10 +268,11 @@ These constraints are load-bearing and have each already been a bug:
   file served under a **zero exit code**. Two dead ends worth not re-walking:
   varying the salt *length* per lane does not help (still one distinct XOR value —
   the salt only changes `S_i`), and four CRC lanes with *distinct* polynomials do
-  work but cap out below 128, because the common CRC-32 polynomials all share the
-  factor `(x+1)` and their lcm has degree 126. The digest is now MurmurHash3
-  x64_128 in `Core/MurmurHash3.hpp` — an existing, published algorithm rather than
-  a bespoke construction, which is the whole point: its conformance is checkable
+  work but cap out below 128: three of the four best-studied CRC-32 polynomials
+  (Castagnoli, Koopman, Koopman-K/2) carry the factor `(x+1)` and only IEEE 802.3
+  does not, so the least common multiple of the four has degree 126, not 128. The
+  digest is now MurmurHash3 x64_128 in `Core/MurmurHash3.hpp` — an existing,
+  published algorithm rather than a bespoke construction, which is the whole point: its conformance is checkable
   against SMHasher's verification value `0x6384BA69`, and a construction assembled
   here would have nothing to be checked against. Consequences that are each
   load-bearing: `objkey-v3` and `manifest-v3` moved together because this is one
@@ -280,9 +282,19 @@ These constraints are load-bearing and have each already been a bug:
   decides an edited header is unchanged. `header-state-v1` deliberately did **not**
   move, because nothing is stored under it and a version with no work to do is the
   mistake `PathCanon::CanonError` already records. Domain separation between the
-  three key spaces is now the leading schema tag rather than the salts, and that is
-  *stronger*: a tag is NUL-free and NUL-terminated, so tag+NUL is a prefix-free code
-  and the blobs are unequal by construction rather than merely unlikely to collide.
+  three key spaces is now the leading schema tag rather than the salts, and each piece
+  of a key is **length-prefixed** (`kind`, big-endian `u64` length, bytes) rather than
+  terminated by a separator byte. That second half is not cosmetic, and it was found
+  in review of this very change: terminating a value with a byte that can occur
+  *inside* a value is not a framing at all, so `{compilerId="cc\0d", preprocessed="x"}`
+  and `{compilerId="cc", preprocessed="d\0x"}` digested identically — the same silent
+  cross-TU mis-serve, reached by a different route, and reachable rather than
+  theoretical because preprocessed text can carry a raw NUL and a build system can
+  pass an argument containing `0x01`. Fixed here rather than filed for the reason
+  `HashFileContents` was: `v3` re-keys the whole cache once, so finding it later would
+  have cost a `v4` invalidation for a defect of the class this change exists to close.
+  The length must be big-endian for the same reason the digest's block loads must be
+  little-endian — a *host*-order length makes the key differ between machines.
   The residual, recorded deliberately: MurmurHash3 is not collision-resistant against
   an **adversary**, and that is accepted because the key is not a security boundary —
   anyone who can STORE can already write a wrong object under a correct key. Closing
