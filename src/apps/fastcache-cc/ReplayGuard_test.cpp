@@ -191,6 +191,39 @@ TEST_CASE("A Windows layout classifies paths the same way on any host", "[replay
     CHECK(paths == std::vector<std::string> { R"(D:\Project\src\a.cpp)", R"(src\rel.hpp)" });
 }
 
+TEST_CASE("A drive-relative dependency is not probed, but a relative one is", "[replay-guard]")
+{
+    // The two must not collapse into one branch. `src\rel.hpp` resolves against
+    // the compile's working directory, which is also the launcher's, so it is this
+    // machine's path and is checked. `C:foo\bar.hpp` resolves against drive C's own
+    // current directory, which std::filesystem::operator/ reaches by no route: on a
+    // POSIX host the join is a name that exists nowhere, so every hit carrying such
+    // a path would be discarded forever. A path that cannot be examined counts as
+    // present (issue #65).
+    auto const regions = Value("",
+                               "",
+                               R"(a.obj: C:foo\bar.hpp src\rel.hpp)"
+                               "\n");
+    auto const paths = ReplayedDependencyPaths(regions, WindowsLayout());
+    CHECK(paths == std::vector<std::string> { R"(src\rel.hpp)" });
+}
+
+TEST_CASE("A drive-relative dependency is skipped even under a drive-relative root", "[replay-guard]")
+{
+    // The guard parts company with the key filter here, and deliberately. That one
+    // needs a portable SPELLING, which a drive-relative root can still supply, so
+    // it keeps this path. This one needs something to stat, and a path anchored to
+    // drive C's current directory is not that under any working directory it could
+    // be handed — so probing it would discard every hit carrying it, forever.
+    PathCanon::Layout const layout { .sourceRoot = R"(C:src\proj)", .buildTree = R"(C:src\build)" };
+    auto const regions = Value("",
+                               "",
+                               R"(a.obj: C:src\proj\a.hpp rel.hpp)"
+                               "\n");
+    auto const paths = ReplayedDependencyPaths(regions, layout);
+    CHECK(paths == std::vector<std::string> { "rel.hpp" });
+}
+
 // --- MissingReplayedDependency: the filesystem probe --------------------------
 
 TEST_CASE("A replay whose dependencies all exist is honoured", "[replay-guard]")

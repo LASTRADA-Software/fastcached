@@ -100,6 +100,36 @@ TEST_CASE("KeyDependencySet classifies a Windows path by the layout, not by the 
     CHECK(out[0] == "<SRCROOT>/inc/a.hpp");
 }
 
+TEST_CASE("KeyDependencySet drops a drive-relative path but keeps a relative one")
+{
+    // The two must not collapse into one branch. `src\rel.hpp` resolves against
+    // the compile's working directory and names the same file on every machine
+    // running the same build, so it is keyed. `C:foo\bar.hpp` resolves against
+    // drive C's own current directory — per-process state on the producing
+    // machine that no cache entry records — so keying it would let two machines
+    // whose C: cwd differs produce the SAME key for DIFFERENT headers. Before
+    // issue #65 the classifier reported it as absolute, which dropped it too, but
+    // by way of an answer that was not true.
+    PathCanon::Layout const windows { .sourceRoot = R"(C:\src\proj)", .buildTree = R"(C:\src\proj\build)" };
+    auto const out = KeySet({ R"(C:foo\bar.hpp)", R"(src\rel.hpp)", "C:" }, windows);
+
+    CHECK(out == std::vector<std::string> { "src/rel.hpp" });
+}
+
+TEST_CASE("A drive-relative path under a drive-relative root is still keyed")
+{
+    // The anchor alone must not decide. `C:src\proj` is a Windows root (backslash
+    // separators) that is itself drive-relative, so every path beneath it is
+    // DriveRelative too — yet each canonicalizes to a token that is portable
+    // exactly because the consumer substitutes its own root. Dropping on the
+    // anchor would silently un-key this whole layout; the sibling below is the
+    // drive-relative path under NO root, which must still go.
+    PathCanon::Layout const layout { .sourceRoot = R"(C:src\proj)", .buildTree = R"(C:src\build)" };
+    auto const out = KeySet({ R"(C:src\proj\a.hpp)", R"(C:elsewhere\b.hpp)" }, layout);
+
+    CHECK(out == std::vector<std::string> { "<SRCROOT>/a.hpp" });
+}
+
 TEST_CASE("SplitIncludeNotes removes every note line from the hashed text")
 {
     // clang-cl reports on STDOUT, the same stream the preprocessed text uses. A

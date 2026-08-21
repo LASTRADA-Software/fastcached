@@ -241,3 +241,105 @@ TEST_CASE("GccDepfile preserves the phony rules -MP emits")
     REQUIRE(localized.has_value());
     CHECK(*localized == depFile);
 }
+
+// ---------------------------------------------------------------------------
+// Task 3: AnchorForLayout — what a compiler-emitted path is anchored to.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+Layout WindowsLayout()
+{
+    return { .sourceRoot = R"(C:\src\proj)", .buildTree = R"(C:\src\proj\build)" };
+}
+
+Layout PosixLayout()
+{
+    return { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
+}
+} // namespace
+
+TEST_CASE("A rooted drive path is absolute, in either separator style")
+{
+    CHECK(PathCanon::AnchorForLayout(R"(C:\src\proj\a.hpp)", WindowsLayout()) == PathCanon::Anchor::Absolute);
+    CHECK(PathCanon::AnchorForLayout("C:/src/proj/a.hpp", WindowsLayout()) == PathCanon::Anchor::Absolute);
+    // Case and drive are irrelevant to the shape question.
+    CHECK(PathCanon::AnchorForLayout(R"(d:\other\x.h)", WindowsLayout()) == PathCanon::Anchor::Absolute);
+}
+
+TEST_CASE("A drive-relative path is neither absolute nor working-directory-relative")
+{
+    // The defect issue #65 records: this used to report absolute, because the
+    // drive test stopped at the colon. `C:foo` resolves against drive C's own
+    // current directory, so it is portable to nothing and checkable by nobody.
+    CHECK(PathCanon::AnchorForLayout(R"(C:foo\bar.hpp)", WindowsLayout()) == PathCanon::Anchor::DriveRelative);
+    CHECK(PathCanon::AnchorForLayout("C:foo/bar.hpp", WindowsLayout()) == PathCanon::Anchor::DriveRelative);
+    // A bare specifier has no tail at all, and *is* "the current directory of
+    // drive C" — the same state, spelled with nothing after it.
+    CHECK(PathCanon::AnchorForLayout("C:", WindowsLayout()) == PathCanon::Anchor::DriveRelative);
+}
+
+TEST_CASE("A root-relative path and a UNC share are both absolute on Windows")
+{
+    // Neither may be resolved against a working directory: both name a fixed
+    // location, and a UNC share opens with the same byte as a root-relative path.
+    CHECK(PathCanon::AnchorForLayout(R"(\Windows\x.h)", WindowsLayout()) == PathCanon::Anchor::Absolute);
+    CHECK(PathCanon::AnchorForLayout(R"(\\host\share\x.h)", WindowsLayout()) == PathCanon::Anchor::Absolute);
+}
+
+TEST_CASE("A Windows path with no anchor at all resolves against the working directory")
+{
+    CHECK(PathCanon::AnchorForLayout(R"(inc\a.hpp)", WindowsLayout()) == PathCanon::Anchor::WorkingDirectory);
+    CHECK(PathCanon::AnchorForLayout("inc/a.hpp", WindowsLayout()) == PathCanon::Anchor::WorkingDirectory);
+}
+
+TEST_CASE("A POSIX layout asks only about the leading separator")
+{
+    CHECK(PathCanon::AnchorForLayout("/usr/include/x.h", PosixLayout()) == PathCanon::Anchor::Absolute);
+    CHECK(PathCanon::AnchorForLayout("inc/a.hpp", PosixLayout()) == PathCanon::Anchor::WorkingDirectory);
+    // A POSIX file may legitimately be named `C:foo`. There are no drives here, so
+    // the drive rule must not fire — the same mistake IsWindowsRoot's own letter
+    // and separator tests exist to prevent for a root like `a:b/proj`.
+    CHECK(PathCanon::AnchorForLayout("C:foo", PosixLayout()) == PathCanon::Anchor::WorkingDirectory);
+    CHECK(PathCanon::AnchorForLayout(R"(C:\foo)", PosixLayout()) == PathCanon::Anchor::WorkingDirectory);
+}
+
+TEST_CASE("An empty path is classified without reading past its end")
+{
+    CHECK(PathCanon::AnchorForLayout("", WindowsLayout()) == PathCanon::Anchor::WorkingDirectory);
+    CHECK(PathCanon::AnchorForLayout("", PosixLayout()) == PathCanon::Anchor::WorkingDirectory);
+}
+
+TEST_CASE("A bare drive specifier is a Windows root, though it is a drive-relative path")
+{
+    // AnchorForLayout and IsWindowsRoot share their drive rule but ask different
+    // questions of it, and `C:` is where they part: as a ROOT it is the degenerate
+    // spelling of the drive root, while as a PATH it names the drive's current
+    // directory. Both halves are asserted against the SAME layout, because it is
+    // their disagreement that is the property: merge the two and one of these two
+    // lines must break, whichever direction the merge went.
+    Layout const layout { .sourceRoot = "C:", .buildTree = "C:" };
+    // Root half: were `C:` rejected as a root, this layout would read as POSIX and
+    // the backslash path would come back WorkingDirectory.
+    CHECK(PathCanon::AnchorForLayout(R"(C:\a.hpp)", layout) == PathCanon::Anchor::Absolute);
+    // Path half: the same two bytes, asked about as a path.
+    CHECK(PathCanon::AnchorForLayout("C:", layout) == PathCanon::Anchor::DriveRelative);
+}
+
+TEST_CASE("A drive-relative root still makes a Windows layout, and still canonicalizes")
+{
+    // `C:src\proj` is drive-relative AND backslash-separated, so IsWindowsRoot
+    // accepts it on its separator branch. Paths under such a root are themselves
+    // drive-relative — which is what the callers' DriveRelative arms turn on, so
+    // it is pinned here rather than left to be inferred.
+    Layout const layout { .sourceRoot = R"(C:src\proj)", .buildTree = R"(C:src\build)" };
+    CHECK(PathCanon::AnchorForLayout(R"(C:src\proj\a.hpp)", layout) == PathCanon::Anchor::DriveRelative);
+
+    // And it canonicalizes anyway: a token is portable because the CONSUMER
+    // substitutes its own root, whatever shape the producer's root had. This is
+    // why the key filter leaves such a path to the root tests instead of dropping
+    // it on the anchor alone.
+    auto const token = PathCanon::Canonicalize(R"(C:src\proj\a.hpp)", layout);
+    REQUIRE(token.has_value());
+    CHECK(*token == "<SRCROOT>/a.hpp");
+}

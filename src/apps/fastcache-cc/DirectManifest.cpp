@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -45,8 +44,11 @@ namespace
     [[nodiscard]] std::string ToComparable(std::string_view text)
     {
         std::string out { text };
-        std::ranges::transform(out, out.begin(), [](unsigned char c) {
-            auto const lowered = static_cast<char>(std::tolower(c));
+        // PathCanon's fold, not std::tolower: case-folding decides whether a
+        // header lies under a root, and a locale-dependent fold lets two machines
+        // classify byte-identical content differently. See PathCanon::AsciiLower.
+        std::ranges::transform(out, out.begin(), [](char c) {
+            auto const lowered = PathCanon::AsciiLower(c);
             return lowered == '/' ? '\\' : lowered;
         });
         return out;
@@ -325,7 +327,11 @@ std::vector<std::string> ParseDepFilePaths(std::string_view depFileText)
             }
             if (line[i] != ':')
                 continue;
-            bool const driveLetter = i == 1 && std::isalpha(static_cast<unsigned char>(line[0])) != 0;
+            // The letter rule is PathCanon's, so all four drive tests share one
+            // definition; what follows the colon is deliberately not asked, because
+            // the question here is where a rule ends and a drive-relative "C:foo"
+            // is still one token.
+            bool const driveLetter = i == 1 && PathCanon::IsDriveLetter(line[0]);
             if (!driveLetter)
             {
                 colon = i;
