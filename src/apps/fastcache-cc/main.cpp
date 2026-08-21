@@ -14,8 +14,8 @@
 //
 // Config (environment):
 //   FASTCACHE_ADDR       host:port of fastcached (required to use the cache)
-//   FASTCACHE_SRCROOT    checkout source root (for keying + canonicalization)
-//   FASTCACHE_BUILDTREE  build output root
+//   FASTCACHE_SOURCE_DIR checkout source root (for keying + canonicalization)
+//   FASTCACHE_BINARY_DIR build output root
 //   FASTCACHE_COHORT     optional cohort id (default "default")
 //   FASTCACHE_VERBOSE    if set, print fall-back diagnostics to stderr
 //   FASTCACHE_NO_STATS   if set, do not record invocations to the statistics log
@@ -153,14 +153,14 @@ struct Config
 [[nodiscard]] Config LoadConfig()
 {
     Config c;
-    c.addr = EnvOr("FASTCACHE_ADDR", "");
-    c.srcRoot = EnvOr("FASTCACHE_SRCROOT", "");
-    c.buildTree = EnvOr("FASTCACHE_BUILDTREE", "");
-    c.cohort = EnvOr("FASTCACHE_COHORT", "default");
-    c.verbose = EnvSet("FASTCACHE_VERBOSE");
-    c.stats = !EnvSet("FASTCACHE_NO_STATS");
-    c.direct = !EnvSet("FASTCACHE_NO_DIRECT");
-    c.ioTimeout = EnvMillis("FASTCACHE_TIMEOUT_MS", DefaultIoTimeout);
+    c.addr = EnvOr(Cc::EnvName::Addr, "");
+    c.srcRoot = EnvOr(Cc::EnvName::SourceDir, "");
+    c.buildTree = EnvOr(Cc::EnvName::BinaryDir, "");
+    c.cohort = EnvOr(Cc::EnvName::Cohort, "default");
+    c.verbose = EnvSet(Cc::EnvName::Verbose);
+    c.stats = !EnvSet(Cc::EnvName::NoStats);
+    c.direct = !EnvSet(Cc::EnvName::NoDirect);
+    c.ioTimeout = EnvMillis(Cc::EnvName::TimeoutMs, DefaultIoTimeout);
     return c;
 }
 
@@ -770,7 +770,7 @@ void RecordManifest(Config const& cfg,
 {
     if (cfg.addr.empty() || cfg.srcRoot.empty() || cfg.buildTree.empty())
     {
-        Warn("missing FASTCACHE_ADDR/SRCROOT/BUILDTREE");
+        Warn("missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
         return std::nullopt;
     }
 

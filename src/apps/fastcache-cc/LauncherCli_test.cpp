@@ -305,8 +305,8 @@ TEST_CASE("the help text documents every environment variable the launcher reads
     // tautological, while this fails if a row is ever dropped.
     auto const help = HelpText();
     for (auto const* name: { "FASTCACHE_ADDR",
-                             "FASTCACHE_SRCROOT",
-                             "FASTCACHE_BUILDTREE",
+                             "FASTCACHE_SOURCE_DIR",
+                             "FASTCACHE_BINARY_DIR",
                              "FASTCACHE_COHORT",
                              "FASTCACHE_VERBOSE",
                              "FASTCACHE_NO_STATS",

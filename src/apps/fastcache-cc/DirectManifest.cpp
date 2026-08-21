@@ -56,7 +56,7 @@ namespace
     /// Fold a path to a comparable form: lowercased, with every separator unified.
     ///
     /// The two sides of a prefix test arrive in different spellings — CMake exports
-    /// `FASTCACHE_SRCROOT` as `D:/Lastrada` (forward slashes) while `cl` emits
+    /// `FASTCACHE_SOURCE_DIR` as `D:/Lastrada` (forward slashes) while `cl` emits
     /// includes as `D:\Lastrada\...` (backslashes). Comparing them raw makes every
     /// project header look like it lies outside the root, which silently classifies
     /// the whole manifest as toolchain content and yields an empty manifest.

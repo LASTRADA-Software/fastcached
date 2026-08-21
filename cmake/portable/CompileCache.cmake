@@ -8,7 +8,7 @@
 #      portable across checkout paths, so a CI runner and a developer working
 #      from different directories share cache hits. It must already be installed
 #      and on PATH. It is configured purely through the environment and caches
-#      nothing unless FASTCACHE_ADDR / FASTCACHE_SRCROOT / FASTCACHE_BUILDTREE
+#      nothing unless FASTCACHE_ADDR / FASTCACHE_SOURCE_DIR / FASTCACHE_BINARY_DIR
 #      are all set; the address defaults to fastcached's own port,
 #      127.0.0.1:6674, and the two roots are injected here via `cmake -E env`,
 #      because CMake already knows them. Selecting it is conditional on a daemon
@@ -108,8 +108,8 @@ set(_FASTCACHE_ADDR_APPLIED "${FASTCACHE_ADDR}" CACHE INTERNAL
 # nothing else runs.
 set(_fc_fastcache_env
     "FASTCACHE_ADDR=${FASTCACHE_ADDR}"
-    "FASTCACHE_SRCROOT=${CMAKE_SOURCE_DIR}"
-    "FASTCACHE_BUILDTREE=${CMAKE_BINARY_DIR}")
+    "FASTCACHE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+    "FASTCACHE_BINARY_DIR=${CMAKE_BINARY_DIR}")
 
 # Optional auto-install of fastcache-cc from this project's GitHub Releases.
 #

@@ -100,8 +100,8 @@ cat > "${proj}/a.cpp" <<'EOF'
 int main() { return helper() + static_cast<int>(std::string{"hi"}.size()); }
 EOF
 
-export FASTCACHE_SRCROOT="$proj"
-export FASTCACHE_BUILDTREE="${proj}/build"
+export FASTCACHE_SOURCE_DIR="$proj"
+export FASTCACHE_BINARY_DIR="${proj}/build"
 
 echo "== compile 1 (expect MISS) =="
 "$launcher" "$compiler" -std=c++23 -MD -MF "${proj}/build/a.d" -c "${proj}/a.cpp" -o "${proj}/build/a.o" \
@@ -154,7 +154,7 @@ mkdir -p "${big}/build"
     echo "int main() { return data[0]; }"
 } > "${big}/big.cpp"
 
-export FASTCACHE_SRCROOT="$big" FASTCACHE_BUILDTREE="${big}/build"
+export FASTCACHE_SOURCE_DIR="$big" FASTCACHE_BINARY_DIR="${big}/build"
 
 "$launcher" "$compiler" -std=c++23 -O0 -c "${big}/big.cpp" -o "${big}/build/big.o" \
     2> "${workdir}/big-miss.log" || fail "large-object compile returned non-zero"
@@ -191,7 +191,7 @@ echo "   large object reproduced byte-identically"
 
 # --- 4: cross-depth portability ---------------------------------------------
 # Same content, different checkout depth. The key must match, because paths
-# under SRCROOT/BUILDTREE are tokenized before hashing.
+# under SOURCE_DIR/BINARY_DIR are tokenized before hashing.
 deep="${workdir}/a/b/c/d/e/deepproj"
 shallow="${workdir}/s"
 mkdir -p "${deep}/build" "${shallow}/build"
@@ -207,14 +207,14 @@ EOF
 done
 
 echo "== store from a DEEP checkout =="
-export FASTCACHE_SRCROOT="$deep" FASTCACHE_BUILDTREE="${deep}/build"
+export FASTCACHE_SOURCE_DIR="$deep" FASTCACHE_BINARY_DIR="${deep}/build"
 "$launcher" "$compiler" -std=c++23 -MD -MF "${deep}/build/t.d" -c "${deep}/t.cpp" -o "${deep}/build/t.o" \
     2> "${workdir}/deep.log" || fail "deep compile returned non-zero"
 cat "${workdir}/deep.log"
 grep -q "STORED" "${workdir}/deep.log" || fail "deep compile did not store its result"
 
 echo "== fetch from a SHALLOW checkout (expect HIT) =="
-export FASTCACHE_SRCROOT="$shallow" FASTCACHE_BUILDTREE="${shallow}/build"
+export FASTCACHE_SOURCE_DIR="$shallow" FASTCACHE_BINARY_DIR="${shallow}/build"
 "$launcher" "$compiler" -std=c++23 -MD -MF "${shallow}/build/t.d" -c "${shallow}/t.cpp" -o "${shallow}/build/t.o" \
     2> "${workdir}/shallow.log" || fail "shallow compile returned non-zero"
 cat "${workdir}/shallow.log"
@@ -252,7 +252,7 @@ echo "== a compile with no -o must pass through and still build =="
 nooutdir="${workdir}/noout"
 mkdir -p "$nooutdir"
 cp "${proj}/a.cpp" "${proj}/hdr.hpp" "$nooutdir/"
-export FASTCACHE_SRCROOT="$nooutdir" FASTCACHE_BUILDTREE="$nooutdir"
+export FASTCACHE_SOURCE_DIR="$nooutdir" FASTCACHE_BINARY_DIR="$nooutdir"
 # The compiler defaults its output to ./a.o, so this must run FROM that
 # directory; `$launcher` may be a relative path, so resolve it before the cd.
 launcher_abs="$(cd "$(dirname "$launcher")" && pwd)/$(basename "$launcher")"
@@ -270,7 +270,7 @@ echo "   passed through uncached, object still produced"
 # begins with -c, and eating it used to break preprocessing and force a
 # permanent, silent fallback to uncached compiles.
 echo "== a flag prefixed like a dropped flag must not break caching =="
-export FASTCACHE_SRCROOT="$proj" FASTCACHE_BUILDTREE="${proj}/build"
+export FASTCACHE_SOURCE_DIR="$proj" FASTCACHE_BINARY_DIR="${proj}/build"
 "$launcher" "$compiler" -std=c++23 -coverage -c "${proj}/a.cpp" -o "${proj}/build/cov.o" \
     2> "${workdir}/coverage.log" || fail "compile with -coverage returned non-zero"
 cat "${workdir}/coverage.log"

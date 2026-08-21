@@ -514,7 +514,7 @@ cmake --build --preset clangcl-debug
 `USE_COMPILER_CACHE` (default ON, `cmake/portable/CompileCache.cmake`) fronts the compiler
 with our own `fastcache-cc` when it is on `PATH` and a daemon answers — at
 `127.0.0.1:6674` by default, or wherever `FASTCACHE_ADDR=host:port` points;
-`FASTCACHE_SRCROOT`/`FASTCACHE_BUILDTREE` are injected from the source and build
+`FASTCACHE_SOURCE_DIR`/`FASTCACHE_BINARY_DIR` are injected from the source and build
 trees. Configure proves the cache works by compiling one tiny file through the
 launcher (~0.1 s) and requiring a `HIT`/`MISS`, because a launcher that cannot
 reach its daemon still compiles fine and would otherwise cost every TU a failed

@@ -111,6 +111,27 @@ struct Command
                                         std::span<FlagSpec const> options,
                                         Action baseAction = Action::ShowStats);
 
+/// The `FASTCACHE_*` variable names, spelled once.
+///
+/// Both the help table and `LoadConfig()` in main.cpp name their variables
+/// through these, so the two cannot drift. That mattered the moment they were
+/// renamed: the table alone drives `--help`, so changing it without the reader
+/// would have left the help text looking correct while the launcher went on
+/// reading names nothing sets any more — caching silently off, and no test in
+/// the default suite to say so, since only the `smoke`-labelled end-to-end
+/// script exercises the reader.
+namespace EnvName
+{
+    constexpr std::string_view Addr = "FASTCACHE_ADDR";
+    constexpr std::string_view SourceDir = "FASTCACHE_SOURCE_DIR";
+    constexpr std::string_view BinaryDir = "FASTCACHE_BINARY_DIR";
+    constexpr std::string_view Cohort = "FASTCACHE_COHORT";
+    constexpr std::string_view Verbose = "FASTCACHE_VERBOSE";
+    constexpr std::string_view NoStats = "FASTCACHE_NO_STATS";
+    constexpr std::string_view NoDirect = "FASTCACHE_NO_DIRECT";
+    constexpr std::string_view TimeoutMs = "FASTCACHE_TIMEOUT_MS";
+} // namespace EnvName
+
 /// One environment variable the launcher reads.
 ///
 /// The single source of truth for what `--help` documents under ENVIRONMENT.

@@ -141,27 +141,28 @@ namespace
 
     /// The `FASTCACHE_*` variables, in the order `--help` documents them.
     ///
-    /// One row per variable, so the names cannot drift from what the launcher
-    /// actually reads. The prose below is what a table genuinely cannot carry:
-    /// it explains *why* a setting matters rather than merely listing it.
+    /// One row per variable, each naming itself through `EnvName` so it cannot
+    /// drift from what the launcher actually reads. The prose below is what a
+    /// table genuinely cannot carry: it explains *why* a setting matters rather
+    /// than merely listing it.
     constexpr std::array EnvironmentTable {
-        EnvVarSpec { .name = "FASTCACHE_ADDR",
+        EnvVarSpec { .name = EnvName::Addr,
                      .summary = "host:port of the fastcached daemon. Unset means every\n"
                                 "compile runs uncached -- the build still succeeds, so\n"
                                 "check this before concluding the cache is working." },
-        EnvVarSpec { .name = "FASTCACHE_SRCROOT", .summary = "Checkout source root, for keying and path canonicalization." },
-        EnvVarSpec { .name = "FASTCACHE_BUILDTREE", .summary = "Build output root." },
-        EnvVarSpec { .name = "FASTCACHE_COHORT",
+        EnvVarSpec { .name = EnvName::SourceDir, .summary = "Checkout source root, for keying and path canonicalization." },
+        EnvVarSpec { .name = EnvName::BinaryDir, .summary = "Build output root." },
+        EnvVarSpec { .name = EnvName::Cohort,
                      .summary = "Prefetch grouping id (default \"default\"). Not part of the\n"
                                 "cache key, so it never partitions the cache." },
-        EnvVarSpec { .name = "FASTCACHE_VERBOSE", .summary = "Print HIT/MISS and fall-back diagnostics to stderr." },
-        EnvVarSpec { .name = "FASTCACHE_NO_STATS", .summary = "Do not record invocations to the statistics log." },
-        EnvVarSpec { .name = "FASTCACHE_NO_DIRECT",
+        EnvVarSpec { .name = EnvName::Verbose, .summary = "Print HIT/MISS and fall-back diagnostics to stderr." },
+        EnvVarSpec { .name = EnvName::NoStats, .summary = "Do not record invocations to the statistics log." },
+        EnvVarSpec { .name = EnvName::NoDirect,
                      .summary = "Disable direct mode (always preprocess to derive the key).\n"
                                 "Direct mode is on by default: it reaches a cached object by\n"
                                 "re-hashing the project headers a previous compile recorded,\n"
                                 "which is far cheaper than preprocessing the translation unit." },
-        EnvVarSpec { .name = "FASTCACHE_TIMEOUT_MS",
+        EnvVarSpec { .name = EnvName::TimeoutMs,
                      .summary = "Per-call deadline, in milliseconds, for every send/recv to\n"
                                 "the daemon (default 10000; 0 disables it). A daemon that\n"
                                 "accepts the connection and then stalls mid-reply would\n"
@@ -201,9 +202,9 @@ namespace
     /// The two closing paragraphs, each its own block so a blank line separates
     /// them the same way one separates any other pair of blocks.
     constexpr std::string_view RequiredVariablesNote =
-        "ADDR, SRCROOT and BUILDTREE must ALL be set to cache; any missing one makes the\n"
-        "launcher run the real compiler and report \"missing FASTCACHE_ADDR/SRCROOT/BUILDTREE\"\n"
-        "under FASTCACHE_VERBOSE.";
+        "ADDR, SOURCE_DIR and BINARY_DIR must ALL be set to cache; any missing one makes\n"
+        "the launcher run the real compiler and report\n"
+        "\"missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR\" under FASTCACHE_VERBOSE.";
 
     /// The promise the whole launcher is built around.
     constexpr std::string_view FallbackNote =

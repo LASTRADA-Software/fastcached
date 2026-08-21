@@ -83,8 +83,8 @@ The fastcached build does this for itself: `cmake/portable/CompileCache.cmake` p
 `fastcache-cc` up automatically whenever the binary is on `PATH` and a daemon
 answers at `127.0.0.1:6674` — at any other daemon, local or remote, when
 `FASTCACHE_ADDR` is exported, at `-DFASTCACHE_ADDR=host:port` ahead of even that,
-nowhere if it is set empty — and injects `FASTCACHE_SRCROOT` /
-`FASTCACHE_BUILDTREE` from the source and binary directories, so those two need
+nowhere if it is set empty — and injects `FASTCACHE_SOURCE_DIR` /
+`FASTCACHE_BINARY_DIR` from the source and binary directories, so those two need
 not be exported.
 
 Exporting `FASTCACHE_ADDR` retargets an existing build tree on its next
@@ -150,8 +150,8 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | Variable | Meaning | Default |
 |----------|---------|---------|
 | `FASTCACHE_ADDR` | `host:port` of the daemon. Hostnames, IPv4 literals, and bracketed IPv6 (`[::1]:6674`) all resolve. | unset — **no caching** |
-| `FASTCACHE_SRCROOT` | Checkout source root, used for keying and path canonicalization. | unset — **no caching** |
-| `FASTCACHE_BUILDTREE` | Build output root. | unset — **no caching** |
+| `FASTCACHE_SOURCE_DIR` | Checkout source root, used for keying and path canonicalization. | unset — **no caching** |
+| `FASTCACHE_BINARY_DIR` | Build output root. | unset — **no caching** |
 | `FASTCACHE_COHORT` | Prefetch grouping id. **Not** part of the cache key, so it never partitions the cache. | `default` |
 | `FASTCACHE_VERBOSE` | Print `HIT`/`MISS` and fall-back diagnostics to stderr. | unset (quiet) |
 | `FASTCACHE_NO_STATS` | Do not record invocations to the statistics log. | unset (recording on) |
@@ -170,20 +170,20 @@ one of the launcher's own. These are read but never written:
 With no usable state directory there is nowhere to append to, so statistics are
 silently disabled. Caching itself is unaffected.
 
-`ADDR`, `SRCROOT` and `BUILDTREE` must **all** be set. If any is missing every
-compile runs uncached — the build still succeeds, which is exactly why this is
-worth checking before concluding the cache does not help. With
+`ADDR`, `SOURCE_DIR` and `BINARY_DIR` must **all** be set. If any is missing
+every compile runs uncached — the build still succeeds, which is exactly why
+this is worth checking before concluding the cache does not help. With
 `FASTCACHE_VERBOSE` set, that case reports
-`missing FASTCACHE_ADDR/SRCROOT/BUILDTREE`.
+`missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR`.
 
 ## How it works
 
 1. **Key.** Direct mode first: re-hash the project headers a previous compile
    recorded and look up a manifest — far cheaper than preprocessing (~18 ms
    versus ~1.4 s on a large translation unit). If that misses, preprocess the
-   TU, relativize checkout-rooted arguments against `SRCROOT`/`BUILDTREE`, and
-   hash `(compiler id + preprocessed text + relativized args)` into a 128-bit
-   key.
+   TU, relativize checkout-rooted arguments against `SOURCE_DIR`/`BINARY_DIR`,
+   and hash `(compiler id + preprocessed text + relativized args)` into a
+   128-bit key.
 2. **FETCH.** On a hit, write the object to the requested output path and replay
    the cached stdout and stderr on their own channels, with header paths
    localized to this machine so the build tool's dependency records stay valid.
@@ -258,7 +258,7 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
 
 | Reason | Meaning |
 |--------|---------|
-| `missing FASTCACHE_ADDR/SRCROOT/BUILDTREE` | Configuration incomplete — the cache was never contacted. |
+| `missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR` | Configuration incomplete — the cache was never contacted. |
 | `connect failed` | The daemon is unreachable at `FASTCACHE_ADDR`. |
 | `preprocess failed` | The compiler rejected the preprocess probe; the line may use an unsupported option form. |
 | `uses __TIME__/__DATE__/__TIMESTAMP__` | Deliberate: the TU is non-deterministic and would never hit. Reported as *uncacheable*, not as an error. |
