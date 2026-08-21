@@ -475,6 +475,23 @@ std::expected<std::string, CanonError> CanonicalizeRegion(std::string_view text,
     return RewriteRegion(text, grammar, xform);
 }
 
+std::expected<std::string, CanonError> RewritePaths(std::string_view text, Grammar grammar, PathTransform const& xform)
+{
+    // An absent transform is the identity, not a crash. std::function throws
+    // std::bad_function_call when empty, and an empty PathTransform is an
+    // idiomatic value here -- it is what RelativizeArgs defaults its own
+    // parameter to -- so a caller that forwards one through would take down a
+    // launcher whose entire contract is that a cache problem never breaks a build.
+    if (!xform)
+        return std::string { text };
+
+    // The same two walkers the canonicalizers use, instantiated on the erased
+    // transform. They stay templated so neither of those pays for the erasure.
+    if (grammar == Grammar::GccDepfile)
+        return RewriteDepfile(text, xform);
+    return RewriteRegion(text, grammar, xform);
+}
+
 std::expected<std::string, CanonError> LocalizeRegion(std::string_view text, Grammar grammar, Layout const& layout)
 {
     auto const xform = [&](std::string_view span) {
