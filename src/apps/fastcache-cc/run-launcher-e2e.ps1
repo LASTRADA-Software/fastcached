@@ -22,6 +22,8 @@
 #      the object are identical after such a move and only the paths differ; the
 #      dependency set is part of the key so that the two layouts are two keys
 #      rather than one key a replay guard has to catch (issues #53 and #56).
+#      Also checked with direct mode off, because the manifest keys on the
+#      source's own bytes and would answer the move-back on its own.
 #
 # The POSIX counterpart (scripts/compile-cache-e2e.sh) additionally asserts that
 # a hit restores the GNU depfile, localized to the consuming checkout. That has
@@ -263,15 +265,24 @@ try {
         New-Item -ItemType Directory -Force -Path $editSrc | Out-Null
         $editBuild = Join-Path $EditTemp "build"; New-Item -ItemType Directory -Force $editBuild | Out-Null
         $editObj = Join-Path $editBuild "u.obj"
+        # Reset per compiler: a throw in the `cl` pass would otherwise leave its
+        # values in scope and let the `clang-cl` pass assert against them.
+        $oEdited = "UNKNOWN"; $firstHash = "<none>"; $secondHash = "<none>"
         $env:FASTCACHE_NO_DIRECT = "1"
         try {
             Set-EditedSource $editSrc 1
-            $null = Invoke-Launcher $cc $editSrc $editBuild $editObj
-            $firstHash = (Get-FileHash $editObj -Algorithm SHA256).Hash
+            $rFirst = Invoke-Launcher $cc $editSrc $editBuild $editObj
+            # Checked, and Test-Path before Get-FileHash: with $ErrorActionPreference
+            # = "Stop" a missing object is a terminating error that unwinds past both
+            # finallys and kills the run, so a first-compile failure would be reported
+            # as an opaque PowerShell exception instead of an EDITED-SOURCE FAIL.
+            if ($rFirst.code -eq 0 -and (Test-Path $editObj)) {
+                $firstHash = (Get-FileHash $editObj -Algorithm SHA256).Hash
 
-            Set-EditedSource $editSrc 2
-            $oEdited = Get-Outcome (Invoke-Launcher $cc $editSrc $editBuild $editObj).stderr
-            $secondHash = (Get-FileHash $editObj -Algorithm SHA256).Hash
+                Set-EditedSource $editSrc 2
+                $oEdited = Get-Outcome (Invoke-Launcher $cc $editSrc $editBuild $editObj).stderr
+                if (Test-Path $editObj) { $secondHash = (Get-FileHash $editObj -Algorithm SHA256).Hash }
+            }
         } finally {
             Remove-Item Env:\FASTCACHE_NO_DIRECT -ErrorAction SilentlyContinue
         }
@@ -290,37 +301,58 @@ try {
         # the dependency set reached the key the two layouts collided, the cached
         # /showIncludes notes named a file that no longer existed, and Ninja (which
         # reads them as deps = msvc) rebuilt that TU on every build, forever.
+        #
+        # Direct mode OFF, for the same reason the edited-source case above turns it
+        # off: moving the header back restores u.cpp byte-for-byte, so the MANIFEST
+        # key is restored too and the final HIT would arrive through direct mode
+        # without the object key ever being computed. The assertion would then pass
+        # in exactly the state it exists to reject — including the one where the
+        # dependency set is silently empty on this driver.
         Remove-Item -Recurse -Force $MoveTemp -ErrorAction SilentlyContinue
         $moveSrc = New-MoveTree $MoveTemp
         $moveBuild = Join-Path $MoveTemp "build"; New-Item -ItemType Directory -Force $moveBuild | Out-Null
         $moveObj = Join-Path $moveBuild "u.obj"
+        $oBefore = "UNKNOWN"; $oMoved = "UNKNOWN"; $oBack = "UNKNOWN"; $staleHit = $false
+        $env:FASTCACHE_NO_DIRECT = "1"
+        try {
+            $oBefore = Get-Outcome (Invoke-Launcher $cc $moveSrc $moveBuild $moveObj).stderr
 
-        $oBefore = Get-Outcome (Invoke-Launcher $cc $moveSrc $moveBuild $moveObj).stderr
+            # -Recurse on the directory removals: without it PowerShell's contract for
+            # a non-empty directory is a prompt (interactive) or, under
+            # $ErrorActionPreference = "Stop", a terminating error — so any stray
+            # artefact a scanner or the compiler leaves behind aborts the run instead
+            # of reporting MOVED-HEADER FAIL.
+            New-Item -ItemType Directory -Force -Path (Join-Path $moveSrc "inc/new") | Out-Null
+            Move-Item (Join-Path $moveSrc "inc/old/h1.h") (Join-Path $moveSrc "inc/new/h1.h")
+            Remove-Item -Recurse -Force (Join-Path $moveSrc "inc/old") -ErrorAction SilentlyContinue
+            Set-MoveSource $moveSrc "inc/new/h1.h"
+            Remove-Item -Force $moveObj -ErrorAction SilentlyContinue
 
-        New-Item -ItemType Directory -Force -Path (Join-Path $moveSrc "inc/new") | Out-Null
-        Move-Item (Join-Path $moveSrc "inc/old/h1.h") (Join-Path $moveSrc "inc/new/h1.h")
-        Remove-Item -Force (Join-Path $moveSrc "inc/old")
-        Set-MoveSource $moveSrc "inc/new/h1.h"
-        Remove-Item -Force $moveObj -ErrorAction SilentlyContinue
+            $rMoved = Invoke-Launcher $cc $moveSrc $moveBuild $moveObj
+            $oMoved = Get-Outcome $rMoved.stderr
+            # A "STALE HIT" here would mean the move still keyed identically and the
+            # replay guard had to catch and discard the value — true before issue #56,
+            # and the difference between detecting the collision and not having one.
+            $staleHit = [bool]($rMoved.stderr -match "STALE HIT")
 
-        $rMoved = Invoke-Launcher $cc $moveSrc $moveBuild $moveObj
-        $oMoved = Get-Outcome $rMoved.stderr
-        # A "STALE HIT" here would mean the move still keyed identically and the
-        # replay guard had to catch and discard the value — true before issue #56,
-        # and the difference between detecting the collision and not having one.
-        $staleHit = [bool]($rMoved.stderr -match "STALE HIT")
+            # Move it back. The entry stored BEFORE the move must never have been
+            # overwritten, which is what separates two keys from one key plus a guard:
+            # a guard-only fix re-stores the moved layout under the shared key and
+            # destroys the value the original layout needs.
+            New-Item -ItemType Directory -Force -Path (Join-Path $moveSrc "inc/old") | Out-Null
+            Move-Item (Join-Path $moveSrc "inc/new/h1.h") (Join-Path $moveSrc "inc/old/h1.h")
+            Remove-Item -Recurse -Force (Join-Path $moveSrc "inc/new") -ErrorAction SilentlyContinue
+            Set-MoveSource $moveSrc "inc/old/h1.h"
+            Remove-Item -Force $moveObj -ErrorAction SilentlyContinue
 
-        # Move it back. The entry stored BEFORE the move must never have been
-        # overwritten, which is what separates two keys from one key plus a guard:
-        # a guard-only fix re-stores the moved layout under the shared key and
-        # destroys the value the original layout needs.
-        New-Item -ItemType Directory -Force -Path (Join-Path $moveSrc "inc/old") | Out-Null
-        Move-Item (Join-Path $moveSrc "inc/new/h1.h") (Join-Path $moveSrc "inc/old/h1.h")
-        Remove-Item -Force (Join-Path $moveSrc "inc/new")
-        Set-MoveSource $moveSrc "inc/old/h1.h"
-        Remove-Item -Force $moveObj -ErrorAction SilentlyContinue
-
-        $oBack = Get-Outcome (Invoke-Launcher $cc $moveSrc $moveBuild $moveObj).stderr
+            $rBack = Invoke-Launcher $cc $moveSrc $moveBuild $moveObj
+            $oBack = Get-Outcome $rBack.stderr
+            # A restored layout that has to discard what it fetched is the collapse
+            # this case is named for, and it reports HIT on its way to a MISS.
+            if ($rBack.stderr -match "STALE HIT") { $staleHit = $true }
+        } finally {
+            Remove-Item Env:\FASTCACHE_NO_DIRECT -ErrorAction SilentlyContinue
+        }
 
         if ($oBefore -eq "MISS" -and $oMoved -eq "MISS" -and -not $staleHit -and $oBack -eq "HIT") {
             Write-Host "  moved header keyed apart, pre-move entry survived: OK ($cc)" -ForegroundColor Green

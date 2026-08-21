@@ -155,25 +155,61 @@ These constraints are load-bearing and have each already been a bug:
   because the compiler has already opened every one of those files. A move is a different
   key by construction, so the *pre-move* entry survives the move rather than being
   overwritten — which is the property `check_header_move` asserts by moving the header
-  back and requiring a HIT.
+  back and requiring a HIT. Anchored as `fastcache-cc: HIT`: the launcher prints
+  `STALE HIT (...); recompiling` on its way to a MISS, so a bare `grep HIT` is satisfied by
+  exactly the collapse the case exists to reject. `ComputeManifestKey`'s `manifest-v2` tag is
+  bumped in lock-step with `objkey-v2` for a related reason — a manifest stores the object key
+  *by value* and its own key never sees the object-key schema, so a v1 manifest keeps resolving
+  to a v1 object; direct mode is on by default and short-circuits before the preprocessed path,
+  so without the second bump the re-key never happens where it matters most.
   - **Which paths are hashed is the whole subtlety, and the exclusion cuts the opposite
-    way from the inclusion.** `KeyDependencySet` keeps a path that canonicalizes to a
+    way from the inclusion.** `KeyDependencySet` normalizes each path through
+    `DirectManifest`'s `NormalizePath` **first** — a driver echoes a path as *resolved*, so
+    `build/../inc/a.hpp` and `./inc/a.hpp` arrive verbatim, and unnormalized they are two
+    key entries for one header and two different keys on two machines whose generators
+    spell an include directory differently. Then it keeps a path that canonicalizes to a
     `<SRCROOT>`/`<BUILDTREE>` token, and keeps a *relative* path (it resolves against the
     compile's working directory, so it is machine-independent) — which must be decided
     before the absolute test, since a relative path lies under no root either. It **drops**
-    an absolute path under neither root: that is toolchain content, already covered
-    collectively by the compiler identity in the key, and hashing it would mean two
-    machines with the same compiler at different install prefixes share *nothing at all*.
-    This is the same split `DirectManifest` makes, for the reason its header states — 476
-    of a real TU's 635 headers are toolchain, and a manifest naming them would be
-    machine-specific. The set is sorted and deduplicated because `/showIncludes` repeats a
-    header once per inclusion site and emission order is a property of the driver.
-  - **A stream driver's notes must not reach the hashed text.** clang-cl reports
-    `/showIncludes` on **stdout**, the same stream the preprocessed text uses, so
-    `SplitIncludeNotes` removes those lines before the rest is hashed — otherwise a note,
-    which carries an absolute path, would be keyed as if it were source, which is precisely
-    what suppressing line markers exists to prevent. It and `ParseIncludePaths` read one
-    `IncludeNoteMarker`, because a note the splitter failed to recognise is a hashed path.
+    toolchain content, judged by `DirectManifest`'s own `IsToolchainHeader` so that this
+    filter, the manifest's and the replay guard's cannot disagree: an absolute path under
+    neither root, *and* a vcpkg tree nested under the build tree, which canonicalizes but is
+    still the producing machine's. That is content already covered collectively by the
+    compiler identity in the key, and hashing it would mean two machines with the same
+    compiler at different install prefixes share *nothing at all* — 476 of a real TU's 635
+    headers are toolchain, and a manifest naming them would be machine-specific. The set is
+    sorted and deduplicated because `/showIncludes` repeats a header once per inclusion site
+    and emission order is a property of the driver.
+  - **A stream driver's notes must not reach the hashed text, and which stream carries them
+    is not the driver table's answer to give.** `DriverSpec::includeStream` describes the
+    *compile* run; the probe is a different command line and clang moves the notes off
+    whichever stream the preprocessed text is using — measured, `clang-cl /c /showIncludes`
+    reports on **stdout** while `clang-cl /EP /showIncludes` reports on **stderr** (LLVM
+    D46394). Routing the probe by that table therefore read an empty set on clang-cl and
+    made this whole key input a silent no-op there. So `Preprocess` guesses at nothing: it
+    splits stdout unconditionally (a byte-exact no-op on a stream with no notes) and unions
+    the notes from both — which is the treatment `RecordManifest` already gives the same
+    question, "rather than guessing which compiler produced this value". A note left in the
+    text would be keyed as if it were source, and it carries an absolute path, which is
+    precisely what suppressing line markers exists to prevent.
+  - **The note grammar is one rule, not one string, and it is anchored.** `SplitIncludeNotes`
+    and `ParseIncludePaths` both call `IncludeNotePath`, which matches after leading blanks
+    (`cl` indents by nesting depth) and **nowhere else**. Matching the marker anywhere in the
+    line is safe on a pure note stream and a mis-serve on the one that also carries
+    preprocessed *source*: it deletes an ordinary line that merely quotes the marker out of
+    the hashed bytes, so two revisions differing only in that string literal key identically
+    and the second is served the first's object. This repository's own sources contain the
+    literal, so it was reachable while building `fastcached` itself.
+  - **A manifest that names no dependency is refused, not recorded.** A direct hit
+    revalidates exactly what its manifest lists, so a manifest built from the source alone
+    replays an object whose headers nobody re-checked — edit a header, leave the `.cpp`
+    untouched, and the stale object is served forever with a zero exit code. That is what a
+    build passing neither `-MD`/`-MF` nor `/showIncludes` produces: no stream carries notes
+    and there is no depfile to read. `RecordManifest` returns instead, which costs that build
+    direct mode (a permanent manifest miss, resolved by the ordinary preprocessed key) and is
+    the one shape where recording nothing is strictly better than recording something. The
+    launcher never injects those flags itself — the compile runs the build system's own argv,
+    so what it can revalidate is bounded by what the build asked the compiler to report.
   - **`Cc::MissingReplayedDependency` stays as the backstop**, and still runs before a hit
     writes anything; a stale hit falls through to the real compile, whose STORE repairs the
     entry. Its filter is load-bearing in both directions: probing a depfile's rule target

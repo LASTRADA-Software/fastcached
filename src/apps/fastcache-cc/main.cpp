@@ -505,6 +505,8 @@ class ScopedFile
 
     ~ScopedFile()
     {
+        if (_path.empty())
+            return;
         // The error_code overload, never the throwing one: a launcher whose whole
         // contract is that a cache problem cannot break a build must not throw out
         // of a destructor because a temporary file was already gone.
@@ -550,27 +552,54 @@ struct SourceProbe
 ///         itself failed.
 [[nodiscard]] std::optional<SourceProbe> Preprocess(Cc::ParsedCommand const& cmd, std::span<std::string const> originalArgs)
 {
+    auto const& driver = Cc::DriverOf(cmd.flavor);
+
+    // One string with two jobs, as PreprocessCommand documents: it is the
+    // destination for a depfile driver and merely the REQUEST for a stream one.
     // Derived from the object path, which is unique per translation unit, so
     // parallel compiles in one build tree cannot collide — and it sits in a
-    // directory the compile already writes to. A stream driver never creates it;
-    // the guard below simply has nothing to remove there.
-    std::string const probeDepPath = cmd.objPath + ".fcdep";
-    ScopedFile const probeDepFile { std::filesystem::path { probeDepPath } };
+    // directory the compile already writes to.
+    std::string probeRequest = cmd.objPath + ".fcdep";
 
-    auto const pp = Cc::PreprocessCommand(cmd, originalArgs, probeDepPath);
+    // A depfile destination is PROVEN writable before it is asked for, because a
+    // driver treats an unopenable `-MF` as a FATAL error rather than a warning: a
+    // build tree that will not take the scratch depfile would otherwise turn every
+    // compile in it into "preprocess failed" and an uncached build, forever and
+    // silently. Withdrawing the request is the degradation this function's contract
+    // describes — an empty set costs this TU its moved-header protection and
+    // nothing else. Only a depfile driver has a file to remove afterwards; a stream
+    // driver never creates one, so it is given no guard rather than a no-op guard.
+    std::filesystem::path probeDepFilePath;
+    if (driver.usesDepfile)
+    {
+        if (std::ofstream { probeRequest, std::ios::binary })
+            probeDepFilePath = probeRequest;
+        else
+        {
+            Note("dependency probe destination is not writable; keying without the dependency set");
+            probeRequest.clear();
+        }
+    }
+    ScopedFile const probeDepFile { std::move(probeDepFilePath) };
+
+    auto const pp = Cc::PreprocessCommand(cmd, originalArgs, probeRequest);
     // Capture stdout and stderr SEPARATELY. Merging them (2>&1) would fold the
     // compiler's diagnostic lines into the hashed text, and the interleave point
     // of two independently-buffered streams is not stable run-to-run — which would
     // make the key nondeterministic and defeat all caching.
-    auto const run = RunCaptureSplit(pp);
+    auto run = RunCaptureSplit(pp);
     if (run.exitCode != 0)
         return std::nullopt;
 
-    auto const& driver = Cc::DriverOf(cmd.flavor);
     if (driver.usesDepfile)
     {
-        SourceProbe probe { .preprocessed = run.out, .dependencyPaths = {} };
-        if (auto const bytes = ReadFileBytes(std::filesystem::path { probeDepPath }); bytes.has_value())
+        SourceProbe probe { .preprocessed = std::move(run.out), .dependencyPaths = {} };
+        if (probeRequest.empty())
+            return probe;
+        // Non-empty, not merely present: the writability check above created the
+        // file, so a driver that wrote nothing into it would otherwise read as a
+        // successful probe that found no dependencies.
+        if (auto const bytes = ReadFileBytes(std::filesystem::path { probeRequest }); bytes.has_value() && !bytes->empty())
             probe.dependencyPaths =
                 Cc::ParseDepFilePaths(std::string_view { reinterpret_cast<char const*>(bytes->data()), bytes->size() });
         else
@@ -847,6 +876,20 @@ void RecordManifest(Config const& cfg,
         if (auto const depText = ReadDepFile(cmd))
             includes = Cc::ParseDepFilePaths(*depText);
 
+    // No dependency record at all means no manifest. A manifest built from the
+    // source alone revalidates the source alone, so a hit against it replays an
+    // object built from headers nobody re-checked: edit a header, leave the .cpp
+    // untouched, and the stale object is served forever with a zero exit code.
+    // That is what a GNU compile with no `-MD`/`-MF` produces — neither stream
+    // carries notes and there is no depfile to read — and it is the one shape
+    // where recording nothing (a permanent direct-mode miss, resolved by the
+    // ordinary preprocessed key) is strictly better than recording something.
+    if (includes.empty())
+    {
+        Note("compile reported no dependencies; not recording a direct-mode manifest");
+        return;
+    }
+
     // The TU itself must be part of what a direct hit revalidates, not only the
     // headers it includes. /showIncludes never names the primary source (it only
     // emits "Note: including file:" for #include targets), and a GNU depfile's
@@ -963,39 +1006,47 @@ void RecordManifest(Config const& cfg,
             return served;
 
     auto const preprocessStarted = std::chrono::steady_clock::now();
-    auto const probe = Preprocess(cmd, argv);
-    if (!probe.has_value())
+    // Scoped, and the text MOVED through it rather than copied: the preprocessed
+    // form of a real translation unit runs to several megabytes, and everything
+    // below — two round trips and, on a miss, the real compiler as a child
+    // process — has no use for it once the key exists. Leaving it live held that
+    // much dead memory resident for exactly as long as the machine is busiest.
+    std::string key;
     {
-        Warn("preprocess failed");
-        return std::nullopt;
-    }
+        auto probe = Preprocess(cmd, argv);
+        if (!probe.has_value())
+        {
+            Warn("preprocess failed");
+            return std::nullopt;
+        }
 
-    // Skip translation units that reference a time/date macro. `__TIME__` /
-    // `__DATE__` / `__TIMESTAMP__` expand to a run-varying (second-granular)
-    // string, so such a TU re-keys on every compile and can never hit —
-    // caching it only churns the store. Preprocessing has already *expanded*
-    // the macro (its name is gone from the output), so we scan the source file
-    // text itself, matching sccache's refusal to cache these. Direct use in the
-    // TU is the overwhelmingly common case; header-introduced use is rare and
-    // its only cost is a permanent miss, never incorrectness.
-    if (SourceReferencesVolatileMacro(cmd.source))
-    {
-        Warn("uses __TIME__/__DATE__/__TIMESTAMP__; not caching (non-deterministic)");
-        return std::nullopt;
-    }
+        // Skip translation units that reference a time/date macro. `__TIME__` /
+        // `__DATE__` / `__TIMESTAMP__` expand to a run-varying (second-granular)
+        // string, so such a TU re-keys on every compile and can never hit —
+        // caching it only churns the store. Preprocessing has already *expanded*
+        // the macro (its name is gone from the output), so we scan the source file
+        // text itself, matching sccache's refusal to cache these. Direct use in the
+        // TU is the overwhelmingly common case; header-introduced use is rare and
+        // its only cost is a permanent miss, never incorrectness.
+        if (SourceReferencesVolatileMacro(cmd.source))
+        {
+            Warn("uses __TIME__/__DATE__/__TIMESTAMP__; not caching (non-deterministic)");
+            return std::nullopt;
+        }
 
-    // The dependency set is reduced to its portable form before it reaches the
-    // key: canonical tokens and relative paths only, sorted and deduplicated, with
-    // toolchain absolutes dropped because the compiler identity above already
-    // covers them and hashing them would end cross-machine sharing outright. See
-    // DependencyProbe.hpp, where each half of that filter is justified.
-    Cc::KeyInputs const inputs {
-        .compilerId = toolchainStamp,
-        .preprocessed = probe->preprocessed,
-        .relativizedArgs = relativizedArgs,
-        .dependencyPaths = Cc::KeyDependencySet(probe->dependencyPaths, layout),
-    };
-    std::string const key = Cc::ComputeKey(inputs);
+        // The dependency set is reduced to its portable form before it reaches the
+        // key: canonical tokens and relative paths only, sorted and deduplicated, with
+        // toolchain absolutes dropped because the compiler identity above already
+        // covers them and hashing them would end cross-machine sharing outright. See
+        // DependencyProbe.hpp, where each half of that filter is justified.
+        Cc::KeyInputs const inputs {
+            .compilerId = toolchainStamp,
+            .preprocessed = std::move(probe->preprocessed),
+            .relativizedArgs = relativizedArgs,
+            .dependencyPaths = Cc::KeyDependencySet(probe->dependencyPaths, layout),
+        };
+        key = Cc::ComputeKey(inputs);
+    }
     invocation.preprocessMs = MsSince(preprocessStarted);
 
     auto const cacheStarted = std::chrono::steady_clock::now();

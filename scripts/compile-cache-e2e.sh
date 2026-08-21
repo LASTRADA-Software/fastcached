@@ -137,7 +137,7 @@ echo "== compile 2 (expect HIT) =="
 "$launcher" "$compiler" -std=c++23 -MD -MF "${proj}/build/a.d" -c "${proj}/a.cpp" -o "${proj}/build/a.o" \
     2> "${workdir}/hit.log" || fail "second compile returned non-zero"
 cat "${workdir}/hit.log"
-grep -q "HIT" "${workdir}/hit.log" || fail "second compile was not served from the cache"
+grep -q "fastcache-cc: HIT" "${workdir}/hit.log" || fail "second compile was not served from the cache"
 [[ -f "${proj}/build/a.o" ]] || fail "cache hit did not write the object"
 cmp "${workdir}/expected.o" "${proj}/build/a.o" || fail "cached object differs from the compiled one"
 echo "   object reproduced byte-identically"
@@ -200,7 +200,7 @@ while kill -0 "$big_pid" 2>/dev/null; do
 done
 wait "$big_pid" || fail "large-object second compile returned non-zero"
 cat "${workdir}/big-hit.log"
-grep -q "HIT" "${workdir}/big-hit.log" || fail "large object was not served from the cache"
+grep -q "fastcache-cc: HIT" "${workdir}/big-hit.log" || fail "large object was not served from the cache"
 cmp "${workdir}/big-expected.o" "${big}/build/big.o" || fail "large cached object differs from the compiled one"
 echo "   large object reproduced byte-identically"
 
@@ -233,7 +233,7 @@ export FASTCACHE_SOURCE_DIR="$shallow" FASTCACHE_BINARY_DIR="${shallow}/build"
 "$launcher" "$compiler" -std=c++23 -MD -MF "${shallow}/build/t.d" -c "${shallow}/t.cpp" -o "${shallow}/build/t.o" \
     2> "${workdir}/shallow.log" || fail "shallow compile returned non-zero"
 cat "${workdir}/shallow.log"
-grep -q "HIT" "${workdir}/shallow.log" \
+grep -q "fastcache-cc: HIT" "${workdir}/shallow.log" \
     || fail "cross-depth portability broken: content stored from a deep checkout did not hit from a shallow one"
 cmp "${deep}/build/t.o" "${shallow}/build/t.o" || fail "cross-depth object differs"
 echo "   cross-depth hit reproduced the object byte-identically"
@@ -372,7 +372,10 @@ HDR
         -MD -MF "${root}/build/t.d" -c "${root}/t.cpp" -o "${root}/build/t.o" \
         2> "${workdir}/${name}-3.log" || fail "${label}: third compile returned non-zero"
     cat "${workdir}/${name}-3.log"
-    grep -q "HIT" "${workdir}/${name}-3.log" \
+    # Anchored: the launcher also prints "fastcache-cc: STALE HIT (...); recompiling"
+    # immediately BEFORE falling through to a MISS, so a bare `grep "HIT"` is
+    # satisfied by the very state these assertions exist to reject.
+    grep -q "fastcache-cc: HIT" "${workdir}/${name}-3.log" \
         || fail "${label}: the repaired entry did not hit, so every build recompiles this TU"
     require_depfile_resolves "$label" "${root}/build/t.d"
     grep -q "inc/new/Hdr.hpp" "${root}/build/t.d" || fail "${label}: the hit replayed the old path again"
@@ -392,8 +395,11 @@ HDR
         -MD -MF "${root}/build/t.d" -c "${root}/t.cpp" -o "${root}/build/t.o" \
         2> "${workdir}/${name}-4.log" || fail "${label}: fourth compile returned non-zero"
     cat "${workdir}/${name}-4.log"
-    grep -q "HIT" "${workdir}/${name}-4.log" \
+    grep -q "fastcache-cc: HIT" "${workdir}/${name}-4.log" \
         || fail "${label}: the pre-move entry was destroyed, so the two layouts share one key"
+    if grep -q "STALE HIT" "${workdir}/${name}-4.log"; then
+        fail "${label}: the restored layout still keyed onto the moved entry"
+    fi
     require_depfile_resolves "$label" "${root}/build/t.d"
     grep -q "inc/old/Hdr.hpp" "${root}/build/t.d" || fail "${label}: the restored hit names the wrong path"
 
@@ -429,6 +435,12 @@ echo "== edited source: first revision =="
 FASTCACHE_NO_DIRECT=1 "$launcher" "$compiler" -std=c++23 -c "${edited}/e.cpp" -o "${edited}/build/e.o" \
     2> "${workdir}/edited-1.log" || fail "first revision returned non-zero"
 cat "${workdir}/edited-1.log"
+# The first revision must actually POPULATE. Without this the second revision's
+# MISS is satisfied by an empty cache rather than by a changed key, and the whole
+# section — the one written for the class of bug where the key carries no content
+# from the source at all — proves nothing.
+grep -q "STORED" "${workdir}/edited-1.log" || fail "first revision did not store, so the next MISS proves nothing"
+[[ -f "${edited}/build/e.o" ]] || fail "first revision produced no object"
 cp "${edited}/build/e.o" "${workdir}/edited-1.o"
 
 cat > "${edited}/e.cpp" <<'SRC'
@@ -447,6 +459,12 @@ echo "   an edit re-keys, and the object follows the source"
 
 # --- 7: the cache is never load-bearing -------------------------------------
 # With no daemon reachable the build must still succeed, uncached.
+#
+# The layout is re-exported first: every section above exports its own, so
+# without this the compile below runs `${proj}/a.cpp` under roots pointing at an
+# unrelated tree and passes for reasons that have nothing to do with the daemon
+# being unreachable.
+export FASTCACHE_SOURCE_DIR="$proj" FASTCACHE_BINARY_DIR="${proj}/build"
 echo "== unreachable daemon must still compile =="
 FASTCACHE_ADDR="127.0.0.1:1" "$launcher" "$compiler" -std=c++23 -c "${proj}/a.cpp" -o "${proj}/build/fb.o" \
     2> "${workdir}/fallback.log" || fail "compile failed when the cache was unreachable"
