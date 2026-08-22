@@ -75,46 +75,99 @@ struct ProbeText
 /// - A path under either root canonicalizes to a `<SRCROOT>/...` or
 ///   `<BUILDTREE>/...` token and is kept. These are the project's own headers —
 ///   the ones that move, and the whole reason this set exists.
-/// - A *relative* path is kept, normalized to forward slashes. It resolves
-///   against the compile's working directory, so it names the same file on any
-///   machine that runs the same build. Note this must be decided before the
-///   toolchain test rather than after it, since that test reports every path
-///   outside the roots as toolchain.
+/// - A *relative* path is **resolved** against the compile's working directory and
+///   then classified exactly like the absolute paths above, rather than kept for its
+///   spelling. That is issue #64, and the whole of it is argued below.
 /// - A Windows **drive-relative** path (`C:foo`) is emphatically *not* treated as
-///   relative. It resolves against drive C's own current directory — per-process
-///   state on the producing machine that no cache entry records — so hashing it
-///   alongside the genuinely relative paths would let two machines whose C: cwd
-///   differs produce the *same* key for *different* headers. `PathCanon::Anchor`
-///   is what separates the two; before issue #65 the classifier stopped at the
-///   colon and called it absolute, reaching the same outcome by an answer that
-///   was not true. It is then left to the root tests rather than dropped outright,
-///   because root membership is the stronger question: under no root it cannot
-///   prefix-match a rooted root and is dropped as toolchain regardless, while
-///   under a drive-relative *root* it canonicalizes to a token that is portable
-///   exactly because the consumer substitutes its own root.
+///   relative, and so is never resolved that way. It resolves against drive C's own
+///   current directory — per-process state on the producing machine that no cache
+///   entry records — so resolving it against the compile's working directory would
+///   name a file that was never read, and hashing its spelling alongside the
+///   genuinely relative paths would let two machines whose C: cwd differs produce the
+///   *same* key for *different* headers. `PathCanon::Anchor` is what separates the
+///   two; before issue #65 the classifier stopped at the colon and called it
+///   absolute, reaching a safe outcome by an answer that was not true. It is then
+///   left to the root tests rather than dropped outright, because root membership is
+///   the stronger question: under no root it cannot prefix-match a rooted root and is
+///   dropped as toolchain regardless, while under a drive-relative *root* it
+///   canonicalizes to a token that is portable exactly because the consumer
+///   substitutes its own root.
 /// - **Toolchain content is dropped**, judged by DirectManifest's
 ///   `IsToolchainHeader` so that this filter, the manifest's and the replay
-///   guard's cannot disagree: an absolute path under neither root, *and* a vcpkg
-///   tree nested under the build tree, which canonicalizes but is still the
-///   producing machine's. It is covered collectively by the compiler identity
+///   guard's cannot disagree *about an absolute path*: one under neither root,
+///   *and* a vcpkg tree nested under the build tree, which canonicalizes but is
+///   still the producing machine's. (About a *relative* one the three part, and
+///   each answer is deliberate: only this filter resolves before it decides;
+///   `ReplayGuard`'s `IsCheckable` keeps every relative path, which is right for an
+///   existence probe against this machine's own cwd; and `BuildManifest` refuses
+///   the whole manifest rather than dropping the path, because it has no working
+///   directory to resolve against and a manifest that silently lost its headers
+///   revalidates the source alone. Anything moved into a shared helper has to
+///   account for all three.) It is covered collectively by the compiler identity
 ///   already in the key, and hashing it would mean two machines with the same
-///   compiler but different install prefixes (`/usr/include/c++/16` against
+///   compiler but
+///   different install prefixes (`/usr/include/c++/16` against
 ///   `/opt/gcc-16/include`) share *nothing at all* — a full duplicate entry set
 ///   for every translation unit. This is the same split DirectManifest makes for
 ///   the same reason (see its header: 476 of a real TU's 635 headers are
 ///   toolchain, and "a manifest naming them would be machine-specific").
+///
+/// **A relative path is classified by what it resolves to, never by its
+/// spelling** (issue #64), which is why this needs a working directory at all.
+/// Both rules above ask what a path *names*; "is it absolute" answers a different
+/// question, and the two invert for a vendored or relocatable toolchain reached
+/// through a relative include path. `-I../../vendor/sdk/include` — the ordinary
+/// way a vendored SDK is referenced from a build directory — makes the driver
+/// report `../../vendor/sdk/include/foo.h`, which lies under no root, so a
+/// spelling test *keeps and hashes* it ahead of the toolchain rule that drops the
+/// very same file when the driver spells it absolutely. Two machines whose build
+/// directory sits at a different depth then key every translation unit that
+/// touches that SDK differently — the "same compiler, share nothing at all"
+/// outcome the toolchain exclusion exists to prevent, arrived at from the other
+/// side. Resolving first makes both branches one branch: a relative project
+/// header becomes the same token its absolute spelling would, and a relative
+/// toolchain header is dropped exactly as an absolute one is.
+///
+/// What that gives up is what ReplayGuard still covers: the key no longer
+/// re-keys when a *vendored* header moves, but a hit's replayed dependency record
+/// is probed for existence before it is written, so the moved path discards the
+/// hit rather than being replayed. That is the same trade, and the same backstop,
+/// the absolute toolchain exclusion has always made.
 ///
 /// The result is sorted and deduplicated. `/showIncludes` repeats a header once
 /// per inclusion site — hundreds of notes for a few dozen files — and sorting
 /// makes the key insensitive to emission-order differences between driver
 /// versions, which are not differences in what was compiled.
 ///
-/// Pure: touches no filesystem.
+/// Pure: touches no filesystem. The resolution is lexical for that reason and for
+/// a second one — `weakly_canonical` would rewrite an 8.3 short component to its
+/// long form, which is precisely what DirectManifest's `NormalizePath` documents
+/// itself as avoiding.
 ///
-/// @param rawPaths The dependency paths as the compiler spelled them.
-/// @param layout   This machine's roots, and the source of path conventions.
+/// @param rawPaths         The dependency paths as the compiler spelled them.
+/// @param layout           This machine's roots, and the source of path
+///                         conventions.
+/// @param workingDirectory What a relative path resolves against: the compile's
+///                         working directory, which is also the launcher's. A
+///                         parameter rather than the process working directory
+///                         for the reason MissingReplayedDependency takes one —
+///                         so tests can drive a synthetic directory without
+///                         mutating global state. A *string* rather than a
+///                         `std::filesystem::path` because the join is the
+///                         LAYOUT's, not the host's: `path::operator/` would
+///                         apply the running machine's rules to a path belonging
+///                         to a cache shared with machines that do not share
+///                         them. The replay guard's is a path because its join
+///                         ends in a real filesystem probe, where the layout and
+///                         the host *are* the same machine. A working directory
+///                         that is itself empty or relative drops every relative
+///                         path rather than guessing: a path this machine cannot
+///                         classify is a path it cannot hash portably, and the
+///                         launcher's `dependency set: N of M` note is what makes
+///                         that visible instead of silent.
 /// @return The portable dependency set, sorted, without duplicates.
 [[nodiscard]] std::vector<std::string> KeyDependencySet(std::span<std::string const> rawPaths,
-                                                        PathCanon::Layout const& layout);
+                                                        PathCanon::Layout const& layout,
+                                                        std::string_view workingDirectory);
 
 } // namespace FastCache::Cc

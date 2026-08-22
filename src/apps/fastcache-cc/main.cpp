@@ -1102,15 +1102,17 @@ void RecordManifest(Config const& cfg,
         }
 
         // The dependency set is reduced to its portable form before it reaches the
-        // key: canonical tokens and relative paths only, sorted and deduplicated, with
-        // toolchain absolutes dropped because the compiler identity above already
-        // covers them and hashing them would end cross-machine sharing outright. See
-        // DependencyProbe.hpp, where each half of that filter is justified.
+        // key: canonical tokens only, sorted and deduplicated, with toolchain paths
+        // dropped because the compiler identity above already covers them and
+        // hashing them would end cross-machine sharing outright. A relative path is
+        // resolved against the compile's working directory first, so it is
+        // classified by the file it names rather than by how the driver spelled it.
+        // See DependencyProbe.hpp, where each half of that filter is justified.
         Cc::KeyInputs const inputs {
             .compilerId = toolchainStamp,
             .preprocessed = std::move(probe->preprocessed),
             .relativizedArgs = relativizedArgs,
-            .dependencyPaths = Cc::KeyDependencySet(probe->dependencyPaths, layout),
+            .dependencyPaths = Cc::KeyDependencySet(probe->dependencyPaths, layout, workingDirectory.string()),
         };
         // Both counts, because they answer different questions and only the pair
         // is diagnostic. An empty set means a moved header cannot re-key — the

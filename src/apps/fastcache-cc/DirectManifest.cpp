@@ -648,8 +648,11 @@ std::string ComputeManifestKey(std::string_view canonicalSource,
     // one-way. An `objkey` bump must drag this tag with it, because a manifest
     // points at an object key BY VALUE and would otherwise keep resolving to a
     // pre-bump object. The reverse costs nothing — an unreachable manifest is
-    // re-recorded on the next compile and points at the same, still-valid v3
-    // objects — so nothing about the object key changed here.
+    // re-recorded on the next compile and points at objects that are still valid
+    // under whatever tag they were written with — so this tag moving did not
+    // require the object key to move. (`objkey` reached v4 separately, for issue
+    // #64's dependency-set re-key; see ComputeKey for why it was taken rather than
+    // forced.)
     //
     // The bump is required because the defect it retires is invisible to the key.
     // A build whose TU source was absolute but whose header paths were relative

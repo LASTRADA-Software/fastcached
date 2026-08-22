@@ -319,7 +319,7 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
   banner from *different* prefixes can still replay a dependency record naming a
   path the consumer lacks. Project headers — the ones that actually move — are
   covered by the key, so this is now confined to the toolchain.
-- The cache key normalization is deliberately young (`objkey-v3`). Tune it
+- The cache key normalization is deliberately young (`objkey-v4`). Tune it
   against real developer↔CI hit rates before relying on it broadly. Bumping the
   schema re-keys the cache: existing entries miss once and are rewritten.
 - Localized path separators may be normalized to `/` in some segments. Ninja

@@ -371,7 +371,7 @@ TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliber
                              .relativizedArgs = { "-c", "-O2", "<SRCROOT>/src/main.cpp" },
                              .dependencyPaths = { "<SRCROOT>/inc/a.hpp", "<SRCROOT>/inc/b.hpp" } };
 
-    CHECK(ComputeKey(inputs) == "65a330c5e6541bf33b2682d642717669");
+    CHECK(ComputeKey(inputs) == "a38a64d1e6e4c72f555c7e97ba26bd16");
 }
 
 TEST_CASE("Field contents cannot be shifted across a field boundary")

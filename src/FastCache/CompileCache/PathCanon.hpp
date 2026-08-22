@@ -22,7 +22,7 @@ struct Layout
 /// There is deliberately no version here. Canonical text only ever travels
 /// inside a CompileValue, whose container carries `CompileValueVersion` and is
 /// rejected on mismatch, so a change to the canonicalization spec is expressed
-/// by bumping that — and by the `objkey-v3` schema tag in the launcher's
+/// by bumping that — and by the `objkey-v4` schema tag in the launcher's
 /// ComputeKey, which re-keys the cache so stale entries miss rather than being
 /// localized under rules they were not written by. A second version here was
 /// declared once and never referenced by anything, because it had no work to do.

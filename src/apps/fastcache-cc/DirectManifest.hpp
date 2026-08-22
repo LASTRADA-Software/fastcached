@@ -115,10 +115,19 @@ enum class DirectError : std::uint8_t
 /// `Anchor::WorkingDirectory`. That is the host coupling PathCanon.hpp forbids in as many words
 /// ("Derived from the LAYOUT, never from the host").
 ///
-/// Spelled once because three callers need exactly this correction and must agree:
-/// `ResolveAgainst`, `AnchorWorkingDirectory`, and DependencyProbe's `PortableForm`
-/// (which had the only copy, inline, until a Windows CI run showed the manifest
-/// side was missing it).
+/// Spelled once because the manifest's own callers need exactly this correction and
+/// must agree: `ResolveAgainst` and `AnchorWorkingDirectory`. The rule started here
+/// as an inline copy in DependencyProbe's `PortableForm`, and was hoisted when a
+/// Windows CI run showed the manifest side was missing it.
+///
+/// `PortableForm` no longer calls this. It answers the same host coupling more
+/// strongly, by folding to `/` on BOTH sides of the lexical pass (`LexicalForm`):
+/// `std::filesystem` treats `\` as a separator only on a Windows *host*, so a
+/// Windows path normalized on POSIX keeps every `..` segment and the collapse this
+/// function exists to perform never happens at all. Correcting the separator
+/// afterwards, as here, cannot recover a collapse that did not occur. The two
+/// spellings are therefore not duplicates of one rule but answers to two different
+/// halves of it, and the divergence is deliberate — see `LexicalForm`.
 ///
 /// @param rawPath A path as the compiler or the environment spelled it.
 /// @param layout  The layout whose path conventions apply.

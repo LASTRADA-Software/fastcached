@@ -143,22 +143,46 @@ std::string ComputeKey(KeyInputs const& inputs)
     // really had, against ~10^5 entries a shared team cache reaches.
     //
     // v3 deliberately did NOT move when RelativizeArgs learned to tokenize a
-    // FUSED object-output path, even though that changes the key of every
-    // Windows build. The tag versions this CONSTRUCTION and the rules the stored
-    // value is written under, and neither moved: the golden vector below is
-    // unchanged, and so is the value's framing and canonicalization. What
-    // changed is one input, for the builds whose command line carried a
-    // machine-specific string it should never have carried. Old entries stay
-    // correct in their own terms; they simply stop being addressed, miss, and
-    // are rewritten. A bump cannot be reached from there -- an old key can only
-    // become a new key by a build literally passing the text `<BUILDTREE>`, and
-    // a `/Fo` path that was already relative canonicalizes to itself and does
-    // not move at all -- while it WOULD invalidate every POSIX entry, where
-    // nothing changed. Direct mode needs no bump for the same reason and not by
-    // luck: ComputeManifestKey takes the relativized args too, so a manifest
-    // key moves exactly where an object key does, in lock-step, for exactly the
-    // builds affected.
-    KeyDigest digest { "objkey-v3" };
+    // FUSED object-output path, even though that changed the key of every
+    // Windows build. That reasoning is kept, because it is the case for NOT
+    // bumping and it stands on its own: the tag versions this CONSTRUCTION and
+    // the rules the stored value is written under, and neither moved -- the
+    // golden vector did not move for that change either, nor did the value's
+    // framing or canonicalization. What changed was one input, for the builds
+    // whose command line carried a machine-specific string it should never have
+    // carried. Old entries stayed correct in their own terms; they simply
+    // stopped being addressed, missed, and were rewritten. A bump could not be
+    // reached from there -- an old key can only become a new key by a build
+    // literally passing the text `<BUILDTREE>`, and a `/Fo` path that was
+    // already relative canonicalizes to itself and does not move at all --
+    // while it WOULD have invalidated every POSIX entry, where nothing changed.
+    // Direct mode needed no bump for the same reason and not by luck:
+    // ComputeManifestKey takes the relativized args too, so a manifest key moves
+    // exactly where an object key does, in lock-step, for exactly the builds
+    // affected.
+    //
+    // v4 is issue #64. A dependency path is now classified by what it RESOLVES to
+    // rather than by whether it was spelled absolutely, so a relative one tokenizes
+    // or drops where it used to be hashed verbatim.
+    //
+    // On its own that would not have required a bump, by exactly the argument
+    // above: it re-keys only the translation units that reported such a path, and
+    // their keys differ by construction, so a pre-fix entry becomes unreachable
+    // rather than servable under rules it was not written by. The bump is taken
+    // anyway, and the reason is worth stating precisely because it is NOT the
+    // lock-step rule this comment used to cite. `manifest-v4` moved separately,
+    // ahead of this, when BuildManifest learned to resolve a relative dependency
+    // instead of dropping it -- and that direction of the coupling costs nothing,
+    // as ComputeManifestKey records: an unreachable manifest is re-recorded on the
+    // next compile. So nothing forced `objkey` here.
+    //
+    // What decides it is that the two tags disagreeing is a state nobody should
+    // have to reason about later. A cache holding v4 manifests that point at v3
+    // objects is correct today and is one careless edit from not being, and the
+    // cost of removing the question is a single cold rebuild. The fused-output
+    // re-key above, which needed no bump of its own, rides along in the same
+    // invalidation event rather than ever costing a second.
+    KeyDigest digest { "objkey-v4" };
     digest.Field(inputs.compilerId);
     digest.Field(inputs.preprocessed);
     for (auto const& arg: inputs.relativizedArgs)
