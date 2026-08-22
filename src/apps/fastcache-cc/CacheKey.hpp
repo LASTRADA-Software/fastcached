@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/CompileCache/PathCanon.hpp>
+
 #include <span>
 #include <string>
 #include <string_view>
@@ -76,12 +78,23 @@ struct KeyInputs
 /// key would differ across machines even for identical content. `PathCanon`
 /// emits `<BUILDTREE>` for the (longer-matching) build-tree paths and
 /// `<SRCROOT>` for the rest.
+/// `resolve` reconciles a spelling before the roots are consulted, and it is
+/// applied to the path PORTION this function has already isolated rather than to
+/// the whole argument — which is the reason it is injected here instead of in the
+/// caller: `IncludePrefixes` is the only table that knows where an `-I` flag ends
+/// and its path begins, and re-deriving that outside would be a second copy of it.
+/// It matters because a build system may spell an include directory in a form the
+/// compiler never echoes back (an 8.3 short component, a `subst` drive), and an
+/// argument that does not reconcile against the roots leaves the checkout location
+/// in the key — issue #66. Left empty, every path is used exactly as written.
 /// @param args       The raw compile arguments (excluding the compiler).
 /// @param sourceRoot The checkout source root to relativize against.
 /// @param buildTree  The build output root to relativize against (may be empty).
+/// @param resolve    Optional spelling reconciliation for each isolated path.
 /// @return The arguments with source-/build-rooted paths tokenized.
 [[nodiscard]] std::vector<std::string> RelativizeArgs(std::span<std::string const> args,
                                                       std::string_view sourceRoot,
-                                                      std::string_view buildTree);
+                                                      std::string_view buildTree,
+                                                      PathCanon::PathTransform const& resolve = {});
 
 } // namespace FastCache::Cc

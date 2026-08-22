@@ -441,6 +441,8 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
             // An include directory or a dependency target goes nowhere, and its
             // separated value is deliberately left to be scanned rather than
             // consumed: it is not a source path, so nothing downstream reads it.
+            // What a stored depfile must not have respelled is read from the
+            // depfile itself, structurally — see ParseDepFileTargets.
             if (destination == nullptr)
                 continue;
 

@@ -343,3 +343,129 @@ TEST_CASE("A drive-relative root still makes a Windows layout, and still canonic
     REQUIRE(token.has_value());
     CHECK(*token == "<SRCROOT>/a.hpp");
 }
+
+// ---------------------------------------------------------------------------
+// RewritePaths: the same grammars, driven by a caller's own transform. The
+// launcher needs this to reconcile a driver's spelling of a path (an 8.3 short
+// component, a `subst` drive) with the roots a STORE is canonicalized against —
+// issue #66. Asking the filesystem is the caller's job; finding the spans is
+// this file's.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+/// A stand-in for the launcher's path resolver: maps one aliased spelling of a
+/// directory onto its real one, and leaves everything else alone.
+[[nodiscard]] std::string DealiasShortName(std::string_view path)
+{
+    constexpr std::string_view Aliased = R"(C:\Users\RUNNER~1\src)";
+    constexpr std::string_view Real = R"(C:\Users\runneradmin\src)";
+    if (!path.starts_with(Aliased))
+        return std::string { path };
+    return std::string { Real } + std::string { path.substr(Aliased.size()) };
+}
+} // namespace
+
+TEST_CASE("RewritePaths reconciles a showIncludes path so the roots can then match it")
+{
+    // The measured Windows shape: the root is spelled long and `clang-cl` echoes
+    // the short spelling it was handed, so canonicalization finds nothing under
+    // either root and the value keeps this machine's absolute paths.
+    Layout const layout { .sourceRoot = R"(C:\Users\runneradmin\src)", .buildTree = R"(C:\Users\runneradmin\build)" };
+    constexpr std::string_view region = "Note: including file:  C:\\Users\\RUNNER~1\\src\\inc\\h1.h\r\n";
+
+    auto const unreconciled = PathCanon::CanonicalizeRegion(region, Grammar::ShowIncludes, layout);
+    REQUIRE(unreconciled.has_value());
+    CHECK(*unreconciled == region); // nothing matched: the defect this exists to end
+
+    auto const reconciled = PathCanon::RewritePaths(region, Grammar::ShowIncludes, DealiasShortName);
+    REQUIRE(reconciled.has_value());
+    auto const canonical = PathCanon::CanonicalizeRegion(*reconciled, Grammar::ShowIncludes, layout);
+    REQUIRE(canonical.has_value());
+    CHECK(*canonical == "Note: including file:  <SRCROOT>/inc/h1.h\r\n");
+}
+
+TEST_CASE("RewritePaths leaves the non-path parts of every grammar byte-for-byte")
+{
+    // The transform sees only what the grammar identifies as a path, so a line that
+    // merely quotes the marker and a diagnostic's location suffix both survive.
+    constexpr std::string_view notes = "char const* s = \"Note: including file: x\";\n"
+                                       "Note: including file: C:\\Users\\RUNNER~1\\src\\a.h\n";
+    auto const rewritten = PathCanon::RewritePaths(notes, Grammar::ShowIncludes, DealiasShortName);
+    REQUIRE(rewritten.has_value());
+    CHECK(*rewritten
+          == "char const* s = \"Note: including file: x\";\n"
+             "Note: including file: C:\\Users\\runneradmin\\src\\a.h\n");
+
+    constexpr std::string_view diagnostic = "C:\\Users\\RUNNER~1\\src\\a.cpp(12,3): warning C4100: unused\n";
+    auto const diag = PathCanon::RewritePaths(diagnostic, Grammar::MsvcDiagnostics, DealiasShortName);
+    REQUIRE(diag.has_value());
+    CHECK(*diag == "C:\\Users\\runneradmin\\src\\a.cpp(12,3): warning C4100: unused\n");
+}
+
+TEST_CASE("RewritePaths reaches every token of a depfile, target included")
+{
+    // The depfile grammar carries many spans per line, so it takes the other
+    // walker; both must be reachable through this entry point or a GNU build's
+    // stored depfile keeps the producing machine's spelling.
+    constexpr std::string_view depFile = "C:\\Users\\RUNNER~1\\src\\a.o: C:\\Users\\RUNNER~1\\src\\a.cpp\\\n"
+                                         "  C:\\Users\\RUNNER~1\\src\\inc\\h1.h\n";
+    auto const rewritten = PathCanon::RewritePaths(depFile, Grammar::GccDepfile, DealiasShortName);
+    REQUIRE(rewritten.has_value());
+    CHECK(*rewritten
+          == "C:\\Users\\runneradmin\\src\\a.o: C:\\Users\\runneradmin\\src\\a.cpp\\\n"
+             "  C:\\Users\\runneradmin\\src\\inc\\h1.h\n");
+}
+
+TEST_CASE("RewritePaths lets a transform preserve one span and rewrite its neighbours")
+{
+    // The per-span decision is the mechanism the launcher builds its depfile rule
+    // on: it preserves the object path — the `-o` value, which the BUILD SYSTEM
+    // named — while reconciling every dependency the compiler reported around it.
+    // Decided by VALUE and not by position, because position does not say what a
+    // path is: `-MP` emits a phony rule whose target is a HEADER, and that one
+    // must be rewritten like any other or a consumer's depfile names a file that
+    // does not exist there.
+    constexpr std::string_view objectPath = R"(C:\Users\RUNNER~1\src\a.o)";
+    auto const preserveObject = [objectPath](std::string_view span) {
+        return span == objectPath ? std::string { span } : DealiasShortName(span);
+    };
+
+    constexpr std::string_view depFile = "C:\\Users\\RUNNER~1\\src\\a.o: C:\\Users\\RUNNER~1\\src\\a.cpp\\\n"
+                                         "  C:\\Users\\RUNNER~1\\src\\inc\\h1.h\n"
+                                         "\n"
+                                         "C:\\Users\\RUNNER~1\\src\\inc\\h1.h:\n";
+
+    auto const rewritten = PathCanon::RewritePaths(depFile, Grammar::GccDepfile, preserveObject);
+    REQUIRE(rewritten.has_value());
+    CHECK(*rewritten
+          == "C:\\Users\\RUNNER~1\\src\\a.o: C:\\Users\\runneradmin\\src\\a.cpp\\\n"
+             "  C:\\Users\\runneradmin\\src\\inc\\h1.h\n"
+             "\n"
+             "C:\\Users\\runneradmin\\src\\inc\\h1.h:\n");
+
+    // The dependency on the `\`-continued line is reached too. gcc wraps at ~76
+    // columns, so a walker that stopped at the first line would exempt most of a
+    // real depfile rather than none of it.
+    CHECK(rewritten->contains(R"(  C:\Users\runneradmin\src\inc\h1.h)"));
+}
+
+TEST_CASE("RewritePaths with an identity transform is a byte-exact no-op")
+{
+    // What makes reconciling twice safe: RecordManifest re-reconciles inputs its
+    // caller already did, and a correctly-spelled build reconciles nothing at all.
+    auto const identity = [](std::string_view path) {
+        return std::string { path };
+    };
+    constexpr std::string_view depFile = "/b/a.o: /s/a.cpp /s/a\\ b.hpp\n"
+                                         "\n"
+                                         "/s/a.hpp:\n";
+    auto const rewritten = PathCanon::RewritePaths(depFile, Grammar::GccDepfile, identity);
+    REQUIRE(rewritten.has_value());
+    CHECK(*rewritten == depFile);
+
+    constexpr std::string_view notes = "Note: including file: /s/inc/h1.h\r\nunrelated\n";
+    auto const notesOut = PathCanon::RewritePaths(notes, Grammar::ShowIncludes, identity);
+    REQUIRE(notesOut.has_value());
+    CHECK(*notesOut == notes);
+}

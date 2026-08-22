@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -180,6 +181,38 @@ enum class Anchor : std::uint8_t
 [[nodiscard]] std::expected<std::string, CanonError> CanonicalizeRegion(std::string_view text,
                                                                         Grammar grammar,
                                                                         Layout const& layout);
+
+/// The transform RewritePaths applies to one path span.
+using PathTransform = std::function<std::string(std::string_view)>;
+
+/// Apply a caller-supplied transform to every path span in a captured text
+/// region, per its grammar, preserving everything else byte-for-byte.
+///
+/// The generalization Canonicalize/LocalizeRegion are special cases of, exposed
+/// because a caller outside this file needs the SAME grammar to find the same
+/// spans: the launcher must reconcile the spelling of each path a compiler
+/// emitted (an 8.3 short component, a `subst` drive, a junction) before the value
+/// is stored, or the daemon's canonicalization finds nothing under either root
+/// and the value keeps the producing machine's absolute paths — issue #66.
+///
+/// The transform is deliberately opaque here, and it decides per span, which is
+/// what lets a caller preserve one path while rewriting its neighbours — the
+/// launcher does exactly that for a depfile's rule target, which is the `-o` path
+/// the BUILD SYSTEM named rather than anything the driver reported.
+///
+/// Reconciling a spelling means asking the filesystem, and this file must never
+/// do that: it also runs on the DAEMON, over a producing machine's roots that do
+/// not exist there. So the grammar stays here and the filesystem stays in the
+/// launcher.
+///
+/// @param text    The region bytes.
+/// @param grammar The grammar identifying path spans within `text`.
+/// @param xform   Applied once per identified span; returning the span unchanged
+///                is a byte-exact no-op.
+/// @return The rewritten region.
+[[nodiscard]] std::expected<std::string, CanonError> RewritePaths(std::string_view text,
+                                                                  Grammar grammar,
+                                                                  PathTransform const& xform);
 
 /// Localize every canonical token span in a captured text region, per its
 /// grammar. The inverse of CanonicalizeRegion.

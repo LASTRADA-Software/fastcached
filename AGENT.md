@@ -68,7 +68,10 @@ src/apps/
                             misses→compile→STORE, and falls back safely on any
                             cache error. Config via `FASTCACHE_*` env, wired
                             through `CMAKE_<LANG>_COMPILER_LAUNCHER`. Platform
-                            work sits behind `IProcessRunner` / `ITcpClient`,
+                            work sits behind `IProcessRunner` / `ITcpClient` /
+                            `IPathResolver` (the last collapsing every spelling
+                            of one location — 8.3, `subst`, junctions, symlinks
+                            — to one, memoized per directory),
                             so main.cpp's flow logic is platform-free. Compiles
                             in `Cli/UsageDoc.cpp` plus `Platform/Environment.cpp`
                             and `Platform/Terminal.cpp` (see `_fc_cc_core`), so
@@ -444,10 +447,154 @@ These constraints are load-bearing and have each already been a bug:
     `run-launcher-e2e.ps1` therefore puts its scratch trees beside the **build tree**
     rather than under `%TEMP%`; it does not try to expand a short name, because nothing
     dependably does — `Resolve-Path`, `Get-Item` and `[IO.Path]::GetFullPath` all preserve
-    it, and `Scripting.FileSystemObject` was tried and echoed it back unchanged. The
-    launcher itself does not normalize, which is issue #66: the fix has to normalize *both*
-    sides or neither, since expanding only the emitted paths breaks clang-cl exactly as
-    spelling only the root long breaks `cl`.
+    it, and `Scripting.FileSystemObject` was tried and echoed it back unchanged.
+  - **The reconciliation translates the emitted paths INTO the build's spelling; it does
+    not respell the roots (issue #66).** There are two spellings of every root and the
+    launcher needs both, for opposite reasons. **Matching** must use the spelling the
+    filesystem reports, because that is what a driver reports. **Emitting** must use the
+    spelling the build system uses, because a replayed depfile's rule target has to be
+    byte-identical to the `-o` path the build passed. Resolving the roots and using that
+    form everywhere satisfies the first and breaks the second — measured: a build tree
+    reached through a symlink stored `.../link/build/a.o:` and replayed
+    `.../real/build/a.o:`, which Ninja rejects outright (`expected depfile ... to mention
+    ...`) while make matches no rule at all and silently drops every header dependency.
+    `RootReconciler` (`apps/fastcache-cc/RootReconciler.cpp`) holds both layouts and is the only
+    thing that sees the resolved one: it canonicalizes an emitted path against the
+    resolved roots and localizes the token into the as-given roots. Everything downstream
+    — the roots on the wire, the key, the manifest, the replay guard, the localized
+    regions — keeps speaking the build system's own spelling exactly as before, so no
+    protocol version moves and nothing else had to learn about this. Consequences that
+    are each load-bearing:
+    - **It is its own translation unit, for the reason `CacheProtocol.cpp` already
+      records.** `main.cpp` is in no test target, so logic that lives there has no unit
+      coverage at all — the mistake this list notes having been made once with the wire
+      framing. `RootReconciler.cpp` is compiled into both the launcher and
+      `fastcache-cc-tests`, and its tests drive it through a table-backed fake
+      `IPathResolver`: the conditions it exists for (an 8.3 short component, a `subst`
+      drive, a junction) cannot be created on the host running the tests, and two of the
+      three cannot be created on any host that is not Windows, so a fake stating the
+      aliasing directly is what makes every case reproducible everywhere.
+    - **The translation is PathCanon's own two operations, not a third prefix test.**
+      `Canonicalize` against one layout, `Localize` into the other. A rule written out
+      again here is a rule that can come to disagree with the one everything else
+      applies, which is the whole failure mode this entry documents.
+    - **Only paths the COMPILER authored are reconciled; one the BUILD SYSTEM authored is
+      already the spelling this build wants, and it is named BY VALUE.** A depfile is the
+      single grammar carrying both, so `Cc::RootReconciler::Region` takes the object path and
+      returns that span verbatim wherever it appears. Respelling it hands the build system
+      back an output it never asked for, and a build whose `-o` does not share a spelling
+      with `FASTCACHE_BINARY_DIR` then gets a depfile Ninja rejects outright and make
+      matches against no rule at all. **By value and not by position**, because position
+      does not say what a path is: `-MP` emits a phony rule per header whose TARGET is a
+      path the compiler reported, and exempting every target would leave those unreconciled
+      and so uncanonicalized, sending a consumer a depfile that points `-MP`'s
+      deleted-header protection at files it cannot stat. Canonicalization on the daemon
+      still rewrites every span, target included — a consumer needs the target pointing
+      into ITS build tree.
+    - **Symmetry is the property, and it is why this is a seam rather than a call at
+      each comparison.** Expanding only the emitted paths breaks clang-cl exactly as
+      spelling only the root long breaks `cl`. `Cc::IPathResolver`
+      (`apps/fastcache-cc/PathResolve.hpp`) is where the filesystem lives, and it lives
+      in the launcher because `PathCanon` also runs on the **daemon**, over a producing
+      machine's roots that do not exist there (`CompileCacheHandler::HandleStore`), so it
+      may never touch a filesystem. Hence `PathCanon::RewritePaths` taking the transform
+      as a parameter: the grammar that finds path spans stays in the library.
+    - **A path already spelled the way this build spells things is returned UNTOUCHED, and
+      that is the correctness case rather than an optimization.** Resolution rewrites a
+      symlink anywhere in a path, not only in the root prefix, so round-tripping an
+      in-tree one (`src/inc -> src/real-inc`) would key it under this machine's real
+      subpath while a machine holding the same content without that symlink keys under the
+      plain one. Two byte-identical checkouts would stop sharing every entry — the property
+      the launcher exists to provide, traded away to repair a spelling that was never wrong
+      here. So `Translate` asks the as-given layout FIRST and only falls through to the
+      resolved round trip when that fails. Measured: two such checkouts key identically,
+      and at the same key a launcher built before this change produces.
+    - **That fast path is also why it costs nothing, and the memo is what bounds the rest.**
+      The resolver memoizes per parent DIRECTORY. Measured on this repository's own
+      `CompileCacheHandler.cpp`: 1099 reported paths, 60 filesystem calls (all of them
+      toolchain headers, which lie under no root by either spelling), and 271-276 ms per
+      cache hit against 271-276 ms before — inside the noise. Per-path resolution with
+      neither fast path nor memo is the version the issue worried about: roughly 1099 calls,
+      ~25 ms, which on a 45 ms preprocess is not a rounding error.
+    - **`Resolve` leaves the leaf as spelled, so an argument naming a directory must use
+      `ResolveDirectory`.** The memo works per parent, so the final component of whatever
+      is handed to `Resolve` is never resolved — fine for an include note (the name comes
+      from an `#include` directive and is already long) and wrong for an `-I` pointing at
+      a symlinked include directory, whose *own* last component is the aliased one. The
+      argument list and the translation unit therefore go through `ResolveDirectory`,
+      which also makes an `-I` resolve the same way the headers reported from under it
+      do; there are few enough arguments that resolving each completely costs nothing.
+    - **A relative path is returned verbatim.** It resolves against the compile's working
+      directory and is therefore already machine-independent; absolutizing it would either
+      re-key it for nothing or, when the working directory lies under neither root, push it
+      outside both and have `KeyDependencySet` drop it. `RootReconciler::IsInTree` has to
+      agree, and it asks its question of the RECONCILED path against the AS-GIVEN layout —
+      the same two values that decide whether the path reaches the key. Asking the resolved
+      layout instead answers a question nothing else asks, and a compile could then key
+      nothing while the diagnostic reported it in-tree.
+    - **A trailing separator is trimmed off each root, and leaving it is worse than a
+      no-op.** `PathCanon::Layout` takes roots without one — `IsSegmentPrefix` requires a
+      separator AFTER the root, so `/x/build/` matches nothing under `/x/build` — and a
+      build system exporting one is doing nothing wrong. Untrimmed, nothing under that root
+      canonicalizes (so the stored value keeps this machine's absolute paths) AND the path
+      then gets a second chance through the resolved root, which `weakly_canonical` returns
+      without the separator, after which `JoinLocalized` adds one of its own and the
+      replayed rule target reads `/x/build//a.o`. A bare root (`/`, `C:\`) is left alone:
+      it IS its trailing separator, and trimming `C:\` to `C:` would also flip the
+      separator style `JoinLocalized` derives from it.
+    - **The "never throws" contract is guarded at the entry points, not around the
+      filesystem calls.** Every `std::filesystem` call here takes an `error_code`, so
+      guarding only those looks sufficient — but on Windows `std::filesystem::path`
+      *stores* a `wstring`, so constructing one from a narrow string converts through the
+      active code page and `path::string()` converts back, either of which throws on a
+      character the code page cannot represent. Those conversions happen before any step
+      runs. `main()` has no catch of its own, so an escape breaks the build over a path
+      the launcher merely failed to tidy up.
+    - **No schema tag moved, and the reconciliation is why it did not have to.** Because it
+      is identity wherever the spellings already agreed, `objkey-v3`/`manifest-v3` and
+      `CompileValueVersion` all stay: verified, a launcher built from the previous commit
+      stores entries this one HITs, and a manifest it recorded still direct-hits. Where the
+      spellings did NOT agree the cache was not working, so there is nothing to invalidate.
+    - **The diagnostic is verbose-gated, which reverses the original call.** It started
+      ungated, on the reasoning that this defect is invisible and a diagnostic nobody
+      enables is as silent as none. Two rounds of narrowing failed to find a condition
+      that means "broken" reliably enough to justify four unsilenceable lines on the
+      compiler's stderr for every translation unit: a source outside both roots is an
+      ordinary CMake layout (`add_subdirectory(../shared shared)`, a superbuild,
+      ExternalProject), and a message that cries wolf on a healthy build is the one that
+      gets ignored when it is right. What tipped it is that `RootReconciler` now REPAIRS
+      the mismatch rather than merely detecting it, so this is a backstop and not the
+      mechanism.
+      **The condition stayed narrow even so**, and reports the roots not containing the
+      SOURCE rather than "nothing was keyed", because the broader one has an innocent
+      reading: `/showIncludes` never names the primary source, so on MSVC a translation
+      unit including only third-party headers outside the roots — Qt, a vendored SDK,
+      anything the four-entry `ToolchainMarkers` table does not know about — reports paths
+      and keys none of them while being perfectly healthy. `0 of 0` stays quiet too: that
+      is a driver reporting nothing on the preprocess line, a different fault this message
+      would misdescribe.
+    - **The e2e cases create the second spelling deliberately** rather than relying on one:
+      `compile-cache-e2e.sh` symlinks a root, `run-launcher-e2e.ps1` substitutes a drive
+      (`subst`, not an 8.3 name — 8.3 creation is off on many volumes). Both compile one
+      tree through both spellings and require the second to HIT the first's entry.
+      **Which paths get which spelling is the whole design of the POSIX case**, and getting
+      it wrong makes the case vacuous: the roots and the OUTPUT paths are the aliased
+      spelling while the source and include paths are the real one, which is what `cl`
+      actually does — a build system spells everything one way and the compiler reports its
+      dependencies resolved the other way. Spelling the outputs the same way as the roots is
+      what a real build does (`-o` and `FASTCACHE_BINARY_DIR` come from one generator) and
+      it is what makes the second property testable at all: the replayed depfile's rule
+      target must be byte-identical to the one the compiler wrote. A third leg repeats it
+      with roots carrying a trailing separator. Both assertions were verified by
+      reintroducing the bug they catch and watching them fail, and the whole case is checked
+      against a launcher built from the previous commit, where it must fail with
+      `dependency set: 0 of 2`. The Windows case names its object by the real path in both
+      legs. That was load-bearing when it was written, because a fused `/Fo<path>` reached
+      the key verbatim and would have keyed the legs apart for an unrelated reason; the
+      bullet below has since made every path-valued flag relativize in its fused spelling
+      too, so the precaution is now belt-and-braces rather than the thing holding the case
+      up. Every other case keeps its roots unambiguous,
+      so a regression in the reconciliation cannot present as a failure of something else.
 - **A flag's value is relativized off one table, or it is relativized in one spelling
   only.** A path-valued flag can be written two ways — `/Fo <path>` and `/Fo<path>` —
   and the separated form needs no table at all: the value is a bare argument, so it
@@ -841,11 +988,19 @@ collapse or a mis-serve and is now covered by regression tests:
   is part of the key so a moved header re-keys; hashing a toolchain path along
   with it would re-key on the *machine* instead, and two boxes with the same
   compiler at different prefixes would stop sharing every entry they have.
+- **A root and the paths a driver emits must be reconciled on both sides or
+  neither.** Every root test is a string prefix comparison, so a root spelled
+  differently from what the compiler echoes back matches nothing it emits — and
+  that empties the keyed dependency set, silences the replay guard, and leaves the
+  producing machine's paths in the stored value, all at once and all silently.
+  `Cc::IPathResolver` resolves the roots and every emitted path through the same
+  function; resolving only one side breaks the driver that previously worked.
 
 The first two break cross-checkout sharing while every unit test still passes,
-and the third breaks it the moment two machines differ, so
-`scripts/compile-cache-e2e.sh` (POSIX) and `run-launcher-e2e.ps1` (Windows)
-assert all of them end-to-end in CI on both platforms.
+the third breaks it the moment two machines differ, and the fourth breaks it the
+moment a root is spelled unusually, so `scripts/compile-cache-e2e.sh` (POSIX) and
+`run-launcher-e2e.ps1` (Windows) assert all of them end-to-end in CI on both
+platforms.
 
 Production flow: `main()` -> CLI -> optional YAML -> `ConfigReloader` ->
 `CacheEngine` over `InMemoryLruStorage` (or, when `--storage` is set, a

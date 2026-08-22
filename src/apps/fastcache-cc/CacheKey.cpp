@@ -43,15 +43,33 @@ namespace
         return IntroducersOf(PathCanon::IsWindowsLayout(layout) ? DriverFamily::Any : DriverFamily::Gnu);
     }
 
+    /// Reconcile one path's spelling, or leave it alone when no transform was
+    /// supplied. Spelled once so the two branches below cannot differ on it.
+    /// @param resolve The caller's transform; may be empty.
+    /// @param path    The isolated path portion.
+    /// @return The reconciled path, or a copy of `path`.
+    [[nodiscard]] std::string Reconciled(PathCanon::PathTransform const& resolve, std::string_view path)
+    {
+        return resolve ? resolve(path) : std::string { path };
+    }
+
     /// Relativize one argument against both roots: if it is a bare path or a
     /// path-valued flag whose fused value lies under the source root or the build
     /// tree, replace the path portion with its canonical token; otherwise return
     /// it unchanged. PathCanon prefers the longer-matching root, so a build tree
     /// nested under the source root tokenizes to `<BUILDTREE>`.
-    /// @param arg    The raw argument.
-    /// @param layout The source-root / build-tree layout to relativize against.
+    ///
+    /// An argument that does not tokenize comes back exactly as written, never in
+    /// its reconciled spelling: reconciliation exists to make the ROOT TEST
+    /// succeed, and rewriting an argument it did not help would change the key for
+    /// a path the cache has no opinion about.
+    /// @param arg     The raw argument.
+    /// @param layout  The source-root / build-tree layout to relativize against.
+    /// @param resolve Optional spelling reconciliation for the isolated path.
     /// @return The (possibly) relativized argument.
-    [[nodiscard]] std::string RelativizeOne(std::string_view arg, PathCanon::Layout const& layout)
+    [[nodiscard]] std::string RelativizeOne(std::string_view arg,
+                                            PathCanon::Layout const& layout,
+                                            PathCanon::PathTransform const& resolve)
     {
         // Fused path-valued flags: <flag><path>, e.g. `/IC:\src\inc` and
         // `/FoC:\src\build\u.obj`. Every role is relativized, because every one
@@ -75,8 +93,9 @@ namespace
         if (auto const match = MatchPathValueFlag(arg, IntroducersFor(layout), DriverFamily::Any);
             match.has_value() && !match->value.empty())
         {
-            auto const canon = PathCanon::Canonicalize(match->value, layout);
-            if (canon.has_value() && *canon != match->value)
+            auto const path = Reconciled(resolve, match->value);
+            auto const canon = PathCanon::Canonicalize(path, layout);
+            if (canon.has_value() && *canon != path)
                 return std::string { match->prefix } + *canon;
             return std::string { arg };
         }
@@ -92,8 +111,9 @@ namespace
         // paths would then key differently despite identical content.
         if (!arg.empty() && !IntroducersFor(layout).contains(arg.front()))
         {
-            auto const canon = PathCanon::Canonicalize(arg, layout);
-            if (canon.has_value())
+            auto const path = Reconciled(resolve, arg);
+            auto const canon = PathCanon::Canonicalize(path, layout);
+            if (canon.has_value() && *canon != path)
                 return *canon;
         }
         return std::string { arg };
@@ -103,13 +123,14 @@ namespace
 
 std::vector<std::string> RelativizeArgs(std::span<std::string const> args,
                                         std::string_view sourceRoot,
-                                        std::string_view buildTree)
+                                        std::string_view buildTree,
+                                        PathCanon::PathTransform const& resolve)
 {
     PathCanon::Layout const layout { .sourceRoot = std::string { sourceRoot }, .buildTree = std::string { buildTree } };
     std::vector<std::string> out;
     out.reserve(args.size());
     for (auto const& arg: args)
-        out.push_back(RelativizeOne(arg, layout));
+        out.push_back(RelativizeOne(arg, layout, resolve));
     return out;
 }
 

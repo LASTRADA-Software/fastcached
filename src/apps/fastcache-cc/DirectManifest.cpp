@@ -369,98 +369,136 @@ std::vector<std::string> ParseIncludePaths(std::string_view showIncludesText)
     return paths;
 }
 
-std::vector<std::string> ParseDepFilePaths(std::string_view depFileText)
+namespace
 {
-    std::vector<std::string> paths;
-
-    // Splice out line continuations first, so a dependency list wrapped across
-    // several lines reads as one rule. Real depfiles wrap aggressively — gcc
-    // breaks at ~76 columns — so a parser that ignored this would see only the
-    // first handful of headers.
-    std::string spliced;
-    spliced.reserve(depFileText.size());
-    for (std::size_t i = 0; i < depFileText.size(); ++i)
+    /// Which half of a depfile rule a walk collects.
+    enum class RuleSide : std::uint8_t
     {
-        if (depFileText[i] == '\\' && i + 1 < depFileText.size() && depFileText[i + 1] == '\n')
-        {
-            spliced.push_back(' ');
-            ++i;
-            continue;
-        }
-        if (depFileText[i] == '\\' && i + 2 < depFileText.size() && depFileText[i + 1] == '\r' && depFileText[i + 2] == '\n')
-        {
-            spliced.push_back(' ');
-            i += 2;
-            continue;
-        }
-        spliced.push_back(depFileText[i]);
-    }
+        Targets,      ///< Before the unescaped `:` — outputs the build system named.
+        Dependencies, ///< After it — the files the compiler reported.
+    };
 
-    // Walk each rule: everything before the unescaped ':' is a target (an output,
-    // not a dependency); everything after it is a dependency list.
-    for (auto const& rule: std::views::split(std::string_view { spliced }, '\n'))
+    /// Walk a GNU depfile and collect one side of every rule.
+    ///
+    /// One walker for both sides, because the splice, the rule-separator rule and
+    /// the escaping rule are the same question asked twice; a second copy is a
+    /// copy that can come to disagree about a drive letter or a `\ ` escape.
+    /// @param depFileText The depfile contents.
+    /// @param side        Which half to collect.
+    /// @return Every path token on that side, in emission order, duplicates kept.
+    [[nodiscard]] std::vector<std::string> ParseDepFile(std::string_view depFileText, RuleSide side)
     {
-        std::string_view line { rule.begin(), rule.end() };
-        if (!line.empty() && line.back() == '\r')
-            line.remove_suffix(1);
+        std::vector<std::string> paths;
 
-        // Find the rule separator, skipping ':' that is escaped or part of a
-        // Windows drive letter ("C:\..." must not read as a target boundary).
-        std::size_t colon = std::string_view::npos;
-        for (std::size_t i = 0; i < line.size(); ++i)
+        // Splice out line continuations first, so a dependency list wrapped across
+        // several lines reads as one rule. Real depfiles wrap aggressively — gcc
+        // breaks at ~76 columns — so a parser that ignored this would see only the
+        // first handful of headers.
+        std::string spliced;
+        spliced.reserve(depFileText.size());
+        for (std::size_t i = 0; i < depFileText.size(); ++i)
         {
-            if (line[i] == '\\')
+            if (depFileText[i] == '\\' && i + 1 < depFileText.size() && depFileText[i + 1] == '\n')
             {
-                ++i; // skip the escaped character
-                continue;
-            }
-            if (line[i] != ':')
-                continue;
-            // The letter rule is PathCanon's, so all four drive tests share one
-            // definition; what follows the colon is deliberately not asked, because
-            // the question here is where a rule ends and a drive-relative "C:foo"
-            // is still one token.
-            bool const driveLetter = i == 1 && PathCanon::IsDriveLetter(line[0]);
-            if (!driveLetter)
-            {
-                colon = i;
-                break;
-            }
-        }
-        if (colon == std::string_view::npos)
-            continue; // not a rule line (blank, or a stray continuation remnant)
-
-        auto deps = line.substr(colon + 1);
-
-        // Split the dependency list on unescaped whitespace. `\ ` is a literal
-        // space inside a path, which is ordinary on Windows and in any checkout
-        // under a directory with a space in its name.
-        std::string current;
-        auto const flush = [&paths, &current]() {
-            if (!current.empty())
-                paths.push_back(current);
-            current.clear();
-        };
-        for (std::size_t i = 0; i < deps.size(); ++i)
-        {
-            char const c = deps[i];
-            if (c == '\\' && i + 1 < deps.size() && (deps[i + 1] == ' ' || deps[i + 1] == '\\' || deps[i + 1] == ':'))
-            {
-                current.push_back(deps[i + 1]);
+                spliced.push_back(' ');
                 ++i;
                 continue;
             }
-            if (c == ' ' || c == '\t')
+            if (depFileText[i] == '\\' && i + 2 < depFileText.size() && depFileText[i + 1] == '\r'
+                && depFileText[i + 2] == '\n')
             {
-                flush();
+                spliced.push_back(' ');
+                i += 2;
                 continue;
             }
-            current.push_back(c);
+            spliced.push_back(depFileText[i]);
         }
-        flush();
-    }
 
-    return paths;
+        // Walk each rule: everything before the unescaped ':' is a target (an output,
+        // not a dependency); everything after it is a dependency list.
+        for (auto const& rule: std::views::split(std::string_view { spliced }, '\n'))
+        {
+            std::string_view line { rule.begin(), rule.end() };
+            if (!line.empty() && line.back() == '\r')
+                line.remove_suffix(1);
+
+            // Find the rule separator, skipping ':' that is escaped or part of a
+            // Windows drive letter ("C:\..." must not read as a target boundary).
+            std::size_t colon = std::string_view::npos;
+            for (std::size_t i = 0; i < line.size(); ++i)
+            {
+                if (line[i] == '\\')
+                {
+                    ++i; // skip the escaped character
+                    continue;
+                }
+                if (line[i] != ':')
+                    continue;
+                // The letter rule is PathCanon's, so all four drive tests share one
+                // definition; what follows the colon is deliberately not asked, because
+                // the question here is where a rule ends and a drive-relative "C:foo"
+                // is still one token.
+                bool const driveLetter = i == 1 && PathCanon::IsDriveLetter(line[0]);
+                if (!driveLetter)
+                {
+                    colon = i;
+                    break;
+                }
+            }
+            if (colon == std::string_view::npos)
+                continue; // not a rule line (blank, or a stray continuation remnant)
+
+            auto const deps = line.substr(colon + 1);
+
+            // A phony rule (`header:` with nothing after the colon, which `-MP`
+            // emits per header) names a path the COMPILER reported, not one the
+            // build system did, so it is not a target for this purpose — the very
+            // distinction a caller asking for targets is asking about.
+            if (side == RuleSide::Targets && deps.find_first_not_of(" \t") == std::string_view::npos)
+                continue;
+
+            auto const span = side == RuleSide::Targets ? line.substr(0, colon) : deps;
+
+            // Split the dependency list on unescaped whitespace. `\ ` is a literal
+            // space inside a path, which is ordinary on Windows and in any checkout
+            // under a directory with a space in its name.
+            std::string current;
+            auto const flush = [&paths, &current]() {
+                if (!current.empty())
+                    paths.push_back(current);
+                current.clear();
+            };
+            for (std::size_t i = 0; i < span.size(); ++i)
+            {
+                char const c = span[i];
+                if (c == '\\' && i + 1 < span.size() && (span[i + 1] == ' ' || span[i + 1] == '\\' || span[i + 1] == ':'))
+                {
+                    current.push_back(span[i + 1]);
+                    ++i;
+                    continue;
+                }
+                if (c == ' ' || c == '\t')
+                {
+                    flush();
+                    continue;
+                }
+                current.push_back(c);
+            }
+            flush();
+        }
+
+        return paths;
+    }
+} // namespace
+
+std::vector<std::string> ParseDepFilePaths(std::string_view depFileText)
+{
+    return ParseDepFile(depFileText, RuleSide::Dependencies);
+}
+
+std::vector<std::string> ParseDepFileTargets(std::string_view depFileText)
+{
+    return ParseDepFile(depFileText, RuleSide::Targets);
 }
 
 std::string ResolveAgainst(std::string_view rawPath, std::string_view workingDirectory, PathCanon::Layout const& layout)
