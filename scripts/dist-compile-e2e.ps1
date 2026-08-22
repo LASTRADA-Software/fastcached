@@ -246,8 +246,30 @@ function Test-SameBytes([string]$a, [string]$b) {
     $sb = (Get-Item -LiteralPath $b).Length
     Write-Host "  reference: $sa bytes, $ha"
     Write-Host "  produced:  $sb bytes, $hb"
-    if ($sa -eq $sb) {
-        Write-Host "  same size, different content -- something environment-specific is embedded in the object"
+    if ($sa -ne $sb) { return $false }
+
+    Write-Host "  same size, different content -- something environment-specific is embedded"
+
+    # WHERE they differ, which is what actually identifies the culprit and can be
+    # read from a CI log without a Windows machine to hand. A COFF header is
+    # Machine(2) NumberOfSections(2) TimeDateStamp(4) ... so bytes 4-7 are the
+    # timestamp: if the differing offsets are exactly those, the driver simply
+    # stamps the clock into every object and byte-identity is unachievable rather
+    # than violated. Offsets scattered through the file mean something else --
+    # a path, a symbol name -- is leaking.
+    $ba = [System.IO.File]::ReadAllBytes($a)
+    $bb = [System.IO.File]::ReadAllBytes($b)
+    $diffs = [System.Collections.Generic.List[int]]::new()
+    for ($i = 0; $i -lt $ba.Length -and $diffs.Count -lt 64; $i++) {
+        if ($ba[$i] -ne $bb[$i]) { [void]$diffs.Add($i) }
+    }
+    $total = 0
+    for ($i = 0; $i -lt $ba.Length; $i++) { if ($ba[$i] -ne $bb[$i]) { $total++ } }
+    Write-Host ("  {0} differing byte(s); first offsets: {1}" -f $total, (($diffs | Select-Object -First 24) -join ', '))
+    if ($diffs.Count -gt 0 -and $diffs[$diffs.Count - 1] -lt 8) {
+        Write-Host "  ALL differences are inside the COFF header's first 8 bytes -- that is TimeDateStamp."
+        Write-Host "  This driver stamps the clock into every object: byte-identity is unachievable,"
+        Write-Host "  and the assertion is what needs to change (see /Brepro)."
     }
     return $false
 }
