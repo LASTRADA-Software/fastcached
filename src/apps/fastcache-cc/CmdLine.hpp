@@ -142,6 +142,34 @@ struct DriverSpec
     DriverFamily family { DriverFamily::None };
     /// Flags that request preprocess-to-stdout, appended for the key probe.
     std::span<std::string_view const> preprocessFlags;
+    /// Flags that request preprocess-to-stdout WITH `#line` markers, for text a
+    /// worker is going to compile.
+    ///
+    /// Separate from `preprocessFlags` because the two runs answer different
+    /// questions. The key's text must carry no path, so it suppresses markers; a
+    /// worker's text must carry them, because they are what tells the compiler
+    /// which lines came from a system header — and without that every warning
+    /// inside libc++ or the CRT resurfaces, which under `-Werror` fails the
+    /// compile outright rather than merely being noisy.
+    std::span<std::string_view const> dispatchPreprocessFlags;
+    /// Flags telling the driver its input is ALREADY preprocessed, appended to a
+    /// remote compile's argument list.
+    ///
+    /// Keeping `#line` markers fixes system-header warnings and immediately creates
+    /// a second problem: under `-pedantic` the markers themselves are a GNU
+    /// extension, so clang reports `-Wgnu-line-marker` and `-Werror` turns that into
+    /// a failed compile. Naming the input's language as preprocessed output is what
+    /// makes the driver expect them — the same thing ccache and distcc do.
+    ///
+    /// Empty for MSVC drivers, which is not an omission: `/E` emits standard `#line`
+    /// directives that `cl` accepts in an ordinary source file, so there is nothing
+    /// to tell it. The `-x` spelling has no MSVC equivalent, and inventing one would
+    /// be a flag the driver rejects.
+    ///
+    /// The C++ / C choice is the caller's, from the source it is compiling; this row
+    /// carries the C++ spelling because a launcher fronting a C++ compiler is the
+    /// case that exists.
+    std::span<std::string_view const> preprocessedInputFlags;
     /// The driver's own flags dropped when building the preprocess command line
     /// (the compile-only marker and the dependency-reporting switches).
     ///
@@ -288,5 +316,22 @@ struct ParsedCommand
 [[nodiscard]] std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
                                                          std::span<std::string const> argv,
                                                          std::string_view dependencyProbePath = {});
+
+/// Build the argv that preprocesses `cmd`'s translation unit for a REMOTE compile.
+///
+/// The same line `PreprocessCommand` builds, except that it keeps `#line` markers
+/// and asks for no dependency reporting. See `DriverSpec::dispatchPreprocessFlags`
+/// for why the markers are not optional.
+///
+/// This is a second preprocess run, and it is paid only on the path that is about
+/// to spend seconds compiling remotely: roughly 45 ms against a compile that would
+/// not have been dispatched at all if it were cheap. Reusing the key's text instead
+/// would save that and break every `-Werror` build, which is not a trade.
+///
+/// @param cmd The parsed command.
+/// @param argv The original full invocation.
+/// @return The preprocess invocation, argv[0] being the compiler.
+[[nodiscard]] std::vector<std::string> DispatchPreprocessCommand(ParsedCommand const& cmd,
+                                                                 std::span<std::string const> argv);
 
 } // namespace FastCache::Cc

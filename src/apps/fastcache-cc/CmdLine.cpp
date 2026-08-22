@@ -65,6 +65,29 @@ namespace
     constexpr std::array<std::string_view, 1> MsvcPreprocess { "/EP" };
     constexpr std::array<std::string_view, 2> GnuPreprocess { "-E", "-P" };
 
+    /// Preprocess flags for text that is going to be COMPILED elsewhere, which
+    /// keep the `#line` markers the key's own probe suppresses.
+    ///
+    /// The markers are what tell the compiler which text came from a system header,
+    /// and `#pragma GCC system_header` suppression rides on that. Without them every
+    /// warning inside libc++ or the CRT resurfaces in the remote compile -- and under
+    /// this project's own `-pedantic -Werror` they are not noise, they are errors, so
+    /// every dispatched translation unit would fail and be retried locally. Measured:
+    /// a trivial TU including <string> produced two, and a real one produces many.
+    ///
+    /// They carry absolute paths, which is exactly why the KEY's probe suppresses
+    /// them and why this text must never reach `ComputeKey`. The two runs answer two
+    /// questions and only one of them has to be portable.
+    constexpr std::array<std::string_view, 1> MsvcDispatchPreprocess { "/E" };
+    constexpr std::array<std::string_view, 1> GnuDispatchPreprocess { "-E" };
+
+    /// Tell a GNU driver its input is already preprocessed. See
+    /// `DriverSpec::preprocessedInputFlags`: without this, `-pedantic` reports the
+    /// `#line` markers themselves as a GNU extension and `-Werror` fails the compile.
+    /// The `.c` spelling is chosen at the call site, from the source's own extension.
+    constexpr std::array<std::string_view, 2> GnuPreprocessedCxx { "-x", "c++-cpp-output" };
+    constexpr std::array<std::string_view, 2> GnuPreprocessedC { "-x", "cpp-output" };
+
     /// Flags dropped when preprocessing that carry no path value of their own:
     /// the compile-only marker (we want text on stdout, not an object) and the
     /// dependency-reporting switches, which would otherwise make the probe
@@ -96,30 +119,40 @@ namespace
         { .flavor = Flavor::Unknown,
           .family = DriverFamily::None,
           .preprocessFlags = {},
+          .dispatchPreprocessFlags = {},
+          .preprocessedInputFlags = {},
           .preprocessDropFlags = {},
           .dependencyProbeFlags = {},
           .usesDepfile = false },
         { .flavor = Flavor::Cl,
           .family = DriverFamily::Msvc,
           .preprocessFlags = MsvcPreprocess,
+          .dispatchPreprocessFlags = MsvcDispatchPreprocess,
+          .preprocessedInputFlags = {},
           .preprocessDropFlags = MsvcDrop,
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false },
         { .flavor = Flavor::ClangCl,
           .family = DriverFamily::Msvc,
           .preprocessFlags = MsvcPreprocess,
+          .dispatchPreprocessFlags = MsvcDispatchPreprocess,
+          .preprocessedInputFlags = {},
           .preprocessDropFlags = MsvcDrop,
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false },
         { .flavor = Flavor::Gcc,
           .family = DriverFamily::Gnu,
           .preprocessFlags = GnuPreprocess,
+          .dispatchPreprocessFlags = GnuDispatchPreprocess,
+          .preprocessedInputFlags = GnuPreprocessedCxx,
           .preprocessDropFlags = GnuDrop,
           .dependencyProbeFlags = GnuDependencyProbe,
           .usesDepfile = true },
         { .flavor = Flavor::Clang,
           .family = DriverFamily::Gnu,
           .preprocessFlags = GnuPreprocess,
+          .dispatchPreprocessFlags = GnuDispatchPreprocess,
+          .preprocessedInputFlags = GnuPreprocessedCxx,
           .preprocessDropFlags = GnuDrop,
           .dependencyProbeFlags = GnuDependencyProbe,
           .usesDepfile = true },
@@ -561,6 +594,45 @@ std::optional<std::vector<std::string>> RemoteCompileArgs(ParsedCommand const& c
         if (CouldNameAFile(a, driver.family))
             return std::nullopt;
 
+        out.emplace_back(a);
+    }
+
+    // Appended last, so a build's own `-x` (if any) is overridden rather than
+    // overriding: the input genuinely IS preprocessed output whatever the build
+    // thought it was handing over.
+    if (!driver.preprocessedInputFlags.empty())
+    {
+        auto const isC = cmd.source.ends_with(".c");
+        for (auto const& flag: isC ? std::span<std::string_view const> { GnuPreprocessedC } : driver.preprocessedInputFlags)
+            out.emplace_back(flag);
+    }
+    return out;
+}
+
+std::vector<std::string> DispatchPreprocessCommand(ParsedCommand const& cmd, std::span<std::string const> argv)
+{
+    auto const& driver = DriverOf(cmd.flavor);
+
+    std::vector<std::string> out;
+    out.reserve(argv.size() + driver.dispatchPreprocessFlags.size() + 1);
+    out.emplace_back(cmd.compiler);
+    for (auto const& flag: driver.dispatchPreprocessFlags)
+        out.emplace_back(flag);
+
+    // No dependency probe: the key's run already reported them, and asking again
+    // would make this run write a depfile the caller has no use for.
+    std::size_t skipUntil = 1;
+    for (auto const i: std::views::iota(std::size_t { 1 }, argv.size()))
+    {
+        if (i < skipUntil)
+            continue;
+        std::string_view const a = argv[i];
+        if (auto const dropped = MatchDroppedFlag(a, driver))
+        {
+            if (a == *dropped && TakesValue(*dropped) && i + 1 < argv.size())
+                skipUntil = i + 2;
+            continue;
+        }
         out.emplace_back(a);
     }
     return out;

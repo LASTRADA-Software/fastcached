@@ -1195,15 +1195,13 @@ void RecordManifest(Config const& cfg,
 /// @param argv The original full invocation.
 /// @param key The object key, for duplicate suppression at the scheduler.
 /// @param fingerprint This client's toolchain identity.
-/// @param preprocessed The translation unit, already preprocessed.
-/// @param dependencyPaths What the probe reported this TU depends on.
+/// @param dependencyPaths What the key's probe reported this TU depends on.
 /// @return A run to continue with, or nullopt to compile locally.
 [[nodiscard]] std::optional<Cc::CompileRun> TryRemoteCompile(Config const& cfg,
                                                              Cc::ParsedCommand const& cmd,
                                                              std::span<std::string const> argv,
                                                              std::string_view key,
                                                              std::string_view fingerprint,
-                                                             std::string const& preprocessed,
                                                              std::vector<std::string> const& dependencyPaths)
 {
     // Refused before anything is sent when the command line carries something this
@@ -1217,13 +1215,25 @@ void RecordManifest(Config const& cfg,
         return std::nullopt;
     }
 
+    // Preprocessed again, with `#line` markers this time. The key's text has them
+    // suppressed so no checkout path reaches the key; a worker needs them, because
+    // they are what marks system-header lines as system-header lines. Without that
+    // the remote compile re-reports every warning inside libc++ or the CRT, which
+    // under `-Werror` is a failed compile rather than noise.
+    auto const preprocessRun = RunCaptureSplit(Cc::DispatchPreprocessCommand(cmd, argv));
+    if (preprocessRun.exitCode != 0)
+    {
+        Note("dispatch preprocess failed; compiling locally");
+        return std::nullopt;
+    }
+
     auto const dialer = Cc::MakeTcpDialer(cfg.ioTimeout);
     auto const outcome = Cc::Dispatch(*dialer,
                                       Cc::DispatchRequest { .schedulerEndpoint = cfg.schedulerAddr,
                                                             .fingerprint = fingerprint,
                                                             .objectKey = key,
                                                             .args = *args,
-                                                            .preprocessed = preprocessed,
+                                                            .preprocessed = preprocessRun.out,
                                                             .sourceName = cmd.source },
                                       cfg.credential);
     if (!outcome.Ran())
@@ -1497,9 +1507,8 @@ void RecordManifest(Config const& cfg,
     // everything below this point is unchanged and cannot tell the difference. That
     // is deliberate: the STORE, the manifest and the statistics all have one path,
     // and a second one would be a second place for them to diverge.
-    auto run = dispatchConfigured
-                   ? TryRemoteCompile(cfg, cmd, argv, key, toolchainStamp, dispatchSource, dispatchDependencies)
-                   : std::optional<Cc::CompileRun> {};
+    auto run = dispatchConfigured ? TryRemoteCompile(cfg, cmd, argv, key, toolchainStamp, dispatchDependencies)
+                                  : std::optional<Cc::CompileRun> {};
     if (!run.has_value())
         run = RunCaptureSplit(argv);
     // Always surface the compiler's output on its true streams and its exit code.

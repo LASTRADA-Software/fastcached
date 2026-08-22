@@ -587,3 +587,90 @@ TEST_CASE("RemoteCompileArgs drops the MSVC spellings too")
     CHECK(std::ranges::find(remote, "/c") == remote.end());
     CHECK(std::ranges::find(remote, "a.cpp") == remote.end());
 }
+
+// --- preprocessing for a remote compile --------------------------------------
+
+TEST_CASE("The dispatch preprocess keeps line markers that the key's suppresses")
+{
+    // The two runs answer different questions. The key's text must carry no path,
+    // so it suppresses markers; a worker's must carry them, because they are what
+    // tells the compiler which lines came from a system header.
+    std::vector<std::string> const argv { "g++", "-O2", "-c", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const forKey = PreprocessCommand(cmd, argv);
+    auto const forWorker = DispatchPreprocessCommand(cmd, argv);
+
+    CHECK(std::ranges::find(forKey, "-P") != forKey.end());
+    CHECK(std::ranges::find(forWorker, "-P") == forWorker.end());
+    CHECK(std::ranges::find(forWorker, "-E") != forWorker.end());
+    // The source still has to be there, or the run preprocesses nothing.
+    CHECK(std::ranges::find(forWorker, "a.cpp") != forWorker.end());
+    // ...and the object output must not, or the run writes one.
+    CHECK(std::ranges::find(forWorker, "-o") == forWorker.end());
+}
+
+TEST_CASE("The dispatch preprocess asks for no dependency reporting")
+{
+    // The key's probe already reported them. Asking again would make this run write
+    // a depfile the caller has no use for -- and, worse, over the build's own.
+    std::vector<std::string> const argv { "g++", "-MD", "-MF", "dep.d", "-c", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    auto const forWorker = DispatchPreprocessCommand(cmd, argv);
+
+    CHECK(std::ranges::find(forWorker, "-MD") == forWorker.end());
+    CHECK(std::ranges::find(forWorker, "-MF") == forWorker.end());
+    CHECK(std::ranges::find(forWorker, "dep.d") == forWorker.end());
+}
+
+TEST_CASE("A remote compile is told its input is already preprocessed")
+{
+    // Keeping the markers fixes system-header warnings and immediately creates a
+    // second problem: under -pedantic the markers themselves are a GNU extension,
+    // so clang reports -Wgnu-line-marker and -Werror turns that into a failed
+    // compile. Naming the language as preprocessed output is what makes the driver
+    // expect them -- the same thing ccache and distcc do. Verified end to end:
+    // -Wall -Wextra -pedantic -Werror dispatches and returns a byte-identical
+    // object, where before it failed and was retried locally.
+    std::vector<std::string> const argv { "g++", "-O2", "-c", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+
+    auto const x = std::ranges::find(remote, "-x");
+    REQUIRE(x != remote.end());
+    REQUIRE(std::next(x) != remote.end());
+    CHECK(*std::next(x) == "c++-cpp-output");
+}
+
+TEST_CASE("A C source is told the C preprocessed language, not the C++ one")
+{
+    // `c++-cpp-output` on a C translation unit compiles it as C++, which changes
+    // overload resolution, name mangling and what even parses.
+    std::vector<std::string> const argv { "gcc", "-O2", "-c", "a.c", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+
+    auto const x = std::ranges::find(remote, "-x");
+    REQUIRE(x != remote.end());
+    CHECK(*std::next(x) == "cpp-output");
+}
+
+TEST_CASE("An MSVC remote compile is told nothing, because there is nothing to tell")
+{
+    // /E emits standard #line directives that cl accepts in an ordinary source
+    // file. The -x spelling has no MSVC equivalent, and inventing one would be a
+    // flag the driver rejects.
+    std::vector<std::string> const argv { "cl", "/O2", "/c", "a.cpp", "/Foa.obj" };
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+
+    CHECK(std::ranges::find(remote, "-x") == remote.end());
+    CHECK(std::ranges::find(remote, "c++-cpp-output") == remote.end());
+}
