@@ -74,6 +74,30 @@ $workerPort   = $BasePort + 2
 
 $procs = @()
 
+# Quote the arguments Start-Process will not quote for you.
+#
+# -ArgumentList joins an array with spaces and hands the result over as ONE
+# command line, so an element that CONTAINS a space arrives at the child as two
+# arguments. That is not hypothetical: on a Windows runner clang-cl lives under
+# `C:\Program Files\...`, so `--toolchain=C:\Program Files\LLVM\bin\clang-cl.exe`
+# reached the worker as `--toolchain=C:\Program` plus a stray positional, and the
+# worker refused it with "unrecognised argument" and exit 2.
+#
+# Applied at EVERY Start-Process here, including the ones whose arguments come
+# from the build tree and therefore have no spaces on a runner today. "Safe
+# because this path happens not to contain a space" is the reasoning that cost a
+# CI round trip once already, and it stops being true the moment someone clones
+# into `C:\Users\Someone\My Projects`.
+#
+# A trailing backslash before the closing quote would escape it -- the classic
+# Windows quoting trap. Nothing passed here ends in a separator; a run of
+# trailing backslashes would need doubling if that ever changed.
+function ConvertTo-QuotedArgs([string[]]$arguments) {
+    return $arguments | ForEach-Object {
+        if ($_ -match '\s' -and $_ -notmatch '^"') { '"' + $_ + '"' } else { $_ }
+    }
+}
+
 # Start a background process with its stderr captured.
 #
 # `-WindowStyle Hidden` exists to keep console windows from flashing up during a
@@ -84,28 +108,9 @@ $procs = @()
 # was written without being run, is the wrong trade. Conditional here costs
 # nothing on Windows and makes the orchestration runnable everywhere.
 function Start-Background([string]$path, [string[]]$arguments, [string]$errorLog) {
-    # Quoted HERE, because Start-Process does not do it. -ArgumentList joins an
-    # array with spaces and passes the result through as one command line, so an
-    # element that CONTAINS a space arrives at the child as two arguments.
-    #
-    # That is not hypothetical on Windows: clang-cl lives under
-    # `C:\Program Files\...`, so `--toolchain=C:\Program Files\LLVM\bin\clang-cl.exe`
-    # reached the worker as `--toolchain=C:\Program` plus a stray positional, and
-    # the worker refused it with "unrecognised argument" and exit 2. The POSIX
-    # sibling of this script never hits it because its paths come from the build
-    # tree, which has no spaces on a runner -- the compiler path is what is
-    # different here.
-    #
-    # A trailing backslash before the closing quote would escape it, which is the
-    # classic Windows quoting trap; these are paths to files, so none ends in a
-    # separator, and doubling any run of trailing backslashes is what would be
-    # needed if that ever changed.
-    $quoted = $arguments | ForEach-Object {
-        if ($_ -match '\s' -and $_ -notmatch '^"') { '"' + $_ + '"' } else { $_ }
-    }
     $common = @{
         FilePath              = $path
-        ArgumentList          = $quoted
+        ArgumentList          = (ConvertTo-QuotedArgs $arguments)
         PassThru              = $true
         RedirectStandardError = $errorLog
     }
@@ -275,7 +280,7 @@ function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj,
     $source  = Join-Path $root "u.cpp"
     $errFile = New-TemporaryFile
     $p = Start-Process -FilePath $Launcher `
-        -ArgumentList $compiler,"/nologo","/c","/Fo$obj",$source `
+        -ArgumentList (ConvertTo-QuotedArgs @($compiler, "/nologo", "/c", "/Fo$obj", $source)) `
         -NoNewWindow -Wait -PassThru -RedirectStandardError $errFile
     $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
     Remove-Item $errFile -ErrorAction SilentlyContinue
