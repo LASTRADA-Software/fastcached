@@ -118,12 +118,25 @@ file(CHMOD "${payloadRoot}/${stem}/${member}"
 
 set(mirrorDir "${FASTCACHED_WORK_DIR}/mirror/fastcached-mirror/releases/download/v${mirrorVersion}")
 file(MAKE_DIRECTORY "${mirrorDir}")
-file(ARCHIVE_CREATE
-     OUTPUT "${mirrorDir}/${stem}.tar.gz"
-     PATHS "${payloadRoot}/${stem}"
-     FORMAT gnutar
-     COMPRESSION GZip
-     WORKING_DIRECTORY "${payloadRoot}")
+# Deliberately `cmake -E tar` rather than `file(ARCHIVE_CREATE)`, and the reason
+# is the interior layout. A real release tarball holds `${stem}/...` relative
+# paths, and reproducing that with `file(ARCHIVE_CREATE)` needs its
+# WORKING_DIRECTORY option -- which is new in CMake 3.31, while this project
+# declares 3.28 and this script repeats that floor above. On a 3.28 host (Ubuntu
+# 24.04 ships 3.28.3) the call did not degrade, it failed outright with
+# `file Unrecognized argument: "WORKING_DIRECTORY"`, so the one test that proves
+# the auto-install path works could never run there. It went unnoticed because
+# the check skips on Windows and CI's other runners carry a newer CMake, which is
+# the shape of gap that survives longest: red only on the configuration nobody
+# looks at. `execute_process`'s own WORKING_DIRECTORY has no such floor.
+execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E tar czf "${mirrorDir}/${stem}.tar.gz" --format=gnutar "${stem}"
+    WORKING_DIRECTORY "${payloadRoot}"
+    RESULT_VARIABLE archiveResult
+    ERROR_VARIABLE archiveError)
+if(NOT archiveResult EQUAL 0)
+    message(FATAL_ERROR "could not build the mirror archive: ${archiveResult} ${archiveError}")
+endif()
 
 set(sandbox "${FASTCACHED_WORK_DIR}/sandbox")
 file(MAKE_DIRECTORY "${sandbox}/usr/bin")
