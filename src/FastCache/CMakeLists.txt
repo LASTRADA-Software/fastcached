@@ -28,7 +28,9 @@ target_sources(FastCache
         Config/DefaultConfigPath.cpp
         Config/EnvExpand.cpp
         Config/YamlReader.cpp
+        Consensus/RaftConfig.cpp
         Consensus/RaftLog.cpp
+        Consensus/RaftNode.cpp
         Core/Crc32c.cpp
         Core/Logger.cpp
         Distributed/LeaseTable.cpp
