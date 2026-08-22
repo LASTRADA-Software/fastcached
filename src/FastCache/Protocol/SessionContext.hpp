@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Auth/AuthPolicy.hpp>
+#include <FastCache/Config/Config.hpp>
 #include <FastCache/Core/Errors/ProtocolError.hpp>
 #include <FastCache/Core/Logger.hpp>
 
@@ -15,6 +16,12 @@ class IPubSubRegistry;       // Protocol/IPubSubRegistry.hpp — process-wide pu
 class IStreamWaiterRegistry; // Protocol/IStreamWaiterRegistry.hpp — blocking stream-read coordinator.
 class WatchRegistry;         // Protocol/RedisTransaction.hpp — process-wide WATCH registry for Redis transactions.
 class KeyspaceNotifier;      // Protocol/KeyspaceNotifier.hpp — Redis keyspace notification publisher.
+
+namespace Distributed
+{
+    class WorkerRegistry; // Distributed/WorkerRegistry.hpp — the live compile-worker fleet.
+    class LeaseTable;     // Distributed/LeaseTable.hpp — outstanding compile authorizations.
+} // namespace Distributed
 
 /// Per-server, immutable context handed to every protocol handler's command
 /// loop. Bundles the optional collaborators a connection needs beyond its
@@ -81,6 +88,30 @@ struct SessionContext
     /// so the `storage:` trace line names the client. Set by Connection; a view
     /// into the connection frame, valid for the session's lifetime.
     std::string_view sourceTag {};
+
+    /// What the listener this connection arrived on is allowed to serve, as a
+    /// `ListenerRole` mask.
+    ///
+    /// Set per-bind by the server loop, which already copies this struct once per
+    /// `BindConfig`, so a connection carries its endpoint's policy rather than the
+    /// daemon's. That is the whole point: without it the compile-cache handler
+    /// cannot tell which port a frame arrived on, and "which surfaces are exposed
+    /// where" stops being an operator decision.
+    ///
+    /// Defaults to `Cache` alone — the same fail-closed default `BindConfig` has,
+    /// so a handler driven directly in a test refuses dispatch verbs unless the
+    /// test says otherwise.
+    std::uint8_t listenerRoles { static_cast<std::uint8_t>(ListenerRole::Cache) };
+
+    /// Worker registry for distributed execution, or nullptr when the daemon was
+    /// not built or configured to schedule. A null pointer here makes every
+    /// dispatch verb refuse, which is what a cache-only daemon should do.
+    Distributed::WorkerRegistry* workers { nullptr };
+
+    /// Lease table pairing with `workers`. Null and non-null must agree: a
+    /// scheduler with a registry and no leases could dispatch but never account for
+    /// what it dispatched.
+    Distributed::LeaseTable* leases { nullptr };
 
     /// Maximum size, in bytes, of a single length-prefixed protocol payload (a
     /// RESP bulk string). Bounds how many bytes one command may push before the

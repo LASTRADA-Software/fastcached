@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+#include <FastCache/Core/Clock.hpp>
+
+#include <chrono>
+#include <cstdint>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+
+namespace FastCache::Distributed
+{
+
+/// One outstanding authorization to compile a key on a worker.
+struct Lease
+{
+    std::string token;    ///< Presented by the client to the worker.
+    std::string workerId; ///< The worker the job was assigned to.
+    std::string key;      ///< The object key being compiled.
+};
+
+/// The set of leases the scheduler has issued and not yet seen resolved.
+///
+/// **Pure with respect to I/O**, over an injected `IClock`, for the reason
+/// `WorkerRegistry` is: expiry is the whole behaviour here and testing it against
+/// wall-clock sleeps would be both slow and flaky.
+///
+/// ## What a lease is for
+///
+/// Two things, and they are worth separating because only the first is obvious.
+///
+/// **It authorizes a job.** A worker must not compile whatever arrives on its
+/// port; it compiles what the scheduler said to. The token is the scheduler's
+/// signature on one job, which is what lets a worker refuse a client that reached
+/// it directly without going through scheduling at all.
+///
+/// **It suppresses duplicate work.** When sixty parallel clients miss the same key
+/// after a header change — which is the ordinary shape of a miss on a shared cache,
+/// not an exotic one — only the first should be dispatched. The other fifty-nine
+/// are told `AlreadyInFlight` and compile locally. That is strictly better than
+/// dispatching sixty identical jobs, and it is something neither distcc nor
+/// sccache-dist can do, because neither is also the cache.
+///
+/// ## Why leases expire
+///
+/// A client can die between taking a lease and sending the job — `Ctrl-C` on a
+/// build is the common case, not a rare one. Without expiry that key would be
+/// marked in-flight forever and every later compile of it would be refused, so a
+/// single interrupted build would permanently un-distribute one translation unit.
+/// Expiry is what makes the suppression safe to have at all.
+class LeaseTable
+{
+  public:
+    /// @param clock Time source; must outlive the table.
+    /// @param leaseTimeout How long a lease may go unresolved before it is
+    ///        reclaimed. Must comfortably exceed the slowest compile in the fleet:
+    ///        reclaiming early does not abort the running job, it merely lets a
+    ///        second client dispatch the same work.
+    explicit LeaseTable(IClock& clock, std::chrono::milliseconds leaseTimeout = DefaultLeaseTimeout) noexcept;
+
+    /// Default lease lifetime. Sized for "longer than any single translation unit
+    /// anybody compiles", because the cost of it being too short is duplicated work
+    /// while the cost of it being too long is one key not being distributed.
+    static constexpr std::chrono::milliseconds DefaultLeaseTimeout { 600'000 };
+
+    /// Result of asking for a lease.
+    enum class Outcome : std::uint8_t
+    {
+        Granted,        ///< The lease is yours; `Acquire` returned a token.
+        AlreadyInFlight ///< Another client holds a live lease for this key.
+    };
+
+    /// Take a lease on `key` for `workerId`, unless one is already outstanding.
+    /// @param key The object key about to be compiled.
+    /// @param workerId The worker the job will go to.
+    /// @return The lease when granted; nullopt when another client holds one.
+    [[nodiscard]] std::optional<Lease> Acquire(std::string_view key, std::string_view workerId);
+
+    /// Look up a lease by its token, without consuming it.
+    ///
+    /// Used by a worker to check that the job it was handed was actually scheduled.
+    /// Deliberately does not consume: the worker validates before it starts, and the
+    /// job is only resolved when it finishes, so consuming here would release the
+    /// key while the compile was still running.
+    /// @param token The token the client presented.
+    /// @return The lease, or nullopt when unknown or expired.
+    [[nodiscard]] std::optional<Lease> Find(std::string_view token) const;
+
+    /// Resolve a lease, however the job ended.
+    /// @param token The token.
+    /// @return The lease that was released, or nullopt when it was already gone.
+    [[nodiscard]] std::optional<Lease> Release(std::string_view token);
+
+    /// Release every lease held against a worker.
+    ///
+    /// Called when a worker is dropped. Without it, a worker dying mid-job would
+    /// leave its keys marked in-flight until each lease expired, and every client
+    /// that missed on one would be refused in the meantime — the fleet losing a
+    /// machine would quietly stop distributing part of the build.
+    /// @param workerId The worker.
+    /// @return How many leases were released.
+    [[nodiscard]] std::size_t ReleaseWorker(std::string_view workerId);
+
+    /// Number of live (unexpired) leases. For diagnostics and tests.
+    [[nodiscard]] std::size_t LiveCount() const;
+
+  private:
+    struct Entry
+    {
+        Lease lease;
+        TimePoint issuedAt {};
+    };
+
+    /// Whether `entry` is still within its lease lifetime.
+    [[nodiscard]] bool IsLive(Entry const& entry, TimePoint now) const noexcept;
+
+    IClock& _clock;
+    std::chrono::milliseconds _leaseTimeout;
+    mutable std::mutex _mutex;
+    std::unordered_map<std::string, Entry> _byToken;          ///< Guarded by _mutex.
+    std::unordered_map<std::string, std::string> _tokenByKey; ///< Guarded by _mutex.
+    std::uint64_t _nextToken { 1 };                           ///< Guarded by _mutex.
+};
+
+} // namespace FastCache::Distributed

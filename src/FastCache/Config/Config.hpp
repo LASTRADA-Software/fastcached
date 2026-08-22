@@ -39,12 +39,49 @@ inline constexpr std::uint16_t DefaultMetricsPort { 9259 };
 /// When `tls` is true the daemon must also be built with `FC_TLS_ENABLED`
 /// and the legacy `tlsCertPath` / `tlsKeyPath` fields must be populated;
 /// per-bind certs (SNI) are out of scope.
+/// What a listener is allowed to serve.
+///
+/// A bitmask rather than an enumeration of endpoint kinds, because an operator
+/// may legitimately want one endpoint to do both — and because the alternative,
+/// hard-coding "the cache port" and "the dispatch port", is the shape that makes
+/// exposure a build-time constant instead of their decision.
+///
+/// The default is `Cache` alone, and that default is the security posture. The
+/// compile-cache surface may reasonably be reachable across a build LAN; the
+/// surface that causes a compiler to *run* on someone else's machine must be
+/// something an operator switched on deliberately, on an endpoint they chose, so
+/// they can firewall it, require TLS on it, or simply never enable it. Serving
+/// both from one listener is expressible, but it has to be spelled.
+enum class ListenerRole : std::uint8_t
+{
+    Cache = 1U << 0,   ///< memcached / RESP / the 0xFC compile cache.
+    Dispatch = 1U << 1 ///< Distributed-execution scheduling verbs.
+};
+
+/// Bitwise OR of two roles, so a mask reads as `Cache | Dispatch`.
+[[nodiscard]] constexpr std::uint8_t operator|(ListenerRole a, ListenerRole b) noexcept
+{
+    return static_cast<std::uint8_t>(static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b));
+}
+
+/// Whether `mask` carries `role`.
+/// @param mask The listener's role mask.
+/// @param role The role being asked about.
+/// @return True when the listener serves that role.
+[[nodiscard]] constexpr bool HasRole(std::uint8_t mask, ListenerRole role) noexcept
+{
+    return (mask & static_cast<std::uint8_t>(role)) != 0;
+}
+
 struct BindConfig
 {
     /// Bind address: IPv4/IPv6 literal or hostname. `::` selects dual-stack.
     std::string address {};
     /// TCP port (1..65535).
     std::uint16_t port { 0 };
+    /// What this endpoint serves. Defaults to the cache alone; see `ListenerRole`
+    /// for why distributed execution is opt-in per endpoint rather than global.
+    std::uint8_t roles { static_cast<std::uint8_t>(ListenerRole::Cache) };
     /// When true, accepted sockets on this endpoint are wrapped through
     /// `TlsWrap` before the protocol handler ever sees a byte.
     bool tls { false };
