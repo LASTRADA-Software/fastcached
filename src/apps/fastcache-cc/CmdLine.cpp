@@ -115,6 +115,15 @@ namespace
     constexpr std::array<std::string_view, 1> MsvcDependencyProbe { "/showIncludes" };
     constexpr std::array<std::string_view, 2> GnuDependencyProbe { "-MD", "-MF" };
 
+    /// Asks a GNU driver to print its include search list.
+    ///
+    /// `-E -v` over an empty C++ input: `-v` is what makes it print the list, `-E`
+    /// stops it before it tries to assemble anything, and `-x c++` names the
+    /// language because the search list DIFFERS between C and C++ — the C++ one
+    /// carries the standard library headers, which are most of what a fingerprint
+    /// is trying to identify. The input path is appended by the caller.
+    constexpr std::array<std::string_view, 4> GnuIncludeProbe { "-E", "-v", "-x", "c++" };
+
     constexpr std::array<DriverSpec, 5> Drivers { {
         { .flavor = Flavor::Unknown,
           .family = DriverFamily::None,
@@ -123,7 +132,9 @@ namespace
           .preprocessedInputFlags = {},
           .preprocessDropFlags = {},
           .dependencyProbeFlags = {},
-          .usesDepfile = false },
+          .usesDepfile = false,
+          .includeDiscovery = IncludeDiscovery::None,
+          .includeProbeFlags = {} },
         { .flavor = Flavor::Cl,
           .family = DriverFamily::Msvc,
           .preprocessFlags = MsvcPreprocess,
@@ -131,7 +142,9 @@ namespace
           .preprocessedInputFlags = {},
           .preprocessDropFlags = MsvcDrop,
           .dependencyProbeFlags = MsvcDependencyProbe,
-          .usesDepfile = false },
+          .usesDepfile = false,
+          .includeDiscovery = IncludeDiscovery::MsvcEnvironment,
+          .includeProbeFlags = {} },
         { .flavor = Flavor::ClangCl,
           .family = DriverFamily::Msvc,
           .preprocessFlags = MsvcPreprocess,
@@ -139,7 +152,9 @@ namespace
           .preprocessedInputFlags = {},
           .preprocessDropFlags = MsvcDrop,
           .dependencyProbeFlags = MsvcDependencyProbe,
-          .usesDepfile = false },
+          .usesDepfile = false,
+          .includeDiscovery = IncludeDiscovery::MsvcEnvironment,
+          .includeProbeFlags = {} },
         { .flavor = Flavor::Gcc,
           .family = DriverFamily::Gnu,
           .preprocessFlags = GnuPreprocess,
@@ -147,7 +162,9 @@ namespace
           .preprocessedInputFlags = GnuPreprocessedCxx,
           .preprocessDropFlags = GnuDrop,
           .dependencyProbeFlags = GnuDependencyProbe,
-          .usesDepfile = true },
+          .usesDepfile = true,
+          .includeDiscovery = IncludeDiscovery::GnuVerbose,
+          .includeProbeFlags = GnuIncludeProbe },
         { .flavor = Flavor::Clang,
           .family = DriverFamily::Gnu,
           .preprocessFlags = GnuPreprocess,
@@ -155,7 +172,9 @@ namespace
           .preprocessedInputFlags = GnuPreprocessedCxx,
           .preprocessDropFlags = GnuDrop,
           .dependencyProbeFlags = GnuDependencyProbe,
-          .usesDepfile = true },
+          .usesDepfile = true,
+          .includeDiscovery = IncludeDiscovery::GnuVerbose,
+          .includeProbeFlags = GnuIncludeProbe },
     } };
 
     // --- path-valued flags --------------------------------------------------

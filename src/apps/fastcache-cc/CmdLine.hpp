@@ -44,6 +44,33 @@ enum class DriverFamily : std::uint8_t
     Any = 3,  ///< Msvc | Gnu — a spelling every driver accepts.
 };
 
+/// How a driver can be asked where it looks for system headers.
+///
+/// A mechanism rather than a flag list, because the two families do not merely
+/// spell the same question differently — they answer it in different places. A
+/// GNU driver PRINTS its search list when asked to be verbose; `cl` does not have
+/// such a switch at all and takes its list from the `INCLUDE` environment
+/// variable the developer command prompt sets. A flags-only column could not
+/// express the second, and a `bool isMsvc` at the use site would be the
+/// "behaviour in code rather than data" this table exists to avoid.
+///
+/// A third mechanism is a new enumerator plus one arm in the one switch that
+/// interprets it, which carries no `default:` so adding one is a compile error at
+/// the site that must handle it rather than a silent fall-through.
+enum class IncludeDiscovery : std::uint8_t
+{
+    /// Unknown driver: no discovery, so no include tree contributes to the
+    /// fingerprint. The compiler banner still does, so an unknown driver degrades
+    /// to the weaker identity rather than to none at all.
+    None = 0,
+    /// Run the driver verbosely over an empty input and read the search list it
+    /// prints between its "search starts here" and "End of search list." markers.
+    GnuVerbose = 1,
+    /// Read the `INCLUDE` environment variable, which is where an MSVC toolchain
+    /// puts its search list and the only place `cl` reads it from.
+    MsvcEnvironment = 2,
+};
+
 /// True when two family sets overlap.
 ///
 /// A membership test when one side is a single family (a driver's), and a
@@ -203,6 +230,16 @@ struct DriverSpec
     /// both streams, and a descriptor row nothing interprets is how the two drifted
     /// apart in the first place.
     bool usesDepfile { false };
+    /// How this driver reveals its system include search paths.
+    IncludeDiscovery includeDiscovery { IncludeDiscovery::None };
+    /// Flags that make the driver print its include search list, for
+    /// `IncludeDiscovery::GnuVerbose`. Empty for every other mechanism.
+    ///
+    /// The input is a separate concern from these flags and is supplied by the
+    /// caller, because "a file that is empty and always exists" has no portable
+    /// spelling: `/dev/null` is not a path on Windows, and reading from stdin
+    /// needs the caller to close it.
+    std::span<std::string_view const> includeProbeFlags;
 };
 
 /// The pieces of a compile command line the launcher needs to key, cache, and
