@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -69,6 +70,70 @@ class OneShotListener final: public IListener
 
   private:
     std::unique_ptr<ISocket> _socket;
+};
+
+/// A listener that reports the poll timeout a real one reports while idle, and
+/// runs a hook once it has done so a given number of times.
+///
+/// Two deliberate choices. It reports *Timeout* rather than EOF, because a
+/// listener that ended the loop by itself would let the shutdown cases pass
+/// without the stop mechanism existing at all -- and "idle, then stopped" is
+/// precisely the production shape, a supervisor sending SIGTERM to a worker that
+/// happens to have no client.
+///
+/// And the hook is called from inside `Accept()` rather than from a second thread
+/// watching the counter. A watcher thread races on that counter, and worse: if a
+/// regression ever stopped the loop from polling, the watcher would spin forever
+/// waiting for a count that never arrives, so the suite would HANG instead of
+/// failing. Measured -- that is exactly what the first version of this test did
+/// when the poll-timeout branch was mutated away. A test that wedges CI reports
+/// less than no test.
+class IdleListener final: public IListener
+{
+  public:
+    IdleListener() = default;
+
+    /// @param pollsBeforeHook Run `hook` on this poll (1-based); 0 never runs it.
+    /// @param hook Called from inside Accept(), single-threaded.
+    IdleListener(int pollsBeforeHook, std::function<void()> hook):
+        _pollsBeforeHook { pollsBeforeHook },
+        _hook { std::move(hook) }
+    {
+    }
+
+    AcceptAwaitable Accept() override
+    {
+        ++_polls;
+        if (_closed)
+            return AcceptAwaitable { AcceptResult {
+                std::unexpect, NetError { .code = NetErrorCode::Eof, .systemCode = 0, .context = {} } } };
+        if (_polls == _pollsBeforeHook && _hook)
+            _hook();
+        return AcceptAwaitable { AcceptResult {
+            std::unexpect, NetError { .code = NetErrorCode::Timeout, .systemCode = 0, .context = {} } } };
+    }
+    void Close() noexcept override
+    {
+        _closed = true;
+    }
+
+    /// How many times the loop has asked for a connection.
+    [[nodiscard]] int Polls() const noexcept
+    {
+        return _polls;
+    }
+
+    /// Whether the loop closed this listener, i.e. observed a shutdown.
+    [[nodiscard]] bool Closed() const noexcept
+    {
+        return _closed;
+    }
+
+  private:
+    int _pollsBeforeHook { 0 };
+    std::function<void()> _hook;
+    bool _closed { false };
+    int _polls { 0 };
 };
 
 struct Fixture
@@ -219,5 +284,43 @@ TEST_CASE("In-flight returns to zero after a job", "[worker-server]")
     OneShotListener listener { std::move(pair.server) };
     WorkerServer server { listener, fix.protocol, 2, fix.logger };
     SyncRun(server.Run());
+    CHECK(server.InFlight() == 0);
+}
+
+TEST_CASE("A poll timeout keeps the accept loop running", "[worker-server]")
+{
+    // The half of the shutdown contract that fails silently: if a poll timeout
+    // ended the loop, an idle worker would exit the first time nothing connected
+    // -- still registered with the scheduler, gone from the network, and every job
+    // dispatched to it hanging until the client's deadline.
+    //
+    // The listener stops the server on its third poll, so reaching three is proof
+    // the loop survived the first two.
+    Fixture fix;
+    WorkerServer* running = nullptr;
+    IdleListener listener { 3, [&] { running->Shutdown(); } };
+    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.logger };
+    running = &server;
+
+    SyncRun(server.Run());
+
+    CHECK(listener.Polls() >= 3);
+    CHECK(listener.Closed());
+}
+
+TEST_CASE("Shutdown ends an idle accept loop", "[worker-server]")
+{
+    // What a SIGTERM ultimately does. The signal handler only sets a flag and the
+    // accept loop is parked inside Accept(), so closing the listener is the whole
+    // mechanism by which a stop reaches the loop -- if this did not return, a
+    // supervisor's stop would time out and escalate to SIGKILL.
+    Fixture fix;
+    IdleListener listener;
+    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.logger };
+
+    server.Shutdown();
+    SyncRun(server.Run());
+
+    CHECK(listener.Closed());
     CHECK(server.InFlight() == 0);
 }

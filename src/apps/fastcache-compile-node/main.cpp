@@ -26,6 +26,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
@@ -76,6 +77,38 @@ constexpr std::chrono::seconds HeartbeatInterval { 20 };
 /// Slices the heartbeat sleep is broken into, so a stop request is observed
 /// promptly rather than after a full interval.
 constexpr int HeartbeatSlices = 20;
+
+/// How often the stop watcher looks at the stop flag.
+///
+/// A signal handler may portably do almost nothing -- it sets a flag -- so
+/// something else has to notice and close the listener, and it cannot be the
+/// accept loop, which is parked inside `Accept()`. Short enough that `systemctl
+/// stop` and Ctrl-C feel immediate, long enough to cost nothing while idle.
+constexpr std::chrono::milliseconds StopPollInterval { 100 };
+
+/// Record a stop request.
+///
+/// `extern "C"` and doing nothing but setting the process-wide flag, because a
+/// signal handler is not allowed to do more: `DaemonControls`' flag is atomic and
+/// lock-free, which is what makes this legal where logging or allocating here
+/// would not be.
+extern "C" void HandleNodeStopSignal(int /*signum*/)
+{
+    DaemonControls::Instance().RequestStop();
+}
+
+/// Ask for a graceful stop on the signals a supervisor actually sends.
+///
+/// SIGHUP is deliberately NOT handled: the daemon reloads its configuration on it,
+/// and this worker has nothing it could reload -- its toolchain table is what its
+/// registration advertised, so re-reading it would leave the scheduler dispatching
+/// against a set this worker no longer serves. Leaving SIGHUP at its default is
+/// therefore the honest behaviour rather than an omission.
+void InstallNodeStopHandlers()
+{
+    std::signal(SIGINT, &HandleNodeStopSignal);
+    std::signal(SIGTERM, &HandleNodeStopSignal);
+}
 
 /// Split `fingerprint=path`.
 [[nodiscard]] std::optional<std::pair<std::string, std::string>> SplitToolchain(std::string_view spec)
@@ -339,6 +372,31 @@ int main(int argc, char** argv)
         }
     } };
 
+    // Installed only once the listener is up and the heartbeat is running, so a
+    // stop arriving during startup cannot close a listener that does not exist yet.
+    InstallNodeStopHandlers();
+
+    // The watcher exists because the two halves of a stop cannot be the same
+    // thread: the signal handler may only set a flag, and the accept loop is parked
+    // inside Accept() and cannot look at one. Closing the listener is what unparks
+    // it -- on POSIX via the poll timeout the loop already treats as "not a
+    // failure", which is the mechanism WorkerServer::Run documents.
+    //
+    // In-flight work needs no separate drain: compiles are served INLINE in the
+    // accept loop, so by the time Run() returns there is nothing still running.
+    // A worker that detached its jobs would need one here, and would need to
+    // decide how long to wait; serving inline is what makes that question not
+    // arise.
+    std::jthread const stopWatch { [&](std::stop_token const& stop) {
+        while (!stop.stop_requested() && !DaemonControls::Instance().StopRequested())
+            std::this_thread::sleep_for(StopPollInterval);
+        if (DaemonControls::Instance().StopRequested())
+        {
+            logger.Logf(LogLevel::Info, "stop requested; no longer accepting compiles");
+            server.Shutdown();
+        }
+    } };
+
     logger.Logf(LogLevel::Info,
                 "compile node ready on {}:{}, advertising {}, {} slot(s), {} toolchain(s)",
                 cfg.bindAddress,
@@ -348,5 +406,15 @@ int main(int argc, char** argv)
                 toolchains.size());
 
     SyncRun(server.Run());
+
+    // No deregistration is sent, and that is a decision rather than a gap. There is
+    // no such verb: the scheduler learns a worker is gone by its heartbeat lapsing,
+    // which is the ONE mechanism that also covers the cases a polite goodbye cannot
+    // -- a killed process, a severed network, a crashed host. Adding a second path
+    // would mean the fleet had two ways to believe a worker is alive and only one of
+    // them exercised in the failure that matters. A client that leases this worker
+    // in the gap finds it unreachable and compiles locally, which is the same
+    // fallback every other refusal takes.
+    logger.Logf(LogLevel::Info, "compile node stopped");
     return 0;
 }

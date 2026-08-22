@@ -1086,6 +1086,35 @@ moment a root is spelled unusually, so `scripts/compile-cache-e2e.sh` (POSIX) an
 `run-launcher-e2e.ps1` (Windows) assert all of them end-to-end in CI on both
 platforms.
 
+Distributed compilation adds two more, and both were found by running the feature
+under **this repository's own build flags** rather than a toy command line — which
+is the reproducible lesson, since no unit test can reach either:
+
+- **The text sent to a worker is NOT the text the key hashed, and the difference
+  is `#line`.** The key's probe suppresses markers so no checkout path reaches it
+  (the rule directly above). Those same markers are the only thing telling the
+  compiler which lines came from a *system header*. Feed a worker the key's text
+  and every warning inside libc++ or the CRT is re-reported as if it came from
+  the user's own file — under `-pedantic -Werror`, which this project builds with,
+  that is a failed compile. Every dispatched TU would fail and be retried locally,
+  so **distribution would appear to work while never once helping**: a silent
+  100 % fallback with a green build. So `DispatchPreprocessCommand` preprocesses
+  a *second* time, with markers, at ~45 ms on a path already committed to seconds
+  of remote compilation. Reusing the key's text is the free-looking option and it
+  is wrong.
+- **A worker must be told its input is already preprocessed.** Having added the
+  markers back, `-pedantic` then rejects the markers themselves as a GNU extension
+  (`-Wgnu-line-marker`) — the fix for the first defect creates the second. The
+  answer is the one ccache and distcc already use: `-x c++-cpp-output`
+  (`cpp-output` for C, and *nothing* for an MSVC driver, whose `/E` emits standard
+  `#line`). It is a `DriverSpec` column, not a branch, so a fifth driver is a row.
+
+`scripts/dist-compile-e2e.sh` asserts the consequence rather than the mechanism:
+that a worker's object is **byte-identical** to a locally compiled one. That single
+assertion is what fails if either rule is broken, and it is the whole soundness
+claim of the feature — an object that differs is stored under a key other machines
+then fetch.
+
 Production flow: `main()` -> CLI -> optional YAML -> `ConfigReloader` ->
 `CacheEngine` over `InMemoryLruStorage` (or, when `--storage` is set, a
 `ShardedStorage` of `LayeredStorage(InMemoryLruStorage, CowTreeStorage)` —
