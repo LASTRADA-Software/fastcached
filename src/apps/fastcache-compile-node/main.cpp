@@ -359,6 +359,40 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    // Socket activation is resolved BEFORE the toolchains, and the order is
+    // deliberate. Computing a fingerprint walks the whole include tree and takes
+    // seconds; a bad handoff is decided in microseconds. Doing the cheap,
+    // fallible thing first means a misconfigured unit fails immediately instead
+    // of after a multi-second pause -- and it means the startup log reads in the
+    // order things actually happened, so an operator watching a worker come up
+    // sees what it did with the socket before the long quiet part.
+    //
+    // When a supervisor already bound the port and handed
+    // the descriptor over, binding it again would fail with "address already in
+    // use" -- against ourselves. Falling through to Bind() when nothing was handed
+    // over is what lets one binary serve both a `.socket` unit and a plain
+    // `--port`, with no flag distinguishing them: the environment says which, and
+    // it says so unambiguously.
+    //
+    // Only the first is used. This worker answers one protocol on one port, so a
+    // unit listing several sockets is a misconfiguration -- reported rather than
+    // half-honoured, since silently ignoring the rest would leave an operator with
+    // a port that accepts nothing and no clue why.
+    auto inherited = AdoptInheritedListeners(AcceptPollInterval, RequestIoTimeout);
+    std::unique_ptr<IListener> activated;
+    if (!inherited.empty())
+    {
+        if (inherited.size() > 1)
+        {
+            logger.Logf(LogLevel::Error,
+                        "socket activation handed over {} listeners; this worker serves exactly one",
+                        inherited.size());
+            return 2;
+        }
+        activated = std::move(inherited.front());
+        logger.Logf(LogLevel::Info, "adopted a socket-activated listener; --bind and --port are not used");
+    }
+
     auto const runner = Cc::MakeProcessRunner();
 
     std::map<std::string, std::string> toolchains;
@@ -401,32 +435,6 @@ int main(int argc, char** argv)
 
     auto const slots = cfg.slots != 0 ? cfg.slots : std::max(1U, std::thread::hardware_concurrency());
     auto const advertise = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
-
-    // Socket activation first: when a supervisor already bound the port and handed
-    // the descriptor over, binding it again would fail with "address already in
-    // use" -- against ourselves. Falling through to Bind() when nothing was handed
-    // over is what lets one binary serve both a `.socket` unit and a plain
-    // `--port`, with no flag distinguishing them: the environment says which, and
-    // it says so unambiguously.
-    //
-    // Only the first is used. This worker answers one protocol on one port, so a
-    // unit listing several sockets is a misconfiguration -- reported rather than
-    // half-honoured, since silently ignoring the rest would leave an operator with
-    // a port that accepts nothing and no clue why.
-    auto inherited = AdoptInheritedListeners(AcceptPollInterval, RequestIoTimeout);
-    std::unique_ptr<IListener> activated;
-    if (!inherited.empty())
-    {
-        if (inherited.size() > 1)
-        {
-            logger.Logf(LogLevel::Error,
-                        "socket activation handed over {} listeners; this worker serves exactly one",
-                        inherited.size());
-            return 2;
-        }
-        activated = std::move(inherited.front());
-        logger.Logf(LogLevel::Info, "adopted a socket-activated listener; --bind and --port are not used");
-    }
 
     // `IsBound()`, not a null check: Bind() NEVER returns null -- it hands back a
     // listener carrying the diagnostic, for Accept() to surface later. Testing for

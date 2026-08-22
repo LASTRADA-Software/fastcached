@@ -844,23 +844,29 @@ jobs:
           systemctl is-active --quiet fastcache-compile-node \
             && { echo "::error::the service started without a connection"; exit 1; }
 
-          # One connection activates it. The worker computes its toolchain
-          # fingerprint on first start, which walks the include tree, so allow
-          # real time for it.
+          # One connection activates it.
           timeout 10 bash -c 'exec 3<>/dev/tcp/127.0.0.1/6676' || true
-          for _ in $(seq 1 60); do
-            systemctl is-active --quiet fastcache-compile-node && break
+
+          # Waited for by its OUTPUT, not by is-active. Type=simple is reported
+          # active the moment systemd forks, while this worker still has to walk
+          # its toolchain's include tree to compute a fingerprint -- seconds of
+          # real work. Polling is-active therefore answers "has it started",
+          # which is not the question; the first version of this step asked it
+          # and read an empty journal.
+          for _ in $(seq 1 90); do
+            sudo journalctl -u fastcache-compile-node --no-pager > /tmp/node-log.txt 2>/dev/null || true
+            grep -q 'compile node ready' /tmp/node-log.txt && break
             sleep 1
           done
-          systemctl is-active --quiet fastcache-compile-node || {
-            echo "::error::a connection did not activate the service"
-            sudo journalctl -u fastcache-compile-node --no-pager; exit 1; }
+          cat /tmp/node-log.txt
+          grep -q 'compile node ready' /tmp/node-log.txt || {
+            echo "::error::a connection did not bring the worker up"
+            systemctl status fastcache-compile-node --no-pager || true; exit 1; }
 
           # It must have ADOPTED the socket rather than bound its own. Binding
           # would have failed against the socket unit already holding the port,
           # so a running service that did not adopt is a service listening
           # somewhere nobody was told about.
-          sudo journalctl -u fastcache-compile-node --no-pager | tee /tmp/node-log.txt
           grep -q 'adopted a socket-activated listener' /tmp/node-log.txt \
             || { echo "::error::the worker did not adopt the activated socket"; exit 1; }
 
