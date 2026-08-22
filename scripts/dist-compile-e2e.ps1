@@ -102,15 +102,39 @@ function Wait-ForPort([int]$port, [System.Diagnostics.Process]$proc, [string]$wh
     throw "$what never listened on port $port"
 }
 
+# Read a file another process is still writing to.
+#
+# Get-Content is not enough here. These logs belong to a worker that is STILL
+# RUNNING, and on Windows opening a file another process holds can fail with a
+# sharing violation depending on the FileShare mode it was opened with -- so a
+# poll built on Get-Content can spin until its timeout and then report "never
+# reported X" when the line was there all along. Opening with FileShare.ReadWrite
+# says explicitly that a concurrent writer is expected.
+#
+# Returns an empty string rather than throwing when the file is missing or
+# momentarily unreadable, because the caller is polling and both are ordinary.
+function Read-LiveText([string]$path) {
+    if (-not (Test-Path $path)) { return "" }
+    try {
+        $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open,
+                                         [System.IO.FileAccess]::Read,
+                                         [System.IO.FileShare]::ReadWrite)
+        try {
+            $reader = New-Object System.IO.StreamReader($stream)
+            try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+        } finally { $stream.Dispose() }
+    } catch {
+        return ""
+    }
+}
+
 function Wait-ForLine([string]$path, [string]$pattern, [int]$seconds, [string]$what) {
     foreach ($attempt in 1..($seconds * 5)) {
-        if (Test-Path $path) {
-            $text = Get-Content -Raw $path -ErrorAction SilentlyContinue
-            if ($text -and ($text -match $pattern)) { return $text }
-        }
+        $text = Read-LiveText $path
+        if ($text -and ($text -match $pattern)) { return $text }
         Start-Sleep -Milliseconds 200
     }
-    if (Test-Path $path) { Write-Host (Get-Content -Raw $path) }
+    Write-Host (Read-LiveText $path)
     throw "$what never reported /$pattern/"
 }
 
@@ -156,8 +180,16 @@ function Test-SameBytes([string]$a, [string]$b) {
     return $ha -eq $hb
 }
 
-function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj, [string]$scheduler) {
-    $env:FASTCACHE_ADDR       = "127.0.0.1:$cachePort"
+# The cache port is a PARAMETER, not read from the enclosing scope.
+#
+# It was the latter, and the isolation case below tried to override
+# $env:FASTCACHE_ADDR around the call -- which this function then clobbered on its
+# own first line, so that case silently used the MAIN cache while talking to the
+# isolation scheduler. It would still have passed, for the wrong reason, which is
+# the failure mode every fixture here is written to avoid.
+function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj,
+                            [string]$scheduler, [int]$cache) {
+    $env:FASTCACHE_ADDR       = "127.0.0.1:$cache"
     $env:FASTCACHE_SOURCE_DIR = $root
     $env:FASTCACHE_BINARY_DIR = (Join-Path $root "build")
     $env:FASTCACHE_VERBOSE    = "1"
@@ -235,7 +267,7 @@ try {
         & $cc /nologo /c "/Fo$refObj" $src | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "the reference compile failed" }
 
-        $r = Invoke-Dispatching $cc $root $obj "127.0.0.1:$dispatchPort"
+        $r = Invoke-Dispatching $cc $root $obj "127.0.0.1:$dispatchPort" $cachePort
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the dispatched compile failed" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
             Write-Host $r.stderr
@@ -251,7 +283,7 @@ try {
         Write-Host "   byte-identical to the local object"
 
         Remove-Item $obj -Force
-        $r = Invoke-Dispatching $cc $root $obj "127.0.0.1:$dispatchPort"
+        $r = Invoke-Dispatching $cc $root $obj "127.0.0.1:$dispatchPort" $cachePort
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the second compile failed" }
         if ($r.stderr -notmatch "fastcache-cc: HIT") {
             Write-Host $r.stderr
@@ -295,13 +327,7 @@ try {
         & $cc /nologo /c "/Fo$isoRef" $isoSrc | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "the case 3 reference compile failed" }
 
-        $savedAddr = $env:FASTCACHE_ADDR
-        $env:FASTCACHE_ADDR = "127.0.0.1:$isoCache"
-        try {
-            $r = Invoke-Dispatching $cc $isoRoot $isoObj "127.0.0.1:$isoDispatch"
-        } finally {
-            $env:FASTCACHE_ADDR = $savedAddr
-        }
+        $r = Invoke-Dispatching $cc $isoRoot $isoObj "127.0.0.1:$isoDispatch" $isoCache
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the compile failed with only a mismatched worker" }
         if ($r.stderr -match "DISPATCHED to ") {
             Write-Host $r.stderr
