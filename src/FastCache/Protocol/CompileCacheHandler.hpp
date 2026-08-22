@@ -46,13 +46,40 @@ namespace FastCache
 ///
 ///   - bad magic                      → close (the peer is not speaking this protocol)
 ///   - unsupported or changed version → Error/UnsupportedVersion, then close
-///   - payload over the session cap   → Error/PayloadTooLarge, then close
+///   - payload over the session cap   → Error/PayloadTooLarge, drain, then close
 ///   - unknown opcode                 → Error/UnknownOpcode, skip the payload, **continue**
+///   - gated verb before AUTH         → Error/Unauthenticated, skip the payload, **continue**
 ///   - fields ≠ declared payload      → Error/MalformedFrame, continue
 ///
 /// The version is pinned to the first command's: a stream that changes version
 /// mid-connection is nonsensical rather than merely unsupported, and saying so is
 /// cheaper than carrying two decoders.
+///
+/// ## Authentication
+///
+/// This handler was the only one in the tree that never consulted
+/// `SessionContext::CurrentAuth()` — memcached text, memcached binary and RESP all
+/// did. So a daemon started with `--requirepass` gated every protocol *except*
+/// this one, and an operator reading the flag's documentation had no way to know
+/// it. That is a cache-poisoning surface on its own, and it becomes remote code
+/// execution the moment the compile-cache port carries anything that runs a
+/// compiler, which is why closing it comes first.
+///
+/// Which verbs are reachable before a credential is accepted is a **column of
+/// `OpTable`** (`OpDescriptor::preAuth`), not a predicate here: it is the
+/// security-relevant property of the whole verb set, so it must be readable off
+/// the table, and a verb added without a thought about it defaults to closed.
+///
+/// The gate runs *before* the payload is buffered and drains it with `Skip`, for
+/// the reason `MemcachedBinary` does the same: gating afterwards would let an
+/// unauthenticated peer pipeline frames declaring the full payload cap and force
+/// the allocation of all of it per frame.
+///
+/// The state is per-connection, and the policy is re-read on every command so a
+/// SIGHUP that toggles `requirepass` reaches connections that are already open in
+/// both directions. Clients pipeline `AUTH` ahead of their real command rather
+/// than waiting for its reply, so authentication costs bytes but no round trip —
+/// see the note in `CompileCacheWire.hpp`.
 class CompileCacheHandler final: public IProtocolHandler
 {
   public:

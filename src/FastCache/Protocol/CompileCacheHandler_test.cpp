@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/LayeredStorage.hpp>
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -758,4 +760,340 @@ TEST_CASE("FETCH of a prefetch group member warms the rest of the prefetch group
     // k2 and k3 are now warm in L1 (a direct L1 Peek finds them).
     CHECK(layered.L1().Peek("k2", clock.Now())->found);
     CHECK(layered.L1().Peek("k3", clock.Now())->found);
+}
+
+// --- authentication ---------------------------------------------------------
+//
+// This handler was the only one in the tree that never consulted
+// SessionContext::CurrentAuth(): a daemon started with --requirepass gated
+// memcached text, memcached binary and RESP, and served the compile cache to
+// anyone. These cases are what keep that from being reintroduced by anybody who
+// adds a verb without noticing the gate.
+
+namespace
+{
+
+/// A session requiring `secret`, with the policy reachable through a live source
+/// so the handler exercises the same rotation-capable path the daemon uses.
+///
+/// Returned as a pair because `SessionContext` holds a borrowed `IAuthSource*`:
+/// the source has to outlive the session, and handing back both makes that the
+/// caller's visible obligation rather than a dangling pointer waiting to happen.
+struct AuthedSession
+{
+    std::unique_ptr<SharedAuthSource> source;
+    SessionContext session;
+};
+
+[[nodiscard]] AuthedSession RequireSecret(std::string_view username, std::string_view secret)
+{
+    auto source = std::make_unique<SharedAuthSource>(
+        std::make_shared<AuthPolicy const>(std::string { username }, std::string { secret }));
+    SessionContext session {};
+    session.authSource = source.get();
+    return AuthedSession { .source = std::move(source), .session = session };
+}
+
+/// Build an AUTH frame.
+[[nodiscard]] std::vector<std::byte> AuthFrame(std::string_view username,
+                                               std::string_view secret,
+                                               Wire::WireVersion version = Wire::CurrentVersion)
+{
+    return Wire::EncodeAuth(Wire::AuthRequest { .username = username, .secret = secret }, version);
+}
+
+} // namespace
+
+TEST_CASE("Every gated verb is refused before AUTH, and the connection survives", "[compile-cache][handler][auth]")
+{
+    // Both gated verbs in one stream: the point is not that FETCH is refused but
+    // that the refusal is a *reply* the peer can read and step over, so a second
+    // command still gets an answer. A gate that closed the connection would pass
+    // a single-command assertion and fail this one.
+    CcFixture fix;
+    auto authed = RequireSecret("", "s3cret");
+
+    CompileValue v;
+    v.objectBlob = { std::byte { 0x01 } };
+    auto const reply = ExchangeWith(
+        fix,
+        Concat({ FetchFrame("k"),
+                 StoreFrame({ .key = "k", .prefetchGroup = "g", .srcRoot = "/src", .buildTree = "/build" }, v) }),
+        authed.session);
+
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 2);
+    for (auto const& frame: frames)
+    {
+        auto const error = ErrorOf(frame);
+        REQUIRE(error.present);
+        CHECK(error.code == Wire::ErrorCode::Unauthenticated);
+    }
+}
+
+TEST_CASE("An unauthenticated FETCH stores nothing and leaks nothing", "[compile-cache][handler][auth]")
+{
+    // The refusal must be a refusal, not a slow serve: assert on the engine, not
+    // only on the reply. A gate that replied Unauthenticated *after* doing the
+    // work would satisfy the case above.
+    CcFixture fix;
+    auto authed = RequireSecret("", "s3cret");
+
+    CompileValue v;
+    v.objectBlob = { std::byte { 0xAB }, std::byte { 0xCD } };
+    (void) ExchangeWith(fix,
+                        StoreFrame({ .key = "gated", .prefetchGroup = "g", .srcRoot = "/src", .buildTree = "/build" }, v),
+                        authed.session);
+
+    auto const got = fix.engine.Get("gated");
+    REQUIRE(got.has_value());
+    CHECK_FALSE(got->found);
+}
+
+TEST_CASE("A correct AUTH opens the connection for the commands pipelined behind it", "[compile-cache][handler][auth]")
+{
+    // Written as ONE stream rather than an exchange per frame, because that is
+    // exactly how the launcher sends it: AUTH and the real command go out in a
+    // single write and both replies are read afterwards. If the handler ever
+    // required a round trip between them, this case is what fails.
+    CcFixture fix;
+    auto authed = RequireSecret("", "s3cret");
+
+    CompileValue v;
+    v.objectBlob = { std::byte { 0x11 }, std::byte { 0x22 } };
+    auto const reply =
+        ExchangeWith(fix,
+                     Concat({ AuthFrame("", "s3cret"),
+                              StoreFrame({ .key = "k", .prefetchGroup = "g", .srcRoot = "/src", .buildTree = "/build" }, v),
+                              FetchFrame("k") }),
+                     authed.session);
+
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 3);
+    CHECK(frames[0].status == Wire::Status::Ok); // AUTH accepted
+    CHECK(frames[1].status == Wire::Status::Ok); // STORE landed
+    REQUIRE(frames[2].status == Wire::Status::Ok);
+
+    auto const decoded = DecodeCompileValue(frames[2].payload);
+    REQUIRE(decoded.has_value());
+    CHECK(decoded->objectBlob == v.objectBlob);
+}
+
+TEST_CASE("A wrong secret is refused and does not open the connection", "[compile-cache][handler][auth]")
+{
+    CcFixture fix;
+    auto authed = RequireSecret("", "s3cret");
+
+    auto const reply = ExchangeWith(fix, Concat({ AuthFrame("", "wrong"), FetchFrame("k") }), authed.session);
+
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 2);
+
+    auto const authError = ErrorOf(frames[0]);
+    REQUIRE(authError.present);
+    CHECK(authError.code == Wire::ErrorCode::Unauthenticated);
+
+    // The command behind it is still gated — a failed attempt must not count as
+    // an attempt made.
+    auto const fetchError = ErrorOf(frames[1]);
+    REQUIRE(fetchError.present);
+    CHECK(fetchError.code == Wire::ErrorCode::Unauthenticated);
+}
+
+TEST_CASE("A named user authenticates with its username, and the secret alone does not", "[compile-cache][handler][auth]")
+{
+    SECTION("username and secret together are accepted")
+    {
+        CcFixture fix;
+        auto authed = RequireSecret("builder", "s3cret");
+        auto const reply = ExchangeWith(fix, AuthFrame("builder", "s3cret"), authed.session);
+        CHECK(SoleReply(reply).status == Wire::Status::Ok);
+    }
+    SECTION("a wrong username with the right secret is refused")
+    {
+        CcFixture fix;
+        auto authed = RequireSecret("builder", "s3cret");
+        auto const reply = ExchangeWith(fix, AuthFrame("intruder", "s3cret"), authed.session);
+        CHECK(ErrorOf(SoleReply(reply)).code == Wire::ErrorCode::Unauthenticated);
+    }
+}
+
+TEST_CASE("With auth disabled a credential is accepted and ignored", "[compile-cache][handler][auth]")
+{
+    // A launcher configured with FASTCACHE_TOKEN must keep working against a
+    // daemon that requires none — otherwise setting a token becomes a breaking
+    // change against every unauthenticated daemon in a mixed fleet, which is
+    // precisely the migration this feature has to survive.
+    CcFixture fix;
+    auto const reply = Exchange(fix, Concat({ AuthFrame("", "any-token"), FetchFrame("absent") }));
+
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 2);
+    CHECK(frames[0].status == Wire::Status::Ok);
+    CHECK(frames[1].status == Wire::Status::Miss);
+}
+
+TEST_CASE("Enabling auth by reload gates a connection that is already open", "[compile-cache][handler][auth]")
+{
+    // The policy is resolved per command from the live source, so a SIGHUP that
+    // *enables* auth reaches connections that are already open. Getting this
+    // wrong is silent: seeding a per-connection "authenticated" flag from the
+    // policy at connect time -- the obvious spelling -- leaves every connection
+    // that predates the reload exempt for its whole life, which on a long-lived
+    // pool is indistinguishable from auth simply not working.
+    //
+    // Driven through a source that arms itself after its first read. That leans
+    // on the loop reading the policy exactly once per command, which is a stated
+    // property of the handler rather than an accident: the gate and the verify
+    // must see the same policy, so they share one read.
+    struct ArmingSource final: IAuthSource
+    {
+        std::shared_ptr<AuthPolicy const> policy;
+        mutable int reads { 0 };
+
+        [[nodiscard]] std::shared_ptr<AuthPolicy const> Current() const noexcept override
+        {
+            ++reads;
+            return reads >= 2 ? policy : std::shared_ptr<AuthPolicy const> {};
+        }
+    };
+
+    CcFixture fix;
+    ArmingSource source;
+    source.policy = std::make_shared<AuthPolicy const>(std::string {}, std::string { "s3cret" });
+    SessionContext session {};
+    session.authSource = &source;
+
+    auto const reply = ExchangeWith(fix, Concat({ FetchFrame("k"), FetchFrame("k") }), session);
+
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 2);
+    // Before the reload: served normally (a miss, since nothing is stored).
+    CHECK(frames[0].status == Wire::Status::Miss);
+    // After it: the same command on the same connection is now gated.
+    auto const error = ErrorOf(frames[1]);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::Unauthenticated);
+}
+
+TEST_CASE("A verified credential survives a secret rotation", "[compile-cache][handler][auth]")
+{
+    // The other direction, and deliberately the opposite answer: a peer that
+    // proved the credential current when it connected keeps its access when the
+    // secret is rotated under it. Re-gating on rotation would fail every
+    // in-flight build the moment an operator rotates, which is what makes
+    // rotation something nobody dares do. Redis behaves the same way.
+    struct RotatingSource final: IAuthSource
+    {
+        std::shared_ptr<AuthPolicy const> first;
+        std::shared_ptr<AuthPolicy const> second;
+        mutable int reads { 0 };
+
+        [[nodiscard]] std::shared_ptr<AuthPolicy const> Current() const noexcept override
+        {
+            ++reads;
+            return reads <= 1 ? first : second;
+        }
+    };
+
+    CcFixture fix;
+    RotatingSource source;
+    source.first = std::make_shared<AuthPolicy const>(std::string {}, std::string { "old-secret" });
+    source.second = std::make_shared<AuthPolicy const>(std::string {}, std::string { "new-secret" });
+    SessionContext session {};
+    session.authSource = &source;
+
+    auto const reply = ExchangeWith(fix, Concat({ AuthFrame("", "old-secret"), FetchFrame("k") }), session);
+
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 2);
+    CHECK(frames[0].status == Wire::Status::Ok);   // proved against the old secret
+    CHECK(frames[1].status == Wire::Status::Miss); // still served after rotation
+}
+
+TEST_CASE("A gated frame is drained by its declared length, not buffered", "[compile-cache][handler][auth]")
+{
+    // The gate runs before the payload is read: an unauthenticated peer could
+    // otherwise pipeline frames declaring the full payload cap and make the
+    // server allocate all of it per frame before being told to authenticate.
+    // Observable as framing rather than as footprint — a handler that failed to
+    // step over the refused body would find the next header inside it and drop
+    // the connection instead of answering the second command.
+    CcFixture fix;
+    auto authed = RequireSecret("", "s3cret");
+
+    CompileValue big;
+    big.objectBlob.assign(64 * 1024, std::byte { 0x5A });
+    auto const reply = ExchangeWith(
+        fix,
+        Concat({ StoreFrame({ .key = "big", .prefetchGroup = "g", .srcRoot = "/src", .buildTree = "/build" }, big),
+                 FetchFrame("after") }),
+        authed.session);
+
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 2);
+    CHECK(ErrorOf(frames[0]).code == Wire::ErrorCode::Unauthenticated);
+    CHECK(ErrorOf(frames[1]).code == Wire::ErrorCode::Unauthenticated);
+}
+
+TEST_CASE("An oversize AUTH is refused on its own ceiling, not the session's", "[compile-cache][handler][auth]")
+{
+    // AUTH is the one verb deliberately reachable before authentication, which
+    // makes it the one hole in the pre-auth allocation gate. Without a ceiling of
+    // its own it is read with `ReadExactly(payloadLength)` bounded only by
+    // `maxPayloadBytes` -- 256 MiB by default -- so an unauthenticated peer gets
+    // exactly the allocation the gate exists to deny, through the door the gate
+    // holds open. A credential does not need 256 MiB.
+    //
+    // Two frames, because the refusal must also be recoverable: the oversize body
+    // is drained by its declared length, so the command behind it still gets an
+    // answer rather than the connection being dropped.
+    CcFixture fix;
+    auto authed = RequireSecret("", "s3cret");
+
+    std::string const huge(Wire::MaxAuthPayload + 1, 'x');
+    auto const reply = ExchangeWith(fix, Concat({ AuthFrame("", huge), FetchFrame("k") }), authed.session);
+
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 2);
+
+    auto const authError = ErrorOf(frames[0]);
+    REQUIRE(authError.present);
+    CHECK(authError.code == Wire::ErrorCode::PayloadTooLarge);
+    // The message must name the verb whose ceiling was hit, not the session cap:
+    // an operator reading "exceeds cap 268435456" for a 4 KiB limit learns nothing.
+    CHECK(authError.message.contains("auth"));
+
+    // Still gated, and still answering.
+    CHECK(ErrorOf(frames[1]).code == Wire::ErrorCode::Unauthenticated);
+}
+
+TEST_CASE("A credential right up against the ceiling is still accepted", "[compile-cache][handler][auth]")
+{
+    // The bound must be a bound, not an off-by-one that quietly rejects the
+    // largest legal credential.
+    CcFixture fix;
+    std::string const secret(Wire::MaxAuthPayload - (2 * sizeof(std::uint32_t)), 'x');
+    auto authed = RequireSecret("", secret);
+
+    auto const reply = ExchangeWith(fix, AuthFrame("", secret), authed.session);
+    CHECK(SoleReply(reply).status == Wire::Status::Ok);
+}
+
+TEST_CASE("A gated verb keeps the operator's cap, not the AUTH ceiling", "[compile-cache][handler][auth]")
+{
+    // The per-op ceiling must not leak onto verbs that legitimately carry an
+    // object file. A STORE larger than MaxAuthPayload is ordinary traffic, and a
+    // shared ceiling would cap every cached object at 4 KiB.
+    CcFixture fix;
+
+    CompileValue v;
+    v.objectBlob.assign(Wire::MaxAuthPayload * 4, std::byte { 0x7E });
+    auto const reply =
+        Exchange(fix, StoreFrame({ .key = "big", .prefetchGroup = "g", .srcRoot = "/src", .buildTree = "/build" }, v));
+
+    CHECK(SoleReply(reply).status == Wire::Status::Ok);
+    auto const got = fix.engine.Get("big");
+    REQUIRE(got.has_value());
+    CHECK(got->found);
 }

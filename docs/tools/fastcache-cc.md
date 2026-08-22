@@ -163,6 +163,8 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | `FASTCACHE_NO_STATS` | Do not record invocations to the statistics log. | unset (recording on) |
 | `FASTCACHE_NO_DIRECT` | Disable direct mode, always preprocessing to derive the key. | unset (direct on) |
 | `FASTCACHE_TIMEOUT_MS` | Per-call deadline, in milliseconds, for every send/recv to the daemon. `0` disables it. A daemon that accepts and then stalls mid-reply would otherwise block the compile forever. Bounds each call, not the whole invocation — see below. | `10000` |
+| `FASTCACHE_TOKEN` | Shared secret presented to a daemon started with `--requirepass`. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe to set against a daemon that requires no credential: such a daemon accepts it and ignores it. | unset — **no credential sent** |
+| `FASTCACHE_USER` | Username to accompany `FASTCACHE_TOKEN`. Unset (the usual case) authenticates against the secret alone, which is what `--requirepass` configures. Ignored without a token — a username on its own is a misconfiguration, not a request to authenticate, and sending an empty secret would be refused by every server that wants one. | unset |
 
 The statistics log is located from the usual per-user state variables rather than
 one of the launcher's own. These are read but never written:
@@ -299,6 +301,8 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
 | `connect failed` | The daemon is unreachable at `FASTCACHE_ADDR`. |
 | `preprocess failed` | The compiler rejected the preprocess probe; the line may use an unsupported option form. |
 | `uses __TIME__/__DATE__/__TIMESTAMP__` | Deliberate: the TU is non-deterministic and would never hit. Reported as *uncacheable*, not as an error. |
+| `daemon does not support authentication; the configured credential was ignored` | `FASTCACHE_TOKEN` is set but the daemon predates the AUTH verb. Caching works normally — the daemon steps over the verb it does not know and serves the command — but this traffic is **not** authenticated. Said once per invocation rather than per exchange. Upgrade the daemon, or unset the token if it was not meant to apply here. |
+| `rejected (unauthenticated): ...` | The daemon requires a credential. `authentication required` means none was sent — set `FASTCACHE_TOKEN`. `authentication failed` means one was sent and was wrong. The two are deliberately different messages because they are different mistakes. Either way the compile still runs locally and the build succeeds; only the caching is lost. |
 | `fetch exchange failed`, `fetch decoded malformed` | Transport or protocol trouble mid-request. Also how a `FASTCACHE_TIMEOUT_MS` expiry surfaces: a daemon that accepted the connection and then went quiet. If these appear in bulk and each compile stalls for the full timeout first, suspect a wedged daemon rather than a flaky network. |
 | `rejected (unsupported-version): …` | The daemon answered and declined: it does not speak this launcher's wire version. **The two binaries ship together, so this means a mixed install** — an old daemon still running against a new `fastcache-cc`, or vice versa. The message names the range the daemon does support. Restart the daemon from the same package as the launcher. |
 | `rejected (payload-too-large): …` | The object exceeded the daemon's `--storage-max-value`. Raise it, or accept that this TU will not cache. |

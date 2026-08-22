@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
@@ -11,6 +12,7 @@
 #include <format>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -168,6 +170,66 @@ namespace
         co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
     }
 
+    /// Handle one AUTH command: verify the presented credential.
+    ///
+    /// Verification goes through `AuthPolicy`, whose comparison is constant-time,
+    /// so the secret cannot be recovered a byte at a time from reply timing.
+    ///
+    /// A failed AUTH is answered and the connection **kept**, matching every other
+    /// handler here: a refusal is a reply, not a close. That does leave a peer free
+    /// to guess repeatedly on one connection, which is a rate-limiting concern
+    /// rather than a framing one, and closing would not fix it — reconnecting costs
+    /// an attacker nothing while costing every honest launcher its pipelining.
+    ///
+    /// @param socket   Client socket.
+    /// @param policy   The policy resolved for this command, or null when auth is
+    ///                 off. Passed in rather than re-resolved so the gate that let
+    ///                 this frame through and the verify that answers it are the
+    ///                 same policy even across a concurrent rotation.
+    /// @param payload  The request payload, by value (see HandleStore).
+    /// @param credentialAccepted [out] Set true only when a credential was actually
+    ///                      VERIFIED. Never cleared: a later failed attempt must not
+    ///                      revoke something the peer already proved.
+    /// @return Whether the command loop should continue or abort.
+    [[nodiscard]] Task<Next> HandleAuth(ISocket* socket,
+                                        std::shared_ptr<AuthPolicy const> policy,
+                                        std::vector<std::byte> payload,
+                                        bool* credentialAccepted)
+    {
+        auto const fields = Wire::DecodeAuthPayload(payload);
+        if (!fields.has_value())
+            co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
+
+        if (policy == nullptr || !policy->Enabled())
+        {
+            // Auth is off, so there is no credential to check and nothing to
+            // refuse. Answering Ok rather than an error keeps a token-configured
+            // launcher working against a server that does not require one — the
+            // alternative would make enabling a token on the client a breaking
+            // change against every unauthenticated daemon.
+            //
+            // `credentialAccepted` is deliberately NOT set: nothing was verified.
+            // Setting it would mean a SIGHUP that later enables auth blesses this
+            // connection on the strength of a check that never ran — the same hole
+            // as seeding the flag from the policy, reached from the other side.
+            // Nothing is lost, because while auth is off the gate never reads it.
+            co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
+        }
+
+        auto const username = Wire::AsStringView(fields->username);
+        auto const secret = Wire::AsStringView(fields->secret);
+        // An empty username asks to be checked against the secret alone (the redis
+        // `requirepass` form), so a client configured with only a token is not
+        // locked out of a server that also names a user.
+        bool const ok = username.empty() ? policy->Verify(secret) : policy->Verify(username, secret);
+        if (!ok)
+            co_return co_await ReplyError(socket, Wire::ErrorCode::Unauthenticated, "authentication failed") ? Next::Continue
+                                                                                                             : Next::Abort;
+
+        *credentialAccepted = true;
+        co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
+    }
+
     /// Claim the right to warm `prefetch group`, once per cache engine.
     ///
     /// A per-connection set cannot bound this work: a compiler launcher opens a fresh
@@ -303,6 +365,26 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
     // than carrying two decoders.
     std::optional<Wire::WireVersion> pinnedVersion;
 
+    // Whether this connection has presented a credential that was actually
+    // VERIFIED. Deliberately not "is this connection allowed through": that is
+    // derived per command from this plus the live policy, so the two questions
+    // cannot drift.
+    //
+    // Seeding it from the policy instead — `authenticated = !authRequired` — is
+    // the obvious spelling and it is wrong in both directions. A connection
+    // opened while auth was off would stay exempt for its whole life across a
+    // SIGHUP that turned auth ON, which is the hole a reload is meant to close;
+    // and nothing would distinguish "auth is off" from "this peer proved
+    // something", so enabling auth later would silently bless every open
+    // connection. Recording only what was *proved* keeps the derivation honest.
+    //
+    // Rotation is the deliberate exception in the other direction: a peer that
+    // authenticated stays authenticated when the secret changes under it, as
+    // redis does. Re-gating on rotation would fail every in-flight build at the
+    // moment an operator rotates a secret, and the peer did prove the credential
+    // that was current when it connected.
+    bool credentialAccepted = false;
+
     while (true)
     {
         auto const headerBytes = co_await reader.ReadExactly(Wire::RequestHeaderSize);
@@ -389,6 +471,51 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             continue;
         }
 
+        // Resolved once per command, and from the LIVE policy: a SIGHUP that turns
+        // auth off releases open connections immediately, and one that turns it on
+        // gates them. Held in a local for the duration of this command so a
+        // concurrent rotation cannot make the gate and the verify disagree.
+        auto const policy = session.CurrentAuth();
+        bool const authRequired = policy != nullptr && policy->Enabled();
+
+        // The gate runs BEFORE the payload is buffered, and drains rather than
+        // reads. Gating after the read would let an unauthenticated peer pipeline
+        // frames declaring `maxPayloadBytes` each (256 MiB by default) and make the
+        // server allocate all of it per frame before being told to authenticate —
+        // a memory-exhaustion hole opened by the very check meant to close a hole.
+        // `Skip` discards in chunks and never materialises the frame, so refusing
+        // costs bandwidth the peer was going to spend anyway, not footprint.
+        // A verb the table bounds more tightly than the session does is checked
+        // here, after the opcode is known. This is what keeps the gate below
+        // meaningful: AUTH is deliberately reachable before authentication, so
+        // without its own ceiling an unauthenticated peer could declare
+        // `maxPayloadBytes` on opcode 0x03 and get exactly the allocation the gate
+        // exists to deny — defeating it through the one door it holds open.
+        //
+        // Drained and answered rather than closed, like every other refusal here.
+        if (auto const opCap = Wire::OpPayloadCap(header->opRaw, session.maxPayloadBytes); header->payloadLength > opCap)
+        {
+            auto message = std::format(
+                "declared payload {} bytes exceeds the {} cap of {}", header->payloadLength, descriptor->name, opCap);
+            session.LogFrameDrop(
+                ProtocolLabel,
+                ProtocolError { .code = ProtocolErrorCode::PayloadTooLarge, .context = std::string { message } });
+            if (!(co_await reader.Skip(header->payloadLength)).has_value())
+                co_return;
+            if (!co_await ReplyError(socket, Wire::ErrorCode::PayloadTooLarge, std::move(message)))
+                co_return;
+            continue;
+        }
+
+        if (authRequired && !credentialAccepted && !Wire::IsPreAuthAllowed(header->opRaw))
+        {
+            if (!(co_await reader.Skip(header->payloadLength)).has_value())
+                co_return;
+            if (!co_await ReplyError(socket, Wire::ErrorCode::Unauthenticated, {}))
+                co_return;
+            continue;
+        }
+
         auto payload = co_await reader.ReadExactly(header->payloadLength);
         if (!payload.has_value())
         {
@@ -404,6 +531,9 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
                 break;
             case Wire::Op::Fetch:
                 next = co_await HandleFetch(socket, engine, &manifest, &primedGroups, std::move(*payload));
+                break;
+            case Wire::Op::Auth:
+                next = co_await HandleAuth(socket, policy, std::move(*payload), &credentialAccepted);
                 break;
         }
 

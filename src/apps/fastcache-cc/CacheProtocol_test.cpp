@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace FastCache;
@@ -35,12 +36,18 @@ class ScriptedTcpClient final: public ITcpClient
 
     bool SendAll(std::span<std::byte const> bytes) override
     {
+        ++_sendCalls;
+        _trace.push_back('S');
         _sent.insert(_sent.end(), bytes.begin(), bytes.end());
         return true;
     }
 
     std::optional<std::vector<std::byte>> RecvExactly(std::size_t count) override
     {
+        // Recorded before the short-read check: an attempted read is still a read
+        // for the purpose of "did this client wait for a reply mid-conversation".
+        if (_trace.empty() || _trace.back() != 'R')
+            _trace.push_back('R');
         if (_replies.size() - _cursor < count)
             return std::nullopt;
         std::vector<std::byte> out { _replies.begin() + static_cast<std::ptrdiff_t>(_cursor),
@@ -61,10 +68,33 @@ class ScriptedTcpClient final: public ITcpClient
         return _cursor;
     }
 
+    /// How many separate writes the client made.
+    [[nodiscard]] std::size_t SendCalls() const noexcept
+    {
+        return _sendCalls;
+    }
+
+    /// The order in which the client wrote and read, collapsed to one character
+    /// per run: "SSRR" is two writes then two reads, "SRSR" is a round trip
+    /// between them.
+    ///
+    /// This, not the write count, is what pipelining actually means. Two SendAll
+    /// calls back-to-back are exactly as pipelined as one concatenated buffer --
+    /// neither waits for a reply -- and demanding a single write would force the
+    /// client to COPY a STORE frame carrying a whole object file just to satisfy
+    /// the test. Asserting the interleaving instead states the round-trip property
+    /// directly and leaves the client free to avoid the copy.
+    [[nodiscard]] std::string const& Trace() const noexcept
+    {
+        return _trace;
+    }
+
   private:
     std::vector<std::byte> _replies;
     std::vector<std::byte> _sent;
     std::size_t _cursor { 0 };
+    std::size_t _sendCalls { 0 };
+    std::string _trace;
 };
 
 /// A client whose socket fails on send.
@@ -227,4 +257,198 @@ TEST_CASE("The store-size limit declines the pathological value and nothing else
         CHECK(IsStorableSize(4UL * 1024UL * 1024UL, DefaultMaxStoreBytes));
         CHECK_FALSE(IsStorableSize(356UL * 1000UL * 1000UL, DefaultMaxStoreBytes));
     }
+}
+
+// --- credentials ------------------------------------------------------------
+
+namespace
+{
+
+/// Concatenate reply frames into one scripted stream.
+[[nodiscard]] std::vector<std::byte> Replies(std::initializer_list<std::vector<std::byte>> frames)
+{
+    std::vector<std::byte> out;
+    for (auto const& frame: frames)
+        out.insert(out.end(), frame.begin(), frame.end());
+    return out;
+}
+
+/// A credential with a secret, i.e. one that will actually be presented.
+[[nodiscard]] Credential Token(std::string_view secret, std::string_view username = {})
+{
+    return Credential { .username = std::string { username }, .secret = std::string { secret } };
+}
+
+} // namespace
+
+TEST_CASE("An unconfigured credential changes nothing on the wire")
+{
+    // The migration property: a launcher that has never been given a token must
+    // send byte-for-byte what it always sent. Anything else would make upgrading
+    // the launcher a wire change for every daemon in a fleet.
+    ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Miss, {}) };
+    (void) CacheFetch(client, "the-key", Credential {});
+
+    CHECK(client.Sent() == Wire::EncodeFetch("the-key"));
+}
+
+TEST_CASE("A username without a secret is not a credential")
+{
+    // FASTCACHE_USER alone is a misconfiguration, not a request to authenticate.
+    // Sending an AUTH carrying an empty secret would be refused by every server
+    // that requires one, turning a harmless typo into a build with no cache.
+    ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Miss, {}) };
+    (void) CacheFetch(client, "k", Credential { .username = "bob", .secret = "" });
+
+    CHECK(client.Sent() == Wire::EncodeFetch("k"));
+}
+
+TEST_CASE("A credential is pipelined ahead of the command, with no round trip between them")
+{
+    // The round-trip-count property, and the reason it is asserted on the write/read
+    // ORDER rather than on the outcome: correctness would also hold if the client
+    // sent AUTH, waited for its reply, then sent the FETCH -- and that spelling
+    // costs a round trip per translation unit, which on the launcher's
+    // connection-per-operation model is the regression the wire's "no handshake"
+    // note exists to prevent. "SSR" is both frames out before either reply is
+    // read; the failure this rejects would read "SRSR".
+    ScriptedTcpClient client { Replies(
+        { Wire::EncodeReply(Wire::Status::Ok, {}), Wire::EncodeReply(Wire::Status::Miss, {}) }) };
+
+    auto const outcome = CacheFetch(client, "k", Token("s3cret"));
+    CHECK(outcome.kind == CacheOutcomeKind::Miss);
+
+    auto expected = Wire::EncodeAuth(Wire::AuthRequest { .username = "", .secret = "s3cret" });
+    auto const fetch = Wire::EncodeFetch("k");
+    expected.insert(expected.end(), fetch.begin(), fetch.end());
+    CHECK(client.Sent() == expected);
+    // Both frames go out before either reply is read. The write COUNT is
+    // deliberately not asserted here: two back-to-back writes are just as
+    // pipelined as one, and requiring a single write would mean copying the
+    // command frame for nothing.
+    CHECK(client.Trace() == "SSR");
+}
+
+TEST_CASE("A hit behind a credential is served, and both replies are consumed")
+{
+    // Leaving the AUTH reply in the socket would be invisible here but fatal on a
+    // reused connection: the next command would read the previous command's
+    // answer. Asserting the cursor is what proves the stream stayed in sync.
+    auto const stored = std::vector<std::byte> { std::byte { 0xBE }, std::byte { 0xEF } };
+    auto const script = Replies({ Wire::EncodeReply(Wire::Status::Ok, {}), Wire::EncodeReply(Wire::Status::Ok, stored) });
+    ScriptedTcpClient client { script };
+
+    auto const outcome = CacheFetch(client, "k", Token("s3cret"));
+    REQUIRE(outcome.IsHit());
+    CHECK(outcome.value == stored);
+    CHECK(client.Cursor() == script.size());
+}
+
+TEST_CASE("A rejected credential surfaces as the credential's refusal, not the command's")
+{
+    // Both replies arrive; the AUTH refusal is the one that explains the build,
+    // so it is the one returned. Reporting the command's own Unauthenticated
+    // instead would say "this key is not available" when the truth is "this
+    // launcher's token is wrong" -- and the two want different fixes.
+    auto const script = Replies({ Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, "authentication failed"),
+                                  Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, {}) });
+    ScriptedTcpClient client { script };
+
+    auto const outcome = CacheFetch(client, "k", Token("wrong"));
+    REQUIRE(outcome.kind == CacheOutcomeKind::Rejected);
+    CHECK(outcome.code == Wire::ErrorCode::Unauthenticated);
+    CHECK(outcome.message == "authentication failed");
+    CHECK(DescribeOutcome(outcome).contains("unauthenticated"));
+
+    // The command's reply is drained even though it is discarded, so the
+    // connection is left usable rather than one frame behind.
+    CHECK(client.Cursor() == script.size());
+}
+
+TEST_CASE("CacheStore presents the credential the same way CacheFetch does")
+{
+    auto const body = std::vector<std::byte> { std::byte { 0x01 } };
+    ScriptedTcpClient client { Replies(
+        { Wire::EncodeReply(Wire::Status::Ok, {}), Wire::EncodeReply(Wire::Status::Ok, {}) }) };
+
+    auto const request = Wire::StoreRequest { .key = "k",
+                                              .prefetchGroup = "g",
+                                              .srcRoot = "/src",
+                                              .buildTree = "/build",
+                                              .value = std::span<std::byte const> { body } };
+    auto const outcome = CacheStore(client, request, Token("s3cret", "bob"));
+    CHECK(outcome.IsHit());
+
+    auto expected = Wire::EncodeAuth(Wire::AuthRequest { .username = "bob", .secret = "s3cret" });
+    auto const store = Wire::EncodeStore(request);
+    expected.insert(expected.end(), store.begin(), store.end());
+    CHECK(client.Sent() == expected);
+    CHECK(client.Trace() == "SSR");
+
+    // A STORE frame carries the object file, so the credential must not be
+    // prepended by copying it: that would raise peak footprint from about twice
+    // the object to three times it, on the hot path of a parallel build, and buy
+    // no round trip at all.
+    CHECK(client.SendCalls() == 2);
+}
+
+TEST_CASE("A daemon that dies after the AUTH reply is a transport failure, not a hit")
+{
+    // A truncated stream must not be read as success. The client asked for two
+    // replies and got one, so there is no command outcome to report.
+    ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Ok, {}) };
+
+    auto const outcome = CacheFetch(client, "k", Token("s3cret"));
+    CHECK(outcome.kind == CacheOutcomeKind::Transport);
+    CHECK_FALSE(outcome.IsHit());
+}
+
+TEST_CASE("A daemon predating the AUTH verb still serves the command behind it")
+{
+    // The mixed-fleet case, and the one this whole design promises is safe. The
+    // AUTH opcode was added WITHOUT bumping the wire version -- deliberately, since
+    // the framing was built so a receiver can step over a verb it does not know --
+    // so an older daemon answers AUTH `unknown-opcode` and then serves the
+    // pipelined command perfectly well.
+    //
+    // Treating that refusal as the exchange's outcome would give a
+    // token-configured launcher a permanent 0% hit rate against every
+    // not-yet-upgraded daemon, reported as `rejected (unknown-opcode)` -- a
+    // regression with no obvious cause and a plausible-looking error message.
+    auto const stored = std::vector<std::byte> { std::byte { 0x42 } };
+    ScriptedTcpClient client { Replies({ Wire::EncodeErrorReply(Wire::ErrorCode::UnknownOpcode, "unknown opcode 0x03"),
+                                         Wire::EncodeReply(Wire::Status::Ok, stored) }) };
+
+    auto const outcome = CacheFetch(client, "k", Token("s3cret"));
+    REQUIRE(outcome.IsHit());
+    CHECK(outcome.value == stored);
+
+    // ...but the operator asked for authentication and did not get it. A cache
+    // that silently does less than it was told to is worse than one that says so.
+    CHECK(outcome.credentialIgnored);
+}
+
+TEST_CASE("An ordinary refusal is not mistaken for an absent AUTH verb")
+{
+    // The complement of the case above: only `unknown-opcode` means "this daemon
+    // has no AUTH verb". Every other refusal is about the credential itself and
+    // must still be reported, or a wrong token would silently degrade to
+    // unauthenticated access against a daemon that does require one.
+    ScriptedTcpClient client { Replies({ Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, "authentication failed"),
+                                         Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, {}) }) };
+
+    auto const outcome = CacheFetch(client, "k", Token("wrong"));
+    CHECK(outcome.kind == CacheOutcomeKind::Rejected);
+    CHECK(outcome.code == Wire::ErrorCode::Unauthenticated);
+    CHECK_FALSE(outcome.credentialIgnored);
+}
+
+TEST_CASE("An uncredentialed exchange never reports an ignored credential")
+{
+    // `credentialIgnored` must mean "you asked for authentication and did not get
+    // it", not "no AUTH frame was involved". A launcher with no token configured
+    // asked for nothing and must say nothing.
+    ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Miss, {}) };
+    auto const outcome = CacheFetch(client, "k", Credential {});
+    CHECK_FALSE(outcome.credentialIgnored);
 }

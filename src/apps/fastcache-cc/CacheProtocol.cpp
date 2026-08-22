@@ -86,15 +86,89 @@ namespace
         return Plain(CacheOutcomeKind::Transport);
     }
 
-    /// Send a framed request and read its reply.
+    /// Send a framed request — optionally preceded by an AUTH frame in the SAME
+    /// write — and read the reply that belongs to the request.
+    ///
+    /// The two frames go out together rather than as a send/await/send sequence.
+    /// Replies are strictly ordered and one-per-request, so pipelining is
+    /// well-defined, and it is what keeps authentication free: the launcher opens
+    /// a fresh connection per operation, so waiting for the AUTH reply would add a
+    /// round trip to every translation unit in a build.
+    ///
+    /// The AUTH reply is consumed **first and unconditionally**. Skipping it on
+    /// the assumption it succeeded would leave a whole frame in the socket and
+    /// hand the caller the AUTH reply as if it were the command's — a
+    /// desynchronisation that reads as a bizarre outcome rather than as the
+    /// authentication failure it is.
+    ///
+    /// The two frames are written back-to-back but as **two calls**, not one
+    /// concatenated buffer. Both spellings are equally pipelined — neither waits
+    /// for a reply, which is the property that matters — but concatenating means
+    /// copying the command frame, and a STORE frame carries a whole object file
+    /// (up to 256 MiB by default). That would raise peak footprint from roughly
+    /// twice the object to three times it, on the hot path of a parallel build,
+    /// to buy nothing.
+    ///
     /// @param client Connected transport.
     /// @param frame The framed request.
-    /// @return The outcome.
-    [[nodiscard]] CacheOutcome Exchange(ITcpClient& client, std::vector<std::byte> const& frame)
+    /// @param credential Credential to present ahead of it; none when unconfigured.
+    /// @return The command's outcome, or the AUTH refusal when the credential was
+    ///         rejected (the command's own reply is still drained first).
+    [[nodiscard]] CacheOutcome Exchange(ITcpClient& client,
+                                        std::vector<std::byte> const& frame,
+                                        Credential const& credential)
     {
-        if (!client.SendAll(frame))
+        if (!credential.Configured())
+        {
+            if (!client.SendAll(frame))
+                return Plain(CacheOutcomeKind::Transport);
+            return RecvReply(client);
+        }
+
+        auto const authFrame =
+            Wire::EncodeAuth(Wire::AuthRequest { .username = credential.username, .secret = credential.secret });
+        if (!client.SendAll(authFrame) || !client.SendAll(frame))
             return Plain(CacheOutcomeKind::Transport);
-        return RecvReply(client);
+
+        // Non-const so the returns below can move rather than copy: an outcome
+        // can carry a whole cached object, and `performance-no-automatic-move`
+        // rejects the const spelling outright.
+        auto authOutcome = RecvReply(client);
+        if (authOutcome.kind == CacheOutcomeKind::Transport)
+            return authOutcome;
+
+        // The command's reply is read even when AUTH was refused: the server
+        // answers every request it read, so leaving it in the socket would strand
+        // a frame and the next command on this connection would read this one's
+        // answer.
+        auto commandOutcome = RecvReply(client);
+
+        // A daemon that predates the AUTH verb answers it `unknown-opcode` and —
+        // because the framing was built to let a receiver step over a verb it does
+        // not know and carry on — serves the command behind it perfectly well. So
+        // that reply is the good one, and returning the refusal instead would give
+        // a token-configured launcher a permanent 0% hit rate against every
+        // not-yet-upgraded daemon in a fleet, reported as `rejected
+        // (unknown-opcode)`. That is precisely the mixed-fleet case the wire's
+        // extensibility exists for, and adding a verb must not break it.
+        //
+        // `credentialIgnored` carries the fact upward rather than swallowing it:
+        // an operator who set a token believes this traffic is authenticated, and
+        // it is not. A cache that silently does less than it was told to is the
+        // failure mode this codebase keeps a list about.
+        if (authOutcome.kind == CacheOutcomeKind::Rejected && authOutcome.code == Wire::ErrorCode::UnknownOpcode)
+        {
+            commandOutcome.credentialIgnored = true;
+            return commandOutcome;
+        }
+
+        // Any other refusal is about the credential itself (wrong secret, an
+        // unsupported version, a malformed frame) and is what the caller has to
+        // act on; the command's own reply says only "unauthenticated", which
+        // explains nothing.
+        if (!authOutcome.IsHit())
+            return authOutcome;
+        return commandOutcome;
     }
 
 } // namespace
@@ -119,14 +193,14 @@ std::string DescribeOutcome(CacheOutcome const& outcome)
     return "unknown outcome";
 }
 
-CacheOutcome CacheFetch(ITcpClient& client, std::string_view key)
+CacheOutcome CacheFetch(ITcpClient& client, std::string_view key, Credential const& credential)
 {
-    return Exchange(client, Wire::EncodeFetch(key));
+    return Exchange(client, Wire::EncodeFetch(key), credential);
 }
 
-CacheOutcome CacheStore(ITcpClient& client, Wire::StoreRequest const& request)
+CacheOutcome CacheStore(ITcpClient& client, Wire::StoreRequest const& request, Credential const& credential)
 {
-    return Exchange(client, Wire::EncodeStore(request));
+    return Exchange(client, Wire::EncodeStore(request), credential);
 }
 
 } // namespace FastCache::Cc

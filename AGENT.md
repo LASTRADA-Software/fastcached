@@ -128,6 +128,71 @@ These constraints are load-bearing and have each already been a bug:
   `CliOptions()` and requires each non-excluded flag to be emitted — the
   exclusions, `--requirepass` above all, are listed with their reasons) and the
   launcher's `FASTCACHE_*` oracle list in `LauncherCli_test`.
+- **Every protocol checks the configured credential, and the compile cache was the
+  one that did not.** `session.CurrentAuth()` was consulted by `MemcachedText`,
+  `MemcachedBinary` and `RedisResp` — and by nothing in `CompileCacheHandler`. So a
+  daemon started with `--requirepass` gated three protocols and served the `0xFC` port
+  to anyone who could open a socket, with no flag, log line or doc saying so. On its own
+  that is a cache-poisoning surface; it becomes remote code execution the moment that
+  port carries anything that *runs* a compiler, which is why it is closed before any
+  distribution work rather than after. Consequences that are each load-bearing:
+  **which verbs are reachable before a credential is a column of `OpTable`**
+  (`OpDescriptor::preAuth`), not a predicate with its own `switch` — it is the
+  security-relevant property of the whole verb set, so a reviewer must read it off the
+  table, a verb added without a thought about it defaults to closed, and an opcode the
+  table does not know is refused rather than waved through. The **gate runs before the
+  payload is buffered** and drains with `Skip`, exactly as `MemcachedBinary`'s does:
+  checking afterwards would let an unauthenticated peer pipeline frames each declaring
+  `maxPayloadBytes` (256 MiB by default) and force that allocation per frame — a
+  memory-exhaustion hole opened by the check meant to close a hole. And the
+  per-connection state records **only what was verified**, never "is this connection
+  allowed through": seeding a flag from the policy at connect time is the obvious
+  spelling and is wrong in both directions — a connection opened while auth was off
+  stays exempt for life across a `SIGHUP` that turns auth *on*, and nothing then
+  distinguishes "auth is off" from "this peer proved something", so enabling auth later
+  silently blesses every open connection. Rotation is the deliberate exception the other
+  way: a peer that proved the credential current when it connected keeps access when the
+  secret changes under it, as redis does, because re-gating on rotation fails every
+  in-flight build at the moment an operator rotates.
+  - **The gate has exactly one door held open, and that door needs its own lock.**
+    `Op::Auth` is `preAuth` by construction, so its payload is read while the peer has
+    proved nothing — bounded only by `session.maxPayloadBytes`, i.e. the whole 256 MiB
+    the gate exists to deny, reached through the gate. `OpDescriptor::maxPayload` is
+    therefore a second column (`MaxAuthPayload`, 4 KiB, for AUTH; `0` = "the session
+    cap" for STORE and FETCH, which carry object files and are read only after
+    authentication), and `PreAuthVerbsAreBounded()` is `static_assert`ed so a future
+    pre-auth verb cannot reopen the hole by omission rather than by decision. The
+    refusal names the verb whose ceiling it hit, because "exceeds cap 268435456" tells
+    an operator nothing about a 4 KiB limit.
+  - **Adding a verb must not break the fleet that does not have it, and that is a
+    property of the CLIENT.** `Op::Auth` deliberately did not bump `CurrentVersion` —
+    the framing exists so a receiver steps over a verb it does not know — so a daemon
+    predating this change answers AUTH `unknown-opcode`, skips it, and serves the
+    pipelined command correctly. Returning that refusal as the exchange's outcome, which
+    is what a plain "any error is the answer" client does, gives a token-configured
+    launcher a permanent **0% hit rate** against every not-yet-upgraded daemon, reported
+    as `rejected (unknown-opcode)`: a plausible-looking message with no obvious cause,
+    and the exact mixed-fleet case the wire's extensibility was built for. So
+    `unknown-opcode` **on AUTH specifically** falls through to the command's own reply;
+    every other refusal is about the credential and is still reported. It is not
+    silent, though — `CacheOutcome::credentialIgnored` surfaces one note per build,
+    because the operator asked for authentication and did not get it, and "the cache
+    quietly did less than you told it to" is the failure mode this list exists for.
+  - **It costs no round trip, and that is a property of how the client sends rather
+    than of the wire.** Authentication is per-connection state and the launcher opens a
+    fresh connection per *operation*, so AUTH-then-await-then-command would double the
+    round trips of every translation unit — the exact cost the "no handshake" decision
+    below exists to avoid. Replies are strictly ordered and one-per-request, so the
+    launcher **pipelines**: both frames go out before either reply is read. They are two
+    `SendAll` calls, not one concatenated buffer — equally pipelined, since neither waits
+    for a reply, but concatenating means copying a STORE frame that carries a whole
+    object file, raising peak footprint from about twice the object to three times it on
+    the hot path of a parallel build, to buy nothing. The test therefore asserts the
+    *write/read interleaving* (`"SSR"`, never `"SRSR"`) rather than a write count: a
+    count of one would state the copy instead of the property, and the bytes are
+    identical either way so the outcome alone cannot tell the two apart. The client must
+    still consume the AUTH reply even when it intends to ignore it; skipping it strands a
+    frame and the next command reads the previous one's answer.
 - **A compile-cache frame declares its own length, so a rejection can be a reply
   instead of a close.** The pre-1 header was `[magic][op]` with no length, and
   that is what made every refusal — bad magic, unknown opcode, oversize field —
