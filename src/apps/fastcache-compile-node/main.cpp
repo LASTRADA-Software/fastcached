@@ -78,6 +78,22 @@ constexpr std::chrono::seconds HeartbeatInterval { 20 };
 /// promptly rather than after a full interval.
 constexpr int HeartbeatSlices = 20;
 
+/// How often a parked `accept()` returns so the loop can observe a shutdown.
+///
+/// POSIX honours `SO_RCVTIMEO` for `accept()`, and it is the ONLY portable way to
+/// stop this loop: closing the listening socket does not unblock a parked accept
+/// on Linux. Short enough that a stop is prompt, long enough that an idle worker
+/// is not spinning.
+constexpr std::chrono::milliseconds AcceptPollInterval { 200 };
+
+/// How long a single request may take to arrive once accepted.
+///
+/// Generous, because a request carries a whole preprocessed translation unit and
+/// the client may be on the other side of a slow link -- but not unbounded, so one
+/// stalled client cannot hold a slot forever against a worker that serves its jobs
+/// inline.
+constexpr std::chrono::milliseconds RequestIoTimeout { 120'000 };
+
 /// How often the stop watcher looks at the stop flag.
 ///
 /// A signal handler may portably do almost nothing -- it sets a flag -- so
@@ -321,12 +337,39 @@ int main(int argc, char** argv)
     auto const slots = cfg.slots != 0 ? cfg.slots : std::max(1U, std::thread::hardware_concurrency());
     auto const advertise = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
 
+    // `IsBound()`, not a null check: Bind() NEVER returns null -- it hands back a
+    // listener carrying the diagnostic, for Accept() to surface later. Testing for
+    // null therefore tested nothing, and the failure it let through was silent and
+    // actively harmful: on a port conflict this worker logged "ready", registered
+    // with the scheduler advertising a port it was not listening on, and then
+    // exited 0 the first time the accept loop touched the dead socket. The
+    // scheduler would go on leasing it to clients until the heartbeat lapsed.
+    // BindError() is what says WHICH of address-in-use, permission or bad address
+    // it was.
     auto listener = BlockingListener::Bind(cfg.bindAddress, cfg.port, /*backlog=*/128);
-    if (listener == nullptr)
+    if (listener == nullptr || !listener->IsBound())
     {
-        logger.Logf(LogLevel::Error, "could not bind {}:{}", cfg.bindAddress, cfg.port);
+        logger.Logf(LogLevel::Error,
+                    "could not bind {}:{} ({})",
+                    cfg.bindAddress,
+                    cfg.port,
+                    listener ? listener->BindError() : std::string_view { "null listener" });
         return 1;
     }
+
+    // Without this the accept loop cannot be stopped on Linux at all, and the way
+    // that presents is worse than a crash: POSIX does not unblock a parked
+    // `accept()` when another thread closes the socket, so `Shutdown()` would set a
+    // flag nothing ever comes back to read and `systemctl stop` would hang until
+    // the supervisor escalated to SIGKILL. macOS hides it -- there `close()` does
+    // wake the accept -- which is exactly why this was worth catching in CI rather
+    // than on one developer's machine. `WorkerServer::Run` already documents the
+    // poll timeout as the mechanism it relies on; this is what supplies it.
+    //
+    // The I/O timeout is separate and larger: it bounds reading a request, which
+    // carries a whole preprocessed translation unit over a possibly slow link,
+    // while the accept poll only decides how promptly a stop is noticed.
+    listener->SetTimeouts(AcceptPollInterval, RequestIoTimeout);
 
     auto const runner = Cc::MakeProcessRunner();
     auto const scratch = std::filesystem::temp_directory_path() / "fastcache-compile-node";

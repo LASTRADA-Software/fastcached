@@ -77,8 +77,23 @@ cleanup() {
     # Every spawned process, not just the ones a happy path reaps: a `fail`
     # anywhere exits the script, and a daemon or worker left holding a port makes
     # the NEXT run fail at startup for a reason unrelated to what actually broke.
+    #
+    # SIGTERM first, then SIGKILL after a grace period -- never a bare `wait`.
+    # These processes handle SIGTERM, so a bug that stops one from finishing its
+    # shutdown would hang cleanup forever, and cleanup runs on EVERY exit path
+    # including the failing ones. That turns "one assertion failed" into "the
+    # suite timed out with no output", which is how this fixture's own first
+    # version reported a real worker-shutdown bug: ***Timeout 900.10 sec, in
+    # three CI jobs, naming nothing.
     for pid in ${pids+"${pids[@]}"}; do
         kill "$pid" >/dev/null 2>&1 || true
+    done
+    for pid in ${pids+"${pids[@]}"}; do
+        for _ in $(seq 1 25); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.2
+        done
+        kill -9 "$pid" >/dev/null 2>&1 || true
         wait "$pid" 2>/dev/null || true
     done
     rm -rf "$workdir"
@@ -130,6 +145,31 @@ wait_for_port() {
     done
     cat "$logfile" >&2
     fail "${what} never listened on port ${port}"
+}
+
+# Stop a process and require it to actually exit, within a bound.
+#
+# `kill` then a bare `wait` is the obvious spelling and it HANGS when the signal
+# is handled but the process never finishes stopping -- which is a real failure
+# mode and was a real bug: the worker installs a SIGTERM handler, and if its
+# accept loop cannot be woken the handler sets a flag nobody comes back to read.
+# A test that hangs reports less than a test that fails, so this bounds the wait
+# and says what it was waiting for.
+#
+# @param 1 pid
+# @param 2 what it is, for the message
+# @param 3 seconds to allow
+stop_and_require_exit() {
+    local pid="$1" what="$2" seconds="$3"
+    kill "$pid" >/dev/null 2>&1 || true
+    local deadline=$(( seconds * 5 ))
+    for _ in $(seq 1 "$deadline"); do
+        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
+        sleep 0.2
+    done
+    kill -9 "$pid" >/dev/null 2>&1 || true
+    wait "$pid" 2>/dev/null || true
+    fail "${what} did not exit within ${seconds}s of being asked to stop"
 }
 
 # Write a translation unit whose content is unique to the caller.
@@ -322,8 +362,7 @@ echo "   a mismatched worker was refused, and the build compiled locally"
 
 # --- 4: with every worker dead the build still succeeds ----------------------
 echo "== case 4: failover to a local compile"
-kill "$iso_worker_pid" >/dev/null 2>&1 || true
-wait "$iso_worker_pid" 2>/dev/null || true
+stop_and_require_exit "$iso_worker_pid" "the isolation worker" 15
 
 write_source "${proj}/four.cpp" "casefour"
 "$compiler" -std=c++17 -O1 -c "${proj}/four.cpp" -o "${proj}/build/four-ref.o" \
@@ -430,6 +469,36 @@ for i in 1 2 3 4; do
     grep -q "DISPATCHED to " "${workdir}/case6-${i}.log" && dispatched_count=$((dispatched_count + 1))
 done
 echo "   4 concurrent compiles all correct (${dispatched_count} dispatched, $((4 - dispatched_count)) local)"
+
+# --- 7: a worker stops when it is asked to --------------------------------------
+echo "== case 7: a worker exits on SIGTERM"
+# The property a supervisor depends on, and one that fails in the worst possible
+# shape: the worker handles SIGTERM, so the signal no longer kills it outright --
+# if the accept loop cannot then be woken, the process hangs and `systemctl stop`
+# waits out its timeout before escalating to SIGKILL. It needs a real socket to
+# catch, because the mechanism IS the socket: POSIX does not unblock a parked
+# accept() when the listener is closed, so the loop only comes back through the
+# SO_RCVTIMEO poll. macOS wakes the accept anyway and hides the whole thing, which
+# is why this is asserted here and not left to a developer machine.
+stop_port="$(free_port)"
+"$node" --scheduler="127.0.0.1:${dispatch_port}" \
+    --bind=127.0.0.1 --port="$stop_port" --advertise="127.0.0.1:${stop_port}" \
+    --toolchain="${fingerprint}=${compiler}" --slots=1 --log-level=info \
+    > "${workdir}/stop-worker.log" 2>&1 &
+stop_worker_pid=$!
+pids+=("$stop_worker_pid")
+wait_for_port "$stop_port" "$stop_worker_pid" "shutdown worker" "${workdir}/stop-worker.log"
+
+stop_and_require_exit "$stop_worker_pid" "the worker under test" 15
+
+# Exiting is necessary but not sufficient: a worker that died of the signal also
+# "exits". These lines are what distinguish a graceful stop from a death, and
+# their absence would mean the handler never ran.
+grep -q "stop requested; no longer accepting compiles" "${workdir}/stop-worker.log" \
+    || { cat "${workdir}/stop-worker.log" >&2; fail "the worker did not report a graceful stop"; }
+grep -q "compile node stopped" "${workdir}/stop-worker.log" \
+    || { cat "${workdir}/stop-worker.log" >&2; fail "the worker did not run its shutdown path to completion"; }
+echo "   the worker stopped gracefully on SIGTERM"
 
 echo
 echo "dist-compile E2E PASSED"
