@@ -4,6 +4,7 @@
 #include <FastCache/Platform/Environment.hpp>
 
 #include <charconv>
+#include <cstdlib>
 #include <string>
 
 #if !defined(_WIN32)

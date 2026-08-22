@@ -447,6 +447,26 @@ int main(int argc, char** argv)
         logger.Logf(LogLevel::Info, "adopted a socket-activated listener; --bind and --port are not used");
     }
 
+    // Socket activation makes --advertise mandatory, because the fallback becomes
+    // a guess the process cannot make. `--bind` and `--port` were not used -- the
+    // socket unit chose the port and this process is never told which -- so the
+    // default would register `0.0.0.0:6676` from config values that describe
+    // nothing, and 0.0.0.0 is not an address a remote client can dial anyway.
+    //
+    // The consequence of guessing is the worst-shaped failure this system has: the
+    // registration SUCCEEDS, the worker heartbeats happily, the scheduler leases
+    // that endpoint to clients, and every one of them fails to connect and
+    // compiles locally. Nothing reports an error, and the fleet looks healthy from
+    // both ends. Refusing at startup, where it can be explained, is the whole
+    // difference.
+    if (activated != nullptr && cfg.advertise.empty())
+    {
+        logger.Logf(LogLevel::Error,
+                    "--advertise is required under socket activation: the socket unit owns the port, so this worker "
+                    "cannot know what address clients should use");
+        return 2;
+    }
+
     auto const runner = Cc::MakeProcessRunner();
 
     auto toolchainsOrNone = ResolveToolchains(cfg.toolchains, *runner, logger);

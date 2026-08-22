@@ -292,14 +292,28 @@ namespace
         // and interleave into it; the rename is what makes the result atomic.
         auto const temp =
             path.parent_path() / (path.filename().string() + "." + std::to_string(CurrentProcessId()) + ".tmp");
+        bool written = false;
         {
             std::ofstream out { temp, std::ios::binary | std::ios::trunc };
-            if (!out)
-                return;
-            out << stamp << '\n' << fingerprint << '\n';
-            if (!out)
-                return;
+            if (out)
+            {
+                out << stamp << '\n' << fingerprint << '\n';
+                out.flush();
+                written = out.good();
+            }
         }
+
+        // Every path that does not end in a rename removes the temp file. Returning
+        // early on a write failure instead -- which is what this did -- leaves one
+        // behind per failure, in a directory nothing ever sweeps, so a machine with
+        // a full disk or a permissions problem accumulates them indefinitely while
+        // the fingerprint silently recomputes on every invocation.
+        if (!written)
+        {
+            std::filesystem::remove(temp, ec);
+            return;
+        }
+
         std::filesystem::rename(temp, path, ec);
         if (ec)
             std::filesystem::remove(temp, ec);
