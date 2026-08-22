@@ -452,14 +452,19 @@ TEST_CASE("Every dispatch verb round-trips its fields")
     {
         auto const args = Bytes({ 0x01, 0x02 });
         auto const source = Bytes({ 0xAA, 0xBB, 0xCC });
-        auto const frame = EncodeCompile(CompileRequest {
-            .leaseToken = "l1", .fingerprint = "gcc-13-abc", .args = args, .source = source, .acceptedCodecs = { 1 } });
+        auto const frame = EncodeCompile(CompileRequest { .leaseToken = "l1",
+                                                          .fingerprint = "gcc-13-abc",
+                                                          .args = args,
+                                                          .source = source,
+                                                          .acceptedCodecs = { 1 },
+                                                          .sourceName = "Widget.cpp" });
         auto const decoded = DecodeCompilePayload(std::span { frame }.subspan(RequestHeaderSize));
         REQUIRE(decoded.has_value());
         CHECK(AsStringView(Unwrap(decoded).leaseToken) == "l1");
         CHECK(std::ranges::equal(Unwrap(decoded).args, args));
         CHECK(std::ranges::equal(Unwrap(decoded).source, source));
         CHECK(Unwrap(decoded).acceptedCodecs == CodecList { 1 });
+        CHECK(AsStringView(Unwrap(decoded).sourceName) == "Widget.cpp");
     }
 }
 

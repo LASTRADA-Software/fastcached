@@ -1247,11 +1247,14 @@ TEST_CASE("The scheduler refuses to execute a compile itself", "[compile-cache][
     CcFixture fix;
     DispatchFixture dispatch;
 
-    auto const reply =
-        ExchangeWith(fix,
-                     Wire::EncodeCompile(Wire::CompileRequest {
-                         .leaseToken = "l1", .fingerprint = "gcc-13", .args = {}, .source = {}, .acceptedCodecs = {} }),
-                     dispatch.SessionWith(ListenerRole::Cache | ListenerRole::Dispatch));
+    auto const reply = ExchangeWith(fix,
+                                    Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+                                                                               .fingerprint = "gcc-13",
+                                                                               .args = {},
+                                                                               .source = {},
+                                                                               .acceptedCodecs = {},
+                                                                               .sourceName = "a.cpp" }),
+                                    dispatch.SessionWith(ListenerRole::Cache | ListenerRole::Dispatch));
 
     auto const error = ErrorOf(SoleReply(reply));
     REQUIRE(error.present);

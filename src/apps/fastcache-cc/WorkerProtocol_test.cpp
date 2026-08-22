@@ -80,7 +80,8 @@ struct Fixture
                                                       .fingerprint = fingerprint,
                                                       .args = {},
                                                       .source = enveloped,
-                                                      .acceptedCodecs = { Wire::IdentityCodec } });
+                                                      .acceptedCodecs = { Wire::IdentityCodec },
+                                                      .sourceName = "a.cpp" });
 }
 
 /// Decode a reply frame into its status and payload.
@@ -188,8 +189,12 @@ TEST_CASE("A source in an undecodable codec is refused, not compiled as garbage"
 {
     Fixture fix;
     auto const bogus = Wire::EncodeCodecEnvelope(/*codec=*/200, 10, Wire::AsBytes("xxxxxxxxxx"));
-    auto const frame = Wire::EncodeCompile(Wire::CompileRequest {
-        .leaseToken = "l1", .fingerprint = "gcc-13", .args = {}, .source = bogus, .acceptedCodecs = {} });
+    auto const frame = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+                                                                  .fingerprint = "gcc-13",
+                                                                  .args = {},
+                                                                  .source = bogus,
+                                                                  .acceptedCodecs = {},
+                                                                  .sourceName = "a.cpp" });
     auto const answer = fix.worker.Answer(frame);
     REQUIRE(answer.has_value());
     CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::UnsupportedCodec);

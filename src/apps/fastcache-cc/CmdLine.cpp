@@ -557,18 +557,14 @@ namespace
         auto const introducers = IntroducersOf(family);
         if (arg.empty() || introducers.empty() || !introducers.contains(arg.front()))
             return false;
-        for (auto const& [spelling, families]: LanguageSelectors)
-        {
-            if (!introducers.contains(spelling.front()) || !Overlaps(families, family))
-                continue;
-            // A plain prefix test, and NOT MatchesFlag: that one only recognises a
-            // fused value for a flag the path-value table knows takes one, so it
-            // reads `-xc++` and `/Tcother.c` as ordinary arguments -- which is
-            // exactly how they would have reached a worker.
-            if (arg.starts_with(spelling))
-                return true;
-        }
-        return false;
+        // A plain prefix test, and NOT MatchesFlag: that one only recognises a fused
+        // value for a flag the path-value table knows takes one, so it reads
+        // `-xc++` and `/Tcother.c` as ordinary arguments -- which is exactly how
+        // they would have reached a worker.
+        return std::ranges::any_of(LanguageSelectors, [&](auto const& row) {
+            auto const& [spelling, families] = row;
+            return introducers.contains(spelling.front()) && Overlaps(families, family) && arg.starts_with(spelling);
+        });
     }
 
     /// The ParsedCommand field a path-valued flag's value belongs in.
@@ -658,20 +654,15 @@ bool ProducesSideArtefact(std::string_view arg, DriverFamily family)
     if (arg.empty() || introducers.empty() || !introducers.contains(arg.front()))
         return false;
 
-    for (SideArtefactFlag const& row: SideArtefacts)
-    {
-        if (!introducers.contains(row.spelling.front()) || !Overlaps(row.families, family))
-            continue;
-        // A prefix test, and NOT MatchesFlag, for the reason IsLanguageSelector
-        // gives: MatchesFlag only recognises a fused value for a flag the
-        // path-value table knows takes one, and every row here takes its value in
-        // the spelling a build actually writes -- `/Yc"pch.h"`,
-        // `-fmodule-output=x.pcm`. Matching only the bare form would have caught
-        // the shape nobody writes and missed the one everybody does.
-        if (arg.starts_with(row.spelling))
-            return true;
-    }
-    return false;
+    // A prefix test, and NOT MatchesFlag, for the reason IsLanguageSelector gives:
+    // MatchesFlag only recognises a fused value for a flag the path-value table
+    // knows takes one, and every row here takes its value in the spelling a build
+    // actually writes -- `/Yc"pch.h"`, `-fmodule-output=x.pcm`. Matching only the
+    // bare form would have caught the shape nobody writes and missed the one
+    // everybody does.
+    return std::ranges::any_of(SideArtefacts, [&](SideArtefactFlag const& row) {
+        return introducers.contains(row.spelling.front()) && Overlaps(row.families, family) && arg.starts_with(row.spelling);
+    });
 }
 
 std::string_view ObjectOutputPrefixFor(DriverFamily family)

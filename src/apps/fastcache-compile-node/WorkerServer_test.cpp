@@ -175,7 +175,8 @@ struct Fixture
                                                       .fingerprint = fingerprint,
                                                       .args = {},
                                                       .source = enveloped,
-                                                      .acceptedCodecs = { Wire::IdentityCodec } });
+                                                      .acceptedCodecs = { Wire::IdentityCodec },
+                                                      .sourceName = "a.cpp" });
 }
 
 /// Drive one request through a server and return everything written back.
