@@ -4,10 +4,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace FastCache::Cc;
@@ -30,11 +32,7 @@ class ScriptedRunner final: public IProcessRunner
         _argv.assign(argv.begin(), argv.end());
         if (_exitCode == 0 && _writeObject)
         {
-            // Honour the -o the runner chose, which is also how the test learns the
-            // worker picked its own path rather than the client's.
-            for (std::size_t i = 0; i + 1 < _argv.size(); ++i)
-                if (_argv[i] == "-o")
-                    std::ofstream { _argv[i + 1], std::ios::binary } << "OBJECT";
+            Test::WriteStubObject(_argv);
         }
         return CompileRun { .exitCode = _exitCode, .out = _stdoutText, .err = _stderrText };
     }
@@ -281,4 +279,46 @@ TEST_CASE("IsAcceptableJobArgument applies the strictest reading", "[compile-job
     CHECK_FALSE(IsAcceptableJobArgument("-I/usr/include"));
     CHECK_FALSE(IsAcceptableJobArgument(R"(-IC:\x)"));
     CHECK_FALSE(IsAcceptableJobArgument("/some/path"));
+}
+
+TEST_CASE("The output flag follows the worker's own driver family", "[compile-job]")
+{
+    // `cl` does not accept `-o`. Hard-coding it meant MSVC wrote `tu.obj` beside
+    // the source, exited 0, and the worker then found nothing at the path it had
+    // asked for -- so it refused the job and distribution never worked on Windows
+    // at all, while reporting "storage write failed" about it.
+    //
+    // The family comes from the worker's OWN configured compiler, never from
+    // anything the client sent, which is the same rule that decides which program
+    // runs at all.
+    SECTION("an MSVC toolchain gets /Fo, fused")
+    {
+        ScriptedRunner runner;
+        ScratchDir scratch;
+        CompileJobRunner jobs { runner, scratch.path, { { "msvc", R"(C:\MSVC\bin\cl.exe)" } } };
+
+        auto job = Job({});
+        job.fingerprint = "msvc";
+        (void) jobs.Run(job);
+
+        auto const& argv = runner.Argv();
+        REQUIRE(!argv.empty());
+        CHECK(std::ranges::any_of(argv, [](std::string const& a) { return a.starts_with("/Fo"); }));
+        // A bare `-o` would be consumed by cl as something else entirely.
+        CHECK(std::ranges::find(argv, "-o") == argv.end());
+    }
+
+    SECTION("a GNU toolchain still gets -o")
+    {
+        ScriptedRunner runner;
+        ScratchDir scratch;
+        CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "/opt/real/g++" } } };
+
+        (void) jobs.Run(Job({}));
+
+        auto const& argv = runner.Argv();
+        REQUIRE(!argv.empty());
+        CHECK(std::ranges::any_of(argv, [](std::string const& a) { return a.starts_with("-o"); }));
+        CHECK(std::ranges::none_of(argv, [](std::string const& a) { return a.starts_with("/Fo"); }));
+    }
 }

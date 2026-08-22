@@ -429,6 +429,25 @@ std::optional<PathValueMatch> MatchPathValueFlag(std::string_view arg, std::stri
     return std::nullopt;
 }
 
+std::string_view ObjectOutputPrefixFor(DriverFamily family)
+{
+    // The MOST SPECIFIC row wins: `-o` is DriverFamily::Any and would match an
+    // MSVC driver too, so a plain "first row that overlaps" scan would hand `cl`
+    // the very flag it does not accept. Preferring a row whose families are not
+    // Any is what makes the table answer this question correctly.
+    std::string_view fallback;
+    for (auto const& row: PathValueFlags())
+    {
+        if (row.role != PathValueRole::ObjectOutput || !Overlaps(row.families, family))
+            continue;
+        if (row.families != DriverFamily::Any)
+            return row.spelling;
+        if (fallback.empty())
+            fallback = row.spelling;
+    }
+    return fallback.empty() ? std::string_view { "-o" } : fallback;
+}
+
 Flavor ClassifyCompiler(std::string_view compiler)
 {
     return ClassifyCompilerImpl(compiler);

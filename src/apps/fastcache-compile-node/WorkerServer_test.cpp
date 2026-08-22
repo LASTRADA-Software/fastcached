@@ -41,9 +41,7 @@ class StubRunner final: public Cc::IProcessRunner
     }
     Cc::CompileRun RunCaptureSplit(std::span<std::string const> argv) override
     {
-        for (std::size_t i = 0; i + 1 < argv.size(); ++i)
-            if (argv[i] == "-o")
-                std::ofstream { argv[i + 1], std::ios::binary } << "OBJECT";
+        Cc::Test::WriteStubObject(argv);
         return Cc::CompileRun { .exitCode = 0, .out = {}, .err = {} };
     }
 };

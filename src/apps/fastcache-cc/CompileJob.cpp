@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CmdLine.hpp"
 #include "CompileJob.hpp"
 
 #include <algorithm>
@@ -172,10 +173,23 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
     argv.insert(argv.end(), job.args.begin(), job.args.end());
     // The compile action and the output are the worker's to name, which is why the
     // client's `RemoteCompileArgs` dropped both rather than passing them through.
+    //
+    // The OUTPUT flag comes from the driver family, because `-o` is not universal:
+    // `cl` does not accept it. Hard-coding it meant MSVC quietly wrote `tu.obj`
+    // beside the source, exited 0, and this worker then found nothing at the path
+    // it had asked for and refused the job as ScratchUnavailable -- so
+    // distribution never worked on Windows, and said "storage write failed" about
+    // it. `-c` needs no such treatment: MSVC drivers accept `-` for every option,
+    // so it means the same to both families.
+    //
+    // The family is derived from the worker's OWN configured compiler, never from
+    // anything the client sent -- the same rule that governs which program runs.
+    auto const family = DriverOf(ClassifyCompiler(toolchain->second)).family;
     argv.emplace_back("-c");
     argv.push_back(source.string());
-    argv.emplace_back("-o");
-    argv.push_back(object.string());
+    // Fused, which both families accept and which is the only form MSVC documents
+    // for `/Fo`.
+    argv.push_back(std::string { ObjectOutputPrefixFor(family) } + object.string());
 
     auto run = _runner.RunCaptureSplit(argv);
     if (run.exitCode == -1)

@@ -123,6 +123,24 @@ struct PathValueFlag
 /// @return The table, in match order.
 [[nodiscard]] std::span<PathValueFlag const> PathValueFlags();
 
+/// How `family` spells "write the object here", as a prefix to fuse a path onto.
+///
+/// Read out of `PathValueFlags()` rather than restated, so the flag a worker
+/// EMITS and the flag the launcher PARSES cannot drift apart -- which is the
+/// defect this exists to close: the compile worker hard-coded the GNU `-o`, and
+/// `cl` does not take it. MSVC quietly wrote `tu.obj` beside the source instead,
+/// exited 0, and the worker then found nothing at the path it had asked for and
+/// refused the job. Distribution therefore never worked on Windows at all.
+///
+/// The value is meant to be FUSED onto the path (`/Fofoo.o`, `-ofoo.o`), which
+/// both families accept and which is the only form MSVC documents for `/Fo`.
+/// Returning a prefix rather than emitting two arguments is what keeps one rule
+/// covering both.
+///
+/// @param family The driver family being invoked.
+/// @return The flag text, or `-o` for a family with no more specific spelling.
+[[nodiscard]] std::string_view ObjectOutputPrefixFor(DriverFamily family);
+
 /// A path-valued flag recognised on a command line.
 struct PathValueMatch
 {
