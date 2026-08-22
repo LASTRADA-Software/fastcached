@@ -305,7 +305,7 @@ inline constexpr std::array OpTable {
                    .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::Compile,
                    .name = "compile",
-                   .fieldCount = 4, // leaseToken, fingerprint, args, preprocessed
+                   .fieldCount = 5, // leaseToken, fingerprint, args, preprocessed, accepted codecs
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = false,
                    .maxPayload = 0 }, // carries a preprocessed TU; the operator's cap governs
@@ -1007,6 +1007,11 @@ struct CompileRequest
     std::string_view fingerprint;      ///< Re-stated so the worker can refuse a mismatch itself.
     std::span<std::byte const> args;   ///< Encoded, allow-listed compile arguments.
     std::span<std::byte const> source; ///< Preprocessed TU, in a codec envelope.
+    /// What the CLIENT can decode, so the worker can compress the object it sends
+    /// back. Carried here rather than inferred from the lease, because the worker
+    /// never sees the lease request -- and asking the scheduler for it would put a
+    /// round trip on the one exchange that must not have one.
+    CodecList acceptedCodecs;
 };
 
 /// The same, as views into a received payload.
@@ -1016,6 +1021,7 @@ struct CompileView
     std::span<std::byte const> fingerprint;
     std::span<std::byte const> args;
     std::span<std::byte const> source; ///< Still enveloped; decode with DecodeCodecEnvelope.
+    CodecList acceptedCodecs;          ///< What the client can decode.
 };
 
 /// Frame a REGISTER request.
@@ -1115,8 +1121,14 @@ struct HeartbeatView
 [[nodiscard]] inline std::vector<std::byte> EncodeCompile(CompileRequest const& request,
                                                           WireVersion version = CurrentVersion)
 {
-    return Detail::EncodeRequest(
-        version, Op::Compile, { AsBytes(request.leaseToken), AsBytes(request.fingerprint), request.args, request.source });
+    auto const codecs = EncodeCodecList(request.acceptedCodecs);
+    return Detail::EncodeRequest(version,
+                                 Op::Compile,
+                                 { AsBytes(request.leaseToken),
+                                   AsBytes(request.fingerprint),
+                                   request.args,
+                                   request.source,
+                                   std::span<std::byte const> { codecs } });
 }
 
 /// Split a COMPILE payload.
@@ -1127,9 +1139,11 @@ struct HeartbeatView
     auto const fields = SplitFields(payload, OpFieldCount(Op::Compile));
     if (!fields.has_value())
         return std::nullopt;
-    return CompileView {
-        .leaseToken = (*fields)[0], .fingerprint = (*fields)[1], .args = (*fields)[2], .source = (*fields)[3]
-    };
+    return CompileView { .leaseToken = (*fields)[0],
+                         .fingerprint = (*fields)[1],
+                         .args = (*fields)[2],
+                         .source = (*fields)[3],
+                         .acceptedCodecs = DecodeCodecList((*fields)[4]) };
 }
 
 /// What a scheduler answers a LEASE with, on success.

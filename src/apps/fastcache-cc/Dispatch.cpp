@@ -164,8 +164,11 @@ DispatchResult Dispatch(IEndpointDialer& dialer,
     // discovered after the whole preprocessed payload had crossed the network.
     auto const sourceField = Envelope(request.preprocessed, grant->workerCodecs);
 
-    auto const compileFrame = Wire::EncodeCompile(Wire::CompileRequest {
-        .leaseToken = token, .fingerprint = request.fingerprint, .args = argsField, .source = sourceField });
+    auto const compileFrame = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = token,
+                                                                         .fingerprint = request.fingerprint,
+                                                                         .args = argsField,
+                                                                         .source = sourceField,
+                                                                         .acceptedCodecs = accepted });
     auto const compileOutcome = ExchangeFramed(*worker, compileFrame, credential);
     if (compileOutcome.kind == CacheOutcomeKind::Transport)
         return Refused(DispatchStatus::Unavailable, std::format("compile exchange with {} failed", endpoint));
