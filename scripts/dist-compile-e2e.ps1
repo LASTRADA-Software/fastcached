@@ -224,6 +224,23 @@ int Entry() {
     return $src
 }
 
+# The set of byte offsets at which two equal-length files differ.
+#
+# Returned as a set rather than a count, because the question this fixture has to
+# answer is not "how many bytes differ" but "does the worker differ ANYWHERE a
+# local rebuild does not". Sizes differing is reported as $null, which callers
+# must treat as a hard failure -- a size change is never noise.
+function Get-DiffOffsets([string]$a, [string]$b) {
+    $ba = [System.IO.File]::ReadAllBytes($a)
+    $bb = [System.IO.File]::ReadAllBytes($b)
+    if ($ba.Length -ne $bb.Length) { return $null }
+    $set = [System.Collections.Generic.HashSet[int]]::new()
+    for ($i = 0; $i -lt $ba.Length; $i++) {
+        if ($ba[$i] -ne $bb[$i]) { [void]$set.Add($i) }
+    }
+    return $set
+}
+
 # Byte-identical, by hash rather than by Compare-Object.
 #
 # Compare-Object over two byte arrays allocates a PSObject per element, which is
@@ -381,94 +398,68 @@ try {
         }
         Write-Host "   fingerprint agreed by launcher and worker"
 
-        # --- 1 + 2: byte-identical, then served from the cache ---------------
+        # --- 1 + 2: the worker's object is a local object, then cached -------
         $root = Join-Path $scratch "proj"
         $src  = New-Source $root "$cc-dist-case-one"
-        $refObj = Join-Path $root "build\reference.obj"
-        $obj    = Join-Path $root "build\u.obj"
-
-        & $cc /nologo /c "/Fo$refObj" $src | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "the reference compile failed" }
+        $obj  = Join-Path $root "build\u.obj"
 
         $r = Invoke-Dispatching $cc $root $obj "127.0.0.1:$dispatchPort" $cachePort
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the dispatched compile failed" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
             Write-Host $r.stderr
-            # The WORKER's log too, not just the client's. A refusal reaches the
-            # client as one line naming a wire error code, and the reason it
-            # happened -- an unwritable scratch directory, a compiler that will not
-            # start -- is only ever visible on the worker. Printing one without the
-            # other is how a dispatch failure turns into a round trip.
             Write-Host "--- worker log ---"
             Write-Host (Read-LiveText $workerLog)
             throw "the compile was not dispatched to a worker"
         }
         if (-not (Test-Path $obj)) { throw "no object was written by the dispatched compile" }
 
-        # The whole soundness claim: an object built on the worker from
-        # `/E`-preprocessed text must equal one this machine compiled directly.
-        if (-not (Test-SameBytes $refObj $obj)) {
-            # THE CONTROL. The reference above compiles the ORIGINAL source; the
-            # worker compiles `/E`-preprocessed text. Those are different inputs,
-            # so a difference between them does not yet say whether distribution
-            # is at fault -- it might be inherent to compiling preprocessed text
-            # on this driver. GNU produces identical objects either way, which is
-            # why the POSIX fixture never had to ask.
-            #
-            # So ask directly: preprocess and compile locally, the same two steps
-            # the worker performs, and compare THAT. Identical means the worker is
-            # doing exactly what a local preprocessed compile does and the
-            # difference is the input, not the machine. Still different means the
-            # worker's environment is leaking into the object, which is the
-            # soundness problem this assertion exists to catch.
-            Write-Host "--- control: preprocess and compile locally, as the worker does ---"
-            $ctlDir = Join-Path $scratch "control"
-            New-Item -ItemType Directory -Force -Path $ctlDir | Out-Null
-            # Named `tu` to match the worker's own scratch source, so a filename
-            # embedded in the object cannot by itself account for a difference.
-            $ctlSrc = Join-Path $ctlDir "tu.cpp"
-            $ctlObj = Join-Path $ctlDir "tu.o"
-            & $cc /nologo /E $src 2>$null | Set-Content -Encoding utf8 $ctlSrc
-            if ($LASTEXITCODE -eq 0) {
-                & $cc /nologo -c $ctlSrc "/Fo$ctlObj" 2>&1 | Out-Null
-                if (Test-Path $ctlObj) {
-                    if (Test-SameBytes $ctlObj $obj) {
-                        Write-Host "  control MATCHES the worker: the difference is preprocessed-vs-original input,"
-                        Write-Host "  not the worker's environment."
-                    } else {
-                        Write-Host "  control DIFFERS from the worker too."
-                        # The control that decides whether this is a LEAK or simply
-                        # not achievable. Compile the identical input twice, in the
-                        # same directory, seconds apart: if THOSE differ, the driver
-                        # does not produce reproducible objects at all -- MSVC stamps
-                        # a TimeDateStamp into the COFF header unless /Brepro is
-                        # given -- and byte-identity is the wrong assertion for this
-                        # platform rather than a violated one.
-                        Write-Host "--- control 2: is this driver even reproducible? ---"
-                        $ctlObj2 = Join-Path $ctlDir "tu2.o"
-                        & $cc /nologo -c $ctlSrc "/Fo$ctlObj2" 2>&1 | Out-Null
-                        if (Test-Path $ctlObj2) {
-                            if (Test-SameBytes $ctlObj $ctlObj2) {
-                                Write-Host "  two identical local compiles MATCH: the driver is reproducible,"
-                                Write-Host "  so the worker really is leaking its environment into the object."
-                            } else {
-                                Write-Host "  two identical local compiles DIFFER: this driver does not produce"
-                                Write-Host "  reproducible objects, so byte-identity is unachievable here and the"
-                                Write-Host "  assertion -- not the product -- is what needs to change."
-                            }
-                        } else {
-                            Write-Host "  second control compile produced no object; inconclusive"
-                        }
-                    }
-                } else {
-                    Write-Host "  control compile produced no object; inconclusive"
-                }
-            } else {
-                Write-Host "  control preprocess failed; inconclusive"
-            }
-            throw "the worker's object differs from the locally compiled one"
+        # THE SOUNDNESS ASSERTION, and on this platform it cannot be plain
+        # byte-identity -- measured, not assumed. Two identical local compiles,
+        # same input and same directory seconds apart, differ by ~70 bytes on an
+        # MSVC driver (CI, run 32592356877). GNU is byte-identical either way,
+        # which is why the POSIX fixture asserts the simple thing and this one
+        # cannot.
+        #
+        # So measure the driver's own NOISE FLOOR and require the worker to stay
+        # inside it: compile the same preprocessed input locally twice, take the
+        # set of offsets at which those two differ, and demand that the worker's
+        # object differ from a local one at NO OTHER offset. Anything the worker
+        # introduces that a local rebuild does not is a leak, and is caught. A
+        # size change is never noise and always fails.
+        #
+        # That keeps the full strength of the claim -- "the worker's object is
+        # what this machine would have produced" -- while not asserting something
+        # the toolchain makes impossible.
+        $ctlDir = Join-Path $scratch "control"
+        New-Item -ItemType Directory -Force -Path $ctlDir | Out-Null
+        $ppSrc = Join-Path $ctlDir "tu.cpp"
+        & $cc /nologo /E $src 2>$null | Set-Content -Encoding utf8 $ppSrc
+        if ($LASTEXITCODE -ne 0) { throw "the control preprocess failed" }
+
+        $ctlA = Join-Path $ctlDir "a.o"
+        $ctlB = Join-Path $ctlDir "b.o"
+        & $cc /nologo -c $ppSrc "/Fo$ctlA" 2>&1 | Out-Null
+        & $cc /nologo -c $ppSrc "/Fo$ctlB" 2>&1 | Out-Null
+        if (-not (Test-Path $ctlA) -or -not (Test-Path $ctlB)) { throw "the control compiles produced no object" }
+
+        $noise = Get-DiffOffsets $ctlA $ctlB
+        if ($null -eq $noise) { throw "two identical local compiles produced DIFFERENT SIZES; cannot establish a noise floor" }
+        Write-Host ("   this driver's nondeterminism: {0} byte(s) between two identical local compiles" -f $noise.Count)
+
+        $actual = Get-DiffOffsets $ctlA $obj
+        if ($null -eq $actual) {
+            Write-Host ("   local: {0} bytes; worker: {1} bytes" -f (Get-Item $ctlA).Length, (Get-Item $obj).Length)
+            throw "the worker's object is a different SIZE from a locally compiled one"
         }
-        Write-Host "   byte-identical to the local object"
+
+        $extra = [System.Collections.Generic.List[int]]::new()
+        foreach ($off in $actual) { if (-not $noise.Contains($off)) { [void]$extra.Add($off) } }
+        if ($extra.Count -gt 0) {
+            $shown = ($extra | Sort-Object | Select-Object -First 24) -join ', '
+            Write-Host ("   worker differs at {0} offset(s) a local rebuild does not: {1}" -f $extra.Count, $shown)
+            throw "the worker's object differs from a locally compiled one beyond this driver's own nondeterminism"
+        }
+        Write-Host "   worker's object is indistinguishable from a local one (differs only where a local rebuild does)"
 
         Remove-Item $obj -Force
         $r = Invoke-Dispatching $cc $root $obj "127.0.0.1:$dispatchPort" $cachePort
