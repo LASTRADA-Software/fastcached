@@ -484,6 +484,88 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
     return out;
 }
 
+/// Whether `arg` could still make a compiler reach a file, after the path-valued
+/// flags this launcher knows about have already been removed.
+///
+/// A separator is the test, not a list of spellings, precisely because the list is
+/// what cannot be kept complete: `-isystem`, `--sysroot`, `-B`, `-specs=`,
+/// `-fplugin=` and `@file` all reach a file and none of them is a `PathValueFlags()`
+/// row. `@` is called out on its own because a response file names a path with no
+/// separator at all when it sits in the working directory.
+///
+/// The **introducer is skipped before the separator is looked for**, and which
+/// characters introduce is the driver's answer rather than this function's. `/`
+/// starts an option for an MSVC driver and an absolute path everywhere else -- the
+/// rule this launcher already lives by -- so testing the raw argument would refuse
+/// `/std:c++20` and `/O2`, i.e. every MSVC compile, while a `\` inside
+/// `/DCONFIG=C:\x` is still exactly the signal being looked for.
+/// @param arg One surviving argument.
+/// @param family The driver family whose spellings apply.
+/// @return True when the argument must not be sent to a worker.
+[[nodiscard]] bool CouldNameAFile(std::string_view arg, DriverFamily family)
+{
+    if (arg.starts_with('@'))
+        return true;
+    // One introducer only: a second `/` is a path separator even on Windows.
+    auto const body = !arg.empty() && IntroducersOf(family).contains(arg.front()) ? arg.substr(1) : arg;
+    return body.contains('/') || body.contains('\\');
+}
+
+std::optional<std::vector<std::string>> RemoteCompileArgs(ParsedCommand const& cmd, std::span<std::string const> argv)
+{
+    auto const& driver = DriverOf(cmd.flavor);
+
+    std::vector<std::string> out;
+    out.reserve(argv.size());
+
+    std::size_t skipUntil = 1; // argv[0] is the compiler; the worker picks its own
+    for (auto const i: std::views::iota(std::size_t { 1 }, argv.size()))
+    {
+        if (i < skipUntil)
+            continue;
+        std::string_view const a = argv[i];
+
+        // The source itself never travels: the worker compiles preprocessed text
+        // from a file of its own. Matched by value against the parsed source rather
+        // than by position, because a build system is free to put it anywhere.
+        if (a == cmd.source)
+            continue;
+
+        // The compile-only marker and the dependency switches, off the driver's own
+        // list. Same rule PreprocessCommand applies, and the same reason for reading
+        // it here rather than restating it: a spelling added to that table has to be
+        // dropped by every consumer or the one that missed it silently diverges.
+        if (auto const dropped = MatchDroppedFlag(a, driver))
+        {
+            if (a == *dropped && TakesValue(*dropped) && i + 1 < argv.size())
+                skipUntil = i + 2;
+            continue;
+        }
+
+        // EVERY path-valued flag, not merely the ones the preprocess line drops.
+        // An include directory is the difference between the two lists: the probe
+        // needs it (it is still resolving headers), and the worker must not have it
+        // (the headers are already inlined, and the path names nothing there).
+        if (auto const match = MatchPathValueFlag(a, IntroducersOf(driver.family), driver.family))
+        {
+            // Only a bare occurrence consumes the next argument; a fused one already
+            // carries its value, and eating the successor would drop a real flag.
+            if (match->value.empty() && i + 1 < argv.size())
+                skipUntil = i + 2;
+            continue;
+        }
+
+        // The positive check, and the last word. See the header: refusing the whole
+        // command line is the only safe answer, because stripping an argument this
+        // function does not recognise would change the generated code.
+        if (CouldNameAFile(a, driver.family))
+            return std::nullopt;
+
+        out.emplace_back(a);
+    }
+    return out;
+}
+
 std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
                                            std::span<std::string const> argv,
                                            std::string_view dependencyProbePath)

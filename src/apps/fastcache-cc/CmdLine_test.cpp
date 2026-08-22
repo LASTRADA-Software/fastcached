@@ -428,3 +428,141 @@ TEST_CASE("Every path-valued flag row is spelled with a known introducer")
         CHECK(IntroducersOf(row.families).contains(row.spelling.front()));
     }
 }
+
+// --- RemoteCompileArgs -------------------------------------------------------
+
+TEST_CASE("RemoteCompileArgs keeps the flags that change generated code")
+{
+    // These are the whole point: -std, -O, -g, -W, -f and their kin decide what
+    // the compiler emits, so an object compiled without them is not the object the
+    // client asked for.
+    std::vector<std::string> const argv { "g++", "-std=c++23", "-O2", "-g", "-Wall", "-fPIC", "-c", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const remote = RemoteCompileArgs(cmd, argv);
+    REQUIRE(remote.has_value());
+    for (auto const* kept: { "-std=c++23", "-O2", "-g", "-Wall", "-fPIC" })
+    {
+        INFO("flag " << kept);
+        CHECK(std::ranges::find(*remote, kept) != remote->end());
+    }
+}
+
+TEST_CASE("RemoteCompileArgs drops the source, the output and the compile marker")
+{
+    // The worker compiles preprocessed text from a file of its own, into a path
+    // only it knows, and adds its own -c.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-o", "build/a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const remote = RemoteCompileArgs(cmd, argv);
+    REQUIRE(remote.has_value());
+    CHECK(std::ranges::find(*remote, "a.cpp") == remote->end());
+    CHECK(std::ranges::find(*remote, "build/a.o") == remote->end());
+    CHECK(std::ranges::find(*remote, "-o") == remote->end());
+    CHECK(std::ranges::find(*remote, "-c") == remote->end());
+    CHECK(std::ranges::find(*remote, "g++") == remote->end());
+}
+
+TEST_CASE("RemoteCompileArgs drops include directories in both spellings")
+{
+    // The difference between this list and the preprocess line's: the probe still
+    // needs -I because it is resolving headers; the worker must NOT have it,
+    // because the headers are already inlined and the path names nothing there.
+    std::vector<std::string> const argv { "g++", "-Iinc", "-I", "other", "-O2", "-c", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const remote = RemoteCompileArgs(cmd, argv);
+    REQUIRE(remote.has_value());
+    for (auto const* gone: { "-Iinc", "-I", "other" })
+    {
+        INFO("argument " << gone);
+        CHECK(std::ranges::find(*remote, gone) == remote->end());
+    }
+    CHECK(std::ranges::find(*remote, "-O2") != remote->end());
+}
+
+TEST_CASE("RemoteCompileArgs refuses a command line it cannot fully account for")
+{
+    // PathValueFlags() does not know -isystem, --sysroot, -B, -specs= or -fplugin=,
+    // and it should not have to: it exists to answer questions about the cache key.
+    // Several of those point a compiler at an EXECUTABLE. Dropping them silently
+    // would change the generated code; sending them would hand a client the ability
+    // to make a worker read or run a file of its choosing. Refusing costs one local
+    // compile, which is the only one of the three that is not a defect.
+    auto const refuses = [](std::vector<std::string> const& argv) {
+        auto const cmd = ParseCommand(argv);
+        return !RemoteCompileArgs(cmd, argv).has_value();
+    };
+
+    CHECK(refuses({ "g++", "-isystem", "/opt/sdk/include", "-c", "a.cpp", "-o", "a.o" }));
+    CHECK(refuses({ "g++", "--sysroot=/opt/sysroot", "-c", "a.cpp", "-o", "a.o" }));
+    CHECK(refuses({ "g++", "-fplugin=/tmp/evil.so", "-c", "a.cpp", "-o", "a.o" }));
+    CHECK(refuses({ "g++", "-specs=/tmp/specs", "-c", "a.cpp", "-o", "a.o" }));
+    // A response file names a path with no separator at all when it sits in the
+    // working directory, so it is called out on its own.
+    CHECK(refuses({ "g++", "@args.rsp", "-c", "a.cpp", "-o", "a.o" }));
+    // A define whose value happens to hold a path is refused too. Over-strict, and
+    // deliberately: the cost is a local compile.
+    CHECK(refuses({ "g++", "-DCONFIG=\"/etc/app.conf\"", "-c", "a.cpp", "-o", "a.o" }));
+
+    // The introducer is skipped before the separator is looked for, so an MSVC
+    // compile is not refused wholesale for spelling its options with `/` -- but a
+    // separator INSIDE one still refuses.
+    CHECK(refuses({ "cl", "/DCONFIG=C:\\app\\x.conf", "/c", "a.cpp", "/Foa.obj" }));
+    CHECK_FALSE(refuses({ "cl", "/std:c++20", "/O2", "/EHsc", "/c", "a.cpp", "/Foa.obj" }));
+}
+
+TEST_CASE("RemoteCompileArgs drops a separated flag together with its value")
+{
+    // The failure this rejects is a stray bare value: dropping `-MF` but keeping
+    // `dep.d` would hand the worker a filename it would treat as a second source.
+    std::vector<std::string> const argv { "g++", "-MF", "dep.d", "-O2", "-c", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const remote = RemoteCompileArgs(cmd, argv);
+    REQUIRE(remote.has_value());
+    CHECK(std::ranges::find(*remote, "dep.d") == remote->end());
+    CHECK(std::ranges::find(*remote, "-MF") == remote->end());
+    CHECK(std::ranges::find(*remote, "-O2") != remote->end());
+}
+
+TEST_CASE("RemoteCompileArgs leaves nothing that names a path")
+{
+    // The security-relevant property, stated as an assertion rather than a hope:
+    // every argument naming a filesystem path is removed, so nothing in this list
+    // can make the worker read or write somewhere of the client's choosing. The
+    // worker separately refuses to take its COMPILER from the client.
+    std::vector<std::string> const argv { "clang++", "-Isecret", "-o",  "/etc/passwd", "-MF",  "/tmp/x.d",
+                                          "-MT",     "target",   "-O2", "-c",          "a.cpp" };
+    auto const cmd = ParseCommand(argv);
+
+    auto const remote = RemoteCompileArgs(cmd, argv);
+    REQUIRE(remote.has_value());
+    for (auto const& arg: *remote)
+    {
+        INFO("surviving argument: " << arg);
+        CHECK_FALSE(arg.contains('/'));
+        CHECK_FALSE(arg.contains('\\'));
+        CHECK_FALSE(arg.starts_with('@'));
+    }
+}
+
+TEST_CASE("RemoteCompileArgs drops the MSVC spellings too")
+{
+    std::vector<std::string> const argv { "cl", "/std:c++20", "/O2", "/Iinc", "/Foa.obj", "/c", "a.cpp" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const remote = RemoteCompileArgs(cmd, argv);
+    REQUIRE(remote.has_value());
+    CHECK(std::ranges::find(*remote, "/std:c++20") != remote->end());
+    CHECK(std::ranges::find(*remote, "/O2") != remote->end());
+    CHECK(std::ranges::find(*remote, "/Iinc") == remote->end());
+    CHECK(std::ranges::find(*remote, "/c") == remote->end());
+    CHECK(std::ranges::find(*remote, "a.cpp") == remote->end());
+}

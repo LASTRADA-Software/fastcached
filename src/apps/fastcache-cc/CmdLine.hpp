@@ -231,6 +231,60 @@ struct ParsedCommand
 ///                            stream driver reports inline and reads nothing out
 ///                            of this but the request.
 /// @return The preprocess invocation, argv[0] being the compiler.
+/// Build the argument list a remote worker compiles this translation unit with.
+///
+/// The worker receives **preprocessed** text, so this is not the build's command
+/// line minus a few things — it is the subset that still means something once the
+/// headers are already inlined and the macros already expanded:
+///
+///   - The **source path** is dropped. The worker compiles a file of its own, in a
+///     directory the client has never heard of.
+///   - Every **path-valued** flag is dropped, whatever its role. An include
+///     directory has already done its work (and naming a path that does not exist
+///     on the worker is at best useless); an object output would make the worker
+///     write where the client wanted it rather than where it can; a depfile or its
+///     rule target would have the worker report dependencies for preprocessed text,
+///     which has none. This is `PathValueFlags()` again, read for a fourth question,
+///     rather than a fourth list of spellings to keep in step.
+///   - The driver's own **compile-only and dependency switches** are dropped, for
+///     the same reason and off the same table `PreprocessCommand` uses. The worker
+///     adds its own `-c`, because only it knows its output path.
+///
+/// Everything else is kept, and deliberately: `-std=`, `-O`, `-g`, `-W`, `-f`, `-m`
+/// and their kin all change the code the compiler generates and must reach it, or
+/// the object the client gets back is not the object it asked for. `-D`/`-U` are
+/// kept too — already expanded, so inert, but dropping them would mean a fifth
+/// classification of flags and no benefit.
+///
+/// Anything left that could still name a file makes the whole command line
+/// **undispatchable**, and this returns nothing.
+///
+/// Dropping the known path-valued flags is a deny-list, and a deny-list is the
+/// losing game here: `PathValueFlags()` does not know `-isystem`, `-iquote`,
+/// `--sysroot`, `-B`, `-specs=`, `-fplugin=` or `@response-file`, and it should not
+/// have to — it exists to answer questions about the cache key. Several of those
+/// point a compiler at an *executable* or at a file it will read, which is exactly
+/// the surface a worker must not expose to a client.
+///
+/// So the last word is a positive check on what survives: an argument carrying a
+/// path separator, or opening a response file, means this translation unit is not
+/// dispatched at all. **Refused rather than stripped**, because the two failure
+/// modes are not comparable — stripping an argument this function does not
+/// recognise would change the code the compiler generates and hand back an object
+/// that is quietly not the one that was asked for, while refusing costs one local
+/// compile. A code-generation flag (`-std=c++23`, `-O2`, `-Wall`, `-fPIC`,
+/// `/std:c++20`) has no path in it, so the ordinary case is unaffected.
+///
+/// The worker separately refuses to take its compiler from the client, so this is
+/// the second of two independent barriers rather than the only one.
+///
+/// @param cmd The parsed compile command.
+/// @param argv The original full invocation.
+/// @return The arguments to send (without the compiler and without the source), or
+///         nullopt when this command line must not be dispatched.
+[[nodiscard]] std::optional<std::vector<std::string>> RemoteCompileArgs(ParsedCommand const& cmd,
+                                                                        std::span<std::string const> argv);
+
 [[nodiscard]] std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
                                                          std::span<std::string const> argv,
                                                          std::string_view dependencyProbePath = {});
