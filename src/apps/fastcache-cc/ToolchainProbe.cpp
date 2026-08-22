@@ -4,6 +4,7 @@
 #include "Stats.hpp"
 #include "ToolchainProbe.hpp"
 
+#include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Platform/Environment.hpp>
 
 #if defined(_WIN32)
@@ -12,6 +13,7 @@
     #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -353,8 +355,27 @@ std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
     if (run.exitCode == 0 && !run.out.empty())
         return run.out.substr(0, run.out.find('\n'));
 
+    // NORMALIZED, not the basename as spelled -- and that is the whole point of
+    // this branch rather than a tidy-up of it.
+    //
+    // Only MSVC reaches here: `cl` has no `--version`, so it errors and every
+    // MSVC fingerprint is built on this fallback. Returning the spelling meant the
+    // digest depended on HOW the compiler was named rather than on which compiler
+    // it is -- `cl` gave one identity and `C:\...\cl.exe` another. A worker is
+    // configured with a path and a build system may invoke the bare name, so the
+    // two computed different fingerprints and the scheduler matched nothing:
+    // "rejected (no-worker): no worker matches this toolchain", on a fleet where
+    // both ends were pointed at the same compiler. Measured in CI, and reproduced
+    // here with a compiler that refuses `--version` under two spellings.
+    //
+    // Lowercased and de-suffixed exactly as `ClassifyCompiler` does, so "which
+    // driver is this" and "what do we call it" cannot disagree about `CL.EXE`.
     auto const slash = compiler.find_last_of("/\\");
-    return slash == std::string::npos ? compiler : compiler.substr(slash + 1);
+    auto base = slash == std::string::npos ? compiler : compiler.substr(slash + 1);
+    std::ranges::transform(base, base.begin(), [](char c) { return PathCanon::AsciiLower(c); });
+    if (base.ends_with(".exe"))
+        base.resize(base.size() - 4);
+    return base;
 }
 
 std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner, std::string const& compiler, DriverSpec const& spec)

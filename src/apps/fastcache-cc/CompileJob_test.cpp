@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CompileJob.hpp"
+#include "ScratchPathTestSupport.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -73,12 +74,10 @@ struct ScratchDir
 
     ScratchDir()
     {
-        // Numbered rather than derived from `this`. A pointer would be unique but
-        // formatting one is the sort of thing that differs between standard
-        // libraries, and a reproducible name is easier to find when a case leaves
-        // something behind.
-        static int counter = 0;
-        path = std::filesystem::temp_directory_path() / std::format("fc-jobtest-{}", ++counter);
+        // UniqueScratchPath, not a bare counter: every TEST_CASE is its own
+        // PROCESS under catch_discover_tests, so a per-process counter hands two
+        // concurrent cases the same directory and the second wipes the first.
+        path = Test::UniqueScratchPath("fc-jobtest");
         std::error_code ignored;
         std::filesystem::remove_all(path, ignored);
         std::filesystem::create_directories(path);

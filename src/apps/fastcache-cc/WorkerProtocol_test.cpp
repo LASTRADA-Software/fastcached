@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "Dispatch.hpp"
+#include "ScratchPathTestSupport.hpp"
 #include "WorkerProtocol.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -49,7 +50,7 @@ struct Fixture
     WorkerProtocol worker;
 
     Fixture():
-        scratch { std::filesystem::temp_directory_path() / std::format("fc-wp-{}", ++Counter()) },
+        scratch { Test::UniqueScratchPath("fc-wp") },
         jobs { runner, (std::filesystem::create_directories(scratch), scratch), { { "gcc-13", "g++" } } },
         worker { jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec } }
     {

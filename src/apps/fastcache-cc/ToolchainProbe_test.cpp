@@ -582,3 +582,38 @@ TEST_CASE("No state directory still yields a fingerprint", "[toolchain-probe]")
     CountingRunner runner { VerboseNaming(root) };
     CHECK(!CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang)).empty());
 }
+
+// --- the compiler banner ------------------------------------------------------
+
+TEST_CASE("A banner falls back to a normalized name, not the spelling", "[toolchain-probe]")
+{
+    // Only MSVC reaches the fallback -- `cl` has no `--version` -- so this branch
+    // decides every MSVC fingerprint. Returning the basename AS SPELLED made the
+    // digest depend on how the compiler was named rather than on which compiler it
+    // is: a worker configured with `C:\path\cl.exe` and a build invoking bare `cl`
+    // computed different fingerprints, and the scheduler matched neither to the
+    // other -- "no worker matches this toolchain", on a fleet where both ends were
+    // pointed at the same compiler.
+    ScriptedRunner refuses { CompileRun { .exitCode = 2, .out = {}, .err = "unknown option" } };
+
+    auto const bare = CompilerBanner(refuses, "cl");
+    auto const full = CompilerBanner(refuses, R"(C:\Program Files\MSVC\bin\cl.exe)");
+    auto const posix = CompilerBanner(refuses, "/usr/bin/cl");
+    auto const shouty = CompilerBanner(refuses, R"(C:\MSVC\CL.EXE)");
+
+    CHECK(bare == "cl");
+    CHECK(full == bare);
+    CHECK(posix == bare);
+    // Case-folded for the same reason ClassifyCompiler folds: "which driver is
+    // this" and "what do we call it" must not disagree about CL.EXE.
+    CHECK(shouty == bare);
+}
+
+TEST_CASE("A working --version wins over the fallback", "[toolchain-probe]")
+{
+    // The fallback is a last resort, not the normal path. A GNU driver answers
+    // --version with real content, and that content -- not its filename -- is what
+    // distinguishes two toolchains.
+    ScriptedRunner answers { CompileRun { .exitCode = 0, .out = "g++ (GCC) 14.2.0\nCopyright ...", .err = {} } };
+    CHECK(CompilerBanner(answers, "/usr/bin/g++") == "g++ (GCC) 14.2.0");
+}

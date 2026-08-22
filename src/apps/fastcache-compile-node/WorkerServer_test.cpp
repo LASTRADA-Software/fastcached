@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <CompileJob.hpp>
+#include <ScratchPathTestSupport.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -145,7 +146,7 @@ struct Fixture
     NullLogger logger;
 
     Fixture():
-        scratch { std::filesystem::temp_directory_path() / std::format("fc-ws-{}", ++Counter()) },
+        scratch { Cc::Test::UniqueScratchPath("fc-ws") },
         jobs { runner, (std::filesystem::create_directories(scratch), scratch), { { "gcc-13", "g++" } } },
         protocol { jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec } }
     {

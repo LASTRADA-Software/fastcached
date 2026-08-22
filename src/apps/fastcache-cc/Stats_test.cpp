@@ -7,6 +7,7 @@
 // it at a throwaway directory so the developer's real statistics are never read
 // or written.
 
+#include "ScratchPathTestSupport.hpp"
 #include "Stats.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -30,34 +31,6 @@ using namespace FastCache::Cc;
 namespace
 {
 
-/// This process's id, so two test *processes* racing under a parallel test
-/// runner (`ctest -j`) can never compute the same directory name.
-///
-/// `catch_discover_tests` registers one CTest test per TEST_CASE, each its own
-/// process invocation of this binary — so a monotonic counter starting at 1 in
-/// every process is not actually monotonic across the run: two concurrently
-/// running single-test processes both take their first ScopedStateDir at
-/// counter value 1 and collide on the same directory, one deleting or
-/// overwriting the log the other is mid-write on. This was a real, reproduced
-/// flake (`ctest -R FormatReport -j8` fails a run in a small majority of
-/// tries), not a hypothetical.
-[[nodiscard]] unsigned long ProcessId() noexcept
-{
-#if defined(_WIN32)
-    return ::GetCurrentProcessId();
-#else
-    return static_cast<unsigned long>(::getpid());
-#endif
-}
-
-/// Monotonic counter so no two ScopedStateDir instances *within this process*
-/// share a directory; combined with the process id for cross-process safety.
-[[nodiscard]] int CounterNext()
-{
-    static int counter = 0;
-    return ++counter;
-}
-
 /// Redirects the statistics log into a temporary directory for one test, and
 /// restores the previous environment afterwards.
 class ScopedStateDir
@@ -65,8 +38,11 @@ class ScopedStateDir
   public:
     ScopedStateDir()
     {
-        auto const unique =
-            std::filesystem::temp_directory_path() / std::format("fastcache-cc-test-{}-{}", ProcessId(), CounterNext());
+        // The shared helper, which this file's own comment used to explain at
+        // length. The explanation moved with it -- three later test files
+        // reintroduced exactly this bug while the fix sat here as a private
+        // helper, which is the argument for it not being private.
+        auto const unique = Test::UniqueScratchPath("fastcache-cc-test");
         std::filesystem::create_directories(unique);
         _dir = unique.string();
 
