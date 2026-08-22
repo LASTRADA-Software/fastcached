@@ -131,6 +131,7 @@ namespace EnvName
     constexpr std::string_view NoDirect = "FASTCACHE_NO_DIRECT";
     constexpr std::string_view TimeoutMs = "FASTCACHE_TIMEOUT_MS";
     constexpr std::string_view MaxStoreBytes = "FASTCACHE_MAX_STORE_BYTES";
+    constexpr std::string_view Scheduler = "FASTCACHE_SCHEDULER";
     constexpr std::string_view Token = "FASTCACHE_TOKEN";
     constexpr std::string_view User = "FASTCACHE_USER";
 } // namespace EnvName

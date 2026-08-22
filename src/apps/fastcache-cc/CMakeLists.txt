@@ -82,6 +82,7 @@ set(_fc_cc_sources
     CacheKey.cpp
     CacheProtocol.cpp
     Dispatch.cpp
+    DependencyOutput.cpp
     DependencyProbe.cpp
     DirectManifest.cpp
     PathResolve.cpp
@@ -140,6 +141,7 @@ if(FASTCACHED_BUILD_TESTS)
         CacheKey_test.cpp
         CacheProtocol_test.cpp
         Dispatch_test.cpp
+        DependencyOutput_test.cpp
         DependencyProbe_test.cpp
         DirectManifest_test.cpp
         PathResolve_test.cpp

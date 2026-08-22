@@ -313,6 +313,7 @@ TEST_CASE("the help text documents every environment variable the launcher reads
                              "FASTCACHE_NO_DIRECT",
                              "FASTCACHE_TIMEOUT_MS",
                              "FASTCACHE_MAX_STORE_BYTES",
+                             "FASTCACHE_SCHEDULER",
                              "FASTCACHE_TOKEN",
                              "FASTCACHE_USER",
                              "LOCALAPPDATA",

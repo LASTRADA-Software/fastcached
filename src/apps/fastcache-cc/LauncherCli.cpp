@@ -184,6 +184,17 @@ namespace
                                 "handshake, so a launcher cannot ask. Raise BOTH to cache a\n"
                                 "result larger than this; raising only one leaves the other\n"
                                 "refusing." },
+        EnvVarSpec { .name = EnvName::Scheduler,
+                     .summary = "host:port of a fastcached scheduling endpoint (its\n"
+                                "--listen-dispatch port). Unset means every miss compiles\n"
+                                "locally, which is the behaviour without this feature.\n"
+                                "On a miss the launcher asks the scheduler for a worker and\n"
+                                "sends it the preprocessed translation unit. EVERY refusal\n"
+                                "-- no matching toolchain, no free slot, another client\n"
+                                "already compiling this key, an unreachable node -- falls\n"
+                                "back to a local compile, so distribution cannot fail a\n"
+                                "build. A worker that reports a FAILED compile is retried\n"
+                                "locally before its diagnostics are believed." },
         EnvVarSpec { .name = EnvName::Token,
                      .summary = "Shared secret presented to a daemon started with\n"
                                 "--requirepass. Unset means no credential is sent, which is\n"
