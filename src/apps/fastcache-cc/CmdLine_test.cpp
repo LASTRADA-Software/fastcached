@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -12,6 +13,20 @@ using namespace FastCache::Cc;
 
 namespace
 {
+
+/// Unwrap an optional for assertion, yielding a default-constructed value when
+/// empty.
+///
+/// The same device the other test files use: clang-tidy's optional analysis cannot
+/// see a `has_value()` guard through Catch2's REQUIRE macro, so a direct `*x` after
+/// one reads as an unchecked access. `value_or` is provably safe, and the preceding
+/// REQUIRE still fails the test first when the optional is empty.
+template <typename T>
+[[nodiscard]] T Unwrap(std::optional<T> const& value)
+{
+    return value.value_or(T {});
+}
+
 ParsedCommand Parse(std::vector<std::string> const& argv)
 {
     return ParseCommand(std::span<std::string const> { argv });
@@ -440,12 +455,13 @@ TEST_CASE("RemoteCompileArgs keeps the flags that change generated code")
     auto const cmd = ParseCommand(argv);
     REQUIRE(cmd.parsedOk);
 
-    auto const remote = RemoteCompileArgs(cmd, argv);
-    REQUIRE(remote.has_value());
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
     for (auto const* kept: { "-std=c++23", "-O2", "-g", "-Wall", "-fPIC" })
     {
         INFO("flag " << kept);
-        CHECK(std::ranges::find(*remote, kept) != remote->end());
+        CHECK(std::ranges::find(remote, kept) != remote.end());
     }
 }
 
@@ -457,13 +473,14 @@ TEST_CASE("RemoteCompileArgs drops the source, the output and the compile marker
     auto const cmd = ParseCommand(argv);
     REQUIRE(cmd.parsedOk);
 
-    auto const remote = RemoteCompileArgs(cmd, argv);
-    REQUIRE(remote.has_value());
-    CHECK(std::ranges::find(*remote, "a.cpp") == remote->end());
-    CHECK(std::ranges::find(*remote, "build/a.o") == remote->end());
-    CHECK(std::ranges::find(*remote, "-o") == remote->end());
-    CHECK(std::ranges::find(*remote, "-c") == remote->end());
-    CHECK(std::ranges::find(*remote, "g++") == remote->end());
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+    CHECK(std::ranges::find(remote, "a.cpp") == remote.end());
+    CHECK(std::ranges::find(remote, "build/a.o") == remote.end());
+    CHECK(std::ranges::find(remote, "-o") == remote.end());
+    CHECK(std::ranges::find(remote, "-c") == remote.end());
+    CHECK(std::ranges::find(remote, "g++") == remote.end());
 }
 
 TEST_CASE("RemoteCompileArgs drops include directories in both spellings")
@@ -475,14 +492,15 @@ TEST_CASE("RemoteCompileArgs drops include directories in both spellings")
     auto const cmd = ParseCommand(argv);
     REQUIRE(cmd.parsedOk);
 
-    auto const remote = RemoteCompileArgs(cmd, argv);
-    REQUIRE(remote.has_value());
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
     for (auto const* gone: { "-Iinc", "-I", "other" })
     {
         INFO("argument " << gone);
-        CHECK(std::ranges::find(*remote, gone) == remote->end());
+        CHECK(std::ranges::find(remote, gone) == remote.end());
     }
-    CHECK(std::ranges::find(*remote, "-O2") != remote->end());
+    CHECK(std::ranges::find(remote, "-O2") != remote.end());
 }
 
 TEST_CASE("RemoteCompileArgs refuses a command line it cannot fully account for")
@@ -524,11 +542,12 @@ TEST_CASE("RemoteCompileArgs drops a separated flag together with its value")
     auto const cmd = ParseCommand(argv);
     REQUIRE(cmd.parsedOk);
 
-    auto const remote = RemoteCompileArgs(cmd, argv);
-    REQUIRE(remote.has_value());
-    CHECK(std::ranges::find(*remote, "dep.d") == remote->end());
-    CHECK(std::ranges::find(*remote, "-MF") == remote->end());
-    CHECK(std::ranges::find(*remote, "-O2") != remote->end());
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+    CHECK(std::ranges::find(remote, "dep.d") == remote.end());
+    CHECK(std::ranges::find(remote, "-MF") == remote.end());
+    CHECK(std::ranges::find(remote, "-O2") != remote.end());
 }
 
 TEST_CASE("RemoteCompileArgs leaves nothing that names a path")
@@ -541,9 +560,10 @@ TEST_CASE("RemoteCompileArgs leaves nothing that names a path")
                                           "-MT",     "target",   "-O2", "-c",          "a.cpp" };
     auto const cmd = ParseCommand(argv);
 
-    auto const remote = RemoteCompileArgs(cmd, argv);
-    REQUIRE(remote.has_value());
-    for (auto const& arg: *remote)
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+    for (auto const& arg: remote)
     {
         INFO("surviving argument: " << arg);
         CHECK_FALSE(arg.contains('/'));
@@ -558,11 +578,12 @@ TEST_CASE("RemoteCompileArgs drops the MSVC spellings too")
     auto const cmd = ParseCommand(argv);
     REQUIRE(cmd.parsedOk);
 
-    auto const remote = RemoteCompileArgs(cmd, argv);
-    REQUIRE(remote.has_value());
-    CHECK(std::ranges::find(*remote, "/std:c++20") != remote->end());
-    CHECK(std::ranges::find(*remote, "/O2") != remote->end());
-    CHECK(std::ranges::find(*remote, "/Iinc") == remote->end());
-    CHECK(std::ranges::find(*remote, "/c") == remote->end());
-    CHECK(std::ranges::find(*remote, "a.cpp") == remote->end());
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+    CHECK(std::ranges::find(remote, "/std:c++20") != remote.end());
+    CHECK(std::ranges::find(remote, "/O2") != remote.end());
+    CHECK(std::ranges::find(remote, "/Iinc") == remote.end());
+    CHECK(std::ranges::find(remote, "/c") == remote.end());
+    CHECK(std::ranges::find(remote, "a.cpp") == remote.end());
 }
