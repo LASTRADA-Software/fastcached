@@ -151,15 +151,15 @@ These constraints are load-bearing and have each already been a bug:
   paths, named a file that is gone. That is worse than a miss, because Ninja records the
   dependency, cannot stat it, rebuilds, hits the same value, and never converges — with a
   successful exit code every time. The dependency path set is therefore part of the key
-  (`objkey-v3`, `KeyInputs::dependencyPaths`), captured on the preprocess run the launcher
+  (`objkey-v4`, `KeyInputs::dependencyPaths`), captured on the preprocess run the launcher
   already makes rather than in a second probe: measured at **+1.5% on a 45 ms preprocess**,
   because the compiler has already opened every one of those files. A move is a different
   key by construction, so the *pre-move* entry survives the move rather than being
   overwritten — which is the property `check_header_move` asserts by moving the header
   back and requiring a HIT. Anchored as `fastcache-cc: HIT`: the launcher prints
   `STALE HIT (...); recompiling` on its way to a MISS, so a bare `grep HIT` is satisfied by
-  exactly the collapse the case exists to reject. `ComputeManifestKey`'s `manifest-v3` tag is
-  bumped in lock-step with `objkey-v3` for a related reason — a manifest stores the object key
+  exactly the collapse the case exists to reject. `ComputeManifestKey`'s `manifest-v4` tag is
+  bumped in lock-step with `objkey-v4` for a related reason — a manifest stores the object key
   *by value* and its own key never sees the object-key schema, so a manifest written by an
   older launcher keeps resolving to an older object; direct mode is on by default and
   short-circuits before the preprocessed path,
@@ -170,18 +170,65 @@ These constraints are load-bearing and have each already been a bug:
     `build/../inc/a.hpp` and `./inc/a.hpp` arrive verbatim, and unnormalized they are two
     key entries for one header and two different keys on two machines whose generators
     spell an include directory differently. Then it keeps a path that canonicalizes to a
-    `<SRCROOT>`/`<BUILDTREE>` token, and keeps a *relative* path (it resolves against the
-    compile's working directory, so it is machine-independent) — which must be decided
-    before the absolute test, since a relative path lies under no root either. It **drops**
-    toolchain content, judged by `DirectManifest`'s own `IsToolchainHeader` so that this
-    filter, the manifest's and the replay guard's cannot disagree: an absolute path under
-    neither root, *and* a vcpkg tree nested under the build tree, which canonicalizes but is
-    still the producing machine's. That is content already covered collectively by the
-    compiler identity in the key, and hashing it would mean two machines with the same
-    compiler at different install prefixes share *nothing at all* — 476 of a real TU's 635
-    headers are toolchain, and a manifest naming them would be machine-specific. The set is
-    sorted and deduplicated because `/showIncludes` repeats a header once per inclusion site
-    and emission order is a property of the driver.
+    `<SRCROOT>`/`<BUILDTREE>` token and **drops** toolchain content, judged by
+    `DirectManifest`'s own `IsToolchainHeader` so that this filter, the manifest's and the
+    replay guard's cannot disagree: a path under neither root, *and* a vcpkg tree nested
+    under the build tree, which canonicalizes but is still the producing machine's. That is
+    content already covered collectively by the compiler identity in the key, and hashing it
+    would mean two machines with the same compiler at different install prefixes share
+    *nothing at all* — 476 of a real TU's 635 headers are toolchain, and a manifest naming
+    them would be machine-specific. The set is sorted and deduplicated because
+    `/showIncludes` repeats a header once per inclusion site and emission order is a
+    property of the driver.
+    - **A relative path is classified by what it resolves to, never by its spelling** —
+      which is why `KeyDependencySet` takes a working directory at all, threaded from
+      `RunCached` through `CompileWorkingDirectory()`, the one place `main.cpp` answers
+      that question for both this filter and the replay guard. Both rules above ask what a
+      path *names*; "is it absolute" answers a different question, and the two invert for a
+      vendored or relocatable toolchain reached through a relative include path (issue
+      #64). `-isystem ../toolchain/include` makes the driver report
+      `../toolchain/include/foo.h`, which lies under no root — so a spelling test *kept and
+      hashed* the very file it drops when the driver spells the same header
+      `/home/dev/toolchain/include/foo.h`, and a build tree at a different depth then keyed
+      every TU that touches it differently. Resolving first collapses the two branches into
+      one: a relative project header becomes the token its absolute spelling would produce
+      (so one header reached two ways is one entry), and a relative toolchain header is
+      dropped exactly as an absolute one is. What the key gives up — a *vendored* header
+      move no longer re-keys — is what `Cc::MissingReplayedDependency` still covers, since
+      it probes a relative replayed path for existence before writing anything; the same
+      trade and the same backstop the absolute exclusion has always had. Two mechanics are
+      load-bearing: the resolution is **lexical**, because `weakly_canonical` would rewrite
+      an 8.3 short component to its long form and break the prefix tests two bullets down;
+      and it runs on `/`-folded text, because `std::filesystem` treats `\` as a separator
+      only on a Windows *host*, so a Windows path normalized on POSIX keeps its `..`
+      segments and canonicalizes to `<BUILDTREE>/../../inc/a.hpp` — a token naming a file
+      the path does not name. Two further host couplings live in that same lexical pass and
+      were each *measured* on libc++ rather than assumed. `lexically_normal` collapses a
+      leading `//` on POSIX and keeps it on Windows, where it is a UNC root name, so the
+      root is carried across the pass by hand — without that, a `\\server\share` layout
+      stops prefix-matching its own root on one host, classifies every project header as
+      toolchain, and hands back an empty set. And the absoluteness test is asked **before**
+      the collapse rather than after, because `C:/../x` normalizes to a bare `x` on POSIX
+      (`C:` is an ordinary filename there for `..` to eat) while Windows cannot ascend past
+      a drive root and keeps `C:/x` — so collapsing first sends an absolute path down the
+      resolve-against-the-working-directory branch on one host only. Asking first is also
+      what makes the relative branch normalize once, after the join, instead of on each
+      side of it. The tags moved to `objkey-v4`/`manifest-v4` for this change, in the
+      lock-step the manifest bullet above describes — but note which half forced it. The
+      *dependency-set* re-key would not have needed a bump on its own: it changes a key only
+      for a translation unit that reported a relative path, and those keys differ by
+      construction, so a stale entry becomes unreachable rather than servable under rules it
+      was not written by. The manifest half is what required it, and `objkey` follows the
+      manifest here rather than the other way round. A working directory that is empty or
+      itself relative drops
+      every relative path rather than guessing, and the `dependency set: N of M` note is
+      what keeps that from being silent. The *residual*, recorded deliberately: a relative
+      include-dir argument (`-I../../vendor/sdk/include`) still reaches the key verbatim
+      through `RelativizeArgs`, which canonicalizes only paths it can resolve — absolute
+      ones — so two machines whose build directories sit at different depths still key
+      apart on the arguments even though the dependency set now agrees. Closing that means
+      resolving arguments against the same working directory, which is a separate change to
+      a separate function.
   - **"Absolute or relative" is the wrong question on Windows, because there are three
     answers.** `C:foo` carries a drive specifier and is still not rooted: it resolves against
     *that drive's* current directory, per-process state on the producing machine that no
@@ -190,9 +237,13 @@ These constraints are load-bearing and have each already been a bug:
     IsAbsoluteForLayout` whose drive test stopped at the colon and so reported all three
     Windows shapes as absolute (issue #65). Every caller switches on it with no `default:`, so
     a fourth state is a compile error at each rather than a silent fall-through. What none of
-    them may do is treat it as `WorkingDirectory`: hashing it as relative would let two
-    machines whose `C:` cwd differs key **identically for different headers**, the same silent
-    cross-TU mis-serve #63 closed by a different route. **Past that the callers part, and
+    them may do is treat it as `WorkingDirectory`, and since issue #64 that branch does
+    something stronger than keep a spelling — it *resolves* the path against the compile's
+    working directory, which for `C:foo` names a file that was never read. Hashing the
+    spelling instead, as it used to, would let two machines whose `C:` cwd differs key
+    **identically for different headers**, the same silent cross-TU mis-serve #63 closed by a
+    different route. Either way the answer is the same: a drive-relative path is neither.
+    **Past that the callers part, and
     the asymmetry is the substance of the fix.** The key filter needs a portable *spelling*,
     so it leaves the path to the root tests — root membership is the stronger question, and
     under a drive-relative *root* (`C:src\proj`, a Windows root by its separators) the path
@@ -424,19 +475,26 @@ These constraints are load-bearing and have each already been a bug:
   longer spells `/Fo` or `-MF` itself — it drops every row whose role is not `IncludeDir`,
   so a spelling added to the table is dropped by construction rather than by someone
   remembering the fourth place.
-  - **This did not bump `objkey-v3` / `manifest-v3`, and that is the deliberate half.**
+  - **This did not bump `objkey-*` / `manifest-*`, and that is the deliberate half.**
+    (The tags now read `v4`, moved by issue #64's manifest half — a different change, for
+    a reason this one does not reach; the re-key here rides along in that invalidation
+    event rather than costing a second. The reasoning below is kept because it is the case
+    for *not* bumping, and it stands on its own.)
     The tag versions the key *construction* and the rules the stored value is written
-    under; both are unmoved, and `ComputeKey`'s golden vector is unchanged. What changed
-    is one *input*, for exactly the builds whose command line carried a machine-specific
-    string it should never have carried. Old entries stay correct in their own terms and
-    simply stop being addressed — they miss and are rewritten. The mis-serve a tag exists
+    under; both are unmoved by this change, and `ComputeKey`'s golden vector did not move
+    for it either. What changed is one *input*, for exactly the builds whose command line
+    carried a machine-specific string it should never have carried. Old entries stay
+    correct in their own terms and simply stop being addressed — they miss and are
+    rewritten. The mis-serve a tag exists
     to prevent is unreachable here: an old key could only become a new key if a build
     literally passed the text `<BUILDTREE>`, and a `/Fo` path that was already relative
     canonicalizes to itself and does not move at all. A bump would meanwhile invalidate
     every POSIX entry, where nothing changed. Direct mode needs no bump either, and not by
     luck: `ComputeManifestKey` takes the relativized args too, so a manifest key moves
     exactly where an object key does, in lock-step, for exactly the affected builds — the
-    property whose *absence* is what forced the `manifest-v2`/`v3` bumps.
+    property whose *absence* is what forced the `manifest-v2`/`v3` bumps, and whose
+    presence is why `manifest-v4` had to be argued from the manifest side rather than
+    from this one.
 - **A key that is 128 bits wide is not a key with 128 bits of strength, and four
   lanes of one polynomial are one lane.** The object key was four CRC32C digests of
   the same blob, distinguished only by a leading salt byte. CRC is affine over
@@ -460,7 +518,7 @@ These constraints are load-bearing and have each already been a bug:
   published algorithm rather than a bespoke construction, which is the whole point: its conformance is checkable
   against SMHasher's verification value `0x6384BA69`, and a construction assembled
   here would have nothing to be checked against. Consequences that are each
-  load-bearing: `objkey-v3` and `manifest-v3` moved together because this is one
+  load-bearing: `objkey-v3` and `manifest-v3` moved together (to v3) because that was one
   invalidation event, and `HashFileContents` moved with them — it paired one CRC32C
   with the byte count, which is 32 bits against exactly the same-length case, and it
   is what a *direct hit* revalidates against, so a collision there does not miss, it

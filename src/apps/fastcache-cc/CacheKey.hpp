@@ -20,8 +20,10 @@ struct KeyInputs
     std::vector<std::string> relativizedArgs; ///< Compile args with checkout-rooted paths relativized.
 
     /// The dependency paths the compile resolves, in portable form (see
-    /// DependencyProbe's KeyDependencySet, which produces this: canonical tokens
-    /// and relative paths, sorted and deduplicated, toolchain absolutes dropped).
+    /// DependencyProbe's KeyDependencySet, which produces this: canonical tokens,
+    /// sorted and deduplicated, toolchain paths dropped — a relative path having
+    /// been resolved against the compile's working directory first, so that what
+    /// it names rather than how it was spelled decides which of the two it is).
     ///
     /// A hit reproduces TWO artefacts — the object and the build system's
     /// dependency record — and without this the key determines only the first.

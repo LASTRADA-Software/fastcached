@@ -43,7 +43,7 @@ enum class KeyPiece : std::uint8_t
 /// **It is also the whole of the domain separation between the key spaces**,
 /// now that the four salt bytes that used to distinguish them are gone (issue
 /// #63 — the salts never separated anything, they were four runs of one CRC).
-/// `objkey-v3`, `manifest-v3` and `header-state-v1` are different lengths and
+/// `objkey-v4`, `manifest-v4` and `header-state-v1` are different lengths and
 /// different bytes, so no blob in one domain can equal a blob in another.
 ///
 /// **Every piece is length-prefixed, not separator-terminated**, and that is
@@ -82,7 +82,7 @@ class KeyDigest
 {
   public:
     /// Begin a digest in the domain named by `schemaTag`.
-    /// @param schemaTag Schema label, e.g. `objkey-v3`.
+    /// @param schemaTag Schema label, e.g. `objkey-v4`.
     explicit KeyDigest(std::string_view schemaTag)
     {
         Field(schemaTag);
