@@ -1087,10 +1087,27 @@ collapse or a mis-serve and is now covered by regression tests:
   `Cc::IPathResolver` resolves the roots and every emitted path through the same
   function; resolving only one side breaks the driver that previously worked.
 
+- **A compile that writes a second artefact is not cached at all.** What a hit
+  reproduces is the object and the dependency record; a **C++ module interface
+  unit** also writes a BMI (`.ifc`, `.pcm`), and `/Yc` a precompiled header. Replay
+  one and the second artefact is either missing afterwards — which fails loudly —
+  or left over from a previous build, which does not. Both halves are one rule and
+  neither may be dropped: the module **extensions** (`.ixx`, `.cppm`, `.ccm`,
+  `.cxxm`, `.c++m`, `.mxx`) are classified as their own language and refused by
+  name, and an ordinary source **promoted by a flag** (`cl /interface`,
+  `-fmodule-output`, `--precompile`) is refused off a table. Until this was written
+  down the first half held by accident — those extensions simply were not in
+  `IsSourceSuffix`, so such a line fell through as "no source file found" and was
+  passed through *in silence*, which reads exactly like a broken cache; and the
+  obvious "add .ixx so modules are supported" change would have turned that
+  accident into a silent wrong build. The refusal now says so under
+  `FASTCACHE_VERBOSE`.
+
 The first two break cross-checkout sharing while every unit test still passes,
-the third breaks it the moment two machines differ, and the fourth breaks it the
-moment a root is spelled unusually, so `scripts/compile-cache-e2e.sh` (POSIX) and
-`run-launcher-e2e.ps1` (Windows) assert all of them end-to-end in CI on both
+the third breaks it the moment two machines differ, the fourth breaks it the
+moment a root is spelled unusually, and the fifth is a wrong *build* rather than a
+cold cache, so `scripts/compile-cache-e2e.sh` (POSIX) and
+`run-launcher-e2e.ps1` (Windows) assert them end-to-end in CI on both
 platforms.
 
 Distributed compilation adds two more, and both were found by running the feature
@@ -1109,12 +1126,53 @@ is the reproducible lesson, since no unit test can reach either:
   a *second* time, with markers, at ~45 ms on a path already committed to seconds
   of remote compilation. Reusing the key's text is the free-looking option and it
   is wrong.
-- **A worker must be told its input is already preprocessed.** Having added the
-  markers back, `-pedantic` then rejects the markers themselves as a GNU extension
-  (`-Wgnu-line-marker`) — the fix for the first defect creates the second. The
-  answer is the one ccache and distcc already use: `-x c++-cpp-output`
-  (`cpp-output` for C, and *nothing* for an MSVC driver, whose `/E` emits standard
-  `#line`). It is a `DriverSpec` column, not a branch, so a fifth driver is a row.
+- **A worker must be told its input is already preprocessed, AND what language it
+  is in.** Having added the markers back, `-pedantic` then rejects the markers
+  themselves as a GNU extension (`-Wgnu-line-marker`) — the fix for the first defect
+  creates the second. The answer is the one ccache and distcc already use:
+  `-x c++-cpp-output`. It is a `DriverSpec` column, not a branch, so a fifth driver
+  is a row.
+  - **MSVC's column was empty, and that was the whole of a second defect.** The
+    reasoning was that `/E` emits standard `#line` which `cl` accepts in an ordinary
+    source file, so there is nothing to tell it — true about the *markers*, and it
+    left nothing stating the *language*. The worker writes its own scratch file and
+    MSVC reads the language off that file's extension, so a dispatched `.c` came
+    back compiled as **C++**: a failed remote compile wherever C is not valid C++
+    (so C silently never distributed — the 100 %-fallback-with-a-green-build shape
+    this list already records twice), and an object with C++ mangling stored under
+    the C key wherever it is. `/TC` and `/TP` are the `-x` spelling MSVC does have,
+    and `/TP` is a **byte-for-byte no-op** on a C++ translation unit, so nothing
+    that worked before moves. Verified end to end on both Windows drivers.
+  - **The extension does not decide the language; it is the last of three
+    answers.** A `++` driver compiles *everything* as C++ — "g++ treats .c, .h and
+    .i files as C++ source files", in as many words — so taking the language off the
+    extension tells a worker to compile as C what the client compiles as C++. That
+    is a wrong object, not a failed one, and `gcc` and `g++` are one `Flavor`, so
+    the answer is a second column on the *name* table rather than a new question.
+    Above both, a build may state the language itself (`/TP`, `-x c++`, which is
+    what CMake emits for `set_source_files_properties(... LANGUAGE CXX)`); the
+    launcher appends its own spelling **last** so it wins, which is right when
+    nothing else spoke and silently overriding when something did — so such a
+    command line is **refused** instead. `/Tc`/`/Tp` are refused by the same row for
+    a second reason: they name a file, and with a bare file name they carry no
+    separator, so `CouldNameAFile` lets them past.
+  - **An extension whose language depends on the driver is never guessed at.** `.C`
+    is C++ to a GNU driver and C to an MSVC one, and `.M` likewise — so the
+    extension does not answer the question and a guess would hand a worker the wrong
+    language. Both are excluded from the table by a case-*sensitive* row, ahead of
+    the case-insensitive lookup that exists so a `.CPP` on Windows still dispatches.
+  - **A module interface unit is refused by both gates, and that is now a rule
+    rather than an accident.** `.ixx`, `.cppm` and their kin write a **BMI** beside
+    the object, and what a hit reproduces is the object and the dependency record —
+    so replaying one leaves the BMI missing (which fails loudly) or left over from a
+    previous build (which does not). They were previously not in `IsSourceSuffix`,
+    so nothing recognised them and every such line fell through as "no source file"
+    and was passed through **in silence**, indistinguishable from the cache being
+    broken; adding one there — the obvious "support modules" change — would have
+    started replaying objects whose BMI nobody reproduced. They are now recognised,
+    refused by name with the reason said out loud, and the same reason refuses an
+    ordinary source promoted by a flag (`cl /interface`, `-fmodule-output`,
+    `--precompile`, and `/Yc` for the precompiled-header case).
 
 Three more come from running the worker as a *service* rather than in a
 terminal, and each has already been a bug:
@@ -1166,6 +1224,28 @@ that a worker's object is **byte-identical** to a locally compiled one. That sin
 assertion is what fails if either rule is broken, and it is the whole soundness
 claim of the feature — an object that differs is stored under a key other machines
 then fetch.
+
+**On Windows that assertion has to be spelled differently, and it is measured
+rather than relaxed.** Both MSVC drivers write the **clock** into the COFF header
+(two compiles of one file to one path two seconds apart differ in exactly byte 4;
+only `/Brepro` suppresses it, and a fixture that passed `/Brepro` would be asserting
+something about a command line no build uses). `cl` additionally records the
+**absolute path of the object file** in `.debug$S` and hashes the file it opened
+into `.chks64`, with no debug flag asked for — and a worker compiles its own scratch
+file to its own scratch path, so neither can ever match. Everything carrying code or
+data does: `.text$mn`, `.rdata`, `.xdata`, `.pdata`, `.drectve`, `.data$r` and
+`.bss` are byte-identical between a reference compile of the original source and a
+worker-shaped compile of `/E` text elsewhere. `dist-compile-e2e.ps1` therefore
+compares **section by section** against a per-driver table of what may differ, and
+`clang-cl`'s row is *empty* — it records only the source's base name, which the
+worker is now told, so its objects differ by the clock alone. Two lessons are worth
+keeping: the COFF **header** is compared field by field rather than skipped, because
+an object built for another architecture differs *there and nowhere a section walk
+would look*; and the comparison has a `-SelfTest` of its own, because the fixture's
+own logic is the one thing nothing else tests — the previous control compared two
+objects with different **names**, which `cl` records inside the object, and so
+reported a perfectly reproducible driver as non-reproducible in a CI log, as the
+answer to the question the fixture had been asking for three commits.
 
 **Every wait in that fixture is bounded, and that is a rule rather than a
 detail.** Its first version killed a worker and then `wait`ed, which HANGS when a

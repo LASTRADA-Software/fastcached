@@ -274,6 +274,20 @@ put mTLS in front of both ports for anything beyond a trusted build network.
   which also regenerates the diagnostics with correct line numbers.
 - **`--install-service` exists on Linux only.** macOS and Windows workers run in
   the foreground or under a supervisor you provide.
+- **On Windows a dispatched object is not byte-identical to a local one — the code
+  in it is.** Every MSVC-family driver stamps the clock into the COFF header, and
+  `cl` also records the absolute path of the object file (in `.debug$S`) and a hash
+  of the source file it opened (in `.chks64`), with no debug flag asked for. A
+  worker compiles its own scratch file, so those three differ; every section
+  carrying code or data is byte-identical, which is what the end-to-end test
+  asserts. If your build compares object bytes across machines, compare sections.
+- **Some compiles are never distributed, by design.** A C++ **module interface
+  unit** and any compile that writes a precompiled header produce a second artefact
+  beside the object, and only the object travels — so those are compiled locally and
+  are not cached either. So is a command line that names its input language itself
+  (`/TP`, `-x c++`), because the launcher has to state the language of the
+  preprocessed text it sends and would otherwise silently override yours. Run with
+  `FASTCACHE_VERBOSE=1` to see which of these applied.
 
 ## Reference
 

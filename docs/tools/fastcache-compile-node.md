@@ -150,12 +150,23 @@ scheduler trying to route around it.
 ## What a worker will not do
 
 - **Run a program a client named.** The compiler comes from `--toolchain`.
-- **Touch a path a client named.** The object path, the source path and the
-  working directory are all the worker's, inside a per-job scratch directory it
-  creates and removes. A command line carrying anything that could name a file is
-  refused outright, on both ends — the client's check protects an honest client
-  from dispatching something that would not work, and the worker's protects it
-  from a client that is not honest.
+- **Touch a path a client named.** The object path and the directory are the
+  worker's own, inside a per-job scratch directory it creates and removes. A
+  command line carrying anything that could name a file is refused outright, on
+  both ends — the client's check protects an honest client from dispatching
+  something that would not work, and the worker's protects it from a client that
+  is not honest.
+
+  The one thing a client does get to choose is what its translation unit is
+  **called**, because a compiler records the name of the file it was handed and an
+  object built under an invented name is gratuitously different from a locally
+  built one. The name is reduced to a single component and an allow-listed shape
+  before it becomes a path — no separators, no parent-directory segments, no
+  drive letters, a bounded length, an extension from a fixed set, and never a
+  Windows device name such as `CON` — and anything failing that is compiled as
+  `tu.cpp` rather than refused. **The language never rides on it:** the client
+  states the language explicitly (`-x c++-cpp-output`, `/TP`), so a name the
+  worker had to invent cannot decide how the text is compiled.
 - **Write to the cache.** Workers get no cache credentials.
 
 ## Security
