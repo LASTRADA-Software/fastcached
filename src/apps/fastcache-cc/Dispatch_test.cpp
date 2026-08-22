@@ -311,7 +311,7 @@ TEST_CASE("A Windows-spelled source path is reduced to its base name too", "[dis
 
     std::vector<std::string> const args { "-O2" };
     auto request = Request(args);
-    request.sourceName = "D:\\checkout\\src\\Widget.cpp";
+    request.sourceName = R"(D:\checkout\src\Widget.cpp)";
     REQUIRE(Dispatch(dialer, request).Ran());
 
     auto const& toWorker = dialer.SentTo(std::string { Worker });
