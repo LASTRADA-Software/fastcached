@@ -414,7 +414,29 @@ try {
                         Write-Host "  control MATCHES the worker: the difference is preprocessed-vs-original input,"
                         Write-Host "  not the worker's environment."
                     } else {
-                        Write-Host "  control DIFFERS from the worker too: the worker's environment is leaking in."
+                        Write-Host "  control DIFFERS from the worker too."
+                        # The control that decides whether this is a LEAK or simply
+                        # not achievable. Compile the identical input twice, in the
+                        # same directory, seconds apart: if THOSE differ, the driver
+                        # does not produce reproducible objects at all -- MSVC stamps
+                        # a TimeDateStamp into the COFF header unless /Brepro is
+                        # given -- and byte-identity is the wrong assertion for this
+                        # platform rather than a violated one.
+                        Write-Host "--- control 2: is this driver even reproducible? ---"
+                        $ctlObj2 = Join-Path $ctlDir "tu2.o"
+                        & $cc /nologo -c $ctlSrc "/Fo$ctlObj2" 2>&1 | Out-Null
+                        if (Test-Path $ctlObj2) {
+                            if (Test-SameBytes $ctlObj $ctlObj2) {
+                                Write-Host "  two identical local compiles MATCH: the driver is reproducible,"
+                                Write-Host "  so the worker really is leaking its environment into the object."
+                            } else {
+                                Write-Host "  two identical local compiles DIFFER: this driver does not produce"
+                                Write-Host "  reproducible objects, so byte-identity is unachievable here and the"
+                                Write-Host "  assertion -- not the product -- is what needs to change."
+                            }
+                        } else {
+                            Write-Host "  second control compile produced no object; inconclusive"
+                        }
                     }
                 } else {
                     Write-Host "  control compile produced no object; inconclusive"
