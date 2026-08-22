@@ -8,11 +8,15 @@ SERVICE="@FASTCACHED_SERVICE_NAME@"
 
 case "$1" in
     configure)
-        # Create the fastcached system user from the shipped sysusers.d entry.
+        # Create the service accounts from the shipped sysusers.d entries.
+        # Two of them, and they are separate on purpose: fastcached owns the
+        # cache storage while the compile worker runs a compiler, and the trust
+        # model gives a worker no cache credentials at all.
         # systemd-sysusers is idempotent, so an upgrade over an existing user
         # is a no-op rather than an error.
         if [ -x /usr/bin/systemd-sysusers ] || [ -x /bin/systemd-sysusers ]; then
             systemd-sysusers "@FASTCACHED_SYSUSERS_FILE@" >/dev/null 2>&1 || true
+            systemd-sysusers "@FASTCACHED_NODE_SYSUSERS_FILE@" >/dev/null 2>&1 || true
         fi
         if [ -x /usr/bin/systemd-tmpfiles ] || [ -x /bin/systemd-tmpfiles ]; then
             systemd-tmpfiles --create "@FASTCACHED_TMPFILES_FILE@" >/dev/null 2>&1 || true

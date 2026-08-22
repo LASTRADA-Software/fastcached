@@ -17,6 +17,10 @@ src/FastCache/
                 BlockingSocket (Winsock + POSIX),
                 EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
                 InMemoryTransport (paired pipes + InMemoryListener),
+                InheritedListener (systemd socket activation: LISTEN_FDS/
+                LISTEN_PID parsing is pure and unit-tested; adoption applies
+                close-on-exec and the shutdown timeouts, which are parameters
+                rather than the caller's job),
                 Framing/ByteReader (line and length-prefixed)
   Cli/          UsageDoc (usage text as data: sections of aligned rows and
                 prose, rendered with an ANSI palette) and Options (OptionSpec
@@ -33,6 +37,14 @@ src/FastCache/
                 + tagged-text-region framing), PrefetchGroupManifest
                 (prefetch-group id -> key-set + reverse index) — the
                 compile-cache executor's domain logic
+  Distributed/  WorkerRegistry (the worker set: exact-fingerprint grouping,
+                least-outstanding pick, heartbeat expiry over IClock) and
+                LeaseTable (lease issue/expiry/release plus the in-flight key
+                map that suppresses duplicate work). Both pure with respect to
+                I/O, which is what lets every capacity and expiry rule be a
+                ManualClock unit test rather than a sleep. Named Distributed
+                and not Dispatch because RedisResp.cpp already has a Dispatch()
+                that collides under unqualified lookup inside namespace FastCache.
   Protocol/     IProtocolHandler, ProtocolAutodetect, MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
                 RedisResp (RESP2), CompileCacheHandler (the executor: custom
@@ -51,7 +63,10 @@ src/FastCache/
   Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader,
                 EnvExpand ($VAR/${VAR} in path settings), DefaultConfigPath
                 (per-platform config lookup + --seed-config, behind IConfigPathProbe)
-  Metrics/      IMetricsSink + AtomicMetricsSink
+  Metrics/      IMetricsSink + AtomicMetricsSink (counter-only by design; the
+                dispatch counters separate no-worker from no-capacity because
+                one says a fleet is misconfigured and the other that it is too
+                small, and summing them hides the first when a fleet is busy)
 ```
 
 Every executable lives under `src/apps/<name>/` and declares its own target and
@@ -78,6 +93,17 @@ src/apps/
                             its help renders and colorizes exactly like the
                             daemon's without linking the library. `Cli/Options`
                             is header-only, so including it costs no build row.
+  fastcache-compile-node/   the compile worker (FASTCACHED_BUILD_NODE, default
+                            ON) — registers with a scheduler's `--listen-dispatch`
+                            endpoint, then answers exactly one verb, `Compile`,
+                            on its own port. It takes a *fingerprint* from a job
+                            and never a program: the compiler comes from this
+                            node's own `--toolchain` table, which is what keeps a
+                            build accelerator from being a remote shell. Links
+                            `FastCache` (unlike the launcher), because it needs
+                            the reactor and the wire, and holds no cache stack of
+                            its own — `AdminHttpServer`, not `Server`, is the
+                            shape it follows.
   compile-cache-testclient/ low-level `0xFC` protocol probe + cross-depth
                             validation (FASTCACHED_BUILD_TESTCLIENT, default
                             OFF — test infrastructure, never installed)
@@ -1061,11 +1087,194 @@ collapse or a mis-serve and is now covered by regression tests:
   `Cc::IPathResolver` resolves the roots and every emitted path through the same
   function; resolving only one side breaks the driver that previously worked.
 
+- **A compile that writes a second artefact is not cached at all.** What a hit
+  reproduces is the object and the dependency record; a **C++ module interface
+  unit** also writes a BMI (`.ifc`, `.pcm`), and `/Yc` a precompiled header. Replay
+  one and the second artefact is either missing afterwards — which fails loudly —
+  or left over from a previous build, which does not. Both halves are one rule and
+  neither may be dropped: the module **extensions** (`.ixx`, `.cppm`, `.ccm`,
+  `.cxxm`, `.c++m`, `.mxx`) are classified as their own language and refused by
+  name, and an ordinary source **promoted by a flag** (`cl /interface`,
+  `-fmodule-output`, `--precompile`) is refused off a table. Until this was written
+  down the first half held by accident — those extensions simply were not in
+  `IsSourceSuffix`, so such a line fell through as "no source file found" and was
+  passed through *in silence*, which reads exactly like a broken cache; and the
+  obvious "add .ixx so modules are supported" change would have turned that
+  accident into a silent wrong build. The refusal now says so under
+  `FASTCACHE_VERBOSE`.
+
 The first two break cross-checkout sharing while every unit test still passes,
-the third breaks it the moment two machines differ, and the fourth breaks it the
-moment a root is spelled unusually, so `scripts/compile-cache-e2e.sh` (POSIX) and
-`run-launcher-e2e.ps1` (Windows) assert all of them end-to-end in CI on both
+the third breaks it the moment two machines differ, the fourth breaks it the
+moment a root is spelled unusually, and the fifth is a wrong *build* rather than a
+cold cache, so `scripts/compile-cache-e2e.sh` (POSIX) and
+`run-launcher-e2e.ps1` (Windows) assert them end-to-end in CI on both
 platforms.
+
+Distributed compilation adds two more, and both were found by running the feature
+under **this repository's own build flags** rather than a toy command line — which
+is the reproducible lesson, since no unit test can reach either:
+
+- **The text sent to a worker is NOT the text the key hashed, and the difference
+  is `#line`.** The key's probe suppresses markers so no checkout path reaches it
+  (the rule directly above). Those same markers are the only thing telling the
+  compiler which lines came from a *system header*. Feed a worker the key's text
+  and every warning inside libc++ or the CRT is re-reported as if it came from
+  the user's own file — under `-pedantic -Werror`, which this project builds with,
+  that is a failed compile. Every dispatched TU would fail and be retried locally,
+  so **distribution would appear to work while never once helping**: a silent
+  100 % fallback with a green build. So `DispatchPreprocessCommand` preprocesses
+  a *second* time, with markers, at ~45 ms on a path already committed to seconds
+  of remote compilation. Reusing the key's text is the free-looking option and it
+  is wrong.
+- **A worker must be told its input is already preprocessed, AND what language it
+  is in.** Having added the markers back, `-pedantic` then rejects the markers
+  themselves as a GNU extension (`-Wgnu-line-marker`) — the fix for the first defect
+  creates the second. The answer is the one ccache and distcc already use:
+  `-x c++-cpp-output`. It is a `DriverSpec` column, not a branch, so a fifth driver
+  is a row.
+  - **MSVC's column was empty, and that was the whole of a second defect.** The
+    reasoning was that `/E` emits standard `#line` which `cl` accepts in an ordinary
+    source file, so there is nothing to tell it — true about the *markers*, and it
+    left nothing stating the *language*. The worker writes its own scratch file and
+    MSVC reads the language off that file's extension, so a dispatched `.c` came
+    back compiled as **C++**: a failed remote compile wherever C is not valid C++
+    (so C silently never distributed — the 100 %-fallback-with-a-green-build shape
+    this list already records twice), and an object with C++ mangling stored under
+    the C key wherever it is. `/TC` and `/TP` are the `-x` spelling MSVC does have,
+    and `/TP` is a **byte-for-byte no-op** on a C++ translation unit, so nothing
+    that worked before moves. Verified end to end on both Windows drivers.
+  - **The extension does not decide the language; it is the last of three
+    answers.** A `++` driver compiles *everything* as C++ — "g++ treats .c, .h and
+    .i files as C++ source files", in as many words — so taking the language off the
+    extension tells a worker to compile as C what the client compiles as C++. That
+    is a wrong object, not a failed one, and `gcc` and `g++` are one `Flavor`, so
+    the answer is a second column on the *name* table rather than a new question.
+    Above both, a build may state the language itself (`/TP`, `-x c++`, which is
+    what CMake emits for `set_source_files_properties(... LANGUAGE CXX)`); the
+    launcher appends its own spelling **last** so it wins, which is right when
+    nothing else spoke and silently overriding when something did — so such a
+    command line is **refused** instead. `/Tc`/`/Tp` are refused by the same row for
+    a second reason: they name a file, and with a bare file name they carry no
+    separator, so `CouldNameAFile` lets them past.
+  - **An extension whose language depends on the driver is never guessed at.** `.C`
+    is C++ to a GNU driver and C to an MSVC one, and `.M` likewise — so the
+    extension does not answer the question and a guess would hand a worker the wrong
+    language. Both are excluded from the table by a case-*sensitive* row, ahead of
+    the case-insensitive lookup that exists so a `.CPP` on Windows still dispatches.
+  - **A module interface unit is refused by both gates, and that is now a rule
+    rather than an accident.** `.ixx`, `.cppm` and their kin write a **BMI** beside
+    the object, and what a hit reproduces is the object and the dependency record —
+    so replaying one leaves the BMI missing (which fails loudly) or left over from a
+    previous build (which does not). They were previously not in `IsSourceSuffix`,
+    so nothing recognised them and every such line fell through as "no source file"
+    and was passed through **in silence**, indistinguishable from the cache being
+    broken; adding one there — the obvious "support modules" change — would have
+    started replaying objects whose BMI nobody reproduced. They are now recognised,
+    refused by name with the reason said out loud, and the same reason refuses an
+    ordinary source promoted by a flag (`cl /interface`, `-fmodule-output`,
+    `--precompile`, and `/Yc` for the precompiled-header case).
+
+Three more come from running the worker as a *service* rather than in a
+terminal, and each has already been a bug:
+
+- **A listener that cannot be woken cannot be shut down, and that is a property
+  of the SOCKET rather than of the loop.** POSIX does not unblock a parked
+  `accept()` when another thread closes the listening socket, so the only
+  portable wake-up is `SO_RCVTIMEO` making `accept()` return periodically —
+  which is exactly what `BlockingListener::SetTimeouts` exists for, and what the
+  daemon's admin listener already does. `WorkerServer::Run` *documents* that poll
+  timeout as the mechanism it relies on, and nothing supplied one: installing a
+  SIGTERM handler then made the signal non-fatal without making the loop
+  reachable, so `systemctl stop` hung until the supervisor escalated to SIGKILL.
+  **macOS hides it** — there `close()` does wake the accept — which is why it
+  passed locally and on `macOS-clang-release` and failed only on Linux, as
+  `dist-compile-e2e ***Timeout 900.10 sec` in three jobs. It then arrived a
+  *second* time through socket activation, where the caller was expected to apply
+  the timeouts after adopting; `AdoptInheritedListeners` now takes them as
+  parameters, so there is no way to obtain a listener that cannot be stopped.
+- **`LISTEN_PID` is not a formality.** The activation variables survive fork and
+  exec, so every grandchild of an activated service sees them. Adopting on their
+  strength alone means treating whatever the parent left on descriptor 3 as a
+  listening socket — a log file, a database connection, the read end of a pipe —
+  and then accepting on it forever. The check is what makes "is fd 3 a listener?"
+  answerable at all, which is why `ParseSocketActivation` is pure and every rule
+  around it is a unit test. Two consequences: the variables are cleared **even
+  when nothing was adopted**, since a process that decided they were not addressed
+  to it must not pass them to a child that would decide differently on a reused
+  pid; and the adopted descriptors are marked close-on-exec, because systemd
+  deliberately omits that so a service can re-exec itself, while this worker
+  spawns a compiler per job and a compiler holding the listening socket keeps the
+  port alive after the worker exits.
+- **Under socket activation `--advertise` is required, because the fallback
+  becomes a guess the process cannot make.** The socket unit owns the port and
+  never tells the service which one, so `{--bind}:{--port}` describes nothing —
+  and `0.0.0.0` is not an address a remote client can dial regardless. The failure
+  is the worst shape this system has: registration *succeeds*, the worker
+  heartbeats happily, the scheduler leases that endpoint out, and every client
+  fails to connect and compiles locally, with no error anywhere and a fleet that
+  looks healthy from both ends. Refused at startup instead — and refused **before**
+  the toolchain walk, which is the same cheap-and-fallible-first ordering the
+  adoption check follows: a fingerprint takes seconds, a misconfiguration is
+  decided in microseconds, and doing the expensive thing first means an operator
+  watching a worker start sees nothing during the part where something can still
+  go wrong.
+
+`scripts/dist-compile-e2e.sh` asserts the consequence rather than the mechanism:
+that a worker's object is **byte-identical** to a locally compiled one. That single
+assertion is what fails if either rule is broken, and it is the whole soundness
+claim of the feature — an object that differs is stored under a key other machines
+then fetch.
+
+**On Windows that assertion has to be spelled differently, and it is measured
+rather than relaxed.** Both MSVC drivers write the **clock** into the COFF header
+(two compiles of one file to one path two seconds apart differ in exactly byte 4;
+only `/Brepro` suppresses it, and a fixture that passed `/Brepro` would be asserting
+something about a command line no build uses). `cl` additionally records the
+**absolute path of the object file** in `.debug$S` and hashes the file it opened
+into `.chks64`, with no debug flag asked for — and a worker compiles its own scratch
+file to its own scratch path, so neither can ever match. Everything carrying code or
+data does: `.text$mn`, `.rdata`, `.xdata`, `.pdata`, `.drectve`, `.data$r` and
+`.bss` are byte-identical between a reference compile of the original source and a
+worker-shaped compile of `/E` text elsewhere. `dist-compile-e2e.ps1` therefore
+compares **section by section** against a per-driver table of what may differ, and
+`clang-cl`'s row is *empty* — it records only the source's base name, which the
+worker is now told, so its objects differ by the clock alone. Three lessons are
+worth keeping, and each was a hole first:
+
+- The COFF **header** is compared field by field rather than skipped, because an
+  object built for another architecture differs *there and nowhere a section walk
+  would look*. Its two excused fields are excused by name — the clock, and the
+  symbol-table pointer, which moves whenever an excused section changes size.
+- **A section walk alone accepted a truncated object.** MSVC writes the symbol
+  table last, so cutting a tenth off a file leaves every section intact and
+  comparing equal — and a truncated transfer is one of the few faults distribution
+  can actually introduce. COFF states its own end (the string table opens with a
+  size that includes itself and is the last thing in the file), and that check runs
+  on both sides under every rule: "the file is as large as it claims" is not a
+  property a driver gets to opt out of. Whether the tail's *content* may differ is
+  a second per-driver column, measured the same way — clang-cl's is identical, and
+  `cl`'s is not.
+- The comparison has a **`-SelfTest`** of its own, because the fixture's own logic
+  is the one thing nothing else tests. Two defects in it were found that way and
+  one by asking it to reject deliberately wrong objects: the earlier control
+  compared two objects with different **names**, which `cl` records inside the
+  object, and so reported a perfectly reproducible driver as non-reproducible in a
+  CI log — as the answer to the question the fixture had been asking for three
+  commits.
+
+**Every wait in that fixture is bounded, and that is a rule rather than a
+detail.** Its first version killed a worker and then `wait`ed, which HANGS when a
+signal is handled but the stop never completes — and a 900-second ctest timeout
+naming nothing is the least useful way CI can report a defect. `stop_and_require_exit`
+fails in 15s saying what it waited for, and the cleanup trap escalates to SIGKILL
+rather than blocking, because cleanup runs on every exit path including the
+failing ones: an unbounded wait there turns any single failed assertion into a
+silent suite timeout. The same lesson applies to unit tests — a helper thread
+spinning on a counter a regression never advances hangs instead of failing, which
+is what the `IdleListener` hook exists to avoid. Relatedly, CI's live-systemd step
+waits for the worker's **own** readiness line rather than `systemctl is-active`:
+`Type=simple` is reported active the moment systemd forks, while the worker still
+has seconds of include-tree walking to do.
 
 Production flow: `main()` -> CLI -> optional YAML -> `ConfigReloader` ->
 `CacheEngine` over `InMemoryLruStorage` (or, when `--storage` is set, a
@@ -1247,6 +1456,23 @@ and exiting 0, matched by `SKIP_REGULAR_EXPRESSION` — a `cmake -P` script cann
 choose its own exit code before CMake 3.29 (`cmake_language(EXIT)`) and this
 project supports 3.28, so a `SKIP_RETURN_CODE` it could never return would be dead
 configuration.
+
+**Which CMakeLists registers a script-driven test is load-bearing, not filing.**
+`src/apps` walks its app table *in order*, so a test registered beside one binary
+cannot name a binary that comes later in that table: at the point
+`src/apps/fastcache-cc` is configured, `fastcache-compile-node` is not a target
+yet, and a `$<TARGET_FILE:>` guard on it does not fail — it silently skips the
+test, forever, with one `message(STATUS)` in a configure log nobody reads.
+`src/tests` is added *after* `src/apps`, so every target exists by the time it
+runs. That is why `dist-compile-e2e` lives there, and the general rule is that a
+script-driven test naming more than one executable belongs in `src/tests`
+regardless of which binary it feels closest to. (`compile-cache-e2e` predates the
+rule and names only `fastcached`, which the table happens to reach first.)
+
+`dist-compile-e2e` additionally allocates its ports per run rather than fixing
+them. It needs four, and four more fixed ports is four more ways to collide with
+whatever else a CI runner is doing — a failure that reads as "distribution is
+broken" when it means "something else was listening".
 
 ## Releasing
 

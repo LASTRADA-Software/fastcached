@@ -134,6 +134,16 @@ enum class Op : std::uint8_t
     Store = 0x01, ///< Canonicalize and store a compile result.
     Fetch = 0x02, ///< Retrieve a compile result in canonical form.
     Auth = 0x03,  ///< Present a credential; gates every other verb when auth is on.
+
+    // Distributed execution. These are answered only on a listener whose role
+    // mask carries `Dispatch` — a cache-only listener refuses them with
+    // `DispatchNotPermitted` rather than serving them, because the surface that
+    // causes a compiler to RUN somewhere else has a different trust posture from
+    // the one that reads and writes a cache. See `BindConfig::roles`.
+    Register = 0x04,  ///< Worker announces its toolchain, endpoint and capacity.
+    Heartbeat = 0x05, ///< Worker reports liveness and its current load.
+    Lease = 0x06,     ///< Client asks the scheduler for a worker to compile on.
+    Compile = 0x07,   ///< Client hands a worker one preprocessed translation unit.
 };
 
 /// Reply status, the first byte of every reply.
@@ -167,6 +177,32 @@ enum class ErrorCode : std::uint8_t
     CanonicalizationFailed = 0x06, ///< A text region's paths could not be canonicalized.
     StorageWriteFailed = 0x07,     ///< The cache engine refused the write.
     Unauthenticated = 0x08,        ///< A credential is required and has not been accepted.
+
+    // Distributed execution. Every one of these is a REFUSAL the client answers by
+    // compiling locally, never by failing: the client is holding the source and has
+    // a working fallback, so distribution must be incapable of breaking a build.
+    // They are distinct codes rather than one "no" because they mean different
+    // things to an operator — no matching toolchain in the fleet is a
+    // configuration problem, no free slot is a capacity problem, and a duplicate
+    // is neither.
+    NoWorker = 0x09,             ///< No registered worker matches the requested toolchain.
+    NoCapacity = 0x0A,           ///< Every matching worker is at its slot limit.
+    AlreadyInFlight = 0x0B,      ///< Another client already holds a lease for this key.
+    DispatchNotPermitted = 0x0C, ///< This listener's role mask does not carry `Dispatch`.
+    UnknownLease = 0x0D,         ///< The lease token is unknown, expired, or already spent.
+    FingerprintMismatch = 0x0E,  ///< The worker's toolchain is not the one the lease named.
+    UnsupportedCodec = 0x0F,     ///< No codec in common between the peers.
+    /// The worker could not prepare a scratch directory, or could not write the
+    /// translation unit into it. Distinct from the next one because they call for
+    /// different operator action -- a full or unwritable disk versus a toolchain
+    /// that is configured but not runnable.
+    WorkerScratchUnavailable = 0x10,
+    /// The worker could not START the compiler. Emphatically NOT "the compiler ran
+    /// and rejected the code": that is a successful exchange carrying a non-zero
+    /// exit code, and the client retries it locally to get real diagnostics. This
+    /// means the program named by the worker's own --toolchain could not be
+    /// executed at all.
+    WorkerSpawnFailed = 0x11,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -213,6 +249,20 @@ struct OpDescriptor
 /// it to make the server take memory.
 inline constexpr std::size_t MaxAuthPayload = 4096;
 
+/// Payload ceiling for the scheduler's control verbs (`Register`, `Heartbeat`,
+/// `Lease`).
+///
+/// These carry identifiers, an endpoint, a fingerprint and small integers — never
+/// anything that scales with a build artefact. `Compile` is the deliberate
+/// exception and leaves its ceiling to the operator's cap, because it carries a
+/// preprocessed translation unit, which is measured in megabytes.
+///
+/// Bounding them matters for a reason `MaxAuthPayload` does not share: these verbs
+/// are answered on a listener a whole fleet is meant to reach, and a scheduler
+/// that can be made to allocate 256 MiB per frame by anything that authenticated
+/// once is a scheduler that stops scheduling.
+inline constexpr std::size_t MaxControlPayload = 64 * 1024;
+
 /// Every opcode this build understands.
 ///
 /// `fieldCount` is the single source of the request arity — parsers take it from
@@ -243,6 +293,33 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = true,
                    .maxPayload = MaxAuthPayload },
+
+    // Distributed execution. None is `preAuth`: causing a compiler to run on
+    // another machine is the last thing an unauthenticated peer should reach.
+    OpDescriptor { .code = Op::Register,
+                   .name = "register",
+                   .fieldCount = 4, // fingerprint, endpoint, u32 slots, accepted codecs
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = false,
+                   .maxPayload = MaxControlPayload },
+    OpDescriptor { .code = Op::Heartbeat,
+                   .name = "heartbeat",
+                   .fieldCount = 2, // workerId, u32 inFlight
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = false,
+                   .maxPayload = MaxControlPayload },
+    OpDescriptor { .code = Op::Lease,
+                   .name = "lease",
+                   .fieldCount = 3, // fingerprint, key, accepted codecs
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = false,
+                   .maxPayload = MaxControlPayload },
+    OpDescriptor { .code = Op::Compile,
+                   .name = "compile",
+                   .fieldCount = 6, // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = false,
+                   .maxPayload = 0 }, // carries a preprocessed TU; the operator's cap governs
 };
 
 /// Whether every verb reachable before authentication declares a payload bound.
@@ -284,6 +361,29 @@ inline constexpr std::array ErrorTable {
         .code = ErrorCode::StorageWriteFailed, .name = "storage-write-failed", .defaultMessage = "storage write failed" },
     ErrorDescriptor {
         .code = ErrorCode::Unauthenticated, .name = "unauthenticated", .defaultMessage = "authentication required" },
+    ErrorDescriptor {
+        .code = ErrorCode::NoWorker, .name = "no-worker", .defaultMessage = "no worker matches this toolchain" },
+    ErrorDescriptor {
+        .code = ErrorCode::NoCapacity, .name = "no-capacity", .defaultMessage = "every matching worker is busy" },
+    ErrorDescriptor { .code = ErrorCode::AlreadyInFlight,
+                      .name = "already-in-flight",
+                      .defaultMessage = "another client is already compiling this key" },
+    ErrorDescriptor { .code = ErrorCode::DispatchNotPermitted,
+                      .name = "dispatch-not-permitted",
+                      .defaultMessage = "this endpoint does not serve distributed execution" },
+    ErrorDescriptor {
+        .code = ErrorCode::UnknownLease, .name = "unknown-lease", .defaultMessage = "unknown or expired lease" },
+    ErrorDescriptor { .code = ErrorCode::FingerprintMismatch,
+                      .name = "fingerprint-mismatch",
+                      .defaultMessage = "this worker's toolchain is not the one the lease named" },
+    ErrorDescriptor {
+        .code = ErrorCode::UnsupportedCodec, .name = "unsupported-codec", .defaultMessage = "no codec in common" },
+    ErrorDescriptor { .code = ErrorCode::WorkerScratchUnavailable,
+                      .name = "worker-scratch-unavailable",
+                      .defaultMessage = "the worker could not prepare a scratch directory" },
+    ErrorDescriptor { .code = ErrorCode::WorkerSpawnFailed,
+                      .name = "worker-spawn-failed",
+                      .defaultMessage = "the worker could not start the compiler" },
 };
 
 /// Look up the descriptor for a raw opcode byte.
@@ -460,6 +560,36 @@ namespace Detail
     inline void PutU32(std::span<std::byte> out, std::size_t offset, std::uint32_t n)
     {
         WriteBigEndian<std::uint32_t>(out.subspan(offset, sizeof(std::uint32_t)), n);
+    }
+
+    /// Pack length-prefixed fields, with no frame header in front of them.
+    ///
+    /// Used for REPLY payloads, which carry the same `[u32 len][bytes]` field
+    /// grammar a request payload does but are preceded by a reply header rather
+    /// than a request one. Factored out so that grammar has one author: it is what
+    /// `SplitFields` parses, and a second hand-rolled packer is how a producer and
+    /// its parser drift.
+    /// @param fields The fields, in wire order.
+    /// @return The packed fields.
+    [[nodiscard]] inline std::vector<std::byte> EncodeFields(std::initializer_list<std::span<std::byte const>> fields)
+    {
+        std::uint64_t const total =
+            std::ranges::fold_left(fields, std::uint64_t { 0 }, [](std::uint64_t acc, std::span<std::byte const> field) {
+                return acc + sizeof(std::uint32_t) + std::uint64_t { field.size() };
+            });
+        if (total > MaxFramePayload)
+            throw std::length_error("compile-cache reply payload exceeds the u32 wire length");
+
+        std::vector<std::byte> out(static_cast<std::size_t>(total));
+        std::size_t offset = 0;
+        for (auto const& field: fields)
+        {
+            PutU32(out, offset, static_cast<std::uint32_t>(field.size()));
+            offset += sizeof(std::uint32_t);
+            std::ranges::copy(field, std::next(out.begin(), Offset(offset)));
+            offset += field.size();
+        }
+        return out;
     }
 
     /// Build a complete request frame. **The only place a request header is
@@ -698,6 +828,446 @@ namespace Detail
     if (payload.empty())
         return std::nullopt;
     return std::pair { static_cast<ErrorCode>(payload[0]), AsStringView(payload.subspan(1)) };
+}
+
+// --- distributed execution ---------------------------------------------------
+//
+// Everything below frames the four dispatch verbs. Two conventions are shared by
+// all of them and are worth stating once.
+//
+// **Integers travel big-endian in a length-prefixed field of their own**, the way
+// every other multi-byte quantity here does. A field holding a `u32` is exactly
+// four bytes; a decoder that finds any other length rejects the frame rather than
+// reading what it can, because a short integer field is a sender this build does
+// not understand rather than a value to guess at.
+//
+// **Bulk payloads travel in a codec envelope**, `[u8 codec][u32 rawLen][bytes]`.
+// The codec byte is the id from `Core/Compression.hpp`'s `CompressionCodec`, and
+// `Identity` (0) is the uncompressed form, always available even in a build
+// configured without compression. The id is NOT re-declared here: this header must
+// stay dependency-free (see the file header), so it frames the byte and leaves its
+// meaning to the one enum that owns it. Both ends static_assert the agreement in a
+// translation unit that includes both, so drift is a build failure rather than a
+// wire incompatibility discovered in production.
+//
+// `rawLen` is the size BEFORE compression and is what a receiver sizes its output
+// buffer from. Carrying it is what lets a decoder reject a payload whose declared
+// expansion exceeds its cap before decompressing a byte — a compressed frame is
+// otherwise an unbounded allocation wearing a small size on the wire.
+
+/// Size of a codec envelope's fixed header: the codec byte plus the raw length.
+inline constexpr std::size_t CodecHeaderSize = 1 + sizeof(std::uint32_t);
+
+/// The codec id meaning "stored verbatim". Mirrors `CompressionCodec::Identity`,
+/// which is asserted equal wherever both headers are visible.
+inline constexpr std::uint8_t IdentityCodec = 0;
+
+/// A bulk payload as it travels: a codec tag, the pre-compression size, and the
+/// (possibly compressed) bytes.
+struct CodecEnvelope
+{
+    std::uint8_t codec { IdentityCodec }; ///< `CompressionCodec` id.
+    std::uint32_t rawLength { 0 };        ///< Size before compression.
+    std::span<std::byte const> bytes;     ///< The payload as it travels.
+};
+
+/// Frame a bulk payload into a codec envelope.
+/// @param codec The `CompressionCodec` id the bytes are encoded with.
+/// @param rawLength Size before compression; equal to `bytes.size()` for Identity.
+/// @param bytes The encoded bytes.
+/// @return The envelope, ready to be used as one length-prefixed field.
+[[nodiscard]] inline std::vector<std::byte> EncodeCodecEnvelope(std::uint8_t codec,
+                                                                std::uint32_t rawLength,
+                                                                std::span<std::byte const> bytes)
+{
+    if (bytes.size() > MaxFramePayload - CodecHeaderSize)
+        throw std::length_error("compile-cache codec envelope exceeds the u32 wire length");
+
+    std::vector<std::byte> out(CodecHeaderSize + bytes.size());
+    out[0] = static_cast<std::byte>(codec);
+    Detail::PutU32(out, 1, rawLength);
+    std::ranges::copy(bytes, std::next(out.begin(), Detail::Offset(CodecHeaderSize)));
+    return out;
+}
+
+/// Split a codec envelope into its tag, declared raw size, and bytes.
+/// @param field One length-prefixed field holding an envelope.
+/// @return The envelope, or nullopt when the field is too short to hold a header.
+[[nodiscard]] inline std::optional<CodecEnvelope> DecodeCodecEnvelope(std::span<std::byte const> field)
+{
+    if (field.size() < CodecHeaderSize)
+        return std::nullopt;
+    return CodecEnvelope { .codec = static_cast<std::uint8_t>(field[0]),
+                           .rawLength = ReadBigEndian<std::uint32_t>(field.subspan(1, sizeof(std::uint32_t))),
+                           .bytes = field.subspan(CodecHeaderSize) };
+}
+
+/// Encode a `u32` as its own length-prefixed field's contents.
+/// @param value The value.
+/// @return Exactly four big-endian bytes.
+[[nodiscard]] inline std::vector<std::byte> EncodeU32Field(std::uint32_t value)
+{
+    std::vector<std::byte> out(sizeof(std::uint32_t));
+    Detail::PutU32(out, 0, value);
+    return out;
+}
+
+/// Read a `u32` from a field that must hold exactly four bytes.
+///
+/// Strict about the width for the reason `SplitFields` is strict about trailing
+/// bytes: a field of another length is a sender speaking a shape this build does
+/// not know, and reading the first four bytes of it would invent a value.
+/// @param field The field.
+/// @return The value, or nullopt when the field is not exactly four bytes.
+[[nodiscard]] inline std::optional<std::uint32_t> DecodeU32Field(std::span<std::byte const> field)
+{
+    if (field.size() != sizeof(std::uint32_t))
+        return std::nullopt;
+    return ReadBigEndian<std::uint32_t>(field);
+}
+
+/// A codec preference list, most-preferred first.
+///
+/// Travels as one byte per codec id in a single field. A list rather than a single
+/// value because this is how the two ends agree WITHOUT a handshake: every exchange
+/// is client-initiated, so the request states what the sender can decode and the
+/// reply picks from it. That costs a few bytes in a frame already being sent, where
+/// a negotiation round trip would cost what the "no handshake" decision exists to
+/// protect.
+///
+/// `Identity` is always implicitly acceptable and need not be listed — a peer that
+/// can speak this protocol at all can read uncompressed bytes. Listing it anyway is
+/// harmless and is what a client with compression compiled out does.
+using CodecList = std::vector<std::uint8_t>;
+
+/// Encode a codec preference list.
+/// @param codecs The ids, most-preferred first.
+/// @return One byte per id.
+[[nodiscard]] inline std::vector<std::byte> EncodeCodecList(CodecList const& codecs)
+{
+    std::vector<std::byte> out;
+    out.reserve(codecs.size());
+    for (auto const id: codecs)
+        out.push_back(static_cast<std::byte>(id));
+    return out;
+}
+
+/// Decode a codec preference list.
+/// @param field The field.
+/// @return The ids, in the order the sender listed them.
+[[nodiscard]] inline CodecList DecodeCodecList(std::span<std::byte const> field)
+{
+    CodecList out;
+    out.reserve(field.size());
+    for (auto const byte: field)
+        out.push_back(static_cast<std::uint8_t>(byte));
+    return out;
+}
+
+/// Choose the codec to answer with: the receiver's most-preferred that the sender
+/// also accepts, falling back to `Identity`.
+///
+/// The SENDER's order decides, not the receiver's, because the sender is the one
+/// that has to decode the answer and knows what is cheap for it. Falling back to
+/// Identity rather than refusing is deliberate: an uncompressed answer is always
+/// correct, and a build must never lose its cache because two peers were compiled
+/// with different codec sets.
+/// @param accepted What the peer said it can decode.
+/// @param available What this build can actually produce.
+/// @return The chosen id; `IdentityCodec` when nothing else is in common.
+[[nodiscard]] inline std::uint8_t ChooseCodec(CodecList const& accepted, CodecList const& available)
+{
+    for (auto const id: accepted)
+        if (std::ranges::find(available, id) != available.end())
+            return id;
+    return IdentityCodec;
+}
+
+/// A worker announcing itself to the scheduler.
+struct RegisterRequest
+{
+    std::string_view fingerprint; ///< Opaque toolchain identity; matched byte-for-byte.
+    std::string_view endpoint;    ///< host:port a client can reach this worker on.
+    std::uint32_t slots { 0 };    ///< Jobs this worker will run concurrently.
+    CodecList acceptedCodecs;     ///< What it can decode.
+};
+
+/// The same, as views into a received payload.
+struct RegisterView
+{
+    std::span<std::byte const> fingerprint;
+    std::span<std::byte const> endpoint;
+    std::uint32_t slots { 0 };
+    CodecList acceptedCodecs;
+};
+
+/// A client asking the scheduler where to compile.
+struct LeaseRequest
+{
+    std::string_view fingerprint; ///< The toolchain the client is compiling with.
+    std::string_view key;         ///< The object key, for duplicate suppression.
+    CodecList acceptedCodecs;     ///< What the client can decode.
+};
+
+/// The same, as views into a received payload.
+struct LeaseView
+{
+    std::span<std::byte const> fingerprint;
+    std::span<std::byte const> key;
+    CodecList acceptedCodecs;
+};
+
+/// A client handing a worker one translation unit.
+struct CompileRequest
+{
+    std::string_view leaseToken;       ///< Issued by the scheduler; authorizes this job.
+    std::string_view fingerprint;      ///< Re-stated so the worker can refuse a mismatch itself.
+    std::span<std::byte const> args;   ///< Encoded, allow-listed compile arguments.
+    std::span<std::byte const> source; ///< Preprocessed TU, in a codec envelope.
+    /// What the CLIENT can decode, so the worker can compress the object it sends
+    /// back. Carried here rather than inferred from the lease, because the worker
+    /// never sees the lease request -- and asking the scheduler for it would put a
+    /// round trip on the one exchange that must not have one.
+    CodecList acceptedCodecs;
+    /// The BASE NAME of the translation unit, for the worker to name its scratch
+    /// file with.
+    ///
+    /// A compiler records the name of the file it was handed -- clang-cl and gcc in
+    /// the COFF/ELF `.file` symbol, MSVC in its compiland record -- so a worker that
+    /// invents a name of its own produces an object that differs from a locally
+    /// compiled one in that name and nothing else. Measured on clang-cl: seven bytes,
+    /// and byte-identical once the names agree.
+    ///
+    /// The base name only. The worker has no use for the client's directory and no
+    /// business learning it, and the worker sanitizes what arrives regardless: this
+    /// is a string from the network that becomes a path, so the two checks are the
+    /// same pair as the argument filter's.
+    std::string_view sourceName;
+};
+
+/// The same, as views into a received payload.
+struct CompileView
+{
+    std::span<std::byte const> leaseToken;
+    std::span<std::byte const> fingerprint;
+    std::span<std::byte const> args;
+    std::span<std::byte const> source;     ///< Still enveloped; decode with DecodeCodecEnvelope.
+    CodecList acceptedCodecs;              ///< What the client can decode.
+    std::span<std::byte const> sourceName; ///< Base name to give the scratch file; sanitize before use.
+};
+
+/// Frame a REGISTER request.
+/// @param request The worker's announcement.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeRegister(RegisterRequest const& request,
+                                                           WireVersion version = CurrentVersion)
+{
+    auto const slots = EncodeU32Field(request.slots);
+    auto const codecs = EncodeCodecList(request.acceptedCodecs);
+    return Detail::EncodeRequest(version,
+                                 Op::Register,
+                                 { AsBytes(request.fingerprint),
+                                   AsBytes(request.endpoint),
+                                   std::span<std::byte const> { slots },
+                                   std::span<std::byte const> { codecs } });
+}
+
+/// Split a REGISTER payload.
+/// @param payload The bytes following the request header.
+/// @return The fields, or nullopt when malformed (including a mis-sized `slots`).
+[[nodiscard]] inline std::optional<RegisterView> DecodeRegisterPayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::Register));
+    if (!fields.has_value())
+        return std::nullopt;
+    auto const slots = DecodeU32Field((*fields)[2]);
+    if (!slots.has_value())
+        return std::nullopt;
+    return RegisterView { .fingerprint = (*fields)[0],
+                          .endpoint = (*fields)[1],
+                          .slots = *slots,
+                          .acceptedCodecs = DecodeCodecList((*fields)[3]) };
+}
+
+/// Frame a HEARTBEAT request.
+/// @param workerId The id the scheduler issued at registration.
+/// @param inFlight How many jobs the worker is running right now.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeHeartbeat(std::string_view workerId,
+                                                            std::uint32_t inFlight,
+                                                            WireVersion version = CurrentVersion)
+{
+    auto const load = EncodeU32Field(inFlight);
+    return Detail::EncodeRequest(version, Op::Heartbeat, { AsBytes(workerId), std::span<std::byte const> { load } });
+}
+
+/// A worker's periodic liveness report.
+struct HeartbeatView
+{
+    std::span<std::byte const> workerId;
+    std::uint32_t inFlight { 0 };
+};
+
+/// Split a HEARTBEAT payload.
+/// @param payload The bytes following the request header.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<HeartbeatView> DecodeHeartbeatPayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::Heartbeat));
+    if (!fields.has_value())
+        return std::nullopt;
+    auto const inFlight = DecodeU32Field((*fields)[1]);
+    if (!inFlight.has_value())
+        return std::nullopt;
+    return HeartbeatView { .workerId = (*fields)[0], .inFlight = *inFlight };
+}
+
+/// Frame a LEASE request.
+/// @param request What the client wants to compile and with what.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeLease(LeaseRequest const& request, WireVersion version = CurrentVersion)
+{
+    auto const codecs = EncodeCodecList(request.acceptedCodecs);
+    return Detail::EncodeRequest(
+        version, Op::Lease, { AsBytes(request.fingerprint), AsBytes(request.key), std::span<std::byte const> { codecs } });
+}
+
+/// Split a LEASE payload.
+/// @param payload The bytes following the request header.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<LeaseView> DecodeLeasePayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::Lease));
+    if (!fields.has_value())
+        return std::nullopt;
+    return LeaseView { .fingerprint = (*fields)[0], .key = (*fields)[1], .acceptedCodecs = DecodeCodecList((*fields)[2]) };
+}
+
+/// Frame a COMPILE request.
+/// @param request The job.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeCompile(CompileRequest const& request,
+                                                          WireVersion version = CurrentVersion)
+{
+    auto const codecs = EncodeCodecList(request.acceptedCodecs);
+    return Detail::EncodeRequest(version,
+                                 Op::Compile,
+                                 { AsBytes(request.leaseToken),
+                                   AsBytes(request.fingerprint),
+                                   request.args,
+                                   request.source,
+                                   std::span<std::byte const> { codecs },
+                                   AsBytes(request.sourceName) });
+}
+
+/// Split a COMPILE payload.
+/// @param payload The bytes following the request header.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<CompileView> DecodeCompilePayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::Compile));
+    if (!fields.has_value())
+        return std::nullopt;
+    return CompileView { .leaseToken = (*fields)[0],
+                         .fingerprint = (*fields)[1],
+                         .args = (*fields)[2],
+                         .source = (*fields)[3],
+                         .acceptedCodecs = DecodeCodecList((*fields)[4]),
+                         .sourceName = (*fields)[5] };
+}
+
+/// What a scheduler answers a LEASE with, on success.
+struct LeaseGrant
+{
+    std::string_view endpoint;   ///< The worker to send the job to.
+    std::string_view leaseToken; ///< Authorizes exactly this job on that worker.
+    /// What the chosen worker can DECODE, relayed from its registration.
+    ///
+    /// Carried here because the client is about to send that worker a multi-megabyte
+    /// preprocessed translation unit and has to choose a codec for it. Without this
+    /// the client would have to either send `Identity` always -- giving up the
+    /// compression on the one payload large enough to care -- or guess, and a guess
+    /// the worker cannot decode is a refused job after the whole payload has already
+    /// crossed the network. The scheduler already knows the answer; relaying it costs
+    /// a few bytes in a reply that is being sent anyway, and keeps the exchange free
+    /// of a negotiation round trip.
+    CodecList workerCodecs;
+};
+
+/// Frame the payload of a successful LEASE reply.
+/// @param grant Where to go and what to present.
+/// @return The reply payload (not a whole frame).
+[[nodiscard]] inline std::vector<std::byte> EncodeLeaseGrant(LeaseGrant const& grant)
+{
+    auto const codecs = EncodeCodecList(grant.workerCodecs);
+    return Detail::EncodeFields(
+        { AsBytes(grant.endpoint), AsBytes(grant.leaseToken), std::span<std::byte const> { codecs } });
+}
+
+/// The fields of a LEASE grant, as views.
+struct LeaseGrantView
+{
+    std::span<std::byte const> endpoint;
+    std::span<std::byte const> leaseToken;
+    CodecList workerCodecs;
+};
+
+/// Split a LEASE reply payload.
+/// @param payload The reply body.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<LeaseGrantView> DecodeLeaseGrant(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, 3);
+    if (!fields.has_value())
+        return std::nullopt;
+    return LeaseGrantView { .endpoint = (*fields)[0],
+                            .leaseToken = (*fields)[1],
+                            .workerCodecs = DecodeCodecList((*fields)[2]) };
+}
+
+/// What a worker answers a COMPILE with.
+///
+/// The exit code travels as a `u32` holding a non-negative code. A spawn failure is
+/// NOT expressible here and must not be: the worker answers `Error` for that, so a
+/// client can tell "the compiler ran and rejected the code" — which it must report
+/// verbatim — from "this worker could not run a compiler at all", which it must
+/// answer by compiling locally.
+struct CompileResult
+{
+    std::uint32_t exitCode { 0 };
+    std::span<std::byte const> object; ///< Codec envelope; empty on a failed compile.
+    std::span<std::byte const> stdoutText;
+    std::span<std::byte const> stderrText;
+};
+
+/// Frame the payload of a COMPILE reply.
+/// @param result The outcome.
+/// @return The reply payload (not a whole frame).
+[[nodiscard]] inline std::vector<std::byte> EncodeCompileResult(CompileResult const& result)
+{
+    auto const code = EncodeU32Field(result.exitCode);
+    return Detail::EncodeFields(
+        { std::span<std::byte const> { code }, result.object, result.stdoutText, result.stderrText });
+}
+
+/// Split a COMPILE reply payload.
+/// @param payload The reply body.
+/// @return The result, or nullopt when malformed.
+[[nodiscard]] inline std::optional<CompileResult> DecodeCompileResult(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, 4);
+    if (!fields.has_value())
+        return std::nullopt;
+    auto const code = DecodeU32Field((*fields)[0]);
+    if (!code.has_value())
+        return std::nullopt;
+    return CompileResult {
+        .exitCode = *code, .object = (*fields)[1], .stdoutText = (*fields)[2], .stderrText = (*fields)[3]
+    };
 }
 
 } // namespace FastCache::CompileCacheWire

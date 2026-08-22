@@ -81,7 +81,7 @@ namespace
     }
 
     /// Directory holding the log, created on demand. Empty on failure.
-    [[nodiscard]] std::filesystem::path StateDirectory()
+    [[nodiscard]] std::filesystem::path StateDirectoryImpl()
     {
         std::error_code ec;
         // The platform `#if` stays: these are genuinely different variables per
@@ -390,9 +390,14 @@ std::string_view ToStringView(Outcome outcome) noexcept
     return "UNAVAILABLE";
 }
 
+std::filesystem::path StateDirectory()
+{
+    return StateDirectoryImpl();
+}
+
 std::string LogPath()
 {
-    auto const dir = StateDirectory();
+    auto const dir = StateDirectoryImpl();
     if (dir.empty())
         return {};
     return (dir / "invocations.log").string();

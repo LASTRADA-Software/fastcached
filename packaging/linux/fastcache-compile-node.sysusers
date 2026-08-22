@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# System account the compile worker runs as. Applied by systemd-sysusers from
+# the package's post-install scriptlet.
+#
+# Deliberately NOT the fastcached account. A worker runs a compiler on input
+# that arrived over the network, while fastcached owns the cache storage -- and
+# the trust model says a worker is given no cache credentials at all. Sharing
+# one account would undo that at the filesystem level: a compromised compile
+# would be running as the identity that can rewrite every cached object.
+#
+# Type User                  ID  GECOS                    Home directory  Shell
+u      fastcache-node        -   "fastcache compile node" /               -

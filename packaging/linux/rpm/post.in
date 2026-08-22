@@ -8,6 +8,7 @@ SERVICE="@FASTCACHED_SERVICE_NAME@"
 
 if [ -x /usr/bin/systemd-sysusers ]; then
     systemd-sysusers "@FASTCACHED_SYSUSERS_FILE@" >/dev/null 2>&1 || true
+    systemd-sysusers "@FASTCACHED_NODE_SYSUSERS_FILE@" >/dev/null 2>&1 || true
 fi
 if [ -x /usr/bin/systemd-tmpfiles ]; then
     systemd-tmpfiles --create "@FASTCACHED_TMPFILES_FILE@" >/dev/null 2>&1 || true

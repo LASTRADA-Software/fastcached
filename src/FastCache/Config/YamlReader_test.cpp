@@ -181,6 +181,90 @@ TEST_CASE("YamlReader: listeners sequence populates cfg.binds", "[config][yaml][
     REQUIRE(cfg->binds[1].tls);
 }
 
+TEST_CASE("YamlReader: a listener defaults to the cache role", "[config][yaml][listeners]")
+{
+    // The default has to stay Cache alone. A listener that silently also served
+    // dispatch would make every existing deployment expose the surface that runs
+    // a compiler on someone else's machine, on the port they already had open.
+    auto const path = WriteTempYaml("listeners-default-role",
+                                    "listeners:\n"
+                                    "  - address: 0.0.0.0\n"
+                                    "    port: 6674\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE(cfg.has_value());
+    REQUIRE(cfg->binds.size() == 1);
+    CHECK(FastCache::HasRole(cfg->binds[0].roles, FastCache::ListenerRole::Cache));
+    CHECK_FALSE(FastCache::HasRole(cfg->binds[0].roles, FastCache::ListenerRole::Dispatch));
+}
+
+TEST_CASE("YamlReader: roles selects what a listener serves", "[config][yaml][listeners]")
+{
+    // Without this the packaged service cannot be a scheduler at all: its unit
+    // runs `fastcached --config=...`, and --listen-dispatch is a command-line
+    // flag, so an operator would have to override ExecStart to enable dispatch.
+    auto const path = WriteTempYaml("listeners-roles",
+                                    "listeners:\n"
+                                    "  - address: 0.0.0.0\n"
+                                    "    port: 6674\n"
+                                    "  - address: 0.0.0.0\n"
+                                    "    port: 6675\n"
+                                    "    roles: [dispatch]\n"
+                                    "  - address: 0.0.0.0\n"
+                                    "    port: 6676\n"
+                                    "    roles: [cache, dispatch]\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE(cfg.has_value());
+    REQUIRE(cfg->binds.size() == 3);
+
+    // Replaces the default rather than adding to it: `roles: [dispatch]` means
+    // dispatch only, or the endpoint an operator was trying to isolate still
+    // serves the cache.
+    CHECK_FALSE(FastCache::HasRole(cfg->binds[1].roles, FastCache::ListenerRole::Cache));
+    CHECK(FastCache::HasRole(cfg->binds[1].roles, FastCache::ListenerRole::Dispatch));
+
+    // Both is expressible, just not the default.
+    CHECK(FastCache::HasRole(cfg->binds[2].roles, FastCache::ListenerRole::Cache));
+    CHECK(FastCache::HasRole(cfg->binds[2].roles, FastCache::ListenerRole::Dispatch));
+}
+
+TEST_CASE("YamlReader: an unknown role is rejected", "[config][yaml][listeners]")
+{
+    // Named rather than ignored, for the reason the `tsl: true` case exists: a
+    // typo that silently left a listener on its default would be a scheduler
+    // that answers no dispatch verb, with a config file that looks correct.
+    auto const path = WriteTempYaml("listeners-bad-role",
+                                    "listeners:\n"
+                                    "  - address: 0.0.0.0\n"
+                                    "    port: 6675\n"
+                                    "    roles: [dispatchh]\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE_FALSE(cfg.has_value());
+    CHECK(cfg.error().field == "listeners[0].roles");
+}
+
+TEST_CASE("YamlReader: an empty or non-sequence roles is rejected", "[config][yaml][listeners]")
+{
+    // An empty list would produce a listener that accepts connections and
+    // refuses every verb on them -- a port that looks open and answers nothing.
+    auto const empty = WriteTempYaml("listeners-empty-roles",
+                                     "listeners:\n"
+                                     "  - address: 0.0.0.0\n"
+                                     "    port: 6675\n"
+                                     "    roles: []\n");
+    auto const emptyCfg = FastCache::ReadYamlConfig(empty);
+    REQUIRE_FALSE(emptyCfg.has_value());
+    CHECK(emptyCfg.error().field == "listeners[0].roles");
+
+    auto const scalar = WriteTempYaml("listeners-scalar-roles",
+                                      "listeners:\n"
+                                      "  - address: 0.0.0.0\n"
+                                      "    port: 6675\n"
+                                      "    roles: dispatch\n");
+    auto const scalarCfg = FastCache::ReadYamlConfig(scalar);
+    REQUIRE_FALSE(scalarCfg.has_value());
+    CHECK(scalarCfg.error().field == "listeners[0].roles");
+}
+
 TEST_CASE("YamlReader: listeners with missing port is rejected", "[config][yaml][listeners]")
 {
     auto const path = WriteTempYaml("listeners-noport",

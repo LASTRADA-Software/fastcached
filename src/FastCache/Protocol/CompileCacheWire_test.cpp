@@ -415,3 +415,201 @@ TEST_CASE("An unknown opcode is never reachable before AUTH")
             CHECK_FALSE(IsPreAuthAllowed(opRaw));
     }
 }
+
+// --- distributed execution ---------------------------------------------------
+
+TEST_CASE("Every dispatch verb round-trips its fields")
+{
+    SECTION("REGISTER")
+    {
+        auto const frame = EncodeRegister(RegisterRequest {
+            .fingerprint = "gcc-13-abc", .endpoint = "10.0.0.1:6676", .slots = 8, .acceptedCodecs = { 2, 1 } });
+        auto const decoded = DecodeRegisterPayload(std::span { frame }.subspan(RequestHeaderSize));
+        REQUIRE(decoded.has_value());
+        CHECK(AsStringView(Unwrap(decoded).fingerprint) == "gcc-13-abc");
+        CHECK(AsStringView(Unwrap(decoded).endpoint) == "10.0.0.1:6676");
+        CHECK(Unwrap(decoded).slots == 8);
+        CHECK(Unwrap(decoded).acceptedCodecs == CodecList { 2, 1 });
+    }
+    SECTION("HEARTBEAT")
+    {
+        auto const frame = EncodeHeartbeat("w7", 3);
+        auto const decoded = DecodeHeartbeatPayload(std::span { frame }.subspan(RequestHeaderSize));
+        REQUIRE(decoded.has_value());
+        CHECK(AsStringView(Unwrap(decoded).workerId) == "w7");
+        CHECK(Unwrap(decoded).inFlight == 3);
+    }
+    SECTION("LEASE")
+    {
+        auto const frame =
+            EncodeLease(LeaseRequest { .fingerprint = "gcc-13-abc", .key = "objkey", .acceptedCodecs = { 1 } });
+        auto const decoded = DecodeLeasePayload(std::span { frame }.subspan(RequestHeaderSize));
+        REQUIRE(decoded.has_value());
+        CHECK(AsStringView(Unwrap(decoded).fingerprint) == "gcc-13-abc");
+        CHECK(AsStringView(Unwrap(decoded).key) == "objkey");
+    }
+    SECTION("COMPILE")
+    {
+        auto const args = Bytes({ 0x01, 0x02 });
+        auto const source = Bytes({ 0xAA, 0xBB, 0xCC });
+        auto const frame = EncodeCompile(CompileRequest { .leaseToken = "l1",
+                                                          .fingerprint = "gcc-13-abc",
+                                                          .args = args,
+                                                          .source = source,
+                                                          .acceptedCodecs = { 1 },
+                                                          .sourceName = "Widget.cpp" });
+        auto const decoded = DecodeCompilePayload(std::span { frame }.subspan(RequestHeaderSize));
+        REQUIRE(decoded.has_value());
+        CHECK(AsStringView(Unwrap(decoded).leaseToken) == "l1");
+        CHECK(std::ranges::equal(Unwrap(decoded).args, args));
+        CHECK(std::ranges::equal(Unwrap(decoded).source, source));
+        CHECK(Unwrap(decoded).acceptedCodecs == CodecList { 1 });
+        CHECK(AsStringView(Unwrap(decoded).sourceName) == "Widget.cpp");
+    }
+}
+
+TEST_CASE("A u32 field of the wrong width is rejected, not read")
+{
+    // A short integer field is a sender speaking a shape this build does not know.
+    // Reading the first four bytes of a longer one, or padding a shorter one, would
+    // invent a value -- and `slots` deciding capacity or `inFlight` deciding load
+    // are exactly the values that must not be invented.
+    CHECK_FALSE(DecodeU32Field(Bytes({ 0x00, 0x00, 0x01 })).has_value());
+    CHECK_FALSE(DecodeU32Field(Bytes({ 0x00, 0x00, 0x00, 0x00, 0x00 })).has_value());
+    CHECK_FALSE(DecodeU32Field({}).has_value());
+    CHECK(DecodeU32Field(Bytes({ 0x00, 0x00, 0x01, 0x00 })) == 256U);
+}
+
+TEST_CASE("A dispatch payload decoded as the wrong verb fails")
+{
+    // Each verb has its own arity, and SplitFields is strict in both directions, so
+    // one verb's payload cannot be silently reinterpreted as another's.
+    auto const lease = EncodeLease(LeaseRequest { .fingerprint = "f", .key = "k", .acceptedCodecs = {} });
+    auto const payload = std::span<std::byte const> { lease }.subspan(RequestHeaderSize);
+    CHECK_FALSE(DecodeRegisterPayload(payload).has_value());
+    CHECK_FALSE(DecodeCompilePayload(payload).has_value());
+    CHECK(DecodeLeasePayload(payload).has_value());
+}
+
+TEST_CASE("A codec envelope round-trips its tag, raw size and bytes")
+{
+    auto const payload = Bytes({ 0xDE, 0xAD, 0xBE, 0xEF });
+    auto const envelope = EncodeCodecEnvelope(/*codec=*/2, /*rawLength=*/9999, payload);
+
+    auto const decoded = DecodeCodecEnvelope(envelope);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).codec == 2);
+    // rawLength is the size BEFORE compression, and is what a receiver sizes its
+    // output buffer from -- so it is deliberately not derivable from bytes.size().
+    CHECK(Unwrap(decoded).rawLength == 9999);
+    CHECK(std::ranges::equal(Unwrap(decoded).bytes, payload));
+}
+
+TEST_CASE("An envelope too short to hold a header is rejected")
+{
+    CHECK_FALSE(DecodeCodecEnvelope({}).has_value());
+    CHECK_FALSE(DecodeCodecEnvelope(Bytes({ 0x00, 0x00, 0x00, 0x00 })).has_value());
+    CHECK(DecodeCodecEnvelope(Bytes({ 0x00, 0x00, 0x00, 0x00, 0x00 })).has_value());
+}
+
+TEST_CASE("An empty payload still travels in a well-formed envelope")
+{
+    // The zero-length case is the one an encoder is most likely to get wrong, and a
+    // failed compile legitimately produces an empty object.
+    auto const envelope = EncodeCodecEnvelope(IdentityCodec, 0, {});
+    auto const decoded = DecodeCodecEnvelope(envelope);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).codec == IdentityCodec);
+    CHECK(Unwrap(decoded).rawLength == 0);
+    CHECK(Unwrap(decoded).bytes.empty());
+}
+
+TEST_CASE("Codec negotiation prefers the sender's order and falls back to Identity")
+{
+    // The SENDER's order decides, because the sender has to decode the answer and
+    // knows what is cheap for it.
+    CHECK(ChooseCodec(/*accepted=*/ { 2, 1 }, /*available=*/ { 1, 2 }) == 2);
+    CHECK(ChooseCodec(/*accepted=*/ { 1, 2 }, /*available=*/ { 1, 2 }) == 1);
+
+    // Nothing in common falls back to Identity rather than refusing: an
+    // uncompressed answer is always correct, and a build must never lose its cache
+    // because two peers were compiled with different codec sets.
+    CHECK(ChooseCodec(/*accepted=*/ { 7, 8 }, /*available=*/ { 1, 2 }) == IdentityCodec);
+    CHECK(ChooseCodec(/*accepted=*/ {}, /*available=*/ { 1, 2 }) == IdentityCodec);
+    CHECK(ChooseCodec(/*accepted=*/ { 2 }, /*available=*/ {}) == IdentityCodec);
+}
+
+TEST_CASE("A build with compression disabled still interoperates")
+{
+    // Such a build offers only Identity and can produce only Identity. Both
+    // directions must still resolve, or enabling compression on one machine would
+    // break the cache for every machine that has it compiled out.
+    CodecList const none { IdentityCodec };
+    CHECK(ChooseCodec(none, { 1, 2 }) == IdentityCodec);
+    CHECK(ChooseCodec({ 2, 1 }, none) == IdentityCodec);
+}
+
+TEST_CASE("A LEASE grant and a COMPILE result round-trip")
+{
+    SECTION("grant")
+    {
+        auto const payload =
+            EncodeLeaseGrant(LeaseGrant { .endpoint = "10.0.0.2:6676", .leaseToken = "l42", .workerCodecs = { 2, 1 } });
+        auto const decoded = DecodeLeaseGrant(payload);
+        REQUIRE(decoded.has_value());
+        CHECK(AsStringView(Unwrap(decoded).endpoint) == "10.0.0.2:6676");
+        CHECK(AsStringView(Unwrap(decoded).leaseToken) == "l42");
+        // Relayed from the worker's registration so the client can pick a codec for
+        // the preprocessed payload without a negotiation round trip.
+        CHECK(Unwrap(decoded).workerCodecs == CodecList { 2, 1 });
+    }
+    SECTION("result")
+    {
+        auto const object = Bytes({ 0x7F, 0x45, 0x4C, 0x46 });
+        auto const payload = EncodeCompileResult(
+            CompileResult { .exitCode = 0, .object = object, .stdoutText = AsBytes("out"), .stderrText = AsBytes("err") });
+        auto const decoded = DecodeCompileResult(payload);
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).exitCode == 0);
+        CHECK(std::ranges::equal(Unwrap(decoded).object, object));
+        CHECK(AsStringView(Unwrap(decoded).stdoutText) == "out");
+        CHECK(AsStringView(Unwrap(decoded).stderrText) == "err");
+    }
+    SECTION("a failed compile carries its diagnostics and no object")
+    {
+        auto const payload = EncodeCompileResult(
+            CompileResult { .exitCode = 1, .object = {}, .stdoutText = {}, .stderrText = AsBytes("error: nope") });
+        auto const decoded = DecodeCompileResult(payload);
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).exitCode == 1);
+        CHECK(Unwrap(decoded).object.empty());
+        CHECK(AsStringView(Unwrap(decoded).stderrText) == "error: nope");
+    }
+}
+
+TEST_CASE("No distributed verb is reachable before authentication")
+{
+    // Causing a compiler to run on another machine is the last thing an
+    // unauthenticated peer should reach.
+    for (auto const op: { Op::Register, Op::Heartbeat, Op::Lease, Op::Compile })
+    {
+        INFO("op 0x" << static_cast<unsigned>(op));
+        CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(op)));
+    }
+}
+
+TEST_CASE("The scheduler's control verbs are bounded well below the session cap")
+{
+    // These are answered on a listener a whole fleet is meant to reach. A scheduler
+    // that can be made to allocate the full payload cap per frame by anything that
+    // authenticated once is a scheduler that stops scheduling.
+    constexpr std::size_t SessionCap = 256U * 1024U * 1024U;
+    for (auto const op: { Op::Register, Op::Heartbeat, Op::Lease })
+    {
+        INFO("op 0x" << static_cast<unsigned>(op));
+        CHECK(OpPayloadCap(static_cast<std::uint8_t>(op), SessionCap) == MaxControlPayload);
+    }
+    // COMPILE is the deliberate exception: it carries a preprocessed translation
+    // unit, so the operator's own cap is the only sensible bound.
+    CHECK(OpPayloadCap(static_cast<std::uint8_t>(Op::Compile), SessionCap) == SessionCap);
+}

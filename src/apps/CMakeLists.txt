@@ -10,6 +10,7 @@ set(FASTCACHED_APPS
     #  directory                   option                          default  description
     "fastcached|FASTCACHED_BUILD_DAEMON|ON|Build the fastcached daemon"
     "fastcache-cc|FASTCACHED_BUILD_LAUNCHER|ON|Build the fastcache-cc compiler launcher"
+    "fastcache-compile-node|FASTCACHED_BUILD_NODE|ON|Build the fastcache-compile-node compile worker"
     "compile-cache-testclient|FASTCACHED_BUILD_TESTCLIENT|OFF|Build the compile-cache test client"
     "fastcache-bench|FASTCACHED_BUILD_BENCHMARKS|OFF|Build the in-process storage micro-benchmarks"
 )

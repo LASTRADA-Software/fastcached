@@ -173,6 +173,11 @@ namespace
 
 } // namespace
 
+CacheOutcome ExchangeFramed(ITcpClient& client, std::vector<std::byte> const& frame, Credential const& credential)
+{
+    return Exchange(client, frame, credential);
+}
+
 std::string DescribeOutcome(CacheOutcome const& outcome)
 {
     switch (outcome.kind)

@@ -129,6 +129,19 @@ class BlockingListener final: public IListener
                                                                 int backlog = 511,
                                                                 IAddressResolver& resolver = DefaultAddressResolver());
 
+    /// Take ownership of a descriptor that is already bound and listening.
+    ///
+    /// For socket activation, where a supervisor bound the port before this
+    /// process existed. It performs no bind and no listen -- doing either on an
+    /// already-listening socket fails -- and asks the socket nothing: whether the
+    /// descriptor really is a listener is decided by `ParseSocketActivation`'s
+    /// `LISTEN_PID` check, which is the only thing that can answer it.
+    ///
+    /// @param native An already-listening descriptor; ownership transfers, so the
+    ///        returned listener closes it.
+    /// @return A listener over that descriptor.
+    [[nodiscard]] static std::unique_ptr<BlockingListener> Adopt(Detail::NativeSocket native);
+
     BlockingListener(BlockingListener const&) = delete;
     BlockingListener(BlockingListener&&) = delete;
     BlockingListener& operator=(BlockingListener const&) = delete;

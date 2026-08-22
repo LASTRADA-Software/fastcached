@@ -178,18 +178,29 @@ namespace
         return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "log-level", std::format("unknown level: {}", sv)));
     }
 
-    /// Parse a `--listen` / `--listen-tls` argument into a `BindConfig`. The
-    /// grammar is the standard `host:port` form, with `[ipv6]:port` for
-    /// IPv6 literals. The `tls` flag is supplied by the caller (the two
-    /// flags share this parser and only differ by which value they pass).
-    /// @param sv  The flag's value text.
-    /// @param tls Whether to set `BindConfig::tls` on the produced entry.
+    // The listener kinds live in Config.hpp's ListenerFlags table, so the flag that
+    // PARSES an endpoint and the flag that SPELLS it back out in a service
+    // registration are one row. They must agree, or a daemon registers with a
+    // listener set it will not accept back.
+    // Values, not references: a `constexpr auto const&` at namespace scope is a
+    // global VARIABLE as far as readability-identifier-naming is concerned, and the
+    // project's convention spells those camelBack. Copying a three-field aggregate
+    // out of the table costs nothing and keeps these reading as the constants they
+    // are -- each still initialized FROM the table, so there is one source of truth.
+    constexpr ListenerFlagSpec PlainListener = ListenerFlags[0];
+    constexpr ListenerFlagSpec TlsListener = ListenerFlags[1];
+    constexpr ListenerFlagSpec DispatchListener = ListenerFlags[2];
+
+    /// Parse a listener flag's argument into a `BindConfig`. The grammar is the
+    /// standard `host:port` form, with `[ipv6]:port` for IPv6 literals.
+    /// @param sv   The flag's value text.
+    /// @param kind Which listener flag this is.
     /// @return A populated BindConfig on success; ConfigError otherwise.
-    [[nodiscard]] std::expected<BindConfig, ConfigError> ParseListenSpec(std::string_view sv, bool tls)
+    [[nodiscard]] std::expected<BindConfig, ConfigError> ParseListenSpec(std::string_view sv, ListenerFlagSpec const& kind)
     {
         if (sv.empty())
             return std::unexpected(
-                ArgvError(ConfigErrorCode::TypeMismatch, tls ? "listen-tls" : "listen", "empty value (expected host:port)"));
+                ArgvError(ConfigErrorCode::TypeMismatch, std::string { kind.flag }, "empty value (expected host:port)"));
         std::string_view host;
         std::string_view portText;
         if (sv.front() == '[')
@@ -199,7 +210,7 @@ namespace
             auto const close = sv.find(']');
             if (close == std::string_view::npos || close + 1 >= sv.size() || sv[close + 1] != ':')
                 return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch,
-                                                 tls ? "listen-tls" : "listen",
+                                                 std::string { kind.flag },
                                                  std::format("malformed [ipv6]:port spec: {}", sv)));
             host = sv.substr(1, close - 1);
             portText = sv.substr(close + 2);
@@ -212,7 +223,7 @@ namespace
             auto const colon = sv.rfind(':');
             if (colon == std::string_view::npos)
                 return std::unexpected(ArgvError(
-                    ConfigErrorCode::TypeMismatch, tls ? "listen-tls" : "listen", std::format("missing :port in: {}", sv)));
+                    ConfigErrorCode::TypeMismatch, std::string { kind.flag }, std::format("missing :port in: {}", sv)));
             host = sv.substr(0, colon);
             portText = sv.substr(colon + 1);
             // Reject unbracketed IPv6 literals: if `host` contains a `:`
@@ -222,7 +233,7 @@ namespace
             if (host.contains(':'))
                 return std::unexpected(
                     ArgvError(ConfigErrorCode::TypeMismatch,
-                              tls ? "listen-tls" : "listen",
+                              std::string { kind.flag },
                               std::format("IPv6 literal requires brackets: [{}]:port (got: {})", host, sv)));
         }
         auto const address = ParseBindAddress(host);
@@ -231,19 +242,19 @@ namespace
         auto const port = ParsePort(portText);
         if (!port.has_value())
             return std::unexpected(port.error());
-        return BindConfig { .address = *address, .port = *port, .tls = tls };
+        return BindConfig { .address = *address, .port = *port, .roles = kind.roles, .tls = kind.tls };
     }
 
     /// `ParseListenSpec` bound to one listener kind, so the two repeatable flags
     /// share one parser and differ only by the row that names them — and by a
     /// template argument rather than by a second copy of this body.
-    /// @tparam Tls Whether the listener terminates TLS.
+    /// @tparam Kind Which listener flag this is.
     /// @param sv The flag's value text.
     /// @return The BindConfig on success; ConfigError otherwise.
-    template <bool Tls>
+    template <ListenerFlagSpec const& Kind>
     [[nodiscard]] std::expected<BindConfig, ConfigError> ParseListen(std::string_view sv)
     {
-        return ParseListenSpec(sv, Tls);
+        return ParseListenSpec(sv, Kind);
     }
 
     /// Every accepted command-line option, in the order `--help` documents them.
@@ -339,16 +350,26 @@ namespace
         { .primary = "--listen",
           .arity = Arity::Value,
           .operand = "=<host:port>",
-          .apply = AppendFrom<&Config::binds, ParseListen<false>>(),
+          .apply = AppendFrom<&Config::binds, ParseListen<PlainListener>>(),
           .description = "additional plaintext listener; repeatable. Use [::1]:{port} for IPv6 literals.\n"
                          "When given, supersedes --bind/--port — every endpoint must be listed.\n"
                          "Also how to keep serving legacy clients: add their port here." },
         { .primary = "--listen-tls",
           .arity = Arity::Value,
           .operand = "=<host:port>",
-          .apply = AppendFrom<&Config::binds, ParseListen<true>>(),
+          .apply = AppendFrom<&Config::binds, ParseListen<TlsListener>>(),
           .description = "additional TLS listener; repeatable. Shares --tls-cert / --tls-key.\n"
                          "Needs a build with OpenSSL (FC_TLS_ENABLED)" },
+        { .primary = "--listen-dispatch",
+          .arity = Arity::Value,
+          .operand = "=<host:port>",
+          .apply = AppendFrom<&Config::binds, ParseListen<DispatchListener>>(),
+          .description = "endpoint serving distributed compilation; repeatable. OFF unless given.\n"
+                         "Serves scheduling only, NOT the cache: something that can make a\n"
+                         "compiler run on another machine is a different trust boundary from\n"
+                         "something that reads and writes a cache, so it gets its own port to\n"
+                         "firewall. Workers register here; clients ask it where to compile.\n"
+                         "Suggested port: 6675." },
         { .primary = "--notify-keyspace-events",
           .arity = Arity::Value,
           .operand = "=<flags>",

@@ -34,8 +34,10 @@
 #include "CacheKey.hpp"
 #include "CacheProtocol.hpp"
 #include "CmdLine.hpp"
+#include "DependencyOutput.hpp"
 #include "DependencyProbe.hpp"
 #include "DirectManifest.hpp"
+#include "Dispatch.hpp"
 #include "IProcessRunner.hpp"
 #include "ITcpClient.hpp"
 #include "LauncherCli.hpp"
@@ -43,6 +45,7 @@
 #include "ReplayGuard.hpp"
 #include "RootReconciler.hpp"
 #include "Stats.hpp"
+#include "ToolchainProbe.hpp"
 
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
@@ -108,6 +111,14 @@ struct Config
     bool verbose { false };
     bool stats { true };  ///< Record each invocation to the per-user log.
     bool direct { true }; ///< Try the manifest shortcut before preprocessing.
+    /// Scheduler endpoint for distributed compilation, empty when not configured.
+    ///
+    /// Distribution is OFF unless this is set. That is the whole switch: a launcher
+    /// with no scheduler behaves exactly as it did before, and a scheduler that
+    /// cannot be reached costs one failed connect on a miss and then a local
+    /// compile, which is the same shape every other cache failure has here.
+    std::string schedulerAddr;
+
     /// Credential presented to the daemon, empty when none is configured. Held
     /// here rather than read at each exchange so every round trip on one
     /// invocation presents the same thing — and so there is exactly one place
@@ -208,6 +219,7 @@ struct Config
     // keys on the secret alone — so an operator who sets only FASTCACHE_USER gets
     // the same unauthenticated behaviour they had before, rather than an AUTH
     // frame carrying an empty secret that every server would refuse.
+    c.schedulerAddr = EnvOr(Cc::EnvName::Scheduler, "");
     c.credential.username = EnvOr(Cc::EnvName::User, "");
     c.credential.secret = EnvOr(Cc::EnvName::Token, "");
     // Clamped, not merely cast: the reader is 64-bit and `std::size_t` need not
@@ -402,16 +414,6 @@ using Cc::CompileRun;
 [[nodiscard]] CompileRun RunCaptureSplit(std::span<std::string const> argv)
 {
     return ProcessRunner().RunCaptureSplit(argv);
-}
-
-/// Run `argv` with stdout and stderr merged. Used where the split does not
-/// matter — the compiler-id probe.
-/// @param argv Full invocation; argv[0] is the compiler.
-/// @return (exit code, combined output).
-[[nodiscard]] std::pair<int, std::string> RunCaptureCombined(std::span<std::string const> argv)
-{
-    auto const run = ProcessRunner().RunCaptureCombined(argv);
-    return { run.exitCode, run.out };
 }
 
 /// Replay captured child bytes on one of our own streams verbatim.
@@ -753,22 +755,38 @@ struct SourceProbe
     return SourceProbe { .preprocessed = std::move(split.preprocessed), .dependencyPaths = std::move(split.notePaths) };
 }
 
-/// A stable-ish compiler identity: its version banner. cl prints it on /? or on
-/// a bare invocation; we use the first line of `<compiler> --version`-ish. To
-/// stay cheap and portable we just use the compiler basename + the banner cl
-/// emits to stderr when run with no input. Best-effort; folded into the key.
+/// This compiler's identity for keying: its version banner.
+///
+/// A thin call through to `Cc::CompilerBanner`, which the compile node also uses.
+/// One definition, because the node derives a fingerprint from this exact string
+/// and two spellings would put a worker permanently out of agreement with its
+/// clients -- silently, as a scheduler that simply never matches.
+/// @param compiler The compiler being fronted.
+/// @return The banner line, or the compiler's basename.
 [[nodiscard]] std::string CompilerId(std::string const& compiler)
 {
-    // `cl` with no args prints its version banner (to stderr). clang-cl honours
-    // `--version`. Try --version first; fall back to the basename.
-    // Passed as argv, not a shell string: the runner spawns the process
-    // directly, so a compiler path containing spaces needs no quoting.
-    std::array<std::string, 2> const probe { compiler, "--version" };
-    auto const [code, out] = RunCaptureCombined(probe);
-    if (code == 0 && !out.empty())
-        return out.substr(0, out.find('\n'));
-    auto const slash = compiler.find_last_of("/\\");
-    return slash == std::string::npos ? compiler : compiler.substr(slash + 1);
+    return Cc::CompilerBanner(ProcessRunner(), compiler);
+}
+
+/// Print the toolchain fingerprint a dispatched compile would send.
+///
+/// Recomputes unconditionally rather than reading the cache. This command exists
+/// to answer "why did no worker match", and a cached answer cannot distinguish
+/// "the two machines genuinely differ" from "one of them is holding a stale
+/// entry" -- which is exactly what the cache's documented staleness window makes
+/// possible. It rewrites the cache on the way past, so running it is the remedy
+/// as well as the diagnosis.
+/// @param compiler The compiler to interrogate.
+/// @return Process exit code.
+[[nodiscard]] int PrintToolchainFingerprint(std::string const& compiler)
+{
+    auto const banner = CompilerId(compiler);
+    auto const flavor = Cc::ClassifyCompiler(compiler);
+    auto const fingerprint =
+        Cc::CachedToolchainFingerprint(ProcessRunner(), compiler, banner, Cc::DriverOf(flavor), /*forceRefresh=*/true);
+
+    std::cout << fingerprint << '\n';
+    return 0;
 }
 
 // --- the cache flow ---------------------------------------------------------
@@ -1148,6 +1166,139 @@ void RecordManifest(Config const& cfg,
     return served;
 }
 
+/// Have a worker compile this translation unit, and leave the tree exactly as a
+/// local compile would have left it.
+///
+/// Returns a `CompileRun` so the whole miss path below is unchanged and cannot tell
+/// a dispatched compile from a local one: the object is on disk at `cmd.objPath`,
+/// the dependency record is written, and the streams are in hand. One path to the
+/// STORE, the manifest and the statistics, rather than two that can diverge.
+///
+/// ## The dependency record is written HERE, and that is not optional
+///
+/// A worker compiles preprocessed text, which has no `#include` left in it, so its
+/// compiler reports no dependencies -- there are none to report. The build system
+/// asked for them anyway, and an object with no dependency record makes Ninja stop
+/// rebuilding this translation unit when its headers change: a wrong build with a
+/// zero exit code that persists until someone cleans. It is the same defect the hit
+/// path guards against in as many words.
+///
+/// The client already has the answer -- its own preprocess probe opened every one
+/// of those headers to compute the key -- so it writes the record rather than the
+/// worker inventing one. See DependencyOutput.hpp.
+///
+/// ## A remote failure is retried locally
+///
+/// When the remote compiler exits non-zero this returns nullopt, so the caller runs
+/// the compile locally and reports THAT. A compile can fail because of the code, in
+/// which case both runs agree and the user sees the same diagnostics; or because of
+/// something about the worker, in which case the local run succeeds and the build
+/// is right. Reporting the remote failure directly would make a bad node fail
+/// builds that are fine, which is the failure mode that gets distribution turned
+/// off and never turned back on. The cost is one wasted remote attempt.
+///
+/// @param cfg Launcher config (scheduler endpoint, credential, timeout).
+/// @param cmd The parsed compile command.
+/// @param argv The original full invocation.
+/// @param key The object key, for duplicate suppression at the scheduler.
+/// @param toolchainStamp The compiler's version banner, as the cache key uses it.
+/// @param dependencyPaths What the key's probe reported this TU depends on.
+/// @return A run to continue with, or nullopt to compile locally.
+[[nodiscard]] std::optional<Cc::CompileRun> TryRemoteCompile(Config const& cfg,
+                                                             Cc::ParsedCommand const& cmd,
+                                                             std::span<std::string const> argv,
+                                                             std::string_view key,
+                                                             std::string_view toolchainStamp,
+                                                             std::vector<std::string> const& dependencyPaths)
+{
+    // Refused before anything is sent when the command line carries something this
+    // launcher cannot account for. See RemoteCompileArgs: refusing costs one local
+    // compile, where stripping an unrecognised argument would change the generated
+    // code and hand back an object nobody asked for.
+    auto const args = Cc::RemoteCompileArgs(cmd, argv);
+    if (!args.has_value())
+    {
+        Note(std::format("not dispatchable ({}); compiling locally", args.error()));
+        return std::nullopt;
+    }
+
+    // Preprocessed again, with `#line` markers this time. The key's text has them
+    // suppressed so no checkout path reaches the key; a worker needs them, because
+    // they are what marks system-header lines as system-header lines. Without that
+    // the remote compile re-reports every warning inside libc++ or the CRT, which
+    // under `-Werror` is a failed compile rather than noise.
+    auto const preprocessRun = RunCaptureSplit(Cc::DispatchPreprocessCommand(cmd, argv));
+    if (preprocessRun.exitCode != 0)
+    {
+        Note("dispatch preprocess failed; compiling locally");
+        return std::nullopt;
+    }
+
+    // The DISPATCH identity, which is not the cache key's. The key folds in the
+    // compiler's `--version` banner, which is enough for a cache -- a wrong answer
+    // there is a miss the replay guard can still backstop. Distribution has no such
+    // backstop: two machines can print an identical banner while resolving
+    // different libstdc++ headers, and the object that comes back would be wrong
+    // rather than merely unhelpful. So a worker is matched on a digest of the whole
+    // include tree instead.
+    //
+    // Computed HERE rather than beside the stamp, so it stays on the miss-and-
+    // dispatch-configured path only: it is a cache read in the steady state, but
+    // several seconds the first time a machine sees a toolchain, and a build that
+    // never dispatches must not pay that at all.
+    auto const fingerprint =
+        Cc::CachedToolchainFingerprint(ProcessRunner(), cmd.compiler, toolchainStamp, Cc::DriverOf(cmd.flavor));
+
+    auto const dialer = Cc::MakeTcpDialer(cfg.ioTimeout);
+    auto const outcome = Cc::Dispatch(*dialer,
+                                      Cc::DispatchRequest { .schedulerEndpoint = cfg.schedulerAddr,
+                                                            .fingerprint = fingerprint,
+                                                            .objectKey = key,
+                                                            .args = *args,
+                                                            .preprocessed = preprocessRun.out,
+                                                            .sourceName = cmd.source },
+                                      cfg.credential);
+    if (!outcome.Ran())
+    {
+        // Declined and Unavailable are both ordinary and both end the same way. The
+        // reason is named because "distribution stopped working" is otherwise a
+        // whole investigation, and the answer is one line.
+        Note(std::format("not dispatched ({}); compiling locally", outcome.detail));
+        return std::nullopt;
+    }
+    if (outcome.exitCode != 0)
+    {
+        Note(std::format(
+            "worker {} reported exit {}; recompiling locally to confirm", outcome.workerEndpoint, outcome.exitCode));
+        return std::nullopt;
+    }
+
+    // The object first: everything after it is a record ABOUT this object, and
+    // writing those first would leave a dependency record describing a file that is
+    // not there if the write fails.
+    if (!WriteFileBytes(cmd.objPath, outcome.object))
+    {
+        Note("could not write the dispatched object; compiling locally");
+        return std::nullopt;
+    }
+
+    // The dependency record, in whichever form this build asked for. Both can be
+    // wanted at once, and neither is inferred from the other.
+    Cc::CompileRun run { .exitCode = 0, .out = outcome.stdoutText, .err = outcome.stderrText };
+    if (!cmd.depPath.empty() && !WriteDepFile(cmd.depPath, Cc::RenderDepFile(cmd.objPath, dependencyPaths)))
+    {
+        Note("could not write the depfile for a dispatched compile; compiling locally");
+        return std::nullopt;
+    }
+    if (cmd.wantShowIncludes)
+        // Prepended, not appended: `cl` emits its notes before its diagnostics, and
+        // the stored value's region ordering is what a later hit replays verbatim.
+        run.out = Cc::RenderShowIncludes(dependencyPaths) + run.out;
+
+    Note(std::format("DISPATCHED to {} key={}", outcome.workerEndpoint, key));
+    return run;
+}
+
 /// Try to serve `cmd` from the cache; returns the process exit code if handled
 /// (hit or miss-then-stored), or std::nullopt to signal "fall back to a plain
 /// real compile" (any cache error).
@@ -1212,6 +1363,14 @@ void RecordManifest(Config const& cfg,
     // process — has no use for it once the key exists. Leaving it live held that
     // much dead memory resident for exactly as long as the machine is busiest.
     std::string key;
+    // Kept alive past the block below ONLY when a scheduler is configured. The
+    // preprocessed form of a real translation unit runs to several megabytes, and
+    // the block exists to drop it the moment the key is computed -- see below.
+    // Dispatch is the one caller that still needs it afterwards, because it is
+    // exactly what a worker compiles, so it pays that cost and nobody else does.
+    std::string dispatchSource;
+    std::vector<std::string> dispatchDependencies;
+    bool const dispatchConfigured = !cfg.schedulerAddr.empty();
     {
         auto probe = Preprocess(cmd, argv, reconciler);
         if (!probe.has_value())
@@ -1241,7 +1400,12 @@ void RecordManifest(Config const& cfg,
         // resolved against the compile's working directory first, so it is
         // classified by the file it names rather than by how the driver spelled it.
         // See DependencyProbe.hpp, where each half of that filter is justified.
-        Cc::KeyInputs const inputs {
+        // Non-const so the preprocessed text can be MOVED out below rather than
+        // copied. It was const, and `std::move` on a const member is a silent copy
+        // -- of several megabytes, on the hot path of a parallel build, while the
+        // comment below claimed the opposite. clang-tidy's performance-move-const-arg
+        // is what caught it.
+        Cc::KeyInputs inputs {
             .compilerId = toolchainStamp,
             .preprocessed = std::move(probe->preprocessed),
             .relativizedArgs = relativizedArgs,
@@ -1260,6 +1424,14 @@ void RecordManifest(Config const& cfg,
                          PathResolver().FilesystemCalls()));
         NoteIfRootsDoNotDescribeCompile(cfg, cmd.source, inputs.dependencyPaths.size(), probe->dependencyPaths, reconciler);
         key = Cc::ComputeKey(inputs);
+
+        // Moved out AFTER the key is computed, so the key path pays nothing: by
+        // here ComputeKey has finished with the text and would otherwise drop it.
+        if (dispatchConfigured)
+        {
+            dispatchSource = std::move(inputs.preprocessed);
+            dispatchDependencies = std::move(probe->dependencyPaths);
+        }
     }
     invocation.preprocessMs = MsSince(preprocessStarted);
 
@@ -1350,14 +1522,23 @@ void RecordManifest(Config const& cfg,
     invocation.cacheMs = MsSince(cacheStarted);
     TraceOutcome("MISS", key);
 
-    // MISS: run the real compiler with SEPARATE stdout/stderr capture, then STORE.
-    auto const run = RunCaptureSplit(argv);
+    // MISS: try a worker first when one is configured, then the real compiler.
+    //
+    // A dispatched compile is shaped to look exactly like a local one -- object on
+    // disk at cmd.objPath, dependency record written, streams in hand -- so
+    // everything below this point is unchanged and cannot tell the difference. That
+    // is deliberate: the STORE, the manifest and the statistics all have one path,
+    // and a second one would be a second place for them to diverge.
+    auto run = dispatchConfigured ? TryRemoteCompile(cfg, cmd, argv, key, toolchainStamp, dispatchDependencies)
+                                  : std::optional<Cc::CompileRun> {};
+    if (!run.has_value())
+        run = RunCaptureSplit(argv);
     // Always surface the compiler's output on its true streams and its exit code.
-    ReplayStreams(run.out, run.err);
+    ReplayStreams(run->out, run->err);
     // A spawn failure reports -1, which a POSIX exit status truncates to 255 —
     // an arbitrary code no build system can interpret. Normalize it the same way
     // the fall-back path does.
-    int const code = run.exitCode == -1 ? 1 : run.exitCode;
+    int const code = run->exitCode == -1 ? 1 : run->exitCode;
     if (code != 0)
         return code; // do not cache a failed compile
 
@@ -1386,8 +1567,8 @@ void RecordManifest(Config const& cfg,
     // absolute paths in it. Reconciling here is what puts the two in one spelling;
     // sending the resolved roots instead would be the other way to do it, and it
     // is the way that breaks the replayed depfile (see RootReconciler).
-    auto const includeTextOut = reconciler.Region(run.out, IncludeGrammar());
-    auto const includeTextErr = reconciler.Region(run.err, IncludeGrammar());
+    auto const includeTextOut = reconciler.Region(run->out, IncludeGrammar());
+    auto const includeTextErr = reconciler.Region(run->err, IncludeGrammar());
     value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = includeTextOut });
     value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = includeTextErr });
 
@@ -1600,6 +1781,8 @@ int main(int argc, char** argv)
             return RunHtmlStatsReport(command.groupFilter, command.outputPath);
         case Cc::Action::ZeroStats:
             return ClearStats();
+        case Cc::Action::PrintFingerprint:
+            return PrintToolchainFingerprint(command.compiler);
         // Stats sub-options, never returned as a top-level action. Handled
         // explicitly so the switch stays exhaustive without silently treating
         // "--prefetch-group"/"--out" as a compiler to spawn.
@@ -1619,6 +1802,15 @@ int main(int argc, char** argv)
     {
         // Not a cacheable compile (a link or preprocess-only step). Recording it
         // would dilute the hit rate with lines that were never candidates.
+        //
+        // One of those reasons is worth naming, because it is the one that looks
+        // like a defect from outside: a compile that also writes a BMI or a
+        // precompiled header is stepped over deliberately, and an operator watching
+        // a module-using build get no hits at all deserves to be told why rather
+        // than left to conclude the cache is broken.
+        if (cmd.sideArtefact)
+            Note("the compile writes a second artefact (a BMI or a precompiled header) "
+                 "that a cache hit cannot reproduce; not cached");
         return RunPassthrough(std::span<std::string const> { args });
     }
 

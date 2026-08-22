@@ -29,6 +29,8 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
+#include <FastCache/Distributed/LeaseTable.hpp>
+#include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Net/HealthProbe.hpp>
@@ -639,6 +641,32 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
     serverOpts.session.streamWaiters = &streamWaiters;
     serverOpts.session.watches = &watches;
     serverOpts.session.keyspaceNotifier = &keyspaceNotifier;
+
+    // The distributed-execution scheduler. Constructed only when a listener asks
+    // for it, and that is the whole enablement: without `--listen-dispatch` no
+    // endpoint carries the Dispatch role, every dispatch verb is refused by the
+    // role gate, and these two objects would answer nobody. Building them anyway
+    // would cost a daemon that only caches two live maps and a heartbeat sweep it
+    // has no use for.
+    //
+    // They share the engine's clock rather than owning one. That clock is a
+    // CachedClock the reactor refreshes once per loop iteration, so lease and
+    // heartbeat expiry read the same instant every command served in that
+    // iteration does -- two clocks would let a lease expire in the middle of the
+    // batch that was about to resolve it.
+    auto const schedulingRequested = std::ranges::any_of(serverOpts.binds, [](FastCache::BindConfig const& bind) {
+        return FastCache::HasRole(bind.roles, FastCache::ListenerRole::Dispatch);
+    });
+    std::optional<FastCache::Distributed::WorkerRegistry> workers;
+    std::optional<FastCache::Distributed::LeaseTable> leases;
+    if (schedulingRequested)
+    {
+        workers.emplace(clock);
+        leases.emplace(clock);
+        serverOpts.session.workers = &*workers;
+        serverOpts.session.leases = &*leases;
+        logger.Logf(FastCache::LogLevel::Info, "distributed execution enabled; workers register on the dispatch endpoint");
+    }
     // The RESP wire cap must admit the largest value the cache will store, so a
     // client can push a value up to --storage-max-value without the connection
     // being dropped mid-command. Keep the protocol default floor when the

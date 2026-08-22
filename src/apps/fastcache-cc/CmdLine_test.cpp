@@ -4,7 +4,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <expected>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -12,6 +14,27 @@ using namespace FastCache::Cc;
 
 namespace
 {
+
+/// Unwrap an optional for assertion, yielding a default-constructed value when
+/// empty.
+///
+/// The same device the other test files use: clang-tidy's optional analysis cannot
+/// see a `has_value()` guard through Catch2's REQUIRE macro, so a direct `*x` after
+/// one reads as an unchecked access. `value_or` is provably safe, and the preceding
+/// REQUIRE still fails the test first when the optional is empty.
+template <typename T>
+[[nodiscard]] T Unwrap(std::optional<T> const& value)
+{
+    return value.value_or(T {});
+}
+
+/// The same, for the `expected` that carries a refusal's reason.
+template <typename T, typename E>
+[[nodiscard]] T Unwrap(std::expected<T, E> const& value)
+{
+    return value.value_or(T {});
+}
+
 ParsedCommand Parse(std::vector<std::string> const& argv)
 {
     return ParseCommand(std::span<std::string const> { argv });
@@ -426,5 +449,415 @@ TEST_CASE("Every path-valued flag row is spelled with a known introducer")
         INFO("row: " << row.spelling);
         REQUIRE_FALSE(row.spelling.empty());
         CHECK(IntroducersOf(row.families).contains(row.spelling.front()));
+    }
+}
+
+// --- RemoteCompileArgs -------------------------------------------------------
+
+TEST_CASE("RemoteCompileArgs keeps the flags that change generated code")
+{
+    // These are the whole point: -std, -O, -g, -W, -f and their kin decide what
+    // the compiler emits, so an object compiled without them is not the object the
+    // client asked for.
+    std::vector<std::string> const argv { "g++", "-std=c++23", "-O2", "-g", "-Wall", "-fPIC", "-c", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+    for (auto const* kept: { "-std=c++23", "-O2", "-g", "-Wall", "-fPIC" })
+    {
+        INFO("flag " << kept);
+        CHECK(std::ranges::find(remote, kept) != remote.end());
+    }
+}
+
+TEST_CASE("RemoteCompileArgs drops the source, the output and the compile marker")
+{
+    // The worker compiles preprocessed text from a file of its own, into a path
+    // only it knows, and adds its own -c.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-o", "build/a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+    CHECK(std::ranges::find(remote, "a.cpp") == remote.end());
+    CHECK(std::ranges::find(remote, "build/a.o") == remote.end());
+    CHECK(std::ranges::find(remote, "-o") == remote.end());
+    CHECK(std::ranges::find(remote, "-c") == remote.end());
+    CHECK(std::ranges::find(remote, "g++") == remote.end());
+}
+
+TEST_CASE("RemoteCompileArgs drops include directories in both spellings")
+{
+    // The difference between this list and the preprocess line's: the probe still
+    // needs -I because it is resolving headers; the worker must NOT have it,
+    // because the headers are already inlined and the path names nothing there.
+    std::vector<std::string> const argv { "g++", "-Iinc", "-I", "other", "-O2", "-c", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+    for (auto const* gone: { "-Iinc", "-I", "other" })
+    {
+        INFO("argument " << gone);
+        CHECK(std::ranges::find(remote, gone) == remote.end());
+    }
+    CHECK(std::ranges::find(remote, "-O2") != remote.end());
+}
+
+TEST_CASE("RemoteCompileArgs refuses a command line it cannot fully account for")
+{
+    // PathValueFlags() does not know -isystem, --sysroot, -B, -specs= or -fplugin=,
+    // and it should not have to: it exists to answer questions about the cache key.
+    // Several of those point a compiler at an EXECUTABLE. Dropping them silently
+    // would change the generated code; sending them would hand a client the ability
+    // to make a worker read or run a file of its choosing. Refusing costs one local
+    // compile, which is the only one of the three that is not a defect.
+    auto const refuses = [](std::vector<std::string> const& argv) {
+        auto const cmd = ParseCommand(argv);
+        return !RemoteCompileArgs(cmd, argv).has_value();
+    };
+
+    CHECK(refuses({ "g++", "-isystem", "/opt/sdk/include", "-c", "a.cpp", "-o", "a.o" }));
+    CHECK(refuses({ "g++", "--sysroot=/opt/sysroot", "-c", "a.cpp", "-o", "a.o" }));
+    CHECK(refuses({ "g++", "-fplugin=/tmp/evil.so", "-c", "a.cpp", "-o", "a.o" }));
+    CHECK(refuses({ "g++", "-specs=/tmp/specs", "-c", "a.cpp", "-o", "a.o" }));
+    // A response file names a path with no separator at all when it sits in the
+    // working directory, so it is called out on its own.
+    CHECK(refuses({ "g++", "@args.rsp", "-c", "a.cpp", "-o", "a.o" }));
+    // A define whose value happens to hold a path is refused too. Over-strict, and
+    // deliberately: the cost is a local compile.
+    CHECK(refuses({ "g++", "-DCONFIG=\"/etc/app.conf\"", "-c", "a.cpp", "-o", "a.o" }));
+
+    // The introducer is skipped before the separator is looked for, so an MSVC
+    // compile is not refused wholesale for spelling its options with `/` -- but a
+    // separator INSIDE one still refuses.
+    CHECK(refuses({ "cl", "/DCONFIG=C:\\app\\x.conf", "/c", "a.cpp", "/Foa.obj" }));
+    CHECK_FALSE(refuses({ "cl", "/std:c++20", "/O2", "/EHsc", "/c", "a.cpp", "/Foa.obj" }));
+}
+
+TEST_CASE("RemoteCompileArgs drops a separated flag together with its value")
+{
+    // The failure this rejects is a stray bare value: dropping `-MF` but keeping
+    // `dep.d` would hand the worker a filename it would treat as a second source.
+    std::vector<std::string> const argv { "g++", "-MF", "dep.d", "-O2", "-c", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+    CHECK(std::ranges::find(remote, "dep.d") == remote.end());
+    CHECK(std::ranges::find(remote, "-MF") == remote.end());
+    CHECK(std::ranges::find(remote, "-O2") != remote.end());
+}
+
+TEST_CASE("RemoteCompileArgs leaves nothing that names a path")
+{
+    // The security-relevant property, stated as an assertion rather than a hope:
+    // every argument naming a filesystem path is removed, so nothing in this list
+    // can make the worker read or write somewhere of the client's choosing. The
+    // worker separately refuses to take its COMPILER from the client.
+    std::vector<std::string> const argv { "clang++", "-Isecret", "-o",  "/etc/passwd", "-MF",  "/tmp/x.d",
+                                          "-MT",     "target",   "-O2", "-c",          "a.cpp" };
+    auto const cmd = ParseCommand(argv);
+
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+    for (auto const& arg: remote)
+    {
+        INFO("surviving argument: " << arg);
+        CHECK_FALSE(arg.contains('/'));
+        CHECK_FALSE(arg.contains('\\'));
+        CHECK_FALSE(arg.starts_with('@'));
+    }
+}
+
+TEST_CASE("RemoteCompileArgs drops the MSVC spellings too")
+{
+    std::vector<std::string> const argv { "cl", "/std:c++20", "/O2", "/Iinc", "/Foa.obj", "/c", "a.cpp" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+    CHECK(std::ranges::find(remote, "/std:c++20") != remote.end());
+    CHECK(std::ranges::find(remote, "/O2") != remote.end());
+    CHECK(std::ranges::find(remote, "/Iinc") == remote.end());
+    CHECK(std::ranges::find(remote, "/c") == remote.end());
+    CHECK(std::ranges::find(remote, "a.cpp") == remote.end());
+}
+
+// --- preprocessing for a remote compile --------------------------------------
+
+TEST_CASE("The dispatch preprocess keeps line markers that the key's suppresses")
+{
+    // The two runs answer different questions. The key's text must carry no path,
+    // so it suppresses markers; a worker's must carry them, because they are what
+    // tells the compiler which lines came from a system header.
+    std::vector<std::string> const argv { "g++", "-O2", "-c", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const forKey = PreprocessCommand(cmd, argv);
+    auto const forWorker = DispatchPreprocessCommand(cmd, argv);
+
+    CHECK(std::ranges::find(forKey, "-P") != forKey.end());
+    CHECK(std::ranges::find(forWorker, "-P") == forWorker.end());
+    CHECK(std::ranges::find(forWorker, "-E") != forWorker.end());
+    // The source still has to be there, or the run preprocesses nothing.
+    CHECK(std::ranges::find(forWorker, "a.cpp") != forWorker.end());
+    // ...and the object output must not, or the run writes one.
+    CHECK(std::ranges::find(forWorker, "-o") == forWorker.end());
+}
+
+TEST_CASE("The dispatch preprocess asks for no dependency reporting")
+{
+    // The key's probe already reported them. Asking again would make this run write
+    // a depfile the caller has no use for -- and, worse, over the build's own.
+    std::vector<std::string> const argv { "g++", "-MD", "-MF", "dep.d", "-c", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    auto const forWorker = DispatchPreprocessCommand(cmd, argv);
+
+    CHECK(std::ranges::find(forWorker, "-MD") == forWorker.end());
+    CHECK(std::ranges::find(forWorker, "-MF") == forWorker.end());
+    CHECK(std::ranges::find(forWorker, "dep.d") == forWorker.end());
+}
+
+TEST_CASE("A remote compile is told its input is already preprocessed")
+{
+    // Keeping the markers fixes system-header warnings and immediately creates a
+    // second problem: under -pedantic the markers themselves are a GNU extension,
+    // so clang reports -Wgnu-line-marker and -Werror turns that into a failed
+    // compile. Naming the language as preprocessed output is what makes the driver
+    // expect them -- the same thing ccache and distcc do. Verified end to end:
+    // -Wall -Wextra -pedantic -Werror dispatches and returns a byte-identical
+    // object, where before it failed and was retried locally.
+    std::vector<std::string> const argv { "g++", "-O2", "-c", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+
+    auto const x = std::ranges::find(remote, "-x");
+    REQUIRE(x != remote.end());
+    REQUIRE(std::next(x) != remote.end());
+    CHECK(*std::next(x) == "c++-cpp-output");
+}
+
+TEST_CASE("A C source is told the C preprocessed language, not the C++ one")
+{
+    // `c++-cpp-output` on a C translation unit compiles it as C++, which changes
+    // overload resolution, name mangling and what even parses.
+    std::vector<std::string> const argv { "gcc", "-O2", "-c", "a.c", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+
+    auto const x = std::ranges::find(remote, "-x");
+    REQUIRE(x != remote.end());
+    CHECK(*std::next(x) == "cpp-output");
+}
+
+TEST_CASE("An MSVC remote compile is told its language too, in MSVC's own spelling")
+{
+    // This used to append nothing, on the reasoning that `/E` emits standard #line
+    // and so there is nothing to tell -- true about the MARKERS, and it left the
+    // LANGUAGE unstated. The worker writes its scratch file as `tu.cpp` and MSVC
+    // reads the language off that extension, so a dispatched `.c` came back
+    // compiled as C++: a failed remote compile where C is not valid C++, and an
+    // object with C++ mangling under the C key where it is.
+    std::vector<std::string> const argv { "cl", "/O2", "/c", "a.cpp", "/Foa.obj" };
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+
+    // Appended LAST, so it overrides a `/TC` the build itself passed.
+    REQUIRE_FALSE(remote.empty());
+    CHECK(remote.back() == "/TP");
+    // And still no GNU spelling, which the driver would reject outright.
+    CHECK(std::ranges::find(remote, "-x") == remote.end());
+}
+
+TEST_CASE("An MSVC C translation unit is told /TC")
+{
+    std::vector<std::string> const argv { "cl", "/O2", "/c", "a.c", "/Foa.obj" };
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+
+    REQUIRE_FALSE(remote.empty());
+    CHECK(remote.back() == "/TC");
+}
+
+TEST_CASE("A language the driver has no spelling for is refused, and says so")
+{
+    // Objective-C is a GNU-driver language: an MSVC driver compiles no such thing,
+    // so there is no flag that would make this work and sending it anyway is how a
+    // job comes back compiled as something else.
+    std::vector<std::string> const argv { "cl", "/c", "a.m", "/Foa.obj" };
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE_FALSE(parsed.has_value());
+    CHECK(parsed.error().contains("Objective-C"));
+
+    // The same source IS dispatchable to a GNU driver.
+    std::vector<std::string> const gnu { "clang", "-c", "a.m", "-o", "a.o" };
+    auto const gnuCmd = ParseCommand(gnu);
+    auto const gnuParsed = RemoteCompileArgs(gnuCmd, gnu);
+    REQUIRE(gnuParsed.has_value());
+    CHECK(Unwrap(gnuParsed).back() == "objective-c-cpp-output");
+}
+
+TEST_CASE("An extension whose language depends on the driver is never guessed at")
+{
+    // `.C` is C++ to a GNU driver and C to an MSVC one, so the extension does not
+    // answer the question and a guess would hand a worker the wrong language.
+    std::vector<std::string> const argv { "g++", "-c", "a.C", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE_FALSE(parsed.has_value());
+    CHECK(parsed.error().contains("a.C"));
+}
+
+TEST_CASE("A compile that writes a second artefact is not cacheable")
+{
+    // What a hit reproduces is the object and the dependency record, so a compile
+    // that also writes a BMI or a precompiled header cannot be replayed: the second
+    // artefact is afterwards missing, which fails loudly, or left over from a
+    // previous build, which does not.
+    //
+    // Every spelling here is the FUSED one, deliberately -- that is how a build
+    // writes them, and matching only the bare form would have caught the shape
+    // nobody uses.
+    for (auto const& argv: { std::vector<std::string> { "cl", "/c", "/Ycpch.h", "a.cpp", "/Foa.obj" },
+                             std::vector<std::string> { "cl", "/c", "/interface", "a.cpp", "/Foa.obj" },
+                             std::vector<std::string> { "cl", "/c", "/ifcOutputa.ifc", "a.cpp", "/Foa.obj" },
+                             std::vector<std::string> { "clang++", "-c", "-fmodule-output=a.pcm", "a.cpp", "-o", "a.o" },
+                             std::vector<std::string> { "g++", "-c", "-fmodule-mapper=a.modmap", "a.cpp", "-o", "a.o" } })
+    {
+        auto const cmd = ParseCommand(argv);
+        INFO("flag: " << argv[2]);
+        CHECK(cmd.sideArtefact);
+        CHECK_FALSE(cmd.parsedOk);
+    }
+
+    // And an ordinary compile is untouched -- including `/Yu`, which USES a
+    // precompiled header rather than writing one.
+    for (auto const& argv: { std::vector<std::string> { "cl", "/c", "/Yupch.h", "a.cpp", "/Foa.obj" },
+                             std::vector<std::string> { "cl", "/c", "/O2", "a.cpp", "/Foa.obj" },
+                             std::vector<std::string> { "g++", "-c", "-fmodules-ts", "a.cpp", "-o", "a.o" } })
+    {
+        auto const cmd = ParseCommand(argv);
+        INFO("flag: " << argv[2]);
+        CHECK_FALSE(cmd.sideArtefact);
+        CHECK(cmd.parsedOk);
+    }
+}
+
+TEST_CASE("A module interface unit is not cacheable, by extension")
+{
+    // Recognised so it can be refused with its reason said out loud. Before this
+    // they were not in IsSourceSuffix at all, so the line fell through as "no
+    // source file found" and was passed through in silence -- and adding `.ixx`
+    // there, the obvious way to "support modules", would have started replaying
+    // objects whose BMI nobody reproduced.
+    for (auto const& source: { std::string { "m.ixx" },
+                               std::string { "m.cppm" },
+                               std::string { "m.ccm" },
+                               std::string { "m.cxxm" },
+                               std::string { "m.mxx" } })
+    {
+        std::vector<std::string> const argv { "clang++", "-c", source, "-o", "m.o" };
+        auto const cmd = ParseCommand(argv);
+        INFO("source: " << source);
+        CHECK(cmd.source == source); // recognised, not ignored
+        CHECK(cmd.sideArtefact);
+        CHECK_FALSE(cmd.parsedOk);
+    }
+}
+
+TEST_CASE("A `++` driver compiles .c as C++, and the worker is told so")
+{
+    // "g++ treats .c, .h and .i files as C++ source files instead of C source
+    // files", in as many words. Taking the language off the extension alone would
+    // tell a worker to compile as C what this machine compiles as C++ -- a wrong
+    // object rather than a failed one, stored under the key for everybody.
+    std::vector<std::string> const argv { "g++", "-c", "a.c", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv);
+    REQUIRE(parsed.has_value());
+    CHECK(Unwrap(parsed).back() == "c++-cpp-output");
+
+    // The same source through the C driver is C, which is the whole point of the
+    // column: `gcc` and `g++` are one Flavor and disagree about this.
+    std::vector<std::string> const c { "gcc", "-c", "a.c", "-o", "a.o" };
+    auto const cCmd = ParseCommand(c);
+    auto const cParsed = RemoteCompileArgs(cCmd, c);
+    REQUIRE(cParsed.has_value());
+    CHECK(Unwrap(cParsed).back() == "cpp-output");
+
+    // Version suffixes and .exe are recognised here exactly as ClassifyCompiler
+    // recognises them, because it is the same table walked for another column.
+    for (auto const& spelling: { std::string { "g++-14" }, std::string { "clang++" }, std::string { "c++" } })
+    {
+        std::vector<std::string> const each { spelling, "-c", "a.c", "-o", "a.o" };
+        auto const eachCmd = ParseCommand(each);
+        auto const eachParsed = RemoteCompileArgs(eachCmd, each);
+        INFO("driver: " << spelling);
+        REQUIRE(eachParsed.has_value());
+        CHECK(Unwrap(eachParsed).back() == "c++-cpp-output");
+    }
+}
+
+TEST_CASE("A command line that names the language itself is not dispatched")
+{
+    // CMake emits exactly this for `set_source_files_properties(x.c PROPERTIES
+    // LANGUAGE CXX)`. The preprocessed-input flags are appended LAST so they win,
+    // which is right when nothing else stated a language and wrong the moment
+    // something did -- it would compile as C what the build asked for as C++.
+    for (auto const& argv: { std::vector<std::string> { "cl", "/c", "/TP", "a.c", "/Foa.obj" },
+                             std::vector<std::string> { "cl", "/c", "/TC", "a.cpp", "/Foa.obj" },
+                             std::vector<std::string> { "g++", "-c", "-x", "c++", "a.c", "-o", "a.o" },
+                             std::vector<std::string> { "clang", "-c", "-xc++", "a.c", "-o", "a.o" } })
+    {
+        auto const cmd = ParseCommand(argv);
+        auto const parsed = RemoteCompileArgs(cmd, argv);
+        INFO("driver: " << argv.front());
+        REQUIRE_FALSE(parsed.has_value());
+        CHECK(parsed.error().contains("names the input language itself"));
+    }
+
+    // `/Tc` and `/Tp` name a FILE as well, and with a bare name they carry no
+    // separator -- so the path filter would have let them past to a worker that
+    // has no such file.
+    std::vector<std::string> const named { "cl", "/c", "/Tcother.c", "/Foa.obj", "a.c" };
+    auto const namedCmd = ParseCommand(named);
+    CHECK_FALSE(RemoteCompileArgs(namedCmd, named).has_value());
+}
+
+TEST_CASE("A module interface unit is never dispatched, whatever the driver")
+{
+    // It writes a BMI beside the object and a dispatched compile carries back only
+    // the object, so the BMI would be missing (a loud failure) or left over from a
+    // previous build (a quiet wrong one).
+    for (auto const& source: { std::string { "m.ixx" }, std::string { "m.cppm" } })
+    {
+        std::vector<std::string> const argv { "clang++", "-c", source, "-o", "m.o" };
+        auto const cmd = ParseCommand(argv);
+        auto const parsed = RemoteCompileArgs(cmd, argv);
+        REQUIRE_FALSE(parsed.has_value());
+        CHECK(parsed.error().contains("BMI"));
     }
 }

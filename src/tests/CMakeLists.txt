@@ -126,6 +126,89 @@ set_tests_properties("compile-cache-install" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# End-to-end distributed-compilation test. Needs THREE real processes -- a
+# scheduler, a worker and the launcher -- which is what makes it a script rather
+# than a Catch2 case. What it asserts is that an object compiled in another
+# process on another port is byte-identical to a locally compiled one, that a
+# dispatched result still populates the cache, that a worker registered for a
+# different toolchain is never chosen, and that every refusal path still ends in
+# a successful build.
+#
+# Registered HERE and not beside the launcher, and that is load-bearing rather
+# than tidiness: src/apps processes its table in order, so at the point
+# src/apps/fastcache-cc is configured the fastcache-compile-node target does not
+# exist yet and a $<TARGET_FILE:> guard on it silently skips the test. src/tests
+# is added after src/apps (see the top-level CMakeLists), so every target this
+# needs is defined by the time this runs -- which is also why AGENT.md names this
+# file as the home for script-driven tests.
+#
+# Both platforms run it, but they do NOT assert the same contract, and that is
+# stated rather than left as an apparent omission. The Windows script covers the
+# four cases that turn on the MSVC driver -- an equivalent object, still a cache,
+# a C translation unit staying C, and fingerprint isolation -- because the driver
+# is the only Windows-specific thing on this path: `/E` for the dispatch
+# preprocess and `/TP`//`/TC` for the language are assertions about a driver
+# nothing else exercises, and if either is wrong every dispatched TU fails and is
+# retried locally, so the build is green and never once helped. Everything the
+# POSIX fixture additionally covers -- failover, the role gate, concurrency, the
+# driver's own language default, graceful stop -- is platform-neutral code already
+# pinned by unit tests.
+#
+# "Equivalent" and not "byte-identical" on Windows, and that difference is
+# measured: both MSVC drivers stamp the clock into the COFF header, and `cl`
+# additionally records the absolute path of the OBJECT inside the object, so a
+# worker's output can never be byte-identical to a local build's. Every section
+# carrying code or data is, and the fixture's own comparison is what says so --
+# which is why that comparison has a self-test of its own below.
+if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cc)
+    message(STATUS "dist-compile-e2e: daemon, compile node or launcher not built — skipping")
+else()
+    if(WIN32)
+        add_test(
+            NAME "dist-compile-e2e"
+            COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.ps1"
+                -Fastcached "$<TARGET_FILE:fastcached>"
+                -Node "$<TARGET_FILE:fastcache-compile-node>"
+                -Launcher "$<TARGET_FILE:fastcache-cc>"
+        )
+    else()
+        add_test(
+            NAME "dist-compile-e2e"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
+                --fastcached "$<TARGET_FILE:fastcached>"
+                --node "$<TARGET_FILE:fastcache-compile-node>"
+                --launcher "$<TARGET_FILE:fastcache-cc>"
+                --compiler "${CMAKE_CXX_COMPILER}"
+        )
+    endif()
+    # Spawns three daemons and several workers and drives real compiles, so it
+    # must not race the other server-starting smoke tests for ports or for CPU.
+    set_tests_properties("dist-compile-e2e" PROPERTIES
+        LABELS "smoke"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 900
+    )
+
+    # The Windows fixture's object comparison, against synthetic COFF input.
+    #
+    # NOT labelled "smoke", deliberately: it starts no daemon, opens no socket and
+    # runs no compiler, so it belongs in the default ctest set -- the same
+    # reasoning that puts repository-hygiene there. It exists because a fixture's
+    # own logic is the one thing nothing else tests, and this one's cost five CI
+    # round trips to find out, the last of them on a control that compared two
+    # objects with different NAMES and so reported a reproducible driver as
+    # non-reproducible.
+    if(WIN32)
+        add_test(
+            NAME "dist-compile-e2e-selftest"
+            COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.ps1" -SelfTest
+        )
+        set_tests_properties("dist-compile-e2e-selftest" PROPERTIES TIMEOUT 120)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # sccache smoke tests. Registered only when an sccache binary is present
 # (SCCACHE is the find_program result from cmake/portable/CompileCache.cmake). Each test
 # the freshly-built fastcached, points sccache at it over one wire protocol,

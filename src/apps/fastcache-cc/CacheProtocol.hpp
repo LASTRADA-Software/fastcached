@@ -80,6 +80,23 @@ struct Credential
     }
 };
 
+/// Send one framed request and read its reply, presenting `credential` if
+/// configured.
+///
+/// The shared exchange every command goes through, exposed because distributed
+/// execution has its own verbs and must not grow a second copy of this: the
+/// credential pipelining, the drain-both-replies rule, and the "a daemon that does
+/// not know AUTH still served the command" fall-through are each subtle enough that
+/// two implementations would differ, and the one that differed would be the one
+/// nobody tested against an old daemon.
+/// @param client Connected transport; not owned.
+/// @param frame A complete framed request.
+/// @param credential Credential to present; default-constructed sends none.
+/// @return The outcome.
+[[nodiscard]] CacheOutcome ExchangeFramed(ITcpClient& client,
+                                          std::vector<std::byte> const& frame,
+                                          Credential const& credential = {});
+
 /// FETCH one key over an already-connected client.
 ///
 /// When `credential` is configured, an AUTH frame is **pipelined** ahead of the

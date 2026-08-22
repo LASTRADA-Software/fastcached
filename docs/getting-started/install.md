@@ -302,6 +302,27 @@ Both ports then speak every protocol, not just their namesake.
 The admin HTTP endpoint (`/metrics`, `/healthz`) is separate and defaults to
 port **9259**; it only listens when `--metrics` is given.
 
+### Distributed compilation
+
+Two further ports, both **off unless you ask for them**:
+
+| Port | What | Default |
+|------|------|---------|
+| **6675** | The scheduler's dispatch endpoint | off; enable with `--listen-dispatch` or `roles: [dispatch]` |
+| **6676** | A compile worker's own port | the worker's `--port` |
+
+The dispatch endpoint is separate from the cache **on purpose**. The cache may
+reasonably be reachable across a build LAN; the surface that causes a compiler to
+*run* on another machine should be something you switch on and firewall
+deliberately. A dispatch request arriving on a cache-only listener is refused
+with a typed error rather than served.
+
+6676 is not an IANA request and is not a client-side default: the scheduler hands
+a client the worker's endpoint explicitly, so it is only ever what an operator
+configured.
+
+See [Distributed compilation](distributed-compilation.md).
+
 ## Building the packages
 
 ```sh

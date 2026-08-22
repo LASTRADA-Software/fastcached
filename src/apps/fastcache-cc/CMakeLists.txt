@@ -24,8 +24,50 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Cli/UsageDoc.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/PathCanon.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/CompileValue.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Compression.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
+
+# Core/Compression.cpp is the one row here that is NOT dependency-free, and it is a
+# deliberate exception to the rule the comment above states.
+#
+# Distributed compilation sends a preprocessed translation unit over the network --
+# several megabytes for an ordinary C++ TU, on the hot path of a parallel build --
+# and shipping that uncompressed is the difference between distribution being worth
+# switching on and not. The codec table is also already the daemon's, so the
+# alternative was a second compressor in the launcher, which is worse: two
+# implementations of one wire format, one of them untested against the other.
+#
+# What it costs, stated so nobody rediscovers it: the launcher's build now needs
+# zstd and lz4, which are CPM-fetched rather than vcpkg -- and they are built with
+# CMake's default MSVC runtime, which the static-CRT link below has to work around
+# in Debug (see the MSVC_RUNTIME_LIBRARY property for what it costs and why the
+# obvious fix is unavailable). It does mean the launcher
+# no longer builds without a network on a cold CPM cache, and it inherits the macOS
+# constraint the packaging job already carries: CPM_USE_LOCAL_PACKAGES=OFF, or a
+# Homebrew shared zstd gets linked and `otool -L` fails the "nothing outside
+# /usr/lib" assertion.
+#
+# FASTCACHED_ENABLE_COMPRESSION=OFF stays a working configuration: the codec table
+# compiles without either library, Identity is always available, and the wire
+# negotiation falls back to it -- so such a launcher still dispatches, just without
+# compressing. That is asserted, not assumed.
+if(FASTCACHED_ENABLE_COMPRESSION)
+    if(TARGET libzstd_static)
+        set(_fc_cc_zstd libzstd_static)
+    elseif(TARGET zstd::libzstd_static)
+        set(_fc_cc_zstd zstd::libzstd_static)
+    elseif(TARGET zstd::libzstd_shared)
+        set(_fc_cc_zstd zstd::libzstd_shared)
+    endif()
+    if(TARGET lz4_static)
+        set(_fc_cc_lz4 lz4_static)
+    elseif(TARGET LZ4::lz4_static)
+        set(_fc_cc_lz4 LZ4::lz4_static)
+    elseif(TARGET lz4::lz4)
+        set(_fc_cc_lz4 lz4::lz4)
+    endif()
+endif()
 
 # The launcher's own reusable pieces. Process spawning and the TCP client are
 # reached through interfaces (IProcessRunner / ITcpClient) so the flow logic
@@ -38,17 +80,23 @@ set(_fc_cc_core
 # distinctly from a miss" be a test rather than a hope.
 set(_fc_cc_sources
     CmdLine.cpp
+    CompileJob.cpp
     LauncherCli.cpp
     CacheKey.cpp
     CacheProtocol.cpp
+    Dispatch.cpp
+    DependencyOutput.cpp
     DependencyProbe.cpp
     DirectManifest.cpp
     PathResolve.cpp
     ReplayGuard.cpp
     RootReconciler.cpp
     Stats.cpp
+    ToolchainFingerprint.cpp
+    ToolchainProbe.cpp
     ProcessRunner.cpp
-    TcpClient.cpp)
+    TcpClient.cpp
+    WorkerProtocol.cpp)
 
 # Fully static, copy-anywhere binary: statically link the MSVC C++ runtime so
 # the launcher depends only on always-present Windows system DLLs (WS2_32,
@@ -64,17 +112,40 @@ add_executable(fastcache-cc
 target_include_directories(fastcache-cc PRIVATE "${CMAKE_SOURCE_DIR}/src")
 target_compile_definitions(fastcache-cc PRIVATE
     FASTCACHE_CC_VERSION="${FASTCACHED_VERSION_STRING}")
+if(FASTCACHED_ENABLE_COMPRESSION AND _fc_cc_zstd AND _fc_cc_lz4)
+    target_link_libraries(fastcache-cc PRIVATE ${_fc_cc_zstd} ${_fc_cc_lz4})
+    target_compile_definitions(fastcache-cc PRIVATE FC_COMPRESSION_ENABLED=1)
+endif()
 
 if(WIN32)
     target_link_libraries(fastcache-cc PRIVATE ws2_32)
 endif()
 
 if(FASTCACHED_STATIC_LAUNCHER AND MSVC)
-    # CMP0091: MSVC_RUNTIME_LIBRARY selects /MT(d) vs /MD(d). Static so the CRT
-    # is baked in; the generator expression keeps the Debug variant (/MTd) for
-    # Debug configs.
+    # CMP0091: MSVC_RUNTIME_LIBRARY selects /MT(d) vs /MD(d). Static so the CRT is
+    # baked in and the shipped launcher needs no redistributable -- it is fetched as
+    # a bare binary by FASTCACHE_AUTO_INSTALL, onto machines that have no reason to
+    # carry one.
+    #
+    # DEBUG IS THE EXCEPTION, and it is not a preference. zstd and lz4 are CPM-built
+    # here and take CMake's default runtime (the DLL one), because the FastCache
+    # library links the very same static libraries and the daemon's vcpkg
+    # dependencies are dynamic-CRT builds -- so those two targets cannot both be
+    # satisfied by one setting. In Release nothing breaks: the CRT entry points zstd
+    # calls resolve out of whichever CRT the exe links. In Debug they do not, because
+    # `assert()` references `__imp__wassert`, which exists ONLY in the DLL CRT, and
+    # the launcher stopped linking at all the moment compression was added to it:
+    #
+    #     zstd_static.lib(zstd_compress.c.obj) : error LNK2001:
+    #         unresolved external symbol __imp__wassert
+    #
+    # Windows CI builds Release only, so `cl-debug` and `clangcl-debug` -- both
+    # documented in AGENT.md -- were broken for every Windows developer while every
+    # job stayed green. The Debug launcher is a developer artefact and never shipped,
+    # so it takes the runtime its dependencies were built with; the artefact that IS
+    # shipped keeps the static CRT it has always had.
     set_property(TARGET fastcache-cc PROPERTY
-        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        MSVC_RUNTIME_LIBRARY "$<IF:$<CONFIG:Debug>,MultiThreadedDebugDLL,MultiThreaded>")
 endif()
 
 install(TARGETS fastcache-cc
@@ -90,9 +161,12 @@ if(FASTCACHED_BUILD_TESTS)
         test_main.cpp
         ${_fc_cc_sources}
         CmdLine_test.cpp
+        CompileJob_test.cpp
         LauncherCli_test.cpp
         CacheKey_test.cpp
         CacheProtocol_test.cpp
+        Dispatch_test.cpp
+        DependencyOutput_test.cpp
         DependencyProbe_test.cpp
         DirectManifest_test.cpp
         PathResolve_test.cpp
@@ -100,11 +174,18 @@ if(FASTCACHED_BUILD_TESTS)
         RootReconciler_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp
+        ToolchainFingerprint_test.cpp
+        ToolchainProbe_test.cpp
         TcpClient_test.cpp
+        WorkerProtocol_test.cpp
         ${_fc_cc_core}
     )
     target_include_directories(fastcache-cc-tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(fastcache-cc-tests PRIVATE Catch2::Catch2)
+    if(FASTCACHED_ENABLE_COMPRESSION AND _fc_cc_zstd AND _fc_cc_lz4)
+        target_link_libraries(fastcache-cc-tests PRIVATE ${_fc_cc_zstd} ${_fc_cc_lz4})
+        target_compile_definitions(fastcache-cc-tests PRIVATE FC_COMPRESSION_ENABLED=1)
+    endif()
     if(WIN32)
         target_link_libraries(fastcache-cc-tests PRIVATE ws2_32)
     endif()

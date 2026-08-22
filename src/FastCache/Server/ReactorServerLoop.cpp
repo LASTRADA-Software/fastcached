@@ -113,8 +113,16 @@ namespace
             // sockets bypass the TLS wrapper; a TLS bind reuses the single
             // shared TlsContext (no per-bind cert/SNI in this iteration).
             auto* const perBindTls = bind.tls ? options.tlsContext : nullptr;
+            // The endpoint's own policy travels with every connection it accepts.
+            // Without this a handler cannot tell which listener a frame arrived on,
+            // and "which surfaces are exposed where" stops being configurable.
             auto session = options.session;
+            session.listenerRoles = bind.roles;
             session.reactor = &reactor;
+            // The same sink the connection counters already use, so a dispatch
+            // outcome and the connection it arrived on land in one place. Null is
+            // ordinary (no metrics endpoint configured) and every use is guarded.
+            session.metrics = metrics;
             servers.push_back(std::make_unique<Server>(*listeners.back(),
                                                        engine,
                                                        logger,
@@ -221,9 +229,11 @@ namespace
 
         // One listening socket per BindConfig; each acceptor thread owns one.
         std::vector<Detail::NativeSocket> listenSocks;
-        std::vector<bool> bindTls; // parallel to listenSocks
+        std::vector<bool> bindTls;           // parallel to listenSocks
+        std::vector<std::uint8_t> bindRoles; // parallel to listenSocks
         listenSocks.reserve(options.binds.size());
         bindTls.reserve(options.binds.size());
+        bindRoles.reserve(options.binds.size());
         for (auto const& bind: options.binds)
         {
             auto bound = Detail::BindAndListen(
@@ -237,6 +247,7 @@ namespace
             }
             listenSocks.push_back(bound->socket);
             bindTls.push_back(bind.tls);
+            bindRoles.push_back(bind.roles);
         }
         logger.Logf(
             LogLevel::Info, "ready, accepting connections ({} bind(s) x {} reactors)", options.binds.size(), reactorCount);
@@ -265,6 +276,7 @@ namespace
                 FC_THREAD_NAME(threadName.c_str());
                 auto const listenSock = listenSocks[bindIdx];
                 auto* const perBindTls = bindTls[bindIdx] ? options.tlsContext : nullptr;
+                auto const bindRoles_ = bindRoles[bindIdx];
                 while (!stopping.load(std::memory_order_acquire) && !stopToken.stop_requested())
                 {
                     auto raw = Detail::AcceptRaw(listenSock);
@@ -296,12 +308,17 @@ namespace
                     // peer; query it now (on the acceptor thread) so --log-source
                     // can prefix this connection's log lines with the client IP.
                     auto peer = options.logSource ? Detail::PeerAddressOf(*raw) : std::string {};
+                    // Per-bind copy for the same reason the other two platform paths
+                    // make one: this connection carries its endpoint's role mask, not
+                    // the daemon's.
+                    auto session = options.session;
+                    session.listenerRoles = bindRoles_;
                     RunHandedOffConnection(reactor,
                                            *raw,
                                            engine,
                                            logger,
                                            admission,
-                                           options.session,
+                                           session,
                                            perBindTls,
                                            std::move(peer),
                                            options.logSource ? LogSource::Yes : LogSource::No);
@@ -405,8 +422,13 @@ namespace
                 }
                 listeners.push_back(std::move(listener));
                 auto* const perBindTls = bind.tls ? options.tlsContext : nullptr;
+                // The endpoint's own policy travels with every connection it accepts.
+                // Without this a handler cannot tell which listener a frame arrived on,
+                // and "which surfaces are exposed where" stops being configurable.
                 auto session = options.session;
+                session.listenerRoles = bind.roles;
                 session.reactor = reactors[i].get();
+                session.metrics = metrics;
                 servers.push_back(std::make_unique<Server>(*listeners.back(),
                                                            engine,
                                                            logger,

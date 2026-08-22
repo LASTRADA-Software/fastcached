@@ -30,9 +30,12 @@ target_sources(FastCache
         Config/YamlReader.cpp
         Core/Crc32c.cpp
         Core/Logger.cpp
+        Distributed/LeaseTable.cpp
+        Distributed/WorkerRegistry.cpp
         Core/BufferPool.cpp
         Metrics/PrometheusFormatter.cpp
         Net/BlockingSocket.cpp
+        Net/InheritedListener.cpp
         Net/HealthProbe.cpp
         Net/EpollSocket.cpp
         Net/IocpSocket.cpp

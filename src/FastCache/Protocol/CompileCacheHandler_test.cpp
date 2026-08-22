@@ -9,6 +9,8 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/LeaseTable.hpp>
+#include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -1096,4 +1098,189 @@ TEST_CASE("A gated verb keeps the operator's cap, not the AUTH ceiling", "[compi
     auto const got = fix.engine.Get("big");
     REQUIRE(got.has_value());
     CHECK(got->found);
+}
+
+// --- distributed execution: the listener role gate ---------------------------
+
+namespace
+{
+
+/// A session that authenticates nobody and serves the roles given.
+///
+/// Dispatch needs a registry and a lease table as well as the role, and both are
+/// owned here so a test cannot accidentally exercise the gate against dangling
+/// collaborators.
+struct DispatchFixture
+{
+    ManualClock schedulerClock;
+    Distributed::WorkerRegistry workers { schedulerClock };
+    Distributed::LeaseTable leases { schedulerClock };
+
+    [[nodiscard]] SessionContext SessionWith(std::uint8_t roles)
+    {
+        SessionContext session {};
+        session.listenerRoles = roles;
+        session.workers = &workers;
+        session.leases = &leases;
+        return session;
+    }
+};
+
+} // namespace
+
+TEST_CASE("A cache-only listener refuses every dispatch verb", "[compile-cache][handler][distributed]")
+{
+    // The default, and the security posture: the surface that causes a compiler to
+    // RUN on somebody else's machine has to be switched on deliberately, on an
+    // endpoint the operator chose. A refusal is a typed reply the client acts on,
+    // not a closed connection — which is what lets an operator move the dispatch
+    // surface without every client needing to know.
+    CcFixture fix;
+    DispatchFixture dispatch;
+
+    auto const reply = ExchangeWith(
+        fix,
+        Concat({ Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc", .key = "k", .acceptedCodecs = {} }),
+                 Wire::EncodeRegister(
+                     Wire::RegisterRequest { .fingerprint = "gcc", .endpoint = "h:1", .slots = 1, .acceptedCodecs = {} }) }),
+        dispatch.SessionWith(static_cast<std::uint8_t>(ListenerRole::Cache)));
+
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 2);
+    for (auto const& frame: frames)
+        CHECK(ErrorOf(frame).code == Wire::ErrorCode::DispatchNotPermitted);
+}
+
+TEST_CASE("A dispatch listener with no scheduler wired still refuses", "[compile-cache][handler][distributed]")
+{
+    // Two conditions gate this, and both must hold. A client cannot act differently
+    // on "you did not enable it here" than on "this build has no scheduler", so the
+    // refusal is deliberately the same one.
+    CcFixture fix;
+    SessionContext session {};
+    session.listenerRoles = static_cast<std::uint8_t>(ListenerRole::Dispatch);
+
+    auto const reply = ExchangeWith(
+        fix, Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc", .key = "k", .acceptedCodecs = {} }), session);
+    CHECK(ErrorOf(SoleReply(reply)).code == Wire::ErrorCode::DispatchNotPermitted);
+}
+
+TEST_CASE("A dispatch listener registers a worker and leases it", "[compile-cache][handler][distributed]")
+{
+    CcFixture fix;
+    DispatchFixture dispatch;
+    auto const session = dispatch.SessionWith(ListenerRole::Cache | ListenerRole::Dispatch);
+
+    auto const reply = ExchangeWith(
+        fix,
+        Concat({ Wire::EncodeRegister(Wire::RegisterRequest {
+                     .fingerprint = "gcc-13", .endpoint = "10.0.0.7:6676", .slots = 2, .acceptedCodecs = {} }),
+                 Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-13", .key = "objkey", .acceptedCodecs = {} }) }),
+        session);
+
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 2);
+    REQUIRE(frames[0].status == Wire::Status::Ok); // registered, payload is the worker id
+    CHECK_FALSE(frames[0].payload.empty());
+
+    REQUIRE(frames[1].status == Wire::Status::Ok);
+    auto const grant = Wire::DecodeLeaseGrant(frames[1].payload);
+    REQUIRE(grant.has_value());
+    // The client is sent to the WORKER's endpoint, not back to the scheduler: the
+    // multi-megabyte payloads must not transit the cache daemon.
+    CHECK(Wire::AsStringView(Unwrap(grant).endpoint) == "10.0.0.7:6676");
+    CHECK_FALSE(Wire::AsStringView(Unwrap(grant).leaseToken).empty());
+}
+
+TEST_CASE("A lease for an unknown toolchain is refused as NoWorker", "[compile-cache][handler][distributed]")
+{
+    CcFixture fix;
+    DispatchFixture dispatch;
+    (void) dispatch.workers.Register({ .fingerprint = "gcc-13", .endpoint = "10.0.0.7:6676", .slots = 2, .codecs = {} });
+
+    auto const reply =
+        ExchangeWith(fix,
+                     Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "clang-19", .key = "k", .acceptedCodecs = {} }),
+                     dispatch.SessionWith(ListenerRole::Cache | ListenerRole::Dispatch));
+    CHECK(ErrorOf(SoleReply(reply)).code == Wire::ErrorCode::NoWorker);
+}
+
+TEST_CASE("A second lease on the same key is refused as AlreadyInFlight", "[compile-cache][handler][distributed]")
+{
+    // Duplicate-work suppression seen through the wire: sixty clients missing the
+    // same key after a header change must not become sixty identical jobs.
+    CcFixture fix;
+    DispatchFixture dispatch;
+    (void) dispatch.workers.Register({ .fingerprint = "gcc-13", .endpoint = "10.0.0.7:6676", .slots = 8, .codecs = {} });
+    auto const session = dispatch.SessionWith(ListenerRole::Cache | ListenerRole::Dispatch);
+
+    auto const lease =
+        Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-13", .key = "same-key", .acceptedCodecs = {} });
+    auto const reply = ExchangeWith(fix, Concat({ lease, lease }), session);
+
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 2);
+    CHECK(frames[0].status == Wire::Status::Ok);
+    CHECK(ErrorOf(frames[1]).code == Wire::ErrorCode::AlreadyInFlight);
+}
+
+TEST_CASE("A worker with no slots is refused at registration", "[compile-cache][handler][distributed]")
+{
+    // It would otherwise register, match every lease for its toolchain, and never
+    // be picked — indistinguishable at the client from a permanently busy fleet.
+    CcFixture fix;
+    DispatchFixture dispatch;
+
+    auto const reply =
+        ExchangeWith(fix,
+                     Wire::EncodeRegister(Wire::RegisterRequest {
+                         .fingerprint = "gcc-13", .endpoint = "10.0.0.7:6676", .slots = 0, .acceptedCodecs = {} }),
+                     dispatch.SessionWith(ListenerRole::Cache | ListenerRole::Dispatch));
+    CHECK(ErrorOf(SoleReply(reply)).code == Wire::ErrorCode::MalformedFrame);
+}
+
+TEST_CASE("The scheduler refuses to execute a compile itself", "[compile-cache][handler][distributed]")
+{
+    // COMPILE is a worker's verb. Sending it here is a client bug, and it is
+    // refused with its own message rather than a bare "not permitted" so it does
+    // not present as an unexplained refusal.
+    CcFixture fix;
+    DispatchFixture dispatch;
+
+    auto const reply = ExchangeWith(fix,
+                                    Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+                                                                               .fingerprint = "gcc-13",
+                                                                               .args = {},
+                                                                               .source = {},
+                                                                               .acceptedCodecs = {},
+                                                                               .sourceName = "a.cpp" }),
+                                    dispatch.SessionWith(ListenerRole::Cache | ListenerRole::Dispatch));
+
+    auto const error = ErrorOf(SoleReply(reply));
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::DispatchNotPermitted);
+    CHECK(error.message.contains("does not execute"));
+}
+
+TEST_CASE("An oversize control frame is refused on the control ceiling", "[compile-cache][handler][distributed]")
+{
+    // The scheduler's listener is reachable by a whole fleet, so its control verbs
+    // carry a ceiling far below the session cap. Drained and answered, so the
+    // connection stays usable.
+    CcFixture fix;
+    DispatchFixture dispatch;
+
+    std::string const huge(Wire::MaxControlPayload + 1, 'k');
+    auto const reply = ExchangeWith(
+        fix,
+        Concat({ Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-13", .key = huge, .acceptedCodecs = {} }),
+                 Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-13", .key = "k", .acceptedCodecs = {} }) }),
+        dispatch.SessionWith(ListenerRole::Cache | ListenerRole::Dispatch));
+
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 2);
+    CHECK(ErrorOf(frames[0]).code == Wire::ErrorCode::PayloadTooLarge);
+    CHECK(ErrorOf(frames[0]).message.contains("lease"));
+    // Still answering afterwards.
+    CHECK(ErrorOf(frames[1]).code == Wire::ErrorCode::NoWorker);
 }

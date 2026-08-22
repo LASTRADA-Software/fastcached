@@ -44,6 +44,12 @@ namespace
                    .arity = Arity::None,
                    .operands = "",
                    .summary = "Discard the statistics log." },
+        FlagSpec { .action = Action::PrintFingerprint,
+                   .primary = "--print-toolchain-fingerprint",
+                   .aliases = NoAliases,
+                   .arity = Arity::Value,
+                   .operands = " <compiler>",
+                   .summary = "Print the toolchain fingerprint a dispatched compile would use." },
         FlagSpec { .action = Action::Help,
                    .primary = "--help",
                    .aliases = HelpAliases,
@@ -128,7 +134,7 @@ namespace
     /// @return The command.
     [[nodiscard]] Command Selected(Action action)
     {
-        return { .action = action, .groupFilter = {}, .outputPath = {}, .diagnostic = {} };
+        return { .action = action, .groupFilter = {}, .outputPath = {}, .compiler = {}, .diagnostic = {} };
     }
 
     /// A rejected command line.
@@ -136,7 +142,11 @@ namespace
     /// @return A `UsageError` command carrying `diagnostic`.
     [[nodiscard]] Command Rejected(std::string diagnostic)
     {
-        return { .action = Action::UsageError, .groupFilter = {}, .outputPath = {}, .diagnostic = std::move(diagnostic) };
+        return { .action = Action::UsageError,
+                 .groupFilter = {},
+                 .outputPath = {},
+                 .compiler = {},
+                 .diagnostic = std::move(diagnostic) };
     }
 
     /// The `FASTCACHE_*` variables, in the order `--help` documents them.
@@ -184,6 +194,17 @@ namespace
                                 "handshake, so a launcher cannot ask. Raise BOTH to cache a\n"
                                 "result larger than this; raising only one leaves the other\n"
                                 "refusing." },
+        EnvVarSpec { .name = EnvName::Scheduler,
+                     .summary = "host:port of a fastcached scheduling endpoint (its\n"
+                                "--listen-dispatch port). Unset means every miss compiles\n"
+                                "locally, which is the behaviour without this feature.\n"
+                                "On a miss the launcher asks the scheduler for a worker and\n"
+                                "sends it the preprocessed translation unit. EVERY refusal\n"
+                                "-- no matching toolchain, no free slot, another client\n"
+                                "already compiling this key, an unreachable node -- falls\n"
+                                "back to a local compile, so distribution cannot fail a\n"
+                                "build. A worker that reports a FAILED compile is retried\n"
+                                "locally before its diagnostics are believed." },
         EnvVarSpec { .name = EnvName::Token,
                      .summary = "Shared secret presented to a daemon started with\n"
                                 "--requirepass. Unset means no credential is sent, which is\n"
@@ -321,6 +342,19 @@ Command ParseTopLevel(std::span<std::string const> args)
             return ParseStatsOptions(args.subspan(1), StatsOptions());
         if (flag->action == Action::HtmlStats)
             return ParseStatsOptions(args.subspan(1), HtmlStatsOptions(), Action::HtmlStats);
+        if (flag->action == Action::PrintFingerprint)
+        {
+            // The operand is required: without a compiler there is nothing to
+            // fingerprint, and defaulting to something plausible ("cc") would
+            // print a digest for a toolchain the operator did not ask about --
+            // which, in the one command whose purpose is diagnosing a mismatch,
+            // is worse than refusing.
+            if (args.size() < 2)
+                return Rejected("--print-toolchain-fingerprint needs a compiler");
+            auto selected = Selected(flag->action);
+            selected.compiler = args[1];
+            return selected;
+        }
         return Selected(flag->action);
     }
 

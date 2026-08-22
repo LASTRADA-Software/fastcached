@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Socket activation for the compile worker.
+#
+# systemd binds and listens here at boot and starts the service only when a
+# client actually connects. Two things follow, and both matter for this
+# particular daemon:
+#
+#   * The port answers from boot, so a client that leases this worker never
+#     races its startup. Without activation there is a window in which the
+#     scheduler has handed out an endpoint that nothing is listening on yet.
+#   * An idle worker costs nothing. Misses on a warm shared cache are bursty
+#     and rare, so a compile fleet is idle most of the time -- which is exactly
+#     the load profile socket activation exists for.
+#
+# The service unit deliberately has no [Install] section: enabling THIS is what
+# enables the worker. `systemctl enable --now fastcache-compile-node.socket`.
+
+[Unit]
+Description=fastcache compile worker socket
+Documentation=https://github.com/LASTRADA-Software/fastcached
+
+[Socket]
+# The default port for a compile worker. It is deliberately NOT an IANA-
+# registered assignment: the scheduler hands a client the worker's endpoint
+# explicitly, so this is never a client-side default -- it is only ever what an
+# operator configured, and this file is where they change it.
+ListenStream=6676
+
+# One connection carries one compile, and a compile occupies a slot for
+# seconds. Accept=no means ONE service instance handles every connection,
+# which is what the worker's own slot accounting assumes; Accept=yes would
+# spawn a process per connection and make the advertised slot count meaningless.
+Accept=no
+
+[Install]
+WantedBy=sockets.target

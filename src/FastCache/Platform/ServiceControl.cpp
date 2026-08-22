@@ -271,8 +271,7 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath, 
     // through FormatListenHost so what is emitted is what ParseListenSpec
     // accepts — these tokens are re-parsed by the daemon at every start.
     for (auto const& bind: cfg.binds)
-        argv.push_back(
-            std::format("--{}={}:{}", bind.tls ? "listen-tls" : "listen", FormatListenHost(bind.address), bind.port));
+        argv.push_back(std::format("--{}={}:{}", ListenFlagFor(bind), FormatListenHost(bind.address), bind.port));
 
     // requirePass is deliberately NOT here, and its omission is reported rather
     // than silent: see InlineCredentialRejection.

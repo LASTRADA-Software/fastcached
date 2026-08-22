@@ -1,6 +1,6 @@
 # fastcached
 
-Two things ship from this repository:
+Three things ship from this repository:
 
 - **`fastcached`** — a fast in-memory cache daemon that speaks the memcached
   text, memcached binary, memcached meta, and Redis RESP2 protocols on a single
@@ -12,6 +12,12 @@ Two things ship from this repository:
   backed by `fastcached`. Unlike those, its cache entries are **portable across
   checkout paths**, so CI runners and developer machines share one cache even
   when their source trees live at different depths.
+- **`fastcache-compile-node`** — an optional compile worker. A cache **miss** can
+  be dispatched to a registered worker instead of being compiled locally, so a
+  build is bounded by the fleet rather than by one machine's cores. A job names a
+  *toolchain fingerprint*, never a program, and the worker runs a compiler from its
+  own configuration — which is what keeps a build accelerator from being a remote
+  shell. See [distributed compilation](docs/getting-started/distributed-compilation.md).
 
 Use them together for a shared compile cache, or run `fastcached` on its own as
 a memcached/Redis-compatible cache — including as a plain

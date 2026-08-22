@@ -52,15 +52,41 @@ TEST_CASE("every accepted flag and alias appears in the help text")
 
 TEST_CASE("every documented top-level flag and alias dispatches to its own action")
 {
+    // Arity comes from the table rather than from a list of exceptions here. A
+    // value-taking flag parsed bare is a usage error BY DESIGN, so passing it
+    // alone would assert the opposite of what its own row says -- and a list of
+    // "flags that need an operand" maintained beside the table is the second
+    // source of truth this table exists to avoid.
+    auto const withOperandIfNeeded = [](std::string token, FlagSpec const& spec) {
+        std::vector<std::string> args { std::move(token) };
+        if (spec.arity == Arity::Value)
+            args.emplace_back("operand");
+        return args;
+    };
+
     for (auto const& spec: TopLevelFlags())
     {
         INFO("flag " << spec.primary);
-        CHECK(Parse({ std::string { spec.primary } }).action == spec.action);
+        CHECK(Parse(withOperandIfNeeded(std::string { spec.primary }, spec)).action == spec.action);
         for (auto const alias: spec.aliases)
         {
             INFO("alias " << alias << " of " << spec.primary);
-            CHECK(Parse({ std::string { alias } }).action == spec.action);
+            CHECK(Parse(withOperandIfNeeded(std::string { alias }, spec)).action == spec.action);
         }
+    }
+}
+
+TEST_CASE("a value-taking top-level flag is rejected without its operand")
+{
+    // The other half of the rule above, and the reason the arity is honoured
+    // rather than worked around: a flag whose whole purpose is to name something
+    // must not silently act on a default.
+    for (auto const& spec: TopLevelFlags())
+    {
+        if (spec.arity != Arity::Value)
+            continue;
+        INFO("flag " << spec.primary);
+        CHECK(Parse({ std::string { spec.primary } }).action == Action::UsageError);
     }
 }
 
@@ -313,6 +339,7 @@ TEST_CASE("the help text documents every environment variable the launcher reads
                              "FASTCACHE_NO_DIRECT",
                              "FASTCACHE_TIMEOUT_MS",
                              "FASTCACHE_MAX_STORE_BYTES",
+                             "FASTCACHE_SCHEDULER",
                              "FASTCACHE_TOKEN",
                              "FASTCACHE_USER",
                              "LOCALAPPDATA",

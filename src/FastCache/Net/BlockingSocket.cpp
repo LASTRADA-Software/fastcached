@@ -361,6 +361,13 @@ std::unique_ptr<BlockingListener> BlockingListener::Bind(std::string_view bindAd
     return listener;
 }
 
+std::unique_ptr<BlockingListener> BlockingListener::Adopt(Detail::NativeSocket native)
+{
+    std::unique_ptr<BlockingListener> listener { new BlockingListener {} };
+    listener->_native = native;
+    return listener;
+}
+
 BlockingListener::~BlockingListener()
 {
     BlockingListener::Close();
