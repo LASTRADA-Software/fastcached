@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <array>
+#include <expected>
+#include <format>
 #include <ranges>
 
 namespace FastCache::Cc
@@ -37,7 +39,13 @@ namespace
     /// True if `lowerName` ends with one of the recognised C/C++ source suffixes.
     [[nodiscard]] bool IsSourceSuffix(std::string_view lowerName)
     {
-        constexpr std::array<std::string_view, 6> Suffixes { ".cpp", ".cc", ".cxx", ".c++", ".c", ".m" };
+        // The module-interface spellings are here to be RECOGNISED, not supported:
+        // a line naming one is then refused by `UncacheableBecause` with its reason
+        // stated, where before it fell through as "no source file found" and was
+        // passed through in silence -- indistinguishable, from outside, from the
+        // cache being broken. See SourceExtensions for why they can never be cached.
+        constexpr std::array<std::string_view, 12> Suffixes { ".cpp", ".cc",   ".cxx", ".c++",  ".c",    ".m",
+                                                              ".ixx", ".cppm", ".ccm", ".cxxm", ".c++m", ".mxx" };
         return std::ranges::any_of(Suffixes, [&](std::string_view s) { return lowerName.ends_with(s); });
     }
 
@@ -81,12 +89,102 @@ namespace
     constexpr std::array<std::string_view, 1> MsvcDispatchPreprocess { "/E" };
     constexpr std::array<std::string_view, 1> GnuDispatchPreprocess { "-E" };
 
-    /// Tell a GNU driver its input is already preprocessed. See
-    /// `DriverSpec::preprocessedInputFlags`: without this, `-pedantic` reports the
-    /// `#line` markers themselves as a GNU extension and `-Werror` fails the compile.
-    /// The `.c` spelling is chosen at the call site, from the source's own extension.
-    constexpr std::array<std::string_view, 2> GnuPreprocessedCxx { "-x", "c++-cpp-output" };
+    /// Tell a driver its input is already preprocessed, per language. See
+    /// `DriverSpec::preprocessedInput`: without this, `-pedantic` reports the
+    /// `#line` markers themselves as a GNU extension and `-Werror` fails the
+    /// compile -- and nothing states the LANGUAGE, which the worker's scratch file
+    /// name would otherwise decide.
     constexpr std::array<std::string_view, 2> GnuPreprocessedC { "-x", "cpp-output" };
+    constexpr std::array<std::string_view, 2> GnuPreprocessedCxx { "-x", "c++-cpp-output" };
+    constexpr std::array<std::string_view, 2> GnuPreprocessedObjC { "-x", "objective-c-cpp-output" };
+    constexpr std::array<std::string_view, 2> GnuPreprocessedObjCxx { "-x", "objective-c++-cpp-output" };
+
+    /// MSVC's own spelling of the same thing. `/TC` and `/TP` say "treat every
+    /// input as C / as C++" and are documented as overriding the extension, which
+    /// is exactly what is needed for a file the worker had to name itself.
+    ///
+    /// There is deliberately no Objective-C row: the MSVC drivers compile no such
+    /// language, so a job in it is refused before it is sent rather than being
+    /// handed over with its language unstated.
+    constexpr std::array<std::string_view, 1> MsvcPreprocessedC { "/TC" };
+    constexpr std::array<std::string_view, 1> MsvcPreprocessedCxx { "/TP" };
+
+    constexpr std::array<PreprocessedInputSpelling, 4> GnuPreprocessedInput { {
+        { .language = SourceLanguage::C, .flags = GnuPreprocessedC },
+        { .language = SourceLanguage::Cxx, .flags = GnuPreprocessedCxx },
+        { .language = SourceLanguage::ObjectiveC, .flags = GnuPreprocessedObjC },
+        { .language = SourceLanguage::ObjectiveCxx, .flags = GnuPreprocessedObjCxx },
+    } };
+
+    constexpr std::array<PreprocessedInputSpelling, 2> MsvcPreprocessedInput { {
+        { .language = SourceLanguage::C, .flags = MsvcPreprocessedC },
+        { .language = SourceLanguage::Cxx, .flags = MsvcPreprocessedCxx },
+    } };
+
+    /// Which extension names which language.
+    ///
+    /// Matched case-insensitively so a `.CPP` on Windows still dispatches, with the
+    /// two genuinely ambiguous spellings excluded below rather than guessed at.
+    ///
+    /// The module-interface rows carry every extension the two toolchains that have
+    /// a convention for one use -- `.ixx` is MSVC's, the `*m` family is clang's --
+    /// and they are here to be REFUSED rather than to be supported. A module
+    /// interface unit writes a BMI beside its object, which is a second artefact
+    /// neither a cache hit nor a dispatched compile can carry (the same rule
+    /// `cmake/portable/CompileCache.cmake` applies when it turns module scanning off
+    /// while a launcher is active). Naming them is what makes that a stated rule
+    /// instead of the accident it was: they simply were not in `IsSourceSuffix`, so
+    /// nothing recognised them, and adding one there would have quietly started
+    /// replaying objects whose BMI nobody reproduced.
+    constexpr std::array<std::pair<std::string_view, SourceLanguage>, 14> SourceExtensions { {
+        { ".c", SourceLanguage::C },
+        { ".cc", SourceLanguage::Cxx },
+        { ".cp", SourceLanguage::Cxx },
+        { ".cpp", SourceLanguage::Cxx },
+        { ".cxx", SourceLanguage::Cxx },
+        { ".c++", SourceLanguage::Cxx },
+        { ".m", SourceLanguage::ObjectiveC },
+        { ".mm", SourceLanguage::ObjectiveCxx },
+        { ".ixx", SourceLanguage::CxxModuleInterface },
+        { ".cppm", SourceLanguage::CxxModuleInterface },
+        { ".ccm", SourceLanguage::CxxModuleInterface },
+        { ".cxxm", SourceLanguage::CxxModuleInterface },
+        { ".c++m", SourceLanguage::CxxModuleInterface },
+        { ".mxx", SourceLanguage::CxxModuleInterface },
+    } };
+
+    /// Extensions whose language depends on the DRIVER and not on the extension:
+    /// a GNU driver reads `.C` as C++ and `.M` as Objective-C++, while an MSVC one
+    /// reads both case-insensitively and so calls them C and Objective-C. Compared
+    /// case-SENSITIVELY, which is the whole point of the row.
+    constexpr std::array<std::string_view, 2> AmbiguousSourceExtensions { ".C", ".M" };
+
+    /// What each language is called, and whether it may be dispatched at all.
+    ///
+    /// `refused` is a REASON rather than a flag, because the two ways a job is
+    /// turned away are not the same fact and must not read as though they were: a
+    /// driver with no spelling for a language (Objective-C on MSVC) is a property of
+    /// that driver, while a module interface unit is refused on every driver, by
+    /// both gates, for a reason no spelling could fix.
+    struct LanguageSpec
+    {
+        SourceLanguage language;
+        std::string_view name;
+        /// Why a translation unit in this language is neither cached nor dispatched.
+        /// Empty when it may be.
+        std::string_view refused;
+    };
+
+    constexpr std::array<LanguageSpec, 5> LanguageSpecs { {
+        { .language = SourceLanguage::C, .name = "C", .refused = {} },
+        { .language = SourceLanguage::Cxx, .name = "C++", .refused = {} },
+        { .language = SourceLanguage::ObjectiveC, .name = "Objective-C", .refused = {} },
+        { .language = SourceLanguage::ObjectiveCxx, .name = "Objective-C++", .refused = {} },
+        { .language = SourceLanguage::CxxModuleInterface,
+          .name = "C++ module interface",
+          .refused = "it writes a BMI beside the object, and neither a cache hit nor a dispatched compile "
+                     "reproduces anything but the object" },
+    } };
 
     /// Flags dropped when preprocessing that carry no path value of their own:
     /// the compile-only marker (we want text on stdout, not an object) and the
@@ -129,7 +227,7 @@ namespace
           .family = DriverFamily::None,
           .preprocessFlags = {},
           .dispatchPreprocessFlags = {},
-          .preprocessedInputFlags = {},
+          .preprocessedInput = {},
           .preprocessDropFlags = {},
           .dependencyProbeFlags = {},
           .usesDepfile = false,
@@ -139,7 +237,7 @@ namespace
           .family = DriverFamily::Msvc,
           .preprocessFlags = MsvcPreprocess,
           .dispatchPreprocessFlags = MsvcDispatchPreprocess,
-          .preprocessedInputFlags = {},
+          .preprocessedInput = MsvcPreprocessedInput,
           .preprocessDropFlags = MsvcDrop,
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false,
@@ -149,7 +247,7 @@ namespace
           .family = DriverFamily::Msvc,
           .preprocessFlags = MsvcPreprocess,
           .dispatchPreprocessFlags = MsvcDispatchPreprocess,
-          .preprocessedInputFlags = {},
+          .preprocessedInput = MsvcPreprocessedInput,
           .preprocessDropFlags = MsvcDrop,
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false,
@@ -159,7 +257,7 @@ namespace
           .family = DriverFamily::Gnu,
           .preprocessFlags = GnuPreprocess,
           .dispatchPreprocessFlags = GnuDispatchPreprocess,
-          .preprocessedInputFlags = GnuPreprocessedCxx,
+          .preprocessedInput = GnuPreprocessedInput,
           .preprocessDropFlags = GnuDrop,
           .dependencyProbeFlags = GnuDependencyProbe,
           .usesDepfile = true,
@@ -169,7 +267,7 @@ namespace
           .family = DriverFamily::Gnu,
           .preprocessFlags = GnuPreprocess,
           .dispatchPreprocessFlags = GnuDispatchPreprocess,
-          .preprocessedInputFlags = GnuPreprocessedCxx,
+          .preprocessedInput = GnuPreprocessedInput,
           .preprocessDropFlags = GnuDrop,
           .dependencyProbeFlags = GnuDependencyProbe,
           .usesDepfile = true,
@@ -201,6 +299,42 @@ namespace
         { .spelling = "-o", .role = PathValueRole::ObjectOutput, .families = DriverFamily::Any },
     } };
 
+    /// One flag that makes a compile write a second artefact, and which families
+    /// spell it that way.
+    struct SideArtefactFlag
+    {
+        std::string_view spelling;
+        DriverFamily families;
+    };
+
+    /// Flags that make a compile write something BESIDES its object file.
+    ///
+    /// One row per spelling, exactly as PathValues does it and for the same reason:
+    /// an MSVC driver accepts `-` for every option, and a row matched on introducer
+    /// alone would let a GNU `-interface` through. See `ProducesSideArtefact` for
+    /// why a line carrying one of these is not cacheable.
+    ///
+    /// The residual, recorded deliberately: clang can be told to emit a module
+    /// interface through `-Xclang -emit-module-interface`, which is two arguments
+    /// and matches nothing here. It is left out rather than half-matched, because a
+    /// row that fires on `-Xclang` alone would un-cache every build that passes any
+    /// `-Xclang` flag at all.
+    constexpr std::array<SideArtefactFlag, 13> SideArtefacts { {
+        { .spelling = "/interface", .families = DriverFamily::Msvc },
+        { .spelling = "-interface", .families = DriverFamily::Msvc },
+        { .spelling = "/internalPartition", .families = DriverFamily::Msvc },
+        { .spelling = "-internalPartition", .families = DriverFamily::Msvc },
+        { .spelling = "/exportHeader", .families = DriverFamily::Msvc },
+        { .spelling = "-exportHeader", .families = DriverFamily::Msvc },
+        { .spelling = "/ifcOutput", .families = DriverFamily::Msvc },
+        { .spelling = "-ifcOutput", .families = DriverFamily::Msvc },
+        { .spelling = "/Yc", .families = DriverFamily::Msvc },
+        { .spelling = "-Yc", .families = DriverFamily::Msvc },
+        { .spelling = "-fmodule-output", .families = DriverFamily::Gnu },
+        { .spelling = "-fmodule-mapper", .families = DriverFamily::Gnu },
+        { .spelling = "--precompile", .families = DriverFamily::Gnu },
+    } };
+
     /// Which introducer characters each family's options start with.
     constexpr std::array<std::pair<DriverFamily, std::string_view>, 4> FamilyIntroducers { {
         { DriverFamily::None, "" },
@@ -221,6 +355,20 @@ namespace
         return role != PathValueRole::IncludeDir;
     }
 
+    /// Whether a driver reads its input's language off the file name, or compiles
+    /// everything as C++ whatever the name says.
+    ///
+    /// The `++` drivers do the latter, in as many words: "g++ treats .c, .h and .i
+    /// files as C++ source files instead of C source files". It is not a detail --
+    /// the launcher has to state the language when it hands preprocessed text to a
+    /// worker, and taking that from the extension alone would tell a worker to
+    /// compile as C what this machine compiles as C++.
+    enum class LanguageDefault : std::uint8_t
+    {
+        FromExtension,
+        AlwaysCxx,
+    };
+
     /// How a driver's basename is recognised. Order matters: the first match
     /// wins, so longer, more specific stems precede their prefixes
     /// ("clang-cl" before "clang", "c++" before "cc").
@@ -228,17 +376,44 @@ namespace
     {
         std::string_view stem;
         Flavor flavor;
+        LanguageDefault languageDefault;
     };
 
     constexpr std::array<NamePattern, 8> NamePatterns { {
-        { .stem = "clang-cl", .flavor = Flavor::ClangCl },
-        { .stem = "clang++", .flavor = Flavor::Clang },
-        { .stem = "clang", .flavor = Flavor::Clang },
-        { .stem = "g++", .flavor = Flavor::Gcc },
-        { .stem = "gcc", .flavor = Flavor::Gcc },
-        { .stem = "c++", .flavor = Flavor::Gcc },
-        { .stem = "cc", .flavor = Flavor::Gcc },
-        { .stem = "cl", .flavor = Flavor::Cl },
+        { .stem = "clang-cl", .flavor = Flavor::ClangCl, .languageDefault = LanguageDefault::FromExtension },
+        { .stem = "clang++", .flavor = Flavor::Clang, .languageDefault = LanguageDefault::AlwaysCxx },
+        { .stem = "clang", .flavor = Flavor::Clang, .languageDefault = LanguageDefault::FromExtension },
+        { .stem = "g++", .flavor = Flavor::Gcc, .languageDefault = LanguageDefault::AlwaysCxx },
+        { .stem = "gcc", .flavor = Flavor::Gcc, .languageDefault = LanguageDefault::FromExtension },
+        { .stem = "c++", .flavor = Flavor::Gcc, .languageDefault = LanguageDefault::AlwaysCxx },
+        { .stem = "cc", .flavor = Flavor::Gcc, .languageDefault = LanguageDefault::FromExtension },
+        { .stem = "cl", .flavor = Flavor::Cl, .languageDefault = LanguageDefault::FromExtension },
+    } };
+
+    /// Flags that state the input's language ON THE COMMAND LINE, overriding both
+    /// the driver's default and the file's extension.
+    ///
+    /// A build reaches these more often than it looks: CMake's
+    /// `set_source_files_properties(x.c PROPERTIES LANGUAGE CXX)` emits `/TP` or
+    /// `-x c++`. A dispatched compile appends its own spelling of "this input is
+    /// preprocessed <language>" LAST, so it would silently override the build's --
+    /// compiling as C what the build asked to be compiled as C++, and storing that
+    /// under the key. The command line is not re-derivable from anything the worker
+    /// sees, so such a compile is refused rather than guessed at.
+    ///
+    /// `/Tc` and `/Tp` are here for a second reason as well: they name a FILE, and
+    /// with a bare file name they carry no separator, so the path filter lets them
+    /// past.
+    constexpr std::array<std::pair<std::string_view, DriverFamily>, 9> LanguageSelectors { {
+        { "/TC", DriverFamily::Msvc },
+        { "-TC", DriverFamily::Msvc },
+        { "/TP", DriverFamily::Msvc },
+        { "-TP", DriverFamily::Msvc },
+        { "/Tc", DriverFamily::Msvc },
+        { "-Tc", DriverFamily::Msvc },
+        { "/Tp", DriverFamily::Msvc },
+        { "-Tp", DriverFamily::Msvc },
+        { "-x", DriverFamily::Gnu },
     } };
 
     /// Classify the compiler flavor from its basename.
@@ -271,6 +446,31 @@ namespace
                 return pattern.flavor;
         }
         return Flavor::Unknown;
+    }
+
+    /// Whether this driver compiles every input as C++ regardless of its name.
+    ///
+    /// The same walk as ClassifyCompilerImpl over the same table, because it is the
+    /// same question asked of a different column -- `g++-14` and `clang++.exe` have
+    /// to be recognised here exactly as they are there, and a second spelling of
+    /// "which driver is this" is a second thing to keep in step.
+    /// @param compiler argv[0] as invoked.
+    /// @return True for a `++` driver.
+    [[nodiscard]] bool CompilesEverythingAsCxx(std::string_view compiler)
+    {
+        std::string base = AsciiLower(Basename(compiler));
+        if (base.ends_with(".exe"))
+            base.resize(base.size() - 4);
+
+        for (NamePattern const& pattern: NamePatterns)
+        {
+            if (!base.starts_with(pattern.stem))
+                continue;
+            auto const rest = std::string_view { base }.substr(pattern.stem.size());
+            if (rest.empty() || rest.front() == '-')
+                return pattern.languageDefault == LanguageDefault::AlwaysCxx;
+        }
+        return false;
     }
 
     /// True if `a` is an option (starts with one of the driver's introducers).
@@ -346,6 +546,29 @@ namespace
     [[nodiscard]] bool MatchesFlag(std::string_view arg, std::string_view flag)
     {
         return arg == flag || IsJoinedValue(arg, flag);
+    }
+
+    /// Whether `arg` states the input language explicitly.
+    /// @param arg    The argument as it appeared on the command line.
+    /// @param family Which family's spellings may match.
+    /// @return True when the build has named the language itself.
+    [[nodiscard]] bool IsLanguageSelector(std::string_view arg, DriverFamily family)
+    {
+        auto const introducers = IntroducersOf(family);
+        if (arg.empty() || introducers.empty() || !introducers.contains(arg.front()))
+            return false;
+        for (auto const& [spelling, families]: LanguageSelectors)
+        {
+            if (!introducers.contains(spelling.front()) || !Overlaps(families, family))
+                continue;
+            // A plain prefix test, and NOT MatchesFlag: that one only recognises a
+            // fused value for a flag the path-value table knows takes one, so it
+            // reads `-xc++` and `/Tcother.c` as ordinary arguments -- which is
+            // exactly how they would have reached a worker.
+            if (arg.starts_with(spelling))
+                return true;
+        }
+        return false;
     }
 
     /// The ParsedCommand field a path-valued flag's value belongs in.
@@ -429,6 +652,21 @@ std::optional<PathValueMatch> MatchPathValueFlag(std::string_view arg, std::stri
     return std::nullopt;
 }
 
+bool ProducesSideArtefact(std::string_view arg, DriverFamily family)
+{
+    auto const introducers = IntroducersOf(family);
+    if (arg.empty() || introducers.empty() || !introducers.contains(arg.front()))
+        return false;
+
+    for (SideArtefactFlag const& row: SideArtefacts)
+        // The same three questions MatchPathValueFlag asks, and in the same order:
+        // does this context recognise the row's introducer, does the family overlap,
+        // and does the argument carry the flag bare or with a value fused on.
+        if (introducers.contains(row.spelling.front()) && Overlaps(row.families, family) && MatchesFlag(arg, row.spelling))
+            return true;
+    return false;
+}
+
 std::string_view ObjectOutputPrefixFor(DriverFamily family)
 {
     // The MOST SPECIFIC row wins: `-o` is DriverFamily::Any and would match an
@@ -461,6 +699,54 @@ DriverSpec const& DriverOf(Flavor flavor)
         if (spec.flavor == flavor)
             return spec;
     return Drivers.front();
+}
+
+std::optional<SourceLanguage> LanguageOfSource(std::string_view path)
+{
+    // The final component first: a directory is free to carry a dot
+    // (`../build.release/src/a.cpp`), and the extension of a path is a property of
+    // its last component only.
+    auto const slash = path.find_last_of("/\\");
+    auto const name = slash == std::string_view::npos ? path : path.substr(slash + 1);
+    auto const dot = name.find_last_of('.');
+    if (dot == std::string_view::npos || dot + 1 == name.size())
+        return std::nullopt;
+    auto const extension = name.substr(dot);
+
+    // Asked BEFORE the case-insensitive lookup, because the ambiguity is exactly a
+    // difference of case: folding first is what would turn `.C` into the C row.
+    if (std::ranges::contains(AmbiguousSourceExtensions, extension))
+        return std::nullopt;
+
+    auto const folded = AsciiLower(extension);
+    for (auto const& [spelling, language]: SourceExtensions)
+        if (folded == spelling)
+            return language;
+    return std::nullopt;
+}
+
+std::string_view DescribeLanguage(SourceLanguage language) noexcept
+{
+    for (auto const& spec: LanguageSpecs)
+        if (spec.language == language)
+            return spec.name;
+    return "unknown";
+}
+
+std::string_view UncacheableBecause(SourceLanguage language) noexcept
+{
+    for (auto const& spec: LanguageSpecs)
+        if (spec.language == language)
+            return spec.refused;
+    return {};
+}
+
+std::optional<std::span<std::string_view const>> PreprocessedInputFlagsFor(DriverSpec const& driver, SourceLanguage language)
+{
+    for (auto const& spelling: driver.preprocessedInput)
+        if (spelling.language == language)
+            return spelling.flags;
+    return std::nullopt;
 }
 
 ParsedCommand ParseCommand(std::span<std::string const> argv)
@@ -535,6 +821,15 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
             continue;
         }
 
+        // Asked of every argument, and of the SOURCE too by way of its extension
+        // below: a compile that also writes a BMI or a precompiled header is not
+        // one a cache hit can reproduce.
+        if (ProducesSideArtefact(a, driver.family))
+        {
+            out.sideArtefact = true;
+            continue;
+        }
+
         // A bare argument ending in a source suffix is the translation unit.
         if (!IsOption(a, driver) && IsSourceSuffix(AsciiLower(a)))
         {
@@ -556,7 +851,18 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
     // no path to read the object back from or write it to — treating it as
     // cacheable makes every such compile report a MISS and then fail to store,
     // forever, and would hand an empty path to the file writer on a hit.
-    out.parsedOk = !out.source.empty() && !out.objPath.empty() && sawCompileOnly && !preprocessOnly;
+    //
+    // A module interface unit reaches a compiler two ways -- as `foo.ixx`, and as
+    // `cl /interface foo.cpp` -- and both must be stepped over for one reason: what
+    // a hit reproduces is the object and the dependency record, so the BMI beside it
+    // would afterwards be missing (which fails loudly) or left from a previous build
+    // (which does not). The extension is asked of the LANGUAGE table so that the
+    // rule has one home, and the flag of `ProducesSideArtefact` above, which also
+    // covers a precompiled header.
+    if (auto const language = LanguageOfSource(out.source); language.has_value() && !UncacheableBecause(*language).empty())
+        out.sideArtefact = true;
+
+    out.parsedOk = !out.source.empty() && !out.objPath.empty() && sawCompileOnly && !preprocessOnly && !out.sideArtefact;
     return out;
 }
 
@@ -587,9 +893,32 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
     return body.contains('/') || body.contains('\\');
 }
 
-std::optional<std::vector<std::string>> RemoteCompileArgs(ParsedCommand const& cmd, std::span<std::string const> argv)
+std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCommand const& cmd,
+                                                                       std::span<std::string const> argv)
 {
     auto const& driver = DriverOf(cmd.flavor);
+
+    // Asked FIRST, before a single argument is examined: what this decides is
+    // whether the job can be dispatched at all, and a refusal that costs nothing is
+    // worth reaching before one that costs a scan.
+    auto language = LanguageOfSource(cmd.source);
+    if (!language.has_value())
+        return std::unexpected(std::format("no language is named unambiguously by the extension of {}", cmd.source));
+    if (auto const because = UncacheableBecause(*language); !because.empty())
+        return std::unexpected(std::format("{} is never dispatched: {}", DescribeLanguage(*language), because));
+
+    // The DRIVER overrides the extension where it has a default of its own: `g++
+    // -c a.c` compiles C++, so telling a worker `-x cpp-output` would have it
+    // compile as C what this machine compiles as C++, and store that under the key.
+    // Only the C row moves -- a driver that always compiles C++ says nothing about
+    // an Objective-C source, whose own driver default is unchanged.
+    if (*language == SourceLanguage::C && CompilesEverythingAsCxx(cmd.compiler))
+        language = SourceLanguage::Cxx;
+
+    auto const preprocessedInput = PreprocessedInputFlagsFor(driver, *language);
+    if (!preprocessedInput.has_value())
+        return std::unexpected(
+            std::format("this driver has no way to be handed preprocessed {}", DescribeLanguage(*language)));
 
     std::vector<std::string> out;
     out.reserve(argv.size());
@@ -631,11 +960,21 @@ std::optional<std::vector<std::string>> RemoteCompileArgs(ParsedCommand const& c
             continue;
         }
 
+        // A language the BUILD named itself. The flags appended at the end of this
+        // function would silently override it -- they are appended last precisely
+        // so they win -- and compiling as C what a build asked to be compiled as
+        // C++ is a wrong object, not a failed one. Refused rather than reconciled,
+        // because the two spellings mean different things: the build says "this
+        // source is C++", and what must reach the worker is "this text is
+        // preprocessed C++", which is not a substitution that can be made blindly.
+        if (IsLanguageSelector(a, driver.family))
+            return std::unexpected(std::format("the command line names the input language itself ({})", a));
+
         // The positive check, and the last word. See the header: refusing the whole
         // command line is the only safe answer, because stripping an argument this
         // function does not recognise would change the generated code.
         if (CouldNameAFile(a, driver.family))
-            return std::nullopt;
+            return std::unexpected(std::format("argument {} could name a file this launcher cannot account for", a));
 
         out.emplace_back(a);
     }
@@ -643,12 +982,8 @@ std::optional<std::vector<std::string>> RemoteCompileArgs(ParsedCommand const& c
     // Appended last, so a build's own `-x` (if any) is overridden rather than
     // overriding: the input genuinely IS preprocessed output whatever the build
     // thought it was handing over.
-    if (!driver.preprocessedInputFlags.empty())
-    {
-        auto const isC = cmd.source.ends_with(".c");
-        for (auto const& flag: isC ? std::span<std::string_view const> { GnuPreprocessedC } : driver.preprocessedInputFlags)
-            out.emplace_back(flag);
-    }
+    for (auto const& flag: *preprocessedInput)
+        out.emplace_back(flag);
     return out;
 }
 

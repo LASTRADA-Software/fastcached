@@ -1218,7 +1218,7 @@ void RecordManifest(Config const& cfg,
     auto const args = Cc::RemoteCompileArgs(cmd, argv);
     if (!args.has_value())
     {
-        Note("command line is not dispatchable; compiling locally");
+        Note(std::format("not dispatchable ({}); compiling locally", args.error()));
         return std::nullopt;
     }
 
@@ -1802,6 +1802,15 @@ int main(int argc, char** argv)
     {
         // Not a cacheable compile (a link or preprocess-only step). Recording it
         // would dilute the hit rate with lines that were never candidates.
+        //
+        // One of those reasons is worth naming, because it is the one that looks
+        // like a defect from outside: a compile that also writes a BMI or a
+        // precompiled header is stepped over deliberately, and an operator watching
+        // a module-using build get no hits at all deserves to be told why rather
+        // than left to conclude the cache is broken.
+        if (cmd.sideArtefact)
+            Note("the compile writes a second artefact (a BMI or a precompiled header) "
+                 "that a cache hit cannot reproduce; not cached");
         return RunPassthrough(std::span<std::string const> { args });
     }
 

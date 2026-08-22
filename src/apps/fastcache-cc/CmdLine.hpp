@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <span>
 #include <string>
@@ -171,6 +172,71 @@ struct PathValueMatch
 /// @return Its introducers; empty for DriverFamily::None.
 [[nodiscard]] std::string_view IntroducersOf(DriverFamily family) noexcept;
 
+/// The source language a translation unit is written in.
+///
+/// Needed only where a driver has to be TOLD, because the ordinary signal — the
+/// file's extension — is lost the moment the text is preprocessed into a worker's
+/// scratch file. See `DriverSpec::preprocessedInput`.
+enum class SourceLanguage : std::uint8_t
+{
+    C,
+    Cxx,
+    ObjectiveC,
+    ObjectiveCxx,
+    /// A module interface unit (`.ixx`, `.cppm`, ...). Recognised so it can be
+    /// REFUSED: it writes a BMI beside its object, and neither a cache hit nor a
+    /// dispatched compile reproduces anything but the object.
+    CxxModuleInterface,
+};
+
+/// One driver's spelling of "this input is preprocessed <language>".
+struct PreprocessedInputSpelling
+{
+    SourceLanguage language;
+    std::span<std::string_view const> flags;
+};
+
+/// The language a source path names, by its extension.
+///
+/// Case-insensitive, with `.C` and `.M` deliberately excluded: those two are read
+/// as C++ / Objective-C++ by a GNU driver and as C / Objective-C by an MSVC one, so
+/// the extension alone does not answer the question and a guess would hand a worker
+/// the wrong language. An extension with no answer is not dispatched.
+///
+/// @param path The source path as the build system spelled it.
+/// @return The language, or nullopt when the extension names none unambiguously.
+[[nodiscard]] std::optional<SourceLanguage> LanguageOfSource(std::string_view path);
+
+/// A language's English name, for a refusal a human has to act on.
+/// @param language The language.
+/// @return Its name.
+[[nodiscard]] std::string_view DescribeLanguage(SourceLanguage language) noexcept;
+
+/// Why a translation unit in this language is neither cached nor dispatched.
+///
+/// Both gates read it, and caching is the wider of the two: a line that is not
+/// cacheable never reaches dispatch at all, so a language refused here is refused
+/// once rather than in two places that can come to disagree.
+///
+/// @param language The language.
+/// @return The reason, or empty when this language may be cached and dispatched.
+[[nodiscard]] std::string_view UncacheableBecause(SourceLanguage language) noexcept;
+
+/// Whether `arg` makes a compile write something BESIDES its object file.
+///
+/// A cache hit reproduces the object and the dependency record and nothing else, so
+/// a line that also writes a BMI (`/ifcOutput`, `-fmodule-output`) or a precompiled
+/// header (`/Yc`) must not be cached: replaying only the object leaves the second
+/// artefact missing, which fails loudly, or stale, which does not. The module
+/// EXTENSIONS are the other half of the same rule and are handled by
+/// `LanguageOfSource` — this table is for an ordinary source promoted by a flag,
+/// which is how a `.cpp` becomes a module interface unit (`cl /interface`).
+///
+/// @param arg    The argument as it appeared on the command line.
+/// @param family Which family's spellings may match.
+/// @return True when this argument means a second artefact is produced.
+[[nodiscard]] bool ProducesSideArtefact(std::string_view arg, DriverFamily family);
+
 /// How one compiler driver spells the options the launcher needs.
 ///
 /// This is the data behind the parser: adding a driver is adding a row to the
@@ -197,8 +263,8 @@ struct DriverSpec
     /// inside libc++ or the CRT resurfaces, which under `-Werror` fails the
     /// compile outright rather than merely being noisy.
     std::span<std::string_view const> dispatchPreprocessFlags;
-    /// Flags telling the driver its input is ALREADY preprocessed, appended to a
-    /// remote compile's argument list.
+    /// How this driver is told, per language, that its input is ALREADY
+    /// preprocessed — appended to a remote compile's argument list.
     ///
     /// Keeping `#line` markers fixes system-header warnings and immediately creates
     /// a second problem: under `-pedantic` the markers themselves are a GNU
@@ -206,15 +272,23 @@ struct DriverSpec
     /// a failed compile. Naming the input's language as preprocessed output is what
     /// makes the driver expect them — the same thing ccache and distcc do.
     ///
-    /// Empty for MSVC drivers, which is not an omission: `/E` emits standard `#line`
-    /// directives that `cl` accepts in an ordinary source file, so there is nothing
-    /// to tell it. The `-x` spelling has no MSVC equivalent, and inventing one would
-    /// be a flag the driver rejects.
+    /// A TABLE and not one span, because the language is the whole point of the
+    /// flag and it was previously inferred from a FILE NAME on the far side. MSVC's
+    /// entry used to be empty on the reasoning that `/E` emits standard `#line` and
+    /// so there is nothing to tell it — true about the markers, and it left nothing
+    /// stating the LANGUAGE. The worker writes its scratch file as `tu.cpp`, MSVC
+    /// reads the language off that extension, and a dispatched `.c` translation unit
+    /// therefore came back compiled as C++: a failed remote compile where C is not
+    /// valid C++ (so C silently never distributed), and where it is valid C++, an
+    /// object with C++ mangling stored under the C key. `/TC` and `/TP` are exactly
+    /// the `-x` spelling MSVC does have, and `/TP` is a byte-for-byte no-op on a C++
+    /// translation unit, so nothing that worked before moves.
     ///
-    /// The C++ / C choice is the caller's, from the source it is compiling; this row
-    /// carries the C++ spelling because a launcher fronting a C++ compiler is the
-    /// case that exists.
-    std::span<std::string_view const> preprocessedInputFlags;
+    /// A language with no row is NOT DISPATCHABLE on this driver, which is the
+    /// difference between an empty table and a missing row: MSVC has no way to be
+    /// handed preprocessed Objective-C, and sending it anyway is how the defect
+    /// above happened. See `PreprocessedInputFlagsFor`.
+    std::span<PreprocessedInputSpelling const> preprocessedInput;
     /// The driver's own flags dropped when building the preprocess command line
     /// (the compile-only marker and the dependency-reporting switches).
     ///
@@ -270,7 +344,12 @@ struct ParsedCommand
     std::string objPath;             ///< The requested object output (/Fo or -o).
     std::string depPath;             ///< The requested depfile (-MF), if any.
     bool wantShowIncludes { false }; ///< True if /showIncludes was requested.
-    bool parsedOk { false };         ///< False if the line is not a cacheable compile.
+    /// True when the line also writes a BMI or a precompiled header, which makes it
+    /// uncacheable. Recorded rather than folded into `parsedOk` alone so the
+    /// launcher can say WHY it stepped aside: a link step and a module interface
+    /// unit are both passed through, and only one of them looks like a defect.
+    bool sideArtefact { false };
+    bool parsedOk { false }; ///< False if the line is not a cacheable compile.
 };
 
 /// Look up the descriptor for a compiler flavor.
@@ -292,6 +371,15 @@ struct ParsedCommand
 
 [[nodiscard]] DriverSpec const& DriverOf(Flavor flavor);
 
+/// How `driver` is told its input is preprocessed `language`.
+///
+/// @param driver   The driver descriptor.
+/// @param language The translation unit's language.
+/// @return The flags to append, or nullopt when this driver has no spelling for
+///         that language — which means the job must not be dispatched to it.
+[[nodiscard]] std::optional<std::span<std::string_view const>> PreprocessedInputFlagsFor(DriverSpec const& driver,
+                                                                                         SourceLanguage language);
+
 /// Parse a compiler invocation (`argv[0]` = compiler, rest = its arguments).
 ///
 /// Recognises MSVC-style (`cl`, `clang-cl`) and GNU-style (`gcc`, `g++`, `cc`,
@@ -301,8 +389,10 @@ struct ParsedCommand
 ///
 /// `parsedOk` is false when the line has no single source file (a link step, a
 /// multi-TU line), names no explicit object output (`g++ -c a.cpp`, which
-/// defaults to `./a.o` — a path the launcher cannot reconstruct), or is
-/// preprocess-only — the launcher then falls back to a plain exec.
+/// defaults to `./a.o` — a path the launcher cannot reconstruct), is
+/// preprocess-only, or writes a second artefact besides the object (a BMI or a
+/// precompiled header — see `ProducesSideArtefact`) — the launcher then falls back
+/// to a plain exec.
 ///
 /// @param argv The full invocation, argv[0] being the compiler.
 /// @return The parsed command; `parsedOk` gates cacheability.
@@ -378,9 +468,11 @@ struct ParsedCommand
 /// @param cmd The parsed compile command.
 /// @param argv The original full invocation.
 /// @return The arguments to send (without the compiler and without the source), or
-///         nullopt when this command line must not be dispatched.
-[[nodiscard]] std::optional<std::vector<std::string>> RemoteCompileArgs(ParsedCommand const& cmd,
-                                                                        std::span<std::string const> argv);
+///         the reason this command line must not be dispatched. The reason travels
+///         because every refusal here ends in a local compile, and "distribution
+///         stopped helping" is otherwise a whole investigation.
+[[nodiscard]] std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCommand const& cmd,
+                                                                                     std::span<std::string const> argv);
 
 [[nodiscard]] std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
                                                          std::span<std::string const> argv,
