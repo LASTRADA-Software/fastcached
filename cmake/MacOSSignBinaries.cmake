@@ -33,8 +33,23 @@ if(NOT _binaries)
 endif()
 
 foreach(_binary IN LISTS _binaries)
-    # The uninstaller is a shell script, not Mach-O; codesign would reject it.
-    if(NOT _binary MATCHES "/(fastcached|fastcache-cc)$")
+    # Skip anything that is not a Mach-O image — the uninstaller is a shell script,
+    # and codesign would reject it.
+    #
+    # Asked of the FILE rather than of its name, and that is the point. This used to
+    # be an allow-list of binary names, which meant every new executable was silently
+    # left unsigned: the glob picked it up, the filter dropped it, nothing failed, and
+    # the first sign of trouble was Apple's notary service rejecting the whole archive
+    # with "The binary is not signed with a valid Developer ID certificate" — one
+    # release cycle later, on a job most changes never run. Adding an app is supposed
+    # to be adding a row to the app table, and this was a second place that had to be
+    # edited in step with it. Now it is not.
+    execute_process(COMMAND /usr/bin/file --brief "${_binary}"
+                    OUTPUT_VARIABLE _kind
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    COMMAND_ERROR_IS_FATAL ANY)
+    if(NOT _kind MATCHES "Mach-O")
+        message(STATUS "MacOSSignBinaries: skipping non-Mach-O ${_binary} (${_kind})")
         continue()
     endif()
 
