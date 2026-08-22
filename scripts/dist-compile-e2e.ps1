@@ -348,6 +348,44 @@ function Get-CoffSections([string]$path) {
     return $out
 }
 
+# The symbol table and the string table that follows it, as one region -- and the
+# check that the file is as large as its own structure says it is.
+#
+# That check is why this exists at all. Sections are compared by content, and a
+# TRUNCATED object can lose its whole symbol table without a single section
+# changing: MSVC writes the symbol table last, so nine-tenths of a file still
+# parses, still has every section intact, and still compares equal. A truncated
+# transfer is one of the few faults distribution can actually introduce, so a
+# comparison that accepts one is worth very little.
+#
+# COFF states its own end: the string table opens with a four-byte size that
+# INCLUDES those four bytes, and it is the last thing in the file. If that number
+# and the bytes actually present disagree, the object is damaged, whatever its
+# sections say.
+#
+# Returns $null for a damaged or unreadable object.
+function Get-CoffTail([string]$path) {
+    $b = [System.IO.File]::ReadAllBytes($path)
+    if ($b.Length -lt 20) { return $null }
+    $ptr   = [BitConverter]::ToUInt32($b, 8)
+    $count = [BitConverter]::ToUInt32($b, 12)
+    if ($ptr -eq 0) { return [pscustomobject]@{ Present = $false; Length = 0; Hash = 'none' } }
+
+    $stringsAt = $ptr + 18 * $count
+    if ($stringsAt + 4 -gt $b.Length) { return $null }
+    $declared = [BitConverter]::ToUInt32($b, $stringsAt)
+    if ($stringsAt + $declared -ne $b.Length) { return $null }
+
+    $length = $b.Length - $ptr
+    $data = New-Object byte[] $length
+    [Array]::Copy($b, $ptr, $data, 0, $length)
+    return [pscustomobject]@{
+        Present = $true
+        Length  = $length
+        Hash    = [BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($data)).Replace('-', '')
+    }
+}
+
 # The COFF header, field by field, and which fields may differ between two
 # compiles of the same code.
 #
@@ -389,8 +427,9 @@ $CoffHeaderFields = @(
 # agreement on; a different ARCHITECTURE by the header table above; and different
 # CODE by `.text$mn` -- the three things `.debug$S` could otherwise be imagined to
 # be concealing.
-function Test-EquivalentObject([string]$reference, [string]$produced, [string[]]$mayDiffer) {
+function Test-EquivalentObject([string]$reference, [string]$produced, [hashtable]$rules) {
     if (Test-SameBytes $reference $produced) { return $true }
+    $mayDiffer = [string[]]$rules.Sections
 
     $ba = [System.IO.File]::ReadAllBytes($reference)
     $bb = [System.IO.File]::ReadAllBytes($produced)
@@ -430,6 +469,30 @@ function Test-EquivalentObject([string]$reference, [string]$produced, [string[]]
                     -f $sa[$i].Name, $sa[$i].Size, $sb[$i].Size)
         return $false
     }
+    # The symbol table and string table, which no section walk covers -- and which a
+    # truncated object loses entirely while every section still compares equal.
+    #
+    # Both objects are checked for structural self-consistency whatever the rules
+    # say, because "the file is as large as it claims" is not a property any driver
+    # gets to opt out of. Whether the CONTENT may differ is a per-driver row:
+    # measured, clang-cl's tail is byte-identical between a local compile and a
+    # worker-shaped one, and `cl`'s is not -- same length, different bytes -- so
+    # the stronger claim is made exactly where it holds.
+    $ta = Get-CoffTail $reference
+    $tb = Get-CoffTail $produced
+    if ($null -eq $ta -or $null -eq $tb) {
+        Write-Host "  one of these is damaged: its string table does not end where the file does (a truncated transfer?)"
+        return $false
+    }
+    if ($ta.Length -ne $tb.Length) {
+        Write-Host ("  the symbol and string tables differ in SIZE: {0} vs {1} bytes" -f $ta.Length, $tb.Length)
+        return $false
+    }
+    if (-not $rules.TailMayDiffer -and $ta.Hash -ne $tb.Hash) {
+        Write-Host "  the symbol and string tables differ, and this driver records nothing there that may"
+        return $false
+    }
+
     $what = if ($excused.Count -eq 0) { "the clock" }
             else { "the clock and " + (($excused | Select-Object -Unique) -join ', ') }
     Write-Host ("  identical apart from {0}, which record when and where the compile happened" -f $what)
@@ -492,7 +555,7 @@ function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj,
 # Real objects cannot: two `cl` runs differ in their object PATH and their source
 # CHECKSUM together, which is precisely the entanglement that made a hand-run
 # control report a reproducible driver as non-reproducible.
-function New-SyntheticCoff([string]$path, [object[]]$sections, [uint32]$stamp = 0, [uint16]$machine = 0x8664) {
+function New-SyntheticCoff([string]$path, [object[]]$sections, [uint32]$stamp = 0, [uint16]$machine = 0x8664, [string]$strings = "") {
     $rows = @($sections)
     $header = New-Object byte[] 20
     [Array]::Copy([BitConverter]::GetBytes($machine), 0, $header, 0, 2)
@@ -515,8 +578,19 @@ function New-SyntheticCoff([string]$path, [object[]]$sections, [uint32]$stamp = 
         $blob.AddRange($bytes)
         $cursor += $bytes.Length
     }
+    # A string table, when asked for: NumberOfSymbols stays zero and the table is
+    # just its own four-byte size followed by the text, which is the shape
+    # Get-CoffTail validates a real object against.
+    $tail = [System.Collections.Generic.List[byte]]::new()
+    if ($strings -ne "") {
+        $text = [Text.Encoding]::ASCII.GetBytes($strings)
+        $tail.AddRange([BitConverter]::GetBytes([uint32]($text.Length + 4)))
+        $tail.AddRange($text)
+        [Array]::Copy([BitConverter]::GetBytes([uint32]$cursor), 0, $header, 8, 4)   # PointerToSymbolTable
+    }
+
     $all = [System.Collections.Generic.List[byte]]::new()
-    $all.AddRange($header); $all.AddRange($headers); $all.AddRange($blob)
+    $all.AddRange($header); $all.AddRange($headers); $all.AddRange($blob); $all.AddRange($tail)
     [System.IO.File]::WriteAllBytes($path, $all.ToArray())
 }
 
@@ -534,45 +608,71 @@ function Invoke-SelfTest {
     try {
         $code    = [byte[]](1..64)
         $other   = [byte[]](65..128)
-        $record  = [Text.Encoding]::ASCII.GetBytes("C:uild\one	u.o")
-        $record2 = [Text.Encoding]::ASCII.GetBytes("C:uild	wo	u.o")
+        # Stand-ins for what `cl` writes into `.debug`$S`: the object's own path,
+        # equal in length so the case turns on content rather than on size.
+        $record  = [Text.Encoding]::ASCII.GetBytes("C-build-one-tu.o")
+        $record2 = [Text.Encoding]::ASCII.GetBytes("C-build-two-tu.o")
 
         $a = Join-Path $dir "a.obj"; $b = Join-Path $dir "b.obj"
-        $mayDiffer = @(".debug`$S", ".chks64")
+
+        # The two standards this fixture applies, as the driver table spells them.
+        $loose  = @{ Sections = @(".debug`$S", ".chks64"); TailMayDiffer = $true }
+        $strict = @{ Sections = @();                      TailMayDiffer = $false }
 
         # Identical objects match under every standard, and the byte comparison is
         # what answers -- the section walk is never reached.
         New-SyntheticCoff $a @(@{ Name = ".text`$mn"; Bytes = $code }, @{ Name = ".debug`$S"; Bytes = $record })
         New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $code }, @{ Name = ".debug`$S"; Bytes = $record })
-        Assert-That (Test-EquivalentObject $a $b @()) "identical objects match with no section excused"
-        Assert-That (Test-EquivalentObject $a $b $mayDiffer) "identical objects match with sections excused"
+        Assert-That (Test-EquivalentObject $a $b $strict) "identical objects match under the strict standard"
+        Assert-That (Test-EquivalentObject $a $b $loose) "identical objects match with sections excused"
 
         # The real MSVC case: same code, a different record of where it was written.
         New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $code }, @{ Name = ".debug`$S"; Bytes = $record2 })
-        Assert-That (Test-EquivalentObject $a $b $mayDiffer) "a differing path record is excused when the driver embeds one"
-        Assert-That (-not (Test-EquivalentObject $a $b @())) "and is NOT excused for a driver that embeds none"
+        Assert-That (Test-EquivalentObject $a $b $loose) "a differing path record is excused when the driver embeds one"
+        Assert-That (-not (Test-EquivalentObject $a $b $strict)) "and is NOT excused for a driver that embeds none"
 
         # The case the whole assertion exists for: different code.
         New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $other }, @{ Name = ".debug`$S"; Bytes = $record })
-        Assert-That (-not (Test-EquivalentObject $a $b $mayDiffer)) "differing code fails even with sections excused"
+        Assert-That (-not (Test-EquivalentObject $a $b $loose)) "differing code fails even with sections excused"
 
         # A section that appears, disappears or is renamed is a failure however the
         # rest compares: the excuse names sections, so it must not widen to a shape.
         New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $code })
-        Assert-That (-not (Test-EquivalentObject $a $b $mayDiffer)) "a missing section fails"
+        Assert-That (-not (Test-EquivalentObject $a $b $loose)) "a missing section fails"
         New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $code }, @{ Name = ".chks64"; Bytes = $record })
-        Assert-That (-not (Test-EquivalentObject $a $b $mayDiffer)) "a renamed section fails"
+        Assert-That (-not (Test-EquivalentObject $a $b $loose)) "a renamed section fails"
 
         # The clock, which both MSVC drivers write and neither can be asked not to
         # without a flag no build passes: excused for every driver, so an object
-        # differing ONLY there matches even where no section may differ.
+        # differing ONLY there matches even under the strict standard.
         New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $code }, @{ Name = ".debug`$S"; Bytes = $record }) 0x67890123
-        Assert-That (Test-EquivalentObject $a $b @()) "a differing timestamp is excused for every driver"
+        Assert-That (Test-EquivalentObject $a $b $strict) "a differing timestamp is excused for every driver"
 
         # The architecture, which differs THERE and nowhere a section walk would
         # see -- the reason the header is a table rather than a skip.
         New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $code }, @{ Name = ".debug`$S"; Bytes = $record }) 0 0x014C
-        Assert-That (-not (Test-EquivalentObject $a $b $mayDiffer)) "a different target architecture fails"
+        Assert-That (-not (Test-EquivalentObject $a $b $loose)) "a different target architecture fails"
+
+        # The symbol and string tables, which no section walk covers. Measured:
+        # clang-cl's are byte-identical between a local compile and a worker-shaped
+        # one, `cl`'s are not -- so the strict standard compares them and the loose
+        # one does not.
+        $withTail  = Join-Path $dir "tail-a.obj"
+        $withTail2 = Join-Path $dir "tail-b.obj"
+        New-SyntheticCoff $withTail  @(@{ Name = ".text`$mn"; Bytes = $code }) 0 0x8664 "symbols-one"
+        New-SyntheticCoff $withTail2 @(@{ Name = ".text`$mn"; Bytes = $code }) 0 0x8664 "symbols-two"
+        Assert-That (-not (Test-EquivalentObject $withTail $withTail2 $strict)) "a differing symbol table fails the strict standard"
+        Assert-That (Test-EquivalentObject $withTail $withTail2 $loose) "and is excused where the driver records paths there"
+
+        # TRUNCATION, which is what all of the above misses: MSVC writes the symbol
+        # table last, so a cut-off object keeps every section intact and compares
+        # equal section by section. COFF states its own end, and that is what says
+        # otherwise.
+        $cut = Join-Path $dir "cut.obj"
+        $bytes = [System.IO.File]::ReadAllBytes($withTail)
+        [System.IO.File]::WriteAllBytes($cut, $bytes[0..($bytes.Length - 4)])
+        Assert-That ($null -eq (Get-CoffTail $cut)) "a truncated object is recognised as damaged"
+        Assert-That (-not (Test-EquivalentObject $withTail $cut $loose)) "and fails even under the loosest standard"
 
         # And the format this cannot read is reported rather than mis-parsed.
         $big = Join-Path $dir "big.obj"
@@ -616,14 +716,14 @@ if ($SelfTest) { exit (Invoke-SelfTest) }
 # A driver that recorded something new would fail here rather than being excused by
 # a rule written wide enough to cover it in advance.
 $Drivers = @(
-    @{ Name = "cl";       MayDiffer = @(".debug`$S", ".chks64") }
-    @{ Name = "clang-cl"; MayDiffer = @() }
+    @{ Name = "cl";       Rules = @{ Sections = @(".debug`$S", ".chks64"); TailMayDiffer = $true } }
+    @{ Name = "clang-cl"; Rules = @{ Sections = @();                       TailMayDiffer = $false } }
 )
 
 try {
     foreach ($driver in $Drivers) {
         $cc = $driver.Name
-        $mayDiffer = [string[]]$driver.MayDiffer
+        $rules = $driver.Rules
         if (-not (Get-Command $cc -ErrorAction SilentlyContinue)) {
             Write-Host "skip $cc (not on PATH)"
             continue
@@ -712,7 +812,7 @@ try {
         # The whole soundness claim: an object built on the worker from
         # `/E`-preprocessed text must match one this machine compiled directly, by
         # this driver's own standard of matching.
-        if (-not (Test-EquivalentObject $refObj $obj $mayDiffer)) {
+        if (-not (Test-EquivalentObject $refObj $obj $rules)) {
             # THE CONTROL, and it answers the question the failure raises rather
             # than the one it looks like. The reference compiles the ORIGINAL
             # source; the worker compiles `/E`-preprocessed text. Those are
@@ -731,7 +831,7 @@ try {
                 & $cc /nologo -c $ctlSrc "/Fo$ctlObj" 2>&1 | Out-Null
                 if (-not (Test-Path $ctlObj)) {
                     Write-Host "  control compile produced no object; inconclusive"
-                } elseif (Test-EquivalentObject $ctlObj $obj $mayDiffer) {
+                } elseif (Test-EquivalentObject $ctlObj $obj $rules) {
                     Write-Host "  control MATCHES the worker: the difference is preprocessed-vs-original input,"
                     Write-Host "  not the worker's environment."
                 } else {
@@ -824,7 +924,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         if (-not (Test-Path $cobj)) { throw "no object was written by the dispatched C compile" }
         # C compiled as C++ differs in far more than a path record: the symbols are
         # mangled, so `.text$mn` and the symbol table both move.
-        if (-not (Test-EquivalentObject $cref $cobj $mayDiffer)) {
+        if (-not (Test-EquivalentObject $cref $cobj $rules)) {
             throw "a dispatched C translation unit did not come back compiled as C"
         }
         Write-Host "   a C translation unit was compiled as C on the worker"
@@ -877,7 +977,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
             Write-Host $r.stderr
             throw "expected a no-worker refusal naming the missing toolchain"
         }
-        if (-not (Test-EquivalentObject $isoRef $isoObj @())) {
+        if (-not (Test-EquivalentObject $isoRef $isoObj $rules)) {
             throw "the locally compiled fallback object does not match the reference"
         }
         Write-Host "   a mismatched worker was refused, and the build compiled locally"
