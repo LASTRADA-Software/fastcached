@@ -142,23 +142,37 @@ set_tests_properties("compile-cache-install" PROPERTIES
 # needs is defined by the time this runs -- which is also why AGENT.md names this
 # file as the home for script-driven tests.
 #
-# POSIX only for now, and deliberately absent rather than silently degraded on
-# Windows: the PowerShell counterpart is still to come, and an e2e that quietly
-# tested less on one platform is the failure mode this suite already has a
-# recorded lesson about.
-if(WIN32)
-    message(STATUS "dist-compile-e2e: no Windows counterpart yet — skipping")
-elseif(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cc)
+# Both platforms run it, but they do NOT assert the same contract, and that is
+# stated rather than left as an apparent omission. The Windows script covers the
+# three cases that turn on the MSVC driver -- byte-identical object, still a
+# cache, fingerprint isolation -- because the driver is the only Windows-specific
+# thing on this path: `/E` for the dispatch preprocess and an EMPTY
+# preprocessedInputFlags are assertions about a driver nothing else exercises, and
+# if either is wrong every dispatched TU fails and is retried locally, so the
+# build is green and never once helped. Everything the POSIX fixture additionally
+# covers -- failover, the role gate, concurrency, graceful stop -- is
+# platform-neutral code already pinned by unit tests.
+if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cc)
     message(STATUS "dist-compile-e2e: daemon, compile node or launcher not built — skipping")
 else()
-    add_test(
-        NAME "dist-compile-e2e"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
-            --fastcached "$<TARGET_FILE:fastcached>"
-            --node "$<TARGET_FILE:fastcache-compile-node>"
-            --launcher "$<TARGET_FILE:fastcache-cc>"
-            --compiler "${CMAKE_CXX_COMPILER}"
-    )
+    if(WIN32)
+        add_test(
+            NAME "dist-compile-e2e"
+            COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.ps1"
+                -Fastcached "$<TARGET_FILE:fastcached>"
+                -Node "$<TARGET_FILE:fastcache-compile-node>"
+                -Launcher "$<TARGET_FILE:fastcache-cc>"
+        )
+    else()
+        add_test(
+            NAME "dist-compile-e2e"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
+                --fastcached "$<TARGET_FILE:fastcached>"
+                --node "$<TARGET_FILE:fastcache-compile-node>"
+                --launcher "$<TARGET_FILE:fastcache-cc>"
+                --compiler "${CMAKE_CXX_COMPILER}"
+        )
+    endif()
     # Spawns three daemons and several workers and drives real compiles, so it
     # must not race the other server-starting smoke tests for ports or for CPU.
     set_tests_properties("dist-compile-e2e" PROPERTIES

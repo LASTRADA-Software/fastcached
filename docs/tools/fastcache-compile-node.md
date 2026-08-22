@@ -188,4 +188,5 @@ For anything beyond a trusted build network, put mTLS in front of both ports.
 - `--install-service` on macOS and Windows. The Linux units are shipped; the
   other two need the daemon shell (a launchd agent needs a service account the
   installer creates, and a Windows service needs a service-control handler).
-- No metrics of its own yet.
+- The worker exposes no metrics of its own. The **scheduler** does — see
+  [Distributed compilation](../getting-started/distributed-compilation.md#confirming-it-works).
