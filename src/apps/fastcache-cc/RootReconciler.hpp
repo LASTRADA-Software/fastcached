@@ -5,6 +5,7 @@
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>

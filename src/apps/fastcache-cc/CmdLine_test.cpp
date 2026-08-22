@@ -24,8 +24,7 @@ TEST_CASE("A -MT or -MQ target is captured, in either spelling")
     // launcher must know it to keep the reconciler from respelling it into the
     // root spelling the environment exported (issue #66). Without -MT the driver
     // uses the object path, which is the ordinary case and already known.
-    auto const separated =
-        Parse({ "gcc", "-c", "a.cpp", "-o", "out/a.o", "-MD", "-MF", "out/a.d", "-MT", "out/a.o" });
+    auto const separated = Parse({ "gcc", "-c", "a.cpp", "-o", "out/a.o", "-MD", "-MF", "out/a.d", "-MT", "out/a.o" });
     CHECK(separated.depTarget == "out/a.o");
 
     auto const fused = Parse({ "gcc", "-c", "a.cpp", "-o", "out/a.o", "-MD", "-MFout/a.d", "-MQout/q.o" });

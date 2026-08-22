@@ -22,12 +22,10 @@ std::string WithoutTrailingSeparator(std::string root)
     // JoinLocalized derives from it, and "/" would become empty, which is a
     // prefix of nothing at all.
     auto const isBareRoot = [&root]() {
-        auto const isDriveLetter = [](char c) {
-            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-        };
         if (root.size() <= 1)
             return true;
-        return root.size() == 3 && isDriveLetter(root[0]) && root[1] == ':' && (root[2] == '/' || root[2] == '\\');
+        return root.size() == 3 && PathCanon::IsDriveLetter(root[0]) && root[1] == ':'
+               && (root[2] == '/' || root[2] == '\\');
     };
     while (!isBareRoot() && (root.back() == '/' || root.back() == '\\'))
         root.pop_back();
