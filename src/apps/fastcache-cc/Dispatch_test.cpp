@@ -278,6 +278,49 @@ TEST_CASE("The arguments the worker receives are the ones it was given", "[dispa
     CHECK(DecodeArgs(Unwrap(compile).args) == args);
 }
 
+TEST_CASE("The worker is told what to call its scratch file, and not where it came from", "[dispatch]")
+{
+    // A compiler records the name of the file it was handed, so an object built
+    // from a worker-invented name differs from a locally built one in that name
+    // and nothing else -- seven bytes on clang-cl, and none once they agree.
+    //
+    // The DIRECTORY is deliberately not sent. The worker has no use for it and no
+    // business learning where a client's checkout lives, and it could not honour it
+    // if it wanted to: the file it creates is inside its own scratch directory.
+    ScriptedDialer dialer;
+    dialer.Serve(std::string { Scheduler }, GrantReply());
+    dialer.Serve(std::string { Worker }, CompileReply("OBJ"));
+
+    std::vector<std::string> const args { "-O2" };
+    auto request = Request(args);
+    request.sourceName = "/home/dev/checkout/src/Widget.cpp";
+    REQUIRE(Dispatch(dialer, request).Ran());
+
+    auto const& toWorker = dialer.SentTo(std::string { Worker });
+    auto const compile =
+        Wire::DecodeCompilePayload(std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize));
+    REQUIRE(compile.has_value());
+    CHECK(Wire::AsStringView(Unwrap(compile).sourceName) == "Widget.cpp");
+}
+
+TEST_CASE("A Windows-spelled source path is reduced to its base name too", "[dispatch]")
+{
+    ScriptedDialer dialer;
+    dialer.Serve(std::string { Scheduler }, GrantReply());
+    dialer.Serve(std::string { Worker }, CompileReply("OBJ"));
+
+    std::vector<std::string> const args { "-O2" };
+    auto request = Request(args);
+    request.sourceName = "D:\\checkout\\src\\Widget.cpp";
+    REQUIRE(Dispatch(dialer, request).Ran());
+
+    auto const& toWorker = dialer.SentTo(std::string { Worker });
+    auto const compile =
+        Wire::DecodeCompilePayload(std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize));
+    REQUIRE(compile.has_value());
+    CHECK(Wire::AsStringView(Unwrap(compile).sourceName) == "Widget.cpp");
+}
+
 TEST_CASE("The preprocessed source reaches the worker intact", "[dispatch]")
 {
     ScriptedDialer dialer;
