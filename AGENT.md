@@ -17,6 +17,10 @@ src/FastCache/
                 BlockingSocket (Winsock + POSIX),
                 EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
                 InMemoryTransport (paired pipes + InMemoryListener),
+                InheritedListener (systemd socket activation: LISTEN_FDS/
+                LISTEN_PID parsing is pure and unit-tested; adoption applies
+                close-on-exec and the shutdown timeouts, which are parameters
+                rather than the caller's job),
                 Framing/ByteReader (line and length-prefixed)
   Cli/          UsageDoc (usage text as data: sections of aligned rows and
                 prose, rendered with an ANSI palette) and Options (OptionSpec
@@ -59,7 +63,10 @@ src/FastCache/
   Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader,
                 EnvExpand ($VAR/${VAR} in path settings), DefaultConfigPath
                 (per-platform config lookup + --seed-config, behind IConfigPathProbe)
-  Metrics/      IMetricsSink + AtomicMetricsSink
+  Metrics/      IMetricsSink + AtomicMetricsSink (counter-only by design; the
+                dispatch counters separate no-worker from no-capacity because
+                one says a fleet is misconfigured and the other that it is too
+                small, and summing them hides the first when a fleet is busy)
 ```
 
 Every executable lives under `src/apps/<name>/` and declares its own target and
@@ -1109,11 +1116,70 @@ is the reproducible lesson, since no unit test can reach either:
   (`cpp-output` for C, and *nothing* for an MSVC driver, whose `/E` emits standard
   `#line`). It is a `DriverSpec` column, not a branch, so a fifth driver is a row.
 
+Three more come from running the worker as a *service* rather than in a
+terminal, and each has already been a bug:
+
+- **A listener that cannot be woken cannot be shut down, and that is a property
+  of the SOCKET rather than of the loop.** POSIX does not unblock a parked
+  `accept()` when another thread closes the listening socket, so the only
+  portable wake-up is `SO_RCVTIMEO` making `accept()` return periodically —
+  which is exactly what `BlockingListener::SetTimeouts` exists for, and what the
+  daemon's admin listener already does. `WorkerServer::Run` *documents* that poll
+  timeout as the mechanism it relies on, and nothing supplied one: installing a
+  SIGTERM handler then made the signal non-fatal without making the loop
+  reachable, so `systemctl stop` hung until the supervisor escalated to SIGKILL.
+  **macOS hides it** — there `close()` does wake the accept — which is why it
+  passed locally and on `macOS-clang-release` and failed only on Linux, as
+  `dist-compile-e2e ***Timeout 900.10 sec` in three jobs. It then arrived a
+  *second* time through socket activation, where the caller was expected to apply
+  the timeouts after adopting; `AdoptInheritedListeners` now takes them as
+  parameters, so there is no way to obtain a listener that cannot be stopped.
+- **`LISTEN_PID` is not a formality.** The activation variables survive fork and
+  exec, so every grandchild of an activated service sees them. Adopting on their
+  strength alone means treating whatever the parent left on descriptor 3 as a
+  listening socket — a log file, a database connection, the read end of a pipe —
+  and then accepting on it forever. The check is what makes "is fd 3 a listener?"
+  answerable at all, which is why `ParseSocketActivation` is pure and every rule
+  around it is a unit test. Two consequences: the variables are cleared **even
+  when nothing was adopted**, since a process that decided they were not addressed
+  to it must not pass them to a child that would decide differently on a reused
+  pid; and the adopted descriptors are marked close-on-exec, because systemd
+  deliberately omits that so a service can re-exec itself, while this worker
+  spawns a compiler per job and a compiler holding the listening socket keeps the
+  port alive after the worker exits.
+- **Under socket activation `--advertise` is required, because the fallback
+  becomes a guess the process cannot make.** The socket unit owns the port and
+  never tells the service which one, so `{--bind}:{--port}` describes nothing —
+  and `0.0.0.0` is not an address a remote client can dial regardless. The failure
+  is the worst shape this system has: registration *succeeds*, the worker
+  heartbeats happily, the scheduler leases that endpoint out, and every client
+  fails to connect and compiles locally, with no error anywhere and a fleet that
+  looks healthy from both ends. Refused at startup instead — and refused **before**
+  the toolchain walk, which is the same cheap-and-fallible-first ordering the
+  adoption check follows: a fingerprint takes seconds, a misconfiguration is
+  decided in microseconds, and doing the expensive thing first means an operator
+  watching a worker start sees nothing during the part where something can still
+  go wrong.
+
 `scripts/dist-compile-e2e.sh` asserts the consequence rather than the mechanism:
 that a worker's object is **byte-identical** to a locally compiled one. That single
 assertion is what fails if either rule is broken, and it is the whole soundness
 claim of the feature — an object that differs is stored under a key other machines
 then fetch.
+
+**Every wait in that fixture is bounded, and that is a rule rather than a
+detail.** Its first version killed a worker and then `wait`ed, which HANGS when a
+signal is handled but the stop never completes — and a 900-second ctest timeout
+naming nothing is the least useful way CI can report a defect. `stop_and_require_exit`
+fails in 15s saying what it waited for, and the cleanup trap escalates to SIGKILL
+rather than blocking, because cleanup runs on every exit path including the
+failing ones: an unbounded wait there turns any single failed assertion into a
+silent suite timeout. The same lesson applies to unit tests — a helper thread
+spinning on a counter a regression never advances hangs instead of failing, which
+is what the `IdleListener` hook exists to avoid. Relatedly, CI's live-systemd step
+waits for the worker's **own** readiness line rather than `systemctl is-active`:
+`Type=simple` is reported active the moment systemd forks, while the worker still
+has seconds of include-tree walking to do.
 
 Production flow: `main()` -> CLI -> optional YAML -> `ConfigReloader` ->
 `CacheEngine` over `InMemoryLruStorage` (or, when `--storage` is set, a
