@@ -126,9 +126,14 @@ constexpr int HeartbeatSlices = 20;
         { "error", LogLevel::Error },
         { "fatal", LogLevel::Fatal },
     } };
-    auto const* const row = std::ranges::find_if(levels, [sv](auto const& pair) { return pair.first == sv; });
-    if (row != levels.end())
-        return row->second;
+    // Iterated rather than searched with an iterator, and that is a portability
+    // fix rather than a style choice. `readability-qualified-auto` asks for
+    // `auto const* const` here, which is right on libc++ -- where a std::array
+    // iterator IS a raw pointer -- and does not compile on MSVC's STL, where it is
+    // a class type. Taking the value directly sidesteps the difference entirely.
+    for (auto const& [name, level]: levels)
+        if (name == sv)
+            return level;
     return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "log-level", std::format("unknown level: {}", sv)));
 }
 
