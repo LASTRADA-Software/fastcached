@@ -194,18 +194,28 @@ For anything beyond a trusted build network, put mTLS in front of both ports.
   reports a non-zero exit is retried locally and the *local* result is what you
   see, which also regenerates diagnostics with correct line numbers.
 - **On MSVC a dispatched object is not byte-identical to a locally compiled
-  one.** `cl` embeds the source path in the object even without `/Zi`, and a
-  worker compiles from its own scratch directory — so the object carries that
-  path instead of yours. The code is the same: same compiler, same flags, same
-  preprocessed input. What it affects is debugging, in the same way
-  `-fdebug-prefix-map` addresses for GCC and clang. A debugger will need
-  `/PDBALTPATH` or an equivalent source-path mapping to find your sources.
+  one — the code in it is.** Measured on MSVC 14.51 and clang-cl, three things
+  differ and no more:
 
-    This is why the Windows end-to-end fixture asserts that a dispatched object
-    is a *plausible* compile — right compiler, right flags, sane size — while the
-    POSIX one asserts strict byte-identity. GCC and clang embed nothing
-    path-dependent without `-g`; `cl` does, and no tolerance can make a byte
-    comparison meaningful across two different source paths.
+    - every MSVC-family driver stamps the **clock** into the COFF header (two
+      compiles of one file to one path two seconds apart differ in exactly byte
+      4; `/Brepro` is what suppresses it);
+    - `cl` records the **absolute path of the object file** in `.debug$S`, even
+      without `/Zi`;
+    - `cl` hashes the source file it opened into `.chks64`, and a worker opens
+      its own scratch file.
+
+    Everything carrying code or data is byte-identical: same compiler, same
+    flags, same preprocessed input. What it affects is debugging, in the same way
+    `-fdebug-prefix-map` addresses for GCC and clang — a debugger will need
+    `/PDBALTPATH` or an equivalent source-path mapping to find your sources.
+
+    So the Windows end-to-end fixture compares **section by section** against a
+    per-driver table of what may differ, and clang-cl's table is *empty*: it
+    records only the source's base name, which the worker is told, so its objects
+    differ by the clock alone. The POSIX fixture asserts strict byte-identity and
+    should — GCC and clang embed nothing path-dependent without `-g`. If your
+    build compares object bytes across machines, compare sections.
 
 ## Not yet done
 
