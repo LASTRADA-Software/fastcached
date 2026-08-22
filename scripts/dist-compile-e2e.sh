@@ -35,6 +35,14 @@
 #                            still all succeed, with correct objects and no hang.
 #                            See the case for why it does not assert WHICH ones were
 #                            refused.
+#   7. Language             — a `.c` source compiled by a C++ driver comes back
+#                            compiled as C++, because that is what this driver does
+#                            with it locally. The client states the language when it
+#                            hands over preprocessed text, and taking that from the
+#                            extension alone is wrong for exactly this shape — a
+#                            wrong object rather than a failed one.
+#   8. Graceful stop        — a worker asked to stop does, promptly, rather than
+#                            waiting for a supervisor to escalate.
 #
 # Ports are allocated per run rather than fixed. This fixture needs four of them
 # (cache, dispatch, and two workers), and four more fixed ports is four more ways
@@ -514,8 +522,43 @@ for i in 1 2 3 4; do
 done
 echo "   4 concurrent compiles all correct (${dispatched_count} dispatched, $((4 - dispatched_count)) local)"
 
-# --- 7: a worker stops when it is asked to --------------------------------------
-echo "== case 7: a worker exits on SIGTERM"
+# --- 7: the language is stated, and the driver has the last word on it -------
+echo "== case 7: a .c source through a C++ driver is compiled as C++"
+# The worker names its own scratch file and its compiler reads the language off
+# that name, so the client has to say which language the text is -- and taking
+# that from the source's EXTENSION alone is wrong for exactly this shape. "g++
+# treats .c, .h and .i files as C++ source files instead of C source files", so a
+# `.c` compiled by this project's C++ driver is C++, and telling a worker
+# `-x cpp-output` would have it compile as C what this machine compiles as C++.
+#
+# That is a WRONG object rather than a failed one -- it is stored under the key
+# and served to everybody -- which is why it is asserted end to end rather than
+# left to the unit test that pins the same rule.
+cat > "${proj}/seven.c" <<'EOF'
+// unique: caseseven
+struct Widget { int a; int b; };
+static int Total(struct Widget const* w) { return w->a + w->b; }
+int caseseven_entry(void)
+{
+    struct Widget w = { 2, 3 };
+    return Total(&w);
+}
+EOF
+
+"$compiler" -O1 -c "${proj}/seven.c" -o "${proj}/build/seven-ref.o"     || fail "the case 7 reference compile failed"
+
+run_launcher "${workdir}/case7.log" -O1 -c "${proj}/seven.c" -o "${proj}/build/seven.o"     || { cat "${workdir}/case7.log" >&2; fail "the .c compile failed"; }
+grep -q "DISPATCHED to " "${workdir}/case7.log"     || { cat "${workdir}/case7.log" >&2; fail "the .c compile was not dispatched"; }
+cmp -s "${proj}/build/seven-ref.o" "${proj}/build/seven.o"     || {
+        # C compiled as C++ differs in far more than a byte: this source has
+        # external linkage, so the symbol names themselves are mangled.
+        cmp -l "${proj}/build/seven-ref.o" "${proj}/build/seven.o" 2>/dev/null | head -5 >&2
+        fail "a .c source did not come back compiled the way this driver compiles it"
+    }
+echo "   a .c source came back matching what this driver produces locally"
+
+# --- 8: a worker stops when it is asked to --------------------------------------
+echo "== case 8: a worker exits on SIGTERM"
 # The property a supervisor depends on, and one that fails in the worst possible
 # shape: the worker handles SIGTERM, so the signal no longer kills it outright --
 # if the accept loop cannot then be woken, the process hangs and `systemctl stop`
