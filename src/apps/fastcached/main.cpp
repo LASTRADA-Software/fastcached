@@ -665,8 +665,7 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
         leases.emplace(clock);
         serverOpts.session.workers = &*workers;
         serverOpts.session.leases = &*leases;
-        logger.Logf(FastCache::LogLevel::Info,
-                    "distributed execution enabled; workers register on the --listen-dispatch endpoint");
+        logger.Logf(FastCache::LogLevel::Info, "distributed execution enabled; workers register on the dispatch endpoint");
     }
     // The RESP wire cap must admit the largest value the cache will store, so a
     // client can push a value up to --storage-max-value without the connection

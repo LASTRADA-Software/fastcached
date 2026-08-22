@@ -78,6 +78,7 @@ nav:
     - Install: getting-started/install.md
     - Quickstart: getting-started/quickstart.md
     - Configuration: getting-started/configuration.md
+    - Distributed compilation: getting-started/distributed-compilation.md
   - Tools:
     - Overview: tools/index.md
     - fastcache-cc (compiler launcher): tools/fastcache-cc.md

@@ -14,6 +14,7 @@ namespace FastCache
 class IReactor;              // Async/IReactor.hpp — the reactor this connection is pinned to.
 class IPubSubRegistry;       // Protocol/IPubSubRegistry.hpp — process-wide pub/sub registry.
 class IStreamWaiterRegistry; // Protocol/IStreamWaiterRegistry.hpp — blocking stream-read coordinator.
+class IMetricsSink;          // Metrics/IMetricsSink.hpp — counter sink for dispatch outcomes.
 class WatchRegistry;         // Protocol/RedisTransaction.hpp — process-wide WATCH registry for Redis transactions.
 class KeyspaceNotifier;      // Protocol/KeyspaceNotifier.hpp — Redis keyspace notification publisher.
 
@@ -112,6 +113,14 @@ struct SessionContext
     /// scheduler with a registry and no leases could dispatch but never account for
     /// what it dispatched.
     Distributed::LeaseTable* leases { nullptr };
+
+    /// Where dispatch outcomes are counted, or null when nothing collects them.
+    ///
+    /// Optional rather than required, because a scheduler must schedule whether or
+    /// not anyone is scraping it. Every use is guarded; there is deliberately no
+    /// null-object default, since a silently-discarding sink and a genuinely
+    /// absent one would then be indistinguishable at the call site.
+    IMetricsSink* metrics { nullptr };
 
     /// Maximum size, in bytes, of a single length-prefixed protocol payload (a
     /// RESP bulk string). Bounds how many bytes one command may push before the

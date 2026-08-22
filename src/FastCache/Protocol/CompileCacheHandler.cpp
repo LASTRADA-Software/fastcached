@@ -5,6 +5,7 @@
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -365,6 +366,18 @@ namespace
     /// @param session The connection's session context.
     /// @param payload The request payload, by value (see HandleStore).
     /// @return Whether the command loop should continue or abort.
+    /// Count one dispatch outcome, when anything is collecting them.
+    ///
+    /// The null check lives here rather than at each call site: a scheduler must
+    /// schedule whether or not it is being scraped, and four copies of the same
+    /// guard is four chances for one of them to be forgotten -- which would be a
+    /// crash on the path this counter exists to observe.
+    void Count(SessionContext const& session, IMetricsSink::Counter counter) noexcept
+    {
+        if (session.metrics != nullptr)
+            session.metrics->Increment(counter);
+    }
+
     [[nodiscard]] Task<Next> HandleRegister(ISocket* socket, SessionContext session, std::vector<std::byte> payload)
     {
         auto const fields = Wire::DecodeRegisterPayload(payload);
@@ -384,6 +397,12 @@ namespace
                                               .endpoint = Wire::AsStringView(fields->endpoint),
                                               .slots = fields->slots,
                                               .codecs = fields->acceptedCodecs });
+        // Counted as an event, not as fleet size. This interface is counter-only,
+        // so it cannot express a gauge -- and the event turns out to be the more
+        // useful number anyway: a rate that stays high means workers keep
+        // re-registering, which is what a fleet whose heartbeats are not arriving
+        // looks like from the scheduler's side.
+        Count(session, IMetricsSink::Counter::DispatchWorkerRegistrations);
         auto const reply = Wire::AsBytes(id);
         co_return co_await Reply(socket, Wire::Status::Ok, std::vector<std::byte> { reply.begin(), reply.end() })
             ? Next::Continue
@@ -430,19 +449,32 @@ namespace
             // The scheduler's own words reach the client, which reports them: an
             // empty fleet for a toolchain and a busy one are different operator
             // problems even though both end in a local compile.
-            auto const code =
-                picked.error() == Distributed::PickError::NoWorker ? Wire::ErrorCode::NoWorker : Wire::ErrorCode::NoCapacity;
+            auto const noWorker = picked.error() == Distributed::PickError::NoWorker;
+            // Counted apart, because they are different operator problems: no
+            // worker means the fleet is misconfigured (a fingerprint nobody
+            // serves), no capacity means it is too small. Summing them would hide
+            // the first behind the second exactly when a fleet is busy.
+            Count(session,
+                  noWorker ? IMetricsSink::Counter::DispatchLeasesNoWorker
+                           : IMetricsSink::Counter::DispatchLeasesNoCapacity);
+            auto const code = noWorker ? Wire::ErrorCode::NoWorker : Wire::ErrorCode::NoCapacity;
             co_return co_await ReplyError(socket, code, {}) ? Next::Continue : Next::Abort;
         }
 
         auto const lease = session.leases->Acquire(Wire::AsStringView(fields->key), picked->id);
         if (!lease.has_value())
+        {
+            // Not a failure: duplicate-work suppression refusing the second of many
+            // clients that missed the same key, each of which compiles locally.
+            Count(session, IMetricsSink::Counter::DispatchLeasesDuplicate);
             co_return co_await ReplyError(socket, Wire::ErrorCode::AlreadyInFlight, {}) ? Next::Continue : Next::Abort;
+        }
 
         // Accounted only once the lease exists. Counting at Pick would inflate the
         // load of a worker whose key turned out to be already in flight, and the
         // correction would not arrive until its next heartbeat.
         session.workers->JobStarted(picked->id);
+        Count(session, IMetricsSink::Counter::DispatchLeasesGranted);
 
         // The worker's codecs travel with the grant so the client can choose one for
         // the preprocessed payload it is about to send -- without a negotiation round

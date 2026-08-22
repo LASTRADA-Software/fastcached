@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,37 @@ enum class ListenerRole : std::uint8_t
 [[nodiscard]] constexpr bool HasRole(std::uint8_t mask, ListenerRole role) noexcept
 {
     return (mask & static_cast<std::uint8_t>(role)) != 0;
+}
+
+/// A role's name in YAML, and the bit it sets.
+///
+/// A table rather than an if-ladder in the reader, for the reason every other
+/// table here exists: a third role is a row, and the name a config file spells is
+/// necessarily one the parser accepts. It is separate from `ListenerFlags` above
+/// because the two answer different questions -- that one maps a whole *flag* to
+/// a complete mask (`--listen-dispatch` means exactly Dispatch), while this maps
+/// one *role name* to one bit, so `roles: [cache, dispatch]` can be composed.
+struct ListenerRoleName
+{
+    std::string_view name; ///< Spelling accepted in `roles:`.
+    ListenerRole role;     ///< The bit it contributes.
+};
+
+/// Every role name a config file may use.
+inline constexpr std::array<ListenerRoleName, 2> ListenerRoleNames {
+    ListenerRoleName { .name = "cache", .role = ListenerRole::Cache },
+    ListenerRoleName { .name = "dispatch", .role = ListenerRole::Dispatch },
+};
+
+/// Look up a role by the name a config file spelled.
+/// @param name The spelling from `roles:`.
+/// @return The role, or nullopt when the name is not one of them.
+[[nodiscard]] constexpr std::optional<ListenerRole> ListenerRoleFor(std::string_view name) noexcept
+{
+    for (auto const& row: ListenerRoleNames)
+        if (row.name == name)
+            return row.role;
+    return std::nullopt;
 }
 
 /// One listener flag, and what an endpoint declared with it serves.

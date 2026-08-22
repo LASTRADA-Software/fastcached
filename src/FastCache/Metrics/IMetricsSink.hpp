@@ -46,6 +46,32 @@ class IMetricsSink
         ConnectionsAdmissionRejectedTls,
         BytesIn,
         BytesOut,
+        /// Lease requests the scheduler answered with a worker. The numerator of
+        /// "is distribution actually happening", and meaningless without the
+        /// refusals below it -- a fleet where every lease is granted and a fleet
+        /// nobody asks look identical on this counter alone.
+        DispatchLeasesGranted,
+        /// Lease requests refused because no registered worker matched the
+        /// toolchain. The counter that says a fleet is MISCONFIGURED rather than
+        /// busy: it rises when workers are up but nobody can use them, which is
+        /// the failure mode a fingerprint mismatch produces and the one that is
+        /// otherwise invisible from both ends.
+        DispatchLeasesNoWorker,
+        /// Lease requests refused because every matching worker was full. Rising
+        /// here means the fleet is too small, which is a different decision from
+        /// the line above and must not be summed with it.
+        DispatchLeasesNoCapacity,
+        /// Lease requests refused because another client already held a lease for
+        /// this key. Not a failure: it is duplicate-work suppression doing its
+        /// job, and the clients it refuses compile locally.
+        DispatchLeasesDuplicate,
+        /// Workers currently registered, as a running total of registrations
+        /// accepted. A gauge would be the better shape and this interface is
+        /// counter-only by design, so this counts events rather than membership:
+        /// it rises on every re-registration, which is itself the signal worth
+        /// watching -- a fleet that re-registers constantly is a fleet whose
+        /// heartbeats are not arriving.
+        DispatchWorkerRegistrations,
         Last,
     };
 
@@ -112,6 +138,16 @@ class AtomicMetricsSink final: public IMetricsSink
             return "bytes_in";
         case IMetricsSink::Counter::BytesOut:
             return "bytes_out";
+        case IMetricsSink::Counter::DispatchLeasesGranted:
+            return "dispatch_leases_granted";
+        case IMetricsSink::Counter::DispatchLeasesNoWorker:
+            return "dispatch_leases_no_worker";
+        case IMetricsSink::Counter::DispatchLeasesNoCapacity:
+            return "dispatch_leases_no_capacity";
+        case IMetricsSink::Counter::DispatchLeasesDuplicate:
+            return "dispatch_leases_duplicate";
+        case IMetricsSink::Counter::DispatchWorkerRegistrations:
+            return "dispatch_worker_registrations";
         case IMetricsSink::Counter::Last:
             return "<last>";
     }

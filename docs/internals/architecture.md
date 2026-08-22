@@ -24,11 +24,23 @@ src/FastCache/
                 LayeredStorage (L1 LRU over L2 disk), ShardedStorage
                 (key-hash fan-out), NotifyingStorage (keyspace events),
                 TracingStorage (Tracy zones)
+  CompileCache/ PathCanon (absolute<->canonical-token path rewriting),
+                CompileValue (object-blob + tagged-text-region framing),
+                PrefetchGroupManifest — the compile cache's domain logic
+  Distributed/  WorkerRegistry (the compile-worker fleet: exact-fingerprint
+                grouping, least-outstanding pick, heartbeat expiry over IClock)
+                and LeaseTable (lease issue/expiry/release plus the in-flight
+                key map that suppresses duplicate work). Both pure with respect
+                to I/O, so every capacity and expiry rule is a ManualClock unit
+                test rather than a sleep.
   Protocol/     IProtocolHandler, ProtocolAutodetect, MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
                 RedisResp (RESP2/RESP3: strings, keys, pub/sub, streams,
                 MULTI/EXEC), PubSubRegistry, StreamWaiterRegistry,
-                KeyspaceNotifier
+                KeyspaceNotifier, CompileCacheHandler (the 0xFC compile cache
+                and the scheduling verbs), CompileCacheWire (header-only,
+                dependency-free: shared verbatim by the daemon, fastcache-cc
+                and fastcache-compile-node)
   Server/       Connection (per-client coroutine), Server (accept loop),
                 ReactorServerLoop (the server driver), AdminHttpServer
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),

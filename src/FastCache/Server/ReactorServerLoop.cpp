@@ -119,6 +119,10 @@ namespace
             auto session = options.session;
             session.listenerRoles = bind.roles;
             session.reactor = &reactor;
+            // The same sink the connection counters already use, so a dispatch
+            // outcome and the connection it arrived on land in one place. Null is
+            // ordinary (no metrics endpoint configured) and every use is guarded.
+            session.metrics = metrics;
             servers.push_back(std::make_unique<Server>(*listeners.back(),
                                                        engine,
                                                        logger,
@@ -424,6 +428,7 @@ namespace
                 auto session = options.session;
                 session.listenerRoles = bind.roles;
                 session.reactor = reactors[i].get();
+                session.metrics = metrics;
                 servers.push_back(std::make_unique<Server>(*listeners.back(),
                                                            engine,
                                                            logger,
