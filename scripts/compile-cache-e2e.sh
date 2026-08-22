@@ -77,11 +77,19 @@ command -v "$compiler" >/dev/null 2>&1 || { echo "compiler not found: '$compiler
 
 workdir="$(mktemp -d)"
 server_pid=""
+# The authentication section starts a second daemon on its own port. It is reaped
+# there on the happy path, but the trap has to know about it too: a `fail` in
+# between exits the script, and a daemon left holding a port makes the NEXT run
+# of this test fail at startup for a reason that has nothing to do with the run
+# that actually broke.
+auth_pid=""
 cleanup() {
-    if [[ -n "$server_pid" ]]; then
-        kill "$server_pid" >/dev/null 2>&1 || true
-        wait "$server_pid" 2>/dev/null || true
-    fi
+    for pid in "$server_pid" "$auth_pid"; do
+        if [[ -n "$pid" ]]; then
+            kill "$pid" >/dev/null 2>&1 || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
     rm -rf "$workdir"
 }
 trap cleanup EXIT
@@ -887,6 +895,88 @@ else
     echo "   direct mode records and serves a manifest on an aliased root: OK"
 fi
 
+# --- authentication ---------------------------------------------------------
+# The compile-cache protocol was the only one in the tree that never checked
+# SessionContext::CurrentAuth(), so a daemon started with --requirepass gated
+# memcached and RESP while serving this port to anyone. Three properties, and
+# the third is the one that would rot silently:
+#
+#   a) the wrong credential (or none) is REFUSED, so the gate is real;
+#   b) the build still SUCCEEDS anyway, because a cache that cannot be reached
+#      must never be load-bearing -- a gate that broke builds would be reverted
+#      by the first person it bit;
+#   c) the right credential still HITs, i.e. authenticating did not cost the
+#      cache its function. A gate that refused everybody would pass (a) and (b).
+echo "== authentication =="
+authport=$((port + 1))
+authdir="${workdir}/authproj"
+mkdir -p "${authdir}/build"
+cat > "${authdir}/a.cpp" <<'EOF'
+#include <string>
+int main() { return static_cast<int>(std::string{"authenticated"}.size()); }
+EOF
+
+"$fastcached" --bind=127.0.0.1 --port="$authport" --requirepass=e2e-s3cret --log-level=info \
+    > "${workdir}/auth-daemon.log" 2>&1 &
+auth_pid=$!
+authready=""
+for _ in $(seq 1 100); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/${authport}") 2>/dev/null; then authready=1; break; fi
+    if ! kill -0 "$auth_pid" 2>/dev/null; then
+        cat "${workdir}/auth-daemon.log" >&2
+        fail "authenticating daemon exited before it started listening"
+    fi
+    sleep 0.2
+done
+[[ -n "$authready" ]] || { cat "${workdir}/auth-daemon.log" >&2; fail "authenticating daemon never listened"; }
+
+(
+    export FASTCACHE_ADDR="127.0.0.1:${authport}"
+    export FASTCACHE_SOURCE_DIR="$authdir"
+    export FASTCACHE_BINARY_DIR="${authdir}/build"
+
+    # (a) + (b): no credential at all.
+    unset FASTCACHE_TOKEN
+    "$launcher" "$compiler" -c "${authdir}/a.cpp" -o "${authdir}/build/none.o" \
+        > "${workdir}/auth-none.log" 2>&1 \
+        || fail "a refused credential broke the build; the cache must never be load-bearing"
+    grep -q "unauthenticated" "${workdir}/auth-none.log" \
+        || { cat "${workdir}/auth-none.log" >&2; fail "an uncredentialed compile was not refused as unauthenticated"; }
+    [[ -f "${authdir}/build/none.o" ]] || fail "no object produced when the cache refused the launcher"
+
+    # (a): a WRONG credential must be refused too, and distinguishably. "failed"
+    # and "required" are different operator problems -- a bad token versus no
+    # token -- and a single message for both is a support ticket either way.
+    FASTCACHE_TOKEN=not-the-secret "$launcher" "$compiler" -c "${authdir}/a.cpp" -o "${authdir}/build/wrong.o" \
+        > "${workdir}/auth-wrong.log" 2>&1 \
+        || fail "a wrong credential broke the build"
+    grep -q "authentication failed" "${workdir}/auth-wrong.log" \
+        || { cat "${workdir}/auth-wrong.log" >&2; fail "a wrong credential was not reported as a failed authentication"; }
+
+    # (c): the right credential caches as usual -- miss, then hit.
+    export FASTCACHE_TOKEN=e2e-s3cret
+    "$launcher" "$compiler" -c "${authdir}/a.cpp" -o "${authdir}/build/ok.o" \
+        > "${workdir}/auth-miss.log" 2>&1 \
+        || fail "an authenticated compile failed"
+    grep -q "MISS" "${workdir}/auth-miss.log" \
+        || { cat "${workdir}/auth-miss.log" >&2; fail "the first authenticated compile was not a miss"; }
+
+    rm -f "${authdir}/build/ok.o"
+    "$launcher" "$compiler" -c "${authdir}/a.cpp" -o "${authdir}/build/ok.o" \
+        > "${workdir}/auth-hit.log" 2>&1 \
+        || fail "the repeat authenticated compile failed"
+    # Anchored on the launcher's own prefix rather than a bare `grep HIT`: the
+    # launcher prints "STALE HIT (...); recompiling" on its way to a MISS, so a
+    # loose match is satisfied by exactly the collapse this case exists to reject.
+    grep -q "fastcache-cc: HIT" "${workdir}/auth-hit.log" \
+        || { cat "${workdir}/auth-hit.log" >&2; fail "the repeat authenticated compile did not HIT"; }
+    [[ -f "${authdir}/build/ok.o" ]] || fail "no object reproduced on the authenticated hit"
+) || exit 1
+
+kill "$auth_pid" >/dev/null 2>&1 || true
+wait "$auth_pid" 2>/dev/null || true
+echo "   a credential is required, refusals never break the build, and the right one still HITs"
+
 # --- statistics -------------------------------------------------------------
 echo "== statistics =="
 "$launcher" --show-stats || fail "--show-stats returned non-zero"
@@ -918,5 +1008,5 @@ echo "   retired flags exit 2 with a diagnostic"
 
 echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, store ceiling, cross-depth," \
      "moved-header convergence (both layouts keyed apart), an edit re-keying," \
-     "and safe fallback"
+     "authentication (refused without a credential, cached with one), and safe fallback"
 exit 0

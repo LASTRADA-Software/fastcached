@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -347,4 +348,70 @@ TEST_CASE("IsSupported admits exactly the declared range")
     CHECK(IsSupported(MinSupportedVersion));
     CHECK_FALSE(IsSupported(static_cast<WireVersion>(CurrentVersion + 1)));
     CHECK_FALSE(IsSupported(0));
+}
+
+// --- AUTH ------------------------------------------------------------------
+
+TEST_CASE("EncodeAuth emits the specified bytes exactly")
+{
+    auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
+
+    auto const expected = Bytes({
+        0xFC, 0x01, 0x03,       // magic, version, op=Auth
+        0x00, 0x00, 0x00, 0x12, // payload length: (4+3) + (4+7) = 18
+        0x00, 0x00, 0x00, 0x03, 'b', 'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
+    });
+    CHECK(frame == expected);
+}
+
+TEST_CASE("DecodeAuthPayload round-trips, including the empty-username form")
+{
+    // The empty username is the redis `requirepass` spelling and is a legitimate
+    // credential, not a malformed one: a launcher configured with only a token
+    // sends exactly this. A decoder that rejected it would lock out the common case.
+    auto const frame = EncodeAuth(AuthRequest { .username = "", .secret = "s3cret" });
+    std::span<std::byte const> const payload = std::span { frame }.subspan(RequestHeaderSize);
+
+    auto const decoded = DecodeAuthPayload(payload);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).username.empty());
+    CHECK(AsStringView(Unwrap(decoded).secret) == "s3cret");
+}
+
+TEST_CASE("DecodeAuthPayload rejects a payload with the wrong field count")
+{
+    // A FETCH payload is one field; AUTH demands two. Decoding one as the other
+    // must fail rather than silently read the key as a username with no secret.
+    auto const fetch = EncodeFetch("some-key");
+    std::span<std::byte const> const payload = std::span { fetch }.subspan(RequestHeaderSize);
+    CHECK_FALSE(DecodeAuthPayload(payload).has_value());
+}
+
+TEST_CASE("Exactly the verbs meant to be reachable before AUTH are reachable")
+{
+    // The whole point of `preAuth` being a table column is that this list is
+    // assertable. If a future verb is added with `preAuth = true`, this case is
+    // what forces that to be a deliberate, reviewed decision rather than a
+    // default nobody looked at.
+    CHECK(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::Auth)));
+    CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::Fetch)));
+    CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::Store)));
+
+    auto const openVerbs = std::ranges::count_if(OpTable, [](auto const& row) { return row.preAuth; });
+    CHECK(openVerbs == 1);
+}
+
+TEST_CASE("An unknown opcode is never reachable before AUTH")
+{
+    // The gate has to fail CLOSED for a byte it does not recognise. A predicate
+    // resolving the descriptor first and treating "no row" as permissive would
+    // hand every future or bogus verb a free pass past authentication.
+    CHECK_FALSE(IsPreAuthAllowed(0x00));
+    CHECK_FALSE(IsPreAuthAllowed(0xFF));
+    for (auto const raw: std::views::iota(0, 256))
+    {
+        auto const opRaw = static_cast<std::uint8_t>(raw);
+        if (FindOp(opRaw) == nullptr)
+            CHECK_FALSE(IsPreAuthAllowed(opRaw));
+    }
 }

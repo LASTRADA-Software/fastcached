@@ -58,6 +58,7 @@ Which statuses an op may be answered with is table data, not convention:
 |----|----------------|
 | STORE | Ok, Error |
 | FETCH | Ok, Miss, Error |
+| AUTH | Ok, Error |
 
 A miss and a refusal being distinct is the point. When both were the byte `0x00`,
 a client the daemon could not serve saw an endlessly cold cache and no
@@ -74,6 +75,7 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x05` | malformed-value | A STORE payload is not a decodable compile-value. |
 | `0x06` | canonicalization-failed | A text region's paths could not be canonicalized. |
 | `0x07` | storage-write-failed | The cache engine refused the write. |
+| `0x08` | unauthenticated | A credential is required and has not been accepted on this connection. |
 
 ### STORE
 
@@ -93,6 +95,100 @@ canonical tokens before storing — so what lands in the cache is layout-neutral
 
 On a hit the reply payload is the stored value, in its **canonical** form — the
 client localizes it to its own layout.
+
+### AUTH
+
+```
+[0xFC][ver][0x03][u32 len]  payload: [username][secret]
+```
+
+An empty `username` asks to be verified against the secret alone — the redis
+`requirepass` form, and the usual one. The field is always present so the frame
+arity does not depend on which credential style a client uses.
+
+## Authentication
+
+When the daemon runs with `--requirepass`, every verb except AUTH is refused with
+`unauthenticated` until an AUTH frame has been accepted on that connection.
+
+This handler was for a long time the only one in the tree that did not check the
+configured credential: memcached text, memcached binary and RESP all did, so a
+daemon started with `--requirepass` gated those three and served the compile
+cache to anyone who could open a socket.
+
+Which verbs are reachable before a credential is a **column of the opcode table**
+(`OpDescriptor::preAuth`), not a condition written into the handler. A verb added
+without a thought about it defaults to closed, and the gate reports "not allowed"
+for an opcode it does not recognise at all.
+
+### Why it costs no round trip
+
+Authentication is per-connection state, and the launcher opens a fresh connection
+per *operation* — so sending AUTH, awaiting its reply, and then sending the real
+command would double the round trips of every translation unit in a build. That
+is exactly the cost [the no-handshake decision](#why-there-is-no-handshake)
+exists to avoid.
+
+It does not have to be spelled that way. Replies are strictly ordered and
+one-per-request, so a client **pipelines**: AUTH and the real command go out in a
+single write, and the two replies are read in order afterwards. The credential
+costs a few dozen bytes in a segment that was being sent anyway. `fastcache-cc`
+does exactly this, and asserts it — a unit test checks the write *count*, because
+the bytes are identical either way and only the call count distinguishes a
+pipelined credential from one that waited.
+
+A client must still read the AUTH reply. Skipping it on the assumption it
+succeeded strands a whole frame in the socket, and the next command on that
+connection reads the previous one's answer.
+
+### Refusals and reloads
+
+A failed AUTH is answered and the connection kept, as every other handler here
+does: a refusal is a reply, not a close. Closing would not slow an attacker
+down — reconnecting is free — while costing every honest launcher its pipelining.
+
+The policy is resolved once per command from the live auth source, so a `SIGHUP`
+that **enables** `requirepass` gates connections that are already open, and one
+that disables it releases them. A connection that has actually *verified* a
+credential keeps its access across a secret **rotation**, as redis does:
+re-gating on rotation would fail every in-flight build at the moment an operator
+rotates, which is what makes rotation something nobody dares do.
+
+Against a daemon with no credential configured, an AUTH frame is answered `Ok`
+and ignored, so setting `FASTCACHE_TOKEN` is safe in a mixed fleet. It does not
+mark the connection as verified, though — nothing was checked — so a later reload
+that enables auth gates it like any other.
+
+### Against a daemon that predates AUTH
+
+The AUTH opcode was added **without** bumping `CurrentVersion`, because the
+framing was built precisely so a receiver can step over a verb it does not know:
+an older daemon answers `unknown-opcode`, skips the payload, and serves the
+pipelined command behind it perfectly well.
+
+A client must therefore treat `unknown-opcode` **on AUTH** as "this daemon has no
+authentication", not as a failed exchange. Returning it as the outcome instead
+gives a token-configured launcher a permanent 0% hit rate against every
+not-yet-upgraded daemon, reported as `rejected (unknown-opcode)` — a regression
+with a plausible-looking error message and no obvious cause. `fastcache-cc` falls
+through to the command's own reply and sets `credentialIgnored`, which surfaces
+once per build as a verbose note: the operator asked for authentication and did
+not get it, and a cache that silently does less than it was told to is worse than
+one that says so. Every *other* refusal is about the credential itself and is
+still reported.
+
+### Payload ceilings
+
+AUTH is the one verb reachable before authentication, which makes it the one hole
+in the gate above: without a bound of its own it would be read with the session's
+`maxPayloadBytes` (256 MiB by default), handing an unauthenticated peer exactly
+the allocation the gate exists to deny. So the opcode table carries a
+`maxPayload` column — `MaxAuthPayload` (4 KiB) for AUTH, and `0` ("the session
+cap") for STORE and FETCH, which carry object files and are read only after the
+peer has authenticated. A `static_assert` requires every `preAuth` row to declare
+a non-zero ceiling, so a future pre-auth verb cannot reopen the hole by omission.
+An over-ceiling frame is drained and answered like any other refusal, and names
+the verb whose cap it hit rather than the session's.
 
 ## Versioning
 

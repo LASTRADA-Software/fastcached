@@ -37,6 +37,17 @@ struct CacheOutcome
     CompileCacheWire::ErrorCode code { CompileCacheWire::ErrorCode::MalformedFrame }; ///< Valid when `kind == Rejected`.
     std::string message; ///< The daemon's own words, when it refused.
 
+    /// True when a credential was presented and the daemon did not understand the
+    /// AUTH verb at all — i.e. it predates authentication on this protocol.
+    ///
+    /// The exchange still succeeds (such a daemon steps over the unknown verb and
+    /// serves the command behind it), so this is not an error and must not be
+    /// treated as one. It is reported because the operator asked for something
+    /// that did not happen: they set a token, and this traffic went unauthenticated.
+    /// Discovering that from a security review rather than from the tool is the
+    /// silent no-op this codebase keeps a list about.
+    bool credentialIgnored { false };
+
     /// @return True when the daemon served a value.
     [[nodiscard]] bool IsHit() const noexcept
     {
@@ -51,17 +62,53 @@ struct CacheOutcome
 /// @return A short human-readable phrase; empty for a hit.
 [[nodiscard]] std::string DescribeOutcome(CacheOutcome const& outcome);
 
+/// The credential this launcher presents, if any.
+///
+/// An empty `secret` means "no credential configured", and every exchange below
+/// then sends exactly the bytes it always did. That is what keeps a launcher that
+/// has never heard of authentication byte-compatible on the wire with one that
+/// has: the AUTH frame exists only when there is something to put in it.
+struct Credential
+{
+    std::string username; ///< Empty selects the default user (the `requirepass` form).
+    std::string secret;   ///< Empty means no credential is configured.
+
+    /// @return True when a credential should be presented.
+    [[nodiscard]] bool Configured() const noexcept
+    {
+        return !secret.empty();
+    }
+};
+
 /// FETCH one key over an already-connected client.
+///
+/// When `credential` is configured, an AUTH frame is **pipelined** ahead of the
+/// FETCH — both are written before either reply is read — so authenticating costs
+/// bytes but no extra round trip. This matters because the launcher opens a fresh
+/// connection per operation, so a wait-for-AUTH-then-send spelling would double
+/// the round trips of every translation unit in a build. See the note in
+/// `CompileCacheWire.hpp`.
+///
+/// A rejected credential surfaces as the *fetch's* outcome (`Rejected` /
+/// `Unauthenticated`), because that is the answer the caller acts on; the AUTH
+/// reply is consumed first so the two never desynchronise.
+///
 /// @param client Connected transport; not owned.
 /// @param key The key to look up.
+/// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome; `value` holds the stored bytes on a hit.
-[[nodiscard]] CacheOutcome CacheFetch(ITcpClient& client, std::string_view key);
+[[nodiscard]] CacheOutcome CacheFetch(ITcpClient& client, std::string_view key, Credential const& credential = {});
 
 /// STORE one entry over an already-connected client.
+///
+/// Pipelines AUTH the same way `CacheFetch` does, for the same reason.
 /// @param client Connected transport; not owned.
 /// @param request The fields to send.
+/// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome; `kind == Hit` means the daemon acknowledged the write.
-[[nodiscard]] CacheOutcome CacheStore(ITcpClient& client, CompileCacheWire::StoreRequest const& request);
+[[nodiscard]] CacheOutcome CacheStore(ITcpClient& client,
+                                      CompileCacheWire::StoreRequest const& request,
+                                      Credential const& credential = {});
 
 /// Default ceiling on a value the launcher will offer to the daemon.
 ///

@@ -62,6 +62,23 @@
 /// unrecognised was to close, which is indistinguishable from a dead peer.
 ///
 /// All multi-byte integers are big-endian.
+///
+/// ## Authentication, and why it costs no round trip
+///
+/// When the server requires a credential, every verb whose `OpDescriptor::preAuth`
+/// is false is refused with `Unauthenticated` until an `Auth` frame has been
+/// accepted on that connection. That is per-connection state, and the launcher
+/// opens a fresh connection *per operation* — so the obvious spelling (send AUTH,
+/// await its reply, then send the real command) would double the round trips on
+/// exactly the path the "no handshake" decision above exists to protect.
+///
+/// It does not have to be spelled that way. Replies are strictly ordered and
+/// one-per-request, so a client may **pipeline**: write `AUTH` and the real
+/// command in a single write, then read the two replies in order. The credential
+/// costs a few dozen bytes in a segment that was going to be sent anyway, and the
+/// round-trip count is unchanged. `Cc::CacheFetch`/`Cc::CacheStore` do exactly
+/// this. A server must therefore never coalesce, reorder, or skip a reply — which
+/// the framing already guarantees, since every request is answered exactly once.
 namespace FastCache::CompileCacheWire
 {
 
@@ -116,6 +133,7 @@ enum class Op : std::uint8_t
 {
     Store = 0x01, ///< Canonicalize and store a compile result.
     Fetch = 0x02, ///< Retrieve a compile result in canonical form.
+    Auth = 0x03,  ///< Present a credential; gates every other verb when auth is on.
 };
 
 /// Reply status, the first byte of every reply.
@@ -148,6 +166,7 @@ enum class ErrorCode : std::uint8_t
     MalformedValue = 0x05,         ///< STORE payload is not a decodable compile-value.
     CanonicalizationFailed = 0x06, ///< A text region's paths could not be canonicalized.
     StorageWriteFailed = 0x07,     ///< The cache engine refused the write.
+    Unauthenticated = 0x08,        ///< A credential is required and has not been accepted.
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -165,7 +184,34 @@ struct OpDescriptor
     std::string_view name;      ///< Stable lower-case name, for logs and diagnostics.
     std::size_t fieldCount;     ///< Exact number of length-prefixed request fields.
     std::uint8_t legalStatuses; ///< Mask of the statuses this op may be answered with.
+    /// Whether this verb may be served before a credential has been accepted.
+    ///
+    /// A column rather than a predicate with its own `switch`: "which verbs are
+    /// reachable by an unauthenticated peer" is the security-relevant property of
+    /// the whole table, and a reviewer must be able to read it off the table
+    /// itself. A verb added without thinking about it defaults to `false` —
+    /// closed, which is the direction a mistake here has to fail in.
+    bool preAuth;
+    /// Largest payload this verb may declare, or 0 for "the session cap".
+    ///
+    /// A verb reachable *before* authentication MUST declare a real bound, and
+    /// `PreAuthVerbsAreBounded` asserts that it does. The pre-auth gate exists so
+    /// an unauthenticated peer cannot make the server allocate `maxPayloadBytes`
+    /// (256 MiB by default) per frame — and a verb waved through that gate is read
+    /// with exactly that allocation unless it says otherwise, which would defeat
+    /// the gate through the one door it deliberately holds open.
+    ///
+    /// A gated verb may legitimately leave this 0: STORE carries a whole object
+    /// file, and by the time it is read the peer has authenticated, so the
+    /// operator's own cap is the right bound.
+    std::size_t maxPayload;
 };
+
+/// Payload ceiling for AUTH: a username and a shared secret, and nothing that
+/// grows with a build artefact. Generous by orders of magnitude against any real
+/// credential, and small enough that a peer which has proved nothing cannot use
+/// it to make the server take memory.
+inline constexpr std::size_t MaxAuthPayload = 4096;
 
 /// Every opcode this build understands.
 ///
@@ -173,17 +219,44 @@ struct OpDescriptor
 /// here rather than spelling a literal, so an op's shape lives in exactly one
 /// place. `legalStatuses` makes "a FETCH may miss but a STORE may not" a property
 /// of the data instead of a convention, and is assertable in tests.
-inline constexpr std::array<OpDescriptor, 2> OpTable {
+///
+/// The array size is deduced rather than spelled: a count that has to be edited
+/// alongside the rows is a second place to change when a verb is added, which is
+/// exactly what this table exists to avoid.
+inline constexpr std::array OpTable {
     OpDescriptor { .code = Op::Store,
                    .name = "store",
                    .fieldCount = 5, // key, prefetchGroup, srcRoot, buildTree, value
-                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)) },
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = false,
+                   .maxPayload = 0 }, // an object file; bounded by the operator's cap
     OpDescriptor { .code = Op::Fetch,
                    .name = "fetch",
                    .fieldCount = 1, // key
-                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Miss)
-                                                              | StatusBit(Status::Error)) },
+                   .legalStatuses =
+                       static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Miss) | StatusBit(Status::Error)),
+                   .preAuth = false,
+                   .maxPayload = 0 },
+    OpDescriptor { .code = Op::Auth,
+                   .name = "auth",
+                   .fieldCount = 2, // username, secret
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = true,
+                   .maxPayload = MaxAuthPayload },
 };
+
+/// Whether every verb reachable before authentication declares a payload bound.
+///
+/// A `static_assert`ed invariant rather than a comment, because getting it wrong
+/// is not a bug in the new verb — it is the pre-auth allocation gate silently
+/// ceasing to hold for the whole protocol.
+/// @return True when no `preAuth` row leaves `maxPayload` at 0.
+[[nodiscard]] constexpr bool PreAuthVerbsAreBounded() noexcept
+{
+    return std::ranges::all_of(OpTable, [](OpDescriptor const& row) { return !row.preAuth || row.maxPayload != 0; });
+}
+
+static_assert(PreAuthVerbsAreBounded(), "a verb reachable before AUTH must declare its own payload ceiling");
 
 /// One row of the error table: the code, its stable name, and the message sent
 /// when the caller has nothing more specific to say.
@@ -194,8 +267,8 @@ struct ErrorDescriptor
     std::string_view defaultMessage; ///< Human-readable text sent when no detail is supplied.
 };
 
-/// Every error code this build emits.
-inline constexpr std::array<ErrorDescriptor, 7> ErrorTable {
+/// Every error code this build emits. Size deduced, for the reason `OpTable`'s is.
+inline constexpr std::array ErrorTable {
     ErrorDescriptor {
         .code = ErrorCode::UnsupportedVersion, .name = "unsupported-version", .defaultMessage = "unsupported wire version" },
     ErrorDescriptor { .code = ErrorCode::UnknownOpcode, .name = "unknown-opcode", .defaultMessage = "unknown opcode" },
@@ -209,6 +282,8 @@ inline constexpr std::array<ErrorDescriptor, 7> ErrorTable {
                       .defaultMessage = "path canonicalization failed" },
     ErrorDescriptor {
         .code = ErrorCode::StorageWriteFailed, .name = "storage-write-failed", .defaultMessage = "storage write failed" },
+    ErrorDescriptor {
+        .code = ErrorCode::Unauthenticated, .name = "unauthenticated", .defaultMessage = "authentication required" },
 };
 
 /// Look up the descriptor for a raw opcode byte.
@@ -242,6 +317,22 @@ inline constexpr std::array<ErrorDescriptor, 7> ErrorTable {
     return row != nullptr ? row->fieldCount : 0;
 }
 
+/// The payload ceiling a raw opcode declares, bounded by the session's own cap.
+///
+/// Takes the raw byte and the session cap together so a caller cannot apply one
+/// without the other: the per-op bound is an *additional* restriction, never a
+/// licence to exceed what the operator configured.
+/// @param opRaw The third header byte, as received.
+/// @param sessionCap The session's configured maximum payload.
+/// @return The effective ceiling for this frame.
+[[nodiscard]] constexpr std::size_t OpPayloadCap(std::uint8_t opRaw, std::size_t sessionCap) noexcept
+{
+    auto const* row = FindOp(opRaw);
+    if (row == nullptr || row->maxPayload == 0)
+        return sessionCap;
+    return row->maxPayload < sessionCap ? row->maxPayload : sessionCap;
+}
+
 /// Whether `op` may legally be answered with `status`, per the table.
 /// @param op The opcode.
 /// @param status The status under consideration.
@@ -250,6 +341,21 @@ inline constexpr std::array<ErrorDescriptor, 7> ErrorTable {
 {
     auto const* row = FindOp(static_cast<std::uint8_t>(op));
     return row != nullptr && (row->legalStatuses & StatusBit(status)) != 0;
+}
+
+/// Whether `op` may be served to a peer that has not authenticated, per the table.
+///
+/// Takes the raw opcode byte, not an `Op`: the gate has to answer for whatever
+/// arrived on the wire, and an unknown opcode must read as "not allowed" rather
+/// than force the caller to resolve the descriptor first and decide what a null
+/// row means. An unknown verb is refused on its own grounds anyway, but a gate
+/// that fails open for anything is the wrong shape regardless of who calls it.
+/// @param opRaw The third header byte, as received.
+/// @return True only for a known verb whose row permits it.
+[[nodiscard]] constexpr bool IsPreAuthAllowed(std::uint8_t opRaw) noexcept
+{
+    auto const* row = FindOp(opRaw);
+    return row != nullptr && row->preAuth;
 }
 
 /// Whether this build can decode a request at `version`.
@@ -306,6 +412,26 @@ struct StoreView
     std::span<std::byte const> srcRoot;       ///< Producer's source root.
     std::span<std::byte const> buildTree;     ///< Producer's build tree.
     std::span<std::byte const> value;         ///< Encoded compile-value.
+};
+
+/// The two fields of an AUTH request, as spans into the caller's payload buffer.
+struct AuthView
+{
+    std::span<std::byte const> username; ///< Username; empty selects the default user.
+    std::span<std::byte const> secret;   ///< Shared secret.
+};
+
+/// The fields of an AUTH request, for encoding.
+///
+/// The username may be empty, which asks to be verified against the secret alone
+/// — the redis one-argument `AUTH <pass>` / `requirepass` form. Carrying it as an
+/// always-present (possibly empty) field rather than a separate one-field opcode
+/// keeps the arity fixed, so the frame shape does not depend on which credential
+/// style the client happens to use.
+struct AuthRequest
+{
+    std::string_view username; ///< Username, or empty for the default user.
+    std::string_view secret;   ///< Shared secret.
 };
 
 /// The fields of a STORE request, as owning views for encoding.
@@ -405,6 +531,16 @@ namespace Detail
 [[nodiscard]] inline std::vector<std::byte> EncodeFetch(std::string_view key, WireVersion version = CurrentVersion)
 {
     return Detail::EncodeRequest(version, Op::Fetch, { AsBytes(key) });
+}
+
+/// Frame an AUTH request.
+/// @param request The credential to present.
+/// @param version Version to advertise; overridable so tests can offer a version
+///                the peer does not support.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeAuth(AuthRequest const& request, WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::Auth, { AsBytes(request.username), AsBytes(request.secret) });
 }
 
 /// Frame a reply. **The only place a reply header is written.**
@@ -540,6 +676,17 @@ namespace Detail
     if (!fields.has_value())
         return std::nullopt;
     return (*fields)[0];
+}
+
+/// Split an AUTH payload into its two named fields.
+/// @param payload The bytes following the request header.
+/// @return The field views, or nullopt when malformed.
+[[nodiscard]] inline std::optional<AuthView> DecodeAuthPayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::Auth));
+    if (!fields.has_value())
+        return std::nullopt;
+    return AuthView { .username = (*fields)[0], .secret = (*fields)[1] };
 }
 
 /// Split an `Error` reply payload into its code and message.

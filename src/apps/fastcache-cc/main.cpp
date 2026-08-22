@@ -108,6 +108,11 @@ struct Config
     bool verbose { false };
     bool stats { true };  ///< Record each invocation to the per-user log.
     bool direct { true }; ///< Try the manifest shortcut before preprocessing.
+    /// Credential presented to the daemon, empty when none is configured. Held
+    /// here rather than read at each exchange so every round trip on one
+    /// invocation presents the same thing — and so there is exactly one place
+    /// that decides whether this build authenticates at all.
+    Cc::Credential credential;
     /// Per-call deadline for every blocking send/recv against the daemon. The
     /// default keeps a wedged daemon from hanging a build while staying far
     /// above any healthy round-trip, including multi-megabyte objects.
@@ -199,6 +204,12 @@ struct Config
     c.stats = !EnvSet(Cc::EnvName::NoStats);
     c.direct = !EnvSet(Cc::EnvName::NoDirect);
     c.ioTimeout = EnvMillis(Cc::EnvName::TimeoutMs, DefaultIoTimeout);
+    // A username without a token is not a credential, and `Credential::Configured`
+    // keys on the secret alone — so an operator who sets only FASTCACHE_USER gets
+    // the same unauthenticated behaviour they had before, rather than an AUTH
+    // frame carrying an empty secret that every server would refuse.
+    c.credential.username = EnvOr(Cc::EnvName::User, "");
+    c.credential.secret = EnvOr(Cc::EnvName::Token, "");
     // Clamped, not merely cast: the reader is 64-bit and `std::size_t` need not
     // be, and a truncating cast turns a ceiling somebody raised into a tiny one
     // that silently stops caching almost everything.
@@ -349,6 +360,27 @@ void NoteIfRootsDoNotDescribeCompile(Config const& cfg,
                      cfg.srcRoot,
                      cfg.buildTree,
                      sourcePath));
+}
+
+/// Report, once, that a configured credential was not understood by the daemon.
+///
+/// This is not a failure — the exchange succeeded and the cache is working — so
+/// it is deliberately not a fall-back reason and does not touch the recorded
+/// outcome. It is said out loud anyway because the operator asked for something
+/// that did not happen: a daemon predating the AUTH verb steps over it and serves
+/// the traffic unauthenticated. Believing a shared cache is authenticated when it
+/// is not is worth a line in a build log.
+///
+/// Guarded so a build of thousands of translation units says it once rather than
+/// thousands of times, which is the difference between a diagnostic and noise.
+/// @param outcome The completed exchange.
+void NoteIfCredentialIgnored(Cc::CacheOutcome const& outcome)
+{
+    static bool reported = false;
+    if (!outcome.credentialIgnored || reported)
+        return;
+    reported = true;
+    Note("daemon does not support authentication; the configured credential was ignored");
 }
 
 // --- process exec -----------------------------------------------------------
@@ -752,7 +784,8 @@ struct SourceProbe
     if (!client.has_value())
         return std::nullopt;
 
-    auto outcome = Cc::CacheFetch(client->Transport(), key);
+    auto outcome = Cc::CacheFetch(client->Transport(), key, cfg.credential);
+    NoteIfCredentialIgnored(outcome);
     if (!outcome.IsHit())
     {
         WarnIfRejected(outcome, "manifest fetch", key);
@@ -787,7 +820,9 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
                                                              .prefetchGroup = cfg.prefetchGroup,
                                                              .srcRoot = cfg.srcRoot,
                                                              .buildTree = cfg.buildTree,
-                                                             .value = Wire::AsBytes(body) });
+                                                             .value = Wire::AsBytes(body) },
+                                        cfg.credential);
+    NoteIfCredentialIgnored(outcome);
     WarnIfRejected(outcome, "STORE (raw)", key);
 }
 
@@ -1238,7 +1273,8 @@ void RecordManifest(Config const& cfg,
             Warn("connect failed");
             return std::nullopt;
         }
-        auto const outcome = Cc::CacheFetch(client->Transport(), key);
+        auto const outcome = Cc::CacheFetch(client->Transport(), key, cfg.credential);
+        NoteIfCredentialIgnored(outcome);
         if (outcome.kind == Cc::CacheOutcomeKind::Transport)
         {
             Warn("fetch exchange failed");
@@ -1393,7 +1429,9 @@ void RecordManifest(Config const& cfg,
                                                              .prefetchGroup = cfg.prefetchGroup,
                                                              .srcRoot = cfg.srcRoot,
                                                              .buildTree = cfg.buildTree,
-                                                             .value = std::span<std::byte const> { encoded } });
+                                                             .value = std::span<std::byte const> { encoded } },
+                                        cfg.credential);
+    NoteIfCredentialIgnored(outcome);
     if (outcome.IsHit())
         Note(std::format("STORED key={} bytes={}", key, encoded.size()));
     else if (outcome.kind == Cc::CacheOutcomeKind::Rejected)

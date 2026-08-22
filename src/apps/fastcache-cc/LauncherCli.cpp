@@ -184,6 +184,18 @@ namespace
                                 "handshake, so a launcher cannot ask. Raise BOTH to cache a\n"
                                 "result larger than this; raising only one leaves the other\n"
                                 "refusing." },
+        EnvVarSpec { .name = EnvName::Token,
+                     .summary = "Shared secret presented to a daemon started with\n"
+                                "--requirepass. Unset means no credential is sent, which is\n"
+                                "correct against a daemon that requires none. Setting it\n"
+                                "against a daemon that requires none is also fine -- such a\n"
+                                "daemon accepts the credential and ignores it. Costs no\n"
+                                "round trip: it is pipelined ahead of the real command\n"
+                                "rather than awaited." },
+        EnvVarSpec { .name = EnvName::User,
+                     .summary = "Username to accompany FASTCACHE_TOKEN. Unset (the usual\n"
+                                "case) authenticates against the secret alone, which is what\n"
+                                "--requirepass configures. Ignored without a token." },
     };
 
     /// Where the statistics log goes.
