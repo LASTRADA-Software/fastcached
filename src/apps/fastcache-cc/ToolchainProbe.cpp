@@ -1,9 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DirectManifest.hpp"
+#include "KeyDigest.hpp"
+#include "Stats.hpp"
 #include "ToolchainProbe.hpp"
 
+#include <FastCache/Platform/Environment.hpp>
+
+#if defined(_WIN32)
+    #include <windows.h>
+#else
+    #include <unistd.h>
+#endif
+
+#include <array>
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <string>
 #include <system_error>
+#include <vector>
 
 namespace FastCache::Cc
 {
@@ -159,6 +175,246 @@ std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> root
     }
 
     return files;
+}
+
+namespace
+{
+    /// An input that is always present and always empty, for the verbose probe.
+    ///
+    /// The driver has to be given something to preprocess or it prints usage
+    /// instead of a search list, and it must be empty so the run costs nothing.
+    /// This is a genuine per-platform difference in what the OS provides, not two
+    /// spellings of one thing, so it is a `#if` rather than a table row.
+    [[nodiscard]] constexpr std::string_view NullInputPath() noexcept
+    {
+#if defined(_WIN32)
+        return "NUL";
+#else
+        return "/dev/null";
+#endif
+    }
+
+    /// This process's id, for a temp filename no concurrent writer will reuse.
+    ///
+    /// A `#if` for the same reason `NullInputPath` is one: the OSes genuinely
+    /// provide this differently rather than spelling one call two ways. Used only
+    /// to make a name unique -- nothing depends on the value -- so it needs no
+    /// injected seam and a collision would cost a rewritten cache entry, not
+    /// correctness.
+    [[nodiscard]] std::uint64_t CurrentProcessId() noexcept
+    {
+#if defined(_WIN32)
+        return static_cast<std::uint64_t>(::GetCurrentProcessId());
+#else
+        return static_cast<std::uint64_t>(::getpid());
+#endif
+    }
+
+    /// The environment variable an MSVC toolchain publishes its search list in.
+    constexpr std::string_view MsvcIncludeVariable = "INCLUDE";
+
+    /// Schema tag for the validity stamp.
+    ///
+    /// Separate from `FingerprintSchema`, because the two version different
+    /// things: this one versions what the stamp COVERS. Adding an input to the
+    /// stamp without moving it would let a cache entry written under the old rules
+    /// validate under the new ones -- a stale fingerprint that looks fresh.
+    constexpr std::string_view StampSchema = "toolchain-stamp-v1";
+
+    /// A path's last-write time as its native tick count, or 0 when unreadable.
+    ///
+    /// The FULL resolution the filesystem offers, deliberately, and not truncated
+    /// to seconds. The two error directions are not symmetric: a stamp that is too
+    /// coarse fails to notice a change and serves a stale fingerprint, while one
+    /// that is too fine merely recomputes something that had not changed. A
+    /// one-second granularity would blind the stamp to everything a toolchain
+    /// installer does within a second of the last read, which is exactly when an
+    /// upgrade happens.
+    ///
+    /// `file_time_type`'s epoch and period are implementation-defined, so a
+    /// standard-library update can change this value for an unchanged file. That
+    /// costs one rewalk per toolchain and then re-stamps -- the harmless
+    /// direction, which is why it is not worth defending against by discarding
+    /// resolution. Filesystems whose timestamps really are second-granular (FAT,
+    /// HFS+) simply get the coarser behaviour back; nothing here can improve on
+    /// what the filesystem records.
+    [[nodiscard]] std::int64_t LastWriteTicks(std::filesystem::path const& path)
+    {
+        std::error_code ec;
+        auto const stamp = std::filesystem::last_write_time(path, ec);
+        if (ec)
+            return 0;
+        return static_cast<std::int64_t>(stamp.time_since_epoch().count());
+    }
+
+    /// Byte size of a file, or 0 when it cannot be read.
+    [[nodiscard]] std::uint64_t FileSizeOrZero(std::filesystem::path const& path)
+    {
+        std::error_code ec;
+        auto const size = std::filesystem::file_size(path, ec);
+        return ec ? 0 : size;
+    }
+
+    /// Where this compiler's cached fingerprint lives.
+    ///
+    /// Named by a digest of the compiler PATH rather than by the path itself: a
+    /// path contains separators and characters no filename may carry, and two
+    /// compilers can differ only in a component a sanitizer would flatten.
+    /// @return The cache file path, or empty when there is no state directory.
+    [[nodiscard]] std::filesystem::path CacheFilePath(std::string const& compiler)
+    {
+        auto const dir = StateDirectory();
+        if (dir.empty())
+            return {};
+
+        KeyDigest name { "toolchain-cache-name-v1" };
+        name.Field(compiler);
+
+        std::error_code ec;
+        auto const sub = dir / "toolchains";
+        std::filesystem::create_directories(sub, ec);
+        if (ec)
+            return {};
+        return sub / (name.ToHex() + ".fingerprint");
+    }
+
+    /// Write `stamp` and `fingerprint` so a concurrent reader sees both or neither.
+    ///
+    /// Temp file plus rename, because sixteen launchers on a cold cache all write
+    /// this at once. A reader that caught a half-written file would either fail to
+    /// parse it -- costing a needless 2-second rewalk -- or, worse, read a stamp
+    /// paired with a truncated fingerprint and dispatch against a toolchain
+    /// identity no other machine will ever produce.
+    void WriteCacheAtomically(std::filesystem::path const& path, std::string_view stamp, std::string_view fingerprint)
+    {
+        std::error_code ec;
+        // The temp name carries the pid so two writers do not share one temp file
+        // and interleave into it; the rename is what makes the result atomic.
+        auto const temp =
+            path.parent_path() / (path.filename().string() + "." + std::to_string(CurrentProcessId()) + ".tmp");
+        {
+            std::ofstream out { temp, std::ios::binary | std::ios::trunc };
+            if (!out)
+                return;
+            out << stamp << '\n' << fingerprint << '\n';
+            if (!out)
+                return;
+        }
+        std::filesystem::rename(temp, path, ec);
+        if (ec)
+            std::filesystem::remove(temp, ec);
+    }
+
+    /// Read a cache file written by `WriteCacheAtomically`.
+    /// @return {stamp, fingerprint}, both empty when unreadable or malformed.
+    [[nodiscard]] std::pair<std::string, std::string> ReadCache(std::filesystem::path const& path)
+    {
+        std::ifstream in { path, std::ios::binary };
+        if (!in)
+            return {};
+        std::string stamp;
+        std::string fingerprint;
+        if (!std::getline(in, stamp) || !std::getline(in, fingerprint))
+            return {};
+        // A `\r` survives a file written on Windows and read with a text-mode
+        // getline elsewhere; left on, the stamp never compares equal and the cache
+        // silently never hits.
+        for (auto* field: { &stamp, &fingerprint })
+            if (!field->empty() && field->back() == '\r')
+                field->pop_back();
+        if (stamp.empty() || fingerprint.empty())
+            return {};
+        return { std::move(stamp), std::move(fingerprint) };
+    }
+} // namespace
+
+std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner, std::string const& compiler, DriverSpec const& spec)
+{
+    // No `default:`, so a mechanism added to the table fails to compile here
+    // rather than silently returning nothing -- which would present as a
+    // fingerprint that quietly stopped covering the include tree.
+    switch (spec.includeDiscovery)
+    {
+        case IncludeDiscovery::None:
+            return {};
+
+        case IncludeDiscovery::GnuVerbose: {
+            std::vector<std::string> argv;
+            argv.reserve(spec.includeProbeFlags.size() + 2);
+            argv.emplace_back(compiler);
+            for (auto const& flag: spec.includeProbeFlags)
+                argv.emplace_back(flag);
+            argv.emplace_back(NullInputPath());
+
+            auto const run = runner.RunCaptureSplit(argv);
+            // The exit code is deliberately NOT checked. The list is printed
+            // before anything that could fail, and a driver can exit non-zero for
+            // reasons that leave it perfectly valid -- a missing SDK component, a
+            // warning promoted by a wrapper script. Parsing decides whether the
+            // output is usable; an exit code cannot.
+            //
+            // Read from stderr, which is where every GNU-family driver prints it.
+            return ParseGnuIncludeSearchPaths(run.err);
+        }
+
+        case IncludeDiscovery::MsvcEnvironment: {
+            auto const value = ReadEnvironmentVariable(std::string { MsvcIncludeVariable });
+            if (!value.has_value())
+                return {};
+            return ParseIncludeEnvironment(*value);
+        }
+    }
+    return {};
+}
+
+std::string ComputeToolchainStamp(std::string_view banner, std::string const& compiler, std::span<std::string const> roots)
+{
+    std::filesystem::path const binary { compiler };
+    auto const size = FileSizeOrZero(binary);
+    auto const mtime = LastWriteTicks(binary);
+    if (size == 0 && mtime == 0)
+        // Not stattable: a bare `cc` resolved through PATH, or a wrapper that is
+        // not a file. Refusing to stamp means refusing to cache, which costs a
+        // rewalk rather than risking a stamp that cannot detect any change.
+        return {};
+
+    KeyDigest digest { StampSchema };
+    digest.Field(banner);
+    digest.Path(compiler);
+    digest.Field(std::to_string(size));
+    digest.Field(std::to_string(mtime));
+    for (auto const& root: roots)
+    {
+        // The root's own mtime changes when an entry is added or removed in it.
+        // Both the path and the time are folded, so a root REPLACED by one with
+        // the same timestamp still restamps.
+        digest.Path(root);
+        digest.Field(std::to_string(LastWriteTicks(std::filesystem::path { root })));
+    }
+    return digest.ToHex();
+}
+
+std::string CachedToolchainFingerprint(
+    IProcessRunner& runner, std::string const& compiler, std::string_view banner, DriverSpec const& spec, bool forceRefresh)
+{
+    auto const roots = DiscoverIncludePaths(runner, compiler, spec);
+    auto const stamp = ComputeToolchainStamp(banner, compiler, roots);
+    auto const cachePath = CacheFilePath(compiler);
+
+    if (!forceRefresh && !stamp.empty() && !cachePath.empty())
+    {
+        auto const [cachedStamp, cachedFingerprint] = ReadCache(cachePath);
+        if (!cachedStamp.empty() && cachedStamp == stamp)
+            return cachedFingerprint;
+    }
+
+    // The expensive part, reached only on a miss or a forced refresh.
+    auto const fingerprint = ComputeToolchainFingerprint(banner, ProbeToolchainFiles(roots));
+
+    if (!stamp.empty() && !cachePath.empty())
+        WriteCacheAtomically(cachePath, stamp, fingerprint);
+
+    return fingerprint;
 }
 
 } // namespace FastCache::Cc

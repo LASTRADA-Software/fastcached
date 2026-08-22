@@ -4,6 +4,7 @@
 #include <FastCache/Cli/UsageDoc.hpp>
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -66,6 +67,19 @@ struct Record
 /// them. Failures are swallowed — statistics must never break a build.
 /// @param record The invocation to record.
 void AppendRecord(Record const& record);
+
+/// The launcher's per-user state directory, created on demand.
+///
+/// `%LOCALAPPDATA%/fastcache-cc` on Windows; `$XDG_STATE_HOME/fastcache-cc` or
+/// `~/.local/state/fastcache-cc` elsewhere. Empty when none can be resolved,
+/// which every caller must treat as "do not persist" rather than as an error:
+/// nothing kept here is required for a correct build.
+///
+/// Exposed rather than private to the statistics log because it is no longer only
+/// the log's: the toolchain-fingerprint cache lives here too. Two copies of the
+/// platform `#if` would be two places for the location to drift, and a cache
+/// written to one path and read from another is a cache that silently never hits.
+[[nodiscard]] std::filesystem::path StateDirectory();
 
 /// Absolute path of the log file (%LOCALAPPDATA%/fastcache-cc/invocations.log on
 /// Windows, $XDG_STATE_HOME or ~/.local/state equivalent elsewhere). Empty when

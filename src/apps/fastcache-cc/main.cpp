@@ -45,6 +45,7 @@
 #include "ReplayGuard.hpp"
 #include "RootReconciler.hpp"
 #include "Stats.hpp"
+#include "ToolchainProbe.hpp"
 
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
@@ -780,6 +781,28 @@ struct SourceProbe
         return out.substr(0, out.find('\n'));
     auto const slash = compiler.find_last_of("/\\");
     return slash == std::string::npos ? compiler : compiler.substr(slash + 1);
+}
+
+/// Print the toolchain fingerprint a dispatched compile would send.
+///
+/// Recomputes unconditionally rather than reading the cache. This command exists
+/// to answer "why did no worker match", and a cached answer cannot distinguish
+/// "the two machines genuinely differ" from "one of them is holding a stale
+/// entry" -- which is the failure the cache's own staleness window makes
+/// possible. It also rewrites the cache on the way past, so running it is the
+/// remedy as well as the diagnosis.
+/// @param compiler The compiler to interrogate.
+/// @return Process exit code.
+[[nodiscard]] int PrintToolchainFingerprint(std::string const& compiler)
+{
+    auto const banner = CompilerId(compiler);
+    auto const flavor = Cc::ClassifyCompiler(compiler);
+    auto const runner = Cc::MakeProcessRunner();
+    auto const fingerprint =
+        Cc::CachedToolchainFingerprint(*runner, compiler, banner, Cc::DriverOf(flavor), /*forceRefresh=*/true);
+
+    std::cout << fingerprint << '\n';
+    return 0;
 }
 
 // --- the cache flow ---------------------------------------------------------
@@ -1759,6 +1782,8 @@ int main(int argc, char** argv)
             return RunHtmlStatsReport(command.groupFilter, command.outputPath);
         case Cc::Action::ZeroStats:
             return ClearStats();
+        case Cc::Action::PrintFingerprint:
+            return PrintToolchainFingerprint(command.compiler);
         // Stats sub-options, never returned as a top-level action. Handled
         // explicitly so the switch stays exhaustive without silently treating
         // "--prefetch-group"/"--out" as a compiler to spawn.

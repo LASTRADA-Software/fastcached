@@ -20,12 +20,21 @@ namespace FastCache::Cc
 /// `StatsOptions()`/`HtmlStatsOptions()`.
 enum class Action : std::uint8_t
 {
-    Compile,       ///< The default: front a real compile.
-    Help,          ///< Print the usage text.
-    Version,       ///< Print the launcher version.
-    ShowStats,     ///< Report the recorded statistics as plain text.
-    HtmlStats,     ///< Render the recorded statistics as a self-contained HTML dashboard.
-    ZeroStats,     ///< Discard the statistics log.
+    Compile,   ///< The default: front a real compile.
+    Help,      ///< Print the usage text.
+    Version,   ///< Print the launcher version.
+    ShowStats, ///< Report the recorded statistics as plain text.
+    HtmlStats, ///< Render the recorded statistics as a self-contained HTML dashboard.
+    ZeroStats, ///< Discard the statistics log.
+    /// Print the toolchain fingerprint for a named compiler and exit.
+    ///
+    /// Exists because switching dispatch from the compiler's `--version` banner to
+    /// an include-tree digest takes the fingerprint out of what an operator can
+    /// derive by hand. A compile node computes its own, so this is not how a fleet
+    /// is normally configured -- it is how a fingerprint MISMATCH is diagnosed,
+    /// which is otherwise invisible: the scheduler simply reports no worker, and
+    /// nothing tells you the two digests that failed to match.
+    PrintFingerprint,
     PrefetchGroup, ///< Stats sub-option: restrict the report to one prefetch group.
     OutputPath,    ///< `--html-stats` sub-option: where to write the dashboard.
     NoArguments,   ///< Invoked with nothing at all — usage, to stderr.
@@ -81,6 +90,7 @@ struct Command
     Action action { Action::Compile }; ///< The selected action.
     std::string groupFilter;           ///< From `--prefetch-group`; empty means no filtering.
     std::string outputPath;            ///< From `--html-stats`'s `--out`; empty means the default path.
+    std::string compiler;              ///< From `--print-toolchain-fingerprint`; the compiler to interrogate.
     std::string diagnostic;            ///< Why parsing failed; set iff `action == UsageError`.
 };
 

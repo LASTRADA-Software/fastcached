@@ -258,6 +258,20 @@ struct ParsedCommand
 /// Look up the descriptor for a compiler flavor.
 /// @param flavor The flavor to describe.
 /// @return Its driver spec; the Unknown spec for an unrecognised flavor.
+/// Classify a compiler's driver flavor from its basename.
+///
+/// Tolerates version suffixes (`g++-14`, `clang-18`) and a `.exe` extension, both
+/// ordinary on real build systems.
+///
+/// Exposed because the flavor is needed outside a parsed command line: asking a
+/// toolchain where it searches for headers requires knowing which family it
+/// belongs to, and that question is asked by `--print-toolchain-fingerprint`,
+/// which has a compiler and no command line at all.
+///
+/// @param compiler argv[0] as invoked.
+/// @return The matching flavor, or `Flavor::Unknown`.
+[[nodiscard]] Flavor ClassifyCompiler(std::string_view compiler);
+
 [[nodiscard]] DriverSpec const& DriverOf(Flavor flavor);
 
 /// Parse a compiler invocation (`argv[0]` = compiler, rest = its arguments).

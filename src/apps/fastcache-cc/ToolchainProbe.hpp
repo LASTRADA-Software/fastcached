@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CmdLine.hpp"
+#include "IProcessRunner.hpp"
 #include "ToolchainFingerprint.hpp"
 
 #include <span>
@@ -70,5 +71,72 @@ namespace FastCache::Cc
 /// @param roots Include search paths, as a driver reported them.
 /// @return One entry per readable file, unsorted (the digest sorts).
 [[nodiscard]] std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> roots);
+
+/// Ask a driver where it searches for system headers.
+///
+/// Dispatches on `spec.includeDiscovery` with no `default:`, so a mechanism added
+/// to the table is a compile error here rather than a silent empty result.
+///
+/// Every failure yields an empty list rather than an error: discovery is
+/// best-effort by construction. A toolchain whose paths cannot be discovered
+/// falls back to a banner-only fingerprint, which is weaker but still correct in
+/// the direction that matters -- it can only cause two genuinely-identical
+/// toolchains to be treated as identical, never two different ones.
+///
+/// @param runner Process-spawning seam.
+/// @param compiler The compiler to interrogate.
+/// @param spec The driver's table row.
+/// @return Search paths in the driver's own order; empty when undiscoverable.
+[[nodiscard]] std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
+                                                            std::string const& compiler,
+                                                            DriverSpec const& spec);
+
+/// A cheap check that a cached fingerprint still describes this toolchain.
+///
+/// Digested rather than stored field-by-field, so validation is a string compare
+/// and the cache file needs no parser -- a format with a parser is a format that
+/// can be misparsed, and this one is written and read by short-lived processes
+/// racing each other.
+///
+/// What it covers, and what it deliberately does not. The compiler binary's size
+/// and mtime catch a toolchain UPGRADE, which is the case that actually happens.
+/// Each search root's own mtime catches headers being added or removed. Neither
+/// catches a header edited IN PLACE without changing any directory -- accepted,
+/// because a system toolchain's headers are installed rather than edited, and the
+/// alternative is the 2-second full walk this exists to avoid. `--print-toolchain
+/// -fingerprint` recomputes unconditionally for when someone needs to be sure.
+///
+/// @param banner The compiler's version line.
+/// @param compiler Path to the compiler binary.
+/// @param roots Its include search roots.
+/// @return A hex digest, or empty when the compiler cannot be stat'd at all.
+[[nodiscard]] std::string ComputeToolchainStamp(std::string_view banner,
+                                                std::string const& compiler,
+                                                std::span<std::string const> roots);
+
+/// A toolchain fingerprint, computed once per machine and remembered.
+///
+/// The full walk costs about 2 seconds over 288 MB on an ordinary Xcode
+/// toolchain. The launcher runs once per translation unit, so without this cache
+/// the fingerprint would cost far more than the compile it exists to distribute
+/// -- which is why the cache is part of the design rather than an optimization.
+///
+/// Concurrency is handled by tolerating it rather than locking: a cold cache and
+/// `-j16` means sixteen launchers all walk the tree and all write the answer.
+/// They write the SAME answer, the write is atomic (temp file plus rename), and
+/// duplicated work once per machine is cheaper than a lock protocol between
+/// short-lived processes that must never deadlock a build.
+///
+/// @param runner Process-spawning seam.
+/// @param compiler Path to the compiler.
+/// @param banner Its version line, already obtained by the caller.
+/// @param spec The driver's table row.
+/// @param forceRefresh Skip the cached value and rewrite it.
+/// @return The fingerprint; never empty (it degrades to a banner-only digest).
+[[nodiscard]] std::string CachedToolchainFingerprint(IProcessRunner& runner,
+                                                     std::string const& compiler,
+                                                     std::string_view banner,
+                                                     DriverSpec const& spec,
+                                                     bool forceRefresh = false);
 
 } // namespace FastCache::Cc

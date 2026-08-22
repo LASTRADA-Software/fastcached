@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ToolchainProbe.hpp"
 
+#include <FastCache/Platform/EnvironmentTestUtils.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -269,4 +272,313 @@ TEST_CASE("A missing search root is skipped, not fatal", "[toolchain-probe]")
 TEST_CASE("Probing nothing yields nothing", "[toolchain-probe]")
 {
     CHECK(ProbeToolchainFiles({}).empty());
+}
+
+// --- discovery over the driver table ----------------------------------------
+
+namespace
+{
+/// A runner that replays one scripted result and records what it was asked.
+class ScriptedRunner final: public IProcessRunner
+{
+  public:
+    explicit ScriptedRunner(CompileRun result):
+        _result { std::move(result) }
+    {
+    }
+
+    CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        _lastArgv.assign(argv.begin(), argv.end());
+        ++_calls;
+        return _result;
+    }
+    CompileRun RunCaptureSplit(std::span<std::string const> argv) override
+    {
+        _lastArgv.assign(argv.begin(), argv.end());
+        ++_calls;
+        return _result;
+    }
+
+    /// The argv of the most recent spawn.
+    [[nodiscard]] std::vector<std::string> const& LastArgv() const noexcept
+    {
+        return _lastArgv;
+    }
+
+    /// How many times a process was spawned.
+    [[nodiscard]] int Calls() const noexcept
+    {
+        return _calls;
+    }
+
+  private:
+    CompileRun _result;
+    std::vector<std::string> _lastArgv;
+    int _calls { 0 };
+};
+
+[[nodiscard]] DriverSpec const& SpecFor(Flavor flavor)
+{
+    return DriverOf(flavor);
+}
+} // namespace
+
+TEST_CASE("A GNU driver is asked verbosely, and its stderr is what is read", "[toolchain-probe]")
+{
+    // The list goes to stderr, not stdout. Reading the wrong stream yields an
+    // empty set and silently reduces the fingerprint to the banner -- the same
+    // class of silent no-op the launcher already hit once, when a driver moved
+    // its /showIncludes notes between streams.
+    ScriptedRunner runner { CompileRun {
+        .exitCode = 0, .out = "should not be read", .err = std::string { AppleClangVerbose } } };
+
+    auto const paths = DiscoverIncludePaths(runner, "/usr/bin/c++", SpecFor(Flavor::Clang));
+
+    REQUIRE(paths.size() == 4);
+    CHECK(paths[0].contains("c++/v1"));
+    REQUIRE(runner.LastArgv().size() >= 2);
+    CHECK(runner.LastArgv().front() == "/usr/bin/c++");
+    CHECK(std::ranges::find(runner.LastArgv(), "-v") != runner.LastArgv().end());
+    CHECK(std::ranges::find(runner.LastArgv(), "-E") != runner.LastArgv().end());
+}
+
+TEST_CASE("A non-zero exit does not discard a printed search list", "[toolchain-probe]")
+{
+    // The list is printed before anything that could fail, and drivers exit
+    // non-zero for reasons that leave it valid. Gating on the exit code would
+    // silently drop the include tree on exactly those toolchains.
+    ScriptedRunner runner { CompileRun { .exitCode = 1, .out = {}, .err = std::string { AppleClangVerbose } } };
+    CHECK(DiscoverIncludePaths(runner, "cc", SpecFor(Flavor::Clang)).size() == 4);
+}
+
+TEST_CASE("An unknown driver is not interrogated at all", "[toolchain-probe]")
+{
+    ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = std::string { AppleClangVerbose } } };
+    CHECK(DiscoverIncludePaths(runner, "mystery", SpecFor(Flavor::Unknown)).empty());
+    CHECK(runner.Calls() == 0);
+}
+
+TEST_CASE("An MSVC driver is not spawned to discover its paths", "[toolchain-probe]")
+{
+    // cl has no such switch; its list comes from the environment. Spawning it
+    // would cost a process per launcher invocation and return nothing.
+    ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
+    (void) DiscoverIncludePaths(runner, "cl.exe", SpecFor(Flavor::Cl));
+    CHECK(runner.Calls() == 0);
+}
+
+// --- the validity stamp ------------------------------------------------------
+
+TEST_CASE("A stamp follows a search root's modification time", "[toolchain-probe]")
+{
+    // The mtime is SET rather than waited for. Adding a file and re-reading races
+    // the filesystem's timestamp granularity -- on a second-granular filesystem
+    // the two readings are identical and the test fails for a reason that has
+    // nothing to do with the stamp. Setting it states the property directly:
+    // whatever the filesystem reports for this root is folded into the stamp.
+    ScratchTree const tree { "stamp-root" };
+    tree.Write("inc/a.hpp", "x");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = tree.Root() + "/cc";
+    auto const includeDir = std::filesystem::path { tree.Root() } / "inc";
+    std::vector<std::string> const roots { includeDir.string() };
+
+    std::error_code ec;
+    auto const original = std::filesystem::last_write_time(includeDir, ec);
+    REQUIRE(!ec);
+
+    auto const before = ComputeToolchainStamp("cc 1.0", compiler, roots);
+    REQUIRE(!before.empty());
+
+    std::filesystem::last_write_time(includeDir, original + std::chrono::hours { 1 }, ec);
+    REQUIRE(!ec);
+    auto const after = ComputeToolchainStamp("cc 1.0", compiler, roots);
+
+    CHECK(before != after);
+}
+
+TEST_CASE("A stamp changes when the compiler binary changes size", "[toolchain-probe]")
+{
+    // Size as well as mtime, because a toolchain restored from an archive can
+    // carry its original timestamps -- an upgrade that moves no clock but
+    // certainly moves the bytes.
+    ScratchTree const tree { "stamp-size" };
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = tree.Root() + "/cc";
+    auto const before = ComputeToolchainStamp("cc 1.0", compiler, {});
+
+    tree.Write("cc", "#!/bin/sh\nexec real-cc \"$@\"\n");
+    std::error_code ec;
+    auto const restored = std::filesystem::last_write_time(std::filesystem::path { compiler }, ec);
+    REQUIRE(!ec);
+    // Put the clock back, so only the SIZE differs between the two readings.
+    std::filesystem::last_write_time(std::filesystem::path { compiler }, restored - std::chrono::hours { 2 }, ec);
+    auto const afterSizeOnly = ComputeToolchainStamp("cc 1.0", compiler, {});
+
+    CHECK(before != afterSizeOnly);
+}
+
+TEST_CASE("A stamp changes when the banner changes", "[toolchain-probe]")
+{
+    ScratchTree const tree { "stamp-banner" };
+    tree.Write("cc", "#!/bin/sh\n");
+    std::vector<std::string> const roots {};
+    auto const compiler = tree.Root() + "/cc";
+
+    CHECK(ComputeToolchainStamp("cc 1.0", compiler, roots) != ComputeToolchainStamp("cc 2.0", compiler, roots));
+}
+
+TEST_CASE("A compiler that cannot be stat'd yields no stamp", "[toolchain-probe]")
+{
+    // No stamp means no caching, which costs a rewalk. That is the right trade
+    // against a stamp that cannot observe any change and would pin a stale
+    // fingerprint forever.
+    CHECK(ComputeToolchainStamp("cc 1.0", "/nonexistent/compiler-that-is-not-here", {}).empty());
+}
+
+// --- the cache ---------------------------------------------------------------
+
+namespace
+{
+/// The variable `StateDirectory()` resolves the cache location from.
+///
+/// The same `#if` StateDirectory itself carries, because these are genuinely
+/// different variables per platform rather than one variable spelled two ways.
+/// The writing goes through Testing::ScopedEnv, which is the project's one
+/// sanctioned way to script the environment.
+#if defined(_WIN32)
+constexpr char const* StateVariable = "LOCALAPPDATA";
+#else
+constexpr char const* StateVariable = "XDG_STATE_HOME";
+#endif
+
+/// A runner that reports a fixed search list and counts how often it was asked.
+class CountingRunner final: public IProcessRunner
+{
+  public:
+    explicit CountingRunner(std::string verbose):
+        _verbose { std::move(verbose) }
+    {
+    }
+
+    CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        return RunCaptureSplit(argv);
+    }
+    CompileRun RunCaptureSplit(std::span<std::string const> /*argv*/) override
+    {
+        ++_calls;
+        return CompileRun { .exitCode = 0, .out = {}, .err = _verbose };
+    }
+
+    /// How many times a process was spawned.
+    [[nodiscard]] int Calls() const noexcept
+    {
+        return _calls;
+    }
+
+  private:
+    std::string _verbose;
+    int _calls { 0 };
+};
+
+/// A verbose-output blob naming `root` as the one search path.
+[[nodiscard]] std::string VerboseNaming(std::string const& root)
+{
+    return "#include <...> search starts here:\n " + root + "\nEnd of search list.\n";
+}
+} // namespace
+
+TEST_CASE("A cached fingerprint is reused rather than rewalked", "[toolchain-probe]")
+{
+    ScratchTree const tree { "cache-hit" };
+    tree.Write("inc/a.hpp", "content");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = tree.Root() + "/cc";
+    auto const root = (std::filesystem::path { tree.Root() } / "inc").string();
+
+    ScratchTree const state { "cache-hit-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Root() };
+
+    CountingRunner runner { VerboseNaming(root) };
+    auto const first = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    auto const second = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+
+    CHECK(!first.empty());
+    CHECK(first == second);
+    // Discovery still runs each time -- it is one cheap process and its result is
+    // what the stamp is computed FROM, so it cannot be cached behind the stamp.
+    // What the cache saves is the walk, which is the 288 MB part.
+    CHECK(runner.Calls() == 2);
+}
+
+TEST_CASE("A changed toolchain invalidates the cached fingerprint", "[toolchain-probe]")
+{
+    ScratchTree const tree { "cache-invalidate" };
+    tree.Write("inc/a.hpp", "original");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = tree.Root() + "/cc";
+    auto const includeDir = std::filesystem::path { tree.Root() } / "inc";
+
+    ScratchTree const state { "cache-invalidate-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Root() };
+
+    CountingRunner runner { VerboseNaming(includeDir.string()) };
+    auto const before = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+
+    // Change the content AND move the directory clock, which is what a toolchain
+    // upgrade does. Content alone would not restamp -- that is the documented
+    // blind spot, and asserting it here would pin the wrong behaviour.
+    tree.Write("inc/a.hpp", "upgraded");
+    std::error_code ec;
+    auto const original = std::filesystem::last_write_time(includeDir, ec);
+    REQUIRE(!ec);
+    std::filesystem::last_write_time(includeDir, original + std::chrono::hours { 1 }, ec);
+    REQUIRE(!ec);
+
+    auto const after = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    CHECK(before != after);
+}
+
+TEST_CASE("A forced refresh ignores a cached value", "[toolchain-probe]")
+{
+    // What --print-toolchain-fingerprint relies on: it exists to answer "why did
+    // no worker match", and a cached answer cannot tell a genuine difference from
+    // a stale entry.
+    ScratchTree const tree { "cache-force" };
+    tree.Write("inc/a.hpp", "original");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = tree.Root() + "/cc";
+    auto const root = (std::filesystem::path { tree.Root() } / "inc").string();
+
+    ScratchTree const state { "cache-force-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Root() };
+
+    CountingRunner runner { VerboseNaming(root) };
+    auto const before = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+
+    // Content changed, clock untouched: the stamp cannot see this, so an
+    // unforced call would return the stale value.
+    tree.Write("inc/a.hpp", "edited in place");
+    auto const stale = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    auto const forced = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang), true);
+
+    CHECK(stale == before);
+    CHECK(forced != before);
+}
+
+TEST_CASE("No state directory still yields a fingerprint", "[toolchain-probe]")
+{
+    // A machine with nowhere to persist must still be able to dispatch. Caching
+    // is an optimization; the fingerprint is not.
+    ScratchTree const tree { "cache-nowhere" };
+    tree.Write("inc/a.hpp", "content");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = tree.Root() + "/cc";
+    auto const root = (std::filesystem::path { tree.Root() } / "inc").string();
+
+    FastCache::Testing::ScopedEnv const env { StateVariable, "" };
+    CountingRunner runner { VerboseNaming(root) };
+    CHECK(!CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang)).empty());
 }

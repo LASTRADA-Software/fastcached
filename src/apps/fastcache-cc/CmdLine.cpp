@@ -248,7 +248,7 @@ namespace
     ///
     /// @param compiler argv[0] as invoked.
     /// @return The matching flavor, or Unknown.
-    [[nodiscard]] Flavor ClassifyCompiler(std::string_view compiler)
+    [[nodiscard]] Flavor ClassifyCompilerImpl(std::string_view compiler)
     {
         std::string base = AsciiLower(Basename(compiler));
         if (base.ends_with(".exe"))
@@ -429,6 +429,11 @@ std::optional<PathValueMatch> MatchPathValueFlag(std::string_view arg, std::stri
     return std::nullopt;
 }
 
+Flavor ClassifyCompiler(std::string_view compiler)
+{
+    return ClassifyCompilerImpl(compiler);
+}
+
 DriverSpec const& DriverOf(Flavor flavor)
 {
     // Iterated rather than searched via a named iterator — see the note in
@@ -446,7 +451,7 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
         return out;
 
     out.compiler = argv.front();
-    out.flavor = ClassifyCompiler(out.compiler);
+    out.flavor = ClassifyCompilerImpl(out.compiler);
     auto const& driver = DriverOf(out.flavor);
     if (out.flavor == Flavor::Unknown)
         return out;
