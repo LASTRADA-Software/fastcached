@@ -659,11 +659,18 @@ bool ProducesSideArtefact(std::string_view arg, DriverFamily family)
         return false;
 
     for (SideArtefactFlag const& row: SideArtefacts)
-        // The same three questions MatchPathValueFlag asks, and in the same order:
-        // does this context recognise the row's introducer, does the family overlap,
-        // and does the argument carry the flag bare or with a value fused on.
-        if (introducers.contains(row.spelling.front()) && Overlaps(row.families, family) && MatchesFlag(arg, row.spelling))
+    {
+        if (!introducers.contains(row.spelling.front()) || !Overlaps(row.families, family))
+            continue;
+        // A prefix test, and NOT MatchesFlag, for the reason IsLanguageSelector
+        // gives: MatchesFlag only recognises a fused value for a flag the
+        // path-value table knows takes one, and every row here takes its value in
+        // the spelling a build actually writes -- `/Yc"pch.h"`,
+        // `-fmodule-output=x.pcm`. Matching only the bare form would have caught
+        // the shape nobody writes and missed the one everybody does.
+        if (arg.starts_with(row.spelling))
             return true;
+    }
     return false;
 }
 

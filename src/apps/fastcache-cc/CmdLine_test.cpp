@@ -731,6 +731,63 @@ TEST_CASE("An extension whose language depends on the driver is never guessed at
     CHECK(parsed.error().contains("a.C"));
 }
 
+TEST_CASE("A compile that writes a second artefact is not cacheable")
+{
+    // What a hit reproduces is the object and the dependency record, so a compile
+    // that also writes a BMI or a precompiled header cannot be replayed: the second
+    // artefact is afterwards missing, which fails loudly, or left over from a
+    // previous build, which does not.
+    //
+    // Every spelling here is the FUSED one, deliberately -- that is how a build
+    // writes them, and matching only the bare form would have caught the shape
+    // nobody uses.
+    for (auto const& argv: { std::vector<std::string> { "cl", "/c", "/Ycpch.h", "a.cpp", "/Foa.obj" },
+                             std::vector<std::string> { "cl", "/c", "/interface", "a.cpp", "/Foa.obj" },
+                             std::vector<std::string> { "cl", "/c", "/ifcOutputa.ifc", "a.cpp", "/Foa.obj" },
+                             std::vector<std::string> { "clang++", "-c", "-fmodule-output=a.pcm", "a.cpp", "-o", "a.o" },
+                             std::vector<std::string> { "g++", "-c", "-fmodule-mapper=a.modmap", "a.cpp", "-o", "a.o" } })
+    {
+        auto const cmd = ParseCommand(argv);
+        INFO("flag: " << argv[2]);
+        CHECK(cmd.sideArtefact);
+        CHECK_FALSE(cmd.parsedOk);
+    }
+
+    // And an ordinary compile is untouched -- including `/Yu`, which USES a
+    // precompiled header rather than writing one.
+    for (auto const& argv: { std::vector<std::string> { "cl", "/c", "/Yupch.h", "a.cpp", "/Foa.obj" },
+                             std::vector<std::string> { "cl", "/c", "/O2", "a.cpp", "/Foa.obj" },
+                             std::vector<std::string> { "g++", "-c", "-fmodules-ts", "a.cpp", "-o", "a.o" } })
+    {
+        auto const cmd = ParseCommand(argv);
+        INFO("flag: " << argv[2]);
+        CHECK_FALSE(cmd.sideArtefact);
+        CHECK(cmd.parsedOk);
+    }
+}
+
+TEST_CASE("A module interface unit is not cacheable, by extension")
+{
+    // Recognised so it can be refused with its reason said out loud. Before this
+    // they were not in IsSourceSuffix at all, so the line fell through as "no
+    // source file found" and was passed through in silence -- and adding `.ixx`
+    // there, the obvious way to "support modules", would have started replaying
+    // objects whose BMI nobody reproduced.
+    for (auto const& source: { std::string { "m.ixx" },
+                               std::string { "m.cppm" },
+                               std::string { "m.ccm" },
+                               std::string { "m.cxxm" },
+                               std::string { "m.mxx" } })
+    {
+        std::vector<std::string> const argv { "clang++", "-c", source, "-o", "m.o" };
+        auto const cmd = ParseCommand(argv);
+        INFO("source: " << source);
+        CHECK(cmd.source == source); // recognised, not ignored
+        CHECK(cmd.sideArtefact);
+        CHECK_FALSE(cmd.parsedOk);
+    }
+}
+
 TEST_CASE("A `++` driver compiles .c as C++, and the worker is told so")
 {
     // "g++ treats .c, .h and .i files as C++ source files instead of C source
