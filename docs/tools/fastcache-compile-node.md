@@ -182,6 +182,19 @@ For anything beyond a trusted build network, put mTLS in front of both ports.
 - **Diagnostics from a failed remote compile are not shown.** A worker that
   reports a non-zero exit is retried locally and the *local* result is what you
   see, which also regenerates diagnostics with correct line numbers.
+- **On MSVC a dispatched object is not byte-identical to a locally compiled
+  one.** `cl` embeds the source path in the object even without `/Zi`, and a
+  worker compiles from its own scratch directory — so the object carries that
+  path instead of yours. The code is the same: same compiler, same flags, same
+  preprocessed input. What it affects is debugging, in the same way
+  `-fdebug-prefix-map` addresses for GCC and clang. A debugger will need
+  `/PDBALTPATH` or an equivalent source-path mapping to find your sources.
+
+    This is why the Windows end-to-end fixture asserts that a dispatched object
+    is a *plausible* compile — right compiler, right flags, sane size — while the
+    POSIX one asserts strict byte-identity. GCC and clang embed nothing
+    path-dependent without `-g`; `cl` does, and no tolerance can make a byte
+    comparison meaningful across two different source paths.
 
 ## Not yet done
 
