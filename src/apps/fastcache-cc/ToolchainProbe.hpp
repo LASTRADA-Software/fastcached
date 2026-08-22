@@ -72,6 +72,24 @@ namespace FastCache::Cc
 /// @return One entry per readable file, unsorted (the digest sorts).
 [[nodiscard]] std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> roots);
 
+/// The compiler's own version banner: its first `--version` line.
+///
+/// Shared rather than private to the launcher because the compile node needs the
+/// identical string. The node derives its own fingerprint from the compiler it
+/// was configured with, and a fingerprint is a digest OF this banner among other
+/// things -- so two spellings of "what does this compiler call itself" would put
+/// a worker and its clients permanently out of agreement, with no error anywhere,
+/// just a scheduler that never finds a match.
+///
+/// Falls back to the compiler's basename when it cannot be run or says nothing.
+/// A weak identity beats an empty one: an empty banner would make every
+/// unrunnable compiler look like every other.
+///
+/// @param runner Process-spawning seam.
+/// @param compiler The compiler to ask.
+/// @return The banner line, or the basename.
+[[nodiscard]] std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler);
+
 /// Ask a driver where it searches for system headers.
 ///
 /// Dispatches on `spec.includeDiscovery` with no `default:`, so a mechanism added

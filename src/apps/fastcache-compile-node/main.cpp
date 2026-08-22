@@ -40,6 +40,7 @@
 
 #include <CompileJob.hpp>
 #include <Dispatch.hpp>
+#include <ToolchainProbe.hpp>
 #include <WorkerProtocol.hpp>
 
 namespace
@@ -126,13 +127,48 @@ void InstallNodeStopHandlers()
     std::signal(SIGTERM, &HandleNodeStopSignal);
 }
 
-/// Split `fingerprint=path`.
-[[nodiscard]] std::optional<std::pair<std::string, std::string>> SplitToolchain(std::string_view spec)
+/// One `--toolchain` entry, resolved.
+struct ToolchainEntry
 {
-    auto const eq = spec.find('=');
-    if (eq == std::string_view::npos || eq == 0 || eq + 1 >= spec.size())
+    std::string fingerprint; ///< Empty when the node must compute it.
+    std::string compiler;    ///< Path to the compiler.
+};
+
+/// Split a `--toolchain` value into its fingerprint and compiler.
+///
+/// Two accepted shapes, and the bare one is the one operators should use:
+///
+///   `<compiler>`               -- the node computes the fingerprint itself
+///   `<fingerprint>=<compiler>` -- an explicit override
+///
+/// The bare form exists because the fingerprint stopped being something a person
+/// can derive. It used to be the compiler's `--version` line, which an operator
+/// could read off a terminal; it is now a digest over the whole include tree, and
+/// requiring that to be pasted into a config would make every toolchain update a
+/// manual two-step that silently un-registers a worker when someone forgets.
+///
+/// The override is kept because it is the only way to run a worker whose compiler
+/// this process cannot execute -- a cross-compiler, or a wrapper that must not be
+/// spawned at configuration time -- and because pinning a fingerprint by hand is
+/// how an operator forces a fleet to agree while a machine is being repaired.
+///
+/// Split on the FIRST `=`, since a fingerprint is hex and contains none. A
+/// compiler path containing `=` is therefore only reachable through the override
+/// form, which is the documented escape hatch rather than a silent mis-parse.
+/// @param spec The flag's value.
+/// @return The entry, or nullopt when it is empty.
+[[nodiscard]] std::optional<ToolchainEntry> SplitToolchain(std::string_view spec)
+{
+    if (spec.empty())
         return std::nullopt;
-    return std::pair { std::string { spec.substr(0, eq) }, std::string { spec.substr(eq + 1) } };
+
+    auto const eq = spec.find('=');
+    if (eq == std::string_view::npos)
+        return ToolchainEntry { .fingerprint = {}, .compiler = std::string { spec } };
+    if (eq == 0 || eq + 1 >= spec.size())
+        return std::nullopt;
+    return ToolchainEntry { .fingerprint = std::string { spec.substr(0, eq) },
+                            .compiler = std::string { spec.substr(eq + 1) } };
 }
 
 /// A port, refusing 0 rather than letting a bind fail with a confusing message.
@@ -221,7 +257,7 @@ void InstallNodeStopHandlers()
           .description = "port to listen on (default 6676)" },
         { .primary = "--toolchain",
           .arity = Arity::Value,
-          .operand = "=<fingerprint>=<compiler>",
+          .operand = "=<compiler>|<fingerprint>=<compiler>",
           .apply = AppendFrom<&NodeConfig::toolchains, ParseText>(),
           .description = "a toolchain this worker serves; repeatable. Required.\n"
                          "There is deliberately no default compiler: a default is\n"
@@ -322,16 +358,44 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    auto const runner = Cc::MakeProcessRunner();
+
     std::map<std::string, std::string> toolchains;
     for (auto const& spec: cfg.toolchains)
     {
         auto const split = SplitToolchain(spec);
         if (!split.has_value())
         {
-            logger.Logf(LogLevel::Error, "malformed --toolchain '{}'; expected <fingerprint>=<compiler>", spec);
+            logger.Logf(
+                LogLevel::Error, "malformed --toolchain '{}'; expected <compiler> or <fingerprint>=<compiler>", spec);
             return 2;
         }
-        toolchains.emplace(split->first, split->second);
+
+        auto fingerprint = split->fingerprint;
+        if (fingerprint.empty())
+        {
+            // The same computation the launcher performs, through the same
+            // functions -- which is the point. A worker that derived its identity
+            // differently from its clients would register successfully, heartbeat
+            // happily, and never be matched, with nothing anywhere reporting why.
+            //
+            // Logged at info because it is slow the first time (a full walk of the
+            // include tree, seconds) and instant afterwards, and an operator
+            // watching a worker start deserves to know which of the two is
+            // happening rather than wondering whether it has hung.
+            logger.Logf(LogLevel::Info, "computing the toolchain fingerprint for {}", split->compiler);
+            auto const banner = Cc::CompilerBanner(*runner, split->compiler);
+            auto const flavor = Cc::ClassifyCompiler(split->compiler);
+            fingerprint = Cc::CachedToolchainFingerprint(*runner, split->compiler, banner, Cc::DriverOf(flavor));
+        }
+
+        // Reported unconditionally, including for an explicit override. A
+        // fingerprint mismatch is invisible from both ends -- the scheduler just
+        // says no worker matches -- so the one place the worker's own digest can
+        // be seen is its startup log, next to `fastcache-cc
+        // --print-toolchain-fingerprint` on the client.
+        logger.Logf(LogLevel::Info, "serving {} as {}", split->compiler, fingerprint);
+        toolchains.emplace(std::move(fingerprint), split->compiler);
     }
 
     auto const slots = cfg.slots != 0 ? cfg.slots : std::max(1U, std::thread::hardware_concurrency());
@@ -371,7 +435,6 @@ int main(int argc, char** argv)
     // while the accept poll only decides how promptly a stop is noticed.
     listener->SetTimeouts(AcceptPollInterval, RequestIoTimeout);
 
-    auto const runner = Cc::MakeProcessRunner();
     auto const scratch = std::filesystem::temp_directory_path() / "fastcache-compile-node";
     Cc::CompileJobRunner jobs { *runner, scratch, toolchains };
 

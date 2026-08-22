@@ -416,16 +416,6 @@ using Cc::CompileRun;
     return ProcessRunner().RunCaptureSplit(argv);
 }
 
-/// Run `argv` with stdout and stderr merged. Used where the split does not
-/// matter — the compiler-id probe.
-/// @param argv Full invocation; argv[0] is the compiler.
-/// @return (exit code, combined output).
-[[nodiscard]] std::pair<int, std::string> RunCaptureCombined(std::span<std::string const> argv)
-{
-    auto const run = ProcessRunner().RunCaptureCombined(argv);
-    return { run.exitCode, run.out };
-}
-
 /// Replay captured child bytes on one of our own streams verbatim.
 ///
 /// Writes through the C `FILE*` in binary mode rather than `std::cout`/`std::cerr`:
@@ -765,22 +755,17 @@ struct SourceProbe
     return SourceProbe { .preprocessed = std::move(split.preprocessed), .dependencyPaths = std::move(split.notePaths) };
 }
 
-/// A stable-ish compiler identity: its version banner. cl prints it on /? or on
-/// a bare invocation; we use the first line of `<compiler> --version`-ish. To
-/// stay cheap and portable we just use the compiler basename + the banner cl
-/// emits to stderr when run with no input. Best-effort; folded into the key.
+/// This compiler's identity for keying: its version banner.
+///
+/// A thin call through to `Cc::CompilerBanner`, which the compile node also uses.
+/// One definition, because the node derives a fingerprint from this exact string
+/// and two spellings would put a worker permanently out of agreement with its
+/// clients -- silently, as a scheduler that simply never matches.
+/// @param compiler The compiler being fronted.
+/// @return The banner line, or the compiler's basename.
 [[nodiscard]] std::string CompilerId(std::string const& compiler)
 {
-    // `cl` with no args prints its version banner (to stderr). clang-cl honours
-    // `--version`. Try --version first; fall back to the basename.
-    // Passed as argv, not a shell string: the runner spawns the process
-    // directly, so a compiler path containing spaces needs no quoting.
-    std::array<std::string, 2> const probe { compiler, "--version" };
-    auto const [code, out] = RunCaptureCombined(probe);
-    if (code == 0 && !out.empty())
-        return out.substr(0, out.find('\n'));
-    auto const slash = compiler.find_last_of("/\\");
-    return slash == std::string::npos ? compiler : compiler.substr(slash + 1);
+    return Cc::CompilerBanner(ProcessRunner(), compiler);
 }
 
 /// Print the toolchain fingerprint a dispatched compile would send.
@@ -788,18 +773,17 @@ struct SourceProbe
 /// Recomputes unconditionally rather than reading the cache. This command exists
 /// to answer "why did no worker match", and a cached answer cannot distinguish
 /// "the two machines genuinely differ" from "one of them is holding a stale
-/// entry" -- which is the failure the cache's own staleness window makes
-/// possible. It also rewrites the cache on the way past, so running it is the
-/// remedy as well as the diagnosis.
+/// entry" -- which is exactly what the cache's documented staleness window makes
+/// possible. It rewrites the cache on the way past, so running it is the remedy
+/// as well as the diagnosis.
 /// @param compiler The compiler to interrogate.
 /// @return Process exit code.
 [[nodiscard]] int PrintToolchainFingerprint(std::string const& compiler)
 {
     auto const banner = CompilerId(compiler);
     auto const flavor = Cc::ClassifyCompiler(compiler);
-    auto const runner = Cc::MakeProcessRunner();
     auto const fingerprint =
-        Cc::CachedToolchainFingerprint(*runner, compiler, banner, Cc::DriverOf(flavor), /*forceRefresh=*/true);
+        Cc::CachedToolchainFingerprint(ProcessRunner(), compiler, banner, Cc::DriverOf(flavor), /*forceRefresh=*/true);
 
     std::cout << fingerprint << '\n';
     return 0;
@@ -1217,14 +1201,14 @@ void RecordManifest(Config const& cfg,
 /// @param cmd The parsed compile command.
 /// @param argv The original full invocation.
 /// @param key The object key, for duplicate suppression at the scheduler.
-/// @param fingerprint This client's toolchain identity.
+/// @param toolchainStamp The compiler's version banner, as the cache key uses it.
 /// @param dependencyPaths What the key's probe reported this TU depends on.
 /// @return A run to continue with, or nullopt to compile locally.
 [[nodiscard]] std::optional<Cc::CompileRun> TryRemoteCompile(Config const& cfg,
                                                              Cc::ParsedCommand const& cmd,
                                                              std::span<std::string const> argv,
                                                              std::string_view key,
-                                                             std::string_view fingerprint,
+                                                             std::string_view toolchainStamp,
                                                              std::vector<std::string> const& dependencyPaths)
 {
     // Refused before anything is sent when the command line carries something this
@@ -1249,6 +1233,21 @@ void RecordManifest(Config const& cfg,
         Note("dispatch preprocess failed; compiling locally");
         return std::nullopt;
     }
+
+    // The DISPATCH identity, which is not the cache key's. The key folds in the
+    // compiler's `--version` banner, which is enough for a cache -- a wrong answer
+    // there is a miss the replay guard can still backstop. Distribution has no such
+    // backstop: two machines can print an identical banner while resolving
+    // different libstdc++ headers, and the object that comes back would be wrong
+    // rather than merely unhelpful. So a worker is matched on a digest of the whole
+    // include tree instead.
+    //
+    // Computed HERE rather than beside the stamp, so it stays on the miss-and-
+    // dispatch-configured path only: it is a cache read in the steady state, but
+    // several seconds the first time a machine sees a toolchain, and a build that
+    // never dispatches must not pay that at all.
+    auto const fingerprint =
+        Cc::CachedToolchainFingerprint(ProcessRunner(), cmd.compiler, toolchainStamp, Cc::DriverOf(cmd.flavor));
 
     auto const dialer = Cc::MakeTcpDialer(cfg.ioTimeout);
     auto const outcome = Cc::Dispatch(*dialer,

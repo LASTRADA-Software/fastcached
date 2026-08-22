@@ -12,12 +12,24 @@
 # fastcache-cc compiles in a few FastCache leaves. They are the client-side and
 # worker-side halves of one protocol, and a second copy of either is how the two
 # ends drift apart.
+#
+# The toolchain-fingerprint group (CmdLine, DirectManifest, Stats,
+# ToolchainFingerprint, ToolchainProbe) is here for the same reason and is not
+# optional: a worker derives its own fingerprint so an operator never has to paste
+# a digest, and it MUST derive it through the identical code its clients use. A
+# second implementation would register cleanly, heartbeat happily, and never be
+# matched -- with nothing anywhere reporting why.
 set(_fc_node_shared
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/CacheProtocol.cpp"
+    "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/CmdLine.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/CompileJob.cpp"
+    "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/DirectManifest.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/Dispatch.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ProcessRunner.cpp"
+    "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/Stats.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/TcpClient.cpp"
+    "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainFingerprint.cpp"
+    "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainProbe.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/WorkerProtocol.cpp")
 
 add_executable(fastcache-compile-node

@@ -210,14 +210,23 @@ int Entry_${token}()
 EOF
 }
 
-# The compiler identity the launcher will send as its fingerprint.
+# The toolchain fingerprint the launcher will send.
 #
-# This must match what fastcache-cc computes, or the scheduler matches nothing and
-# every case degrades to a local compile that still exits 0 -- the fixture would
-# pass while testing nothing. The launcher takes the first line of
-# `<compiler> --version`; this reproduces that rule rather than guessing.
-fingerprint="$("$compiler" --version 2>&1 | head -1)"
-[[ -n "$fingerprint" ]] || fail "could not determine the compiler fingerprint"
+# Asked of the launcher rather than derived here. It used to be the first line of
+# `<compiler> --version`, which a script could reproduce; it is now a digest over
+# the compiler's whole include tree, and a fixture that recomputed it by hand would
+# be asserting its own reimplementation rather than the launcher's.
+#
+# This matters more than it looks: if the fixture and the launcher disagreed, every
+# case would degrade to a local compile and still exit 0 -- the fixture would pass
+# while testing nothing at all. Case 1 catches that by requiring a DISPATCH, and
+# this keeps it from arising.
+#
+# The workers below are given a bare --toolchain and compute the same digest
+# themselves, so this value is used only to assert that all three agree.
+fingerprint="$("$launcher" --print-toolchain-fingerprint "$compiler")" \
+    || fail "the launcher could not compute a toolchain fingerprint"
+[[ -n "$fingerprint" ]] || fail "the launcher reported an empty toolchain fingerprint"
 
 # --- start the daemon --------------------------------------------------------
 # Two listeners: the cache surface and the dispatch surface. They are separate
@@ -245,7 +254,7 @@ export FASTCACHE_ADDR="127.0.0.1:${cache_port}"
 worker_port="$(free_port)"
 "$node" --scheduler="127.0.0.1:${dispatch_port}" \
     --bind=127.0.0.1 --port="$worker_port" --advertise="127.0.0.1:${worker_port}" \
-    --toolchain="${fingerprint}=${compiler}" --slots=2 --log-level=debug \
+    --toolchain="${compiler}" --slots=2 --log-level=debug \
     > "${workdir}/worker.log" 2>&1 &
 worker_pid=$!
 pids+=("$worker_pid")
@@ -253,6 +262,27 @@ wait_for_port "$worker_port" "$worker_pid" "worker" "${workdir}/worker.log"
 
 # Registration is the worker's own outbound step and completes after it listens,
 # so the port being up is not enough to start dispatching against.
+# The worker computed its own fingerprint from a bare --toolchain. If it derived
+# a different digest from the launcher's, everything below still "works": it
+# registers, it heartbeats, and the scheduler simply never matches it -- so every
+# case falls back to a local compile and exits 0. Asserting the agreement here is
+# what keeps a fingerprint regression from presenting as a fixture that passes
+# while testing nothing.
+worker_fingerprint=""
+for _ in $(seq 1 150); do
+    worker_fingerprint="$(sed -n 's/.*serving .* as //p' "${workdir}/worker.log" | head -1)"
+    [[ -n "$worker_fingerprint" ]] && break
+    if ! kill -0 "$worker_pid" 2>/dev/null; then
+        cat "${workdir}/worker.log" >&2
+        fail "worker exited before reporting its toolchain fingerprint"
+    fi
+    sleep 0.2
+done
+[[ -n "$worker_fingerprint" ]] || { cat "${workdir}/worker.log" >&2; fail "worker never reported a toolchain fingerprint"; }
+[[ "$worker_fingerprint" == "$fingerprint" ]] \
+    || fail "worker and launcher disagree on the toolchain fingerprint: '${worker_fingerprint}' vs '${fingerprint}'"
+echo "== toolchain fingerprint agreed by launcher and worker"
+
 registered=""
 for _ in $(seq 1 100); do
     if grep -q "registered" "${workdir}/worker.log"; then registered=1; break; fi
@@ -428,7 +458,7 @@ wait_for_port "$cap_dispatch_port" "$cap_daemon_pid" "capacity daemon" "${workdi
 cap_worker_port="$(free_port)"
 "$node" --scheduler="127.0.0.1:${cap_dispatch_port}" \
     --bind=127.0.0.1 --port="$cap_worker_port" --advertise="127.0.0.1:${cap_worker_port}" \
-    --toolchain="${fingerprint}=${compiler}" --slots=1 --log-level=debug \
+    --toolchain="${compiler}" --slots=1 --log-level=debug \
     > "${workdir}/cap-worker.log" 2>&1 &
 cap_worker_pid=$!
 pids+=("$cap_worker_pid")
@@ -483,7 +513,7 @@ echo "== case 7: a worker exits on SIGTERM"
 stop_port="$(free_port)"
 "$node" --scheduler="127.0.0.1:${dispatch_port}" \
     --bind=127.0.0.1 --port="$stop_port" --advertise="127.0.0.1:${stop_port}" \
-    --toolchain="${fingerprint}=${compiler}" --slots=1 --log-level=info \
+    --toolchain="${compiler}" --slots=1 --log-level=info \
     > "${workdir}/stop-worker.log" 2>&1 &
 stop_worker_pid=$!
 pids+=("$stop_worker_pid")

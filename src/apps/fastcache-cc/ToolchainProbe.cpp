@@ -328,6 +328,21 @@ namespace
     }
 } // namespace
 
+std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
+{
+    // Combined capture, because the drivers disagree about which stream this goes
+    // to: clang and gcc print it on stdout, while `cl` with no input prints its
+    // banner on stderr. Asking for both is what makes one call cover every driver
+    // instead of a per-family rule that would need its own table row.
+    std::array<std::string, 2> const probe { compiler, "--version" };
+    auto const run = runner.RunCaptureCombined(probe);
+    if (run.exitCode == 0 && !run.out.empty())
+        return run.out.substr(0, run.out.find('\n'));
+
+    auto const slash = compiler.find_last_of("/\\");
+    return slash == std::string::npos ? compiler : compiler.substr(slash + 1);
+}
+
 std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner, std::string const& compiler, DriverSpec const& spec)
 {
     // No `default:`, so a mechanism added to the table fails to compile here
