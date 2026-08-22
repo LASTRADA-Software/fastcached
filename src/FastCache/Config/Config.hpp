@@ -5,6 +5,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -73,6 +74,35 @@ enum class ListenerRole : std::uint8_t
     return (mask & static_cast<std::uint8_t>(role)) != 0;
 }
 
+/// One listener flag, and what an endpoint declared with it serves.
+///
+/// The single source of truth for the mapping between a `--listen*` spelling and
+/// a `BindConfig`, in **both** directions: `CliParser` binds a parser to each row,
+/// and `BuildServiceArgv` spells a bind back out by finding its row. Those two
+/// must agree or a daemon registers with a listener set it will not accept back —
+/// which is the class of defect `FormatListenHost` and `MaybeQuote` already exist
+/// to prevent, reached through a different door.
+///
+/// It was a `bind.tls ? "listen-tls" : "listen"` ternary in each place while there
+/// were two kinds. A third made that a three-way conditional in three files, which
+/// is the shape a table replaces.
+struct ListenerFlagSpec
+{
+    std::string_view flag; ///< Flag spelling, without the leading `--`.
+    bool tls;              ///< Whether accepted sockets are TLS-wrapped.
+    std::uint8_t roles;    ///< What the endpoint is permitted to serve.
+};
+
+/// Every listener flag. Order is documentation order; lookup is by content.
+inline constexpr std::array<ListenerFlagSpec, 3> ListenerFlags {
+    ListenerFlagSpec { .flag = "listen", .tls = false, .roles = static_cast<std::uint8_t>(ListenerRole::Cache) },
+    ListenerFlagSpec { .flag = "listen-tls", .tls = true, .roles = static_cast<std::uint8_t>(ListenerRole::Cache) },
+    // Deliberately NOT `Cache | Dispatch`: the point of a separate endpoint is that
+    // the surface which causes a compiler to run elsewhere can be reached,
+    // firewalled and TLS-required independently of the one serving a cache.
+    ListenerFlagSpec { .flag = "listen-dispatch", .tls = false, .roles = static_cast<std::uint8_t>(ListenerRole::Dispatch) },
+};
+
 struct BindConfig
 {
     /// Bind address: IPv4/IPv6 literal or hostname. `::` selects dual-stack.
@@ -91,6 +121,22 @@ struct BindConfig
     /// it must reject), plus by tests asserting parsed binds verbatim.
     friend bool operator==(BindConfig const&, BindConfig const&) = default;
 };
+
+/// Which listener flag spells `bind`.
+///
+/// Falls back to plain `listen` when no row matches, which is the safe direction:
+/// a bind whose role mask this build does not recognise is re-registered as an
+/// ordinary cache endpoint rather than silently gaining a dispatch surface it was
+/// never given.
+/// @param bind The endpoint to spell.
+/// @return The flag name, without the leading `--`.
+[[nodiscard]] constexpr std::string_view ListenFlagFor(BindConfig const& bind) noexcept
+{
+    for (auto const& row: ListenerFlags)
+        if (row.tls == bind.tls && row.roles == bind.roles)
+            return row.flag;
+    return ListenerFlags.front().flag;
+}
 
 /// Durability policy for the persistent storage backend. Decoupled from
 /// the storage subsystem so the Config layer does not depend on Cache

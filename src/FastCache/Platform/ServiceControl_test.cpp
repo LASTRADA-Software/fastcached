@@ -415,6 +415,35 @@ TEST_CASE("ServiceControl: an IPv6 listener round-trips through its own parser",
     REQUIRE(std::ranges::find(v4, "--listen=127.0.0.1:11211") != v4.end());
 }
 
+TEST_CASE("ServiceControl: a listener's role survives the registration", "[platform][service]")
+{
+    // A dispatch endpoint must come back as one. Re-registering it as a plain
+    // `--listen` would silently drop distributed execution at the next start --
+    // the daemon would come up, serve the cache, and simply never schedule, which
+    // is the shape of failure this file exists to catch: registers cleanly, then
+    // does the wrong thing forever.
+    //
+    // The inverse matters just as much and is worse: a cache endpoint re-spelled
+    // as `--listen-dispatch` would hand a scheduling surface to a port the
+    // operator opened for the cache alone.
+    FastCache::Config cfg {};
+    cfg.binds = { { .address = "127.0.0.1",
+                    .port = 6674,
+                    .roles = static_cast<std::uint8_t>(FastCache::ListenerRole::Cache),
+                    .tls = false },
+                  { .address = "127.0.0.1",
+                    .port = 6675,
+                    .roles = static_cast<std::uint8_t>(FastCache::ListenerRole::Dispatch),
+                    .tls = false } };
+
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    CHECK(std::ranges::find(argv, "--listen=127.0.0.1:6674") != argv.end());
+    CHECK(std::ranges::find(argv, "--listen-dispatch=127.0.0.1:6675") != argv.end());
+    // And the dispatch endpoint is not ALSO emitted as a plain listener, which
+    // would open the scheduling port twice with different policies.
+    CHECK(std::ranges::find(argv, "--listen=127.0.0.1:6675") == argv.end());
+}
+
 TEST_CASE("ServiceControl: a value ending in a backslash survives quoting", "[platform][service]")
 {
     // Inside quotes a backslash run immediately before the closing `"` is
@@ -494,9 +523,11 @@ TEST_CASE("ServiceControl: every Config-backed flag reaches the service argv", "
         // to keep out. ServiceRegistrationRejection reports the omission instead,
         // and the case below asserts that.
         "--requirepass",
-        // Repeatable listeners are emitted as a group and asserted separately.
+        // Repeatable listeners are emitted as a group and asserted separately, by
+        // "a listener's role survives the registration" below.
         "--listen",
         "--listen-tls",
+        "--listen-dispatch",
     });
 
     // A configuration in which no field holds its default, so every emitIfSet
