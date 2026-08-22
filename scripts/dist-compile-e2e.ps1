@@ -356,6 +356,13 @@ try {
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the dispatched compile failed" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
             Write-Host $r.stderr
+            # The WORKER's log too, not just the client's. A refusal reaches the
+            # client as one line naming a wire error code, and the reason it
+            # happened -- an unwritable scratch directory, a compiler that will not
+            # start -- is only ever visible on the worker. Printing one without the
+            # other is how a dispatch failure turns into a round trip.
+            Write-Host "--- worker log ---"
+            Write-Host (Read-LiveText $workerLog)
             throw "the compile was not dispatched to a worker"
         }
         if (-not (Test-Path $obj)) { throw "no object was written by the dispatched compile" }

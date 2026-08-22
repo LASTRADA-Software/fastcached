@@ -192,6 +192,17 @@ enum class ErrorCode : std::uint8_t
     UnknownLease = 0x0D,         ///< The lease token is unknown, expired, or already spent.
     FingerprintMismatch = 0x0E,  ///< The worker's toolchain is not the one the lease named.
     UnsupportedCodec = 0x0F,     ///< No codec in common between the peers.
+    /// The worker could not prepare a scratch directory, or could not write the
+    /// translation unit into it. Distinct from the next one because they call for
+    /// different operator action -- a full or unwritable disk versus a toolchain
+    /// that is configured but not runnable.
+    WorkerScratchUnavailable = 0x10,
+    /// The worker could not START the compiler. Emphatically NOT "the compiler ran
+    /// and rejected the code": that is a successful exchange carrying a non-zero
+    /// exit code, and the client retries it locally to get real diagnostics. This
+    /// means the program named by the worker's own --toolchain could not be
+    /// executed at all.
+    WorkerSpawnFailed = 0x11,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -367,6 +378,12 @@ inline constexpr std::array ErrorTable {
                       .defaultMessage = "this worker's toolchain is not the one the lease named" },
     ErrorDescriptor {
         .code = ErrorCode::UnsupportedCodec, .name = "unsupported-codec", .defaultMessage = "no codec in common" },
+    ErrorDescriptor { .code = ErrorCode::WorkerScratchUnavailable,
+                      .name = "worker-scratch-unavailable",
+                      .defaultMessage = "the worker could not prepare a scratch directory" },
+    ErrorDescriptor { .code = ErrorCode::WorkerSpawnFailed,
+                      .name = "worker-spawn-failed",
+                      .defaultMessage = "the worker could not start the compiler" },
 };
 
 /// Look up the descriptor for a raw opcode byte.

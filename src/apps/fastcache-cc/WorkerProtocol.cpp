@@ -46,12 +46,17 @@ namespace
             case JobRefusal::RejectedArgument:
                 return Wire::ErrorCode::MalformedFrame;
             case JobRefusal::ScratchUnavailable:
+                return Wire::ErrorCode::WorkerScratchUnavailable;
             case JobRefusal::SpawnFailed:
-                // Both mean "this worker is broken", not "your code is wrong", and
-                // the client must be able to tell them apart from a compile that
-                // ran. StorageWriteFailed is the nearest existing code for "I could
-                // not do my job", and it is deliberately NOT an exit code.
-                return Wire::ErrorCode::StorageWriteFailed;
+                // Separate codes, because collapsing them was actively misleading:
+                // both used to answer StorageWriteFailed, so a worker with no
+                // storage told the client "storage write failed" and the two
+                // genuinely different operator problems -- an unwritable scratch
+                // disk, and a toolchain that is configured but cannot be executed
+                // -- were indistinguishable from either end. Found the hard way,
+                // diagnosing a CI failure that reported the one thing it could not
+                // possibly be.
+                return Wire::ErrorCode::WorkerSpawnFailed;
         }
         return Wire::ErrorCode::MalformedFrame;
     }

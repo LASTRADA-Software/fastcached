@@ -322,7 +322,14 @@ run_launcher "${workdir}/case1.log" -std=c++17 -O1 -c "${proj}/one.cpp" -o "${pr
     || { cat "${workdir}/case1.log" >&2; fail "the dispatched compile failed"; }
 
 grep -q "DISPATCHED to " "${workdir}/case1.log" \
-    || { cat "${workdir}/case1.log" >&2; fail "the compile was not dispatched to a worker"; }
+    || {
+        cat "${workdir}/case1.log" >&2
+        # The worker's side as well. A refusal reaches the client as one line
+        # naming a wire error code; WHY it happened is only visible on the worker.
+        echo "--- worker log ---" >&2
+        cat "${workdir}/worker.log" >&2
+        fail "the compile was not dispatched to a worker"
+    }
 
 [[ -f "${proj}/build/one.o" ]] || fail "no object was written by the dispatched compile"
 cmp -s "${proj}/build/reference.o" "${proj}/build/one.o" \
