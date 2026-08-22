@@ -24,8 +24,48 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Cli/UsageDoc.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/PathCanon.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/CompileValue.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Compression.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
+
+# Core/Compression.cpp is the one row here that is NOT dependency-free, and it is a
+# deliberate exception to the rule the comment above states.
+#
+# Distributed compilation sends a preprocessed translation unit over the network --
+# several megabytes for an ordinary C++ TU, on the hot path of a parallel build --
+# and shipping that uncompressed is the difference between distribution being worth
+# switching on and not. The codec table is also already the daemon's, so the
+# alternative was a second compressor in the launcher, which is worse: two
+# implementations of one wire format, one of them untested against the other.
+#
+# What it costs, stated so nobody rediscovers it: the launcher's build now needs
+# zstd and lz4, which are CPM-fetched rather than vcpkg, so MSVC_RUNTIME_LIBRARY
+# still propagates and the static-CRT link is unaffected. It does mean the launcher
+# no longer builds without a network on a cold CPM cache, and it inherits the macOS
+# constraint the packaging job already carries: CPM_USE_LOCAL_PACKAGES=OFF, or a
+# Homebrew shared zstd gets linked and `otool -L` fails the "nothing outside
+# /usr/lib" assertion.
+#
+# FASTCACHED_ENABLE_COMPRESSION=OFF stays a working configuration: the codec table
+# compiles without either library, Identity is always available, and the wire
+# negotiation falls back to it -- so such a launcher still dispatches, just without
+# compressing. That is asserted, not assumed.
+if(FASTCACHED_ENABLE_COMPRESSION)
+    if(TARGET libzstd_static)
+        set(_fc_cc_zstd libzstd_static)
+    elseif(TARGET zstd::libzstd_static)
+        set(_fc_cc_zstd zstd::libzstd_static)
+    elseif(TARGET zstd::libzstd_shared)
+        set(_fc_cc_zstd zstd::libzstd_shared)
+    endif()
+    if(TARGET lz4_static)
+        set(_fc_cc_lz4 lz4_static)
+    elseif(TARGET LZ4::lz4_static)
+        set(_fc_cc_lz4 LZ4::lz4_static)
+    elseif(TARGET lz4::lz4)
+        set(_fc_cc_lz4 lz4::lz4)
+    endif()
+endif()
 
 # The launcher's own reusable pieces. Process spawning and the TCP client are
 # reached through interfaces (IProcessRunner / ITcpClient) so the flow logic
@@ -41,6 +81,7 @@ set(_fc_cc_sources
     LauncherCli.cpp
     CacheKey.cpp
     CacheProtocol.cpp
+    Dispatch.cpp
     DependencyProbe.cpp
     DirectManifest.cpp
     PathResolve.cpp
@@ -65,6 +106,10 @@ add_executable(fastcache-cc
 target_include_directories(fastcache-cc PRIVATE "${CMAKE_SOURCE_DIR}/src")
 target_compile_definitions(fastcache-cc PRIVATE
     FASTCACHE_CC_VERSION="${FASTCACHED_VERSION_STRING}")
+if(FASTCACHED_ENABLE_COMPRESSION AND _fc_cc_zstd AND _fc_cc_lz4)
+    target_link_libraries(fastcache-cc PRIVATE ${_fc_cc_zstd} ${_fc_cc_lz4})
+    target_compile_definitions(fastcache-cc PRIVATE FC_COMPRESSION_ENABLED=1)
+endif()
 
 if(WIN32)
     target_link_libraries(fastcache-cc PRIVATE ws2_32)
@@ -94,6 +139,7 @@ if(FASTCACHED_BUILD_TESTS)
         LauncherCli_test.cpp
         CacheKey_test.cpp
         CacheProtocol_test.cpp
+        Dispatch_test.cpp
         DependencyProbe_test.cpp
         DirectManifest_test.cpp
         PathResolve_test.cpp
@@ -107,6 +153,10 @@ if(FASTCACHED_BUILD_TESTS)
     )
     target_include_directories(fastcache-cc-tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(fastcache-cc-tests PRIVATE Catch2::Catch2)
+    if(FASTCACHED_ENABLE_COMPRESSION AND _fc_cc_zstd AND _fc_cc_lz4)
+        target_link_libraries(fastcache-cc-tests PRIVATE ${_fc_cc_zstd} ${_fc_cc_lz4})
+        target_compile_definitions(fastcache-cc-tests PRIVATE FC_COMPRESSION_ENABLED=1)
+    endif()
     if(WIN32)
         target_link_libraries(fastcache-cc-tests PRIVATE ws2_32)
     endif()

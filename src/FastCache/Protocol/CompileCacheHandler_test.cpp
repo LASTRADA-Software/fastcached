@@ -1196,7 +1196,7 @@ TEST_CASE("A lease for an unknown toolchain is refused as NoWorker", "[compile-c
 {
     CcFixture fix;
     DispatchFixture dispatch;
-    (void) dispatch.workers.Register("gcc-13", "10.0.0.7:6676", 2);
+    (void) dispatch.workers.Register({ .fingerprint = "gcc-13", .endpoint = "10.0.0.7:6676", .slots = 2, .codecs = {} });
 
     auto const reply =
         ExchangeWith(fix,
@@ -1211,7 +1211,7 @@ TEST_CASE("A second lease on the same key is refused as AlreadyInFlight", "[comp
     // same key after a header change must not become sixty identical jobs.
     CcFixture fix;
     DispatchFixture dispatch;
-    (void) dispatch.workers.Register("gcc-13", "10.0.0.7:6676", 8);
+    (void) dispatch.workers.Register({ .fingerprint = "gcc-13", .endpoint = "10.0.0.7:6676", .slots = 8, .codecs = {} });
     auto const session = dispatch.SessionWith(ListenerRole::Cache | ListenerRole::Dispatch);
 
     auto const lease =

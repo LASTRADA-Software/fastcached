@@ -380,7 +380,10 @@ namespace
                 : Next::Abort;
 
         auto const id = session.workers->Register(
-            Wire::AsStringView(fields->fingerprint), Wire::AsStringView(fields->endpoint), fields->slots);
+            Distributed::WorkerRegistration { .fingerprint = Wire::AsStringView(fields->fingerprint),
+                                              .endpoint = Wire::AsStringView(fields->endpoint),
+                                              .slots = fields->slots,
+                                              .codecs = fields->acceptedCodecs });
         auto const reply = Wire::AsBytes(id);
         co_return co_await Reply(socket, Wire::Status::Ok, std::vector<std::byte> { reply.begin(), reply.end() })
             ? Next::Continue
@@ -441,8 +444,12 @@ namespace
         // correction would not arrive until its next heartbeat.
         session.workers->JobStarted(picked->id);
 
-        auto const grant =
-            Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = picked->endpoint, .leaseToken = lease->token });
+        // The worker's codecs travel with the grant so the client can choose one for
+        // the preprocessed payload it is about to send -- without a negotiation round
+        // trip, and without guessing at something the worker cannot decode after the
+        // whole payload has already crossed the network.
+        auto const grant = Wire::EncodeLeaseGrant(
+            Wire::LeaseGrant { .endpoint = picked->endpoint, .leaseToken = lease->token, .workerCodecs = picked->codecs });
         co_return co_await Reply(socket, Wire::Status::Ok, grant) ? Next::Continue : Next::Abort;
     }
 

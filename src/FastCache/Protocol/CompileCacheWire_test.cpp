@@ -547,11 +547,15 @@ TEST_CASE("A LEASE grant and a COMPILE result round-trip")
 {
     SECTION("grant")
     {
-        auto const payload = EncodeLeaseGrant(LeaseGrant { .endpoint = "10.0.0.2:6676", .leaseToken = "l42" });
+        auto const payload =
+            EncodeLeaseGrant(LeaseGrant { .endpoint = "10.0.0.2:6676", .leaseToken = "l42", .workerCodecs = { 2, 1 } });
         auto const decoded = DecodeLeaseGrant(payload);
         REQUIRE(decoded.has_value());
         CHECK(AsStringView(Unwrap(decoded).endpoint) == "10.0.0.2:6676");
         CHECK(AsStringView(Unwrap(decoded).leaseToken) == "l42");
+        // Relayed from the worker's registration so the client can pick a codec for
+        // the preprocessed payload without a negotiation round trip.
+        CHECK(Unwrap(decoded).workerCodecs == CodecList { 2, 1 });
     }
     SECTION("result")
     {

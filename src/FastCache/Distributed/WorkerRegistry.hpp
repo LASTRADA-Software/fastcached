@@ -36,6 +36,25 @@ struct WorkerInfo
     std::string endpoint;      ///< host:port a client can reach it on.
     std::uint32_t slots {};    ///< Concurrent jobs it will accept.
     std::uint32_t inFlight {}; ///< Jobs currently outstanding on it.
+    /// Compression codec ids this worker can DECODE, most-preferred first.
+    ///
+    /// Kept here so a lease can relay them: the client is about to send this worker
+    /// a multi-megabyte preprocessed translation unit and has to pick a codec for
+    /// it. Held as raw ids rather than the wire header's alias, so the registry
+    /// keeps no dependency on the protocol layer.
+    std::vector<std::uint8_t> codecs;
+};
+
+/// What a worker announces about itself.
+///
+/// A struct rather than four positional parameters: two of them are strings that
+/// would be transposable at a call site, and a fifth field is a foreseeable change.
+struct WorkerRegistration
+{
+    std::string_view fingerprint;     ///< Toolchain identity.
+    std::string_view endpoint;        ///< host:port clients should use.
+    std::uint32_t slots {};           ///< Concurrent job limit.
+    std::vector<std::uint8_t> codecs; ///< What it can decode.
 };
 
 /// The set of live compile workers, grouped by toolchain.
@@ -91,11 +110,9 @@ class WorkerRegistry
     /// the same toolchain, and treating it as new would leak the old entry until it
     /// expired — during which half the leases for that toolchain would be sent to a
     /// port nothing is listening on.
-    /// @param fingerprint Toolchain identity.
-    /// @param endpoint host:port clients should use.
-    /// @param slots Concurrent job limit.
+    /// @param registration What the worker announced.
     /// @return The worker's id.
-    [[nodiscard]] std::string Register(std::string_view fingerprint, std::string_view endpoint, std::uint32_t slots);
+    [[nodiscard]] std::string Register(WorkerRegistration const& registration);
 
     /// Record a heartbeat and the worker's own view of its load.
     ///

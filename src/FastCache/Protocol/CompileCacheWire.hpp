@@ -1137,6 +1137,17 @@ struct LeaseGrant
 {
     std::string_view endpoint;   ///< The worker to send the job to.
     std::string_view leaseToken; ///< Authorizes exactly this job on that worker.
+    /// What the chosen worker can DECODE, relayed from its registration.
+    ///
+    /// Carried here because the client is about to send that worker a multi-megabyte
+    /// preprocessed translation unit and has to choose a codec for it. Without this
+    /// the client would have to either send `Identity` always -- giving up the
+    /// compression on the one payload large enough to care -- or guess, and a guess
+    /// the worker cannot decode is a refused job after the whole payload has already
+    /// crossed the network. The scheduler already knows the answer; relaying it costs
+    /// a few bytes in a reply that is being sent anyway, and keeps the exchange free
+    /// of a negotiation round trip.
+    CodecList workerCodecs;
 };
 
 /// Frame the payload of a successful LEASE reply.
@@ -1144,14 +1155,17 @@ struct LeaseGrant
 /// @return The reply payload (not a whole frame).
 [[nodiscard]] inline std::vector<std::byte> EncodeLeaseGrant(LeaseGrant const& grant)
 {
-    return Detail::EncodeFields({ AsBytes(grant.endpoint), AsBytes(grant.leaseToken) });
+    auto const codecs = EncodeCodecList(grant.workerCodecs);
+    return Detail::EncodeFields(
+        { AsBytes(grant.endpoint), AsBytes(grant.leaseToken), std::span<std::byte const> { codecs } });
 }
 
-/// The two fields of a LEASE grant, as views.
+/// The fields of a LEASE grant, as views.
 struct LeaseGrantView
 {
     std::span<std::byte const> endpoint;
     std::span<std::byte const> leaseToken;
+    CodecList workerCodecs;
 };
 
 /// Split a LEASE reply payload.
@@ -1159,10 +1173,12 @@ struct LeaseGrantView
 /// @return The fields, or nullopt when malformed.
 [[nodiscard]] inline std::optional<LeaseGrantView> DecodeLeaseGrant(std::span<std::byte const> payload)
 {
-    auto const fields = SplitFields(payload, 2);
+    auto const fields = SplitFields(payload, 3);
     if (!fields.has_value())
         return std::nullopt;
-    return LeaseGrantView { .endpoint = (*fields)[0], .leaseToken = (*fields)[1] };
+    return LeaseGrantView { .endpoint = (*fields)[0],
+                            .leaseToken = (*fields)[1],
+                            .workerCodecs = DecodeCodecList((*fields)[2]) };
 }
 
 /// What a worker answers a COMPILE with.

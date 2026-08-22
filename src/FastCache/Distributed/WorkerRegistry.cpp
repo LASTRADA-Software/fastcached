@@ -25,7 +25,7 @@ bool WorkerRegistry::IsLive(Entry const& entry, TimePoint now) const noexcept
     return std::chrono::duration_cast<std::chrono::milliseconds>(now - entry.lastSeen) <= _heartbeatTimeout;
 }
 
-std::string WorkerRegistry::Register(std::string_view fingerprint, std::string_view endpoint, std::uint32_t slots)
+std::string WorkerRegistry::Register(WorkerRegistration const& registration)
 {
     std::scoped_lock const guard { _mutex };
     auto const now = _clock.Now();
@@ -36,11 +36,13 @@ std::string WorkerRegistry::Register(std::string_view fingerprint, std::string_v
     // dead until it expired, and half the leases for that toolchain would be sent
     // there in the meantime.
     auto const existing = std::ranges::find_if(_workers, [&](auto const& pair) {
-        return pair.second.info.fingerprint == fingerprint && pair.second.info.endpoint == endpoint;
+        return pair.second.info.fingerprint == registration.fingerprint
+               && pair.second.info.endpoint == registration.endpoint;
     });
     if (existing != _workers.end())
     {
-        existing->second.info.slots = slots;
+        existing->second.info.slots = registration.slots;
+        existing->second.info.codecs = registration.codecs;
         // Reset to zero rather than kept: a re-registering worker has restarted, so
         // whatever it was running is gone. Carrying the old count forward would
         // make a restarted worker look permanently busy and take it out of rotation
@@ -53,10 +55,11 @@ std::string WorkerRegistry::Register(std::string_view fingerprint, std::string_v
     auto id = std::format("w{}", _nextId++);
     _workers.emplace(id,
                      Entry { .info = WorkerInfo { .id = id,
-                                                  .fingerprint = std::string { fingerprint },
-                                                  .endpoint = std::string { endpoint },
-                                                  .slots = slots,
-                                                  .inFlight = 0 },
+                                                  .fingerprint = std::string { registration.fingerprint },
+                                                  .endpoint = std::string { registration.endpoint },
+                                                  .slots = registration.slots,
+                                                  .inFlight = 0,
+                                                  .codecs = registration.codecs },
                              .lastSeen = now });
     return id;
 }
