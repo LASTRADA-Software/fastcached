@@ -216,6 +216,30 @@ inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
 /// @return Every dependency path, in emission order, with duplicates preserved.
 [[nodiscard]] std::vector<std::string> ParseDepFilePaths(std::string_view depFileText);
 
+/// Extract the rule TARGETS from a GNU-style Makefile depfile (`-MF`).
+///
+/// The other half of the same grammar, and the distinction matters because a
+/// depfile is the one place where paths from two authors meet: a rule's target is
+/// an output the BUILD SYSTEM named (`-o`, or `-MT`/`-MQ` when given), while its
+/// dependencies are what the COMPILER reported. The launcher reconciles a driver's
+/// spelling and must leave the build system's alone — respelling a target hands
+/// the build back an output it never asked for, which Ninja rejects outright and
+/// make matches against no rule at all.
+///
+/// Structural rather than a comparison against the command line, and that is the
+/// point: a compile may pass `-MT` more than once (gcc concatenates the targets),
+/// and `-MQ` escapes make-special characters on the way out, so a token in the
+/// file need not equal any argument the launcher parsed.
+///
+/// A PHONY rule — `header:` with nothing after the colon, which `-MP` emits per
+/// dependency — is excluded: its target is a path the compiler reported, so it
+/// must be reconciled like any other, or a consumer's replayed depfile points
+/// `-MP`'s deleted-header protection at files it cannot stat.
+///
+/// @param depFileText The depfile contents.
+/// @return Every non-phony rule target, in emission order, with duplicates kept.
+[[nodiscard]] std::vector<std::string> ParseDepFileTargets(std::string_view depFileText);
+
 /// Everything one compile contributes to its manifest.
 ///
 /// A struct rather than six positional arguments, for the reason `Cc::KeyInputs`

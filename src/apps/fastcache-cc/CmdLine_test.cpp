@@ -18,29 +18,6 @@ ParsedCommand Parse(std::vector<std::string> const& argv)
 }
 } // namespace
 
-TEST_CASE("A -MT or -MQ target is captured, in either spelling")
-{
-    // The depfile's rule target is a string the BUILD SYSTEM authored, and the
-    // launcher must know it to keep the reconciler from respelling it into the
-    // root spelling the environment exported (issue #66). Without -MT the driver
-    // uses the object path, which is the ordinary case and already known.
-    auto const separated = Parse({ "gcc", "-c", "a.cpp", "-o", "out/a.o", "-MD", "-MF", "out/a.d", "-MT", "out/a.o" });
-    CHECK(separated.depTarget == "out/a.o");
-
-    auto const fused = Parse({ "gcc", "-c", "a.cpp", "-o", "out/a.o", "-MD", "-MFout/a.d", "-MQout/q.o" });
-    CHECK(fused.depTarget == "out/q.o");
-
-    // Absent by default, so a caller can tell "no -MT" from "-MT of empty".
-    auto const none = Parse({ "gcc", "-c", "a.cpp", "-o", "out/a.o" });
-    CHECK(none.depTarget.empty());
-
-    // `-MT` is a GNU row: for an MSVC driver `-MTd` selects the static
-    // multithreaded runtime and must not swallow the next argument.
-    auto const msvc = Parse({ "cl", "/c", "a.cpp", "/Foout\\a.obj", "-MTd" });
-    CHECK(msvc.depTarget.empty());
-    CHECK(msvc.source == "a.cpp");
-}
-
 TEST_CASE("ParseCommand extracts source/obj/flavor from a cl line with fused /Fo")
 {
     auto const p = Parse({ "cl.exe", "/nologo", "/c", "/showIncludes", R"(/FoD:\b\x.obj)", R"(D:\s\x.cpp)" });

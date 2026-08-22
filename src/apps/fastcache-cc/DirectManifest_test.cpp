@@ -776,6 +776,74 @@ TEST_CASE("BuildManifest drops toolchain headers and deduplicates project header
 
 // --- GNU depfile parsing ----------------------------------------------------
 
+TEST_CASE("ParseDepFileTargets names the outputs and skips the phony rules")
+{
+    // The two halves of one grammar, and the split is what the launcher needs: a
+    // rule's target is an output the BUILD SYSTEM named, its dependencies are what
+    // the compiler reported, and only the second may have its spelling reconciled.
+    constexpr std::string_view depFile = "build/a.o: src/a.cpp src/inc/h1.h\n"
+                                         "\n"
+                                         "src/inc/h1.h:\n";
+
+    auto const targets = ParseDepFileTargets(depFile);
+    REQUIRE(targets.size() == 1);
+    CHECK(targets[0] == "build/a.o");
+
+    // The phony rule -MP emits per header names a path the COMPILER reported, so
+    // it is NOT an output: leaving it unreconciled would send a consumer a depfile
+    // pointing -MP's deleted-header protection at files it cannot stat.
+    CHECK(std::ranges::find(targets, "src/inc/h1.h") == targets.end());
+
+    // And the dependency side is unchanged by the split.
+    auto const deps = ParseDepFilePaths(depFile);
+    REQUIRE(deps.size() == 2);
+    CHECK(deps[0] == "src/a.cpp");
+}
+
+TEST_CASE("ParseDepFileTargets reads what the file says, not what the command line did")
+{
+    // Structural on purpose. Comparing against a parsed `-MT` value fails twice
+    // over: gcc CONCATENATES repeated `-MT`, so a rule can carry several targets
+    // while the parser keeps one; and `-MQ` escapes make-special characters on the
+    // way out, so the token in the file need not equal any argument at all.
+    constexpr std::string_view several = "build/a.o build/a.d: src/a.cpp\n";
+    auto const many = ParseDepFileTargets(several);
+    REQUIRE(many.size() == 2);
+    CHECK(many[0] == "build/a.o");
+    CHECK(many[1] == "build/a.d");
+
+    // `-MQ 'b$uild/a.o'` reaches the file as `b$$uild/a.o`; the token is whatever
+    // the file holds, which is exactly what the rewriter will compare against.
+    constexpr std::string_view escaped = "b$$uild/a.o: src/a.cpp\n";
+    auto const dollar = ParseDepFileTargets(escaped);
+    REQUIRE(dollar.size() == 1);
+    CHECK(dollar[0] == "b$$uild/a.o");
+}
+
+TEST_CASE("ParseDepFileTargets keeps a Windows drive letter out of the rule separator")
+{
+    // The same drive rule the dependency side uses, because it is one walker: a
+    // `C:` that is a drive prefix is part of the target, not the end of it.
+    constexpr std::string_view depFile = R"(D:\proj\build\a.obj: D:\proj\src\a.cpp)"
+                                         "\n";
+    auto const targets = ParseDepFileTargets(depFile);
+    REQUIRE(targets.size() == 1);
+    CHECK(targets[0] == R"(D:\proj\build\a.obj)");
+}
+
+TEST_CASE("ParseDepFileTargets reaches a target on a continued line")
+{
+    // gcc wraps at ~76 columns, so a rule's two halves are routinely on different
+    // physical lines; the splice happens before the rule is split, for both sides.
+    constexpr std::string_view depFile = "build/a.o: \\\n"
+                                         "  src/a.cpp \\\n"
+                                         "  src/inc/h1.h\n";
+    auto const targets = ParseDepFileTargets(depFile);
+    REQUIRE(targets.size() == 1);
+    CHECK(targets[0] == "build/a.o");
+    CHECK(ParseDepFilePaths(depFile).size() == 2);
+}
+
 TEST_CASE("ParseDepFilePaths reads the dependencies of a simple rule")
 {
     // The target (before the colon) is an OUTPUT, not a dependency: listing it

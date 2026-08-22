@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "RootReconciler.hpp"
 
+#include <algorithm>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -57,10 +59,11 @@ void RootReconciler::All(std::vector<std::string>& paths)
         path = Path(path);
 }
 
-std::string RootReconciler::Region(std::string_view text, PathCanon::Grammar grammar, std::string_view preserve)
+std::string RootReconciler::Region(std::string_view text, PathCanon::Grammar grammar, std::span<std::string const> preserve)
 {
     auto rewritten = PathCanon::RewritePaths(text, grammar, [this, preserve](std::string_view span) {
-        return span == preserve ? std::string { span } : Path(span);
+        auto const named = std::ranges::find(preserve, span) != preserve.end();
+        return named ? std::string { span } : Path(span);
     });
     return rewritten.has_value() ? *std::move(rewritten) : std::string { text };
 }

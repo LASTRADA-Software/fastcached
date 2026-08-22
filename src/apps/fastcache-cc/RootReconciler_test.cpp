@@ -159,7 +159,8 @@ TEST_CASE("Region reconciles a depfile's dependencies and preserves the named ou
                                          "\n"
                                          "C:\\Users\\runneradmin\\p\\src\\inc\\h1.h:\n";
 
-    auto const out = reconciler.Region(depFile, PathCanon::Grammar::GccDepfile, R"(C:\Users\runneradmin\p\build\a.o)");
+    std::vector<std::string> const targets { R"(C:\Users\runneradmin\p\build\a.o)" };
+    auto const out = reconciler.Region(depFile, PathCanon::Grammar::GccDepfile, targets);
     CHECK(out
           == "C:\\Users\\runneradmin\\p\\build\\a.o: C:\\Users\\RUNNER~1\\p\\src\\a.cpp\\\n"
              "  C:\\Users\\RUNNER~1\\p\\src\\inc\\h1.h\n"

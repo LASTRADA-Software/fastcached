@@ -310,9 +310,8 @@ namespace
                 return &ParsedCommand::objPath;
             case PathValueRole::DepFile:
                 return &ParsedCommand::depPath;
-            case PathValueRole::DepTarget:
-                return &ParsedCommand::depTarget;
             case PathValueRole::IncludeDir:
+            case PathValueRole::DepTarget:
                 break;
         }
         return nullptr;
@@ -439,11 +438,11 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
         if (auto const match = MatchPathValueFlag(a, IntroducersOf(driver.family), driver.family))
         {
             auto const destination = DestinationFor(match->flag.role);
-            // An include directory goes nowhere, and its separated value is
-            // deliberately left to be scanned rather than consumed: it is not a
-            // source path, so nothing downstream reads it. A dependency target
-            // does have a destination now -- the launcher needs it to know which
-            // span of a stored depfile it must not respell.
+            // An include directory or a dependency target goes nowhere, and its
+            // separated value is deliberately left to be scanned rather than
+            // consumed: it is not a source path, so nothing downstream reads it.
+            // What a stored depfile must not have respelled is read from the
+            // depfile itself, structurally — see ParseDepFileTargets.
             if (destination == nullptr)
                 continue;
 

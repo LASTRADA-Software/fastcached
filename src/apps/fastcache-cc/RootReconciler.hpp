@@ -6,6 +6,7 @@
 #include <FastCache/CompileCache/PathCanon.hpp>
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -106,17 +107,22 @@ class RootReconciler
     /// `FASTCACHE_BINARY_DIR` then gets a depfile Ninja rejects outright and make
     /// matches against no rule at all.
     ///
-    /// Named by its VALUE rather than by its position in the grammar, because
-    /// position does not say what a path is: `-MP` emits a phony rule per header,
-    /// whose target is a path the COMPILER reported and which must be reconciled
-    /// like any other, or a consumer's replayed depfile names files that do not
-    /// exist there and `-MP`'s deleted-header protection is lost with them.
+    /// Named by VALUE rather than by position in the grammar, because position
+    /// does not say what a path is: `-MP` emits a phony rule per header, whose
+    /// target is a path the COMPILER reported and which must be reconciled like
+    /// any other, or a consumer's replayed depfile names files that do not exist
+    /// there and `-MP`'s deleted-header protection is lost with them. The caller
+    /// derives the set from the depfile itself (`ParseDepFileTargets`) rather than
+    /// from the command line, since a compile may name a target more than once and
+    /// `-MQ` escapes it on the way out.
     /// @param text     The captured region.
     /// @param grammar  The grammar identifying path spans within it.
-    /// @param preserve A path to return verbatim wherever it appears; empty for
-    ///                 none, which no span can equal.
+    /// @param preserve Paths to return verbatim wherever they appear; empty for
+    ///                 none.
     /// @return The region with every other span reconciled; the input on failure.
-    [[nodiscard]] std::string Region(std::string_view text, PathCanon::Grammar grammar, std::string_view preserve = {});
+    [[nodiscard]] std::string Region(std::string_view text,
+                                     PathCanon::Grammar grammar,
+                                     std::span<std::string const> preserve = {});
 
     /// Whether `path` has a portable form under one of this build's roots.
     ///

@@ -182,20 +182,10 @@ struct DriverSpec
 struct ParsedCommand
 {
     Flavor flavor { Flavor::Unknown };
-    std::string compiler; ///< argv[0] — the real compiler to exec.
-    std::string source;   ///< The translation-unit source path.
-    std::string objPath;  ///< The requested object output (/Fo or -o).
-    std::string depPath;  ///< The requested depfile (-MF), if any.
-
-    /// The rule target named inside that depfile (`-MT`/`-MQ`), if any.
-    ///
-    /// Captured because it is a path the BUILD SYSTEM authored, and the launcher
-    /// has to know which span of a stored depfile it must not respell: without it
-    /// the reconciler would translate a `-MT`-named target into the root spelling
-    /// the environment exported, and a build whose two differ then gets a replayed
-    /// depfile naming a rule make never asked for (issue #66). `objPath` answers
-    /// the same question when no `-MT` was given, which is the ordinary case.
-    std::string depTarget;
+    std::string compiler;            ///< argv[0] — the real compiler to exec.
+    std::string source;              ///< The translation-unit source path.
+    std::string objPath;             ///< The requested object output (/Fo or -o).
+    std::string depPath;             ///< The requested depfile (-MF), if any.
     bool wantShowIncludes { false }; ///< True if /showIncludes was requested.
     bool parsedOk { false };         ///< False if the line is not a cacheable compile.
 };
