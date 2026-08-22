@@ -233,7 +233,23 @@ int Entry() {
 function Test-SameBytes([string]$a, [string]$b) {
     $ha = (Get-FileHash -Algorithm SHA256 -LiteralPath $a).Hash
     $hb = (Get-FileHash -Algorithm SHA256 -LiteralPath $b).Hash
-    return $ha -eq $hb
+    if ($ha -eq $hb) { return $true }
+
+    # Say HOW they differ, not just that they do. This is the soundness assertion
+    # of the whole feature, so its failure is the one most worth being able to act
+    # on -- and equal sizes with different hashes means something quite different
+    # from a size mismatch: the first says the compile embedded something
+    # environment-specific, the second that it compiled something else entirely.
+    # Written before this ever fired, because every other diagnostic on this branch
+    # was written after it cost a round trip.
+    $sa = (Get-Item -LiteralPath $a).Length
+    $sb = (Get-Item -LiteralPath $b).Length
+    Write-Host "  reference: $sa bytes, $ha"
+    Write-Host "  produced:  $sb bytes, $hb"
+    if ($sa -eq $sb) {
+        Write-Host "  same size, different content -- something environment-specific is embedded in the object"
+    }
+    return $false
 }
 
 # The cache port is a PARAMETER, not read from the enclosing scope.

@@ -332,8 +332,15 @@ grep -q "DISPATCHED to " "${workdir}/case1.log" \
     }
 
 [[ -f "${proj}/build/one.o" ]] || fail "no object was written by the dispatched compile"
-cmp -s "${proj}/build/reference.o" "${proj}/build/one.o" \
-    || fail "the worker's object differs from the locally compiled one"
+cmp -s "${proj}/build/reference.o" "${proj}/build/one.o" || {
+    # How they differ, not just that they do: equal sizes with different bytes
+    # means something environment-specific was embedded, which is a different
+    # investigation from a size mismatch.
+    echo "  reference: $(wc -c < "${proj}/build/reference.o") bytes" >&2
+    echo "  produced:  $(wc -c < "${proj}/build/one.o") bytes" >&2
+    cmp -l "${proj}/build/reference.o" "${proj}/build/one.o" 2>/dev/null | head -5 >&2
+    fail "the worker's object differs from the locally compiled one"
+}
 echo "   byte-identical to the local object"
 
 # The same compile again must come from the cache, not from a worker. A
