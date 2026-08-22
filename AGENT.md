@@ -8,9 +8,10 @@ in-memory transport.
 
 ```
 src/FastCache/
-  Core/         Errors taxonomy, Clock, Logger, BufferPool, Bytes, Endian,
-                Crc32c, MurmurHash3 (128-bit key digest), StringHash, Owner,
-                Profiling (Tracy wrappers)
+  Core/         Errors taxonomy, Clock, IRandomSource (the randomness seam,
+                beside Clock and for the same reason), Logger, BufferPool,
+                Bytes, Endian, Crc32c, MurmurHash3 (128-bit key digest),
+                StringHash, Owner, Profiling (Tracy wrappers)
   Async/        Task<T>, Cancellation, ResumeOn, IReactor + TestReactor and the
                 platform reactors (EpollReactor / IocpReactor / KqueueReactor)
   Net/          ISocket, IListener, IoAwaitable, IAdmissionControl, SocketAddress,
