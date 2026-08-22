@@ -386,6 +386,42 @@ try {
         # The whole soundness claim: an object built on the worker from
         # `/E`-preprocessed text must equal one this machine compiled directly.
         if (-not (Test-SameBytes $refObj $obj)) {
+            # THE CONTROL. The reference above compiles the ORIGINAL source; the
+            # worker compiles `/E`-preprocessed text. Those are different inputs,
+            # so a difference between them does not yet say whether distribution
+            # is at fault -- it might be inherent to compiling preprocessed text
+            # on this driver. GNU produces identical objects either way, which is
+            # why the POSIX fixture never had to ask.
+            #
+            # So ask directly: preprocess and compile locally, the same two steps
+            # the worker performs, and compare THAT. Identical means the worker is
+            # doing exactly what a local preprocessed compile does and the
+            # difference is the input, not the machine. Still different means the
+            # worker's environment is leaking into the object, which is the
+            # soundness problem this assertion exists to catch.
+            Write-Host "--- control: preprocess and compile locally, as the worker does ---"
+            $ctlDir = Join-Path $scratch "control"
+            New-Item -ItemType Directory -Force -Path $ctlDir | Out-Null
+            # Named `tu` to match the worker's own scratch source, so a filename
+            # embedded in the object cannot by itself account for a difference.
+            $ctlSrc = Join-Path $ctlDir "tu.cpp"
+            $ctlObj = Join-Path $ctlDir "tu.o"
+            & $cc /nologo /E $src 2>$null | Set-Content -Encoding utf8 $ctlSrc
+            if ($LASTEXITCODE -eq 0) {
+                & $cc /nologo -c $ctlSrc "/Fo$ctlObj" 2>&1 | Out-Null
+                if (Test-Path $ctlObj) {
+                    if (Test-SameBytes $ctlObj $obj) {
+                        Write-Host "  control MATCHES the worker: the difference is preprocessed-vs-original input,"
+                        Write-Host "  not the worker's environment."
+                    } else {
+                        Write-Host "  control DIFFERS from the worker too: the worker's environment is leaking in."
+                    }
+                } else {
+                    Write-Host "  control compile produced no object; inconclusive"
+                }
+            } else {
+                Write-Host "  control preprocess failed; inconclusive"
+            }
             throw "the worker's object differs from the locally compiled one"
         }
         Write-Host "   byte-identical to the local object"
