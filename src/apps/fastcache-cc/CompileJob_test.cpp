@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -68,10 +69,18 @@ class ScriptedRunner final: public IProcessRunner
 /// A scratch root that cleans itself up.
 struct ScratchDir
 {
-    std::filesystem::path path { std::filesystem::temp_directory_path()
-                                 / std::format("fc-jobtest-{}", static_cast<void const*>(this)) };
+    std::filesystem::path path;
+
     ScratchDir()
     {
+        // Numbered rather than derived from `this`. A pointer would be unique but
+        // formatting one is the sort of thing that differs between standard
+        // libraries, and a reproducible name is easier to find when a case leaves
+        // something behind.
+        static int counter = 0;
+        path = std::filesystem::temp_directory_path() / std::format("fc-jobtest-{}", ++counter);
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
         std::filesystem::create_directories(path);
     }
     ~ScratchDir()
