@@ -78,6 +78,7 @@ endif()
 # distinctly from a miss" be a test rather than a hope.
 set(_fc_cc_sources
     CmdLine.cpp
+    CompileJob.cpp
     LauncherCli.cpp
     CacheKey.cpp
     CacheProtocol.cpp
@@ -137,6 +138,7 @@ if(FASTCACHED_BUILD_TESTS)
         test_main.cpp
         ${_fc_cc_sources}
         CmdLine_test.cpp
+        CompileJob_test.cpp
         LauncherCli_test.cpp
         CacheKey_test.cpp
         CacheProtocol_test.cpp
