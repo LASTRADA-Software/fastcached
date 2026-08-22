@@ -310,8 +310,9 @@ namespace
                 return &ParsedCommand::objPath;
             case PathValueRole::DepFile:
                 return &ParsedCommand::depPath;
-            case PathValueRole::IncludeDir:
             case PathValueRole::DepTarget:
+                return &ParsedCommand::depTarget;
+            case PathValueRole::IncludeDir:
                 break;
         }
         return nullptr;

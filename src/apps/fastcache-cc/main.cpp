@@ -1113,6 +1113,18 @@ void RecordManifest(Config const& cfg,
     return served;
 }
 
+/// The rule target a compile's depfile will carry.
+///
+/// `-MT`/`-MQ` name it explicitly; otherwise the driver uses the object path.
+/// Either way it is a string the BUILD SYSTEM authored, which is what the
+/// reconciler must not respell — see RootReconciler::Region.
+/// @param cmd The parsed compile command.
+/// @return The target, or empty when the command names neither.
+[[nodiscard]] std::string_view RuleTargetOf(Cc::ParsedCommand const& cmd)
+{
+    return cmd.depTarget.empty() ? std::string_view { cmd.objPath } : std::string_view { cmd.depTarget };
+}
+
 /// Try to serve `cmd` from the cache; returns the process exit code if handled
 /// (hit or miss-then-stored), or std::nullopt to signal "fall back to a plain
 /// real compile" (any cache error).
@@ -1360,8 +1372,9 @@ void RecordManifest(Config const& cfg,
     // paths inside it — a depfile full of this machine's absolute paths would be
     // useless (and wrong) when replayed on another checkout.
     if (auto const depText = ReadDepFile(cmd))
-        value.textRegions.push_back({ .grammar = PathCanon::Grammar::GccDepfile,
-                                      .bytes = reconciler.Region(*depText, PathCanon::Grammar::GccDepfile, cmd.objPath) });
+        value.textRegions.push_back(
+            { .grammar = PathCanon::Grammar::GccDepfile,
+              .bytes = reconciler.Region(*depText, PathCanon::Grammar::GccDepfile, RuleTargetOf(cmd)) });
 
     auto const encoded = EncodeCompileValue(value);
     if (!Cc::IsStorableSize(encoded.size(), cfg.maxStoreBytes))

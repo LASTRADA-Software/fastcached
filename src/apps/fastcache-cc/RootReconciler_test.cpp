@@ -78,11 +78,18 @@ TEST_CASE("WithoutTrailingSeparator trims a root but never a bare one")
     CHECK(WithoutTrailingSeparator("/x/build") == "/x/build");
 
     // A bare root IS its trailing separator; trimming `C:\` to `C:` would also
-    // flip the separator style PathCanon derives from it when localizing.
+    // flip the separator style PathCanon derives from it when localizing, and `/`
+    // would become empty, which is a prefix of nothing at all.
     CHECK(WithoutTrailingSeparator("/") == "/");
     CHECK(WithoutTrailingSeparator(R"(C:\)") == R"(C:\)");
     CHECK(WithoutTrailingSeparator("C:/") == "C:/");
     CHECK(WithoutTrailingSeparator("").empty());
+
+    // The drive test is narrow, so a three-byte string that merely has a colon in
+    // the middle is an ordinary root and its separator comes off.
+    CHECK(WithoutTrailingSeparator("a:/") == "a:/"); // a real drive letter
+    CHECK(WithoutTrailingSeparator("1:/") == "1:");  // not a drive at all
+    CHECK(WithoutTrailingSeparator("ab/") == "ab");
 }
 
 TEST_CASE("A path the driver spelled differently is translated into the build's spelling")

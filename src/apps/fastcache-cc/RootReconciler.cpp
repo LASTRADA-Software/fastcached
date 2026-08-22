@@ -11,9 +11,23 @@ namespace FastCache::Cc
 
 std::string WithoutTrailingSeparator(std::string root)
 {
+    // "/" on POSIX; "C:\" or "C:/" on Windows. The drive test is as narrow as
+    // IsWindowsRoot's, and for the same reason: without the letter check, any
+    // three-byte string whose middle byte is a colon reads as a drive root.
+    //
+    // Nothing under a bare root canonicalizes anyway -- IsSegmentPrefix wants a
+    // separator AFTER the root, and a bare root IS its separator -- so exempting
+    // one costs that configuration nothing it had. It is exempt because trimming
+    // would be worse: "C:\" would become "C:", which flips the separator style
+    // JoinLocalized derives from it, and "/" would become empty, which is a
+    // prefix of nothing at all.
     auto const isBareRoot = [&root]() {
-        // "/" on POSIX; "C:\" or "C:/" on Windows.
-        return root.size() <= 1 || (root.size() == 3 && root[1] == ':');
+        auto const isDriveLetter = [](char c) {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        };
+        if (root.size() <= 1)
+            return true;
+        return root.size() == 3 && isDriveLetter(root[0]) && root[1] == ':' && (root[2] == '/' || root[2] == '\\');
     };
     while (!isBareRoot() && (root.back() == '/' || root.back() == '\\'))
         root.pop_back();
