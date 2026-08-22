@@ -74,13 +74,38 @@ $workerPort   = $BasePort + 2
 
 $procs = @()
 
+# Start a background process with its stderr captured.
+#
+# `-WindowStyle Hidden` exists to keep console windows from flashing up during a
+# Windows CI run, and it is REJECTED outright by PowerShell on macOS and Linux
+# ("not supported for the cmdlet 'Start-Process' on this edition"). Passing it
+# unconditionally therefore made this script impossible to even structurally
+# exercise anywhere but Windows -- which, for a file whose whole risk is that it
+# was written without being run, is the wrong trade. Conditional here costs
+# nothing on Windows and makes the orchestration runnable everywhere.
+function Start-Background([string]$path, [string[]]$arguments, [string]$errorLog) {
+    $common = @{
+        FilePath              = $path
+        ArgumentList          = $arguments
+        PassThru              = $true
+        RedirectStandardError = $errorLog
+    }
+    if ($IsWindows) { return Start-Process @common -WindowStyle Hidden }
+    return Start-Process @common
+}
+
 function Stop-Spawned {
     # Every spawned process, on every exit path. One left holding a port makes the
     # NEXT run fail at startup for a reason unrelated to what actually broke.
     foreach ($p in $script:procs) {
         if ($null -eq $p) { continue }
-        try { if (-not $p.HasExited) { $p.Kill() } } catch { }
-        try { $p.WaitForExit(5000) | Out-Null } catch { }
+        # Both swallow deliberately: a process that exited between the check and
+        # the Kill throws, and so does WaitForExit on a handle that is already
+        # gone. Cleanup runs on every exit path INCLUDING the failing ones, so
+        # anything thrown here would replace the real diagnostic with a secondary
+        # one about tearing down.
+        try { if (-not $p.HasExited) { $p.Kill() } } catch { $null = $_ }
+        try { $p.WaitForExit(5000) | Out-Null } catch { $null = $_ }
     }
     $script:procs = @()
 }
@@ -187,6 +212,31 @@ function Test-SameBytes([string]$a, [string]$b) {
 # own first line, so that case silently used the MAIN cache while talking to the
 # isolation scheduler. It would still have passed, for the wrong reason, which is
 # the failure mode every fixture here is written to avoid.
+# Can this driver actually compile, or is it merely on PATH?
+#
+# `Get-Command` answers presence, which is not the question. A clang-cl that
+# cannot find an MSVC SDK is on PATH and cannot build anything, and so is one on
+# a machine where the Visual Studio environment was never sourced -- both would
+# turn this fixture into a red build reporting "the reference compile failed",
+# which describes the runner rather than the code under test.
+#
+# A missing runtime prerequisite is a SKIP, and this is what makes the two
+# distinguishable. It also happens to make the script runnable to a clean
+# conclusion on a developer machine, where clang-cl exists, targets MSVC, and has
+# no SDK to target it with.
+function Test-CompilerWorks([string]$compiler, [string]$where) {
+    $probeDir = Join-Path $where "probe"
+    New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+    $probeSrc = Join-Path $probeDir "probe.cpp"
+    $probeObj = Join-Path $probeDir "probe.obj"
+    @'
+#include <string>
+int Probe() { return static_cast<int>(std::string("x").size()); }
+'@ | Set-Content -Encoding utf8 $probeSrc
+    & $compiler /nologo /c "/Fo$probeObj" $probeSrc 2>&1 | Out-Null
+    return (Test-Path $probeObj)
+}
+
 function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj,
                             [string]$scheduler, [int]$cache) {
     $env:FASTCACHE_ADDR       = "127.0.0.1:$cache"
@@ -212,21 +262,25 @@ try {
             Write-Host "skip $cc (not on PATH)"
             continue
         }
-        $ranAnyCompiler = $true
-        Write-Host "== driver: $cc"
 
         if (Test-Path $scratch) { Remove-Item -Recurse -Force $scratch }
         New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+
+        if (-not (Test-CompilerWorks $cc $scratch)) {
+            Write-Host "skip $cc (on PATH but cannot compile here)"
+            continue
+        }
+        $ranAnyCompiler = $true
+        Write-Host "== driver: $cc"
 
         # Statistics are per-user state; keep this run out of the developer's log.
         $env:LOCALAPPDATA = Join-Path $scratch "state"
         New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
 
         $daemonLog = Join-Path $scratch "daemon.log"
-        $daemon = Start-Process -FilePath $Fastcached `
-            -ArgumentList "--listen=127.0.0.1:$cachePort","--listen-dispatch=127.0.0.1:$dispatchPort", `
-                          "--storage-max-value=64M","--log-level=info" `
-            -PassThru -WindowStyle Hidden -RedirectStandardError $daemonLog
+        $daemon = Start-Background $Fastcached @(
+            "--listen=127.0.0.1:$cachePort", "--listen-dispatch=127.0.0.1:$dispatchPort",
+            "--storage-max-value=64M", "--log-level=info") $daemonLog
         $procs += $daemon
         Wait-ForPort $cachePort    $daemon "daemon"
         Wait-ForPort $dispatchPort $daemon "daemon (dispatch listener)"
@@ -241,10 +295,10 @@ try {
         if (-not $fingerprint) { throw "the launcher reported no toolchain fingerprint for $cc" }
 
         $workerLog = Join-Path $scratch "worker.log"
-        $worker = Start-Process -FilePath $Node `
-            -ArgumentList "--scheduler=127.0.0.1:$dispatchPort","--bind=127.0.0.1","--port=$workerPort", `
-                          "--advertise=127.0.0.1:$workerPort","--toolchain=$ccPath","--slots=2","--log-level=debug" `
-            -PassThru -WindowStyle Hidden -RedirectStandardError $workerLog
+        $worker = Start-Background $Node @(
+            "--scheduler=127.0.0.1:$dispatchPort", "--bind=127.0.0.1", "--port=$workerPort",
+            "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=2",
+            "--log-level=debug") $workerLog
         $procs += $worker
         Wait-ForPort $workerPort $worker "worker"
         $workerText = Wait-ForLine $workerLog "toolchain\(s\) registered" 120 "worker"
@@ -304,18 +358,18 @@ try {
         $isoWorker   = $BasePort + 5
 
         $isoDaemonLog = Join-Path $scratch "iso-daemon.log"
-        $isoDaemon = Start-Process -FilePath $Fastcached `
-            -ArgumentList "--listen=127.0.0.1:$isoCache","--listen-dispatch=127.0.0.1:$isoDispatch","--log-level=info" `
-            -PassThru -WindowStyle Hidden -RedirectStandardError $isoDaemonLog
+        $isoDaemon = Start-Background $Fastcached @(
+            "--listen=127.0.0.1:$isoCache", "--listen-dispatch=127.0.0.1:$isoDispatch",
+            "--log-level=info") $isoDaemonLog
         $procs += $isoDaemon
         Wait-ForPort $isoDispatch $isoDaemon "isolation daemon"
 
         $isoWorkerLog = Join-Path $scratch "iso-worker.log"
-        $isoNode = Start-Process -FilePath $Node `
-            -ArgumentList "--scheduler=127.0.0.1:$isoDispatch","--bind=127.0.0.1","--port=$isoWorker", `
-                          "--advertise=127.0.0.1:$isoWorker", `
-                          "--toolchain=not-the-compiler-this-client-uses=$ccPath","--slots=2","--log-level=debug" `
-            -PassThru -WindowStyle Hidden -RedirectStandardError $isoWorkerLog
+        $isoNode = Start-Background $Node @(
+            "--scheduler=127.0.0.1:$isoDispatch", "--bind=127.0.0.1", "--port=$isoWorker",
+            "--advertise=127.0.0.1:$isoWorker",
+            "--toolchain=not-the-compiler-this-client-uses=$ccPath", "--slots=2",
+            "--log-level=debug") $isoWorkerLog
         $procs += $isoNode
         Wait-ForPort $isoWorker $isoNode "isolation worker"
         Wait-ForLine $isoWorkerLog "toolchain\(s\) registered" 120 "isolation worker" | Out-Null
@@ -346,7 +400,7 @@ try {
     }
 
     if (-not $ranAnyCompiler) {
-        Write-Host "no MSVC-family compiler on PATH; skipping"
+        Write-Host "no usable MSVC-family compiler here; skipping"
         exit $SKIP
     }
     Write-Host ""
