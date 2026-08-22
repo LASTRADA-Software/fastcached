@@ -2,6 +2,8 @@
 #include "CmdLine.hpp"
 #include "CompileJob.hpp"
 
+#include <FastCache/CompileCache/PathCanon.hpp>
+
 #include <algorithm>
 #include <array>
 #include <format>
@@ -48,22 +50,6 @@ namespace
         "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
     };
 
-    /// ASCII lower-case, deliberately not `std::tolower`.
-    ///
-    /// Locale-dependent folding is how a rule comes to mean different things on two
-    /// machines: under a Turkish locale `std::tolower('I')` is not `i`, so `LPT1`
-    /// would be reserved on one worker and allowed on the next.
-    /// @param text The text to fold.
-    /// @return The folded copy.
-    [[nodiscard]] std::string AsciiLower(std::string_view text)
-    {
-        std::string out { text };
-        for (char& c: out)
-            if (c >= 'A' && c <= 'Z')
-                c = static_cast<char>(c - 'A' + 'a');
-        return out;
-    }
-
     /// Whether a stem may be used as a file name inside the scratch directory.
     /// @param stem The name without its extension.
     /// @return True when it is safe to create.
@@ -74,7 +60,12 @@ namespace
         constexpr std::string_view Allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-";
         if (!std::ranges::all_of(stem, [&](char c) { return Allowed.contains(c); }))
             return false;
-        return std::ranges::find(ReservedDeviceNames, AsciiLower(stem)) == ReservedDeviceNames.end();
+        // Folded through PathCanon's byte rule rather than `std::tolower`, which is
+        // locale-dependent: under a Turkish locale `std::tolower('I')` is not `i`,
+        // so `LPT1` would be reserved on one worker and allowed on the next.
+        std::string folded { stem };
+        std::ranges::transform(folded, folded.begin(), [](char c) { return PathCanon::AsciiLower(c); });
+        return std::ranges::find(ReservedDeviceNames, folded) == ReservedDeviceNames.end();
     }
 
     /// Read a whole file as bytes.
