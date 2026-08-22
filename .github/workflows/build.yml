@@ -668,7 +668,7 @@ jobs:
         run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
-        run: cmake --build --preset gcc-release --target fastcached fastcache-cc
+        run: cmake --build --preset gcc-release --target fastcached fastcache-cc fastcache-compile-node
 
       - name: "Package"
         working-directory: out/build/gcc-release
@@ -710,7 +710,7 @@ jobs:
 
           # The binaries, the units and the config must each land in the one
           # location that works; /usr/etc or /lib would silently never be read.
-          for path in ./usr/bin/fastcached ./usr/bin/fastcache-cc \
+          for path in ./usr/bin/fastcached ./usr/bin/fastcache-cc ./usr/bin/fastcache-compile-node \
                       ./usr/lib/systemd/system/fastcached.service \
                       ./usr/lib/systemd/user/fastcached.service \
                       ./usr/lib/sysusers.d/fastcached.conf \
@@ -739,7 +739,7 @@ jobs:
           rpm -qlp "$rpmfile" > /tmp/rpm-paths.txt
           rpm -qcp "$rpmfile" > /tmp/rpm-config.txt
 
-          for path in /usr/bin/fastcached /usr/bin/fastcache-cc \
+          for path in /usr/bin/fastcached /usr/bin/fastcache-cc /usr/bin/fastcache-compile-node \
                       /usr/lib/systemd/system/fastcached.service \
                       /usr/lib/systemd/user/fastcached.service \
                       /usr/lib/sysusers.d/fastcached.conf \
@@ -1001,7 +1001,7 @@ jobs:
             -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
-        run: cmake --build out/build/macos-package --target fastcached fastcache-cc
+        run: cmake --build out/build/macos-package --target fastcached fastcache-cc fastcache-compile-node
 
       - name: "Verify the binaries are redistributable"
         # The regression that would otherwise ship silently: everything builds,
@@ -1009,7 +1009,7 @@ jobs:
         # without the build host's Homebrew prefix.
         run: |
           set -euo pipefail
-          for tool in fastcached fastcache-cc; do
+          for tool in fastcached fastcache-cc fastcache-compile-node; do
             binary="out/build/macos-package/target/$tool"
             echo "== $tool"; otool -L "$binary"
             strays="$(otool -L "$binary" | tail -n +2 | awk '{print $1}' | grep -v '^/usr/lib/' || true)"
@@ -1157,7 +1157,7 @@ jobs:
         run: cmake --preset cl-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
-        run: cmake --build --preset cl-release --target fastcached fastcache-cc
+        run: cmake --build --preset cl-release --target fastcached fastcache-cc fastcache-compile-node
 
       # On failure CPack only says "check wix.log", which lives in the build
       # tree and is otherwise discarded with the runner — so the actual WiX
