@@ -1238,14 +1238,29 @@ data does: `.text$mn`, `.rdata`, `.xdata`, `.pdata`, `.drectve`, `.data$r` and
 worker-shaped compile of `/E` text elsewhere. `dist-compile-e2e.ps1` therefore
 compares **section by section** against a per-driver table of what may differ, and
 `clang-cl`'s row is *empty* — it records only the source's base name, which the
-worker is now told, so its objects differ by the clock alone. Two lessons are worth
-keeping: the COFF **header** is compared field by field rather than skipped, because
-an object built for another architecture differs *there and nowhere a section walk
-would look*; and the comparison has a `-SelfTest` of its own, because the fixture's
-own logic is the one thing nothing else tests — the previous control compared two
-objects with different **names**, which `cl` records inside the object, and so
-reported a perfectly reproducible driver as non-reproducible in a CI log, as the
-answer to the question the fixture had been asking for three commits.
+worker is now told, so its objects differ by the clock alone. Three lessons are
+worth keeping, and each was a hole first:
+
+- The COFF **header** is compared field by field rather than skipped, because an
+  object built for another architecture differs *there and nowhere a section walk
+  would look*. Its two excused fields are excused by name — the clock, and the
+  symbol-table pointer, which moves whenever an excused section changes size.
+- **A section walk alone accepted a truncated object.** MSVC writes the symbol
+  table last, so cutting a tenth off a file leaves every section intact and
+  comparing equal — and a truncated transfer is one of the few faults distribution
+  can actually introduce. COFF states its own end (the string table opens with a
+  size that includes itself and is the last thing in the file), and that check runs
+  on both sides under every rule: "the file is as large as it claims" is not a
+  property a driver gets to opt out of. Whether the tail's *content* may differ is
+  a second per-driver column, measured the same way — clang-cl's is identical, and
+  `cl`'s is not.
+- The comparison has a **`-SelfTest`** of its own, because the fixture's own logic
+  is the one thing nothing else tests. Two defects in it were found that way and
+  one by asking it to reject deliberately wrong objects: the earlier control
+  compared two objects with different **names**, which `cl` records inside the
+  object, and so reported a perfectly reproducible driver as non-reproducible in a
+  CI log — as the answer to the question the fixture had been asking for three
+  commits.
 
 **Every wait in that fixture is bounded, and that is a rule rather than a
 detail.** Its first version killed a worker and then `wait`ed, which HANGS when a
