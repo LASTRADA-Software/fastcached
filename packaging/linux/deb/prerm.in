@@ -5,11 +5,20 @@
 set -e
 
 SERVICE="@FASTCACHED_SERVICE_NAME@"
+NODE_SERVICE="fastcache-compile-node.service"
+NODE_SOCKET="fastcache-compile-node.socket"
 
 case "$1" in
     remove|deconfigure)
         if [ -d /run/systemd/system ]; then
             systemctl stop "${SERVICE}" >/dev/null 2>&1 || true
+            # The socket first, then the service. Stopping only the service
+            # leaves the socket holding the port and ready to activate a binary
+            # that is about to be deleted -- so the next connection starts a
+            # unit that fails, and the failure names a missing executable rather
+            # than an incomplete removal.
+            systemctl stop "${NODE_SOCKET}" >/dev/null 2>&1 || true
+            systemctl stop "${NODE_SERVICE}" >/dev/null 2>&1 || true
         fi
         ;;
 esac

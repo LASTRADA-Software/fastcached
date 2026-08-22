@@ -67,6 +67,19 @@ if(FASTCACHED_PACKAGE_ROOT_PREFIX AND UNIX AND NOT APPLE)
         "linux/fastcached.sysusers|${FASTCACHED_SYSUSERS_DIR}|data|fastcached.conf|Runtime"
         "linux/fastcached.tmpfiles|${FASTCACHED_TMPFILES_DIR}|data|fastcached.conf|Runtime"
         "linux/fastcached.yaml|${FASTCACHED_SYSCONF_DIR}|config|fastcached.yaml|Runtime"
+        # The compile worker. Its socket unit is what an operator enables, so the
+        # service carries no [Install] and is pulled in by the socket -- see the
+        # units themselves. The account is its own rather than fastcached's,
+        # because a worker runs a compiler while fastcached owns the cache
+        # storage, and the trust model gives a worker no cache credentials at all.
+        "linux/fastcache-compile-node.service|${FASTCACHED_SYSTEMD_SYSTEM_DIR}|data|fastcache-compile-node.service|Runtime"
+        "linux/fastcache-compile-node.socket|${FASTCACHED_SYSTEMD_SYSTEM_DIR}|data|fastcache-compile-node.socket|Runtime"
+        "linux/fastcache-compile-node.sysusers|${FASTCACHED_SYSUSERS_DIR}|data|fastcache-node.conf|Runtime"
+        # Marked `config` so dpkg registers it as a conffile and rpm as
+        # %config(noreplace): it is the file an operator edits to make the worker
+        # work at all, and an upgrade that reset it would un-register the worker
+        # silently.
+        "linux/compile-node.env|${FASTCACHED_SYSCONF_DIR}|config|compile-node.env|Runtime"
     )
 elseif(FASTCACHED_PACKAGE_ROOT_PREFIX AND APPLE)
     # The generated scripts are referenced from the build tree; see below.
@@ -137,6 +150,11 @@ if(FASTCACHED_PACKAGE_ROOT_PREFIX AND UNIX AND NOT APPLE)
 
     # Absolute paths as seen on the installed system — the scriptlets run there.
     set(FASTCACHED_SYSUSERS_FILE "/${FASTCACHED_SYSUSERS_DIR}/fastcached.conf")
+    # Named separately rather than letting `systemd-sysusers` with no argument
+    # apply everything on the system. Both accounts must exist or the unit that
+    # needs one fails to start with "user does not exist" -- a message that says
+    # nothing about which package forgot to create it.
+    set(FASTCACHED_NODE_SYSUSERS_FILE "/${FASTCACHED_SYSUSERS_DIR}/fastcache-node.conf")
     set(FASTCACHED_TMPFILES_FILE "/${FASTCACHED_TMPFILES_DIR}/fastcached.conf")
 
     set(FASTCACHED_SCRIPTLETS deb/postinst deb/prerm deb/postrm

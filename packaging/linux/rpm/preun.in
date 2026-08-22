@@ -5,10 +5,18 @@
 set -e
 
 SERVICE="@FASTCACHED_SERVICE_NAME@"
+NODE_SERVICE="fastcache-compile-node.service"
+NODE_SOCKET="fastcache-compile-node.socket"
 
 if [ "$1" -eq 0 ] && [ -d /run/systemd/system ]; then
     systemctl --no-reload disable "${SERVICE}" >/dev/null 2>&1 || true
     systemctl stop "${SERVICE}" >/dev/null 2>&1 || true
+    # The socket is the enabled unit, so it is the one to disable -- and it must
+    # go before the service, or it stays ready to activate a binary this erase
+    # is about to delete.
+    systemctl --no-reload disable "${NODE_SOCKET}" >/dev/null 2>&1 || true
+    systemctl stop "${NODE_SOCKET}" >/dev/null 2>&1 || true
+    systemctl stop "${NODE_SERVICE}" >/dev/null 2>&1 || true
 fi
 
 exit 0

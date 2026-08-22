@@ -4,11 +4,15 @@
 set -e
 
 SERVICE="@FASTCACHED_SERVICE_NAME@"
+# The socket is the unit an operator enables, so it is the one carrying
+# enable-state symlinks that have to be dropped here.
+NODE_SOCKET="fastcache-compile-node.socket"
 
 case "$1" in
     remove)
         if command -v deb-systemd-helper >/dev/null 2>&1; then
             deb-systemd-helper mask "${SERVICE}" >/dev/null 2>&1 || true
+            deb-systemd-helper mask "${NODE_SOCKET}" >/dev/null 2>&1 || true
         fi
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload >/dev/null 2>&1 || true
@@ -19,6 +23,8 @@ case "$1" in
         if command -v deb-systemd-helper >/dev/null 2>&1; then
             deb-systemd-helper purge "${SERVICE}" >/dev/null 2>&1 || true
             deb-systemd-helper unmask "${SERVICE}" >/dev/null 2>&1 || true
+            deb-systemd-helper purge "${NODE_SOCKET}" >/dev/null 2>&1 || true
+            deb-systemd-helper unmask "${NODE_SOCKET}" >/dev/null 2>&1 || true
         fi
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload >/dev/null 2>&1 || true
