@@ -144,14 +144,22 @@ set_tests_properties("compile-cache-install" PROPERTIES
 #
 # Both platforms run it, but they do NOT assert the same contract, and that is
 # stated rather than left as an apparent omission. The Windows script covers the
-# three cases that turn on the MSVC driver -- byte-identical object, still a
-# cache, fingerprint isolation -- because the driver is the only Windows-specific
-# thing on this path: `/E` for the dispatch preprocess and an EMPTY
-# preprocessedInputFlags are assertions about a driver nothing else exercises, and
-# if either is wrong every dispatched TU fails and is retried locally, so the
-# build is green and never once helped. Everything the POSIX fixture additionally
-# covers -- failover, the role gate, concurrency, graceful stop -- is
-# platform-neutral code already pinned by unit tests.
+# four cases that turn on the MSVC driver -- an equivalent object, still a cache,
+# a C translation unit staying C, and fingerprint isolation -- because the driver
+# is the only Windows-specific thing on this path: `/E` for the dispatch
+# preprocess and `/TP`//`/TC` for the language are assertions about a driver
+# nothing else exercises, and if either is wrong every dispatched TU fails and is
+# retried locally, so the build is green and never once helped. Everything the
+# POSIX fixture additionally covers -- failover, the role gate, concurrency, the
+# driver's own language default, graceful stop -- is platform-neutral code already
+# pinned by unit tests.
+#
+# "Equivalent" and not "byte-identical" on Windows, and that difference is
+# measured: both MSVC drivers stamp the clock into the COFF header, and `cl`
+# additionally records the absolute path of the OBJECT inside the object, so a
+# worker's output can never be byte-identical to a local build's. Every section
+# carrying code or data is, and the fixture's own comparison is what says so --
+# which is why that comparison has a self-test of its own below.
 if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cc)
     message(STATUS "dist-compile-e2e: daemon, compile node or launcher not built — skipping")
 else()
@@ -181,6 +189,23 @@ else()
         RUN_SERIAL TRUE
         TIMEOUT 900
     )
+
+    # The Windows fixture's object comparison, against synthetic COFF input.
+    #
+    # NOT labelled "smoke", deliberately: it starts no daemon, opens no socket and
+    # runs no compiler, so it belongs in the default ctest set -- the same
+    # reasoning that puts repository-hygiene there. It exists because a fixture's
+    # own logic is the one thing nothing else tests, and this one's cost five CI
+    # round trips to find out, the last of them on a control that compared two
+    # objects with different NAMES and so reported a reproducible driver as
+    # non-reproducible.
+    if(WIN32)
+        add_test(
+            NAME "dist-compile-e2e-selftest"
+            COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.ps1" -SelfTest
+        )
+        set_tests_properties("dist-compile-e2e-selftest" PROPERTIES TIMEOUT 120)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

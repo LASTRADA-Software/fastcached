@@ -11,9 +11,9 @@
 # platform-neutral code already covered by unit tests and by the POSIX fixture.
 # What is NOT covered anywhere else is that an MSVC driver can be preprocessed
 # for a worker and then compile that text: `DriverSpec::dispatchPreprocessFlags`
-# is `/E` for MSVC and `preprocessedInputFlags` is EMPTY -- `/E` emits standard
-# `#line` that cl accepts in an ordinary source file, so there is nothing to tell
-# it, and the `-x c++-cpp-output` spelling has no MSVC equivalent.
+# is `/E` for MSVC, and `preprocessedInput` names the language in MSVC's own
+# spelling (`/TP`, `/TC`) because the worker writes its scratch file itself and
+# MSVC reads the language off that file's extension.
 #
 # Both of those are assertions about a driver that had never been exercised on
 # this path. If either is wrong, distribution silently never works on Windows:
@@ -23,12 +23,37 @@
 #
 # So the cases here are the ones that would catch that:
 #
-#   1. Byte-identical    -- a worker's object equals a locally compiled one.
+#   1. Equivalent object -- a worker's object matches a locally compiled one.
 #   2. Still a cache     -- a dispatched result is served from the cache next time.
-#   3. Fingerprint       -- a worker for another toolchain is never chosen.
+#   3. C, not C++        -- a dispatched C translation unit comes back compiled as C.
+#   4. Fingerprint       -- a worker for another toolchain is never chosen.
+#
+# "MATCHES" IS NOT BYTE-IDENTICAL HERE, and every part of that is measured rather
+# than assumed -- the POSIX fixture asserts byte-identity and is right to, because
+# an ELF object records none of this.
+#
+# Both MSVC drivers write the CLOCK into the COFF header: two compiles of one file
+# to one path two seconds apart differ in exactly byte 4, and only `/Brepro`
+# suppresses it. A fixture that passed `/Brepro` to make its own assertion true
+# would be asserting something about a command line no build uses.
+#
+# clang-cl records one further thing, the source's BASE NAME in the COFF `.file`
+# symbol -- which the worker is now told, so that difference is gone rather than
+# excused. `cl` records the ABSOLUTE PATH OF THE OBJECT in `.debug$S` and hashes
+# the file it opened into `.chks64`, with no debug flag asked for, and a worker
+# compiles its own scratch file to its own scratch path: neither can ever match.
+# Everything carrying code or data does: measured, `.text$mn`, `.rdata`, `.xdata`,
+# `.pdata`, `.drectve`, `.data$r` and `.bss` are byte-identical between a reference
+# compile of the original source and a worker-shaped compile of `/E` text at
+# another path.
+#
+# So each driver asserts the strongest property it can actually carry, off a table,
+# and a difference anywhere else -- a section, or a header field such as the target
+# architecture -- is still a failure.
 #
 # Usage:
 #   dist-compile-e2e.ps1 -Fastcached <path> -Node <path> -Launcher <path>
+#   dist-compile-e2e.ps1 -SelfTest        # the object comparison only, no build
 #
 # Exit codes: 0 = all assertions held; 1 = a failure; 77 = a runtime prerequisite
 # was missing (skip).
@@ -41,7 +66,16 @@ param(
     # ports and shares a runner with several other socket-using tests; this needs
     # three and is RUN_SERIAL, and a fixed base keeps the failure mode ("something
     # else holds 21730") legible instead of intermittent.
-    [int]$BasePort      = 21730
+    [int]$BasePort      = 21730,
+    # Exercise the object comparison against synthetic COFF input and exit.
+    #
+    # The comparison is the one piece of this fixture with logic of its own, and a
+    # fixture's own logic is exactly what nothing else tests -- this file spent five
+    # CI round trips learning that the hard way, one of them on a control that
+    # compared two objects with DIFFERENT NAMES and so reported a driver as
+    # non-reproducible when it is perfectly reproducible. This needs no daemon, no
+    # worker and no compiler, so it runs anywhere pwsh does.
+    [switch]$SelfTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,16 +83,21 @@ $SKIP = 77
 $exit = 0
 $ranAnyCompiler = $false
 
-if (-not (Test-Path $Fastcached)) { Write-Host "fastcached not found: $Fastcached; skipping"; exit $SKIP }
-if (-not (Test-Path $Node))       { Write-Host "fastcache-compile-node not found: $Node; skipping"; exit $SKIP }
-if (-not (Test-Path $Launcher))   { Write-Host "fastcache-cc not found: $Launcher; skipping"; exit $SKIP }
+# Skipped entirely under -SelfTest, which drives no process at all: requiring the
+# three binaries there would make the one check that needs no build the one check
+# that cannot run without one.
+if (-not $SelfTest) {
+    if (-not (Test-Path $Fastcached)) { Write-Host "fastcached not found: $Fastcached; skipping"; exit $SKIP }
+    if (-not (Test-Path $Node))       { Write-Host "fastcache-compile-node not found: $Node; skipping"; exit $SKIP }
+    if (-not (Test-Path $Launcher))   { Write-Host "fastcache-cc not found: $Launcher; skipping"; exit $SKIP }
 
-# Start-Process resolves a relative -FilePath against the PROCESS working
-# directory rather than PowerShell's, so a caller passing "out/build/..." would
-# get a spurious "file not found".
-$Fastcached = (Resolve-Path $Fastcached).Path
-$Node       = (Resolve-Path $Node).Path
-$Launcher   = (Resolve-Path $Launcher).Path
+    # Start-Process resolves a relative -FilePath against the PROCESS working
+    # directory rather than PowerShell's, so a caller passing "out/build/..." would
+    # get a spurious "file not found".
+    $Fastcached = (Resolve-Path $Fastcached).Path
+    $Node       = (Resolve-Path $Node).Path
+    $Launcher   = (Resolve-Path $Launcher).Path
+}
 
 # Scratch beside the build tree, not under %TEMP%, for the reason
 # run-launcher-e2e.ps1 records at length: on a GitHub runner %TEMP% is an 8.3
@@ -224,24 +263,186 @@ int Entry() {
     return $src
 }
 
-# Is `produced` a plausible compile of the same translation unit as `expected`?
+# Byte-identical, by hash rather than by Compare-Object.
 #
-# A SIZE comparison with a tolerance, not a byte comparison, and on this platform
-# that is forced rather than chosen. `cl` embeds the source path in the object
-# even without /Zi, so an object compiled from the worker's scratch directory
-# differs from a local one deterministically -- and in size, when the paths are
-# different lengths. Even two LOCAL compiles differ, by nine bytes of the
-# driver's own nondeterminism.
+# Compare-Object over two byte arrays allocates a PSObject per element, which is
+# fine for a small object file and needlessly fragile as soon as one is not. The
+# hash also makes the failure message useful: two digests say "these differ",
+# where a Compare-Object dump says it several thousand times.
+function Test-SameBytes([string]$a, [string]$b) {
+    $ha = (Get-FileHash -Algorithm SHA256 -LiteralPath $a).Hash
+    $hb = (Get-FileHash -Algorithm SHA256 -LiteralPath $b).Hash
+    if ($ha -eq $hb) { return $true }
+
+    # Say HOW they differ, not just that they do. This is the soundness assertion
+    # of the whole feature, so its failure is the one most worth being able to act
+    # on -- and equal sizes with different hashes means something quite different
+    # from a size mismatch: the first says the compile embedded something
+    # environment-specific, the second that it compiled something else entirely.
+    $sa = (Get-Item -LiteralPath $a).Length
+    $sb = (Get-Item -LiteralPath $b).Length
+    Write-Host "  reference: $sa bytes, $ha"
+    Write-Host "  produced:  $sb bytes, $hb"
+    if ($sa -ne $sb) { return $false }
+
+    $ba = [System.IO.File]::ReadAllBytes($a)
+    $bb = [System.IO.File]::ReadAllBytes($b)
+    $diffs = [System.Collections.Generic.List[int]]::new()
+    for ($i = 0; $i -lt $ba.Length; $i++) {
+        if ($ba[$i] -ne $bb[$i]) { [void]$diffs.Add($i) }
+    }
+    Write-Host ("  {0} differing byte(s); first offsets: {1}" -f $diffs.Count, (($diffs | Select-Object -First 24) -join ', '))
+    return $false
+}
+
+# The sections of a COFF object, in file order, each with a digest of its bytes.
 #
-# The tolerance is loose enough for a path and far too tight for a real fault: a
-# wrong optimisation level, a truncated transfer or the wrong toolchain each move
-# an object by far more than one percent, while the longest plausible path
-# difference is a few hundred bytes in sixty-odd kilobytes. The floor of 1 KiB
-# keeps it meaningful for very small objects.
+# Written rather than shelled out to `dumpbin` for two reasons: parsing a tool's
+# prose is worse than reading the structure it describes, and this has to run
+# against SYNTHETIC input in -SelfTest, where there is no object a linker would
+# recognise as belonging to anything.
 #
-# The POSIX fixture asserts strict byte-identity instead, and should: GCC and
-# clang embed nothing path-dependent without -g -- verified, including across
-# differing source filenames.
+# Returns $null for an object this cannot read -- today that means the `/bigobj`
+# format, whose header is a different structure entirely (Sig1 = 0x0000, Sig2 =
+# 0xFFFF where an ordinary object has its Machine field). Reporting that is the
+# point: silently mis-parsing it would compare two objects field by field against
+# a layout neither of them has.
+function Get-CoffSections([string]$path) {
+    $b = [System.IO.File]::ReadAllBytes($path)
+    if ($b.Length -lt 20) { return $null }
+    if ($b[0] -eq 0 -and $b[1] -eq 0 -and $b[2] -eq 0xFF -and $b[3] -eq 0xFF) { return $null } # /bigobj
+
+    $sectionCount = [BitConverter]::ToUInt16($b, 2)
+    $symbolTable  = [BitConverter]::ToUInt32($b, 8)
+    $symbolCount  = [BitConverter]::ToUInt32($b, 12)
+    $optionalSize = [BitConverter]::ToUInt16($b, 16)
+    $base = 20 + $optionalSize
+    if ($b.Length -lt $base + 40 * $sectionCount) { return $null }
+
+    $out = @()
+    foreach ($i in 0..([int]$sectionCount - 1)) {
+        $off = $base + 40 * $i
+        $name = [Text.Encoding]::ASCII.GetString($b, $off, 8).TrimEnd([char]0)
+        if ($name.StartsWith('/')) {
+            # A name too long for the eight-byte field lives in the string table,
+            # which follows the symbol table. COMDAT section names reach that length
+            # routinely, so this is the ordinary case rather than an exotic one.
+            $stringBase = $symbolTable + 18 * $symbolCount
+            $at = $stringBase + [int]$name.Substring(1)
+            if ($at -ge $b.Length) { return $null }
+            $stop = $at
+            while ($stop -lt $b.Length -and $b[$stop] -ne 0) { $stop++ }
+            $name = [Text.Encoding]::ASCII.GetString($b, $at, $stop - $at)
+        }
+        $size = [BitConverter]::ToUInt32($b, $off + 16)
+        $ptr  = [BitConverter]::ToUInt32($b, $off + 20)
+        $hash = 'empty'
+        if ($ptr -ne 0 -and $size -ne 0) {
+            if ($ptr + $size -gt $b.Length) { return $null }
+            $data = New-Object byte[] $size
+            [Array]::Copy($b, $ptr, $data, 0, $size)
+            $hash = [BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($data)).Replace('-', '')
+        }
+        $out += [pscustomobject]@{ Name = $name; Size = $size; Hash = $hash }
+    }
+    return $out
+}
+
+# The COFF header, field by field, and which fields may differ between two
+# compiles of the same code.
+#
+# TimeDateStamp is the clock, and both MSVC-family drivers write it: measured, two
+# compiles of one file to one path two seconds apart differ in exactly byte 4, and
+# `/Brepro` is what suppresses it. So no MSVC object is ever byte-identical to one
+# compiled in a different second, by anybody, distribution or not -- and the
+# fixture must not pass `/Brepro` to make its own assertion true, because then it
+# would be asserting something about a command line no build uses.
+#
+# PointerToSymbolTable is a FILE OFFSET, so it moves whenever an excused section
+# changes size, which on `cl` it always does. Excusing the record but not the
+# offset it shifts would fail every comparison for the reason it just excused.
+#
+# Everything else is compared, and Machine is why this is a table rather than a
+# skip: an object built for another architecture differs there and NOWHERE else
+# that a section walk would notice, which is exactly the class of wrongness this
+# whole fixture exists to catch.
+$CoffHeaderFields = @(
+    @{ Name = "Machine";              Offset = 0;  Size = 2; MayDiffer = $false }
+    @{ Name = "NumberOfSections";     Offset = 2;  Size = 2; MayDiffer = $false }
+    @{ Name = "TimeDateStamp";        Offset = 4;  Size = 4; MayDiffer = $true  }
+    @{ Name = "PointerToSymbolTable"; Offset = 8;  Size = 4; MayDiffer = $true  }
+    @{ Name = "NumberOfSymbols";      Offset = 12; Size = 4; MayDiffer = $false }
+    @{ Name = "SizeOfOptionalHeader"; Offset = 16; Size = 2; MayDiffer = $false }
+    @{ Name = "Characteristics";      Offset = 18; Size = 2; MayDiffer = $false }
+)
+
+# Does the produced object match the reference, by this driver's own standard?
+#
+# `$mayDiffer` names the SECTIONS whose content is the compiler's record of WHERE
+# it compiled rather than WHAT it compiled, and it is empty for a driver that
+# records no such thing. Everything outside it must match byte for byte, in the
+# same order and under the same names, so the exclusion cannot widen quietly: a
+# section that appears, disappears, or moves is a failure however it is spelled.
+#
+# What the exclusions cannot hide is covered elsewhere. A worker running a
+# DIFFERENT COMPILER is caught by the fingerprint the fixture already asserts
+# agreement on; a different ARCHITECTURE by the header table above; and different
+# CODE by `.text$mn` -- the three things `.debug$S` could otherwise be imagined to
+# be concealing.
+function Test-EquivalentObject([string]$reference, [string]$produced, [string[]]$mayDiffer) {
+    if (Test-SameBytes $reference $produced) { return $true }
+
+    $ba = [System.IO.File]::ReadAllBytes($reference)
+    $bb = [System.IO.File]::ReadAllBytes($produced)
+    if ($ba.Length -lt 20 -or $bb.Length -lt 20) {
+        Write-Host "  one of these is too short to be a COFF object"
+        return $false
+    }
+    foreach ($field in $CoffHeaderFields) {
+        if ($field.MayDiffer) { continue }
+        $x = if ($field.Size -eq 2) { [BitConverter]::ToUInt16($ba, $field.Offset) } else { [BitConverter]::ToUInt32($ba, $field.Offset) }
+        $y = if ($field.Size -eq 2) { [BitConverter]::ToUInt16($bb, $field.Offset) } else { [BitConverter]::ToUInt32($bb, $field.Offset) }
+        if ($x -ne $y) {
+            Write-Host ("  COFF header field {0} differs: {1} vs {2}" -f $field.Name, $x, $y)
+            return $false
+        }
+    }
+
+    $sa = Get-CoffSections $reference
+    $sb = Get-CoffSections $produced
+    if ($null -eq $sa -or $null -eq $sb) {
+        Write-Host "  one of these is not an ordinary COFF object (/bigobj?); cannot compare section by section"
+        return $false
+    }
+
+    $excused = @()
+    foreach ($i in 0..($sa.Count - 1)) {
+        if ($sa[$i].Name -ne $sb[$i].Name) {
+            Write-Host ("  section {0} is '{1}' in one and '{2}' in the other" -f $i, $sa[$i].Name, $sb[$i].Name)
+            return $false
+        }
+        if ($sa[$i].Hash -eq $sb[$i].Hash) { continue }
+        if ($mayDiffer -contains $sa[$i].Name) {
+            $excused += $sa[$i].Name
+            continue
+        }
+        Write-Host ("  section '{0}' differs ({1} vs {2} bytes) -- that is code or data, not a path record" `
+                    -f $sa[$i].Name, $sa[$i].Size, $sb[$i].Size)
+        return $false
+    }
+    $what = if ($excused.Count -eq 0) { "the clock" }
+            else { "the clock and " + (($excused | Select-Object -Unique) -join ', ') }
+    Write-Host ("  identical apart from {0}, which record when and where the compile happened" -f $what)
+    return $true
+}
+
+# The cache port is a PARAMETER, not read from the enclosing scope.
+#
+# It was the latter, and the isolation case below tried to override
+# $env:FASTCACHE_ADDR around the call -- which this function then clobbered on its
+# own first line, so that case silently used the MAIN cache while talking to the
+# isolation scheduler. It would still have passed, for the wrong reason, which is
+# the failure mode every fixture here is written to avoid.
 # Can this driver actually compile, or is it merely on PATH?
 #
 # `Get-Command` answers presence, which is not the question. A clang-cl that
@@ -267,21 +468,8 @@ int Probe() { return static_cast<int>(std::string("x").size()); }
     return (Test-Path $probeObj)
 }
 
-function Test-PlausibleObject([string]$expected, [string]$produced, [string]$what) {
-    if (-not (Test-Path $produced)) {
-        Write-Host ("  {0}: no object was produced" -f $what)
-        return $false
-    }
-    $a = (Get-Item -LiteralPath $expected).Length
-    $b = (Get-Item -LiteralPath $produced).Length
-    $tolerance = [Math]::Max(1024, [int]($a * 0.01))
-    $delta = [Math]::Abs($b - $a)
-    Write-Host ("   {0}: expected {1} bytes, produced {2} (delta {3}, tolerance {4})" -f $what, $a, $b, $delta, $tolerance)
-    return ($delta -le $tolerance)
-}
-
 function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj,
-                            [string]$scheduler, [int]$cache) {
+                            [string]$scheduler, [int]$cache, [string]$sourceName = "u.cpp") {
     $env:FASTCACHE_ADDR       = "127.0.0.1:$cache"
     $env:FASTCACHE_SOURCE_DIR = $root
     $env:FASTCACHE_BINARY_DIR = (Join-Path $root "build")
@@ -289,7 +477,7 @@ function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj,
     if ($scheduler) { $env:FASTCACHE_SCHEDULER = $scheduler }
     else            { Remove-Item -Path "env:FASTCACHE_SCHEDULER" -ErrorAction SilentlyContinue }
 
-    $source  = Join-Path $root "u.cpp"
+    $source  = Join-Path $root $sourceName
     $errFile = New-TemporaryFile
     $p = Start-Process -FilePath $Launcher `
         -ArgumentList (ConvertTo-QuotedArgs @($compiler, "/nologo", "/c", "/Fo$obj", $source)) `
@@ -298,9 +486,144 @@ function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj,
     Remove-Item $errFile -ErrorAction SilentlyContinue
     return @{ code = $p.ExitCode; stderr = $err }
 }
+# --- the object comparison, tested against input it can be given on purpose ----
+#
+# A COFF object built by hand, so the cases below can differ in exactly one thing.
+# Real objects cannot: two `cl` runs differ in their object PATH and their source
+# CHECKSUM together, which is precisely the entanglement that made a hand-run
+# control report a reproducible driver as non-reproducible.
+function New-SyntheticCoff([string]$path, [object[]]$sections, [uint32]$stamp = 0, [uint16]$machine = 0x8664) {
+    $rows = @($sections)
+    $header = New-Object byte[] 20
+    [Array]::Copy([BitConverter]::GetBytes($machine), 0, $header, 0, 2)
+    [Array]::Copy([BitConverter]::GetBytes([uint16]$rows.Count), 0, $header, 2, 2)
+    [Array]::Copy([BitConverter]::GetBytes($stamp), 0, $header, 4, 4)
+    # The symbol table pointer, the symbol count, the optional header size and the
+    # characteristics stay zero: nothing here reads them except the long-name path,
+    # which these names deliberately do not take.
+
+    $tableBytes = 40 * $rows.Count
+    $headers = New-Object byte[] $tableBytes
+    $blob = [System.Collections.Generic.List[byte]]::new()
+    $cursor = 20 + $tableBytes
+    foreach ($i in 0..($rows.Count - 1)) {
+        $name = [Text.Encoding]::ASCII.GetBytes($rows[$i].Name)
+        [Array]::Copy($name, 0, $headers, 40 * $i, [Math]::Min(8, $name.Length))
+        $bytes = [byte[]]$rows[$i].Bytes
+        [Array]::Copy([BitConverter]::GetBytes([uint32]$bytes.Length), 0, $headers, 40 * $i + 16, 4)
+        [Array]::Copy([BitConverter]::GetBytes([uint32]$cursor), 0, $headers, 40 * $i + 20, 4)
+        $blob.AddRange($bytes)
+        $cursor += $bytes.Length
+    }
+    $all = [System.Collections.Generic.List[byte]]::new()
+    $all.AddRange($header); $all.AddRange($headers); $all.AddRange($blob)
+    [System.IO.File]::WriteAllBytes($path, $all.ToArray())
+}
+
+function Invoke-SelfTest {
+    $failures = 0
+    function Assert-That([bool]$condition, [string]$what) {
+        if ($condition) { Write-Host "   ok   $what" }
+        else { Write-Host "   FAIL $what"; $script:selfTestFailures++ }
+    }
+    $script:selfTestFailures = 0
+
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("dist-e2e-selftest-" + [System.Diagnostics.Process]::GetCurrentProcess().Id)
+    if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    try {
+        $code    = [byte[]](1..64)
+        $other   = [byte[]](65..128)
+        $record  = [Text.Encoding]::ASCII.GetBytes("C:uild\one	u.o")
+        $record2 = [Text.Encoding]::ASCII.GetBytes("C:uild	wo	u.o")
+
+        $a = Join-Path $dir "a.obj"; $b = Join-Path $dir "b.obj"
+        $mayDiffer = @(".debug`$S", ".chks64")
+
+        # Identical objects match under every standard, and the byte comparison is
+        # what answers -- the section walk is never reached.
+        New-SyntheticCoff $a @(@{ Name = ".text`$mn"; Bytes = $code }, @{ Name = ".debug`$S"; Bytes = $record })
+        New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $code }, @{ Name = ".debug`$S"; Bytes = $record })
+        Assert-That (Test-EquivalentObject $a $b @()) "identical objects match with no section excused"
+        Assert-That (Test-EquivalentObject $a $b $mayDiffer) "identical objects match with sections excused"
+
+        # The real MSVC case: same code, a different record of where it was written.
+        New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $code }, @{ Name = ".debug`$S"; Bytes = $record2 })
+        Assert-That (Test-EquivalentObject $a $b $mayDiffer) "a differing path record is excused when the driver embeds one"
+        Assert-That (-not (Test-EquivalentObject $a $b @())) "and is NOT excused for a driver that embeds none"
+
+        # The case the whole assertion exists for: different code.
+        New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $other }, @{ Name = ".debug`$S"; Bytes = $record })
+        Assert-That (-not (Test-EquivalentObject $a $b $mayDiffer)) "differing code fails even with sections excused"
+
+        # A section that appears, disappears or is renamed is a failure however the
+        # rest compares: the excuse names sections, so it must not widen to a shape.
+        New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $code })
+        Assert-That (-not (Test-EquivalentObject $a $b $mayDiffer)) "a missing section fails"
+        New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $code }, @{ Name = ".chks64"; Bytes = $record })
+        Assert-That (-not (Test-EquivalentObject $a $b $mayDiffer)) "a renamed section fails"
+
+        # The clock, which both MSVC drivers write and neither can be asked not to
+        # without a flag no build passes: excused for every driver, so an object
+        # differing ONLY there matches even where no section may differ.
+        New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $code }, @{ Name = ".debug`$S"; Bytes = $record }) 0x67890123
+        Assert-That (Test-EquivalentObject $a $b @()) "a differing timestamp is excused for every driver"
+
+        # The architecture, which differs THERE and nowhere a section walk would
+        # see -- the reason the header is a table rather than a skip.
+        New-SyntheticCoff $b @(@{ Name = ".text`$mn"; Bytes = $code }, @{ Name = ".debug`$S"; Bytes = $record }) 0 0x014C
+        Assert-That (-not (Test-EquivalentObject $a $b $mayDiffer)) "a different target architecture fails"
+
+        # And the format this cannot read is reported rather than mis-parsed.
+        $big = Join-Path $dir "big.obj"
+        [System.IO.File]::WriteAllBytes($big, [byte[]](0x00, 0x00, 0xFF, 0xFF) + (New-Object byte[] 64))
+        Assert-That ($null -eq (Get-CoffSections $big)) "a /bigobj header is refused rather than mis-parsed"
+
+        # The parse itself, since everything above rests on it.
+        $sections = Get-CoffSections $a
+        Assert-That ($sections.Count -eq 2) "both sections are found"
+        Assert-That ($sections[0].Name -eq ".text`$mn" -and $sections[1].Name -eq ".debug`$S") "in file order, by name"
+        Assert-That ($sections[0].Size -eq $code.Length) "with their sizes"
+    } finally {
+        Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+    }
+
+    if ($script:selfTestFailures -ne 0) {
+        Write-Host "object-comparison self-test FAILED ($script:selfTestFailures)"
+        return 1
+    }
+    Write-Host "object-comparison self-test PASSED"
+    return 0
+}
+
+if ($SelfTest) { exit (Invoke-SelfTest) }
+
+
+# What "the same object" means, per driver, and why it is not one answer.
+#
+# Measured on MSVC 14.51 and clang-cl, by compiling the same text at different
+# paths and comparing section by section:
+#
+#   clang-cl records the source's BASE NAME (the COFF `.file` symbol) and nothing
+#   else about where it ran, and the worker is told that name -- so nothing but the
+#   clock may differ, and an empty row is what says so.
+#
+#   cl additionally writes the ABSOLUTE PATH OF THE OBJECT into `.debug$S`, with no
+#   debug flag asked for, and `.chks64` hashes the file it actually opened. A worker
+#   compiles its own scratch file to its own scratch path, so neither can ever
+#   match; every other section does, and those are the ones carrying code.
+#
+# A driver that recorded something new would fail here rather than being excused by
+# a rule written wide enough to cover it in advance.
+$Drivers = @(
+    @{ Name = "cl";       MayDiffer = @(".debug`$S", ".chks64") }
+    @{ Name = "clang-cl"; MayDiffer = @() }
+)
 
 try {
-    foreach ($cc in @("cl", "clang-cl")) {
+    foreach ($driver in $Drivers) {
+        $cc = $driver.Name
+        $mayDiffer = [string[]]$driver.MayDiffer
         if (-not (Get-Command $cc -ErrorAction SilentlyContinue)) {
             Write-Host "skip $cc (not on PATH)"
             continue
@@ -355,66 +678,95 @@ try {
         }
         Write-Host "   fingerprint agreed by launcher and worker"
 
-        # --- 1 + 2: the worker's object is a local object, then cached -------
+        # --- 1 + 2: an equivalent object, then served from the cache ---------
         $root = Join-Path $scratch "proj"
         $src  = New-Source $root "$cc-dist-case-one"
-        $obj  = Join-Path $root "build\u.obj"
+        $refObj = Join-Path $root "build\reference.obj"
+        $obj    = Join-Path $root "build\u.obj"
+
+        # Compiled to the object path the LAUNCHER will write, then moved aside.
+        #
+        # Not tidiness: `cl` records the absolute path of the object inside the
+        # object, so a reference built as `reference.obj` differs from one built as
+        # `u.obj` in that record alone -- which would put a difference into every
+        # comparison below that has nothing to do with distribution, and did.
+        & $cc /nologo /c "/Fo$obj" $src | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "the reference compile failed" }
+        Move-Item -LiteralPath $obj -Destination $refObj -Force
 
         $r = Invoke-Dispatching $cc $root $obj "127.0.0.1:$dispatchPort" $cachePort
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the dispatched compile failed" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
             Write-Host $r.stderr
+            # The WORKER's log too, not just the client's. A refusal reaches the
+            # client as one line naming a wire error code, and the reason it
+            # happened -- an unwritable scratch directory, a compiler that will not
+            # start -- is only ever visible on the worker. Printing one without the
+            # other is how a dispatch failure turns into a round trip.
             Write-Host "--- worker log ---"
             Write-Host (Read-LiveText $workerLog)
             throw "the compile was not dispatched to a worker"
         }
         if (-not (Test-Path $obj)) { throw "no object was written by the dispatched compile" }
 
-        # THE SOUNDNESS ASSERTION, and on MSVC it cannot be a byte comparison at
-        # all. Measured, not assumed, and the measurement corrected once:
-        #
-        # `cl` embeds the SOURCE PATH in the object even without /Zi. The worker
-        # compiles from its own scratch directory, so its path necessarily differs
-        # from any local one and the objects differ deterministically -- by a
-        # contiguous run of path text, and in SIZE when the two paths are different
-        # lengths. Both Windows jobs proved it by failing DIFFERENTLY on the same
-        # driver and input: the only variable between the runners is the build
-        # directory name (`cl-release` versus `clangcl-release`), which the local
-        # path contains and the worker's `%TEMP%` path does not.
-        #
-        # An earlier version of this asserted byte-identity "modulo the driver's
-        # nondeterminism". That was wrong twice over: the 70-byte figure it was
-        # calibrated on came from clang-cl rather than cl (whose own
-        # nondeterminism is 9 bytes), and the difference is not nondeterminism at
-        # all -- it is deterministic and path-dependent, so no tolerance for
-        # jitter could ever accommodate it.
-        #
-        # What IS assertable, and what this now checks: the compile was dispatched,
-        # the worker produced an object, the build succeeded, the object is of a
-        # sane size, and it is served from the cache next time. Correctness is not
-        # weakened by the embedded path -- same compiler, same flags, same
-        # preprocessed input -- and the POSIX fixture keeps the strict
-        # byte-identity claim, because GCC and clang embed nothing path-dependent
-        # without -g. See docs/tools/fastcache-compile-node.md.
-        #
-        # The size bound is deliberately loose enough for a path and far too tight
-        # for a real fault: a wrong optimisation level, a truncated transfer or the
-        # wrong toolchain all move an object by far more than one percent, while
-        # the longest plausible path difference here is a few hundred bytes in
-        # sixty-odd kilobytes.
-        $ctlDir = Join-Path $scratch "control"
-        New-Item -ItemType Directory -Force -Path $ctlDir | Out-Null
-        $ppSrc = Join-Path $ctlDir "tu.cpp"
-        & $cc /nologo /E $src 2>$null | Set-Content -Encoding utf8 $ppSrc
-        if ($LASTEXITCODE -ne 0) { throw "the control preprocess failed" }
-        $ctlObj = Join-Path $ctlDir "a.o"
-        & $cc /nologo -c $ppSrc "/Fo$ctlObj" 2>&1 | Out-Null
-        if (-not (Test-Path $ctlObj)) { throw "the control compile produced no object" }
+        # The whole soundness claim: an object built on the worker from
+        # `/E`-preprocessed text must match one this machine compiled directly, by
+        # this driver's own standard of matching.
+        if (-not (Test-EquivalentObject $refObj $obj $mayDiffer)) {
+            # THE CONTROL, and it answers the question the failure raises rather
+            # than the one it looks like. The reference compiles the ORIGINAL
+            # source; the worker compiles `/E`-preprocessed text. Those are
+            # different inputs, so a difference between them does not yet say
+            # whether distribution is at fault -- it might be inherent to compiling
+            # preprocessed text on this driver.
+            Write-Host "--- control: preprocess and compile locally, as the worker does ---"
+            $ctlDir = Join-Path $scratch "control"
+            New-Item -ItemType Directory -Force -Path $ctlDir | Out-Null
+            $ctlSrc = Join-Path $ctlDir (Split-Path $src -Leaf)
+            $ctlObj = Join-Path $ctlDir "control.obj"
+            & $cc /nologo /E $src 2>$null | Set-Content -Encoding utf8 $ctlSrc
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "  control preprocess failed; inconclusive"
+            } else {
+                & $cc /nologo -c $ctlSrc "/Fo$ctlObj" 2>&1 | Out-Null
+                if (-not (Test-Path $ctlObj)) {
+                    Write-Host "  control compile produced no object; inconclusive"
+                } elseif (Test-EquivalentObject $ctlObj $obj $mayDiffer) {
+                    Write-Host "  control MATCHES the worker: the difference is preprocessed-vs-original input,"
+                    Write-Host "  not the worker's environment."
+                } else {
+                    Write-Host "  control DIFFERS from the worker too."
 
-        if (-not (Test-PlausibleObject $ctlObj $obj "worker vs local")) {
-            throw "the worker's object is not a plausible compile of this translation unit"
+                    # Is this driver reproducible at all? Compile the identical
+                    # input a second time TO THE SAME PATH, keeping the first
+                    # result aside.
+                    #
+                    # The same path is the whole point, and the previous version of
+                    # this control got it wrong: it compiled to `tu2.o` and compared
+                    # against `tu.o`, so the object NAME differed -- which `cl`
+                    # records inside the object -- and it reported a perfectly
+                    # reproducible driver as non-reproducible, in a CI log, as the
+                    # answer to the question this fixture had been asking for three
+                    # commits.
+                    Write-Host "--- control 2: is this driver even reproducible? ---"
+                    $ctlKeep = Join-Path $ctlDir "control-first.obj"
+                    Move-Item -LiteralPath $ctlObj -Destination $ctlKeep -Force
+                    & $cc /nologo -c $ctlSrc "/Fo$ctlObj" 2>&1 | Out-Null
+                    if (-not (Test-Path $ctlObj)) {
+                        Write-Host "  second control compile produced no object; inconclusive"
+                    } elseif (Test-SameBytes $ctlKeep $ctlObj) {
+                        Write-Host "  two identical local compiles MATCH: the driver is reproducible,"
+                        Write-Host "  so the worker really is leaking its environment into the object."
+                    } else {
+                        Write-Host "  two identical local compiles DIFFER at the same path: this driver does"
+                        Write-Host "  not produce reproducible objects at all, and the assertion -- not the"
+                        Write-Host "  product -- is what needs to change."
+                    }
+                }
+            }
+            throw "the worker's object differs from the locally compiled one"
         }
-        Write-Host "   worker produced a sane object (byte-identity is not assertable on MSVC; see the note above)"
+        Write-Host "   the worker's object matches the local one"
 
         Remove-Item $obj -Force
         $r = Invoke-Dispatching $cc $root $obj "127.0.0.1:$dispatchPort" $cachePort
@@ -429,7 +781,55 @@ try {
         }
         Write-Host "   served from the cache on the second compile"
 
-        # --- 3: a worker for another toolchain is never chosen ---------------
+        # --- 3: a C translation unit comes back compiled as C --------------
+        #
+        # The worker names its own scratch file, and an MSVC driver reads the
+        # language off that name -- so while nothing stated the language, a
+        # dispatched `.c` was compiled as C++: a failed remote compile where C is
+        # not valid C++ (distribution silently never helping, with a green build),
+        # and an object with C++ mangling stored under the C key where it is.
+        #
+        # `/TP` and `/TC` are what state it now, and this is what would notice them
+        # being dropped again. It has to be an end-to-end case: the language is
+        # decided on the client, applied by a compiler in another process, and
+        # visible only in the object that comes back.
+        $croot = Join-Path $scratch "cproj"
+        New-Item -ItemType Directory -Force -Path (Join-Path $croot "build") | Out-Null
+        $csrc = Join-Path $croot "u.c"
+        # The tag is a string LITERAL, as New-Source explains at length: a comment
+        # does not survive preprocessing, and two cases whose preprocessed text is
+        # identical key identically -- so the second would open on the first one's
+        # entry and pass for a reason unrelated to its property.
+        @"
+#include <stddef.h>
+static const char Tag[] = "$cc-dist-case-c";
+static int Helper(int v) { return v + (int) sizeof(Tag); }
+int Entry(void) { return Helper((int) sizeof(size_t)); }
+"@ | Set-Content -Encoding utf8 $csrc
+
+        $cref = Join-Path $croot "build\reference.obj"
+        $cobj = Join-Path $croot "build\u.obj"
+        & $cc /nologo /c "/Fo$cobj" $csrc | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "the C reference compile failed" }
+        Move-Item -LiteralPath $cobj -Destination $cref -Force
+
+        $r = Invoke-Dispatching $cc $croot $cobj "127.0.0.1:$dispatchPort" $cachePort "u.c"
+        if ($r.code -ne 0) { Write-Host $r.stderr; throw "the dispatched C compile failed" }
+        if ($r.stderr -notmatch "DISPATCHED to ") {
+            Write-Host $r.stderr
+            Write-Host "--- worker log ---"
+            Write-Host (Read-LiveText $workerLog)
+            throw "the C compile was not dispatched to a worker"
+        }
+        if (-not (Test-Path $cobj)) { throw "no object was written by the dispatched C compile" }
+        # C compiled as C++ differs in far more than a path record: the symbols are
+        # mangled, so `.text$mn` and the symbol table both move.
+        if (-not (Test-EquivalentObject $cref $cobj $mayDiffer)) {
+            throw "a dispatched C translation unit did not come back compiled as C"
+        }
+        Write-Host "   a C translation unit was compiled as C on the worker"
+
+        # --- 4: a worker for another toolchain is never chosen ---------------
         # Its own daemon and its own worker, so the mismatched worker is the ONLY
         # one registered. Reusing the fleet above would leave a matching worker
         # available and the case would pass without testing anything.
@@ -458,8 +858,14 @@ try {
         $isoSrc  = New-Source $isoRoot "$cc-dist-case-three"
         $isoRef  = Join-Path $isoRoot "build\reference.obj"
         $isoObj  = Join-Path $isoRoot "build\u.obj"
-        & $cc /nologo /c "/Fo$isoRef" $isoSrc | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "the case 3 reference compile failed" }
+        # Compiled to the launcher's own output path and moved aside, as case 1
+        # does and for the same reason: `cl` records that path inside the object,
+        # so a reference built under another name differs from the fallback in the
+        # record alone. Both objects here are local compiles of one source by one
+        # driver to one path, so the ONLY thing left that may differ is the clock.
+        & $cc /nologo /c "/Fo$isoObj" $isoSrc | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "the case 4 reference compile failed" }
+        Move-Item -LiteralPath $isoObj -Destination $isoRef -Force
 
         $r = Invoke-Dispatching $cc $isoRoot $isoObj "127.0.0.1:$isoDispatch" $isoCache
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the compile failed with only a mismatched worker" }
@@ -471,12 +877,8 @@ try {
             Write-Host $r.stderr
             throw "expected a no-worker refusal naming the missing toolchain"
         }
-        # Tolerant here as well, and not for the same reason: these two DO compile
-        # the same source at the same path, so no path text differs -- but `cl` is
-        # nondeterministic by nine bytes between two identical compiles, so a
-        # strict comparison would flake rather than fail.
-        if (-not (Test-PlausibleObject $isoRef $isoObj "fallback vs reference")) {
-            throw "the locally compiled fallback object is wrong"
+        if (-not (Test-EquivalentObject $isoRef $isoObj @())) {
+            throw "the locally compiled fallback object does not match the reference"
         }
         Write-Host "   a mismatched worker was refused, and the build compiled locally"
 
