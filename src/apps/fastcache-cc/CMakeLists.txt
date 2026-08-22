@@ -39,8 +39,10 @@ set(_fc_cc_core
 # implementations of one wire format, one of them untested against the other.
 #
 # What it costs, stated so nobody rediscovers it: the launcher's build now needs
-# zstd and lz4, which are CPM-fetched rather than vcpkg, so MSVC_RUNTIME_LIBRARY
-# still propagates and the static-CRT link is unaffected. It does mean the launcher
+# zstd and lz4, which are CPM-fetched rather than vcpkg -- and they are built with
+# CMake's default MSVC runtime, which the static-CRT link below has to work around
+# in Debug (see the MSVC_RUNTIME_LIBRARY property for what it costs and why the
+# obvious fix is unavailable). It does mean the launcher
 # no longer builds without a network on a cold CPM cache, and it inherits the macOS
 # constraint the packaging job already carries: CPM_USE_LOCAL_PACKAGES=OFF, or a
 # Homebrew shared zstd gets linked and `otool -L` fails the "nothing outside
@@ -120,11 +122,30 @@ if(WIN32)
 endif()
 
 if(FASTCACHED_STATIC_LAUNCHER AND MSVC)
-    # CMP0091: MSVC_RUNTIME_LIBRARY selects /MT(d) vs /MD(d). Static so the CRT
-    # is baked in; the generator expression keeps the Debug variant (/MTd) for
-    # Debug configs.
+    # CMP0091: MSVC_RUNTIME_LIBRARY selects /MT(d) vs /MD(d). Static so the CRT is
+    # baked in and the shipped launcher needs no redistributable -- it is fetched as
+    # a bare binary by FASTCACHE_AUTO_INSTALL, onto machines that have no reason to
+    # carry one.
+    #
+    # DEBUG IS THE EXCEPTION, and it is not a preference. zstd and lz4 are CPM-built
+    # here and take CMake's default runtime (the DLL one), because the FastCache
+    # library links the very same static libraries and the daemon's vcpkg
+    # dependencies are dynamic-CRT builds -- so those two targets cannot both be
+    # satisfied by one setting. In Release nothing breaks: the CRT entry points zstd
+    # calls resolve out of whichever CRT the exe links. In Debug they do not, because
+    # `assert()` references `__imp__wassert`, which exists ONLY in the DLL CRT, and
+    # the launcher stopped linking at all the moment compression was added to it:
+    #
+    #     zstd_static.lib(zstd_compress.c.obj) : error LNK2001:
+    #         unresolved external symbol __imp__wassert
+    #
+    # Windows CI builds Release only, so `cl-debug` and `clangcl-debug` -- both
+    # documented in AGENT.md -- were broken for every Windows developer while every
+    # job stayed green. The Debug launcher is a developer artefact and never shipped,
+    # so it takes the runtime its dependencies were built with; the artefact that IS
+    # shipped keeps the static CRT it has always had.
     set_property(TARGET fastcache-cc PROPERTY
-        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        MSVC_RUNTIME_LIBRARY "$<IF:$<CONFIG:Debug>,MultiThreadedDebugDLL,MultiThreaded>")
 endif()
 
 install(TARGETS fastcache-cc
