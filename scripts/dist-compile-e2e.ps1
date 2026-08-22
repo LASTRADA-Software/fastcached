@@ -706,7 +706,10 @@ if ($SelfTest) { exit (Invoke-SelfTest) }
 #
 #   clang-cl records the source's BASE NAME (the COFF `.file` symbol) and nothing
 #   else about where it ran, and the worker is told that name -- so nothing but the
-#   clock may differ, and an empty row is what says so.
+#   clock may differ, and an empty row is what says so. That strictness is load-
+#   bearing rather than tidy: it is what fails, end to end, if the client ever
+#   stops telling the worker what to call its scratch file. Verified by making it
+#   stop.
 #
 #   cl additionally writes the ABSOLUTE PATH OF THE OBJECT into `.debug$S`, with no
 #   debug flag asked for, and `.chks64` hashes the file it actually opened. A worker
@@ -889,10 +892,23 @@ try {
         # not valid C++ (distribution silently never helping, with a green build),
         # and an object with C++ mangling stored under the C key where it is.
         #
-        # `/TP` and `/TC` are what state it now, and this is what would notice them
-        # being dropped again. It has to be an end-to-end case: the language is
-        # decided on the client, applied by a compiler in another process, and
-        # visible only in the object that comes back.
+        # WHAT THIS CASE GUARDS, established by reintroducing each defect and
+        # watching which leg fails, because two independent things now prevent it
+        # and a case that cannot tell them apart is worth stating precisely:
+        #
+        #   - with `/TC`//`/TP` removed AND the client's source name no longer sent,
+        #     this case fails (the remote compile of C-as-C++ fails outright, so
+        #     nothing is dispatched);
+        #   - with only the source name unsent, `/TC` carries the language and this
+        #     case still passes -- which is the point of stating it explicitly
+        #     rather than letting it ride on a file name;
+        #   - with only `/TC` removed, the name carries it instead, and the CASE 1
+        #     leg on clang-cl is what fails, because its symbol table then records
+        #     a name this machine never compiled.
+        #
+        # So the two mechanisms are guarded by two different legs, and neither is
+        # merely redundant. Which of them a given driver relies on is exactly what
+        # must not matter, and that is why both exist.
         $croot = Join-Path $scratch "cproj"
         New-Item -ItemType Directory -Force -Path (Join-Path $croot "build") | Out-Null
         $csrc = Join-Path $croot "u.c"
