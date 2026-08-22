@@ -84,7 +84,10 @@ struct DispatchRequest
     std::string_view objectKey;         ///< The cache key, for duplicate suppression.
     std::span<std::string const> args;  ///< Already filtered by `RemoteCompileArgs`.
     std::string_view preprocessed;      ///< The translation unit, preprocessed.
-    std::string_view sourceName;        ///< Base name the worker should give its temp file.
+    /// The translation unit's path, as the build system spelled it. Only its base
+    /// name travels -- see `Dispatch`, which takes it -- because that is what a
+    /// compiler records in the object and the worker has no use for the rest.
+    std::string_view sourceName;
 };
 
 /// Ask the scheduler for a worker and have it compile this translation unit.

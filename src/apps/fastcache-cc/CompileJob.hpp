@@ -22,7 +22,10 @@ struct CompileJob
     std::string fingerprint;       ///< The toolchain the client compiled against.
     std::vector<std::string> args; ///< Already filtered by the client's `RemoteCompileArgs`.
     std::string preprocessed;      ///< The translation unit, preprocessed.
-    std::string sourceName;        ///< The client's source name, used ONLY for its extension.
+    /// The base name the client asked its scratch file to be given. Sanitized
+    /// before it becomes a path -- see `SafeSourceName` -- and never trusted: this
+    /// is a string that arrived over a socket.
+    std::string sourceName;
 };
 
 /// Why a job was refused before any compiler ran.
@@ -120,15 +123,38 @@ class CompileJobRunner
 /// @return True when the worker will pass it on.
 [[nodiscard]] bool IsAcceptableJobArgument(std::string_view arg);
 
-/// The language extension a job's source name implies, sanitized.
+/// The file name a job's scratch source may be given, sanitized.
 ///
-/// Only the extension is taken, and only from a fixed set. The client's name is
-/// otherwise ignored entirely: it is used to decide C from C++, not to decide where
-/// anything goes. A name with no recognised extension yields `.cpp`, because a
-/// worker registered for a C++ toolchain compiling C++ is the overwhelmingly common
-/// case and guessing wrong costs a failed compile that is retried locally.
-/// @param sourceName The client's source name.
-/// @return An extension including the dot, always from the known set.
-[[nodiscard]] std::string_view SafeSourceExtension(std::string_view sourceName);
+/// The client asks for its own translation unit's base name, and it is worth having
+/// rather than inventing one: a compiler records the name of the file it was handed
+/// -- clang-cl and gcc in the `.file` symbol, MSVC in its compiland record -- so a
+/// worker naming every input `tu.cpp` produces an object that differs from a
+/// locally compiled one in that name and nothing else.
+///
+/// What it must never do is decide where anything GOES. The name arrives over a
+/// socket and becomes a path under the scratch directory, so it is reduced to one
+/// component and then to an allow-listed shape:
+///
+/// - the final component only, split on both separators and on a colon, so neither
+///   a parent-directory escape nor a drive-relative `C:x` survives;
+/// - a stem of `[A-Za-z0-9._+-]` with no leading dot, capped in length, which is
+///   what makes `..` unspellable rather than merely unlikely;
+/// - an extension from the same fixed table as before, defaulting to `.cpp`;
+/// - never a Windows reserved device name (CON, NUL, COM1, ...), which on a Windows
+///   worker names a device rather than a file and would send the translation unit
+///   to the console instead of to disk.
+///
+/// Anything failing any of those yields `tu` plus a safe extension. A name never
+/// fails a job: it is a cosmetic input, and refusing over one would cost a compile
+/// to gain nothing.
+///
+/// The LANGUAGE no longer rides on this. Every driver family is now told the
+/// language explicitly by the client (`-x c++-cpp-output`, `/TP`), which is what
+/// closed a dispatched `.c` translation unit being compiled as C++ because the
+/// worker had named its file `tu.cpp`.
+///
+/// @param sourceName The base name the client asked for.
+/// @return A file name safe to create inside the scratch directory.
+[[nodiscard]] std::string SafeSourceName(std::string_view sourceName);
 
 } // namespace FastCache::Cc

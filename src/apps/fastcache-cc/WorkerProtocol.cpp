@@ -120,7 +120,11 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     auto const outcome = _jobs.Run(CompileJob { .fingerprint = std::string { fingerprint },
                                                 .args = DecodeArgs(fields->args),
                                                 .preprocessed = *std::move(source),
-                                                .sourceName = {} });
+                                                // Sanitized where it becomes a path, not here: the
+                                                // runner is what creates the file, so the check
+                                                // belongs beside the creation rather than at each
+                                                // caller that might forget it.
+                                                .sourceName = std::string { Wire::AsStringView(fields->sourceName) } });
     if (!outcome.has_value())
         return Wire::EncodeErrorReply(WireCodeFor(outcome.error()), {});
 

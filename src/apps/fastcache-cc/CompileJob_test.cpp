@@ -161,9 +161,12 @@ TEST_CASE("An argument that could name a file is refused by the worker too", "[c
     CHECK(runner.Argv().empty()); // nothing was ever spawned
 }
 
-TEST_CASE("The worker names the source and the object, not the client", "[compile-job]")
+TEST_CASE("The worker decides where a byte lands, whatever the client asked to call it", "[compile-job]")
 {
-    // Nothing the client sends decides where a byte lands.
+    // The client now names its file, so this string genuinely arrives over a socket
+    // and becomes a path -- where before it was a theoretical defence for a field
+    // nothing encoded. What it may decide is the NAME; what it may never decide is
+    // the directory.
     ScriptedRunner runner;
     ScratchDir scratch;
     CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "g++" } } };
@@ -172,12 +175,35 @@ TEST_CASE("The worker names the source and the object, not the client", "[compil
     job.sourceName = "../../../etc/passwd.cpp";
     REQUIRE(jobs.Run(job).has_value());
 
+    // The LEAF may be what the client asked for -- that is the feature -- and the
+    // directory may not. So the assertion is containment, not absence: every path
+    // on the command line lies under this worker's own scratch root, and no
+    // parent-directory segment survived to take one back out of it.
+    auto const root = std::filesystem::weakly_canonical(scratch.path).generic_string();
     for (auto const& arg: runner.Argv())
     {
         INFO("argv entry: " << arg);
-        CHECK_FALSE(arg.contains("passwd"));
         CHECK_FALSE(arg.contains(".."));
+        if (arg.contains("passwd"))
+            CHECK(std::filesystem::weakly_canonical(arg).generic_string().starts_with(root));
     }
+}
+
+TEST_CASE("The worker gives its scratch file the name the client asked for", "[compile-job]")
+{
+    // A compiler records the name of the file it was handed, so a worker that
+    // invents one produces an object differing from a locally compiled one in that
+    // name and nothing else -- seven bytes on clang-cl, and the reason this travels
+    // at all.
+    ScriptedRunner runner;
+    ScratchDir scratch;
+    CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "g++" } } };
+
+    auto job = Job();
+    job.sourceName = "Widget.cpp";
+    REQUIRE(jobs.Run(job).has_value());
+
+    CHECK(std::ranges::any_of(runner.Argv(), [](std::string const& a) { return a.ends_with("Widget.cpp"); }));
 }
 
 TEST_CASE("A successful compile returns the object the compiler wrote", "[compile-job]")
@@ -252,17 +278,47 @@ TEST_CASE("Each job gets its own scratch directory, and it is removed", "[compil
     CHECK(std::filesystem::is_empty(scratch.path));
 }
 
-TEST_CASE("SafeSourceExtension takes only a known extension", "[compile-job]")
+TEST_CASE("SafeSourceName keeps a name that is one, and replaces every name that is not", "[compile-job]")
 {
-    CHECK(SafeSourceExtension("a.cpp") == ".cpp");
-    CHECK(SafeSourceExtension("a.c") == ".c");
-    CHECK(SafeSourceExtension("a.cc") == ".cc");
-    // Anything unrecognised, and anything that is not really an extension, becomes
-    // the common case rather than reaching a compiler's command line.
-    CHECK(SafeSourceExtension("a.exe") == ".cpp");
-    CHECK(SafeSourceExtension("a") == ".cpp");
-    CHECK(SafeSourceExtension("") == ".cpp");
-    CHECK(SafeSourceExtension("a.cpp; rm -rf /") == ".cpp");
+    // Kept: an ordinary base name with a known extension.
+    CHECK(SafeSourceName("a.cpp") == "a.cpp");
+    CHECK(SafeSourceName("Widget.cc") == "Widget.cc");
+    CHECK(SafeSourceName("legacy_module-2.c") == "legacy_module-2.c");
+
+    // One component only, in either separator style, so nothing decides a directory.
+    CHECK(SafeSourceName("../../../etc/passwd.cpp") == "passwd.cpp");
+    CHECK(SafeSourceName("..\\..\\windows\\system32\\evil.cpp") == "evil.cpp");
+    CHECK(SafeSourceName("/absolute/a.cpp") == "a.cpp");
+    // A colon counts as a separator: `C:a.cpp` is drive-relative on a Windows worker.
+    CHECK(SafeSourceName("C:a.cpp") == "a.cpp");
+    // And a name that is nothing BUT an escape has nothing left to keep.
+    CHECK(SafeSourceName("..") == "tu.cpp");
+    CHECK(SafeSourceName("../..") == "tu.cpp");
+
+    // An unrecognised extension becomes the common case rather than reaching a
+    // compiler's command line.
+    CHECK(SafeSourceName("a.exe") == "a.cpp");
+    CHECK(SafeSourceName("a") == "a.cpp");
+    CHECK(SafeSourceName("") == "tu.cpp");
+
+    // A stem that is not an allow-listed shape is replaced whole, so nothing a
+    // shell or a compiler treats specially survives.
+    CHECK(SafeSourceName("a.cpp; rm -rf /") == "tu.cpp");
+    CHECK(SafeSourceName("a b.cpp") == "tu.cpp");
+    CHECK(SafeSourceName("$(whoami).cpp") == "tu.cpp");
+    CHECK(SafeSourceName(".hidden.cpp") == "tu.cpp");
+    CHECK(SafeSourceName(std::string(65, 'x') + ".cpp") == "tu.cpp");
+
+    // Windows device names, with and without an extension and in any case: on a
+    // Windows worker `CON.cpp` is the console, so the translation unit would be
+    // written to a terminal and the compile would find nothing to read.
+    CHECK(SafeSourceName("CON.cpp") == "tu.cpp");
+    CHECK(SafeSourceName("con.cpp") == "tu.cpp");
+    CHECK(SafeSourceName("NUL.c") == "tu.c");
+    CHECK(SafeSourceName("com1.cpp") == "tu.cpp");
+    CHECK(SafeSourceName("LPT9.cc") == "tu.cc");
+    // ... and a name that merely starts like one is ordinary.
+    CHECK(SafeSourceName("console.cpp") == "console.cpp");
 }
 
 TEST_CASE("IsAcceptableJobArgument applies the strictest reading", "[compile-job]")

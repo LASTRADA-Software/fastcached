@@ -29,6 +29,23 @@ namespace
         return out;
     }
 
+    /// The final component of a path, in either separator style.
+    ///
+    /// The worker is told what to CALL its scratch file, not where the client keeps
+    /// its sources: a compiler records the name it was handed (clang-cl and gcc in
+    /// the `.file` symbol, MSVC in its compiland record), so matching the base name
+    /// is what makes a dispatched object byte-identical to a locally compiled one --
+    /// measured at seven bytes' difference on clang-cl before this, and none after.
+    /// The directory buys none of that and would tell a worker where a client's
+    /// checkout lives.
+    /// @param path The source path as the build system spelled it.
+    /// @return Its final component.
+    [[nodiscard]] std::string_view BaseName(std::string_view path)
+    {
+        auto const slash = path.find_last_of("/\\");
+        return slash == std::string_view::npos ? path : path.substr(slash + 1);
+    }
+
     /// Wrap `payload` in a codec envelope, compressing when it is worth it.
     ///
     /// Falls back to `Identity` whenever compression did not actually shrink the
@@ -168,7 +185,8 @@ DispatchResult Dispatch(IEndpointDialer& dialer,
                                                                          .fingerprint = request.fingerprint,
                                                                          .args = argsField,
                                                                          .source = sourceField,
-                                                                         .acceptedCodecs = accepted });
+                                                                         .acceptedCodecs = accepted,
+                                                                         .sourceName = BaseName(request.sourceName) });
     auto const compileOutcome = ExchangeFramed(*worker, compileFrame, credential);
     if (compileOutcome.kind == CacheOutcomeKind::Transport)
         return Refused(DispatchStatus::Unavailable, std::format("compile exchange with {} failed", endpoint));

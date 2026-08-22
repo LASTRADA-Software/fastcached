@@ -316,7 +316,7 @@ inline constexpr std::array OpTable {
                    .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::Compile,
                    .name = "compile",
-                   .fieldCount = 5, // leaseToken, fingerprint, args, preprocessed, accepted codecs
+                   .fieldCount = 6, // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = false,
                    .maxPayload = 0 }, // carries a preprocessed TU; the operator's cap governs
@@ -1029,6 +1029,20 @@ struct CompileRequest
     /// never sees the lease request -- and asking the scheduler for it would put a
     /// round trip on the one exchange that must not have one.
     CodecList acceptedCodecs;
+    /// The BASE NAME of the translation unit, for the worker to name its scratch
+    /// file with.
+    ///
+    /// A compiler records the name of the file it was handed -- clang-cl and gcc in
+    /// the COFF/ELF `.file` symbol, MSVC in its compiland record -- so a worker that
+    /// invents a name of its own produces an object that differs from a locally
+    /// compiled one in that name and nothing else. Measured on clang-cl: seven bytes,
+    /// and byte-identical once the names agree.
+    ///
+    /// The base name only. The worker has no use for the client's directory and no
+    /// business learning it, and the worker sanitizes what arrives regardless: this
+    /// is a string from the network that becomes a path, so the two checks are the
+    /// same pair as the argument filter's.
+    std::string_view sourceName;
 };
 
 /// The same, as views into a received payload.
@@ -1037,8 +1051,9 @@ struct CompileView
     std::span<std::byte const> leaseToken;
     std::span<std::byte const> fingerprint;
     std::span<std::byte const> args;
-    std::span<std::byte const> source; ///< Still enveloped; decode with DecodeCodecEnvelope.
-    CodecList acceptedCodecs;          ///< What the client can decode.
+    std::span<std::byte const> source;     ///< Still enveloped; decode with DecodeCodecEnvelope.
+    CodecList acceptedCodecs;              ///< What the client can decode.
+    std::span<std::byte const> sourceName; ///< Base name to give the scratch file; sanitize before use.
 };
 
 /// Frame a REGISTER request.
@@ -1145,7 +1160,8 @@ struct HeartbeatView
                                    AsBytes(request.fingerprint),
                                    request.args,
                                    request.source,
-                                   std::span<std::byte const> { codecs } });
+                                   std::span<std::byte const> { codecs },
+                                   AsBytes(request.sourceName) });
 }
 
 /// Split a COMPILE payload.
@@ -1160,7 +1176,8 @@ struct HeartbeatView
                          .fingerprint = (*fields)[1],
                          .args = (*fields)[2],
                          .source = (*fields)[3],
-                         .acceptedCodecs = DecodeCodecList((*fields)[4]) };
+                         .acceptedCodecs = DecodeCodecList((*fields)[4]),
+                         .sourceName = (*fields)[5] };
 }
 
 /// What a scheduler answers a LEASE with, on success.

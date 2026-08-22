@@ -25,6 +25,58 @@ namespace
         ".cpp", ".cc", ".cxx", ".c", ".m", ".mm", ".S",
     };
 
+    /// What a name falls back to when the client's cannot be used.
+    constexpr std::string_view DefaultStem = "tu";
+    constexpr std::string_view DefaultExtension = ".cpp";
+
+    /// The longest stem a client may ask for.
+    ///
+    /// A real source name is far shorter; the cap is here because the string comes
+    /// off a socket and a path has a limit on every platform this runs on.
+    constexpr std::size_t MaxStemLength = 64;
+
+    /// Names Windows resolves to a DEVICE rather than to a file, with or without an
+    /// extension: `CON.cpp` opens the console.
+    ///
+    /// Compared case-insensitively against the stem, which is why the table carries
+    /// one spelling each. A worker on POSIX is unaffected and checks anyway -- the
+    /// scratch file is written by whichever host is doing the compiling, and a rule
+    /// that holds only on the host that happens to be running the test is the kind
+    /// this repository keeps finding the hard way.
+    constexpr std::array<std::string_view, 22> ReservedDeviceNames {
+        "con",  "prn",  "aux",  "nul",  "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+        "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    };
+
+    /// ASCII lower-case, deliberately not `std::tolower`.
+    ///
+    /// Locale-dependent folding is how a rule comes to mean different things on two
+    /// machines: under a Turkish locale `std::tolower('I')` is not `i`, so `LPT1`
+    /// would be reserved on one worker and allowed on the next.
+    /// @param text The text to fold.
+    /// @return The folded copy.
+    [[nodiscard]] std::string AsciiLower(std::string_view text)
+    {
+        std::string out { text };
+        for (char& c: out)
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c - 'A' + 'a');
+        return out;
+    }
+
+    /// Whether a stem may be used as a file name inside the scratch directory.
+    /// @param stem The name without its extension.
+    /// @return True when it is safe to create.
+    [[nodiscard]] bool IsSafeStem(std::string_view stem)
+    {
+        if (stem.empty() || stem.size() > MaxStemLength || stem.front() == '.')
+            return false;
+        constexpr std::string_view Allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-";
+        if (!std::ranges::all_of(stem, [&](char c) { return Allowed.contains(c); }))
+            return false;
+        return std::ranges::find(ReservedDeviceNames, AsciiLower(stem)) == ReservedDeviceNames.end();
+    }
+
     /// Read a whole file as bytes.
     /// Read a whole file as bytes.
     ///
@@ -76,16 +128,24 @@ bool IsAcceptableJobArgument(std::string_view arg)
     return !body.contains('/') && !body.contains('\\');
 }
 
-std::string_view SafeSourceExtension(std::string_view sourceName)
+std::string SafeSourceName(std::string_view sourceName)
 {
-    auto const dot = sourceName.find_last_of('.');
-    if (dot != std::string_view::npos)
-    {
-        auto const extension = sourceName.substr(dot);
-        if (std::ranges::find(KnownExtensions, extension) != KnownExtensions.end())
-            return extension;
-    }
-    return ".cpp";
+    // One component. A colon counts as a separator here even on POSIX: `C:x` is a
+    // path on a Windows worker and an ordinary file name nowhere that matters, and
+    // the cost of being wrong is a name, while the cost of being right is nothing.
+    auto const separator = sourceName.find_last_of("/\\:");
+    auto const name = separator == std::string_view::npos ? sourceName : sourceName.substr(separator + 1);
+
+    auto const dot = name.find_last_of('.');
+    auto const stem = dot == std::string_view::npos ? name : name.substr(0, dot);
+    auto const extension = dot == std::string_view::npos ? std::string_view {} : name.substr(dot);
+
+    auto const safeExtension =
+        std::ranges::find(KnownExtensions, extension) != KnownExtensions.end() ? extension : DefaultExtension;
+
+    if (!IsSafeStem(stem))
+        return std::string { DefaultStem } + std::string { safeExtension };
+    return std::string { stem } + std::string { safeExtension };
 }
 
 CompileJobRunner::CompileJobRunner(IProcessRunner& runner,
@@ -156,7 +216,7 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
     };
     ScratchGuard const guard { scratch };
 
-    auto const source = scratch / std::format("tu{}", SafeSourceExtension(job.sourceName));
+    auto const source = scratch / SafeSourceName(job.sourceName);
     auto const object = scratch / "tu.o";
     {
         std::ofstream out { source, std::ios::binary };
