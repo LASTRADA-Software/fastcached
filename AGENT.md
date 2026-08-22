@@ -33,6 +33,14 @@ src/FastCache/
                 + tagged-text-region framing), PrefetchGroupManifest
                 (prefetch-group id -> key-set + reverse index) — the
                 compile-cache executor's domain logic
+  Distributed/  WorkerRegistry (the worker set: exact-fingerprint grouping,
+                least-outstanding pick, heartbeat expiry over IClock) and
+                LeaseTable (lease issue/expiry/release plus the in-flight key
+                map that suppresses duplicate work). Both pure with respect to
+                I/O, which is what lets every capacity and expiry rule be a
+                ManualClock unit test rather than a sleep. Named Distributed
+                and not Dispatch because RedisResp.cpp already has a Dispatch()
+                that collides under unqualified lookup inside namespace FastCache.
   Protocol/     IProtocolHandler, ProtocolAutodetect, MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
                 RedisResp (RESP2), CompileCacheHandler (the executor: custom
@@ -78,6 +86,17 @@ src/apps/
                             its help renders and colorizes exactly like the
                             daemon's without linking the library. `Cli/Options`
                             is header-only, so including it costs no build row.
+  fastcache-compile-node/   the compile worker (FASTCACHED_BUILD_NODE, default
+                            ON) — registers with a scheduler's `--listen-dispatch`
+                            endpoint, then answers exactly one verb, `Compile`,
+                            on its own port. It takes a *fingerprint* from a job
+                            and never a program: the compiler comes from this
+                            node's own `--toolchain` table, which is what keeps a
+                            build accelerator from being a remote shell. Links
+                            `FastCache` (unlike the launcher), because it needs
+                            the reactor and the wire, and holds no cache stack of
+                            its own — `AdminHttpServer`, not `Server`, is the
+                            shape it follows.
   compile-cache-testclient/ low-level `0xFC` protocol probe + cross-depth
                             validation (FASTCACHED_BUILD_TESTCLIENT, default
                             OFF — test infrastructure, never installed)
@@ -1247,6 +1266,23 @@ and exiting 0, matched by `SKIP_REGULAR_EXPRESSION` — a `cmake -P` script cann
 choose its own exit code before CMake 3.29 (`cmake_language(EXIT)`) and this
 project supports 3.28, so a `SKIP_RETURN_CODE` it could never return would be dead
 configuration.
+
+**Which CMakeLists registers a script-driven test is load-bearing, not filing.**
+`src/apps` walks its app table *in order*, so a test registered beside one binary
+cannot name a binary that comes later in that table: at the point
+`src/apps/fastcache-cc` is configured, `fastcache-compile-node` is not a target
+yet, and a `$<TARGET_FILE:>` guard on it does not fail — it silently skips the
+test, forever, with one `message(STATUS)` in a configure log nobody reads.
+`src/tests` is added *after* `src/apps`, so every target exists by the time it
+runs. That is why `dist-compile-e2e` lives there, and the general rule is that a
+script-driven test naming more than one executable belongs in `src/tests`
+regardless of which binary it feels closest to. (`compile-cache-e2e` predates the
+rule and names only `fastcached`, which the table happens to reach first.)
+
+`dist-compile-e2e` additionally allocates its ports per run rather than fixing
+them. It needs four, and four more fixed ports is four more ways to collide with
+whatever else a CI runner is doing — a failure that reads as "distribution is
+broken" when it means "something else was listening".
 
 ## Releasing
 
