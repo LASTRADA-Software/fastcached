@@ -47,6 +47,7 @@ set(_fc_cc_sources
     ReplayGuard.cpp
     RootReconciler.cpp
     Stats.cpp
+    ToolchainFingerprint.cpp
     ProcessRunner.cpp
     TcpClient.cpp)
 
@@ -100,6 +101,7 @@ if(FASTCACHED_BUILD_TESTS)
         RootReconciler_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp
+        ToolchainFingerprint_test.cpp
         TcpClient_test.cpp
         ${_fc_cc_core}
     )
