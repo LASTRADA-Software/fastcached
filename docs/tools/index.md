@@ -1,6 +1,6 @@
 # Tools
 
-The project ships two executables and one test client.
+The project ships three executables and one test client.
 
 ## `fastcached` — the cache daemon
 
@@ -27,6 +27,23 @@ entries instead of each maintaining their own.
 
 Full reference: [fastcache-cc](fastcache-cc.md).
 
+## `fastcache-compile-node` — the compile worker
+
+Takes translation units that missed the cache and compiles them, so a build is
+not limited to the cores of the machine running it. Workers register with a
+`fastcached` acting as scheduler, and clients are handed one on a miss.
+
+It is not a cache and not a scheduler: it holds no keys, stores nothing, and is
+given no cache credentials — the object goes back to the client, which stores
+it. A job names a *toolchain fingerprint*, never a program, and the worker maps
+that to a compiler from its own configuration; that is what keeps a build
+accelerator from being a remote shell.
+
+Every refusal — no matching toolchain, no free slot, an unreachable worker —
+falls back to a local compile, so distribution cannot fail a build.
+
+Full reference: [fastcache-compile-node](fastcache-compile-node.md).
+
 ## `compile-cache-testclient` — the protocol probe
 
 Test infrastructure, not a product: a low-level client for the `0xFC` protocol
@@ -40,6 +57,7 @@ Reference: [compile-cache-testclient](compile-cache-testclient.md).
 | Goal | Use |
 |------|-----|
 | Speed up C/C++ compiles across machines | `fastcache-cc` + a `fastcached` daemon |
+| Compile on other machines too, not just cache | add `fastcache-compile-node` workers |
 | Back an existing sccache setup | `fastcached` alone, via `SCCACHE_MEMCACHED` / `SCCACHE_REDIS` |
 | A memcached- or Redis-compatible cache | `fastcached` alone |
 | Verify path canonicalization while hacking on the cache | `compile-cache-testclient` |

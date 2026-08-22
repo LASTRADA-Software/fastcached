@@ -59,6 +59,10 @@ Which statuses an op may be answered with is table data, not convention:
 | STORE | Ok, Error |
 | FETCH | Ok, Miss, Error |
 | AUTH | Ok, Error |
+| REGISTER | Ok, Error |
+| HEARTBEAT | Ok, Error |
+| LEASE | Ok, Error |
+| COMPILE | Ok, Error |
 
 A miss and a refusal being distinct is the point. When both were the byte `0x00`,
 a client the daemon could not serve saw an endlessly cold cache and no
@@ -76,6 +80,13 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x06` | canonicalization-failed | A text region's paths could not be canonicalized. |
 | `0x07` | storage-write-failed | The cache engine refused the write. |
 | `0x08` | unauthenticated | A credential is required and has not been accepted on this connection. |
+| `0x09` | no-worker | No registered worker matches the requested toolchain. |
+| `0x0a` | no-capacity | Every matching worker is at its slot limit. |
+| `0x0b` | already-in-flight | Another client is already compiling this key. |
+| `0x0c` | dispatch-not-permitted | This listener does not serve distributed execution. |
+| `0x0d` | unknown-lease | The lease token is unknown or has expired. |
+| `0x0e` | fingerprint-mismatch | The worker does not serve the toolchain the job names. |
+| `0x0f` | unsupported-codec | No codec in common with what the request offered. |
 
 ### STORE
 
@@ -105,6 +116,66 @@ client localizes it to its own layout.
 An empty `username` asks to be verified against the secret alone — the redis
 `requirepass` form, and the usual one. The field is always present so the frame
 arity does not depend on which credential style a client uses.
+
+## Distributed execution
+
+Four more verbs turn the same wire into a scheduler and a worker protocol. They
+are served **only** on a listener an operator opted in with `--listen-dispatch`;
+a dispatch verb arriving on a cache-only listener is answered
+`dispatch-not-permitted` rather than served, because the surface that makes a
+compiler *run* on another machine should be firewalled separately from the cache.
+
+`REGISTER` carries **one** fingerprint, so a worker serving several toolchains
+registers once per toolchain. The scheduler keys a worker on
+(fingerprint, endpoint), so those are separate entries — but every one of them
+heartbeats the same machine-wide in-flight count, so the entries fill up together
+and the pool behaves as one rather than advertising N times the machine.
+
+`REGISTER`, `HEARTBEAT` and `LEASE` go to the scheduler. `COMPILE` goes to a
+worker, on its own port, and is the only verb a worker answers at all —
+everything else, the scheduler's verbs included, is refused with
+`dispatch-not-permitted`, so a client that sent the wrong verb to the wrong port
+learns which rather than seeing a dropped connection it cannot tell from a dead
+host.
+
+```
+REGISTER   [fingerprint][endpoint][slots][codecs]       -> [workerId]
+HEARTBEAT  [workerId][inFlight]                          -> Ok
+LEASE      [fingerprint][objectKey][codecs]              -> [endpoint][leaseToken][workerCodecs]
+COMPILE    [leaseToken][fingerprint][args][source][codecs] -> [exitCode][object][stdout][stderr]
+```
+
+Two rules carry the weight and neither is configurable. A job goes only to a
+worker whose fingerprint is **byte-identical**: an over-strict match costs a
+local compile, an over-loose one produces a silently wrong object stored under a
+key other machines fetch, and those errors are not symmetric. And the scheduler
+picks the **least-outstanding** worker rather than round-robining, because
+compile times vary by an order of magnitude within one build, so distributing
+arrivals rather than load queues a long translation unit behind another while a
+worker idles.
+
+Because the scheduler *is* the cache, it can also suppress duplicate work: when
+many clients miss the same key at once — the ordinary shape of a miss after a
+header change — only the first is dispatched and the rest compile locally.
+
+### Bulk fields carry a codec envelope
+
+A preprocessed translation unit and an object file are both large, so those
+fields travel as `[u8 codec][u32 rawLen][bytes]` using the same codec ids the
+cache already documents. The request carries the list of codecs the sender
+accepts and the reply picks one from it, so the two ends agree with **no extra
+round trip** — the same reasoning that keeps `AUTH` free. `rawLen` is what lets
+a receiver reject a declared expansion before decompressing a byte, and nothing
+in common falls back to `Identity` rather than refusing, so a build never loses
+its cache because two peers were compiled with different codec sets.
+
+### Control verbs have a lower ceiling
+
+`REGISTER`, `HEARTBEAT` and `LEASE` are capped at 64 KiB rather than the session
+cap. That listener is meant to be reachable by a whole fleet, and a scheduler
+that can be made to allocate 256 MiB per frame by anything that authenticated
+once is a scheduler that stops scheduling. `COMPILE` is the deliberate exception,
+since it carries a whole translation unit.
 
 ## Authentication
 

@@ -81,6 +81,7 @@ nav:
   - Tools:
     - Overview: tools/index.md
     - fastcache-cc (compiler launcher): tools/fastcache-cc.md
+    - fastcache-compile-node (compile worker): tools/fastcache-compile-node.md
     - compile-cache-testclient: tools/compile-cache-testclient.md
   - Protocols:
     - Overview: protocols/overview.md

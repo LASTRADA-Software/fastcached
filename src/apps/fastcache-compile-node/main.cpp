@@ -172,6 +172,60 @@ struct ToolchainEntry
                             .compiler = std::string { spec.substr(eq + 1) } };
 }
 
+/// Resolve every `--toolchain` value to a fingerprint the scheduler can match.
+///
+/// Extracted from `main` rather than inlined, and not only for its length: this
+/// is the one part of startup that runs an external process and can take
+/// seconds, so it is worth being able to read on its own.
+///
+/// @param specs The raw `--toolchain` values.
+/// @param runner Process-spawning seam, for the compiler probes.
+/// @param logger Startup log.
+/// @return Fingerprint to compiler path, or nullopt when a value is malformed.
+[[nodiscard]] std::optional<std::map<std::string, std::string>> ResolveToolchains(std::vector<std::string> const& specs,
+                                                                                  Cc::IProcessRunner& runner,
+                                                                                  ILogger& logger)
+{
+    std::map<std::string, std::string> toolchains;
+    for (auto const& spec: specs)
+    {
+        auto const split = SplitToolchain(spec);
+        if (!split.has_value())
+        {
+            logger.Logf(
+                LogLevel::Error, "malformed --toolchain '{}'; expected <compiler> or <fingerprint>=<compiler>", spec);
+            return std::nullopt;
+        }
+
+        auto fingerprint = split->fingerprint;
+        if (fingerprint.empty())
+        {
+            // The same computation the launcher performs, through the same
+            // functions -- which is the point. A worker that derived its identity
+            // differently from its clients would register successfully, heartbeat
+            // happily, and never be matched, with nothing anywhere reporting why.
+            //
+            // Logged at info because it is slow the first time (a full walk of the
+            // include tree, seconds) and instant afterwards, and an operator
+            // watching a worker start deserves to know which of the two is
+            // happening rather than wondering whether it has hung.
+            logger.Logf(LogLevel::Info, "computing the toolchain fingerprint for {}", split->compiler);
+            auto const banner = Cc::CompilerBanner(runner, split->compiler);
+            auto const flavor = Cc::ClassifyCompiler(split->compiler);
+            fingerprint = Cc::CachedToolchainFingerprint(runner, split->compiler, banner, Cc::DriverOf(flavor));
+        }
+
+        // Reported unconditionally, including for an explicit override. A
+        // fingerprint mismatch is invisible from both ends -- the scheduler just
+        // says no worker matches -- so the one place the worker's own digest can
+        // be seen is its startup log, next to `fastcache-cc
+        // --print-toolchain-fingerprint` on the client.
+        logger.Logf(LogLevel::Info, "serving {} as {}", split->compiler, fingerprint);
+        toolchains.emplace(std::move(fingerprint), split->compiler);
+    }
+    return toolchains;
+}
+
 /// A port, refusing 0 rather than letting a bind fail with a confusing message.
 [[nodiscard]] std::expected<std::uint16_t, ConfigError> ParseNodePort(std::string_view sv)
 {
@@ -395,43 +449,10 @@ int main(int argc, char** argv)
 
     auto const runner = Cc::MakeProcessRunner();
 
-    std::map<std::string, std::string> toolchains;
-    for (auto const& spec: cfg.toolchains)
-    {
-        auto const split = SplitToolchain(spec);
-        if (!split.has_value())
-        {
-            logger.Logf(
-                LogLevel::Error, "malformed --toolchain '{}'; expected <compiler> or <fingerprint>=<compiler>", spec);
-            return 2;
-        }
-
-        auto fingerprint = split->fingerprint;
-        if (fingerprint.empty())
-        {
-            // The same computation the launcher performs, through the same
-            // functions -- which is the point. A worker that derived its identity
-            // differently from its clients would register successfully, heartbeat
-            // happily, and never be matched, with nothing anywhere reporting why.
-            //
-            // Logged at info because it is slow the first time (a full walk of the
-            // include tree, seconds) and instant afterwards, and an operator
-            // watching a worker start deserves to know which of the two is
-            // happening rather than wondering whether it has hung.
-            logger.Logf(LogLevel::Info, "computing the toolchain fingerprint for {}", split->compiler);
-            auto const banner = Cc::CompilerBanner(*runner, split->compiler);
-            auto const flavor = Cc::ClassifyCompiler(split->compiler);
-            fingerprint = Cc::CachedToolchainFingerprint(*runner, split->compiler, banner, Cc::DriverOf(flavor));
-        }
-
-        // Reported unconditionally, including for an explicit override. A
-        // fingerprint mismatch is invisible from both ends -- the scheduler just
-        // says no worker matches -- so the one place the worker's own digest can
-        // be seen is its startup log, next to `fastcache-cc
-        // --print-toolchain-fingerprint` on the client.
-        logger.Logf(LogLevel::Info, "serving {} as {}", split->compiler, fingerprint);
-        toolchains.emplace(std::move(fingerprint), split->compiler);
-    }
+    auto toolchainsOrNone = ResolveToolchains(cfg.toolchains, *runner, logger);
+    if (!toolchainsOrNone.has_value())
+        return 2;
+    auto const toolchains = *std::move(toolchainsOrNone);
 
     auto const slots = cfg.slots != 0 ? cfg.slots : std::max(1U, std::thread::hardware_concurrency());
     auto const advertise = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
@@ -492,7 +513,25 @@ int main(int argc, char** argv)
     Node::WorkerServer server { listenerRef, protocol, slots, logger };
 
     Cc::Credential const credential { .username = {}, .secret = cfg.token };
-    Cc::WorkerRegistrar registrar { toolchains.begin()->first, advertise, slots, { Wire::IdentityCodec } };
+
+    // One registrar per toolchain, because REGISTER carries ONE fingerprint and
+    // `--toolchain` is repeatable. Registering only the first -- which is what
+    // this did -- meant a worker configured with g++ and clang++ served exactly
+    // one of them, and which one depended on where two hex digests happened to
+    // sort. The scheduler never heard about the other, so every job for it went
+    // to a local compile with nothing anywhere reporting a reason.
+    //
+    // The scheduler keys a worker on (fingerprint, endpoint), so these are
+    // separate entries with separate slot budgets -- which looks like advertising
+    // N times this machine's capacity, and is not. Every entry heartbeats the
+    // SAME machine-wide in-flight count, so once this worker is busy all of its
+    // entries report themselves busy together and the scheduler stops picking any
+    // of them. The pool behaves as one because the number it reports describes
+    // the machine rather than the entry.
+    std::vector<Cc::WorkerRegistrar> registrars;
+    registrars.reserve(toolchains.size());
+    for (auto const& [fingerprint, compiler]: toolchains)
+        registrars.emplace_back(fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec });
 
     // Registration and heartbeating are one loop because they are one concern: a
     // worker is registered exactly as long as it keeps saying so, and a scheduler
@@ -506,12 +545,25 @@ int main(int argc, char** argv)
                 logger.Logf(LogLevel::Warn, "scheduler {} unreachable", cfg.scheduler);
             else
             {
-                bool ok = !registrar.WorkerId().empty()
-                          && registrar.Heartbeat(*client, static_cast<std::uint32_t>(server.InFlight()), credential);
-                if (!ok)
-                    ok = registrar.Register(*client, credential);
-                logger.Logf(
-                    ok ? LogLevel::Debug : LogLevel::Warn, "scheduler {}: {}", cfg.scheduler, ok ? "registered" : "refused");
+                // Counted rather than short-circuited: one toolchain the scheduler
+                // refuses must not stop the others from being announced, or a
+                // single bad entry silently un-registers the whole worker.
+                std::size_t accepted = 0;
+                auto const inFlight = static_cast<std::uint32_t>(server.InFlight());
+                for (auto& registrar: registrars)
+                {
+                    bool ok = !registrar.WorkerId().empty() && registrar.Heartbeat(*client, inFlight, credential);
+                    if (!ok)
+                        ok = registrar.Register(*client, credential);
+                    if (ok)
+                        ++accepted;
+                }
+                bool const ok = accepted == registrars.size();
+                logger.Logf(ok ? LogLevel::Debug : LogLevel::Warn,
+                            "scheduler {}: {} of {} toolchain(s) registered",
+                            cfg.scheduler,
+                            accepted,
+                            registrars.size());
             }
 
             // Slept in slices so a stop request is observed promptly: a worker that
