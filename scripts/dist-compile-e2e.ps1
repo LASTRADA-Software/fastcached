@@ -144,6 +144,18 @@ int Entry() {
     return $src
 }
 
+# Byte-identical, by hash rather than by Compare-Object.
+#
+# Compare-Object over two byte arrays allocates a PSObject per element, which is
+# fine for a small object file and needlessly fragile as soon as one is not. The
+# hash also makes the failure message useful: two digests say "these differ",
+# where a Compare-Object dump says it several thousand times.
+function Test-SameBytes([string]$a, [string]$b) {
+    $ha = (Get-FileHash -Algorithm SHA256 -LiteralPath $a).Hash
+    $hb = (Get-FileHash -Algorithm SHA256 -LiteralPath $b).Hash
+    return $ha -eq $hb
+}
+
 function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj, [string]$scheduler) {
     $env:FASTCACHE_ADDR       = "127.0.0.1:$cachePort"
     $env:FASTCACHE_SOURCE_DIR = $root
@@ -233,9 +245,7 @@ try {
 
         # The whole soundness claim: an object built on the worker from
         # `/E`-preprocessed text must equal one this machine compiled directly.
-        $a = [System.IO.File]::ReadAllBytes($refObj)
-        $b = [System.IO.File]::ReadAllBytes($obj)
-        if ($a.Length -ne $b.Length -or (Compare-Object $a $b -SyncWindow 0)) {
+        if (-not (Test-SameBytes $refObj $obj)) {
             throw "the worker's object differs from the locally compiled one"
         }
         Write-Host "   byte-identical to the local object"
@@ -301,9 +311,7 @@ try {
             Write-Host $r.stderr
             throw "expected a no-worker refusal naming the missing toolchain"
         }
-        $a = [System.IO.File]::ReadAllBytes($isoRef)
-        $b = [System.IO.File]::ReadAllBytes($isoObj)
-        if ($a.Length -ne $b.Length -or (Compare-Object $a $b -SyncWindow 0)) {
+        if (-not (Test-SameBytes $isoRef $isoObj)) {
             throw "the locally compiled fallback object is wrong"
         }
         Write-Host "   a mismatched worker was refused, and the build compiled locally"
