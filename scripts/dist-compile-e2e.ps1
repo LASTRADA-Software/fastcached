@@ -84,9 +84,28 @@ $procs = @()
 # was written without being run, is the wrong trade. Conditional here costs
 # nothing on Windows and makes the orchestration runnable everywhere.
 function Start-Background([string]$path, [string[]]$arguments, [string]$errorLog) {
+    # Quoted HERE, because Start-Process does not do it. -ArgumentList joins an
+    # array with spaces and passes the result through as one command line, so an
+    # element that CONTAINS a space arrives at the child as two arguments.
+    #
+    # That is not hypothetical on Windows: clang-cl lives under
+    # `C:\Program Files\...`, so `--toolchain=C:\Program Files\LLVM\bin\clang-cl.exe`
+    # reached the worker as `--toolchain=C:\Program` plus a stray positional, and
+    # the worker refused it with "unrecognised argument" and exit 2. The POSIX
+    # sibling of this script never hits it because its paths come from the build
+    # tree, which has no spaces on a runner -- the compiler path is what is
+    # different here.
+    #
+    # A trailing backslash before the closing quote would escape it, which is the
+    # classic Windows quoting trap; these are paths to files, so none ends in a
+    # separator, and doubling any run of trailing backslashes is what would be
+    # needed if that ever changed.
+    $quoted = $arguments | ForEach-Object {
+        if ($_ -match '\s' -and $_ -notmatch '^"') { '"' + $_ + '"' } else { $_ }
+    }
     $common = @{
         FilePath              = $path
-        ArgumentList          = $arguments
+        ArgumentList          = $quoted
         PassThru              = $true
         RedirectStandardError = $errorLog
     }
@@ -110,9 +129,16 @@ function Stop-Spawned {
     $script:procs = @()
 }
 
-function Wait-ForPort([int]$port, [System.Diagnostics.Process]$proc, [string]$what) {
+function Wait-ForPort([int]$port, [System.Diagnostics.Process]$proc, [string]$what, [string]$errorLog) {
     foreach ($attempt in 1..100) {
-        if ($proc.HasExited) { throw "$what exited before listening (exit $($proc.ExitCode))" }
+        if ($proc.HasExited) {
+            # The log, not just the code. "exited before listening (exit 2)" names
+            # a whole class of startup refusals and distinguishes none of them --
+            # which cost a CI round trip to learn that an argument had been split
+            # in two. What the process itself said is the answer.
+            if ($errorLog) { Write-Host (Read-LiveText $errorLog) }
+            throw "$what exited before listening (exit $($proc.ExitCode))"
+        }
         $client = New-Object System.Net.Sockets.TcpClient
         try {
             $client.Connect("127.0.0.1", $port)
@@ -282,8 +308,8 @@ try {
             "--listen=127.0.0.1:$cachePort", "--listen-dispatch=127.0.0.1:$dispatchPort",
             "--storage-max-value=64M", "--log-level=info") $daemonLog
         $procs += $daemon
-        Wait-ForPort $cachePort    $daemon "daemon"
-        Wait-ForPort $dispatchPort $daemon "daemon (dispatch listener)"
+        Wait-ForPort $cachePort    $daemon "daemon" $daemonLog
+        Wait-ForPort $dispatchPort $daemon "daemon (dispatch listener)" $daemonLog
 
         # Asked of the launcher rather than derived here. The fingerprint is a
         # digest over the compiler's whole include tree; a fixture that recomputed
@@ -300,7 +326,7 @@ try {
             "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=2",
             "--log-level=debug") $workerLog
         $procs += $worker
-        Wait-ForPort $workerPort $worker "worker"
+        Wait-ForPort $workerPort $worker "worker" $workerLog
         $workerText = Wait-ForLine $workerLog "toolchain\(s\) registered" 120 "worker"
 
         # The worker computed its own fingerprint from a bare --toolchain. If it
@@ -362,7 +388,7 @@ try {
             "--listen=127.0.0.1:$isoCache", "--listen-dispatch=127.0.0.1:$isoDispatch",
             "--log-level=info") $isoDaemonLog
         $procs += $isoDaemon
-        Wait-ForPort $isoDispatch $isoDaemon "isolation daemon"
+        Wait-ForPort $isoDispatch $isoDaemon "isolation daemon" $isoDaemonLog
 
         $isoWorkerLog = Join-Path $scratch "iso-worker.log"
         $isoNode = Start-Background $Node @(
@@ -371,7 +397,7 @@ try {
             "--toolchain=not-the-compiler-this-client-uses=$ccPath", "--slots=2",
             "--log-level=debug") $isoWorkerLog
         $procs += $isoNode
-        Wait-ForPort $isoWorker $isoNode "isolation worker"
+        Wait-ForPort $isoWorker $isoNode "isolation worker" $isoWorkerLog
         Wait-ForLine $isoWorkerLog "toolchain\(s\) registered" 120 "isolation worker" | Out-Null
 
         $isoRoot = Join-Path $scratch "iso-proj"
