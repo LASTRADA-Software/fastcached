@@ -16,6 +16,7 @@
 #include <FastCache/Cli/UsageDoc.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/InheritedListener.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/Terminal.hpp>
@@ -401,6 +402,32 @@ int main(int argc, char** argv)
     auto const slots = cfg.slots != 0 ? cfg.slots : std::max(1U, std::thread::hardware_concurrency());
     auto const advertise = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
 
+    // Socket activation first: when a supervisor already bound the port and handed
+    // the descriptor over, binding it again would fail with "address already in
+    // use" -- against ourselves. Falling through to Bind() when nothing was handed
+    // over is what lets one binary serve both a `.socket` unit and a plain
+    // `--port`, with no flag distinguishing them: the environment says which, and
+    // it says so unambiguously.
+    //
+    // Only the first is used. This worker answers one protocol on one port, so a
+    // unit listing several sockets is a misconfiguration -- reported rather than
+    // half-honoured, since silently ignoring the rest would leave an operator with
+    // a port that accepts nothing and no clue why.
+    auto inherited = AdoptInheritedListeners(AcceptPollInterval, RequestIoTimeout);
+    std::unique_ptr<IListener> activated;
+    if (!inherited.empty())
+    {
+        if (inherited.size() > 1)
+        {
+            logger.Logf(LogLevel::Error,
+                        "socket activation handed over {} listeners; this worker serves exactly one",
+                        inherited.size());
+            return 2;
+        }
+        activated = std::move(inherited.front());
+        logger.Logf(LogLevel::Info, "adopted a socket-activated listener; --bind and --port are not used");
+    }
+
     // `IsBound()`, not a null check: Bind() NEVER returns null -- it hands back a
     // listener carrying the diagnostic, for Accept() to surface later. Testing for
     // null therefore tested nothing, and the failure it let through was silent and
@@ -410,15 +437,19 @@ int main(int argc, char** argv)
     // scheduler would go on leasing it to clients until the heartbeat lapsed.
     // BindError() is what says WHICH of address-in-use, permission or bad address
     // it was.
-    auto listener = BlockingListener::Bind(cfg.bindAddress, cfg.port, /*backlog=*/128);
-    if (listener == nullptr || !listener->IsBound())
+    std::unique_ptr<BlockingListener> bound;
+    if (activated == nullptr)
     {
-        logger.Logf(LogLevel::Error,
-                    "could not bind {}:{} ({})",
-                    cfg.bindAddress,
-                    cfg.port,
-                    listener ? listener->BindError() : std::string_view { "null listener" });
-        return 1;
+        bound = BlockingListener::Bind(cfg.bindAddress, cfg.port, /*backlog=*/128);
+        if (bound == nullptr || !bound->IsBound())
+        {
+            logger.Logf(LogLevel::Error,
+                        "could not bind {}:{} ({})",
+                        cfg.bindAddress,
+                        cfg.port,
+                        bound ? bound->BindError() : std::string_view { "null listener" });
+            return 1;
+        }
     }
 
     // Without this the accept loop cannot be stopped on Linux at all, and the way
@@ -433,7 +464,12 @@ int main(int argc, char** argv)
     // The I/O timeout is separate and larger: it bounds reading a request, which
     // carries a whole preprocessed translation unit over a possibly slow link,
     // while the accept poll only decides how promptly a stop is noticed.
-    listener->SetTimeouts(AcceptPollInterval, RequestIoTimeout);
+    // An adopted listener already has these -- AdoptInheritedListeners requires
+    // them, so there is no path to a listener that cannot be shut down.
+    if (bound != nullptr)
+        bound->SetTimeouts(AcceptPollInterval, RequestIoTimeout);
+
+    IListener& listenerRef = activated != nullptr ? *activated : static_cast<IListener&>(*bound);
 
     auto const scratch = std::filesystem::temp_directory_path() / "fastcache-compile-node";
     Cc::CompileJobRunner jobs { *runner, scratch, toolchains };
@@ -445,7 +481,7 @@ int main(int argc, char** argv)
     // LeaseValidator exists so that is a substitution, not a rewrite.
     Cc::WorkerProtocol protocol { jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec } };
 
-    Node::WorkerServer server { *listener, protocol, slots, logger };
+    Node::WorkerServer server { listenerRef, protocol, slots, logger };
 
     Cc::Credential const credential { .username = {}, .secret = cfg.token };
     Cc::WorkerRegistrar registrar { toolchains.begin()->first, advertise, slots, { Wire::IdentityCodec } };
@@ -503,10 +539,17 @@ int main(int argc, char** argv)
         }
     } };
 
+    // The listening endpoint is described by where it CAME FROM, not by the
+    // config. When a socket was adopted, `--bind` and `--port` were never used,
+    // and printing them names an address this process is not listening on -- which
+    // in the one line an operator reads to confirm a worker came up is worse than
+    // printing nothing. What matters to a client is the advertised endpoint, and
+    // that is reported either way.
+    auto const listeningOn = activated != nullptr ? std::string { "a socket-activated listener" }
+                                                  : std::format("{}:{}", cfg.bindAddress, cfg.port);
     logger.Logf(LogLevel::Info,
-                "compile node ready on {}:{}, advertising {}, {} slot(s), {} toolchain(s)",
-                cfg.bindAddress,
-                cfg.port,
+                "compile node ready on {}, advertising {}, {} slot(s), {} toolchain(s)",
+                listeningOn,
                 advertise,
                 slots,
                 toolchains.size());
