@@ -9,6 +9,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -18,21 +19,14 @@
 #include <variant>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Consensus;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
-
-/// Unwrap an optional for assertion; see CompileCacheHandler_test for why a
-/// direct dereference after a Catch2 REQUIRE reads as an unchecked access.
-/// @param value The optional to read.
-/// @return Its value, or a default-constructed one.
-template <typename T>
-[[nodiscard]] T Unwrap(std::optional<T> const& value)
-{
-    return value.value_or(T {});
-}
 
 /// Frame a message, then decode it back through the header.
 ///
@@ -56,61 +50,76 @@ template <typename T>
 
 } // namespace
 
-TEST_CASE("Every message type round-trips", "[consensus][raft][wire]")
+TEST_CASE("Every message type round-trips, field for field", "[consensus][raft][wire]")
 {
-    SECTION("RequestVote")
+    // One exemplar per row of `MessageTable`, and **every field carries a
+    // different value**. That is the whole design of this table rather than a
+    // flourish: five of the eight encoder arms are near-copies of each other --
+    // PreVote of RequestVote, InstallSnapshotResponse of AppendEntriesResponse --
+    // and the mistake copying invites is a transposed field index, which two
+    // fields sharing a value would let through. The four types added with pre-vote
+    // and snapshots had no positive round trip at all until this existed, so an
+    // arm encoding `lastIncludedTerm` where `lastIncludedIndex` belongs passed the
+    // entire suite.
+    auto const exemplars = std::vector<RaftMessage> {
+        RequestVoteRequest { .term = Term { .value = 11 },
+                             .candidateId = "rv-candidate",
+                             .lastLogIndex = LogIndex { .value = 12 },
+                             .lastLogTerm = Term { .value = 13 } },
+        RequestVoteResponse { .term = Term { .value = 21 }, .decision = VoteDecision::Granted, .voterId = "rv-voter" },
+        AppendEntriesRequest { .term = Term { .value = 31 },
+                               .leaderId = "ae-leader",
+                               .prevLogIndex = LogIndex { .value = 32 },
+                               .prevLogTerm = Term { .value = 33 },
+                               .entries = { LogEntry { .term = Term { .value = 34 },
+                                                       .kind = EntryKind::Configuration,
+                                                       .payload = BytesFromString("ae-payload") } },
+                               .leaderCommit = LogIndex { .value = 35 } },
+        AppendEntriesResponse { .term = Term { .value = 41 },
+                                .result = AppendResult::Accepted,
+                                .matchIndex = LogIndex { .value = 42 },
+                                .followerId = "ae-follower" },
+        PreVoteRequest { .term = Term { .value = 51 },
+                         .candidateId = "pv-candidate",
+                         .lastLogIndex = LogIndex { .value = 52 },
+                         .lastLogTerm = Term { .value = 53 } },
+        PreVoteResponse { .term = Term { .value = 61 }, .decision = VoteDecision::Granted, .voterId = "pv-voter" },
+        InstallSnapshotRequest { .term = Term { .value = 71 },
+                                 .leaderId = "is-leader",
+                                 .lastIncludedIndex = LogIndex { .value = 72 },
+                                 .lastIncludedTerm = Term { .value = 73 },
+                                 .members = { "is-m1", "is-m2" },
+                                 .state = BytesFromString("is-state") },
+        InstallSnapshotResponse { .term = Term { .value = 81 },
+                                  .result = AppendResult::Accepted,
+                                  .matchIndex = LogIndex { .value = 82 },
+                                  .followerId = "is-follower" },
+    };
+
+    // A ninth row added without an exemplar fails here rather than going quietly
+    // untested, which is how four of these came to be uncovered in the first place.
+    REQUIRE(exemplars.size() == RaftWire::MessageTable.size());
+
+    auto covered = std::vector<std::uint8_t> {};
+    for (auto const& sent: exemplars)
     {
-        RaftMessage const sent { RequestVoteRequest { .term = Term { .value = 7 },
-                                                      .candidateId = "n3",
-                                                      .lastLogIndex = LogIndex { .value = 42 },
-                                                      .lastLogTerm = Term { .value = 6 } } };
+        auto const frame = RaftWire::Encode(sent);
+        auto const header = RaftWire::DecodeHeader(frame);
+        REQUIRE(header.has_value());
+        covered.push_back(Unwrap(header).kindRaw);
+
+        // Compared whole. Field-by-field checks are what the copied arms already
+        // survived; equality on the message cannot be satisfied by a subset.
         auto const got = RoundTrip(sent);
         REQUIRE(got.has_value());
-        REQUIRE(std::holds_alternative<RequestVoteRequest>(*got));
-
-        auto const& m = std::get<RequestVoteRequest>(*got);
-        CHECK(m.term == Term { .value = 7 });
-        CHECK(m.candidateId == "n3");
-        CHECK(m.lastLogIndex == LogIndex { .value = 42 });
-        CHECK(m.lastLogTerm == Term { .value = 6 });
+        CHECK(*got == sent);
     }
 
-    SECTION("RequestVoteResponse")
-    {
-        for (auto const decision: { VoteDecision::Denied, VoteDecision::Granted })
-        {
-            RaftMessage const sent { RequestVoteResponse {
-                .term = Term { .value = 9 }, .decision = decision, .voterId = "n1" } };
-            auto const got = RoundTrip(sent);
-            REQUIRE(got.has_value());
-            REQUIRE(std::holds_alternative<RequestVoteResponse>(*got));
-
-            auto const& m = std::get<RequestVoteResponse>(*got);
-            CHECK(m.term == Term { .value = 9 });
-            CHECK(m.decision == decision);
-            CHECK(m.voterId == "n1");
-        }
-    }
-
-    SECTION("AppendEntriesResponse")
-    {
-        for (auto const result: { AppendResult::Rejected, AppendResult::Accepted })
-        {
-            RaftMessage const sent { AppendEntriesResponse { .term = Term { .value = 3 },
-                                                             .result = result,
-                                                             .matchIndex = LogIndex { .value = 11 },
-                                                             .followerId = "n2" } };
-            auto const got = RoundTrip(sent);
-            REQUIRE(got.has_value());
-            REQUIRE(std::holds_alternative<AppendEntriesResponse>(*got));
-
-            auto const& m = std::get<AppendEntriesResponse>(*got);
-            CHECK(m.term == Term { .value = 3 });
-            CHECK(m.result == result);
-            CHECK(m.matchIndex == LogIndex { .value = 11 });
-            CHECK(m.followerId == "n2");
-        }
-    }
+    // The types the exemplars produced are exactly the table's, so an exemplar
+    // duplicating a type -- the natural slip when one is copied from the next --
+    // cannot stand in for the row it left out.
+    for (auto const& row: RaftWire::MessageTable)
+        CHECK(std::ranges::count(covered, static_cast<std::uint8_t>(row.type)) == 1);
 }
 
 TEST_CASE("An AppendEntries carries its entries verbatim", "[consensus][raft][wire]")
@@ -223,7 +232,7 @@ TEST_CASE("A header decodes only when the reader is in sync", "[consensus][raft]
         auto const header = RaftWire::DecodeHeader(frame);
         REQUIRE(header.has_value());
         CHECK(Unwrap(header).version == RaftWire::CurrentVersion);
-        CHECK(Unwrap(header).typeRaw == static_cast<std::uint8_t>(RaftWire::MessageType::RequestVoteResponse));
+        CHECK(Unwrap(header).kindRaw == static_cast<std::uint8_t>(RaftWire::MessageType::RequestVoteResponse));
         CHECK(Unwrap(header).payloadLength == frame.size() - RaftWire::HeaderSize);
     }
 
@@ -346,7 +355,7 @@ TEST_CASE("A counter field of the wrong width is refused", "[consensus][raft][wi
     auto const payload = WireFields::Encode(fields);
 
     RaftWire::FrameHeader const header { .version = RaftWire::CurrentVersion,
-                                         .typeRaw = static_cast<std::uint8_t>(RaftWire::MessageType::RequestVote),
+                                         .kindRaw = static_cast<std::uint8_t>(RaftWire::MessageType::RequestVote),
                                          .payloadLength = static_cast<std::uint32_t>(payload.size()) };
 
     auto const decoded = RaftWire::DecodeMessage(header, payload);
@@ -368,7 +377,7 @@ TEST_CASE("An enum byte naming no enumerator is refused", "[consensus][raft][wir
                                                                  WireFields::AsBytes("n1") };
         auto const payload = WireFields::Encode(fields);
         RaftWire::FrameHeader const header { .version = RaftWire::CurrentVersion,
-                                             .typeRaw =
+                                             .kindRaw =
                                                  static_cast<std::uint8_t>(RaftWire::MessageType::RequestVoteResponse),
                                              .payloadLength = static_cast<std::uint32_t>(payload.size()) };
 
@@ -396,7 +405,7 @@ TEST_CASE("An enum byte naming no enumerator is refused", "[consensus][raft][wir
         };
         auto const payload = WireFields::Encode(fields);
         RaftWire::FrameHeader const header { .version = RaftWire::CurrentVersion,
-                                             .typeRaw = static_cast<std::uint8_t>(RaftWire::MessageType::AppendEntries),
+                                             .kindRaw = static_cast<std::uint8_t>(RaftWire::MessageType::AppendEntries),
                                              .payloadLength = static_cast<std::uint32_t>(payload.size()) };
 
         auto const decoded = RaftWire::DecodeMessage(header, payload);
@@ -420,10 +429,63 @@ TEST_CASE("The message table and the decoder agree on every type", "[consensus][
         // report a *malformed* frame -- never "unknown type", which would mean
         // the table and `FindMessage` disagree.
         RaftWire::FrameHeader const header { .version = RaftWire::CurrentVersion,
-                                             .typeRaw = static_cast<std::uint8_t>(row.type),
+                                             .kindRaw = static_cast<std::uint8_t>(row.type),
                                              .payloadLength = 0 };
         auto const decoded = RaftWire::DecodeMessage(header, {});
         REQUIRE_FALSE(decoded.has_value());
         CHECK(decoded.error().code == ConsensusErrorCode::MalformedFrame);
     }
+}
+
+TEST_CASE("Every enum field carries both of its values", "[consensus][raft][wire]")
+{
+    // The exemplar table above fixes ONE value per enum field, which is what keeps
+    // its values all distinct and so makes a transposition visible; this sweeps
+    // the other. Splitting the two questions is deliberate — a single table trying
+    // to answer both would have to repeat a value, and then a transposed pair
+    // would encode identically.
+    for (auto const decision: { VoteDecision::Denied, VoteDecision::Granted })
+    {
+        for (auto const& sent:
+             { RaftMessage { RequestVoteResponse { .term = Term { .value = 5 }, .decision = decision, .voterId = "rv" } },
+               RaftMessage { PreVoteResponse { .term = Term { .value = 5 }, .decision = decision, .voterId = "pv" } } })
+        {
+            auto const got = RoundTrip(sent);
+            REQUIRE(got.has_value());
+            CHECK(*got == sent);
+        }
+    }
+
+    for (auto const result: { AppendResult::Rejected, AppendResult::Accepted })
+    {
+        for (auto const& sent: { RaftMessage { AppendEntriesResponse { .term = Term { .value = 6 },
+                                                                       .result = result,
+                                                                       .matchIndex = LogIndex { .value = 7 },
+                                                                       .followerId = "ae" } },
+                                 RaftMessage { InstallSnapshotResponse { .term = Term { .value = 6 },
+                                                                         .result = result,
+                                                                         .matchIndex = LogIndex { .value = 7 },
+                                                                         .followerId = "is" } } })
+        {
+            auto const got = RoundTrip(sent);
+            REQUIRE(got.has_value());
+            CHECK(*got == sent);
+        }
+    }
+}
+
+TEST_CASE("A snapshot with no members and no state round-trips", "[consensus][raft][wire]")
+{
+    // The degenerate shape of the only message carrying two variable-length
+    // fields: empty ones must survive as empty rather than collapsing into each
+    // other, which is exactly what a length-prefixed field grammar is for.
+    RaftMessage const sent { InstallSnapshotRequest { .term = Term { .value = 2 },
+                                                      .leaderId = "n1",
+                                                      .lastIncludedIndex = LogIndex { .value = 9 },
+                                                      .lastIncludedTerm = Term { .value = 1 },
+                                                      .members = {},
+                                                      .state = {} } };
+    auto const got = RoundTrip(sent);
+    REQUIRE(got.has_value());
+    CHECK(*got == sent);
 }

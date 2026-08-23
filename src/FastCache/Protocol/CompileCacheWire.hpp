@@ -3,6 +3,7 @@
 
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/WireFields.hpp>
+#include <FastCache/Core/WireFrame.hpp>
 
 #include <algorithm>
 #include <array>
@@ -109,7 +110,7 @@ inline constexpr WireVersion CurrentVersion = 1;
 inline constexpr WireVersion MinSupportedVersion = 1;
 
 /// Size of the fixed request header: magic, version, op, payload length.
-inline constexpr std::size_t RequestHeaderSize = 7;
+inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
 
 /// Size of the fixed reply header: status, payload length.
 inline constexpr std::size_t ReplyHeaderSize = 5;
@@ -464,7 +465,7 @@ inline constexpr std::array ErrorTable {
 /// @return True when within [MinSupportedVersion, CurrentVersion].
 [[nodiscard]] constexpr bool IsSupported(WireVersion version) noexcept
 {
-    return version >= MinSupportedVersion && version <= CurrentVersion;
+    return WireFrame::IsSupported(version, MinSupportedVersion, CurrentVersion);
 }
 
 // The byte/text reinterpretation and the length-prefixed field grammar below are
@@ -562,10 +563,7 @@ namespace Detail
 
         std::vector<std::byte> frame(RequestHeaderSize + payloadSize);
         std::span<std::byte> const out { frame };
-        out[0] = Magic;
-        out[1] = static_cast<std::byte>(version);
-        out[2] = static_cast<std::byte>(op);
-        WireFields::PutBigEndian<std::uint32_t>(out, 3, static_cast<std::uint32_t>(payloadSize));
+        WireFrame::PutHeader(out, Magic, version, static_cast<std::uint8_t>(op), static_cast<std::uint32_t>(payloadSize));
         WireFields::EncodeInto(out, RequestHeaderSize, view);
         return frame;
     }
@@ -657,11 +655,17 @@ namespace Detail
 /// @return The header, or nullopt when short or not this protocol.
 [[nodiscard]] inline std::optional<RequestHeader> DecodeRequestHeader(std::span<std::byte const> bytes)
 {
-    if (bytes.size() < RequestHeaderSize || bytes[0] != Magic)
+    auto const header = WireFrame::DecodeHeader(bytes, Magic);
+    if (!header.has_value())
         return std::nullopt;
-    return RequestHeader { .version = static_cast<WireVersion>(bytes[1]),
-                           .opRaw = static_cast<std::uint8_t>(bytes[2]),
-                           .payloadLength = ReadBigEndian<std::uint32_t>(bytes.subspan(3, sizeof(std::uint32_t))) };
+
+    // Rebuilt into this protocol's own struct rather than aliased, unlike
+    // `RaftWire::FrameHeader`. The field is named `opRaw` at some seventy call
+    // sites across the daemon, the launcher and the test client, and renaming
+    // them to share a struct would be a large diff whose only effect is that two
+    // protocols spell one byte the same way. The *layout* is what had to stop
+    // being duplicated, and it has.
+    return RequestHeader { .version = header->version, .opRaw = header->kindRaw, .payloadLength = header->payloadLength };
 }
 
 /// Decode the fixed reply header.

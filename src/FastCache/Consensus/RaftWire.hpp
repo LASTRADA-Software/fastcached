@@ -7,6 +7,7 @@
 #include <FastCache/Core/Errors/ConsensusError.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/WireFields.hpp>
+#include <FastCache/Core/WireFrame.hpp>
 
 #include <array>
 #include <cstddef>
@@ -59,7 +60,7 @@ namespace FastCache::Consensus::RaftWire
 /// which the receiver very likely does understand, still arrives. Without a
 /// declared length the only available response to an unrecognised type is to
 /// close, and a node running a newer build would silently partition itself from
-/// every older peer it talked to. That is why `FrameHeader::typeRaw` is kept
+/// every older peer it talked to. That is why `FrameHeader::kindRaw` is kept
 /// **raw**: an unknown type is a recoverable condition the reader skips, not a
 /// decode failure, and validating it into an enum too early is what would throw
 /// that away.
@@ -82,12 +83,10 @@ inline constexpr std::byte Magic { 0xFA };
 
 /// Protocol version, carried in every frame header.
 ///
-/// A plain integer rather than an `enum class`: it is an ordered quantity
-/// compared against a supported range, and an enumeration would need a cast at
-/// every comparison. Deliberately not derived from the release version — the wire
-/// changes far more rarely than the product, and tying them would force a flag
-/// day on every release.
-using WireVersion = std::uint8_t;
+/// Deliberately not derived from the release version — the wire changes far more
+/// rarely than the product, and tying them would force a flag day on every
+/// release. The type itself is `WireFrame`'s, since the header it appears in is.
+using WireVersion = WireFrame::Version;
 
 /// The version this build speaks and emits.
 inline constexpr WireVersion CurrentVersion = 1;
@@ -98,7 +97,7 @@ inline constexpr WireVersion CurrentVersion = 1;
 inline constexpr WireVersion MinSupportedVersion = 1;
 
 /// Size of the fixed frame header: magic, version, type, payload length.
-inline constexpr std::size_t HeaderSize = 7;
+inline constexpr std::size_t HeaderSize = WireFrame::HeaderSize;
 
 /// Wire type codes. One byte, third in the frame header.
 ///
@@ -146,12 +145,12 @@ inline constexpr std::array MessageTable {
 inline constexpr std::size_t LogEntryFieldCount = 3;
 
 /// Look a raw type byte up in the table.
-/// @param typeRaw The byte from a frame header.
+/// @param kindRaw The byte from a frame header.
 /// @return The descriptor, or nullptr when this build does not know the type.
-[[nodiscard]] constexpr MessageDescriptor const* FindMessage(std::uint8_t typeRaw) noexcept
+[[nodiscard]] constexpr MessageDescriptor const* FindMessage(std::uint8_t kindRaw) noexcept
 {
     return FindOrNull(
-        MessageTable, typeRaw, [](MessageDescriptor const& row) { return static_cast<std::uint8_t>(row.type); });
+        MessageTable, kindRaw, [](MessageDescriptor const& row) { return static_cast<std::uint8_t>(row.type); });
 }
 
 /// How many top-level fields `type`'s payload holds, from the table.
@@ -171,18 +170,17 @@ inline constexpr std::size_t LogEntryFieldCount = 3;
 /// @return True when within [MinSupportedVersion, CurrentVersion].
 [[nodiscard]] constexpr bool IsSupported(WireVersion version) noexcept
 {
-    return version >= MinSupportedVersion && version <= CurrentVersion;
+    return WireFrame::IsSupported(version, MinSupportedVersion, CurrentVersion);
 }
 
 /// The decoded fixed part of a frame.
 ///
-/// The type is kept **raw**, deliberately; see *Why a declared length* above.
-struct FrameHeader
-{
-    WireVersion version {};         ///< Protocol version the sender used.
-    std::uint8_t typeRaw {};        ///< Type byte, not yet validated against MessageTable.
-    std::uint32_t payloadLength {}; ///< Exact byte count following the header.
-};
+/// `WireFrame::Header` itself rather than a copy of its three fields: the layout
+/// is shared with the compile-cache wire, so a second struct here would be a
+/// second thing to keep in step with it. The type is kept **raw**, deliberately;
+/// see *Why a declared length* above, and `WireFrame::Header` for the same
+/// reasoning stated at the layer that enforces it.
+using FrameHeader = WireFrame::Header;
 
 namespace Detail
 {
@@ -265,10 +263,7 @@ namespace Detail
 
         std::vector<std::byte> frame(HeaderSize + payloadSize);
         std::span<std::byte> const out { frame };
-        out[0] = Magic;
-        out[1] = static_cast<std::byte>(version);
-        out[2] = static_cast<std::byte>(Type);
-        WireFields::PutBigEndian<std::uint32_t>(out, 3, static_cast<std::uint32_t>(payloadSize));
+        WireFrame::PutHeader(out, Magic, version, static_cast<std::uint8_t>(Type), static_cast<std::uint32_t>(payloadSize));
         WireFields::EncodeInto(out, HeaderSize, fields);
         return frame;
     }
@@ -496,16 +491,12 @@ namespace Detail
 /// @return The header, or nullopt when the buffer is short or the magic is wrong.
 [[nodiscard]] inline std::optional<FrameHeader> DecodeHeader(std::span<std::byte const> bytes) noexcept
 {
-    if (bytes.size() < HeaderSize || bytes[0] != Magic)
-        return std::nullopt;
-    return FrameHeader { .version = static_cast<WireVersion>(bytes[1]),
-                         .typeRaw = static_cast<std::uint8_t>(bytes[2]),
-                         .payloadLength = ReadBigEndian<std::uint32_t>(bytes.subspan(3, sizeof(std::uint32_t))) };
+    return WireFrame::DecodeHeader(bytes, Magic);
 }
 
 /// Decode a frame's payload into a message.
 ///
-/// Takes the header's `typeRaw` and `version` rather than re-reading them, so a
+/// Takes the header's `kindRaw` and `version` rather than re-reading them, so a
 /// caller that has already used `payloadLength` to collect exactly this payload
 /// does not have to keep the header bytes around.
 /// @param header The already-decoded frame header.
@@ -522,10 +513,10 @@ namespace Detail
                                                                     unsigned { MinSupportedVersion },
                                                                     unsigned { CurrentVersion })) };
 
-    auto const* const descriptor = FindMessage(header.typeRaw);
+    auto const* const descriptor = FindMessage(header.kindRaw);
     if (descriptor == nullptr)
         return std::unexpected { UnknownWireMessage(
-            std::format("raft frame type 0x{:02X} is not known to this build", header.typeRaw)) };
+            std::format("raft frame type 0x{:02X} is not known to this build", header.kindRaw)) };
 
     auto const fields = WireFields::SplitExactly(payload, descriptor->fieldCount);
     if (!fields.has_value())

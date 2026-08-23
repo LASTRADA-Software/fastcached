@@ -236,6 +236,9 @@ struct PreVoteRequest
     NodeId candidateId;       ///< Who is asking.
     LogIndex lastLogIndex {}; ///< Index of the sender's last log entry.
     Term lastLogTerm {};      ///< Term of the sender's last log entry.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(PreVoteRequest const&) const = default;
 };
 
 /// A voter's answer to a pre-vote.
@@ -251,6 +254,9 @@ struct PreVoteResponse
     Term term {};             ///< The request's term when granted; the voter's when it is ahead.
     VoteDecision decision {}; ///< Whether an election would have this voter's support.
     NodeId voterId;           ///< Who answered, so the sender can count distinct answers.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(PreVoteResponse const&) const = default;
 };
 
 /// Candidate asking for a vote (Raft §5.2, §5.4.1).
@@ -260,6 +266,9 @@ struct RequestVoteRequest
     NodeId candidateId;       ///< Who is asking.
     LogIndex lastLogIndex {}; ///< Index of the candidate's last log entry.
     Term lastLogTerm {};      ///< Term of the candidate's last log entry.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(RequestVoteRequest const&) const = default;
 };
 
 /// A voter's answer.
@@ -268,6 +277,9 @@ struct RequestVoteResponse
     Term term {};             ///< The voter's current term, so a stale candidate steps down.
     VoteDecision decision {}; ///< Whether the vote was granted.
     NodeId voterId;           ///< Who answered, so the candidate can count distinct votes.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(RequestVoteResponse const&) const = default;
 };
 
 /// Leader replicating entries, and — with `entries` empty — the heartbeat (§5.3).
@@ -279,6 +291,9 @@ struct AppendEntriesRequest
     Term prevLogTerm {};           ///< Term of the entry at `prevLogIndex`.
     std::vector<LogEntry> entries; ///< Empty for a heartbeat.
     LogIndex leaderCommit {};      ///< The leader's commit index.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(AppendEntriesRequest const&) const = default;
 };
 
 /// A follower's answer.
@@ -288,6 +303,9 @@ struct AppendEntriesResponse
     AppendResult result {}; ///< Whether the entries were accepted.
     LogIndex matchIndex {}; ///< On acceptance, how far the follower now matches.
     NodeId followerId;      ///< Who answered.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(AppendEntriesResponse const&) const = default;
 };
 
 /// A leader handing a follower state it can no longer replay from the log.
@@ -310,6 +328,9 @@ struct InstallSnapshotRequest
     Term lastIncludedTerm {};      ///< Term of that index.
     std::vector<NodeId> members;   ///< The configuration as of that index.
     std::vector<std::byte> state;  ///< The application's own bytes, never interpreted.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(InstallSnapshotRequest const&) const = default;
 };
 
 /// A follower's answer to a snapshot.
@@ -323,6 +344,9 @@ struct InstallSnapshotResponse
     AppendResult result {}; ///< Whether the snapshot was taken on.
     LogIndex matchIndex {}; ///< How far the follower now matches.
     NodeId followerId;      ///< Who answered.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(InstallSnapshotResponse const&) const = default;
 };
 
 } // namespace FastCache::Consensus
