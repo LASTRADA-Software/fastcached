@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 namespace FastCache
@@ -73,5 +74,56 @@ struct DiskSpace
 /// @param path Any path on the filesystem of interest; need not exist.
 /// @return Its capacity and free space, or zeroes.
 [[nodiscard]] DiskSpace QueryDiskSpace(std::filesystem::path const& path) noexcept;
+
+/// What a machine is, behind a seam.
+///
+/// The free functions above are the implementation; this is what code that has to
+/// be *tested* asks. The project's rule is that anything touching the environment
+/// arrives through an interface, and "how many cores has this machine" is exactly
+/// that: a derivation from it — a node's slot count, say — is otherwise assertable
+/// only against whatever machine the suite happens to run on, which means it is not
+/// really assertable at all.
+///
+/// It carries the static facts only. Live utilization is `IHostCounterSource` in
+/// `Platform/HostLoad.hpp`, split for the reason `HostFacts` records: these do not
+/// change while a process runs and those do, and one interface answering both would
+/// invite a caller to cache what it must not.
+///
+/// A startup path reading one of these as a *default* — the daemon's `--threads`,
+/// a percentage memory budget — may still call the free function directly. Nobody
+/// needs to fake a machine to check that a default was applied, and a seam nothing
+/// substitutes for is a seam nobody has checked.
+class IHostFactsSource
+{
+  public:
+    IHostFactsSource() = default;
+    IHostFactsSource(IHostFactsSource const&) = delete;
+    IHostFactsSource& operator=(IHostFactsSource const&) = delete;
+    IHostFactsSource(IHostFactsSource&&) = delete;
+    IHostFactsSource& operator=(IHostFactsSource&&) = delete;
+    virtual ~IHostFactsSource() = default;
+
+    /// What this machine is: OS, version, architecture.
+    [[nodiscard]] virtual HostFacts const& Facts() const = 0;
+
+    /// Hardware threads available to this process.
+    ///
+    /// Never zero: a machine that would not say is reported as one core, because a
+    /// zero would have every caller writing the same clamp and one of them
+    /// forgetting it.
+    [[nodiscard]] virtual std::uint32_t LogicalCores() const = 0;
+
+    /// Physical memory, in bytes, or 0 when the platform would not say.
+    [[nodiscard]] virtual std::uint64_t TotalMemoryBytes() const = 0;
+
+    /// Space on the filesystem holding `path`; zeroes when it could not be read.
+    /// @param path Any path on the filesystem of interest; need not exist.
+    /// @return Its capacity and free space.
+    [[nodiscard]] virtual DiskSpace SpaceOn(std::filesystem::path const& path) const = 0;
+};
+
+/// A facts source reading the real machine, through the functions above.
+/// @return The source; never null.
+[[nodiscard]] std::unique_ptr<IHostFactsSource> MakeSystemHostFacts();
 
 } // namespace FastCache

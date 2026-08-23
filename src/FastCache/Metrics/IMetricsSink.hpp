@@ -63,10 +63,20 @@ class IMetricsSink
         /// the failure mode a fingerprint mismatch produces and the one that is
         /// otherwise invisible from both ends.
         DispatchLeasesNoWorker,
-        /// Lease requests refused because every matching worker was full. Rising
-        /// here means the fleet is too small, which is a different decision from
-        /// the line above and must not be summed with it.
+        /// Lease requests refused because every matching worker was full of this
+        /// fleet's own work. Rising here means the fleet is too small, which is a
+        /// different decision from the line above and must not be summed with it.
         DispatchLeasesNoCapacity,
+        /// Lease requests refused because matching workers had slots free on paper
+        /// and had withdrawn them -- their machines are busy with something else, or
+        /// out of scratch space.
+        ///
+        /// The third arm of the same split, and the one whose absence would be worst:
+        /// folded into `DispatchLeasesNoCapacity` it reads as "the fleet is too
+        /// small", so an operator whose build hosts have all filled their scratch
+        /// disks would go and buy machines rather than free 200 MB. Rising here with
+        /// a flat `NoCapacity` is a fleet that is big enough and unavailable.
+        DispatchLeasesWithdrawn,
         /// Lease requests refused because another client already held a lease for
         /// this key. Not a failure: it is duplicate-work suppression doing its
         /// job, and the clients it refuses compile locally.
@@ -120,6 +130,17 @@ class IMetricsSink
         /// hide a misconfigured toolchain behind a busy machine — the same reason
         /// the scheduler splits no-worker from no-capacity.
         WorkerJobsRefusedNoSlot,
+
+        /// Connections refused because the caller is neither on this machine nor a
+        /// member of this cluster.
+        ///
+        /// The anti-leeching rule at the compile port, and its own counter because
+        /// it is the only refusal here that is about **who** rather than about what:
+        /// the four above describe a job this worker could not do, while a rise in
+        /// this one means something is trying to spend a machine it has no claim on.
+        /// An operator reads it very differently, which is the whole reason the
+        /// refusals are split.
+        WorkerJobsRefusedNotAMember,
 
         /// Bytes of request payload read from clients, and of reply written back.
         /// The pair is what says whether a codec negotiation is doing anything:

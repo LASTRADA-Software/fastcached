@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string_view>
 
@@ -86,6 +87,23 @@ static_assert(NodeClassTableIsComplete(), "NodeClassTable must hold one row per 
     return NodeClassTable[static_cast<std::size_t>(nodeClass)];
 }
 
+/// Turn a raw wire byte into a class.
+///
+/// Returns an optional rather than clamping, because the two failure modes are not
+/// symmetric. A byte this build does not know comes from a peer built with a class
+/// this one lacks, and the honest answer is to refuse the registration and say so:
+/// silently reading it as `Workstation` would offer a dedicated build server two
+/// cores fewer than it has, and silently reading it as `Dedicated` would saturate
+/// somebody's desktop. Neither is visible from either end.
+/// @param raw The byte as received.
+/// @return The class, or nullopt when this build does not know it.
+[[nodiscard]] constexpr std::optional<NodeClass> NodeClassFromRaw(std::uint8_t raw) noexcept
+{
+    if (raw >= NodeClassTable.size())
+        return std::nullopt;
+    return NodeClassTable[raw].nodeClass;
+}
+
 /// What a machine is, as far as scheduling onto it is concerned.
 ///
 /// Deliberately not `Platform::HostFacts`: that describes what a machine *is* — its
@@ -93,6 +111,12 @@ static_assert(NodeClassTableIsComplete(), "NodeClassTable must hold one row per 
 /// scheduler *weighs*. They are collected together and travel together, but a
 /// scheduler that took the whole of `HostFacts` would be coupled to every field
 /// somebody adds to it for a diagnostic.
+///
+/// Everything here is **stable for the life of a worker process**, which is what
+/// makes it a registration fact rather than a heartbeat one. Free disk is the field
+/// that most looks like it belongs and does not: it moves while the process runs, so
+/// a copy captured at registration would be a number the scheduler kept believing
+/// long after it stopped being true.
 struct NodeCapacity
 {
     /// Hardware threads the machine has. Zero means "did not say", which is
@@ -100,8 +124,6 @@ struct NodeCapacity
     std::uint32_t logicalCores { 0 };
     /// Physical memory, in bytes. Zero means "did not say".
     std::uint64_t totalMemoryBytes { 0 };
-    /// Free space on the scratch filesystem, in bytes. Zero means "did not say".
-    std::uint64_t freeDiskBytes { 0 };
     /// How hard this machine may be driven.
     NodeClass nodeClass { NodeClass::Workstation };
     /// Cores held back from the fleet. Defaults to the class's reserve; an
@@ -111,29 +133,191 @@ struct NodeCapacity
     bool reserveIsExplicit { false };
 };
 
+/// Memory a single translation unit is budgeted at, for slot derivation.
+///
+/// One job per core is the obvious rule and is wrong on a machine whose cores
+/// outrun its RAM: a C++ translation unit with heavy template instantiation
+/// routinely peaks in the hundreds of megabytes, so a 128-thread box with 32 GiB
+/// asked for 128 concurrent compiles swaps, or the OOM killer takes them. Neither
+/// failure is quiet in the right way -- the jobs come back as refusals the client
+/// retries locally, so distribution appears to work while making the build slower
+/// than not distributing at all, which is the shape this list already records twice.
+///
+/// 1 GiB is a *heuristic*, and it is deliberately generous enough that it binds
+/// only where the ratio is genuinely skewed: it does not bind on any machine with
+/// at least a gigabyte per hardware thread, which is every ordinary build host. An
+/// operator who knows better says so with an explicit slot count, which is a
+/// ceiling this never raises.
+inline constexpr std::uint64_t MemoryBudgetPerJobBytes = 1ULL << 30;
+
+/// How many concurrent jobs this machine's memory supports.
+///
+/// Separate from `OfferableSlots` so the arithmetic that turns bytes into a job
+/// count has one author and one test, rather than being inlined into a larger
+/// expression where an off-by-one is invisible.
+/// @param totalMemoryBytes Physical memory, or 0 when the machine did not say.
+/// @return The memory-implied job count, or nullopt when there is nothing to say.
+[[nodiscard]] constexpr std::optional<std::uint32_t> MemorySlotCeiling(std::uint64_t totalMemoryBytes) noexcept
+{
+    // Absent is not zero: a machine that could not read its own memory must be
+    // scheduled on its other properties, not clamped to the one slot a literal
+    // reading of "0 bytes" would give it.
+    if (totalMemoryBytes == 0)
+        return std::nullopt;
+    auto const jobs = totalMemoryBytes / MemoryBudgetPerJobBytes;
+    return jobs == 0 ? 1U
+                     : static_cast<std::uint32_t>(std::min<std::uint64_t>(jobs, std::numeric_limits<std::uint32_t>::max()));
+}
+
 /// How many concurrent jobs this machine should be offered.
 ///
-/// The workstation reserve applied, and clamped so a machine always offers at least
-/// one: a node that offered zero would register, heartbeat, never be picked, and be
-/// indistinguishable at the client from a fleet that is permanently busy — the
-/// failure `WorkerRegistration`'s own zero-slot refusal exists to prevent, arriving
-/// here by arithmetic instead of by configuration.
+/// Two rules, and which one applies is decided by whether the operator named a
+/// number:
+///
+///   - **They did not** (`advertisedSlots == 0`): derive it. The core count,
+///     clamped by what the memory supports, minus the class's reserve.
+///   - **They did**: use it, untouched. `--slots` is set by the person whose
+///     machine this is, so it is not a hint to be clamped by a heuristic written
+///     here -- it is the answer. Capping it at the core count would silently
+///     refuse the deliberate oversubscription an I/O-heavy build wants, and
+///     subtracting the reserve on top of it would mean `--slots 4` on a
+///     workstation quietly offered two, which is not what the flag says.
+///
+/// Never zero, and that is the load-bearing half. A node offering no slots would
+/// register, match every lease for its toolchain, never be picked, and be
+/// indistinguishable at the client from a fleet that is permanently busy -- the
+/// diagnosis an operator would then chase is "buy more machines" for a node that
+/// is sitting idle. Guaranteeing it here is what lets the scheduler stop
+/// hand-checking for it, and what lets the pick comparison divide by a slot count.
 ///
 /// A machine that reported no core count is treated as having one. Refusing to
 /// schedule onto it would punish a worker for a fact it merely failed to collect,
 /// and one slot is the answer that is never wrong by much.
 /// @param capacity What the machine says about itself.
-/// @param advertisedSlots What the worker asked to be given, or 0 to derive it.
+/// @param advertisedSlots What the operator asked for, or 0 to derive it.
 /// @return Concurrent jobs to offer; never zero.
 [[nodiscard]] constexpr std::uint32_t OfferableSlots(NodeCapacity const& capacity, std::uint32_t advertisedSlots) noexcept
 {
-    auto const cores = capacity.logicalCores == 0 ? 1U : capacity.logicalCores;
-    auto const ceiling = advertisedSlots == 0 ? cores : std::min(advertisedSlots, cores);
+    if (advertisedSlots != 0)
+        return advertisedSlots;
+
+    auto ceiling = capacity.logicalCores == 0 ? 1U : capacity.logicalCores;
+    if (auto const byMemory = MemorySlotCeiling(capacity.totalMemoryBytes); byMemory.has_value())
+        ceiling = std::min(ceiling, *byMemory);
     auto const reserve = capacity.reserveIsExplicit ? capacity.reservedCores : TraitsFor(capacity.nodeClass).reservedCores;
 
     // Saturating rather than wrapping: a two-core workstation reserving two cores
     // must offer one, not 4294967295.
     return reserve >= ceiling ? 1U : ceiling - reserve;
+}
+
+/// Disk a single job is budgeted at on the worker's scratch filesystem.
+///
+/// A preprocessed translation unit and the object it produces, with room to spare.
+/// Smaller than `MemoryBudgetPerJobBytes` by an order of magnitude because the
+/// artefacts genuinely are: what this guards against is not a large job but a
+/// filesystem that has quietly filled up, which on a build host is one of the most
+/// common failures there is and one of the least visible from the other end -- a
+/// worker with no scratch room refuses every job it accepts, so the fleet looks
+/// busy while the build compiles everything locally.
+inline constexpr std::uint64_t ScratchBudgetPerJobBytes = 128ULL << 20;
+
+/// What a machine is doing right now, as the scheduler is told on each heartbeat.
+///
+/// The dynamic counterpart of `NodeCapacity`, and separate for the reason that
+/// struct's own comment gives: these move while the worker runs, so a copy captured
+/// at registration would be a number the scheduler kept believing long after it
+/// stopped being true.
+///
+/// Everything but `inFlight` is optional, because **absent is not zero** and here
+/// the two lead to opposite decisions: a machine that could not read its CPU must
+/// be scheduled on its other properties, while one that read it and got zero is
+/// idle and should be given work. `inFlight` needs no optional -- the worker always
+/// knows what it is running, and that is the one number it cannot fail to have.
+struct NodeLoad
+{
+    std::uint32_t inFlight { 0 };                      ///< Fleet jobs running here right now.
+    std::optional<std::uint32_t> cpuBusyPermille;      ///< Host-wide CPU busy, 0..1000.
+    std::optional<std::uint64_t> availableMemoryBytes; ///< Memory a new job could get.
+    std::optional<std::uint64_t> freeScratchBytes;     ///< Room where jobs are compiled.
+};
+
+namespace Detail
+{
+    /// How many more jobs a resource with `available` bytes left supports.
+    ///
+    /// Expressed as "on top of what is already running", which is the shape all
+    /// three dynamic limits share and the reason it is worth naming once: a machine
+    /// reports what is left AFTER its current jobs have taken theirs, so a ceiling
+    /// of `available / budget` alone would count the running jobs' own share twice
+    /// and shrink a busy machine to nothing the moment it started working.
+    /// @param inFlight Jobs already running.
+    /// @param available Bytes left of the resource.
+    /// @param budgetPerJob Bytes one job is assumed to want.
+    /// @return The total job count this resource supports, running ones included.
+    [[nodiscard]] constexpr std::uint32_t CeilingFrom(std::uint32_t inFlight,
+                                                      std::uint64_t available,
+                                                      std::uint64_t budgetPerJob) noexcept
+    {
+        auto const extra = std::min<std::uint64_t>(available / budgetPerJob, std::numeric_limits<std::uint32_t>::max());
+        return static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(std::uint64_t { inFlight } + extra, std::numeric_limits<std::uint32_t>::max()));
+    }
+} // namespace Detail
+
+/// Slots this worker may be given **right now**.
+///
+/// `OfferableSlots` answers what a machine is worth in general; this answers what it
+/// can take at this moment, and the difference is everything a heartbeat carries.
+/// Three limits, each of which lowers the count and none of which raises it:
+///
+///   - **Somebody else is using the machine.** Host CPU busy, less what this fleet
+///     is running here, is capacity that belongs to whoever is using it.
+///   - **Memory is nearly gone.** What is left decides how many more jobs fit.
+///   - **The scratch filesystem is nearly full.** Likewise, and it is the limit that
+///     most often reaches zero on a long-lived build host.
+///
+/// It may legitimately return **zero**, unlike `OfferableSlots`. A registered worker
+/// must always be worth picking *eventually*, which is why that one has a floor; a
+/// worker whose disk is full right now must be worth picking *never, until that
+/// changes*, and a floor here would keep handing it jobs it cannot run.
+///
+/// @param capacity What the machine is.
+/// @param registeredSlots What `OfferableSlots` gave it at registration.
+/// @param load What it is doing now.
+/// @return Concurrent jobs it may hold right now; may be zero.
+[[nodiscard]] constexpr std::uint32_t AvailableSlots(NodeCapacity const& capacity,
+                                                     std::uint32_t registeredSlots,
+                                                     NodeLoad const& load) noexcept
+{
+    auto ceiling = registeredSlots;
+
+    if (load.cpuBusyPermille.has_value())
+    {
+        auto const cores = capacity.logicalCores == 0 ? 1U : capacity.logicalCores;
+        auto const busyCores = (std::uint64_t { *load.cpuBusyPermille } * cores) / 1000;
+
+        // This fleet's own jobs are subtracted, and that subtraction is what keeps
+        // the rule from fighting itself: without it, giving a machine work raises
+        // its CPU, which withdraws the capacity that let it take the work, which
+        // frees the CPU -- a fleet that oscillates for reasons no operator can see.
+        // One core per job is an approximation, and it errs towards believing a
+        // machine is less loaded than it is, which is the direction the fallback
+        // already covers: an over-full worker refuses and the client compiles
+        // locally, where an over-shy one leaves a whole machine unused with nothing
+        // reporting why.
+        auto const external =
+            busyCores <= std::uint64_t { load.inFlight } ? 0U : static_cast<std::uint32_t>(busyCores) - load.inFlight;
+        ceiling = external >= ceiling ? 0U : ceiling - external;
+    }
+
+    if (load.availableMemoryBytes.has_value())
+        ceiling = std::min(ceiling, Detail::CeilingFrom(load.inFlight, *load.availableMemoryBytes, MemoryBudgetPerJobBytes));
+
+    if (load.freeScratchBytes.has_value())
+        ceiling = std::min(ceiling, Detail::CeilingFrom(load.inFlight, *load.freeScratchBytes, ScratchBudgetPerJobBytes));
+
+    return ceiling;
 }
 
 } // namespace FastCache::Distributed

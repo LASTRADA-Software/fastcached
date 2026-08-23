@@ -91,6 +91,38 @@ namespace FastCache
     return static_cast<std::uint16_t>(value);
 }
 
+/// Whether a host names this machine over the loopback interface.
+///
+/// The one test for "is this caller on the same machine as me", spelled once
+/// because two layers now ask it and they must not be able to disagree: a peer the
+/// membership oracle counts as local while the cache surface does not would be
+/// admitted to the fleet and refused its objects, or the reverse.
+///
+/// Textual rather than a `SocketAddress` comparison, because what a caller has at
+/// these two sites is what `ISocket::PeerAddress()` reports — a host string. The
+/// spellings recognised are the ones a kernel actually produces for a loopback
+/// connection: `127.0.0.0/8` in any of its forms, IPv6 `::1`, and the
+/// IPv4-mapped `::ffff:127.x.x.x` a dual-stack listener reports for an IPv4 client.
+/// The literal name `localhost` is **not** among them: it is whatever a resolver
+/// says it is, and a resolver is not something a security decision may depend on.
+/// @param host The peer's host, without a port or brackets.
+/// @return True when the peer is on this machine.
+[[nodiscard]] inline bool IsLoopbackHost(std::string_view host) noexcept
+{
+    // Any 127.x.x.x, not 127.0.0.1 alone: the whole /8 is loopback, and a client
+    // bound to 127.0.0.2 is no less local for it.
+    constexpr std::string_view V4Prefix = "127.";
+    constexpr std::string_view MappedPrefix = "::ffff:";
+
+    if (host == "::1")
+        return true;
+    if (host.starts_with(V4Prefix))
+        return true;
+    if (host.starts_with(MappedPrefix))
+        return host.substr(MappedPrefix.size()).starts_with(V4Prefix);
+    return false;
+}
+
 /// Split an endpoint that may name only a port.
 ///
 /// A bare port means `defaultHost`, which callers set to loopback: an endpoint

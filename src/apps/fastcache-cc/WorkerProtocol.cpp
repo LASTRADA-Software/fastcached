@@ -207,18 +207,23 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
 WorkerRegistrar::WorkerRegistrar(std::string fingerprint,
                                  std::string endpoint,
                                  std::uint32_t slots,
-                                 Wire::CodecList acceptedCodecs):
+                                 Wire::CodecList acceptedCodecs,
+                                 Wire::CapacityFields capacity):
     _fingerprint { std::move(fingerprint) },
     _endpoint { std::move(endpoint) },
     _slots { slots },
-    _acceptedCodecs { std::move(acceptedCodecs) }
+    _acceptedCodecs { std::move(acceptedCodecs) },
+    _capacity { capacity }
 {
 }
 
 bool WorkerRegistrar::Register(ITcpClient& scheduler, Credential const& credential)
 {
-    auto const frame = Wire::EncodeRegister(Wire::RegisterRequest {
-        .fingerprint = _fingerprint, .endpoint = _endpoint, .slots = _slots, .acceptedCodecs = _acceptedCodecs });
+    auto const frame = Wire::EncodeRegister(Wire::RegisterRequest { .fingerprint = _fingerprint,
+                                                                    .endpoint = _endpoint,
+                                                                    .slots = _slots,
+                                                                    .acceptedCodecs = _acceptedCodecs,
+                                                                    .capacity = _capacity });
     auto const outcome = ExchangeFramed(scheduler, frame, credential);
     if (!outcome.IsHit())
         return false;
@@ -227,12 +232,15 @@ bool WorkerRegistrar::Register(ITcpClient& scheduler, Credential const& credenti
     return !_workerId.empty();
 }
 
-bool WorkerRegistrar::Heartbeat(ITcpClient& scheduler, std::uint32_t inFlight, Credential const& credential)
+bool WorkerRegistrar::Heartbeat(ITcpClient& scheduler,
+                                std::uint32_t inFlight,
+                                Wire::LoadFields const& load,
+                                Credential const& credential)
 {
     if (_workerId.empty())
         return false; // never registered; nothing to refresh
 
-    auto const frame = Wire::EncodeHeartbeat(_workerId, inFlight);
+    auto const frame = Wire::EncodeHeartbeat(_workerId, inFlight, load);
     auto const outcome = ExchangeFramed(scheduler, frame, credential);
     if (outcome.IsHit())
         return true;

@@ -10,7 +10,7 @@
 
 using namespace FastCache::Distributed;
 
-TEST_CASE("An empty cluster admits nobody", "[distributed][membership]")
+TEST_CASE("An empty cluster admits nobody but this machine", "[distributed][membership]")
 {
     // The direction a mistake has to fail in. A node that has not yet discovered a
     // peer -- or whose discovery is misconfigured, or whose key is wrong -- must not
@@ -21,6 +21,10 @@ TEST_CASE("An empty cluster admits nobody", "[distributed][membership]")
     CHECK(cluster.Size() == 0);
     CHECK(cluster.Classify("10.0.0.9") == Membership::Outsider);
     CHECK(cluster.Classify("") == Membership::Outsider);
+
+    // This machine is the one exception, and it is unconditional -- see the case
+    // below for why an unconfigured node still has to serve its own builds.
+    CHECK(cluster.Classify("127.0.0.1") == Membership::Member);
 }
 
 TEST_CASE("A member is admitted by host, whatever port it dials from", "[distributed][membership]")
@@ -121,4 +125,53 @@ TEST_CASE("A scheduler refuses a non-member through the oracle", "[distributed][
 
     // A stranger never gets that far.
     CHECK(ask("10.0.0.9").error == FastCache::CompileCacheWire::ErrorCode::NotAMember);
+}
+
+TEST_CASE("This machine is a member of its own fleet, whatever the list says", "[distributed][membership]")
+{
+    // The rule that makes an unconfigured node useful and still closed to the
+    // network. Anti-leeching exists to stop OTHER machines spending capacity they do
+    // not contribute; a process on this host already has this host's CPU, and the
+    // `fastcache-cc` a developer runs against their own node is the whole reason the
+    // node is there.
+    //
+    // Without it, a node whose operator had listed only their peers would refuse
+    // their own builds — a fleet that looks configured and serves nobody locally,
+    // and which nothing would report.
+    ClusterMembership const remoteOnly { { "10.0.0.1:7000", "10.0.0.2:7000" } };
+
+    CHECK(remoteOnly.Classify("127.0.0.1") == Membership::Member);
+    CHECK(remoteOnly.Classify("::1") == Membership::Member);
+    CHECK(remoteOnly.Classify("10.0.0.1") == Membership::Member);
+    CHECK(remoteOnly.Classify("10.9.9.9") == Membership::Outsider);
+
+    // And an empty list is still closed to everybody but this machine, which is what
+    // makes "no configuration" a safe state rather than an open one.
+    ClusterMembership const unconfigured { {} };
+    CHECK(unconfigured.Classify("127.0.0.1") == Membership::Member);
+    CHECK(unconfigured.Classify("10.0.0.1") == Membership::Outsider);
+}
+
+TEST_CASE("Every spelling a kernel reports for a local peer is local", "[distributed][membership]")
+{
+    // The whole 127/8, IPv6 loopback, and the IPv4-mapped form a dual-stack listener
+    // reports for an IPv4 client. Missing that last one is the subtle failure: a node
+    // bound to `::` would classify every local client as a stranger and refuse its
+    // own machine, on some hosts and not others.
+    ClusterMembership const membership { {} };
+
+    CHECK(membership.Classify("127.0.0.1") == Membership::Member);
+    CHECK(membership.Classify("127.0.0.53") == Membership::Member);
+    CHECK(membership.Classify("::ffff:127.0.0.1") == Membership::Member);
+
+    // Not local, and the near-misses are the point: a prefix test on "127." alone
+    // would be right, but one on "1" or on "::ffff:" alone would admit the network.
+    CHECK(membership.Classify("128.0.0.1") == Membership::Outsider);
+    CHECK(membership.Classify("::ffff:10.0.0.1") == Membership::Outsider);
+    CHECK(membership.Classify("10.127.0.1") == Membership::Outsider);
+
+    // `localhost` is deliberately NOT local here: it is whatever a resolver says it
+    // is, and a resolver is not something a security decision may depend on. No
+    // kernel reports it as a peer address either, so nothing legitimate is lost.
+    CHECK(membership.Classify("localhost") == Membership::Outsider);
 }

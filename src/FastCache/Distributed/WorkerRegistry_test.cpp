@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Distributed/NodeLoadTestUtils.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -9,6 +10,7 @@
 
 using namespace FastCache;
 using namespace FastCache::Distributed;
+using namespace FastCache::Distributed::Testing;
 
 namespace
 {
@@ -127,7 +129,7 @@ TEST_CASE("A heartbeat keeps a worker alive and corrects its load", "[distribute
     // The worker's own count is authoritative: the registry's drifts whenever a
     // client dies between leasing and compiling, and only the worker knows what it
     // is actually running.
-    CHECK(fix.registry.Heartbeat(id, 3));
+    CHECK(fix.registry.Heartbeat(id, Busy(3)));
     fix.clock.Advance(std::chrono::milliseconds { 900 });
 
     auto const picked = fix.registry.Pick(Gcc13);
@@ -139,7 +141,7 @@ TEST_CASE("A heartbeat from an unknown worker is refused", "[distributed][regist
 {
     // So the worker learns to register again rather than heartbeating into a void.
     Fixture fix;
-    CHECK_FALSE(fix.registry.Heartbeat("w999", 0));
+    CHECK_FALSE(fix.registry.Heartbeat("w999", NodeLoad {}));
 }
 
 TEST_CASE("A worker that restarts keeps one identity, not two", "[distributed][registry]")
@@ -267,4 +269,93 @@ TEST_CASE("A full machine is never picked however large it is", "[distributed][r
     auto const picked = fix.registry.Pick(Gcc13);
     REQUIRE(picked.has_value());
     CHECK(picked->id == small);
+}
+
+TEST_CASE("A worker whose machine is busy elsewhere is passed over", "[distributed][registry]")
+{
+    // The end-to-end shape of the live-load rule, through the registry rather than
+    // against the policy function: this is the path that would silently keep sending
+    // work to a saturated developer machine if the heartbeat's load were recorded
+    // and then never consulted.
+    Fixture fix;
+    auto const desk = fix.registry.Register(
+        WorkerRegistration { .fingerprint = Gcc13,
+                             .endpoint = "10.0.0.1:6676",
+                             .slots = 0,
+                             .codecs = {},
+                             .capacity = NodeCapacity { .logicalCores = 8, .nodeClass = NodeClass::Workstation } });
+    auto const server = fix.registry.Register(
+        WorkerRegistration { .fingerprint = Gcc13,
+                             .endpoint = "10.0.0.2:6676",
+                             .slots = 0,
+                             .codecs = {},
+                             .capacity = NodeCapacity { .logicalCores = 4, .nodeClass = NodeClass::Dedicated } });
+
+    // Six slots against four: with nothing else known, the bigger machine wins.
+    auto const idle = fix.registry.Pick(Gcc13);
+    REQUIRE(idle.has_value());
+    CHECK(idle->id == desk);
+
+    // Its owner then starts using it. Eight busy cores of eight, none of them ours,
+    // so it withdraws entirely and the small dedicated node takes the work.
+    REQUIRE(fix.registry.Heartbeat(desk, WithCpu(0, 1000)));
+    auto const shifted = fix.registry.Pick(Gcc13);
+    REQUIRE(shifted.has_value());
+    CHECK(shifted->id == server);
+
+    // And it comes back when they stop, rather than being written off.
+    REQUIRE(fix.registry.Heartbeat(desk, WithCpu(0, 0)));
+    auto const recovered = fix.registry.Pick(Gcc13);
+    REQUIRE(recovered.has_value());
+    CHECK(recovered->id == desk);
+}
+
+TEST_CASE("A fleet that is unavailable is a different refusal from one that is small", "[distributed][registry]")
+{
+    // Three refusals rather than two, for the reason there were two rather than one:
+    // they are different operator problems with different fixes. Told "no capacity",
+    // an operator buys machines; the truth in the first section below is that the
+    // machines they already own have filled their scratch disks, and 200 MB fixes it.
+    Fixture fix;
+    auto const id = fix.registry.Register(
+        WorkerRegistration { .fingerprint = Gcc13,
+                             .endpoint = "10.0.0.1:6676",
+                             .slots = 4,
+                             .codecs = {},
+                             .capacity = NodeCapacity { .logicalCores = 8, .nodeClass = NodeClass::Dedicated } });
+
+    SECTION("slots free on paper, withdrawn in practice")
+    {
+        REQUIRE(fix.registry.Heartbeat(id, WithScratch(0, 0)));
+
+        auto const picked = fix.registry.Pick(Gcc13);
+        REQUIRE_FALSE(picked.has_value());
+        CHECK(picked.error() == PickError::Withdrawn);
+    }
+
+    SECTION("genuinely full of this fleet's own work")
+    {
+        // No live-load report at all, so nothing is withdrawn; the four slots are
+        // simply taken. This is the case that really does mean "buy more machines".
+        REQUIRE(fix.registry.Heartbeat(id, Busy(4)));
+
+        auto const picked = fix.registry.Pick(Gcc13);
+        REQUIRE_FALSE(picked.has_value());
+        CHECK(picked.error() == PickError::NoCapacity);
+    }
+
+    SECTION("both at once reports the actionable one")
+    {
+        // A second worker full of our own work, beside the first with a full disk.
+        // `Withdrawn` wins: "some of your machines are unavailable" is fixable today,
+        // where "the fleet is small" is a purchase -- and reporting the purchase
+        // would hide the full disk behind a number that looks like growth.
+        auto const busy = fix.registry.Register(Announce(Gcc13, "10.0.0.2:6676", 2));
+        REQUIRE(fix.registry.Heartbeat(busy, Busy(2)));
+        REQUIRE(fix.registry.Heartbeat(id, WithScratch(0, 0)));
+
+        auto const picked = fix.registry.Pick(Gcc13);
+        REQUIRE_FALSE(picked.has_value());
+        CHECK(picked.error() == PickError::Withdrawn);
+    }
 }

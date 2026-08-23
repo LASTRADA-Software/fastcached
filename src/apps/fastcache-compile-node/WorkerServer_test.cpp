@@ -2,6 +2,7 @@
 #include "WorkerServer.hpp"
 
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -140,6 +141,11 @@ struct Fixture
     Cc::WorkerProtocol protocol;
     NullLogger logger;
 
+    /// Admits everybody, because these cases are about the accept loop rather than
+    /// about who may reach it. The anti-leeching rule has its own case below, which
+    /// substitutes a listed oracle for exactly that reason.
+    Distributed::OpenMembership membership;
+
     Fixture():
         scratch { Cc::Test::UniqueScratchPath("fc-ws") },
         jobs { runner, (std::filesystem::create_directories(scratch), scratch), { { "gcc-13", "g++" } } },
@@ -187,7 +193,7 @@ struct Fixture
     pair.client->ShutdownWrite();
 
     OneShotListener listener { std::move(pair.server) };
-    WorkerServer server { listener, fix.protocol, slots, fix.metrics, fix.logger };
+    WorkerServer server { listener, fix.protocol, slots, fix.membership, fix.metrics, fix.logger };
     SyncRun(server.Run());
 
     return SyncRun([](ISocket* s) -> Task<std::vector<std::byte>> {
@@ -279,7 +285,7 @@ TEST_CASE("In-flight returns to zero after a job", "[worker-server]")
     pair.client->ShutdownWrite();
 
     OneShotListener listener { std::move(pair.server) };
-    WorkerServer server { listener, fix.protocol, 2, fix.metrics, fix.logger };
+    WorkerServer server { listener, fix.protocol, 2, fix.membership, fix.metrics, fix.logger };
     SyncRun(server.Run());
     CHECK(server.InFlight() == 0);
 }
@@ -296,7 +302,7 @@ TEST_CASE("A poll timeout keeps the accept loop running", "[worker-server]")
     Fixture fix;
     WorkerServer* running = nullptr;
     IdleListener listener { 3, [&] { running->Shutdown(); } };
-    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.metrics, fix.logger };
+    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.membership, fix.metrics, fix.logger };
     running = &server;
 
     SyncRun(server.Run());
@@ -313,7 +319,7 @@ TEST_CASE("Shutdown ends an idle accept loop", "[worker-server]")
     // supervisor's stop would time out and escalate to SIGKILL.
     Fixture fix;
     IdleListener listener;
-    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.metrics, fix.logger };
+    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.membership, fix.metrics, fix.logger };
 
     server.Shutdown();
     SyncRun(server.Run());
@@ -359,4 +365,83 @@ TEST_CASE("A served request counts the bytes in both directions", "[worker-serve
 
     CHECK(fix.metrics.Read(Sink::WorkerBytesReceived) == request.size());
     CHECK(fix.metrics.Read(Sink::WorkerBytesReturned) == reply.size());
+}
+
+TEST_CASE("A stranger is refused this machine's CPU before it can send a payload", "[node][worker][membership]")
+{
+    // The most serious of the three anti-leeching gates, and the one that was missing:
+    // `--bind` defaults to 0.0.0.0 and the lease validator accepts every token, so
+    // before this check anybody who could route to the port could have this machine
+    // run their compiler for them.
+    //
+    // Checked BEFORE the request is read, which is why it lives in the accept loop
+    // rather than in the protocol. Afterwards would let a caller with no claim on
+    // this machine make it buffer a multi-megabyte preprocessed translation unit --
+    // a memory-exhaustion hole opened by the check meant to close a hole, exactly
+    // as `CompileCacheHandler`'s auth gate documents.
+    Fixture fix;
+    Distributed::ClusterMembership const listed { { "10.0.0.1:6676" } };
+
+    auto const request = CompileFrame();
+
+    auto refuse = [&](std::string peer) {
+        auto pair = InMemorySocketPair::Create(0, std::move(peer));
+        REQUIRE(SyncRun([](ISocket* s, std::vector<std::byte> bytes) -> Task<bool> {
+            auto const r = co_await s->Write(std::span<std::byte const> { bytes });
+            co_return r.has_value();
+        }(pair.client.get(), request)));
+        pair.client->ShutdownWrite();
+
+        OneShotListener listener { std::move(pair.server) };
+        WorkerServer server { listener, fix.protocol, 2, listed, fix.metrics, fix.logger };
+        SyncRun(server.Run());
+
+        return SyncRun([](ISocket* s) -> Task<std::vector<std::byte>> {
+            std::vector<std::byte> out;
+            while (true)
+            {
+                std::vector<std::byte> chunk(4096);
+                auto const r = co_await s->Read(std::span<std::byte> { chunk });
+                if (!r.has_value() || *r == 0)
+                    break;
+                out.insert(out.end(), chunk.begin(), std::next(chunk.begin(), static_cast<std::ptrdiff_t>(*r)));
+            }
+            co_return out;
+        }(pair.client.get()));
+    };
+
+    SECTION("a machine nobody admitted")
+    {
+        // Answered rather than dropped: a misconfigured peer learns it is not a
+        // member instead of seeing a connection it cannot tell from a dead host.
+        auto const reply = refuse("10.9.9.9");
+        auto const header = Wire::DecodeReplyHeader(reply);
+        REQUIRE(header.has_value());
+        CHECK(Unwrap(header).status == Wire::Status::Error);
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) == 1);
+
+        // And no job was started, which is the property that matters: the refusal
+        // happened before the payload, so nothing was buffered and no compiler ran.
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+    }
+
+    SECTION("this machine, whatever the member list says")
+    {
+        // The rule that keeps an unconfigured node useful: a developer's own
+        // `fastcache-cc` must reach its own worker even though the operator listed
+        // only their peers.
+        auto const reply = refuse("127.0.0.1");
+        auto const header = Wire::DecodeReplyHeader(reply);
+        REQUIRE(header.has_value());
+        CHECK(Unwrap(header).status == Wire::Status::Ok);
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) == 0);
+    }
+
+    SECTION("a listed peer")
+    {
+        auto const reply = refuse("10.0.0.1");
+        auto const header = Wire::DecodeReplyHeader(reply);
+        REQUIRE(header.has_value());
+        CHECK(Unwrap(header).status == Wire::Status::Ok);
+    }
 }

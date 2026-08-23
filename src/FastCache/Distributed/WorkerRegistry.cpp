@@ -41,13 +41,16 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
     });
     if (existing != _workers.end())
     {
-        existing->second.info.slots = registration.slots;
+        existing->second.info.slots = OfferableSlots(registration.capacity, registration.slots);
+        existing->second.info.capacity = registration.capacity;
         existing->second.info.codecs = registration.codecs;
-        // Reset to zero rather than kept: a re-registering worker has restarted, so
-        // whatever it was running is gone. Carrying the old count forward would
-        // make a restarted worker look permanently busy and take it out of rotation
-        // until the first heartbeat corrected it.
+        // Reset rather than kept, both of them, and for one reason: a re-registering
+        // worker has restarted, so whatever it was running is gone and whatever its
+        // machine was doing is a reading from before that. Carrying either forward
+        // would make a restarted worker look permanently busy and take it out of
+        // rotation until the first heartbeat corrected it.
         existing->second.info.inFlight = 0;
+        existing->second.info.load = {};
         existing->second.lastSeen = now;
         return existing->second.info.id;
     }
@@ -57,14 +60,16 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
                      Entry { .info = WorkerInfo { .id = id,
                                                   .fingerprint = std::string { registration.fingerprint },
                                                   .endpoint = std::string { registration.endpoint },
-                                                  .slots = registration.slots,
+                                                  .slots = OfferableSlots(registration.capacity, registration.slots),
                                                   .inFlight = 0,
+                                                  .capacity = registration.capacity,
+                                                  .load = {},
                                                   .codecs = registration.codecs },
                              .lastSeen = now });
     return id;
 }
 
-bool WorkerRegistry::Heartbeat(std::string_view workerId, std::uint32_t inFlight)
+bool WorkerRegistry::Heartbeat(std::string_view workerId, NodeLoad const& load)
 {
     std::scoped_lock const guard { _mutex };
     auto const it = _workers.find(std::string { workerId });
@@ -74,19 +79,27 @@ bool WorkerRegistry::Heartbeat(std::string_view workerId, std::uint32_t inFlight
     // The worker's own count wins. The registry's drifts whenever a client dies
     // between taking a lease and sending the job, and only the worker knows what it
     // is actually running; a heartbeat is a correction as much as a liveness signal.
-    it->second.info.inFlight = inFlight;
+    it->second.info.inFlight = load.inFlight;
+    it->second.info.load = load;
     it->second.lastSeen = _clock.Now();
     return true;
 }
 
 namespace
 {
-    /// Free slots on a worker that has room.
+    /// Slots a worker could take a job into right now.
+    ///
+    /// Its registered count reduced by what it last reported about itself, then by
+    /// what it is already running. Both steps matter and neither substitutes for the
+    /// other: the first is capacity somebody ELSE has taken -- a developer using
+    /// their own machine, a filesystem that filled up -- and the second is capacity
+    /// this fleet has taken.
     /// @param info The worker.
-    /// @return Slots not currently occupied.
+    /// @return Slots not currently occupied and not withdrawn.
     [[nodiscard]] std::uint32_t FreeSlots(WorkerInfo const& info) noexcept
     {
-        return info.inFlight >= info.slots ? 0U : info.slots - info.inFlight;
+        auto const usable = AvailableSlots(info.capacity, info.slots, info.load);
+        return info.inFlight >= usable ? 0U : usable - info.inFlight;
     }
 
     /// Whether `candidate` should be preferred over `incumbent`.
@@ -119,8 +132,13 @@ namespace
             return candidateFree > incumbentFree;
 
         // candidateFree/candidate.slots > incumbentFree/incumbent.slots, without
-        // the division. Both slot counts are non-zero here: a worker with none is
-        // refused at registration.
+        // the division. Both slot counts are non-zero here because `OfferableSlots`
+        // never yields zero -- which is why that guarantee is stated at the function
+        // rather than left as something each caller happens to observe. The
+        // denominator is the REGISTERED count deliberately: it asks "how much of this
+        // machine is left", and a denominator that shrank with the machine's live
+        // load would make a busy workstation look proportionally emptier the busier
+        // its owner made it.
         return static_cast<std::uint64_t>(candidateFree) * incumbent.slots
                > static_cast<std::uint64_t>(incumbentFree) * candidate.slots;
     }
@@ -133,6 +151,7 @@ std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view finge
 
     WorkerInfo const* best = nullptr;
     bool sawMatch = false;
+    bool sawWithdrawn = false;
     for (auto const& [id, entry]: _workers)
     {
         // Byte-identical, never "compatible". See the header: an over-strict match
@@ -141,18 +160,37 @@ std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view finge
         if (entry.info.fingerprint != fingerprint || !IsLive(entry, now))
             continue;
         sawMatch = true;
-        if (entry.info.inFlight >= entry.info.slots)
+        // Asked through `FreeSlots` rather than against `slots` directly, so a
+        // worker whose scratch disk has filled or whose owner is using it is skipped
+        // here rather than picked and left to refuse every job it is sent.
+        if (FreeSlots(entry.info) == 0)
+        {
+            // Which of the two refusals this becomes is decided here, per worker,
+            // because it is a per-worker fact: slots free on paper and none in
+            // practice is a machine doing something else, while none either way is
+            // a fleet full of this build's own work.
+            sawWithdrawn = sawWithdrawn || entry.info.inFlight < entry.info.slots;
             continue;
+        }
         if (best == nullptr || PrefersFirst(entry.info, *best))
             best = &entry.info;
     }
 
     if (best != nullptr)
         return *best;
-    // Distinguished so the client reports the right thing: "nothing in the fleet
-    // has your toolchain" and "the fleet is busy" want different responses from an
-    // operator, even though both make this compile local.
-    return std::unexpected(sawMatch ? PickError::NoCapacity : PickError::NoWorker);
+    // Three refusals rather than one "no", because they are three different
+    // operator problems: a fingerprint nobody serves, a fleet too small, and a
+    // fleet whose machines are busy elsewhere. All three end the same way at the
+    // client -- compile locally -- so the distinction exists entirely for whoever
+    // has to fix it.
+    //
+    // `Withdrawn` wins over `NoCapacity` when both are true, and that is the useful
+    // way round: "some of your machines are unavailable" is actionable today, while
+    // "the fleet is small" is a purchase, and reporting the purchase would hide a
+    // fleet-wide full disk behind a number that looks like growth.
+    if (!sawMatch)
+        return std::unexpected(PickError::NoWorker);
+    return std::unexpected(sawWithdrawn ? PickError::Withdrawn : PickError::NoCapacity);
 }
 
 void WorkerRegistry::JobStarted(std::string_view workerId)

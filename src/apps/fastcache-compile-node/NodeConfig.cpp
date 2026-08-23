@@ -74,6 +74,52 @@ namespace
         return value;
     }
 
+    /// A node class, by the name `NodeClassTable` spells it.
+    ///
+    /// Off the shared table rather than a two-arm `if`, so a class added there is
+    /// accepted here without an edit -- and so the spelling an operator types is
+    /// necessarily the spelling the table documents.
+    /// @param sv Text to parse.
+    /// @return The class, or why it is not one.
+    [[nodiscard]] std::expected<Distributed::NodeClass, ConfigError> ParseNodeClass(std::string_view sv)
+    {
+        if (auto const parsed = Distributed::NodeClassByName(sv); parsed.has_value())
+            return *parsed;
+
+        // Names the accepted spellings, because a rejection that cannot say what
+        // would have worked cannot be acted on -- the same reason the wire's
+        // `UnsupportedVersion` names its supported range.
+        std::string accepted;
+        for (auto const& row: Distributed::NodeClassTable)
+        {
+            if (!accepted.empty())
+                accepted += ", ";
+            accepted += row.name;
+        }
+        return std::unexpected(ArgvError(
+            ConfigErrorCode::OutOfRange, "node-class", std::format("not a node class: {} (expected {})", sv, accepted)));
+    }
+
+    /// A core reserve, which may legitimately be zero.
+    ///
+    /// Unlike `ParseSlots`, zero is accepted: "reserve nothing" is a real answer an
+    /// operator gives for a machine they are not sitting at, and it is a *different*
+    /// answer from not passing the flag at all -- which is why the field holding it
+    /// is an optional.
+    /// @param sv Text to parse.
+    /// @return The count, or why it is not one.
+    [[nodiscard]] std::expected<std::optional<std::uint32_t>, ConfigError> ParseReservedCores(std::string_view sv)
+    {
+        auto value = 0U;
+        auto const* const begin = sv.data();
+        auto const* const end = std::next(begin, static_cast<std::ptrdiff_t>(sv.size()));
+        auto const [ptr, ec] = std::from_chars(begin, end, value);
+        if (ec != std::errc {} || ptr != end)
+            return std::unexpected(
+                ArgvError(ConfigErrorCode::OutOfRange, "reserve-cores", std::format("not a core count: {}", sv)));
+        return std::optional<std::uint32_t> { value };
+    }
+
     /// A byte count for the local cache tier, accepting the k/m/g suffixes the
     /// daemon's own size flags do.
     ///
@@ -179,10 +225,30 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::Value,
           .operand = "=<n>",
           .apply = AssignFrom<&NodeConfig::slots, ParseSlots>(),
-          .description = "concurrent compiles (default: one per hardware thread).\n"
-                         "Advertised to the scheduler AND enforced here: a worker\n"
-                         "that accepted more would be fuller and slower than the\n"
-                         "scheduler believes, at the same moment." },
+          .description = "concurrent compiles. Default: derived from this\n"
+                         "machine's cores and memory, less what --node-class\n"
+                         "reserves. A number given here is the answer and is\n"
+                         "not clamped or reduced further. Advertised to the\n"
+                         "scheduler AND enforced here: a worker that accepted\n"
+                         "more would be fuller and slower than the scheduler\n"
+                         "believes, at the same moment." },
+        { .primary = "--node-class",
+          .arity = Arity::Value,
+          .operand = "=workstation|dedicated",
+          .apply = AssignFrom<&NodeConfig::nodeClass, ParseNodeClass>(),
+          .description = "how hard this machine may be driven (default:\n"
+                         "workstation). A workstation keeps cores free for the\n"
+                         "person using it; a dedicated node may be driven to its\n"
+                         "slot limit. The default is the safe answer rather than\n"
+                         "the common one." },
+        { .primary = "--reserve-cores",
+          .arity = Arity::Value,
+          .operand = "=<n>",
+          .apply = AssignFrom<&NodeConfig::reservedCores, ParseReservedCores>(),
+          .description = "cores never offered to the fleet, overriding what the\n"
+                         "node class reserves. 0 is a real answer and is not the\n"
+                         "same as omitting the flag. Ignored when --slots names\n"
+                         "a number, which is the operator's answer already." },
         { .primary = "--admin-listen",
           .arity = Arity::Value,
           .operand = "=[<address>:]<port>",
@@ -222,10 +288,10 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::Value,
           .operand = "=<bytes>",
           .apply = AssignFrom<&NodeConfig::cacheMemoryBytes, ParseCacheBytes>(),
-          .description = "size of this node's own in-memory cache tier; 0 (the\n"
-                         "default) means no local cache. It exists so a local\n"
-                         "rebuild on a slow or bad network never reaches the\n"
-                         "wire at all." },
+          .description = "size of this node's own in-memory cache tier\n"
+                         "(default 256m; 0 turns it off). It exists so a\n"
+                         "local rebuild on a slow or bad network never\n"
+                         "reaches the wire at all." },
         { .primary = "--cache-dir",
           .arity = Arity::Value,
           .operand = "=<path>",
@@ -237,11 +303,13 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::Value,
           .operand = "=[<address>:]<port>",
           .apply = AssignFrom<&NodeConfig::cacheListen, ParseText>(),
-          .description = "serve cache verbs to local clients here; off unless\n"
-                         "given. Point FASTCACHE_ADDR at it so misses read\n"
-                         "through and hits never leave the machine. A bare\n"
-                         "port binds LOOPBACK: a node's private cache\n"
-                         "reachable from the network is a decision." },
+          .description = "serve cache verbs to local clients here (default\n"
+                         "127.0.0.1:6674, where fastcache-cc already looks;\n"
+                         "empty turns it off). A bare port binds LOOPBACK,\n"
+                         "unlike --listen-scheduler: a cache any host can\n"
+                         "dial is this machine's whole build output served\n"
+                         "to strangers. Widen it and only this machine and\n"
+                         "--fleet-member peers are still admitted." },
         { .primary = "--upstream",
           .arity = Arity::Value,
           .operand = "=<host:port>",
@@ -311,6 +379,23 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
     return options;
 }
 
+Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg, IHostFactsSource const& host)
+{
+    return Distributed::NodeCapacity { .logicalCores = host.LogicalCores(),
+                                       .totalMemoryBytes = host.TotalMemoryBytes(),
+                                       .nodeClass = cfg.nodeClass,
+                                       // Absent is not zero, and this is the one line
+                                       // where the two are told apart: a reserve the
+                                       // operator typed as 0 means "drive this machine
+                                       // to its last core", while one they never
+                                       // mentioned means "use whatever the class
+                                       // reserves". Collapsing them makes somebody's
+                                       // desktop unusable in one direction and wastes
+                                       // a build server in the other.
+                                       .reservedCores = cfg.reservedCores.value_or(0),
+                                       .reserveIsExplicit = cfg.reservedCores.has_value() };
+}
+
 ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig const& cfg)
 {
     NodeConfig const defaults {};
@@ -344,6 +429,14 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitIfSet("bind", cfg.bindAddress, defaults.bindAddress);
     emitIfSet("port", cfg.port, defaults.port);
     emitIfSet("slots", cfg.slots, defaults.slots);
+    emitIfSet("node-class",
+              std::string { Distributed::TraitsFor(cfg.nodeClass).name },
+              std::string { Distributed::TraitsFor(defaults.nodeClass).name });
+    // Emitted on presence rather than on difference, because the difference this
+    // flag carries IS presence: a reserve of zero the operator typed and a reserve
+    // nobody mentioned are different instructions, and `emitIfSet` compares values.
+    if (cfg.reservedCores.has_value())
+        argv.push_back(std::format("--reserve-cores={}", *cfg.reservedCores));
     emitIfSet("admin-listen", cfg.adminListen, defaults.adminListen);
     emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
     emitIfSet("cache-memory", cfg.cacheMemoryBytes, defaults.cacheMemoryBytes);

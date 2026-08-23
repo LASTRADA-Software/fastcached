@@ -34,6 +34,7 @@ namespace
         RefusalDescriptor { .code = Wire::ErrorCode::NoWorker, .counter = IMetricsSink::Counter::DispatchLeasesNoWorker },
         RefusalDescriptor { .code = Wire::ErrorCode::NoCapacity,
                             .counter = IMetricsSink::Counter::DispatchLeasesNoCapacity },
+        RefusalDescriptor { .code = Wire::ErrorCode::Withdrawn, .counter = IMetricsSink::Counter::DispatchLeasesWithdrawn },
         RefusalDescriptor { .code = Wire::ErrorCode::AlreadyInFlight,
                             .counter = IMetricsSink::Counter::DispatchLeasesDuplicate },
     };
@@ -68,6 +69,29 @@ namespace
     }
 
     static_assert(RefusalsAreDisjoint(), "a refusal either moves a counter or is listed as moving none, never both");
+
+    /// One row per `PickError`, in enumerator order: the wire code it becomes.
+    ///
+    /// A table rather than a conditional for the reason the refusal table below is
+    /// one: the mapping is the whole of what a client and an operator are told, and
+    /// a `PickError` added without a row here would silently arrive as whichever
+    /// arm an `if` happened to fall through to.
+    constexpr std::array PickErrorTable {
+        Wire::ErrorCode::NoWorker,
+        Wire::ErrorCode::NoCapacity,
+        Wire::ErrorCode::Withdrawn,
+    };
+
+    static_assert(PickErrorTable.size() == static_cast<std::size_t>(PickError::Withdrawn) + 1,
+                  "PickErrorTable must hold one row per PickError, in enumerator order");
+
+    /// The wire code a pick refusal is reported as.
+    /// @param error Why no worker could be chosen.
+    /// @return The code to answer with.
+    [[nodiscard]] constexpr Wire::ErrorCode WireCodeFor(PickError error) noexcept
+    {
+        return PickErrorTable[static_cast<std::size_t>(error)];
+    }
 
     /// The counter a refusal moves, if any.
     /// @param code The refusal.
@@ -133,12 +157,15 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     if (auto refusal = Gate(caller); refusal.has_value())
         return std::move(*refusal);
 
-    // A worker with no slots would register, match every lease for its toolchain,
-    // and never be picked -- indistinguishable at the client from a fleet that is
-    // permanently busy. Refuse it where it can be explained.
-    if (registration.slots == 0)
-        return Refuse(Wire::ErrorCode::MalformedFrame, "a worker must offer at least one slot");
-
+    // No zero-slot refusal any more, and its removal is a decision rather than a
+    // simplification. A zero used to mean "a worker that will never be picked" and
+    // was refused for that reason; since `OfferableSlots` it means "size me from my
+    // own hardware", which is the *preferred* spelling -- a node that computed its
+    // own slot count would be the one place a workstation's reserve could be got
+    // wrong with nothing downstream able to tell. The failure the refusal protected
+    // against is closed by construction instead: `OfferableSlots` never returns
+    // zero, so no registration can produce a worker that matches leases and is
+    // never picked.
     auto const id = _workers.Register(registration);
     // Counted as an event, not as fleet size. This interface is counter-only, so it
     // cannot express a gauge -- and the event turns out to be the more useful
@@ -151,7 +178,7 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     return SchedulerReply::Success(std::vector<std::byte> { bytes.begin(), bytes.end() });
 }
 
-SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller, std::string_view workerId, std::uint32_t inFlight)
+SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller, std::string_view workerId, NodeLoad const& load)
 {
     if (auto refusal = Gate(caller); refusal.has_value())
         return std::move(*refusal);
@@ -160,7 +187,7 @@ SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller, std::str
     // expired this worker, and the worker's correct response is to register again.
     // Silence would leave it heartbeating into a void forever while the fleet ran
     // without it.
-    if (!_workers.Heartbeat(workerId, inFlight))
+    if (!_workers.Heartbeat(workerId, load))
         return Refuse(Wire::ErrorCode::UnknownLease, "unknown worker; register again");
 
     return SchedulerReply::Success();
@@ -186,11 +213,16 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
 
     auto const picked = _workers.Pick(request.fingerprint);
     if (!picked.has_value())
-        // Counted apart by the table above, because they are different operator
-        // problems: no worker means the fleet is misconfigured (a fingerprint
-        // nobody serves), no capacity means it is too small. Summing them would
-        // hide the first behind the second exactly when a fleet is busy.
-        return Refuse(picked.error() == PickError::NoWorker ? Wire::ErrorCode::NoWorker : Wire::ErrorCode::NoCapacity);
+        // Counted apart by the table above, because they are three different
+        // operator problems: no worker means the fleet is misconfigured (a
+        // fingerprint nobody serves), no capacity means it is too small, and
+        // withdrawn means it is big enough and its machines are doing something
+        // else. Summing any two of them hides the more actionable one.
+        //
+        // A table rather than a `switch`, so a fourth `PickError` is a build failure
+        // here rather than a refusal that silently arrives as one of the other
+        // three.
+        return Refuse(WireCodeFor(picked.error()));
 
     auto const lease = _leases.Acquire(request.key, picked->id);
     if (!lease.has_value())

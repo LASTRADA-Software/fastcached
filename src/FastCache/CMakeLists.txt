@@ -62,6 +62,7 @@ target_sources(FastCache
         Platform/Environment.cpp
         Platform/FileTrust.cpp
         Platform/HostInfo.cpp
+        Platform/HostLoad.cpp
         Platform/HostMemory.cpp
         Platform/PosixDaemonHost.cpp
         Platform/ServiceControl.cpp

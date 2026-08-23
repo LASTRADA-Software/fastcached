@@ -76,6 +76,14 @@ readonly SKIP=77
 
 [[ -n "$fastcached" && -x "$fastcached" ]] || { echo "fastcached not found: '$fastcached'; skipping"; exit "$SKIP"; }
 [[ -n "$node"       && -x "$node"       ]] || { echo "fastcache-compile-node not found: '$node'; skipping"; exit "$SKIP"; }
+
+# Every node below except the cache-tier case turns its own cache port OFF.
+# `--listen-cache` defaults to 127.0.0.1:6674 -- where `fastcache-cc` looks --
+# which is right for the one node per machine a real deployment runs and wrong
+# here, where several share a host and would race for it. Said explicitly rather
+# than left to the default's warn-and-continue, so a node that failed to bind for
+# some OTHER reason still shows up as the fault it is.
+no_local_cache="--listen-cache="
 [[ -n "$launcher"   && -x "$launcher"   ]] || { echo "fastcache-cc not found: '$launcher'; skipping"; exit "$SKIP"; }
 command -v "$compiler" >/dev/null 2>&1 || { echo "compiler not found: '$compiler'; skipping"; exit "$SKIP"; }
 
@@ -291,7 +299,7 @@ export FASTCACHE_ADDR="127.0.0.1:${cache_port}"
 dispatch_port="$(free_port)"
 sched_worker_port="$(free_port)"
 
-"$node" --listen-scheduler="127.0.0.1:${dispatch_port}" --fleet-open \
+"$node" "$no_local_cache" --listen-scheduler="127.0.0.1:${dispatch_port}" --fleet-open \
     --scheduler="127.0.0.1:${dispatch_port}" \
     --bind=127.0.0.1 --port="$sched_worker_port" \
     --advertise="127.0.0.1:${sched_worker_port}" \
@@ -307,7 +315,7 @@ grep -q "scheduling for the fleet" "${workdir}/scheduler.log" \
 # --- start a worker ----------------------------------------------------------
 worker_port="$(free_port)"
 worker_admin_port="$(free_port)"
-"$node" --scheduler="127.0.0.1:${dispatch_port}" \
+"$node" "$no_local_cache" --scheduler="127.0.0.1:${dispatch_port}" \
     --bind=127.0.0.1 --port="$worker_port" --advertise="127.0.0.1:${worker_port}" \
     --admin-listen="$worker_admin_port" \
     --toolchain="${compiler}" --slots=2 --log-level=debug \
@@ -475,7 +483,7 @@ iso_daemon_pid=$!
 pids+=("$iso_daemon_pid")
 wait_for_port "$iso_cache_port" "$iso_daemon_pid" "isolation daemon" "${workdir}/iso-daemon.log"
 
-"$node" --listen-scheduler="127.0.0.1:${iso_dispatch_port}" --fleet-open \
+"$node" "$no_local_cache" --listen-scheduler="127.0.0.1:${iso_dispatch_port}" --fleet-open \
     --scheduler="127.0.0.1:${iso_dispatch_port}" \
     --bind=127.0.0.1 --port="$iso_sched_worker_port" \
     --advertise="127.0.0.1:${iso_sched_worker_port}" \
@@ -486,7 +494,7 @@ pids+=("$iso_scheduler_pid")
 wait_for_port "$iso_dispatch_port" "$iso_scheduler_pid" "isolation scheduler" "${workdir}/iso-scheduler.log"
 
 iso_worker_port="$(free_port)"
-"$node" --scheduler="127.0.0.1:${iso_dispatch_port}" \
+"$node" "$no_local_cache" --scheduler="127.0.0.1:${iso_dispatch_port}" \
     --bind=127.0.0.1 --port="$iso_worker_port" --advertise="127.0.0.1:${iso_worker_port}" \
     --toolchain="not-the-compiler-this-client-uses=${compiler}" --slots=2 --log-level=debug \
     > "${workdir}/iso-worker.log" 2>&1 &
@@ -588,7 +596,7 @@ wait_for_port "$cap_cache_port" "$cap_daemon_pid" "capacity daemon" "${workdir}/
 # Every node is both a peer and a possible scheduler, so it always registers as a
 # worker too -- and a second MATCHING worker would give this fleet two slots when
 # the whole point of the case is that it has one.
-"$node" --listen-scheduler="127.0.0.1:${cap_dispatch_port}" --fleet-open \
+"$node" "$no_local_cache" --listen-scheduler="127.0.0.1:${cap_dispatch_port}" --fleet-open \
     --scheduler="127.0.0.1:${cap_dispatch_port}" \
     --bind=127.0.0.1 --port="$cap_sched_worker_port" \
     --advertise="127.0.0.1:${cap_sched_worker_port}" \
@@ -599,7 +607,7 @@ pids+=("$cap_scheduler_pid")
 wait_for_port "$cap_dispatch_port" "$cap_scheduler_pid" "capacity scheduler" "${workdir}/cap-scheduler.log"
 
 cap_worker_port="$(free_port)"
-"$node" --scheduler="127.0.0.1:${cap_dispatch_port}" \
+"$node" "$no_local_cache" --scheduler="127.0.0.1:${cap_dispatch_port}" \
     --bind=127.0.0.1 --port="$cap_worker_port" --advertise="127.0.0.1:${cap_worker_port}" \
     --toolchain="${compiler}" --slots=1 --log-level=debug \
     > "${workdir}/cap-worker.log" 2>&1 &
@@ -689,7 +697,7 @@ echo "== case 8: a worker exits on SIGTERM"
 # SO_RCVTIMEO poll. macOS wakes the accept anyway and hides the whole thing, which
 # is why this is asserted here and not left to a developer machine.
 stop_port="$(free_port)"
-"$node" --scheduler="127.0.0.1:${dispatch_port}" \
+"$node" "$no_local_cache" --scheduler="127.0.0.1:${dispatch_port}" \
     --bind=127.0.0.1 --port="$stop_port" --advertise="127.0.0.1:${stop_port}" \
     --toolchain="${compiler}" --slots=1 --log-level=info \
     > "${workdir}/stop-worker.log" 2>&1 &
@@ -764,6 +772,38 @@ grep -q "fastcache-cc: HIT" "${workdir}/case9-offline.log"     || { cat "${workd
 
 cmp -s "${proj}/build/nine-ref.o" "${proj}/build/nine.o"     || fail "the object served from the node's tier is wrong"
 echo "   a hit was served with the shared cache stopped, and the object is right"
+
+# --- case 10: a worker that names no slot count sizes itself ------------------
+#
+# Every other case passes --slots explicitly, so the DERIVED path -- which is what
+# an operator who reads the docs and sets only --node-class actually runs -- would
+# otherwise never be exercised outside unit tests. The failure it guards against is
+# quiet in the usual way: a worker that derived zero, or that refused the flag,
+# registers and is simply never picked, which reads at the client as a fleet that is
+# permanently busy.
+echo "== case 10: a worker sizes itself from its node class"
+
+sizing_port="$(free_port)"
+"$node" "$no_local_cache" --scheduler="127.0.0.1:${dispatch_port}" \
+    --bind=127.0.0.1 --port="$sizing_port" --advertise="127.0.0.1:${sizing_port}" \
+    --toolchain="self-sizing=${compiler}" \
+    --node-class=dedicated --reserve-cores=0 --log-level=debug \
+    > "${workdir}/sizing.log" 2>&1 &
+sizing_pid=$!
+pids+=("$sizing_pid")
+wait_for_port "$sizing_port" "$sizing_pid" "self-sizing worker" "${workdir}/sizing.log"
+
+# The count itself depends on the runner, so what is asserted is that it is a
+# positive number and that the class reached the worker -- not a fixed value, which
+# would make this case a report about the CI machine rather than about the code.
+sizing_slots="$(sed -n "s/.*, \([0-9][0-9]*\) slot(s) as a dedicated node.*/\1/p" "${workdir}/sizing.log" | head -1)"
+[[ -n "$sizing_slots" ]] \
+    || { cat "${workdir}/sizing.log" >&2; fail "the worker did not report a derived slot count for its node class"; }
+[[ "$sizing_slots" -ge 1 ]] \
+    || { cat "${workdir}/sizing.log" >&2; fail "a self-sizing worker offered no slots at all"; }
+echo "   a dedicated worker sized itself to ${sizing_slots} slot(s) with no --slots given"
+
+stop_and_require_exit "$sizing_pid" "the self-sizing worker" 15
 
 echo
 echo "dist-compile E2E PASSED"

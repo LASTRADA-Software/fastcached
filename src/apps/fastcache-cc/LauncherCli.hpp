@@ -130,6 +130,24 @@ struct Command
 /// reading names nothing sets any more — caching silently off, and no test in
 /// the default suite to say so, since only the `smoke`-labelled end-to-end
 /// script exercises the reader.
+/// Where the cache is when `FASTCACHE_ADDR` says nothing.
+///
+/// Localhost, so `fastcache-cc` works with no configuration at all: whichever of
+/// `fastcached` or `fastcache-compile-node` a developer runs answers here, and the
+/// node's `--listen-cache` defaults to this same address for exactly that reason.
+///
+/// Defaulting to a *remote* address would be indefensible — every translation unit
+/// on a machine with nothing listening would pay a connect timeout, in silence. A
+/// loopback connect to a closed port is not that: it is refused immediately, with no
+/// timeout and no round trip, so a machine running neither daemon pays microseconds
+/// per compile rather than seconds. That asymmetry is the whole argument, and it is
+/// why this default is localhost and could not be anything else.
+///
+/// `FASTCACHE_ADDR=` (set but empty) still means *off*, which is what a build that
+/// wants no cache at all sets — see `EnvOr`, which treats set-but-empty as unset,
+/// and `cmake/portable/CompileCache.cmake`, which passes an empty value to opt out.
+constexpr std::string_view DefaultAddr = "127.0.0.1:6674";
+
 namespace EnvName
 {
     constexpr std::string_view Addr = "FASTCACHE_ADDR";

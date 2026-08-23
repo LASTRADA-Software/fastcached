@@ -4,6 +4,8 @@
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/NodePolicy.hpp>
+#include <FastCache/Platform/HostInfo.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <cstdint>
@@ -35,7 +37,30 @@ struct NodeConfig
     /// which is deliberate: there is no default compiler, because a default is how
     /// a job ends up running against something nobody chose.
     std::vector<std::string> toolchains;
-    std::uint32_t slots { 0 }; ///< 0 means "one per hardware thread".
+    /// Concurrent compiles, or 0 to size the machine from `nodeClass` and its
+    /// hardware. Enforced here as well as advertised, through the one shared
+    /// `Distributed::OfferableSlots`: two implementations of that arithmetic is how
+    /// a worker comes to accept more jobs than the scheduler believes it has.
+    std::uint32_t slots { 0 };
+
+    /// Cores held back from the fleet, when the operator named a number.
+    ///
+    /// Absent is not zero, and this is one of the places that distinction is the
+    /// whole point: absent means "reserve whatever this node class reserves", while
+    /// a zero the operator typed means "reserve nothing, drive this machine to its
+    /// last core". A plain `std::uint32_t` cannot carry the difference, so a
+    /// workstation whose operator wanted no reserve and one who simply did not
+    /// mention it would be indistinguishable — and one of the two answers is
+    /// somebody's desktop becoming unusable.
+    std::optional<std::uint32_t> reservedCores;
+
+    /// How hard this machine may be driven. See `Distributed::NodeClass`.
+    ///
+    /// Defaults to `Workstation`, which is the safe answer rather than the common
+    /// one: a node whose class nobody set is somebody's desktop until proven
+    /// otherwise, and getting that backwards is a failure the person experiences as
+    /// "my editor stutters" and never connects to a build fleet.
+    Distributed::NodeClass nodeClass { Distributed::NodeClass::Workstation };
 
     /// Where the admin endpoint listens, or empty to leave it off.
     ///
@@ -73,14 +98,40 @@ struct NodeConfig
     std::filesystem::path cacheDir;
 
     /// Bytes the in-memory half of the tier may hold. 0 means "no local cache".
-    std::uint64_t cacheMemoryBytes { 0 };
-
-    /// Where this node serves cache verbs to its local clients, or empty for off.
     ///
-    /// A bare port binds LOOPBACK, unlike `--listen-scheduler`'s wildcard: this is
-    /// the surface `fastcache-cc` on this machine talks to, and a node's private
-    /// cache reachable from the network is a decision rather than a default.
-    std::string cacheListen;
+    /// Non-zero by default, unlike almost everything else here, because a local tier
+    /// is what this program is *for*: the whole reason a developer runs a node rather
+    /// than pointing at the shared cache is that a rebuild should not reach the wire.
+    /// A default of zero would mean nobody got that unless they read this file.
+    ///
+    /// 256 MiB rather than a fraction of RAM: this runs on somebody's workstation
+    /// beside their editor and their browser, and the daemon's quarter-of-the-machine
+    /// default is sized for a host whose job is caching. Enough for a few thousand
+    /// objects, small enough that nobody notices it.
+    std::uint64_t cacheMemoryBytes { 256ULL * 1024ULL * 1024ULL };
+
+    /// Where this node serves cache verbs to its local clients; empty turns it off.
+    ///
+    /// Defaults to the address `fastcache-cc` already looks at when nobody sets
+    /// `FASTCACHE_ADDR`, which is what makes the local tier work with **no
+    /// configuration at all**: start a node, build, and the launcher finds it. The
+    /// alternative — an off-by-default port an operator has to discover, and a
+    /// `FASTCACHE_ADDR` they then have to point at it — is two steps to get the
+    /// behaviour that is the point of running the program.
+    ///
+    /// Loopback, unlike `--listen-scheduler`'s wildcard, and that asymmetry is the
+    /// anti-leeching rule rather than a preference: a scheduler no peer can dial does
+    /// nothing, while a cache any host can dial is this machine's entire build output
+    /// served to strangers. Widening it is an operator's decision, and even then
+    /// `CacheResponder` admits only this machine and this cluster's members.
+    ///
+    /// A port already taken is fatal when the operator **named** it and a warning when
+    /// it is this default -- the same distinction the admin endpoint draws between an
+    /// endpoint asked for and one got anyway. Typed, it is a promise, and a broken
+    /// promise is fatal; defaulted, a node sharing a machine with `fastcached` would
+    /// otherwise refuse to start over a convenience nobody requested, and the launcher
+    /// reaches the daemon on that port instead. Never silently, either way.
+    std::string cacheListen { "127.0.0.1:6674" };
 
     /// The shared `fastcached` this node reads through to, or empty for none.
     ///
@@ -120,6 +171,23 @@ struct NodeConfig
     bool help { false };
     bool version { false };
 };
+
+/// What this machine offers the fleet, from its configuration and its hardware.
+///
+/// Extracted from `main.cpp` — which is in no test target — for the reason
+/// `CacheProtocol.cpp`, `RootReconciler.cpp` and `AdminEndpoint.cpp` were each
+/// extracted: the rule it applies is worth checking. What it decides is which facts
+/// come from the operator (`--node-class`, `--reserve-cores`) and which from the
+/// machine (cores, memory), and getting that mapping wrong is invisible — the node
+/// registers, heartbeats and is simply sized wrong forever.
+///
+/// The machine arrives through `IHostFactsSource` rather than through
+/// `OnlineCpuCount()` and friends, so a two-core laptop and a 128-thread server are
+/// both assertable from one test run.
+/// @param cfg The parsed configuration.
+/// @param host What the machine says about itself.
+/// @return The capacity to advertise, and to size this worker's own limit by.
+[[nodiscard]] Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg, IHostFactsSource const& host);
 
 /// Every accepted option, one row each.
 ///

@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Platform/CpuAffinity.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
+#include <FastCache/Platform/HostMemory.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <system_error>
 
@@ -126,6 +131,44 @@ DiskSpace QueryDiskSpace(std::filesystem::path const& path) noexcept
     // use, and a compile worker is not root. Reporting `free` would promise space
     // an unprivileged process cannot write into.
     return DiskSpace { .capacityBytes = space.capacity, .freeBytes = space.available };
+}
+
+namespace
+{
+    /// The real machine, behind the facts seam.
+    class SystemHostFacts final: public IHostFactsSource
+    {
+      public:
+        [[nodiscard]] HostFacts const& Facts() const override
+        {
+            return QueryHostFacts();
+        }
+
+        [[nodiscard]] std::uint32_t LogicalCores() const override
+        {
+            // Clamped here rather than at each caller, which is the point of the
+            // seam answering instead of the free function: `OnlineCpuCount` can
+            // report a machine it could not read as zero, and a caller that divided
+            // by it or subtracted a reserve from it would be wrong in a different
+            // way each time somebody forgot.
+            return std::max(std::uint32_t { 1 }, static_cast<std::uint32_t>(OnlineCpuCount()));
+        }
+
+        [[nodiscard]] std::uint64_t TotalMemoryBytes() const override
+        {
+            return static_cast<std::uint64_t>(QueryHostTotalMemoryBytes());
+        }
+
+        [[nodiscard]] DiskSpace SpaceOn(std::filesystem::path const& path) const override
+        {
+            return QueryDiskSpace(path);
+        }
+    };
+} // namespace
+
+std::unique_ptr<IHostFactsSource> MakeSystemHostFacts()
+{
+    return std::make_unique<SystemHostFacts>();
 }
 
 } // namespace FastCache

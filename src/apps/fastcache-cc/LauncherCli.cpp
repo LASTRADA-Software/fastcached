@@ -157,9 +157,13 @@ namespace
     /// than merely listing it.
     constexpr std::array EnvironmentTable {
         EnvVarSpec { .name = EnvName::Addr,
-                     .summary = "host:port of the fastcached daemon. Unset means every\n"
-                                "compile runs uncached -- the build still succeeds, so\n"
-                                "check this before concluding the cache is working." },
+                     .summary = "host:port of the cache. Defaults to 127.0.0.1:6674,\n"
+                                "where both fastcached and a local\n"
+                                "fastcache-compile-node listen, so a local daemon is\n"
+                                "found with no configuration. Set it EMPTY to run\n"
+                                "every compile uncached -- the build still succeeds\n"
+                                "either way, so check this before concluding the\n"
+                                "cache is working." },
         EnvVarSpec { .name = EnvName::SourceDir, .summary = "Checkout source root, for keying and path canonicalization." },
         EnvVarSpec { .name = EnvName::BinaryDir, .summary = "Build output root." },
         EnvVarSpec { .name = EnvName::PrefetchGroup,

@@ -12,6 +12,7 @@
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
 #include "NodeConfig.hpp"
+#include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
 #include "WorkerServer.hpp"
 
@@ -22,6 +23,7 @@
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
@@ -30,6 +32,7 @@
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
+#include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/Terminal.hpp>
@@ -321,7 +324,21 @@ constexpr int ExitOk = 0;
         return ExitUsage;
     auto const toolchains = *std::move(toolchainsOrNone);
 
-    auto const slots = cfg.slots != 0 ? cfg.slots : std::max(1U, std::thread::hardware_concurrency());
+    // Computed HERE and advertised, rather than left for the scheduler to derive.
+    // Both would use the same `OfferableSlots`, so the numbers would agree -- but
+    // this worker has to enforce a limit before it has a scheduler to ask, and a
+    // worker running to one number while the scheduler leases against another is
+    // exactly the "fuller and slower than the scheduler believes" failure `--slots`
+    // documents. One call, one answer, used for both.
+    // The machine arrives through a seam rather than through `hardware_concurrency()`
+    // and `QueryHostTotalMemoryBytes()` directly: `NodeCapacityOf` is what decides
+    // which facts come from the operator and which from the hardware, and that rule
+    // is only checkable if a test can present a two-core laptop and a 128-thread
+    // server in one run. It also lives in `NodeConfig.cpp` rather than here, because
+    // this file is in no test target.
+    auto const host = MakeSystemHostFacts();
+    auto const capacity = Node::NodeCapacityOf(cfg, *host);
+    auto const slots = Distributed::OfferableSlots(capacity, cfg.slots);
     auto const advertise = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
 
     // `IsBound()`, not a null check: Bind() NEVER returns null -- it hands back a
@@ -376,11 +393,29 @@ constexpr int ExitOk = 0;
     // seam's other implementation and belongs with mTLS rather than bolted on here;
     // LeaseValidator exists so that is a substitution, not a rewrite.
     AtomicMetricsSink metrics;
+    // One policy for all THREE surfaces -- the compile port here, the scheduler and
+    // the cache below -- and it outlives every one of them. A node that answered "is
+    // this peer one of ours" differently at two of its surfaces would admit a peer to
+    // the fleet and refuse it the objects that fleet produced, or worse, the reverse.
+    Node::NodeMembership const membership { cfg };
+
+    // No lease validation, and it is recorded here rather than left looking like a
+    // stub. `WorkerServer` gates the port on membership, so what reaches this
+    // protocol is already this machine or a peer the operator admitted -- and a
+    // worker cannot check a token it did not issue without a round trip to the
+    // scheduler per job, or a signing key the two would have to share.
+    //
+    // The residual, deliberately: an admitted member can compile here without taking
+    // a lease first, bypassing the scheduler's slot accounting. Inside a trusted
+    // fleet that is a fairness question rather than a security one -- the machine
+    // would be busier than the scheduler believes, which the heartbeat corrects
+    // within one interval. Closing it properly means signing lease tokens, which is
+    // its own change.
     Cc::WorkerProtocol protocol {
         jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics
     };
 
-    Node::WorkerServer server { listenerRef, protocol, slots, metrics, logger };
+    Node::WorkerServer server { listenerRef, protocol, slots, membership.Oracle(), metrics, logger };
 
     // The admin endpoint, when the operator asked for one. Off by default and on
     // loopback for a bare port: a scrape surface reachable from the network is a
@@ -398,20 +433,28 @@ constexpr int ExitOk = 0;
             cfg.adminListen,
             "127.0.0.1",
             metrics,
-            [startedAt = std::chrono::steady_clock::now(), &server, slots, scratchRoot = jobs.ScratchRoot()] {
+            [startedAt = std::chrono::steady_clock::now(),
+             &server,
+             slots,
+             host = host.get(),
+             scratchRoot = jobs.ScratchRoot()] {
                 // Sampled per scrape rather than captured once: the disk fills and
                 // the busy count moves, and a value frozen at startup is worse than
                 // no value because it looks current.
-                auto const disk = QueryDiskSpace(scratchRoot);
+                // Through the same facts source the capacity above came from, so a
+                // scrape and a registration cannot disagree about the machine they
+                // describe. `host` outlives this lambda: it is declared before the
+                // endpoint and destroyed after it.
+                auto const disk = host->SpaceOn(scratchRoot);
 
                 // No storage: a worker has no cache, and reporting a
                 // default-constructed one would state an empty unbounded cache as a
                 // fact rather than as an absence.
                 return MetricsSnapshot {
                     .storage = std::nullopt,
-                    .host = HostCapacity { .logicalCores = OnlineCpuCount(),
+                    .host = HostCapacity { .logicalCores = host->LogicalCores(),
                                            .configuredSlots = slots,
-                                           .totalMemoryBytes = static_cast<std::uint64_t>(QueryHostTotalMemoryBytes()),
+                                           .totalMemoryBytes = host->TotalMemoryBytes(),
                                            .diskCapacityBytes = static_cast<std::uint64_t>(disk.capacityBytes),
                                            .diskFreeBytes = static_cast<std::uint64_t>(disk.freeBytes),
                                            .busySlots = server.InFlight() },
@@ -452,7 +495,7 @@ constexpr int ExitOk = 0;
     std::unique_ptr<Node::SchedulerTier> schedulerTier;
     if (!cfg.schedulerListen.empty())
     {
-        auto started = Node::SchedulerTier::Start(cfg, schedulerClock, metrics, logger);
+        auto started = Node::SchedulerTier::Start(cfg, membership.Oracle(), schedulerClock, metrics, logger);
         if (!started.has_value())
         {
             // Fatal for the same reason the admin endpoint's is: an operator who asked
@@ -470,17 +513,16 @@ constexpr int ExitOk = 0;
     //
     // Five collaborators in a reference chain, owned as one object rather than as
     // locals whose declaration ORDER is load-bearing and silently so.
-    std::unique_ptr<Node::CacheTier> cacheTier;
-    if (!cfg.cacheListen.empty())
+    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(cfg, membership.Oracle(), cacheClock, metrics, logger);
+    if (!cacheTierOrRefusal.has_value())
     {
-        auto started = Node::CacheTier::Start(cfg, cacheClock, metrics, logger);
-        if (!started.has_value())
-        {
-            logger.Logf(LogLevel::Error, "--listen-cache {}; refusing to start", started.error());
-            return ExitUsage;
-        }
-        cacheTier = std::move(*started);
+        logger.Logf(LogLevel::Error, "--listen-cache {}; refusing to start", cacheTierOrRefusal.error());
+        return ExitUsage;
     }
+    // May legitimately be null: `StartCacheTierOrExplain` treats an emptied
+    // `--listen-cache`, and a DEFAULT address that was already taken, as reasons to
+    // carry on without a tier rather than as failures. Both have been logged.
+    auto const cacheTier = std::move(*cacheTierOrRefusal);
 
     Cc::Credential const credential { .username = {}, .secret = cfg.token };
 
@@ -501,7 +543,20 @@ constexpr int ExitOk = 0;
     std::vector<Cc::WorkerRegistrar> registrars;
     registrars.reserve(toolchains.size());
     for (auto const& [fingerprint, compiler]: toolchains)
-        registrars.emplace_back(fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec });
+        registrars.emplace_back(
+            fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, Distributed::CapacityToWire(capacity));
+
+    // One sampler for the whole loop, not one per heartbeat. CPU utilization is a
+    // difference between two readings, so a sampler constructed per iteration would
+    // have no earlier reading to difference against and would report nothing,
+    // forever -- a scheduler that never learned this machine was busy, with nothing
+    // anywhere saying so.
+    //
+    // Configured with the scratch path at construction rather than handed one per
+    // call: which filesystem this worker writes to is a property of the worker, and
+    // the "zero free bytes means the query failed, not that the disk is full" rule
+    // belongs beside the query rather than at whoever remembers to apply it.
+    auto const loadSampler = MakeHostLoadSampler(MakeSystemCounterSource(jobs.ScratchRoot()));
 
     // Registration and heartbeating are one loop because they are one concern: a
     // worker is registered exactly as long as it keeps saying so, and a scheduler
@@ -520,9 +575,21 @@ constexpr int ExitOk = 0;
                 // single bad entry silently un-registers the whole worker.
                 std::size_t accepted = 0;
                 auto const inFlight = static_cast<std::uint32_t>(server.InFlight());
+
+                // Sampled once per round rather than once per registrar: every
+                // entry describes the SAME machine, so sampling per toolchain would
+                // report several different views of one host and, worse, would cut
+                // the CPU interval into pieces too short to mean anything.
+                auto const sampled = loadSampler->Sample();
+                auto const load =
+                    Distributed::LoadToWire(Distributed::NodeLoad { .inFlight = inFlight,
+                                                                    .cpuBusyPermille = sampled.cpuBusyPermille,
+                                                                    .availableMemoryBytes = sampled.availableMemoryBytes,
+                                                                    .freeScratchBytes = sampled.freeScratchBytes });
+
                 for (auto& registrar: registrars)
                 {
-                    bool ok = !registrar.WorkerId().empty() && registrar.Heartbeat(*client, inFlight, credential);
+                    bool ok = !registrar.WorkerId().empty() && registrar.Heartbeat(*client, inFlight, load, credential);
                     if (!ok)
                         ok = registrar.Register(*client, credential);
                     if (ok)
@@ -578,10 +645,11 @@ constexpr int ExitOk = 0;
     auto const listeningOn = activated != nullptr ? std::string { "a socket-activated listener" }
                                                   : std::format("{}:{}", cfg.bindAddress, cfg.port);
     logger.Logf(LogLevel::Info,
-                "compile node ready on {}, advertising {}, {} slot(s), {} toolchain(s)",
+                "compile node ready on {}, advertising {}, {} slot(s) as a {} node, {} toolchain(s)",
                 listeningOn,
                 advertise,
                 slots,
+                Distributed::TraitsFor(cfg.nodeClass).name,
                 toolchains.size());
 
     SyncRun(server.Run());

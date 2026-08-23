@@ -188,7 +188,7 @@ enum class ErrorCode : std::uint8_t
     // configuration problem, no free slot is a capacity problem, and a duplicate
     // is neither.
     NoWorker = 0x09,             ///< No registered worker matches the requested toolchain.
-    NoCapacity = 0x0A,           ///< Every matching worker is at its slot limit.
+    NoCapacity = 0x0A,           ///< Every matching worker is full of this fleet's own work.
     AlreadyInFlight = 0x0B,      ///< Another client already holds a lease for this key.
     DispatchNotPermitted = 0x0C, ///< This listener's role mask does not carry `Dispatch`.
     UnknownLease = 0x0D,         ///< The lease token is unknown, expired, or already spent.
@@ -215,6 +215,15 @@ enum class ErrorCode : std::uint8_t
     /// endpoint requires; this is about contribution, and a non-member is still
     /// served the cache.
     NotAMember = 0x13,
+    /// Matching workers exist and have withdrawn their capacity: their machines are
+    /// busy with something other than this fleet, or out of scratch space.
+    ///
+    /// Distinct from `NoCapacity`, which means the fleet is full of this build's own
+    /// work. Both make the client compile locally, so the split is entirely for
+    /// whoever has to act on it -- one says "somebody is using your machines" and
+    /// the other says "buy more machines", and summing them would send an operator
+    /// shopping for hardware they already own.
+    Withdrawn = 0x14,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -310,13 +319,13 @@ inline constexpr std::array OpTable {
     // another machine is the last thing an unauthenticated peer should reach.
     OpDescriptor { .code = Op::Register,
                    .name = "register",
-                   .fieldCount = 4, // fingerprint, endpoint, u32 slots, accepted codecs
+                   .fieldCount = 5, // fingerprint, endpoint, u32 slots, accepted codecs, capacity
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = false,
                    .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::Heartbeat,
                    .name = "heartbeat",
-                   .fieldCount = 2, // workerId, u32 inFlight
+                   .fieldCount = 3, // workerId, u32 inFlight, load
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = false,
                    .maxPayload = MaxControlPayload },
@@ -400,6 +409,9 @@ inline constexpr std::array ErrorTable {
         .code = ErrorCode::NotLeader, .name = "not-leader", .defaultMessage = "this node does not lead the cluster" },
     ErrorDescriptor {
         .code = ErrorCode::NotAMember, .name = "not-a-member", .defaultMessage = "not a member of this cluster" },
+    ErrorDescriptor { .code = ErrorCode::Withdrawn,
+                      .name = "withdrawn",
+                      .defaultMessage = "every matching worker has withdrawn its capacity" },
 };
 
 /// Look up the descriptor for a raw opcode byte.
@@ -917,12 +929,126 @@ using CodecList = std::vector<std::uint8_t>;
 }
 
 /// A worker announcing itself to the scheduler.
+/// A worker's static hardware facts, as they travel inside REGISTER.
+///
+/// Raw values rather than the scheduler's own `Distributed::NodeClass`, for the
+/// reason `CodecList` holds raw codec ids: this header is compiled into
+/// `fastcache-cc`, which does not link `FastCache`, so it may not know the
+/// scheduler's vocabulary. The mapping happens one layer up, where an unknown
+/// class can be answered rather than assumed.
+struct CapacityFields
+{
+    std::uint32_t logicalCores { 0 };     ///< Hardware threads; 0 means "did not say".
+    std::uint64_t totalMemoryBytes { 0 }; ///< Physical memory; 0 means "did not say".
+    std::uint8_t nodeClassRaw { 0 };      ///< How hard the machine may be driven.
+    /// Cores held back from the fleet, when the operator named a number.
+    ///
+    /// Absent is not zero, and conflating them is the bug this optional exists to
+    /// prevent: absent means "use whatever the class reserves", while zero means
+    /// "the operator said to reserve nothing". A machine that merely failed to
+    /// mention a reserve would otherwise be driven to its last core.
+    std::optional<std::uint32_t> reservedCores {};
+};
+
+/// Frame a capacity record as one nested field list.
+///
+/// **Nested rather than five more REGISTER fields**, and that is the extensibility
+/// decision. `SplitFields` is exact by design — the property that makes a fixed
+/// message shape self-describing — so every fact added at the top level would move
+/// REGISTER's arity and make two builds of this fleet unable to speak at all. The
+/// grammar's own header names the way out: *"a protocol that wants both nests one
+/// inside a field of the other rather than giving up either"*. So REGISTER keeps an
+/// exact five fields forever, and this record inside it is read with the
+/// variable-arity split: a fact this build has not heard of is skipped, and one it
+/// expects but was not sent keeps its default, which is "did not say".
+/// @param capacity The facts to encode.
+/// @return The nested record's bytes, to be carried as a single REGISTER field.
+[[nodiscard]] inline std::vector<std::byte> EncodeCapacity(CapacityFields const& capacity)
+{
+    auto const cores = WireFields::ToBigEndian<std::uint32_t>(capacity.logicalCores);
+    auto const memory = WireFields::ToBigEndian<std::uint64_t>(capacity.totalMemoryBytes);
+    auto const nodeClass = std::array { static_cast<std::byte>(capacity.nodeClassRaw) };
+    // An absent reserve travels as a zero-length field rather than as a zero value.
+    // They mean different things -- see the member's own comment -- and a wire that
+    // could not tell them apart would put the whole distinction back on the sender.
+    auto const reserveBytes = WireFields::ToBigEndian<std::uint32_t>(capacity.reservedCores.value_or(0));
+    auto const reserve =
+        capacity.reservedCores.has_value() ? std::span<std::byte const> { reserveBytes } : std::span<std::byte const> {};
+    return WireFields::Encode({ std::span<std::byte const> { cores },
+                                std::span<std::byte const> { memory },
+                                std::span<std::byte const> { nodeClass },
+                                reserve });
+}
+
+/// Read a capacity record back.
+///
+/// Every field is optional in the sense that matters: a record holding fewer than
+/// this build expects is accepted with the rest left at "did not say", and one
+/// holding more is accepted with the surplus ignored. What is *not* tolerated is a
+/// field of the wrong width — that is a sender speaking a shape this build does not
+/// know, and reading its first four bytes would invent a number.
+/// @param field The nested record's bytes.
+/// @return The facts, or nullopt when the record itself is malformed.
+[[nodiscard]] inline std::optional<CapacityFields> DecodeCapacity(std::span<std::byte const> field)
+{
+    // An absent record is not a malformed one: a peer that predates this field, or
+    // one that had nothing to say, is answered rather than refused.
+    if (field.empty())
+        return CapacityFields {};
+
+    auto const parts = WireFields::SplitAll(field);
+    if (!parts.has_value())
+        return std::nullopt;
+
+    CapacityFields out {};
+    auto const at = [&](std::size_t index) {
+        return index < parts->size() ? (*parts)[index] : std::span<std::byte const> {};
+    };
+
+    if (auto const cores = at(0); !cores.empty())
+    {
+        auto const value = WireFields::FromBigEndian<std::uint32_t>(cores);
+        if (!value.has_value())
+            return std::nullopt;
+        out.logicalCores = *value;
+    }
+    if (auto const memory = at(1); !memory.empty())
+    {
+        auto const value = WireFields::FromBigEndian<std::uint64_t>(memory);
+        if (!value.has_value())
+            return std::nullopt;
+        out.totalMemoryBytes = *value;
+    }
+    if (auto const nodeClass = at(2); !nodeClass.empty())
+    {
+        if (nodeClass.size() != 1)
+            return std::nullopt;
+        out.nodeClassRaw = static_cast<std::uint8_t>(nodeClass[0]);
+    }
+    if (auto const reserve = at(3); !reserve.empty())
+    {
+        auto const value = WireFields::FromBigEndian<std::uint32_t>(reserve);
+        if (!value.has_value())
+            return std::nullopt;
+        // Assigned as the optional it already is. Unwrapping and re-wrapping is the
+        // obvious spelling and is what `bugprone-optional-value-conversion` exists
+        // to catch: it puts a dereference in the path for no gain.
+        out.reservedCores = value;
+    }
+    return out;
+}
+
 struct RegisterRequest
 {
     std::string_view fingerprint; ///< Opaque toolchain identity; matched byte-for-byte.
     std::string_view endpoint;    ///< host:port a client can reach this worker on.
-    std::uint32_t slots { 0 };    ///< Jobs this worker will run concurrently.
-    CodecList acceptedCodecs;     ///< What it can decode.
+    /// Jobs this worker will run concurrently, or 0 to let the scheduler size it
+    /// from `capacity`. Zero is the spelling a node should prefer: a node that did
+    /// that arithmetic itself would be the one place a workstation's reserve could
+    /// be got wrong with nothing downstream able to tell.
+    std::uint32_t slots { 0 };
+    CodecList acceptedCodecs;   ///< What it can decode.
+    CapacityFields capacity {}; ///< What the machine is, for slot derivation.
 };
 
 /// The same, as views into a received payload.
@@ -932,6 +1058,7 @@ struct RegisterView
     std::span<std::byte const> endpoint;
     std::uint32_t slots { 0 };
     CodecList acceptedCodecs;
+    CapacityFields capacity {};
 };
 
 /// A client asking the scheduler where to compile.
@@ -998,12 +1125,14 @@ struct CompileView
 {
     auto const slots = EncodeU32Field(request.slots);
     auto const codecs = EncodeCodecList(request.acceptedCodecs);
+    auto const capacity = EncodeCapacity(request.capacity);
     return Detail::EncodeRequest(version,
                                  Op::Register,
                                  { AsBytes(request.fingerprint),
                                    AsBytes(request.endpoint),
                                    std::span<std::byte const> { slots },
-                                   std::span<std::byte const> { codecs } });
+                                   std::span<std::byte const> { codecs },
+                                   std::span<std::byte const> { capacity } });
 }
 
 /// Split a REGISTER payload.
@@ -1017,23 +1146,108 @@ struct CompileView
     auto const slots = DecodeU32Field((*fields)[2]);
     if (!slots.has_value())
         return std::nullopt;
+    auto capacity = DecodeCapacity((*fields)[4]);
+    if (!capacity.has_value())
+        return std::nullopt;
     return RegisterView { .fingerprint = (*fields)[0],
                           .endpoint = (*fields)[1],
                           .slots = *slots,
-                          .acceptedCodecs = DecodeCodecList((*fields)[3]) };
+                          .acceptedCodecs = DecodeCodecList((*fields)[3]),
+                          .capacity = *capacity };
+}
+
+/// What a worker reports about itself beyond its job count.
+///
+/// Every field optional in the same sense `CapacityFields::reservedCores` is:
+/// absent means "this machine would not say", which is a different fact from a
+/// measured zero and leads to the opposite decision. A node whose CPU cannot be
+/// read must be scheduled on its other properties; one that reads zero is idle.
+struct LoadFields
+{
+    std::optional<std::uint32_t> cpuBusyPermille;      ///< Host-wide CPU busy, 0..1000.
+    std::optional<std::uint64_t> availableMemoryBytes; ///< Memory a new job could get.
+    std::optional<std::uint64_t> freeScratchBytes;     ///< Room where jobs are compiled.
+};
+
+/// Frame a live-load record as one nested field list.
+///
+/// Nested for the reason `EncodeCapacity` is, and it is the same decision made a
+/// second time rather than a coincidence: a heartbeat is the message most likely to
+/// grow a field, since every new thing a scheduler learns to weigh is something a
+/// worker has to start reporting. Keeping HEARTBEAT at an exact three fields means
+/// none of those ever costs a fleet the ability to speak to itself.
+/// @param load What to encode; an absent value travels as a zero-length field.
+/// @return The nested record's bytes, to be carried as a single HEARTBEAT field.
+[[nodiscard]] inline std::vector<std::byte> EncodeLoad(LoadFields const& load)
+{
+    auto const cpu = WireFields::ToBigEndian<std::uint32_t>(load.cpuBusyPermille.value_or(0));
+    auto const memory = WireFields::ToBigEndian<std::uint64_t>(load.availableMemoryBytes.value_or(0));
+    auto const scratch = WireFields::ToBigEndian<std::uint64_t>(load.freeScratchBytes.value_or(0));
+    return WireFields::Encode(
+        { load.cpuBusyPermille.has_value() ? std::span<std::byte const> { cpu } : std::span<std::byte const> {},
+          load.availableMemoryBytes.has_value() ? std::span<std::byte const> { memory } : std::span<std::byte const> {},
+          load.freeScratchBytes.has_value() ? std::span<std::byte const> { scratch } : std::span<std::byte const> {} });
+}
+
+/// Read a live-load record back.
+///
+/// Tolerant of a peer that reports fewer facts or more, and strict about the width
+/// of the ones it does report -- exactly as `DecodeCapacity` is, and for the same
+/// reasons.
+/// @param field The nested record's bytes.
+/// @return The values, or nullopt when a field is present at the wrong width.
+[[nodiscard]] inline std::optional<LoadFields> DecodeLoad(std::span<std::byte const> field)
+{
+    if (field.empty())
+        return LoadFields {};
+
+    auto const parts = WireFields::SplitAll(field);
+    if (!parts.has_value())
+        return std::nullopt;
+
+    LoadFields out {};
+    auto const at = [&](std::size_t index) {
+        return index < parts->size() ? (*parts)[index] : std::span<std::byte const> {};
+    };
+
+    if (auto const cpu = at(0); !cpu.empty())
+    {
+        out.cpuBusyPermille = WireFields::FromBigEndian<std::uint32_t>(cpu);
+        if (!out.cpuBusyPermille.has_value())
+            return std::nullopt;
+    }
+    if (auto const memory = at(1); !memory.empty())
+    {
+        out.availableMemoryBytes = WireFields::FromBigEndian<std::uint64_t>(memory);
+        if (!out.availableMemoryBytes.has_value())
+            return std::nullopt;
+    }
+    if (auto const scratch = at(2); !scratch.empty())
+    {
+        out.freeScratchBytes = WireFields::FromBigEndian<std::uint64_t>(scratch);
+        if (!out.freeScratchBytes.has_value())
+            return std::nullopt;
+    }
+    return out;
 }
 
 /// Frame a HEARTBEAT request.
 /// @param workerId The id the scheduler issued at registration.
 /// @param inFlight How many jobs the worker is running right now.
+/// @param load What else the worker has to say about itself.
 /// @param version Version to advertise.
 /// @return The framed request.
 [[nodiscard]] inline std::vector<std::byte> EncodeHeartbeat(std::string_view workerId,
                                                             std::uint32_t inFlight,
+                                                            LoadFields const& load = {},
                                                             WireVersion version = CurrentVersion)
 {
-    auto const load = EncodeU32Field(inFlight);
-    return Detail::EncodeRequest(version, Op::Heartbeat, { AsBytes(workerId), std::span<std::byte const> { load } });
+    auto const jobs = EncodeU32Field(inFlight);
+    auto const rest = EncodeLoad(load);
+    return Detail::EncodeRequest(
+        version,
+        Op::Heartbeat,
+        { AsBytes(workerId), std::span<std::byte const> { jobs }, std::span<std::byte const> { rest } });
 }
 
 /// A worker's periodic liveness report.
@@ -1041,6 +1255,7 @@ struct HeartbeatView
 {
     std::span<std::byte const> workerId;
     std::uint32_t inFlight { 0 };
+    LoadFields load {};
 };
 
 /// Split a HEARTBEAT payload.
@@ -1054,7 +1269,10 @@ struct HeartbeatView
     auto const inFlight = DecodeU32Field((*fields)[1]);
     if (!inFlight.has_value())
         return std::nullopt;
-    return HeartbeatView { .workerId = (*fields)[0], .inFlight = *inFlight };
+    auto const load = DecodeLoad((*fields)[2]);
+    if (!load.has_value())
+        return std::nullopt;
+    return HeartbeatView { .workerId = (*fields)[0], .inFlight = *inFlight, .load = *load };
 }
 
 /// Frame a LEASE request.

@@ -193,12 +193,16 @@ TEST_CASE("A member registers over a real socket", "[node][scheduler]")
     CHECK(Unwrap(header).status == Wire::Status::Ok);
 }
 
-TEST_CASE("A stranger is refused the fleet over a real socket", "[node][scheduler]")
+TEST_CASE("This machine is admitted whatever the member list says", "[node][scheduler]")
 {
-    // The anti-leeching rule reaching the wire. The oracle here admits only
-    // 10.0.0.1, so a loopback connection is a non-member -- which is the same
-    // classification a machine outside the cluster would get, expressed in the one
-    // way a test can actually arrange.
+    // The rule that makes an unconfigured node useful and still closed. Anti-leeching
+    // exists to stop OTHER machines spending capacity they do not contribute; a
+    // process on this host already has this host's CPU, and the `fastcache-cc` a
+    // developer runs against their own node is the whole reason the node is there.
+    //
+    // The member list names only a remote host, so before this rule a node whose
+    // operator had listed their peers would have refused their own builds -- a fleet
+    // that looks configured and serves nobody locally.
     Fleet fleet;
     fleet.membership.Publish({ "10.0.0.1:7000" });
 
@@ -210,8 +214,27 @@ TEST_CASE("A stranger is refused the fleet over a real socket", "[node][schedule
     // elsewhere and what a log line has to say to be worth printing.
     CHECK((*started)->BoundEndpoint() == std::format("127.0.0.1:{}", port));
 
+    // Refused for having no worker, which is the fleet answering the question rather
+    // than the gate refusing to hear it. `NotAMember` here would be the regression.
     auto const frame = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
-    CHECK(ErrorOf(Exchange(port, frame)) == Wire::ErrorCode::NotAMember);
+    CHECK(ErrorOf(Exchange(port, frame)) == Wire::ErrorCode::NoWorker);
+}
+
+TEST_CASE("A stranger is refused the fleet", "[node][scheduler]")
+{
+    // Not over a socket, and that is a consequence of the rule above rather than a
+    // weaker test: every connection a test can make to itself arrives from loopback,
+    // and loopback is now a member by construction. Naming the peer directly is the
+    // only way left to express "a different machine" -- and it is the same string the
+    // transport would have handed over, so nothing is being simulated away.
+    Fleet fleet;
+    fleet.membership.Publish({ "10.0.0.1:7000" });
+
+    auto const frame = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+
+    CHECK(ErrorOf(fleet.responder.Answer(frame, "10.9.9.9")) == Wire::ErrorCode::NotAMember);
+    // And a listed peer gets past the gate to the fleet's own answer.
+    CHECK(ErrorOf(fleet.responder.Answer(frame, "10.0.0.1")) == Wire::ErrorCode::NoWorker);
 }
 
 TEST_CASE("An oversize frame is refused with both numbers, and never buffered", "[node][scheduler]")

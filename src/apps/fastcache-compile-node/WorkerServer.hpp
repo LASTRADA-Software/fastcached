@@ -3,6 +3,7 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Net/ISocket.hpp>
@@ -54,9 +55,14 @@ class WorkerServer
     /// that is where it happens: the check is before the request is read, so the
     /// protocol never sees the job at all. Counting it beside the other refusals
     /// would mean reporting a busy worker as one whose toolchain does not match.
+    /// @param membership Decides who may spend this machine's CPU; must outlive
+    ///        the run. Checked **before** the request is read, for the reason the
+    ///        slot cap is: a caller with no claim on this machine must not be able
+    ///        to make it buffer a multi-megabyte preprocessed payload first.
     WorkerServer(IListener& listener,
                  Cc::WorkerProtocol& protocol,
                  std::size_t slots,
+                 Distributed::IMembershipOracle const& membership,
                  IMetricsSink& metrics,
                  ILogger& logger) noexcept;
 
@@ -73,6 +79,7 @@ class WorkerServer
     IListener& _listener;
     Cc::WorkerProtocol& _protocol;
     std::size_t _slots;
+    Distributed::IMembershipOracle const& _membership;
     IMetricsSink& _metrics;
     ILogger& _logger;
     std::atomic<bool> _shuttingDown { false };

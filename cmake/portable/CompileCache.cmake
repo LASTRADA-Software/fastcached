@@ -73,9 +73,11 @@ if(FASTCACHE_CC AND NOT EXISTS "${FASTCACHE_CC}")
     find_program(FASTCACHE_CC fastcache-cc DOC "fastcache-cc tool path; needs a fastcached daemon to be used")
 endif()
 
-# Where the daemon is: FASTCACHE_ADDR from the environment, else fastcached's
-# own port, which a stock daemon (and the service the installers register)
-# listens on. An empty -DFASTCACHE_ADDR= opts out of fastcache-cc entirely.
+# Where the cache is: FASTCACHE_ADDR from the environment, else localhost's own
+# port. That default reaches whichever of the two serves it -- a stock `fastcached`
+# (and the service the installers register) listens there, and so does a
+# `fastcache-compile-node`, whose --listen-cache defaults to the same address for
+# exactly this reason. An empty -DFASTCACHE_ADDR= opts out of fastcache-cc entirely.
 set(_fc_addr_env "$ENV{FASTCACHE_ADDR}")
 if(_fc_addr_env STREQUAL "")
     set(_fc_addr_wanted "127.0.0.1:6674")
