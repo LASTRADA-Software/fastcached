@@ -161,6 +161,39 @@ class RaftNode
     /// @return Where it landed and what to do, or why it was refused.
     [[nodiscard]] std::expected<Proposal, ConsensusError> Propose(std::vector<std::byte> payload, TimePoint now);
 
+    /// Propose a new member set, one member added or removed (§4.3).
+    ///
+    /// Restricted to a single-member delta, and that restriction is the whole
+    /// safety argument: any majority of the old configuration and any majority
+    /// of the new one then share at least one member, so the two cannot elect
+    /// different leaders in the same term. Going from three members to five in
+    /// one step makes `{n1,n2}` a majority of the old and `{n3,n4,n5}` a
+    /// majority of the new, with nobody in common — which is what joint
+    /// consensus exists to handle and why this refuses instead.
+    ///
+    /// Only one change may be in flight. A second proposed before the first
+    /// commits would be built on a configuration that can still be rolled back
+    /// by a truncation, so the safety argument above would be comparing against
+    /// a set that never existed.
+    ///
+    /// The new configuration takes effect on **this node** immediately, before
+    /// it is committed, because a configuration that waited for commitment could
+    /// not be used to reach it.
+    /// @param members The proposed member set.
+    /// @param now The current instant.
+    /// @return Where the entry landed and what to do, or why it was refused.
+    [[nodiscard]] std::expected<Proposal, ConsensusError> ProposeMembership(std::vector<NodeId> members, TimePoint now);
+
+    /// The member set this node is currently operating under.
+    ///
+    /// The latest configuration in its log, which is not necessarily a committed
+    /// one; see `ProposeMembership`.
+    /// @return The active members.
+    [[nodiscard]] std::vector<NodeId> const& ActiveMembers() const noexcept
+    {
+        return _members;
+    }
+
     /// When the driver must next call `Tick`.
     ///
     /// Which deadline this is depends on the role and comes from `RoleTable`.
@@ -199,6 +232,11 @@ class RaftNode
     /// @param id The claimed identity.
     /// @return True when the configuration contains it.
     [[nodiscard]] bool IsMember(NodeId const& id) const;
+    [[nodiscard]] std::size_t Quorum() const noexcept;
+    void AdoptMembers(std::vector<NodeId> members);
+    void RefreshConfiguration();
+    [[nodiscard]] bool HasUncommittedConfiguration() const;
+    [[nodiscard]] LogIndex LatestConfigurationIndex() const;
 
     /// Begin an election for the next term (§5.2).
     void StartPreVote(TimePoint now, RaftOutput& output);
@@ -316,6 +354,15 @@ class RaftNode
     /// would otherwise be counted twice, and two counted votes from one node is a
     /// quorum that does not exist.
     std::unordered_set<NodeId> _votesGranted;
+
+    /// The member set this node is operating under: the latest configuration in
+    /// its log, or `_config.members` when the log holds none.
+    ///
+    /// Separate from `_config.members`, which stays the set this node was
+    /// *bootstrapped* with. Keeping both is what lets a restart re-derive the
+    /// active set from the log rather than silently reverting a change the
+    /// cluster already made.
+    std::vector<NodeId> _members;
 
     /// Peers that said an election would be winnable, itself included.
     ///

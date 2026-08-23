@@ -107,8 +107,9 @@ using NodeId = std::string;
 /// inferring the difference would make one indistinguishable from the other.
 enum class EntryKind : std::uint8_t
 {
-    Command = 0, ///< Application bytes, delivered through `RaftOutput::applied`.
-    NoOp,        ///< Consensus' own; ordered and committed, but never delivered.
+    Command = 0,   ///< Application bytes, delivered through `RaftOutput::applied`.
+    NoOp,          ///< Consensus' own; ordered and committed, but never delivered.
+    Configuration, ///< The cluster's member set; adopted on append, never delivered.
 };
 
 /// One entry in the replicated log.
@@ -179,7 +180,7 @@ struct WireEnumBound;
 template <>
 struct WireEnumBound<EntryKind>
 {
-    static constexpr EntryKind Highest = EntryKind::NoOp;
+    static constexpr EntryKind Highest = EntryKind::Configuration;
 };
 
 /// `VoteDecision`'s bound.

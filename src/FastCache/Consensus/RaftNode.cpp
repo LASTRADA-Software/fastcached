@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Consensus/RaftNode.hpp>
 
 #include <algorithm>
@@ -59,8 +60,14 @@ RaftNode::RaftNode(RaftConfig config, IRandomSource& random, TimePoint now, Reco
     _random { random },
     _currentTerm { recovered.state.currentTerm },
     _votedFor { std::move(recovered.state.votedFor) },
-    _log { std::move(recovered.entries) }
+    _log { std::move(recovered.entries) },
+    _members { _config.members }
 {
+    // A recovered log may already carry a configuration change, and the node must
+    // come back under it rather than under the one it was bootstrapped with --
+    // otherwise a restart silently reverts a membership change the cluster made.
+    RefreshConfiguration();
+
     // A recovered node comes back as a follower whatever it was before, which is
     // not a simplification: role is not durable state, and a node that resumed as
     // a leader would be a second leader for a term that has since moved on.
@@ -152,8 +159,15 @@ void RaftNode::AdvanceCommitIndex()
     // and its own match index is its whole log -- a leader trivially has what it
     // wrote.
     auto matches = std::vector<LogIndex> {};
-    matches.reserve(_config.members.size());
-    matches.push_back(_log.LastIndex());
+    matches.reserve(_members.size());
+
+    // Itself, but only while it IS a member. A leader that has been removed keeps
+    // replicating until the entry removing it commits -- and that commitment is
+    // decided by the NEW configuration, which it is not part of. Counting itself
+    // there would let it commit its own removal on a quorum that does not
+    // include enough of the members who have to live with it.
+    if (IsMember(_config.self))
+        matches.push_back(_log.LastIndex());
     for (auto const& peer: _peers)
     {
         auto const found = _matchIndex.find(peer);
@@ -161,7 +175,7 @@ void RaftNode::AdvanceCommitIndex()
     }
 
     std::ranges::sort(matches, std::greater {});
-    auto const replicated = matches[_config.Quorum() - 1];
+    auto const replicated = matches[Quorum() - 1];
     if (replicated <= _commitIndex)
         return;
 
@@ -201,10 +215,26 @@ void RaftNode::ApplyCommitted(RaftOutput& output)
         // Consensus' own entries are committed like any other and never
         // delivered: the application asked for none of them and cannot interpret
         // them.
-        if (entry->kind == EntryKind::NoOp)
+        if (entry->kind == EntryKind::NoOp || entry->kind == EntryKind::Configuration)
             continue;
 
         output.applied.push_back(AppliedEntry { .index = _lastApplied, .payload = entry->payload });
+    }
+
+    // A leader that has been removed from the configuration steps down once the
+    // change is committed (§4.2.2). It cannot simply stop: the entry that removes
+    // it has to be committed first, and only this leader can commit it -- so it
+    // keeps leading a cluster it is no longer part of for exactly as long as it
+    // takes to make its own removal durable. Staying leader past that point would
+    // let a node outside the configuration keep replicating to it.
+    if (_role == Role::Leader && !IsMember(_config.self) && LatestConfigurationIndex() <= _commitIndex)
+    {
+        _role = Role::Follower;
+        _knownLeader.reset();
+        _votesGranted.clear();
+        _preVotesGranted.clear();
+        _nextIndex.clear();
+        _matchIndex.clear();
     }
 }
 
@@ -223,7 +253,60 @@ Term RaftNode::TermOf(RaftMessage const& message) noexcept
 
 bool RaftNode::IsMember(NodeId const& id) const
 {
-    return std::ranges::find(_config.members, id) != _config.members.end();
+    return std::ranges::find(_members, id) != _members.end();
+}
+
+std::size_t RaftNode::Quorum() const noexcept
+{
+    // From the ACTIVE member set, never from the bootstrap configuration. A
+    // quorum computed against a stale size is the one number that makes every
+    // other rule unsafe: too small and a minority commits, too large and a
+    // healthy cluster cannot.
+    return (_members.size() / 2) + 1;
+}
+
+void RaftNode::AdoptMembers(std::vector<NodeId> members)
+{
+    _members = std::move(members);
+
+    _peers.clear();
+    for (auto const& member: _members)
+        if (member != _config.self)
+            _peers.push_back(member);
+
+    // Progress bookkeeping for a member that is no longer one would count toward
+    // a quorum it is not part of.
+    std::erase_if(_nextIndex, [this](auto const& entry) { return !IsMember(entry.first); });
+    std::erase_if(_matchIndex, [this](auto const& entry) { return !IsMember(entry.first); });
+    std::erase_if(_votesGranted, [this](NodeId const& id) { return !IsMember(id); });
+    std::erase_if(_preVotesGranted, [this](NodeId const& id) { return !IsMember(id); });
+}
+
+void RaftNode::RefreshConfiguration()
+{
+    // The LATEST configuration in the log, committed or not (§4.3). That looks
+    // unsafe and is the opposite: a configuration that only took effect once
+    // committed could not be used to *reach* commitment, because committing it
+    // needs a quorum of the very set it describes.
+    //
+    // Re-derived by scanning rather than tracked forward, because an uncommitted
+    // change can be rolled back by a truncation -- so this is not a value that
+    // only ever moves in one direction, and a node that treated it as one would
+    // keep a configuration the cluster has discarded.
+    for (auto index = _log.LastIndex().value; index >= 1; --index)
+    {
+        auto const* const entry = _log.EntryAt(LogIndex { .value = index });
+        if (entry == nullptr || entry->kind != EntryKind::Configuration)
+            continue;
+
+        auto decoded = Membership::Decode(entry->payload);
+        if (decoded.has_value() && !decoded->empty())
+            AdoptMembers(*std::move(decoded));
+        return;
+    }
+
+    // No configuration entry: the bootstrap set is the active one.
+    AdoptMembers(_config.members);
 }
 
 void RaftNode::StepDown(Term term, TimePoint now, RaftOutput& output)
@@ -286,7 +369,7 @@ void RaftNode::StartPreVote(TimePoint now, RaftOutput& output)
 
     // A single-node cluster is its own quorum, so it goes straight to a real
     // election -- the pre-vote round costs it nothing and skips no step.
-    if (_preVotesGranted.size() >= _config.Quorum())
+    if (_preVotesGranted.size() >= Quorum())
     {
         StartElection(now, output);
         return;
@@ -322,7 +405,7 @@ void RaftNode::StartElection(TimePoint now, RaftOutput& output)
     ArmElectionTimer(now);
     MarkPersist(output);
 
-    if (_votesGranted.size() >= _config.Quorum())
+    if (_votesGranted.size() >= Quorum())
     {
         BecomeLeader(now, output);
         return;
@@ -400,6 +483,77 @@ RaftOutput RaftNode::Tick(TimePoint now)
     _heartbeatDeadline = now + _config.heartbeatInterval;
     ReplicateToPeers(output);
     return output;
+}
+
+LogIndex RaftNode::LatestConfigurationIndex() const
+{
+    for (auto index = _log.LastIndex().value; index >= 1; --index)
+    {
+        auto const* const entry = _log.EntryAt(LogIndex { .value = index });
+        if (entry != nullptr && entry->kind == EntryKind::Configuration)
+            return LogIndex { .value = index };
+    }
+    return LogIndex::BeforeFirst();
+}
+
+bool RaftNode::HasUncommittedConfiguration() const
+{
+    // Any configuration entry above the commit index. Scanned downward and
+    // stopped at the commit index rather than walked whole, because everything
+    // at or below it is settled by definition.
+    for (auto index = _log.LastIndex().value; index > _commitIndex.value; --index)
+    {
+        auto const* const entry = _log.EntryAt(LogIndex { .value = index });
+        if (entry != nullptr && entry->kind == EntryKind::Configuration)
+            return true;
+    }
+    return false;
+}
+
+std::expected<RaftNode::Proposal, ConsensusError> RaftNode::ProposeMembership(std::vector<NodeId> members, TimePoint now)
+{
+    if (_role != Role::Leader)
+        return std::unexpected { FastCache::NotLeader(_knownLeader) };
+
+    if (auto valid = Membership::Validate(members); !valid.has_value())
+        return std::unexpected { valid.error() };
+
+    // One change at a time, and it must have committed. A second built on a
+    // configuration that a truncation can still roll back would have its safety
+    // argument made against a set that never existed.
+    if (HasUncommittedConfiguration())
+        return std::unexpected { InvalidConfiguration("a membership change is already in flight; wait for it to commit") };
+
+    switch (Membership::Classify(_members, members))
+    {
+        case Membership::ChangeShape::Unchanged:
+            return std::unexpected { InvalidConfiguration("the proposed member set is the current one") };
+        case Membership::ChangeShape::Unsafe:
+            return std::unexpected { InvalidConfiguration(
+                "only one member may be added or removed at a time; two majorities that share no member "
+                "could otherwise elect two leaders in one term") };
+        case Membership::ChangeShape::AddedOne:
+        case Membership::ChangeShape::RemovedOne:
+            break;
+    }
+
+    auto output = RaftOutput {};
+    auto const index = _log.Append(
+        LogEntry { .term = _currentTerm, .kind = EntryKind::Configuration, .payload = Membership::Encode(members) });
+
+    // Adopted here, before commitment and before replication, because a
+    // configuration that waited for commitment could not be used to REACH it:
+    // committing this entry needs a quorum of the very set it describes.
+    AdoptMembers(std::move(members));
+
+    RecordLogAppend(output, index);
+    ReplicateToPeers(output);
+    _heartbeatDeadline = now + _config.heartbeatInterval;
+
+    AdvanceCommitIndex();
+    ApplyCommitted(output);
+
+    return Proposal { .index = index, .output = std::move(output) };
 }
 
 std::expected<RaftNode::Proposal, ConsensusError> RaftNode::Propose(std::vector<std::byte> payload, TimePoint now)
@@ -535,7 +689,7 @@ void RaftNode::OnPreVoteResponse(PreVoteResponse const& response, TimePoint now,
         return;
 
     _preVotesGranted.insert(response.voterId);
-    if (_preVotesGranted.size() >= _config.Quorum())
+    if (_preVotesGranted.size() >= Quorum())
         StartElection(now, output);
 }
 
@@ -609,7 +763,7 @@ void RaftNode::OnRequestVoteResponse(RequestVoteResponse const& response, TimePo
         return;
 
     _votesGranted.insert(response.voterId);
-    if (_votesGranted.size() >= _config.Quorum())
+    if (_votesGranted.size() >= Quorum())
         BecomeLeader(now, output);
 }
 
@@ -657,7 +811,21 @@ void RaftNode::OnAppendEntries(AppendEntriesRequest const& request, TimePoint no
         // `fromIndex` is where the leader's run starts, which is also the
         // truncation point when this repaired a divergent suffix.
         if (!request.entries.empty())
+        {
             RecordLogAppend(output, request.prevLogIndex.Advanced(1));
+
+            // The log moved, so the active configuration may have moved with it
+            // -- forwards on a new entry, and BACKWARDS when a conflicting
+            // suffix was truncated. Re-derived rather than tracked, because an
+            // uncommitted configuration is exactly the kind that gets rolled
+            // back, and a node that kept one the cluster discarded would count
+            // quorums against a set nobody else has.
+            //
+            // Inside the guard, not beside it: a heartbeat carries no entries
+            // and cannot have moved anything, so scanning on one would be a walk
+            // of the log per interval per peer for a result that cannot change.
+            RefreshConfiguration();
+        }
 
         // Bounded by what THIS request established, not by the leader's own
         // commit index alone. The leader may have committed entries this follower
