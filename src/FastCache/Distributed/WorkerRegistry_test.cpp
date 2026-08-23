@@ -208,3 +208,63 @@ TEST_CASE("A clock that moves backwards does not expire the fleet", "[distribute
     fix.clock.Advance(std::chrono::milliseconds { -2000 });
     CHECK(fix.registry.Pick(Gcc13).has_value());
 }
+
+TEST_CASE("A big machine with more running jobs still wins on headroom", "[distributed][registry]")
+{
+    // The correction. `Pick` compared `inFlight` in ABSOLUTE terms, which treats
+    // every worker as an identical box: a 64-slot server running 8 jobs looked
+    // busier than a 4-slot laptop running 2, when the server had 56 slots free and
+    // the laptop had 2. Across a fleet of mixed machines -- the ordinary case, not
+    // an exotic one -- that sends work to the smallest machines first and leaves the
+    // big ones idle.
+    Fixture fix;
+    auto const server = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 64));
+    auto const laptop = fix.registry.Register(Announce(Gcc13, "10.0.0.2:6676", 4));
+
+    // The server is carrying four times the laptop's load and is still the better
+    // place for the next job.
+    for (auto job = 0; job < 8; ++job)
+        fix.registry.JobStarted(server);
+    for (auto job = 0; job < 2; ++job)
+        fix.registry.JobStarted(laptop);
+
+    auto const picked = fix.registry.Pick(Gcc13);
+    REQUIRE(picked.has_value());
+    CHECK(picked->id == server);
+}
+
+TEST_CASE("Equal headroom is broken by which machine has more of itself left", "[distributed][registry]")
+{
+    // Where the headroom ties, the proportionally emptier machine takes it: 4 free
+    // of 8 has more of itself left than 4 free of 64, and is the better place to put
+    // a job that will occupy a core for seconds.
+    Fixture fix;
+    auto const big = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 64));
+    auto const small = fix.registry.Register(Announce(Gcc13, "10.0.0.2:6676", 8));
+
+    for (auto job = 0; job < 60; ++job)
+        fix.registry.JobStarted(big);
+    for (auto job = 0; job < 4; ++job)
+        fix.registry.JobStarted(small);
+
+    auto const picked = fix.registry.Pick(Gcc13);
+    REQUIRE(picked.has_value());
+    CHECK(picked->id == small);
+}
+
+TEST_CASE("A full machine is never picked however large it is", "[distributed][registry]")
+{
+    // Headroom is a preference; the slot cap is not. A worker at its limit is out of
+    // the running entirely, or the fleet would be fuller and slower than it believes
+    // at the same moment.
+    Fixture fix;
+    auto const big = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 64));
+    auto const small = fix.registry.Register(Announce(Gcc13, "10.0.0.2:6676", 2));
+
+    for (auto job = 0; job < 64; ++job)
+        fix.registry.JobStarted(big);
+
+    auto const picked = fix.registry.Pick(Gcc13);
+    REQUIRE(picked.has_value());
+    CHECK(picked->id == small);
+}

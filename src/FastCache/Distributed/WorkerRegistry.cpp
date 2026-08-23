@@ -79,6 +79,53 @@ bool WorkerRegistry::Heartbeat(std::string_view workerId, std::uint32_t inFlight
     return true;
 }
 
+namespace
+{
+    /// Free slots on a worker that has room.
+    /// @param info The worker.
+    /// @return Slots not currently occupied.
+    [[nodiscard]] std::uint32_t FreeSlots(WorkerInfo const& info) noexcept
+    {
+        return info.inFlight >= info.slots ? 0U : info.slots - info.inFlight;
+    }
+
+    /// Whether `candidate` should be preferred over `incumbent`.
+    ///
+    /// Most free slots wins, and that is a correction rather than a tweak. The
+    /// comparison used to be least-*outstanding* in absolute terms, which treats
+    /// every worker as an identical box -- so a 64-core server running 8 jobs looked
+    /// busier than a 4-core laptop running 2, when the server had 56 slots free and
+    /// the laptop had none. Across a fleet of mixed machines, which is the ordinary
+    /// case rather than an exotic one, that sends work to the smallest machines
+    /// first and leaves the big ones idle.
+    ///
+    /// Utilization breaks the tie, so between two workers with equal headroom the
+    /// less loaded one takes it. That matters where the headroom is equal but the
+    /// machines are not: 4 free of 64 and 4 free of 8 can both take a job, and the
+    /// second has proportionally more of itself left.
+    ///
+    /// Compared as a cross-multiplication rather than a ratio, because a double
+    /// would make the ordering depend on rounding and two workers that should tie
+    /// could swap on a rebuild -- the kind of instability that makes a fixture flaky
+    /// for reasons nobody can reproduce.
+    /// @param candidate The worker being considered.
+    /// @param incumbent The best so far.
+    /// @return True when the candidate is the better choice.
+    [[nodiscard]] bool PrefersFirst(WorkerInfo const& candidate, WorkerInfo const& incumbent) noexcept
+    {
+        auto const candidateFree = FreeSlots(candidate);
+        auto const incumbentFree = FreeSlots(incumbent);
+        if (candidateFree != incumbentFree)
+            return candidateFree > incumbentFree;
+
+        // candidateFree/candidate.slots > incumbentFree/incumbent.slots, without
+        // the division. Both slot counts are non-zero here: a worker with none is
+        // refused at registration.
+        return static_cast<std::uint64_t>(candidateFree) * incumbent.slots
+               > static_cast<std::uint64_t>(incumbentFree) * candidate.slots;
+    }
+} // namespace
+
 std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view fingerprint) const
 {
     std::scoped_lock const guard { _mutex };
@@ -96,7 +143,7 @@ std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view finge
         sawMatch = true;
         if (entry.info.inFlight >= entry.info.slots)
             continue;
-        if (best == nullptr || entry.info.inFlight < best->inFlight)
+        if (best == nullptr || PrefersFirst(entry.info, *best))
             best = &entry.info;
     }
 
