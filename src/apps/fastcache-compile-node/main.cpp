@@ -18,6 +18,9 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Platform/CpuAffinity.hpp>
+#include <FastCache/Platform/HostInfo.hpp>
+#include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Net/InheritedListener.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/Environment.hpp>
@@ -603,12 +606,23 @@ int main(int argc, char** argv)
         adminServer = std::make_unique<AdminHttpServer>(
             *adminListener,
             metrics,
-            [startedAt] {
+            [startedAt, &server, slots, scratchRoot = jobs.ScratchRoot()] {
+                // Sampled per scrape rather than captured once: the disk fills and
+                // the busy count moves, and a value frozen at startup is worse than
+                // no value because it looks current.
+                auto const disk = QueryDiskSpace(scratchRoot);
+
                 // No storage: a worker has no cache, and reporting a
-                // default-constructed one would state an empty unbounded cache as
-                // a fact.
+                // default-constructed one would state an empty unbounded cache as a
+                // fact rather than as an absence.
                 return MetricsSnapshot {
                     .storage = std::nullopt,
+                    .host = HostCapacity { .logicalCores = OnlineCpuCount(),
+                                           .totalMemoryBytes = QueryHostTotalMemoryBytes(),
+                                           .diskCapacityBytes = disk.capacityBytes,
+                                           .diskFreeBytes = disk.freeBytes,
+                                           .configuredSlots = slots,
+                                           .busySlots = server.InFlight() },
                     .uptime = Uptime { std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::steady_clock::now() - startedAt) },
                 };

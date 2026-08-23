@@ -134,3 +134,36 @@ TEST_CASE("A process with no cache renders no cache metrics", "[metrics][prometh
     for (auto const& row: CounterTable)
         CHECK(body.contains(std::format("# TYPE {} ", row.prometheusName)));
 }
+
+TEST_CASE("A compile node reports its size, and a cache daemon does not", "[metrics][prometheus]")
+{
+    // "Is this node pulling its weight" is unanswerable without knowing how big it
+    // is, so a worker's capacity is what an operator most wants off its scrape --
+    // and it is what PR 8's resource-aware scheduling will weigh.
+    AtomicMetricsSink metrics;
+
+    auto const withHost = RenderPrometheus(metrics,
+                                           MetricsSnapshot { .storage = std::nullopt,
+                                                             .host = HostCapacity { .logicalCores = 16,
+                                                                                    .totalMemoryBytes = 68719476736ULL,
+                                                                                    .diskCapacityBytes = 500107862016ULL,
+                                                                                    .diskFreeBytes = 123456789ULL,
+                                                                                    .configuredSlots = 14,
+                                                                                    .busySlots = 3 },
+                                                             .uptime = Uptime { 1s } });
+
+    CHECK(withHost.contains("# TYPE fastcache_node_logical_cores gauge"));
+    CHECK(withHost.contains("fastcache_node_logical_cores 16"));
+    CHECK(withHost.contains("fastcache_node_memory_total_bytes 68719476736"));
+    CHECK(withHost.contains("fastcache_node_disk_free_bytes 123456789"));
+    CHECK(withHost.contains("fastcache_node_slots_configured 14"));
+    CHECK(withHost.contains("fastcache_node_slots_busy 3"));
+
+    // The daemon leaves it absent rather than reporting cores it does not schedule
+    // against. Absent means the series is missing, not present and zero -- a zero
+    // would read as a machine with no cores.
+    auto const withoutHost =
+        RenderPrometheus(metrics, MetricsSnapshot { .storage = StorageStats {}, .uptime = Uptime { 1s } });
+    CHECK_FALSE(withoutHost.contains("fastcache_node_logical_cores"));
+    CHECK_FALSE(withoutHost.contains("fastcache_node_slots_busy"));
+}

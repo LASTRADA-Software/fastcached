@@ -43,6 +43,48 @@ namespace
 
 } // namespace
 
+/// Render what a machine's size looks like on the wire.
+///
+/// Gauges, every one: they describe a machine rather than count events, which is
+/// why they arrive in a struct instead of through the counter-only sink.
+/// @param out Destination.
+/// @param host The machine's capacity.
+static void AppendHostMetrics(std::string& out, HostCapacity const& host)
+{
+    using enum MetricType;
+
+    auto const table = std::array {
+        Metric { .name = "fastcache_node_logical_cores",
+                 .help = "Schedulable hardware threads on this node.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.logicalCores) },
+        Metric { .name = "fastcache_node_memory_total_bytes",
+                 .help = "Physical memory, or the container ceiling when that binds first.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.totalMemoryBytes) },
+        Metric { .name = "fastcache_node_disk_capacity_bytes",
+                 .help = "Size of the filesystem this node compiles on.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.diskCapacityBytes) },
+        Metric { .name = "fastcache_node_disk_free_bytes",
+                 .help = "Space on that filesystem an unprivileged process may still write.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.diskFreeBytes) },
+        Metric { .name = "fastcache_node_slots_configured",
+                 .help = "Concurrent compiles this node advertises to the scheduler.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.configuredSlots) },
+        Metric { .name = "fastcache_node_slots_busy",
+                 .help = "Compiles running right now. Sampled, not derived from the job "
+                         "counters, which are incremented separately.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.busySlots) },
+    };
+
+    for (auto const& metric: table)
+        Append(out, metric);
+}
+
 /// Render the metrics a cache's own statistics carry.
 ///
 /// Separate from the sink's counters because the two have different *sources*,
@@ -168,6 +210,11 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
     // otherwise report an empty, unbounded one — zeroes that read as facts.
     if (snapshot.storage.has_value())
         AppendStorageMetrics(out, *snapshot.storage);
+
+    // And only when the process is a compile node. The daemon leaves this absent
+    // rather than reporting cores it does not schedule against.
+    if (snapshot.host.has_value())
+        AppendHostMetrics(out, *snapshot.host);
 
     // Every counter the sink knows, without exception. Exporting the *table*
     // rather than a hand-picked subset is the whole point: seven of the eleven
