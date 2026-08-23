@@ -248,6 +248,7 @@ what that machine is doing:
 | `fastcache_worker_jobs_refused_rejected_argument_total` | A command line carrying something that could name a file. |
 | `fastcache_worker_jobs_refused_scratch_unavailable_total` | The scratch disk is full or unwritable. |
 | `fastcache_worker_jobs_refused_spawn_failed_total` | The toolchain is configured but cannot be executed. |
+| `fastcache_worker_jobs_refused_not_a_member_total` | Something with no claim on this machine tried to compile on it. Not a fault of yours; check who can reach `--port`. |
 | `fastcache_worker_bytes_received_total` / `..._returned_total` | Link volume, counted at the socket. |
 
 The refusals are split by reason for the same reason the scheduler's two are:
