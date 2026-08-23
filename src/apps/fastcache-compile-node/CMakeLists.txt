@@ -36,6 +36,7 @@ add_executable(fastcache-compile-node
     main.cpp
     AdminEndpoint.cpp
     NodeConfig.cpp
+    SchedulerEndpoint.cpp
     WorkerServer.cpp
     ${_fc_node_shared}
 )
@@ -54,9 +55,9 @@ install(TARGETS fastcache-compile-node
     COMPONENT Runtime
 )
 
-# The node's own unit tests. WorkerServer and AdminEndpoint are the only sources
-# here that the launcher's test binary does not already cover -- and AdminEndpoint
-# is here rather than in main.cpp precisely so that it can be.
+# The node's own unit tests. WorkerServer, AdminEndpoint and SchedulerEndpoint are
+# the only sources here that the launcher's test binary does not already cover --
+# and each of the last two lives outside main.cpp precisely so that it can be.
 if(FASTCACHED_BUILD_TESTS)
     add_executable(fastcache-compile-node-tests
         "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/test_main.cpp"
@@ -64,6 +65,8 @@ if(FASTCACHED_BUILD_TESTS)
         AdminEndpoint_test.cpp
         NodeConfig.cpp
         NodeConfig_test.cpp
+        SchedulerEndpoint.cpp
+        SchedulerEndpoint_test.cpp
         WorkerServer.cpp
         WorkerServer_test.cpp
         ${_fc_node_shared}
