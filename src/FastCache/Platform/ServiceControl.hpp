@@ -29,6 +29,117 @@ enum class EmitDaemonFlag : std::uint8_t
     Yes, ///< Fork into the background (Windows SCM).
 };
 
+/// Whether the command line that asked for a registration carried a secret.
+///
+/// An `enum class` and not a `bool` because the call site reads as a claim about
+/// the invocation rather than as a flag: `InlineCredential::Present` says what is
+/// true, where `true` would say nothing at all.
+enum class InlineCredential : std::uint8_t
+{
+    Absent,  ///< Nothing secret would reach the supervisor.
+    Present, ///< A credential was typed alongside `--install-service`.
+};
+
+/// A service to register, described independently of which binary runs it.
+///
+/// This is the seam that lets one implementation of "install this as a service"
+/// serve more than one executable. Every function below used to take
+/// `Config const&` -- the *daemon's* configuration type -- so a second binary
+/// could not reach any of it without either depending on the daemon's config or
+/// growing a parallel copy of this entire file, and `fastcache-compile-node` had
+/// no service integration on macOS or Windows for exactly that reason.
+///
+/// What is deliberately **not** here is how `arguments` was derived. An
+/// `OptionSpec` describes how to *parse* a flag and carries no way to read a
+/// value back out, so "emit every field that differs from a default" cannot be
+/// written once generically -- each binary walks its own table and hands the
+/// result over. That is why `BuildServiceArgv` stays hand-written per binary and
+/// is guarded by a test that walks the option table and requires every
+/// non-excluded flag to be emitted.
+struct ServiceSpec
+{
+    /// The supervisor's key: the SCM service name, and the stem of the launchd
+    /// label and plist file. Reaches the filesystem, so `ServiceNameRejection`
+    /// has rules about it.
+    std::string serviceName;
+
+    /// Absolute path to the executable the supervisor launches.
+    std::filesystem::path exePath;
+
+    /// `argv[1..]`, unquoted, and **without** any backgrounding flag.
+    ///
+    /// Values are unquoted because quoting is a property of a flat command line
+    /// rather than of an argv array, and launchd's `ProgramArguments` must
+    /// receive the literal value. `BuildServiceCommandLine` adds quotes when it
+    /// joins.
+    std::vector<std::string> arguments;
+
+    /// The token that makes this binary fork into the background, empty when it
+    /// has none.
+    ///
+    /// Held apart from `arguments` rather than baked into them, because the two
+    /// supervisors disagree and one spec has to answer both. The Windows SCM
+    /// needs it -- it is the hook that hands control to `WindowsServiceHost` --
+    /// and launchd needs its absence: like systemd it supervises the process it
+    /// started, so a job that double-forks is reaped instantly as "exited".
+    std::string daemonFlag;
+
+    /// Name shown by `services.msc` and in Login Items.
+    std::string displayName;
+
+    /// One-line description registered with the SCM.
+    std::string description;
+
+    /// The unprivileged account a system-scope job runs as, empty to run as the
+    /// supervisor's default (root / LocalSystem).
+    ///
+    /// A field rather than the constant it used to be, because it is the answer
+    /// to "who owns this service's files" and a second binary may well want a
+    /// different one.
+    std::string serviceAccount;
+
+    /// Directories `serviceAccount` must own before the job first runs.
+    ///
+    /// Only ever directories the operator actually named. Handing over a
+    /// **parent** gives away a directory nobody asked about: `--storage=/var/db/fc`
+    /// would reassign `/var/db`, shared with other system services, to an
+    /// unprivileged cache account -- silently, under a message saying the service
+    /// had been installed. The daemon drops to `serviceAccount`, so a directory
+    /// root created for it has to change hands or the first write fails with
+    /// EACCES, which launchd surfaces only as a job that exits over and over.
+    std::vector<std::filesystem::path> ownedDirectories;
+
+    /// Whether a secret was typed on the installing command line.
+    InlineCredential inlineCredential { InlineCredential::Absent };
+
+    /// The `--config` path the operator named, or empty.
+    ///
+    /// Used only to make the credential refusal say where the secret should go
+    /// instead. It is not a hint that the combination is safe -- see
+    /// `InlineCredentialRejection`.
+    std::string configPath;
+};
+
+/// Resolve the absolute path of the running executable.
+///
+/// Published because a `ServiceSpec` states what the supervisor should launch,
+/// so every binary that builds one has to be able to answer it. Resolved through
+/// symlinks where the platform can: whatever records this path keeps it verbatim,
+/// and a path through a symlink that later moves pins a service to nothing.
+/// @return Path on success; an empty path when it cannot be determined.
+[[nodiscard]] std::filesystem::path CurrentExecutablePath();
+
+/// Describe the running daemon as a service to register.
+///
+/// The daemon's half of the seam: it owns `Config`, so it is what turns one into
+/// a `ServiceSpec`. `fastcache-compile-node` has its own equivalent over its own
+/// configuration type.
+///
+/// @param exePath Absolute path to the fastcached executable.
+/// @param cfg Effective configuration to embed in the launch arguments.
+/// @return The spec a supervisor is registered from.
+[[nodiscard]] ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, Config const& cfg);
+
 /// Build the argument vector a service supervisor launches fastcached with.
 ///
 /// Element 0 is @p exePath; the rest are `--flag=value` tokens, one for every
@@ -66,7 +177,7 @@ enum class EmitDaemonFlag : std::uint8_t
 /// @param exePath Absolute path to the fastcached executable.
 /// @param cfg Effective configuration to embed in the service command line.
 /// @return Fully-quoted command line string.
-[[nodiscard]] std::string BuildServiceCommandLine(std::filesystem::path const& exePath, Config const& cfg);
+[[nodiscard]] std::string BuildServiceCommandLine(ServiceSpec const& spec);
 
 /// Why @p cfg cannot be handed to a service supervisor, if it cannot.
 ///
@@ -86,9 +197,9 @@ enum class EmitDaemonFlag : std::uint8_t
 ///
 /// Pure, so the rule is unit-testable on every platform.
 ///
-/// @param cfg Configuration about to be baked into a service registration.
+/// @param spec Service about to be registered.
 /// @return An explanatory message when the install must be refused, else nullopt.
-[[nodiscard]] std::optional<std::string> InlineCredentialRejection(Config const& cfg);
+[[nodiscard]] std::optional<std::string> InlineCredentialRejection(ServiceSpec const& spec);
 
 /// Why @p cfg's `serviceName` cannot name a service, if it cannot.
 ///
@@ -101,9 +212,9 @@ enum class EmitDaemonFlag : std::uint8_t
 ///
 /// Pure, so the rule is unit-testable on every platform.
 ///
-/// @param cfg Configuration whose `serviceName` is to be validated.
+/// @param spec Service whose `serviceName` is to be validated.
 /// @return An explanatory message when the name must be refused, else nullopt.
-[[nodiscard]] std::optional<std::string> ServiceNameRejection(Config const& cfg);
+[[nodiscard]] std::optional<std::string> ServiceNameRejection(ServiceSpec const& spec);
 
 /// Why @p cfg cannot be handed to a service supervisor at all, if it cannot.
 ///
@@ -111,9 +222,9 @@ enum class EmitDaemonFlag : std::uint8_t
 /// InlineCredentialRejection — and reports the first that objects, so both
 /// platforms' InstallService share one gate and a new rule is a new table row.
 ///
-/// @param cfg Configuration about to be registered.
+/// @param spec Service about to be registered.
 /// @return An explanatory message when the install must be refused, else nullopt.
-[[nodiscard]] std::optional<std::string> ServiceRegistrationRejection(Config const& cfg);
+[[nodiscard]] std::optional<std::string> ServiceRegistrationRejection(ServiceSpec const& spec);
 
 /// Parse the `--service-scope` argument.
 /// @param text One of `user` or `system`, lowercase.
@@ -131,17 +242,17 @@ enum class EmitDaemonFlag : std::uint8_t
 /// reverse-DNS; it is also the handle every `launchctl` subcommand takes, and
 /// the name the job appears under in System Settings → Login Items.
 ///
-/// @param cfg Effective configuration; only `serviceName` is used.
+/// @param spec Service to label; only `serviceName` is used.
 /// @return e.g. `software.lastrada.fastcached`.
-[[nodiscard]] std::string LaunchdLabel(Config const& cfg);
+[[nodiscard]] std::string LaunchdLabel(ServiceSpec const& spec);
 
 /// Absolute path of the plist file backing a job in @p scope.
-/// @param cfg Effective configuration; names the plist via LaunchdLabel.
+/// @param spec Service to locate; names the plist via LaunchdLabel.
 /// @param scope Which domain the job belongs to.
 /// @param homeDirectory The user's home directory; used only for
 ///        ServiceScope::User, ignored otherwise.
 /// @return Absolute path, e.g. `/Library/LaunchDaemons/<label>.plist`.
-[[nodiscard]] std::filesystem::path LaunchdPlistPath(Config const& cfg,
+[[nodiscard]] std::filesystem::path LaunchdPlistPath(ServiceSpec const& spec,
                                                      ServiceScope scope,
                                                      std::filesystem::path const& homeDirectory);
 
@@ -151,14 +262,13 @@ enum class EmitDaemonFlag : std::uint8_t
 /// and so the plists shipped in the package can be generated by the very binary
 /// that later registers them — one implementation, no drift.
 ///
-/// @param exePath Absolute path to the fastcached executable.
-/// @param cfg Effective configuration to embed in `ProgramArguments`.
+/// @param spec Service to describe; `exePath` and `arguments` become
+///        `ProgramArguments`, and `daemonFlag` is deliberately not emitted.
 /// @param scope Which domain the job is for; selects the supervision policy
 ///        (see the scope table in the implementation).
 /// @param logDirectory Directory for the job's stdout/stderr files.
 /// @return A complete `<?xml ...?><plist>` document.
-[[nodiscard]] std::string BuildLaunchdPlist(std::filesystem::path const& exePath,
-                                            Config const& cfg,
+[[nodiscard]] std::string BuildLaunchdPlist(ServiceSpec const& spec,
                                             ServiceScope scope,
                                             std::filesystem::path const& logDirectory);
 
@@ -185,13 +295,13 @@ struct ServiceControlResult
 ///
 /// On platforms with neither supervisor this is a no-op that reports an error.
 ///
-/// @param cfg Effective configuration; `serviceName` names the service and the
-///            remaining fields are embedded in the launch arguments.
+/// @param spec Service to register: what to launch, with which arguments, under
+///             which name.
 /// @param scope Which supervisor domain to register in. Ignored on Windows,
 ///              which has only one.
 /// @return ServiceControlResult with exit code 0 and a success message, or a
 ///         non-zero code and a diagnostic (e.g. needs elevation, already exists).
-[[nodiscard]] ServiceControlResult InstallService(Config const& cfg, ServiceScope scope = ServiceScope::System);
+[[nodiscard]] ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope = ServiceScope::System);
 
 /// Remove a previously-registered fastcached service.
 ///
@@ -199,10 +309,10 @@ struct ServiceControlResult
 /// deletes its registration. On platforms with no supervisor this is a no-op
 /// that reports an error.
 ///
-/// @param cfg Effective configuration; only `serviceName` is used.
+/// @param spec Service to remove; only `serviceName` is used.
 /// @param scope Which supervisor domain to remove from. Ignored on Windows.
 /// @return ServiceControlResult with exit code 0 and a success message, or a
 ///         non-zero code and a diagnostic (e.g. needs elevation, no such service).
-[[nodiscard]] ServiceControlResult UninstallService(Config const& cfg, ServiceScope scope = ServiceScope::System);
+[[nodiscard]] ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope scope = ServiceScope::System);
 
 } // namespace FastCache

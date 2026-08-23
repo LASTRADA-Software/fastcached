@@ -948,10 +948,14 @@ int main(int argc, char const* const* argv)
     if (parsed->outcome == FastCache::CliOutcome::InstallService
         || parsed->outcome == FastCache::CliOutcome::UninstallService)
     {
-        auto const& registered = parsed->config;
+        // The command-line config, never the merged one -- see the comment above.
+        // Turned into a ServiceSpec here because that is the seam the platform
+        // registration speaks: `fastcache-compile-node` builds its own from its
+        // own configuration type rather than reaching for the daemon's.
+        auto const spec = FastCache::MakeDaemonServiceSpec(FastCache::CurrentExecutablePath(), parsed->config);
         auto const result = parsed->outcome == FastCache::CliOutcome::InstallService
-                                ? FastCache::InstallService(registered, parsed->serviceScope)
-                                : FastCache::UninstallService(registered, parsed->serviceScope);
+                                ? FastCache::InstallService(spec, parsed->serviceScope)
+                                : FastCache::UninstallService(spec, parsed->serviceScope);
         if (result.exitCode == 0)
             std::println("fastcached: {}", result.message);
         else
