@@ -2,6 +2,8 @@
 #pragma once
 
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/WireFields.hpp>
+#include <FastCache/Core/WireFrame.hpp>
 
 #include <algorithm>
 #include <array>
@@ -108,7 +110,7 @@ inline constexpr WireVersion CurrentVersion = 1;
 inline constexpr WireVersion MinSupportedVersion = 1;
 
 /// Size of the fixed request header: magic, version, op, payload length.
-inline constexpr std::size_t RequestHeaderSize = 7;
+inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
 
 /// Size of the fixed reply header: status, payload length.
 inline constexpr std::size_t ReplyHeaderSize = 5;
@@ -126,7 +128,7 @@ inline constexpr std::size_t ReplyHeaderSize = 5;
 /// not return — which is what lets every caller index the result without first
 /// proving it non-empty. It is also unreachable in practice: the daemon caps
 /// values at `--storage-max-value` (256 MiB by default), far below this.
-inline constexpr std::uint64_t MaxFramePayload = 0xFFFFFFFFULL;
+inline constexpr std::uint64_t MaxFramePayload = WireFields::MaxPayload;
 
 /// Wire opcodes. One byte, third in the request header.
 enum class Op : std::uint8_t
@@ -463,24 +465,15 @@ inline constexpr std::array ErrorTable {
 /// @return True when within [MinSupportedVersion, CurrentVersion].
 [[nodiscard]] constexpr bool IsSupported(WireVersion version) noexcept
 {
-    return version >= MinSupportedVersion && version <= CurrentVersion;
+    return WireFrame::IsSupported(version, MinSupportedVersion, CurrentVersion);
 }
 
-/// Reinterpret a string view as wire bytes. No copy.
-/// @param text The text to view.
-/// @return A span over the same storage.
-[[nodiscard]] inline std::span<std::byte const> AsBytes(std::string_view text) noexcept
-{
-    return { reinterpret_cast<std::byte const*>(text.data()), text.size() };
-}
-
-/// Reinterpret wire bytes as a string view. No copy.
-/// @param bytes The bytes to view.
-/// @return A view over the same storage.
-[[nodiscard]] inline std::string_view AsStringView(std::span<std::byte const> bytes) noexcept
-{
-    return { reinterpret_cast<char const*>(bytes.data()), bytes.size() };
-}
+// The byte/text reinterpretation and the length-prefixed field grammar below are
+// protocol-agnostic and live in `Core/WireFields.hpp`, so this format and the
+// Raft one cannot drift apart. Re-exported under the names call sites here
+// already use.
+using WireFields::AsBytes;
+using WireFields::AsStringView;
 
 /// The decoded fixed part of a request. The opcode is kept **raw** because an
 /// unrecognised one is a recoverable condition the caller answers with a typed
@@ -547,61 +540,16 @@ struct StoreRequest
 namespace Detail
 {
 
-    /// Byte offset `n` into a buffer, as an iterator difference.
-    [[nodiscard]] constexpr std::ptrdiff_t Offset(std::size_t n) noexcept
-    {
-        return static_cast<std::ptrdiff_t>(n);
-    }
-
-    /// Write a big-endian u32 at `offset` within `out`.
-    /// @param out Destination buffer, already sized to hold it.
-    /// @param offset Byte offset to write at.
-    /// @param n Value to write.
-    inline void PutU32(std::span<std::byte> out, std::size_t offset, std::uint32_t n)
-    {
-        WriteBigEndian<std::uint32_t>(out.subspan(offset, sizeof(std::uint32_t)), n);
-    }
-
-    /// Pack length-prefixed fields, with no frame header in front of them.
-    ///
-    /// Used for REPLY payloads, which carry the same `[u32 len][bytes]` field
-    /// grammar a request payload does but are preceded by a reply header rather
-    /// than a request one. Factored out so that grammar has one author: it is what
-    /// `SplitFields` parses, and a second hand-rolled packer is how a producer and
-    /// its parser drift.
-    /// @param fields The fields, in wire order.
-    /// @return The packed fields.
-    [[nodiscard]] inline std::vector<std::byte> EncodeFields(std::initializer_list<std::span<std::byte const>> fields)
-    {
-        std::uint64_t const total =
-            std::ranges::fold_left(fields, std::uint64_t { 0 }, [](std::uint64_t acc, std::span<std::byte const> field) {
-                return acc + sizeof(std::uint32_t) + std::uint64_t { field.size() };
-            });
-        if (total > MaxFramePayload)
-            throw std::length_error("compile-cache reply payload exceeds the u32 wire length");
-
-        std::vector<std::byte> out(static_cast<std::size_t>(total));
-        std::size_t offset = 0;
-        for (auto const& field: fields)
-        {
-            PutU32(out, offset, static_cast<std::uint32_t>(field.size()));
-            offset += sizeof(std::uint32_t);
-            std::ranges::copy(field, std::next(out.begin(), Offset(offset)));
-            offset += field.size();
-        }
-        return out;
-    }
-
     /// Build a complete request frame. **The only place a request header is
     /// written** — every encoder funnels through here, so the layout has exactly
     /// one author.
     ///
-    /// The frame is sized exactly once and then filled in place. Growing it with
-    /// `reserve` + `push_back` + `insert` would be the obvious spelling, but the
-    /// total is known up front, so one allocation and no reallocation is both
-    /// simpler and faster — and it keeps GCC's `-Wfree-nonheap-object` analysis
-    /// out of a false positive it reaches when a `reserve`d vector is fed from a
-    /// stack buffer at -O3.
+    /// The frame is sized exactly once and then filled in place, header and
+    /// payload together. Encoding the payload into a buffer of its own and then
+    /// prepending the header would be the obvious spelling and is what
+    /// `WireFields::EncodeInto` exists to avoid: a STORE frame carries a whole
+    /// object file, so the extra copy would raise peak footprint from about twice
+    /// the object to three times it, on the hot path of a parallel build.
     /// @param version Version to advertise.
     /// @param op The opcode.
     /// @param fields The length-prefixed fields, in wire order.
@@ -610,28 +558,13 @@ namespace Detail
                                                               Op op,
                                                               std::initializer_list<std::span<std::byte const>> fields)
     {
-        std::uint64_t const payloadSize =
-            std::ranges::fold_left(fields, std::uint64_t { 0 }, [](std::uint64_t acc, std::span<std::byte const> field) {
-                return acc + sizeof(std::uint32_t) + std::uint64_t { field.size() };
-            });
-        if (payloadSize > MaxFramePayload)
-            throw std::length_error("compile-cache request payload exceeds the u32 wire length");
+        auto const view = WireFields::AsFields(fields);
+        auto const payloadSize = WireFields::RequireEncodable(view);
 
-        std::vector<std::byte> frame(RequestHeaderSize + static_cast<std::size_t>(payloadSize));
+        std::vector<std::byte> frame(RequestHeaderSize + payloadSize);
         std::span<std::byte> const out { frame };
-        out[0] = Magic;
-        out[1] = static_cast<std::byte>(version);
-        out[2] = static_cast<std::byte>(op);
-        PutU32(out, 3, static_cast<std::uint32_t>(payloadSize));
-
-        std::size_t offset = RequestHeaderSize;
-        for (auto const& field: fields)
-        {
-            PutU32(out, offset, static_cast<std::uint32_t>(field.size()));
-            offset += sizeof(std::uint32_t);
-            std::ranges::copy(field, std::next(frame.begin(), Offset(offset)));
-            offset += field.size();
-        }
+        WireFrame::PutHeader(out, Magic, version, static_cast<std::uint8_t>(op), static_cast<std::uint32_t>(payloadSize));
+        WireFields::EncodeInto(out, RequestHeaderSize, view);
         return frame;
     }
 
@@ -688,8 +621,8 @@ namespace Detail
     std::vector<std::byte> frame(ReplyHeaderSize + payload.size());
     std::span<std::byte> const out { frame };
     out[0] = static_cast<std::byte>(status);
-    Detail::PutU32(out, 1, static_cast<std::uint32_t>(payload.size()));
-    std::ranges::copy(payload, std::next(frame.begin(), Detail::Offset(ReplyHeaderSize)));
+    WireFields::PutBigEndian<std::uint32_t>(out, 1, static_cast<std::uint32_t>(payload.size()));
+    std::ranges::copy(payload, out.subspan(ReplyHeaderSize).begin());
     return frame;
 }
 
@@ -722,11 +655,17 @@ namespace Detail
 /// @return The header, or nullopt when short or not this protocol.
 [[nodiscard]] inline std::optional<RequestHeader> DecodeRequestHeader(std::span<std::byte const> bytes)
 {
-    if (bytes.size() < RequestHeaderSize || bytes[0] != Magic)
+    auto const header = WireFrame::DecodeHeader(bytes, Magic);
+    if (!header.has_value())
         return std::nullopt;
-    return RequestHeader { .version = static_cast<WireVersion>(bytes[1]),
-                           .opRaw = static_cast<std::uint8_t>(bytes[2]),
-                           .payloadLength = ReadBigEndian<std::uint32_t>(bytes.subspan(3, sizeof(std::uint32_t))) };
+
+    // Rebuilt into this protocol's own struct rather than aliased, unlike
+    // `RaftWire::FrameHeader`. The field is named `opRaw` at some seventy call
+    // sites across the daemon, the launcher and the test client, and renaming
+    // them to share a struct would be a large diff whose only effect is that two
+    // protocols spell one byte the same way. The *layout* is what had to stop
+    // being duplicated, and it has.
+    return RequestHeader { .version = header->version, .opRaw = header->kindRaw, .payloadLength = header->payloadLength };
 }
 
 /// Decode the fixed reply header.
@@ -762,24 +701,7 @@ namespace Detail
 [[nodiscard]] inline std::optional<std::vector<std::span<std::byte const>>> SplitFields(std::span<std::byte const> payload,
                                                                                         std::size_t expectedCount)
 {
-    std::vector<std::span<std::byte const>> fields;
-    fields.reserve(expectedCount);
-
-    std::size_t offset = 0;
-    for ([[maybe_unused]] auto const index: std::views::iota(std::size_t { 0 }, expectedCount))
-    {
-        if (payload.size() - offset < sizeof(std::uint32_t))
-            return std::nullopt;
-        auto const length = ReadBigEndian<std::uint32_t>(payload.subspan(offset, sizeof(std::uint32_t)));
-        offset += sizeof(std::uint32_t);
-        if (payload.size() - offset < length)
-            return std::nullopt;
-        fields.push_back(payload.subspan(offset, length));
-        offset += length;
-    }
-    if (offset != payload.size())
-        return std::nullopt; // trailing bytes
-    return fields;
+    return WireFields::SplitExactly(payload, expectedCount);
 }
 
 /// Split a STORE payload into its five named fields.
@@ -883,11 +805,12 @@ struct CodecEnvelope
     if (bytes.size() > MaxFramePayload - CodecHeaderSize)
         throw std::length_error("compile-cache codec envelope exceeds the u32 wire length");
 
-    std::vector<std::byte> out(CodecHeaderSize + bytes.size());
+    std::vector<std::byte> envelope(CodecHeaderSize + bytes.size());
+    std::span<std::byte> const out { envelope };
     out[0] = static_cast<std::byte>(codec);
-    Detail::PutU32(out, 1, rawLength);
-    std::ranges::copy(bytes, std::next(out.begin(), Detail::Offset(CodecHeaderSize)));
-    return out;
+    WireFields::PutBigEndian<std::uint32_t>(out, 1, rawLength);
+    std::ranges::copy(bytes, out.subspan(CodecHeaderSize).begin());
+    return envelope;
 }
 
 /// Split a codec envelope into its tag, declared raw size, and bytes.
@@ -905,11 +828,9 @@ struct CodecEnvelope
 /// Encode a `u32` as its own length-prefixed field's contents.
 /// @param value The value.
 /// @return Exactly four big-endian bytes.
-[[nodiscard]] inline std::vector<std::byte> EncodeU32Field(std::uint32_t value)
+[[nodiscard]] inline std::array<std::byte, sizeof(std::uint32_t)> EncodeU32Field(std::uint32_t value)
 {
-    std::vector<std::byte> out(sizeof(std::uint32_t));
-    Detail::PutU32(out, 0, value);
-    return out;
+    return WireFields::ToBigEndian<std::uint32_t>(value);
 }
 
 /// Read a `u32` from a field that must hold exactly four bytes.
@@ -921,9 +842,7 @@ struct CodecEnvelope
 /// @return The value, or nullopt when the field is not exactly four bytes.
 [[nodiscard]] inline std::optional<std::uint32_t> DecodeU32Field(std::span<std::byte const> field)
 {
-    if (field.size() != sizeof(std::uint32_t))
-        return std::nullopt;
-    return ReadBigEndian<std::uint32_t>(field);
+    return WireFields::FromBigEndian<std::uint32_t>(field);
 }
 
 /// A codec preference list, most-preferred first.
@@ -1204,8 +1123,7 @@ struct LeaseGrant
 [[nodiscard]] inline std::vector<std::byte> EncodeLeaseGrant(LeaseGrant const& grant)
 {
     auto const codecs = EncodeCodecList(grant.workerCodecs);
-    return Detail::EncodeFields(
-        { AsBytes(grant.endpoint), AsBytes(grant.leaseToken), std::span<std::byte const> { codecs } });
+    return WireFields::Encode({ AsBytes(grant.endpoint), AsBytes(grant.leaseToken), std::span<std::byte const> { codecs } });
 }
 
 /// The fields of a LEASE grant, as views.
@@ -1250,8 +1168,7 @@ struct CompileResult
 [[nodiscard]] inline std::vector<std::byte> EncodeCompileResult(CompileResult const& result)
 {
     auto const code = EncodeU32Field(result.exitCode);
-    return Detail::EncodeFields(
-        { std::span<std::byte const> { code }, result.object, result.stdoutText, result.stderrText });
+    return WireFields::Encode({ std::span<std::byte const> { code }, result.object, result.stdoutText, result.stderrText });
 }
 
 /// Split a COMPILE reply payload.

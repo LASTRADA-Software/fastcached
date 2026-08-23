@@ -34,12 +34,15 @@ target_sources(FastCache
         Consensus/RaftDriver.cpp
         Consensus/RaftLog.cpp
         Consensus/RaftNode.cpp
+        Consensus/RaftPeerServer.cpp
+        Consensus/RaftPeerTransport.cpp
         Core/Crc32c.cpp
         Core/Logger.cpp
         Distributed/LeaseTable.cpp
         Distributed/WorkerRegistry.cpp
         Core/BufferPool.cpp
         Metrics/PrometheusFormatter.cpp
+        Net/BlockingConnector.cpp
         Net/BlockingSocket.cpp
         Net/InheritedListener.cpp
         Net/HealthProbe.cpp

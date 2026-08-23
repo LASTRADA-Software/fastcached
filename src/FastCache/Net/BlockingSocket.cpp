@@ -58,12 +58,7 @@ namespace Detail
         std::atomic<bool> winsockInitialised { false };
         std::atomic<bool> winsockInitialising { false };
 
-        [[nodiscard]] int LastNetworkError() noexcept
-        {
-            return WSAGetLastError();
-        }
-
-        [[nodiscard]] NetErrorCode TranslateError(int code) noexcept
+        [[nodiscard]] NetErrorCode TranslateErrorImpl(int code) noexcept
         {
             switch (code)
             {
@@ -72,6 +67,10 @@ namespace Detail
                 case WSAECONNREFUSED:
                     return NetErrorCode::ConnRefused;
                 case WSAEHOSTUNREACH:
+                // A route that does not exist and a host that does not answer are
+                // one category here: both mean this endpoint is unreachable from
+                // where we are, and neither is retryable at this layer.
+                case WSAENETUNREACH:
                     return NetErrorCode::HostUnreach;
                 case WSAEADDRINUSE:
                     return NetErrorCode::AddressInUse;
@@ -123,12 +122,7 @@ namespace Detail
     {
         std::atomic<bool> posixInitialised { false };
 
-        [[nodiscard]] int LastNetworkError() noexcept
-        {
-            return errno;
-        }
-
-        [[nodiscard]] NetErrorCode TranslateError(int code) noexcept
+        [[nodiscard]] NetErrorCode TranslateErrorImpl(int code) noexcept
         {
             switch (code)
             {
@@ -137,6 +131,10 @@ namespace Detail
                 case ECONNREFUSED:
                     return NetErrorCode::ConnRefused;
                 case EHOSTUNREACH:
+                // A route that does not exist and a host that does not answer are
+                // one category here: both mean this endpoint is unreachable from
+                // where we are, and neither is retryable at this layer.
+                case ENETUNREACH:
                     return NetErrorCode::HostUnreach;
                 case EADDRINUSE:
                     return NetErrorCode::AddressInUse;
@@ -179,18 +177,32 @@ namespace Detail
 
 #endif
 
+    int LastNetworkError() noexcept
+    {
+#if defined(_WIN32)
+        return WSAGetLastError();
+#else
+        return errno;
+#endif
+    }
+
+    NetErrorCode TranslateSocketError(int code) noexcept
+    {
+        return TranslateErrorImpl(code);
+    }
+
+    NetError MakeNetError(int code, std::string context)
+    {
+        return NetError { .code = TranslateSocketError(code), .systemCode = code, .context = std::move(context) };
+    }
+
 } // namespace Detail
 
 namespace
 {
     [[nodiscard]] NetError MakeSystemError(std::string_view context)
     {
-        auto const code = Detail::LastNetworkError();
-        return NetError {
-            .code = Detail::TranslateError(code),
-            .systemCode = code,
-            .context = std::string { context },
-        };
+        return Detail::MakeNetError(Detail::LastNetworkError(), std::string { context });
     }
 } // namespace
 
@@ -380,6 +392,32 @@ void BlockingListener::Close() noexcept
         std::ignore = Detail::CloseNative(_native);
         _native = Detail::InvalidSocket;
     }
+}
+
+std::uint16_t BlockingListener::BoundPort() const noexcept
+{
+    if (_native == Detail::InvalidSocket)
+        return 0;
+
+    sockaddr_storage storage {};
+#if defined(_WIN32)
+    auto length = static_cast<int>(sizeof(storage));
+    auto const handle = static_cast<SOCKET>(_native);
+#else
+    auto length = static_cast<socklen_t>(sizeof(storage));
+    auto const handle = static_cast<int>(_native);
+#endif
+    if (::getsockname(handle, reinterpret_cast<sockaddr*>(&storage), &length) != 0)
+        return 0;
+
+    // Read the port out of whichever family the socket actually is: the two
+    // sockaddr layouts put it at different offsets, and reading the wrong one
+    // yields a plausible-looking number rather than an error.
+    if (storage.ss_family == AF_INET)
+        return ntohs(reinterpret_cast<sockaddr_in const*>(&storage)->sin_port);
+    if (storage.ss_family == AF_INET6)
+        return ntohs(reinterpret_cast<sockaddr_in6 const*>(&storage)->sin6_port);
+    return 0;
 }
 
 void BlockingListener::SetTimeouts(std::chrono::milliseconds acceptPoll, std::chrono::milliseconds ioTimeout) noexcept

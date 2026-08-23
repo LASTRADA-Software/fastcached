@@ -3,6 +3,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <set>
 #include <vector>
@@ -107,4 +109,68 @@ TEST_CASE("The system source actually varies across a range", "[core][random]")
         seen.insert(source.UniformInRange(0, 99));
 
     CHECK(seen.size() > 50);
+}
+
+TEST_CASE("A seeded draw sequence is the same on every platform", "[core][random]")
+{
+    // `std::mt19937_64` is specified bit-for-bit; `std::uniform_int_distribution`
+    // is not, and libstdc++ and libc++ reduce to a range differently. Sourcing the
+    // range reduction from the library therefore made the fixed-seed constructor —
+    // whose entire purpose is replaying a failure — a promise that held only within
+    // one standard library, and `RaftClusterHarness` ran a different adversarial
+    // schedule on macOS than on Linux and Windows because of it.
+    //
+    // A golden vector is the only thing that can hold that property: it fails on
+    // the machine whose answer differs, which is exactly the machine that would
+    // otherwise report someone else's passing branch as a regression.
+    SystemRandomSource source { 12345 };
+
+    auto drawn = std::vector<std::uint64_t> {};
+    for (auto index = 0; index < 8; ++index)
+        drawn.push_back(source.UniformInRange(150, 300));
+
+    CHECK(drawn == std::vector<std::uint64_t> { 241, 252, 293, 297, 203, 157, 270, 203 });
+}
+
+TEST_CASE("A draw covers its whole range and never leaves it", "[core][random]")
+{
+    // Rejection sampling has two ways to be wrong that a golden vector cannot see:
+    // a bound that is never returned, and one that is returned when it should not
+    // be. Both are silent — a jitter range short by one at either end still looks
+    // random.
+    SystemRandomSource source { 99 };
+
+    auto low = false;
+    auto high = false;
+    for (auto index = 0; index < 20000; ++index)
+    {
+        auto const value = source.UniformInRange(7, 11);
+        REQUIRE(value >= 7);
+        REQUIRE(value <= 11);
+        low = low || value == 7;
+        high = high || value == 11;
+    }
+
+    CHECK(low);
+    CHECK(high);
+}
+
+TEST_CASE("Adjacent seeds do not draw in lockstep", "[core][random]")
+{
+    // `RaftClusterHarness` gives each node `base + index` so every node has its own
+    // stream, and election jitter exists to decorrelate those streams. Mersenne
+    // Twister's *low* bits are correlated across neighbouring seeds, so reducing a
+    // range by masking them made five nodes draw near-identical first timeouts,
+    // campaign together, and split the vote round after round.
+    auto first = std::vector<std::uint64_t> {};
+    for (auto seed = std::uint64_t { 3000 }; seed < 3005; ++seed)
+    {
+        SystemRandomSource source { seed };
+        first.push_back(source.UniformInRange(150, 300));
+    }
+
+    // Not a statistical claim, just the one that failed: five neighbouring seeds
+    // must not all open with the same value.
+    auto const same = static_cast<std::size_t>(std::ranges::count(first, first.front()));
+    CHECK(same < first.size());
 }

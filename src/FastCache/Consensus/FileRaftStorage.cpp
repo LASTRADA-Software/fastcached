@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Consensus/FileRaftStorage.hpp>
+#include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Core/Crc32c.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/Owner.hpp>
+#include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstring>
 #include <format>
 #include <optional>
@@ -29,8 +32,9 @@ namespace
     /// Identifies these files and rejects anything else pointed at this
     /// directory, so a mistyped path fails loudly rather than being parsed as a
     /// log of garbage.
-    constexpr std::uint32_t StateMagic = 0x46435253U; // "FCRS"
-    constexpr std::uint32_t LogMagic = 0x4643524CU;   // "FCRL"
+    constexpr std::uint32_t StateMagic = 0x46435253U;    // "FCRS"
+    constexpr std::uint32_t LogMagic = 0x4643524CU;      // "FCRL"
+    constexpr std::uint32_t SnapshotMagic = 0x4643524EU; // "FCRN"
 
     /// Bumped when either layout changes. A version this build does not know is
     /// refused rather than guessed at: reading an unknown layout as if it were
@@ -39,6 +43,7 @@ namespace
 
     constexpr std::string_view StateFileName = "raft-state";
     constexpr std::string_view LogFileName = "raft-log";
+    constexpr std::string_view SnapshotFileName = "raft-snapshot";
 
     /// Append a big-endian integer to `out`.
     template <typename T>
@@ -131,19 +136,38 @@ namespace
         return state;
     }
 
-    /// One decoded log record and how many bytes it occupied.
+    /// One decoded log record, the index it claims, and how many bytes it took.
     struct DecodedRecord
     {
         LogEntry entry;
+        LogIndex index {};
         std::size_t length {};
     };
+
+    /// Encode one log record, index included.
+    /// @param index The index this entry occupies.
+    /// @param entry What to write.
+    /// @return The record's bytes, CRC last.
+    [[nodiscard]] std::vector<std::byte> EncodeLogRecord(LogIndex index, LogEntry const& entry)
+    {
+        auto body = std::vector<std::byte> {};
+        PutBigEndian<std::uint32_t>(body, LogMagic);
+        PutBigEndian<std::uint64_t>(body, index.value);
+        PutBigEndian<std::uint64_t>(body, entry.term.value);
+        body.push_back(static_cast<std::byte>(entry.kind));
+        PutBigEndian<std::uint32_t>(body, static_cast<std::uint32_t>(entry.payload.size()));
+        body.insert(body.end(), entry.payload.begin(), entry.payload.end());
+        PutBigEndian<std::uint32_t>(body, Crc32c::Compute(body));
+        return body;
+    }
 
     /// Decode one log record from the front of `raw`.
     /// @param raw Remaining file contents.
     /// @return The record, or nullopt when it is incomplete or corrupt.
     [[nodiscard]] std::optional<DecodedRecord> ParseLogRecord(std::span<std::byte const> raw)
     {
-        constexpr auto header = sizeof(std::uint32_t) + sizeof(std::uint64_t) + 1 + sizeof(std::uint32_t);
+        constexpr auto header =
+            sizeof(std::uint32_t) + sizeof(std::uint64_t) + sizeof(std::uint64_t) + 1 + sizeof(std::uint32_t);
         if (raw.size() < header + sizeof(std::uint32_t))
             return std::nullopt;
 
@@ -153,16 +177,23 @@ namespace
         if (magic != LogMagic)
             return std::nullopt;
 
+        auto index = LogIndex { .value = ReadBigEndian<std::uint64_t>(raw.subspan(cursor)) };
+        cursor += sizeof(std::uint64_t);
+
         auto entry = LogEntry {};
         entry.term = Term { .value = ReadBigEndian<std::uint64_t>(raw.subspan(cursor)) };
         cursor += sizeof(std::uint64_t);
 
-        auto const kind = static_cast<std::uint8_t>(raw[cursor]);
+        // The range check is `DecodeWireEnum`'s, whose bound lives beside the
+        // enum, so this reader and `RaftWire`'s cannot disagree about the highest
+        // kind -- a disagreement that would not fail to compile but would reject
+        // every record carrying a newly added one.
+        auto const kind = DecodeWireEnum<EntryKind>(static_cast<std::uint8_t>(raw[cursor]));
         cursor += 1;
-        if (kind > static_cast<std::uint8_t>(EntryKind::NoOp))
+        if (!kind.has_value())
             return std::nullopt;
 
-        entry.kind = static_cast<EntryKind>(kind);
+        entry.kind = *kind;
 
         auto const payloadLength = ReadBigEndian<std::uint32_t>(raw.subspan(cursor));
         cursor += sizeof(std::uint32_t);
@@ -174,7 +205,71 @@ namespace
         auto const payload = raw.subspan(cursor, payloadLength);
         entry.payload.assign(payload.begin(), payload.end());
 
-        return DecodedRecord { .entry = std::move(entry), .length = total };
+        return DecodedRecord { .entry = std::move(entry), .index = index, .length = total };
+    }
+
+    /// Encode a snapshot record.
+    /// @param snapshot What to write.
+    /// @return Its bytes, CRC last.
+    [[nodiscard]] std::vector<std::byte> EncodeSnapshot(RaftSnapshot const& snapshot)
+    {
+        auto body = std::vector<std::byte> {};
+        PutBigEndian<std::uint32_t>(body, SnapshotMagic);
+        PutBigEndian<std::uint16_t>(body, FormatVersion);
+        PutBigEndian<std::uint64_t>(body, snapshot.lastIncludedIndex.value);
+        PutBigEndian<std::uint64_t>(body, snapshot.lastIncludedTerm.value);
+
+        // The member set through `Membership::Encode`, so this reader and the log
+        // entry's cannot come to disagree about how a configuration is spelled.
+        auto const members = Membership::Encode(snapshot.members);
+        auto const tail =
+            WireFields::Encode({ std::span<std::byte const> { members }, std::span<std::byte const> { snapshot.state } });
+        body.insert(body.end(), tail.begin(), tail.end());
+
+        PutBigEndian<std::uint32_t>(body, Crc32c::Compute(body));
+        return body;
+    }
+
+    /// Decode a snapshot record.
+    /// @param raw Its whole contents.
+    /// @return The snapshot, or why it could not be read.
+    [[nodiscard]] std::expected<RaftSnapshot, ConsensusError> ParseSnapshot(std::span<std::byte const> raw)
+    {
+        constexpr auto minimum = sizeof(std::uint32_t) + sizeof(std::uint16_t) + sizeof(std::uint64_t)
+                                 + sizeof(std::uint64_t) + sizeof(std::uint32_t);
+        if (raw.size() < minimum || !ChecksumHolds(raw))
+            return std::unexpected { FastCache::StorageFailure("the snapshot record is corrupt") };
+
+        auto cursor = std::size_t { 0 };
+        auto const magic = ReadBigEndian<std::uint32_t>(raw.subspan(cursor));
+        cursor += sizeof(std::uint32_t);
+        if (magic != SnapshotMagic)
+            return std::unexpected { FastCache::StorageFailure("the snapshot file is not one of ours") };
+
+        auto const version = ReadBigEndian<std::uint16_t>(raw.subspan(cursor));
+        cursor += sizeof(std::uint16_t);
+        if (version != FormatVersion)
+            return std::unexpected { FastCache::StorageFailure(
+                std::format("snapshot format version {} is not supported (this build writes {})", version, FormatVersion)) };
+
+        auto snapshot = RaftSnapshot {};
+        snapshot.lastIncludedIndex = LogIndex { .value = ReadBigEndian<std::uint64_t>(raw.subspan(cursor)) };
+        cursor += sizeof(std::uint64_t);
+        snapshot.lastIncludedTerm = Term { .value = ReadBigEndian<std::uint64_t>(raw.subspan(cursor)) };
+        cursor += sizeof(std::uint64_t);
+
+        auto const tail = raw.subspan(cursor, raw.size() - cursor - sizeof(std::uint32_t));
+        auto const fields = WireFields::SplitExactly(tail, 2);
+        if (!fields.has_value())
+            return std::unexpected { FastCache::StorageFailure("the snapshot record's fields do not fit") };
+
+        auto members = Membership::Decode((*fields)[0]);
+        if (!members.has_value())
+            return std::unexpected { FastCache::StorageFailure("the snapshot's configuration is malformed") };
+
+        snapshot.members = *std::move(members);
+        snapshot.state.assign((*fields)[1].begin(), (*fields)[1].end());
+        return snapshot;
     }
 
     /// Seek to an absolute offset that may exceed 2 GiB.
@@ -215,34 +310,108 @@ namespace
     }
 
     /// Read a whole file into memory.
+    ///
+    /// Returns the reason rather than a bare failure flag. Every step here can
+    /// fail for a different and actionable cause -- the path is a directory, the
+    /// permissions are wrong, the disk gave up mid-read -- and a caller handed
+    /// only "false" can say no more than "cannot read <path>", which is the one
+    /// thing the operator already knew. `std::filesystem` reports through
+    /// `error_code` and `fopen` through `errno`, so both are translated here where
+    /// they are still in scope; a caller cannot recover them afterwards.
     /// @param path What to read.
     /// @param into Destination, cleared first.
-    /// @return True on success; a missing file is success with nothing read.
-    [[nodiscard]] bool ReadWholeFile(std::filesystem::path const& path, std::vector<std::byte>& into)
+    /// @return Nothing, or why it could not be read; a missing file reads as empty.
+    [[nodiscard]] std::expected<void, ConsensusError> ReadWholeFile(std::filesystem::path const& path,
+                                                                    std::vector<std::byte>& into)
     {
         into.clear();
 
         auto error = std::error_code {};
-        if (!std::filesystem::exists(path, error) || error)
-            return !error;
+        auto const present = std::filesystem::exists(path, error);
+        if (error)
+            return std::unexpected { FastCache::StorageFailure(
+                std::format("cannot stat {}: {}", path.string(), error.message())) };
+
+        // A file that is not there is not a failure: a store starting for the
+        // first time has neither a log nor a snapshot, and that is the ordinary
+        // case rather than an error.
+        if (!present)
+            return {};
 
         auto const size = std::filesystem::file_size(path, error);
         if (error)
-            return false;
+            return std::unexpected { FastCache::StorageFailure(
+                std::format("cannot size {}: {}", path.string(), error.message())) };
 
+        errno = 0;
         gsl::owner<std::FILE*> const file = OpenBinary(path, "rb");
         if (file == nullptr)
-            return false;
+            return std::unexpected { FastCache::StorageFailure(
+                std::format("cannot open {}: {}", path.string(), std::generic_category().message(errno))) };
 
         into.resize(static_cast<std::size_t>(size));
+
+        errno = 0;
         auto const read = into.empty() ? std::size_t { 0 } : std::fread(into.data(), 1, into.size(), file);
-        auto const ok = read == into.size();
+        auto const failure = errno;
+        auto const truncated = std::ferror(file) != 0 || read != into.size();
         (void) std::fclose(file);
 
-        if (!ok)
+        if (truncated)
+        {
             into.clear();
 
-        return ok;
+            // A short read with no errno is a file that shrank between the size
+            // call and the read, which is a different fault from an I/O error and
+            // is worth saying so rather than reporting errno 0 as a cause.
+            return std::unexpected { FastCache::StorageFailure(
+                failure != 0 ? std::format("cannot read {}: {}", path.string(), std::generic_category().message(failure))
+                             : std::format("{} is shorter than its reported size of {} bytes", path.string(), size)) };
+        }
+
+        return {};
+    }
+
+    /// Replace `path` with `body`, indivisibly.
+    ///
+    /// Written beside the target and renamed over it: rename is the only single
+    /// filesystem operation that replaces a file's contents in one step, so a
+    /// crash leaves either the whole previous file or the whole new one.
+    /// @param path What to replace.
+    /// @param body The new contents.
+    /// @return Nothing, or why it could not be replaced.
+    [[nodiscard]] std::expected<void, ConsensusError> ReplaceFileAtomically(std::filesystem::path const& path,
+                                                                            std::span<std::byte const> body)
+    {
+        auto const temporary = std::filesystem::path { path }.concat(".tmp");
+
+        errno = 0;
+        gsl::owner<std::FILE*> const file = OpenBinary(temporary, "wb");
+        if (file == nullptr)
+            return std::unexpected { FastCache::StorageFailure(
+                std::format("cannot open {}: {}", temporary.string(), std::generic_category().message(errno))) };
+
+        errno = 0;
+        auto const wrote = body.empty() || std::fwrite(body.data(), 1, body.size(), file) == body.size();
+        auto const flushed = wrote && FlushToDisk(file);
+        auto const failure = errno;
+        (void) std::fclose(file);
+
+        if (!flushed)
+        {
+            auto discard = std::error_code {};
+            std::filesystem::remove(temporary, discard);
+            return std::unexpected { FastCache::StorageFailure(
+                std::format("cannot write {}: {}", temporary.string(), std::generic_category().message(failure))) };
+        }
+
+        auto error = std::error_code {};
+        std::filesystem::rename(temporary, path, error);
+        if (error)
+            return std::unexpected { FastCache::StorageFailure(
+                std::format("cannot replace {}: {}", path.string(), error.message())) };
+
+        return {};
     }
 } // namespace
 
@@ -257,6 +426,7 @@ std::expected<FileRaftStorage, ConsensusError> FileRaftStorage::Open(std::filesy
     auto store = FileRaftStorage {};
     store._statePath = directory / StateFileName;
     store._logPath = directory / LogFileName;
+    store._snapshotPath = directory / SnapshotFileName;
 
     // Opened for update rather than append: a truncation has to seek backwards,
     // and "a" would silently move every write to the end regardless.
@@ -283,8 +453,23 @@ std::expected<FileRaftStorage, ConsensusError> FileRaftStorage::Open(std::filesy
     // nothing enforced -- and Load returns early when the *state* file is corrupt,
     // without ever reaching the log -- so a SaveLog after that would see an empty
     // table, compute a start of zero, and erase every stored record.
-    if (auto scanned = store.ScanLogOffsets(); !scanned.has_value())
+    if (auto scanned = store.ScanLog(nullptr); !scanned.has_value())
         return std::unexpected { scanned.error() };
+
+    // And the snapshot with it, by the same argument, **unconditionally** rather
+    // than only when the scan found nothing. Two things ride on that. A log a
+    // snapshot has trimmed to nothing has no record left to state where it
+    // resumes, so the scan above leaves `_firstIndex` at 1 and a `SaveLog` before
+    // `Load` would be refused as a gap. And reading it here is what makes a
+    // damaged snapshot refuse to *open* the store -- a store that opens and then
+    // fails on first read is a store whose caller has to remember the ordering
+    // again, which is the requirement this whole step exists to remove.
+    auto snapshot = store.ReadSnapshot();
+    if (!snapshot.has_value())
+        return std::unexpected { snapshot.error() };
+
+    if (snapshot->has_value() && store._offsets.size() == 1)
+        store._firstIndex = (*snapshot)->lastIncludedIndex.Advanced(1);
 
     return store;
 }
@@ -292,8 +477,10 @@ std::expected<FileRaftStorage, ConsensusError> FileRaftStorage::Open(std::filesy
 FileRaftStorage::FileRaftStorage(FileRaftStorage&& other) noexcept:
     _statePath { std::move(other._statePath) },
     _logPath { std::move(other._logPath) },
+    _snapshotPath { std::move(other._snapshotPath) },
     _log { std::exchange(other._log, nullptr) },
-    _offsets { std::move(other._offsets) }
+    _offsets { std::move(other._offsets) },
+    _firstIndex { other._firstIndex }
 {
 }
 
@@ -304,6 +491,7 @@ FileRaftStorage& FileRaftStorage::operator=(FileRaftStorage&& other) noexcept
         CloseLog();
         _statePath = std::move(other._statePath);
         _logPath = std::move(other._logPath);
+        _snapshotPath = std::move(other._snapshotPath);
 
         // Spelled out rather than `std::exchange`, whose return type drops the
         // `gsl::owner` annotation and so reads to clang-tidy as a raw handle being
@@ -313,6 +501,7 @@ FileRaftStorage& FileRaftStorage::operator=(FileRaftStorage&& other) noexcept
         _log = adopted;
 
         _offsets = std::move(other._offsets);
+        _firstIndex = other._firstIndex;
     }
 
     return *this;
@@ -343,18 +532,63 @@ std::uint64_t FileRaftStorage::OffsetOf(LogIndex index) const noexcept
     if (_offsets.empty())
         return 0;
 
-    auto const wanted = std::max<std::uint64_t>(index.value, 1);
-    auto const slot = std::min<std::size_t>(_offsets.size(), static_cast<std::size_t>(wanted));
+    // Relative to the log's own first index, not to 1. After a snapshot has
+    // trimmed the prefix the file no longer starts at index 1, and an offset
+    // computed from the absolute index would land the next append that many
+    // records into the file.
+    auto const wanted = std::max<std::uint64_t>(index.value, _firstIndex.value);
+    auto const slot = std::min<std::size_t>(_offsets.size(), static_cast<std::size_t>(wanted - _firstIndex.value) + 1);
     return _offsets[slot - 1];
 }
 
-std::expected<void, ConsensusError> FileRaftStorage::ScanLogOffsets()
+std::expected<void, ConsensusError> FileRaftStorage::ScanLog(std::vector<LogEntry>* entries)
 {
     auto raw = std::vector<std::byte> {};
-    if (!ReadWholeFile(_logPath, raw))
-        return std::unexpected { FastCache::StorageFailure(std::format("cannot read {}", _logPath.string())) };
+    if (auto read = ReadWholeFile(_logPath, raw); !read.has_value())
+        return std::unexpected { read.error() };
 
     _offsets.assign(1, 0);
+    _firstIndex = LogIndex { .value = 1 };
+
+    auto cursor = std::size_t { 0 };
+    auto expected = std::optional<LogIndex> {};
+    while (cursor < raw.size())
+    {
+        auto record = ParseLogRecord(std::span { raw }.subspan(cursor));
+        if (!record.has_value())
+            break; // A torn tail: it was never acknowledged, so nobody committed on it.
+
+        // The first record states where this log begins; every later one must
+        // continue it. A gap means the file was rewritten by something that is not
+        // this store, and reading past it would place every subsequent entry under
+        // an index it does not hold -- so the scan stops there and treats the rest
+        // as a tail, which is the one disposal this format already knows is safe.
+        if (!expected.has_value())
+            _firstIndex = record->index;
+        else if (record->index != *expected)
+            break;
+
+        expected = record->index.Advanced(1);
+        cursor += record->length;
+        _offsets.push_back(cursor);
+
+        if (entries != nullptr)
+            entries->push_back(std::move(record->entry));
+    }
+
+    return {};
+}
+
+std::expected<void, ConsensusError> FileRaftStorage::TrimLogThrough(LogIndex through)
+{
+    auto raw = std::vector<std::byte> {};
+    if (auto read = ReadWholeFile(_logPath, raw); !read.has_value())
+        return std::unexpected { read.error() };
+
+    // Only the records above the boundary survive, re-written in place with the
+    // indices they already carry -- so a trim renumbers nothing and a crash
+    // mid-way leaves the whole old file, which still reads correctly.
+    auto kept = std::vector<std::byte> {};
     auto cursor = std::size_t { 0 };
     while (cursor < raw.size())
     {
@@ -362,9 +596,39 @@ std::expected<void, ConsensusError> FileRaftStorage::ScanLogOffsets()
         if (!record.has_value())
             break;
 
+        if (record->index > through)
+        {
+            auto const bytes = std::span { raw }.subspan(cursor, record->length);
+            kept.insert(kept.end(), bytes.begin(), bytes.end());
+        }
+
         cursor += record->length;
-        _offsets.push_back(cursor);
     }
+
+    // The handle is closed across the rename: on Windows a file cannot be
+    // replaced while it is open, and reopening afterwards is also what makes the
+    // stream's position and buffer agree with the file it now refers to.
+    CloseLog();
+
+    if (auto replaced = ReplaceFileAtomically(_logPath, kept); !replaced.has_value())
+    {
+        _log = OpenBinary(_logPath, "r+b");
+        return std::unexpected { replaced.error() };
+    }
+
+    _log = OpenBinary(_logPath, "r+b");
+    if (_log == nullptr)
+        return std::unexpected { FastCache::StorageFailure(
+            std::format("cannot reopen {} after trimming", _logPath.string())) };
+
+    if (auto scanned = ScanLog(nullptr); !scanned.has_value())
+        return std::unexpected { scanned.error() };
+
+    // An empty log has no record left to state where it begins, so the boundary
+    // is taken from the snapshot instead. Without this the next append is refused
+    // as a gap, permanently: `SaveLog` would be comparing against 1.
+    if (_offsets.size() == 1)
+        _firstIndex = through.Advanced(1);
 
     return {};
 }
@@ -386,32 +650,22 @@ std::expected<void, ConsensusError> FileRaftStorage::SaveState(PersistentState c
 
     PutBigEndian<std::uint32_t>(body, Crc32c::Compute(body));
 
-    // Written beside the target and renamed over it: rename is the only single
-    // filesystem operation that replaces contents indivisibly, and a half-written
-    // vote reads as no vote at all.
-    auto const temporary = std::filesystem::path { _statePath }.concat(".tmp");
-    gsl::owner<std::FILE*> const file = OpenBinary(temporary, "wb");
-    if (file == nullptr)
-        return std::unexpected { FastCache::StorageFailure(std::format("cannot open {}", temporary.string())) };
+    // A half-written vote reads as no vote at all, so this file is replaced rather
+    // than rewritten in place.
+    return ReplaceFileAtomically(_statePath, body);
+}
 
-    auto const wrote = std::fwrite(body.data(), 1, body.size(), file) == body.size();
-    auto const flushed = wrote && FlushToDisk(file);
-    (void) std::fclose(file);
+std::expected<void, ConsensusError> FileRaftStorage::SaveSnapshot(RaftSnapshot const& snapshot)
+{
+    auto const body = EncodeSnapshot(snapshot);
+    if (auto written = ReplaceFileAtomically(_snapshotPath, body); !written.has_value())
+        return std::unexpected { written.error() };
 
-    if (!flushed)
-    {
-        auto discard = std::error_code {};
-        std::filesystem::remove(temporary, discard);
-        return std::unexpected { FastCache::StorageFailure(std::format("cannot write {}", temporary.string())) };
-    }
-
-    auto error = std::error_code {};
-    std::filesystem::rename(temporary, _statePath, error);
-    if (error)
-        return std::unexpected { FastCache::StorageFailure(
-            std::format("cannot replace {}: {}", _statePath.string(), error.message())) };
-
-    return {};
+    // Only now. A crash between these two leaves a durable snapshot beside a log
+    // that still holds the entries it covers, which `RaftNode` reconciles on
+    // recovery; the opposite order leaves a log missing committed entries and no
+    // snapshot to replace them, which nothing can repair.
+    return TrimLogThrough(snapshot.lastIncludedIndex);
 }
 
 std::expected<void, ConsensusError> FileRaftStorage::SaveLog(LogAppend const& append)
@@ -424,14 +678,15 @@ std::expected<void, ConsensusError> FileRaftStorage::SaveLog(LogAppend const& ap
     // different index than it claims and leave the store disagreeing with the node
     // about where entries live. No correct driver produces one, which is why it is
     // worth making an error rather than leaving it to luck.
-    if (append.fromIndex.value > _offsets.size())
+    // Both ends, because a trimmed log no longer begins at 1: an append below its
+    // first index names entries the snapshot has deliberately replaced.
+    if (append.fromIndex < _firstIndex || append.fromIndex.value > _firstIndex.value + _offsets.size() - 1)
         return std::unexpected { FastCache::StorageFailure("a log append would leave a gap") };
 
     // fromIndex is a truncation point as well as a start, so anything at or after
     // it stops being part of the log.
     auto const start = OffsetOf(append.fromIndex);
-    auto const wanted = std::max<std::uint64_t>(append.fromIndex.value, 1);
-    auto const slot = std::min<std::size_t>(_offsets.size(), static_cast<std::size_t>(wanted));
+    auto const slot = static_cast<std::size_t>(append.fromIndex.value - _firstIndex.value) + 1;
 
     // Truncated BEFORE the replacement is written, and made durable -- the
     // opposite of the obvious order. Writing first and shortening afterwards looks
@@ -470,22 +725,16 @@ std::expected<void, ConsensusError> FileRaftStorage::SaveLog(LogAppend const& ap
     if (!SeekTo(_log, start))
         return std::unexpected { FastCache::StorageFailure("cannot seek the log") };
 
-    auto body = std::vector<std::byte> {};
     auto offset = start;
+    auto index = append.fromIndex;
     for (auto const& entry: append.entries)
     {
-        body.clear();
-        PutBigEndian<std::uint32_t>(body, LogMagic);
-        PutBigEndian<std::uint64_t>(body, entry.term.value);
-        body.push_back(static_cast<std::byte>(entry.kind));
-        PutBigEndian<std::uint32_t>(body, static_cast<std::uint32_t>(entry.payload.size()));
-        body.insert(body.end(), entry.payload.begin(), entry.payload.end());
-        PutBigEndian<std::uint32_t>(body, Crc32c::Compute(body));
-
+        auto const body = EncodeLogRecord(index, entry);
         if (std::fwrite(body.data(), 1, body.size(), _log) != body.size())
             return std::unexpected { FastCache::StorageFailure("cannot write the log") };
 
         offset += body.size();
+        index = index.Advanced(1);
         _offsets.push_back(offset);
     }
 
@@ -495,13 +744,29 @@ std::expected<void, ConsensusError> FileRaftStorage::SaveLog(LogAppend const& ap
     return {};
 }
 
+std::expected<std::optional<RaftSnapshot>, ConsensusError> FileRaftStorage::ReadSnapshot()
+{
+    auto raw = std::vector<std::byte> {};
+    if (auto read = ReadWholeFile(_snapshotPath, raw); !read.has_value())
+        return std::unexpected { read.error() };
+
+    if (raw.empty())
+        return std::optional<RaftSnapshot> {};
+
+    auto parsed = ParseSnapshot(raw);
+    if (!parsed.has_value())
+        return std::unexpected { parsed.error() };
+
+    return std::optional<RaftSnapshot> { *std::move(parsed) };
+}
+
 std::expected<RecoveredState, ConsensusError> FileRaftStorage::Load()
 {
     auto recovered = RecoveredState {};
 
     auto raw = std::vector<std::byte> {};
-    if (!ReadWholeFile(_statePath, raw))
-        return std::unexpected { FastCache::StorageFailure(std::format("cannot read {}", _statePath.string())) };
+    if (auto read = ReadWholeFile(_statePath, raw); !read.has_value())
+        return std::unexpected { read.error() };
 
     if (!raw.empty())
     {
@@ -512,22 +777,25 @@ std::expected<RecoveredState, ConsensusError> FileRaftStorage::Load()
         recovered.state = *parsed;
     }
 
-    if (!ReadWholeFile(_logPath, raw))
-        return std::unexpected { FastCache::StorageFailure(std::format("cannot read {}", _logPath.string())) };
+    auto snapshot = ReadSnapshot();
+    if (!snapshot.has_value())
+        return std::unexpected { snapshot.error() };
 
-    _offsets.assign(1, 0);
-    auto cursor = std::size_t { 0 };
-    while (cursor < raw.size())
-    {
-        auto const record = ParseLogRecord(std::span { raw }.subspan(cursor));
-        if (!record.has_value())
-            break; // A torn tail: it was never acknowledged, so nobody committed on it.
+    recovered.snapshot = *std::move(snapshot);
 
-        recovered.entries.push_back(record->entry);
-        cursor += record->length;
-        _offsets.push_back(cursor);
-    }
+    // The same walk `Open` performs, rather than a second copy of it: the offset
+    // table and the entries come from one pass over one grammar, so a rule that
+    // changes cannot change for only one of them.
+    if (auto scanned = ScanLog(&recovered.entries); !scanned.has_value())
+        return std::unexpected { scanned.error() };
 
+    // A log trimmed to nothing carries no record to state where it begins, so the
+    // snapshot answers instead -- the same repair `Open` makes, and needed in both
+    // because either can be the first to touch the store after a restart.
+    if (recovered.entries.empty() && recovered.snapshot.has_value())
+        _firstIndex = recovered.snapshot->lastIncludedIndex.Advanced(1);
+
+    recovered.firstIndex = _firstIndex;
     return recovered;
 }
 

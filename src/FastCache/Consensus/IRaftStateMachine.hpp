@@ -3,6 +3,10 @@
 
 #include <FastCache/Consensus/RaftOutput.hpp>
 
+#include <cstddef>
+#include <span>
+#include <vector>
+
 namespace FastCache::Consensus
 {
 
@@ -33,6 +37,25 @@ class IRaftStateMachine
     /// Act on one committed entry.
     /// @param entry The entry, with the index it was committed at.
     virtual void Apply(AppliedEntry const& entry) = 0;
+
+    /// Serialize everything applied so far, so the log below it can be discarded.
+    ///
+    /// The bytes are opaque to consensus, exactly as an entry's payload is. What
+    /// consensus guarantees in return is *when* it asks: only ever at an index it
+    /// has applied, so the state described is a state this machine actually
+    /// reached.
+    /// @return The serialized state.
+    [[nodiscard]] virtual std::vector<std::byte> TakeSnapshot() = 0;
+
+    /// Replace this machine's state with `state`, wholesale.
+    ///
+    /// Called when a follower is handed state it cannot replay its way to,
+    /// because the entries that would have taken it there have been compacted
+    /// away everywhere. **Replace, do not merge**: the snapshot is the complete
+    /// state as of its index, and folding it into what this machine already holds
+    /// would keep entries the cluster has superseded.
+    /// @param state Bytes previously produced by `TakeSnapshot` on some node.
+    virtual void RestoreSnapshot(std::span<std::byte const> state) = 0;
 };
 
 } // namespace FastCache::Consensus

@@ -14,7 +14,9 @@ src/FastCache/
                 StringHash, Owner, Profiling (Tracy wrappers)
   Async/        Task<T>, Cancellation, ResumeOn, IReactor + TestReactor and the
                 platform reactors (EpollReactor / IocpReactor / KqueueReactor)
-  Net/          ISocket, IListener, IoAwaitable, IAdmissionControl, SocketAddress,
+  Net/          ISocket, IListener, IConnector (the outbound counterpart to
+                IListener; BlockingConnector dials non-blocking so its timeout
+                means something), IoAwaitable, IAdmissionControl, SocketAddress,
                 BlockingSocket (Winsock + POSIX),
                 EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
                 InMemoryTransport (paired pipes + InMemoryListener),
@@ -39,7 +41,12 @@ src/FastCache/
                 (prefetch-group id -> key-set + reverse index) — the
                 compile-cache executor's domain logic
   Consensus/    RaftTypes, RaftLog, RaftNode and RaftDriver behind the
-                IRaftStorage / IRaftTransport / IRaftStateMachine seams — Raft,
+                IRaftStorage (state, log and snapshot, the last being what makes
+                RaftLog::Compact's precondition satisfiable at all) /
+                IRaftTransport / IRaftStateMachine / IRaftMessageSink seams, plus
+                RaftWire (the 0xFA peer frame), RaftPeerTransport (outbound,
+                a thread per peer), RaftPeerServer (inbound, on the reactor)
+                and RaftMembership (the member set as a log entry) — Raft,
                 split into a pure state machine and a coroutine driver that
                 carries out what it asks for. RaftNode reads no clock, opens no
                 socket and draws no randomness of its own: time arrives as a
@@ -157,6 +164,119 @@ packaging/
 `cmake/Packaging.cmake` turns that into `.deb`/`.rpm`/`.pkg`/`.msi` via CPack.
 These constraints are load-bearing and have each already been a bug:
 
+- **A snapshot is durable before it is acknowledged, and its configuration travels
+  with it.** `IRaftStorage` had `SaveState` and `SaveLog` and nothing else, so
+  `RaftLog::Compact`'s stated precondition — the caller has made a snapshot through
+  `through` durable first — could not be satisfied by any API in the tree. Two
+  consequences, and neither fails loudly. A follower that answers `InstallSnapshot`
+  at index N without persisting it **retracts that acknowledgement on restart**,
+  after a leader may already have counted it towards commitment: Leader
+  Completeness, lost to a write nobody made. And a leader that compacted and
+  restarted came back with an *empty* `_snapshotState`, so the next follower far
+  enough behind was shipped an empty snapshot **as though it were state**. Hence
+  `IRaftStorage::SaveSnapshot`, the snapshot on `RecoveredState`, and
+  `RaftOutput::saveSnapshot` — carried through the output channel rather than
+  written by whoever asked for the compaction, for exactly the reason `persist`
+  and `persistLog` are: it is a durability write that has to be ordered against
+  the messages, and only the driver can order it. Consequences that are each
+  load-bearing:
+  - **The write order is snapshot-then-trim, and the crash window it leaves is
+    the reason that order is right.** A crash between them leaves a durable
+    snapshot beside a log that still holds the entries it covers, which
+    `RaftNode`'s constructor reconciles by compacting to the boundary. The
+    opposite order leaves a log missing committed entries and no snapshot to
+    replace them, which nothing can repair. That reconciliation is also what lets
+    a store which never trims its log be merely wasteful rather than wrong.
+  - **A trimmed log cannot be positional, so each record carries its own index.**
+    `FileRaftStorage` derived an entry's index from its position in the file,
+    which has no answer once a prefix is gone — and in the crash window above it
+    has a *wrong* answer, silently: entry 8 recovers as entry 1, and every index
+    in the store is off by the length of the discarded prefix. The degenerate case
+    needs the snapshot as well: a log trimmed to nothing has no record left to
+    state where it resumes, and without that the next append is refused as a gap
+    forever.
+  - **The configuration is part of the snapshot, because compaction is precisely
+    what leaves nothing to re-derive it from.** `RefreshConfiguration` scans the
+    log for the newest `Configuration` entry and falls back when it finds none —
+    and the fall-back was the **bootstrap** member set. So a node that took part in
+    a membership change and then compacted past it forgot that change, silently,
+    and only after a restart: `Quorum()` then counts a majority of the wrong set.
+    The scan also ran to index 1 rather than stopping at the log's own first index,
+    which is what made "no entry" the answer for a log that merely no longer holds
+    one.
+  - **`HasUncommittedConfiguration()` is `LatestConfigurationIndex() > _commitIndex`,
+    derived rather than scanned for separately.** They are the same question, and
+    two backward scans answering it independently are two places for the rule to
+    drift.
+- **A seeded draw must be the same on every platform, or a seeded harness is not
+  reproducible.** `std::mt19937_64` is specified bit-for-bit by the standard;
+  `std::uniform_int_distribution` is **not** — how it reduces the engine's output
+  to a range is the implementation's business, and libstdc++ and libc++ do it
+  differently. `SystemRandomSource`'s fixed-seed constructor exists so a failure
+  can be replayed, and `RaftClusterHarness` seeds one per node so a whole cluster's
+  adversarial schedule is reproducible; both promises held only within one standard
+  library. The harness therefore ran a **different** schedule on macOS than on
+  Linux and Windows, and three cluster cases failed there and nowhere else — in CI,
+  at `-O3`, where nothing local reproduces it. `UniformInRange` now does the range
+  reduction itself, and a golden vector pins it. The same argument `Core/MurmurHash3`
+  makes about its digest and `PathCanon::AsciiLower` about locale: a value this
+  codebase relies on being identical everywhere cannot come from something allowed
+  to vary. Two consequences:
+  - **It takes the HIGH bits of the engine draw, and that is not a detail.**
+    Masking the low bits is the shorter spelling and was the first version. Mersenne
+    Twister seeded with *adjacent* values produces correlated low-order output for
+    its first draws, and the harness seeds its nodes `base + 0`, `base + 1`, … — so
+    five nodes drew near-identical first election timeouts, campaigned together and
+    split the vote, round after round. Election jitter exists precisely to
+    decorrelate those draws; sourcing it from the one part of the output that is
+    correlated across neighbouring seeds defeats the mechanism it feeds.
+  - **The three tests it was masking were a real defect, not bad luck.** See the
+    next entry — which is the reason a harness like this is worth its cost at all.
+- **Pre-vote asks whether a LEADER is live, so it must not be answered from this
+  node's own election timer.** `OnPreVote` refused when `now < _electionDeadline`,
+  and that deadline is re-armed when the node *starts its own pre-vote round*. So a
+  node that had just begun campaigning answered "yes, I heard from a leader
+  recently" for a full timeout and refused every peer that timed out alongside it —
+  which is the ordinary case in a cluster whose nodes are meant to race. Nothing
+  fails and nothing is unsafe: a five-node cluster simply took some **forty**
+  election rounds to elect anybody where one should do, which reads as a livelock
+  in a cluster test and is invisible to a unit test that only ever has one
+  candidate. Measured at 994 harness steps before and 20–23 after. `_lastLeaderContact`
+  is now its own field, set only where a leader actually spoke — an accepted
+  AppendEntries or InstallSnapshot — through `NoteLeaderContact`, while standing for
+  election and granting a vote still arm the timer alone. The window is
+  `electionTimeoutMin` rather than the node's own randomized deadline, because "is
+  there a live leader" is a fact about the cluster that every node should answer
+  the same way at the same instant. Both halves are tested: a campaigning node
+  still grants, and a node that has just heard from a leader still refuses —
+  losing the second while fixing the first would trade a slow election for the
+  disruption pre-vote exists to prevent. The residual, unchanged by this and
+  recorded deliberately: a **leader** never hears from a leader, so its own
+  `_lastLeaderContact` ages out and it grants a challenger's pre-vote — exactly as
+  it did before, since a leader arms no election timer either. Refusing there is
+  CheckQuorum or a leader lease, which `RaftCluster_test` already names as a
+  separate mechanism and which nothing here needs yet.
+- **A round-trip test that omits a message type omits the arm most likely to be
+  wrong.** Five of `RaftWire`'s eight encoder arms are near-copies of another —
+  PreVote of RequestVote, `InstallSnapshotResponse` of `AppendEntriesResponse` —
+  and the mistake copying invites is a transposed field index. The four types added
+  with pre-vote and snapshots had **no positive round trip at all**, so an arm
+  writing `lastIncludedTerm` where `lastIncludedIndex` belongs passed the entire
+  suite; verified by making that transposition and watching only the new cases
+  fail. The replacement is one exemplar per `MessageTable` row with **every field a
+  different value** — two fields sharing a value would let the transposition
+  through — compared whole through `operator==` rather than field by field, since
+  field-by-field checks are what the copied arms already survived. A row without an
+  exemplar fails the case rather than going quietly untested, and the enum sweep is
+  kept separate precisely so the exemplars' values can stay distinct.
+- **The residuals here are recorded rather than closed**, because each belongs to a
+  later phase and closing it now would be guessing at that phase's shape:
+  `RaftDriver` has no compaction *policy*, so `CompactThroughApplied` has no
+  production caller yet — the log grows until something decides when to trim, which
+  is the daemon's decision and lands with the daemon shell. And a member added by
+  `ProposeMembership` carries an id but no **endpoint**, so a node the cluster has
+  agreed to admit is still unreachable until discovery supplies one; membership and
+  addressing are deliberately separate, and joining the two is what PR 5 is for.
 - **A flag is one row, and every binary's row table drives both parsing and
   help.** The daemon used to declare flags four ways — hand-written `if (arg ==
   …)`, a descriptor array, two inline `initializer_list<tuple<…>>` tables, and
@@ -868,6 +988,23 @@ These constraints are load-bearing and have each already been a bug:
   help text still said `default 16m` long after the default became 256 MiB: the
   one knob this failure sends an operator to, misreporting itself.
 
+- **The wire's two grammars are shared, and both live in `Core/` for the same
+  reason.** `Core/WireFields` is the payload — a run of `[u32 length][bytes]` —
+  and `Core/WireFrame` is the seven bytes in front of it:
+  `[magic][version][kind][u32 payloadLength]`. `CompileCacheWire` and `RaftWire`
+  had each spelled the second one out, the encoder character-identical and
+  `IsSupported` identical outright, which is the drift `CompileCacheWire`'s own
+  documentation warns about applied to the half a reader reaches first. What
+  `WireFrame` deliberately does **not** decide is what any of it means: the magic
+  is the caller's, so two protocols on two ports stay distinguishable; the kind
+  byte comes back raw and is validated against the caller's own table, because a
+  receiver has to be able to *step over* a frame whose kind it does not know; and
+  the supported version range is a parameter, because the wires version
+  independently and always will. `RaftWire::FrameHeader` is an alias of
+  `WireFrame::Header` while `CompileCacheWire::RequestHeader` is rebuilt from it —
+  not an inconsistency but the cost of a rename: that struct's field is spelled
+  `opRaw` at some seventy call sites across the daemon, the launcher and the test
+  client, and the thing that had to stop being duplicated was the *layout*.
 - **`Protocol/CompileCacheWire.hpp` must stay header-only and dependency-free.**
   Same constraint as `Cli/UsageDoc`, same reason: `fastcache-cc` does not link
   the `FastCache` library, so an include of anything from `Net/`, `Cache/`,
@@ -879,6 +1016,27 @@ These constraints are load-bearing and have each already been a bug:
   lives in `apps/fastcache-cc/CacheProtocol.cpp` rather than `main.cpp` for a
   related reason: `main.cpp` is in no test target, so while the framing sat there
   it had *no* unit coverage at all.
+- **A platform socket error is classified in one place.** `Detail::TranslateError`
+  in `BlockingSocket.cpp` mapped ten conditions onto `NetErrorCode`;
+  `BlockingConnector` then grew a three-condition copy of it, so `EACCES` — a
+  firewall or a privileged port, the two most likely reasons an outbound
+  connection is refused *administratively* — came back as an unclassified
+  `SystemError`, and a caller matching on `PermissionDenied` never saw it. It is
+  now `Detail::TranslateSocketError`, published from `BlockingSocket.hpp` and used
+  by both; the connector's own contribution, `ENETUNREACH`/`WSAENETUNREACH`, moved
+  into the table rather than being lost, beside `EHOSTUNREACH` because no route
+  and no answer are the same fact to a caller: this endpoint is unreachable from
+  here, and neither is retryable at this layer.
+- **A failure is reported with its reason, and the reason has to be captured where
+  it is still in scope.** `ReadWholeFile` in `FileRaftStorage` returned a `bool`,
+  so every caller could say no more than `cannot read <path>` — the one thing the
+  operator already knew. Each step there fails for a different and actionable
+  cause (the path is a directory, the permissions are wrong, the file shrank
+  under the read), `std::filesystem` reports through `error_code` and `fopen`
+  through `errno`, and a caller handed a `bool` cannot recover either. It returns
+  `std::expected<void, ConsensusError>` and translates both at the point of
+  failure. A missing file stays *success with nothing read*: a store starting for
+  the first time is the ordinary case, not a fault.
 - **The supervisor's launch arguments must not pass `--daemon`.** The POSIX
   daemonize path double-forks and sends stdout/stderr to `/dev/null`, which
   silences journald; its pidfile is also written after both parents exit, racing
@@ -1392,6 +1550,18 @@ down across a suspend point.
 - **C-style loops are forbidden.** Use range-based `for`, `std::views::iota`, and other range views for generation/transformation.
 - **`std::span`** for arrays and contiguous sequences.
 - **`auto` type deduction** for readability; **structured bindings** for tuple-like returns.
+- **A local gate cannot see a configuration it does not build.** The default agent
+  preset is `clang-debug`: one compiler, one standard library, `-O0`, sanitizers on.
+  CI is four more — GCC at `-O3`, clang-cl, MSVC, and clang against **libc++** on
+  macOS — and each of the three defects that reached CI on the Raft branch was
+  invisible to every configuration below it. GCC 14 at `-O3` reports
+  `-Wnull-dereference` inside `std::optional::value_or` where clang does not;
+  clang-tidy 22 knows checks clang-tidy 20 has never heard of; and libc++'s
+  `uniform_int_distribution` is a different function from libstdc++'s. Before
+  pushing a change that touches a header everything includes, a randomness or
+  timing seam, or anything a test harness's determinism rests on, build **at least
+  one release configuration and one non-clang compiler** locally —
+  `cmake --preset gcc-release` and `clang-release` both exist and both run in WSL.
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins.** Both jobs
   run the `$CLANG_TOOLS_VERSION` binary (`.github/workflows/build.yml`), and successive LLVM
   releases do not agree with each other: the style job compares against a *newer formatter*,
@@ -1400,9 +1570,15 @@ down across a suspend point.
   code nobody mis-wrote, and one no local run catches unless it uses the same version. Name the
   version explicitly rather than relying on `PATH`:
   `git ls-files '*.h' '*.hpp' '*.cpp' | xargs clang-format-$V --dry-run --Werror --style=file`,
-  and `-DCMAKE_CXX_CLANG_TIDY=clang-tidy-$V` over the `clang-debug` preset. Found twice in one
-  branch: four files reformatted by 22 after 20 had passed them, and four `find(...) != npos`
-  tests that only 22 knows to report as `readability-container-contains`.
+  and `-DCMAKE_CXX_CLANG_TIDY=clang-tidy-$V` **in a build directory of its own**. Found three
+  times in one branch: four files reformatted by 22 after 20 had passed them, four
+  `find(...) != npos` tests that only 22 reports as `readability-container-contains`, and five
+  `std::lock_guard`s that only 22 reports as `modernize-use-scoped-lock`. **The preset alone is
+  not that sweep**, and that is the trap: `clang-debug` sets `CMAKE_CXX_CLANG_TIDY=clang-tidy`,
+  which on a machine carrying both resolves to whichever `PATH` finds first — 20 in this
+  project's WSL image, where 22 sits right beside it as `clang-tidy-22`. So a `clang-debug`
+  build reports "clang-tidy clean" in exactly the way that means nothing, and the version it
+  used is printed nowhere. Configure a second build directory naming the version, and run that.
 - **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT` — address the underlying issue. The `clang-debug` preset enables `clang-tidy` automatically, at whatever version `PATH` resolves to — see the bullet above for why that is not the same as the one CI enforces.
 - **No `g_`-prefix on globals either — and the rule lives in `.clang-tidy`, not only here.** A file-scope or `thread_local` name is spelled like any other name of its kind: `CamelCase` if it is a constant, `camelBack` if it is mutable. There is no "forbid this prefix" option in `readability-identifier-naming` (its `...Prefix` keys only ever *require* one), so the `GlobalVariableCase`/`GlobalConstantCase`/`StaticVariableCase` rows are what reject `g_foo` — and with `WarningsAsErrors: "*"` that is a build failure rather than a review comment. A function-local `static` is `camelBack` whether or not it is `const`: `StaticConstantCase` is left unset precisely so a local constant falls back to that, which keeps `g_` rejected there without demanding PascalCase for locals that are `static` only for their lifetime. The prefix is a substitute for a naming convention rather than one, and it makes ambient state read as normal; if a bare name looks wrong at the call site, that is the "inject it" rule above telling you something.
 - **No `k`-prefix on identifiers.** Do not use the Google-style `kFoo` prefix for constants, enumerators, or any other symbol — it violates the project `.clang-tidy` naming convention. Use `Foo` (PascalCase) for constants/enumerators and `foo`/`fooBar` for locals and members instead.
@@ -1417,6 +1593,17 @@ down across a suspend point.
 - Prefer `std::expected<T, SomeError>` over throwing on the public API surface.
 
 ## Building
+
+Line endings are LF everywhere, and that is a `.gitattributes` rule
+(`* text=auto eol=lf`) rather than an instruction to set `core.autocrlf`. The
+config is per-clone and per-developer, so without the rule two people editing one
+file disagree about what a line ending is — and the disagreement is invisible
+until a diff comes back as *every line changed* for a two-line edit, which is how
+it was found. Stored content was already LF, so the rule changed nothing that is
+committed, only what lands on disk at checkout. `*.sh` keeps a row of its own even
+though the general rule covers it, because the consequence there is specific: a
+CRLF shebang makes the kernel look for an interpreter whose name ends in a
+carriage return, so such a script does not misbehave — it fails to start at all.
 
 CMake presets live in `CMakePresets.json`. Common entry points:
 
@@ -1472,6 +1659,20 @@ PDB is a second artefact no hit can reproduce).
 ## Testing
 
 Catch2 tests live next to the implementation files, so `Foo.cpp` has a `Foo_test.cpp`. A `test_main.cpp` serves as the entry point.
+
+`src/tests/Unwrap.hpp` holds the one helper every test target shares.
+clang-tidy's `bugprone-unchecked-optional-access` cannot see a `has_value()`
+guard through Catch2's `REQUIRE`, so a plain `*x` after one is a **build failure**
+under `WarningsAsErrors` — `Unwrap(x)` goes through `value_or`, which is provably
+safe, and the preceding `REQUIRE` still fails first when the optional is empty.
+It replaced eleven copies that were *near*-identical rather than identical: each
+carried its own abbreviation of that reasoning, so why the idiom exists was
+reconstructible from some and not from others, and an author who found a terse
+copy had nothing telling them a plain dereference was not simply better. It is
+header-only and includes only `<optional>`, so the launcher's and worker's test
+binaries can use it without linking `FastCache`. `std::expected` is **not**
+covered by that check, so a `*result` after `REQUIRE(result.has_value())` stays as
+it is — routing it through `Unwrap` does not even compile.
 
 Not every test is a Catch2 case. Script-driven tests are registered in
 `src/tests/CMakeLists.txt`: the `smoke`-labelled ones start a real daemon or

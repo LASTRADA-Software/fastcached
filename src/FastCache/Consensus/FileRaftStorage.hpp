@@ -14,14 +14,15 @@
 namespace FastCache::Consensus
 {
 
-/// `IRaftStorage` backed by two files in a directory.
+/// `IRaftStorage` backed by three files in a directory.
 ///
-/// ## Why two files rather than one
+/// ## Why separate files rather than one
 ///
-/// Term and vote change once per election; the log changes on every entry. One
-/// file would mean rewriting the log whenever a vote was cast, or threading the
-/// small record through an append-structured file and compacting it later. Two
-/// files make each write proportional to what actually changed.
+/// Term and vote change once per election; the log changes on every entry; a
+/// snapshot is written rarely and read only at startup. One file would mean
+/// rewriting the log whenever a vote was cast, or threading the small records
+/// through an append-structured file and compacting them later. Separate files
+/// make each write proportional to what actually changed.
 ///
 /// ## How each is made crash-safe, and how the two differ
 ///
@@ -39,6 +40,20 @@ namespace FastCache::Consensus
 /// CRC, and everything from there is discarded. That is correct rather than
 /// lenient — a record that was still being written was never acknowledged to a
 /// leader, so no one can have committed on it.
+///
+/// The **snapshot** is written the state file's way, whole and renamed over, for
+/// the state file's reason: it is small by design and replaced rather than
+/// extended. What is not interchangeable is the *order* it stands in relative to
+/// the log. It is made durable **first**, and only then is the prefix it covers
+/// dropped from the log — because a crash between the two leaves a snapshot plus
+/// entries it already covers, which `RaftNode` reconciles on recovery, whereas
+/// the opposite order leaves a log missing committed entries and a snapshot that
+/// never arrived, which nothing can repair.
+///
+/// That ordering is also why each log record carries its own **index**. A
+/// positional file cannot say where a trimmed log now begins, so the crash window
+/// above would recover entry 8 as entry 1 — every index in the store off by the
+/// length of the discarded prefix, silently.
 ///
 /// The residual, recorded deliberately: `fsync` on the file does not make the
 /// *directory entry* durable on POSIX, so a crash immediately after the rename
@@ -65,6 +80,7 @@ class FileRaftStorage final: public IRaftStorage
 
     [[nodiscard]] std::expected<void, ConsensusError> SaveState(PersistentState const& state) override;
     [[nodiscard]] std::expected<void, ConsensusError> SaveLog(LogAppend const& append) override;
+    [[nodiscard]] std::expected<void, ConsensusError> SaveSnapshot(RaftSnapshot const& snapshot) override;
     [[nodiscard]] std::expected<RecoveredState, ConsensusError> Load() override;
 
   private:
@@ -81,11 +97,26 @@ class FileRaftStorage final: public IRaftStorage
     /// Rebuild the offset table by walking the log file.
     ///
     /// Called from `Open`, so the table is valid before any write can use it.
+    /// @param entries Receives the decoded entries when non-null.
     /// @return Nothing, or why the log could not be read.
-    [[nodiscard]] std::expected<void, ConsensusError> ScanLogOffsets();
+    [[nodiscard]] std::expected<void, ConsensusError> ScanLog(std::vector<LogEntry>* entries);
+
+    /// Read the snapshot file, if there is one.
+    /// @return The snapshot, absent when none is stored, or why it is unreadable.
+    [[nodiscard]] std::expected<std::optional<RaftSnapshot>, ConsensusError> ReadSnapshot();
+
+    /// Rewrite the log without the entries at or below `through`.
+    ///
+    /// Written beside the log and renamed over it, so the file is only ever the
+    /// whole old log or the whole new one. Called only after the snapshot covering
+    /// those entries is durable.
+    /// @param through The last index the snapshot covers.
+    /// @return Nothing, or why the log could not be rewritten.
+    [[nodiscard]] std::expected<void, ConsensusError> TrimLogThrough(LogIndex through);
 
     std::filesystem::path _statePath;
     std::filesystem::path _logPath;
+    std::filesystem::path _snapshotPath;
 
     /// Open handle on the log, kept for the life of the store: reopening per
     /// append would put a path resolution and a permission check on every entry.
@@ -99,6 +130,13 @@ class FileRaftStorage final: public IRaftStorage
     /// "where does the next entry go?" answerable: without it an append past the
     /// end has to guess, and guessing the last record's start overwrites it.
     std::vector<std::uint64_t> _offsets { 0 };
+
+    /// Index of the first record in the log file; 1 until a snapshot trims it.
+    ///
+    /// Read from that record rather than assumed, which is what a per-record index
+    /// buys: an empty log after a trim would otherwise have nothing left to say
+    /// where the next entry belongs.
+    LogIndex _firstIndex { .value = 1 };
 };
 
 } // namespace FastCache::Consensus

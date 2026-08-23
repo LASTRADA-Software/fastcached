@@ -63,13 +63,35 @@ std::expected<void, ConsensusError> RaftDriver::Deliver(RaftOutput output)
         }
     }
 
+    // Third, and still before anything is sent. A node that acknowledged a
+    // snapshot it had not written would retract that acknowledgement on restart --
+    // after a leader may already have counted it towards commitment -- and a node
+    // that had discarded the entries it replaces would come back missing them
+    // outright.
+    if (output.saveSnapshot.has_value())
+    {
+        if (auto written = _storage.SaveSnapshot(*output.saveSnapshot); !written.has_value())
+        {
+            _failure = written.error();
+            return std::unexpected { written.error() };
+        }
+    }
+
     for (auto& outbound: output.messages)
         _transport.Send(outbound.to, std::move(outbound.message));
 
     // Last: peers cannot make progress until the messages are out, and applying
     // is local.
-    for (auto const& entry: output.applied)
-        _application.Apply(entry);
+    //
+    // A restore REPLACES rather than advances, so it is delivered instead of the
+    // applied entries and not alongside them -- the snapshot already includes
+    // everything up to its index, and replaying entries over it would re-apply
+    // what it contains.
+    if (output.restoreSnapshot.has_value())
+        _application.RestoreSnapshot(output.restoreSnapshot->state);
+    else
+        for (auto const& entry: output.applied)
+            _application.Apply(entry);
 
     return {};
 }

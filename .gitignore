@@ -31,3 +31,9 @@ perf.data*
 # hide a `version.txt` anywhere below — a path the check does not look at, so the
 # ignore rule would be silently wider than the rule it exists to support.
 /version.txt
+
+# CTest writes this beside whatever directory it was invoked from, so running
+# `ctest --preset ...` at the repository root leaves it in the source tree.
+# Anchored to the root: a `Testing/` directory further down would be somebody
+# else's and is not this rule's to hide.
+/Testing/

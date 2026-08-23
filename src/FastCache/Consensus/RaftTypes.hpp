@@ -4,6 +4,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -106,8 +107,9 @@ using NodeId = std::string;
 /// inferring the difference would make one indistinguishable from the other.
 enum class EntryKind : std::uint8_t
 {
-    Command = 0, ///< Application bytes, delivered through `RaftOutput::applied`.
-    NoOp,        ///< Consensus' own; ordered and committed, but never delivered.
+    Command = 0,   ///< Application bytes, delivered through `RaftOutput::applied`.
+    NoOp,          ///< Consensus' own; ordered and committed, but never delivered.
+    Configuration, ///< The cluster's member set; adopted on append, never delivered.
 };
 
 /// One entry in the replicated log.
@@ -134,6 +136,7 @@ struct LogEntry
 enum class Role : std::uint8_t
 {
     Follower = 0, ///< Accepts entries; stands for election when it stops hearing a leader.
+    PreCandidate, ///< Asking whether an election could be won, without starting one.
     Candidate,    ///< Standing for election in its current term.
     Leader,       ///< Replicating entries and sending heartbeats.
 };
@@ -156,6 +159,106 @@ enum class AppendResult : std::uint8_t
     Accepted,     ///< The follower's log now matches the leader's through the entries sent.
 };
 
+/// The largest enumerator of an enum that travels on the wire or on disk.
+///
+/// A trait rather than an argument each decoder passes, because "what is the
+/// highest `EntryKind`?" is a property of the enum and not of the call site. The
+/// primary template is deliberately **left undefined**, so a new wire enum that
+/// forgets its bound is a compile error at the decode site rather than a decoder
+/// that silently accepts every byte.
+///
+/// The alternative — and what this replaced — was each decoder naming the current
+/// highest enumerator itself, which `RaftWire` and `FileRaftStorage` were both
+/// doing for `EntryKind`. Adding a kind then means finding every site, and a
+/// missed one does not fail to compile: it *rejects* every frame or log record
+/// carrying the new kind, which reads as corruption rather than as an omission.
+/// @tparam E The enumeration.
+template <typename E>
+struct WireEnumBound;
+
+/// `EntryKind`'s bound. Raise it in lock-step with the last enumerator.
+template <>
+struct WireEnumBound<EntryKind>
+{
+    static constexpr EntryKind Highest = EntryKind::Configuration;
+};
+
+/// `VoteDecision`'s bound.
+template <>
+struct WireEnumBound<VoteDecision>
+{
+    static constexpr VoteDecision Highest = VoteDecision::Granted;
+};
+
+/// `AppendResult`'s bound.
+template <>
+struct WireEnumBound<AppendResult>
+{
+    static constexpr AppendResult Highest = AppendResult::Accepted;
+};
+
+/// Turn a byte that arrived from a peer or from disk into an enumerator.
+///
+/// Casting an arbitrary byte into an enumeration produces a value no `switch`
+/// handles and no invariant covers, and the byte is not this process's to trust —
+/// so an out-of-range one is a malformed record to refuse, never a precondition
+/// to assert on.
+/// @tparam E The enumeration, which must specialize `WireEnumBound`.
+/// @param raw The byte as read.
+/// @return The enumerator, or nullopt when the byte names none.
+template <typename E>
+[[nodiscard]] constexpr std::optional<E> DecodeWireEnum(std::uint8_t raw) noexcept
+{
+    if (raw > static_cast<std::uint8_t>(WireEnumBound<E>::Highest))
+        return std::nullopt;
+    return static_cast<E>(raw);
+}
+
+/// A node asking whether it *could* win an election, without starting one.
+///
+/// The pre-vote round (Ongaro's thesis §9.6) exists to stop a node that has been
+/// partitioned away from disrupting a cluster that is working perfectly well.
+/// Such a node times out, increments its term, times out again, and comes back
+/// carrying a term far above everyone else's — at which point §5.1 obliges the
+/// healthy leader to step down and the cluster runs an election it did not need.
+/// The disruption is worst exactly when it is least welcome: the moment a
+/// partition heals.
+///
+/// The fix is to ask first and change nothing. `term` is the term the sender
+/// *would* use, one above its own — it has not adopted it and will not unless a
+/// quorum says the election is winnable. A voter answering this **records
+/// nothing**: no term change, no vote cast, no write. That is what makes the
+/// round free, and it is why `PreVoteRequest` is exempt from the §5.1 term rule
+/// that every other message obeys.
+struct PreVoteRequest
+{
+    Term term {};             ///< The term the sender would move to; not yet adopted.
+    NodeId candidateId;       ///< Who is asking.
+    LogIndex lastLogIndex {}; ///< Index of the sender's last log entry.
+    Term lastLogTerm {};      ///< Term of the sender's last log entry.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(PreVoteRequest const&) const = default;
+};
+
+/// A voter's answer to a pre-vote.
+///
+/// On a grant, `term` echoes the **request's** term rather than the voter's own.
+/// That is not a slip: the pre-candidate is counting answers to a question about
+/// a term it has not entered, and a response carrying a higher term would trip
+/// the §5.1 rule and demote the very node the grant encourages. On a refusal
+/// because the voter is ahead, `term` is the voter's own — which is exactly the
+/// case where stepping down is right.
+struct PreVoteResponse
+{
+    Term term {};             ///< The request's term when granted; the voter's when it is ahead.
+    VoteDecision decision {}; ///< Whether an election would have this voter's support.
+    NodeId voterId;           ///< Who answered, so the sender can count distinct answers.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(PreVoteResponse const&) const = default;
+};
+
 /// Candidate asking for a vote (Raft §5.2, §5.4.1).
 struct RequestVoteRequest
 {
@@ -163,6 +266,9 @@ struct RequestVoteRequest
     NodeId candidateId;       ///< Who is asking.
     LogIndex lastLogIndex {}; ///< Index of the candidate's last log entry.
     Term lastLogTerm {};      ///< Term of the candidate's last log entry.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(RequestVoteRequest const&) const = default;
 };
 
 /// A voter's answer.
@@ -171,6 +277,9 @@ struct RequestVoteResponse
     Term term {};             ///< The voter's current term, so a stale candidate steps down.
     VoteDecision decision {}; ///< Whether the vote was granted.
     NodeId voterId;           ///< Who answered, so the candidate can count distinct votes.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(RequestVoteResponse const&) const = default;
 };
 
 /// Leader replicating entries, and — with `entries` empty — the heartbeat (§5.3).
@@ -182,6 +291,9 @@ struct AppendEntriesRequest
     Term prevLogTerm {};           ///< Term of the entry at `prevLogIndex`.
     std::vector<LogEntry> entries; ///< Empty for a heartbeat.
     LogIndex leaderCommit {};      ///< The leader's commit index.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(AppendEntriesRequest const&) const = default;
 };
 
 /// A follower's answer.
@@ -191,6 +303,50 @@ struct AppendEntriesResponse
     AppendResult result {}; ///< Whether the entries were accepted.
     LogIndex matchIndex {}; ///< On acceptance, how far the follower now matches.
     NodeId followerId;      ///< Who answered.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(AppendEntriesResponse const&) const = default;
+};
+
+/// A leader handing a follower state it can no longer replay from the log.
+///
+/// Needed because a log that is compacted is a log a leader can no longer send
+/// from: once the entries a lagging follower asks for have been discarded, the
+/// only way to catch it up is to give it the state those entries produced.
+///
+/// Sent whole rather than chunked. That is a deliberate bound on what this log
+/// may hold, not an oversight: it carries cluster configuration and cluster
+/// state — never cache entries, which is the decision this whole feature rests
+/// on — so a snapshot of it is kilobytes. A design that streamed would need
+/// offsets, resumption and a partial-state file on the receiver, all to move
+/// something smaller than one compile's output.
+struct InstallSnapshotRequest
+{
+    Term term {};                  ///< The leader's term.
+    NodeId leaderId;               ///< So a follower can redirect a client.
+    LogIndex lastIncludedIndex {}; ///< Last index the snapshot covers.
+    Term lastIncludedTerm {};      ///< Term of that index.
+    std::vector<NodeId> members;   ///< The configuration as of that index.
+    std::vector<std::byte> state;  ///< The application's own bytes, never interpreted.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(InstallSnapshotRequest const&) const = default;
+};
+
+/// A follower's answer to a snapshot.
+///
+/// Carries `matchIndex` rather than a bare acceptance so the leader can move
+/// `nextIndex` forward exactly as an AppendEntries response does, instead of
+/// keeping a second rule for how progress advances.
+struct InstallSnapshotResponse
+{
+    Term term {};           ///< The follower's current term.
+    AppendResult result {}; ///< Whether the snapshot was taken on.
+    LogIndex matchIndex {}; ///< How far the follower now matches.
+    NodeId followerId;      ///< Who answered.
+    /// Value equality, so a round trip can be asserted whole rather than
+    /// field by field — which is what makes a transposed field visible.
+    [[nodiscard]] bool operator==(InstallSnapshotResponse const&) const = default;
 };
 
 } // namespace FastCache::Consensus

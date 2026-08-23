@@ -45,8 +45,9 @@ struct RoleTraits
 /// discovery needs when a machine joins a running cluster. Adding it should be a
 /// row plus whatever columns it forces, not an edit to every function that asks
 /// what role this node is playing.
-inline constexpr std::array<RoleTraits, 3> RoleTable { {
+inline constexpr std::array<RoleTraits, 4> RoleTable { {
     { .role = Role::Follower, .name = "follower", .timer = TimerKind::Election },
+    { .role = Role::PreCandidate, .name = "pre-candidate", .timer = TimerKind::Election },
     { .role = Role::Candidate, .name = "candidate", .timer = TimerKind::Election },
     { .role = Role::Leader, .name = "leader", .timer = TimerKind::Heartbeat },
 } };
@@ -160,6 +161,83 @@ class RaftNode
     /// @return Where it landed and what to do, or why it was refused.
     [[nodiscard]] std::expected<Proposal, ConsensusError> Propose(std::vector<std::byte> payload, TimePoint now);
 
+    /// Propose a new member set, one member added or removed (§4.3).
+    ///
+    /// Restricted to a single-member delta, and that restriction is the whole
+    /// safety argument: any majority of the old configuration and any majority
+    /// of the new one then share at least one member, so the two cannot elect
+    /// different leaders in the same term. Going from three members to five in
+    /// one step makes `{n1,n2}` a majority of the old and `{n3,n4,n5}` a
+    /// majority of the new, with nobody in common — which is what joint
+    /// consensus exists to handle and why this refuses instead.
+    ///
+    /// Only one change may be in flight. A second proposed before the first
+    /// commits would be built on a configuration that can still be rolled back
+    /// by a truncation, so the safety argument above would be comparing against
+    /// a set that never existed.
+    ///
+    /// The new configuration takes effect on **this node** immediately, before
+    /// it is committed, because a configuration that waited for commitment could
+    /// not be used to reach it.
+    /// @param members The proposed member set.
+    /// @param now The current instant.
+    /// @return Where the entry landed and what to do, or why it was refused.
+    [[nodiscard]] std::expected<Proposal, ConsensusError> ProposeMembership(std::vector<NodeId> members, TimePoint now);
+
+    /// Compact the log, keeping `state` as the snapshot that replaces it.
+    ///
+    /// The log carries cluster configuration and cluster state only, so it grows
+    /// slowly — but a log nobody ever trims is a restart that takes longer every
+    /// time, and a leader that has to keep every entry forever in case some
+    /// follower is behind.
+    ///
+    /// Only applied state may be discarded: entries above `LastApplied()` have
+    /// not reached the application, so a snapshot does not describe them. The
+    /// configuration is captured alongside, because a follower catching up from
+    /// this snapshot has no entries left to learn it from.
+    /// @param state The application's serialized state as of `LastApplied()`.
+    /// @param output Receives the snapshot to make durable.
+    /// @return True when the log was compacted.
+    ///
+    /// The snapshot leaves through `output` rather than being written here, for
+    /// the reason every other durability write does: the entries it replaces are
+    /// gone from memory the moment this returns, so a node that discarded them
+    /// without recording what they produced comes back from a restart missing
+    /// committed state.
+    bool CompactThroughApplied(std::vector<std::byte> state, RaftOutput& output);
+
+    /// The snapshot this node currently holds, as a durable record.
+    ///
+    /// Composed from the log's own boundary rather than stored beside it: the log
+    /// already owns where the snapshot ends, and a second copy of that pair is a
+    /// second thing that can come to disagree with it.
+    /// @return The record.
+    [[nodiscard]] RaftSnapshot CurrentSnapshot() const;
+
+    /// The last index this node's snapshot covers, or `BeforeFirst()`.
+    /// @return The snapshot point.
+    [[nodiscard]] LogIndex SnapshotIndex() const noexcept
+    {
+        return _log.SnapshotIndex();
+    }
+
+    /// How far the application has been advanced.
+    /// @return The last applied index.
+    [[nodiscard]] LogIndex LastApplied() const noexcept
+    {
+        return _lastApplied;
+    }
+
+    /// The member set this node is currently operating under.
+    ///
+    /// The latest configuration in its log, which is not necessarily a committed
+    /// one; see `ProposeMembership`.
+    /// @return The active members.
+    [[nodiscard]] std::vector<NodeId> const& ActiveMembers() const noexcept
+    {
+        return _members;
+    }
+
     /// When the driver must next call `Tick`.
     ///
     /// Which deadline this is depends on the role and comes from `RoleTable`.
@@ -198,8 +276,14 @@ class RaftNode
     /// @param id The claimed identity.
     /// @return True when the configuration contains it.
     [[nodiscard]] bool IsMember(NodeId const& id) const;
+    [[nodiscard]] std::size_t Quorum() const noexcept;
+    void AdoptMembers(std::vector<NodeId> members);
+    void RefreshConfiguration();
+    [[nodiscard]] bool HasUncommittedConfiguration() const;
+    [[nodiscard]] LogIndex LatestConfigurationIndex() const;
 
     /// Begin an election for the next term (§5.2).
+    void StartPreVote(TimePoint now, RaftOutput& output);
     void StartElection(TimePoint now, RaftOutput& output);
 
     /// Adopt a higher term and return to being a follower (§5.1).
@@ -213,6 +297,15 @@ class RaftNode
 
     /// Win the election and start heartbeating.
     void BecomeLeader(TimePoint now, RaftOutput& output);
+
+    /// Record that a leader was heard from, and arm the election timer.
+    ///
+    /// The two together, and only where a leader actually spoke — an accepted
+    /// AppendEntries or InstallSnapshot. Arming *alone* is what this node does
+    /// when it stands for election or grants a vote, and neither of those is
+    /// contact from a leader.
+    /// @param now Current time.
+    void NoteLeaderContact(TimePoint now);
 
     /// Arm the election timer with a freshly drawn randomized timeout.
     ///
@@ -239,6 +332,15 @@ class RaftNode
     /// Send each peer the AppendEntries it is owed.
     void ReplicateToPeers(RaftOutput& output) const;
 
+    /// Record how far a follower has confirmed it matches, and where to send next.
+    ///
+    /// One function rather than one per response type: an AppendEntries and an
+    /// InstallSnapshot both establish a match index by the same rule, and two
+    /// copies of a rule this delicate are two places for it to drift.
+    /// @param follower Which peer answered.
+    /// @param reported The match index it claims, before clamping.
+    void AdvanceFollowerProgress(NodeId const& follower, LogIndex reported);
+
     /// Advance the commit index if a quorum has caught up (§5.4.2).
     void AdvanceCommitIndex();
 
@@ -259,10 +361,20 @@ class RaftNode
     void MarkPersist(RaftOutput& output) const;
 
     /// Per-message handlers; each may append to `output`.
+    /// Whether the §5.1 term rule must NOT be applied to this message.
+    /// @param message The message being received.
+    /// @return True for a pre-vote request, and for a granted pre-vote response.
+    [[nodiscard]] static bool IsPreVoteExempt(RaftMessage const& message) noexcept;
+    void OnPreVote(PreVoteRequest const& request, TimePoint now, RaftOutput& output);
+    void OnPreVoteResponse(PreVoteResponse const& response, TimePoint now, RaftOutput& output);
     void OnRequestVote(RequestVoteRequest const& request, TimePoint now, RaftOutput& output);
     void OnRequestVoteResponse(RequestVoteResponse const& response, TimePoint now, RaftOutput& output);
     void OnAppendEntries(AppendEntriesRequest const& request, TimePoint now, RaftOutput& output);
     void OnAppendEntriesResponse(AppendEntriesResponse const& response, TimePoint now, RaftOutput& output);
+    void OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoint now, RaftOutput& output);
+    void OnInstallSnapshotResponse(InstallSnapshotResponse const& response, TimePoint now, RaftOutput& output);
+    [[nodiscard]] bool NeedsSnapshot(NodeId const& peer) const;
+    [[nodiscard]] InstallSnapshotRequest MakeInstallSnapshotFor() const;
 
     /// The term carried by any message, so the §5.1 rule can be applied once.
     [[nodiscard]] static Term TermOf(RaftMessage const& message) noexcept;
@@ -286,6 +398,16 @@ class RaftNode
     std::optional<NodeId> _knownLeader;
     RaftLog _log;
 
+    /// When a leader was last heard from; absent until one is.
+    ///
+    /// Deliberately **not** `_electionDeadline`, which is the obvious place to
+    /// look and answers a different question. That deadline is re-armed when this
+    /// node starts its own pre-vote round, so a node using it to answer "have I
+    /// heard from a leader recently?" answers *yes* for a full timeout after it
+    /// began campaigning — and that question is the whole of pre-vote's
+    /// disruption check. Nodes racing then refused each other almost every round.
+    std::optional<TimePoint> _lastLeaderContact;
+
     TimePoint _electionDeadline {};
     TimePoint _heartbeatDeadline {};
 
@@ -308,6 +430,41 @@ class RaftNode
     /// would otherwise be counted twice, and two counted votes from one node is a
     /// quorum that does not exist.
     std::unordered_set<NodeId> _votesGranted;
+
+    /// The configuration as of the snapshot.
+    ///
+    /// The fall-back for `RefreshConfiguration` when the retained log holds no
+    /// configuration entry — which is precisely what compaction produces. Without
+    /// it the fall-back is the *bootstrap* set, so a node that took part in a
+    /// membership change and then compacted would forget it, silently and only
+    /// after a restart.
+    std::vector<NodeId> _snapshotMembers;
+
+    /// The application state the log's discarded prefix produced.
+    ///
+    /// Held by the node rather than fetched from the application when needed,
+    /// because it must be shippable to a follower at the moment that follower
+    /// turns out to be behind — and asking the application for a snapshot *then*
+    /// would produce one as of a different index than the log was compacted to.
+    std::vector<std::byte> _snapshotState;
+
+    /// The member set this node is operating under: the latest configuration in
+    /// its log, or `_config.members` when the log holds none.
+    ///
+    /// Separate from `_config.members`, which stays the set this node was
+    /// *bootstrapped* with. Keeping both is what lets a restart re-derive the
+    /// active set from the log rather than silently reverting a change the
+    /// cluster already made.
+    std::vector<NodeId> _members;
+
+    /// Peers that said an election would be winnable, itself included.
+    ///
+    /// Separate from `_votesGranted` rather than reusing it, because the two
+    /// count answers to different questions in different terms: a pre-vote is
+    /// about the term this node has NOT entered, and folding them would let a
+    /// pre-vote be counted toward the real election that follows -- which is a
+    /// vote nobody cast.
+    std::unordered_set<NodeId> _preVotesGranted;
 };
 
 } // namespace FastCache::Consensus

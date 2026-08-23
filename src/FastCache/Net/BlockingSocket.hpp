@@ -36,6 +36,33 @@ namespace Detail
     /// One-time Winsock startup / Linux SIGPIPE setup. Idempotent.
     void EnsureNetworkInitialised();
 
+    /// The last error the socket API reported on this thread.
+    ///
+    /// `WSAGetLastError()` on Windows, `errno` elsewhere — which is why every
+    /// caller has to go through a seam rather than reading one of them directly.
+    /// @return The platform error code.
+    [[nodiscard]] int LastNetworkError() noexcept;
+
+    /// Map a platform socket error onto the shared taxonomy.
+    ///
+    /// Declared here rather than kept private to `BlockingSocket.cpp` because it
+    /// is the **only** classification of these codes in the tree, and a second one
+    /// is a second answer. `BlockingConnector` had that second answer: a
+    /// three-condition ladder that reported `EACCES` — a firewall or a privileged
+    /// port, the two most likely reasons an outbound connection is refused
+    /// administratively — as an unclassified `SystemError`, so a caller matching
+    /// on `PermissionDenied` never saw it. A code with no row maps to
+    /// `SystemError`, and `systemCode` still carries the original either way.
+    /// @param code A `WSAGetLastError()` / `errno` value.
+    /// @return The category it belongs to.
+    [[nodiscard]] NetErrorCode TranslateSocketError(int code) noexcept;
+
+    /// Build a `NetError` from a platform code and a description of the attempt.
+    /// @param code A `WSAGetLastError()` / `errno` value.
+    /// @param context What was being attempted, for the message.
+    /// @return The structured error.
+    [[nodiscard]] NetError MakeNetError(int code, std::string context);
+
     /// Apply latency-critical socket options to a freshly accepted or
     /// connected stream socket. Currently sets TCP_NODELAY so that small
     /// request/response writes are not delayed by Nagle's algorithm — which,
@@ -171,6 +198,18 @@ class BlockingListener final: public IListener
     {
         return _bindError;
     }
+
+    /// The port actually bound, which is what an ephemeral bind is for.
+    ///
+    /// Binding port 0 lets the OS choose a free one, and this is how the caller
+    /// learns which. That matters beyond convenience: a test or fixture that
+    /// hard-codes a port collides with whatever else is running on the machine,
+    /// and the failure reads as the feature under test being broken rather than
+    /// as the port being taken — the lesson `dist-compile-e2e` records for its
+    /// own four ports.
+    /// @return The bound port in host byte order, or 0 when not bound or when
+    ///         the OS would not report it.
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept;
 
   private:
     BlockingListener() = default;

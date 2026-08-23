@@ -30,7 +30,14 @@ struct PersistentState
 /// data, the set is closed by the protocol rather than open for extension, and
 /// `std::visit` over it gives exhaustiveness checking that a `switch` on a kind
 /// tag would not.
-using RaftMessage = std::variant<RequestVoteRequest, RequestVoteResponse, AppendEntriesRequest, AppendEntriesResponse>;
+using RaftMessage = std::variant<PreVoteRequest,
+                                 PreVoteResponse,
+                                 RequestVoteRequest,
+                                 RequestVoteResponse,
+                                 AppendEntriesRequest,
+                                 AppendEntriesResponse,
+                                 InstallSnapshotRequest,
+                                 InstallSnapshotResponse>;
 
 /// A change to the durable log: write `entries` at `fromIndex`, discarding
 /// anything already at or after it.
@@ -67,6 +74,23 @@ struct OutboundMessage
 {
     NodeId to;           ///< The member to send it to.
     RaftMessage message; ///< What to send.
+};
+
+/// A snapshot the application must adopt wholesale.
+///
+/// Emitted when a follower receives state covering more than its log holds. The
+/// application cannot replay its way there — the entries that would have taken
+/// it are gone from every node that compacted them — so it replaces its state
+/// rather than advancing it.
+struct RaftSnapshot
+{
+    LogIndex lastIncludedIndex {}; ///< The index the state is as of.
+    Term lastIncludedTerm {};      ///< Term of that index.
+    std::vector<NodeId> members;   ///< The configuration as of that index.
+    std::vector<std::byte> state;  ///< The application's own bytes, never interpreted here.
+
+    /// Value equality, for tests and for skipping a redundant write.
+    [[nodiscard]] bool operator==(RaftSnapshot const&) const = default;
 };
 
 /// Everything a node wants done as a result of one event.
@@ -130,6 +154,23 @@ struct RaftOutput
     /// (`EntryKind::NoOp`) are committed like any other but never delivered, so
     /// the indices seen here can skip one.
     std::vector<AppliedEntry> applied;
+
+    /// A snapshot to make durable, before anything is sent and under the same
+    /// rule; absent normally.
+    ///
+    /// Carried through the output channel rather than written by whoever asked
+    /// for the compaction, for the reason `persist` and `persistLog` are: it is a
+    /// durability write that has to be ordered against the messages, and a node
+    /// that acknowledged a snapshot it had not written would retract that
+    /// acknowledgement on restart -- after a leader may have committed on it.
+    std::optional<RaftSnapshot> saveSnapshot;
+
+    /// State the application must adopt in place of its own; absent normally.
+    ///
+    /// Delivered instead of `applied` rather than alongside it: the two are
+    /// alternative ways to reach the same point, and handing over both would
+    /// have the application replay entries the snapshot already includes.
+    std::optional<RaftSnapshot> restoreSnapshot;
 };
 
 } // namespace FastCache::Consensus

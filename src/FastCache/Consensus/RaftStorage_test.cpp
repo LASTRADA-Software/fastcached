@@ -16,9 +16,12 @@
 #include <system_error>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Consensus;
 using namespace std::chrono_literals;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -505,6 +508,10 @@ TEST_CASE("A leader's own writes round-trip through the store", "[consensus][raf
     };
 
     feed(node.Tick(TimePoint {} + 150ms));
+    // The timeout starts a pre-vote round; the real election, and the durable
+    // write it produces, follow the grant that carries it.
+    feed(node.Receive(PreVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+                      TimePoint {} + 150ms));
     feed(
         node.Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
                      TimePoint {} + 150ms));
@@ -586,6 +593,200 @@ TEST_CASE("A torn tail is removed by the next append, not written over", "[conse
     REQUIRE(loaded->entries.size() == 2);
     CHECK(FastCache::AsStringView(loaded->entries[1].payload) == "b");
 
-    auto const finalSize = std::filesystem::file_size(logPath);
-    CHECK(finalSize < goodSize + 24);
+    // Compared against a store given the same two appends and no garbage, rather
+    // than against a byte count written out here. A literal states the record
+    // layout a second time, so it goes stale the moment a field is added to one --
+    // which is exactly what happened when records grew an index.
+    ScratchDirectory reference;
+    {
+        auto clean = OpenStore(reference.Path());
+        REQUIRE(
+            clean.SaveLog(LogAppend { .fromIndex = LogIndex { .value = 1 }, .entries = { Entry(1, "aaaa") } }).has_value());
+        REQUIRE(clean.SaveLog(LogAppend { .fromIndex = LogIndex { .value = 2 }, .entries = { Entry(1, "b") } }).has_value());
+    }
+
+    CHECK(std::filesystem::file_size(logPath) == std::filesystem::file_size(reference.Path() / "raft-log"));
+}
+
+TEST_CASE("A saved snapshot survives a reopen and trims the log", "[consensus][raft][storage]")
+{
+    // Both stores, one case: the in-memory one is what a cluster simulation gives
+    // its nodes, so a rule only the file store obeyed would be untested exactly
+    // where restarts are actually exercised.
+    ScratchDirectory scratch;
+    auto const snapshot = RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 2 },
+                                         .lastIncludedTerm = Term { .value = 1 },
+                                         .members = { "n1", "n2", "n3" },
+                                         .state = FastCache::BytesFromString("state-bytes") };
+
+    auto seed = [&](IRaftStorage& store) {
+        REQUIRE(store
+                    .SaveLog(LogAppend { .fromIndex = LogIndex { .value = 1 },
+                                         .entries = { Entry(1, "a"), Entry(1, "b"), Entry(1, "c") } })
+                    .has_value());
+        REQUIRE(store.SaveSnapshot(snapshot).has_value());
+    };
+
+    InMemoryRaftStorage memory;
+    seed(memory);
+    {
+        auto file = OpenStore(scratch.Path());
+        seed(file);
+    }
+
+    auto file = OpenStore(scratch.Path());
+    for (IRaftStorage* store: { static_cast<IRaftStorage*>(&memory), static_cast<IRaftStorage*>(&file) })
+    {
+        auto const loaded = store->Load();
+        REQUIRE(loaded.has_value());
+
+        REQUIRE(loaded->snapshot.has_value());
+        CHECK(Unwrap(loaded->snapshot) == snapshot);
+
+        // The covered prefix is gone and what remains still knows its own index --
+        // a positional file could not say where a trimmed log now begins, so entry
+        // three would come back as entry one.
+        CHECK(loaded->firstIndex == LogIndex { .value = 3 });
+        REQUIRE(loaded->entries.size() == 1);
+        CHECK(FastCache::AsStringView(loaded->entries[0].payload) == "c");
+    }
+}
+
+TEST_CASE("A log trimmed to nothing still knows where it resumes", "[consensus][raft][storage]")
+{
+    // The degenerate case, and the one a per-record index alone does not answer:
+    // with every record gone there is none left to state the boundary, so the
+    // snapshot has to. Without it the next append is refused as a gap, forever.
+    ScratchDirectory scratch;
+    auto const snapshot = RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 3 },
+                                         .lastIncludedTerm = Term { .value = 2 },
+                                         .members = { "n1" },
+                                         .state = FastCache::BytesFromString("all-of-it") };
+
+    InMemoryRaftStorage memory;
+    ScratchDirectory fileScratch;
+    auto file = OpenStore(fileScratch.Path());
+
+    for (IRaftStorage* store: { static_cast<IRaftStorage*>(&memory), static_cast<IRaftStorage*>(&file) })
+    {
+        REQUIRE(store
+                    ->SaveLog(LogAppend { .fromIndex = LogIndex { .value = 1 },
+                                          .entries = { Entry(1, "a"), Entry(2, "b"), Entry(2, "c") } })
+                    .has_value());
+        REQUIRE(store->SaveSnapshot(snapshot).has_value());
+
+        auto const loaded = store->Load();
+        REQUIRE(loaded.has_value());
+        CHECK(loaded->entries.empty());
+        CHECK(loaded->firstIndex == LogIndex { .value = 4 });
+
+        // And the log carries on from there rather than refusing.
+        REQUIRE(
+            store->SaveLog(LogAppend { .fromIndex = LogIndex { .value = 4 }, .entries = { Entry(3, "d") } }).has_value());
+
+        auto const after = store->Load();
+        REQUIRE(after.has_value());
+        REQUIRE(after->entries.size() == 1);
+        CHECK(FastCache::AsStringView(after->entries[0].payload) == "d");
+        CHECK(after->firstIndex == LogIndex { .value = 4 });
+    }
+}
+
+TEST_CASE("An append below the snapshot boundary is refused", "[consensus][raft][storage]")
+{
+    // It names entries the snapshot has deliberately replaced. Silently accepting
+    // it would leave the store's indices disagreeing with the node's, which is the
+    // fault the gap check exists for -- and a trimmed log is the case where the
+    // old one-ended check could not see it.
+    ScratchDirectory scratch;
+    auto store = OpenStore(scratch.Path());
+    InMemoryRaftStorage memory;
+
+    for (IRaftStorage* target: { static_cast<IRaftStorage*>(&store), static_cast<IRaftStorage*>(&memory) })
+    {
+        REQUIRE(target
+                    ->SaveLog(LogAppend { .fromIndex = LogIndex { .value = 1 },
+                                          .entries = { Entry(1, "a"), Entry(1, "b"), Entry(1, "c") } })
+                    .has_value());
+        REQUIRE(target
+                    ->SaveSnapshot(RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 2 },
+                                                  .lastIncludedTerm = Term { .value = 1 },
+                                                  .members = { "n1" },
+                                                  .state = {} })
+                    .has_value());
+
+        CHECK_FALSE(
+            target->SaveLog(LogAppend { .fromIndex = LogIndex { .value = 2 }, .entries = { Entry(2, "x") } }).has_value());
+
+        // The boundary itself is still writable, which is what a leader replacing
+        // the first retained entry does.
+        CHECK(target->SaveLog(LogAppend { .fromIndex = LogIndex { .value = 3 }, .entries = { Entry(2, "C") } }).has_value());
+    }
+}
+
+TEST_CASE("A corrupt snapshot is refused rather than read as an empty one", "[consensus][raft][storage]")
+{
+    // An empty snapshot is a legitimate value -- an application with no state yet
+    // produces one -- so a reader that fell back to it on damage would hand a node
+    // "you are caught up through index N with nothing in you", and the node would
+    // ship that to a follower as though it were state.
+    ScratchDirectory scratch;
+    {
+        auto store = OpenStore(scratch.Path());
+        REQUIRE(store
+                    .SaveSnapshot(RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 4 },
+                                                 .lastIncludedTerm = Term { .value = 2 },
+                                                 .members = { "n1" },
+                                                 .state = FastCache::BytesFromString("real") })
+                    .has_value());
+    }
+
+    auto const path = scratch.Path() / "raft-snapshot";
+    {
+        std::fstream out { path, std::ios::binary | std::ios::in | std::ios::out };
+        REQUIRE(out.is_open());
+        out.seekp(static_cast<std::streamoff>(std::filesystem::file_size(path)) - 1);
+        char const flipped = '\x7f';
+        out.write(&flipped, 1);
+    }
+
+    // Refused at `Open`, not merely at `Load`. A store that opens and then fails on
+    // first read is a store whose caller has to remember an ordering, which is
+    // what `Open` reading the log and the snapshot together exists to remove.
+    CHECK_FALSE(FileRaftStorage::Open(scratch.Path()).has_value());
+}
+
+TEST_CASE("A reopened store knows its boundary before anything reads it", "[consensus][raft][storage]")
+{
+    // `Open` scans the log so the offset table is valid from the moment the store
+    // exists -- and a log a snapshot has trimmed to nothing has no record left to
+    // state where it resumes, so the scan alone leaves the boundary at 1. A
+    // `SaveLog` before `Load` would then be refused as a gap. The same repair has
+    // to happen in both places, because either can be the first to touch the store
+    // after a restart.
+    ScratchDirectory scratch;
+    {
+        auto store = OpenStore(scratch.Path());
+        REQUIRE(
+            store.SaveLog(LogAppend { .fromIndex = LogIndex { .value = 1 }, .entries = { Entry(1, "a"), Entry(1, "b") } })
+                .has_value());
+        REQUIRE(store
+                    .SaveSnapshot(RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 2 },
+                                                 .lastIncludedTerm = Term { .value = 1 },
+                                                 .members = { "n1" },
+                                                 .state = FastCache::BytesFromString("s") })
+                    .has_value());
+    }
+
+    auto reopened = OpenStore(scratch.Path());
+
+    // Deliberately no Load() in between: this is the ordering requirement the
+    // comment in `Open` exists to remove.
+    REQUIRE(reopened.SaveLog(LogAppend { .fromIndex = LogIndex { .value = 3 }, .entries = { Entry(2, "c") } }).has_value());
+
+    auto const loaded = reopened.Load();
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->firstIndex == LogIndex { .value = 3 });
+    REQUIRE(loaded->entries.size() == 1);
+    CHECK(FastCache::AsStringView(loaded->entries[0].payload) == "c");
 }

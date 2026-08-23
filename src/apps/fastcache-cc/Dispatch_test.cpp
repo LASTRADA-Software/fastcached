@@ -9,19 +9,15 @@
 #include <string>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Cc;
+using FastCache::Testing::Unwrap;
 namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
-
-/// Unwrap an optional for assertion; see CompileCacheHandler_test for why.
-template <typename T>
-[[nodiscard]] T Unwrap(std::optional<T> const& value)
-{
-    return value.value_or(T {});
-}
 
 /// One scripted peer: replays canned replies and records what it was sent.
 class ScriptedPeer final: public ITcpClient
