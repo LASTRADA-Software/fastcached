@@ -97,6 +97,19 @@ struct LogIndex
 /// from the discovery handshake.
 using NodeId = std::string;
 
+/// What a log entry is for.
+///
+/// The consensus layer needs entries of its own — a new leader appends one to
+/// establish its term — and those must not reach the application as commands.
+/// Distinguishing them by a tag rather than by an empty payload is deliberate:
+/// an empty payload is a legitimate thing for an application to commit, so
+/// inferring the difference would make one indistinguishable from the other.
+enum class EntryKind : std::uint8_t
+{
+    Command = 0, ///< Application bytes, delivered through `RaftOutput::applied`.
+    NoOp,        ///< Consensus' own; ordered and committed, but never delivered.
+};
+
 /// One entry in the replicated log.
 ///
 /// The payload is **opaque to consensus**, which is what makes this a generic
@@ -105,8 +118,9 @@ using NodeId = std::string;
 /// are what this repository will put here; cache entries deliberately never are.
 struct LogEntry
 {
-    Term term {};                   ///< Term of the leader that created this entry.
-    std::vector<std::byte> payload; ///< Application bytes; never interpreted here.
+    Term term {};                          ///< Term of the leader that created this entry.
+    EntryKind kind { EntryKind::Command }; ///< Whether the application ever sees it.
+    std::vector<std::byte> payload;        ///< Application bytes; never interpreted here.
 
     /// Value equality, which the log-matching rules and their tests compare on.
     [[nodiscard]] bool operator==(LogEntry const&) const = default;

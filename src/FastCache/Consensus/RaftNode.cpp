@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace FastCache::Consensus
 {
@@ -81,6 +83,11 @@ RaftLog const& RaftNode::Log() const noexcept
     return _log;
 }
 
+LogIndex RaftNode::CommitIndex() const noexcept
+{
+    return _commitIndex;
+}
+
 TimePoint RaftNode::NextDeadline() const noexcept
 {
     return TraitsOf(_role).timer == TimerKind::Election ? _electionDeadline : _heartbeatDeadline;
@@ -105,18 +112,95 @@ void RaftNode::BroadcastToPeers(RaftOutput& output, RaftMessage const& message) 
         output.messages.push_back(OutboundMessage { .to = peer, .message = message });
 }
 
-AppendEntriesRequest RaftNode::MakeHeartbeat() const
+AppendEntriesRequest RaftNode::MakeAppendEntriesFor(NodeId const& peer) const
 {
-    // Carries no entries, but still the leader's prevLogIndex/prevLogTerm: a
-    // heartbeat is also how a follower discovers its log has diverged, and one
-    // that named nothing would leave a divergent follower undetected until real
-    // entries happened to be sent.
+    auto const found = _nextIndex.find(peer);
+    auto const next = found != _nextIndex.end() ? found->second : _log.LastIndex().Advanced(1);
+    auto const prevIndex = next.Prev();
+
     return AppendEntriesRequest { .term = _currentTerm,
                                   .leaderId = _config.self,
-                                  .prevLogIndex = _log.LastIndex(),
-                                  .prevLogTerm = _log.LastTerm(),
-                                  .entries = {},
-                                  .leaderCommit = LogIndex::BeforeFirst() };
+                                  .prevLogIndex = prevIndex,
+                                  .prevLogTerm = _log.TermAt(prevIndex).value_or(Term::None()),
+                                  .entries = _log.EntriesFrom(next),
+                                  .leaderCommit = _commitIndex };
+}
+
+void RaftNode::ReplicateToPeers(RaftOutput& output) const
+{
+    for (auto const& peer: _peers)
+        output.messages.push_back(OutboundMessage { .to = peer, .message = MakeAppendEntriesFor(peer) });
+}
+
+void RaftNode::AdvanceCommitIndex()
+{
+    // The highest index a quorum holds: sort every member's match index
+    // descending and take the one at position quorum-1. This node counts itself,
+    // and its own match index is its whole log -- a leader trivially has what it
+    // wrote.
+    auto matches = std::vector<LogIndex> {};
+    matches.reserve(_config.members.size());
+    matches.push_back(_log.LastIndex());
+    for (auto const& peer: _peers)
+    {
+        auto const found = _matchIndex.find(peer);
+        matches.push_back(found != _matchIndex.end() ? found->second : LogIndex::BeforeFirst());
+    }
+
+    std::ranges::sort(matches, std::greater {});
+    auto const replicated = matches[_config.Quorum() - 1];
+    if (replicated <= _commitIndex)
+        return;
+
+    // Raft §5.4.2, and the rule whose omission is the Figure 8 defect: a leader
+    // may only conclude an entry is committed by counting replicas when that
+    // entry is from its OWN term. An entry from an earlier term can sit on a
+    // majority and still be overwritten, because a future leader elected under
+    // §5.4.1's up-to-dateness test may lack it -- being replicated widely is not
+    // the same as being safe. Such entries commit indirectly, carried by the
+    // first current-term entry that commits above them, which is why this is a
+    // guard rather than a special case: the moment a current-term entry reaches a
+    // quorum, everything below it commits with it.
+    if (_log.TermAt(replicated) != _currentTerm)
+        return;
+
+    _commitIndex = replicated;
+}
+
+void RaftNode::ApplyCommitted(RaftOutput& output)
+{
+    // Bounded by what this node actually holds, not by the commit index alone.
+    // The two can legitimately disagree -- a node keeps its commit index across a
+    // step-down while its log may still be repaired backwards by the new leader --
+    // and advancing `_lastApplied` past the end would mark those indices applied
+    // forever, so the entries would be silently skipped when they did arrive and
+    // this node's state machine would diverge without anything failing.
+    auto const applyThrough = std::min(_commitIndex, _log.LastIndex());
+
+    while (_lastApplied < applyThrough)
+    {
+        _lastApplied = _lastApplied.Advanced(1);
+
+        auto const* const entry = _log.EntryAt(_lastApplied);
+        if (entry == nullptr)
+            continue;
+
+        // Consensus' own entries are committed like any other and never
+        // delivered: the application asked for none of them and cannot interpret
+        // them.
+        if (entry->kind == EntryKind::NoOp)
+            continue;
+
+        output.applied.push_back(AppliedEntry { .index = _lastApplied, .payload = entry->payload });
+    }
+}
+
+void RaftNode::RecordLogAppend(RaftOutput& output, LogIndex fromIndex)
+{
+    if (fromIndex > _log.LastIndex())
+        return;
+
+    output.persistLog = LogAppend { .fromIndex = fromIndex, .entries = _log.EntriesFrom(fromIndex) };
 }
 
 Term RaftNode::TermOf(RaftMessage const& message) noexcept
@@ -157,6 +241,15 @@ void RaftNode::StepDown(Term term, TimePoint now, RaftOutput& output)
     _knownLeader.reset();
     _role = Role::Follower;
     _votesGranted.clear();
+
+    // Per-follower progress is a leader's bookkeeping about a term it no longer
+    // leads. Keeping it would let a re-elected node resume from stale guesses
+    // about logs that have moved on since. `_commitIndex` and `_lastApplied` are
+    // deliberately NOT reset: they record what is already committed cluster-wide,
+    // which no change of leadership can un-decide.
+    _nextIndex.clear();
+    _matchIndex.clear();
+
     if (wasLeader)
         ArmElectionTimer(now);
 
@@ -197,11 +290,44 @@ void RaftNode::BecomeLeader(TimePoint now, RaftOutput& output)
     _knownLeader = _config.self;
     _heartbeatDeadline = now + _config.heartbeatInterval;
 
+    // Optimistic for nextIndex, pessimistic for matchIndex, and both are
+    // deliberate. A new leader does not know how far any follower has caught up,
+    // so it guesses that each is fully caught up and walks the guess back on
+    // rejection -- one round trip per missing entry, against a wrong optimistic
+    // guess costing nothing but that. matchIndex starts at zero because it
+    // records what is *known*, and nothing is yet.
+    _nextIndex.clear();
+    _matchIndex.clear();
+    for (auto const& peer: _peers)
+    {
+        _nextIndex[peer] = _log.LastIndex().Advanced(1);
+        _matchIndex[peer] = LogIndex::BeforeFirst();
+    }
+
+    // A no-op of this leader's own term, and it is the companion to the §5.4.2
+    // guard rather than a nicety. That guard refuses to commit an earlier term's
+    // entry by replica count, so a leader whose log ends in fully-replicated
+    // entries from the previous term can never commit them -- and therefore
+    // applies nothing -- until a client happens to propose something. With no
+    // client traffic the cluster is live, healthy, and permanently stuck one term
+    // behind. Committing one entry of the current term releases everything below
+    // it, so a leader creates that entry itself instead of waiting to be handed
+    // one. Appended AFTER nextIndex is initialized, so it is inside the range
+    // each follower is sent rather than past it.
+    auto const noOp = _log.Append(LogEntry { .term = _currentTerm, .kind = EntryKind::NoOp, .payload = {} });
+    MarkPersist(output);
+    RecordLogAppend(output, noOp);
+
     // Immediately, not at the next heartbeat interval: until peers hear from the
     // new leader they are still counting down to their own elections, so a
     // deferred first heartbeat gives away part of the timeout the algorithm just
     // spent to establish this leader.
-    BroadcastToPeers(output, MakeHeartbeat());
+    ReplicateToPeers(output);
+
+    // A single-node cluster is its own quorum, so the no-op is committed the
+    // moment it is written -- which is what releases any earlier-term entries.
+    AdvanceCommitIndex();
+    ApplyCommitted(output);
 }
 
 RaftOutput RaftNode::Tick(TimePoint now)
@@ -217,8 +343,38 @@ RaftOutput RaftNode::Tick(TimePoint now)
     }
 
     _heartbeatDeadline = now + _config.heartbeatInterval;
-    BroadcastToPeers(output, MakeHeartbeat());
+    ReplicateToPeers(output);
     return output;
+}
+
+std::expected<RaftNode::Proposal, ConsensusError> RaftNode::Propose(std::vector<std::byte> payload, TimePoint now)
+{
+    if (_role != Role::Leader)
+        return std::unexpected { FastCache::NotLeader(_knownLeader) };
+
+    auto output = RaftOutput {};
+    auto const index =
+        _log.Append(LogEntry { .term = _currentTerm, .kind = EntryKind::Command, .payload = std::move(payload) });
+
+    // The log is durable state, so the entry has to reach stable storage before
+    // it is replicated -- a leader that sends an entry it then loses on restart
+    // can be asked about it by a follower that kept it. `persistLog` is what
+    // carries that; `MarkPersist` alone says nothing about the log, which is what
+    // an earlier draft of this got wrong.
+    RecordLogAppend(output, index);
+    ReplicateToPeers(output);
+
+    // These entries are a heartbeat too, so the next one is due a full interval
+    // from now rather than from whenever the last one happened to go out.
+    _heartbeatDeadline = now + _config.heartbeatInterval;
+
+    // A single-node cluster has a quorum of one and its own log is that quorum,
+    // so the entry is committed the moment it is appended and there is nobody to
+    // hear from. Without this it would sit uncommitted until some other event.
+    AdvanceCommitIndex();
+    ApplyCommitted(output);
+
+    return Proposal { .index = index, .output = std::move(output) };
 }
 
 RaftOutput RaftNode::Receive(RaftMessage const& message, TimePoint now)
@@ -353,15 +509,83 @@ void RaftNode::OnAppendEntries(AppendEntriesRequest const& request, TimePoint no
     ArmElectionTimer(now);
 
     auto const outcome = _log.TryAppend(request.prevLogIndex, request.prevLogTerm, request.entries);
+    if (outcome.result == AppendResult::Accepted)
+    {
+        // The log is durable state on a follower exactly as on a leader: these
+        // entries are about to be acknowledged, and a leader may commit on that
+        // acknowledgement, so losing them to a restart loses a committed entry.
+        // `fromIndex` is where the leader's run starts, which is also the
+        // truncation point when this repaired a divergent suffix.
+        if (!request.entries.empty())
+            RecordLogAppend(output, request.prevLogIndex.Advanced(1));
+
+        // Bounded by what THIS request established, not by the leader's own
+        // commit index alone. The leader may have committed entries this follower
+        // has not received yet -- an AppendEntries can be delayed or truncated by
+        // the network -- and adopting its number outright would mark entries
+        // committed that are absent from this log, so the next thing to apply
+        // would be whatever happened to sit at that index.
+        //
+        // And never downward. Guarding on `leaderCommit > _commitIndex` alone is
+        // not enough, because the value assigned is the *minimum*: a delayed
+        // duplicate carrying a high leaderCommit and a low match index would take
+        // the commit index backwards, and `CommitIndex()` promises that an entry
+        // at or below it is never taken back. A stale duplicate producing exactly
+        // that low match index is not hypothetical -- RaftLog::TryAppend has a
+        // test for it.
+        auto const advanced = std::min(request.leaderCommit, outcome.matchIndex);
+        _commitIndex = std::max(_commitIndex, advanced);
+    }
+
     reply(outcome.result, outcome.matchIndex);
+    ApplyCommitted(output);
 }
 
-void RaftNode::OnAppendEntriesResponse(AppendEntriesResponse const& /*response*/, TimePoint /*now*/, RaftOutput& /*output*/)
+void RaftNode::OnAppendEntriesResponse(AppendEntriesResponse const& response, TimePoint /*now*/, RaftOutput& output)
 {
     // The §5.1 term check in `Receive` has already demoted this node if the
-    // responder knew a higher term, which is the whole of what a response means
-    // to leader election. Tracking how far each follower has caught up is
-    // replication's business and arrives with it.
+    // responder knew a higher term. What is left matters only to a leader still
+    // leading the term it asked in: a response to a previous term's request says
+    // nothing about this one.
+    if (_role != Role::Leader || response.term != _currentTerm || !IsMember(response.followerId))
+        return;
+
+    if (response.result == AppendResult::Rejected)
+    {
+        // The consistency check failed, so this leader's guess about where the
+        // follower's log agrees was too high. Walk it back and retry immediately
+        // rather than at the next heartbeat: each round trip recovers exactly one
+        // index, so waiting an interval per index makes catching up take
+        // heartbeat-interval times divergence.
+        // Floored at the first index: `Prev()` saturates at zero, which names no
+        // entry, and sending from there would ask the follower about a position
+        // that cannot exist.
+        auto& next = _nextIndex[response.followerId];
+        next = std::max(next.Prev(), LogIndex { .value = 1 });
+
+        output.messages.push_back(
+            OutboundMessage { .to = response.followerId, .message = MakeAppendEntriesFor(response.followerId) });
+        return;
+    }
+
+    // Never move a match index backwards. Responses arrive out of order, and an
+    // older one carrying a smaller index would un-acknowledge entries this
+    // follower has already confirmed -- and since match indices are what decide
+    // commitment, that can only end with a committed entry treated as
+    // uncommitted.
+    // Clamped to this leader's own log as well. A follower cannot hold more than
+    // was sent to it, so a larger number is nonsense -- but taken at face value it
+    // pushes `nextIndex` past the end, and every subsequent AppendEntries then
+    // names a `prevLogIndex` that does not exist, is rejected, and walks back one
+    // index per round trip: that peer never converges again. It reaches
+    // `AdvanceCommitIndex` too, where only `TermAt` returning nullopt for a
+    // phantom index prevents committing one.
+    auto& match = _matchIndex[response.followerId];
+    match = std::max(match, std::min(response.matchIndex, _log.LastIndex()));
+    _nextIndex[response.followerId] = match.Advanced(1);
+
+    AdvanceCommitIndex();
+    ApplyCommitted(output);
 }
 
 } // namespace FastCache::Consensus

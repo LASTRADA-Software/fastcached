@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Consensus/RaftNode.hpp>
+#include <FastCache/Core/Bytes.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -179,8 +180,13 @@ TEST_CASE("A quorum of votes wins the election", "[consensus][raft][election]")
     // elections.
     auto const heartbeats = MessagesOfType<AppendEntriesRequest>(output);
     REQUIRE(heartbeats.size() == 2);
-    CHECK(heartbeats[0].entries.empty());
     CHECK(heartbeats[0].leaderId == "n1");
+
+    // Not empty: a new leader writes one no-op of its own term, and that entry is
+    // what later releases any earlier-term entries for commitment.
+    REQUIRE(heartbeats[0].entries.size() == 1);
+    CHECK(heartbeats[0].entries[0].kind == EntryKind::NoOp);
+    CHECK(heartbeats[0].entries[0].term == Term { .value = 1 });
 }
 
 TEST_CASE("A retransmitted vote response is not counted twice", "[consensus][raft][election]")
@@ -565,4 +571,462 @@ TEST_CASE("Role traits cover every role exactly once", "[consensus][raft][electi
 
     for (auto const& row: RoleTable)
         CHECK(TraitsOf(row.role).role == row.role);
+}
+
+// --------------------------------------------------------------------------
+// Log replication and commitment (Raft §5.3, §5.4.2).
+
+TEST_CASE("Only a leader accepts a proposal", "[consensus][raft][replication]")
+{
+    Fixture fix;
+
+    auto const refused = fix.node.Propose(FastCache::BytesFromString("x"), At(10));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().code == ConsensusErrorCode::NotLeader);
+    // Nobody leads yet, which is a different answer from "ask that node instead"
+    // and the one that means give up rather than chase it.
+    CHECK_FALSE(refused.error().knownLeader.has_value());
+
+    fix.ElectAsLeader();
+    auto const accepted = fix.node.Propose(FastCache::BytesFromString("x"), At(200));
+    REQUIRE(accepted.has_value());
+    // Index 2, because becoming leader wrote a no-op at index 1.
+    CHECK(accepted->index == LogIndex { .value = 2 });
+}
+
+TEST_CASE("A follower redirects a proposal to the leader it knows", "[consensus][raft][replication]")
+{
+    Fixture fix;
+    (void) fix.node.Receive(AppendEntriesRequest { .term = Term { .value = 2 },
+                                                   .leaderId = "n2",
+                                                   .prevLogIndex = LogIndex::BeforeFirst(),
+                                                   .prevLogTerm = Term::None(),
+                                                   .entries = {},
+                                                   .leaderCommit = LogIndex::BeforeFirst() },
+                            At(10));
+
+    auto const refused = fix.node.Propose(FastCache::BytesFromString("x"), At(20));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().knownLeader == std::optional<std::string> { "n2" });
+}
+
+TEST_CASE("A proposal is replicated to every peer and persisted first", "[consensus][raft][replication]")
+{
+    Fixture fix;
+    fix.ElectAsLeader();
+
+    auto const proposed = fix.node.Propose(FastCache::BytesFromString("hello"), At(200));
+    REQUIRE(proposed.has_value());
+
+    // The log is durable state: a leader that sends an entry and then loses it on
+    // restart can be asked about it by a follower that kept it. It is persistLog
+    // that carries this -- `persist` holds only term and vote, so asserting on it
+    // would pass while proving nothing about the entry.
+    REQUIRE(proposed->output.persistLog.has_value());
+    auto const logged = Unwrap(proposed->output.persistLog);
+    CHECK(logged.fromIndex == LogIndex { .value = 2 });
+    REQUIRE(logged.entries.size() == 1);
+    CHECK(FastCache::AsStringView(logged.entries[0].payload) == "hello");
+
+    auto const sent = MessagesOfType<AppendEntriesRequest>(proposed->output);
+    REQUIRE(sent.size() == 2);
+    // Both entries: this leader was elected with an empty log, so each peer's
+    // nextIndex is still 1 and the no-op has not been acknowledged yet.
+    REQUIRE(sent[0].entries.size() == 2);
+    CHECK(sent[0].prevLogIndex == LogIndex::BeforeFirst());
+    CHECK(sent[0].entries[0].kind == EntryKind::NoOp);
+    CHECK(sent[0].entries[1].kind == EntryKind::Command);
+}
+
+TEST_CASE("An entry commits once a quorum has it", "[consensus][raft][replication]")
+{
+    Fixture fix;
+    fix.ElectAsLeader();
+    REQUIRE(fix.node.Propose(FastCache::BytesFromString("v1"), At(200)).has_value());
+    REQUIRE(fix.node.CommitIndex() == LogIndex::BeforeFirst());
+
+    // Three-node cluster: the leader plus one follower is a quorum. Index 1 is
+    // the leader's no-op and index 2 is "v1".
+    auto const output = fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
+                                                                 .result = AppendResult::Accepted,
+                                                                 .matchIndex = LogIndex { .value = 2 },
+                                                                 .followerId = "n2" },
+                                         At(210));
+
+    CHECK(fix.node.CommitIndex() == LogIndex { .value = 2 });
+    // One applied entry, not two: the no-op is committed like any other and never
+    // delivered, so the indices seen here skip it.
+    REQUIRE(output.applied.size() == 1);
+    CHECK(output.applied[0].index == LogIndex { .value = 2 });
+    CHECK(FastCache::AsStringView(output.applied[0].payload) == "v1");
+}
+
+TEST_CASE("A committed entry is applied exactly once", "[consensus][raft][replication]")
+{
+    Fixture fix;
+    fix.ElectAsLeader();
+    REQUIRE(fix.node.Propose(FastCache::BytesFromString("v1"), At(200)).has_value());
+
+    auto const accepted = AppendEntriesResponse { .term = Term { .value = 1 },
+                                                  .result = AppendResult::Accepted,
+                                                  .matchIndex = LogIndex { .value = 2 },
+                                                  .followerId = "n2" };
+
+    auto const first = fix.node.Receive(accepted, At(210));
+    auto const again = fix.node.Receive(accepted, At(211));
+
+    CHECK(first.applied.size() == 1);
+    // The driver applies blindly, so a second emission would be a second
+    // application of the same command.
+    CHECK(again.applied.empty());
+}
+
+TEST_CASE("A single-node cluster commits its own proposal immediately", "[consensus][raft][replication]")
+{
+    ScriptedRandomSource random { { 0 } };
+    auto config = ThreeNodes();
+    config.members = { "n1" };
+    RaftNode node = MakeNode(config, random);
+    (void) node.Tick(At(ElectionMin.count()));
+    REQUIRE(node.CurrentRole() == Role::Leader);
+
+    auto const proposed = node.Propose(FastCache::BytesFromString("solo"), At(200));
+
+    REQUIRE(proposed.has_value());
+    // Index 1 is the no-op this node wrote on election; "solo" is index 2.
+    CHECK(node.CommitIndex() == LogIndex { .value = 2 });
+    REQUIRE(proposed->output.applied.size() == 1);
+    CHECK(FastCache::AsStringView(proposed->output.applied[0].payload) == "solo");
+}
+
+TEST_CASE("A rejection walks nextIndex back and retries at once", "[consensus][raft][replication]")
+{
+    // Each round trip recovers exactly one index, so retrying at the next
+    // heartbeat instead would make catching up cost interval-times-divergence.
+    //
+    // The log has to exist *before* this node is elected. `nextIndex` is a guess
+    // made at election time from the leader's own last index and moved only by
+    // responses -- appending entries afterwards does not advance it -- so a
+    // leader elected with an empty log sits at nextIndex 1 and a rejection has
+    // nowhere further back to walk.
+    Fixture fix;
+    (void) fix.node.Receive(
+        AppendEntriesRequest {
+            .term = Term { .value = 1 },
+            .leaderId = "n2",
+            .prevLogIndex = LogIndex::BeforeFirst(),
+            .prevLogTerm = Term::None(),
+            .entries = { LogEntry { .term = Term { .value = 1 }, .payload = FastCache::BytesFromString("a") },
+                         LogEntry { .term = Term { .value = 1 }, .payload = FastCache::BytesFromString("b") } },
+            .leaderCommit = LogIndex::BeforeFirst() },
+        At(10));
+    REQUIRE(fix.node.Log().LastIndex() == LogIndex { .value = 2 });
+
+    (void) fix.node.Tick(At(200));
+    (void) fix.node.Receive(
+        RequestVoteResponse { .term = Term { .value = 2 }, .decision = VoteDecision::Granted, .voterId = "n2" }, At(201));
+    REQUIRE(fix.node.CurrentRole() == Role::Leader);
+
+    auto const output = fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 2 },
+                                                                 .result = AppendResult::Rejected,
+                                                                 .matchIndex = LogIndex::BeforeFirst(),
+                                                                 .followerId = "n2" },
+                                         At(210));
+
+    auto const retries = MessagesOfType<AppendEntriesRequest>(output);
+    REQUIRE(retries.size() == 1);
+    // nextIndex went from 3 to 2, so the retry starts one entry further back and
+    // carries "b" plus the no-op this node wrote at index 3 on election.
+    CHECK(retries[0].prevLogIndex == LogIndex { .value = 1 });
+    CHECK(retries[0].entries.size() == 2);
+    CHECK(retries[0].entries[1].kind == EntryKind::NoOp);
+}
+
+TEST_CASE("An out-of-order response never moves a match index backwards", "[consensus][raft][replication]")
+{
+    // Match indices decide commitment, so un-acknowledging a confirmed entry can
+    // only end with a committed entry treated as uncommitted.
+    Fixture fix;
+    fix.ElectAsLeader();
+    REQUIRE(fix.node.Propose(FastCache::BytesFromString("a"), At(200)).has_value());
+    REQUIRE(fix.node.Propose(FastCache::BytesFromString("b"), At(201)).has_value());
+
+    (void) fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
+                                                    .result = AppendResult::Accepted,
+                                                    .matchIndex = LogIndex { .value = 2 },
+                                                    .followerId = "n2" },
+                            At(210));
+    REQUIRE(fix.node.CommitIndex() == LogIndex { .value = 2 });
+
+    // A straggler from an earlier request arrives late.
+    (void) fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
+                                                    .result = AppendResult::Accepted,
+                                                    .matchIndex = LogIndex { .value = 1 },
+                                                    .followerId = "n2" },
+                            At(211));
+
+    CHECK(fix.node.CommitIndex() == LogIndex { .value = 2 });
+}
+
+TEST_CASE("A follower's commit index is bounded by what the request carried", "[consensus][raft][replication]")
+{
+    // The leader may have committed entries this follower has not received --
+    // AppendEntries can be delayed or truncated -- and adopting its number
+    // outright would mark absent entries committed, so the next thing applied
+    // would be whatever happened to sit at that index.
+    Fixture fix;
+
+    auto const output =
+        fix.node.Receive(AppendEntriesRequest { .term = Term { .value = 2 },
+                                                .leaderId = "n2",
+                                                .prevLogIndex = LogIndex::BeforeFirst(),
+                                                .prevLogTerm = Term::None(),
+                                                .entries = { LogEntry { .term = Term { .value = 2 },
+                                                                        .payload = FastCache::BytesFromString("a") } },
+                                                .leaderCommit = LogIndex { .value = 9 } },
+                         At(10));
+
+    CHECK(fix.node.CommitIndex() == LogIndex { .value = 1 });
+    REQUIRE(output.applied.size() == 1);
+    CHECK(FastCache::AsStringView(output.applied[0].payload) == "a");
+}
+
+TEST_CASE("Figure 8: an earlier term's entry is not committed by replica count", "[consensus][raft][replication]")
+{
+    // Raft §5.4.2, and the defect the paper devotes a figure to. An entry from an
+    // earlier term can sit on a majority and still be overwritten, because a
+    // future leader elected under §5.4.1 may lack it -- widely replicated is not
+    // the same as safe. Counting replicas for such an entry loses committed data;
+    // it must instead commit indirectly, carried by a current-term entry above it.
+    Fixture fix;
+
+    // Take an entry from term 2 as a follower, so this node's log holds one.
+    (void) fix.node.Receive(AppendEntriesRequest { .term = Term { .value = 2 },
+                                                   .leaderId = "n2",
+                                                   .prevLogIndex = LogIndex::BeforeFirst(),
+                                                   .prevLogTerm = Term::None(),
+                                                   .entries = { LogEntry { .term = Term { .value = 2 },
+                                                                           .payload = FastCache::BytesFromString("old") } },
+                                                   .leaderCommit = LogIndex::BeforeFirst() },
+                            At(10));
+    REQUIRE(fix.node.Log().LastIndex() == LogIndex { .value = 1 });
+    REQUIRE(fix.node.CommitIndex() == LogIndex::BeforeFirst());
+
+    // Now win term 3 and hear that a follower holds that term-2 entry.
+    (void) fix.node.Tick(At(200));
+    REQUIRE(fix.node.CurrentTerm() == Term { .value = 3 });
+    (void) fix.node.Receive(
+        RequestVoteResponse { .term = Term { .value = 3 }, .decision = VoteDecision::Granted, .voterId = "n2" }, At(201));
+    REQUIRE(fix.node.CurrentRole() == Role::Leader);
+
+    (void) fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 3 },
+                                                    .result = AppendResult::Accepted,
+                                                    .matchIndex = LogIndex { .value = 1 },
+                                                    .followerId = "n2" },
+                            At(210));
+
+    // A quorum holds index 1, but it is from term 2 and this leader is on term 3.
+    // Index 2 is this leader's own no-op, which the follower has not confirmed.
+    CHECK(fix.node.CommitIndex() == LogIndex::BeforeFirst());
+
+    // Replicating a term-3 entry commits it AND carries the term-2 entry with it.
+    // "new" lands at index 3, behind the no-op at index 2.
+    REQUIRE(fix.node.Propose(FastCache::BytesFromString("new"), At(220)).has_value());
+    auto const output = fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 3 },
+                                                                 .result = AppendResult::Accepted,
+                                                                 .matchIndex = LogIndex { .value = 3 },
+                                                                 .followerId = "n2" },
+                                         At(230));
+
+    CHECK(fix.node.CommitIndex() == LogIndex { .value = 3 });
+    // Two delivered, not three: the no-op at index 2 committed with them and was
+    // never handed to the application.
+    REQUIRE(output.applied.size() == 2);
+    CHECK(output.applied[0].index == LogIndex { .value = 1 });
+    CHECK(FastCache::AsStringView(output.applied[0].payload) == "old");
+    CHECK(output.applied[1].index == LogIndex { .value = 3 });
+    CHECK(FastCache::AsStringView(output.applied[1].payload) == "new");
+}
+
+TEST_CASE("Losing leadership does not un-commit anything", "[consensus][raft][replication]")
+{
+    Fixture fix;
+    fix.ElectAsLeader();
+    REQUIRE(fix.node.Propose(FastCache::BytesFromString("v1"), At(200)).has_value());
+    (void) fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
+                                                    .result = AppendResult::Accepted,
+                                                    .matchIndex = LogIndex { .value = 1 },
+                                                    .followerId = "n2" },
+                            At(210));
+    REQUIRE(fix.node.CommitIndex() == LogIndex { .value = 1 });
+
+    (void) fix.node.Receive(AppendEntriesRequest { .term = Term { .value = 5 },
+                                                   .leaderId = "n3",
+                                                   .prevLogIndex = LogIndex { .value = 1 },
+                                                   .prevLogTerm = Term { .value = 1 },
+                                                   .entries = {},
+                                                   .leaderCommit = LogIndex { .value = 1 } },
+                            At(300));
+
+    REQUIRE(fix.node.CurrentRole() == Role::Follower);
+    // Commitment is a cluster-wide fact; no change of leadership can un-decide it.
+    CHECK(fix.node.CommitIndex() == LogIndex { .value = 1 });
+}
+
+TEST_CASE("A follower's commit index never moves backwards", "[consensus][raft][replication]")
+{
+    // Guarding only on `leaderCommit > _commitIndex` is not enough, because the
+    // value assigned is the *minimum* of that and what the request established. A
+    // delayed duplicate carrying a high leaderCommit and a low match index would
+    // take the commit index backwards, and CommitIndex() promises an entry at or
+    // below it is never taken back.
+    Fixture fix;
+
+    auto const twoEntries = std::vector {
+        LogEntry { .term = Term { .value = 1 }, .kind = EntryKind::Command, .payload = FastCache::BytesFromString("a") },
+        LogEntry { .term = Term { .value = 1 }, .kind = EntryKind::Command, .payload = FastCache::BytesFromString("b") }
+    };
+
+    (void) fix.node.Receive(AppendEntriesRequest { .term = Term { .value = 1 },
+                                                   .leaderId = "n2",
+                                                   .prevLogIndex = LogIndex::BeforeFirst(),
+                                                   .prevLogTerm = Term::None(),
+                                                   .entries = twoEntries,
+                                                   .leaderCommit = LogIndex { .value = 2 } },
+                            At(10));
+    REQUIRE(fix.node.CommitIndex() == LogIndex { .value = 2 });
+
+    // A stale duplicate of "entry 1 only", arriving late with a high leaderCommit.
+    // TryAppend accepts it (the entry is already present at the same term) and
+    // reports a match index of 1, which is below what is already committed.
+    (void) fix.node.Receive(AppendEntriesRequest { .term = Term { .value = 1 },
+                                                   .leaderId = "n2",
+                                                   .prevLogIndex = LogIndex::BeforeFirst(),
+                                                   .prevLogTerm = Term::None(),
+                                                   .entries = { twoEntries[0] },
+                                                   .leaderCommit = LogIndex { .value = 9 } },
+                            At(11));
+
+    CHECK(fix.node.CommitIndex() == LogIndex { .value = 2 });
+}
+
+TEST_CASE("A follower records its appended entries as durable work", "[consensus][raft][replication]")
+{
+    // These entries are about to be acknowledged and a leader may commit on that
+    // acknowledgement, so losing them to a restart loses a committed entry.
+    Fixture fix;
+
+    auto const output =
+        fix.node.Receive(AppendEntriesRequest { .term = Term { .value = 1 },
+                                                .leaderId = "n2",
+                                                .prevLogIndex = LogIndex::BeforeFirst(),
+                                                .prevLogTerm = Term::None(),
+                                                .entries = { LogEntry { .term = Term { .value = 1 },
+                                                                        .kind = EntryKind::Command,
+                                                                        .payload = FastCache::BytesFromString("a") } },
+                                                .leaderCommit = LogIndex::BeforeFirst() },
+                         At(10));
+
+    REQUIRE(output.persistLog.has_value());
+    auto const logged = Unwrap(output.persistLog);
+    CHECK(logged.fromIndex == LogIndex { .value = 1 });
+    REQUIRE(logged.entries.size() == 1);
+    CHECK(FastCache::AsStringView(logged.entries[0].payload) == "a");
+}
+
+TEST_CASE("A heartbeat asks for no durable log work", "[consensus][raft][replication]")
+{
+    // An fsync per heartbeat would put a disk flush on the interval that decides
+    // how fast a dead leader is noticed.
+    Fixture fix;
+
+    auto const output = fix.node.Receive(AppendEntriesRequest { .term = Term { .value = 1 },
+                                                                .leaderId = "n2",
+                                                                .prevLogIndex = LogIndex::BeforeFirst(),
+                                                                .prevLogTerm = Term::None(),
+                                                                .entries = {},
+                                                                .leaderCommit = LogIndex::BeforeFirst() },
+                                         At(10));
+
+    CHECK_FALSE(output.persistLog.has_value());
+}
+
+TEST_CASE("A match index beyond the leader's own log is clamped", "[consensus][raft][replication]")
+{
+    // Taken at face value it pushes nextIndex past the end, every later
+    // AppendEntries then names a prevLogIndex that does not exist, and that peer
+    // never converges again.
+    Fixture fix;
+    fix.ElectAsLeader();
+    REQUIRE(fix.node.Log().LastIndex() == LogIndex { .value = 1 });
+
+    (void) fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
+                                                    .result = AppendResult::Accepted,
+                                                    .matchIndex = LogIndex { .value = 99 },
+                                                    .followerId = "n2" },
+                            At(210));
+
+    // Clamped to the leader's own last index, so the no-op commits and no phantom
+    // index is committed above it.
+    CHECK(fix.node.CommitIndex() == LogIndex { .value = 1 });
+
+    // And the next request to that peer still names a position that exists.
+    auto const next = fix.node.Tick(At(400));
+    auto const sent = MessagesOfType<AppendEntriesRequest>(next);
+    REQUIRE_FALSE(sent.empty());
+    CHECK(sent[0].prevLogIndex <= fix.node.Log().LastIndex());
+}
+
+TEST_CASE("A new leader commits a previous term's entries without a client", "[consensus][raft][replication]")
+{
+    // The companion to the §5.4.2 guard. Without a no-op of the leader's own
+    // term, a leader whose log ends in fully replicated entries from the previous
+    // term can never commit them -- and applies nothing -- until a client happens
+    // to propose. With no client traffic the cluster is live and permanently one
+    // term behind.
+    Fixture fix;
+
+    (void) fix.node.Receive(AppendEntriesRequest { .term = Term { .value = 1 },
+                                                   .leaderId = "n2",
+                                                   .prevLogIndex = LogIndex::BeforeFirst(),
+                                                   .prevLogTerm = Term::None(),
+                                                   .entries = { LogEntry { .term = Term { .value = 1 },
+                                                                           .kind = EntryKind::Command,
+                                                                           .payload = FastCache::BytesFromString("old") } },
+                                                   .leaderCommit = LogIndex::BeforeFirst() },
+                            At(10));
+    REQUIRE(fix.node.CommitIndex() == LogIndex::BeforeFirst());
+
+    (void) fix.node.Tick(At(200));
+    (void) fix.node.Receive(
+        RequestVoteResponse { .term = Term { .value = 2 }, .decision = VoteDecision::Granted, .voterId = "n2" }, At(201));
+    REQUIRE(fix.node.CurrentRole() == Role::Leader);
+
+    // A quorum confirms the no-op at index 2. No client has proposed anything.
+    auto const output = fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 2 },
+                                                                 .result = AppendResult::Accepted,
+                                                                 .matchIndex = LogIndex { .value = 2 },
+                                                                 .followerId = "n2" },
+                                         At(210));
+
+    CHECK(fix.node.CommitIndex() == LogIndex { .value = 2 });
+    REQUIRE(output.applied.size() == 1);
+    CHECK(FastCache::AsStringView(output.applied[0].payload) == "old");
+}
+
+TEST_CASE("A no-op is committed but never delivered", "[consensus][raft][replication]")
+{
+    // Tagged rather than inferred from an empty payload, because an empty payload
+    // is a legitimate thing for an application to commit.
+    Fixture fix;
+    fix.ElectAsLeader();
+
+    auto const output = fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
+                                                                 .result = AppendResult::Accepted,
+                                                                 .matchIndex = LogIndex { .value = 1 },
+                                                                 .followerId = "n2" },
+                                         At(210));
+
+    CHECK(fix.node.CommitIndex() == LogIndex { .value = 1 });
+    CHECK(output.applied.empty());
 }

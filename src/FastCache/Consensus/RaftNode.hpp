@@ -9,10 +9,12 @@
 #include <FastCache/Core/IRandomSource.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -122,6 +124,37 @@ class RaftNode
     /// @return The node's log.
     [[nodiscard]] RaftLog const& Log() const noexcept;
 
+    /// The highest index known to be committed.
+    ///
+    /// Committed means present in every future leader's log, so an entry at or
+    /// below this can be acted on and will never be taken back.
+    /// @return The commit index.
+    [[nodiscard]] LogIndex CommitIndex() const noexcept;
+
+    /// What a successful proposal yields.
+    struct Proposal
+    {
+        LogIndex index {}; ///< Where the entry landed; watch `CommitIndex()` for it.
+        RaftOutput output; ///< What the driver should do about it.
+    };
+
+    /// Offer an entry to the cluster.
+    ///
+    /// Only a leader may accept one, so this refuses on every other node — with
+    /// the leader's identity when it knows one, because "ask that node instead"
+    /// and "nobody leads right now" are different answers and only the second
+    /// means give up and act locally.
+    ///
+    /// Acceptance is not commitment. The entry is appended to this leader's log
+    /// and replicated; it is committed when a quorum has it, which is reported
+    /// through `RaftOutput::applied` on some later event. A caller that needs to
+    /// know when to act watches for the index, and one that cannot wait treats a
+    /// proposal like any other refusal.
+    /// @param payload Application bytes, never interpreted here.
+    /// @param now The current instant.
+    /// @return Where it landed and what to do, or why it was refused.
+    [[nodiscard]] std::expected<Proposal, ConsensusError> Propose(std::vector<std::byte> payload, TimePoint now);
+
     /// When the driver must next call `Tick`.
     ///
     /// Which deadline this is depends on the role and comes from `RoleTable`.
@@ -186,8 +219,35 @@ class RaftNode
     /// Queue a message to every peer.
     void BroadcastToPeers(RaftOutput& output, RaftMessage const& message) const;
 
-    /// A heartbeat, i.e. an AppendEntries carrying no entries.
-    [[nodiscard]] AppendEntriesRequest MakeHeartbeat() const;
+    /// The AppendEntries this leader owes `peer`, given how far it has caught up.
+    ///
+    /// Carries whatever sits at and after that peer's `nextIndex`, which is empty
+    /// for a peer that is up to date — so a heartbeat is not a separate kind of
+    /// message, it is this one with nothing left to send. Keeping them one thing
+    /// is what makes a heartbeat also the mechanism that discovers a divergent
+    /// follower, rather than a second code path that has to remember to.
+    /// @param peer The follower.
+    /// @return The request to send it.
+    [[nodiscard]] AppendEntriesRequest MakeAppendEntriesFor(NodeId const& peer) const;
+
+    /// Send each peer the AppendEntries it is owed.
+    void ReplicateToPeers(RaftOutput& output) const;
+
+    /// Advance the commit index if a quorum has caught up (§5.4.2).
+    void AdvanceCommitIndex();
+
+    /// Emit every entry that has become committed since the last call.
+    void ApplyCommitted(RaftOutput& output);
+
+    /// Ask the driver to make the log durable from `fromIndex` onward.
+    ///
+    /// Reads the entries out of the log rather than taking them from the caller,
+    /// so the record is of what was actually written — including a truncation
+    /// that a follower's repair performed, which the incoming request does not
+    /// describe on its own.
+    /// @param output Where to record it.
+    /// @param fromIndex First index that changed.
+    void RecordLogAppend(RaftOutput& output, LogIndex fromIndex);
 
     /// Record the durable state in `output`, for the driver to write first.
     void MarkPersist(RaftOutput& output) const;
@@ -222,6 +282,20 @@ class RaftNode
 
     TimePoint _electionDeadline {};
     TimePoint _heartbeatDeadline {};
+
+    LogIndex _commitIndex {}; ///< Highest index known committed.
+    LogIndex _lastApplied {}; ///< Highest index already emitted as applied.
+
+    /// Per-peer: the next index to send. A guess, revised downward on rejection.
+    std::unordered_map<NodeId, LogIndex> _nextIndex;
+
+    /// Per-peer: the highest index known to be replicated there.
+    ///
+    /// Distinct from `_nextIndex` and not derivable from it, which is the usual
+    /// place to go wrong: `nextIndex` is optimistic and moves both ways, while
+    /// `matchIndex` is a fact that only ever increases. Committing on the
+    /// optimistic one would commit an entry nobody has acknowledged.
+    std::unordered_map<NodeId, LogIndex> _matchIndex;
 
     /// Voters that granted this node their vote in the current term, itself
     /// included. A set rather than a counter because a retransmitted response
