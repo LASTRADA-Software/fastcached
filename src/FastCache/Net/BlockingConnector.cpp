@@ -34,23 +34,12 @@ namespace
 #if defined(_WIN32)
     using AddrLen = int;
 
-    /// @return The last socket-layer error code.
-    [[nodiscard]] int LastSocketError() noexcept
-    {
-        return WSAGetLastError();
-    }
-
     /// Whether the last error means "connect is under way", not "connect failed".
     /// @param code The error code from `::connect`.
     /// @return True when the attempt is still in progress.
     [[nodiscard]] bool ConnectInProgress(int code) noexcept
     {
         return code == WSAEWOULDBLOCK || code == WSAEINPROGRESS;
-    }
-
-    void CloseSocket(Detail::NativeSocket s) noexcept
-    {
-        std::ignore = ::closesocket(static_cast<SOCKET>(s));
     }
 
     /// Put a socket into non-blocking mode.
@@ -97,19 +86,9 @@ namespace
 #else
     using AddrLen = socklen_t;
 
-    [[nodiscard]] int LastSocketError() noexcept
-    {
-        return errno;
-    }
-
     [[nodiscard]] bool ConnectInProgress(int code) noexcept
     {
         return code == EINPROGRESS;
-    }
-
-    void CloseSocket(Detail::NativeSocket s) noexcept
-    {
-        std::ignore = ::close(static_cast<int>(s));
     }
 
     [[nodiscard]] bool SetNonBlocking(Detail::NativeSocket s) noexcept
@@ -144,33 +123,6 @@ namespace
     }
 #endif
 
-    /// Translate a connect-time OS error into the shared taxonomy.
-    /// @param code The OS error code.
-    /// @param context What was being attempted.
-    /// @return The structured error.
-    [[nodiscard]] NetError ConnectError(int code, std::string context)
-    {
-#if defined(_WIN32)
-        auto const refused = code == WSAECONNREFUSED;
-        auto const unreachable = code == WSAEHOSTUNREACH || code == WSAENETUNREACH;
-        auto const timedOut = code == WSAETIMEDOUT;
-#else
-        auto const refused = code == ECONNREFUSED;
-        auto const unreachable = code == EHOSTUNREACH || code == ENETUNREACH;
-        auto const timedOut = code == ETIMEDOUT;
-#endif
-
-        auto category = NetErrorCode::SystemError;
-        if (refused)
-            category = NetErrorCode::ConnRefused;
-        else if (unreachable)
-            category = NetErrorCode::HostUnreach;
-        else if (timedOut)
-            category = NetErrorCode::Timeout;
-
-        return NetError { .code = category, .systemCode = code, .context = std::move(context) };
-    }
-
     /// Dial one resolved endpoint.
     /// @param endpoint The candidate to try.
     /// @param timeout How long to allow.
@@ -180,13 +132,13 @@ namespace
     {
         auto const native = static_cast<Detail::NativeSocket>(::socket(endpoint.family, SOCK_STREAM, endpoint.protocol));
         if (native == Detail::InvalidSocket)
-            return std::unexpected { ConnectError(LastSocketError(), "socket() failed") };
+            return std::unexpected { Detail::MakeNetError(Detail::LastNetworkError(), "socket() failed") };
 
         if (!SetNonBlocking(native))
         {
-            auto const code = LastSocketError();
-            CloseSocket(native);
-            return std::unexpected { ConnectError(code, "could not make the socket non-blocking") };
+            auto const code = Detail::LastNetworkError();
+            Detail::CloseNativeSocket(native);
+            return std::unexpected { Detail::MakeNetError(code, "could not make the socket non-blocking") };
         }
 
         // The address bytes are opaque here; ResolvedEndpoint carries whatever the
@@ -205,17 +157,17 @@ namespace
 
         if (result != 0)
         {
-            auto const pending = LastSocketError();
+            auto const pending = Detail::LastNetworkError();
             if (!ConnectInProgress(pending))
             {
-                CloseSocket(native);
-                return std::unexpected { ConnectError(pending, "connect() failed") };
+                Detail::CloseNativeSocket(native);
+                return std::unexpected { Detail::MakeNetError(pending, "connect() failed") };
             }
 
             auto const ready = WaitWritable(native, timeout);
             if (ready == 0)
             {
-                CloseSocket(native);
+                Detail::CloseNativeSocket(native);
                 return std::unexpected { NetError { .code = NetErrorCode::Timeout,
                                                     .systemCode = 0,
                                                     .context =
@@ -223,9 +175,9 @@ namespace
             }
             if (ready < 0)
             {
-                auto const code = LastSocketError();
-                CloseSocket(native);
-                return std::unexpected { ConnectError(code, "waiting for connect to complete failed") };
+                auto const code = Detail::LastNetworkError();
+                Detail::CloseNativeSocket(native);
+                return std::unexpected { Detail::MakeNetError(code, "waiting for connect to complete failed") };
             }
 
             // Readiness is not success: a refused connect also makes the socket
@@ -246,17 +198,17 @@ namespace
                                              &length);
             if (probed != 0 || pendingError != 0)
             {
-                auto const code = probed != 0 ? LastSocketError() : pendingError;
-                CloseSocket(native);
-                return std::unexpected { ConnectError(code, "connect did not complete") };
+                auto const code = probed != 0 ? Detail::LastNetworkError() : pendingError;
+                Detail::CloseNativeSocket(native);
+                return std::unexpected { Detail::MakeNetError(code, "connect did not complete") };
             }
         }
 
         if (!SetBlocking(native))
         {
-            auto const code = LastSocketError();
-            CloseSocket(native);
-            return std::unexpected { ConnectError(code, "could not restore blocking mode") };
+            auto const code = Detail::LastNetworkError();
+            Detail::CloseNativeSocket(native);
+            return std::unexpected { Detail::MakeNetError(code, "could not restore blocking mode") };
         }
 
         Detail::ApplyHotSocketOptions(native);
