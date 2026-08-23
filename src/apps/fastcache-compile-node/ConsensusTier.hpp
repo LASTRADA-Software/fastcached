@@ -17,6 +17,7 @@
 #include <FastCache/Net/BlockingSocket.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -87,6 +88,18 @@ class ConsensusTier
     /// a peer whose absence the election timer should be deciding about, not a read
     /// this node waits on.
     static constexpr std::chrono::milliseconds PeerIoTimeout { 2'000 };
+
+    /// Applied entries above the snapshot before the log is traded for one.
+    ///
+    /// A constant rather than a flag, deliberately. What this log carries is cluster
+    /// membership and cluster settings — changes an operator makes by hand, so a
+    /// fleet reaches this figure over months rather than minutes — and the state a
+    /// snapshot replaces them with is a member list and a handful of strings. There
+    /// is no deployment whose arithmetic comes out differently enough to tune, and a
+    /// knob nobody turns is a knob that rots. Non-zero, though: a log nobody ever
+    /// trims is a restart that re-reads its whole history every time, which is what
+    /// the driver's own default of "never" would leave here.
+    static constexpr std::uint64_t CompactAfterEntries { 512 };
 
     /// Told this node's role whenever consensus changes it.
     ///

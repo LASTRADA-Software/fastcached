@@ -10,11 +10,13 @@ namespace FastCache::Consensus
 RaftDriver::RaftDriver(RaftNode node,
                        IRaftStorage& storage,
                        IRaftTransport& transport,
-                       IRaftStateMachine& application) noexcept:
+                       IRaftStateMachine& application,
+                       CompactionPolicy compaction) noexcept:
     _node { std::move(node) },
     _storage { storage },
     _transport { transport },
     _application { application },
+    _compaction { compaction },
     _reportedRole { _node.CurrentRole() },
     _reportedLeader { _node.KnownLeader() }
 {
@@ -124,6 +126,46 @@ std::expected<void, ConsensusError> RaftDriver::Deliver(RaftOutput output)
     // write above fails, the early return means it is never told at all, which is
     // correct: a node whose durable state would not write has not become anything.
     PublishRoleIfChanged();
+
+    // And only now is there anything to compact: the entries this step applied are
+    // what moved `LastApplied` past the snapshot boundary.
+    return CompactIfDue();
+}
+
+std::expected<void, ConsensusError> RaftDriver::CompactIfDue()
+{
+    if (_compaction.appliedEntriesBeforeCompaction == 0)
+        return {};
+
+    // The unsnapshotted, already-applied span -- which is what a restart replays
+    // and what the log holds in memory. `LastApplied` can sit AT the boundary (a
+    // follower that has just installed a snapshot) but never below it, so the
+    // subtraction is guarded rather than assumed.
+    auto const applied = _node.LastApplied();
+    auto const covered = _node.Log().SnapshotIndex();
+    if (applied <= covered || applied.value - covered.value < _compaction.appliedEntriesBeforeCompaction)
+        return {};
+
+    auto output = RaftOutput {};
+    if (!_node.CompactThroughApplied(_application.TakeSnapshot(), output))
+        return {};
+
+    // `CompactThroughApplied` sets this whenever it returns true; the check is here
+    // because dereferencing on a contract rather than on a value is how a later
+    // change to that contract becomes a crash instead of a compile error.
+    if (!output.saveSnapshot.has_value())
+        return {};
+
+    // The one durability write this produces, and the store discards the covered
+    // prefix as part of it -- snapshot first, entries afterwards, so a crash in
+    // between leaves a durable snapshot beside a log that still holds what it
+    // covers, which recovery reconciles.
+    if (auto written = _storage.SaveSnapshot(*output.saveSnapshot); !written.has_value())
+    {
+        _failure = written.error();
+        return std::unexpected { written.error() };
+    }
+
     return {};
 }
 

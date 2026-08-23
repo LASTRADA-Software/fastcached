@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <optional>
@@ -74,11 +75,39 @@ class RaftDriver
     /// on.
     using RoleObserver = std::function<void(Role role, std::optional<NodeId> const& knownLeader)>;
 
+    /// When the log is traded for a snapshot of what it produced.
+    ///
+    /// The policy is the caller's because the cost it balances is: a snapshot is
+    /// the *whole* application state written out, so trimming often makes a small
+    /// log expensive, and trimming never makes a long-lived node re-read its entire
+    /// history at every restart and keep every entry in memory in between. Only
+    /// whoever knows how large that state is can say where the crossover sits.
+    struct CompactionPolicy
+    {
+        /// Applied entries above the snapshot that provoke one; zero never does.
+        ///
+        /// Measured from the snapshot boundary rather than from the log's length,
+        /// because those differ on a follower whose leader has already trimmed
+        /// further than it has applied -- and it is the *unsnapshotted* part that a
+        /// restart has to replay.
+        std::uint64_t appliedEntriesBeforeCompaction { 0 };
+    };
+
     /// @param node The state machine to drive; taken by value and owned.
     /// @param storage Where durable state goes; must outlive this driver.
     /// @param transport How peers are reached; must outlive this driver.
     /// @param application What committed entries are handed to; must outlive this.
-    RaftDriver(RaftNode node, IRaftStorage& storage, IRaftTransport& transport, IRaftStateMachine& application) noexcept;
+    /// @param compaction When to trim the log; defaults to never.
+    ///
+    /// The default is "never" so that a caller which has not thought about
+    /// compaction gets the behaviour that cannot lose anything -- a log that grows
+    /// is wasteful, and a snapshot taken by a machine whose `TakeSnapshot` is not
+    /// yet meaningful is wrong.
+    RaftDriver(RaftNode node,
+               IRaftStorage& storage,
+               IRaftTransport& transport,
+               IRaftStateMachine& application,
+               CompactionPolicy compaction = CompactionPolicy {}) noexcept;
 
     /// Install the role observer.
     ///
@@ -152,10 +181,22 @@ class RaftDriver
     /// Report the role if it has moved since the last report.
     void PublishRoleIfChanged();
 
+    /// Trade the applied prefix of the log for a snapshot, if enough has piled up.
+    ///
+    /// Runs after the outputs rather than as one of them, because it is
+    /// maintenance rather than something the algorithm asked for -- but it is
+    /// ordered here, in the driver, for the reason every other durability write is:
+    /// the entries are gone from memory the moment `CompactThroughApplied` returns,
+    /// so a node that discarded them without first recording what they produced
+    /// comes back from a restart missing committed state.
+    /// @return Nothing, or the storage failure that stopped this node.
+    [[nodiscard]] std::expected<void, ConsensusError> CompactIfDue();
+
     RaftNode _node;
     IRaftStorage& _storage;
     IRaftTransport& _transport;
     IRaftStateMachine& _application;
+    CompactionPolicy _compaction;
     RoleObserver _onRole;
 
     /// What was last reported, so an unchanged role is not re-announced.

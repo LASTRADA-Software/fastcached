@@ -275,7 +275,12 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     if (!node.has_value())
         return std::unexpected { node.error().context };
 
-    _driver = std::make_unique<Consensus::RaftDriver>(*std::move(node), _storage, *_transport, _application);
+    _driver = std::make_unique<Consensus::RaftDriver>(
+        *std::move(node),
+        _storage,
+        *_transport,
+        _application,
+        Consensus::RaftDriver::CompactionPolicy { .appliedEntriesBeforeCompaction = CompactAfterEntries });
 
     // Pushed, not polled. A poll interval is a window in which this node has stopped
     // leading and is still handing out other machines' capacity, and the driver knows

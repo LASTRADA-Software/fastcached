@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <format>
+#include <ranges>
 #include <string>
 #include <utility>
 #include <vector>
@@ -444,4 +446,124 @@ TEST_CASE("Stop ends the run loop", "[consensus][raft][driver]")
     // Nothing is left parked, so the loop actually finished rather than
     // rescheduling itself forever.
     CHECK(reactor.PendingTimers() == 0);
+}
+
+TEST_CASE("An applied log is traded for a snapshot once enough has piled up", "[consensus][raft][driver]")
+{
+    // The residual this closes: `CompactThroughApplied` existed and nothing called
+    // it, so a long-lived cluster's log grew without bound and every restart
+    // replayed the whole of it. Slowly -- cluster configuration changes are rare by
+    // construction -- but "slowly" is not "never".
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    RecordingMachine machine { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    constexpr auto Threshold = std::uint64_t { 4 };
+
+    RaftDriver driver { std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(),
+                        storage,
+                        transport,
+                        machine,
+                        RaftDriver::CompactionPolicy { .appliedEntriesBeforeCompaction = Threshold } };
+
+    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(driver.Node().CurrentRole() == Role::Leader);
+
+    // Driven to one short of the threshold rather than by a hand-counted number of
+    // proposals: a new leader appends a no-op of its own term, which is applied
+    // like any other entry and is exactly the sort of implementation detail a
+    // counted assertion would silently encode. A single-node cluster is its own
+    // quorum, so each proposal commits and applies at once.
+    auto step = 0;
+    auto const unsnapshotted = [&driver] {
+        return driver.Node().LastApplied().value - driver.Node().Log().SnapshotIndex().value;
+    };
+
+    while (unsnapshotted() + 1 < Threshold)
+    {
+        REQUIRE(driver.Propose(FastCache::BytesFromString(std::format("e{}", step)), TimePoint {} + 200ms).has_value());
+        ++step;
+    }
+
+    CHECK(std::ranges::find(journal.events, "persist-snapshot") == journal.events.end());
+    CHECK(driver.Node().Log().SnapshotIndex() == LogIndex::BeforeFirst());
+
+    // One more crosses it.
+    REQUIRE(driver.Propose(FastCache::BytesFromString("crossing"), TimePoint {} + 210ms).has_value());
+
+    // The snapshot is asked of the application and made durable, and the log below
+    // it is gone -- which is the point: what a restart replays is now bounded.
+    CHECK(std::ranges::find(journal.events, "snapshot") != journal.events.end());
+    CHECK(std::ranges::find(journal.events, "persist-snapshot") != journal.events.end());
+    CHECK(driver.Node().Log().SnapshotIndex() == driver.Node().LastApplied());
+    CHECK(driver.Node().Log().FirstIndex() == driver.Node().LastApplied().Advanced(1));
+
+    // And the node carries on from there rather than refusing its own next append
+    // as a gap -- the failure a trimmed log invites, and the reason the boundary is
+    // recovered rather than assumed.
+    auto const after = driver.Propose(FastCache::BytesFromString("after"), TimePoint {} + 220ms);
+    REQUIRE(after.has_value());
+    CHECK(driver.Node().Log().LastIndex() == *after);
+}
+
+TEST_CASE("A driver told nothing about compaction never discards anything", "[consensus][raft][driver]")
+{
+    // The default, and it is the safe one deliberately: a log that grows is
+    // wasteful, while a snapshot taken from a machine whose `TakeSnapshot` means
+    // nothing yet is wrong.
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    RecordingMachine machine { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    RaftDriver driver {
+        std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(), storage, transport, machine
+    };
+
+    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+
+    for (auto const step: std::views::iota(0, 8))
+        REQUIRE(driver.Propose(FastCache::BytesFromString(std::format("e{}", step)), TimePoint {} + 200ms).has_value());
+
+    CHECK(std::ranges::find(journal.events, "snapshot") == journal.events.end());
+    CHECK(driver.Node().Log().SnapshotIndex() == LogIndex::BeforeFirst());
+}
+
+TEST_CASE("A snapshot that cannot be written stops the driver", "[consensus][raft][driver]")
+{
+    // Compaction discards the entries from memory the moment it succeeds, so a
+    // node that carried on after failing to record what they produced would come
+    // back from a restart missing committed state. It is the same latch every other
+    // durability failure gets, and it is reported rather than swallowed because a
+    // caller that treated maintenance as best-effort would never learn.
+    Journal journal;
+    InMemoryRaftStorage storage { InMemoryRaftStorage::FailurePlan { .failNthSaveSnapshot = 1 } };
+    RecordingTransport transport { journal };
+    RecordingMachine machine { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    // Two, not one: the no-op a new leader appends is applied during the election
+    // itself, so a threshold of one would fall due before there is a proposal to
+    // attribute the refusal to.
+    RaftDriver driver { std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(),
+                        storage,
+                        transport,
+                        machine,
+                        RaftDriver::CompactionPolicy { .appliedEntriesBeforeCompaction = 2 } };
+
+    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+
+    auto const proposed = driver.Propose(FastCache::BytesFromString("one"), TimePoint {} + 200ms);
+    REQUIRE(!proposed.has_value());
+    REQUIRE(driver.Failure().has_value());
+
+    // Latched: the next call refuses with the same error rather than pretending
+    // this node is still taking part.
+    CHECK(!driver.Tick(TimePoint {} + 400ms).has_value());
 }
