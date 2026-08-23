@@ -1763,6 +1763,32 @@ Consequences that are each load-bearing:
   four chances to forget one, and a refusal with no counter is invisible in exactly
   the situation an operator is trying to diagnose.
 
+**The scheduler's port is reachable before membership is established, so its payload
+cap is the small one.** `SchedulerServer` refuses a frame declaring more than 64 KiB,
+against the cache port's 256 MiB, and the asymmetry is the whole point: the gate runs
+*inside* `SchedulerService`, i.e. after the frame has been read, so an unauthenticated
+peer can make this endpoint buffer whatever it declares. That is the same hole
+`OpDescriptor::maxPayload` closes for `AUTH`, reached by a different route, and it is
+closed the same way — a scheduler verb carries a fingerprint, an endpoint and a key,
+none of which is large. Three consequences:
+
+- **The check is on the DECLARED length, before the read**, so an over-cap frame costs
+  no allocation at all. Checking after would be a memory-exhaustion hole opened by the
+  check meant to close one.
+- **The refusal names both numbers and is a reply, not a close** — `payload-too-large`
+  with the ceiling in it, because "too large" alone tells an operator nothing about a
+  64 KiB limit, and a close is indistinguishable from a dead host.
+- **A wrong magic is still the one condition that closes.** With no declared length
+  there is nowhere to resynchronize to, so there is nothing an answer could mean.
+
+**An endpoint reports the port it bound, not the one it was asked for.** `Start` formats
+`BoundEndpoint()` from `listener->BoundPort()`, which matters because `0` means "pick a
+free one" — an endpoint echoing `:0` back cannot tell an operator, a log line or a test
+where it ended up. `ParseTcpPort` still refuses `0` as a *CLI* value, correctly: as
+something an operator types it names no port anyone could dial. The two rules are not in
+tension, and the node's tests find a free port by binding a probe and releasing it, the
+idiom `AdminEndpoint_test` already uses.
+
 `scripts/dist-compile-e2e.sh` asserts the consequence rather than the mechanism:
 that a worker's object is **byte-identical** to a locally compiled one. That single
 assertion is what fails if either rule is broken, and it is the whole soundness
