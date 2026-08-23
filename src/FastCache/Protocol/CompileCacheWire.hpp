@@ -205,6 +205,16 @@ enum class ErrorCode : std::uint8_t
     /// means the program named by the worker's own --toolchain could not be
     /// executed at all.
     WorkerSpawnFailed = 0x11,
+    /// This node is not the cluster's leader. The message carries the leader's
+    /// endpoint when one is known, so a client can redirect rather than give up --
+    /// and is empty during an election, which is a *different* fact and one the
+    /// client answers the same way it answers every refusal here: compile locally.
+    NotLeader = 0x12,
+    /// The caller is not a member of this cluster, so it may not spend the fleet's
+    /// capacity. Distinct from `Unauthenticated`, which is about a credential this
+    /// endpoint requires; this is about contribution, and a non-member is still
+    /// served the cache.
+    NotAMember = 0x13,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -386,6 +396,10 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::WorkerSpawnFailed,
                       .name = "worker-spawn-failed",
                       .defaultMessage = "the worker could not start the compiler" },
+    ErrorDescriptor {
+        .code = ErrorCode::NotLeader, .name = "not-leader", .defaultMessage = "this node does not lead the cluster" },
+    ErrorDescriptor {
+        .code = ErrorCode::NotAMember, .name = "not-a-member", .defaultMessage = "not a member of this cluster" },
 };
 
 /// Look up the descriptor for a raw opcode byte.
