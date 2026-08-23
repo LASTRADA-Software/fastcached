@@ -38,6 +38,8 @@ target_sources(FastCache
         Consensus/RaftPeerTransport.cpp
         Core/Crc32c.cpp
         Core/Sha256.cpp
+        Cluster/ClusterState.cpp
+        Cluster/ClusterStateMachine.cpp
         Cluster/DiscoveryService.cpp
         Cluster/PeerDirectory.cpp
         Net/InMemoryDatagram.cpp
