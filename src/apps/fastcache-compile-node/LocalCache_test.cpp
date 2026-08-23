@@ -12,8 +12,11 @@
 #include <string>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -61,10 +64,13 @@ class ScriptedUpstream final: public ICacheUpstream
 /// A node with a small local tier over a scripted shared cache.
 struct Fixture
 {
-    ManualClock clock;
-    AtomicMetricsSink metrics;
+    // Field order is the analyzer's, not the reading order: `local` and `cache` are
+    // large and alignment-sensitive, and putting the small members first left 64
+    // bytes of padding in a struct every test instantiates.
     InMemoryLruStorage local { 64 * 1024 };
+    ManualClock clock;
     ScriptedUpstream upstream;
+    AtomicMetricsSink metrics;
     LocalCache cache { local, upstream, clock, metrics };
 
     [[nodiscard]] std::uint64_t Count(IMetricsSink::Counter counter) const
@@ -90,7 +96,7 @@ TEST_CASE("A local hit never touches the network", "[node][cache]")
 
     auto const hit = fix.cache.Fetch("k1");
     REQUIRE(hit.has_value());
-    CHECK(*hit == Bytes("object-one"));
+    CHECK(Unwrap(hit) == Bytes("object-one"));
 
     // Not "few" calls -- zero. That is the property.
     CHECK(fix.upstream.fetches == 0);
@@ -107,14 +113,14 @@ TEST_CASE("A local miss reads through and fills the local tier", "[node][cache]"
 
     auto const first = fix.cache.Fetch("k2");
     REQUIRE(first.has_value());
-    CHECK(*first == Bytes("object-two"));
+    CHECK(Unwrap(first) == Bytes("object-two"));
     CHECK(fix.upstream.fetches == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamHits) == 1);
 
     // The second lookup is local, which is the whole point of having filled it.
     auto const second = fix.cache.Fetch("k2");
     REQUIRE(second.has_value());
-    CHECK(*second == Bytes("object-two"));
+    CHECK(Unwrap(second) == Bytes("object-two"));
     CHECK(fix.upstream.fetches == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheHits) == 1);
 }
@@ -165,7 +171,7 @@ TEST_CASE("A store survives a shared cache that will not take it", "[node][cache
     // And it is still served locally, which is what "costs this machine nothing" means.
     auto const hit = fix.cache.Fetch("k5");
     REQUIRE(hit.has_value());
-    CHECK(*hit == Bytes("object-five"));
+    CHECK(Unwrap(hit) == Bytes("object-five"));
 }
 
 TEST_CASE("A node with no shared cache still caches locally", "[node][cache]")
@@ -183,7 +189,7 @@ TEST_CASE("A node with no shared cache still caches locally", "[node][cache]")
     CHECK(cache.Store("k6", Bytes("object-six")));
     auto const hit = cache.Fetch("k6");
     REQUIRE(hit.has_value());
-    CHECK(*hit == Bytes("object-six"));
+    CHECK(Unwrap(hit) == Bytes("object-six"));
 
     // A key nobody stored is simply a miss -- not an error, and not a hang.
     CHECK_FALSE(cache.Fetch("never-stored").has_value());

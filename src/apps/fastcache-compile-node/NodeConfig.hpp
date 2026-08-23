@@ -64,6 +64,30 @@ struct NodeConfig
     /// produces and what an operator has written down.
     std::vector<std::string> fleetMembers;
 
+    /// Where this node keeps its own cache tier, or empty for memory only.
+    ///
+    /// The tier exists so a local rebuild on a slow or bad network does not reach
+    /// the wire at all. Memory-only is a legitimate configuration and is the
+    /// default: a disk tier is a resource an operator should have to name, and an
+    /// in-memory one already removes the round trip for a working set that fits.
+    std::filesystem::path cacheDir;
+
+    /// Bytes the in-memory half of the tier may hold. 0 means "no local cache".
+    std::uint64_t cacheMemoryBytes { 0 };
+
+    /// Where this node serves cache verbs to its local clients, or empty for off.
+    ///
+    /// A bare port binds LOOPBACK, unlike `--listen-scheduler`'s wildcard: this is
+    /// the surface `fastcache-cc` on this machine talks to, and a node's private
+    /// cache reachable from the network is a decision rather than a default.
+    std::string cacheListen;
+
+    /// The shared `fastcached` this node reads through to, or empty for none.
+    ///
+    /// Empty is honest rather than broken -- one developer's machine has no shared
+    /// cache, and `NoUpstream` is what that configuration gets.
+    std::string upstream;
+
     std::string token;
     std::string user;
     LogLevel logLevel { LogLevel::Info };

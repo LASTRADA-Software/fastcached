@@ -10,13 +10,16 @@
 /// rather than an accident of layering.
 ///
 #include "AdminEndpoint.hpp"
+#include "CacheTier.hpp"
 #include "NodeConfig.hpp"
-#include "SchedulerEndpoint.hpp"
+#include "SchedulerTier.hpp"
 #include "WorkerServer.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
+#include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -439,33 +442,17 @@ constexpr int ExitOk = 0;
     // The three objects have to outlive the endpoint, which holds references into
     // them, so they are declared here rather than inside the `if` -- and in
     // construction order, since each takes the one before it.
+    // The two framed surfaces this node may serve besides its worker port, each
+    // owned as one object. Both are off unless asked for: handing out other machines'
+    // CPU time, and caching to this machine's disk, are decisions an operator makes
+    // rather than things they get by starting a worker.
     SteadyClock schedulerClock;
-    Distributed::SchedulerService scheduler { schedulerClock, metrics };
-    Distributed::SchedulerProtocol schedulerProtocol { scheduler };
-    Distributed::OpenMembership openMembership;
-    Distributed::ClusterMembership listedMembership { cfg.fleetMembers };
-    std::unique_ptr<Node::SchedulerEndpoint> schedulerEndpoint;
+    SteadyClock cacheClock;
+
+    std::unique_ptr<Node::SchedulerTier> schedulerTier;
     if (!cfg.schedulerListen.empty())
     {
-        // Which oracle is the operator's stated choice, never a fallback:
-        // `SchedulerPolicyRejection` has already refused the case where neither was
-        // given, so there is no branch here that guesses.
-        Distributed::IMembershipOracle const& membership =
-            cfg.fleetOpen ? static_cast<Distributed::IMembershipOracle const&>(openMembership) : listedMembership;
-
-        // Static leadership, and it is a placeholder said out loud rather than a
-        // silent one. Consensus is what will publish this -- `SetRole` exists for
-        // exactly that -- but until the node runs a `RaftDriver`, a scheduler that
-        // never became leader would refuse every verb with `NotLeader` and be
-        // indistinguishable from a permanent election. That is strictly worse than
-        // what `--listen-dispatch` did, and shipping it would break the rule that a
-        // replacement is never a regression on what it replaces.
-        scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
-
-        // A bare port binds the WILDCARD here, unlike the admin endpoint's loopback:
-        // a scheduler no peer can dial is a scheduler that does nothing, so loopback
-        // would be a default that silently cannot work.
-        auto started = Node::SchedulerEndpoint::Start(cfg.schedulerListen, "0.0.0.0", schedulerProtocol, membership, logger);
+        auto started = Node::SchedulerTier::Start(cfg, schedulerClock, metrics, logger);
         if (!started.has_value())
         {
             // Fatal for the same reason the admin endpoint's is: an operator who asked
@@ -474,13 +461,25 @@ constexpr int ExitOk = 0;
             logger.Logf(LogLevel::Error, "--listen-scheduler {}; refusing to start", started.error());
             return ExitUsage;
         }
+        schedulerTier = std::move(*started);
+    }
 
-        schedulerEndpoint = std::move(*started);
-        logger.Logf(LogLevel::Info,
-                    "scheduling for the fleet on {} ({})",
-                    schedulerEndpoint->BoundEndpoint(),
-                    cfg.fleetOpen ? std::string { "every caller admitted" }
-                                  : std::format("{} member host(s)", listedMembership.Size()));
+    // The node's own cache tier, in front of the shared one. It exists so a local
+    // rebuild on a slow or bad network never reaches the wire: the shared cache holds
+    // every object, but what is saved here is the round trip rather than the compile.
+    //
+    // Five collaborators in a reference chain, owned as one object rather than as
+    // locals whose declaration ORDER is load-bearing and silently so.
+    std::unique_ptr<Node::CacheTier> cacheTier;
+    if (!cfg.cacheListen.empty())
+    {
+        auto started = Node::CacheTier::Start(cfg, cacheClock, metrics, logger);
+        if (!started.has_value())
+        {
+            logger.Logf(LogLevel::Error, "--listen-cache {}; refusing to start", started.error());
+            return ExitUsage;
+        }
+        cacheTier = std::move(*started);
     }
 
     Cc::Credential const credential { .username = {}, .secret = cfg.token };

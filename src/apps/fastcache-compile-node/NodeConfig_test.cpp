@@ -71,6 +71,10 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.schedulerListen = "0.0.0.0:6678";
     cfg.fleetMembers = { "10.0.0.1:6676", "10.0.0.2:6676" };
     cfg.fleetOpen = true;
+    cfg.cacheMemoryBytes = 256 * 1024 * 1024;
+    cfg.cacheDir = "cache";
+    cfg.cacheListen = "127.0.0.1:6679";
+    cfg.upstream = "cache.internal:6674";
     cfg.logLevel = LogLevel::Debug;
     cfg.pidfile = "worker.pid";
 
@@ -222,6 +226,10 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig cfg;
         cfg.schedulerListen = "0.0.0.0:6678";
         cfg.fleetOpen = true;
+        cfg.cacheMemoryBytes = 256 * 1024 * 1024;
+        cfg.cacheDir = "cache";
+        cfg.cacheListen = "127.0.0.1:6679";
+        cfg.upstream = "cache.internal:6674";
         cfg.fleetMembers = { "10.0.0.1:6676" };
 
         REQUIRE(SchedulerPolicyRejection(cfg).has_value());

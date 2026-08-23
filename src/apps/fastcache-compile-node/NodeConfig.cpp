@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeConfig.hpp"
 
+#include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
 #include <array>
@@ -71,6 +72,31 @@ namespace
             return std::unexpected(
                 ArgvError(ConfigErrorCode::OutOfRange, "slots", std::format("must be a positive count: {}", sv)));
         return value;
+    }
+
+    /// A byte count for the local cache tier, accepting the k/m/g suffixes the
+    /// daemon's own size flags do.
+    ///
+    /// Reuses `ParseByteSize` rather than a second parser: an operator who has
+    /// written `--storage-max-value=64m` for the daemon must not discover that this
+    /// flag spells sizes differently, and two grammars for one concept is the
+    /// table-shaped defect this codebase keeps a list about.
+    /// @param sv Text to parse.
+    /// @return The size in bytes, or why it is not one.
+    [[nodiscard]] std::expected<std::uint64_t, ConfigError> ParseCacheBytes(std::string_view sv)
+    {
+        auto const parsed = ParseByteSize(sv, "cache-memory");
+        if (!parsed.has_value())
+            return std::unexpected(parsed.error());
+        return static_cast<std::uint64_t>(*parsed);
+    }
+
+    /// A filesystem path, taken as written.
+    /// @param sv Text to parse.
+    /// @return The path.
+    [[nodiscard]] std::expected<std::filesystem::path, ConfigError> ParsePathValue(std::string_view sv)
+    {
+        return std::filesystem::path { sv };
     }
 
     /// A log level by name.
@@ -192,6 +218,37 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "that is already the boundary. Explicit because\n"
                          "'no policy' and 'admit everybody' must be the same\n"
                          "decision -- listing nobody refuses everybody." },
+        { .primary = "--cache-memory",
+          .arity = Arity::Value,
+          .operand = "=<bytes>",
+          .apply = AssignFrom<&NodeConfig::cacheMemoryBytes, ParseCacheBytes>(),
+          .description = "size of this node's own in-memory cache tier; 0 (the\n"
+                         "default) means no local cache. It exists so a local\n"
+                         "rebuild on a slow or bad network never reaches the\n"
+                         "wire at all." },
+        { .primary = "--cache-dir",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&NodeConfig::cacheDir, ParsePathValue>(),
+          .description = "back the local cache tier with disk at this path.\n"
+                         "Memory-only otherwise: a disk tier is a resource an\n"
+                         "operator should have to name." },
+        { .primary = "--listen-cache",
+          .arity = Arity::Value,
+          .operand = "=[<address>:]<port>",
+          .apply = AssignFrom<&NodeConfig::cacheListen, ParseText>(),
+          .description = "serve cache verbs to local clients here; off unless\n"
+                         "given. Point FASTCACHE_ADDR at it so misses read\n"
+                         "through and hits never leave the machine. A bare\n"
+                         "port binds LOOPBACK: a node's private cache\n"
+                         "reachable from the network is a decision." },
+        { .primary = "--upstream",
+          .arity = Arity::Value,
+          .operand = "=<host:port>",
+          .apply = AssignFrom<&NodeConfig::upstream, ParseText>(),
+          .description = "the shared fastcached this node reads through to.\n"
+                         "Empty is honest rather than broken: one developer's\n"
+                         "machine has no shared cache." },
         { .primary = "--requirepass",
           .arity = Arity::Value,
           .operand = "=<secret>",
@@ -289,6 +346,10 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitIfSet("slots", cfg.slots, defaults.slots);
     emitIfSet("admin-listen", cfg.adminListen, defaults.adminListen);
     emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
+    emitIfSet("cache-memory", cfg.cacheMemoryBytes, defaults.cacheMemoryBytes);
+    emitIfSet("listen-cache", cfg.cacheListen, defaults.cacheListen);
+    emitIfSet("upstream", cfg.upstream, defaults.upstream);
+    emitPathIfSet("cache-dir", cfg.cacheDir.string());
     if (cfg.fleetOpen)
         argv.emplace_back("--fleet-open");
     for (auto const& member: cfg.fleetMembers)
