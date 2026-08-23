@@ -44,26 +44,43 @@ namespace
         bool ok { false };
     };
 
-    /// Read bytes until the first CRLF (the end of the request line) or the
-    /// byte cap, then split it into method and target. Headers and body are
-    /// ignored — the admin routes are all parameterless GETs.
-    Task<RequestLine> ReadRequestLine(ISocket* socket)
+    /// Read the whole request head — up to the blank line that ends the headers,
+    /// or the byte cap — then split its first line into method and target.
+    ///
+    /// The admin routes are all parameterless GETs, so the headers are not *used*.
+    /// They are still **consumed**, and that is the point: this used to stop at the
+    /// first CRLF, and a request split across TCP segments then left `Host:` and
+    /// `Connection: close` unread in the receive queue. Closing a socket with unread
+    /// received data makes the kernel send **RST instead of FIN**, so the client sees
+    /// `Connection reset by peer` rather than a clean end of response — intermittently,
+    /// depending only on how the request happened to be segmented.
+    ///
+    /// That is not a fixture problem. Every consumer of this endpoint is a monitoring
+    /// probe, and an endpoint whose job is to report that a worker is healthy must not
+    /// be the thing that looks unhealthy. Consuming the request before answering it is
+    /// also simply what a correct HTTP server does.
+    ///
+    /// A client that never sends the blank line is bounded by the accepted socket's
+    /// receive timeout, which is what a request timeout is for. A head that exceeds
+    /// the cap is answered and then closed with whatever is left unread — that peer
+    /// is malformed or hostile, and a reset is a fine thing for it to see.
+    Task<RequestLine> ReadRequestHead(ISocket* socket)
     {
         std::string buffer;
-        bool sawCrlf = false;
-        while (!sawCrlf && buffer.size() < MaxRequestBytes)
+        bool sawHeadEnd = false;
+        while (!sawHeadEnd && buffer.size() < MaxRequestBytes)
         {
             std::array<std::byte, 1024> chunk {};
             auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
             if (!result.has_value() || *result == 0)
                 break;
-            // Only rescan from one byte before the freshly-appended region (a CR
-            // may have ended the previous chunk and the LF start this one), so the
-            // total scan stays linear rather than re-reading the whole buffer each
-            // iteration; append in one call rather than byte-by-byte.
-            auto const scanFrom = buffer.empty() ? 0 : buffer.size() - 1;
+            // Rescan from three bytes before the freshly-appended region: the
+            // terminator is four bytes and may straddle a chunk boundary in any of
+            // three ways. That keeps the total scan linear rather than re-reading
+            // the whole buffer each iteration; append in one call, not byte-by-byte.
+            auto const scanFrom = buffer.size() < 3 ? 0 : buffer.size() - 3;
             buffer.append(reinterpret_cast<char const*>(chunk.data()), *result);
-            sawCrlf = buffer.find("\r\n", scanFrom) != std::string::npos;
+            sawHeadEnd = buffer.find("\r\n\r\n", scanFrom) != std::string::npos;
         }
 
         auto const eol = buffer.find("\r\n");
@@ -97,7 +114,7 @@ namespace
 
 Task<void> ServeAdminHttp(ISocket* socket, IMetricsSink const* metrics, AdminHttpServer::SnapshotProvider snapshotProvider)
 {
-    auto const request = co_await ReadRequestLine(socket);
+    auto const request = co_await ReadRequestHead(socket);
     if (!request.ok)
     {
         (void) co_await WriteResponse(socket, "400 Bad Request", "text/plain", "bad request\n");
