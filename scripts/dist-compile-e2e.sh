@@ -136,6 +136,25 @@ free_port() {
     fail "could not find a free port"
 }
 
+# GET one path off a worker's admin endpoint and echo the whole response.
+#
+# `/dev/tcp` rather than curl, because a fixture that skips when curl is absent
+# tests nothing on the machine that lacks it, and this needs no more than one
+# request. Every read is bounded with `read -t`: the endpoint closes the
+# connection itself (`Connection: close`), so a healthy server ends the loop on
+# its own -- and a WEDGED one, which is exactly the state this probe exists to
+# detect, would otherwise hang the suite instead of failing it.
+# @param 1 port
+# @param 2 path
+http_get() {
+    local port="$1" path="$2" line="" body=""
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || return 1
+    printf 'GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' "$path" >&3
+    while IFS= read -r -t 5 line <&3; do body+="${line}"$'\n'; done
+    exec 3<&-
+    printf '%s' "$body"
+}
+
 # Block until something answers on a port, or the process behind it dies.
 #
 # Waiting on the listener rather than sleeping a fixed amount: a cold CI runner
@@ -260,8 +279,10 @@ export FASTCACHE_ADDR="127.0.0.1:${cache_port}"
 
 # --- start a worker ----------------------------------------------------------
 worker_port="$(free_port)"
+worker_admin_port="$(free_port)"
 "$node" --scheduler="127.0.0.1:${dispatch_port}" \
     --bind=127.0.0.1 --port="$worker_port" --advertise="127.0.0.1:${worker_port}" \
+    --admin-listen="$worker_admin_port" \
     --toolchain="${compiler}" --slots=2 --log-level=debug \
     > "${workdir}/worker.log" 2>&1 &
 worker_pid=$!
@@ -301,6 +322,33 @@ for _ in $(seq 1 100); do
     sleep 0.2
 done
 [[ -n "$registered" ]] || { cat "${workdir}/worker.log" >&2; fail "worker never registered with the scheduler"; }
+
+# --- the worker's own admin endpoint -----------------------------------------
+#
+# Asserted in a real process rather than only in a unit test, because what the
+# unit tests cannot reach is whether the endpoint is actually SERVED by a worker
+# that is simultaneously doing its job -- it runs on its own thread beside the
+# accept loop, and "it constructs" and "it answers while the worker is busy" are
+# different claims.
+wait_for_port "$worker_admin_port" "$worker_pid" "worker admin endpoint" "${workdir}/worker.log"
+
+health="$(http_get "$worker_admin_port" /healthz)" \
+    || fail "worker admin endpoint refused a connection on ${worker_admin_port}"
+[[ "$health" == *"200 OK"* ]] \
+    || { printf '%s\n' "$health" >&2; fail "worker /healthz did not answer 200"; }
+
+# A worker has no cache, so the cache series must be ABSENT rather than present
+# and zero -- `fastcached_items 0` states an empty unbounded cache as a fact, and
+# a dashboard reads it as one. This is the assertion that would fail if
+# `MetricsSnapshot::storage` stopped being optional.
+before="$(http_get "$worker_admin_port" /metrics)"     || fail "worker admin endpoint refused a /metrics request"
+[[ "$before" == *"fastcache_worker_jobs_completed_total"* ]] \
+    || { printf '%s\n' "$before" >&2; fail "worker /metrics carries no worker counters"; }
+[[ "$before" == *"fastcache_node_logical_cores"* ]] \
+    || { printf '%s\n' "$before" >&2; fail "worker /metrics does not report the machine's size"; }
+[[ "$before" != *"fastcached_items"* ]] \
+    || { printf '%s\n' "$before" >&2; fail "worker /metrics reports cache series for a process with no cache"; }
+echo "== worker serves /healthz and /metrics"
 
 # --- the project layout every case compiles in -------------------------------
 proj="${workdir}/proj"
@@ -365,6 +413,22 @@ grep -q "DISPATCHED to " "${workdir}/case2.log" \
 cmp -s "${proj}/build/reference.o" "${proj}/build/one.o" \
     || fail "the cached object differs from the locally compiled one"
 echo "   served from the cache on the second compile"
+
+# The counters moved, which is the half no unit test can reach. A counter that is
+# incremented in a unit test and by nothing on the real path is the defect the
+# catalog exists to prevent, one layer up: it exports a permanent zero, which
+# reads as "distribution is not happening" rather than as "nobody wired this".
+after="$(http_get "$worker_admin_port" /metrics)"     || fail "worker admin endpoint stopped answering after serving a compile"
+completed="$(sed -n 's/^fastcache_worker_jobs_completed_total \([0-9][0-9]*\)$/\1/p' <<< "$after" | tail -1)"
+[[ -n "$completed" && "$completed" -ge 1 ]] \
+    || { printf '%s\n' "$after" >&2; fail "worker completed a compile but its jobs counter did not move"; }
+millis="$(sed -n 's/^fastcache_worker_compile_milliseconds_total \([0-9][0-9]*\)$/\1/p' <<< "$after" | tail -1)"
+[[ -n "$millis" ]] \
+    || { printf '%s\n' "$after" >&2; fail "worker reports no compile wall time"; }
+bytes="$(sed -n 's/^fastcache_worker_bytes_received_total \([0-9][0-9]*\)$/\1/p' <<< "$after" | tail -1)"
+[[ -n "$bytes" && "$bytes" -ge 1 ]] \
+    || { printf '%s\n' "$after" >&2; fail "worker received a job but its byte counter did not move"; }
+echo "   worker metrics moved: ${completed} job(s), ${millis}ms, ${bytes} bytes in"
 
 # --- 3: a worker for a different toolchain is never chosen -------------------
 echo "== case 3: fingerprint isolation"

@@ -30,7 +30,8 @@ TEST_CASE("RenderPrometheus emits HELP/TYPE/value triples", "[metrics][prometheu
     stats.evictions = 3;
     stats.writeErrors = 9;
 
-    auto const body = RenderPrometheus(metrics, MetricsSnapshot { .storage = stats, .uptime = Uptime { 42s } });
+    auto const body =
+        RenderPrometheus(metrics, MetricsSnapshot { .storage = stats, .host = std::nullopt, .uptime = Uptime { 42s } });
 
     SECTION("counter from the storage snapshot")
     {
@@ -68,7 +69,7 @@ TEST_CASE("RenderPrometheus emits HELP/TYPE/value triples", "[metrics][prometheu
 TEST_CASE("Every counter the sink knows reaches the scrape", "[metrics][prometheus]")
 {
     // The case that would have caught the defect this table exists to prevent.
-    // Seven of the eleven live counters were absent from the renderer — both TLS
+    // Seven of the nine live counters were absent from the renderer — both TLS
     // splits and all five `dispatch_*`, the last of which
     // docs/getting-started/distributed-compilation.md names one by one as what to
     // read off /metrics when distribution misbehaves. Every one of those series
@@ -84,7 +85,8 @@ TEST_CASE("Every counter the sink knows reaches the scrape", "[metrics][promethe
     for (auto const& row: CounterTable)
         metrics.Increment(row.counter, static_cast<std::uint64_t>(row.counter) + 1);
 
-    auto const body = RenderPrometheus(metrics, MetricsSnapshot { .storage = StorageStats {}, .uptime = Uptime { 0s } });
+    auto const body = RenderPrometheus(
+        metrics, MetricsSnapshot { .storage = StorageStats {}, .host = std::nullopt, .uptime = Uptime { 0s } });
 
     for (auto const& row: CounterTable)
     {
@@ -122,7 +124,8 @@ TEST_CASE("A process with no cache renders no cache metrics", "[metrics][prometh
     AtomicMetricsSink metrics;
     metrics.Increment(IMetricsSink::Counter::WorkerJobsCompleted, 3);
 
-    auto const body = RenderPrometheus(metrics, MetricsSnapshot { .storage = std::nullopt, .uptime = Uptime { 9s } });
+    auto const body = RenderPrometheus(
+        metrics, MetricsSnapshot { .storage = std::nullopt, .host = std::nullopt, .uptime = Uptime { 9s } });
 
     CHECK_FALSE(body.contains("fastcached_items"));
     CHECK_FALSE(body.contains("fastcached_bytes_limit"));
@@ -145,10 +148,10 @@ TEST_CASE("A compile node reports its size, and a cache daemon does not", "[metr
     auto const withHost = RenderPrometheus(metrics,
                                            MetricsSnapshot { .storage = std::nullopt,
                                                              .host = HostCapacity { .logicalCores = 16,
+                                                                                    .configuredSlots = 14,
                                                                                     .totalMemoryBytes = 68719476736ULL,
                                                                                     .diskCapacityBytes = 500107862016ULL,
                                                                                     .diskFreeBytes = 123456789ULL,
-                                                                                    .configuredSlots = 14,
                                                                                     .busySlots = 3 },
                                                              .uptime = Uptime { 1s } });
 
@@ -162,8 +165,8 @@ TEST_CASE("A compile node reports its size, and a cache daemon does not", "[metr
     // The daemon leaves it absent rather than reporting cores it does not schedule
     // against. Absent means the series is missing, not present and zero -- a zero
     // would read as a machine with no cores.
-    auto const withoutHost =
-        RenderPrometheus(metrics, MetricsSnapshot { .storage = StorageStats {}, .uptime = Uptime { 1s } });
+    auto const withoutHost = RenderPrometheus(
+        metrics, MetricsSnapshot { .storage = StorageStats {}, .host = std::nullopt, .uptime = Uptime { 1s } });
     CHECK_FALSE(withoutHost.contains("fastcache_node_logical_cores"));
     CHECK_FALSE(withoutHost.contains("fastcache_node_slots_busy"));
 }

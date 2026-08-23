@@ -9,6 +9,7 @@
 #include <FastCache/Net/ISocket.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <functional>
 
@@ -29,6 +30,21 @@ namespace FastCache
 class AdminHttpServer
 {
   public:
+    /// How long an `accept()` may park before the loop looks at its stop flag.
+    ///
+    /// POSIX does not unblock a parked `accept()` when another thread closes the
+    /// listening socket, so this poll is the only portable way `Shutdown()` is ever
+    /// observed -- the mechanism whose *absence* this repository already records as
+    /// a `systemctl stop` that hung until the supervisor escalated to SIGKILL.
+    static constexpr auto AcceptPoll = std::chrono::milliseconds { 500 };
+
+    /// How long one request read may take before the connection is dropped.
+    ///
+    /// The endpoint serves one connection at a time on its owning thread, so an
+    /// idle client that never finishes its request head would otherwise wedge it
+    /// for everybody (slowloris).
+    static constexpr auto RequestTimeout = std::chrono::milliseconds { 2000 };
+
     /// Provider for a fresh metrics snapshot (storage stats + uptime), so
     /// `/metrics` reflects live state on each scrape rather than a stale copy.
     /// Computing uptime here keeps the server itself clock-agnostic.

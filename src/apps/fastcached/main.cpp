@@ -743,10 +743,10 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
         }
         else
         {
-            // Poll accept() every 500ms so Shutdown() is observed on POSIX, and
-            // time out a stalled request read after 2s so one idle client cannot
-            // wedge the single-threaded admin endpoint (slowloris).
-            adminListener->SetTimeouts(std::chrono::milliseconds { 500 }, std::chrono::seconds { 2 });
+            // Both values belong to the endpoint rather than to this call site --
+            // the worker serves the same server and had grown its own copy of the
+            // pair, which is two places for one decision to drift.
+            adminListener->SetTimeouts(FastCache::AdminHttpServer::AcceptPoll, FastCache::AdminHttpServer::RequestTimeout);
 
             // Uptime reads `steadyClock`, not the cached one the engine uses.
             // The cached clock only advances when a reactor completes a loop
@@ -760,6 +760,12 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
                 [&engine, &steadyClock, adminStartedAt] {
                     return FastCache::MetricsSnapshot {
                         .storage = engine.Snapshot(),
+                        // Absent, and said out loud rather than left to the default:
+                        // this is a cache, not a compile node, and cores it does not
+                        // schedule against are noise on its scrape. Naming the field
+                        // is also what keeps a field added to the middle of the
+                        // struct from silently defaulting here.
+                        .host = std::nullopt,
                         .uptime = FastCache::Uptime { std::chrono::duration_cast<std::chrono::seconds>(steadyClock.Now()
                                                                                                        - adminStartedAt) },
                     };

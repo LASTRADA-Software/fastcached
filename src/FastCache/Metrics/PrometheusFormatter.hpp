@@ -30,11 +30,17 @@ struct Uptime
 /// of its own.
 struct HostCapacity
 {
-    std::size_t logicalCores { 0 };       ///< Schedulable hardware threads.
-    std::size_t totalMemoryBytes { 0 };   ///< Physical memory, or the container's ceiling.
-    std::uintmax_t diskCapacityBytes { 0 }; ///< Size of the filesystem the work happens on.
-    std::uintmax_t diskFreeBytes { 0 };     ///< What an unprivileged process may still write.
-    std::size_t configuredSlots { 0 };      ///< Concurrent compiles this node advertises.
+    std::size_t logicalCores { 0 };    ///< Schedulable hardware threads.
+    std::size_t configuredSlots { 0 }; ///< Concurrent compiles this node advertises.
+
+    // Every byte count is `uint64_t` and not `size_t`/`uintmax_t`, which is what the
+    // two sources happen to return. These are numbers this node will state to a
+    // scheduler on another machine, so their width has to be a property of the fact
+    // rather than of whoever measured it -- and a 32-bit host would otherwise report
+    // a machine with more than 4 GiB of memory as having rather less.
+    std::uint64_t totalMemoryBytes { 0 };  ///< Physical memory, or the container's ceiling.
+    std::uint64_t diskCapacityBytes { 0 }; ///< Size of the filesystem the work happens on.
+    std::uint64_t diskFreeBytes { 0 };     ///< What an unprivileged process may still write.
 
     /// Compiles running right now.
     ///
