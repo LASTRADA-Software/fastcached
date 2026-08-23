@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -48,7 +49,7 @@ std::string Exchange(std::string_view request, FastCache::IMetricsSink const& me
     pair.client->ShutdownWrite();
     using namespace std::chrono_literals;
     auto provider = [&stats] {
-        return FastCache::MetricsSnapshot { .storage = stats, .uptime = FastCache::Uptime { 7s } };
+        return FastCache::MetricsSnapshot { .storage = stats, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
     };
     FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider));
     pair.server->Close();

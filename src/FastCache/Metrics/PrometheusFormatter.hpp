@@ -5,6 +5,9 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <string>
 
 namespace FastCache
@@ -18,13 +21,64 @@ struct Uptime
     std::chrono::seconds value { 0 };
 };
 
+/// The size of the machine, as a scrape reports it.
+///
+/// A struct rather than four `IMetricsSink` counters, because none of these is a
+/// count of anything: they are gauges, and this interface is counter-only by
+/// design. Bundled with the storage snapshot for the same reason that one is —
+/// the renderer takes one value per scrape and the server needs no collaborators
+/// of its own.
+struct HostCapacity
+{
+    std::size_t logicalCores { 0 };    ///< Schedulable hardware threads.
+    std::size_t configuredSlots { 0 }; ///< Concurrent compiles this node advertises.
+
+    // Every byte count is `uint64_t` and not `size_t`/`uintmax_t`, which is what the
+    // two sources happen to return. These are numbers this node will state to a
+    // scheduler on another machine, so their width has to be a property of the fact
+    // rather than of whoever measured it -- and a 32-bit host would otherwise report
+    // a machine with more than 4 GiB of memory as having rather less.
+    std::uint64_t totalMemoryBytes { 0 };  ///< Physical memory, or the container's ceiling.
+    std::uint64_t diskCapacityBytes { 0 }; ///< Size of the filesystem the work happens on.
+    std::uint64_t diskFreeBytes { 0 };     ///< What an unprivileged process may still write.
+
+    /// Compiles running right now.
+    ///
+    /// A gauge, and the one number here that moves. Sampled at scrape time rather
+    /// than derived from `WorkerJobsStarted - WorkerJobsCompleted`, because those
+    /// two counters are incremented by different components and a scrape landing
+    /// between them would report a phantom job — the difference is right on
+    /// average and wrong at exactly the moment somebody is looking.
+    std::size_t busySlots { 0 };
+};
+
 /// Everything a `/metrics` scrape needs that varies per call: the storage
 /// snapshot plus the process uptime. Produced by the admin server's snapshot
 /// provider so the renderer takes a single bundle and the server itself needs
 /// no clock.
 struct MetricsSnapshot
 {
-    StorageStats storage {};
+    /// The cache's own statistics, absent in a process that has no cache.
+    ///
+    /// Optional rather than a default-constructed `StorageStats`, because a
+    /// worker has no storage and zeroes are not the truth about it: a scrape
+    /// reporting `fastcached_items 0` and `fastcached_bytes_limit 0` says the
+    /// cache is empty and unbounded, which an alert or a dashboard will read as
+    /// a fact rather than as an absence. `fastcache-compile-node` runs the same
+    /// `AdminHttpServer` and shares this renderer, so the alternative was a
+    /// second renderer that drifts from this one.
+    std::optional<StorageStats> storage;
+
+    /// What this machine is and how much room it has, absent when the process has
+    /// no reason to say.
+    ///
+    /// A worker's capacity is the thing a fleet operator most wants off a scrape —
+    /// "is this node pulling its weight" is unanswerable without knowing how big
+    /// it is — and it is what PR 8's resource-aware scheduling will weigh. The
+    /// daemon leaves it absent: it is not a compile node, and reporting cores it
+    /// does not schedule against would be noise.
+    std::optional<HostCapacity> host;
+
     Uptime uptime {};
 };
 

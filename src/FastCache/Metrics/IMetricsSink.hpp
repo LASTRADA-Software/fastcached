@@ -9,12 +9,26 @@
 namespace FastCache
 {
 
-/// Counter-style metrics sink. The cache engine, server, and protocol
-/// handlers increment counters via this interface. Snapshot() is read by
-/// the `stats` family of commands.
+/// Counter-style metrics sink for facts the *connection* layer knows.
 ///
-/// Designed thin on purpose: only counters today; histograms and gauges
-/// come later if/when needed. Implementations must be thread-safe.
+/// Designed thin on purpose: only counters today; histograms and gauges come
+/// later if/when needed. Implementations must be thread-safe.
+///
+/// ## What belongs here, and what does not
+///
+/// Command counts, hit/miss splits and evictions do **not**: those are
+/// `StorageStats`, produced by the storage that actually performs them, and that
+/// is what `stats`, `INFO` and `/metrics` all report. This enum used to carry a
+/// second set of enumerators for the same concepts — `CmdGet`, `CmdSet`,
+/// `CmdDelete`, `GetHits`, `GetMisses`, `Evictions`, `BytesIn`, `BytesOut` — and
+/// not one of them was incremented anywhere in the tree, so each exported a
+/// permanent zero under a name an operator would reasonably read as the real
+/// count. They are removed rather than wired up: a second source of truth for a
+/// number `StorageStats` already owns is the thing to avoid, not to complete.
+///
+/// Every remaining enumerator needs a row in `Metrics/MetricsCatalog.hpp`, which
+/// `static_assert`s that it has one — that is what makes a new counter reach
+/// `/metrics` by construction rather than by somebody remembering.
 class IMetricsSink
 {
   public:
@@ -27,13 +41,7 @@ class IMetricsSink
 
     enum class Counter : std::uint8_t
     {
-        CmdGet = 0,
-        CmdSet,
-        CmdDelete,
-        GetHits,
-        GetMisses,
-        Evictions,
-        ConnectionsTotal,
+        ConnectionsTotal = 0,
         ConnectionsAdmissionRejected,
         /// Subset of `ConnectionsTotal` that came in on a TLS-flagged
         /// bind. Lets operators attribute traffic to plaintext vs TLS
@@ -44,8 +52,6 @@ class IMetricsSink
         /// Subset of `ConnectionsAdmissionRejected` that came in on a
         /// TLS-flagged bind. Pairs with ConnectionsTotalTls.
         ConnectionsAdmissionRejectedTls,
-        BytesIn,
-        BytesOut,
         /// Lease requests the scheduler answered with a worker. The numerator of
         /// "is distribution actually happening", and meaningless without the
         /// refusals below it -- a fleet where every lease is granted and a fleet
@@ -72,6 +78,55 @@ class IMetricsSink
         /// watching -- a fleet that re-registers constantly is a fleet whose
         /// heartbeats are not arriving.
         DispatchWorkerRegistrations,
+
+        /// Compiles a worker began. With `WorkerJobsCompleted` this is also the
+        /// in-flight count — two monotone counters rather than a gauge, which this
+        /// interface deliberately does not have, and their difference is what
+        /// "slots in use" means. Slots *configured* is not here at all: it is
+        /// configuration rather than a measurement, and pushing it through a
+        /// counter would mean incrementing to its value at startup.
+        WorkerJobsStarted,
+        /// Compiles that finished, whatever the compiler concluded. A compiler
+        /// that ran and rejected the code did its job; that is the client's
+        /// answer, not a worker failure, and it is deliberately not a refusal.
+        WorkerJobsCompleted,
+        /// Total wall time spent compiling, in milliseconds.
+        ///
+        /// The `_sum` half of a duration, with `WorkerJobsCompleted` as `_count` —
+        /// which is exactly how a Prometheus histogram reports one, so
+        /// `rate(sum)/rate(count)` is the average compile time and this interface
+        /// stays counter-only. A gauge would answer a different and less useful
+        /// question: the duration of whichever compile happened to finish last.
+        WorkerCompileMillisTotal,
+
+        /// Jobs refused because no compiler here matches the client's fingerprint.
+        /// The worker's own half of `DispatchLeasesNoWorker`: rising here means
+        /// the fleet is misconfigured, and it is the commonest setup failure.
+        WorkerJobsRefusedUnknownFingerprint,
+        /// Jobs refused over an argument this worker will not pass to a compiler.
+        WorkerJobsRefusedRejectedArgument,
+        /// Jobs refused because the scratch directory could not be prepared.
+        /// An operational fault — a full or read-only disk — and nothing the
+        /// client or the fleet's configuration can fix.
+        WorkerJobsRefusedScratchUnavailable,
+        /// Jobs refused because the compiler could not be spawned at all.
+        /// Distinct from a compiler that ran and failed: this one says the
+        /// toolchain this worker advertises is not actually usable here.
+        WorkerJobsRefusedSpawnFailed,
+        /// Jobs refused because every slot was busy.
+        ///
+        /// Not a fault and deliberately its own counter: it is the worker's half
+        /// of `DispatchLeasesNoCapacity`, and summing it with the four above would
+        /// hide a misconfigured toolchain behind a busy machine — the same reason
+        /// the scheduler splits no-worker from no-capacity.
+        WorkerJobsRefusedNoSlot,
+
+        /// Bytes of request payload read from clients, and of reply written back.
+        /// The pair is what says whether a codec negotiation is doing anything:
+        /// preprocessed text in against object bytes out.
+        WorkerBytesReceived,
+        WorkerBytesReturned,
+
         Last,
     };
 
@@ -105,53 +160,5 @@ class AtomicMetricsSink final: public IMetricsSink
   private:
     std::atomic<std::uint64_t> _counters[static_cast<std::size_t>(Counter::Last)] {};
 };
-
-/// Convert a counter to its canonical stats-line name (used by memcached
-/// `stats` and Redis `INFO`).
-/// @param counter Counter id.
-/// @return Lowercase canonical name (never empty).
-[[nodiscard]] constexpr std::string_view ToStringView(IMetricsSink::Counter counter) noexcept
-{
-    switch (counter)
-    {
-        case IMetricsSink::Counter::CmdGet:
-            return "cmd_get";
-        case IMetricsSink::Counter::CmdSet:
-            return "cmd_set";
-        case IMetricsSink::Counter::CmdDelete:
-            return "cmd_delete";
-        case IMetricsSink::Counter::GetHits:
-            return "get_hits";
-        case IMetricsSink::Counter::GetMisses:
-            return "get_misses";
-        case IMetricsSink::Counter::Evictions:
-            return "evictions";
-        case IMetricsSink::Counter::ConnectionsTotal:
-            return "connections_total";
-        case IMetricsSink::Counter::ConnectionsAdmissionRejected:
-            return "connections_rejected";
-        case IMetricsSink::Counter::ConnectionsTotalTls:
-            return "connections_total_tls";
-        case IMetricsSink::Counter::ConnectionsAdmissionRejectedTls:
-            return "connections_rejected_tls";
-        case IMetricsSink::Counter::BytesIn:
-            return "bytes_in";
-        case IMetricsSink::Counter::BytesOut:
-            return "bytes_out";
-        case IMetricsSink::Counter::DispatchLeasesGranted:
-            return "dispatch_leases_granted";
-        case IMetricsSink::Counter::DispatchLeasesNoWorker:
-            return "dispatch_leases_no_worker";
-        case IMetricsSink::Counter::DispatchLeasesNoCapacity:
-            return "dispatch_leases_no_capacity";
-        case IMetricsSink::Counter::DispatchLeasesDuplicate:
-            return "dispatch_leases_duplicate";
-        case IMetricsSink::Counter::DispatchWorkerRegistrations:
-            return "dispatch_worker_registrations";
-        case IMetricsSink::Counter::Last:
-            return "<last>";
-    }
-    return "<unknown>";
-}
 
 } // namespace FastCache

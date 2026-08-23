@@ -211,14 +211,39 @@ On the scheduler, the `/metrics` endpoint counts the outcomes:
 
 | Counter | Rising means |
 |---------|--------------|
-| `dispatch_leases_granted` | Work is being distributed. |
-| `dispatch_leases_no_worker` | The fleet is **misconfigured** — workers are up but nobody matches. |
-| `dispatch_leases_no_capacity` | The fleet is **too small**. |
-| `dispatch_leases_duplicate` | Duplicate-work suppression is doing its job. Not a problem. |
-| `dispatch_worker_registrations` | Workers registering. A steady rise means heartbeats are not arriving. |
+| `fastcached_dispatch_leases_granted_total` | Work is being distributed. |
+| `fastcached_dispatch_leases_no_worker_total` | The fleet is **misconfigured** — workers are up but nobody matches. |
+| `fastcached_dispatch_leases_no_capacity_total` | The fleet is **too small**. |
+| `fastcached_dispatch_leases_duplicate_total` | Duplicate-work suppression is doing its job. Not a problem. |
+| `fastcached_dispatch_worker_registrations_total` | Workers registering. A steady rise means heartbeats are not arriving. |
 
 The first two are different operator problems and are deliberately counted
 apart: summing them hides a misconfiguration behind a busy fleet.
+
+On each **worker**, start it with `--admin-listen` and the same endpoint reports
+what that machine is doing:
+
+| Counter | Rising means |
+|---------|--------------|
+| `fastcache_worker_jobs_started_total` | Jobs accepted. |
+| `fastcache_worker_jobs_completed_total` | Jobs that ran to an exit code — including a **non-zero** one, which is the client's answer rather than a worker failure. |
+| `fastcache_worker_compile_milliseconds_total` | Compile wall time. Divide by `..._jobs_completed_total` for the mean; both are counters, so a rate over a window gives you the current one. |
+| `fastcache_worker_jobs_refused_no_slot_total` | This worker is **full**. Pair it with the scheduler's `..._no_capacity_total`. |
+| `fastcache_worker_jobs_refused_unknown_fingerprint_total` | Somebody is dispatching a toolchain this worker does not have. |
+| `fastcache_worker_jobs_refused_rejected_argument_total` | A command line carrying something that could name a file. |
+| `fastcache_worker_jobs_refused_scratch_unavailable_total` | The scratch disk is full or unwritable. |
+| `fastcache_worker_jobs_refused_spawn_failed_total` | The toolchain is configured but cannot be executed. |
+| `fastcache_worker_bytes_received_total` / `..._returned_total` | Link volume, counted at the socket. |
+
+The refusals are split by reason for the same reason the scheduler's two are:
+a full worker and a misconfigured one are different problems with different
+fixes, and one number covering both tells you neither.
+
+The worker also reports what the machine **is** — `fastcache_node_logical_cores`,
+`fastcache_node_memory_total_bytes`, `fastcache_node_disk_capacity_bytes`,
+`fastcache_node_disk_free_bytes`, `fastcache_node_slots_configured` and
+`fastcache_node_slots_busy`. Those are gauges: "is this node pulling its weight"
+is not answerable without knowing how big it is.
 
 ### "No worker matches this toolchain"
 

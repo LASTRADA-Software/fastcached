@@ -32,10 +32,12 @@ namespace
     }
 } // namespace
 
-WorkerServer::WorkerServer(IListener& listener, Cc::WorkerProtocol& protocol, std::size_t slots, ILogger& logger) noexcept:
+WorkerServer::WorkerServer(
+    IListener& listener, Cc::WorkerProtocol& protocol, std::size_t slots, IMetricsSink& metrics, ILogger& logger) noexcept:
     _listener { listener },
     _protocol { protocol },
     _slots { slots },
+    _metrics { metrics },
     _logger { logger }
 {
 }
@@ -78,6 +80,7 @@ Task<void> WorkerServer::Run()
         if (before >= _slots)
         {
             _inFlight.fetch_sub(1, std::memory_order_acq_rel);
+            _metrics.Increment(IMetricsSink::Counter::WorkerJobsRefusedNoSlot);
             (void) co_await WriteAll(socket.get(), Wire::EncodeErrorReply(Wire::ErrorCode::NoCapacity, {}));
             socket->Close();
             continue;
@@ -100,8 +103,18 @@ Task<void> WorkerServer::Run()
                 {
                     std::vector<std::byte> frame { header->begin(), header->end() };
                     frame.insert(frame.end(), payload->begin(), payload->end());
+
+                    // Counted at the socket, which is what "bytes received" means
+                    // to an operator sizing a link: the payload as it arrived, not
+                    // what it decompressed to.
+                    _metrics.Increment(IMetricsSink::Counter::WorkerBytesReceived, static_cast<std::uint64_t>(frame.size()));
+
                     if (auto const reply = _protocol.Answer(frame); reply.has_value())
+                    {
+                        _metrics.Increment(IMetricsSink::Counter::WorkerBytesReturned,
+                                           static_cast<std::uint64_t>(reply->size()));
                         (void) co_await WriteAll(socket.get(), *reply);
+                    }
                     // No reply means a foreign magic: the peer is not speaking this
                     // protocol, and there is no framing in which an answer would be
                     // meaningful. Closing is the only thing left.

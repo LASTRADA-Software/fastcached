@@ -99,6 +99,18 @@ class CompileJobRunner
     /// @return Every configured fingerprint, sorted.
     [[nodiscard]] std::vector<std::string> Fingerprints() const;
 
+    /// Where scratch files are written.
+    ///
+    /// Exposed so a caller can report the space on *that* filesystem rather than
+    /// on whichever one happens to hold the working directory — a worker's scratch
+    /// directory is routinely a different mount, and a disk metric for the wrong
+    /// one is worse than none.
+    /// @return The scratch root.
+    [[nodiscard]] std::filesystem::path const& ScratchRoot() const noexcept
+    {
+        return _scratchRoot;
+    }
+
   private:
     IProcessRunner& _runner;
     std::filesystem::path _scratchRoot;

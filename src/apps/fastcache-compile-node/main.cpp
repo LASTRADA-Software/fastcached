@@ -9,16 +9,23 @@
 /// the client, which stores it — see `Cc::Dispatch` for why that is the trust model
 /// rather than an accident of layering.
 ///
+#include "AdminEndpoint.hpp"
 #include "WorkerServer.hpp"
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Net/InheritedListener.hpp>
+#include <FastCache/Platform/CpuAffinity.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/HostInfo.hpp>
+#include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -61,6 +68,16 @@ struct NodeConfig
     /// a job ends up running against something nobody chose.
     std::vector<std::string> toolchains;
     std::uint32_t slots { 0 }; ///< 0 means "one per hardware thread".
+
+    /// Where the admin endpoint listens, or empty to leave it off.
+    ///
+    /// One string rather than the daemon's address/port/enabled triple, because a
+    /// worker has one reason to want this and an empty value is already the "off"
+    /// it would otherwise need a flag for. Defaults to off, and to loopback when a
+    /// bare port is given: a scrape endpoint reachable from the network is the
+    /// operator's decision, not this program's.
+    std::string adminListen;
+
     std::string token;
     std::string user;
     LogLevel logLevel { LogLevel::Info };
@@ -325,6 +342,15 @@ struct ToolchainEntry
                          "Advertised to the scheduler AND enforced here: a worker\n"
                          "that accepted more would be fuller and slower than the\n"
                          "scheduler believes, at the same moment." },
+        { .primary = "--admin-listen",
+          .arity = Arity::Value,
+          .operand = "=[<address>:]<port>",
+          .apply = AssignFrom<&NodeConfig::adminListen, ParseText>(),
+          .description = "serve /metrics and /healthz here; off unless given.\n"
+                         "A bare port binds loopback: a scrape endpoint on a\n"
+                         "public interface is an operator's decision, not a\n"
+                         "default. /healthz is also the liveness probe this\n"
+                         "worker otherwise has none of." },
         { .primary = "--requirepass",
           .arity = Arity::Value,
           .operand = "=<secret>",
@@ -366,6 +392,69 @@ struct ToolchainEntry
     return RenderUsage({ .sections = sections }, color);
 }
 
+/// Adopt a socket-activated listener, when a supervisor handed one over.
+///
+/// Separated from `main` so the whole handoff -- how many descriptors arrived,
+/// and whether the configuration can still describe this worker afterwards -- is
+/// one decision with one answer, rather than three checks interleaved with
+/// everything else a startup does.
+/// @param cfg What the operator asked for.
+/// @param logger Where the adoption is announced.
+/// @return The adopted listener, null when nothing was handed over, or why the
+///         handoff cannot be served.
+[[nodiscard]] std::expected<std::unique_ptr<IListener>, std::string> AdoptActivatedListener(NodeConfig const& cfg,
+                                                                                            ILogger& logger)
+{
+    // When a supervisor already bound the port and handed the descriptor over,
+    // binding it again would fail with "address already in use" -- against
+    // ourselves. Falling through to Bind() when nothing was handed over is what
+    // lets one binary serve both a `.socket` unit and a plain `--port`, with no
+    // flag distinguishing them: the environment says which, and it says so
+    // unambiguously.
+    auto inherited = AdoptInheritedListeners(AcceptPollInterval, RequestIoTimeout);
+    if (inherited.empty())
+        return std::unique_ptr<IListener> {};
+
+    // Only the first would be used. This worker answers one protocol on one port,
+    // so a unit listing several sockets is a misconfiguration -- reported rather
+    // than half-honoured, since silently ignoring the rest would leave an operator
+    // with a port that accepts nothing and no clue why.
+    if (inherited.size() > 1)
+        return std::unexpected { std::format("socket activation handed over {} listeners; this worker serves exactly one",
+                                             inherited.size()) };
+
+    // Socket activation makes --advertise mandatory, because the fallback becomes
+    // a guess the process cannot make. `--bind` and `--port` were not used -- the
+    // socket unit chose the port and this process is never told which -- so the
+    // default would register `0.0.0.0:6676` from config values that describe
+    // nothing, and 0.0.0.0 is not an address a remote client can dial anyway.
+    //
+    // The consequence of guessing is the worst-shaped failure this system has: the
+    // registration SUCCEEDS, the worker heartbeats happily, the scheduler leases
+    // that endpoint to clients, and every one of them fails to connect and
+    // compiles locally. Nothing reports an error, and the fleet looks healthy from
+    // both ends. Refusing at startup, where it can be explained, is the whole
+    // difference.
+    if (cfg.advertise.empty())
+        return std::unexpected { std::string {
+            "--advertise is required under socket activation: the socket unit owns the port, so this worker "
+            "cannot know what address clients should use" } };
+
+    logger.Logf(LogLevel::Info, "adopted a socket-activated listener; --bind and --port are not used");
+    return std::move(inherited.front());
+}
+
+/// What `main` returns when the operator's configuration is wrong.
+///
+/// Every refusal in this program is that same fact -- a flag missing, a flag that
+/// cannot be honoured, an endpoint that will not bind -- so it is one name rather
+/// than a `2` spelled seven times, and distinct from the `1` a supervisor reads as
+/// "it ran and then died".
+constexpr int ExitUsage = 2;
+
+/// What `main` returns when the worker served until it was asked to stop.
+constexpr int ExitOk = 0;
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -377,7 +466,7 @@ int main(int argc, char** argv)
     if (!flow.has_value())
     {
         std::cerr << "fastcache-compile-node: " << flow.error().context << '\n';
-        return 2;
+        return ExitUsage;
     }
 
     if (cfg.help)
@@ -403,75 +492,36 @@ int main(int argc, char** argv)
     if (cfg.scheduler.empty())
     {
         logger.Logf(LogLevel::Error, "--scheduler is required; a worker nothing knows about serves nobody");
-        return 2;
+        return ExitUsage;
     }
     if (cfg.toolchains.empty())
     {
         logger.Logf(LogLevel::Error,
                     "--toolchain is required; a worker with none would register and then refuse every job "
                     "the scheduler sent it");
-        return 2;
+        return ExitUsage;
     }
 
     // Socket activation is resolved BEFORE the toolchains, and the order is
     // deliberate. Computing a fingerprint walks the whole include tree and takes
-    // seconds; a bad handoff is decided in microseconds. Doing the cheap,
-    // fallible thing first means a misconfigured unit fails immediately instead
-    // of after a multi-second pause -- and it means the startup log reads in the
-    // order things actually happened, so an operator watching a worker come up
-    // sees what it did with the socket before the long quiet part.
-    //
-    // When a supervisor already bound the port and handed
-    // the descriptor over, binding it again would fail with "address already in
-    // use" -- against ourselves. Falling through to Bind() when nothing was handed
-    // over is what lets one binary serve both a `.socket` unit and a plain
-    // `--port`, with no flag distinguishing them: the environment says which, and
-    // it says so unambiguously.
-    //
-    // Only the first is used. This worker answers one protocol on one port, so a
-    // unit listing several sockets is a misconfiguration -- reported rather than
-    // half-honoured, since silently ignoring the rest would leave an operator with
-    // a port that accepts nothing and no clue why.
-    auto inherited = AdoptInheritedListeners(AcceptPollInterval, RequestIoTimeout);
-    std::unique_ptr<IListener> activated;
-    if (!inherited.empty())
+    // seconds; a bad handoff is decided in microseconds. Doing the cheap, fallible
+    // thing first means a misconfigured unit fails immediately instead of after a
+    // multi-second pause -- and it means the startup log reads in the order things
+    // actually happened, so an operator watching a worker come up sees what it did
+    // with the socket before the long quiet part.
+    auto activatedOrError = AdoptActivatedListener(cfg, logger);
+    if (!activatedOrError.has_value())
     {
-        if (inherited.size() > 1)
-        {
-            logger.Logf(LogLevel::Error,
-                        "socket activation handed over {} listeners; this worker serves exactly one",
-                        inherited.size());
-            return 2;
-        }
-        activated = std::move(inherited.front());
-        logger.Logf(LogLevel::Info, "adopted a socket-activated listener; --bind and --port are not used");
+        logger.Logf(LogLevel::Error, "{}", activatedOrError.error());
+        return ExitUsage;
     }
-
-    // Socket activation makes --advertise mandatory, because the fallback becomes
-    // a guess the process cannot make. `--bind` and `--port` were not used -- the
-    // socket unit chose the port and this process is never told which -- so the
-    // default would register `0.0.0.0:6676` from config values that describe
-    // nothing, and 0.0.0.0 is not an address a remote client can dial anyway.
-    //
-    // The consequence of guessing is the worst-shaped failure this system has: the
-    // registration SUCCEEDS, the worker heartbeats happily, the scheduler leases
-    // that endpoint to clients, and every one of them fails to connect and
-    // compiles locally. Nothing reports an error, and the fleet looks healthy from
-    // both ends. Refusing at startup, where it can be explained, is the whole
-    // difference.
-    if (activated != nullptr && cfg.advertise.empty())
-    {
-        logger.Logf(LogLevel::Error,
-                    "--advertise is required under socket activation: the socket unit owns the port, so this worker "
-                    "cannot know what address clients should use");
-        return 2;
-    }
+    auto activated = std::move(*activatedOrError);
 
     auto const runner = Cc::MakeProcessRunner();
 
     auto toolchainsOrNone = ResolveToolchains(cfg.toolchains, *runner, logger);
     if (!toolchainsOrNone.has_value())
-        return 2;
+        return ExitUsage;
     auto const toolchains = *std::move(toolchainsOrNone);
 
     auto const slots = cfg.slots != 0 ? cfg.slots : std::max(1U, std::thread::hardware_concurrency());
@@ -528,9 +578,65 @@ int main(int argc, char** argv)
     // boundary the cache itself has. Validating a token against the scheduler is the
     // seam's other implementation and belongs with mTLS rather than bolted on here;
     // LeaseValidator exists so that is a substitution, not a rewrite.
-    Cc::WorkerProtocol protocol { jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec } };
+    AtomicMetricsSink metrics;
+    Cc::WorkerProtocol protocol {
+        jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics
+    };
 
-    Node::WorkerServer server { listenerRef, protocol, slots, logger };
+    Node::WorkerServer server { listenerRef, protocol, slots, metrics, logger };
+
+    // The admin endpoint, when the operator asked for one. Off by default and on
+    // loopback for a bare port: a scrape surface reachable from the network is a
+    // decision, not a default.
+    //
+    // The same `AdminHttpServer` the daemon runs, over the same renderer. A second
+    // implementation for a process with no cache is what `MetricsSnapshot::storage`
+    // being optional exists to avoid -- and it brings `/healthz`, which this worker
+    // has never had: a supervisor could tell that the process was alive and not
+    // that it was answering.
+    std::unique_ptr<Node::AdminEndpoint> adminEndpoint;
+    if (!cfg.adminListen.empty())
+    {
+        auto started = Node::AdminEndpoint::Start(
+            cfg.adminListen,
+            "127.0.0.1",
+            metrics,
+            [startedAt = std::chrono::steady_clock::now(), &server, slots, scratchRoot = jobs.ScratchRoot()] {
+                // Sampled per scrape rather than captured once: the disk fills and
+                // the busy count moves, and a value frozen at startup is worse than
+                // no value because it looks current.
+                auto const disk = QueryDiskSpace(scratchRoot);
+
+                // No storage: a worker has no cache, and reporting a
+                // default-constructed one would state an empty unbounded cache as a
+                // fact rather than as an absence.
+                return MetricsSnapshot {
+                    .storage = std::nullopt,
+                    .host = HostCapacity { .logicalCores = OnlineCpuCount(),
+                                           .configuredSlots = slots,
+                                           .totalMemoryBytes = static_cast<std::uint64_t>(QueryHostTotalMemoryBytes()),
+                                           .diskCapacityBytes = static_cast<std::uint64_t>(disk.capacityBytes),
+                                           .diskFreeBytes = static_cast<std::uint64_t>(disk.freeBytes),
+                                           .busySlots = server.InFlight() },
+                    .uptime = Uptime { std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()
+                                                                                        - startedAt) },
+                };
+            },
+            logger);
+
+        // Fatal rather than a warning, unlike the daemon's: an operator who asked a
+        // *worker* for an endpoint is almost always wiring a probe to it, and a
+        // worker that starts without one looks healthy to everything that would
+        // have noticed.
+        if (!started.has_value())
+        {
+            logger.Logf(LogLevel::Error, "--admin-listen {}; refusing to start", started.error());
+            return ExitUsage;
+        }
+
+        adminEndpoint = std::move(*started);
+        logger.Logf(LogLevel::Info, "metrics endpoint on http://{}/metrics (and /healthz)", adminEndpoint->BoundEndpoint());
+    }
 
     Cc::Credential const credential { .username = {}, .secret = cfg.token };
 
@@ -636,6 +742,12 @@ int main(int argc, char** argv)
 
     SyncRun(server.Run());
 
+    // Unblocks the admin accept loop so its jthread can join -- without this the
+    // destructor's implicit join waits on a thread parked in accept(), and a worker
+    // that stops cleanly would hang instead. The same reason the daemon does it.
+    // `adminEndpoint`'s destructor stops the server and joins its thread; there is
+    // deliberately nothing to remember at this return path or any other.
+
     // No deregistration is sent, and that is a decision rather than a gap. There is
     // no such verb: the scheduler learns a worker is gone by its heartbeat lapsing,
     // which is the ONE mechanism that also covers the cases a polite goodbye cannot
@@ -645,5 +757,5 @@ int main(int argc, char** argv)
     // in the gap finds it unreachable and compiles locally, which is the same
     // fallback every other refusal takes.
     logger.Logf(LogLevel::Info, "compile node stopped");
-    return 0;
+    return ExitOk;
 }

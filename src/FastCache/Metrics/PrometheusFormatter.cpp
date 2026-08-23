@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 
 #include <array>
@@ -13,14 +14,12 @@ namespace FastCache
 namespace
 {
 
-    /// Prometheus metric kind. Counters are monotonic; gauges may go up or down.
-    enum class MetricType : std::uint8_t
-    {
-        Counter,
-        Gauge,
-    };
-
     /// One rendered metric: fully-qualified name, help text, kind and value.
+    ///
+    /// Distinct from `CounterDescriptor` because the storage rows below have no
+    /// `IMetricsSink::Counter` to be described by — they come from a
+    /// `StorageStats` field instead. What the two share is the *rendering*, which
+    /// is the loop at the bottom.
     struct Metric
     {
         std::string_view name;
@@ -29,22 +28,75 @@ namespace
         std::uint64_t value;
     };
 
-    [[nodiscard]] constexpr std::string_view TypeName(MetricType type) noexcept
+    /// How many rows `AppendStorageMetrics` emits, for the one `reserve`.
+    /// A loose estimate by design — it only sizes a buffer.
+    constexpr std::size_t StorageMetricCount = 24;
+
+    /// Append one metric's three exposition lines to `out`.
+    /// @param out Destination.
+    /// @param metric What to render.
+    void Append(std::string& out, Metric const& metric)
     {
-        return type == MetricType::Gauge ? "gauge" : "counter";
+        out += std::format(
+            "# HELP {0} {1}\n# TYPE {0} {2}\n{0} {3}\n", metric.name, metric.help, TypeName(metric.type), metric.value);
     }
 
 } // namespace
 
-std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
+/// Render what a machine's size looks like on the wire.
+///
+/// Gauges, every one: they describe a machine rather than count events, which is
+/// why they arrive in a struct instead of through the counter-only sink.
+/// @param out Destination.
+/// @param host The machine's capacity.
+static void AppendHostMetrics(std::string& out, HostCapacity const& host)
 {
     using enum MetricType;
-    using Sink = IMetricsSink::Counter;
-    auto const& stats = snapshot.storage;
 
-    // Single source of truth: command/capacity metrics from the storage
-    // snapshot, connection metrics from the sink. Adding a row here is the only
-    // step needed to expose a new metric.
+    auto const table = std::array {
+        Metric { .name = "fastcache_node_logical_cores",
+                 .help = "Schedulable hardware threads on this node.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.logicalCores) },
+        Metric { .name = "fastcache_node_memory_total_bytes",
+                 .help = "Physical memory, or the container ceiling when that binds first.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.totalMemoryBytes) },
+        Metric { .name = "fastcache_node_disk_capacity_bytes",
+                 .help = "Size of the filesystem this node compiles on.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.diskCapacityBytes) },
+        Metric { .name = "fastcache_node_disk_free_bytes",
+                 .help = "Space on that filesystem an unprivileged process may still write.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.diskFreeBytes) },
+        Metric { .name = "fastcache_node_slots_configured",
+                 .help = "Concurrent compiles this node advertises to the scheduler.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.configuredSlots) },
+        Metric { .name = "fastcache_node_slots_busy",
+                 .help = "Compiles running right now. Sampled, not derived from the job "
+                         "counters, which are incremented separately.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.busySlots) },
+    };
+
+    for (auto const& metric: table)
+        Append(out, metric);
+}
+
+/// Render the metrics a cache's own statistics carry.
+///
+/// Separate from the sink's counters because the two have different *sources*,
+/// not because they render differently: these come from `StorageStats`, which is
+/// authoritative for command and capacity numbers, and a process without a cache
+/// has none of them. The rendering itself is `Append` either way.
+/// @param out Destination.
+/// @param stats The cache's statistics.
+static void AppendStorageMetrics(std::string& out, StorageStats const& stats)
+{
+    using enum MetricType;
+
     auto const table = std::array {
         Metric {
             .name = "fastcached_cmd_get_total", .help = "GET commands processed.", .type = Counter, .value = stats.cmdGet },
@@ -128,14 +180,6 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
                  .help = "Entries that expired before ever being read.",
                  .type = Counter,
                  .value = stats.expiredUnfetched },
-        Metric { .name = "fastcached_connections_total",
-                 .help = "Connections accepted since start.",
-                 .type = Counter,
-                 .value = metrics.Read(Sink::ConnectionsTotal) },
-        Metric { .name = "fastcached_connections_rejected_total",
-                 .help = "Connections refused by admission control.",
-                 .type = Counter,
-                 .value = metrics.Read(Sink::ConnectionsAdmissionRejected) },
         Metric { .name = "fastcached_items",
                  .help = "Live entries currently stored.",
                  .type = Gauge,
@@ -148,20 +192,47 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
                  .help = "Configured byte budget (0 = unbounded).",
                  .type = Gauge,
                  .value = static_cast<std::uint64_t>(stats.bytesLimit) },
-        Metric { .name = "fastcached_uptime_seconds",
-                 .help = "Seconds since the daemon started.",
-                 .type = Gauge,
-                 .value = static_cast<std::uint64_t>(snapshot.uptime.value.count()) },
     };
 
+    for (auto const& metric: table)
+        Append(out, metric);
+}
+
+std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
+{
     std::string out;
     // Each metric renders ~3 lines (HELP/TYPE/value); ~200 bytes is a generous
     // per-row estimate, so one reserve avoids the handful of reallocations the
     // += loop would otherwise do on every scrape.
-    out.reserve(table.size() * 200);
-    for (auto const& metric: table)
-        out += std::format(
-            "# HELP {0} {1}\n# TYPE {0} {2}\n{0} {3}\n", metric.name, metric.help, TypeName(metric.type), metric.value);
+    out.reserve((StorageMetricCount + CounterTable.size() + 1) * 200);
+
+    // Only when there is a cache. A worker running this same endpoint would
+    // otherwise report an empty, unbounded one — zeroes that read as facts.
+    if (snapshot.storage.has_value())
+        AppendStorageMetrics(out, *snapshot.storage);
+
+    // And only when the process is a compile node. The daemon leaves this absent
+    // rather than reporting cores it does not schedule against.
+    if (snapshot.host.has_value())
+        AppendHostMetrics(out, *snapshot.host);
+
+    // Every counter the sink knows, without exception. Exporting the *table*
+    // rather than a hand-picked subset is the whole point: seven of the nine
+    // live counters used to be absent here, including all five the distributed-
+    // compilation guide tells an operator to read.
+    for (auto const& row: CounterTable)
+        Append(
+            out,
+            Metric { .name = row.prometheusName, .help = row.help, .type = row.type, .value = metrics.Read(row.counter) });
+
+    // Uptime is neither the cache's nor the sink's: every process that serves
+    // this endpoint has one, and a worker's is as useful as a daemon's.
+    Append(out,
+           Metric { .name = "fastcached_uptime_seconds",
+                    .help = "Seconds since the process started.",
+                    .type = MetricType::Gauge,
+                    .value = static_cast<std::uint64_t>(snapshot.uptime.value.count()) });
+
     return out;
 }
 

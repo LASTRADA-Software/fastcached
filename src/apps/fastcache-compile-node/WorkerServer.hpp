@@ -3,6 +3,7 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Net/ISocket.hpp>
 
@@ -46,8 +47,18 @@ class WorkerServer
     /// @param listener Bound listener; must outlive the run.
     /// @param protocol Answers each request; must outlive the run.
     /// @param slots Maximum concurrent compiles.
+    /// @param metrics Counts the refusals this loop makes; must outlive the run.
     /// @param logger Shared logger.
-    WorkerServer(IListener& listener, Cc::WorkerProtocol& protocol, std::size_t slots, ILogger& logger) noexcept;
+    ///
+    /// The cap refusal is counted **here** rather than in the protocol, because
+    /// that is where it happens: the check is before the request is read, so the
+    /// protocol never sees the job at all. Counting it beside the other refusals
+    /// would mean reporting a busy worker as one whose toolchain does not match.
+    WorkerServer(IListener& listener,
+                 Cc::WorkerProtocol& protocol,
+                 std::size_t slots,
+                 IMetricsSink& metrics,
+                 ILogger& logger) noexcept;
 
     /// Accept loop; returns when the listener is closed via `Shutdown()`.
     [[nodiscard]] Task<void> Run();
@@ -62,6 +73,7 @@ class WorkerServer
     IListener& _listener;
     Cc::WorkerProtocol& _protocol;
     std::size_t _slots;
+    IMetricsSink& _metrics;
     ILogger& _logger;
     std::atomic<bool> _shuttingDown { false };
     std::atomic<std::size_t> _inFlight { 0 };
