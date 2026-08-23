@@ -87,6 +87,16 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x0d` | unknown-lease | The lease token is unknown or has expired. |
 | `0x0e` | fingerprint-mismatch | The worker does not serve the toolchain the job names. |
 | `0x0f` | unsupported-codec | No codec in common with what the request offered. |
+| `0x10` | worker-scratch-unavailable | The worker could not prepare a scratch directory, or could not write the translation unit into it. |
+| `0x11` | worker-spawn-failed | The worker could not *start* the compiler. Not "the compiler rejected the code" — that is a successful exchange carrying a non-zero exit code. |
+| `0x12` | not-leader | This node does not lead the cluster. The message carries the leader's endpoint when one is known, and is empty during an election. |
+| `0x13` | not-a-member | The caller is not a member of this cluster, so it may not spend the fleet's capacity. It is still served the cache. |
+
+Every one of these is a **refusal the client answers by compiling locally**,
+never by failing. They are distinct codes rather than one "no" because they mean
+different things to an operator: `not-a-member` is a policy decision somebody
+made, `no-worker` is a fingerprint nobody in the fleet serves, `no-capacity` is a
+fleet that is too small, and `already-in-flight` is none of the three.
 
 ### STORE
 
