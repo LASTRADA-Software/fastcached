@@ -37,6 +37,11 @@ target_sources(FastCache
         Consensus/RaftPeerServer.cpp
         Consensus/RaftPeerTransport.cpp
         Core/Crc32c.cpp
+        Core/Sha256.cpp
+        Cluster/DiscoveryService.cpp
+        Cluster/PeerDirectory.cpp
+        Net/InMemoryDatagram.cpp
+        Net/UdpSocket.cpp
         Core/Logger.cpp
         Distributed/LeaseTable.cpp
         Distributed/WorkerRegistry.cpp

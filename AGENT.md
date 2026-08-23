@@ -178,6 +178,72 @@ packaging/
 `cmake/Packaging.cmake` turns that into `.deb`/`.rpm`/`.pkg`/`.msi` via CPack.
 These constraints are load-bearing and have each already been a bug:
 
+- **A pre-shared key authenticates a handshake; it never travels in a beacon.**
+  Discovery broadcasts what a node *is* -- cluster, id, Raft endpoint -- and nothing
+  derived from the key, because a broadcast reaches every listener on the segment
+  and anything key-derived in one hands them what they need to join. The key only
+  ever appears inside an HMAC over a nonce the challenger chose. Five consequences,
+  each of which some plausible simpler design gets wrong:
+  - **The proof authenticates a `(node, endpoint)` PAIR, not the nonce alone.**
+    Both are inside the MAC. Signing the nonce only would let anyone who observed
+    one valid proof replay its tag with a *different* endpoint substituted --
+    admitting a legitimate node id at an attacker's address. An admitted node is
+    assigned compile jobs and returns objects cached fleet-wide, so that is object
+    injection into everybody's build. Verified by removing the endpoint from the
+    MAC and watching exactly the one case that asserts it fail.
+  - **A proof is only ever an answer to a challenge THIS node issued**, and the
+    nonce is spent whatever the outcome. An unsolicited proof is refused *even when
+    it carries the real key*: it answers a nonce nobody here chose, and accepting
+    one would make the nonce -- and therefore the replay protection -- pointless.
+  - **A peer that moves loses its authenticated bit.** The bit is a property of the
+    node *at an endpoint*, not of the node, because that is what the proof covered.
+    Carrying it across a change would admit an address nobody proved.
+  - **The pending-challenge table is one entry per node, with a lifetime.** A
+    beacon is unauthenticated by construction, so anything on the segment can
+    provoke a challenge -- a table that grew per datagram would be a
+    memory-exhaustion hole reachable without holding the key, which is the same
+    shape as the pre-auth payload cap on the `0xFC` port.
+  - **Discovery never changes membership.** It answers who proved the key and where
+    they answer; a caller proposes. Admitting a node is a Raft decision only a
+    leader may make, and a layer that proposed directly would have every node on
+    the segment proposing the same change at once.
+- **A cluster id is routing, not authentication, and saying so keeps it honest.**
+  It is plain text in every beacon, so treating it as a credential would be the
+  mistake. What it buys is that two unrelated fleets on one segment ignore each
+  other -- before a challenge is issued, and again before one is answered -- which
+  holds even when somebody shares a key across fleets, which they should not.
+- **SHA-256 is implemented here because OpenSSL is optional and authentication is
+  not.** `FASTCACHED_ENABLE_TLS` is off by default, so a cluster that could only
+  authenticate its members when TLS happened to be compiled in would silently
+  accept anybody in the common configuration. `Core/Compression` reaches for a
+  library because a codec is large and its output need only round-trip; a MAC is
+  small and its output has to be *identical* on every machine that checks it. An
+  existing published algorithm, for the reason `MurmurHash3` records -- conformance
+  is checkable against FIPS 180-4 and RFC 4231, and a local construction would have
+  nothing to check against. Three things it carries:
+  - **`ConstantTimeEquals` for every MAC compared against an untrusted value.**
+    `memcmp` stops at the first difference, so its timing reveals how many leading
+    bytes a guess got right and lets an attacker who can retry recover a tag byte at
+    a time instead of guessing all 32.
+  - **The padding sweep, not just `"abc"`.** The rule has two branches -- the length
+    fits this block or forces another -- and the boundary is where a hand-written
+    implementation goes wrong; a single vector never reaches it.
+  - **A miscounted test vector accuses the wrong code.** Both long-key RFC 4231
+    cases were hand-typed as hex runs and both were wrong (49 bytes for 50, 120 for
+    131), which reads exactly like an implementation failure. They are constructed
+    programmatically now.
+- **A datagram double delivers a broadcast to the sender too, and loses only what
+  it is told to.** `DatagramBus` mirrors what a real broadcast does, which is
+  precisely the case `PeerDirectory` must ignore -- a double that spared the sender
+  would hide the bug where a lone node records its own beacon and proposes a
+  membership change to admit itself. Loss is scripted per destination rather than
+  random: a random rate fails occasionally for reasons nobody can reproduce, and
+  what discovery must survive is a specific peer going quiet. And the seam has a
+  **real** implementation exercised by a smoke case, because an interface with only
+  a fake behind it is an interface nobody has checked -- `OpenUdpSocket` returned
+  null on Windows until it called `Detail::EnsureNetworkInitialised`, and no fake
+  would ever have shown that.
+
 - **A service to register is a `ServiceSpec`, and what it runs as is part of it.**
   Every function in `Platform/ServiceControl` took `Config const&` -- the *daemon's*
   configuration type -- so a second binary could reach none of it without either
