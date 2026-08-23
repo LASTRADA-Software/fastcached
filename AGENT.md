@@ -1677,6 +1677,57 @@ terminal, and each has already been a bug:
   watching a worker start sees nothing during the part where something can still
   go wrong.
 
+**The scheduler lives where leadership lives, and that is not the cache daemon.**
+`WorkerRegistry` and `LeaseTable` used to be reached through a `Dispatch` role on one
+of `fastcached`'s listeners, which made the cache daemon a scheduler as well as a
+store. The two have opposite deployment shapes: a cache is shared infrastructure
+somebody operates, while handing out capacity is a decision only **one** node may
+make at a time — and nothing in `fastcached` can establish which node that is.
+`Distributed::SchedulerService` is that logic with leadership as a first-class
+input, and it is pure with respect to I/O for the reason the two tables under it
+are: every rule below is a `ManualClock` unit test rather than a socket and a sleep.
+Consequences that are each load-bearing:
+
+- **Leadership and membership are one `Gate()`, not a check per handler.** These are
+  the security- and policy-relevant decisions of the whole surface, so a verb added
+  without them would be a verb that quietly skips both — and the test asserts the
+  refusal *per verb* precisely because "I added a handler that forgot the gate" is
+  the regression the arrangement exists to make impossible.
+- **Leadership is asked first, and the reason is the diagnostic rather than the
+  cost.** A follower cannot know the cluster's membership any better than it knows
+  the fleet, so answering `NotAMember` there sends an operator to inspect a policy
+  that was never consulted. `NotLeader` carries the leader's endpoint **in the
+  message**, so a client redirects instead of giving up; `SchedulerRole::Undecided`
+  is the same code with an empty message, because an election in progress is a
+  different fact and there is nobody to name. Three roles rather than a `bool`, for
+  exactly that third state.
+- **Anti-leeching refuses the fleet, never the cache.** A non-member reads and
+  writes objects exactly as before — the cache is a separate service this class
+  cannot reach — and is refused only the fleet's CPU time, which is the thing
+  membership pays for. Hence `NotAMember` rather than `Unauthenticated`: one is
+  about a credential an endpoint requires, the other about contribution.
+- **Duplicate suppression is asked BEFORE capacity, and the order is the whole
+  point.** `LeaseTable::Acquire` needs a worker id, so the code this was lifted from
+  had to `Pick` first — which meant a second client missing the same key at a busy
+  fleet was told `NoCapacity`. Both conditions genuinely hold; the operator reads
+  "buy more machines" where the truth is "this build asked for the same object
+  twice", and it lands hardest exactly where duplicate suppression does the most
+  good: a wide parallel build where many translation units miss one key at once.
+  That is the same defect the no-worker/no-capacity split already exists to prevent,
+  reached by a third route. `LeaseTable::IsInFlight` is what makes the question
+  answerable without a worker; it is **advisory**, and `Acquire`'s own refusal stays
+  as the backstop for the race, because that one decides atomically. It reports
+  *liveness*, not presence — an expired entry is left behind until the next
+  `Acquire` for that key sweeps it, so a check on the map alone would refuse one key
+  forever after a single client abandoned it, with nothing saying so.
+- **A refusal that moves a counter says so in a table.** `RefusalTable` pairs each
+  code with the counter it moves, and `std::nullopt` is a legitimate row: a
+  malformed frame is a *client* defect, and counting it beside the capacity
+  refusals would put one broken build's noise into the numbers a fleet is sized
+  from. Four hand-written `Count(...)` calls beside four `Refuse(...)` calls are
+  four chances to forget one, and a refusal with no counter is invisible in exactly
+  the situation an operator is trying to diagnose.
+
 `scripts/dist-compile-e2e.sh` asserts the consequence rather than the mechanism:
 that a worker's object is **byte-identical** to a locally compiled one. That single
 assertion is what fails if either rule is broken, and it is the whole soundness
