@@ -14,7 +14,9 @@ src/FastCache/
                 StringHash, Owner, Profiling (Tracy wrappers)
   Async/        Task<T>, Cancellation, ResumeOn, IReactor + TestReactor and the
                 platform reactors (EpollReactor / IocpReactor / KqueueReactor)
-  Net/          ISocket, IListener, IoAwaitable, IAdmissionControl, SocketAddress,
+  Net/          ISocket, IListener, IConnector (the outbound counterpart to
+                IListener; BlockingConnector dials non-blocking so its timeout
+                means something), IoAwaitable, IAdmissionControl, SocketAddress,
                 BlockingSocket (Winsock + POSIX),
                 EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
                 InMemoryTransport (paired pipes + InMemoryListener),
@@ -39,7 +41,10 @@ src/FastCache/
                 (prefetch-group id -> key-set + reverse index) — the
                 compile-cache executor's domain logic
   Consensus/    RaftTypes, RaftLog, RaftNode and RaftDriver behind the
-                IRaftStorage / IRaftTransport / IRaftStateMachine seams — Raft,
+                IRaftStorage / IRaftTransport / IRaftStateMachine seams, plus
+                RaftWire (the 0xFA peer frame), RaftPeerTransport (outbound,
+                a thread per peer), RaftPeerServer (inbound, on the reactor)
+                and RaftMembership (the member set as a log entry) — Raft,
                 split into a pure state machine and a coroutine driver that
                 carries out what it asks for. RaftNode reads no clock, opens no
                 socket and draws no randomness of its own: time arrives as a
