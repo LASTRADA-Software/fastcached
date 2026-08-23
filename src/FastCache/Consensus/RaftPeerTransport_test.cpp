@@ -57,7 +57,7 @@ class RecordingSocket final: public ISocket
 
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override
     {
-        std::lock_guard const guard { _record->mutex };
+        std::scoped_lock const guard { _record->mutex };
         if (_record->failWrites)
             return IoAwaitable { std::unexpected {
                 NetError { .code = NetErrorCode::ConnReset, .systemCode = 0, .context = "scripted write failure" } } };
@@ -204,7 +204,7 @@ TEST_CASE("A sent message reaches the peer as a decodable frame", "[consensus][r
 
     REQUIRE(WaitForWrites(*record, 1));
 
-    std::lock_guard const guard { record->mutex };
+    std::scoped_lock const guard { record->mutex };
     REQUIRE(record->writes.size() == 1);
 
     // Asserted by decoding rather than by byte count: what matters is that the
@@ -238,7 +238,7 @@ TEST_CASE("A message for this node itself is not sent anywhere", "[consensus][ra
     transport.Send("n2", Vote(2));
     REQUIRE(WaitForWrites(*record, 1));
 
-    std::lock_guard const guard { record->mutex };
+    std::scoped_lock const guard { record->mutex };
     // Exactly one write: the peer's. The self-addressed one was dropped.
     CHECK(record->writes.size() == 1);
 }
@@ -359,7 +359,7 @@ TEST_CASE("A dropped connection is redialled", "[consensus][raft][transport]")
 
     // Break the connection under the sender.
     {
-        std::lock_guard const guard { record->mutex };
+        std::scoped_lock const guard { record->mutex };
         record->failWrites = true;
     }
     transport.Send("n2", Vote(2));
@@ -372,7 +372,7 @@ TEST_CASE("A dropped connection is redialled", "[consensus][raft][transport]")
     REQUIRE(WaitFor([&] { return connector.Attempts() > firstAttempts; }));
 
     {
-        std::lock_guard const guard { record->mutex };
+        std::scoped_lock const guard { record->mutex };
         record->failWrites = false;
     }
 
