@@ -323,6 +323,58 @@ cluster admitted is served by all three surfaces at once — its compile port, t
 scheduler, and every member's cache tier. `--fleet-member` is the answer before a
 cluster exists; this is the answer once one does.
 
+### Finding peers instead of typing them
+
+`--raft-peer` works and needs no network magic, but it means editing a file on every
+machine each time one joins. `--discovery` replaces the editing with a broadcast:
+
+```sh
+head -c 32 /dev/urandom | base64 > /etc/fastcached/cluster.key   # once, per fleet
+chmod 600 /etc/fastcached/cluster.key                            # then copy it around
+
+fastcache-compile-node \
+    --node-id=n1 --listen-raft=6680 --raft-peer=n1=10.0.0.1:6680 \
+    --discovery=255.255.255.255:6681 \
+    --cluster-key-file=/etc/fastcached/cluster.key \
+    --cluster-id=build-farm \
+    --listen-scheduler=6675 --toolchain=/usr/bin/g++
+```
+
+Every node still names **itself** in `--raft-peer`, because that is the address its
+peers dial and only it knows it. What it no longer has to name is anybody else.
+
+**The key authenticates a handshake; it never travels in a beacon.** A beacon says
+what a node *is* — cluster, id, consensus endpoint — and nothing derived from the
+key, because a broadcast reaches every listener on the segment and anything
+key-derived in one hands them what they need to join. The key appears only inside an
+HMAC over a nonce the challenger chose, and that MAC covers the `(node, endpoint)`
+**pair**: signing the nonce alone would let anyone who observed one valid proof
+replay its tag with a different endpoint substituted, admitting a legitimate node id
+at an attacker's address.
+
+**`--cluster-key-file` is a file and not a flag**, and that is the whole reason it
+exists in that shape. A command line is readable through `ps` on every POSIX system,
+and a service's arguments end up in a unit file or a registry key that more accounts
+can read than can read a mode-0600 file. A leaked key admits a node, an admitted node
+is assigned compile jobs, and the objects it returns are cached fleet-wide — so it is
+object injection into everybody's build.
+
+**`--cluster-id` is routing, not authentication.** It is plain text in every beacon,
+so treating it as a credential would be the mistake. What it buys is that two
+unrelated fleets on one segment ignore each other, which holds even when somebody
+shares a key across fleets — which they should not.
+
+**Discovery never changes membership by itself.** It answers who proved the key and
+where they answer; the *leader* proposes, and only the leader, because admitting a
+node is a Raft decision. Every node on the segment sees the same peers and all but
+one of them do nothing about it.
+
+**It never proposes a removal either.** A peer vanishes from a broadcast for reasons
+that are almost never "it left" — a lost datagram, a switch rebooting, a laptop
+closed for an hour — and a cluster that re-computed its membership from reachability
+could shrink itself below a majority and never come back. Raft already tolerates a
+member that does not answer. Removing one stays an operator decision.
+
 ### Where its state lives
 
 `--cluster-dir`, defaulting to `fastcache-cluster/<node-id>`. Durable by necessity
@@ -625,10 +677,12 @@ For anything beyond a trusted build network, put mTLS in front of every port.
   leader can propose them, and every node applies and snapshots them — but there is
   no operator surface that says "set `upstream` to this". Until there is,
   `--upstream` on each node is what configures it.
-- **Membership is bootstrap-only in practice.** A node admitted by a proposal is
-  replicated, persisted and served correctly; what is missing is the thing that
-  *makes* the proposal. Discovery proves who holds the pre-shared key and where
-  they answer, and joining that to a membership change is the remaining step.
+- **A discovered node joins the cluster's *state*, not its quorum.** The leader
+  records it, every node then serves it, and it survives a restart — but
+  `RaftNode`'s own member set still comes from `--raft-peer` at startup, so the new
+  node does not yet vote and this node's transport does not yet dial it. What that
+  costs today is that a node discovered at runtime is admitted to the fleet without
+  taking part in electing its leader.
 - **The log is never compacted.** `CompactThroughApplied` exists and nothing calls
   it, so a long-lived cluster's log grows without bound. It grows *slowly* —
   cluster configuration changes are rare by construction — but "slowly" is not

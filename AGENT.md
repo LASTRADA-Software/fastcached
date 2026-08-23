@@ -64,14 +64,19 @@ src/FastCache/
                 verification vector to check against the way MurmurHash3 has
                 SMHasher's, so that harness is the closest available oracle.
   Cluster/      DiscoveryService + DiscoveryWire (the LAN beacon and its PSK
-                challenge), PeerDirectory (who proved the key, and where), and
+                challenge), PeerDirectory (who proved the key, and where),
                 ClusterState + ClusterStateMachine — the cluster's replicated
                 configuration: who is a member, WHERE they answer, and the settings
-                every member must agree on. The endpoint is the point: consensus
-                counts ids, which is all a quorum needs and which leaves a node the
-                cluster agreed to admit unreachable. `Apply` is total because it runs
-                after commitment, when refusing is no longer an option; `Validate` is
-                where a change can be refused, and it runs on the proposer.
+                every member must agree on — and MembershipPolicy, the pure decision
+                a leader makes about what to propose. The endpoint is the point:
+                consensus counts ids, which is all a quorum needs and which leaves a
+                node the cluster agreed to admit unreachable. A member records TWO
+                addresses, and that pairing closed a defect rather than generalising
+                one: `NotLeader` carries a redirect, and with only the consensus
+                endpoint recorded a follower answered "ask the leader, at its Raft
+                peer port". `Apply` is total because it runs after commitment, when
+                refusing is no longer an option; `Validate` is where a change can be
+                refused, and it runs on the proposer.
   Distributed/  WorkerRegistry (the worker set: exact-fingerprint grouping,
                 least-outstanding pick, heartbeat expiry over IClock) and
                 LeaseTable (lease issue/expiry/release plus the in-flight key
@@ -257,6 +262,20 @@ These constraints are load-bearing and have each already been a bug:
   a fake behind it is an interface nobody has checked -- `OpenUdpSocket` returned
   null on Windows until it called `Detail::EnsureNetworkInitialised`, and no fake
   would ever have shown that.
+
+- **Absent is not empty, and a membership proposal is where that pays.**
+  `Cluster::DesiredMember` carries `std::optional<std::string> schedulerEndpoint`
+  while `ClusterMember` carries a plain string, and the difference is load-bearing in
+  one direction only. `AddMember` applies **wholesale** — a re-proposal that omitted a
+  field would clear it — which is right when the proposer knows the member has no
+  scheduler surface, and destructive when it simply never knew. Discovery is always
+  the second case: it proves where a peer answers *consensus*, because that is what
+  the MAC covered, and learns nothing about the port clients speak to since nobody
+  dials it. So a node says `""` about itself and `nullopt` about a peer, and only the
+  first is an assertion. Collapsing the two would have every follower's discovery loop
+  clear the leader's redirect address the moment it noticed the leader — a fleet whose
+  redirects break on a timer, self-healing at the next election and therefore
+  intermittent.
 
 - **A service to register is a `ServiceSpec`, and what it runs as is part of it.**
   Every function in `Platform/ServiceControl` took `Config const&` -- the *daemon's*

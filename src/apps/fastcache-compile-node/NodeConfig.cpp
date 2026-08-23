@@ -279,6 +279,29 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .description = "where consensus keeps its durable state. A node\n"
                          "that answered a vote and forgot it votes twice in\n"
                          "one term after a restart, which is two leaders." },
+        { .primary = "--cluster-id",
+          .arity = Arity::Value,
+          .operand = "=<name>",
+          .apply = AssignFrom<&NodeConfig::clusterId, ParseText>(),
+          .description = "which fleet this node belongs to. Plain text in every\n"
+                         "beacon and NOT a credential: what it buys is that two\n"
+                         "unrelated fleets on one segment ignore each other." },
+        { .primary = "--discovery",
+          .arity = Arity::Value,
+          .operand = "=<address>:<port>",
+          .apply = AssignFrom<&NodeConfig::discoveryAddress, ParseText>(),
+          .description = "announce this node on the segment and listen for peers\n"
+                         "here; off unless given. Needs --node-id and\n"
+                         "--cluster-key-file. Without it a cluster is exactly\n"
+                         "the --raft-peer list an operator typed." },
+        { .primary = "--cluster-key-file",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&NodeConfig::clusterKeyFile, ParsePathValue>(),
+          .description = "the cluster's pre-shared key. A FILE and not a flag:\n"
+                         "a command line is readable through ps, and a key that\n"
+                         "leaks admits a node whose objects the whole fleet\n"
+                         "then caches." },
         { .primary = "--admin-listen",
           .arity = Arity::Value,
           .operand = "=[<address>:]<port>",
@@ -474,6 +497,9 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitIfSet("node-id", cfg.nodeId, defaults.nodeId);
     emitIfSet("listen-raft", cfg.raftListen, defaults.raftListen);
     emitPathIfSet("cluster-dir", cfg.clusterDir.string());
+    emitIfSet("cluster-id", cfg.clusterId, defaults.clusterId);
+    emitIfSet("discovery", cfg.discoveryAddress, defaults.discoveryAddress);
+    emitPathIfSet("cluster-key-file", cfg.clusterKeyFile.string());
     // Repeatable, so one token per peer rather than one joined value -- for the
     // reason the toolchains are: a service that came back knowing fewer members than
     // it was installed with would present as a cluster that stopped forming quorum,
@@ -554,7 +580,7 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
     return std::nullopt;
 }
 
-std::optional<std::string> SchedulerPolicyRejection(NodeConfig const& cfg)
+std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
 {
     // Separate from NodeServiceRejection because it is a *startup* rule rather than
     // an install-time one: this misconfiguration is fatal every time the process
@@ -581,6 +607,18 @@ std::optional<std::string> SchedulerPolicyRejection(NodeConfig const& cfg)
           .message = "--fleet-member and --fleet-open describe who this node's scheduler admits, and it is not "
                      "running one: add --listen-scheduler, or drop them. A policy nothing consults is a policy an "
                      "operator believes is in force." },
+        { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && c.nodeId.empty(); },
+          .message = "--discovery needs --node-id: discovery finds peers for a CLUSTER, and without an id this "
+                     "node is not in one. It would broadcast, be answered, prove the key and have nowhere to "
+                     "put the answer." },
+        { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && c.clusterKeyFile.empty(); },
+          .message = "--discovery needs --cluster-key-file: a beacon is unauthenticated by construction, so the "
+                     "key is the only thing separating a peer from anything else on the segment. With none, no "
+                     "peer can ever be admitted and this node would announce itself forever to no effect." },
+        { .refuses = [](NodeConfig const& c) { return !c.clusterKeyFile.empty() && c.discoveryAddress.empty(); },
+          .message = "--cluster-key-file is read by discovery and nothing else, and --discovery is not set. A "
+                     "secret an operator went to the trouble of provisioning, being read by nobody, is exactly "
+                     "the silent no-op this list exists to refuse." },
     });
 
     for (auto const& rule: Rules)

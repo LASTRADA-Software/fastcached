@@ -176,9 +176,15 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     _listener { std::move(listener) },
     _onRole { std::move(onRole) },
     _boundEndpoint { std::move(boundEndpoint) },
-    _self { std::move(self) },
-    _desired { { _self } }
+    _self { std::move(self) }
 {
+    // Seeded with this node's own record, and its scheduler endpoint travels as a
+    // value that is PRESENT even when it is empty. That is an assertion -- "I know
+    // what mine is" -- where a peer discovered on the segment has no opinion at
+    // all, and `DesiredMember` keeps the two apart precisely so one cannot clear
+    // what the other announced.
+    _desired.push_back(Cluster::DesiredMember {
+        .id = _self.id, .raftEndpoint = _self.raftEndpoint, .schedulerEndpoint = _self.schedulerEndpoint });
 }
 
 std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
@@ -405,7 +411,7 @@ Cluster::ClusterState ConsensusTier::State() const
     return _application.State();
 }
 
-void ConsensusTier::Desire(std::span<Cluster::ClusterMember const> records)
+void ConsensusTier::Desire(std::span<Cluster::DesiredMember const> records)
 {
     auto const guard = std::unique_lock { _desiredMutex };
     for (auto const& record: records)
@@ -415,7 +421,7 @@ void ConsensusTier::Desire(std::span<Cluster::ClusterMember const> records)
         // and so a peer that MOVED supersedes its own older record instead of
         // sitting beside it, which would make the reconciler propose two addresses
         // for one node in a fixed order forever.
-        auto const it = std::ranges::find(_desired, record.id, &Cluster::ClusterMember::id);
+        auto const it = std::ranges::find(_desired, record.id, &Cluster::DesiredMember::id);
         if (it != _desired.end())
             *it = record;
         else
@@ -431,7 +437,7 @@ void ConsensusTier::Reconcile()
     if (!_leads.load(std::memory_order_relaxed))
         return;
 
-    auto desired = std::vector<Cluster::ClusterMember> {};
+    auto desired = std::vector<Cluster::DesiredMember> {};
     {
         auto const guard = std::unique_lock { _desiredMutex };
         desired = _desired;

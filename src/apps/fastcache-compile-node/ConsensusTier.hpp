@@ -200,7 +200,17 @@ class ConsensusTier
     /// which is the separation discovery's own documentation insists on: it answers
     /// who proved the key and where they answer, and a caller proposes.
     /// @param records Members this node knows should be present.
-    void Desire(std::span<Cluster::ClusterMember const> records);
+    void Desire(std::span<Cluster::DesiredMember const> records);
+
+    /// This node's own record, as it announces it.
+    ///
+    /// Exposed because discovery announces the same consensus endpoint on the
+    /// segment that consensus dials, and deriving it twice is how the beacon and
+    /// the transport come to disagree about where this node answers.
+    [[nodiscard]] Cluster::ClusterMember const& Self() const noexcept
+    {
+        return _self;
+    }
 
     /// The address this node's peer port bound.
     [[nodiscard]] std::string const& BoundEndpoint() const noexcept
@@ -278,7 +288,7 @@ class ConsensusTier
     /// are different threads by construction -- hence the mutex, held only across
     /// the vector operations and never across a proposal.
     mutable std::mutex _desiredMutex;
-    std::vector<Cluster::ClusterMember> _desired;
+    std::vector<Cluster::DesiredMember> _desired;
 
     /// Whether this node may propose at all, as the observer last reported it.
     ///

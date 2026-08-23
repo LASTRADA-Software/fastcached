@@ -12,6 +12,7 @@
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
 #include "ConsensusTier.hpp"
+#include "DiscoveryTier.hpp"
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
@@ -534,6 +535,23 @@ constexpr int ExitOk = 0;
     // May legitimately be null: no `--node-id` means this node leads alone.
     auto const consensusTier = std::move(*consensusOrRefusal);
 
+    // Discovery, when the operator configured it. Declared AFTER consensus and so
+    // destroyed before it, because its observer pushes into the tier above: a
+    // discovery loop outliving the thing it hands peers to is a dangling reference
+    // that only fires while a node is shutting down.
+    auto discoveryOrRefusal = Node::StartDiscoveryOrExplain(cfg, consensusTier, logger);
+    if (!discoveryOrRefusal.has_value())
+    {
+        // Fatal, like the other two surfaces an operator has to ask for: a node that
+        // started without the discovery it was told to run looks healthy to a fleet
+        // that will never hear from it.
+        logger.Logf(LogLevel::Error, "--discovery {}; refusing to start", discoveryOrRefusal.error());
+        return ExitUsage;
+    }
+    // May legitimately be null: no `--discovery` means the cluster is the
+    // `--raft-peer` list an operator typed, which is the ordinary deployment.
+    auto const discoveryTier = std::move(*discoveryOrRefusal);
+
     auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(cfg, membership.Oracle(), cacheClock, metrics, logger);
     if (!cacheTierOrRefusal.has_value())
     {
@@ -775,7 +793,7 @@ int main(int argc, char** argv)
     // the POSIX host has already redirected stdout to /dev/null by the time the body
     // runs, so a diagnosis printed there goes nowhere in the one deployment where a
     // scheduler is most likely to be misconfigured.
-    if (auto const rejection = SchedulerPolicyRejection(cfg))
+    if (auto const rejection = StartupPolicyRejection(cfg))
     {
         logger.Logf(LogLevel::Error, "{}", *rejection);
         return ExitUsage;

@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -12,14 +13,25 @@ using namespace FastCache::Cluster;
 
 namespace
 {
-/// A member record, spelled once so the cases vary only what they are about.
+/// A record the cluster has agreed on.
 /// @param id The identity.
 /// @param raft Where its consensus port answers.
 /// @param scheduler Where clients reach it while it leads.
-/// @return The record.
+/// @return The member.
 [[nodiscard]] ClusterMember Member(std::string id, std::string raft, std::string scheduler = {})
 {
     return ClusterMember { .id = std::move(id), .raftEndpoint = std::move(raft), .schedulerEndpoint = std::move(scheduler) };
+}
+
+/// A record this node believes should be present.
+/// @param id The identity.
+/// @param raft Where its consensus port answers.
+/// @param scheduler What this node knows about its scheduler port; absent for "no
+///        opinion", which is what discovery has about a peer.
+/// @return The desire.
+[[nodiscard]] DesiredMember Desire(std::string id, std::string raft, std::optional<std::string> scheduler = std::nullopt)
+{
+    return DesiredMember { .id = std::move(id), .raftEndpoint = std::move(raft), .schedulerEndpoint = std::move(scheduler) };
 }
 
 /// The state a cluster reaches after admitting each of `members`.
@@ -29,25 +41,32 @@ namespace
 {
     return ClusterState { .members = std::move(members), .settings = {} };
 }
+
+/// `MembershipProposals`, spelled without the span conversion at every call.
+/// @param state What the cluster holds.
+/// @param desired What this node believes.
+/// @return The proposals.
+[[nodiscard]] std::vector<Command> Proposals(ClusterState const& state, std::vector<DesiredMember> const& desired)
+{
+    return MembershipProposals(state, std::span<DesiredMember const> { desired });
+}
 } // namespace
 
 TEST_CASE("A record the state already holds is not proposed again", "[cluster][membership]")
 {
     // Proposing one costs a log entry, a replication round and a snapshot's worth of
-    // growth per beacon interval, forever. Worse, `AddMember` applies wholesale, so a
-    // re-proposal that dropped a field would clear it.
+    // growth per beacon interval, forever.
     auto const state = StateOf({ Member("n1", "10.0.0.1:6675", "10.0.0.1:7000") });
-    std::vector const desired { Member("n1", "10.0.0.1:6675", "10.0.0.1:7000") };
 
-    CHECK(MembershipProposals(state, std::span<ClusterMember const> { desired }).empty());
+    CHECK(Proposals(state, { Desire("n1", "10.0.0.1:6675", "10.0.0.1:7000") }).empty());
 }
 
 TEST_CASE("A member the state has never heard of is proposed", "[cluster][membership]")
 {
     ClusterState const state;
-    std::vector const desired { Member("n1", "10.0.0.1:6675", "10.0.0.1:7000"), Member("n2", "10.0.0.2:6675") };
+    auto const proposals =
+        Proposals(state, { Desire("n1", "10.0.0.1:6675", "10.0.0.1:7000"), Desire("n2", "10.0.0.2:6675") });
 
-    auto const proposals = MembershipProposals(state, std::span<ClusterMember const> { desired });
     REQUIRE(proposals.size() == 2);
     CHECK(proposals[0]
           == Command {
@@ -62,24 +81,48 @@ TEST_CASE("A record that differs in any field is re-proposed", "[cluster][member
     // half is the case that matters: a node that has just become leader differs from
     // its recorded self only by a scheduler endpoint nobody had asked it for, and
     // that is precisely the value a follower needs in order to redirect.
-    auto const state = StateOf({ Member("n1", "10.0.0.1:6675", "10.0.0.1:7000") });
-
     SECTION("its consensus endpoint moved")
     {
-        std::vector const desired { Member("n1", "10.0.0.9:6675", "10.0.0.9:7000") };
-        auto const proposals = MembershipProposals(state, std::span<ClusterMember const> { desired });
+        auto const state = StateOf({ Member("n1", "10.0.0.1:6675", "10.0.0.1:7000") });
+        auto const proposals = Proposals(state, { Desire("n1", "10.0.0.9:6675", "10.0.0.9:7000") });
         REQUIRE(proposals.size() == 1);
         CHECK(proposals[0].value == "10.0.0.9:6675");
+        CHECK(proposals[0].schedulerEndpoint == "10.0.0.9:7000");
     }
 
     SECTION("it has just announced where clients reach it")
     {
-        auto const unannounced = StateOf({ Member("n1", "10.0.0.1:6675") });
-        std::vector const desired { Member("n1", "10.0.0.1:6675", "10.0.0.1:7000") };
-        auto const proposals = MembershipProposals(unannounced, std::span<ClusterMember const> { desired });
+        auto const state = StateOf({ Member("n1", "10.0.0.1:6675") });
+        auto const proposals = Proposals(state, { Desire("n1", "10.0.0.1:6675", "10.0.0.1:7000") });
         REQUIRE(proposals.size() == 1);
         CHECK(proposals[0].schedulerEndpoint == "10.0.0.1:7000");
     }
+}
+
+TEST_CASE("Knowing nothing about a scheduler endpoint leaves the recorded one alone", "[cluster][membership]")
+{
+    // The distinction `DesiredMember` exists for, and getting it wrong is a fleet
+    // whose redirects break every time a follower's discovery loop notices the
+    // leader. Discovery proves a peer's CONSENSUS endpoint and learns nothing about
+    // the port clients speak to -- so it has no opinion, and no opinion must not
+    // overwrite an assertion the peer made about itself.
+    auto const state = StateOf({ Member("n1", "10.0.0.1:6675", "10.0.0.1:7000") });
+
+    // No opinion, same consensus endpoint: nothing to say.
+    CHECK(Proposals(state, { Desire("n1", "10.0.0.1:6675") }).empty());
+
+    // No opinion, moved consensus endpoint: proposed, and the recorded scheduler
+    // endpoint travels with it rather than being dropped by omission.
+    auto const moved = Proposals(state, { Desire("n1", "10.0.0.9:6675") });
+    REQUIRE(moved.size() == 1);
+    CHECK(moved[0].value == "10.0.0.9:6675");
+    CHECK(moved[0].schedulerEndpoint == "10.0.0.1:7000");
+
+    // An EMPTY string is an opinion -- "I know it has none" -- and does clear it.
+    // That is what a node says about itself when it serves no scheduler surface.
+    auto const cleared = Proposals(state, { Desire("n1", "10.0.0.1:6675", std::string {}) });
+    REQUIRE(cleared.size() == 1);
+    CHECK(cleared[0].schedulerEndpoint.empty());
 }
 
 TEST_CASE("A member the state holds and nobody desires is left alone", "[cluster][membership]")
@@ -91,9 +134,8 @@ TEST_CASE("A member the state holds and nobody desires is left alone", "[cluster
     // membership from reachability can shrink itself below a majority and never come
     // back.
     auto const state = StateOf({ Member("n1", "10.0.0.1:6675"), Member("n2", "10.0.0.2:6675") });
-    std::vector const desired { Member("n1", "10.0.0.1:6675") };
 
-    CHECK(MembershipProposals(state, std::span<ClusterMember const> { desired }).empty());
+    CHECK(Proposals(state, { Desire("n1", "10.0.0.1:6675") }).empty());
 }
 
 TEST_CASE("A half-record is dropped rather than proposed", "[cluster][membership]")
@@ -102,9 +144,9 @@ TEST_CASE("A half-record is dropped rather than proposed", "[cluster][membership
     // refusal per interval and change nothing -- and the diagnostic would name the
     // reconciler rather than whatever produced the half-record.
     ClusterState const state;
-    std::vector const desired { Member("", "10.0.0.1:6675"), Member("n2", ""), Member("n3", "10.0.0.3:6675") };
+    auto const proposals =
+        Proposals(state, { Desire("", "10.0.0.1:6675"), Desire("n2", ""), Desire("n3", "10.0.0.3:6675") });
 
-    auto const proposals = MembershipProposals(state, std::span<ClusterMember const> { desired });
     REQUIRE(proposals.size() == 1);
     CHECK(proposals[0].key == "n3");
 }

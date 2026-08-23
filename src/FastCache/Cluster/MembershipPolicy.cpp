@@ -6,7 +6,7 @@
 namespace FastCache::Cluster
 {
 
-std::vector<Command> MembershipProposals(ClusterState const& state, std::span<ClusterMember const> desired)
+std::vector<Command> MembershipProposals(ClusterState const& state, std::span<DesiredMember const> desired)
 {
     std::vector<Command> proposals;
     for (auto const& member: desired)
@@ -19,13 +19,21 @@ std::vector<Command> MembershipProposals(ClusterState const& state, std::span<Cl
             continue;
 
         auto const it = std::ranges::find(state.members, member.id, &ClusterMember::id);
-        if (it != state.members.end() && *it == member)
+        auto const known = it != state.members.end();
+
+        // `value_or` rather than a checked dereference, for the reason `Unwrap` is
+        // spelled that way in the tests: it is provably safe, so the "unchecked
+        // optional access" analysis has nothing to object to. What it computes is the
+        // rule this type exists for -- no opinion means whatever is recorded stands.
+        auto const scheduler = member.schedulerEndpoint.value_or(known ? it->schedulerEndpoint : std::string {});
+
+        if (known && it->raftEndpoint == member.raftEndpoint && it->schedulerEndpoint == scheduler)
             continue;
 
         proposals.push_back(Command { .kind = CommandKind::AddMember,
                                       .key = member.id,
                                       .value = member.raftEndpoint,
-                                      .schedulerEndpoint = member.schedulerEndpoint });
+                                      .schedulerEndpoint = scheduler });
     }
     return proposals;
 }

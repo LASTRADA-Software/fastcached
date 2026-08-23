@@ -181,6 +181,33 @@ struct NodeConfig
     /// leaders in one term.
     std::filesystem::path clusterDir;
 
+    /// Which fleet this node belongs to, for discovery.
+    ///
+    /// Routing, not authentication, and saying so keeps it honest: it is plain
+    /// text in every beacon, so treating it as a credential would be the mistake.
+    /// What it buys is that two unrelated fleets on one segment ignore each other,
+    /// which holds even when somebody shares a key across fleets -- which they
+    /// should not.
+    std::string clusterId { "fastcache" };
+
+    /// Where discovery beacons go, empty to leave discovery off.
+    ///
+    /// Off by default because a cluster does not need it: `--raft-peer` is a list
+    /// an operator typed, and that works. Discovery is what makes a *changing*
+    /// fleet possible -- a machine that joins without anybody editing a file on
+    /// every other machine.
+    std::string discoveryAddress;
+
+    /// File holding the cluster's pre-shared key.
+    ///
+    /// A path rather than the key itself, and that is a security decision rather
+    /// than a convenience: a command line is readable through `ps` on every POSIX
+    /// system and through the process list on Windows, and a service's arguments
+    /// end up in a unit file or a registry key that more accounts can read than
+    /// can read a mode-0600 file. A leaked key admits a node, and an admitted node
+    /// returns objects the whole fleet then caches.
+    std::filesystem::path clusterKeyFile;
+
     /// The name the platform's supervisor keys this worker's registration on.
     ///
     /// Distinct from the daemon's `FastCached` by default, because the two are
@@ -269,7 +296,7 @@ struct NodeConfig
 /// @return An explanatory message when the install must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg);
 
-/// Why this worker's scheduler configuration cannot work, if it cannot.
+/// Why this worker's configuration cannot work, if it cannot.
 ///
 /// A *startup* rule rather than an install-time one, and the split is deliberate:
 /// each of these is fatal every time the process runs, not only when a registration
@@ -281,7 +308,7 @@ struct NodeConfig
 /// at the one moment an operator is watching.
 /// @param cfg The parsed configuration.
 /// @return The refusal and its remedy, or nullopt when the configuration can work.
-[[nodiscard]] std::optional<std::string> SchedulerPolicyRejection(NodeConfig const& cfg);
+[[nodiscard]] std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg);
 
 /// Render the usage text from the same rows the parser matches.
 /// @param color Whether to emit ANSI colour.
