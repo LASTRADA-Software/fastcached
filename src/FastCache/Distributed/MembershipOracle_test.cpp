@@ -175,3 +175,14 @@ TEST_CASE("Every spelling a kernel reports for a local peer is local", "[distrib
     // kernel reports it as a peer address either, so nothing legitimate is lost.
     CHECK(membership.Classify("localhost") == Membership::Outsider);
 }
+
+TEST_CASE("A peer this machine cannot name is refused", "[distributed][membership]")
+{
+    // The direction an unidentifiable caller has to fail in. An empty host is what
+    // `FormatPeerAddress` answers for a peer whose family it does not know or whose
+    // `getpeername` failed, and handing this machine's CPU to something it cannot
+    // name is the one outcome that must not be possible.
+    ClusterMembership const membership { { "10.0.0.1:7000" } };
+
+    CHECK(membership.Classify("") == Membership::Outsider);
+}

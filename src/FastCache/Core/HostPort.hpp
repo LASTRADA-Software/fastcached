@@ -105,6 +105,14 @@ namespace FastCache
 /// IPv4-mapped `::ffff:127.x.x.x` a dual-stack listener reports for an IPv4 client.
 /// The literal name `localhost` is **not** among them: it is whatever a resolver
 /// says it is, and a resolver is not something a security decision may depend on.
+///
+/// An **empty** host is not local either, and that direction is deliberate. It is
+/// what `FormatPeerAddress` answers for a peer it could not identify — a family it
+/// does not know, or a `getpeername` that failed — and a caller this machine cannot
+/// name must not be handed its CPU. The one shape that is genuinely local and
+/// reports nothing is a Unix-domain socket, which is unreachable here: the node
+/// listens on TCP, and a socket-activated one is *required* to `--advertise` a
+/// host:port, so a Unix socket would already be a worker no client could dial.
 /// @param host The peer's host, without a port or brackets.
 /// @return True when the peer is on this machine.
 [[nodiscard]] inline bool IsLoopbackHost(std::string_view host) noexcept
