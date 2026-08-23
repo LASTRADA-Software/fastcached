@@ -50,6 +50,17 @@ class SchedulerTier
     SchedulerTier(SchedulerTier&&) = delete;
     SchedulerTier& operator=(SchedulerTier&&) = delete;
 
+    /// Tell the scheduler what this node is, and who leads if it does not.
+    ///
+    /// The seam consensus drives. Without a `--node-id` nobody ever calls it and the
+    /// constructor's standalone leadership stands, which is what one machine wants.
+    /// @param role What this node is now.
+    /// @param leaderEndpoint Where the leader answers, empty when nobody leads.
+    void SetRole(Distributed::SchedulerRole role, std::string_view leaderEndpoint)
+    {
+        _service.SetRole(role, leaderEndpoint);
+    }
+
     /// The address the scheduler surface bound.
     [[nodiscard]] std::string const& BoundEndpoint() const noexcept
     {

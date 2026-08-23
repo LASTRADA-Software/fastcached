@@ -143,6 +143,44 @@ struct NodeConfig
     std::string user;
     LogLevel logLevel { LogLevel::Info };
 
+    /// This node's identity in the cluster, or empty to run without consensus.
+    ///
+    /// The switch for the whole consensus tier, and empty is the default because the
+    /// common deployment is one machine. A node alone leads trivially -- it schedules
+    /// for itself and nobody else -- and requiring an operator to configure a
+    /// one-member cluster to get that would be ceremony for the ordinary case.
+    ///
+    /// Given, it must appear in the cluster with an endpoint, which is what
+    /// `--raft-peer` supplies.
+    std::string nodeId;
+
+    /// Where this node answers its peers' Raft traffic.
+    ///
+    /// A bare port binds the WILDCARD, like `--listen-scheduler` and unlike
+    /// `--listen-cache`: peers are on other machines by definition, so a loopback
+    /// default would be one that silently cannot work.
+    std::string raftListen;
+
+    /// The cluster's members as `id=host:port`; repeatable.
+    ///
+    /// Both halves in one token because they are one fact. A member id without an
+    /// address is a node the cluster counts towards quorum and cannot reach -- the
+    /// residual `RaftMembership` recorded, and the reason `Cluster::ClusterMember`
+    /// pairs them.
+    ///
+    /// This is the BOOTSTRAP set only. Once the cluster is running, membership is a
+    /// replicated log entry and this list is not consulted again -- which is what
+    /// makes a node that was admitted at runtime survive a restart without anybody
+    /// editing a config file on every other machine.
+    std::vector<std::string> raftPeers;
+
+    /// Where consensus keeps its durable state, empty for a default beside the cache.
+    ///
+    /// Durable by necessity rather than by preference: a node that answered a vote
+    /// and forgot it would vote twice in one term after a restart, which is two
+    /// leaders in one term.
+    std::filesystem::path clusterDir;
+
     /// The name the platform's supervisor keys this worker's registration on.
     ///
     /// Distinct from the daemon's `FastCached` by default, because the two are

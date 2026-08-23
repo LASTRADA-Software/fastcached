@@ -142,6 +142,10 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.cacheDir = "cache";
     cfg.cacheListen = "127.0.0.1:6679";
     cfg.upstream = "cache.internal:6674";
+    cfg.nodeId = "n1";
+    cfg.raftListen = "0.0.0.0:6680";
+    cfg.raftPeers = { "n1=10.0.0.4:6680", "n2=10.0.0.5:6680" };
+    cfg.clusterDir = "cluster";
     cfg.logLevel = LogLevel::Debug;
     cfg.pidfile = "worker.pid";
 

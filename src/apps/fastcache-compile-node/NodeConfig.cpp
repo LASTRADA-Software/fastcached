@@ -249,6 +249,36 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "node class reserves. 0 is a real answer and is not the\n"
                          "same as omitting the flag. Ignored when --slots names\n"
                          "a number, which is the operator's answer already." },
+        { .primary = "--node-id",
+          .arity = Arity::Value,
+          .operand = "=<id>",
+          .apply = AssignFrom<&NodeConfig::nodeId, ParseText>(),
+          .description = "this node's identity in the cluster. Giving it turns\n"
+                         "consensus ON; without it this node leads alone,\n"
+                         "which is right for one machine and is the default." },
+        { .primary = "--listen-raft",
+          .arity = Arity::Value,
+          .operand = "=[<address>:]<port>",
+          .apply = AssignFrom<&NodeConfig::raftListen, ParseText>(),
+          .description = "where peers reach this node's consensus port. A bare\n"
+                         "port binds the WILDCARD: peers are on other machines\n"
+                         "by definition, so loopback would silently not work." },
+        { .primary = "--raft-peer",
+          .arity = Arity::Value,
+          .operand = "=<id>=<host>:<port>",
+          .apply = AppendFrom<&NodeConfig::raftPeers, ParseText>(),
+          .description = "a cluster member and where it answers; repeatable.\n"
+                         "Both halves in one token because a member id with\n"
+                         "no address is a node counted towards quorum and\n"
+                         "unreachable. This is the BOOTSTRAP set only:\n"
+                         "membership is replicated once the cluster runs." },
+        { .primary = "--cluster-dir",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&NodeConfig::clusterDir, ParsePathValue>(),
+          .description = "where consensus keeps its durable state. A node\n"
+                         "that answered a vote and forgot it votes twice in\n"
+                         "one term after a restart, which is two leaders." },
         { .primary = "--admin-listen",
           .arity = Arity::Value,
           .operand = "=[<address>:]<port>",
@@ -441,6 +471,15 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
     emitIfSet("cache-memory", cfg.cacheMemoryBytes, defaults.cacheMemoryBytes);
     emitIfSet("listen-cache", cfg.cacheListen, defaults.cacheListen);
+    emitIfSet("node-id", cfg.nodeId, defaults.nodeId);
+    emitIfSet("listen-raft", cfg.raftListen, defaults.raftListen);
+    emitPathIfSet("cluster-dir", cfg.clusterDir.string());
+    // Repeatable, so one token per peer rather than one joined value -- for the
+    // reason the toolchains are: a service that came back knowing fewer members than
+    // it was installed with would present as a cluster that stopped forming quorum,
+    // not as a packaging bug.
+    for (auto const& peer: cfg.raftPeers)
+        argv.push_back(std::format("--raft-peer={}", peer));
     emitIfSet("upstream", cfg.upstream, defaults.upstream);
     emitPathIfSet("cache-dir", cfg.cacheDir.string());
     if (cfg.fleetOpen)

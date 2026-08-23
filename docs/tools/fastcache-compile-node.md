@@ -248,6 +248,64 @@ protocol.
 On a shared multi-user machine, "local" means every account on it. That is the same
 trust level the daemon assumes; use `--requirepass` if it is not the one you want.
 
+## A cluster, and who leads it
+
+Run one node and it leads itself: it schedules for its own machine, nobody else's,
+and that needs no configuration. That is the common deployment and the default.
+
+Run several and exactly one of them must schedule at a time. Without consensus
+every node believes it does — and two nodes handing out the same machine's slots is
+not a degraded fleet, it is the one thing the architecture says only one node may
+do. So a fleet gives each node an identity and tells it who its peers are:
+
+```sh
+fastcache-compile-node     --node-id=n1 --listen-raft=6680     --raft-peer=n1=10.0.0.1:6680     --raft-peer=n2=10.0.0.2:6680     --raft-peer=n3=10.0.0.3:6680     --listen-scheduler=6675 --advertise=10.0.0.1:6676     --toolchain=/usr/bin/g++
+```
+
+Each peer is an **identity and an address in one token**, because they are one
+fact. A member id with no address is a node the cluster counts towards every quorum
+and cannot reach: the fleet is then one node short of forming one, and nothing says
+why.
+
+A node must name itself among its own peers, and it is refused at startup if it
+does not — such a node could never win a vote and could never be voted for, so it
+would stand for election forever against a cluster that has never heard of it.
+
+### What the log carries
+
+Cluster configuration and nothing else: **who is a member, where they answer**, and
+the handful of settings every member must agree on. Not the cache — a log is
+replicated to every member and kept until it is snapshotted, and multi-megabyte
+objects written constantly are the opposite of what belongs in one. Cached objects
+live in the `fastcached` this state merely names.
+
+| Setting | Means |
+| --- | --- |
+| `upstream` | host:port of the shared `fastcached` every member reads through to |
+| `fleet-open` | `1` to admit every caller to the fleet, `0` for members only |
+
+A key the build does not know is **refused when it is proposed**, not stored. The
+alternative is a typo replicated to every node, snapshotted, carried across
+restarts — and doing nothing, with the only symptom being that the thing you
+configured did not happen.
+
+### Membership at runtime
+
+`--raft-peer` is the **bootstrap** set. Once the cluster is running, membership is
+a replicated log entry, and that is what makes a node admitted at runtime survive a
+restart without anybody editing a config file on every other machine.
+
+The agreed member set becomes the fleet's admission policy directly, so a node the
+cluster admitted is served by all three surfaces at once — its compile port, the
+scheduler, and every member's cache tier. `--fleet-member` is the answer before a
+cluster exists; this is the answer once one does.
+
+### Where its state lives
+
+`--cluster-dir`, defaulting to `fastcache-cluster/<node-id>`. Durable by necessity
+rather than by preference: a node that answered a vote and forgot it would vote
+twice in one term after a restart, which is two leaders in one term.
+
 ## Running it as a service
 
 ### Linux
@@ -540,7 +598,15 @@ For anything beyond a trusted build network, put mTLS in front of every port.
   ([#87](https://github.com/LASTRADA-Software/fastcached/issues/87)).
   `--service-scope=user` works, and is the right answer on a developer machine
   anyway.
-- Host **CPU and memory utilization** are not reported. Size, slots and disk are;
-  what the machine is doing *right now* is what resource-aware scheduling will
-  need, and it lands with the scheduling policy that consumes it rather than
-  ahead of it.
+- **Nothing changes a cluster setting at runtime yet.** The log carries them, a
+  leader can propose them, and every node applies and snapshots them — but there is
+  no operator surface that says "set `upstream` to this". Until there is,
+  `--upstream` on each node is what configures it.
+- **Membership is bootstrap-only in practice.** A node admitted by a proposal is
+  replicated, persisted and served correctly; what is missing is the thing that
+  *makes* the proposal. Discovery proves who holds the pre-shared key and where
+  they answer, and joining that to a membership change is the remaining step.
+- **The log is never compacted.** `CompactThroughApplied` exists and nothing calls
+  it, so a long-lived cluster's log grows without bound. It grows *slowly* —
+  cluster configuration changes are rare by construction — but "slowly" is not
+  "never" and this is the policy decision that closes it.

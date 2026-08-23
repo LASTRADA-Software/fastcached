@@ -11,6 +11,7 @@
 ///
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
+#include "ConsensusTier.hpp"
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
@@ -397,7 +398,10 @@ constexpr int ExitOk = 0;
     // the cache below -- and it outlives every one of them. A node that answered "is
     // this peer one of ours" differently at two of its surfaces would admit a peer to
     // the fleet and refuse it the objects that fleet produced, or worse, the reverse.
-    Node::NodeMembership const membership { cfg };
+    // Not `const`: consensus republishes the member set into it while the node runs,
+    // which is the whole point of membership being a replicated log entry rather than
+    // a command-line list.
+    Node::NodeMembership membership { cfg };
 
     // No lease validation, and it is recorded here rather than left looking like a
     // stub. `WorkerServer` gates the port on membership, so what reaches this
@@ -513,6 +517,23 @@ constexpr int ExitOk = 0;
     //
     // Five collaborators in a reference chain, owned as one object rather than as
     // locals whose declaration ORDER is load-bearing and silently so.
+    // Consensus, when the operator configured a cluster. It is what turns the
+    // scheduler tier's standalone leadership into a real one: without it, every node
+    // in a fleet believes it schedules, and two nodes handing out the same machine's
+    // slots is the one thing the architecture says only one may do.
+    //
+    // Started AFTER the scheduler tier, because its observers push into it, and
+    // declared after too, so it is destroyed first and cannot call into a tier that
+    // has gone.
+    auto consensusOrRefusal = Node::StartConsensusOrExplain(cfg, schedulerTier, membership, logger);
+    if (!consensusOrRefusal.has_value())
+    {
+        logger.Logf(LogLevel::Error, "--node-id {}; refusing to start", consensusOrRefusal.error());
+        return ExitUsage;
+    }
+    // May legitimately be null: no `--node-id` means this node leads alone.
+    auto const consensusTier = std::move(*consensusOrRefusal);
+
     auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(cfg, membership.Oracle(), cacheClock, metrics, logger);
     if (!cacheTierOrRefusal.has_value())
     {

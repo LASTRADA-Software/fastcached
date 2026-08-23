@@ -37,6 +37,7 @@ add_executable(fastcache-compile-node
     AdminEndpoint.cpp
     CacheProxy.cpp
     CacheTier.cpp
+    ConsensusTier.cpp
     SchedulerTier.cpp
     LocalCache.cpp
     NodeConfig.cpp
@@ -70,8 +71,10 @@ if(FASTCACHED_BUILD_TESTS)
         AdminEndpoint_test.cpp
         CacheProxy.cpp
     CacheTier.cpp
+    ConsensusTier.cpp
     SchedulerTier.cpp
         CacheProxy_test.cpp
+        ConsensusTier_test.cpp
         LocalCache.cpp
         LocalCache_test.cpp
         RemoteUpstream.cpp
