@@ -28,6 +28,8 @@ target_sources(FastCache
         Config/DefaultConfigPath.cpp
         Config/EnvExpand.cpp
         Config/YamlReader.cpp
+        Consensus/FileRaftStorage.cpp
+        Consensus/InMemoryRaftStorage.cpp
         Consensus/RaftConfig.cpp
         Consensus/RaftLog.cpp
         Consensus/RaftNode.cpp

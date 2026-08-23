@@ -51,6 +51,20 @@ class RaftLog
         LogIndex matchIndex {}; ///< How far the log now provably matches the leader.
     };
 
+    RaftLog() = default;
+
+    /// Reconstruct a log from durable storage.
+    ///
+    /// Not a back door around the truncation rules above: recovery is the one
+    /// moment there is no prior state to protect, because whatever this node knew
+    /// is exactly what is being handed back. Every subsequent change still goes
+    /// through `Append` or `TryAppend`.
+    /// @param entries The stored entries, in index order from 1.
+    explicit RaftLog(std::vector<LogEntry> entries) noexcept:
+        _entries { std::move(entries) }
+    {
+    }
+
     /// Index of the last entry, or `LogIndex::BeforeFirst()` when empty.
     /// @return The last index.
     [[nodiscard]] LogIndex LastIndex() const noexcept;

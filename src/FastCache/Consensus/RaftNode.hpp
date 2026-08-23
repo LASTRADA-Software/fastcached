@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Consensus/IRaftStorage.hpp>
 #include <FastCache/Consensus/RaftConfig.hpp>
 #include <FastCache/Consensus/RaftLog.hpp>
 #include <FastCache/Consensus/RaftOutput.hpp>
@@ -93,15 +94,19 @@ class RaftNode
     ///
     /// Everything the node needs is supplied here and fixed afterwards, so there
     /// is no window in which a node exists but does not yet know who it is.
-    /// Restoring one from durable state is a separate entry point, added with the
-    /// storage seam that produces such state.
     /// @param config The cluster configuration.
     /// @param random Source for election-timeout jitter; must outlive this node.
     /// @param now The current instant, used to arm the first election timeout.
+    /// @param recovered What durable storage held; defaults to a node that has
+    ///        never run. One entry point rather than two, because a
+    ///        default-constructed `RecoveredState` *is* a fresh node — a separate
+    ///        restore path would be a second construction sequence able to drift
+    ///        from this one.
     /// @return The node, or why the configuration was refused.
     [[nodiscard]] static std::expected<RaftNode, ConsensusError> Create(RaftConfig config,
                                                                         IRandomSource& random,
-                                                                        TimePoint now);
+                                                                        TimePoint now,
+                                                                        RecoveredState recovered = {});
 
     /// @return The role this node is currently playing.
     [[nodiscard]] Role CurrentRole() const noexcept;
@@ -182,7 +187,8 @@ class RaftNode
     /// @param config A configuration that has already passed `Validate()`.
     /// @param random Source for election-timeout jitter.
     /// @param now The current instant.
-    RaftNode(RaftConfig config, IRandomSource& random, TimePoint now);
+    /// @param recovered What durable storage held.
+    RaftNode(RaftConfig config, IRandomSource& random, TimePoint now, RecoveredState recovered);
 
     /// Whether `id` is a configured member of this cluster.
     ///

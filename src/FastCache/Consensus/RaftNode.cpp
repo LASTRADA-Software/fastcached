@@ -42,19 +42,32 @@ RoleTraits const& TraitsOf(Role role) noexcept
     return RoleTable.front();
 }
 
-std::expected<RaftNode, ConsensusError> RaftNode::Create(RaftConfig config, IRandomSource& random, TimePoint now)
+std::expected<RaftNode, ConsensusError> RaftNode::Create(RaftConfig config,
+                                                         IRandomSource& random,
+                                                         TimePoint now,
+                                                         RecoveredState recovered)
 {
     if (auto valid = config.Validate(); !valid.has_value())
         return std::unexpected { valid.error() };
 
-    return RaftNode { std::move(config), random, now };
+    return RaftNode { std::move(config), random, now, std::move(recovered) };
 }
 
-RaftNode::RaftNode(RaftConfig config, IRandomSource& random, TimePoint now):
+RaftNode::RaftNode(RaftConfig config, IRandomSource& random, TimePoint now, RecoveredState recovered):
     _config { std::move(config) },
     _peers { _config.Peers() },
-    _random { random }
+    _random { random },
+    _currentTerm { recovered.state.currentTerm },
+    _votedFor { std::move(recovered.state.votedFor) },
+    _log { std::move(recovered.entries) }
 {
+    // A recovered node comes back as a follower whatever it was before, which is
+    // not a simplification: role is not durable state, and a node that resumed as
+    // a leader would be a second leader for a term that has since moved on.
+    // `_commitIndex` is deliberately not recovered either -- it is re-learned from
+    // the first leader that reaches this node, and starting at zero merely
+    // re-applies entries the application already has, which the driver's state
+    // machine must tolerate anyway after any restart.
     ArmElectionTimer(now);
 }
 

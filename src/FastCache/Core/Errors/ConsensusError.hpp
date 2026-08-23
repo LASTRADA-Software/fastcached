@@ -19,6 +19,7 @@ enum class ConsensusErrorCode : std::uint8_t
 {
     InvalidConfiguration = 0, ///< The cluster configuration is not self-consistent.
     NotLeader,                ///< Only a leader may accept a proposal; see `knownLeader`.
+    StorageFailure,           ///< Durable state could not be written or read back.
 };
 
 /// Structured consensus error.
@@ -71,6 +72,16 @@ struct ConsensusError
                             .context = knownLeader.has_value() ? std::format("not the leader; {} is", *knownLeader)
                                                                : std::string { "not the leader, and none is known" },
                             .knownLeader = std::move(knownLeader) };
+}
+
+/// Build a `StorageFailure` error.
+/// @param context What failed, and where.
+/// @return The error.
+[[nodiscard]] inline ConsensusError StorageFailure(std::string_view context)
+{
+    return ConsensusError { .code = ConsensusErrorCode::StorageFailure,
+                            .context = std::string { context },
+                            .knownLeader = std::nullopt };
 }
 
 } // namespace FastCache
