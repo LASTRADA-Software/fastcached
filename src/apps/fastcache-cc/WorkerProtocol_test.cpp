@@ -164,7 +164,9 @@ TEST_CASE("An unauthorized lease is refused before the payload is even decoded",
     std::filesystem::create_directories(scratch);
     CompileJobRunner jobs { runner, scratch, { { "gcc-13", "g++" } } };
     AtomicMetricsSink metrics;
-    WorkerProtocol worker { jobs, [](std::string_view, std::string_view) { return false; }, { Wire::IdentityCodec }, metrics };
+    WorkerProtocol worker {
+        jobs, [](std::string_view, std::string_view) { return false; }, { Wire::IdentityCodec }, metrics
+    };
 
     auto const answer = worker.Answer(CompileFrame());
     REQUIRE(answer.has_value());

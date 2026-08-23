@@ -56,6 +56,19 @@ namespace FastCache
 
 /// Parse a TCP port from text.
 ///
+/// Named `ParseTcpPort` and not `ParsePort` because `Config/CliParser` already
+/// owns that name in this namespace, with the same parameter list and a different
+/// return type (`std::expected<std::uint16_t, ConfigError>`, which the CLI needs
+/// so it can tell "not a number" from "out of range"). That is **not an overload**
+/// and the compiler cannot say so: each translation unit sees only one of the two
+/// declarations, and the Itanium ABI does not encode a return type in a free
+/// function's mangled name -- so both definitions claim the identical symbol, the
+/// linker keeps the strong one, and every caller of the header's `inline` version
+/// silently reaches the other. It reads an `expected` as an `optional` and
+/// segfaults. **MSVC hides this**: its mangling does include the return type, so
+/// the same tree links and passes on Windows and crashes on Linux, which is how it
+/// was found -- 1730 green MSVC tests and two ASan SIGSEGVs.
+///
 /// Rejects a trailing remainder rather than stopping at it, so `6674x` is an
 /// error instead of port 6674 — a listener silently bound somewhere other than
 /// where the operator wrote is the kind of no-op this codebase keeps recording.
@@ -63,12 +76,15 @@ namespace FastCache
 /// scrape or dispatch endpoint is an address nobody can be told in advance.
 /// @param text The port digits.
 /// @return The port, or nullopt when it is not a usable one.
-[[nodiscard]] inline std::optional<std::uint16_t> ParsePort(std::string_view text)
+[[nodiscard]] inline std::optional<std::uint16_t> ParseTcpPort(std::string_view text)
 {
     auto value = 0U;
-    auto const* const end = text.data() + text.size();
-    auto const parsed = std::from_chars(text.data(), end, value);
-    if (parsed.ec != std::errc {} || parsed.ptr != end)
+    // Spelled inline rather than through a hoisted `end`, which is both this
+    // codebase's own idiom everywhere else and what keeps the size visibly paired
+    // with the pointer -- `bugprone-suspicious-stringview-data-usage` reads a
+    // hoisted one as a `data()` handed off with no length at all.
+    auto const parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc {} || parsed.ptr != text.data() + text.size())
         return std::nullopt;
     if (value == 0 || value > 65535U)
         return std::nullopt;
@@ -88,13 +104,13 @@ namespace FastCache
 {
     if (auto const split = SplitHostPort(text); split.has_value())
     {
-        auto const port = ParsePort(split->second);
+        auto const port = ParseTcpPort(split->second);
         if (!port.has_value())
             return std::nullopt;
         return std::pair { split->first, *port };
     }
 
-    auto const port = ParsePort(text);
+    auto const port = ParseTcpPort(text);
     if (!port.has_value())
         return std::nullopt;
     return std::pair { std::string { defaultHost }, *port };

@@ -5,6 +5,7 @@
 // WSAStartup, so the socket loops themselves are written once.
 
 #include "ITcpClient.hpp"
+
 #include <FastCache/Core/HostPort.hpp>
 
 #include <chrono>

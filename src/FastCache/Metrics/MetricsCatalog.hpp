@@ -3,8 +3,10 @@
 
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <ranges>
 #include <string_view>
 
 namespace FastCache
@@ -162,10 +164,9 @@ inline constexpr std::array<CounterDescriptor, static_cast<std::size_t>(IMetrics
 /// @return True when every enumerator has its own row.
 [[nodiscard]] consteval bool CoversEveryCounter() noexcept
 {
-    for (std::size_t index = 0; index < CounterTable.size(); ++index)
-        if (static_cast<std::size_t>(CounterTable[index].counter) != index)
-            return false;
-    return true;
+    return std::ranges::all_of(std::views::iota(std::size_t { 0 }, CounterTable.size()), [](std::size_t index) {
+        return static_cast<std::size_t>(CounterTable[index].counter) == index;
+    });
 }
 
 static_assert(CoversEveryCounter(), "CounterTable must hold one row per IMetricsSink::Counter, in enumerator order");

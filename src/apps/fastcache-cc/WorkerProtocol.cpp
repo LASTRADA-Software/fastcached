@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProtocol.hpp"
-#include <chrono>
-#include <array>
 #include "Dispatch.hpp"
 #include "WorkerProtocol.hpp"
 
 #include <FastCache/Core/Compression.hpp>
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <ranges>
 #include <utility>
 
 namespace FastCache::Cc
@@ -41,11 +43,17 @@ namespace
     /// operator watching a fleet -- and a refusal counted under one reason while
     /// being reported as another is worse than not counting it at all. Splitting
     /// them across a `switch` and a second `switch` is how that happens.
+    ///
+    /// No member carries a default, deliberately. A row answering only two of the
+    /// three questions is not a row -- and `ErrorCode` has no zero enumerator to
+    /// default to in the first place, so `{}` there names a value the enum does not
+    /// have. Omitting the initializers makes the compiler ask for all three, which
+    /// is the property the table wanted anyway.
     struct RefusalDescriptor
     {
-        JobRefusal refusal {};                  ///< The reason this row describes.
-        Wire::ErrorCode code {};                ///< What the client is told.
-        IMetricsSink::Counter counter {};       ///< What the operator sees rise.
+        JobRefusal refusal;            ///< The reason this row describes.
+        Wire::ErrorCode code;          ///< What the client is told.
+        IMetricsSink::Counter counter; ///< What the operator sees rise.
     };
 
     /// One row per `JobRefusal`, in enumerator order.
@@ -77,14 +85,12 @@ namespace
     /// @return True when every `JobRefusal` has its own row.
     [[nodiscard]] consteval bool CoversEveryRefusal() noexcept
     {
-        for (std::size_t index = 0; index < RefusalTable.size(); ++index)
-            if (static_cast<std::size_t>(RefusalTable[index].refusal) != index)
-                return false;
-        return true;
+        return std::ranges::all_of(std::views::iota(std::size_t { 0 }, RefusalTable.size()), [](std::size_t index) {
+            return static_cast<std::size_t>(RefusalTable[index].refusal) == index;
+        });
     }
 
-    static_assert(RefusalTable.size() == static_cast<std::size_t>(JobRefusal::SpawnFailed) + 1
-                      && CoversEveryRefusal(),
+    static_assert(RefusalTable.size() == static_cast<std::size_t>(JobRefusal::SpawnFailed) + 1 && CoversEveryRefusal(),
                   "RefusalTable must hold one row per JobRefusal, in enumerator order");
 
     /// The row describing `refusal`.
@@ -179,8 +185,7 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     // A compiler that ran and rejected the code did its job — that is the client's
     // answer, not a worker failure — so this counts completions rather than
     // successes, and a non-zero exit is not a refusal.
-    auto const elapsed =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
+    auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
     _metrics.Increment(IMetricsSink::Counter::WorkerJobsCompleted);
     _metrics.Increment(IMetricsSink::Counter::WorkerCompileMillisTotal, static_cast<std::uint64_t>(elapsed.count()));
 

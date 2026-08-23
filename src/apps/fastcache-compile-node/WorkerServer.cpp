@@ -32,11 +32,8 @@ namespace
     }
 } // namespace
 
-WorkerServer::WorkerServer(IListener& listener,
-                           Cc::WorkerProtocol& protocol,
-                           std::size_t slots,
-                           IMetricsSink& metrics,
-                           ILogger& logger) noexcept:
+WorkerServer::WorkerServer(
+    IListener& listener, Cc::WorkerProtocol& protocol, std::size_t slots, IMetricsSink& metrics, ILogger& logger) noexcept:
     _listener { listener },
     _protocol { protocol },
     _slots { slots },
@@ -110,8 +107,7 @@ Task<void> WorkerServer::Run()
                     // Counted at the socket, which is what "bytes received" means
                     // to an operator sizing a link: the payload as it arrived, not
                     // what it decompressed to.
-                    _metrics.Increment(IMetricsSink::Counter::WorkerBytesReceived,
-                                       static_cast<std::uint64_t>(frame.size()));
+                    _metrics.Increment(IMetricsSink::Counter::WorkerBytesReceived, static_cast<std::uint64_t>(frame.size()));
 
                     if (auto const reply = _protocol.Answer(frame); reply.has_value())
                     {

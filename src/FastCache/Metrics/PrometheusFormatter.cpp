@@ -217,15 +217,13 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
         AppendHostMetrics(out, *snapshot.host);
 
     // Every counter the sink knows, without exception. Exporting the *table*
-    // rather than a hand-picked subset is the whole point: seven of the eleven
+    // rather than a hand-picked subset is the whole point: seven of the nine
     // live counters used to be absent here, including all five the distributed-
     // compilation guide tells an operator to read.
     for (auto const& row: CounterTable)
-        Append(out,
-               Metric { .name = row.prometheusName,
-                        .help = row.help,
-                        .type = row.type,
-                        .value = metrics.Read(row.counter) });
+        Append(
+            out,
+            Metric { .name = row.prometheusName, .help = row.help, .type = row.type, .value = metrics.Read(row.counter) });
 
     // Uptime is neither the cache's nor the sink's: every process that serves
     // this endpoint has one, and a worker's is as useful as a daemon's.
