@@ -263,7 +263,7 @@ These constraints are load-bearing and have each already been a bug:
   null on Windows until it called `Detail::EnsureNetworkInitialised`, and no fake
   would ever have shown that.
 
-- **Consensus had never been RUN, and four defects were waiting where no unit test
+- **Consensus had never been RUN, and five defects were waiting where no unit test
   could reach them.** `RaftNode`, `RaftLog`, `RaftDriver` and `RaftClusterHarness`
   are exhaustively tested against a simulated cluster in one process — which is the
   right place for the algorithm's rules, since a scripted partition is not something
@@ -296,6 +296,40 @@ These constraints are load-bearing and have each already been a bug:
     which a client cannot tell from an election in progress and answers by compiling
     locally, every time. `ConsensusTier::Republish` therefore runs on a state change
     as well, and suppresses only an answer that has genuinely not moved.
+  - **A loop that parks on a deadline it read cannot be told the deadline moved.**
+    `RaftDriver::Run` reads `NextDeadline()` and hands the coroutine to the
+    reactor's timer wheel, and `SleepUntil` has no cancellation -- while `Receive`,
+    arriving from a peer-reader coroutine on that same reactor, can move that
+    deadline *earlier*. The case that matters is a candidate winning: its deadline
+    goes from an election deadline up to `electionTimeoutMax` away to a heartbeat
+    deadline one interval away. The new leader's first heartbeat still goes out
+    immediately (`BecomeLeader` sends it), so the cluster looks elected; its
+    **second** is then late by most of an election timeout, the follower that drew
+    the shortest randomized timeout elects itself,
+    and the next leader repeats it. Measured on three real nodes: **nine role
+    changes in twelve seconds** with nothing else wrong, against two after the fix
+    -- and a `Linux-clang-release` CI failure in which `cluster-e2e` found exactly
+    one leader, counted exactly one, and then found a *second* one two assertions
+    later. The sleep is bounded by the heartbeat interval now, which is the same
+    answer `BlockingListener::SetTimeouts` gives to the same shape of problem: a
+    wait nothing can interrupt is bounded rather than left to be woken. It costs a
+    leader nothing (it already wakes at that cadence) and a follower a few empty
+    wake-ups per election timeout. Three things worth keeping:
+    - **No single-threaded test can see it, which is why it is on this list.**
+      `RaftDriver_test` and `RaftClusterHarness` both advance a node by calling
+      `Tick` directly, so the deadline the loop is *sleeping on* does not exist in
+      either. The regression case therefore drives `Run` on a `TestReactor` and
+      delivers the winning vote through `Receive` while the loop is parked --
+      verified by removing the bound and watching that one case, and only it, fail.
+    - **A single poll passes against leadership that never settles.** A cluster
+      re-electing on a timer has exactly one leader at almost every instant; two
+      only in the window where a deposed leader has not yet heard from its
+      successor. `cluster-e2e` asked once, which is how this reached CI as an
+      unrelated-looking failure. It now holds the question open for three seconds
+      and requires the same node to answer throughout.
+    - **The fixture dumps every node's log on any failure**, not only when no
+      leader appears. A consensus defect that reproduces once in five runs is
+      diagnosable from the logs or not at all, and cleanup deletes them.
 
   Two further consequences are worth stating on their own. **`RaftDriver` holds a
   mutex now**, because the node is advanced from three routes by construction — the
@@ -2280,9 +2314,12 @@ with the six it needs.
 
 `cluster-e2e` is the consensus counterpart, and what it covers is deliberately
 disjoint from the unit tests rather than a slower repeat of them: three real
-processes elect a leader, a follower's refusal names an endpoint that a client then
-successfully dials, a setting replicates, a member is removed, and the cluster
-re-forms after its leader is killed. Every one of those is a property of the wire,
+processes elect a leader and *keep* that leader for three seconds of polling, a
+follower's refusal names an endpoint that a client then successfully dials, a
+setting replicates, a member is removed, and the cluster re-forms after its leader
+is killed. The stability half is not padding: a cluster that re-elects on a timer
+has exactly one leader at almost every instant, so a single poll passes against
+leadership that never settles. Every one of those is a property of the wire,
 the transport, the timers and the command line meeting at once — which
 `RaftClusterHarness` cannot reach precisely because it replaces all four. It is
 POSIX-only for now: the properties are platform-independent and the fixture is not,

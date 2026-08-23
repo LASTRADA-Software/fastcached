@@ -169,9 +169,6 @@ class RaftDriver
     /// @return The node.
     [[nodiscard]] RaftNode const& Node() const noexcept;
 
-    /// @return When `Tick` must next be called.
-    [[nodiscard]] TimePoint NextDeadline() const;
-
     /// The failure that stopped this driver, if one did.
     ///
     /// Latched: once storage has failed, every later call refuses with the same
@@ -200,7 +197,7 @@ class RaftDriver
     /// Ask `Run` to finish. Safe to call before it starts, and from any thread.
     ///
     /// The loop observes this when its current wait expires, so teardown can lag
-    /// by up to `electionTimeoutMax`. That is a deliberate limit rather than an
+    /// by one heartbeat interval. That is a deliberate limit rather than an
     /// oversight: waking the wait early needs a reactor-side cancellation this
     /// library does not have yet, and a supervisor that cannot wait stops the
     /// reactor as well. The flag is atomic because the natural caller is a signal
@@ -210,6 +207,15 @@ class RaftDriver
   private:
     /// Perform one output in the required order; `_mutex` must be held.
     [[nodiscard]] std::expected<void, ConsensusError> Deliver(RaftOutput output);
+
+    /// How long `Run` may sleep, given the node's own next deadline.
+    ///
+    /// Bounded rather than taken from the node alone; the reason is at the
+    /// definition and it is the difference between a cluster that settles and one
+    /// that re-elects every second.
+    /// @param now The instant the sleep starts from.
+    /// @return The instant to wake at.
+    [[nodiscard]] TimePoint SleepDeadline(TimePoint now) const;
 
     /// Report the role if it has moved since the last report.
     void PublishRoleIfChanged();

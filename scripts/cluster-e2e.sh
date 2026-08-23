@@ -8,12 +8,15 @@
 # The properties asserted here are the ones no unit test can reach, because each
 # needs three real processes, a real election and a real socket between them:
 #
-#   1. One leader        — of three nodes that started together, exactly ONE answers
-#                          a cluster verb and the other two refuse. Every unit test
-#                          in the consensus library asserts this about a simulated
-#                          cluster; this asserts it about three processes and a
-#                          network stack, which is where the wire, the transport and
-#                          the timers all get their first say.
+#   1. One leader, and it — of three nodes that started together, exactly ONE
+#      keeps leading         answers a cluster verb, the other two refuse, and that
+#                            is still true three seconds later. Every unit test in
+#                            the consensus library asserts the first half about a
+#                            simulated cluster; this asserts it about three
+#                            processes and a network stack, which is where the wire,
+#                            the transport and the timers all get their first say.
+#                            The second half is what catches leadership that never
+#                            settles, which a single poll cannot see.
 #   2. Redirect is usable — a follower's refusal names the leader's SCHEDULER port,
 #                          and dialling that endpoint works. This is the defect the
 #                          two-endpoint member record exists to close: while one
@@ -79,7 +82,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-fail() { echo "cluster E2E FAILED: $*" >&2; exit 1; }
+# Every node's log, on the way out of any failure.
+#
+# The alternative is what this fixture shipped with: one line naming the
+# assertion, and nothing at all about what the three processes were doing. A
+# consensus defect that reproduces intermittently is diagnosable from the logs or
+# it is not diagnosable at all, and the logs are gone the moment cleanup runs.
+dump_logs() {
+    for log in ${node_logs+"${node_logs[@]}"}; do
+        [[ -n "$log" && -r "$log" ]] || continue
+        { echo "--- $log"; cat "$log"; } >&2
+    done
+}
+
+fail() { dump_logs; echo "cluster E2E FAILED: $*" >&2; exit 1; }
 
 export XDG_STATE_HOME="${workdir}/state"
 
@@ -105,16 +121,14 @@ free_port() {
 
 # Block until something answers on a port, or the process behind it dies.
 wait_for_port() {
-    local port="$1" pid="$2" what="$3" logfile="$4"
+    local port="$1" pid="$2" what="$3"
     for _ in $(seq 1 100); do
         if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then return 0; fi
         if ! kill -0 "$pid" 2>/dev/null; then
-            cat "$logfile" >&2
             fail "${what} exited before it started listening"
         fi
         sleep 0.2
     done
-    cat "$logfile" >&2
     fail "${what} never listened on port ${port}"
 }
 
@@ -169,7 +183,7 @@ start_node() {
         --log-level=info \
         > "$log" 2>&1 &
     pids+=("$!")
-    wait_for_port "${scheduler_ports[$index]}" "$!" "${id}" "$log"
+    wait_for_port "${scheduler_ports[$index]}" "$!" "${id}"
 }
 
 for index in 0 1 2; do
@@ -199,25 +213,41 @@ find_leader() {
         done
         sleep 0.2
     done
-    for log in "${node_logs[@]}"; do
-        [[ -n "$log" ]] && { echo "--- $log"; cat "$log"; } >&2
-    done
     fail "no node ever answered a cluster question; the cluster never elected a leader"
 }
 
 find_leader
 echo "cluster E2E: leader answers at ${leader_endpoint}"
 
-# --- 1. exactly one leader ---------------------------------------------------
+# --- 1. exactly one leader, and it stays -------------------------------------
 
-answered=0
-for index in 0 1 2; do
-    [[ -n "${scheduler_ports[$index]}" ]] || continue
-    answer="$(cluster "127.0.0.1:${scheduler_ports[$index]}" --cluster-status)"
-    [[ "$answer" == *"known settings:"* ]] && answered=$(( answered + 1 ))
+# Asked repeatedly over a few seconds rather than once, and the difference is the
+# whole assertion. A cluster that re-elects on a timer has exactly one leader at
+# almost every instant -- two only in the window where a deposed leader has not
+# yet heard from its successor -- so a single poll passes against leadership that
+# never settles, and the two-leader window shows up later as some other assertion
+# failing for no visible reason. That is exactly how the driver's stale sleep
+# reached CI: `find_leader` and one count both passed, and the follower check two
+# steps later found a second leader. With all three processes alive and nothing
+# else wrong, a healthy cluster elects once and never moves.
+for round in $(seq 1 15); do
+    answered=0
+    who=""
+    for index in 0 1 2; do
+        [[ -n "${scheduler_ports[$index]}" ]] || continue
+        endpoint="127.0.0.1:${scheduler_ports[$index]}"
+        if [[ "$(cluster "$endpoint" --cluster-status)" == *"known settings:"* ]]; then
+            answered=$(( answered + 1 ))
+            who="$endpoint"
+        fi
+    done
+    [[ "$answered" -eq 1 ]] ||
+        fail "round ${round}: expected exactly one node to answer, got ${answered}"
+    [[ "$who" == "$leader_endpoint" ]] ||
+        fail "round ${round}: leadership moved from ${leader_endpoint} to ${who}, all three alive"
+    sleep 0.2
 done
-[[ "$answered" -eq 1 ]] || fail "expected exactly one node to answer a cluster question, got ${answered}"
-echo "cluster E2E: exactly one node answers"
+echo "cluster E2E: exactly one node answers, and keeps answering"
 
 # --- 2. a follower's redirect names an endpoint that works -------------------
 

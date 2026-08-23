@@ -2,6 +2,7 @@
 #include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Consensus/RaftDriver.hpp>
 
+#include <algorithm>
 #include <mutex>
 #include <utility>
 
@@ -44,12 +45,6 @@ void RaftDriver::PublishRoleIfChanged()
 RaftNode const& RaftDriver::Node() const noexcept
 {
     return _node;
-}
-
-TimePoint RaftDriver::NextDeadline() const
-{
-    auto const guard = std::scoped_lock { _mutex };
-    return _node.NextDeadline();
 }
 
 std::optional<ConsensusError> RaftDriver::Failure() const
@@ -207,23 +202,45 @@ std::expected<LogIndex, ConsensusError> RaftDriver::Propose(std::vector<std::byt
     return index;
 }
 
+TimePoint RaftDriver::SleepDeadline(TimePoint now) const
+{
+    // The node owns its own deadline, so the loop never has to know whether it is
+    // waiting on an election or a heartbeat -- and a spurious early wake-up costs
+    // nothing, because `Tick` before the deadline does nothing.
+    //
+    // Bounded by the heartbeat interval, and that bound is the whole point. This
+    // loop parks on a deadline read BEFORE it suspends, and `SleepUntil` cannot be
+    // cancelled: it hands the coroutine to the reactor's timer wheel and nothing
+    // takes it back. Something else can meanwhile move the node's deadline
+    // *earlier* -- `Propose` from another thread, and decisively `Receive` from a
+    // peer-reader coroutine sharing this very reactor, which is where the vote
+    // that wins an election arrives. Winning turns an election deadline up to
+    // `electionTimeoutMax` away into a heartbeat deadline one interval away. Sleeping to the stale
+    // value then delays the new leader's SECOND heartbeat by most of an election
+    // timeout, a follower whose randomized timeout is at the short end elects
+    // itself, and the cluster does the same thing again one term later: measured
+    // at nine role changes in twelve seconds on a healthy three-node cluster with
+    // nothing else wrong. A leader is unaffected in cost, since it already wakes
+    // at exactly this cadence; a follower wakes a few times per election timeout
+    // and does nothing. This is the same answer `BlockingListener::SetTimeouts`
+    // gives to the same shape of problem -- a wait nothing can interrupt is
+    // bounded rather than left to be woken.
+    auto const guard = std::scoped_lock { _mutex };
+    return std::min(_node.NextDeadline(), now + _node.HeartbeatInterval());
+}
+
 Task<void> RaftDriver::Run(IReactor* reactor)
 {
     while (reactor != nullptr && !_stopped.load(std::memory_order_relaxed) && !Failure().has_value())
     {
-        // The node owns its own deadline, so the loop never has to know whether
-        // it is waiting on an election or a heartbeat -- and a spurious early
-        // wake-up costs nothing, because `Tick` before the deadline does nothing.
-        //
-        // Read through the accessor, which takes the lock: another thread may be
-        // mid-`Propose` and moving the very deadline this is about to sleep on.
-        co_await SleepUntil { .reactor = reactor, .deadline = NextDeadline() };
-
-        if (_stopped.load(std::memory_order_relaxed))
-            break;
-
         reactor->Clock().Refresh();
-        (void) Tick(reactor->Clock().Now());
+        auto const now = reactor->Clock().Now();
+        (void) Tick(now);
+
+        // The loop condition is the stop check: `Stop` during the sleep is seen
+        // when it returns, and the bound above is what makes that at most one
+        // heartbeat interval rather than most of an election timeout.
+        co_await SleepUntil { .reactor = reactor, .deadline = SleepDeadline(now) };
     }
 }
 

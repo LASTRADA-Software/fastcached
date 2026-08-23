@@ -20,9 +20,11 @@ namespace
     /// Hands what the peer server decoded to the driver.
     ///
     /// A shim rather than making `RaftDriver` an `IRaftMessageSink` itself: the sink
-    /// is called from the ACCEPT thread and `Receive` needs a timestamp, so this is
-    /// where the two threads and the two vocabularies meet. Keeping it here means
-    /// the driver's own interface says nothing about who calls it or when.
+    /// is called from a peer-reader coroutine and `Receive` needs a timestamp, so
+    /// this is where the two vocabularies meet. Keeping it here means the driver's
+    /// own interface says nothing about who calls it or when -- which matters,
+    /// because that reader shares the reactor thread with the driver's own tick
+    /// loop and advances the node while that loop sits parked in the timer wheel.
     class DriverSink final: public Consensus::IRaftMessageSink
     {
       public:
@@ -398,7 +400,7 @@ ConsensusTier::~ConsensusTier()
     // `Shutdown` closes the listener AND every accepted connection, which is what
     // completes each parked read and lets its task reach its own end. The driver's
     // loop observes its stop when its current wait expires, which is bounded by the
-    // election timeout. The `jthread` joins in its own destructor after that, in
+    // heartbeat interval. The `jthread` joins in its own destructor after that, in
     // reverse declaration order, which is what the member ordering buys.
     if (_peerServer != nullptr)
         _peerServer->Shutdown();

@@ -420,6 +420,64 @@ TEST_CASE("Run ticks the node on the reactor's timer", "[consensus][raft][driver
     (void) reactor.Drain();
 }
 
+TEST_CASE("A node elected between ticks still heartbeats on time", "[consensus][raft][driver]")
+{
+    // Invisible to every other case in this file and to `RaftClusterHarness`,
+    // because both advance a node by calling `Tick` directly. `Run` parks on a
+    // deadline read BEFORE it suspends, and `SleepUntil` cannot be cancelled --
+    // while `Receive`, which in production arrives from a peer-reader coroutine on
+    // the same reactor, can move that deadline EARLIER: a candidate that wins goes
+    // from an election
+    // deadline up to `electionTimeoutMax` away to a heartbeat deadline one
+    // interval away. Sleeping to the stale value delays the new leader's second
+    // heartbeat past the shortest election timeout a follower can draw, that
+    // follower elects itself, and the cluster does it again one term later.
+    // Measured on three real nodes before the bound went in: nine role changes in
+    // twelve seconds with nothing else wrong.
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    RecordingMachine machine { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    ManualClock clock;
+    TestReactor reactor { clock };
+
+    RaftDriver driver {
+        std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine
+    };
+
+    auto loop = driver.Run(&reactor);
+    reactor.Submit(loop.Native());
+    (void) reactor.Drain();
+
+    clock.Advance(150ms);
+    (void) reactor.Drain();
+    REQUIRE(CarryPreVote(driver, clock.Now()));
+    REQUIRE(driver.Node().CurrentRole() == Role::Candidate);
+
+    // The vote that carries the election, delivered while the loop is parked --
+    // which is exactly how it arrives in production.
+    REQUIRE(
+        driver
+            .Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+                     clock.Now())
+            .has_value());
+    REQUIRE(driver.Node().CurrentRole() == Role::Leader);
+
+    // Everything the election itself produced, including the first heartbeat a
+    // new leader sends immediately. What is asserted is the SECOND one.
+    auto const afterElection = transport.Sent().size();
+
+    clock.Advance(50ms);
+    (void) reactor.Drain();
+    CHECK(transport.Sent().size() > afterElection);
+
+    driver.Stop();
+    clock.Advance(400ms);
+    (void) reactor.Drain();
+}
+
 TEST_CASE("Stop ends the run loop", "[consensus][raft][driver]")
 {
     Journal journal;
