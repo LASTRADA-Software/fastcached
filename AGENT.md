@@ -8,9 +8,10 @@ in-memory transport.
 
 ```
 src/FastCache/
-  Core/         Errors taxonomy, Clock, Logger, BufferPool, Bytes, Endian,
-                Crc32c, MurmurHash3 (128-bit key digest), StringHash, Owner,
-                Profiling (Tracy wrappers)
+  Core/         Errors taxonomy, Clock, IRandomSource (the randomness seam,
+                beside Clock and for the same reason), Logger, BufferPool,
+                Bytes, Endian, Crc32c, MurmurHash3 (128-bit key digest),
+                StringHash, Owner, Profiling (Tracy wrappers)
   Async/        Task<T>, Cancellation, ResumeOn, IReactor + TestReactor and the
                 platform reactors (EpollReactor / IocpReactor / KqueueReactor)
   Net/          ISocket, IListener, IoAwaitable, IAdmissionControl, SocketAddress,
@@ -37,6 +38,23 @@ src/FastCache/
                 + tagged-text-region framing), PrefetchGroupManifest
                 (prefetch-group id -> key-set + reverse index) — the
                 compile-cache executor's domain logic
+  Consensus/    RaftTypes, RaftLog, RaftNode and RaftDriver behind the
+                IRaftStorage / IRaftTransport / IRaftStateMachine seams — Raft,
+                split into a pure state machine and a coroutine driver that
+                carries out what it asks for. RaftNode reads no clock, opens no
+                socket and draws no randomness of its own: time arrives as a
+                parameter, entropy through Core/IRandomSource, and everything
+                the node wants done leaves as a RaftOutput. That split is what
+                makes persist-before-send expressible at all — a callback sink
+                cannot await a durability write, and a node whose vote reaches
+                the wire before stable storage votes twice in one term after a
+                restart, which is two leaders in one term. It is also what lets
+                RaftClusterHarness run a whole cluster in one process against
+                scripted partitions, loss, reordering and restarts while
+                asserting the paper's safety properties after every step: a
+                hand-written consensus implementation has no published
+                verification vector to check against the way MurmurHash3 has
+                SMHasher's, so that harness is the closest available oracle.
   Distributed/  WorkerRegistry (the worker set: exact-fingerprint grouping,
                 least-outstanding pick, heartbeat expiry over IClock) and
                 LeaseTable (lease issue/expiry/release plus the in-flight key
@@ -1374,8 +1392,18 @@ down across a suspend point.
 - **C-style loops are forbidden.** Use range-based `for`, `std::views::iota`, and other range views for generation/transformation.
 - **`std::span`** for arrays and contiguous sequences.
 - **`auto` type deduction** for readability; **structured bindings** for tuple-like returns.
-- **`clang-format` after every change** — use the project `.clang-format`.
-- **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT` — address the underlying issue. The `clang-debug` preset enables `clang-tidy` automatically.
+- **`clang-format` and `clang-tidy` after every change — at the version CI pins.** Both jobs
+  run the `$CLANG_TOOLS_VERSION` binary (`.github/workflows/build.yml`), and successive LLVM
+  releases do not agree with each other: the style job compares against a *newer formatter*,
+  and the clang-tidy job enables *checks that did not exist* in an older one. So a tree that is
+  clean under whichever binary happens to be on `PATH` can still be rejected — a red build for
+  code nobody mis-wrote, and one no local run catches unless it uses the same version. Name the
+  version explicitly rather than relying on `PATH`:
+  `git ls-files '*.h' '*.hpp' '*.cpp' | xargs clang-format-$V --dry-run --Werror --style=file`,
+  and `-DCMAKE_CXX_CLANG_TIDY=clang-tidy-$V` over the `clang-debug` preset. Found twice in one
+  branch: four files reformatted by 22 after 20 had passed them, and four `find(...) != npos`
+  tests that only 22 knows to report as `readability-container-contains`.
+- **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT` — address the underlying issue. The `clang-debug` preset enables `clang-tidy` automatically, at whatever version `PATH` resolves to — see the bullet above for why that is not the same as the one CI enforces.
 - **No `g_`-prefix on globals either — and the rule lives in `.clang-tidy`, not only here.** A file-scope or `thread_local` name is spelled like any other name of its kind: `CamelCase` if it is a constant, `camelBack` if it is mutable. There is no "forbid this prefix" option in `readability-identifier-naming` (its `...Prefix` keys only ever *require* one), so the `GlobalVariableCase`/`GlobalConstantCase`/`StaticVariableCase` rows are what reject `g_foo` — and with `WarningsAsErrors: "*"` that is a build failure rather than a review comment. A function-local `static` is `camelBack` whether or not it is `const`: `StaticConstantCase` is left unset precisely so a local constant falls back to that, which keeps `g_` rejected there without demanding PascalCase for locals that are `static` only for their lifetime. The prefix is a substitute for a naming convention rather than one, and it makes ambient state read as normal; if a bare name looks wrong at the call site, that is the "inject it" rule above telling you something.
 - **No `k`-prefix on identifiers.** Do not use the Google-style `kFoo` prefix for constants, enumerators, or any other symbol — it violates the project `.clang-tidy` naming convention. Use `Foo` (PascalCase) for constants/enumerators and `foo`/`fooBar` for locals and members instead.
 - **All changes covered by unit tests.** Aim to **increase** coverage with every PR.
