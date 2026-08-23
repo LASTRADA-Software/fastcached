@@ -5,6 +5,7 @@
 #include "CompileJob.hpp"
 #include "ITcpClient.hpp"
 
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
@@ -49,7 +50,17 @@ class WorkerProtocol
     /// @param jobs Runs the compiles; must outlive this.
     /// @param validator Decides whether a lease token authorizes a job.
     /// @param acceptedCodecs What this worker can decode, most-preferred first.
-    WorkerProtocol(CompileJobRunner& jobs, LeaseValidator validator, CompileCacheWire::CodecList acceptedCodecs);
+    /// @param metrics Where job outcomes are counted; must outlive this.
+    ///
+    /// The metrics sink is injected like every other collaborator rather than
+    /// reached for: a worker under test counts into one the test can read, and the
+    /// interface is header-only and depends on nothing but the standard library,
+    /// so including it costs `fastcache-cc` — which compiles this file in without
+    /// linking `FastCache` — nothing at link time.
+    WorkerProtocol(CompileJobRunner& jobs,
+                   LeaseValidator validator,
+                   CompileCacheWire::CodecList acceptedCodecs,
+                   IMetricsSink& metrics);
 
     /// Answer one complete request frame.
     /// @param frame A whole request, header included.
@@ -65,6 +76,7 @@ class WorkerProtocol
     CompileJobRunner& _jobs;
     LeaseValidator _validator;
     CompileCacheWire::CodecList _acceptedCodecs;
+    IMetricsSink& _metrics;
 };
 
 /// Register this worker with a scheduler, and keep it registered.

@@ -136,13 +136,14 @@ struct Fixture
     StubRunner runner;
     std::filesystem::path scratch;
     Cc::CompileJobRunner jobs;
+    AtomicMetricsSink metrics;
     Cc::WorkerProtocol protocol;
     NullLogger logger;
 
     Fixture():
         scratch { Cc::Test::UniqueScratchPath("fc-ws") },
         jobs { runner, (std::filesystem::create_directories(scratch), scratch), { { "gcc-13", "g++" } } },
-        protocol { jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec } }
+        protocol { jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics }
     {
     }
     ~Fixture()
@@ -186,7 +187,7 @@ struct Fixture
     pair.client->ShutdownWrite();
 
     OneShotListener listener { std::move(pair.server) };
-    WorkerServer server { listener, fix.protocol, slots, fix.logger };
+    WorkerServer server { listener, fix.protocol, slots, fix.metrics, fix.logger };
     SyncRun(server.Run());
 
     return SyncRun([](ISocket* s) -> Task<std::vector<std::byte>> {
@@ -278,7 +279,7 @@ TEST_CASE("In-flight returns to zero after a job", "[worker-server]")
     pair.client->ShutdownWrite();
 
     OneShotListener listener { std::move(pair.server) };
-    WorkerServer server { listener, fix.protocol, 2, fix.logger };
+    WorkerServer server { listener, fix.protocol, 2, fix.metrics, fix.logger };
     SyncRun(server.Run());
     CHECK(server.InFlight() == 0);
 }
@@ -295,7 +296,7 @@ TEST_CASE("A poll timeout keeps the accept loop running", "[worker-server]")
     Fixture fix;
     WorkerServer* running = nullptr;
     IdleListener listener { 3, [&] { running->Shutdown(); } };
-    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.logger };
+    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.metrics, fix.logger };
     running = &server;
 
     SyncRun(server.Run());
@@ -312,11 +313,50 @@ TEST_CASE("Shutdown ends an idle accept loop", "[worker-server]")
     // supervisor's stop would time out and escalate to SIGKILL.
     Fixture fix;
     IdleListener listener;
-    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.logger };
+    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.metrics, fix.logger };
 
     server.Shutdown();
     SyncRun(server.Run());
 
     CHECK(listener.Closed());
     CHECK(server.InFlight() == 0);
+}
+
+TEST_CASE("A capacity refusal is counted apart from every other refusal", "[worker-server][metrics]")
+{
+    // The worker's half of `dispatch_leases_no_capacity`, and it must not be summed
+    // with the four reasons the protocol counts: a busy worker and one whose
+    // toolchain nobody matches are different operator problems, and the second is
+    // the one that hides behind the first. Counted here rather than in the protocol
+    // because the cap is checked before the request is read, so the protocol never
+    // sees this job at all.
+    Fixture fix;
+    using Sink = IMetricsSink::Counter;
+
+    auto const reply = ServeOne(fix, CompileFrame(), /*slots=*/0);
+    REQUIRE(ErrorOf(reply) == Wire::ErrorCode::NoCapacity);
+
+    CHECK(fix.metrics.Read(Sink::WorkerJobsRefusedNoSlot) == 1);
+
+    // And nothing else moved: the job was never started, so it cannot appear as one
+    // the worker took, nor as a refusal of any other kind.
+    CHECK(fix.metrics.Read(Sink::WorkerJobsStarted) == 0);
+    CHECK(fix.metrics.Read(Sink::WorkerJobsRefusedUnknownFingerprint) == 0);
+    CHECK(fix.metrics.Read(Sink::WorkerBytesReceived) == 0);
+}
+
+TEST_CASE("A served request counts the bytes in both directions", "[worker-server][metrics]")
+{
+    // What says whether a codec negotiation is doing anything: preprocessed text
+    // in against object bytes out. Counted at the socket, so "received" means the
+    // payload as it arrived rather than what it decompressed to.
+    Fixture fix;
+    using Sink = IMetricsSink::Counter;
+
+    auto const request = CompileFrame();
+    auto const reply = ServeOne(fix, request, /*slots=*/2);
+    REQUIRE_FALSE(reply.empty());
+
+    CHECK(fix.metrics.Read(Sink::WorkerBytesReceived) == request.size());
+    CHECK(fix.metrics.Read(Sink::WorkerBytesReturned) == reply.size());
 }

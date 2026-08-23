@@ -42,12 +42,13 @@ struct Fixture
     StubRunner runner;
     std::filesystem::path scratch;
     CompileJobRunner jobs;
+    AtomicMetricsSink metrics;
     WorkerProtocol worker;
 
     Fixture():
         scratch { Test::UniqueScratchPath("fc-wp") },
         jobs { runner, (std::filesystem::create_directories(scratch), scratch), { { "gcc-13", "g++" } } },
-        worker { jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec } }
+        worker { jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics }
     {
     }
     ~Fixture()
@@ -162,7 +163,8 @@ TEST_CASE("An unauthorized lease is refused before the payload is even decoded",
     auto const scratch = std::filesystem::temp_directory_path() / "fc-wp-deny";
     std::filesystem::create_directories(scratch);
     CompileJobRunner jobs { runner, scratch, { { "gcc-13", "g++" } } };
-    WorkerProtocol worker { jobs, [](std::string_view, std::string_view) { return false; }, { Wire::IdentityCodec } };
+    AtomicMetricsSink metrics;
+    WorkerProtocol worker { jobs, [](std::string_view, std::string_view) { return false; }, { Wire::IdentityCodec }, metrics };
 
     auto const answer = worker.Answer(CompileFrame());
     REQUIRE(answer.has_value());
@@ -227,4 +229,65 @@ TEST_CASE("An unknown opcode is refused and does not close the connection", "[wo
     auto const answer = fix.worker.Answer(frame);
     REQUIRE(answer.has_value());
     CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::UnknownOpcode);
+}
+
+TEST_CASE("A compile is counted from start to finish", "[worker-protocol][metrics]")
+{
+    // Started and completed are two counters rather than a gauge, because this
+    // sink is counter-only by design: their difference is how many compiles are
+    // running, and the completed count is also the divisor for the wall-time sum.
+    Fixture fix;
+    using Sink = IMetricsSink::Counter;
+
+    REQUIRE(fix.worker.Answer(CompileFrame()).has_value());
+
+    CHECK(fix.metrics.Read(Sink::WorkerJobsStarted) == 1);
+    CHECK(fix.metrics.Read(Sink::WorkerJobsCompleted) == 1);
+
+    // No refusal was counted anywhere. A job that ran must not also appear as one
+    // that did not, which is what a counter incremented on every exit path does.
+    for (auto const counter: { Sink::WorkerJobsRefusedUnknownFingerprint,
+                               Sink::WorkerJobsRefusedRejectedArgument,
+                               Sink::WorkerJobsRefusedScratchUnavailable,
+                               Sink::WorkerJobsRefusedSpawnFailed })
+        CHECK(fix.metrics.Read(counter) == 0);
+}
+
+TEST_CASE("A refusal is counted under its own reason", "[worker-protocol][metrics]")
+{
+    // The split is the whole point, exactly as the scheduler's no-worker /
+    // no-capacity split is: a fingerprint nobody serves says the fleet is
+    // misconfigured, and a scratch disk that will not take a file says a machine
+    // is broken. Summing them hides the first behind the second.
+    Fixture fix;
+    using Sink = IMetricsSink::Counter;
+
+    REQUIRE(fix.worker.Answer(CompileFrame("clang-19")).has_value());
+
+    CHECK(fix.metrics.Read(Sink::WorkerJobsRefusedUnknownFingerprint) == 1);
+    CHECK(fix.metrics.Read(Sink::WorkerJobsRefusedScratchUnavailable) == 0);
+    CHECK(fix.metrics.Read(Sink::WorkerJobsRefusedSpawnFailed) == 0);
+
+    // The job started -- the worker took it -- but did not complete, so the
+    // in-flight difference still returns to zero and the wall-time sum is
+    // untouched by a compile that never ran.
+    CHECK(fix.metrics.Read(Sink::WorkerJobsStarted) == 1);
+    CHECK(fix.metrics.Read(Sink::WorkerJobsCompleted) == 0);
+    CHECK(fix.metrics.Read(Sink::WorkerCompileMillisTotal) == 0);
+}
+
+TEST_CASE("A refusal's counter and its wire code come from one row", "[worker-protocol][metrics]")
+{
+    // Both halves of the same refusal, asserted together: the client is told
+    // `fingerprint-mismatch` and the operator sees the fingerprint counter rise.
+    // Two switches could answer these differently and still compile, which is why
+    // they are one table.
+    Fixture fix;
+
+    auto const answer = fix.worker.Answer(CompileFrame("clang-19"));
+    REQUIRE(answer.has_value());
+
+    auto const reply = Decode(Unwrap(answer));
+    CHECK(reply.status == Wire::Status::Error);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedUnknownFingerprint) == 1);
 }

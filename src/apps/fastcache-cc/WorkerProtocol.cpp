@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProtocol.hpp"
+#include <chrono>
+#include <array>
 #include "Dispatch.hpp"
 #include "WorkerProtocol.hpp"
 
@@ -32,40 +34,76 @@ namespace
         return std::string { Wire::AsStringView(*decoded) };
     }
 
-    /// The wire error a refusal maps to.
+    /// What one refusal means on the wire and in the metrics.
     ///
-    /// A table read rather than a switch with a default, so a refusal added to
-    /// JobRefusal without a code here is a compile error rather than a silent
-    /// `malformed-frame` that tells an operator nothing.
-    [[nodiscard]] Wire::ErrorCode WireCodeFor(JobRefusal refusal)
+    /// Both in one row, deliberately. They are answers to the same question asked
+    /// by two audiences -- the client that has to decide whether to retry, and the
+    /// operator watching a fleet -- and a refusal counted under one reason while
+    /// being reported as another is worse than not counting it at all. Splitting
+    /// them across a `switch` and a second `switch` is how that happens.
+    struct RefusalDescriptor
     {
-        switch (refusal)
-        {
-            case JobRefusal::UnknownFingerprint:
-                return Wire::ErrorCode::FingerprintMismatch;
-            case JobRefusal::RejectedArgument:
-                return Wire::ErrorCode::MalformedFrame;
-            case JobRefusal::ScratchUnavailable:
-                return Wire::ErrorCode::WorkerScratchUnavailable;
-            case JobRefusal::SpawnFailed:
-                // Separate codes, because collapsing them was actively misleading:
-                // both used to answer StorageWriteFailed, so a worker with no
-                // storage told the client "storage write failed" and the two
-                // genuinely different operator problems -- an unwritable scratch
-                // disk, and a toolchain that is configured but cannot be executed
-                // -- were indistinguishable from either end. Found the hard way,
-                // diagnosing a CI failure that reported the one thing it could not
-                // possibly be.
-                return Wire::ErrorCode::WorkerSpawnFailed;
-        }
-        return Wire::ErrorCode::MalformedFrame;
+        JobRefusal refusal {};                  ///< The reason this row describes.
+        Wire::ErrorCode code {};                ///< What the client is told.
+        IMetricsSink::Counter counter {};       ///< What the operator sees rise.
+    };
+
+    /// One row per `JobRefusal`, in enumerator order.
+    ///
+    /// The codes are separate rather than collapsed, because collapsing them was
+    /// actively misleading: `ScratchUnavailable` and `SpawnFailed` both used to
+    /// answer `StorageWriteFailed`, so a worker with no storage told the client
+    /// "storage write failed" and two genuinely different operator problems -- an
+    /// unwritable scratch disk, and a toolchain that is configured but cannot be
+    /// executed -- were indistinguishable from either end. Found the hard way,
+    /// diagnosing a CI failure that reported the one thing it could not possibly
+    /// be.
+    constexpr auto RefusalTable = std::array {
+        RefusalDescriptor { .refusal = JobRefusal::UnknownFingerprint,
+                            .code = Wire::ErrorCode::FingerprintMismatch,
+                            .counter = IMetricsSink::Counter::WorkerJobsRefusedUnknownFingerprint },
+        RefusalDescriptor { .refusal = JobRefusal::RejectedArgument,
+                            .code = Wire::ErrorCode::MalformedFrame,
+                            .counter = IMetricsSink::Counter::WorkerJobsRefusedRejectedArgument },
+        RefusalDescriptor { .refusal = JobRefusal::ScratchUnavailable,
+                            .code = Wire::ErrorCode::WorkerScratchUnavailable,
+                            .counter = IMetricsSink::Counter::WorkerJobsRefusedScratchUnavailable },
+        RefusalDescriptor { .refusal = JobRefusal::SpawnFailed,
+                            .code = Wire::ErrorCode::WorkerSpawnFailed,
+                            .counter = IMetricsSink::Counter::WorkerJobsRefusedSpawnFailed },
+    };
+
+    /// Whether the table has one row per enumerator, in order.
+    /// @return True when every `JobRefusal` has its own row.
+    [[nodiscard]] consteval bool CoversEveryRefusal() noexcept
+    {
+        for (std::size_t index = 0; index < RefusalTable.size(); ++index)
+            if (static_cast<std::size_t>(RefusalTable[index].refusal) != index)
+                return false;
+        return true;
+    }
+
+    static_assert(RefusalTable.size() == static_cast<std::size_t>(JobRefusal::SpawnFailed) + 1
+                      && CoversEveryRefusal(),
+                  "RefusalTable must hold one row per JobRefusal, in enumerator order");
+
+    /// The row describing `refusal`.
+    /// @param refusal What the runner reported.
+    /// @return Its descriptor.
+    [[nodiscard]] constexpr RefusalDescriptor const& DescriptorFor(JobRefusal refusal) noexcept
+    {
+        return RefusalTable[static_cast<std::size_t>(refusal)];
     }
 } // namespace
 
-WorkerProtocol::WorkerProtocol(CompileJobRunner& jobs, LeaseValidator validator, Wire::CodecList acceptedCodecs):
+WorkerProtocol::WorkerProtocol(CompileJobRunner& jobs,
+                               LeaseValidator validator,
+                               Wire::CodecList acceptedCodecs,
+                               IMetricsSink& metrics):
     _jobs { jobs },
     _validator { std::move(validator) },
-    _acceptedCodecs { std::move(acceptedCodecs) }
+    _acceptedCodecs { std::move(acceptedCodecs) },
+    _metrics { metrics }
 {
 }
 
@@ -117,6 +155,12 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
         return Wire::EncodeErrorReply(Wire::ErrorCode::UnsupportedCodec,
                                       "the preprocessed source is in a codec this worker cannot decode");
 
+    // Counted around the runner rather than inside it: the runner is a seam with
+    // its own fakes, and a fake that forgot to count would make every test agree
+    // with a worker that does not.
+    _metrics.Increment(IMetricsSink::Counter::WorkerJobsStarted);
+    auto const startedAt = std::chrono::steady_clock::now();
+
     auto const outcome = _jobs.Run(CompileJob { .fingerprint = std::string { fingerprint },
                                                 .args = DecodeArgs(fields->args),
                                                 .preprocessed = *std::move(source),
@@ -126,7 +170,19 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
                                                 // caller that might forget it.
                                                 .sourceName = std::string { Wire::AsStringView(fields->sourceName) } });
     if (!outcome.has_value())
-        return Wire::EncodeErrorReply(WireCodeFor(outcome.error()), {});
+    {
+        auto const& descriptor = DescriptorFor(outcome.error());
+        _metrics.Increment(descriptor.counter);
+        return Wire::EncodeErrorReply(descriptor.code, {});
+    }
+
+    // A compiler that ran and rejected the code did its job — that is the client's
+    // answer, not a worker failure — so this counts completions rather than
+    // successes, and a non-zero exit is not a refusal.
+    auto const elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
+    _metrics.Increment(IMetricsSink::Counter::WorkerJobsCompleted);
+    _metrics.Increment(IMetricsSink::Counter::WorkerCompileMillisTotal, static_cast<std::uint64_t>(elapsed.count()));
 
     // The object goes back in an envelope chosen from what the CLIENT said it
     // accepts -- carried in its own request, so no negotiation round trip.

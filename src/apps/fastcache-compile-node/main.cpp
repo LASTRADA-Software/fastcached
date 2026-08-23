@@ -528,9 +528,12 @@ int main(int argc, char** argv)
     // boundary the cache itself has. Validating a token against the scheduler is the
     // seam's other implementation and belongs with mTLS rather than bolted on here;
     // LeaseValidator exists so that is a substitution, not a rewrite.
-    Cc::WorkerProtocol protocol { jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec } };
+    AtomicMetricsSink metrics;
+    Cc::WorkerProtocol protocol {
+        jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics
+    };
 
-    Node::WorkerServer server { listenerRef, protocol, slots, logger };
+    Node::WorkerServer server { listenerRef, protocol, slots, metrics, logger };
 
     Cc::Credential const credential { .username = {}, .secret = cfg.token };
 

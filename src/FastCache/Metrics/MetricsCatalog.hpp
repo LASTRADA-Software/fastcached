@@ -103,6 +103,54 @@ inline constexpr std::array<CounterDescriptor, static_cast<std::size_t>(IMetrics
       .help = "Worker registrations accepted. A steady rise means heartbeats are "
               "not arriving.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsStarted,
+      .prometheusName = "fastcache_worker_jobs_started_total",
+      .help = "Compiles this worker began. Minus jobs_completed_total, the number "
+              "running right now.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsCompleted,
+      .prometheusName = "fastcache_worker_jobs_completed_total",
+      .help = "Compiles that finished, whatever the compiler concluded. Also the "
+              "count half of the compile-time sum below.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerCompileMillisTotal,
+      .prometheusName = "fastcache_worker_compile_milliseconds_total",
+      .help = "Total wall time spent compiling. Divide by jobs_completed_total, or "
+              "take rate() of both, for the average compile.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedUnknownFingerprint,
+      .prometheusName = "fastcache_worker_jobs_refused_unknown_fingerprint_total",
+      .help = "Jobs refused because no compiler here matches the client's "
+              "toolchain fingerprint: the fleet is misconfigured.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedRejectedArgument,
+      .prometheusName = "fastcache_worker_jobs_refused_rejected_argument_total",
+      .help = "Jobs refused over an argument this worker will not pass to a "
+              "compiler.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedScratchUnavailable,
+      .prometheusName = "fastcache_worker_jobs_refused_scratch_unavailable_total",
+      .help = "Jobs refused because the scratch directory could not be prepared: "
+              "a full or read-only disk, not a client or fleet problem.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedSpawnFailed,
+      .prometheusName = "fastcache_worker_jobs_refused_spawn_failed_total",
+      .help = "Jobs refused because the compiler could not be spawned: the "
+              "toolchain this worker advertises is not usable here.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedNoSlot,
+      .prometheusName = "fastcache_worker_jobs_refused_no_slot_total",
+      .help = "Jobs refused because every slot was busy: this worker is too "
+              "small, or the fleet is. Never sum with the refusals above.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerBytesReceived,
+      .prometheusName = "fastcache_worker_bytes_received_total",
+      .help = "Request payload bytes read from clients.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerBytesReturned,
+      .prometheusName = "fastcache_worker_bytes_returned_total",
+      .help = "Reply payload bytes written back to clients.",
+      .type = MetricType::Counter },
 } };
 
 /// Whether `CounterTable` has exactly one row per enumerator, in order.
