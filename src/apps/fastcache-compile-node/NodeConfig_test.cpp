@@ -210,8 +210,8 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
 
         auto const refusal = SchedulerPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
-        CHECK(refusal->contains("--fleet-member"));
-        CHECK(refusal->contains("--fleet-open"));
+        CHECK(Unwrap(refusal).contains("--fleet-member"));
+        CHECK(Unwrap(refusal).contains("--fleet-open"));
     }
 
     SECTION("the two policies contradicting each other")
@@ -237,7 +237,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
 
         auto const refusal = SchedulerPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
-        CHECK(refusal->contains("--listen-scheduler"));
+        CHECK(Unwrap(refusal).contains("--listen-scheduler"));
     }
 
     SECTION("the working shapes are accepted")

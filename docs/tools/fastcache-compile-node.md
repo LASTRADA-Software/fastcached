@@ -35,12 +35,27 @@ switched on in a fleet where machines come and go.
 
 ## Quick start
 
-Three processes. The scheduler is an ordinary `fastcached` with a second
-listener:
+Three processes. A cache:
 
 ```sh
-fastcached --listen=0.0.0.0:6674 --listen-dispatch=0.0.0.0:6675
+fastcached --listen=0.0.0.0:6674
 ```
+
+A scheduler, which is a compile node rather than the cache — handing out capacity
+is a decision only one node may make at a time, and the cache cannot establish
+which node that is:
+
+```sh
+fastcache-compile-node \
+    --listen-scheduler=0.0.0.0:6675 --fleet-open \
+    --scheduler=127.0.0.1:6675 \
+    --advertise=scheduler.internal:6676 \
+    --toolchain=/usr/bin/g++
+```
+
+One of `--fleet-member` or `--fleet-open` is required: a scheduler with no member
+list refuses every caller, which is the right default and not a working
+configuration.
 
 A worker, on each machine that should take work:
 
@@ -240,11 +255,16 @@ The `0xFC` surface is authenticated: start the scheduler with `--requirepass` an
 give workers and clients the same secret (`--requirepass` on the worker,
 `FASTCACHE_TOKEN` on the client).
 
-Keep `--listen-dispatch` off any network you would not run a compiler for. That
-is why it is a separate listener from the cache: the cache may reasonably be
+Keep `--listen-scheduler` off any network you would not run a compiler for. That
+is why it is a separate process from the cache: the cache may reasonably be
 reachable across a build LAN, while the surface that makes a compiler *run* on
-another machine should be firewalled separately. A dispatch verb arriving on a
-cache-only listener is refused with a typed reply.
+another machine should be firewalled separately. A scheduling verb arriving at a
+`fastcached` listener is refused with a typed reply naming where the scheduler
+went.
+
+`--fleet-member` restricts which hosts may spend the fleet's capacity. It is a
+policy about contribution rather than a credential — a non-member still reads and
+writes the cache — so it complements `--requirepass` and does not replace it.
 
 For anything beyond a trusted build network, put mTLS in front of both ports.
 

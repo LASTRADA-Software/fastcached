@@ -53,7 +53,6 @@ constexpr auto Samples = std::to_array<FlagSample>({
     { .flag = "--tls-key", .value = "key.pem" },
     { .flag = "--listen", .value = "127.0.0.1:1234" },
     { .flag = "--listen-tls", .value = "127.0.0.1:1235" },
-    { .flag = "--listen-dispatch", .value = "127.0.0.1:6675" },
     { .flag = "--notify-keyspace-events", .value = "KEA" },
     { .flag = "--log-timestamps", .value = "" },
     { .flag = "--log-source", .value = "" },

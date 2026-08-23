@@ -189,7 +189,6 @@ namespace
     // are -- each still initialized FROM the table, so there is one source of truth.
     constexpr ListenerFlagSpec PlainListener = ListenerFlags[0];
     constexpr ListenerFlagSpec TlsListener = ListenerFlags[1];
-    constexpr ListenerFlagSpec DispatchListener = ListenerFlags[2];
 
     /// Parse a listener flag's argument into a `BindConfig`. The grammar is the
     /// standard `host:port` form, with `[ipv6]:port` for IPv6 literals.
@@ -242,7 +241,7 @@ namespace
         auto const port = ParsePort(portText);
         if (!port.has_value())
             return std::unexpected(port.error());
-        return BindConfig { .address = *address, .port = *port, .roles = kind.roles, .tls = kind.tls };
+        return BindConfig { .address = *address, .port = *port, .tls = kind.tls };
     }
 
     /// `ParseListenSpec` bound to one listener kind, so the two repeatable flags
@@ -360,16 +359,6 @@ namespace
           .apply = AppendFrom<&Config::binds, ParseListen<TlsListener>>(),
           .description = "additional TLS listener; repeatable. Shares --tls-cert / --tls-key.\n"
                          "Needs a build with OpenSSL (FC_TLS_ENABLED)" },
-        { .primary = "--listen-dispatch",
-          .arity = Arity::Value,
-          .operand = "=<host:port>",
-          .apply = AppendFrom<&Config::binds, ParseListen<DispatchListener>>(),
-          .description = "endpoint serving distributed compilation; repeatable. OFF unless given.\n"
-                         "Serves scheduling only, NOT the cache: something that can make a\n"
-                         "compiler run on another machine is a different trust boundary from\n"
-                         "something that reads and writes a cache, so it gets its own port to\n"
-                         "firewall. Workers register here; clients ask it where to compile.\n"
-                         "Suggested port: 6675." },
         { .primary = "--notify-keyspace-events",
           .arity = Arity::Value,
           .operand = "=<flags>",

@@ -308,7 +308,7 @@ Two further ports, both **off unless you ask for them**:
 
 | Port | What | Default |
 |------|------|---------|
-| **6675** | The scheduler's dispatch endpoint | off; enable with `--listen-dispatch` or `roles: [dispatch]` |
+| **6675** | The fleet scheduler | off; enable with `fastcache-compile-node --listen-scheduler`. Not served by `fastcached` |
 | **6676** | A compile worker's own port | the worker's `--port` |
 
 The dispatch endpoint is separate from the cache **on purpose**. The cache may

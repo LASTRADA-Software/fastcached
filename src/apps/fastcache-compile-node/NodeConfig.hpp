@@ -64,16 +64,6 @@ struct NodeConfig
     /// produces and what an operator has written down.
     std::vector<std::string> fleetMembers;
 
-    /// Admit every caller to the fleet, rather than only `--fleet-member` hosts.
-    ///
-    /// The right answer for one machine, or a fleet whose network reachability is
-    /// already its boundary. It is a *flag* rather than the behaviour you get by
-    /// listing no members, because "no policy" and "a policy that admits everybody"
-    /// have to be the same explicit decision -- listing nobody refuses everybody, and
-    /// a scheduler that quietly served strangers would look identical to a healthy one
-    /// from both ends.
-    bool fleetOpen { false };
-
     std::string token;
     std::string user;
     LogLevel logLevel { LogLevel::Info };
@@ -91,6 +81,15 @@ struct NodeConfig
     /// Where a POSIX daemonized run writes its pid, empty for none.
     std::string pidfile;
 
+    /// Admit every caller to the fleet, rather than only `--fleet-member` hosts.
+    ///
+    /// The right answer for one machine, or a fleet whose network reachability is
+    /// already its boundary. It is a *flag* rather than the behaviour you get by
+    /// listing no members, because "no policy" and "a policy that admits everybody"
+    /// have to be the same explicit decision -- listing nobody refuses everybody, and
+    /// a scheduler that quietly served strangers would look identical to a healthy one
+    /// from both ends.
+    bool fleetOpen { false };
     bool daemon { false };           ///< Fork into the background / run under the SCM.
     bool installService { false };   ///< Register with the platform's supervisor and exit.
     bool uninstallService { false }; ///< Remove that registration and exit.
