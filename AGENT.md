@@ -63,6 +63,15 @@ src/FastCache/
                 hand-written consensus implementation has no published
                 verification vector to check against the way MurmurHash3 has
                 SMHasher's, so that harness is the closest available oracle.
+  Cluster/      DiscoveryService + DiscoveryWire (the LAN beacon and its PSK
+                challenge), PeerDirectory (who proved the key, and where), and
+                ClusterState + ClusterStateMachine — the cluster's replicated
+                configuration: who is a member, WHERE they answer, and the settings
+                every member must agree on. The endpoint is the point: consensus
+                counts ids, which is all a quorum needs and which leaves a node the
+                cluster agreed to admit unreachable. `Apply` is total because it runs
+                after commitment, when refusing is no longer an option; `Validate` is
+                where a change can be refused, and it runs on the proposer.
   Distributed/  WorkerRegistry (the worker set: exact-fingerprint grouping,
                 least-outstanding pick, heartbeat expiry over IClock) and
                 LeaseTable (lease issue/expiry/release plus the in-flight key
@@ -128,10 +137,15 @@ src/apps/
                             its help renders and colorizes exactly like the
                             daemon's without linking the library. `Cli/Options`
                             is header-only, so including it costs no build row.
-  fastcache-compile-node/   the compile worker (FASTCACHED_BUILD_NODE, default
-                            ON) — registers with a scheduler's `--listen-dispatch`
-                            endpoint, then answers exactly one verb, `Compile`,
-                            on its own port. Carries its own daemon shell:
+  fastcache-compile-node/   the compile worker AND the peer service (
+                            FASTCACHED_BUILD_NODE, default ON) — registers with a
+                            scheduler's `--listen-scheduler` endpoint (another node's;
+                            `--listen-dispatch` on the daemon is gone) and answers
+                            `Compile` on its own port. It may also BE the scheduler,
+                            hold a cache tier for this machine's clients, and run
+                            consensus — four surfaces, each off unless asked for
+                            except the cache, and all four admitting this machine and
+                            `--fleet-member` peers only. Carries its own daemon shell:
                             `NodeConfig` and its option table live in their own
                             translation unit (main.cpp is in no test target) so
                             `MakeNodeServiceSpec` and the install-time
@@ -2005,7 +2019,16 @@ down across a suspend point.
 - **C-style loops are forbidden.** Use range-based `for`, `std::views::iota`, and other range views for generation/transformation.
 - **`std::span`** for arrays and contiguous sequences.
 - **`auto` type deduction** for readability; **structured bindings** for tuple-like returns.
-- **A local gate cannot see a configuration it does not build.** The default agent
+- **A local gate cannot see a configuration it does not build, and advice nobody
+  runs is not a gate.** `scripts/local-gate.sh` is that advice as a script:
+  clang-format at the pinned version, then `clang-debug` and `gcc-release`, refusing
+  to run `ctest` against a build that did not complete. It exists because this
+  paragraph was already here and was skipped twice in one branch -- once for a GCC
+  `-Wnull-dereference` through an inlined `memcpy` that clang emits at no level, and
+  once for a clang-tidy check the binary on `PATH` had never heard of. Both cost a
+  full CI cycle for a configuration the developer already had.
+
+  The default agent
   preset is `clang-debug`: one compiler, one standard library, `-O0`, sanitizers on.
   CI is four more — GCC at `-O3`, clang-cl, MSVC, and clang against **libc++** on
   macOS — and each of the three defects that reached CI on the Raft branch was
