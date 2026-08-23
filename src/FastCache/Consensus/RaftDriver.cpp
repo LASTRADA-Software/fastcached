@@ -14,8 +14,28 @@ RaftDriver::RaftDriver(RaftNode node,
     _node { std::move(node) },
     _storage { storage },
     _transport { transport },
-    _application { application }
+    _application { application },
+    _reportedRole { _node.CurrentRole() },
+    _reportedLeader { _node.KnownLeader() }
 {
+}
+
+void RaftDriver::ObserveRole(RoleObserver observer)
+{
+    _onRole = std::move(observer);
+}
+
+void RaftDriver::PublishRoleIfChanged()
+{
+    auto const role = _node.CurrentRole();
+    auto const& leader = _node.KnownLeader();
+    if (role == _reportedRole && leader == _reportedLeader)
+        return;
+
+    _reportedRole = role;
+    _reportedLeader = leader;
+    if (_onRole)
+        _onRole(role, leader);
 }
 
 RaftNode const& RaftDriver::Node() const noexcept
@@ -93,6 +113,17 @@ std::expected<void, ConsensusError> RaftDriver::Deliver(RaftOutput output)
         for (auto const& entry: output.applied)
             _application.Apply(entry);
 
+    // Reported here and only here, which is the point of putting it at the end of
+    // `Deliver` rather than in `Tick`, `Receive` and `Propose`: those are three ways
+    // in and this is the one place all of them come out, so a fourth entry point
+    // cannot forget to announce a role it changed.
+    //
+    // AFTER the outputs, deliberately. An observer told "you lead now" before the
+    // vote that made it true had been persisted and the heartbeats sent would be
+    // acting on a leadership this node had not yet established -- and if a storage
+    // write above fails, the early return means it is never told at all, which is
+    // correct: a node whose durable state would not write has not become anything.
+    PublishRoleIfChanged();
     return {};
 }
 

@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstddef>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -53,11 +54,40 @@ namespace FastCache::Consensus
 class RaftDriver
 {
   public:
+    /// Told this node's role whenever it changes, and never otherwise.
+    ///
+    /// **Pushed rather than polled**, because the alternatives are both worse. A
+    /// caller polling `Node().CurrentRole()` needs a thread and an interval, and the
+    /// interval is a window during which this node has stopped leading and is still
+    /// handing out other machines' capacity. `RaftNode` deliberately reports
+    /// transitions as *state* rather than as events -- a node that emitted one per
+    /// transition would make its own callers order-dependent -- so the observation
+    /// belongs here, at the one place that knows when a step has been taken.
+    ///
+    /// Called from whichever thread advanced the node: the timer loop for an
+    /// election timeout, the transport's reader for a message that deposed it. An
+    /// implementation must therefore be safe to call from either, and must not block
+    /// -- it is on the path that also has to send the next heartbeat.
+    ///
+    /// The leader id travels with the role because a follower's whole use for one is
+    /// to redirect, and a refusal that cannot say who to ask instead cannot be acted
+    /// on.
+    using RoleObserver = std::function<void(Role role, std::optional<NodeId> const& knownLeader)>;
+
     /// @param node The state machine to drive; taken by value and owned.
     /// @param storage Where durable state goes; must outlive this driver.
     /// @param transport How peers are reached; must outlive this driver.
     /// @param application What committed entries are handed to; must outlive this.
     RaftDriver(RaftNode node, IRaftStorage& storage, IRaftTransport& transport, IRaftStateMachine& application) noexcept;
+
+    /// Install the role observer.
+    ///
+    /// A setter and not a constructor parameter, which is one of the documented
+    /// carve-outs: the natural owner of the observer is the object that owns the
+    /// driver, and it cannot pass `this` to a member it is still constructing.
+    /// Called once, before `Run`.
+    /// @param observer Told about role changes; may be empty to stop observing.
+    void ObserveRole(RoleObserver observer);
 
     /// Advance time, doing whatever falls due.
     /// @param now The current instant.
@@ -119,10 +149,23 @@ class RaftDriver
     /// Perform one output in the required order.
     [[nodiscard]] std::expected<void, ConsensusError> Deliver(RaftOutput output);
 
+    /// Report the role if it has moved since the last report.
+    void PublishRoleIfChanged();
+
     RaftNode _node;
     IRaftStorage& _storage;
     IRaftTransport& _transport;
     IRaftStateMachine& _application;
+    RoleObserver _onRole;
+
+    /// What was last reported, so an unchanged role is not re-announced.
+    ///
+    /// Seeded to the node's role at construction rather than to a sentinel, so a
+    /// node that recovered as a follower and stays one reports nothing -- an
+    /// observer that fired once at startup for no transition would make "the role
+    /// changed" mean two different things.
+    Role _reportedRole;
+    std::optional<NodeId> _reportedLeader;
 
     /// Written only by the loop thread, so it needs no synchronization of its
     /// own — unlike `_stopped`, which any thread may set.
