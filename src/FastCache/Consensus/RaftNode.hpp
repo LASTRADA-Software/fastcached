@@ -45,8 +45,9 @@ struct RoleTraits
 /// discovery needs when a machine joins a running cluster. Adding it should be a
 /// row plus whatever columns it forces, not an edit to every function that asks
 /// what role this node is playing.
-inline constexpr std::array<RoleTraits, 3> RoleTable { {
+inline constexpr std::array<RoleTraits, 4> RoleTable { {
     { .role = Role::Follower, .name = "follower", .timer = TimerKind::Election },
+    { .role = Role::PreCandidate, .name = "pre-candidate", .timer = TimerKind::Election },
     { .role = Role::Candidate, .name = "candidate", .timer = TimerKind::Election },
     { .role = Role::Leader, .name = "leader", .timer = TimerKind::Heartbeat },
 } };
@@ -200,6 +201,7 @@ class RaftNode
     [[nodiscard]] bool IsMember(NodeId const& id) const;
 
     /// Begin an election for the next term (§5.2).
+    void StartPreVote(TimePoint now, RaftOutput& output);
     void StartElection(TimePoint now, RaftOutput& output);
 
     /// Adopt a higher term and return to being a follower (§5.1).
@@ -259,6 +261,12 @@ class RaftNode
     void MarkPersist(RaftOutput& output) const;
 
     /// Per-message handlers; each may append to `output`.
+    /// Whether the §5.1 term rule must NOT be applied to this message.
+    /// @param message The message being received.
+    /// @return True for a pre-vote request, and for a granted pre-vote response.
+    [[nodiscard]] static bool IsPreVoteExempt(RaftMessage const& message) noexcept;
+    void OnPreVote(PreVoteRequest const& request, TimePoint now, RaftOutput& output);
+    void OnPreVoteResponse(PreVoteResponse const& response, TimePoint now, RaftOutput& output);
     void OnRequestVote(RequestVoteRequest const& request, TimePoint now, RaftOutput& output);
     void OnRequestVoteResponse(RequestVoteResponse const& response, TimePoint now, RaftOutput& output);
     void OnAppendEntries(AppendEntriesRequest const& request, TimePoint now, RaftOutput& output);
@@ -308,6 +316,15 @@ class RaftNode
     /// would otherwise be counted twice, and two counted votes from one node is a
     /// quorum that does not exist.
     std::unordered_set<NodeId> _votesGranted;
+
+    /// Peers that said an election would be winnable, itself included.
+    ///
+    /// Separate from `_votesGranted` rather than reusing it, because the two
+    /// count answers to different questions in different terms: a pre-vote is
+    /// about the term this node has NOT entered, and folding them would let a
+    /// pre-vote be counted toward the real election that follows -- which is a
+    /// vote nobody cast.
+    std::unordered_set<NodeId> _preVotesGranted;
 };
 
 } // namespace FastCache::Consensus

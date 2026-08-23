@@ -111,6 +111,8 @@ enum class MessageType : std::uint8_t
     RequestVoteResponse = 0x02,   ///< A voter's answer.
     AppendEntries = 0x03,         ///< Leader replicating; a heartbeat when empty (§5.3).
     AppendEntriesResponse = 0x04, ///< A follower's answer.
+    PreVote = 0x05,               ///< Asking whether an election could be won (thesis §9.6).
+    PreVoteResponse = 0x06,       ///< A voter's answer to that question.
 };
 
 /// What one message type needs, as a row rather than as a branch.
@@ -131,6 +133,8 @@ inline constexpr std::array MessageTable {
     MessageDescriptor { .type = MessageType::RequestVoteResponse, .name = "RequestVoteResponse", .fieldCount = 3 },
     MessageDescriptor { .type = MessageType::AppendEntries, .name = "AppendEntries", .fieldCount = 6 },
     MessageDescriptor { .type = MessageType::AppendEntriesResponse, .name = "AppendEntriesResponse", .fieldCount = 4 },
+    MessageDescriptor { .type = MessageType::PreVote, .name = "PreVote", .fieldCount = 4 },
+    MessageDescriptor { .type = MessageType::PreVoteResponse, .name = "PreVoteResponse", .fieldCount = 3 },
 };
 
 /// How many fields one log entry encodes as: term, kind, payload.
@@ -387,7 +391,27 @@ namespace Detail
 {
     return std::visit(
         [version]<typename T>(T const& m) -> std::vector<std::byte> {
-            if constexpr (std::is_same_v<T, RequestVoteRequest>)
+            if constexpr (std::is_same_v<T, PreVoteRequest>)
+            {
+                auto const term = Detail::CounterField(m.term);
+                auto const lastIndex = Detail::CounterField(m.lastLogIndex);
+                auto const lastTerm = Detail::CounterField(m.lastLogTerm);
+                std::array const fields { std::span<std::byte const> { term },
+                                          WireFields::AsBytes(m.candidateId),
+                                          std::span<std::byte const> { lastIndex },
+                                          std::span<std::byte const> { lastTerm } };
+                return Detail::Frame<MessageType::PreVote>(version, fields);
+            }
+            else if constexpr (std::is_same_v<T, PreVoteResponse>)
+            {
+                auto const term = Detail::CounterField(m.term);
+                auto const decision = Detail::EnumField(m.decision);
+                std::array const fields { std::span<std::byte const> { term },
+                                          std::span<std::byte const> { decision },
+                                          WireFields::AsBytes(m.voterId) };
+                return Detail::Frame<MessageType::PreVoteResponse>(version, fields);
+            }
+            else if constexpr (std::is_same_v<T, RequestVoteRequest>)
             {
                 auto const term = Detail::CounterField(m.term);
                 auto const lastIndex = Detail::CounterField(m.lastLogIndex);
@@ -487,6 +511,29 @@ namespace Detail
 
     switch (descriptor->type)
     {
+        case MessageType::PreVote: {
+            auto const term = WireFields::FromBigEndian<std::uint64_t>((*fields)[0]);
+            auto const lastIndex = WireFields::FromBigEndian<std::uint64_t>((*fields)[2]);
+            auto const lastTerm = WireFields::FromBigEndian<std::uint64_t>((*fields)[3]);
+            if (!term.has_value() || !lastIndex.has_value() || !lastTerm.has_value())
+                return malformed("a counter field is not eight bytes");
+            return RaftMessage { PreVoteRequest { .term = Term { .value = *term },
+                                                  .candidateId = NodeId { WireFields::AsStringView((*fields)[1]) },
+                                                  .lastLogIndex = LogIndex { .value = *lastIndex },
+                                                  .lastLogTerm = Term { .value = *lastTerm } } };
+        }
+        case MessageType::PreVoteResponse: {
+            auto const term = WireFields::FromBigEndian<std::uint64_t>((*fields)[0]);
+            auto const decision = Detail::DecodeEnum<VoteDecision>((*fields)[1]);
+            if (!term.has_value())
+                return malformed("a counter field is not eight bytes");
+            if (!decision.has_value())
+                return malformed("the vote decision names no known outcome");
+            return RaftMessage { Consensus::PreVoteResponse { .term = Term { .value = *term },
+                                                              .decision = *decision,
+                                                              .voterId =
+                                                                  NodeId { WireFields::AsStringView((*fields)[2]) } } };
+        }
         case MessageType::RequestVote: {
             auto const term = WireFields::FromBigEndian<std::uint64_t>((*fields)[0]);
             auto const lastIndex = WireFields::FromBigEndian<std::uint64_t>((*fields)[2]);

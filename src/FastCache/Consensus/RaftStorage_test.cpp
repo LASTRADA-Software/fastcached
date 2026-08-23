@@ -505,6 +505,10 @@ TEST_CASE("A leader's own writes round-trip through the store", "[consensus][raf
     };
 
     feed(node.Tick(TimePoint {} + 150ms));
+    // The timeout starts a pre-vote round; the real election, and the durable
+    // write it produces, follow the grant that carries it.
+    feed(node.Receive(PreVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+                      TimePoint {} + 150ms));
     feed(
         node.Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
                      TimePoint {} + 150ms));

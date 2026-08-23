@@ -135,6 +135,7 @@ struct LogEntry
 enum class Role : std::uint8_t
 {
     Follower = 0, ///< Accepts entries; stands for election when it stops hearing a leader.
+    PreCandidate, ///< Asking whether an election could be won, without starting one.
     Candidate,    ///< Standing for election in its current term.
     Leader,       ///< Replicating entries and sending heartbeats.
 };
@@ -211,6 +212,45 @@ template <typename E>
         return std::nullopt;
     return static_cast<E>(raw);
 }
+
+/// A node asking whether it *could* win an election, without starting one.
+///
+/// The pre-vote round (Ongaro's thesis §9.6) exists to stop a node that has been
+/// partitioned away from disrupting a cluster that is working perfectly well.
+/// Such a node times out, increments its term, times out again, and comes back
+/// carrying a term far above everyone else's — at which point §5.1 obliges the
+/// healthy leader to step down and the cluster runs an election it did not need.
+/// The disruption is worst exactly when it is least welcome: the moment a
+/// partition heals.
+///
+/// The fix is to ask first and change nothing. `term` is the term the sender
+/// *would* use, one above its own — it has not adopted it and will not unless a
+/// quorum says the election is winnable. A voter answering this **records
+/// nothing**: no term change, no vote cast, no write. That is what makes the
+/// round free, and it is why `PreVoteRequest` is exempt from the §5.1 term rule
+/// that every other message obeys.
+struct PreVoteRequest
+{
+    Term term {};             ///< The term the sender would move to; not yet adopted.
+    NodeId candidateId;       ///< Who is asking.
+    LogIndex lastLogIndex {}; ///< Index of the sender's last log entry.
+    Term lastLogTerm {};      ///< Term of the sender's last log entry.
+};
+
+/// A voter's answer to a pre-vote.
+///
+/// On a grant, `term` echoes the **request's** term rather than the voter's own.
+/// That is not a slip: the pre-candidate is counting answers to a question about
+/// a term it has not entered, and a response carrying a higher term would trip
+/// the §5.1 rule and demote the very node the grant encourages. On a refusal
+/// because the voter is ahead, `term` is the voter's own — which is exactly the
+/// case where stepping down is right.
+struct PreVoteResponse
+{
+    Term term {};             ///< The request's term when granted; the voter's when it is ahead.
+    VoteDecision decision {}; ///< Whether an election would have this voter's support.
+    NodeId voterId;           ///< Who answered, so the sender can count distinct answers.
+};
 
 /// Candidate asking for a vote (Raft §5.2, §5.4.1).
 struct RequestVoteRequest

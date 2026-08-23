@@ -89,16 +89,53 @@ template <typename Message>
 /// A node driven by a scripted random source that always draws the low bound, so
 /// every election timeout is exactly `ElectionMin` and the tests are arithmetic
 /// rather than guesswork.
+/// Drive `node` through a pre-vote round so it becomes a candidate.
+///
+/// An election timeout no longer starts an election -- it starts a pre-vote
+/// round, and the real election follows only once a quorum answers that one is
+/// winnable. Cases about what a *candidate* does go through here so the extra
+/// round has one home instead of being spelled at each of them.
+/// Grants come from every id any fixture here uses, rather than from a count the
+/// helper would have to be told: a cluster of five needs three and a cluster of
+/// three needs two, and once the round is carried the node is a candidate, so
+/// every later grant is ignored by the role check. A grant from an id outside
+/// the configuration is ignored too, which is what makes one list serve both.
+/// @param node The node to drive.
+/// @param at When the timeout falls due.
+void DriveToCandidate(RaftNode& node, TimePoint at)
+{
+    auto const standingFor = node.CurrentTerm().Next();
+    (void) node.Tick(at);
+    for (auto const* const voter: { "n2", "n3", "n4", "n5" })
+        (void) node.Receive(PreVoteResponse { .term = standingFor, .decision = VoteDecision::Granted, .voterId = voter },
+                            at);
+}
+
 struct Fixture
 {
     ScriptedRandomSource random { { 0 } };
     RaftNode node = MakeNode(ThreeNodes(), random);
 
+    /// Drive this node from follower to candidate of term 1.
+    ///
+    /// Two steps rather than one, because an election timeout no longer starts an
+    /// election: it starts a pre-vote round, and the real election follows only
+    /// once a quorum says it is winnable. Every case that wants a candidate goes
+    /// through here so the extra round has one home.
+    /// @return The output produced by the pre-vote that carried the round.
+    RaftOutput StandForElection()
+    {
+        (void) node.Tick(At(ElectionMin.count()));
+        return node.Receive(
+            PreVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+            At(ElectionMin.count()));
+    }
+
     /// Drive this node to leadership of term 1 by granting it a quorum.
     /// @return The output produced by the winning vote.
     RaftOutput ElectAsLeader()
     {
-        (void) node.Tick(At(ElectionMin.count()));
+        (void) StandForElection();
         return node.Receive(
             RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
             At(ElectionMin.count()));
@@ -131,24 +168,61 @@ TEST_CASE("Ticking before the deadline does nothing", "[consensus][raft][electio
     CHECK(fix.node.CurrentRole() == Role::Follower);
 }
 
-TEST_CASE("An election timeout makes a follower stand for election", "[consensus][raft][election]")
+TEST_CASE("An election timeout starts a pre-vote round, not an election", "[consensus][raft][prevote]")
 {
+    // The disruption this prevents: a node partitioned away times out, increments
+    // its term, times out again, and returns carrying a term far above everyone
+    // else's -- at which point §5.1 obliges a healthy leader to step down and the
+    // cluster runs an election it did not need, exactly when the partition heals.
     Fixture fix;
 
     auto const output = fix.node.Tick(At(ElectionMin.count()));
+
+    CHECK(fix.node.CurrentRole() == Role::PreCandidate);
+
+    // Nothing moved and nothing was written. A round that changed durable state
+    // would cost a disk flush per election timeout on every node that cannot
+    // reach a leader -- which is every node, during the partition this exists to
+    // make cheap.
+    CHECK(fix.node.CurrentTerm() == Term::None());
+    CHECK_FALSE(fix.node.VotedFor().has_value());
+    CHECK_FALSE(output.persist.has_value());
+
+    // No real vote was solicited.
+    CHECK(MessagesOfType<RequestVoteRequest>(output).empty());
+
+    auto const asked = MessagesOfType<PreVoteRequest>(output);
+    REQUIRE(asked.size() == 2); // both peers, never itself
+
+    // The term asked about is one ABOVE this node's own: the question is "would
+    // you support me if I stood", and that is the term it would stand in.
+    CHECK(asked[0].term == Term { .value = 1 });
+    CHECK(asked[0].candidateId == "n1");
+}
+
+TEST_CASE("A quorum of pre-votes starts the real election", "[consensus][raft][prevote]")
+{
+    Fixture fix;
+    (void) fix.node.Tick(At(ElectionMin.count()));
+    REQUIRE(fix.node.CurrentRole() == Role::PreCandidate);
+
+    auto const output =
+        fix.node.Receive(PreVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+                         At(ElectionMin.count()));
 
     CHECK(fix.node.CurrentRole() == Role::Candidate);
     CHECK(fix.node.CurrentTerm() == Term { .value = 1 });
     CHECK(fix.node.VotedFor() == std::optional<NodeId> { "n1" });
 
-    // The vote for itself must be durable before the request goes out, or a
-    // crash-restart votes again in the same term.
+    // Only NOW is anything durable: the vote for itself must reach stable storage
+    // before the request goes out, or a crash-restart votes again in the same
+    // term.
     REQUIRE(output.persist.has_value());
     CHECK(Unwrap(output.persist).currentTerm == Term { .value = 1 });
     CHECK(Unwrap(output.persist).votedFor == std::optional<NodeId> { "n1" });
 
     auto const requests = MessagesOfType<RequestVoteRequest>(output);
-    REQUIRE(requests.size() == 2); // both peers, never itself
+    REQUIRE(requests.size() == 2);
     CHECK(requests[0].term == Term { .value = 1 });
     CHECK(requests[0].candidateId == "n1");
 }
@@ -198,7 +272,7 @@ TEST_CASE("A retransmitted vote response is not counted twice", "[consensus][raf
     config.members = { "n1", "n2", "n3", "n4", "n5" }; // quorum 3
     RaftNode node = MakeNode(config, random);
 
-    (void) node.Tick(At(ElectionMin.count()));
+    DriveToCandidate(node, At(ElectionMin.count()));
     auto const granted =
         RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" };
 
@@ -252,7 +326,7 @@ TEST_CASE("Re-asking the same candidate gets the same answer", "[consensus][raft
 TEST_CASE("A candidate from an older term is refused", "[consensus][raft][election]")
 {
     Fixture fix;
-    (void) fix.node.Tick(At(ElectionMin.count())); // now a candidate at term 1
+    DriveToCandidate(fix.node, At(ElectionMin.count())); // now a candidate at term 1
 
     auto const output = fix.node.Receive(RequestVoteRequest { .term = Term::None(),
                                                               .candidateId = "n2",
@@ -339,7 +413,7 @@ TEST_CASE("A candidate steps down when a leader of its own term appears", "[cons
 {
     // Without this a split vote is resolved and then immediately re-run.
     Fixture fix;
-    (void) fix.node.Tick(At(ElectionMin.count()));
+    DriveToCandidate(fix.node, At(ElectionMin.count()));
     REQUIRE(fix.node.CurrentRole() == Role::Candidate);
     REQUIRE(fix.node.CurrentTerm() == Term { .value = 1 });
 
@@ -440,7 +514,7 @@ TEST_CASE("A vote response from outside the configuration is ignored", "[consens
     // id must not reach it: here one such response plus this node's own vote would
     // otherwise be a quorum of the three-node cluster.
     Fixture fix;
-    (void) fix.node.Tick(At(ElectionMin.count()));
+    DriveToCandidate(fix.node, At(ElectionMin.count()));
     REQUIRE(fix.node.CurrentRole() == Role::Candidate);
 
     (void) fix.node.Receive(
@@ -687,7 +761,7 @@ TEST_CASE("A single-node cluster commits its own proposal immediately", "[consen
     auto config = ThreeNodes();
     config.members = { "n1" };
     RaftNode node = MakeNode(config, random);
-    (void) node.Tick(At(ElectionMin.count()));
+    DriveToCandidate(node, At(ElectionMin.count()));
     REQUIRE(node.CurrentRole() == Role::Leader);
 
     auto const proposed = node.Propose(FastCache::BytesFromString("solo"), At(200));
@@ -722,7 +796,7 @@ TEST_CASE("A rejection walks nextIndex back and retries at once", "[consensus][r
         At(10));
     REQUIRE(fix.node.Log().LastIndex() == LogIndex { .value = 2 });
 
-    (void) fix.node.Tick(At(200));
+    DriveToCandidate(fix.node, At(200));
     (void) fix.node.Receive(
         RequestVoteResponse { .term = Term { .value = 2 }, .decision = VoteDecision::Granted, .voterId = "n2" }, At(201));
     REQUIRE(fix.node.CurrentRole() == Role::Leader);
@@ -813,7 +887,7 @@ TEST_CASE("Figure 8: an earlier term's entry is not committed by replica count",
     REQUIRE(fix.node.CommitIndex() == LogIndex::BeforeFirst());
 
     // Now win term 3 and hear that a follower holds that term-2 entry.
-    (void) fix.node.Tick(At(200));
+    DriveToCandidate(fix.node, At(200));
     REQUIRE(fix.node.CurrentTerm() == Term { .value = 3 });
     (void) fix.node.Receive(
         RequestVoteResponse { .term = Term { .value = 3 }, .decision = VoteDecision::Granted, .voterId = "n2" }, At(201));
@@ -997,7 +1071,7 @@ TEST_CASE("A new leader commits a previous term's entries without a client", "[c
                             At(10));
     REQUIRE(fix.node.CommitIndex() == LogIndex::BeforeFirst());
 
-    (void) fix.node.Tick(At(200));
+    DriveToCandidate(fix.node, At(200));
     (void) fix.node.Receive(
         RequestVoteResponse { .term = Term { .value = 2 }, .decision = VoteDecision::Granted, .voterId = "n2" }, At(201));
     REQUIRE(fix.node.CurrentRole() == Role::Leader);
@@ -1029,4 +1103,146 @@ TEST_CASE("A no-op is committed but never delivered", "[consensus][raft][replica
 
     CHECK(fix.node.CommitIndex() == LogIndex { .value = 1 });
     CHECK(output.applied.empty());
+}
+
+TEST_CASE("A pre-vote does not disturb the node that answers it", "[consensus][raft][prevote]")
+{
+    // The whole mechanism in one assertion. If answering cost a term change, a
+    // vote, or a disk write, the pre-vote round would be the disruption it
+    // exists to prevent, wearing a different name.
+    Fixture fix;
+
+    auto const output = fix.node.Receive(PreVoteRequest { .term = Term { .value = 99 },
+                                                          .candidateId = "n2",
+                                                          .lastLogIndex = LogIndex::BeforeFirst(),
+                                                          .lastLogTerm = Term::None() },
+                                         At(ElectionMin.count()));
+
+    CHECK(fix.node.CurrentTerm() == Term::None());
+    CHECK_FALSE(fix.node.VotedFor().has_value());
+    CHECK(fix.node.CurrentRole() == Role::Follower);
+    CHECK_FALSE(output.persist.has_value());
+
+    // It still answers -- silence would be indistinguishable from being
+    // unreachable, and the asker would wait out its timeout for nothing.
+    auto const replies = MessagesOfType<PreVoteResponse>(output);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Granted);
+}
+
+TEST_CASE("A pre-vote is refused while a leader is being heard from", "[consensus][raft][prevote]")
+{
+    // The condition that does the work. A cluster with a healthy leader refuses
+    // every pre-vote, so a node returning from a partition gets no quorum, never
+    // increments its term, and cannot depose anybody.
+    Fixture fix;
+
+    // Hearing from a leader re-arms the election timer, which is where
+    // "recently" already lives.
+    (void) fix.node.Receive(AppendEntriesRequest { .term = Term { .value = 4 },
+                                                   .leaderId = "n2",
+                                                   .prevLogIndex = LogIndex::BeforeFirst(),
+                                                   .prevLogTerm = Term::None(),
+                                                   .entries = {},
+                                                   .leaderCommit = LogIndex::BeforeFirst() },
+                            At(0));
+
+    auto const output = fix.node.Receive(PreVoteRequest { .term = Term { .value = 5 },
+                                                          .candidateId = "n3",
+                                                          .lastLogIndex = LogIndex::BeforeFirst(),
+                                                          .lastLogTerm = Term::None() },
+                                         At(1));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(output);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Denied);
+}
+
+TEST_CASE("A granted pre-vote does not raise the asker's term", "[consensus][raft][prevote]")
+{
+    // A grant echoes the term that was ASKED about, which is one above the
+    // sender's own. Left to the §5.1 rule it would demote the very node it
+    // encourages, and no pre-vote round could ever succeed.
+    Fixture fix;
+    (void) fix.node.Tick(At(ElectionMin.count()));
+    REQUIRE(fix.node.CurrentRole() == Role::PreCandidate);
+    REQUIRE(fix.node.CurrentTerm() == Term::None());
+
+    (void) fix.node.Receive(
+        PreVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+        At(ElectionMin.count()));
+
+    // It became a candidate by winning the round, not by being demoted by it.
+    CHECK(fix.node.CurrentRole() == Role::Candidate);
+    CHECK(fix.node.CurrentTerm() == Term { .value = 1 });
+}
+
+TEST_CASE("A refused pre-vote from a later term steps the asker down", "[consensus][raft][prevote]")
+{
+    // The other half of the exemption. A refusal carries the VOTER's term, and
+    // learning that this node is behind is exactly when stepping down is right.
+    Fixture fix;
+    (void) fix.node.Tick(At(ElectionMin.count()));
+    REQUIRE(fix.node.CurrentRole() == Role::PreCandidate);
+
+    (void) fix.node.Receive(
+        PreVoteResponse { .term = Term { .value = 9 }, .decision = VoteDecision::Denied, .voterId = "n2" },
+        At(ElectionMin.count()));
+
+    CHECK(fix.node.CurrentRole() == Role::Follower);
+    CHECK(fix.node.CurrentTerm() == Term { .value = 9 });
+}
+
+TEST_CASE("A partitioned node cannot inflate the term it returns with", "[consensus][raft][prevote]")
+{
+    // The defect the round exists to close, end to end. Before pre-vote, each
+    // timeout here incremented the term; a node away for twenty timeouts came
+    // back twenty terms ahead and deposed a leader that was working fine.
+    Fixture fix;
+
+    for (auto round = 0; round < 20; ++round)
+        (void) fix.node.Tick(At(ElectionMin.count() * (round + 1) * 4));
+
+    // Twenty timeouts, no answers, and the term has not moved once.
+    CHECK(fix.node.CurrentTerm() == Term::None());
+    CHECK(fix.node.CurrentRole() == Role::PreCandidate);
+    CHECK_FALSE(fix.node.VotedFor().has_value());
+}
+
+TEST_CASE("A pre-vote from outside the configuration is refused", "[consensus][raft][prevote]")
+{
+    // Same reasoning as a real vote: a machine outside the configuration must
+    // not be able to make this node believe an election is warranted.
+    Fixture fix;
+
+    auto const output = fix.node.Receive(PreVoteRequest { .term = Term { .value = 1 },
+                                                          .candidateId = "stranger",
+                                                          .lastLogIndex = LogIndex::BeforeFirst(),
+                                                          .lastLogTerm = Term::None() },
+                                         At(ElectionMin.count()));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(output);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Denied);
+}
+
+TEST_CASE("A pre-vote from a node with a stale log is refused", "[consensus][raft][prevote]")
+{
+    // §5.4.1 applies to the question as much as to the vote: encouraging a node
+    // that could not win wastes an election, and encouraging one that could win
+    // but should not is how Leader Completeness is lost.
+    Fixture fix;
+    (void) fix.ElectAsLeader();
+    auto const proposal = fix.node.Propose(FastCache::BytesFromString("x"), At(200));
+    REQUIRE(proposal.has_value());
+
+    auto const output = fix.node.Receive(PreVoteRequest { .term = Term { .value = 9 },
+                                                          .candidateId = "n2",
+                                                          .lastLogIndex = LogIndex::BeforeFirst(),
+                                                          .lastLogTerm = Term::None() },
+                                         At(10'000));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(output);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Denied);
 }

@@ -30,7 +30,12 @@ struct PersistentState
 /// data, the set is closed by the protocol rather than open for extension, and
 /// `std::visit` over it gives exhaustiveness checking that a `switch` on a kind
 /// tag would not.
-using RaftMessage = std::variant<RequestVoteRequest, RequestVoteResponse, AppendEntriesRequest, AppendEntriesResponse>;
+using RaftMessage = std::variant<PreVoteRequest,
+                                 PreVoteResponse,
+                                 RequestVoteRequest,
+                                 RequestVoteResponse,
+                                 AppendEntriesRequest,
+                                 AppendEntriesResponse>;
 
 /// A change to the durable log: write `entries` at `fromIndex`, discarding
 /// anything already at or after it.

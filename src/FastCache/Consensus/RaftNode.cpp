@@ -269,6 +269,39 @@ void RaftNode::StepDown(Term term, TimePoint now, RaftOutput& output)
     MarkPersist(output);
 }
 
+void RaftNode::StartPreVote(TimePoint now, RaftOutput& output)
+{
+    // Nothing durable changes here, and that is the entire point: no term
+    // increment, no vote recorded, no `MarkPersist`. A round that wrote anything
+    // would cost a disk flush per election timeout on every node that cannot
+    // reach a leader -- which is every node, during exactly the partition this
+    // is meant to make cheap.
+    _role = Role::PreCandidate;
+    _knownLeader.reset();
+
+    _preVotesGranted.clear();
+    _preVotesGranted.insert(_config.self);
+
+    ArmElectionTimer(now);
+
+    // A single-node cluster is its own quorum, so it goes straight to a real
+    // election -- the pre-vote round costs it nothing and skips no step.
+    if (_preVotesGranted.size() >= _config.Quorum())
+    {
+        StartElection(now, output);
+        return;
+    }
+
+    // The term asked about is one ABOVE this node's own: the question is "would
+    // you support me if I stood", and the term it would stand in is the one a
+    // voter has to compare its log against.
+    BroadcastToPeers(output,
+                     PreVoteRequest { .term = _currentTerm.Next(),
+                                      .candidateId = _config.self,
+                                      .lastLogIndex = _log.LastIndex(),
+                                      .lastLogTerm = _log.LastTerm() });
+}
+
 void RaftNode::StartElection(TimePoint now, RaftOutput& output)
 {
     _currentTerm = _currentTerm.Next();
@@ -280,6 +313,11 @@ void RaftNode::StartElection(TimePoint now, RaftOutput& output)
     // immediately and why the quorum test below is the same one for every size.
     _votesGranted.clear();
     _votesGranted.insert(_config.self);
+
+    // The pre-vote round is over; its answers were about whether to stand, not
+    // about who to elect, and counting them here would be counting votes nobody
+    // cast.
+    _preVotesGranted.clear();
 
     ArmElectionTimer(now);
     MarkPersist(output);
@@ -351,7 +389,11 @@ RaftOutput RaftNode::Tick(TimePoint now)
 
     if (TraitsOf(_role).timer == TimerKind::Election)
     {
-        StartElection(now, output);
+        // A pre-vote round, not an election. The term is untouched until a
+        // quorum says an election is winnable, which is what keeps a node that
+        // has been partitioned away from returning with an inflated term and
+        // deposing a leader that was working perfectly well.
+        StartPreVote(now, output);
         return output;
     }
 
@@ -397,11 +439,29 @@ RaftOutput RaftNode::Receive(RaftMessage const& message, TimePoint now)
     // §5.1, applied once for every message rather than per handler: a higher term
     // always wins and always demotes. Doing this in each handler is how the rule
     // comes to be applied to requests and forgotten on responses.
-    auto const incomingTerm = TermOf(message);
-    if (incomingTerm > _currentTerm)
-        StepDown(incomingTerm, now, output);
+    //
+    // The pre-vote messages are the two deliberate exemptions, and getting either
+    // wrong silently defeats the whole mechanism:
+    //
+    //   - A `PreVoteRequest` carries the term its sender WOULD use, not one it
+    //     holds. Adopting it here would let a partitioned node inflate everyone
+    //     else's term just by asking -- which is precisely the disruption the
+    //     round exists to prevent, reintroduced by the code meant to prevent it.
+    //   - A GRANTED `PreVoteResponse` echoes that same not-yet-entered term. Left
+    //     to the rule below it would demote the node its grant is encouraging, so
+    //     a pre-vote round could never succeed at all. A *refused* one carries the
+    //     voter's own term, and stepping down on that is exactly right: it means
+    //     this node is behind.
+    if (!IsPreVoteExempt(message))
+    {
+        auto const incomingTerm = TermOf(message);
+        if (incomingTerm > _currentTerm)
+            StepDown(incomingTerm, now, output);
+    }
 
     std::visit(Overloaded {
+                   [&](PreVoteRequest const& request) { OnPreVote(request, now, output); },
+                   [&](PreVoteResponse const& response) { OnPreVoteResponse(response, now, output); },
                    [&](RequestVoteRequest const& request) { OnRequestVote(request, now, output); },
                    [&](RequestVoteResponse const& response) { OnRequestVoteResponse(response, now, output); },
                    [&](AppendEntriesRequest const& request) { OnAppendEntries(request, now, output); },
@@ -410,6 +470,73 @@ RaftOutput RaftNode::Receive(RaftMessage const& message, TimePoint now)
                message);
 
     return output;
+}
+
+bool RaftNode::IsPreVoteExempt(RaftMessage const& message) noexcept
+{
+    if (std::holds_alternative<PreVoteRequest>(message))
+        return true;
+
+    auto const* const response = std::get_if<PreVoteResponse>(&message);
+    return response != nullptr && response->decision == VoteDecision::Granted;
+}
+
+void RaftNode::OnPreVote(PreVoteRequest const& request, TimePoint now, RaftOutput& output)
+{
+    // A refusal carries THIS node's term so a sender that is behind learns it.
+    // A grant echoes the request's term, so the sender is not demoted by the very
+    // answer that encourages it -- see the exemption in `Receive`.
+    auto const reply = [&](VoteDecision decision) {
+        output.messages.push_back(OutboundMessage {
+            .to = request.candidateId,
+            .message = PreVoteResponse { .term = decision == VoteDecision::Granted ? request.term : _currentTerm,
+                                         .decision = decision,
+                                         .voterId = _config.self } });
+    };
+
+    // Nothing below writes, records a vote, or moves a timer. A pre-vote must
+    // leave this node exactly as it found it -- otherwise a node asking
+    // repeatedly from behind a partition could delay every healthy node's
+    // election simply by asking, which is the disruption in a new costume.
+    if (request.term <= _currentTerm || !IsMember(request.candidateId))
+    {
+        reply(VoteDecision::Denied);
+        return;
+    }
+
+    // The one condition beyond the log check, and the one that does the work:
+    // this node must not have heard from a leader recently. A cluster with a
+    // healthy leader refuses every pre-vote, so a partitioned node gets no
+    // quorum, never increments its term, and cannot disturb anything when it
+    // returns. `_electionDeadline` is where "recently" already lives: it is
+    // re-armed by every AppendEntries this node accepts.
+    if (now < _electionDeadline)
+    {
+        reply(VoteDecision::Denied);
+        return;
+    }
+
+    reply(_log.CandidateIsAtLeastAsUpToDate(request.lastLogIndex, request.lastLogTerm) ? VoteDecision::Granted
+                                                                                       : VoteDecision::Denied);
+}
+
+void RaftNode::OnPreVoteResponse(PreVoteResponse const& response, TimePoint now, RaftOutput& output)
+{
+    // An answer to a question this node is no longer asking decides nothing. The
+    // term compared against is the one that was ASKED about -- one above this
+    // node's own -- because that is what a grant echoes.
+    if (_role != Role::PreCandidate || response.term != _currentTerm.Next())
+        return;
+
+    if (response.decision != VoteDecision::Granted)
+        return;
+
+    if (!IsMember(response.voterId))
+        return;
+
+    _preVotesGranted.insert(response.voterId);
+    if (_preVotesGranted.size() >= _config.Quorum())
+        StartElection(now, output);
 }
 
 void RaftNode::OnRequestVote(RequestVoteRequest const& request, TimePoint now, RaftOutput& output)
