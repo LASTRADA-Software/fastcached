@@ -204,7 +204,21 @@ inline void EncodeInto(std::span<std::byte> out, std::size_t offset, FieldList f
 /// @throws std::length_error When a field, or the total, exceeds the u32 ceiling.
 [[nodiscard]] inline std::vector<std::byte> Encode(FieldList fields)
 {
-    std::vector<std::byte> out(RequireEncodable(fields));
+    auto const size = RequireEncodable(fields);
+
+    // Returned early rather than falling through to a zero-length `EncodeInto`, and
+    // the reason is a diagnostic rather than a saving. A `std::vector` of size zero
+    // may hold a **null** `data()`, and GCC at -O3 inlines this whole chain down to
+    // the `memcpy` in `WriteBigEndian` and reports `-Wnull-dereference` on it -- a
+    // build failure under `-Werror`, and one clang does not produce, so it reaches CI
+    // rather than a local gate. It is not a false positive either: `memcpy(nullptr,
+    // …, 0)` is undefined behaviour however harmless it looks. Returning here proves
+    // to the compiler what the loop below already relied on, which is that there is
+    // something to write into.
+    if (size == 0)
+        return {};
+
+    std::vector<std::byte> out(size);
     EncodeInto(out, 0, fields);
     return out;
 }
