@@ -17,7 +17,6 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Net/PlatformListener.hpp>
 
 #include <atomic>
