@@ -50,21 +50,36 @@ class SchedulerResponder final: public IFrameResponder
 };
 
 /// Serves this node's own cache tier to clients on this machine.
+///
+/// **Local callers and cluster members only.** The bind already answers most of it
+/// -- this surface is loopback by default -- but a bind is not a policy: an operator
+/// who widens it to share the tier with their peers would otherwise be sharing it
+/// with everybody who can route to the port, and the objects in it are this
+/// machine's whole build output.
+///
+/// This is deliberately *stricter* than `fastcached`'s own cache, which serves
+/// non-members on purpose. That one is shared infrastructure somebody operates; this
+/// is a developer's private tier, and the two are different things that happen to
+/// speak one protocol.
 class CacheResponder final: public IFrameResponder
 {
   public:
     /// @param proxy Answers each request; must outlive this.
-    explicit CacheResponder(CacheProxy& proxy) noexcept:
-        _proxy { proxy }
+    /// @param membership Decides who may read this machine's tier; must outlive this.
+    CacheResponder(CacheProxy& proxy, Distributed::IMembershipOracle const& membership) noexcept:
+        _proxy { proxy },
+        _membership { membership }
     {
     }
 
-    [[nodiscard]] std::vector<std::byte> Answer(std::span<std::byte const> frame, std::string_view /*peer*/) override
+    [[nodiscard]] std::vector<std::byte> Answer(std::span<std::byte const> frame, std::string_view peer) override
     {
-        // The peer is not consulted, and that is the design rather than an omission:
-        // this surface binds loopback by default, so "who is asking" is answered by
-        // the bind rather than by a policy. A cache deliberately exposed to a network
-        // wants `--requirepass`, which is a credential rather than a membership.
+        // Refused as a *reply*, never by closing: a client that cannot tell a policy
+        // refusal from a dead host retries forever and reports a flaky network, which
+        // is the failure the declared frame length exists to make avoidable.
+        if (_membership.Classify(peer) != Distributed::Membership::Member)
+            return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::NotAMember,
+                                                      "this node serves its cache to its own machine and its cluster");
         return _proxy.Answer(frame);
     }
 
@@ -80,6 +95,7 @@ class CacheResponder final: public IFrameResponder
 
   private:
     CacheProxy& _proxy;
+    Distributed::IMembershipOracle const& _membership;
 };
 
 } // namespace FastCache::Node

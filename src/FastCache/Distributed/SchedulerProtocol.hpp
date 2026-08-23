@@ -5,11 +5,51 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <vector>
 
 namespace FastCache::Distributed
 {
+
+/// Render a node's capacity in the vocabulary the wire uses.
+///
+/// The counterpart of `CapacityFromWire`, and they are declared together on
+/// purpose: they are one mapping written twice, and the failure they invite is a
+/// transposition — cores read as memory, a reserve read as a class. Kept side by
+/// side so a round trip can pin them against each other, which is what
+/// `SchedulerProtocol_test` does with every field set to a distinct value.
+///
+/// This direction cannot fail. `NodeClass` is an enumerator, so it always has a
+/// byte; the reverse is not true, which is why only that one returns an optional.
+/// @param capacity What this machine is.
+/// @return The same facts, as raw wire values.
+[[nodiscard]] CompileCacheWire::CapacityFields CapacityToWire(NodeCapacity const& capacity);
+
+/// Read a capacity record back into the scheduler's vocabulary.
+///
+/// Fails only on a node class this build does not know — see `NodeClassFromRaw`
+/// for why that is a refusal rather than a guess.
+/// @param fields The raw values as received.
+/// @return The facts, or nullopt when the class byte is not one of ours.
+[[nodiscard]] std::optional<NodeCapacity> CapacityFromWire(CompileCacheWire::CapacityFields const& fields);
+
+/// Render a node's live load in the vocabulary the wire uses.
+///
+/// Paired with `LoadFromWire` for the reason `CapacityToWire` is paired with
+/// `CapacityFromWire`: one mapping written twice, whose characteristic failure is a
+/// transposition that no compiler can see. `inFlight` is deliberately not part of
+/// the pair — it travels as a field of HEARTBEAT itself rather than inside the
+/// nested record, because it is the one number a worker can never fail to have.
+/// @param load What this machine is doing.
+/// @return The same facts, as raw wire values.
+[[nodiscard]] CompileCacheWire::LoadFields LoadToWire(NodeLoad const& load);
+
+/// Read a live-load record back into the scheduler's vocabulary.
+/// @param fields The raw values as received.
+/// @param inFlight The job count, which travels outside the record.
+/// @return The facts.
+[[nodiscard]] NodeLoad LoadFromWire(CompileCacheWire::LoadFields const& fields, std::uint32_t inFlight);
 
 /// Turn one `0xFC` request into one reply, for a fleet scheduler.
 ///

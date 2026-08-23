@@ -127,11 +127,26 @@ class ClusterMembership final: public IMembershipOracle
     /// @return Whether that peer may be scheduled onto the fleet.
     [[nodiscard]] Membership Classify(std::string_view peerAddress) const override
     {
-        // An empty list refuses everybody rather than admitting them. A node that has
-        // not yet discovered a peer, or whose discovery is misconfigured, must not
-        // silently become an open scheduler -- the failure would be invisible from
-        // both ends and is exactly what `OpenMembership` exists to make an explicit
-        // choice instead.
+        // This machine is always a member of its own node's fleet, whatever the list
+        // says, and that is a rule rather than a convenience. Anti-leeching exists to
+        // stop OTHER machines spending capacity they do not contribute; a process on
+        // this host already has this host's CPU, and the `fastcache-cc` a developer
+        // runs against their own node is the entire reason the node is there. Without
+        // it, a node whose operator listed only their peers would refuse their own
+        // builds -- a fleet that looks configured and serves nobody locally, which is
+        // exactly the shape of failure this file's other rules exist to prevent.
+        //
+        // It is also what makes "off by default" safe: an unconfigured node admits
+        // its own machine and nothing else, so it is useful immediately and closed to
+        // the network until somebody says otherwise.
+        if (IsLoopbackHost(peerAddress))
+            return Membership::Member;
+
+        // An empty list then refuses everybody else rather than admitting them. A node
+        // that has not yet discovered a peer, or whose discovery is misconfigured,
+        // must not silently become an open scheduler -- the failure would be
+        // invisible from both ends and is exactly what `OpenMembership` exists to
+        // make an explicit choice instead.
         //
         // Whole-string, never a prefix: `10.0.0.1` must not admit `10.0.0.10`.
         return std::ranges::find(_hosts, peerAddress) != _hosts.end() ? Membership::Member : Membership::Outsider;

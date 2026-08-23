@@ -36,10 +36,12 @@ class SchedulerTier
     /// @param metrics Where dispatch outcomes are counted.
     /// @param logger Where to announce the bound address.
     /// @return The running tier, or why it could not be served.
-    [[nodiscard]] static std::expected<std::unique_ptr<SchedulerTier>, std::string> Start(NodeConfig const& cfg,
-                                                                                          IClock& clock,
-                                                                                          IMetricsSink& metrics,
-                                                                                          ILogger& logger);
+    [[nodiscard]] static std::expected<std::unique_ptr<SchedulerTier>, std::string> Start(
+        NodeConfig const& cfg,
+        Distributed::IMembershipOracle const& membership,
+        IClock& clock,
+        IMetricsSink& metrics,
+        ILogger& logger);
 
     ~SchedulerTier() = default;
 
@@ -55,14 +57,12 @@ class SchedulerTier
     }
 
   private:
-    SchedulerTier(NodeConfig const& cfg, IClock& clock, IMetricsSink& metrics);
+    SchedulerTier(Distributed::IMembershipOracle const& membership, IClock& clock, IMetricsSink& metrics);
 
     // Declaration order IS construction order, and each is referenced by the one
     // below it.
     Distributed::SchedulerService _service;
     Distributed::SchedulerProtocol _protocol;
-    Distributed::OpenMembership _open;
-    Distributed::ClusterMembership _listed;
     SchedulerResponder _responder;
     std::unique_ptr<FrameEndpoint> _endpoint;
 };

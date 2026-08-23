@@ -226,12 +226,14 @@ On the scheduler, the `/metrics` endpoint counts the outcomes:
 |---------|--------------|
 | `fastcached_dispatch_leases_granted_total` | Work is being distributed. |
 | `fastcached_dispatch_leases_no_worker_total` | The fleet is **misconfigured** — workers are up but nobody matches. |
-| `fastcached_dispatch_leases_no_capacity_total` | The fleet is **too small**. |
+| `fastcached_dispatch_leases_no_capacity_total` | The fleet is **too small** — full of your own build. |
+| `fastcached_dispatch_leases_withdrawn_total` | The fleet is **unavailable** — slots free on paper, machines busy elsewhere or out of scratch space. |
 | `fastcached_dispatch_leases_duplicate_total` | Duplicate-work suppression is doing its job. Not a problem. |
 | `fastcached_dispatch_worker_registrations_total` | Workers registering. A steady rise means heartbeats are not arriving. |
 
-The first two are different operator problems and are deliberately counted
-apart: summing them hides a misconfiguration behind a busy fleet.
+The first three refusals are different operator problems and are deliberately
+counted apart: summing them hides a misconfiguration behind a busy fleet, and
+hides an unavailable fleet behind one that merely looks undersized.
 
 On each **worker**, start it with `--admin-listen` and the same endpoint reports
 what that machine is doing:
@@ -246,6 +248,7 @@ what that machine is doing:
 | `fastcache_worker_jobs_refused_rejected_argument_total` | A command line carrying something that could name a file. |
 | `fastcache_worker_jobs_refused_scratch_unavailable_total` | The scratch disk is full or unwritable. |
 | `fastcache_worker_jobs_refused_spawn_failed_total` | The toolchain is configured but cannot be executed. |
+| `fastcache_worker_jobs_refused_not_a_member_total` | Something with no claim on this machine tried to compile on it. Not a fault of yours; check who can reach `--port`. |
 | `fastcache_worker_bytes_received_total` / `..._returned_total` | Link volume, counted at the socket. |
 
 The refusals are split by reason for the same reason the scheduler's two are:
@@ -286,9 +289,31 @@ every other machine fetches.
   fleet is idle most of the time and the value is concentrated in the first
   build of a commit, developer branches and toolchain bumps. Socket activation
   exists for exactly this shape.
-- **`--slots`** defaults to one per hardware thread. It is advertised *and*
-  enforced locally, so a worker cannot end up fuller and slower than the
-  scheduler believes at the same moment.
+- **`--slots`** defaults to *derived*: hardware threads, clamped by what the
+  memory supports, less what `--node-class` reserves (two cores on a
+  workstation, none on a dedicated node). A number you give it overrides all
+  three. Whatever it resolves to is advertised *and* enforced locally from one
+  calculation, so a worker cannot end up fuller and slower than the scheduler
+  believes at the same moment. See
+  [the worker's own page](../tools/fastcache-compile-node.md#capacity).
+- **`--node-class` defaults to `workstation`,** which is the safe answer rather
+  than the common one: a node nobody classified is somebody's desktop until
+  proven otherwise. Set `--node-class dedicated` on build servers, or the fleet
+  quietly runs two cores short on every one of them.
+- **The scheduler picks by free slots, not by fewest running jobs.** Absolute
+  counts make a 64-slot server running 8 jobs look busier than a 4-slot laptop
+  running 2, which sends work to the smallest machines first.
+- **Workers withdraw capacity while their machines are busy elsewhere.** Each
+  heartbeat carries host CPU, available memory and free scratch space; the
+  fleet's own jobs are subtracted, so what is left is load that belongs to
+  somebody else. A worker whose scratch filesystem fills up stops being picked
+  entirely, and starts again when it drains.
+- **Three lease refusals, never summed.** `no-worker` means a fingerprint
+  nobody serves, `no-capacity` means the fleet is too small, and `withdrawn`
+  means the machines are there and unavailable. Each has its own
+  `fastcached_dispatch_leases_*_total`, because the fixes are different and
+  folding `withdrawn` into `no-capacity` sends an operator to buy hardware they
+  already own.
 - **Workers can come and go.** A worker that stops heartbeating is dropped after
   90 s; a client that leases one in the gap finds it unreachable and compiles
   locally.
@@ -296,8 +321,15 @@ every other machine fetches.
 ## Security
 
 Start the scheduler with `--requirepass` and give the same secret to workers
-(`--requirepass`) and clients (`FASTCACHE_TOKEN`). Without it, anything that can
-reach the scheduler port can queue work onto your fleet.
+(`--requirepass`) and clients (`FASTCACHE_TOKEN`).
+
+Even without it, a node is closed by default: its compile port, its scheduler and
+its own cache tier all admit **this machine and `--fleet-member` peers only**. That
+matters most for the compile port, which binds `0.0.0.0` because peers have to dial
+it — anybody who could route to it would otherwise have your machine run their
+compiler on source they chose. `--requirepass` is still worth setting: membership is
+about who you are and a credential is about what you know, and a build LAN where
+addresses can be spoofed wants both.
 
 Keep `--listen-scheduler` off any network you would not run a compiler for, and
 put mTLS in front of both ports for anything beyond a trusted build network.

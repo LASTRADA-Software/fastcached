@@ -170,12 +170,12 @@ class SchedulerService
     /// @return `Ok` carrying the assigned worker id, or a refusal.
     [[nodiscard]] SchedulerReply Register(CallerContext const& caller, WorkerRegistration const& registration);
 
-    /// Refresh a worker's liveness and correct its load count.
+    /// Refresh a worker's liveness and record what it says about itself.
     /// @param caller Who is asking.
     /// @param workerId The id handed back by `Register`.
-    /// @param inFlight The worker's own count of running compiles.
+    /// @param load The worker's own account of its job count and its machine.
     /// @return `Ok`, or a refusal.
-    [[nodiscard]] SchedulerReply Heartbeat(CallerContext const& caller, std::string_view workerId, std::uint32_t inFlight);
+    [[nodiscard]] SchedulerReply Heartbeat(CallerContext const& caller, std::string_view workerId, NodeLoad const& load);
 
     /// Pick a worker and authorize one job on it.
     /// @param caller Who is asking.

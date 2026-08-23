@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "LauncherCli.hpp"
 #include "NodeConfig.hpp"
 
 #include <FastCache/Cli/Options.hpp>
@@ -8,11 +9,13 @@
 
 #include <algorithm>
 #include <array>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <tests/Unwrap.hpp>
 
@@ -32,6 +35,66 @@ namespace
     cfg.toolchains = { "/usr/bin/g++" };
     return cfg;
 }
+
+/// Parse an argv fragment into a `NodeConfig`, the way `main` does.
+///
+/// A local helper rather than a shared one because the two cases below are the only
+/// callers: everything else here builds a config directly, since what it is testing
+/// is what comes back OUT of one.
+/// @param args The flags, without the program name.
+/// @return The configuration, or the first parse error.
+[[nodiscard]] std::expected<NodeConfig, ConfigError> ParseNodeArgv(std::vector<char const*> const& args)
+{
+    NodeConfig cfg;
+    auto const flow = ParseOptionsInto(NodeOptions(), std::span<char const* const> { args }, cfg);
+    if (!flow.has_value())
+        return std::unexpected(flow.error());
+    return cfg;
+}
+
+/// A machine a test can describe, standing in for the one it runs on.
+///
+/// The whole reason `IHostFactsSource` is a seam. Every rule `NodeCapacityOf` and
+/// `OfferableSlots` apply is a function of cores and memory, and asserting them
+/// against `OnlineCpuCount()` would mean asserting whatever the CI runner happens to
+/// be — a test that passes for the wrong reason on one machine and fails on the next.
+class FakeHost final: public IHostFactsSource
+{
+  public:
+    /// @param cores Hardware threads to report.
+    /// @param memoryBytes Physical memory to report.
+    FakeHost(std::uint32_t cores, std::uint64_t memoryBytes) noexcept:
+        _cores { cores },
+        _memoryBytes { memoryBytes }
+    {
+    }
+
+    [[nodiscard]] HostFacts const& Facts() const override
+    {
+        return _facts;
+    }
+
+    [[nodiscard]] std::uint32_t LogicalCores() const override
+    {
+        return _cores;
+    }
+
+    [[nodiscard]] std::uint64_t TotalMemoryBytes() const override
+    {
+        return _memoryBytes;
+    }
+
+    [[nodiscard]] DiskSpace SpaceOn(std::filesystem::path const& /*path*/) const override
+    {
+        return DiskSpace { .capacityBytes = 0, .freeBytes = 0 };
+    }
+
+  private:
+    HostFacts _facts;
+    std::uint32_t _cores;
+    std::uint64_t _memoryBytes;
+};
+
 } // namespace
 
 TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", "[node][service]")
@@ -67,11 +130,15 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.port = 7777;
     cfg.toolchains = { "/usr/bin/g++", "abc123=/usr/bin/clang++" };
     cfg.slots = 12;
+    cfg.nodeClass = Distributed::NodeClass::Dedicated;
+    cfg.reservedCores = 3;
     cfg.adminListen = "0.0.0.0:6677";
     cfg.schedulerListen = "0.0.0.0:6678";
     cfg.fleetMembers = { "10.0.0.1:6676", "10.0.0.2:6676" };
     cfg.fleetOpen = true;
-    cfg.cacheMemoryBytes = 256 * 1024 * 1024;
+    // Not 256 MiB: that is the default now, and this case exists to give every
+    // field a value differing from its default so every emitter fires.
+    cfg.cacheMemoryBytes = 512 * 1024 * 1024;
     cfg.cacheDir = "cache";
     cfg.cacheListen = "127.0.0.1:6679";
     cfg.upstream = "cache.internal:6674";
@@ -226,7 +293,9 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig cfg;
         cfg.schedulerListen = "0.0.0.0:6678";
         cfg.fleetOpen = true;
-        cfg.cacheMemoryBytes = 256 * 1024 * 1024;
+        // Not 256 MiB: that is the default now, and this case exists to give every
+        // field a value differing from its default so every emitter fires.
+        cfg.cacheMemoryBytes = 512 * 1024 * 1024;
         cfg.cacheDir = "cache";
         cfg.cacheListen = "127.0.0.1:6679";
         cfg.upstream = "cache.internal:6674";
@@ -264,4 +333,141 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // untouched by any of this.
         CHECK_FALSE(SchedulerPolicyRejection(NodeConfig {}).has_value());
     }
+}
+
+TEST_CASE("NodeConfig: a reserve of zero is re-emitted, because zero is an answer", "[node][service]")
+{
+    // `emitIfSet` compares against the default and stays silent when they match,
+    // which is right for every other flag and wrong for this one: the difference
+    // `--reserve-cores=0` carries IS its presence. Registered without it, a service
+    // that its operator told to hold nothing back would come up holding two cores
+    // back on every start, with a command line that looks correct.
+    NodeConfig cfg;
+    cfg.scheduler = "cache.internal:6675";
+    cfg.advertise = "worker-01.internal:6676";
+    cfg.toolchains = { "/usr/bin/g++" };
+    cfg.reservedCores = 0;
+
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
+    CHECK(std::ranges::contains(spec.arguments, std::string { "--reserve-cores=0" }));
+
+    // And a configuration that never mentioned one emits nothing, so the class
+    // default keeps applying rather than being frozen at install time.
+    NodeConfig quiet = cfg;
+    quiet.reservedCores.reset();
+    auto const quietSpec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, quiet);
+    CHECK_FALSE(std::ranges::any_of(quietSpec.arguments,
+                                    [](std::string const& arg) { return FlagMatches(arg, "--reserve-cores"); }));
+}
+
+TEST_CASE("NodeConfig: a node class is parsed by name and refused by name", "[node][cli]")
+{
+    // Off `NodeClassTable`, so a class added there is accepted here without an edit.
+    auto const dedicated = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--node-class=dedicated" });
+    REQUIRE(dedicated.has_value());
+    CHECK(dedicated->nodeClass == Distributed::NodeClass::Dedicated);
+
+    // The default is the safe one rather than the common one.
+    auto const unstated = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc" });
+    REQUIRE(unstated.has_value());
+    CHECK(unstated->nodeClass == Distributed::NodeClass::Workstation);
+    CHECK_FALSE(unstated->reservedCores.has_value());
+
+    // Refused rather than defaulted, and the message names what would have worked:
+    // a rejection that cannot say that cannot be acted on.
+    auto const wrong = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--node-class=server" });
+    REQUIRE_FALSE(wrong.has_value());
+    CHECK(wrong.error().context.contains("workstation"));
+    CHECK(wrong.error().context.contains("dedicated"));
+}
+
+TEST_CASE("NodeConfig: a reserve of zero parses, unlike a slot count of zero", "[node][cli]")
+{
+    // The two flags differ deliberately. Zero slots is a worker that can do nothing
+    // and is refused; zero reserved cores is a real instruction -- drive this machine
+    // to its last core -- and is distinct from not passing the flag at all.
+    auto const none = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--reserve-cores=0" });
+    REQUIRE(none.has_value());
+    REQUIRE(none->reservedCores.has_value());
+    CHECK(Unwrap(none->reservedCores) == 0U);
+
+    CHECK_FALSE(ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--slots=0" }).has_value());
+}
+
+TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node][capacity]")
+{
+    // The mapping `NodeCapacityOf` exists to make checkable: which facts come from
+    // the operator and which from the machine. Getting it wrong is invisible — the
+    // node registers, heartbeats and is simply sized wrong forever, with a command
+    // line that reads correctly.
+    NodeConfig cfg;
+
+    SECTION("a developer's laptop keeps cores for its owner")
+    {
+        FakeHost const laptop { 8, 32ULL << 30 };
+        auto const capacity = NodeCapacityOf(cfg, laptop);
+
+        CHECK(capacity.logicalCores == 8);
+        CHECK(capacity.totalMemoryBytes == (32ULL << 30));
+        // Unstated, so the class decides — which is the distinction the optional
+        // carries and the reason it is not a plain integer.
+        CHECK(capacity.nodeClass == Distributed::NodeClass::Workstation);
+        CHECK_FALSE(capacity.reserveIsExplicit);
+        CHECK(Distributed::OfferableSlots(capacity, cfg.slots) == 6);
+    }
+
+    SECTION("a build server is driven to its limit")
+    {
+        cfg.nodeClass = Distributed::NodeClass::Dedicated;
+        FakeHost const server { 128, 512ULL << 30 };
+
+        CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, server), cfg.slots) == 128);
+    }
+
+    SECTION("a machine whose cores outrun its memory is sized by the memory")
+    {
+        cfg.nodeClass = Distributed::NodeClass::Dedicated;
+        FakeHost const cramped { 128, 32ULL << 30 };
+
+        CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, cramped), cfg.slots) == 32);
+    }
+
+    SECTION("a typed reserve of zero is not the same as no reserve")
+    {
+        FakeHost const laptop { 8, 32ULL << 30 };
+
+        cfg.reservedCores = 0;
+        auto const explicitNone = NodeCapacityOf(cfg, laptop);
+        CHECK(explicitNone.reserveIsExplicit);
+        CHECK(Distributed::OfferableSlots(explicitNone, cfg.slots) == 8);
+
+        cfg.reservedCores = 4;
+        CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, laptop), cfg.slots) == 4);
+    }
+
+    SECTION("an explicit slot count overrides every derivation")
+    {
+        cfg.slots = 20;
+        FakeHost const laptop { 8, 32ULL << 30 };
+
+        CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, laptop), cfg.slots) == 20);
+    }
+}
+
+TEST_CASE("NodeConfig: the node answers where the launcher looks", "[node][cli]")
+{
+    // Two programs agreeing on one constant, asserted here because that agreement is
+    // the entire mechanism: it is what makes `fastcache-cc` find a local node with no
+    // FASTCACHE_ADDR set, and nothing else would notice if one of them moved. The
+    // symptom of a drift is not an error — the launcher connects to a closed port,
+    // falls back, and every build is silently uncached.
+    CHECK(NodeConfig {}.cacheListen == Cc::DefaultAddr);
+
+    // Loopback, and that is the anti-leeching half rather than a preference: this
+    // surface serves this machine's whole build output, so reaching it from the
+    // network has to be something an operator typed.
+    CHECK(NodeConfig {}.cacheListen.starts_with("127.0.0.1:"));
+
+    // And it is on by default, because a local tier is what the program is for.
+    CHECK(NodeConfig {}.cacheMemoryBytes > 0);
 }

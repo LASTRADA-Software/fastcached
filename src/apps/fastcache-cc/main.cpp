@@ -13,7 +13,8 @@
 // never breaks because the cache is unavailable.
 //
 // Config (environment):
-//   FASTCACHE_ADDR       host:port of fastcached (required to use the cache)
+//   FASTCACHE_ADDR       host:port of the cache; defaults to 127.0.0.1:6674,
+//                        empty disables caching
 //   FASTCACHE_SOURCE_DIR checkout source root (for keying + canonicalization)
 //   FASTCACHE_BINARY_DIR build output root
 //   FASTCACHE_PREFETCH_GROUP     optional prefetch group id (default "default")
@@ -201,7 +202,22 @@ struct Config
 [[nodiscard]] Config LoadConfig()
 {
     Config c;
-    c.addr = EnvOr(Cc::EnvName::Addr, "");
+    // Three-valued on purpose, unlike every other setting here. UNSET means "use
+    // the default", which is localhost -- so the launcher caches with no
+    // configuration at all against whichever of `fastcached` or
+    // `fastcache-compile-node` a developer is running, and the node's
+    // `--listen-cache` defaults to the same address for exactly that reason. SET
+    // BUT EMPTY still means *off*, which is the documented opt-out
+    // `cmake/portable/CompileCache.cmake` exports, so `EnvOr` -- which collapses the
+    // two -- cannot be used here without turning that opt-out into the default.
+    //
+    // Defaulting to a REMOTE address would be indefensible: every translation unit
+    // on a machine with nothing listening would pay a connect timeout in silence.
+    // Loopback is not that -- a closed port refuses immediately, no timeout and no
+    // round trip -- which is the whole argument for this default and why it could
+    // not be any other address.
+    auto const configuredAddr = FastCache::ReadEnvironmentVariable(Cc::EnvName::Addr);
+    c.addr = configuredAddr.has_value() ? *configuredAddr : std::string { Cc::DefaultAddr };
     // Deliberately NOT resolved here. These are the spelling the build system
     // exported, and they stay that way: they are the roots that go on the wire,
     // that the key tokenizes against, and that a hit's replayed paths are built

@@ -32,11 +32,16 @@ namespace
     }
 } // namespace
 
-WorkerServer::WorkerServer(
-    IListener& listener, Cc::WorkerProtocol& protocol, std::size_t slots, IMetricsSink& metrics, ILogger& logger) noexcept:
+WorkerServer::WorkerServer(IListener& listener,
+                           Cc::WorkerProtocol& protocol,
+                           std::size_t slots,
+                           Distributed::IMembershipOracle const& membership,
+                           IMetricsSink& metrics,
+                           ILogger& logger) noexcept:
     _listener { listener },
     _protocol { protocol },
     _slots { slots },
+    _membership { membership },
     _metrics { metrics },
     _logger { logger }
 {
@@ -70,6 +75,29 @@ Task<void> WorkerServer::Run()
         }
 
         auto socket = *std::move(accepted);
+
+        // Anti-leeching, and it comes FIRST -- before the slot cap, before the
+        // payload -- for the reason the cap itself comes before the payload: a
+        // caller with no claim on this machine must not be able to make it buffer a
+        // multi-megabyte preprocessed translation unit, which would be a
+        // memory-exhaustion hole reachable by exactly the peers this check exists to
+        // keep out. The same ordering `CompileCacheHandler`'s auth gate documents.
+        //
+        // This machine and this cluster's members. Everyone else is refused as a
+        // *reply* rather than by closing, so a misconfigured peer learns which of
+        // the two it is instead of seeing a connection it cannot tell from a dead
+        // host. Without this the port accepted anybody who could route to it and ran
+        // their compiler for them: `--bind` defaults to 0.0.0.0, so that was the
+        // network.
+        if (_membership.Classify(socket->PeerAddress()) != Distributed::Membership::Member)
+        {
+            _metrics.Increment(IMetricsSink::Counter::WorkerJobsRefusedNotAMember);
+            (void) co_await WriteAll(socket.get(),
+                                     Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember,
+                                                            "this worker compiles for its own machine and its cluster"));
+            socket->Close();
+            continue;
+        }
 
         // The cap is checked before the request is read, so an over-capacity client
         // is refused without this worker buffering its multi-megabyte payload

@@ -89,12 +89,17 @@ class WorkerRegistrar
   public:
     /// @param fingerprint The toolchain this worker serves.
     /// @param endpoint host:port clients should reach this worker on.
-    /// @param slots Concurrent job limit to advertise.
+    /// @param slots Concurrent job limit to advertise, or 0 to let the scheduler
+    ///        derive one from `capacity`. Zero is what a node should normally send:
+    ///        deriving it here would put a workstation's core reserve in every
+    ///        worker rather than in the one place that can be checked.
     /// @param acceptedCodecs What this worker can decode.
+    /// @param capacity What this machine is, for the scheduler to size it by.
     WorkerRegistrar(std::string fingerprint,
                     std::string endpoint,
                     std::uint32_t slots,
-                    CompileCacheWire::CodecList acceptedCodecs);
+                    CompileCacheWire::CodecList acceptedCodecs,
+                    CompileCacheWire::CapacityFields capacity = {});
 
     /// Announce this worker over an already-connected scheduler client.
     /// @param scheduler Connected transport; not owned.
@@ -110,9 +115,13 @@ class WorkerRegistrar
     /// reports the need to re-register rather than merely failing.
     /// @param scheduler Connected transport; not owned.
     /// @param inFlight Jobs running right now.
+    /// @param load What else this machine has to say about itself right now.
     /// @param credential Credential to present.
     /// @return True when accepted; false means "register again".
-    [[nodiscard]] bool Heartbeat(ITcpClient& scheduler, std::uint32_t inFlight, Credential const& credential = {});
+    [[nodiscard]] bool Heartbeat(ITcpClient& scheduler,
+                                 std::uint32_t inFlight,
+                                 CompileCacheWire::LoadFields const& load = {},
+                                 Credential const& credential = {});
 
     /// The id the scheduler assigned, empty until a successful `Register`.
     [[nodiscard]] std::string const& WorkerId() const noexcept
@@ -125,6 +134,7 @@ class WorkerRegistrar
     std::string _endpoint;
     std::uint32_t _slots;
     CompileCacheWire::CodecList _acceptedCodecs;
+    CompileCacheWire::CapacityFields _capacity;
     std::string _workerId;
 };
 

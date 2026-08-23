@@ -22,17 +22,19 @@ namespace
 
 CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
                      std::unique_ptr<ICacheUpstream> upstream,
+                     Distributed::IMembershipOracle const& membership,
                      IClock& clock,
                      IMetricsSink& metrics):
     _storage { std::move(storage) },
     _upstream { std::move(upstream) },
     _cache { *_storage, *_upstream, clock, metrics },
     _proxy { _cache },
-    _responder { _proxy }
+    _responder { _proxy, membership }
 {
 }
 
 std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConfig const& cfg,
+                                                                        Distributed::IMembershipOracle const& membership,
                                                                         IClock& clock,
                                                                         IMetricsSink& metrics,
                                                                         ILogger& logger)
@@ -50,6 +52,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConf
     auto tier = std::unique_ptr<CacheTier> { new CacheTier {
         std::make_unique<InMemoryLruStorage>(static_cast<std::size_t>(cfg.cacheMemoryBytes)),
         std::move(upstream),
+        membership,
         clock,
         metrics } };
 
@@ -68,6 +71,40 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConf
                 FormatByteSize(static_cast<std::size_t>(cfg.cacheMemoryBytes)),
                 cfg.upstream.empty() ? std::string { "none" } : cfg.upstream);
     return tier;
+}
+
+std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
+    NodeConfig const& cfg,
+    Distributed::IMembershipOracle const& membership,
+    IClock& clock,
+    IMetricsSink& metrics,
+    ILogger& logger)
+{
+    // Emptied deliberately. A node that only compiles for others wants no cache port
+    // at all, and saying so must not be an error.
+    if (cfg.cacheListen.empty())
+        return std::unique_ptr<CacheTier> {};
+
+    auto started = CacheTier::Start(cfg, membership, clock, metrics, logger);
+    if (started.has_value())
+        return std::move(*started);
+
+    // Fatal only when the operator NAMED this address -- the same distinction the
+    // admin endpoint draws between an endpoint asked for and one got anyway. It
+    // matters because this port is on by default: a node sharing a machine with
+    // `fastcached` would otherwise refuse to start over a convenience nobody
+    // requested. Typed, it is a promise, and a broken promise is fatal.
+    if (cfg.cacheListen != NodeConfig {}.cacheListen)
+        return std::unexpected { started.error() };
+
+    // Never silent. The launcher will reach whatever else holds that port -- very
+    // likely the daemon -- so the build still works, but "the cache quietly did less
+    // than you configured" is the failure mode this codebase keeps a list about.
+    logger.Logf(LogLevel::Warn,
+                "default cache endpoint {}: {}; continuing without a local cache tier",
+                cfg.cacheListen,
+                started.error());
+    return std::unique_ptr<CacheTier> {};
 }
 
 } // namespace FastCache::Node

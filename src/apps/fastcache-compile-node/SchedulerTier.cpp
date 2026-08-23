@@ -7,16 +7,15 @@
 namespace FastCache::Node
 {
 
-SchedulerTier::SchedulerTier(NodeConfig const& cfg, IClock& clock, IMetricsSink& metrics):
+SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership, IClock& clock, IMetricsSink& metrics):
     _service { clock, metrics },
     _protocol { _service },
-    _listed { cfg.fleetMembers },
-    // Which oracle is the operator's stated choice, never a fall-back:
-    // `SchedulerPolicyRejection` has already refused the case where neither
-    // `--fleet-open` nor `--fleet-member` was given, so nothing here guesses.
-    _responder { _protocol,
-                 cfg.fleetOpen ? static_cast<Distributed::IMembershipOracle const&>(_open)
-                               : static_cast<Distributed::IMembershipOracle const&>(_listed) }
+    // The oracle is the NODE's, not this tier's: the cache surface consults the same
+    // object, and a node that answered "is this peer one of ours" differently at its
+    // two surfaces would admit a peer to the fleet and refuse it the objects that
+    // fleet produced. It also outlives this tier, which is what lets a node serve a
+    // cache with no scheduler at all.
+    _responder { _protocol, membership }
 {
     // Static leadership, and it is a placeholder said out loud rather than a silent
     // one. Consensus is what will publish this -- `SetRole` exists for exactly that --
@@ -27,12 +26,14 @@ SchedulerTier::SchedulerTier(NodeConfig const& cfg, IClock& clock, IMetricsSink&
     _service.SetRole(Distributed::SchedulerRole::Leader, {});
 }
 
-std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(NodeConfig const& cfg,
-                                                                                IClock& clock,
-                                                                                IMetricsSink& metrics,
-                                                                                ILogger& logger)
+std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
+    NodeConfig const& cfg,
+    Distributed::IMembershipOracle const& membership,
+    IClock& clock,
+    IMetricsSink& metrics,
+    ILogger& logger)
 {
-    auto tier = std::unique_ptr<SchedulerTier> { new SchedulerTier { cfg, clock, metrics } };
+    auto tier = std::unique_ptr<SchedulerTier> { new SchedulerTier { membership, clock, metrics } };
 
     // A bare port binds the WILDCARD here, the opposite of the cache surface's
     // loopback: a scheduler no peer can dial is a scheduler that does nothing, so
@@ -45,8 +46,14 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     logger.Logf(LogLevel::Info,
                 "scheduling for the fleet on {} ({})",
                 tier->BoundEndpoint(),
+                // Off the configuration rather than off the oracle: the count is a
+                // property of what the operator wrote, and the oracle is now shared
+                // with the cache surface and no longer this tier's to inspect. It
+                // also says "plus this machine" out loud, because that admission is
+                // unconditional and an operator reading "2 member host(s)" would
+                // otherwise not know their own builds were covered.
                 cfg.fleetOpen ? std::string { "every caller admitted" }
-                              : std::format("{} member host(s)", tier->_listed.Size()));
+                              : std::format("this machine plus {} member host(s)", cfg.fleetMembers.size()));
     return tier;
 }
 

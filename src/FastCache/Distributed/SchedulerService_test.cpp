@@ -92,7 +92,7 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
         // regression this arrangement exists to make impossible.
         service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000");
         CHECK(service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).error == Wire::ErrorCode::NotLeader);
-        CHECK(service.Heartbeat(Insider, "whoever", 0).error == Wire::ErrorCode::NotLeader);
+        CHECK(service.Heartbeat(Insider, "whoever", NodeLoad {}).error == Wire::ErrorCode::NotLeader);
         CHECK(service.Lease(Insider, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NotLeader);
     }
 }
@@ -106,7 +106,7 @@ TEST_CASE("A non-member is refused the fleet but not the cache", "[distributed][
     Leading fleet;
 
     CHECK(fleet.service.Register(Outsider, OneSlot("gcc-14", "10.0.0.2:7100")).error == Wire::ErrorCode::NotAMember);
-    CHECK(fleet.service.Heartbeat(Outsider, "whoever", 0).error == Wire::ErrorCode::NotAMember);
+    CHECK(fleet.service.Heartbeat(Outsider, "whoever", NodeLoad {}).error == Wire::ErrorCode::NotAMember);
     CHECK(fleet.service.Lease(Outsider, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NotAMember);
 
     // And nothing was admitted along the way: a refused registration must not leave
@@ -138,7 +138,7 @@ TEST_CASE("A member registers, heartbeats and is leased", "[distributed][schedul
     REQUIRE_FALSE(admitted.payload.empty());
     auto const workerId = std::string { Wire::AsStringView(admitted.payload) };
 
-    CHECK(fleet.service.Heartbeat(Insider, workerId, 0).status == Wire::Status::Ok);
+    CHECK(fleet.service.Heartbeat(Insider, workerId, NodeLoad {}).status == Wire::Status::Ok);
 
     auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
     REQUIRE(granted.status == Wire::Status::Ok);
@@ -148,22 +148,31 @@ TEST_CASE("A member registers, heartbeats and is leased", "[distributed][schedul
     CHECK_FALSE(Unwrap(grant).leaseToken.empty());
 }
 
-TEST_CASE("A worker offering no slots is refused where it can be explained", "[distributed][scheduler]")
+TEST_CASE("A worker that names no slot count is sized from its own hardware", "[distributed][scheduler]")
 {
-    // Such a worker would register, match every lease for its toolchain, and never
-    // be picked -- indistinguishable at the client from a fleet that is permanently
-    // busy.
+    // Zero used to be refused as "a worker that will never be picked". It now means
+    // "size me from what I told you about myself", which is the spelling a node
+    // should prefer: a node that did the arithmetic itself would be the one place a
+    // workstation's reserve could be got wrong with nothing able to tell. What the
+    // old refusal protected against is closed by `OfferableSlots` never returning
+    // zero, so the worker below must be pickable rather than refused.
     Leading fleet;
 
-    auto const reply = fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100"));
-    REQUIRE(reply.status == Wire::Status::Ok);
+    auto sized = OneSlot("gcc-14", "10.0.0.2:7100");
+    sized.slots = 0;
+    sized.capacity = NodeCapacity { .logicalCores = 8,
+                                    .totalMemoryBytes = 32ULL << 30,
+                                    .nodeClass = NodeClass::Workstation,
+                                    .reservedCores = 0,
+                                    .reserveIsExplicit = false };
+    REQUIRE(fleet.service.Register(Insider, sized).status == Wire::Status::Ok);
 
-    auto slotless = OneSlot("gcc-14", "10.0.0.3:7100");
-    slotless.slots = 0;
-    auto const refused = fleet.service.Register(Insider, slotless);
-    CHECK(refused.status == Wire::Status::Error);
-    CHECK(refused.error == Wire::ErrorCode::MalformedFrame);
-    CHECK(refused.message == "a worker must offer at least one slot");
+    // Eight cores less the workstation reserve of two.
+    auto const live = fleet.service.Workers().LiveWorkers();
+    REQUIRE(live.size() == 1);
+    CHECK(live[0].slots == 6);
+
+    CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-1")).status == Wire::Status::Ok);
 }
 
 TEST_CASE("An empty fleet and a busy one are different refusals", "[distributed][scheduler]")
@@ -211,7 +220,7 @@ TEST_CASE("An unknown worker is told to register again", "[distributed][schedule
     // answers.
     Leading fleet;
 
-    auto const reply = fleet.service.Heartbeat(Insider, "worker-that-never-was", 0);
+    auto const reply = fleet.service.Heartbeat(Insider, "worker-that-never-was", NodeLoad {});
     CHECK(reply.status == Wire::Status::Error);
     CHECK(reply.error == Wire::ErrorCode::UnknownLease);
     CHECK(reply.message == "unknown worker; register again");
@@ -258,10 +267,16 @@ TEST_CASE("Refusals an operator sizes a fleet from are counted; client defects a
     CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-2")).error == Wire::ErrorCode::NoCapacity);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesNoCapacity) == 1);
 
-    auto slotless = OneSlot("gcc-14", "10.0.0.9:7100");
-    slotless.slots = 0;
-    CHECK(fleet.service.Register(Insider, slotless).error == Wire::ErrorCode::MalformedFrame);
-    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkerRegistrations) == 1);
+    // The client-defect arm lives one layer up now: a malformed frame is a decode
+    // failure, so `SchedulerProtocol` is what produces it and what must not count it.
+    // What this layer still owes the counter is that a registration it ACCEPTS moves
+    // it exactly once -- including one that named no slot count, which used to be
+    // refused here and is now the ordinary way a node asks to be sized.
+    auto sized = OneSlot("gcc-14", "10.0.0.9:7100");
+    sized.slots = 0;
+    sized.capacity = NodeCapacity { .logicalCores = 4, .nodeClass = NodeClass::Dedicated };
+    CHECK(fleet.service.Register(Insider, sized).status == Wire::Status::Ok);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkerRegistrations) == 2);
 }
 
 TEST_CASE("Every refusal this service makes is describable on the wire", "[distributed][scheduler][wire]")
@@ -272,9 +287,9 @@ TEST_CASE("Every refusal this service makes is describable on the wire", "[distr
     // added are the ones at risk, so the check is over the set this class can
     // actually produce.
     constexpr std::array Producible {
-        Wire::ErrorCode::NotLeader,      Wire::ErrorCode::NotAMember,   Wire::ErrorCode::NoWorker,
-        Wire::ErrorCode::NoCapacity,     Wire::ErrorCode::UnknownLease, Wire::ErrorCode::AlreadyInFlight,
-        Wire::ErrorCode::MalformedFrame,
+        Wire::ErrorCode::NotLeader,       Wire::ErrorCode::NotAMember,     Wire::ErrorCode::NoWorker,
+        Wire::ErrorCode::NoCapacity,      Wire::ErrorCode::Withdrawn,      Wire::ErrorCode::UnknownLease,
+        Wire::ErrorCode::AlreadyInFlight, Wire::ErrorCode::MalformedFrame,
     };
 
     for (auto const code: Producible)
@@ -328,7 +343,7 @@ TEST_CASE("An expired lease stops suppressing its key", "[distributed][scheduler
         fleet.clock.Advance(Step);
         auto const workers = fleet.service.Workers().LiveWorkers();
         REQUIRE(workers.size() == 1);
-        REQUIRE(fleet.service.Heartbeat(Insider, workers.front().id, 0).status == Wire::Status::Ok);
+        REQUIRE(fleet.service.Heartbeat(Insider, workers.front().id, NodeLoad {}).status == Wire::Status::Ok);
     }
 
     CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "abandoned")).status == Wire::Status::Ok);

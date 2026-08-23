@@ -92,8 +92,15 @@ inline constexpr std::array<CounterDescriptor, static_cast<std::size_t>(IMetrics
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::DispatchLeasesNoCapacity,
       .prometheusName = "fastcached_dispatch_leases_no_capacity_total",
-      .help = "Lease requests refused because every matching worker was full: "
-              "the fleet is too small. Never sum this with no_worker.",
+      .help = "Lease requests refused because every matching worker was full of "
+              "this fleet's own work: the fleet is too small. Never sum this with "
+              "no_worker or withdrawn.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchLeasesWithdrawn,
+      .prometheusName = "fastcached_dispatch_leases_withdrawn_total",
+      .help = "Lease requests refused because matching workers had slots free and "
+              "had withdrawn them: their machines are busy elsewhere or out of "
+              "scratch space. The fleet is big enough and unavailable.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::DispatchLeasesDuplicate,
       .prometheusName = "fastcached_dispatch_leases_duplicate_total",
@@ -144,6 +151,12 @@ inline constexpr std::array<CounterDescriptor, static_cast<std::size_t>(IMetrics
       .prometheusName = "fastcache_worker_jobs_refused_no_slot_total",
       .help = "Jobs refused because every slot was busy: this worker is too "
               "small, or the fleet is. Never sum with the refusals above.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedNotAMember,
+      .prometheusName = "fastcache_worker_jobs_refused_not_a_member_total",
+      .help = "Connections refused because the caller is neither on this machine "
+              "nor a cluster member. A rise means something is trying to spend a "
+              "machine it has no claim on.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerBytesReceived,
       .prometheusName = "fastcache_worker_bytes_received_total",

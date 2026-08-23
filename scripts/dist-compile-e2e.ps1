@@ -96,6 +96,14 @@ if (-not $SelfTest) {
     # get a spurious "file not found".
     $Fastcached = (Resolve-Path $Fastcached).Path
     $Node       = (Resolve-Path $Node).Path
+
+# Every node started below turns its own cache port OFF. `--listen-cache` defaults
+# to 127.0.0.1:6674 -- where `fastcache-cc` looks -- which is right for the one node
+# per machine a real deployment runs and wrong here, where several share a host and
+# would race for it. Said explicitly rather than left to the default's
+# warn-and-continue, so a node that failed to bind for some OTHER reason still shows
+# up as the fault it is.
+$NoLocalCache = "--listen-cache="
     $Launcher   = (Resolve-Path $Launcher).Path
 }
 
@@ -770,6 +778,7 @@ try {
         $schedWorkerPort = $BasePort + 6
         $schedLog = Join-Path $scratch "scheduler.log"
         $scheduler = Start-Background $Node @(
+            $NoLocalCache,
             "--listen-scheduler=127.0.0.1:$dispatchPort", "--fleet-open",
             "--scheduler=127.0.0.1:$dispatchPort", "--bind=127.0.0.1",
             "--port=$schedWorkerPort", "--advertise=127.0.0.1:$schedWorkerPort",
@@ -789,6 +798,7 @@ try {
 
         $workerLog = Join-Path $scratch "worker.log"
         $worker = Start-Background $Node @(
+            $NoLocalCache,
             "--scheduler=127.0.0.1:$dispatchPort", "--bind=127.0.0.1", "--port=$workerPort",
             "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=2",
             "--log-level=debug") $workerLog
@@ -990,6 +1000,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $isoSchedWorker = $BasePort + 7
         $isoSchedLog = Join-Path $scratch "iso-scheduler.log"
         $isoScheduler = Start-Background $Node @(
+            $NoLocalCache,
             "--listen-scheduler=127.0.0.1:$isoDispatch", "--fleet-open",
             "--scheduler=127.0.0.1:$isoDispatch", "--bind=127.0.0.1",
             "--port=$isoSchedWorker", "--advertise=127.0.0.1:$isoSchedWorker",
@@ -1000,6 +1011,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
 
         $isoWorkerLog = Join-Path $scratch "iso-worker.log"
         $isoNode = Start-Background $Node @(
+            $NoLocalCache,
             "--scheduler=127.0.0.1:$isoDispatch", "--bind=127.0.0.1", "--port=$isoWorker",
             "--advertise=127.0.0.1:$isoWorker",
             "--toolchain=not-the-compiler-this-client-uses=$ccPath", "--slots=2",

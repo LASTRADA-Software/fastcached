@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProxy.hpp"
+#include "Responders.hpp"
 
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -15,8 +16,11 @@
 #include <string>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::Unwrap;
 
 namespace Wire = FastCache::CompileCacheWire;
 
@@ -124,4 +128,38 @@ TEST_CASE("An unknown opcode is stepped over, not fatal", "[node][cacheproxy]")
     std::array<std::byte, Wire::RequestHeaderSize> frame {};
     WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, 0xEE, 0);
     CHECK(ErrorOf(fix.proxy.Answer(frame)) == Wire::ErrorCode::UnknownOpcode);
+}
+
+TEST_CASE("The node's cache answers this machine and refuses a stranger", "[node][cache][membership]")
+{
+    // The bind already answers most of this -- the cache surface is loopback by
+    // default -- but a bind is not a policy. An operator who widens it to share the
+    // tier with their peers would otherwise be sharing this machine's entire build
+    // output with everybody who can route to the port.
+    //
+    // Deliberately stricter than `fastcached`'s own cache, which serves non-members
+    // on purpose: that one is shared infrastructure somebody operates, this is a
+    // developer's private tier, and the two are different things that happen to speak
+    // one protocol.
+    Fixture fixture;
+    Distributed::ClusterMembership membership { { "10.0.0.1:7000" } };
+    CacheResponder responder { fixture.proxy, membership };
+
+    auto const fetch = Wire::EncodeFetch("some-key");
+
+    // A stranger is refused as a *reply*, never by closing: a client that cannot tell
+    // a policy refusal from a dead host retries forever and reports a flaky network.
+    auto const refused = Wire::DecodeReplyHeader(responder.Answer(fetch, "10.9.9.9"));
+    REQUIRE(refused.has_value());
+    CHECK(Unwrap(refused).status == Wire::Status::Error);
+
+    // This machine gets the cache's own answer -- a miss, since nothing is stored.
+    auto const local = Wire::DecodeReplyHeader(responder.Answer(fetch, "127.0.0.1"));
+    REQUIRE(local.has_value());
+    CHECK(Unwrap(local).status == Wire::Status::Miss);
+
+    // And so does a listed peer, which is what makes widening the bind usable at all.
+    auto const peer = Wire::DecodeReplyHeader(responder.Answer(fetch, "10.0.0.1"));
+    REQUIRE(peer.has_value());
+    CHECK(Unwrap(peer).status == Wire::Status::Miss);
 }

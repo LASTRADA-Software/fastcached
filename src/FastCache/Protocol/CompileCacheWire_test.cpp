@@ -411,22 +411,43 @@ TEST_CASE("Every dispatch verb round-trips its fields")
 {
     SECTION("REGISTER")
     {
+        // Every field a different value, for the reason `RaftWire`'s exemplars are:
+        // two fields sharing one lets a transposition through, and the capacity
+        // record's four members are exactly the shape a transposition hides in.
         auto const frame = EncodeRegister(RegisterRequest {
-            .fingerprint = "gcc-13-abc", .endpoint = "10.0.0.1:6676", .slots = 8, .acceptedCodecs = { 2, 1 } });
+            .fingerprint = "gcc-13-abc",
+            .endpoint = "10.0.0.1:6676",
+            .slots = 8,
+            .acceptedCodecs = { 2, 1 },
+            .capacity = CapacityFields {
+                .logicalCores = 24, .totalMemoryBytes = 137438953472, .nodeClassRaw = 1, .reservedCores = 5 } });
         auto const decoded = DecodeRegisterPayload(std::span { frame }.subspan(RequestHeaderSize));
         REQUIRE(decoded.has_value());
         CHECK(AsStringView(Unwrap(decoded).fingerprint) == "gcc-13-abc");
         CHECK(AsStringView(Unwrap(decoded).endpoint) == "10.0.0.1:6676");
         CHECK(Unwrap(decoded).slots == 8);
         CHECK(Unwrap(decoded).acceptedCodecs == CodecList { 2, 1 });
+        CHECK(Unwrap(decoded).capacity.logicalCores == 24);
+        CHECK(Unwrap(decoded).capacity.totalMemoryBytes == 137438953472);
+        CHECK(Unwrap(decoded).capacity.nodeClassRaw == 1);
+        CHECK(Unwrap(decoded).capacity.reservedCores == 5U);
     }
     SECTION("HEARTBEAT")
     {
-        auto const frame = EncodeHeartbeat("w7", 3);
+        // Every field a distinct value again, and the three inside the load record
+        // are of two different widths -- which is where a transposition here would
+        // land, since swapping the two u64s is the one mistake that still decodes.
+        auto const frame = EncodeHeartbeat(
+            "w7",
+            3,
+            LoadFields { .cpuBusyPermille = 640, .availableMemoryBytes = 8589934592, .freeScratchBytes = 274877906944 });
         auto const decoded = DecodeHeartbeatPayload(std::span { frame }.subspan(RequestHeaderSize));
         REQUIRE(decoded.has_value());
         CHECK(AsStringView(Unwrap(decoded).workerId) == "w7");
         CHECK(Unwrap(decoded).inFlight == 3);
+        CHECK(Unwrap(decoded).load.cpuBusyPermille == 640U);
+        CHECK(Unwrap(decoded).load.availableMemoryBytes == 8589934592ULL);
+        CHECK(Unwrap(decoded).load.freeScratchBytes == 274877906944ULL);
     }
     SECTION("LEASE")
     {
@@ -454,6 +475,111 @@ TEST_CASE("Every dispatch verb round-trips its fields")
         CHECK(std::ranges::equal(Unwrap(decoded).source, source));
         CHECK(Unwrap(decoded).acceptedCodecs == CodecList { 1 });
         CHECK(AsStringView(Unwrap(decoded).sourceName) == "Widget.cpp");
+    }
+}
+
+TEST_CASE("A capacity record tolerates a peer that says less, or more")
+{
+    // The whole reason it is NESTED rather than four more REGISTER fields.
+    // `SplitFields` is exact by design, so a fact added at the top level would move
+    // REGISTER's arity and make two builds of one fleet unable to speak at all.
+    // Inside a field, a shorter record keeps this build's defaults and a longer one
+    // is read as far as this build understands it.
+    SECTION("a record from a peer that knew fewer facts")
+    {
+        // Cores and memory only: what a build predating the class byte would send.
+        auto const cores = WireFields::ToBigEndian<std::uint32_t>(12U);
+        auto const memory = WireFields::ToBigEndian<std::uint64_t>(17179869184ULL);
+        auto const shortened =
+            WireFields::Encode({ std::span<std::byte const> { cores }, std::span<std::byte const> { memory } });
+
+        auto const decoded = DecodeCapacity(shortened);
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).logicalCores == 12);
+        CHECK(Unwrap(decoded).totalMemoryBytes == 17179869184ULL);
+        CHECK(Unwrap(decoded).nodeClassRaw == 0);
+        // Absent, not zero -- so the receiver applies the class reserve rather than
+        // concluding the operator asked for none.
+        CHECK_FALSE(Unwrap(decoded).reservedCores.has_value());
+    }
+    SECTION("a record from a peer that knew more")
+    {
+        auto const full = EncodeCapacity(CapacityFields {
+            .logicalCores = 12, .totalMemoryBytes = 17179869184ULL, .nodeClassRaw = 1, .reservedCores = 3 });
+        auto const surplus = WireFields::ToBigEndian<std::uint64_t>(99U);
+        auto extended = full;
+        auto const tail = WireFields::Encode({ std::span<std::byte const> { surplus } });
+        extended.insert(extended.end(), tail.begin(), tail.end());
+
+        auto const decoded = DecodeCapacity(extended);
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).logicalCores == 12);
+        CHECK(Unwrap(decoded).nodeClassRaw == 1);
+        CHECK(Unwrap(decoded).reservedCores == 3U);
+    }
+    SECTION("no record at all")
+    {
+        // Answered rather than refused: an empty field is a peer with nothing to say,
+        // and the defaults it lands on are the "did not say" the fields document.
+        auto const decoded = DecodeCapacity({});
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).logicalCores == 0);
+        CHECK_FALSE(Unwrap(decoded).reservedCores.has_value());
+    }
+    SECTION("a field of the wrong width is refused")
+    {
+        // The one thing tolerance must not extend to. Reading the first four bytes of
+        // a five-byte core count would invent the number that decides this machine's
+        // share of the fleet.
+        auto const bad = WireFields::Encode({ Bytes({ 0x00, 0x00, 0x01 }) });
+        CHECK_FALSE(DecodeCapacity(bad).has_value());
+    }
+    SECTION("a reserve of zero survives the round trip as a reserve of zero")
+    {
+        // The distinction the optional exists for: "drive this machine to its last
+        // core" must not arrive as "I did not mention a reserve".
+        auto const encoded = EncodeCapacity(
+            CapacityFields { .logicalCores = 0, .totalMemoryBytes = 0, .nodeClassRaw = 0, .reservedCores = 0 });
+        auto const decoded = DecodeCapacity(encoded);
+        REQUIRE(decoded.has_value());
+        REQUIRE(Unwrap(decoded).reservedCores.has_value());
+        CHECK(Unwrap(Unwrap(decoded).reservedCores) == 0U);
+    }
+}
+
+TEST_CASE("A load record tells silence apart from a measured zero")
+{
+    // The distinction the whole record is optional for, and it runs both ways: a
+    // machine that could not read its CPU must be scheduled on its other
+    // properties, while one that read it and got zero is idle and should be given
+    // work. A wire that flattened them would have to pick one, and both choices are
+    // wrong for half the fleet.
+    SECTION("a worker with nothing to report")
+    {
+        auto const frame = EncodeHeartbeat("w1", 0);
+        auto const decoded = DecodeHeartbeatPayload(std::span { frame }.subspan(RequestHeaderSize));
+        REQUIRE(decoded.has_value());
+        CHECK_FALSE(Unwrap(decoded).load.cpuBusyPermille.has_value());
+        CHECK_FALSE(Unwrap(decoded).load.availableMemoryBytes.has_value());
+        CHECK_FALSE(Unwrap(decoded).load.freeScratchBytes.has_value());
+    }
+    SECTION("a worker reporting a measured zero")
+    {
+        auto const frame = EncodeHeartbeat(
+            "w1", 0, LoadFields { .cpuBusyPermille = 0, .availableMemoryBytes = std::nullopt, .freeScratchBytes = 0 });
+        auto const decoded = DecodeHeartbeatPayload(std::span { frame }.subspan(RequestHeaderSize));
+        REQUIRE(decoded.has_value());
+        REQUIRE(Unwrap(decoded).load.cpuBusyPermille.has_value());
+        CHECK(Unwrap(Unwrap(decoded).load.cpuBusyPermille) == 0U);
+        REQUIRE(Unwrap(decoded).load.freeScratchBytes.has_value());
+        CHECK(Unwrap(Unwrap(decoded).load.freeScratchBytes) == 0ULL);
+        // And the one it did not mention stays unmentioned.
+        CHECK_FALSE(Unwrap(decoded).load.availableMemoryBytes.has_value());
+    }
+    SECTION("a field present at the wrong width is refused")
+    {
+        auto const bad = WireFields::Encode({ Bytes({ 0x00, 0x01 }) });
+        CHECK_FALSE(DecodeLoad(bad).has_value());
     }
 }
 

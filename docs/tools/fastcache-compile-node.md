@@ -167,19 +167,12 @@ Four rules, and none of them is the obvious choice:
 `scripts/dist-compile-e2e.sh` asserts the first of those by **stopping the shared
 cache** and requiring the next compile to still hit, with a byte-correct object.
 
-### `--listen-cache` binds loopback
-
-A bare port binds `127.0.0.1`, the opposite of `--listen-scheduler`'s wildcard. A
-scheduler no peer can dial does nothing, so it has to be reachable; a node's own
-cache is for clients on that machine, and exposing it to the network should be
-something you type an address for. If you do expose it, use `--requirepass`.
-
 ### `--upstream` may be empty
 
 That is the honest configuration for one developer's machine, not a broken one: the
-tier caches locally and never tries to reach a fleet. `--cache-memory=0` (the
-default) means no local cache at all, which is what a node that only compiles for
-others wants.
+tier caches locally and never tries to reach a fleet. `--cache-memory=0` turns the
+local cache off, which is what a node that only compiles for others wants; a node
+that serves this machine's builds should keep it.
 
 ### Reading it
 
@@ -200,13 +193,60 @@ small for this machine's working set — a different problem from a fleet that i
 missing a lot, and a different fix. An upstream *store* failure says the fleet is
 unreachable; a local store failure says this node is broken.
 
-### Why `FASTCACHE_ADDR` is not defaulted to the node
+### It answers where `fastcache-cc` already looks
 
-Unset means *the cache is off*, and it stays that way. Defaulting it to localhost
-would make every build on a machine without a node running pay a failed connect per
-translation unit, in silence — the cost `USE_COMPILER_CACHE` already probes at
-configure time to avoid. Pointing it at the node is one line of configuration, and
-it is better that you write it than that a tool assumes it.
+`--listen-cache` defaults to **`127.0.0.1:6674`** — the address the launcher uses
+when nobody sets `FASTCACHE_ADDR`, and the one `cmake/portable/CompileCache.cmake`
+passes. So the whole thing works with no configuration: start a node, build, and
+the launcher finds it.
+
+That port is also `fastcached`'s. On a machine running both, one of them loses the
+bind and the node refuses to start saying so — which is the right outcome, because
+they are two ways to serve one port and a node silently losing the race would leave
+your builds talking to the daemon while its own tier sat unused. Give one of them a
+different port, or run one.
+
+### Who may use it
+
+**Local clients and cluster members. Nobody else, by default.**
+
+| Caller | Cache (`--listen-cache`) | Fleet (`--listen-scheduler`) | Compile (`--port`) |
+| --- | --- | --- | --- |
+| A process on this machine | always | always | always |
+| A `--fleet-member` peer | yes | yes | yes |
+| Anyone else | refused | refused | refused |
+
+The **compile port** is the one that matters most. `--bind` defaults to `0.0.0.0`
+because peers have to dial it, so without a check anybody who could route to that
+port could have this machine run their compiler on source they chose. It is refused
+before the request payload is read — a caller with no claim on this machine must not
+be able to make it buffer a multi-megabyte translation unit first, which would be a
+memory-exhaustion hole opened by the check meant to close one.
+
+Two mechanisms, and both are needed:
+
+- **The bind.** `--listen-cache` takes loopback for a bare port, the opposite of
+  `--listen-scheduler`'s wildcard. A scheduler no peer can dial does nothing, while
+  a cache any host can dial is this machine's entire build output served to
+  strangers.
+- **The membership check.** A bind is not a policy. If you widen the cache to share
+  the tier with your peers — `--listen-cache 0.0.0.0:6674` — only this machine and
+  your `--fleet-member` hosts are still admitted; everyone else gets a typed
+  `not-a-member` refusal rather than a dropped connection.
+
+**This machine is always a member of its own fleet**, whatever `--fleet-member`
+says. Anti-leeching exists to stop *other* machines spending capacity they do not
+contribute; a process here already has this machine's CPU. Without that rule a node
+whose operator had listed their peers would refuse their own builds — a fleet that
+looks configured and serves nobody locally.
+
+It is deliberately stricter than `fastcached`'s own cache, which serves non-members
+on purpose. That one is shared infrastructure somebody operates; this is a
+developer's private tier. The two are different things that happen to speak one
+protocol.
+
+On a shared multi-user machine, "local" means every account on it. That is the same
+trust level the daemon assumes; use `--requirepass` if it is not the one you want.
 
 ## Running it as a service
 
@@ -277,12 +317,110 @@ time and re-probing would boot out one that was never there).
 
 ## Capacity
 
-`--slots` bounds concurrent compiles (default: one per hardware thread). It is
-advertised to the scheduler **and** enforced locally: a worker that accepted more
-would be fuller and slower than the scheduler believes, at the same moment. A job
-over the cap is refused rather than queued, because the client has a local
-compile waiting either way and queueing only hides the overload from the
+Say nothing and the worker sizes itself. It takes its hardware threads, clamps
+that by what its memory supports, and subtracts what its **node class** reserves:
+
+| `--node-class` | Cores held back | For |
+| --- | --- | --- |
+| `workstation` (default) | 2 | a machine somebody is sitting at |
+| `dedicated` | 0 | a machine nobody is sitting at |
+
+`workstation` is the default because it is the **safe** answer, not the common
+one. A node whose class nobody set is somebody's desktop until proven otherwise,
+and getting that backwards is a failure the person experiences as "my editor
+stutters" and never connects to a build fleet. Two cores rather than one: a
+modern editor, its language server and a browser will each want one, and the
+point of the reserve is that the machine stays usable while it contributes.
+
+```sh
+# A build server. Nobody is at it, so drive it to its limit.
+fastcache-compile-node --node-class dedicated ...
+
+# A workstation whose owner wants four cores kept free, not two.
+fastcache-compile-node --reserve-cores 4 ...
+
+# A workstation whose owner wants none kept free. This is NOT the same as
+# omitting the flag -- see below.
+fastcache-compile-node --reserve-cores 0 ...
+```
+
+`--reserve-cores 0` and omitting `--reserve-cores` are different instructions.
+Omitting it means "reserve whatever the class reserves"; typing zero means
+"reserve nothing". A worker that could not tell them apart would have to pick
+one, and one of the two answers is somebody's desktop becoming unusable.
+
+### The memory clamp
+
+One job per core is wrong on a machine whose cores outrun its RAM. A C++
+translation unit with heavy template instantiation routinely peaks in the
+hundreds of megabytes, so a 128-thread box with 32 GiB asked for 128 concurrent
+compiles swaps, or the OOM killer takes them — and those come back as refusals
+the client retries locally, so **distribution appears to work while making the
+build slower than not distributing at all**. The worker therefore also caps
+itself at one job per gigabyte of physical memory. It is deliberately generous
+enough not to bind on any machine with a gigabyte per thread, which is every
+ordinary build host.
+
+### `--slots` overrides all of it
+
+A number given to `--slots` is the answer, not a hint: it is neither capped at
+the core count nor reduced by the class reserve nor clamped by the memory
+heuristic. You are the person whose machine this is. Capping it would silently
+refuse the deliberate oversubscription an I/O-heavy build wants, and subtracting
+the reserve on top of it would make `--slots 4` on a workstation quietly offer
+two, which is not what the flag says.
+
+Whatever the number ends up being, it is advertised to the scheduler **and**
+enforced locally, from one calculation — a worker running to one number while
+the scheduler leases against another is exactly the overload the cap exists to
+prevent. A job over the cap is refused rather than queued, because the client has
+a local compile waiting either way and queueing only hides the overload from the
 scheduler trying to route around it.
+
+### Withdrawing while the machine is busy
+
+The class reserve is static — two cores held back permanently. What happens when
+the machine's owner starts using six more of them is the other half, and it rides
+on the heartbeat: every 20 seconds a worker reports its host CPU, its available
+memory and the free space where it compiles, and the scheduler subtracts what
+that leaves from the slots it may be given.
+
+Three things about it are worth knowing:
+
+- **The fleet's own jobs are subtracted first.** Without that, giving a machine
+  work raises its CPU, which withdraws the capacity that let it take the work,
+  which frees the CPU — a fleet that oscillates for reasons nobody can see from
+  either end. So only load that is *not* this fleet's counts against it.
+- **A worker can withdraw to zero, and come back.** Unlike the registered slot
+  count, which never reaches zero, the live figure may: a machine whose scratch
+  filesystem has filled cannot compile anything, and continuing to send it jobs
+  would only produce refusals. It is picked again as soon as it says so.
+- **Absent is not zero.** A worker whose platform will not report its CPU is
+  scheduled on everything else, not treated as idle *or* as saturated.
+
+The refusal an operator sees distinguishes the two cases, because the fixes are
+opposite:
+
+| Refusal | Counter | What to do |
+| --- | --- | --- |
+| `no-worker` | `fastcached_dispatch_leases_no_worker_total` | Nothing serves that toolchain — a fingerprint mismatch. |
+| `no-capacity` | `fastcached_dispatch_leases_no_capacity_total` | The fleet is full of your own build. Add machines. |
+| `withdrawn` | `fastcached_dispatch_leases_withdrawn_total` | The machines are there and unavailable — somebody is using them, or a disk is full. |
+
+Never sum them. `withdrawn` folded into `no-capacity` reads as "the fleet is too
+small", so a fleet whose build hosts have all filled their scratch disks would
+send you shopping for hardware you already own.
+
+### How the scheduler picks
+
+Among workers with a byte-identical toolchain fingerprint, the one with the most
+**free slots** wins — not the one running the fewest jobs. Absolute counts treat
+every machine as an identical box, so a 64-slot server running 8 jobs looks
+busier than a 4-slot laptop running 2, when the server has 56 slots free and the
+laptop has none. Across a fleet of mixed machines, which is the ordinary case,
+that sends work to the smallest machines first and leaves the big ones idle.
+Equal headroom is broken by utilization, so between two workers with four slots
+free the one with proportionally more of itself left takes the job.
 
 ## Watching one
 
@@ -347,11 +485,19 @@ another machine should be firewalled separately. A scheduling verb arriving at a
 `fastcached` listener is refused with a typed reply naming where the scheduler
 went.
 
-`--fleet-member` restricts which hosts may spend the fleet's capacity. It is a
-policy about contribution rather than a credential — a non-member still reads and
-writes the cache — so it complements `--requirepass` and does not replace it.
+`--fleet-member` restricts which hosts may reach **all three** of this node's
+surfaces: its compile port, its scheduler, and its own cache tier. This machine is
+always admitted, whatever the list says, so a node is useful to its owner with no
+configuration and closed to the network until they name a peer.
 
-For anything beyond a trusted build network, put mTLS in front of both ports.
+Note where this differs from `fastcached`. There, membership is a policy about
+*contribution* and a non-member still reads and writes the shared cache — that
+cache is shared infrastructure somebody operates. A node's tier is a developer's
+own build output, and its compile port is its own CPU, so both are closed by
+default. Membership still complements `--requirepass` rather than replacing it: one
+is about who you are, the other about what you know.
+
+For anything beyond a trusted build network, put mTLS in front of every port.
 
 ## Known limitations
 

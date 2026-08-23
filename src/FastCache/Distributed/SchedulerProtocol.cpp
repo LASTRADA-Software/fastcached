@@ -70,6 +70,47 @@ std::vector<std::byte> SchedulerProtocol::Answer(std::span<std::byte const> fram
     return Wire::EncodeErrorReply(reply.error, reply.message);
 }
 
+Wire::CapacityFields CapacityToWire(NodeCapacity const& capacity)
+{
+    return Wire::CapacityFields { .logicalCores = capacity.logicalCores,
+                                  .totalMemoryBytes = capacity.totalMemoryBytes,
+                                  .nodeClassRaw = static_cast<std::uint8_t>(capacity.nodeClass),
+                                  // Absent, not zero: the wire has to carry the
+                                  // difference between "reserve nothing" and "use
+                                  // whatever the class reserves", or the receiver
+                                  // cannot tell a deliberate zero from silence.
+                                  .reservedCores = capacity.reserveIsExplicit
+                                                       ? std::optional<std::uint32_t> { capacity.reservedCores }
+                                                       : std::nullopt };
+}
+
+std::optional<NodeCapacity> CapacityFromWire(Wire::CapacityFields const& fields)
+{
+    auto const nodeClass = NodeClassFromRaw(fields.nodeClassRaw);
+    if (!nodeClass.has_value())
+        return std::nullopt;
+    return NodeCapacity { .logicalCores = fields.logicalCores,
+                          .totalMemoryBytes = fields.totalMemoryBytes,
+                          .nodeClass = *nodeClass,
+                          .reservedCores = fields.reservedCores.value_or(0),
+                          .reserveIsExplicit = fields.reservedCores.has_value() };
+}
+
+Wire::LoadFields LoadToWire(NodeLoad const& load)
+{
+    return Wire::LoadFields { .cpuBusyPermille = load.cpuBusyPermille,
+                              .availableMemoryBytes = load.availableMemoryBytes,
+                              .freeScratchBytes = load.freeScratchBytes };
+}
+
+NodeLoad LoadFromWire(Wire::LoadFields const& fields, std::uint32_t inFlight)
+{
+    return NodeLoad { .inFlight = inFlight,
+                      .cpuBusyPermille = fields.cpuBusyPermille,
+                      .availableMemoryBytes = fields.availableMemoryBytes,
+                      .freeScratchBytes = fields.freeScratchBytes };
+}
+
 SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> payload, CallerContext const& caller)
 {
     switch (op)
@@ -78,17 +119,25 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             auto const fields = Wire::DecodeRegisterPayload(payload);
             if (!fields.has_value())
                 return SchedulerReply::Malformed();
+            // A class byte this build does not know means a peer built with a class
+            // this one lacks. Guessing either way is a fleet decision made silently
+            // -- see `NodeClassFromRaw` -- so it is refused where it can be said.
+            auto const capacity = CapacityFromWire(fields->capacity);
+            if (!capacity.has_value())
+                return SchedulerReply::Malformed("this scheduler does not know that node class");
             return _service.Register(caller,
                                      WorkerRegistration { .fingerprint = Wire::AsStringView(fields->fingerprint),
                                                           .endpoint = Wire::AsStringView(fields->endpoint),
                                                           .slots = fields->slots,
-                                                          .codecs = fields->acceptedCodecs });
+                                                          .codecs = fields->acceptedCodecs,
+                                                          .capacity = *capacity });
         }
         case Wire::Op::Heartbeat: {
             auto const fields = Wire::DecodeHeartbeatPayload(payload);
             if (!fields.has_value())
                 return SchedulerReply::Malformed();
-            return _service.Heartbeat(caller, Wire::AsStringView(fields->workerId), fields->inFlight);
+            return _service.Heartbeat(
+                caller, Wire::AsStringView(fields->workerId), LoadFromWire(fields->load, fields->inFlight));
         }
         case Wire::Op::Lease: {
             auto const fields = Wire::DecodeLeasePayload(payload);
