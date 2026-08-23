@@ -8,7 +8,8 @@ in-memory transport.
 
 ```
 src/FastCache/
-  Core/         Errors taxonomy, Clock, IRandomSource (the randomness seam,
+  Core/         Errors taxonomy, Clock, HostPort (one parser for
+                `port` / `host:port` / `[v6]:port`), IRandomSource (the randomness seam,
                 beside Clock and for the same reason), Logger, BufferPool,
                 Bytes, Endian, Crc32c, MurmurHash3 (128-bit key digest),
                 StringHash, Owner, Profiling (Tracy wrappers)
@@ -82,7 +83,9 @@ src/FastCache/
                 ReactorServerLoop (the server driver)
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
                 ISignalSource, DaemonControls (process-wide stop/reload flags),
-                CpuAffinity, HostMemory, ServiceControl, Terminal,
+                CpuAffinity, HostMemory, HostInfo (what a machine IS: OS, version,
+                architecture, disk space -- the facts a scheduler weighs),
+                ServiceControl, Terminal,
                 Environment (the one place the process environment is read),
                 FileTrust (could only an administrator have put a file here?)
   Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader,
@@ -91,7 +94,11 @@ src/FastCache/
   Metrics/      IMetricsSink + AtomicMetricsSink (counter-only by design; the
                 dispatch counters separate no-worker from no-capacity because
                 one says a fleet is misconfigured and the other that it is too
-                small, and summing them hides the first when a fleet is busy)
+                small, and summing them hides the first when a fleet is busy),
+                MetricsCatalog (the counter table: enumerator -> exported name,
+                help and type, `static_assert`ed to cover every enumerator) and
+                PrometheusFormatter, which renders that table rather than a
+                hand-picked subset of it
 ```
 
 Every executable lives under `src/apps/<name>/` and declares its own target and
@@ -163,6 +170,140 @@ packaging/
 
 `cmake/Packaging.cmake` turns that into `.deb`/`.rpm`/`.pkg`/`.msi` via CPack.
 These constraints are load-bearing and have each already been a bug:
+
+- **A return type is not part of a function's name on Linux, and MSVC's mangling
+  hides that.** `Core/HostPort.hpp` added an `inline FastCache::ParsePort(
+  std::string_view)` returning `std::optional<std::uint16_t>` while
+  `Config/CliParser` already had a `FastCache::ParsePort(std::string_view)`
+  returning `std::expected<std::uint16_t, ConfigError>`. That is **not an
+  overload**, and no compiler can say so: each translation unit sees exactly one
+  of the two declarations, so both compile, and the Itanium ABI does not encode a
+  return type in a free function's mangled name -- so both definitions claim the
+  identical symbol, the linker keeps `CliParser`'s strong one over the header's
+  weak inline, and every caller of the header version silently reaches the other.
+  It reads an `expected` as an `optional`: a SIGSEGV on the first call, from code
+  that is correct in isolation. Renamed to `ParseTcpPort`, with the reason at the
+  declaration. Three things worth keeping:
+  - **Windows cannot find this and will report the tree as green.** MSVC's
+    mangling *does* include the return type, so the two are distinct symbols
+    there and both link. This branch had 1730 passing MSVC tests at the moment
+    Linux was segfaulting, which is the whole argument for running the Linux
+    gate locally rather than discovering it in CI a phase later.
+  - **A standalone reproducer will not reproduce it**, because the bug is in the
+    *link*, not the code: the same calls compiled against the header alone are
+    correct and pass under ASan. What identified it was `nm -C` on the library
+    object, showing a strong `T FastCache::ParsePort(...)` that the test binary
+    had no business resolving to.
+  - **The two implementations were not merged**, deliberately. The CLI's version
+    distinguishes "not a number" from "out of range" because an operator needs
+    to be told which; an `optional` cannot carry that. Collapsing them to share
+    one body would trade a real diagnostic for a de-duplication nobody asked for
+    -- the same reasoning that keeps the dispatch counters split.
+
+- **A counter is a row, so it cannot increment somewhere and export nothing.**
+  `RenderPrometheus` listed the series it emitted by hand, and seven of the nine
+  live counters were not on that list: both TLS splits, and **all five**
+  `dispatch_*` -- which `docs/getting-started/distributed-compilation.md` names one
+  by one as what to read off `/metrics` when distribution misbehaves. The guide sent
+  an operator to an endpoint that had never carried a single one of them. Nothing
+  fails: the daemon counts correctly, the scrape parses, and the series simply is not
+  there, which a dashboard shows as a gap and an alert as "no data" rather than as a
+  fault. `Metrics/MetricsCatalog.hpp` is now the one table -- enumerator, exported
+  name, help text, type -- `static_assert`ed to hold one row per enumerator in
+  enumerator order, and the renderer walks it. (The guide's names were wrong as well
+  as absent -- it said `dispatch_leases_granted` where the series is
+  `fastcached_dispatch_leases_granted_total` -- which is what documenting a series
+  nobody could scrape lets you get away with.) Consequences that are each
+  load-bearing:
+  - **The test asserts over the TABLE, not against a list written out beside it.**
+    A hand-written list of expected series is the very thing that went stale, and it
+    would have to be updated by the same person who forgot the renderer. Each counter
+    is incremented by a **distinct** value first, because a table of near-identical
+    rows makes "this row renders its neighbour's value" the likely slip, and equal
+    values would let it through.
+  - **Eight enumerators were deleted rather than exported.** `CmdGet`, `CmdSet`,
+    `CmdDelete`, `GetHits`, `GetMisses`, `Evictions`, `BytesIn` and `BytesOut` were
+    incremented by nothing anywhere in the tree -- the real numbers come from
+    `StorageStats`, which is authoritative for them -- so giving them rows would have
+    published a permanent zero next to the true value under a similar name, which is
+    worse than an absent series. The 17-arm `ToStringView` that named them went with
+    them; it had no caller either.
+  - **A duration is a `_sum`/`_count` pair, not a gauge.** The sink is counter-only
+    by design, and a "last compile took N ms" gauge is a sample of one that a scrape
+    lands on by luck. `WorkerCompileMillisTotal` beside `WorkerJobsCompleted` is what
+    a Prometheus histogram already reports, and a rate over either window gives the
+    mean for that window rather than for all time.
+- **A refusal's wire code and its counter are one row, because they are one fact
+  told to two audiences.** The client decides whether to retry from the code; the
+  operator decides what to fix from the counter. Split across a `switch` and a second
+  `switch` they drift, and a refusal counted under one reason while being reported as
+  another is worse than not counting it at all -- `ScratchUnavailable` and
+  `SpawnFailed` had both answered `StorageWriteFailed`, so a worker with no scratch
+  disk told the client "storage write failed" and an unwritable disk was
+  indistinguishable from a toolchain that is configured but cannot be executed, from
+  either end. Found diagnosing a CI failure that reported the one thing it could not
+  possibly be. `RefusalTable` carries no default member initializers, deliberately: a
+  row answering two of the three questions is not a row, and `ErrorCode` has no zero
+  enumerator for `{}` to name in the first place.
+- **A process with no cache reports no cache, and absent is not zero.**
+  `fastcache-compile-node` serves the daemon's own `AdminHttpServer` over the same
+  renderer -- a second implementation for a process without storage is exactly how
+  two endpoints come to disagree -- so `MetricsSnapshot::storage` and `::host` are
+  `optional`. A default-constructed `StorageStats` would publish `fastcached_items 0`
+  and `fastcached_bytes_limit 0`, which is not "no cache" but "an empty, unbounded
+  cache", and a dashboard reads that as a fact. The daemon leaves `host` absent for
+  the mirror-image reason, and **names the field to do it** (`.host = std::nullopt`)
+  rather than letting it default: a designated initializer that skips a field added
+  to the middle of a struct is a warning at best and a silent zero at worst.
+- **A worker's admin endpoint is off unless asked for, binds loopback for a bare
+  port, and is FATAL when it cannot be served.** All three differ from the daemon's
+  and each was chosen: a scrape surface reachable from the network is an operator's
+  decision rather than something they get by typing a port; and an operator who asked
+  a *worker* for an endpoint is almost always wiring a probe to it, so a worker that
+  started without one looks healthy to the very thing that would have reported it was
+  not. It also brings `/healthz`, which the worker has never had -- a supervisor could
+  tell that the process was alive and not that it was *answering*, which is the state
+  a wedged worker is in.
+  - **It is a class in its own translation unit, and both halves of that are the
+    point.** The listener, the server and the serving thread have a *destruction
+    order* -- the server must close its listener before the thread can be joined,
+    because POSIX does not unblock a parked `accept()` -- and three locals in
+    `main()` express that as a `Shutdown()` somebody has to remember at every return
+    path. Here it is the destructor. And `main.cpp` is in no test target, the lesson
+    `CacheProtocol.cpp` and `RootReconciler.cpp` are each recorded as having been
+    extracted for, so the wiring lives in `AdminEndpoint.cpp` where its tests can
+    reach it.
+  - **"Bind a port twice" is not a portable way to test a bind failure.**
+    `SocketAddress.cpp` sets `SO_REUSEADDR` unconditionally, which on POSIX only
+    skips `TIME_WAIT` but on **Windows lets a second socket bind an address already
+    in use** -- so the obvious test passes on Linux and macOS and fails on Windows.
+    The case provokes the refusal with an address no host holds (RFC 5737
+    `192.0.2.1`) instead. That the option means two different things on the two
+    platforms is a real defect in its own right and is filed as issue #85, not fixed
+    here.
+  - **The stop test is bounded rather than allowed to hang.** A case that deadlocks
+    when the destruction order is reversed reports the defect as a suite timeout
+    naming nothing, which this repository has already paid for once
+    (`dist-compile-e2e ***Timeout 900.10 sec`). It destroys the endpoint on another
+    thread and fails in 15s saying what it waited for.
+- **`main` is not exempt from cognitive complexity, and the fix is extraction rather
+  than a raised threshold.** The node's `main` reached 70 against clang-tidy's limit
+  of 60 as the admin endpoint was wired in. Both blocks that came out --
+  `AdminEndpoint::Start` and `AdoptActivatedListener` -- are coherent decisions with
+  one answer each, which is why the number was a symptom worth listening to rather
+  than a rule to argue with. The six bare `return 2`s it left behind became
+  `ExitUsage` for the same reason: seven copies of a magic exit code is the
+  table-shaped defect this list keeps recording.
+- **An architecture is what the compiler built for, not what the kernel is running.**
+  `QueryHostFacts` reads the architecture from the compiler's own macros rather than
+  from `uname`/`GetNativeSystemInfo`, because an x86-64 process under Rosetta or
+  WOW64 executes x86-64 code on a machine that truthfully reports `arm64`. A
+  scheduler weighing this node has to be told what the binary that will run a compile
+  is, not what silicon is under it. Windows's version comes from `RtlGetVersion` and
+  not `GetVersionEx`, which reports 6.2 for every release since Windows 8 unless the
+  caller ships a compatibility manifest. And free space is `space.available`, not
+  `space.free`: the difference is the root-reserved portion, which an unprivileged
+  worker cannot write and must not offer to a scheduler as room it has.
 
 - **A snapshot is durable before it is acknowledged, and its configuration travels
   with it.** `IRaftStorage` had `SaveState` and `SaveLog` and nothing else, so

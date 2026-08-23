@@ -147,6 +147,34 @@ over the cap is refused rather than queued, because the client has a local
 compile waiting either way and queueing only hides the overload from the
 scheduler trying to route around it.
 
+## Watching one
+
+`--admin-listen` serves `/metrics` and `/healthz`, and is **off unless you ask
+for it**: a scrape surface reachable from the network is a decision, not a
+default. A bare port binds loopback, so `--admin-listen 6675` is reachable from
+the machine and nowhere else; write `--admin-listen 0.0.0.0:6675` when you mean
+the network.
+
+```sh
+fastcache-compile-node --scheduler cache.internal:6674 \
+                       --toolchain /usr/bin/c++ \
+                       --admin-listen 6675
+curl -s localhost:6675/healthz     # 200 while the worker is answering
+curl -s localhost:6675/metrics     # Prometheus exposition
+```
+
+It is the same endpoint and the same renderer the daemon serves — a worker has
+no cache, so the cache series are **absent** rather than present and zero, which
+a dashboard would otherwise read as an empty unbounded cache rather than as no
+cache at all.
+
+`/healthz` is worth wiring even if you never scrape: without it a supervisor can
+tell that the process is alive but not that it is *answering*, which is the state
+a wedged worker is in. It is what `systemd`'s and Kubernetes' probes want.
+
+What the counters mean is tabulated under
+[Distributed compilation](../getting-started/distributed-compilation.md#confirming-it-works).
+
 ## What a worker will not do
 
 - **Run a program a client named.** The compiler comes from `--toolchain`.
@@ -222,5 +250,7 @@ For anything beyond a trusted build network, put mTLS in front of both ports.
 - `--install-service` on macOS and Windows. The Linux units are shipped; the
   other two need the daemon shell (a launchd agent needs a service account the
   installer creates, and a Windows service needs a service-control handler).
-- The worker exposes no metrics of its own. The **scheduler** does — see
-  [Distributed compilation](../getting-started/distributed-compilation.md#confirming-it-works).
+- Host **CPU and memory utilization** are not reported. Size, slots and disk are;
+  what the machine is doing *right now* is what resource-aware scheduling will
+  need, and it lands with the scheduling policy that consumes it rather than
+  ahead of it.
