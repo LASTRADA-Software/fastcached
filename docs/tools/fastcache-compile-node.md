@@ -123,6 +123,91 @@ different toolchains — different patch releases, different SDKs, a vendored
 header that differs. `--print-toolchain-fingerprint` recomputes rather than
 reading the cache, so it also repairs a stale entry on its way past.
 
+## A cache of its own
+
+A node can hold a cache tier in front of the shared `fastcached`, and point the
+launcher at itself:
+
+```sh
+fastcache-compile-node \
+    --listen-cache=6677 --cache-memory=8g \
+    --upstream=build-cache.internal:6674 \
+    --scheduler=scheduler.internal:6675 \
+    --advertise=worker-01.internal:6676 \
+    --toolchain=/usr/bin/g++
+```
+
+```sh
+export FASTCACHE_ADDR=127.0.0.1:6677   # the node, not the shared cache
+```
+
+### Why a second copy is not redundant
+
+The shared cache already holds every object, so caching them again on the node
+looks like waste. What the tier saves is not the compile — it is the **round
+trip**. A developer who rebuilds the same tree twenty times a day pays that trip
+twenty times for objects that never left their machine, and on a slow or lossy
+link that is the difference between a cache that helps and one that hurts.
+
+Four rules, and none of them is the obvious choice:
+
+- **A local hit does not consult the upstream at all.** Revalidating would move the
+  round trip rather than remove it. It is safe by construction: an object key is a
+  digest over the preprocessed text, the arguments, the compiler identity and the
+  dependency set, so a key that matches names the same object.
+- **A local miss populates the tier from the upstream.** Without that the tier is a
+  proxy and the second build is exactly as slow as the first.
+- **A store writes local first, then offers upstream.** The local write must not fail
+  for a reason the network chose. Offering it to the fleet is best-effort: a shared
+  cache that cannot be reached costs the fleet one entry and costs this machine
+  nothing.
+- **An unreachable shared cache is a miss, not an error.** Every caller compiles
+  either way, so a build never fails because a cache was down.
+
+`scripts/dist-compile-e2e.sh` asserts the first of those by **stopping the shared
+cache** and requiring the next compile to still hit, with a byte-correct object.
+
+### `--listen-cache` binds loopback
+
+A bare port binds `127.0.0.1`, the opposite of `--listen-scheduler`'s wildcard. A
+scheduler no peer can dial does nothing, so it has to be reachable; a node's own
+cache is for clients on that machine, and exposing it to the network should be
+something you type an address for. If you do expose it, use `--requirepass`.
+
+### `--upstream` may be empty
+
+That is the honest configuration for one developer's machine, not a broken one: the
+tier caches locally and never tries to reach a fleet. `--cache-memory=0` (the
+default) means no local cache at all, which is what a node that only compiles for
+others wants.
+
+### Reading it
+
+Seven counters on `/metrics`, and the splits are the point:
+
+| Series | Says |
+|---|---|
+| `fastcache_node_cache_hits_total` | Served without touching the network. |
+| `fastcache_node_cache_misses_total` | The local tier did not hold it. |
+| `fastcache_node_cache_upstream_hits_total` | The shared cache answered after a local miss. |
+| `fastcache_node_cache_fill_failures_total` | The upstream supplied it and the local tier refused. |
+| `fastcache_node_cache_store_failures_total` | A local write failed — this one is reported to the client. |
+| `fastcache_node_cache_upstream_stores_total` | The fleet accepted an object this node offered. |
+| `fastcache_node_cache_upstream_store_failures_total` | The fleet would not take it. |
+
+A high **upstream**-hit rate against a low **local**-hit rate means the tier is too
+small for this machine's working set — a different problem from a fleet that is
+missing a lot, and a different fix. An upstream *store* failure says the fleet is
+unreachable; a local store failure says this node is broken.
+
+### Why `FASTCACHE_ADDR` is not defaulted to the node
+
+Unset means *the cache is off*, and it stays that way. Defaulting it to localhost
+would make every build on a machine without a node running pay a failed connect per
+translation unit, in silence — the cost `USE_COMPILER_CACHE` already probes at
+configure time to avoid. Pointing it at the node is one line of configuration, and
+it is better that you write it than that a tool assumes it.
+
 ## Running it as a service
 
 ### Linux

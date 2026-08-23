@@ -35,8 +35,13 @@ set(_fc_node_shared
 add_executable(fastcache-compile-node
     main.cpp
     AdminEndpoint.cpp
+    CacheProxy.cpp
+    CacheTier.cpp
+    SchedulerTier.cpp
+    LocalCache.cpp
     NodeConfig.cpp
-    SchedulerEndpoint.cpp
+    RemoteUpstream.cpp
+    FrameEndpoint.cpp
     WorkerServer.cpp
     ${_fc_node_shared}
 )
@@ -63,10 +68,17 @@ if(FASTCACHED_BUILD_TESTS)
         "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/test_main.cpp"
         AdminEndpoint.cpp
         AdminEndpoint_test.cpp
+        CacheProxy.cpp
+    CacheTier.cpp
+    SchedulerTier.cpp
+        CacheProxy_test.cpp
+        LocalCache.cpp
+        LocalCache_test.cpp
+        RemoteUpstream.cpp
         NodeConfig.cpp
         NodeConfig_test.cpp
-        SchedulerEndpoint.cpp
-        SchedulerEndpoint_test.cpp
+        FrameEndpoint.cpp
+        FrameEndpoint_test.cpp
         WorkerServer.cpp
         WorkerServer_test.cpp
         ${_fc_node_shared}

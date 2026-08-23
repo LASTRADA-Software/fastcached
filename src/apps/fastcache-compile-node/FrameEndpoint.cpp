@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "SchedulerEndpoint.hpp"
+#include "FrameEndpoint.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
@@ -30,24 +30,21 @@ namespace
     }
 } // namespace
 
-SchedulerServer::SchedulerServer(IListener& listener,
-                                 Distributed::SchedulerProtocol& protocol,
-                                 Distributed::IMembershipOracle const& membership,
-                                 ILogger& logger) noexcept:
+FrameServer::FrameServer(IListener& listener, IFrameResponder& responder, std::string_view what, ILogger& logger) noexcept:
     _listener { listener },
-    _protocol { protocol },
-    _membership { membership },
+    _responder { responder },
+    _what { what },
     _logger { logger }
 {
 }
 
-void SchedulerServer::Shutdown() noexcept
+void FrameServer::Shutdown() noexcept
 {
     _shuttingDown.store(true, std::memory_order_release);
     _listener.Close();
 }
 
-Task<void> SchedulerServer::Run()
+Task<void> FrameServer::Run()
 {
     while (!_shuttingDown.load(std::memory_order_acquire))
     {
@@ -59,18 +56,19 @@ Task<void> SchedulerServer::Run()
             auto const code = accepted.error().code;
             if (code == NetErrorCode::WouldBlock || code == NetErrorCode::Timeout)
                 continue;
-            _logger.Logf(LogLevel::Debug, "scheduler: accept loop ended ({})", accepted.error().ToString());
+            _logger.Logf(LogLevel::Debug, "{}: accept loop ended ({})", _what, accepted.error().ToString());
             co_return;
         }
 
         auto socket = *std::move(accepted);
 
-        // The peer's HOST, which is the vocabulary `ClusterMembership` speaks -- a
-        // connection's source port is ephemeral and is not the peer's endpoint, so
-        // there is nothing else here that could identify it.
+        // The peer's HOST. A connection's source port is ephemeral and is not the
+        // peer's endpoint, so for a surface whose policy needs an identity -- the
+        // scheduler's -- there is nothing else here that could supply one.
         auto const peer = socket->PeerAddress();
 
-        ByteReader reader { *socket, /*maxLineBytes*/ 1, MaxRequestBytes };
+        auto const cap = _responder.MaxRequestBytes();
+        ByteReader reader { *socket, /*maxLineBytes*/ 1, cap };
         auto const header = co_await reader.ReadExactly(Wire::RequestHeaderSize);
         if (header.has_value())
         {
@@ -81,24 +79,23 @@ Task<void> SchedulerServer::Run()
                 // declared length there is nowhere to resynchronize to. Closing is the
                 // only thing left, and is what an empty answer means here.
             }
-            else if (decoded->payloadLength > MaxRequestBytes)
+            else if (decoded->payloadLength > cap)
             {
                 // Refused with a reply naming BOTH numbers, because "too large" without
                 // the ceiling tells an operator nothing about a 64 KiB limit. The bytes
                 // are never taken: the check is on the declared length, before the read.
-                (void) co_await WriteAll(socket.get(),
-                                         Wire::EncodeErrorReply(Wire::ErrorCode::PayloadTooLarge,
-                                                                std::format("{} exceeds the scheduler's {}-byte request cap",
-                                                                            decoded->payloadLength,
-                                                                            MaxRequestBytes)));
+                (void) co_await WriteAll(
+                    socket.get(),
+                    Wire::EncodeErrorReply(
+                        Wire::ErrorCode::PayloadTooLarge,
+                        std::format("{} exceeds the {} {}-byte request cap", decoded->payloadLength, _what, cap)));
             }
             else if (auto const payload = co_await reader.ReadExactly(decoded->payloadLength); payload.has_value())
             {
                 std::vector<std::byte> frame { header->begin(), header->end() };
                 frame.insert(frame.end(), payload->begin(), payload->end());
 
-                auto const caller = Distributed::CallerContext { .membership = _membership.Classify(peer), .peerId = peer };
-                if (auto const reply = _protocol.Answer(frame, caller); !reply.empty())
+                if (auto const reply = _responder.Answer(frame, peer); !reply.empty())
                     (void) co_await WriteAll(socket.get(), reply);
             }
         }
@@ -108,19 +105,19 @@ Task<void> SchedulerServer::Run()
     co_return;
 }
 
-SchedulerEndpoint::SchedulerEndpoint(std::unique_ptr<BlockingListener> listener,
-                                     Distributed::SchedulerProtocol& protocol,
-                                     Distributed::IMembershipOracle const& membership,
-                                     std::string boundEndpoint,
-                                     ILogger& logger):
+FrameEndpoint::FrameEndpoint(std::unique_ptr<BlockingListener> listener,
+                             IFrameResponder& responder,
+                             std::string_view what,
+                             std::string boundEndpoint,
+                             ILogger& logger):
     _listener { std::move(listener) },
-    _server { std::make_unique<SchedulerServer>(*_listener, protocol, membership, logger) },
+    _server { std::make_unique<FrameServer>(*_listener, responder, what, logger) },
     _boundEndpoint { std::move(boundEndpoint) },
     _thread { [server = _server.get()] { SyncRun(server->Run()); } }
 {
 }
 
-SchedulerEndpoint::~SchedulerEndpoint()
+FrameEndpoint::~FrameEndpoint()
 {
     // Order, not tidiness: closing the listener is what returns `Run()`, and the
     // jthread destructor that follows joins a loop which would otherwise still be
@@ -128,12 +125,11 @@ SchedulerEndpoint::~SchedulerEndpoint()
     _server->Shutdown();
 }
 
-std::expected<std::unique_ptr<SchedulerEndpoint>, std::string> SchedulerEndpoint::Start(
-    std::string_view listenSpec,
-    std::string_view defaultHost,
-    Distributed::SchedulerProtocol& protocol,
-    Distributed::IMembershipOracle const& membership,
-    ILogger& logger)
+std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(std::string_view listenSpec,
+                                                                                std::string_view defaultHost,
+                                                                                IFrameResponder& responder,
+                                                                                std::string_view what,
+                                                                                ILogger& logger)
 {
     auto const endpoint = ParseEndpoint(listenSpec, defaultHost);
     if (!endpoint.has_value())
@@ -149,19 +145,19 @@ std::expected<std::unique_ptr<SchedulerEndpoint>, std::string> SchedulerEndpoint
     // Applied here rather than left to the caller, for the reason
     // `AdoptInheritedListeners` was changed to take them as parameters: there must be
     // no way to obtain a listener this endpoint cannot stop.
-    listener->SetTimeouts(SchedulerServer::AcceptPoll, SchedulerServer::RequestTimeout);
+    listener->SetTimeouts(FrameServer::AcceptPoll, FrameServer::RequestTimeout);
 
     // The port the listener ACTUALLY bound, not the one asked for. `0` means "pick a
     // free one", and an endpoint that echoed `:0` back could not tell an operator --
     // or a test -- where it ended up.
     auto bound = std::format("{}:{}", endpoint->first, listener->BoundPort());
-    logger.Logf(LogLevel::Info, "scheduler listening on {}", bound);
+    logger.Logf(LogLevel::Info, "{} listening on {}", what, bound);
 
     // `new` rather than `make_unique` because the constructor is private: the two ways
     // to reach it are this factory, which has already proved the listener is bound,
     // and nothing else.
-    return std::unique_ptr<SchedulerEndpoint> { new SchedulerEndpoint {
-        std::move(listener), protocol, membership, std::move(bound), logger } };
+    return std::unique_ptr<FrameEndpoint> { new FrameEndpoint {
+        std::move(listener), responder, what, std::move(bound), logger } };
 }
 
 } // namespace FastCache::Node

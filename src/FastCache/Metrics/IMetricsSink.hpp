@@ -127,6 +127,38 @@ class IMetricsSink
         WorkerBytesReceived,
         WorkerBytesReturned,
 
+        /// The node's own cache tier, which exists so a local rebuild on a slow or
+        /// bad network does not go to the wire at all.
+        ///
+        /// Hits and misses are the node's OWN tier, before any upstream is asked;
+        /// `NodeCacheUpstreamHits` is how often the shared cache answered what this
+        /// node could not. The three together are what say whether the local tier is
+        /// earning its disk: a high upstream-hit rate against a low local-hit rate is
+        /// a tier too small to hold this machine's working set, which is a different
+        /// problem from a fleet that is missing a lot.
+        NodeCacheHits,
+        NodeCacheMisses,
+        NodeCacheUpstreamHits,
+
+        /// A value the shared cache supplied that the local tier then refused. Costs
+        /// one future round trip rather than a build, so it is counted rather than
+        /// reported -- but a rate that stays high means the tier is misconfigured
+        /// (unwritable path, a cap below the objects being stored) and is silently
+        /// doing nothing.
+        NodeCacheFillFailures,
+
+        /// A local write that failed. Distinct from the fill failure above because
+        /// this one IS reported to the client: it is the write that must not be lost.
+        NodeCacheStoreFailures,
+
+        /// What the fleet got. Best-effort by contract -- the local write already
+        /// succeeded -- so a failure here costs the fleet a shared entry and costs
+        /// this machine nothing. Split from the local counters precisely so an
+        /// operator can tell "my node is fine, the fleet is unreachable" from "my
+        /// node is broken", which are different things to go and fix.
+        NodeCacheUpstreamStores,
+        NodeCacheUpstreamStoreFailures,
+
         Last,
     };
 

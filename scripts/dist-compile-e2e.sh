@@ -708,5 +708,62 @@ grep -q "compile node stopped" "${workdir}/stop-worker.log" \
     || { cat "${workdir}/stop-worker.log" >&2; fail "the worker did not run its shutdown path to completion"; }
 echo "   the worker stopped gracefully on SIGTERM"
 
+# --- 9: a node's own cache serves a hit without the network --------------------
+echo "== case 9: a local hit never reaches the shared cache"
+# The reason the node has a cache tier at all: a rebuild on a slow or bad network
+# should not go to the wire. The shared cache holds every object, so a second copy
+# looks redundant -- what is saved is the ROUND TRIP, not the compile.
+#
+# Proved by taking the shared cache away. A tier that merely proxied, or that
+# revalidated a hit against the upstream, would fail the third compile; one that
+# genuinely holds the object serves it with nothing listening upstream.
+cache_node_port="$(free_port)"
+cache_node_worker="$(free_port)"
+cache_upstream_port="$(free_port)"
+
+"$fastcached" --listen="127.0.0.1:${cache_upstream_port}" --log-level=info     > "${workdir}/tier-upstream.log" 2>&1 &
+tier_upstream_pid=$!
+pids+=("$tier_upstream_pid")
+wait_for_port "$cache_upstream_port" "$tier_upstream_pid" "tier upstream" "${workdir}/tier-upstream.log"
+
+"$node" --listen-cache="127.0.0.1:${cache_node_port}" --cache-memory=64m     --upstream="127.0.0.1:${cache_upstream_port}"     --scheduler="127.0.0.1:${dispatch_port}"     --bind=127.0.0.1 --port="$cache_node_worker"     --advertise="127.0.0.1:${cache_node_worker}"     --toolchain="cache-node-only=${compiler}" --slots=1 --log-level=debug     > "${workdir}/tier-node.log" 2>&1 &
+tier_node_pid=$!
+pids+=("$tier_node_pid")
+wait_for_port "$cache_node_port" "$tier_node_pid" "cache node" "${workdir}/tier-node.log"
+
+write_source "${proj}/nine.cpp" "casenine"
+"$compiler" -std=c++17 -O1 -c "${proj}/nine.cpp" -o "${proj}/build/nine-ref.o"     || fail "the case 9 reference compile failed"
+
+(
+    # Pointed at the NODE, not at the shared cache. That is the whole deployment
+    # this tier exists for.
+    export FASTCACHE_ADDR="127.0.0.1:${cache_node_port}"
+    unset FASTCACHE_SCHEDULER
+    run_launcher "${workdir}/case9-store.log" -std=c++17 -O1 -c "${proj}/nine.cpp" -o "${proj}/build/nine.o"
+) || { cat "${workdir}/case9-store.log" >&2; fail "the first compile through the node failed"; }
+
+rm -f "${proj}/build/nine.o"
+(
+    export FASTCACHE_ADDR="127.0.0.1:${cache_node_port}"
+    unset FASTCACHE_SCHEDULER
+    run_launcher "${workdir}/case9-hit.log" -std=c++17 -O1 -c "${proj}/nine.cpp" -o "${proj}/build/nine.o"
+) || { cat "${workdir}/case9-hit.log" >&2; fail "the second compile through the node failed"; }
+grep -q "fastcache-cc: HIT" "${workdir}/case9-hit.log"     || { cat "${workdir}/case9-hit.log" >&2; fail "the node did not serve a hit"; }
+
+# Now take the shared cache away and ask again. This is the assertion: a hit is
+# answered from the node's own tier, so it must survive an upstream that is gone.
+stop_and_require_exit "$tier_upstream_pid" "the shared cache" 15
+
+rm -f "${proj}/build/nine.o"
+(
+    export FASTCACHE_ADDR="127.0.0.1:${cache_node_port}"
+    unset FASTCACHE_SCHEDULER
+    run_launcher "${workdir}/case9-offline.log" -std=c++17 -O1 -c "${proj}/nine.cpp" -o "${proj}/build/nine.o"
+) || { cat "${workdir}/case9-offline.log" >&2; fail "a build survived neither the hit nor the fallback"; }
+grep -q "fastcache-cc: HIT" "${workdir}/case9-offline.log"     || { cat "${workdir}/case9-offline.log" >&2; fail "the node went to the network for an object it held"; }
+
+cmp -s "${proj}/build/nine-ref.o" "${proj}/build/nine.o"     || fail "the object served from the node's tier is wrong"
+echo "   a hit was served with the shared cache stopped, and the object is right"
+
 echo
 echo "dist-compile E2E PASSED"

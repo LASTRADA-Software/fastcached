@@ -3,9 +3,6 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Distributed/MembershipOracle.hpp>
-#include <FastCache/Distributed/SchedulerProtocol.hpp>
-#include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Net/IListener.hpp>
 
@@ -21,7 +18,44 @@
 namespace FastCache::Node
 {
 
-/// Accepts connections and answers each with one scheduler verb.
+/// Answers one framed request.
+///
+/// The seam that lets one accept loop serve every framed surface this node exposes.
+/// A node runs a scheduler, a cache tier and a compile worker; each speaks the same
+/// `0xFC` framing and differs only in what it answers and how much it will buffer.
+/// A second accept loop per surface would be three near-copies of a listener, a
+/// shutdown order and a poll timeout -- the copy-paste this codebase treats as a
+/// defect rather than a coincidence.
+///
+/// An interface rather than a `std::function`, deliberately: a responder outlives
+/// the endpoint and a closure would keep its whole enclosing scope alive with it.
+class IFrameResponder
+{
+  public:
+    virtual ~IFrameResponder() = default;
+
+    IFrameResponder() = default;
+    IFrameResponder(IFrameResponder const&) = default;
+    IFrameResponder& operator=(IFrameResponder const&) = default;
+    IFrameResponder(IFrameResponder&&) = default;
+    IFrameResponder& operator=(IFrameResponder&&) = default;
+
+    /// @param frame Header plus payload, exactly as received.
+    /// @param peer The connecting peer's host, for surfaces whose policy needs it.
+    /// @return The encoded reply, or empty to close without answering — which is
+    ///         only ever right when the peer is not speaking this protocol at all.
+    [[nodiscard]] virtual std::vector<std::byte> Answer(std::span<std::byte const> frame, std::string_view peer) = 0;
+
+    /// Largest request this surface will buffer.
+    ///
+    /// Per-responder rather than one constant, and the spread is the point: a
+    /// scheduler verb carries a fingerprint and a key, while a cache STORE carries a
+    /// whole object file. Sizing both for the larger would hand an unauthenticated
+    /// peer a way to make the scheduler allocate megabytes.
+    [[nodiscard]] virtual std::size_t MaxRequestBytes() const noexcept = 0;
+};
+
+/// Accepts connections and answers each with one framed request.
 ///
 /// Shaped after `WorkerServer` rather than `Server`, and for the reason that governs
 /// the whole node: `Connection` is built around a `CacheEngine`, and a scheduler has
@@ -45,16 +79,9 @@ namespace FastCache::Node
 /// fingerprint, an endpoint and a key, none of which is large, so the ceiling is
 /// kilobytes rather than the cache's megabytes. A frame over it is refused with a
 /// *reply* naming both numbers, not a close.
-class SchedulerServer
+class FrameServer
 {
   public:
-    /// Largest request this endpoint will buffer.
-    ///
-    /// Reachable before membership is established, so it is sized for the verbs
-    /// rather than for comfort: the longest is a REGISTER carrying a toolchain
-    /// fingerprint, an endpoint and a codec list.
-    static constexpr std::size_t MaxRequestBytes = 64ULL * 1024ULL;
-
     /// How often a parked `Accept()` returns so the loop can observe `Shutdown()`.
     ///
     /// POSIX does not unblock a parked `accept()` when another thread closes the
@@ -67,13 +94,11 @@ class SchedulerServer
     static constexpr std::chrono::milliseconds RequestTimeout { 5'000 };
 
     /// @param listener Bound listener; must outlive the run.
-    /// @param protocol Answers each request; must outlive the run.
-    /// @param membership Decides who may spend the fleet's capacity; must outlive the run.
+    /// @param responder Answers each request; must outlive the run.
+    /// @param what Names this surface in log lines, so three endpoints in one
+    ///        process are distinguishable when one of them stops accepting.
     /// @param logger Shared logger.
-    SchedulerServer(IListener& listener,
-                    Distributed::SchedulerProtocol& protocol,
-                    Distributed::IMembershipOracle const& membership,
-                    ILogger& logger) noexcept;
+    FrameServer(IListener& listener, IFrameResponder& responder, std::string_view what, ILogger& logger) noexcept;
 
     /// Accept loop; returns when the listener is closed via `Shutdown()`.
     [[nodiscard]] Task<void> Run();
@@ -83,8 +108,8 @@ class SchedulerServer
 
   private:
     IListener& _listener;
-    Distributed::SchedulerProtocol& _protocol;
-    Distributed::IMembershipOracle const& _membership;
+    IFrameResponder& _responder;
+    std::string _what;
     ILogger& _logger;
     std::atomic<bool> _shuttingDown { false };
 };
@@ -98,7 +123,7 @@ class SchedulerServer
 /// expresses that as a `Shutdown()` somebody has to remember at every return path.
 /// Here it is the destructor. And `main.cpp` in this binary is in no test target, so
 /// wiring that lives there has no unit coverage at all.
-class SchedulerEndpoint
+class FrameEndpoint
 {
   public:
     /// Bind the endpoint and start serving it.
@@ -109,28 +134,29 @@ class SchedulerEndpoint
     /// `ConfigError`, an address that will not bind is a `NetError` -- the caller's
     /// response is identical either way, and what it needs is the text.
     /// @param listenSpec `port`, `host:port` or `[v6]:port`.
-    /// @param defaultHost What a bare port binds to.
-    /// @param protocol Answers each request; must outlive the endpoint.
-    /// @param membership Decides who may be scheduled; must outlive the endpoint.
+    /// @param defaultHost What a bare port binds to. Differs per surface and is the
+    ///        caller's decision: a scheduler no peer can dial does nothing, while a
+    ///        node's private cache reachable from the network is a decision.
+    /// @param responder Answers each request; must outlive the endpoint.
+    /// @param what Names this surface in log lines.
     /// @param logger Where to announce the bound address.
     /// @return The running endpoint, or why it could not be served.
-    [[nodiscard]] static std::expected<std::unique_ptr<SchedulerEndpoint>, std::string> Start(
-        std::string_view listenSpec,
-        std::string_view defaultHost,
-        Distributed::SchedulerProtocol& protocol,
-        Distributed::IMembershipOracle const& membership,
-        ILogger& logger);
+    [[nodiscard]] static std::expected<std::unique_ptr<FrameEndpoint>, std::string> Start(std::string_view listenSpec,
+                                                                                          std::string_view defaultHost,
+                                                                                          IFrameResponder& responder,
+                                                                                          std::string_view what,
+                                                                                          ILogger& logger);
 
     /// Stop serving and join the thread.
-    ~SchedulerEndpoint();
+    ~FrameEndpoint();
 
-    SchedulerEndpoint(SchedulerEndpoint const&) = delete;
-    SchedulerEndpoint& operator=(SchedulerEndpoint const&) = delete;
+    FrameEndpoint(FrameEndpoint const&) = delete;
+    FrameEndpoint& operator=(FrameEndpoint const&) = delete;
 
     // Neither movable, for the reason `AdminEndpoint` gives: the serving thread holds
     // a pointer to `_server`, and `_server` a reference to `_listener`.
-    SchedulerEndpoint(SchedulerEndpoint&&) = delete;
-    SchedulerEndpoint& operator=(SchedulerEndpoint&&) = delete;
+    FrameEndpoint(FrameEndpoint&&) = delete;
+    FrameEndpoint& operator=(FrameEndpoint&&) = delete;
 
     /// The address this endpoint actually bound.
     [[nodiscard]] std::string const& BoundEndpoint() const noexcept
@@ -139,14 +165,14 @@ class SchedulerEndpoint
     }
 
   private:
-    SchedulerEndpoint(std::unique_ptr<BlockingListener> listener,
-                      Distributed::SchedulerProtocol& protocol,
-                      Distributed::IMembershipOracle const& membership,
-                      std::string boundEndpoint,
-                      ILogger& logger);
+    FrameEndpoint(std::unique_ptr<BlockingListener> listener,
+                  IFrameResponder& responder,
+                  std::string_view what,
+                  std::string boundEndpoint,
+                  ILogger& logger);
 
     std::unique_ptr<BlockingListener> _listener;
-    std::unique_ptr<SchedulerServer> _server;
+    std::unique_ptr<FrameServer> _server;
     std::string _boundEndpoint;
     std::jthread _thread;
 };

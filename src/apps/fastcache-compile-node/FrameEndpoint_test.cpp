@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "SchedulerEndpoint.hpp"
+#include "FrameEndpoint.hpp"
+#include "Responders.hpp"
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
@@ -52,6 +53,7 @@ struct Fleet
     // endpoint is given with a port so the constructor's host/endpoint collapse is
     // exercised rather than bypassed.
     Distributed::ClusterMembership membership { { "127.0.0.1:7000" } };
+    SchedulerResponder responder { protocol, membership };
     NullLogger logger;
 };
 
@@ -116,7 +118,7 @@ struct Fleet
 TEST_CASE("An unparseable --listen-scheduler is refused, not guessed at", "[node][scheduler]")
 {
     Fleet fleet;
-    auto const started = SchedulerEndpoint::Start("not-a-port", "127.0.0.1", fleet.protocol, fleet.membership, fleet.logger);
+    auto const started = FrameEndpoint::Start("not-a-port", "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
 
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains("not-a-port"));
@@ -131,7 +133,7 @@ TEST_CASE("An endpoint that cannot bind reports why", "[node][scheduler]")
     // test passes on Linux and macOS and fails on Windows (issue #85).
     Fleet fleet;
     auto const unreachable = std::string { "192.0.2.1:6674" };
-    auto const started = SchedulerEndpoint::Start(unreachable, "127.0.0.1", fleet.protocol, fleet.membership, fleet.logger);
+    auto const started = FrameEndpoint::Start(unreachable, "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
 
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains(unreachable));
@@ -153,8 +155,7 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
     // that HANGS when the order is wrong reports a defect as a suite timeout naming
     // nothing, which this repository has already paid for once.
     auto stopped = std::async(std::launch::async, [&] {
-        auto started =
-            SchedulerEndpoint::Start(std::to_string(port), "127.0.0.1", fleet.protocol, fleet.membership, fleet.logger);
+        auto started = FrameEndpoint::Start(std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
         return started.has_value();
     });
 
@@ -175,8 +176,7 @@ TEST_CASE("A member registers over a real socket", "[node][scheduler]")
     // host reaches the oracle, and that a reply comes back framed.
     Fleet fleet;
     auto const port = FreePort();
-    auto started =
-        SchedulerEndpoint::Start(std::to_string(port), "127.0.0.1", fleet.protocol, fleet.membership, fleet.logger);
+    auto started = FrameEndpoint::Start(std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
     REQUIRE(started.has_value());
 
     // The endpoint reports what it actually bound, which is what makes `0` usable
@@ -203,8 +203,7 @@ TEST_CASE("A stranger is refused the fleet over a real socket", "[node][schedule
     fleet.membership.Publish({ "10.0.0.1:7000" });
 
     auto const port = FreePort();
-    auto started =
-        SchedulerEndpoint::Start(std::to_string(port), "127.0.0.1", fleet.protocol, fleet.membership, fleet.logger);
+    auto started = FrameEndpoint::Start(std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
     REQUIRE(started.has_value());
 
     // The endpoint reports what it actually bound, which is what makes `0` usable
@@ -225,8 +224,7 @@ TEST_CASE("An oversize frame is refused with both numbers, and never buffered", 
     // the DECLARED length, so the bytes are never taken.
     Fleet fleet;
     auto const port = FreePort();
-    auto started =
-        SchedulerEndpoint::Start(std::to_string(port), "127.0.0.1", fleet.protocol, fleet.membership, fleet.logger);
+    auto started = FrameEndpoint::Start(std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
     REQUIRE(started.has_value());
 
     // The endpoint reports what it actually bound, which is what makes `0` usable
@@ -239,12 +237,12 @@ TEST_CASE("An oversize frame is refused with both numbers, and never buffered", 
                          Wire::Magic,
                          Wire::CurrentVersion,
                          static_cast<std::uint8_t>(Wire::Op::Register),
-                         static_cast<std::uint32_t>(SchedulerServer::MaxRequestBytes + 1));
+                         static_cast<std::uint32_t>(fleet.responder.MaxRequestBytes() + 1));
 
     auto const reply = Exchange(port, frame);
     REQUIRE(ErrorOf(reply) == Wire::ErrorCode::PayloadTooLarge);
 
     auto const payload = std::span<std::byte const> { reply }.subspan(Wire::ReplyHeaderSize + 1);
     auto const text = std::string { reinterpret_cast<char const*>(payload.data()), payload.size() };
-    CHECK(text.contains(std::to_string(SchedulerServer::MaxRequestBytes)));
+    CHECK(text.contains(std::to_string(fleet.responder.MaxRequestBytes())));
 }
