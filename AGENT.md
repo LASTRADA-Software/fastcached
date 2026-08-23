@@ -38,6 +38,23 @@ src/FastCache/
                 + tagged-text-region framing), PrefetchGroupManifest
                 (prefetch-group id -> key-set + reverse index) — the
                 compile-cache executor's domain logic
+  Consensus/    RaftTypes, RaftLog, RaftNode and RaftDriver behind the
+                IRaftStorage / IRaftTransport / IRaftStateMachine seams — Raft,
+                split into a pure state machine and a coroutine driver that
+                carries out what it asks for. RaftNode reads no clock, opens no
+                socket and draws no randomness of its own: time arrives as a
+                parameter, entropy through Core/IRandomSource, and everything
+                the node wants done leaves as a RaftOutput. That split is what
+                makes persist-before-send expressible at all — a callback sink
+                cannot await a durability write, and a node whose vote reaches
+                the wire before stable storage votes twice in one term after a
+                restart, which is two leaders in one term. It is also what lets
+                RaftClusterHarness run a whole cluster in one process against
+                scripted partitions, loss, reordering and restarts while
+                asserting the paper's safety properties after every step: a
+                hand-written consensus implementation has no published
+                verification vector to check against the way MurmurHash3 has
+                SMHasher's, so that harness is the closest available oracle.
   Distributed/  WorkerRegistry (the worker set: exact-fingerprint grouping,
                 least-outstanding pick, heartbeat expiry over IClock) and
                 LeaseTable (lease issue/expiry/release plus the in-flight key

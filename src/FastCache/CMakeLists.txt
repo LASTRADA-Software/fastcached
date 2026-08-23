@@ -31,6 +31,7 @@ target_sources(FastCache
         Consensus/FileRaftStorage.cpp
         Consensus/InMemoryRaftStorage.cpp
         Consensus/RaftConfig.cpp
+        Consensus/RaftDriver.cpp
         Consensus/RaftLog.cpp
         Consensus/RaftNode.cpp
         Core/Crc32c.cpp
