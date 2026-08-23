@@ -1,3 +1,19 @@
-# Shell scripts must keep LF endings so they run on Linux/macOS CI even when
-# edited or checked out on Windows (a CRLF shebang breaks the interpreter).
+# Line endings are a property of the REPOSITORY, not of each machine's git
+# config. Without a rule here the answer comes from `core.autocrlf`, which is
+# per-clone and per-developer, so two people editing the same file disagree about
+# what a line ending is — and the disagreement is invisible until a diff comes
+# back as "every line changed" for a two-line edit, which is exactly how this was
+# found.
+#
+# `text=auto` lets git decide what is text (binaries are left alone by content
+# inspection, so no allow-list here can go stale); `eol=lf` then fixes the working
+# tree to LF on every platform, Windows included. Stored content was already LF —
+# `core.autocrlf` had been normalizing it on the way in — so this changes nothing
+# that is committed, only what lands on disk at checkout.
+* text=auto eol=lf
+
+# Kept as its own row even though the rule above already covers it, because the
+# consequence here is specific and worth stating: a CRLF shebang line makes the
+# kernel look for an interpreter whose name ends in a carriage return, so a shell
+# script that picked up CRLF does not misbehave — it fails to start at all.
 *.sh text eol=lf
