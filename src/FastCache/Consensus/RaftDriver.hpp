@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -71,6 +72,21 @@ struct CompactionPolicy
 /// **Then apply.** Applying is local and the peers cannot make progress until the
 /// messages are out, so doing it first would add the application's latency to the
 /// replication path and buy nothing.
+///
+/// ## Why it holds a lock
+///
+/// The node is advanced from more than one thread by construction, and not by
+/// accident: the timer loop ticks it, a peer reader hands it messages, and
+/// whatever wants to change the cluster's own configuration proposes on its own
+/// schedule. `RaftNode` is a plain state machine with no synchronization of its
+/// own -- that is what makes it testable -- so the serialization has to live
+/// here, at the one place all three routes meet.
+///
+/// Held across the durability writes and the sends, which is the point rather
+/// than an oversight: those are exactly the steps whose ORDER the algorithm
+/// depends on, and a second thread interleaving a vote between a node's persist
+/// and its reply is the crash-restart double vote spelled with threads instead
+/// of a power cut. Never held across a suspension: `Run` awaits outside it.
 ///
 /// ## What a storage failure does
 ///
@@ -145,18 +161,25 @@ class RaftDriver
     /// @return Where it landed, or why it was refused.
     [[nodiscard]] std::expected<LogIndex, ConsensusError> Propose(std::vector<std::byte> payload, TimePoint now);
 
-    /// @return The node being driven, for inspection.
+    /// The node being driven, for inspection.
+    ///
+    /// **Not synchronized**, and it cannot be: a reference outlives any lock this
+    /// could take. For tests and for a caller that knows no other thread is
+    /// advancing this driver.
+    /// @return The node.
     [[nodiscard]] RaftNode const& Node() const noexcept;
 
     /// @return When `Tick` must next be called.
-    [[nodiscard]] TimePoint NextDeadline() const noexcept;
+    [[nodiscard]] TimePoint NextDeadline() const;
 
     /// The failure that stopped this driver, if one did.
     ///
     /// Latched: once storage has failed, every later call refuses with the same
     /// error rather than pretending the node is still participating.
+    /// By value, because reading it takes the same lock everything else here does
+    /// -- a reference would hand the caller a member another thread may be writing.
     /// @return The failure, or nullopt.
-    [[nodiscard]] std::optional<ConsensusError> const& Failure() const noexcept;
+    [[nodiscard]] std::optional<ConsensusError> Failure() const;
 
     /// Drive the node's timers on a reactor until stopped or broken.
     ///
@@ -185,7 +208,7 @@ class RaftDriver
     void Stop() noexcept;
 
   private:
-    /// Perform one output in the required order.
+    /// Perform one output in the required order; `_mutex` must be held.
     [[nodiscard]] std::expected<void, ConsensusError> Deliver(RaftOutput output);
 
     /// Report the role if it has moved since the last report.
@@ -201,6 +224,9 @@ class RaftDriver
     /// comes back from a restart missing committed state.
     /// @return Nothing, or the storage failure that stopped this node.
     [[nodiscard]] std::expected<void, ConsensusError> CompactIfDue();
+
+    /// Serializes every route into `_node`. See the class comment.
+    mutable std::mutex _mutex;
 
     RaftNode _node;
     IRaftStorage& _storage;

@@ -146,6 +146,14 @@ enum class Op : std::uint8_t
     Heartbeat = 0x05, ///< Worker reports liveness and its current load.
     Lease = 0x06,     ///< Client asks the scheduler for a worker to compile on.
     Compile = 0x07,   ///< Client hands a worker one preprocessed translation unit.
+
+    // Cluster administration. Answered on the scheduler's port by the LEADER
+    // only, and only to a member, through the same gate the dispatch verbs go
+    // through -- these change what every node in the fleet believes, so the two
+    // questions the gate asks are exactly the two that matter.
+    ClusterStatus = 0x08, ///< Operator asks what the cluster has agreed.
+    ClusterSet = 0x09,    ///< Operator changes a replicated setting.
+    ClusterForget = 0x0A, ///< Operator removes a member.
 };
 
 /// Reply status, the first byte of every reply.
@@ -224,6 +232,23 @@ enum class ErrorCode : std::uint8_t
     /// the other says "buy more machines", and summing them would send an operator
     /// shopping for hardware they already own.
     Withdrawn = 0x14,
+    /// A change the cluster could not accept.
+    ///
+    /// A setting nobody has heard of, a member named with no address, a field a
+    /// verb ignores. Refused at the PROPOSER because that is the only place a
+    /// change can be refused at all -- an entry is applied after it is committed,
+    /// when there is nobody left to report to. The message carries which, because
+    /// the reader is a person and "no such cluster setting: upsteam" is what they
+    /// can act on.
+    InvalidClusterChange = 0x16,
+
+    /// This node runs no cluster, so there is nothing to administer.
+    ///
+    /// Distinct from `NotLeader`, and the difference is what an operator does
+    /// next: `NotLeader` names somewhere else to ask, while this says the
+    /// question does not apply here at all -- a single node started without
+    /// `--node-id` leads itself and has no replicated state to change.
+    NoCluster = 0x15,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -335,6 +360,24 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = false,
                    .maxPayload = MaxControlPayload },
+    OpDescriptor { .code = Op::ClusterStatus,
+                   .name = "cluster-status",
+                   .fieldCount = 0, // nothing to ask with
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = false,
+                   .maxPayload = MaxControlPayload },
+    OpDescriptor { .code = Op::ClusterSet,
+                   .name = "cluster-set",
+                   .fieldCount = 2, // setting name, value
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = false,
+                   .maxPayload = MaxControlPayload },
+    OpDescriptor { .code = Op::ClusterForget,
+                   .name = "cluster-forget",
+                   .fieldCount = 1, // member id
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = false,
+                   .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::Compile,
                    .name = "compile",
                    .fieldCount = 6, // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName
@@ -412,7 +455,39 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::Withdrawn,
                       .name = "withdrawn",
                       .defaultMessage = "every matching worker has withdrawn its capacity" },
+    ErrorDescriptor { .code = ErrorCode::NoCluster, .name = "no-cluster", .defaultMessage = "this node runs no cluster" },
+    ErrorDescriptor { .code = ErrorCode::InvalidClusterChange,
+                      .name = "invalid-cluster-change",
+                      .defaultMessage = "the cluster cannot accept that change" },
 };
+
+/// Verbs that legitimately carry no fields at all.
+///
+/// Zero is also what a row that forgot its `fieldCount` would hold, and such a row
+/// would then demand an empty payload and silently refuse every well-formed request.
+/// So "this verb asks nothing" is stated here rather than left looking like an
+/// omission, and `FieldCountsAgree` checks the two in both directions -- which is
+/// what makes this a check rather than a second place to be wrong.
+inline constexpr std::array FieldlessOps { Op::ClusterStatus };
+
+/// Whether `op` legitimately carries no fields.
+/// @param op The verb.
+/// @return True when it is listed as fieldless.
+[[nodiscard]] constexpr bool CarriesNoFields(Op op) noexcept
+{
+    return std::ranges::contains(FieldlessOps, op);
+}
+
+/// Whether every zero field count is a deliberate one, and every deliberate one is
+/// zero.
+/// @return True when the two tables agree.
+[[nodiscard]] consteval bool FieldCountsAgree() noexcept
+{
+    return std::ranges::all_of(OpTable,
+                               [](OpDescriptor const& row) { return (row.fieldCount == 0) == CarriesNoFields(row.code); });
+}
+
+static_assert(FieldCountsAgree(), "a verb carries fields, or is listed as carrying none -- never neither, never both");
 
 /// Look up the descriptor for a raw opcode byte.
 /// @param opRaw The third header byte, as received.
@@ -1295,6 +1370,74 @@ struct HeartbeatView
     if (!fields.has_value())
         return std::nullopt;
     return LeaseView { .fingerprint = (*fields)[0], .key = (*fields)[1], .acceptedCodecs = DecodeCodecList((*fields)[2]) };
+}
+
+/// An operator changing one replicated cluster setting.
+struct ClusterSetRequest
+{
+    std::string_view name;  ///< A key from `Cluster::SettingTable`.
+    std::string_view value; ///< Whatever it is being set to.
+};
+
+/// The same, as views into a received payload.
+struct ClusterSetView
+{
+    std::span<std::byte const> name;
+    std::span<std::byte const> value;
+};
+
+/// Frame a CLUSTER-STATUS request.
+///
+/// No fields at all, which is a real shape rather than a placeholder: the request
+/// carries no question, so a payload that is not empty is a client this build does
+/// not understand and `SplitFields` refuses it on the count alone.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeClusterStatus(WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::ClusterStatus, {});
+}
+
+/// Frame a CLUSTER-SET request.
+/// @param request The setting and its new value.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeClusterSet(ClusterSetRequest const& request,
+                                                             WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::ClusterSet, { AsBytes(request.name), AsBytes(request.value) });
+}
+
+/// Split a CLUSTER-SET payload.
+/// @param payload The bytes following the request header.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<ClusterSetView> DecodeClusterSetPayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::ClusterSet));
+    if (!fields.has_value())
+        return std::nullopt;
+    return ClusterSetView { .name = (*fields)[0], .value = (*fields)[1] };
+}
+
+/// Frame a CLUSTER-FORGET request.
+/// @param memberId Who to remove.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeClusterForget(std::string_view memberId,
+                                                                WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::ClusterForget, { AsBytes(memberId) });
+}
+
+/// Split a CLUSTER-FORGET payload.
+/// @param payload The bytes following the request header.
+/// @return The member id, or nullopt when malformed.
+[[nodiscard]] inline std::optional<std::span<std::byte const>> DecodeClusterForgetPayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::ClusterForget));
+    if (!fields.has_value())
+        return std::nullopt;
+    return (*fields)[0];
 }
 
 /// Frame a COMPILE request.

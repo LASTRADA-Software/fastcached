@@ -57,12 +57,11 @@ struct Peer
     /// @param nodeId This node's identity.
     /// @param key The cluster key it holds.
     Peer(DatagramBus& bus, std::string const& nodeId, std::vector<std::byte> key):
-        tier { DiscoveryTier::Over(bus.Open(nodeId + ":6677"),
-                                   ConfigFor(nodeId, std::move(key)),
-                                   [this](std::span<Cluster::DesiredMember const> peers) {
-                                       seen.assign(peers.begin(), peers.end());
-                                   },
-                                   logger) }
+        tier { DiscoveryTier::Over(
+            bus.Open(nodeId + ":6677"),
+            ConfigFor(nodeId, std::move(key)),
+            [this](std::span<Cluster::DesiredMember const> peers) { seen.assign(peers.begin(), peers.end()); },
+            logger) }
     {
     }
 };

@@ -120,6 +120,12 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         // emitting the secret would publish it to exactly the accounts it exists
         // to keep out. InlineCredentialRejection reports the omission instead.
         "--requirepass",
+        // One-shot questions asked OF a running cluster, not state a worker runs
+        // with. A registration carrying one would replay a single operator
+        // decision at every boot, forever.
+        "--cluster-status",
+        "--cluster-set",
+        "--cluster-forget",
     });
 
     // A configuration in which no field holds its default, so every emitter fires.

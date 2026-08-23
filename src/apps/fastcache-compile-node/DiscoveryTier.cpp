@@ -5,8 +5,8 @@
 #include <FastCache/Net/UdpSocket.hpp>
 
 #include <cstdio>
-#include <optional>
 #include <format>
+#include <optional>
 #include <utility>
 
 namespace FastCache::Node
@@ -133,11 +133,8 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
             ;
     } };
 
-    logger.Logf(LogLevel::Info,
-                "discovery on {} for cluster {}, announcing {}",
-                tier->BoundEndpoint(),
-                cfg.clusterId,
-                raftEndpoint);
+    logger.Logf(
+        LogLevel::Info, "discovery on {} for cluster {}, announcing {}", tier->BoundEndpoint(), cfg.clusterId, raftEndpoint);
     return tier;
 }
 

@@ -13,6 +13,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace FastCache::Node
@@ -26,6 +27,38 @@ namespace FastCache::Node
 /// extracted for -- and what is derived here is a *service registration*, where
 /// a value that cannot survive its own parser produces a worker that registers
 /// cleanly and then never starts again.
+/// What the operator asked this process to do to the cluster, if anything.
+///
+/// An `enum class` and not three booleans, because the three are mutually
+/// exclusive: a command line naming two of them is a mistake somebody made rather
+/// than a request, and `None` -- the ordinary case, a worker starting up -- has to
+/// be one of the states rather than "all three happen to be false".
+enum class ClusterAction : std::uint8_t
+{
+    None = 0, ///< Serve, rather than administer.
+    Status,   ///< Print what the cluster has agreed.
+    Set,      ///< Change one replicated setting.
+    Forget,   ///< Remove a member.
+};
+
+/// One cluster-administration request, as parsed from the command line.
+struct ClusterRequest
+{
+    ClusterAction action { ClusterAction::None };
+    std::string key;   ///< The setting name for `Set`, the member id for `Forget`.
+    std::string value; ///< The setting's new value; empty otherwise.
+};
+
+/// Split `name=value` as `--cluster-set` takes it.
+///
+/// At the FIRST `=`, so a value may contain one and a name may not -- the same
+/// rule `ParsePeerSpec` applies and for the same reason. Splitting at the last one
+/// would read `upstream=cache=1:6674` as a setting called `upstream=cache`, which
+/// is refused as unknown while naming something the operator did not type.
+/// @param text What the operator wrote.
+/// @return The pair, or nullopt when it is not one.
+[[nodiscard]] std::optional<std::pair<std::string, std::string>> ParseSettingAssignment(std::string_view text);
+
 struct NodeConfig
 {
     std::string scheduler; ///< host:port of the scheduler's dispatch endpoint.
@@ -235,6 +268,14 @@ struct NodeConfig
     bool uninstallService { false }; ///< Remove that registration and exit.
     bool help { false };
     bool version { false };
+
+    /// What to do to the cluster instead of serving, when anything.
+    ///
+    /// A mode rather than a serving option, like `--install-service`: the process
+    /// asks one question of a running cluster and exits. It is deliberately NOT
+    /// part of a service registration -- a worker that administered the cluster at
+    /// every boot would replay one operator's decision forever.
+    ClusterRequest cluster;
 };
 
 /// What this machine offers the fleet, from its configuration and its hardware.

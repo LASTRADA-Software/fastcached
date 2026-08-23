@@ -120,6 +120,42 @@ namespace
         return std::optional<std::uint32_t> { value };
     }
 
+    /// An applier for a flag that names a cluster action AND carries its operand.
+    ///
+    /// Neither `SelectOutcome` nor `AssignFrom` covers this on its own: one sets
+    /// the action and the other the operand, and a row using either would leave
+    /// the other half to a second row nobody would remember to add. `Status` takes
+    /// no operand at all, which is why the operand handling is a compile-time
+    /// branch rather than a runtime one -- a `--cluster-status` row that quietly
+    /// stored an empty key would be a row whose arity and whose applier disagreed.
+    /// @return The applier, usable as an OptionSpec::apply in a `constexpr` table.
+    template <ClusterAction Action>
+    [[nodiscard]] constexpr auto SelectClusterAction() noexcept
+    {
+        return [](auto& result, std::string_view value) -> std::expected<void, ConfigError> {
+            auto& request = TargetOf<&NodeConfig::cluster>(result);
+            request.action = Action;
+
+            if constexpr (Action == ClusterAction::Set)
+            {
+                auto assignment = ParseSettingAssignment(value);
+                if (!assignment.has_value())
+                    return std::unexpected(
+                        ArgvError(ConfigErrorCode::ParseError, "cluster-set", std::format("not <name>=<value>: {}", value)));
+                request.key = std::move(assignment->first);
+                request.value = std::move(assignment->second);
+            }
+            else if constexpr (Action == ClusterAction::Forget)
+            {
+                if (value.empty())
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "cluster-forget", "names no member"));
+                request.key = std::string { value };
+            }
+
+            return {};
+        };
+    }
+
     /// A byte count for the local cache tier, accepting the k/m/g suffixes the
     /// daemon's own size flags do.
     ///
@@ -184,6 +220,19 @@ namespace
         return ParseServiceScope(sv);
     }
 } // namespace
+
+std::optional<std::pair<std::string, std::string>> ParseSettingAssignment(std::string_view text)
+{
+    auto const split = text.find('=');
+    if (split == std::string_view::npos)
+        return std::nullopt;
+
+    auto name = std::string { text.substr(0, split) };
+    if (name.empty())
+        return std::nullopt;
+
+    return std::pair { std::move(name), std::string { text.substr(split + 1) } };
+}
 
 std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
 {
@@ -279,6 +328,27 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .description = "where consensus keeps its durable state. A node\n"
                          "that answered a vote and forgot it votes twice in\n"
                          "one term after a restart, which is two leaders." },
+        { .primary = "--cluster-status",
+          .arity = Arity::None,
+          .apply = SelectClusterAction<ClusterAction::Status>(),
+          .description = "ask the cluster at --scheduler what it has agreed,\n"
+                         "print it and exit. Answered by the LEADER; a\n"
+                         "follower says who to ask instead." },
+        { .primary = "--cluster-set",
+          .arity = Arity::Value,
+          .operand = "=<name>=<value>",
+          .apply = SelectClusterAction<ClusterAction::Set>(),
+          .description = "change one replicated cluster setting and exit.\n"
+                         "Every member then agrees on it, and it survives\n"
+                         "their restarts. --cluster-status lists the keys." },
+        { .primary = "--cluster-forget",
+          .arity = Arity::Value,
+          .operand = "=<node-id>",
+          .apply = SelectClusterAction<ClusterAction::Forget>(),
+          .description = "remove a member from the cluster and exit. The one\n"
+                         "membership change nothing automatic makes:\n"
+                         "discovery only ever adds, because a peer goes\n"
+                         "quiet far more often than it leaves." },
         { .primary = "--cluster-id",
           .arity = Arity::Value,
           .operand = "=<name>",

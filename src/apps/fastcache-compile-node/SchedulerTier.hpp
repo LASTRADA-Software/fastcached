@@ -61,6 +61,18 @@ class SchedulerTier
         _service.SetRole(role, leaderEndpoint);
     }
 
+    /// Give this surface a cluster to administer.
+    ///
+    /// The second seam consensus drives, and it is a setter for the same reason
+    /// `SetRole` is: consensus is constructed after this surface, because it needs
+    /// the port this one bound. Left uncalled, the cluster verbs answer
+    /// `NoCluster`, which is what a node running no cluster should say.
+    /// @param admin The cluster; must outlive this tier.
+    void Administer(Distributed::IClusterAdmin& admin) noexcept
+    {
+        _service.AdministerWith(admin);
+    }
+
     /// The address the scheduler surface bound.
     [[nodiscard]] std::string const& BoundEndpoint() const noexcept
     {

@@ -62,7 +62,7 @@ struct Fixture
 }
 } // namespace
 
-TEST_CASE("A scheduler answers its three verbs and nothing else", "[distributed][scheduler][protocol]")
+TEST_CASE("A scheduler answers its own verbs and nothing else", "[distributed][scheduler][protocol]")
 {
     // The refusal is a *reply* and not a close: a client that sent a cache verb to
     // the scheduler's port learns which, rather than seeing a dropped connection it

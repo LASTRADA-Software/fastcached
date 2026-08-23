@@ -23,13 +23,9 @@ namespace FastCache
 /// copied platform ladder is how a port to a fourth platform comes to build one half
 /// of a binary and not the other.
 ///
-/// **The listener alias is deliberately not here.** `ReactorServerLoop` pairs its
-/// reactor with a matching `IocpListener`/`EpollListener`/`KqueueListener` because
-/// it accepts on the reactor; consensus does not -- `RaftPeerServer` takes a plain
-/// blocking `IListener` and reads the driver's timers off this. Hoisting the
-/// listener too would hand every consumer a type most of them must not use, and the
-/// pairing that matters would be stated in a header instead of at the one place it
-/// is true.
+/// The matching listener is `Net/PlatformListener.hpp`, and it was hoisted a commit
+/// later than this one -- on the mistaken reasoning, recorded there, that consensus
+/// could accept on a blocking listener.
 #if defined(_WIN32)
 using PlatformReactor = IocpReactor;
 #elif defined(__linux__)

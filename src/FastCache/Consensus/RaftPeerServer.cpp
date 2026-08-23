@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <thread>
 #include <utility>
@@ -34,14 +35,51 @@ namespace
     /// @param skipped Counter for frames stepped over.
     /// @param delivered Counter for messages handed on.
     /// @param active In-flight connection counter, decremented on exit.
+    /// Keeps one connection in `OpenConnections` for as long as it is being served.
+    ///
+    /// RAII rather than a call at each of the loop's five exits, because the one
+    /// that gets forgotten is a dangling pointer `Shutdown` would then close --
+    /// and a use-after-free at teardown is the shape of bug that reproduces once
+    /// in a hundred runs and never on the machine looking at it.
+    class RegisteredConnection
+    {
+      public:
+        /// @param open Where to register; must outlive this.
+        /// @param socket The connection.
+        RegisteredConnection(OpenConnections* open, ISocket* socket) noexcept:
+            _open { open },
+            _socket { socket }
+        {
+            auto const guard = std::scoped_lock { _open->mutex };
+            _open->sockets.push_back(_socket);
+        }
+
+        RegisteredConnection(RegisteredConnection const&) = delete;
+        RegisteredConnection(RegisteredConnection&&) = delete;
+        RegisteredConnection& operator=(RegisteredConnection const&) = delete;
+        RegisteredConnection& operator=(RegisteredConnection&&) = delete;
+
+        ~RegisteredConnection()
+        {
+            auto const guard = std::scoped_lock { _open->mutex };
+            std::erase(_open->sockets, _socket);
+        }
+
+      private:
+        OpenConnections* _open;
+        ISocket* _socket;
+    };
+
     DetachedTask ServePeer(std::unique_ptr<ISocket> socket,
                            IRaftMessageSink* sink,
                            ILogger* logger,
                            PeerServerOptions options,
                            std::atomic<std::uint64_t>* skipped,
                            std::atomic<std::uint64_t>* delivered,
-                           std::atomic<std::size_t>* active)
+                           std::atomic<std::size_t>* active,
+                           OpenConnections* open)
     {
+        RegisteredConnection const registration { open, socket.get() };
         // No line is ever read on this wire, so the line cap is nominal; the
         // payload cap is the frame cap, which makes the reader refuse an
         // over-large frame even if the explicit check below were ever removed.
@@ -162,7 +200,7 @@ Task<void> RaftPeerServer::Run()
         // Serving them inline -- which is right for the compile worker, whose
         // connections are one CPU-bound job each -- would mean reading only one
         // peer ever, and a cluster that never hears from the rest.
-        ServePeer(std::move(*accepted), &_sink, &_logger, _options, &_skipped, &_delivered, &_active);
+        ServePeer(std::move(*accepted), &_sink, &_logger, _options, &_skipped, &_delivered, &_active, &_open);
     }
     co_return;
 }
@@ -171,6 +209,20 @@ void RaftPeerServer::Shutdown() noexcept
 {
     _shuttingDown.store(true, std::memory_order_release);
     _listener.Close();
+
+    // And every connection already accepted. Closing one completes whatever read
+    // was parked on it, which is how each per-connection task reaches its own end
+    // -- a task still parked when the reactor's `Run()` returns is a frame nobody
+    // resumes and nobody frees. Copied out under the lock rather than closed under
+    // it, because a close resumes the task that removes itself from this very
+    // vector.
+    auto sockets = std::vector<ISocket*> {};
+    {
+        auto const guard = std::scoped_lock { _open.mutex };
+        sockets = _open.sockets;
+    }
+    for (auto* socket: sockets)
+        socket->Close();
 
     // Detached connection coroutines borrow the sink, the logger and the
     // counters held on this object, so they must drain before Shutdown returns

@@ -2,6 +2,7 @@
 #include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Consensus/RaftDriver.hpp>
 
+#include <mutex>
 #include <utility>
 
 namespace FastCache::Consensus
@@ -45,13 +46,15 @@ RaftNode const& RaftDriver::Node() const noexcept
     return _node;
 }
 
-TimePoint RaftDriver::NextDeadline() const noexcept
+TimePoint RaftDriver::NextDeadline() const
 {
+    auto const guard = std::scoped_lock { _mutex };
     return _node.NextDeadline();
 }
 
-std::optional<ConsensusError> const& RaftDriver::Failure() const noexcept
+std::optional<ConsensusError> RaftDriver::Failure() const
 {
+    auto const guard = std::scoped_lock { _mutex };
     return _failure;
 }
 
@@ -171,6 +174,7 @@ std::expected<void, ConsensusError> RaftDriver::CompactIfDue()
 
 std::expected<void, ConsensusError> RaftDriver::Tick(TimePoint now)
 {
+    auto const guard = std::scoped_lock { _mutex };
     if (_failure.has_value())
         return std::unexpected { *_failure };
 
@@ -179,6 +183,7 @@ std::expected<void, ConsensusError> RaftDriver::Tick(TimePoint now)
 
 std::expected<void, ConsensusError> RaftDriver::Receive(RaftMessage const& message, TimePoint now)
 {
+    auto const guard = std::scoped_lock { _mutex };
     if (_failure.has_value())
         return std::unexpected { *_failure };
 
@@ -187,6 +192,7 @@ std::expected<void, ConsensusError> RaftDriver::Receive(RaftMessage const& messa
 
 std::expected<LogIndex, ConsensusError> RaftDriver::Propose(std::vector<std::byte> payload, TimePoint now)
 {
+    auto const guard = std::scoped_lock { _mutex };
     if (_failure.has_value())
         return std::unexpected { *_failure };
 
@@ -203,12 +209,15 @@ std::expected<LogIndex, ConsensusError> RaftDriver::Propose(std::vector<std::byt
 
 Task<void> RaftDriver::Run(IReactor* reactor)
 {
-    while (reactor != nullptr && !_stopped.load(std::memory_order_relaxed) && !_failure.has_value())
+    while (reactor != nullptr && !_stopped.load(std::memory_order_relaxed) && !Failure().has_value())
     {
         // The node owns its own deadline, so the loop never has to know whether
         // it is waiting on an election or a heartbeat -- and a spurious early
         // wake-up costs nothing, because `Tick` before the deadline does nothing.
-        co_await SleepUntil { .reactor = reactor, .deadline = _node.NextDeadline() };
+        //
+        // Read through the accessor, which takes the lock: another thread may be
+        // mid-`Propose` and moving the very deadline this is about to sleep on.
+        co_await SleepUntil { .reactor = reactor, .deadline = NextDeadline() };
 
         if (_stopped.load(std::memory_order_relaxed))
             break;

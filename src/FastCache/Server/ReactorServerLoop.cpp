@@ -4,6 +4,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Net/SocketAddress.hpp>
 #include <FastCache/Platform/CpuAffinity.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
@@ -35,18 +36,6 @@
 
 namespace FastCache
 {
-
-// The reactor comes from `Async/PlatformReactor.hpp`; only the LISTENER pairing is
-// this file's, because only this file accepts on the reactor. Consensus wants the
-// same reactor and a plain blocking listener, so hoisting both would hand every
-// consumer a type most of them must not use.
-#if defined(_WIN32)
-using PlatformListener = IocpListener;
-#elif defined(__linux__)
-using PlatformListener = EpollListener;
-#elif defined(__APPLE__)
-using PlatformListener = KqueueListener;
-#endif
 
 namespace
 {

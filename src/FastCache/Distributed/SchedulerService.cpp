@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <optional>
 #include <utility>
 
@@ -51,7 +52,14 @@ namespace
     constexpr std::array UncountedRefusals { Wire::ErrorCode::NotLeader,
                                              Wire::ErrorCode::NotAMember,
                                              Wire::ErrorCode::MalformedFrame,
-                                             Wire::ErrorCode::UnknownLease };
+                                             Wire::ErrorCode::UnknownLease,
+                                             // Cluster administration: an operator typed something, and what
+                                             // they typed is not a fact about fleet capacity. Counting these
+                                             // beside the lease refusals would put one person's typo into the
+                                             // numbers a fleet is sized from.
+                                             Wire::ErrorCode::NoCluster,
+                                             Wire::ErrorCode::InvalidClusterChange,
+                                             Wire::ErrorCode::StorageWriteFailed };
 
     /// Whether every refusal this service can produce is accounted for exactly once.
     ///
@@ -69,6 +77,36 @@ namespace
     }
 
     static_assert(RefusalsAreDisjoint(), "a refusal either moves a counter or is listed as moving none, never both");
+
+    /// One row per `ConsensusErrorCode`, in enumerator order: the wire code it
+    /// becomes when a proposal is refused.
+    ///
+    /// A table for the reason the two above are: a `switch` here and a `switch`
+    /// somewhere else drift, and a refusal reported under the wrong code sends an
+    /// operator to fix something that was never wrong. The last three rows are
+    /// peer-wire decode failures that a *local* proposal cannot produce -- they
+    /// exist because a reader disagreed with a sender about some bytes, and no
+    /// bytes are involved here -- so they map to the generic refusal, which is the
+    /// closed-by-default answer rather than a claim about what happened.
+    constexpr std::array ProposalRefusals {
+        Wire::ErrorCode::InvalidClusterChange, // InvalidConfiguration
+        Wire::ErrorCode::NotLeader,            // NotLeader
+        Wire::ErrorCode::StorageWriteFailed,   // StorageFailure
+        Wire::ErrorCode::InvalidClusterChange, // MalformedFrame
+        Wire::ErrorCode::InvalidClusterChange, // UnknownMessageType
+        Wire::ErrorCode::InvalidClusterChange, // UnsupportedVersion
+    };
+
+    static_assert(ProposalRefusals.size() == static_cast<std::size_t>(ConsensusErrorCode::UnsupportedVersion) + 1,
+                  "ProposalRefusals must hold one row per ConsensusErrorCode, in enumerator order");
+
+    /// The wire code a consensus refusal is reported as.
+    /// @param code What consensus said.
+    /// @return The wire code.
+    [[nodiscard]] constexpr Wire::ErrorCode WireCodeFor(ConsensusErrorCode code) noexcept
+    {
+        return ProposalRefusals[static_cast<std::size_t>(code)];
+    }
 
     /// One row per `PickError`, in enumerator order: the wire code it becomes.
     ///
@@ -124,6 +162,62 @@ void SchedulerService::SetRole(SchedulerRole role, std::string_view leaderEndpoi
 {
     _role = role;
     _leaderEndpoint.assign(leaderEndpoint);
+}
+
+SchedulerReply SchedulerService::Offer(Cluster::Command const& command)
+{
+    auto const proposed = _admin->ProposeToCluster(command);
+    if (proposed.has_value())
+        // Appended, not committed, and the reply says only that. A leader cannot
+        // know the difference until a majority answers, and an operator who wants
+        // to see the result asks for the state again -- which is a round trip they
+        // were going to make anyway.
+        return SchedulerReply::Success();
+
+    // The context rather than the code as the message, because these refusals are
+    // read by a person: "no such cluster setting: upsteam" is actionable and a
+    // numeric code is not. `NotLeader` is the exception the other way -- its
+    // message is a machine-readable endpoint a client redirects to -- so it names
+    // the leader when consensus knew one.
+    auto const& error = proposed.error();
+    auto const code = WireCodeFor(error.code);
+    if (code == Wire::ErrorCode::NotLeader)
+        return Refuse(code, error.knownLeader.value_or(std::string {}));
+    return Refuse(code, error.context);
+}
+
+SchedulerReply SchedulerService::ClusterStatus(CallerContext const& caller)
+{
+    if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+    if (_admin == nullptr)
+        return Refuse(Wire::ErrorCode::NoCluster);
+
+    return SchedulerReply::Success(Cluster::Encode(_admin->ClusterState()));
+}
+
+SchedulerReply SchedulerService::ClusterSet(CallerContext const& caller, std::string_view name, std::string_view value)
+{
+    if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+    if (_admin == nullptr)
+        return Refuse(Wire::ErrorCode::NoCluster);
+
+    return Offer(Cluster::Command { .kind = Cluster::CommandKind::SetSetting,
+                                    .key = std::string { name },
+                                    .value = std::string { value },
+                                    .schedulerEndpoint = {} });
+}
+
+SchedulerReply SchedulerService::ClusterForget(CallerContext const& caller, std::string_view memberId)
+{
+    if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+    if (_admin == nullptr)
+        return Refuse(Wire::ErrorCode::NoCluster);
+
+    return Offer(Cluster::Command {
+        .kind = Cluster::CommandKind::RemoveMember, .key = std::string { memberId }, .value = {}, .schedulerEndpoint = {} });
 }
 
 SchedulerReply SchedulerService::Refuse(Wire::ErrorCode code, std::string message) const

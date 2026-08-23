@@ -11,6 +11,7 @@
 ///
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
+#include "ClusterAdminCli.hpp"
 #include "ConsensusTier.hpp"
 #include "DiscoveryTier.hpp"
 #include "NodeConfig.hpp"
@@ -770,6 +771,22 @@ int main(int argc, char** argv)
         else
             std::cerr << "fastcache-compile-node: " << result.message << '\n';
         return result.exitCode;
+    }
+
+    // A question asked OF a running cluster, rather than a worker starting up.
+    // After the service block, because an installation is about this machine and
+    // this is about somebody else's; before the `--scheduler` and `--toolchain`
+    // checks, because a cluster command needs the first and not the second.
+    if (cfg.cluster.action != ClusterAction::None)
+    {
+        auto const answer = RunClusterAdmin(cfg, cfg.cluster);
+        if (!answer.has_value())
+        {
+            std::cerr << "fastcache-compile-node: " << answer.error() << '\n';
+            return ExitUsage;
+        }
+        std::cout << *answer;
+        return ExitOk;
     }
 
     // Both are refused at startup rather than at the first job. A worker missing

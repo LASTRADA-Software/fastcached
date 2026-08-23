@@ -323,6 +323,53 @@ cluster admitted is served by all three surfaces at once — its compile port, t
 scheduler, and every member's cache tier. `--fleet-member` is the answer before a
 cluster exists; this is the answer once one does.
 
+### Changing it while it runs
+
+The log carries the cluster's configuration so it can be changed without editing a
+file on every machine and restarting them. Three flags ask a running cluster
+directly, and each exits when it has an answer:
+
+```sh
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-status
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-set=upstream=cache.internal:6674
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-forget=n3
+```
+
+`--cluster-status` prints the members, the settings, and **every key this build
+knows** — because the question an operator usually has is "what *can* I set", and a
+report listing only what somebody had already set would answer it wrongly by
+omission.
+
+**They go through the same gate as everything else on that port**, which for a read
+is worth stating: a follower's copy of the state is perfectly valid and merely
+older, so `--cluster-status` could have been answered by any member. Refusing and
+naming the leader keeps one rule for the whole surface — a verb added without the
+gate is the regression the arrangement exists to make impossible — and it sends you
+to the node you would have needed anyway to change anything. A follower answers with
+where to ask instead:
+
+```
+fastcache-compile-node: this node does not lead the cluster; ask --scheduler=10.0.0.2:6675 instead
+```
+
+**A non-member is refused too**, and here anti-leeching is not about capacity: a
+stranger who could set `upstream` would point the whole fleet's cache at a host of
+their choosing.
+
+**A node running no cluster says so** rather than answering as though it had one. A
+single node started without `--node-id` leads itself and has no replicated state,
+which is a different fact from "ask somebody else" — being sent elsewhere would have
+you looking for a node that does not exist.
+
+**A change is reported as accepted, not as committed.** The leader appends the entry
+and answers; whether a majority has taken it is not something it knows yet. Ask for
+the status again to see the result — which is the round trip you were going to make
+anyway.
+
+**`--cluster-forget` is the one membership change nothing automatic makes.**
+Discovery only ever adds, for the reason below, so removing a machine that has left
+for good is a decision somebody makes on purpose.
+
 ### Finding peers instead of typing them
 
 `--raft-peer` works and needs no network magic, but it means editing a file on every
@@ -673,17 +720,9 @@ For anything beyond a trusted build network, put mTLS in front of every port.
   ([#87](https://github.com/LASTRADA-Software/fastcached/issues/87)).
   `--service-scope=user` works, and is the right answer on a developer machine
   anyway.
-- **Nothing changes a cluster setting at runtime yet.** The log carries them, a
-  leader can propose them, and every node applies and snapshots them — but there is
-  no operator surface that says "set `upstream` to this". Until there is,
-  `--upstream` on each node is what configures it.
 - **A discovered node joins the cluster's *state*, not its quorum.** The leader
   records it, every node then serves it, and it survives a restart — but
   `RaftNode`'s own member set still comes from `--raft-peer` at startup, so the new
   node does not yet vote and this node's transport does not yet dial it. What that
   costs today is that a node discovered at runtime is admitted to the fleet without
   taking part in electing its leader.
-- **The log is never compacted.** `CompactThroughApplied` exists and nothing calls
-  it, so a long-lived cluster's log grows without bound. It grows *slowly* —
-  cluster configuration changes are rare by construction — but "slowly" is not
-  "never" and this is the policy decision that closes it.

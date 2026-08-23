@@ -263,6 +263,83 @@ These constraints are load-bearing and have each already been a bug:
   null on Windows until it called `Detail::EnsureNetworkInitialised`, and no fake
   would ever have shown that.
 
+- **Consensus had never been RUN, and four defects were waiting where no unit test
+  could reach them.** `RaftNode`, `RaftLog`, `RaftDriver` and `RaftClusterHarness`
+  are exhaustively tested against a simulated cluster in one process — which is the
+  right place for the algorithm's rules, since a scripted partition is not something
+  three real processes can be made to reproduce. What that cannot reach is the wire,
+  the transport, the timers and the operator's own command line all having their
+  first say at once, and `scripts/cluster-e2e.sh` is what does. It found, in order:
+  - **`SyncRun` cannot drive a reactor.** It resumes a coroutine exactly once and
+    throws when the coroutine is still suspended, so `SyncRun(driver->Run(&reactor))`
+    aborted the process the moment `RaftDriver::Run` awaited `SleepUntil`. The
+    correct spelling is the one `ReactorServerLoop` already uses: submit the loop as
+    a `DetachedTask` and call `reactor.Run()`.
+  - **A blocking listener serves one peer and never accepts another.** With
+    `BlockingSocket`, every `co_await` inside `RaftPeerServer` completes
+    synchronously, so its per-connection `DetachedTask` — written detached precisely
+    so several peers can be read at once — runs to completion inline and the accept
+    loop never reaches its next iteration. In a three-node cluster each node reads
+    from exactly one of its two peers. Nothing crashes and nothing logs a fault; the
+    fleet simply never becomes ready. Hence `Net/PlatformListener.hpp`, and hence the
+    two loops sharing one reactor rather than owning a thread each.
+  - **`RaftPeerTransport::Start()` was called by nobody.** The outbound side owns a
+    thread per peer and starts them on request, so every node came up, listened,
+    ticked its own timers and sent *nothing*. Three nodes sat at `undecided` forever
+    with no error anywhere — the exact shape of failure this list keeps recording,
+    and invisible to a single-node cluster, which elects itself with no messages at
+    all.
+  - **A leader's ADDRESS arrives after its role does.** A node announces its own
+    record once elected, so the entry carrying its scheduler endpoint commits
+    strictly after the role change that provoked it. Publishing only on a role change
+    left every follower answering `NotLeader` with nothing for the rest of the term —
+    which a client cannot tell from an election in progress and answers by compiling
+    locally, every time. `ConsensusTier::Republish` therefore runs on a state change
+    as well, and suppresses only an answer that has genuinely not moved.
+
+  Two further consequences are worth stating on their own. **`RaftDriver` holds a
+  mutex now**, because the node is advanced from three routes by construction — the
+  timer loop, a peer reader, and whatever proposes a configuration change — and
+  `RaftNode` has no synchronization of its own, which is exactly what makes it
+  testable. And **the reactor is stopped by the loops themselves, when the second of
+  them finishes**, because `IReactor::Run` returns with its timer heap and its parked
+  work exactly where they were: a loop still suspended at that moment is a coroutine
+  frame nobody ever resumes and nobody ever frees. For the same reason
+  `RaftPeerServer::Shutdown` closes the connections it accepted and not only its
+  listener.
+
+- **A cluster setting that nothing can change at runtime is a log entry pretending to
+  be configuration.** The replicated log carried settings, applied them, snapshotted
+  them and replicated them — and no surface anywhere said "set `upstream` to this", so
+  the only way to configure a fleet was still `--upstream` on every machine, which is
+  the file-editing the log exists to replace. `Op::ClusterStatus` / `ClusterSet` /
+  `ClusterForget` on the scheduler's port close that, and four things about their
+  shape are load-bearing:
+  - **They go through the same `Gate()` as the dispatch verbs, the READ included.** A
+    follower's copy of the state is valid and merely older, so `ClusterStatus` could
+    have been answered anywhere; one rule for the whole surface is what makes "a verb
+    added without the gate" impossible, and it sends an operator to the node they
+    would need anyway to change anything. The refusal for a non-member is not about
+    capacity here: a stranger who could set `upstream` would point the whole fleet's
+    cache at a host of their choosing.
+  - **`NoCluster` is distinct from `NotLeader`, because the operator does something
+    different.** `NotLeader` names somewhere else to ask; `NoCluster` says the
+    question does not apply here at all — a single node started without `--node-id`
+    leads itself and has no replicated state. Answering the second with the first
+    sends somebody looking for a node that does not exist.
+  - **The consensus-to-wire refusal mapping is a table with one row per
+    `ConsensusErrorCode`, `static_assert`ed on its length.** A `switch` here and a
+    `switch` somewhere else drift, and a refusal reported under the wrong code sends
+    an operator to fix something that was never wrong. The three peer-wire decode
+    codes cannot arise from a *local* proposal — no bytes are involved — so they map
+    to the generic refusal rather than to a claim about what happened.
+  - **The reply says "accepted", never "committed".** A leader appends the entry and
+    answers; whether a majority has taken it is not something it knows yet, and a
+    tool that said otherwise would be the one kind of report that must not be wrong.
+    `IClusterAdmin` is the seam the scheduler reaches all of this through, which is
+    what lets the whole verb surface be tested against a fake that records what it was
+    asked to propose, with no log, no threads and no cluster.
+
 - **Absent is not empty, and a membership proposal is where that pays.**
   `Cluster::DesiredMember` carries `std::optional<std::string> schedulerEndpoint`
   while `ClusterMember` carries a plain string, and the difference is load-bearing in
@@ -2198,7 +2275,18 @@ rule and names only `fastcached`, which the table happens to reach first.)
 `dist-compile-e2e` additionally allocates its ports per run rather than fixing
 them. It needs four, and four more fixed ports is four more ways to collide with
 whatever else a CI runner is doing — a failure that reads as "distribution is
-broken" when it means "something else was listening".
+broken" when it means "something else was listening". `cluster-e2e` does the same
+with the six it needs.
+
+`cluster-e2e` is the consensus counterpart, and what it covers is deliberately
+disjoint from the unit tests rather than a slower repeat of them: three real
+processes elect a leader, a follower's refusal names an endpoint that a client then
+successfully dials, a setting replicates, a member is removed, and the cluster
+re-forms after its leader is killed. Every one of those is a property of the wire,
+the transport, the timers and the command line meeting at once — which
+`RaftClusterHarness` cannot reach precisely because it replaces all four. It is
+POSIX-only for now: the properties are platform-independent and the fixture is not,
+so a Windows counterpart would be a translation rather than new coverage.
 
 ## Releasing
 

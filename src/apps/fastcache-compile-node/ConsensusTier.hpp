@@ -5,6 +5,7 @@
 #include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
 
+#include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/ClusterStateMachine.hpp>
 #include <FastCache/Cluster/MembershipPolicy.hpp>
@@ -14,8 +15,10 @@
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/PlatformListener.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -88,30 +91,31 @@ namespace FastCache::Node
 /// and silently so, and getting it wrong is a dangling reference rather than a
 /// compile error.
 ///
-/// ## Two threads, not one
+/// ## One reactor, and the reason it is one
 ///
-/// `RaftDriver::Run` drives the election and heartbeat timers on a reactor;
-/// `RaftPeerServer::Run` blocks in `accept`. Neither can host the other — the
-/// driver's loop must not be held up by a peer that stopped reading, and the accept
-/// loop cannot service a timer wheel. They meet only through the message sink, which
-/// is the one place their threads touch.
-class ConsensusTier
+/// The election timers and the peer port share a reactor and a thread. The first
+/// version gave them one each, on the reasoning that `RaftDriver::Run` needs a
+/// timer wheel while `RaftPeerServer::Run` blocks in `accept` -- and both halves
+/// of that were wrong in a way nothing reported.
+///
+/// `SyncRun` cannot drive a reactor: it resumes a coroutine once and throws if it
+/// is still suspended, so a driver awaiting `SleepUntil` aborted the process the
+/// first time three nodes were started. And a *blocking* listener makes every
+/// `co_await` inside `RaftPeerServer` complete synchronously, so its
+/// per-connection task runs inline and the accept loop serves one peer and never
+/// accepts another -- in a three-node cluster, each node reads from one of its two
+/// peers and nobody is ever elected, with nothing crashing and nothing logging a
+/// fault.
+///
+/// So both loops are detached tasks on one `PlatformReactor`, which is what
+/// `RaftPeerServer`'s own documentation always said it wanted. The reactor stops
+/// when BOTH have finished rather than when somebody outside decides to:
+/// `IReactor::Run` returns with its timer heap and its parked work exactly where
+/// they were, so a loop still suspended at that moment is a coroutine frame nobody
+/// ever resumes and nobody ever frees.
+class ConsensusTier final: public Distributed::IClusterAdmin
 {
   public:
-    /// How often a parked `accept()` returns so a stop can be observed.
-    ///
-    /// The only portable way to wake one: POSIX does not unblock it when another
-    /// thread closes the socket. Short enough that a `systemctl stop` does not look
-    /// hung, long enough that an idle cluster is not spinning.
-    static constexpr std::chrono::milliseconds AcceptPoll { 250 };
-
-    /// How long a peer connection may stall before it is abandoned.
-    ///
-    /// Consensus messages are small and a peer that cannot take one in this long is
-    /// a peer whose absence the election timer should be deciding about, not a read
-    /// this node waits on.
-    static constexpr std::chrono::milliseconds PeerIoTimeout { 2'000 };
-
     /// Applied entries above the snapshot before the log is traded for one.
     ///
     /// A constant rather than a flag, deliberately. What this log carries is cluster
@@ -168,13 +172,13 @@ class ConsensusTier
     ConsensusTier(ConsensusTier&&) = delete;
     ConsensusTier& operator=(ConsensusTier&&) = delete;
 
-    /// Stops both loops and joins both threads.
+    /// Stops every loop and joins every thread.
     ///
     /// A destructor rather than a `Shutdown()` somebody has to remember at every
     /// return path — the lesson `AdminEndpoint` records. The peer server's listener
     /// is closed before its thread is joined, because POSIX does not unblock a
     /// parked `accept()`.
-    ~ConsensusTier();
+    ~ConsensusTier() override;
 
     /// Propose a change to the cluster's state.
     ///
@@ -189,7 +193,16 @@ class ConsensusTier
     ///
     /// By value, because the applying thread is not this one: see
     /// `ClusterStateMachine::State`.
-    [[nodiscard]] Cluster::ClusterState State() const;
+    [[nodiscard]] Cluster::ClusterState ClusterState() const override;
+
+    /// Offer a change to the cluster, discarding where it landed.
+    ///
+    /// The `IClusterAdmin` spelling of `Propose`. The index is dropped because the
+    /// caller is an operator surface and an index is not something an operator can
+    /// act on -- what they do next is ask for the state again either way.
+    /// @param command The change.
+    /// @return Nothing, or why it was refused.
+    [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& command) override;
 
     /// Add to what this node believes the membership should include.
     ///
@@ -221,7 +234,6 @@ class ConsensusTier
   private:
     ConsensusTier(Cluster::ClusterMember self,
                   Consensus::FileRaftStorage storage,
-                  std::unique_ptr<IListener> listener,
                   std::string boundEndpoint,
                   RoleObserver onRole,
                   MembersObserver onMembers,
@@ -234,9 +246,13 @@ class ConsensusTier
     /// is the same reason the reference chain is member-ordered rather than local.
     /// @param cfg The parsed configuration.
     /// @param members The bootstrap member set, already parsed and validated.
+    /// @param bindAddress Where the peer port binds.
+    /// @param bindPort The peer port.
     /// @return Nothing on success, or the fatal reason.
     [[nodiscard]] std::expected<void, std::string> Launch(NodeConfig const& cfg,
-                                                          std::vector<Cluster::ClusterMember> const& members);
+                                                          std::vector<Cluster::ClusterMember> const& members,
+                                                          std::string_view bindAddress,
+                                                          std::uint16_t bindPort);
 
     /// Translate a consensus role into the scheduler's, and pass it on.
     ///
@@ -248,6 +264,22 @@ class ConsensusTier
     /// @param knownLeader Who it believes leads, if anybody.
     void PublishRole(Consensus::Role role, std::optional<Consensus::NodeId> const& knownLeader);
 
+    /// Tell the scheduler what this node is, if that has changed since last time.
+    ///
+    /// Called both when consensus moves the role and when the replicated state
+    /// moves, because the two answers arrive separately and the second one is the
+    /// address. A node announces its own record once it is elected, so the entry
+    /// carrying the leader's scheduler endpoint commits strictly AFTER the role
+    /// change that provoked it -- and a follower that only ever heard the first of
+    /// those answers `NotLeader` with nothing for the rest of the term, which a
+    /// client cannot tell from an election in progress and answers by compiling
+    /// locally. Every time.
+    void Republish();
+
+    /// Act on a change to the replicated state.
+    /// @param state What the cluster now holds.
+    void OnStateChanged(Cluster::ClusterState const& state);
+
     /// Propose whatever the replicated state does not yet say, if this node may.
     ///
     /// A loop of its own rather than a call from the role observer, and that is
@@ -257,17 +289,37 @@ class ConsensusTier
     /// block, being on the path that still has to send the next heartbeat.
     void Reconcile();
 
+    /// Record that one of the two reactor loops has ended.
+    ///
+    /// The second one to call this stops the reactor. Public to the class only --
+    /// it is called from the detached tasks `Launch` submits, which are lambdas
+    /// rather than members and so reach it through a pointer.
+    void NoteLoopFinished() noexcept;
+
     ILogger& _logger;
 
     // Declaration order IS construction order, and each is referenced by the one
     // below it. This is the ordering the class exists to make the language check.
+
+    /// The clock the reactor stamps with, and the one `DriverSink` reads.
+    ///
+    /// They have to be the same kind: `DriverSink` reads `steady_clock` directly,
+    /// so a reactor on a wall clock would put a received message and a fired timer
+    /// on two timelines, and an NTP step would look like an election timeout.
+    SteadyClock _clock;
+
+    /// Constructed here and RUN on `_ioThread`, which is allowed and is what the
+    /// daemon's multi-reactor path already does: the descriptor is made in the
+    /// constructor and the loop is a separate call.
+    PlatformReactor _reactor { _clock };
+
     Consensus::FileRaftStorage _storage;
     std::unique_ptr<IRandomSource> _random;
     std::unique_ptr<IConnector> _connector;
     std::unique_ptr<Consensus::RaftPeerTransport> _transport;
     Cluster::ClusterStateMachine _application;
     std::unique_ptr<Consensus::RaftDriver> _driver;
-    std::unique_ptr<IListener> _listener;
+    std::unique_ptr<PlatformListener> _listener;
     std::unique_ptr<Consensus::IRaftMessageSink> _sink;
     std::unique_ptr<Consensus::RaftPeerServer> _peerServer;
 
@@ -281,6 +333,32 @@ class ConsensusTier
     /// never connect to. So a node announces itself, and only while it leads --
     /// which is exactly when its scheduler endpoint is the one clients need.
     Cluster::ClusterMember _self;
+
+    /// Told the member set whenever it changes; may be empty.
+    MembersObserver _onMembers;
+
+    /// What consensus last said, so a state change can be re-read against it.
+    Consensus::Role _lastRole { Consensus::Role::Follower };
+    std::optional<Consensus::NodeId> _lastLeader;
+
+    /// What the scheduler was last told, so an unchanged answer is not re-announced.
+    ///
+    /// Both halves, because either can move on its own: a role change with the same
+    /// leader endpoint is a real change, and so is the endpoint arriving for a
+    /// leader this node already knew about.
+    Distributed::SchedulerRole _publishedRole { Distributed::SchedulerRole::Undecided };
+    std::string _publishedEndpoint;
+
+    /// Whether the scheduler has been told anything at all yet.
+    ///
+    /// The first publish must happen even when it announces `Undecided`, and that
+    /// is not a formality: `SchedulerService` starts as a STANDALONE leader --
+    /// correct for a node with no `--node-id`, and wrong the instant there is a
+    /// cluster. Suppressing the first announcement because it equalled this
+    /// object's own initial value left the service leading, so all three nodes of
+    /// a fresh cluster answered as leader at once. Which is the exact failure the
+    /// consensus tier exists to prevent.
+    bool _published { false };
 
     /// Everything this node believes should be a member, `_self` included.
     ///
@@ -298,6 +376,12 @@ class ConsensusTier
     /// pass repeats.
     std::atomic<bool> _leads { false };
 
+    /// How many of the two reactor loops are still running.
+    ///
+    /// Whichever finishes last stops the reactor, so `Run()` never returns while a
+    /// coroutine is still parked on it -- which would leak that frame outright.
+    std::atomic<int> _loopsRunning { 2 };
+
     /// Wakes the reconciler for a stop rather than leaving it in a bare sleep.
     ///
     /// A stop that had to wait out a full interval would make teardown look hung
@@ -307,8 +391,7 @@ class ConsensusTier
     std::mutex _wakeMutex;
 
     // Started last and joined first, which the member order gives for free.
-    std::jthread _timerThread;
-    std::jthread _acceptThread;
+    std::jthread _ioThread;
     std::jthread _reconcileThread;
 };
 
