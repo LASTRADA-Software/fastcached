@@ -5,6 +5,8 @@
 #include <FastCache/Distributed/SchedulerService.hpp>
 
 #include <algorithm>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -101,24 +103,39 @@ class ClusterMembership final: public IMembershipOracle
     /// construction: membership is precisely the thing that changes while this
     /// object lives, and rebuilding the oracle on every join would mean handing a
     /// new one to a running server.
+    ///
+    /// **Thread-safe against `Classify`**, which is not a nicety here: the natural
+    /// caller is consensus, publishing what the cluster just agreed from its own
+    /// thread, while three surfaces classify callers on theirs. A plain vector
+    /// mutated under those readers is a data race whose symptom is a torn string
+    /// compare -- a peer admitted or refused at random, on a path where the answer
+    /// decides who may spend this machine's CPU.
     /// @param memberEndpoints The new set, as `host:port`.
     void Publish(std::vector<std::string> const& memberEndpoints)
     {
-        _hosts.clear();
-        _hosts.reserve(memberEndpoints.size());
+        std::vector<std::string> hosts;
+        hosts.reserve(memberEndpoints.size());
         for (auto const& endpoint: memberEndpoints)
         {
             // An endpoint that will not split is kept whole rather than dropped: a
             // member the set cannot represent must not silently stop being one, and a
             // bare host is a legitimate spelling for a peer whose port nobody recorded.
             auto const split = SplitHostPort(endpoint);
-            _hosts.push_back(split.has_value() ? split->first : endpoint);
+            hosts.push_back(split.has_value() ? split->first : endpoint);
         }
+
+        // Built outside the lock and swapped in, so a reader never observes a set
+        // that is half of the old one and half of the new -- which for a membership
+        // set is a window in which a member is neither admitted nor refused but
+        // both, depending on which surface asked.
+        std::unique_lock const guard { _mutex };
+        _hosts = std::move(hosts);
     }
 
     /// How many member hosts are currently admitted.
-    [[nodiscard]] std::size_t Size() const noexcept
+    [[nodiscard]] std::size_t Size() const
     {
+        std::shared_lock const guard { _mutex };
         return _hosts.size();
     }
 
@@ -142,6 +159,12 @@ class ClusterMembership final: public IMembershipOracle
         if (IsLoopbackHost(peerAddress))
             return Membership::Member;
 
+        // A shared lock: this is asked once per connection on three surfaces and
+        // written only when the cluster agrees a change, so readers must not
+        // serialize against each other over a list that is almost always identical
+        // to what the last reader saw.
+        std::shared_lock const guard { _mutex };
+
         // An empty list then refuses everybody else rather than admitting them. A node
         // that has not yet discovered a peer, or whose discovery is misconfigured,
         // must not silently become an open scheduler -- the failure would be
@@ -153,6 +176,10 @@ class ClusterMembership final: public IMembershipOracle
     }
 
   private:
+    /// Guards `_hosts`. Mutable because `Classify` and `Size` are logically const
+    /// and must still take it -- the alternative is a const method that reads a
+    /// vector somebody else is replacing.
+    mutable std::shared_mutex _mutex;
     std::vector<std::string> _hosts;
 };
 
