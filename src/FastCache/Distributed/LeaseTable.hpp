@@ -104,6 +104,23 @@ class LeaseTable
     /// @return How many leases were released.
     [[nodiscard]] std::size_t ReleaseWorker(std::string_view workerId);
 
+    /// Whether somebody is already compiling `key` right now.
+    ///
+    /// Exists so a caller can ask about the *key* before it has committed to a
+    /// *worker*, which `Acquire` cannot answer because it needs the worker id in
+    /// order to issue. That ordering is not a detail: asking for a worker first
+    /// means a duplicate request arriving at a full fleet is refused for capacity,
+    /// and an operator reads "buy more machines" where the truth is "this build
+    /// asked for the same object twice".
+    ///
+    /// Advisory rather than a reservation, and deliberately so: the answer can go
+    /// stale between this call and `Acquire`. `Acquire` is still the one that
+    /// decides, atomically, so a race costs the caller a refusal it would have got
+    /// anyway -- never a second lease on one key.
+    /// @param key The object key.
+    /// @return True when a live lease is outstanding for it.
+    [[nodiscard]] bool IsInFlight(std::string_view key) const;
+
     /// Number of live (unexpired) leases. For diagnostics and tests.
     [[nodiscard]] std::size_t LiveCount() const;
 

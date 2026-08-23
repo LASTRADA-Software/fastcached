@@ -1677,6 +1677,118 @@ terminal, and each has already been a bug:
   watching a worker start sees nothing during the part where something can still
   go wrong.
 
+**The scheduler lives where leadership lives, and that is not the cache daemon.**
+`WorkerRegistry` and `LeaseTable` used to be reached through a `Dispatch` role on one
+of `fastcached`'s listeners, which made the cache daemon a scheduler as well as a
+store. The two have opposite deployment shapes: a cache is shared infrastructure
+somebody operates, while handing out capacity is a decision only **one** node may
+make at a time — and nothing in `fastcached` can establish which node that is.
+`Distributed::SchedulerService` is that logic with leadership as a first-class
+input, and it is pure with respect to I/O for the reason the two tables under it
+are: every rule below is a `ManualClock` unit test rather than a socket and a sleep.
+Consequences that are each load-bearing:
+
+- **Leadership and membership are one `Gate()`, not a check per handler.** These are
+  the security- and policy-relevant decisions of the whole surface, so a verb added
+  without them would be a verb that quietly skips both — and the test asserts the
+  refusal *per verb* precisely because "I added a handler that forgot the gate" is
+  the regression the arrangement exists to make impossible.
+- **Leadership is asked first, and the reason is the diagnostic rather than the
+  cost.** A follower cannot know the cluster's membership any better than it knows
+  the fleet, so answering `NotAMember` there sends an operator to inspect a policy
+  that was never consulted. `NotLeader` carries the leader's endpoint **in the
+  message**, so a client redirects instead of giving up; `SchedulerRole::Undecided`
+  is the same code with an empty message, because an election in progress is a
+  different fact and there is nobody to name. Three roles rather than a `bool`, for
+  exactly that third state.
+- **Anti-leeching refuses the fleet, never the cache.** A non-member reads and
+  writes objects exactly as before — the cache is a separate service this class
+  cannot reach — and is refused only the fleet's CPU time, which is the thing
+  membership pays for. Hence `NotAMember` rather than `Unauthenticated`: one is
+  about a credential an endpoint requires, the other about contribution.
+  - **An empty member set refuses everybody, and "admit everybody" is a named type
+    somebody constructs.** `ClusterMembership` with nothing in it is the state of a
+    node whose discovery has not run, has the wrong key, or is misconfigured — and a
+    scheduler that answered "member" there would silently become an open one, which
+    is invisible from both ends because the fleet keeps working and merely serves
+    strangers too. `OpenMembership` is the right answer for one machine or a fleet
+    whose reachability is its boundary, but it is never a *default*: "no policy" and
+    "a policy that admits everybody" have to be the same explicit decision, which is
+    also why `Membership::Outsider` is the zero value. Matching is whole-string, not
+    by prefix — `10.0.0.1` must not admit `10.0.0.10` — and the port is part of the
+    identity, because the proof a peer gave covered the `(node, endpoint)` pair.
+  - **The identity is a HOST, and the two vocabularies are collapsed in the
+    constructor rather than left to each caller.** Discovery admits a peer at a
+    `(node, endpoint)` pair, so the obvious member set is endpoints — and matching a
+    caller against it would never succeed even once: a peer *connecting* to the
+    scheduler comes from an **ephemeral source port**, which is not its Raft endpoint,
+    so `ISocket::PeerAddress()` reports a bare host and there is nothing to compare a
+    port against. An endpoint-keyed set refuses every legitimate member while looking
+    entirely correct, and the fleet silently never distributes anything. So
+    `ClusterMembership` takes endpoints and stores their host parts, and `Classify`
+    takes a host; there is no way to publish one vocabulary and query the other. It
+    splits through `Core/HostPort` rather than locally, because `rfind(':')` on
+    `[::1]:7000` splits at the wrong colon — the defect that header exists to hold in
+    one place. An endpoint with no port is kept whole rather than dropped: a member the
+    set cannot represent must not silently stop being one. What this gives up is
+    recorded rather than hidden — two nodes behind one NAT are indistinguishable here,
+    which is acceptable because this refuses *strangers* rather than co-located peers,
+    and separating them needs a credential in the frame.
+  - **The oracle is a seam and not a call into `Cluster::PeerDirectory`.** The
+    dependency would run the wrong way — `Distributed` is the policy, `Cluster` is
+    one way of establishing the fact it needs — and the answer is *deployment*-shaped
+    rather than universal, which is what an interface is for. `Publish` is a setter
+    and one of the documented carve-outs to configuration-at-construction: membership
+    is precisely what changes while the object lives, and rebuilding the oracle per
+    join would mean handing a new one to a running server.
+- **Duplicate suppression is asked BEFORE capacity, and the order is the whole
+  point.** `LeaseTable::Acquire` needs a worker id, so the code this was lifted from
+  had to `Pick` first — which meant a second client missing the same key at a busy
+  fleet was told `NoCapacity`. Both conditions genuinely hold; the operator reads
+  "buy more machines" where the truth is "this build asked for the same object
+  twice", and it lands hardest exactly where duplicate suppression does the most
+  good: a wide parallel build where many translation units miss one key at once.
+  That is the same defect the no-worker/no-capacity split already exists to prevent,
+  reached by a third route. `LeaseTable::IsInFlight` is what makes the question
+  answerable without a worker; it is **advisory**, and `Acquire`'s own refusal stays
+  as the backstop for the race, because that one decides atomically. It reports
+  *liveness*, not presence — an expired entry is left behind until the next
+  `Acquire` for that key sweeps it, so a check on the map alone would refuse one key
+  forever after a single client abandoned it, with nothing saying so.
+- **A refusal that moves a counter says so in a table.** `RefusalTable` pairs each
+  code with the counter it moves, and `std::nullopt` is a legitimate row: a
+  malformed frame is a *client* defect, and counting it beside the capacity
+  refusals would put one broken build's noise into the numbers a fleet is sized
+  from. Four hand-written `Count(...)` calls beside four `Refuse(...)` calls are
+  four chances to forget one, and a refusal with no counter is invisible in exactly
+  the situation an operator is trying to diagnose.
+
+**The scheduler's port is reachable before membership is established, so its payload
+cap is the small one.** `SchedulerServer` refuses a frame declaring more than 64 KiB,
+against the cache port's 256 MiB, and the asymmetry is the whole point: the gate runs
+*inside* `SchedulerService`, i.e. after the frame has been read, so an unauthenticated
+peer can make this endpoint buffer whatever it declares. That is the same hole
+`OpDescriptor::maxPayload` closes for `AUTH`, reached by a different route, and it is
+closed the same way — a scheduler verb carries a fingerprint, an endpoint and a key,
+none of which is large. Three consequences:
+
+- **The check is on the DECLARED length, before the read**, so an over-cap frame costs
+  no allocation at all. Checking after would be a memory-exhaustion hole opened by the
+  check meant to close one.
+- **The refusal names both numbers and is a reply, not a close** — `payload-too-large`
+  with the ceiling in it, because "too large" alone tells an operator nothing about a
+  64 KiB limit, and a close is indistinguishable from a dead host.
+- **A wrong magic is still the one condition that closes.** With no declared length
+  there is nowhere to resynchronize to, so there is nothing an answer could mean.
+
+**An endpoint reports the port it bound, not the one it was asked for.** `Start` formats
+`BoundEndpoint()` from `listener->BoundPort()`, which matters because `0` means "pick a
+free one" — an endpoint echoing `:0` back cannot tell an operator, a log line or a test
+where it ended up. `ParseTcpPort` still refuses `0` as a *CLI* value, correctly: as
+something an operator types it names no port anyone could dial. The two rules are not in
+tension, and the node's tests find a free port by binding a probe and releasing it, the
+idiom `AdminEndpoint_test` already uses.
+
 `scripts/dist-compile-e2e.sh` asserts the consequence rather than the mechanism:
 that a worker's object is **byte-identical** to a locally compiled one. That single
 assertion is what fails if either rule is broken, and it is the whole soundness

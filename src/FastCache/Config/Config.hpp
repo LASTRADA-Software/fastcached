@@ -35,77 +35,6 @@ inline constexpr std::uint16_t DefaultPort { 6674 };
 /// protocols.
 inline constexpr std::uint16_t DefaultMetricsPort { 9259 };
 
-/// One listening endpoint. Multiple `BindConfig` entries on a single daemon
-/// let an operator serve plaintext on one interface (e.g. a private LAN)
-/// while terminating TLS on another (e.g. the public WAN) from one process.
-/// When `tls` is true the daemon must also be built with `FC_TLS_ENABLED`
-/// and the legacy `tlsCertPath` / `tlsKeyPath` fields must be populated;
-/// per-bind certs (SNI) are out of scope.
-/// What a listener is allowed to serve.
-///
-/// A bitmask rather than an enumeration of endpoint kinds, because an operator
-/// may legitimately want one endpoint to do both — and because the alternative,
-/// hard-coding "the cache port" and "the dispatch port", is the shape that makes
-/// exposure a build-time constant instead of their decision.
-///
-/// The default is `Cache` alone, and that default is the security posture. The
-/// compile-cache surface may reasonably be reachable across a build LAN; the
-/// surface that causes a compiler to *run* on someone else's machine must be
-/// something an operator switched on deliberately, on an endpoint they chose, so
-/// they can firewall it, require TLS on it, or simply never enable it. Serving
-/// both from one listener is expressible, but it has to be spelled.
-enum class ListenerRole : std::uint8_t
-{
-    Cache = 1U << 0,   ///< memcached / RESP / the 0xFC compile cache.
-    Dispatch = 1U << 1 ///< Distributed-execution scheduling verbs.
-};
-
-/// Bitwise OR of two roles, so a mask reads as `Cache | Dispatch`.
-[[nodiscard]] constexpr std::uint8_t operator|(ListenerRole a, ListenerRole b) noexcept
-{
-    return static_cast<std::uint8_t>(static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b));
-}
-
-/// Whether `mask` carries `role`.
-/// @param mask The listener's role mask.
-/// @param role The role being asked about.
-/// @return True when the listener serves that role.
-[[nodiscard]] constexpr bool HasRole(std::uint8_t mask, ListenerRole role) noexcept
-{
-    return (mask & static_cast<std::uint8_t>(role)) != 0;
-}
-
-/// A role's name in YAML, and the bit it sets.
-///
-/// A table rather than an if-ladder in the reader, for the reason every other
-/// table here exists: a third role is a row, and the name a config file spells is
-/// necessarily one the parser accepts. It is separate from `ListenerFlags` above
-/// because the two answer different questions -- that one maps a whole *flag* to
-/// a complete mask (`--listen-dispatch` means exactly Dispatch), while this maps
-/// one *role name* to one bit, so `roles: [cache, dispatch]` can be composed.
-struct ListenerRoleName
-{
-    std::string_view name; ///< Spelling accepted in `roles:`.
-    ListenerRole role;     ///< The bit it contributes.
-};
-
-/// Every role name a config file may use.
-inline constexpr std::array<ListenerRoleName, 2> ListenerRoleNames {
-    ListenerRoleName { .name = "cache", .role = ListenerRole::Cache },
-    ListenerRoleName { .name = "dispatch", .role = ListenerRole::Dispatch },
-};
-
-/// Look up a role by the name a config file spelled.
-/// @param name The spelling from `roles:`.
-/// @return The role, or nullopt when the name is not one of them.
-[[nodiscard]] constexpr std::optional<ListenerRole> ListenerRoleFor(std::string_view name) noexcept
-{
-    for (auto const& row: ListenerRoleNames)
-        if (row.name == name)
-            return row.role;
-    return std::nullopt;
-}
-
 /// One listener flag, and what an endpoint declared with it serves.
 ///
 /// The single source of truth for the mapping between a `--listen*` spelling and
@@ -122,17 +51,12 @@ struct ListenerFlagSpec
 {
     std::string_view flag; ///< Flag spelling, without the leading `--`.
     bool tls;              ///< Whether accepted sockets are TLS-wrapped.
-    std::uint8_t roles;    ///< What the endpoint is permitted to serve.
 };
 
 /// Every listener flag. Order is documentation order; lookup is by content.
-inline constexpr std::array<ListenerFlagSpec, 3> ListenerFlags {
-    ListenerFlagSpec { .flag = "listen", .tls = false, .roles = static_cast<std::uint8_t>(ListenerRole::Cache) },
-    ListenerFlagSpec { .flag = "listen-tls", .tls = true, .roles = static_cast<std::uint8_t>(ListenerRole::Cache) },
-    // Deliberately NOT `Cache | Dispatch`: the point of a separate endpoint is that
-    // the surface which causes a compiler to run elsewhere can be reached,
-    // firewalled and TLS-required independently of the one serving a cache.
-    ListenerFlagSpec { .flag = "listen-dispatch", .tls = false, .roles = static_cast<std::uint8_t>(ListenerRole::Dispatch) },
+inline constexpr std::array<ListenerFlagSpec, 2> ListenerFlags {
+    ListenerFlagSpec { .flag = "listen", .tls = false },
+    ListenerFlagSpec { .flag = "listen-tls", .tls = true },
 };
 
 struct BindConfig
@@ -141,9 +65,6 @@ struct BindConfig
     std::string address {};
     /// TCP port (1..65535).
     std::uint16_t port { 0 };
-    /// What this endpoint serves. Defaults to the cache alone; see `ListenerRole`
-    /// for why distributed execution is opt-in per endpoint rather than global.
-    std::uint8_t roles { static_cast<std::uint8_t>(ListenerRole::Cache) };
     /// When true, accepted sockets on this endpoint are wrapped through
     /// `TlsWrap` before the protocol handler ever sees a byte.
     bool tls { false };
@@ -165,7 +86,7 @@ struct BindConfig
 [[nodiscard]] constexpr std::string_view ListenFlagFor(BindConfig const& bind) noexcept
 {
     for (auto const& row: ListenerFlags)
-        if (row.tls == bind.tls && row.roles == bind.roles)
+        if (row.tls == bind.tls)
             return row.flag;
     return ListenerFlags.front().flag;
 }

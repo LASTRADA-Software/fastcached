@@ -134,28 +134,41 @@ STORE, the manifest and the statistics all take one path.
 
 ### The scheduler
 
-An ordinary `fastcached` with a second listener:
+The scheduler is a **compile node**, not the cache. Pick one machine and give it
+`--listen-scheduler`:
 
 ```sh
-fastcached --listen=0.0.0.0:6674 --listen-dispatch=0.0.0.0:6675
+fastcache-compile-node     --listen-scheduler=0.0.0.0:6675     --fleet-member=worker-01.internal     --fleet-member=worker-02.internal     --scheduler=127.0.0.1:6675     --advertise=scheduler.internal:6676     --toolchain=/usr/bin/g++
 ```
 
-Or in `/etc/fastcached/fastcached.yaml`:
+It used to be `fastcached --listen-dispatch=...`, and that flag is **gone** rather
+than deprecated. The two jobs have opposite deployment shapes: a cache is shared
+infrastructure somebody operates, while handing out capacity is a decision only
+**one** node may make at a time — and nothing in the cache daemon can establish
+which node that is. So scheduling moved to where cluster leadership lives.
 
-```yaml
-listeners:
-  - address: 0.0.0.0
-    port: 6674
-  - address: 0.0.0.0
-    port: 6675
-    roles: [dispatch]
-```
+A scheduling verb arriving at a `fastcached` listener is refused with a typed
+error naming where the scheduler went, so a client configured for the old layout
+tells you what to fix instead of failing mysteriously.
 
-The dispatch endpoint is deliberately separate. The cache may reasonably be
-reachable across a build LAN; the surface that makes a compiler **run** on
-another machine should be something you switch on and firewall on purpose. A
-dispatch request arriving on a cache-only listener is refused with a typed
-error, not served.
+Note that the scheduler also registers as a worker. Every node is a peer; being
+the one that schedules is a role, not a different program. If you do not want it
+taking work, give it a `--toolchain` nothing in your fleet compiles with.
+
+#### Who may use the fleet
+
+`--fleet-member` lists the hosts that may be scheduled onto it, and it is matched
+by **host**: a peer dials from an ephemeral source port, so an endpoint is not
+something a connection can be compared against.
+
+`--fleet-open` admits everybody, for one machine or a network that is already
+your boundary. One of the two is **required** — a scheduler with no member list
+refuses every caller, which is the right default and not a working configuration,
+so it is refused at startup rather than left to be discovered as a fleet that
+silently distributes nothing.
+
+Non-members are refused the *fleet*, never the *cache*: they read and write cached
+objects exactly as before. What membership pays for is CPU time.
 
 ### The workers
 
@@ -284,10 +297,13 @@ every other machine fetches.
 
 Start the scheduler with `--requirepass` and give the same secret to workers
 (`--requirepass`) and clients (`FASTCACHE_TOKEN`). Without it, anything that can
-reach the dispatch port can queue work onto your fleet.
+reach the scheduler port can queue work onto your fleet.
 
-Keep `--listen-dispatch` off any network you would not run a compiler for, and
+Keep `--listen-scheduler` off any network you would not run a compiler for, and
 put mTLS in front of both ports for anything beyond a trusted build network.
+`--fleet-member` is a policy about contribution rather than a credential: it stops
+a machine that is not part of your fleet from spending its capacity, and it is not
+a substitute for `--requirepass`.
 
 ## Limits worth knowing before you adopt it
 

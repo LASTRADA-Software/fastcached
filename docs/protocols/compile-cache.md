@@ -87,6 +87,16 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x0d` | unknown-lease | The lease token is unknown or has expired. |
 | `0x0e` | fingerprint-mismatch | The worker does not serve the toolchain the job names. |
 | `0x0f` | unsupported-codec | No codec in common with what the request offered. |
+| `0x10` | worker-scratch-unavailable | The worker could not prepare a scratch directory, or could not write the translation unit into it. |
+| `0x11` | worker-spawn-failed | The worker could not *start* the compiler. Not "the compiler rejected the code" — that is a successful exchange carrying a non-zero exit code. |
+| `0x12` | not-leader | This node does not lead the cluster. The message carries the leader's endpoint when one is known, and is empty during an election. |
+| `0x13` | not-a-member | The caller is not a member of this cluster, so it may not spend the fleet's capacity. It is still served the cache. |
+
+Every one of these is a **refusal the client answers by compiling locally**,
+never by failing. They are distinct codes rather than one "no" because they mean
+different things to an operator: `not-a-member` is a policy decision somebody
+made, `no-worker` is a fingerprint nobody in the fleet serves, `no-capacity` is a
+fleet that is too small, and `already-in-flight` is none of the three.
 
 ### STORE
 
@@ -119,11 +129,16 @@ arity does not depend on which credential style a client uses.
 
 ## Distributed execution
 
-Four more verbs turn the same wire into a scheduler and a worker protocol. They
-are served **only** on a listener an operator opted in with `--listen-dispatch`;
-a dispatch verb arriving on a cache-only listener is answered
-`dispatch-not-permitted` rather than served, because the surface that makes a
-compiler *run* on another machine should be firewalled separately from the cache.
+Four more verbs turn the same wire into a scheduler and a worker protocol. None
+of them is served by `fastcached`: the scheduler is `fastcache-compile-node
+--listen-scheduler` and the worker is the same binary's own port.
+
+A scheduling verb arriving at a cache listener is answered `dispatch-not-permitted`
+with a message naming where the scheduler went. It is a **reply**, not a dropped
+connection, and it keeps its opcode rather than becoming unknown — a client built
+against an older daemon has to learn *why* its scheduling stopped, and a close is
+indistinguishable from a dead host while `unknown-opcode` would say this daemon is
+too old when it is in fact too new.
 
 `REGISTER` carries **one** fingerprint, so a worker serving several toolchains
 registers once per toolchain. The scheduler keys a worker on
@@ -131,8 +146,8 @@ registers once per toolchain. The scheduler keys a worker on
 heartbeats the same machine-wide in-flight count, so the entries fill up together
 and the pool behaves as one rather than advertising N times the machine.
 
-`REGISTER`, `HEARTBEAT` and `LEASE` go to the scheduler. `COMPILE` goes to a
-worker, on its own port, and is the only verb a worker answers at all —
+`REGISTER`, `HEARTBEAT` and `LEASE` go to the scheduler; `COMPILE` goes to a
+worker on its own port, and is the only verb a worker answers at all —
 everything else, the scheduler's verbs included, is refused with
 `dispatch-not-permitted`, so a client that sent the wrong verb to the wrong port
 learns which rather than seeing a dropped connection it cannot tell from a dead
@@ -154,9 +169,12 @@ compile times vary by an order of magnitude within one build, so distributing
 arrivals rather than load queues a long translation unit behind another while a
 worker idles.
 
-Because the scheduler *is* the cache, it can also suppress duplicate work: when
-many clients miss the same key at once — the ordinary shape of a miss after a
-header change — only the first is dispatched and the rest compile locally.
+The scheduler also suppresses duplicate work: when many clients miss the same key
+at once — the ordinary shape of a miss after a header change — only the first is
+dispatched and the rest compile locally. That check runs **before** the capacity
+check, so a second client asking for a key already in flight at a busy fleet is
+told `already-in-flight` rather than `no-capacity`: both are true, but only one of
+them is something an operator can act on.
 
 ### Bulk fields carry a codec envelope
 

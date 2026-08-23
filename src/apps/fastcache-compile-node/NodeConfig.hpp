@@ -46,6 +46,24 @@ struct NodeConfig
     /// operator's decision, not this program's.
     std::string adminListen;
 
+    /// Where this node serves the fleet's scheduler verbs, or empty to leave it off.
+    ///
+    /// Off by default and for the same reason `--admin-listen` is: handing out other
+    /// machines' CPU time is an operator's decision, not something they get by
+    /// starting a worker. Unlike the admin endpoint, a bare port binds the WILDCARD
+    /// rather than loopback -- a scheduler no peer can dial is a scheduler that does
+    /// nothing, so loopback would be a default that silently cannot work, which is
+    /// exactly the shape `--advertise` is refused for.
+    std::string schedulerListen;
+
+    /// Peers this node will schedule work onto, as `host:port`; repeatable.
+    ///
+    /// Only the host part is used -- a peer connecting to the scheduler comes from an
+    /// ephemeral source port, so an endpoint is not something a connection can be
+    /// matched against. The endpoint form is accepted because it is what discovery
+    /// produces and what an operator has written down.
+    std::vector<std::string> fleetMembers;
+
     std::string token;
     std::string user;
     LogLevel logLevel { LogLevel::Info };
@@ -63,6 +81,15 @@ struct NodeConfig
     /// Where a POSIX daemonized run writes its pid, empty for none.
     std::string pidfile;
 
+    /// Admit every caller to the fleet, rather than only `--fleet-member` hosts.
+    ///
+    /// The right answer for one machine, or a fleet whose network reachability is
+    /// already its boundary. It is a *flag* rather than the behaviour you get by
+    /// listing no members, because "no policy" and "a policy that admits everybody"
+    /// have to be the same explicit decision -- listing nobody refuses everybody, and
+    /// a scheduler that quietly served strangers would look identical to a healthy one
+    /// from both ends.
+    bool fleetOpen { false };
     bool daemon { false };           ///< Fork into the background / run under the SCM.
     bool installService { false };   ///< Register with the platform's supervisor and exit.
     bool uninstallService { false }; ///< Remove that registration and exit.
@@ -111,6 +138,20 @@ struct NodeConfig
 /// @param cfg Configuration about to be baked into a registration.
 /// @return An explanatory message when the install must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg);
+
+/// Why this worker's scheduler configuration cannot work, if it cannot.
+///
+/// A *startup* rule rather than an install-time one, and the split is deliberate:
+/// each of these is fatal every time the process runs, not only when a registration
+/// is written, so gating them on `--install-service` would let a hand-started
+/// scheduler make the identical mistake with nothing saying so.
+///
+/// Every rule here describes a configuration that would **start successfully** and
+/// then not work -- silent from both ends, which is the shape this codebase refuses
+/// at the one moment an operator is watching.
+/// @param cfg The parsed configuration.
+/// @return The refusal and its remedy, or nullopt when the configuration can work.
+[[nodiscard]] std::optional<std::string> SchedulerPolicyRejection(NodeConfig const& cfg);
 
 /// Render the usage text from the same rows the parser matches.
 /// @param color Whether to emit ANSI colour.

@@ -746,13 +746,37 @@ try {
         $env:LOCALAPPDATA = Join-Path $scratch "state"
         New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
 
+        # One listener now, and only the cache. `fastcached` used to carry the
+        # scheduler too, on a second `--listen-dispatch` endpoint; that flag is gone.
+        # Handing out capacity is a decision only ONE node may make at a time, and
+        # nothing in the cache daemon can establish which node that is -- so the
+        # scheduler moved to where cluster leadership lives, which is the node.
         $daemonLog = Join-Path $scratch "daemon.log"
         $daemon = Start-Background $Fastcached @(
-            "--listen=127.0.0.1:$cachePort", "--listen-dispatch=127.0.0.1:$dispatchPort",
+            "--listen=127.0.0.1:$cachePort",
             "--storage-max-value=64M", "--log-level=info") $daemonLog
         $procs += $daemon
-        Wait-ForPort $cachePort    $daemon "daemon" $daemonLog
-        Wait-ForPort $dispatchPort $daemon "daemon (dispatch listener)" $daemonLog
+        Wait-ForPort $cachePort $daemon "daemon" $daemonLog
+
+        # A compile node running the fleet's scheduler. --fleet-open because every
+        # peer here is loopback -- and because the policy has to be STATED: a node
+        # with no member list refuses everybody, which is the right default and not a
+        # working configuration, so it is refused at startup.
+        #
+        # It names a toolchain nothing here compiles with, deliberately. Every node is
+        # both a peer and a possible scheduler, so it always registers as a worker too
+        # -- and a second MATCHING worker would make "which worker ran this job" a race
+        # that the cases below assert against by reading one worker's counters.
+        $schedWorkerPort = $BasePort + 6
+        $schedLog = Join-Path $scratch "scheduler.log"
+        $scheduler = Start-Background $Node @(
+            "--listen-scheduler=127.0.0.1:$dispatchPort", "--fleet-open",
+            "--scheduler=127.0.0.1:$dispatchPort", "--bind=127.0.0.1",
+            "--port=$schedWorkerPort", "--advertise=127.0.0.1:$schedWorkerPort",
+            "--toolchain=scheduler-only=$((Get-Command $cc).Source)", "--slots=1",
+            "--log-level=debug") $schedLog
+        $procs += $scheduler
+        Wait-ForPort $dispatchPort $scheduler "scheduler" $schedLog
 
         # Asked of the launcher rather than derived here. The fingerprint is a
         # digest over the compiler's whole include tree; a fixture that recomputed
@@ -955,10 +979,24 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
 
         $isoDaemonLog = Join-Path $scratch "iso-daemon.log"
         $isoDaemon = Start-Background $Fastcached @(
-            "--listen=127.0.0.1:$isoCache", "--listen-dispatch=127.0.0.1:$isoDispatch",
+            "--listen=127.0.0.1:$isoCache",
             "--log-level=info") $isoDaemonLog
         $procs += $isoDaemon
-        Wait-ForPort $isoDispatch $isoDaemon "isolation daemon" $isoDaemonLog
+        Wait-ForPort $isoCache $isoDaemon "isolation daemon" $isoDaemonLog
+
+        # A second SCHEDULER as well, so the mismatched worker is the only one
+        # registered with it -- and it too serves a toolchain nothing here uses, or it
+        # would BE a matching worker and the case would pass without testing anything.
+        $isoSchedWorker = $BasePort + 7
+        $isoSchedLog = Join-Path $scratch "iso-scheduler.log"
+        $isoScheduler = Start-Background $Node @(
+            "--listen-scheduler=127.0.0.1:$isoDispatch", "--fleet-open",
+            "--scheduler=127.0.0.1:$isoDispatch", "--bind=127.0.0.1",
+            "--port=$isoSchedWorker", "--advertise=127.0.0.1:$isoSchedWorker",
+            "--toolchain=also-not-the-compiler-this-client-uses=$((Get-Command $cc).Source)",
+            "--slots=1", "--log-level=debug") $isoSchedLog
+        $procs += $isoScheduler
+        Wait-ForPort $isoDispatch $isoScheduler "isolation scheduler" $isoSchedLog
 
         $isoWorkerLog = Join-Path $scratch "iso-worker.log"
         $isoNode = Start-Background $Node @(

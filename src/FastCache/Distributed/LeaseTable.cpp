@@ -99,6 +99,20 @@ std::size_t LeaseTable::ReleaseWorker(std::string_view workerId)
     return tokens.size();
 }
 
+bool LeaseTable::IsInFlight(std::string_view key) const
+{
+    std::scoped_lock const guard { _mutex };
+    auto const held = _tokenByKey.find(std::string { key });
+    if (held == _tokenByKey.end())
+        return false;
+
+    // Liveness, not mere presence. An expired entry is left behind until the next
+    // `Acquire` for that key sweeps it, so reporting on the map alone would refuse
+    // a key forever once one client had abandoned it.
+    auto const entry = _byToken.find(held->second);
+    return entry != _byToken.end() && IsLive(entry->second, _clock.Now());
+}
+
 std::size_t LeaseTable::LiveCount() const
 {
     std::scoped_lock const guard { _mutex };

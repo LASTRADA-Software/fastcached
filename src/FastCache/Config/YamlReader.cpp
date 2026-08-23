@@ -226,54 +226,6 @@ namespace
             {
                 bind.tls = kv.second.as<bool>();
             }
-            else if (k == "roles")
-            {
-                // A sequence, because a listener may serve more than one surface
-                // and "cache plus dispatch" has to be expressible -- it is simply
-                // not the default, which is the whole point of the separation.
-                if (!kv.second.IsSequence())
-                {
-                    auto rolesField = field;
-                    rolesField += ".roles";
-                    return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch,
-                                                     path,
-                                                     std::move(rolesField),
-                                                     "expected a sequence, e.g. [cache, dispatch]",
-                                                     line));
-                }
-                // Replaces the default rather than adding to it: an operator who
-                // writes `roles: [dispatch]` means dispatch ONLY, and silently
-                // keeping the cache role would leave the surface they were trying
-                // to isolate still serving the cache.
-                std::uint8_t mask = 0;
-                for (auto const& entry: kv.second)
-                {
-                    auto const name = entry.as<std::string>();
-                    auto const role = ListenerRoleFor(name);
-                    if (!role.has_value())
-                    {
-                        auto rolesField = field;
-                        rolesField += ".roles";
-                        return std::unexpected(MakeError(ConfigErrorCode::ParseError,
-                                                         path,
-                                                         std::move(rolesField),
-                                                         std::format("unknown role '{}'; expected cache or dispatch", name),
-                                                         YamlLine(entry)));
-                    }
-                    mask |= static_cast<std::uint8_t>(*role);
-                }
-                // An empty sequence would produce a listener that accepts
-                // connections and refuses every verb on them -- a port that looks
-                // open and answers nothing. Refused where it can be explained.
-                if (mask == 0)
-                {
-                    auto rolesField = field;
-                    rolesField += ".roles";
-                    return std::unexpected(MakeError(
-                        ConfigErrorCode::ParseError, path, std::move(rolesField), "at least one role is required", line));
-                }
-                bind.roles = mask;
-            }
             else
             {
                 auto unknownField = field;
