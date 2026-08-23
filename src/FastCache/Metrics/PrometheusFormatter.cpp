@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 
 #include <array>
@@ -13,14 +14,12 @@ namespace FastCache
 namespace
 {
 
-    /// Prometheus metric kind. Counters are monotonic; gauges may go up or down.
-    enum class MetricType : std::uint8_t
-    {
-        Counter,
-        Gauge,
-    };
-
     /// One rendered metric: fully-qualified name, help text, kind and value.
+    ///
+    /// Distinct from `CounterDescriptor` because the storage rows below have no
+    /// `IMetricsSink::Counter` to be described by — they come from a
+    /// `StorageStats` field instead. What the two share is the *rendering*, which
+    /// is the loop at the bottom.
     struct Metric
     {
         std::string_view name;
@@ -29,9 +28,13 @@ namespace
         std::uint64_t value;
     };
 
-    [[nodiscard]] constexpr std::string_view TypeName(MetricType type) noexcept
+    /// Append one metric's three exposition lines to `out`.
+    /// @param out Destination.
+    /// @param metric What to render.
+    void Append(std::string& out, Metric const& metric)
     {
-        return type == MetricType::Gauge ? "gauge" : "counter";
+        out += std::format(
+            "# HELP {0} {1}\n# TYPE {0} {2}\n{0} {3}\n", metric.name, metric.help, TypeName(metric.type), metric.value);
     }
 
 } // namespace
@@ -39,12 +42,12 @@ namespace
 std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
 {
     using enum MetricType;
-    using Sink = IMetricsSink::Counter;
     auto const& stats = snapshot.storage;
 
-    // Single source of truth: command/capacity metrics from the storage
-    // snapshot, connection metrics from the sink. Adding a row here is the only
-    // step needed to expose a new metric.
+    // Command and capacity metrics come from the storage snapshot, which is the
+    // authoritative source for them; the sink's own counters are rendered from
+    // `CounterTable` below rather than restated here, because a row that had to
+    // be added in two places is a row that gets added in one.
     auto const table = std::array {
         Metric {
             .name = "fastcached_cmd_get_total", .help = "GET commands processed.", .type = Counter, .value = stats.cmdGet },
@@ -128,14 +131,6 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
                  .help = "Entries that expired before ever being read.",
                  .type = Counter,
                  .value = stats.expiredUnfetched },
-        Metric { .name = "fastcached_connections_total",
-                 .help = "Connections accepted since start.",
-                 .type = Counter,
-                 .value = metrics.Read(Sink::ConnectionsTotal) },
-        Metric { .name = "fastcached_connections_rejected_total",
-                 .help = "Connections refused by admission control.",
-                 .type = Counter,
-                 .value = metrics.Read(Sink::ConnectionsAdmissionRejected) },
         Metric { .name = "fastcached_items",
                  .help = "Live entries currently stored.",
                  .type = Gauge,
@@ -158,10 +153,21 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
     // Each metric renders ~3 lines (HELP/TYPE/value); ~200 bytes is a generous
     // per-row estimate, so one reserve avoids the handful of reallocations the
     // += loop would otherwise do on every scrape.
-    out.reserve(table.size() * 200);
+    out.reserve((table.size() + CounterTable.size()) * 200);
     for (auto const& metric: table)
-        out += std::format(
-            "# HELP {0} {1}\n# TYPE {0} {2}\n{0} {3}\n", metric.name, metric.help, TypeName(metric.type), metric.value);
+        Append(out, metric);
+
+    // Every counter the sink knows, without exception. Exporting the *table*
+    // rather than a hand-picked subset is the whole point: seven of the eleven
+    // live counters used to be absent here, including all five the distributed-
+    // compilation guide tells an operator to read.
+    for (auto const& row: CounterTable)
+        Append(out,
+               Metric { .name = row.prometheusName,
+                        .help = row.help,
+                        .type = row.type,
+                        .value = metrics.Read(row.counter) });
+
     return out;
 }
 

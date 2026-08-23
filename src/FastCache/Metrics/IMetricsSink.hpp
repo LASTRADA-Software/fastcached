@@ -9,12 +9,26 @@
 namespace FastCache
 {
 
-/// Counter-style metrics sink. The cache engine, server, and protocol
-/// handlers increment counters via this interface. Snapshot() is read by
-/// the `stats` family of commands.
+/// Counter-style metrics sink for facts the *connection* layer knows.
 ///
-/// Designed thin on purpose: only counters today; histograms and gauges
-/// come later if/when needed. Implementations must be thread-safe.
+/// Designed thin on purpose: only counters today; histograms and gauges come
+/// later if/when needed. Implementations must be thread-safe.
+///
+/// ## What belongs here, and what does not
+///
+/// Command counts, hit/miss splits and evictions do **not**: those are
+/// `StorageStats`, produced by the storage that actually performs them, and that
+/// is what `stats`, `INFO` and `/metrics` all report. This enum used to carry a
+/// second set of enumerators for the same concepts — `CmdGet`, `CmdSet`,
+/// `CmdDelete`, `GetHits`, `GetMisses`, `Evictions`, `BytesIn`, `BytesOut` — and
+/// not one of them was incremented anywhere in the tree, so each exported a
+/// permanent zero under a name an operator would reasonably read as the real
+/// count. They are removed rather than wired up: a second source of truth for a
+/// number `StorageStats` already owns is the thing to avoid, not to complete.
+///
+/// Every remaining enumerator needs a row in `Metrics/MetricsCatalog.hpp`, which
+/// `static_assert`s that it has one — that is what makes a new counter reach
+/// `/metrics` by construction rather than by somebody remembering.
 class IMetricsSink
 {
   public:
@@ -27,13 +41,7 @@ class IMetricsSink
 
     enum class Counter : std::uint8_t
     {
-        CmdGet = 0,
-        CmdSet,
-        CmdDelete,
-        GetHits,
-        GetMisses,
-        Evictions,
-        ConnectionsTotal,
+        ConnectionsTotal = 0,
         ConnectionsAdmissionRejected,
         /// Subset of `ConnectionsTotal` that came in on a TLS-flagged
         /// bind. Lets operators attribute traffic to plaintext vs TLS
@@ -44,8 +52,6 @@ class IMetricsSink
         /// Subset of `ConnectionsAdmissionRejected` that came in on a
         /// TLS-flagged bind. Pairs with ConnectionsTotalTls.
         ConnectionsAdmissionRejectedTls,
-        BytesIn,
-        BytesOut,
         /// Lease requests the scheduler answered with a worker. The numerator of
         /// "is distribution actually happening", and meaningless without the
         /// refusals below it -- a fleet where every lease is granted and a fleet
@@ -105,53 +111,5 @@ class AtomicMetricsSink final: public IMetricsSink
   private:
     std::atomic<std::uint64_t> _counters[static_cast<std::size_t>(Counter::Last)] {};
 };
-
-/// Convert a counter to its canonical stats-line name (used by memcached
-/// `stats` and Redis `INFO`).
-/// @param counter Counter id.
-/// @return Lowercase canonical name (never empty).
-[[nodiscard]] constexpr std::string_view ToStringView(IMetricsSink::Counter counter) noexcept
-{
-    switch (counter)
-    {
-        case IMetricsSink::Counter::CmdGet:
-            return "cmd_get";
-        case IMetricsSink::Counter::CmdSet:
-            return "cmd_set";
-        case IMetricsSink::Counter::CmdDelete:
-            return "cmd_delete";
-        case IMetricsSink::Counter::GetHits:
-            return "get_hits";
-        case IMetricsSink::Counter::GetMisses:
-            return "get_misses";
-        case IMetricsSink::Counter::Evictions:
-            return "evictions";
-        case IMetricsSink::Counter::ConnectionsTotal:
-            return "connections_total";
-        case IMetricsSink::Counter::ConnectionsAdmissionRejected:
-            return "connections_rejected";
-        case IMetricsSink::Counter::ConnectionsTotalTls:
-            return "connections_total_tls";
-        case IMetricsSink::Counter::ConnectionsAdmissionRejectedTls:
-            return "connections_rejected_tls";
-        case IMetricsSink::Counter::BytesIn:
-            return "bytes_in";
-        case IMetricsSink::Counter::BytesOut:
-            return "bytes_out";
-        case IMetricsSink::Counter::DispatchLeasesGranted:
-            return "dispatch_leases_granted";
-        case IMetricsSink::Counter::DispatchLeasesNoWorker:
-            return "dispatch_leases_no_worker";
-        case IMetricsSink::Counter::DispatchLeasesNoCapacity:
-            return "dispatch_leases_no_capacity";
-        case IMetricsSink::Counter::DispatchLeasesDuplicate:
-            return "dispatch_leases_duplicate";
-        case IMetricsSink::Counter::DispatchWorkerRegistrations:
-            return "dispatch_worker_registrations";
-        case IMetricsSink::Counter::Last:
-            return "<last>";
-    }
-    return "<unknown>";
-}
 
 } // namespace FastCache
