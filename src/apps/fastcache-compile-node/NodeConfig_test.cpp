@@ -377,8 +377,8 @@ TEST_CASE("NodeConfig: a node class is parsed by name and refused by name", "[no
     // a rejection that cannot say that cannot be acted on.
     auto const wrong = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--node-class=server" });
     REQUIRE_FALSE(wrong.has_value());
-    CHECK(wrong.error().context.find("workstation") != std::string::npos);
-    CHECK(wrong.error().context.find("dedicated") != std::string::npos);
+    CHECK(wrong.error().context.contains("workstation"));
+    CHECK(wrong.error().context.contains("dedicated"));
 }
 
 TEST_CASE("NodeConfig: a reserve of zero parses, unlike a slot count of zero", "[node][cli]")
