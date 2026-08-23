@@ -503,7 +503,7 @@ TEST_CASE("CliParser: --help names every location the daemon would read a config
     // same table the lookup walks, so a new location cannot be added without
     // showing up here.
     for (auto const& candidate: FastCache::DefaultConfigCandidates())
-        REQUIRE(usage.contains(candidate.display));
+        REQUIRE(usage.contains(FastCache::ExpandApplicationName(candidate.display, FastCache::DaemonApplicationName)));
 }
 
 TEST_CASE("CliParser: --seed-config parses and selects the seeding action", "[config][cli]")

@@ -85,7 +85,10 @@ src/FastCache/
                 ISignalSource, DaemonControls (process-wide stop/reload flags),
                 CpuAffinity, HostMemory, HostInfo (what a machine IS: OS, version,
                 architecture, disk space -- the facts a scheduler weighs),
-                ServiceControl, Terminal,
+                ServiceControl (ServiceSpec: what to launch, with which
+                arguments, under which name and account -- the seam that lets one
+                implementation of "install this as a service" serve more than one
+                binary), Terminal,
                 Environment (the one place the process environment is read),
                 FileTrust (could only an administrator have put a file here?)
   Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader,
@@ -128,7 +131,11 @@ src/apps/
   fastcache-compile-node/   the compile worker (FASTCACHED_BUILD_NODE, default
                             ON) — registers with a scheduler's `--listen-dispatch`
                             endpoint, then answers exactly one verb, `Compile`,
-                            on its own port. It takes a *fingerprint* from a job
+                            on its own port. Carries its own daemon shell:
+                            `NodeConfig` and its option table live in their own
+                            translation unit (main.cpp is in no test target) so
+                            `MakeNodeServiceSpec` and the install-time
+                            `NodeServiceRejection` can be tested. It takes a *fingerprint* from a job
                             and never a program: the compiler comes from this
                             node's own `--toolchain` table, which is what keeps a
                             build accelerator from being a remote shell. Links
@@ -170,6 +177,74 @@ packaging/
 
 `cmake/Packaging.cmake` turns that into `.deb`/`.rpm`/`.pkg`/`.msi` via CPack.
 These constraints are load-bearing and have each already been a bug:
+
+- **A service to register is a `ServiceSpec`, and what it runs as is part of it.**
+  Every function in `Platform/ServiceControl` took `Config const&` -- the *daemon's*
+  configuration type -- so a second binary could reach none of it without either
+  depending on the daemon's configuration or growing a parallel copy of a 1273-line
+  file. That is the whole reason `fastcache-compile-node` had no service integration
+  on macOS or Windows. Four things about the seam's shape are load-bearing:
+  - **`daemonFlag` is a field rather than an argument**, because the two supervisors
+    disagree and one spec has to answer both: the Windows SCM needs it (it is the
+    hook that hands control to `WindowsServiceHost`) and launchd needs its absence,
+    since like systemd it supervises the process it started and reaps a job that
+    forks as "exited".
+  - **`serviceAccount` and `ownedDirectories` replaced a constant and a reach into
+    `cfg.storagePath`.** Which account a service runs as, and which directories it
+    must own before its first write, are properties of the *service*. The rule they
+    carry is unchanged and still the point: only directories the operator actually
+    named, never a parent -- `--storage=/var/db/fc` must not hand `/var/db`, shared
+    with other system services, to an unprivileged cache account.
+  - **An empty `serviceAccount` means root, so a worker names one.** A system-scope
+    launchd job with no `UserName` runs as root, and `fastcache-compile-node`
+    compiles input that arrived over the network. Naming `fastcache-node` -- the
+    account the Linux unit already uses -- puts the existing "that account does not
+    exist" guard in the way, so a macOS system-scope install **refuses** until the
+    package creates it rather than silently succeeding with root privileges
+    (issue #87). It is deliberately not the daemon's `_fastcached`: one account
+    would let a compromised compile rewrite every cached object.
+  - **`BuildServiceArgv` stays hand-written per binary.** An `OptionSpec` says how
+    to *parse* a flag and carries no way to read a value back out, so "emit every
+    field that differs from its default" cannot be written once generically. Each
+    binary's version is guarded by a test that walks its own option table and
+    requires every non-excluded row to be emitted -- the daemon's table once
+    stopped after nine fields, so `--install-service --tls --metrics` reported
+    success and registered a plaintext, unmonitored daemon.
+  - **The refactor was checked to change nothing rather than argued to.** The
+    registered command line is byte-identical to the one the previous version
+    produced, which is why `--daemon` is inserted at the *front*: nothing downstream
+    cares about flag order, and a refactor that can be shown to be identity is worth
+    more than one that merely ought to be.
+- **An install-time refusal is the only place an operator is watching.** Every rule
+  in `NodeServiceRejection` describes a registration that would **succeed** and then
+  produce a service which cannot do its job -- silent from both ends, since the
+  operator is told it was installed and nothing later says otherwise. `--advertise`
+  is the one worth naming: left empty it bakes in `{--bind}:{--port}`, and `--bind`
+  defaults to `0.0.0.0`, which is not an address a client can dial. Such a worker
+  registers, heartbeats happily, is leased out by the scheduler, and is never
+  reached. `--scheduler` and `--toolchain` get the same treatment because each
+  would start and exit at every boot. Two related choices: an **uninstall** is not
+  gated the same way -- refusing to remove a registration because it was
+  misconfigured is how a bad one becomes permanent -- and a bare compiler path is
+  **not** resolved to a fingerprint at install time, because the worker derives that
+  at startup through the identical code its clients use and a digest computed once
+  would pin the registration to a toolchain an update then changes underneath it.
+- **A candidate config location names an application, not `fastcached`.** Every row
+  of `DefaultConfigCandidates()` hardcoded the daemon's file name, so a second
+  binary had nothing to generalize onto. The rows carry `{app}` now, and two things
+  about that are deliberate: the table stays `constexpr` so its four `static_assert`s
+  keep stopping the *build* rather than waiting for `ctest`, and the substitution is
+  a literal replace rather than `std::format` -- a display form already contains
+  `%VAR%` on Windows and `$VAR` on POSIX, so a third meta-syntax whose braces are
+  also `std::format`'s own grammar is how a path containing a brace becomes a thrown
+  exception at startup.
+- **A daemon host wraps the body, so what must reach a terminal has to happen
+  first.** `WorkerBody` is separate from `main` because `IDaemonHost` double-forks on
+  POSIX or hands control to the SCM, and neither can wrap a `main` that has already
+  parsed, validated and registered. The cheap, fallible checks stay in `main`
+  deliberately: run inside the body they would print their diagnosis to a stdout the
+  POSIX host has already redirected to `/dev/null`, so a misconfigured worker would
+  exit in silence.
 
 - **A return type is not part of a function's name on Linux, and MSVC's mangling
   hides that.** `Core/HostPort.hpp` added an `inline FastCache::ParsePort(

@@ -15,19 +15,43 @@
 #include <string_view>
 #include <vector>
 
-using FastCache::BuildServiceCommandLine;
+namespace
+{
+/// The `ServiceSpec` the daemon would register for @p cfg.
+///
+/// These cases are about which *flags* survive a round trip into a
+/// supervisor, which is unchanged; what moved is that the platform half now
+/// speaks `ServiceSpec` rather than the daemon's `Config`. Routing through
+/// `MakeDaemonServiceSpec` keeps each case asking its original question.
+/// @param exePath Executable to register.
+/// @param cfg Configuration to bake in.
+/// @return The spec.
+[[nodiscard]] FastCache::ServiceSpec SpecFor(std::filesystem::path const& exePath, FastCache::Config const& cfg)
+{
+    return FastCache::MakeDaemonServiceSpec(exePath, cfg);
+}
+
+/// The command line the SCM would be launched with for @p cfg.
+/// @param exePath Executable to register.
+/// @param cfg Configuration to bake in.
+/// @return The fully-quoted command line.
+[[nodiscard]] std::string CommandLineFor(std::filesystem::path const& exePath, FastCache::Config const& cfg)
+{
+    return FastCache::BuildServiceCommandLine(SpecFor(exePath, cfg));
+}
+} // namespace
 
 TEST_CASE("ServiceControl: default config yields a minimal command line", "[platform][service]")
 {
     FastCache::Config const cfg {};
-    auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
+    auto const cmd = CommandLineFor(std::filesystem::path { "fastcached" }, cfg);
     REQUIRE(cmd == "\"fastcached\" --daemon --service-name=FastCached");
 }
 
 TEST_CASE("ServiceControl: the executable path is always quoted", "[platform][service]")
 {
     FastCache::Config const cfg {};
-    auto const cmd = BuildServiceCommandLine(std::filesystem::path { "C:/Program Files/fastcached.exe" }, cfg);
+    auto const cmd = CommandLineFor(std::filesystem::path { "C:/Program Files/fastcached.exe" }, cfg);
     REQUIRE(cmd.starts_with("\"C:/Program Files/fastcached.exe\" --daemon"));
 }
 
@@ -39,7 +63,7 @@ TEST_CASE("ServiceControl: non-default scalar flags are baked in", "[platform][s
     cfg.workerThreads = 8;
     cfg.maxMemoryBytes = 128U * 1024U * 1024U;
     cfg.storageShards = 4;
-    auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
+    auto const cmd = CommandLineFor(std::filesystem::path { "fastcached" }, cfg);
     REQUIRE(cmd.contains("--port=6000"));
     REQUIRE(cmd.contains("--bind=0.0.0.0"));
     REQUIRE(cmd.contains("--threads=8"));
@@ -50,7 +74,7 @@ TEST_CASE("ServiceControl: non-default scalar flags are baked in", "[platform][s
 TEST_CASE("ServiceControl: flags left at their default are omitted", "[platform][service]")
 {
     FastCache::Config const cfg {};
-    auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
+    auto const cmd = CommandLineFor(std::filesystem::path { "fastcached" }, cfg);
     REQUIRE(!cmd.contains("--port="));
     REQUIRE(!cmd.contains("--bind="));
     REQUIRE(!cmd.contains("--max-memory="));
@@ -64,7 +88,7 @@ TEST_CASE("ServiceControl: enum flags use their CLI spellings", "[platform][serv
     FastCache::Config cfg {};
     cfg.logLevel = FastCache::LogLevel::Debug;
     cfg.storageDurability = FastCache::StorageDurability::Fsync;
-    auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
+    auto const cmd = CommandLineFor(std::filesystem::path { "fastcached" }, cfg);
     REQUIRE(cmd.contains("--log-level=debug"));
     REQUIRE(cmd.contains("--storage-durability=fsync"));
 }
@@ -73,7 +97,7 @@ TEST_CASE("ServiceControl: the service name is always emitted, quoted when it ha
 {
     FastCache::Config cfg {};
     cfg.serviceName = "My Cache";
-    auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
+    auto const cmd = CommandLineFor(std::filesystem::path { "fastcached" }, cfg);
     REQUIRE(cmd.contains("--service-name=\"My Cache\""));
 }
 
@@ -81,7 +105,7 @@ TEST_CASE("ServiceControl: a relative storage path is absolutized", "[platform][
 {
     FastCache::Config cfg {};
     cfg.storagePath = "relative/cache.cow";
-    auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
+    auto const cmd = CommandLineFor(std::filesystem::path { "fastcached" }, cfg);
 
     auto const expected = std::filesystem::absolute("relative/cache.cow").string();
     REQUIRE(cmd.contains(expected));
@@ -94,8 +118,9 @@ TEST_CASE("ServiceControl: install/uninstall are unsupported without a superviso
 {
 #if !defined(_WIN32) && !defined(__APPLE__)
     FastCache::Config const cfg {};
-    auto const installed = FastCache::InstallService(cfg);
-    auto const removed = FastCache::UninstallService(cfg);
+    auto const spec = SpecFor(std::filesystem::path { "fastcached" }, cfg);
+    auto const installed = FastCache::InstallService(spec);
+    auto const removed = FastCache::UninstallService(spec);
     REQUIRE(installed.exitCode != 0);
     REQUIRE(removed.exitCode != 0);
 #else
@@ -119,7 +144,7 @@ namespace
 /// The plist a default config produces in @p scope, for the assertions below.
 [[nodiscard]] std::string PlistFor(FastCache::Config const& cfg, ServiceScope scope)
 {
-    return BuildLaunchdPlist(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, cfg, scope, "/tmp/logs");
+    return BuildLaunchdPlist(SpecFor(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, cfg), scope, "/tmp/logs");
 }
 } // namespace
 
@@ -166,17 +191,17 @@ TEST_CASE("ServiceControl: an unset path flag is omitted rather than absolutized
 TEST_CASE("ServiceControl: the launchd label is reverse-DNS and lowercased", "[platform][service][launchd]")
 {
     FastCache::Config cfg {};
-    REQUIRE(FastCache::LaunchdLabel(cfg) == "software.lastrada.fastcached");
+    REQUIRE(FastCache::LaunchdLabel(SpecFor("fastcached", cfg)) == "software.lastrada.fastcached");
 
     cfg.serviceName = "FastCachedSmoke";
-    REQUIRE(FastCache::LaunchdLabel(cfg) == "software.lastrada.fastcachedsmoke");
+    REQUIRE(FastCache::LaunchdLabel(SpecFor("fastcached", cfg)) == "software.lastrada.fastcachedsmoke");
 }
 
 TEST_CASE("ServiceControl: the plist path follows the scope", "[platform][service][launchd]")
 {
     FastCache::Config const cfg {};
-    auto const user = FastCache::LaunchdPlistPath(cfg, ServiceScope::User, "/Users/jo");
-    auto const system = FastCache::LaunchdPlistPath(cfg, ServiceScope::System, "/Users/jo");
+    auto const user = FastCache::LaunchdPlistPath(SpecFor("fastcached", cfg), ServiceScope::User, "/Users/jo");
+    auto const system = FastCache::LaunchdPlistPath(SpecFor("fastcached", cfg), ServiceScope::System, "/Users/jo");
 
     REQUIRE(user == std::filesystem::path { "/Users/jo/Library/LaunchAgents/software.lastrada.fastcached.plist" });
     REQUIRE(system == std::filesystem::path { "/Library/LaunchDaemons/software.lastrada.fastcached.plist" });
@@ -376,7 +401,7 @@ TEST_CASE("ServiceControl: dropping a password is reported, not silent", "[platf
     // while printing "installed and started" — the failure mode this guards.
     FastCache::Config cfg {};
     cfg.requirePass = "hunter2";
-    auto const rejection = FastCache::InlineCredentialRejection(cfg);
+    auto const rejection = FastCache::InlineCredentialRejection(SpecFor("fastcached", cfg));
     REQUIRE(rejection.has_value());
     REQUIRE(rejection.value_or("").contains("--config"));
 
@@ -386,12 +411,12 @@ TEST_CASE("ServiceControl: dropping a password is reported, not silent", "[platf
     // silent drop under another name. The operator was told their password had
     // been registered and got a daemon serving with no authentication at all.
     cfg.configPath = "/opt/fastcached/etc/fastcached.yaml";
-    auto const withConfig = FastCache::InlineCredentialRejection(cfg);
+    auto const withConfig = FastCache::InlineCredentialRejection(SpecFor("fastcached", cfg));
     REQUIRE(withConfig.has_value());
     REQUIRE(withConfig.value_or("").contains("/opt/fastcached/etc/fastcached.yaml"));
 
     // And a config with no secret at all is never in the way.
-    REQUIRE(!FastCache::InlineCredentialRejection(FastCache::Config {}).has_value());
+    REQUIRE(!FastCache::InlineCredentialRejection(SpecFor("fastcached", FastCache::Config {})).has_value());
 }
 
 TEST_CASE("ServiceControl: an IPv6 listener round-trips through its own parser", "[platform][service]")
@@ -454,7 +479,7 @@ TEST_CASE("ServiceControl: a value ending in a backslash survives quoting", "[pl
     cfg.storagePath = R"(C:\Program Files\fastcached\cache\)";
     cfg.pidfile = R"(C:\run\fastcached.pid)";
 
-    auto const cmd = BuildServiceCommandLine(std::filesystem::path { "fastcached" }, cfg);
+    auto const cmd = CommandLineFor(std::filesystem::path { "fastcached" }, cfg);
 
     // The pidfile flag must still be recognisable as its own token; if the
     // storage value swallowed it, this is what would go missing.
@@ -475,7 +500,7 @@ TEST_CASE("ServiceControl: a service name that escapes its directory is refused"
     auto rejects = [](std::string_view name) {
         FastCache::Config cfg {};
         cfg.serviceName = name;
-        return FastCache::ServiceNameRejection(cfg).has_value();
+        return FastCache::ServiceNameRejection(SpecFor("fastcached", cfg)).has_value();
     };
 
     REQUIRE(rejects("../../../../etc/periodic/daily/zz"));
@@ -583,11 +608,11 @@ TEST_CASE("ServiceControl: every registration rule gates an install", "[platform
     // on one supervisor and forgotten on the other.
     FastCache::Config named {};
     named.serviceName = "../escape";
-    REQUIRE(FastCache::ServiceRegistrationRejection(named).has_value());
+    REQUIRE(FastCache::ServiceRegistrationRejection(SpecFor("fastcached", named)).has_value());
 
     FastCache::Config secret {};
     secret.requirePass = "hunter2";
-    REQUIRE(FastCache::ServiceRegistrationRejection(secret).has_value());
+    REQUIRE(FastCache::ServiceRegistrationRejection(SpecFor("fastcached", secret)).has_value());
 
-    REQUIRE(!FastCache::ServiceRegistrationRejection(FastCache::Config {}).has_value());
+    REQUIRE(!FastCache::ServiceRegistrationRejection(SpecFor("fastcached", FastCache::Config {})).has_value());
 }

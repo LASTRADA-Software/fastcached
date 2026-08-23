@@ -39,6 +39,46 @@ extern char** environ;
 namespace FastCache
 {
 
+std::filesystem::path CurrentExecutablePath()
+{
+#if defined(_WIN32)
+    std::string buffer(MAX_PATH, '\0');
+    while (true)
+    {
+        auto const copied = GetModuleFileNameA(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (copied == 0)
+            return {};
+        if (copied < buffer.size())
+        {
+            buffer.resize(copied);
+            return std::filesystem::path { buffer };
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+#elif defined(__APPLE__)
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size); // Sets `size` to what is required.
+    std::string buffer(size, '\0');
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0)
+        return {};
+    buffer.resize(std::strlen(buffer.c_str()));
+
+    // _NSGetExecutablePath may hand back a path containing symlinks or `..`;
+    // launchd records ProgramArguments verbatim, so resolve it once here
+    // rather than pinning the job to a path that may later dangle.
+    std::error_code ec;
+    auto const resolved = std::filesystem::canonical(buffer, ec);
+    return ec ? std::filesystem::path { buffer } : resolved;
+#else
+    // Linux and the BSDs. Resolved rather than read raw for the same reason the
+    // macOS arm resolves: whatever records this path keeps it verbatim, and a
+    // path through a symlink that later moves pins a service to nothing.
+    std::error_code ec;
+    auto const resolved = std::filesystem::read_symlink("/proc/self/exe", ec);
+    return ec ? std::filesystem::path {} : resolved;
+#endif
+}
+
 namespace
 {
     /// CLI spelling of a LogLevel, matching the values ParseLogLevel accepts.
@@ -278,9 +318,42 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath, 
     return argv;
 }
 
-std::optional<std::string> InlineCredentialRejection(Config const& cfg)
+ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, Config const& cfg)
 {
-    if (cfg.requirePass.empty())
+    // The dedicated account a system-wide job runs as, created by the package's
+    // postinstall. Mirrors the `fastcached` user in
+    // packaging/linux/fastcached.sysusers. It lives here, with the daemon's own
+    // spec, rather than beside the launchd code that used to hardcode it: which
+    // account a service runs as is a property of the service, and a second
+    // binary registering itself may well want a different one.
+    constexpr std::string_view DaemonServiceAccount = "_fastcached";
+
+    // EmitDaemonFlag::No, and the flag carried separately: the spec has to be
+    // able to answer both supervisors, and only the SCM wants backgrounding.
+    auto argv = BuildServiceArgv(exePath, cfg, EmitDaemonFlag::No);
+
+    // argv[0] is the executable, which the spec holds in its own field.
+    argv.erase(argv.begin());
+
+    std::vector<std::filesystem::path> owned;
+    if (!cfg.storagePath.empty())
+        owned.emplace_back(cfg.storagePath);
+
+    return ServiceSpec { .serviceName = cfg.serviceName,
+                         .exePath = exePath,
+                         .arguments = std::move(argv),
+                         .daemonFlag = "--daemon",
+                         .displayName = "fastcached",
+                         .description = "fastcached — fast cache daemon",
+                         .serviceAccount = std::string { DaemonServiceAccount },
+                         .ownedDirectories = std::move(owned),
+                         .inlineCredential = cfg.requirePass.empty() ? InlineCredential::Absent : InlineCredential::Present,
+                         .configPath = cfg.configPath };
+}
+
+std::optional<std::string> InlineCredentialRejection(ServiceSpec const& spec)
+{
+    if (spec.inlineCredential == InlineCredential::Absent)
         return std::nullopt;
 
     // A supervisor records its launch arguments in a file every local user can
@@ -296,7 +369,7 @@ std::optional<std::string> InlineCredentialRejection(Config const& cfg)
         "Put `requirepass:` in a config file (mode 0640, readable by the account the service runs as) "
         "and install with --config=<path> instead.";
 
-    if (cfg.configPath.empty())
+    if (spec.configPath.empty())
         return std::string { Preamble };
 
     // --config does not make the combination safe. Nothing here can tell
@@ -306,10 +379,10 @@ std::optional<std::string> InlineCredentialRejection(Config const& cfg)
     // password had been registered.
     return std::format("{} You passed --config={}, so put it there and drop --requirepass from this command line.",
                        Preamble,
-                       cfg.configPath);
+                       spec.configPath);
 }
 
-std::optional<std::string> ServiceNameRejection(Config const& cfg)
+std::optional<std::string> ServiceNameRejection(ServiceSpec const& spec)
 {
     // The service name is not merely a label. LaunchdPlistPath concatenates it
     // into `<LaunchAgents|LaunchDaemons>/<label>.plist`, and the SCM keys its
@@ -322,47 +395,55 @@ std::optional<std::string> ServiceNameRejection(Config const& cfg)
     // names with spaces and punctuation since forever, and tightening that here
     // would break existing Windows registrations to fix a traversal that only
     // separators and dots can express.
-    if (cfg.serviceName.empty())
+    if (spec.serviceName.empty())
         return "--service-name must not be empty";
 
-    if (cfg.serviceName.find_first_of("/\\") != std::string::npos)
-        return std::format("--service-name must not contain a path separator: '{}'", cfg.serviceName);
+    if (spec.serviceName.find_first_of("/\\") != std::string::npos)
+        return std::format("--service-name must not contain a path separator: '{}'", spec.serviceName);
 
     // A leading dot covers `..` — the traversal that needs no separator — and a
     // dotfile, which launchd's directory scan skips, so the job would silently
     // never come back after a reboot.
-    if (cfg.serviceName.starts_with('.'))
-        return std::format("--service-name must not start with '.': '{}'", cfg.serviceName);
+    if (spec.serviceName.starts_with('.'))
+        return std::format("--service-name must not start with '.': '{}'", spec.serviceName);
 
-    if (std::ranges::any_of(cfg.serviceName, [](unsigned char ch) { return std::iscntrl(ch) != 0; }))
-        return std::format("--service-name must not contain control characters: '{}'", cfg.serviceName);
+    if (std::ranges::any_of(spec.serviceName, [](unsigned char ch) { return std::iscntrl(ch) != 0; }))
+        return std::format("--service-name must not contain control characters: '{}'", spec.serviceName);
 
     return std::nullopt;
 }
 
-std::optional<std::string> ServiceRegistrationRejection(Config const& cfg)
+std::optional<std::string> ServiceRegistrationRejection(ServiceSpec const& spec)
 {
     // A table, so a new rule is a new row rather than another `if` threaded
     // through both platforms' InstallService.
-    using Validator = std::optional<std::string> (*)(Config const&);
+    using Validator = std::optional<std::string> (*)(ServiceSpec const&);
     constexpr auto Validators = std::to_array<Validator>({ &ServiceNameRejection, &InlineCredentialRejection });
 
     for (auto const validator: Validators)
-        if (auto rejection = validator(cfg))
+        if (auto rejection = validator(spec))
             return rejection;
 
     return std::nullopt;
 }
 
-std::string BuildServiceCommandLine(std::filesystem::path const& exePath, Config const& cfg)
+std::string BuildServiceCommandLine(ServiceSpec const& spec)
 {
-    auto const argv = BuildServiceArgv(exePath, cfg, EmitDaemonFlag::Yes);
-
     // The executable path is always quoted so an install directory containing
     // spaces (e.g. "C:\Program Files\fastcached") tokenizes correctly.
-    std::string out = std::format("\"{}\"", argv.front());
+    std::string out = std::format("\"{}\"", spec.exePath.string());
 
-    for (auto const& arg: argv | std::views::drop(1))
+    // The SCM is the supervisor that wants backgrounding, so this is where the
+    // spec's daemon flag is spent. At the FRONT, which keeps the registered
+    // command line byte-identical to the one this produced before the arguments
+    // moved into a ServiceSpec -- nothing downstream cares about flag order, and
+    // a refactor that can be shown to change nothing is worth more than one that
+    // merely ought not to.
+    auto argv = spec.arguments;
+    if (!spec.daemonFlag.empty())
+        argv.insert(argv.begin(), spec.daemonFlag);
+
+    for (auto const& arg: argv)
     {
         // Quote the value, not the whole token: the SCM splits `--flag=value`
         // on whitespace, so `--storage="C:\a b"` is one argument while
@@ -386,10 +467,6 @@ namespace
     /// CPACK_PRODUCTBUILD_IDENTIFIER, which must stay identical: the uninstaller
     /// derives the receipt names to forget from it.
     constexpr std::string_view LaunchdLabelPrefix = "software.lastrada.";
-
-    /// The dedicated account a system-wide job runs as, created by the package's
-    /// postinstall. Mirrors the `fastcached` user in packaging/linux/fastcached.sysusers.
-    constexpr std::string_view ServiceAccount = "_fastcached";
 
     /// Everything that differs between the two launchd domains, as data. A third
     /// scope would be a row here, not a new branch threaded through the
@@ -503,37 +580,35 @@ std::string_view ServiceScopeName(ServiceScope scope) noexcept
     return TraitsOf(scope).name;
 }
 
-std::string LaunchdLabel(Config const& cfg)
+std::string LaunchdLabel(ServiceSpec const& spec)
 {
-    auto lowered = cfg.serviceName;
+    auto lowered = spec.serviceName;
     std::ranges::transform(lowered, lowered.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     return std::format("{}{}", LaunchdLabelPrefix, lowered);
 }
 
-std::filesystem::path LaunchdPlistPath(Config const& cfg, ServiceScope scope, std::filesystem::path const& homeDirectory)
+std::filesystem::path LaunchdPlistPath(ServiceSpec const& spec,
+                                       ServiceScope scope,
+                                       std::filesystem::path const& homeDirectory)
 {
     auto const& traits = TraitsOf(scope);
-    auto const fileName = std::format("{}.plist", LaunchdLabel(cfg));
+    auto const fileName = std::format("{}.plist", LaunchdLabel(spec));
 
     if (traits.homeRelative)
         return homeDirectory / traits.plistDirectory / fileName;
     return std::filesystem::path { traits.plistDirectory } / fileName;
 }
 
-std::string BuildLaunchdPlist(std::filesystem::path const& exePath,
-                              Config const& cfg,
-                              ServiceScope scope,
-                              std::filesystem::path const& logDirectory)
+std::string BuildLaunchdPlist(ServiceSpec const& spec, ServiceScope scope, std::filesystem::path const& logDirectory)
 {
     auto const& traits = TraitsOf(scope);
-    auto const label = LaunchdLabel(cfg);
+    auto const label = LaunchdLabel(spec);
 
-    // EmitDaemonFlag::No is the whole point: launchd supervises the process it
-    // started, and a job that double-forks is reaped instantly as "exited".
-    auto const argv = BuildServiceArgv(exePath, cfg, EmitDaemonFlag::No);
-
-    std::string arguments;
-    for (auto const& arg: argv)
+    // `spec.daemonFlag` is deliberately not emitted, and that is the whole
+    // point of holding it apart: launchd supervises the process it started, and
+    // a job that double-forks is reaped instantly as "exited".
+    std::string arguments = std::format("        <string>{}</string>\n", XmlEscape(spec.exePath.string()));
+    for (auto const& arg: spec.arguments)
         arguments += std::format("        <string>{}</string>\n", XmlEscape(arg));
 
     // ProcessType is not optional for a cache daemon: launchd gives a job with
@@ -558,7 +633,7 @@ std::string BuildLaunchdPlist(std::filesystem::path const& exePath,
                "        <key>Crashed</key>\n        <true/>\n"
                "    </dict>\n";
 
-    if (traits.runsAsServiceAccount)
+    if (traits.runsAsServiceAccount && !spec.serviceAccount.empty())
     {
         // UserName only. launchd already runs the job under that account's
         // primary group when GroupName is absent, so naming it adds nothing —
@@ -567,7 +642,7 @@ std::string BuildLaunchdPlist(std::filesystem::path const& exePath,
         // indefinitely, and the `kickstart` that waits for the spawn hangs with
         // it until something kills the installer. One name to resolve is one
         // failure mode, not two.
-        out += std::format("    <key>UserName</key>\n    <string>{}</string>\n", ServiceAccount);
+        out += std::format("    <key>UserName</key>\n    <string>{}</string>\n", spec.serviceAccount);
     }
 
     out += "    <key>ProcessType</key>\n    <string>Interactive</string>\n";
@@ -593,25 +668,6 @@ namespace
     /// One-line description registered with the SCM (shown in services.msc).
     constexpr std::string_view ServiceDescription = "fastcached — fast cache daemon";
 
-    /// Resolve the absolute path of the running executable.
-    /// @return Path on success; empty path on failure.
-    [[nodiscard]] std::filesystem::path CurrentExecutablePath()
-    {
-        std::string buffer(MAX_PATH, '\0');
-        while (true)
-        {
-            auto const copied = GetModuleFileNameA(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-            if (copied == 0)
-                return {};
-            if (copied < buffer.size())
-            {
-                buffer.resize(copied);
-                return std::filesystem::path { buffer };
-            }
-            buffer.resize(buffer.size() * 2);
-        }
-    }
-
     /// Standard "needs elevation" guidance reused across SCM error paths.
     [[nodiscard]] std::string ElevationHint(std::string_view action)
     {
@@ -619,16 +675,16 @@ namespace
     }
 } // namespace
 
-ServiceControlResult InstallService(Config const& cfg, ServiceScope /*scope*/)
+ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scope*/)
 {
-    if (auto const rejection = ServiceRegistrationRejection(cfg))
+    if (auto const rejection = ServiceRegistrationRejection(spec))
         return { .exitCode = 1, .message = *rejection };
 
     auto const exe = CurrentExecutablePath();
     if (exe.empty())
         return { .exitCode = 1, .message = "could not determine the fastcached executable path" };
 
-    auto const commandLine = BuildServiceCommandLine(exe, cfg);
+    auto const commandLine = BuildServiceCommandLine(spec);
 
     SC_HANDLE const manager = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (manager == nullptr)
@@ -640,8 +696,8 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope /*scope*/)
     }
 
     SC_HANDLE const service = CreateServiceA(manager,
-                                             cfg.serviceName.c_str(),
-                                             cfg.serviceName.c_str(),
+                                             spec.serviceName.c_str(),
+                                             spec.serviceName.c_str(),
                                              SERVICE_ALL_ACCESS,
                                              SERVICE_WIN32_OWN_PROCESS,
                                              SERVICE_AUTO_START,
@@ -659,14 +715,14 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope /*scope*/)
         if (err == ERROR_SERVICE_EXISTS)
             return { .exitCode = 1,
                      .message = std::format("service '{}' already exists; remove it first with --uninstall-service",
-                                            cfg.serviceName) };
+                                            spec.serviceName) };
         if (err == ERROR_ACCESS_DENIED)
             return { .exitCode = 1, .message = ElevationHint("creating the service") };
         return { .exitCode = 1, .message = std::format("CreateService failed (error {})", err) };
     }
 
     // Best-effort friendly description; failure here does not fail the install.
-    std::string description { ServiceDescription };
+    std::string description { spec.description };
     SERVICE_DESCRIPTIONA descriptor { .lpDescription = description.data() };
     ChangeServiceConfig2A(service, SERVICE_CONFIG_DESCRIPTION, &descriptor);
 
@@ -674,15 +730,16 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope /*scope*/)
     CloseServiceHandle(manager);
 
     return { .exitCode = 0,
-             .message = std::format(
-                 "installed service '{}' (auto-start); start it now with: sc start {}", cfg.serviceName, cfg.serviceName) };
+             .message = std::format("installed service '{}' (auto-start); start it now with: sc start {}",
+                                    spec.serviceName,
+                                    spec.serviceName) };
 }
 
-ServiceControlResult UninstallService(Config const& cfg, ServiceScope /*scope*/)
+ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope /*scope*/)
 {
     // The name gates removal too: it selects which registration is addressed,
     // and one that could never have been installed cannot be removed either.
-    if (auto const rejection = ServiceNameRejection(cfg))
+    if (auto const rejection = ServiceNameRejection(spec))
         return { .exitCode = 1, .message = *rejection };
 
     SC_HANDLE const manager = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
@@ -694,13 +751,13 @@ ServiceControlResult UninstallService(Config const& cfg, ServiceScope /*scope*/)
         return { .exitCode = 1, .message = std::format("OpenSCManager failed (error {})", err) };
     }
 
-    SC_HANDLE const service = OpenServiceA(manager, cfg.serviceName.c_str(), SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
+    SC_HANDLE const service = OpenServiceA(manager, spec.serviceName.c_str(), SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
     if (service == nullptr)
     {
         auto const err = GetLastError();
         CloseServiceHandle(manager);
         if (err == ERROR_SERVICE_DOES_NOT_EXIST)
-            return { .exitCode = 1, .message = std::format("no service named '{}' is installed", cfg.serviceName) };
+            return { .exitCode = 1, .message = std::format("no service named '{}' is installed", spec.serviceName) };
         if (err == ERROR_ACCESS_DENIED)
             return { .exitCode = 1, .message = ElevationHint("opening the service") };
         return { .exitCode = 1, .message = std::format("OpenService failed (error {})", err) };
@@ -717,32 +774,13 @@ ServiceControlResult UninstallService(Config const& cfg, ServiceScope /*scope*/)
 
     if (!deleted)
         return { .exitCode = 1, .message = std::format("DeleteService failed (error {})", deleteErr) };
-    return { .exitCode = 0, .message = std::format("uninstalled service '{}'", cfg.serviceName) };
+    return { .exitCode = 0, .message = std::format("uninstalled service '{}'", spec.serviceName) };
 }
 
 #elif defined(__APPLE__)
 
 namespace
 {
-    /// Resolve the absolute path of the running executable.
-    /// @return Path on success; empty path on failure.
-    [[nodiscard]] std::filesystem::path CurrentExecutablePath()
-    {
-        std::uint32_t size = 0;
-        _NSGetExecutablePath(nullptr, &size); // Sets `size` to what is required.
-        std::string buffer(size, '\0');
-        if (_NSGetExecutablePath(buffer.data(), &size) != 0)
-            return {};
-        buffer.resize(std::strlen(buffer.c_str()));
-
-        // _NSGetExecutablePath may hand back a path containing symlinks or `..`;
-        // launchd records ProgramArguments verbatim, so resolve it once here
-        // rather than pinning the job to a path that may later dangle.
-        std::error_code ec;
-        auto const resolved = std::filesystem::canonical(buffer, ec);
-        return ec ? std::filesystem::path { buffer } : resolved;
-    }
-
     /// The invoking user's home directory, from the password database rather
     /// than $HOME: this runs under `sudo` and from pkg postinstall scripts,
     /// where $HOME belongs to root or is unset entirely.
@@ -793,21 +831,39 @@ namespace
     /// the package's `<prefix>/etc/fastcached.yaml`, so there is nothing to
     /// default.
     ///
-    /// @param cfg Configuration as parsed from the command line.
+    /// Whether @p spec already carries an argument introduced by @p flag.
+    ///
+    /// "The operator set this" is exactly "BuildServiceArgv emitted it", because
+    /// that function emits a flag only for a field differing from its default --
+    /// so asking the argument list is asking the same question the Config test
+    /// used to, one layer further along.
+    /// @param spec Service being registered.
+    /// @param flag Flag prefix including its `=`, e.g. `--config=`.
+    /// @return True when the flag is already present.
+    [[nodiscard]] bool HasArgument(ServiceSpec const& spec, std::string_view flag)
+    {
+        return std::ranges::any_of(spec.arguments, [flag](std::string const& arg) { return arg.starts_with(flag); });
+    }
+
+    /// @param spec Service as described from the command line.
     /// @param scope Domain being installed into.
     /// @param home The invoking user's home directory.
     /// @param packagedConfig The machine-wide config file, empty when it is
     ///        absent or unreadable. Resolved by the caller for the same reason
     ///        @p home is: this function decides, the composition root probes.
-    /// @return @p cfg with `storagePath` and `configPath` filled in when the
+    /// @return @p spec with the storage and config arguments filled in when the
     ///         caller left them unset.
-    [[nodiscard]] Config WithScopeDefaults(Config cfg,
-                                           ServiceScope scope,
-                                           std::filesystem::path const& home,
-                                           std::filesystem::path const& packagedConfig)
+    [[nodiscard]] ServiceSpec WithScopeDefaults(ServiceSpec spec,
+                                                ServiceScope scope,
+                                                std::filesystem::path const& home,
+                                                std::filesystem::path const& packagedConfig)
     {
-        if (scope == ServiceScope::User && cfg.storagePath.empty() && cfg.configPath.empty())
-            cfg.storagePath = (home / "Library/Caches/fastcached/cache").string();
+        if (scope == ServiceScope::User && !HasArgument(spec, "--storage=") && !HasArgument(spec, "--config="))
+        {
+            auto const storage = home / "Library/Caches/fastcached/cache";
+            spec.arguments.push_back(std::format("--storage={}", storage.string()));
+            spec.ownedDirectories.emplace_back(storage);
+        }
 
         // The daemon would find this file on its own — it is the machine-wide
         // candidate its startup lookup probes — so registering it is a choice,
@@ -825,10 +881,13 @@ namespace
         //
         // An empty packagedConfig means it is not actually there, so a
         // build-from-source install does not point launchd at a missing path.
-        if (scope == ServiceScope::System && cfg.configPath.empty())
-            cfg.configPath = packagedConfig.string();
+        if (scope == ServiceScope::System && !HasArgument(spec, "--config=") && !packagedConfig.empty())
+        {
+            spec.arguments.push_back(std::format("--config={}", packagedConfig.string()));
+            spec.configPath = packagedConfig.string();
+        }
 
-        return cfg;
+        return spec;
     }
 
     /// Whether a launchctl invocation's own diagnostics reach the terminal.
@@ -1034,19 +1093,21 @@ namespace
         return std::nullopt;
     }
 
-    /// Why ServiceAccount could not read @p path, if it could not.
+    /// Why @p account could not read @p path, if it could not.
     ///
-    /// A system daemon drops to ServiceAccount before it opens its config, so a
+    /// A system daemon drops to @p account before it opens its config, so a
     /// root-owned mode-0600 file — exactly what InlineCredentialRejection sends
     /// the operator off to create — leaves launchd restarting a job that exits
     /// at every start, with the EACCES visible nowhere. Checked here, where the
     /// remedy can be named, rather than discovered from a restart loop.
     ///
+    /// @param account The unprivileged account the job runs as.
     /// @param path Config file the job will be pointed at.
     /// @return A diagnostic naming the fix, or nullopt when the file is readable.
-    [[nodiscard]] std::optional<std::string> ServiceAccountReadDenial(std::filesystem::path const& path)
+    [[nodiscard]] std::optional<std::string> ServiceAccountReadDenial(std::string const& account,
+                                                                      std::filesystem::path const& path)
     {
-        auto const* const pw = ::getpwnam(std::string { ServiceAccount }.c_str());
+        auto const* const pw = ::getpwnam(account.c_str());
         if (pw == nullptr)
             return std::nullopt; // Reported by its own guard; nothing to add.
 
@@ -1062,21 +1123,20 @@ namespace
         return std::format("{} is not readable by '{}', the account the daemon runs as, so the job would exit at "
                            "every start. Grant it access first: chown root:{} {} && chmod 0640 {}",
                            path.string(),
-                           ServiceAccount,
-                           ServiceAccount,
+                           account,
+                           account,
                            path.string(),
                            path.string());
     }
 } // namespace
 
-ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
+ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
 {
-    if (auto const rejection = ServiceRegistrationRejection(cfg))
+    if (auto const rejection = ServiceRegistrationRejection(spec))
         return { .exitCode = 1, .message = *rejection };
 
-    auto const exe = CurrentExecutablePath();
-    if (exe.empty())
-        return { .exitCode = 1, .message = "could not determine the fastcached executable path" };
+    if (spec.exePath.empty())
+        return { .exitCode = 1, .message = "could not determine the executable path to register" };
 
     if (scope == ServiceScope::System && ::geteuid() != 0)
         return { .exitCode = 1, .message = "installing a system LaunchDaemon requires root; re-run with sudo" };
@@ -1105,12 +1165,12 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
     // check the tool prints "installed and started" while nothing ever listens.
     // The account is created by the .pkg postinstall, which is the only thing
     // that creates it, so a tarball or from-source install lands here.
-    if (scope == ServiceScope::System && ::getpwnam(std::string { ServiceAccount }.c_str()) == nullptr)
+    if (scope == ServiceScope::System && !spec.serviceAccount.empty() && ::getpwnam(spec.serviceAccount.c_str()) == nullptr)
         return { .exitCode = 1,
                  .message = std::format("the '{}' service account does not exist. It is created by the macOS "
                                         "installer package; for a manual install, create it first (see "
                                         "docs/operations/deployment.md) or use --service-scope=user.",
-                                        ServiceAccount) };
+                                        spec.serviceAccount) };
 
     // The two ambient inputs WithScopeDefaults decides from, both resolved here
     // rather than inside it: readability, not mere existence, is the test, for
@@ -1120,19 +1180,19 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
     // disagreeing about which configs count.
     SystemConfigPathProbe const probe;
     auto const packagedConfig = [&] {
-        auto const path = SystemConfigPath(probe);
+        auto const path = SystemConfigPath(probe, DaemonApplicationName);
         return path.has_value() && probe.IsReadableFile(*path) && probe.IsTrustedSystemLocation(*path)
                    ? *path
                    : std::filesystem::path {};
     }();
 
-    auto const effective = WithScopeDefaults(cfg, scope, home, packagedConfig);
+    auto const effective = WithScopeDefaults(spec, scope, home, packagedConfig);
     auto const label = LaunchdLabel(effective);
     auto const plistPath = LaunchdPlistPath(effective, scope, home);
     auto const logDirectory = DefaultLogDirectory(scope, home);
 
     if (scope == ServiceScope::System && !effective.configPath.empty())
-        if (auto const denial = ServiceAccountReadDenial(effective.configPath))
+        if (auto const denial = ServiceAccountReadDenial(effective.serviceAccount, effective.configPath))
             return { .exitCode = 1, .message = *denial };
 
     std::error_code ec;
@@ -1145,7 +1205,7 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
     if (ec)
         return { .exitCode = 1, .message = std::format("could not create {}: {}", logDirectory.string(), ec.message()) };
 
-    // The daemon drops to ServiceAccount, so directories root created for it
+    // The daemon drops to its service account, so directories root created for it
     // have to change hands or its first write fails with EACCES — which launchd
     // surfaces only as a job that exits immediately, over and over.
     //
@@ -1154,16 +1214,16 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
     // reassigned /var/db, shared with other system services, to an unprivileged
     // cache account, and `--storage=/tmp/cache` reassigned /private/tmp — both
     // silently, under a message that said the service had been installed.
-    if (scope == ServiceScope::System)
-        if (auto const* const pw = ::getpwnam(std::string { ServiceAccount }.c_str()); pw != nullptr)
+    if (scope == ServiceScope::System && !effective.serviceAccount.empty())
+        if (auto const* const pw = ::getpwnam(effective.serviceAccount.c_str()); pw != nullptr)
         {
             std::vector<std::filesystem::path> owned { logDirectory };
-            if (!effective.storagePath.empty())
+            for (auto const& directory: effective.ownedDirectories)
             {
-                std::error_code storageEc;
-                std::filesystem::create_directories(effective.storagePath, storageEc);
-                if (!storageEc)
-                    owned.emplace_back(effective.storagePath);
+                std::error_code ownedEc;
+                std::filesystem::create_directories(directory, ownedEc);
+                if (!ownedEc)
+                    owned.emplace_back(directory);
             }
             for (auto const& path: owned)
                 (void) ::chown(path.c_str(), pw->pw_uid, pw->pw_gid);
@@ -1173,7 +1233,7 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
         std::ofstream out { plistPath, std::ios::binary | std::ios::trunc };
         if (!out)
             return { .exitCode = 1, .message = std::format("could not write {}", plistPath.string()) };
-        out << BuildLaunchdPlist(exe, effective, scope, logDirectory);
+        out << BuildLaunchdPlist(effective, scope, logDirectory);
         if (!out)
             return { .exitCode = 1, .message = std::format("could not write {}", plistPath.string()) };
     }
@@ -1215,9 +1275,9 @@ ServiceControlResult InstallService(Config const& cfg, ServiceScope scope)
                                     plistPath.string()) };
 }
 
-ServiceControlResult UninstallService(Config const& cfg, ServiceScope scope)
+ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope scope)
 {
-    if (auto const rejection = ServiceNameRejection(cfg))
+    if (auto const rejection = ServiceNameRejection(spec))
         return { .exitCode = 1, .message = *rejection };
 
     if (scope == ServiceScope::System && ::geteuid() != 0)
@@ -1235,8 +1295,8 @@ ServiceControlResult UninstallService(Config const& cfg, ServiceScope scope)
     if (scope == ServiceScope::User && home.empty())
         return { .exitCode = 1, .message = "could not determine the invoking user's home directory" };
 
-    auto const label = LaunchdLabel(cfg);
-    auto const plistPath = LaunchdPlistPath(cfg, scope, home);
+    auto const label = LaunchdLabel(spec);
+    auto const plistPath = LaunchdPlistPath(spec, scope, home);
 
     // Best-effort stop; a job that was never loaded is not an error here, so
     // launchctl's "No such process" complaint is suppressed. Waited on for the
@@ -1258,12 +1318,12 @@ ServiceControlResult UninstallService(Config const& cfg, ServiceScope scope)
 
 #else
 
-ServiceControlResult InstallService(Config const& /*cfg*/, ServiceScope /*scope*/)
+ServiceControlResult InstallService(ServiceSpec const& /*spec*/, ServiceScope /*scope*/)
 {
     return { .exitCode = 1, .message = "service control is only available on Windows (SCM) and macOS (launchd)" };
 }
 
-ServiceControlResult UninstallService(Config const& /*cfg*/, ServiceScope /*scope*/)
+ServiceControlResult UninstallService(ServiceSpec const& /*spec*/, ServiceScope /*scope*/)
 {
     return { .exitCode = 1, .message = "service control is only available on Windows (SCM) and macOS (launchd)" };
 }

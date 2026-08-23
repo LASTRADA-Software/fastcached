@@ -104,7 +104,7 @@ constexpr std::string_view ProgramVersion = FastCache::VersionString;
 [[nodiscard]] int SeedDefaultConfig(std::string const& templatePath)
 {
     FastCache::SystemConfigPathProbe const probe;
-    auto const destination = FastCache::SystemConfigPath(probe);
+    auto const destination = FastCache::SystemConfigPath(probe, FastCache::DaemonApplicationName);
     auto const seeded = destination.and_then([&](auto const& dest) {
         return FastCache::SeedConfigFile(templatePath, dest, FastCache::DirectoryPolicy::AdministratorsOnly);
     });
@@ -833,7 +833,8 @@ int main(int argc, char const* const* argv)
     // path baked into a service's launch arguments would outrank the file itself
     // forever, and InlineCredentialRejection would start naming a path nobody
     // typed.
-    auto const lookup = FastCache::EffectiveConfigPath(parsed->config.configPath, FastCache::SystemConfigPathProbe {});
+    auto const lookup = FastCache::EffectiveConfigPath(
+        parsed->config.configPath, FastCache::SystemConfigPathProbe {}, FastCache::DaemonApplicationName);
     auto const configPath = lookup.path.string();
 
     // A config that exists and is readable but was passed over anyway has to say
@@ -948,10 +949,14 @@ int main(int argc, char const* const* argv)
     if (parsed->outcome == FastCache::CliOutcome::InstallService
         || parsed->outcome == FastCache::CliOutcome::UninstallService)
     {
-        auto const& registered = parsed->config;
+        // The command-line config, never the merged one -- see the comment above.
+        // Turned into a ServiceSpec here because that is the seam the platform
+        // registration speaks: `fastcache-compile-node` builds its own from its
+        // own configuration type rather than reaching for the daemon's.
+        auto const spec = FastCache::MakeDaemonServiceSpec(FastCache::CurrentExecutablePath(), parsed->config);
         auto const result = parsed->outcome == FastCache::CliOutcome::InstallService
-                                ? FastCache::InstallService(registered, parsed->serviceScope)
-                                : FastCache::UninstallService(registered, parsed->serviceScope);
+                                ? FastCache::InstallService(spec, parsed->serviceScope)
+                                : FastCache::UninstallService(spec, parsed->serviceScope);
         if (result.exitCode == 0)
             std::println("fastcached: {}", result.message);
         else
