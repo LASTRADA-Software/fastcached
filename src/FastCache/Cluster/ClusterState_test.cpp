@@ -41,7 +41,7 @@ TEST_CASE("A member is admitted with an endpoint, never without one", "[cluster]
     // report to and no way to un-commit it.
     auto const addressless = Validate(Cmd(CommandKind::AddMember, "n1"));
     REQUIRE_FALSE(addressless.has_value());
-    CHECK(addressless.error().context.find("endpoint") != std::string::npos);
+    CHECK(addressless.error().context.contains("endpoint"));
 
     CHECK_FALSE(Validate(Cmd(CommandKind::AddMember, "", "10.0.0.1:6675")).has_value());
 }
@@ -56,7 +56,7 @@ TEST_CASE("A setting this build does not know is refused, not stored", "[cluster
 
     auto const unknown = Validate(Cmd(CommandKind::SetSetting, "upsteam", "typo"));
     REQUIRE_FALSE(unknown.has_value());
-    CHECK(unknown.error().context.find("upsteam") != std::string::npos);
+    CHECK(unknown.error().context.contains("upsteam"));
 
     // The table is the only source of truth for what is a setting, so a local flag
     // that describes ONE machine is not one -- replicating `--slots` would impose one

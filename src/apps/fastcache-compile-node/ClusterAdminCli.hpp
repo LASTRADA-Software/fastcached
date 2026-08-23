@@ -47,7 +47,6 @@ namespace FastCache::Node
 /// @param cfg Where the scheduler is, and the credential to present.
 /// @param request What to ask.
 /// @return What to print, or what went wrong.
-[[nodiscard]] std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg,
-                                                                      ClusterRequest const& request);
+[[nodiscard]] std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg, ClusterRequest const& request);
 
 } // namespace FastCache::Node

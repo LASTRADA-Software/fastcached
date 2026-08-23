@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "ClusterAdminCli.hpp"
-
 #include "CacheProtocol.hpp"
+#include "ClusterAdminCli.hpp"
 #include "ITcpClient.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
@@ -128,9 +127,8 @@ std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg, C
     // credential pipelining and the "a daemon that does not know AUTH still served
     // the command" fall-through are each subtle enough that two implementations
     // would differ, and the one that differed would be the untested one.
-    auto const outcome = Cc::ExchangeFramed(*client,
-                                            EncodeClusterRequest(request),
-                                            Cc::Credential { .username = {}, .secret = cfg.token });
+    auto const outcome =
+        Cc::ExchangeFramed(*client, EncodeClusterRequest(request), Cc::Credential { .username = {}, .secret = cfg.token });
 
     if (outcome.kind == Cc::CacheOutcomeKind::Transport)
         return std::unexpected { std::format("the scheduler at {} did not answer", cfg.scheduler) };

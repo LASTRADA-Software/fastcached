@@ -129,10 +129,9 @@ struct Fixture
                                    std::string value = {},
                                    std::string scheduler = {})
 {
-    return Cluster::Command { .kind = kind,
-                              .key = std::move(key),
-                              .value = std::move(value),
-                              .schedulerEndpoint = std::move(scheduler) };
+    return Cluster::Command {
+        .kind = kind, .key = std::move(key), .value = std::move(value), .schedulerEndpoint = std::move(scheduler)
+    };
 }
 
 /// A cluster-administration request, spelled once so a field added to
@@ -249,8 +248,7 @@ TEST_CASE("A change reaches the cluster as the command it names", "[node][cluste
     FakeCluster cluster;
     fixture.service.AdministerWith(cluster);
 
-    CHECK(StatusOf(fixture.Ask(Ask(ClusterAction::Set, "upstream", "cache.internal:6674")))
-          == Wire::Status::Ok);
+    CHECK(StatusOf(fixture.Ask(Ask(ClusterAction::Set, "upstream", "cache.internal:6674"))) == Wire::Status::Ok);
     CHECK(StatusOf(fixture.Ask(Ask(ClusterAction::Forget, "n3"))) == Wire::Status::Ok);
 
     REQUIRE(cluster.proposed.size() == 2);
@@ -266,9 +264,8 @@ TEST_CASE("A node with no cluster says so rather than pretending", "[node][clust
     // and an operator sent elsewhere would go looking for a node that does not exist.
     Fixture fixture;
 
-    for (auto const& request: std::array { Ask(ClusterAction::Status),
-                                           Ask(ClusterAction::Set, "upstream", "x"),
-                                           Ask(ClusterAction::Forget, "n3") })
+    for (auto const& request: std::array {
+             Ask(ClusterAction::Status), Ask(ClusterAction::Set, "upstream", "x"), Ask(ClusterAction::Forget, "n3") })
     {
         auto const reply = fixture.Ask(request);
         CHECK(StatusOf(reply) == Wire::Status::Error);
@@ -303,11 +300,9 @@ TEST_CASE("A non-member may not change what the fleet believes", "[node][cluster
     FakeCluster cluster;
     fixture.service.AdministerWith(cluster);
 
-    constexpr Distributed::CallerContext Stranger { .membership = Distributed::Membership::Outsider,
-                                                    .peerId = "stranger" };
+    constexpr Distributed::CallerContext Stranger { .membership = Distributed::Membership::Outsider, .peerId = "stranger" };
 
-    auto const reply =
-        fixture.Ask(Ask(ClusterAction::Set, "upstream", "x"), Stranger);
+    auto const reply = fixture.Ask(Ask(ClusterAction::Set, "upstream", "x"), Stranger);
     CHECK(StatusOf(reply) == Wire::Status::Error);
     CHECK(ErrorOf(reply) == Wire::ErrorCode::NotAMember);
     CHECK(cluster.proposed.empty());
