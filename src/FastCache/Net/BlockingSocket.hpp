@@ -172,6 +172,18 @@ class BlockingListener final: public IListener
         return _bindError;
     }
 
+    /// The port actually bound, which is what an ephemeral bind is for.
+    ///
+    /// Binding port 0 lets the OS choose a free one, and this is how the caller
+    /// learns which. That matters beyond convenience: a test or fixture that
+    /// hard-codes a port collides with whatever else is running on the machine,
+    /// and the failure reads as the feature under test being broken rather than
+    /// as the port being taken — the lesson `dist-compile-e2e` records for its
+    /// own four ports.
+    /// @return The bound port in host byte order, or 0 when not bound or when
+    ///         the OS would not report it.
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept;
+
   private:
     BlockingListener() = default;
 

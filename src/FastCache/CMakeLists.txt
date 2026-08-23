@@ -40,6 +40,7 @@ target_sources(FastCache
         Distributed/WorkerRegistry.cpp
         Core/BufferPool.cpp
         Metrics/PrometheusFormatter.cpp
+        Net/BlockingConnector.cpp
         Net/BlockingSocket.cpp
         Net/InheritedListener.cpp
         Net/HealthProbe.cpp

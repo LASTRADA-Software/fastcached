@@ -382,6 +382,32 @@ void BlockingListener::Close() noexcept
     }
 }
 
+std::uint16_t BlockingListener::BoundPort() const noexcept
+{
+    if (_native == Detail::InvalidSocket)
+        return 0;
+
+    sockaddr_storage storage {};
+#if defined(_WIN32)
+    auto length = static_cast<int>(sizeof(storage));
+    auto const handle = static_cast<SOCKET>(_native);
+#else
+    auto length = static_cast<socklen_t>(sizeof(storage));
+    auto const handle = static_cast<int>(_native);
+#endif
+    if (::getsockname(handle, reinterpret_cast<sockaddr*>(&storage), &length) != 0)
+        return 0;
+
+    // Read the port out of whichever family the socket actually is: the two
+    // sockaddr layouts put it at different offsets, and reading the wrong one
+    // yields a plausible-looking number rather than an error.
+    if (storage.ss_family == AF_INET)
+        return ntohs(reinterpret_cast<sockaddr_in const*>(&storage)->sin_port);
+    if (storage.ss_family == AF_INET6)
+        return ntohs(reinterpret_cast<sockaddr_in6 const*>(&storage)->sin6_port);
+    return 0;
+}
+
 void BlockingListener::SetTimeouts(std::chrono::milliseconds acceptPoll, std::chrono::milliseconds ioTimeout) noexcept
 {
     _ioTimeout = ioTimeout;
