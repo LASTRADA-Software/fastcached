@@ -79,6 +79,7 @@ nav:
     - Quickstart: getting-started/quickstart.md
     - Configuration: getting-started/configuration.md
     - Distributed compilation: getting-started/distributed-compilation.md
+    - Cluster discovery: getting-started/cluster-discovery.md
   - Tools:
     - Overview: tools/index.md
     - fastcache-cc (compiler launcher): tools/fastcache-cc.md
