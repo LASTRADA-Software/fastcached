@@ -6,6 +6,7 @@
 #include <FastCache/Core/Errors/ConsensusError.hpp>
 
 #include <expected>
+#include <optional>
 #include <vector>
 
 namespace FastCache::Consensus
@@ -20,7 +21,17 @@ namespace FastCache::Consensus
 struct RecoveredState
 {
     PersistentState state;         ///< Term and vote as last written.
-    std::vector<LogEntry> entries; ///< The log, starting at index 1.
+    std::vector<LogEntry> entries; ///< The log, starting at `firstIndex`.
+
+    /// Index of `entries[0]`; above 1 when the log was compacted.
+    ///
+    /// Recovered rather than assumed, because a node that came back reporting
+    /// `FirstIndex() == 1` for a log whose prefix is gone would answer questions
+    /// about indices it does not hold.
+    LogIndex firstIndex { .value = 1 };
+
+    /// The snapshot the discarded prefix was replaced by; absent when none.
+    std::optional<RaftSnapshot> snapshot;
 };
 
 /// Where a Raft node's durable state lives.
@@ -70,6 +81,17 @@ class IRaftStorage
     /// @param append What to write, and from where.
     /// @return Nothing, or why it failed.
     [[nodiscard]] virtual std::expected<void, ConsensusError> SaveLog(LogAppend const& append) = 0;
+
+    /// Make a snapshot durable, replacing any earlier one.
+    ///
+    /// The write `RaftLog::Compact` requires before it discards anything, and the
+    /// one an acknowledged `InstallSnapshot` rests on. Both are the same rule the
+    /// log already obeys: a node that acknowledges state it has not made durable
+    /// retracts that acknowledgement when it restarts, and a leader may already
+    /// have committed on it.
+    /// @param snapshot The state and the point it is as of.
+    /// @return Nothing on success, or why it could not be written.
+    [[nodiscard]] virtual std::expected<void, ConsensusError> SaveSnapshot(RaftSnapshot const& snapshot) = 0;
 
     /// Read back everything a node needs to resume.
     ///

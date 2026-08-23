@@ -156,7 +156,7 @@ class RaftPeerTransport final: public IRaftTransport
     struct Peer
     {
         PeerEndpoint endpoint;                     ///< Where to dial.
-        std::mutex mutex;                          ///< Guards `outbox` and `stopping`.
+        std::mutex mutex;                          ///< Guards `outbox`.
         std::condition_variable wake;              ///< Signalled on a new message or on stop.
         std::deque<std::vector<std::byte>> outbox; ///< Framed messages awaiting the wire.
         std::jthread worker;                       ///< Drains `outbox`; joined by `Stop`.

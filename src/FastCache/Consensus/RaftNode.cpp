@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <ranges>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -43,6 +44,23 @@ RoleTraits const& TraitsOf(Role role) noexcept
     return RoleTable.front();
 }
 
+namespace
+{
+    /// Term of the entry just below a recovered log's first index.
+    ///
+    /// `Term::None()` for a log that starts at 1: there is no entry below it, and
+    /// handing the snapshot's term there would make an append naming index 0
+    /// match on a term that index does not have.
+    /// @param recovered What the store handed back.
+    /// @return The preceding term.
+    [[nodiscard]] Term PrecedingTermOf(RecoveredState const& recovered) noexcept
+    {
+        if (recovered.firstIndex.value <= 1 || !recovered.snapshot.has_value())
+            return Term::None();
+        return recovered.snapshot->lastIncludedTerm;
+    }
+} // namespace
+
 std::expected<RaftNode, ConsensusError> RaftNode::Create(RaftConfig config,
                                                          IRandomSource& random,
                                                          TimePoint now,
@@ -60,9 +78,35 @@ RaftNode::RaftNode(RaftConfig config, IRandomSource& random, TimePoint now, Reco
     _random { random },
     _currentTerm { recovered.state.currentTerm },
     _votedFor { std::move(recovered.state.votedFor) },
-    _log { std::move(recovered.entries) },
+    _log { std::move(recovered.entries), recovered.firstIndex, PrecedingTermOf(recovered) },
     _members { _config.members }
 {
+    if (recovered.snapshot.has_value())
+    {
+        auto const& snapshot = *recovered.snapshot;
+
+        // Set before `RefreshConfiguration`, which falls back to the snapshot's
+        // configuration when the retained log holds no entry to re-derive one from.
+        _snapshotMembers = snapshot.members;
+        _snapshotState = snapshot.state;
+
+        // A snapshot is only ever taken of applied state, so both indices come
+        // back with it. `_commitIndex` is otherwise deliberately not recovered --
+        // see below -- but starting at zero here would leave a node whose log
+        // begins above zero unable to apply anything at all.
+        _commitIndex = snapshot.lastIncludedIndex;
+        _lastApplied = snapshot.lastIncludedIndex;
+
+        // The store may still hold entries the snapshot covers. That is not a
+        // fault: a snapshot must be durable BEFORE the prefix it replaces is
+        // discarded, so a crash between the two leaves exactly this, and the
+        // opposite order would lose committed entries outright. Reconciling here
+        // is what lets that window be safe -- and it is also what lets a store
+        // that never trims its log be correct, merely wasteful.
+        if (snapshot.lastIncludedIndex >= _log.FirstIndex() && !_log.Compact(snapshot.lastIncludedIndex))
+            _log.ResetToSnapshot(snapshot.lastIncludedIndex, snapshot.lastIncludedTerm);
+    }
+
     // A recovered log may already carry a configuration change, and the node must
     // come back under it rather than under the one it was bootstrapped with --
     // otherwise a restart silently reverts a membership change the cluster made.
@@ -159,14 +203,26 @@ bool RaftNode::NeedsSnapshot(NodeId const& peer) const
     return found->second <= _log.SnapshotIndex();
 }
 
+RaftSnapshot RaftNode::CurrentSnapshot() const
+{
+    // Composed from the log's boundary rather than stored alongside it. The log
+    // already owns where the snapshot ends, and a second copy of that pair is a
+    // second thing that can come to disagree with it after a compaction.
+    return RaftSnapshot { .lastIncludedIndex = _log.SnapshotIndex(),
+                          .lastIncludedTerm = _log.SnapshotTerm(),
+                          .members = _snapshotMembers,
+                          .state = _snapshotState };
+}
+
 InstallSnapshotRequest RaftNode::MakeInstallSnapshotFor() const
 {
+    auto snapshot = CurrentSnapshot();
     return InstallSnapshotRequest { .term = _currentTerm,
                                     .leaderId = _config.self,
-                                    .lastIncludedIndex = _log.SnapshotIndex(),
-                                    .lastIncludedTerm = _log.SnapshotTerm(),
-                                    .members = _members,
-                                    .state = _snapshotState };
+                                    .lastIncludedIndex = snapshot.lastIncludedIndex,
+                                    .lastIncludedTerm = snapshot.lastIncludedTerm,
+                                    .members = std::move(snapshot.members),
+                                    .state = std::move(snapshot.state) };
 }
 
 void RaftNode::ReplicateToPeers(RaftOutput& output) const
@@ -183,7 +239,7 @@ void RaftNode::ReplicateToPeers(RaftOutput& output) const
     }
 }
 
-bool RaftNode::CompactThroughApplied(std::vector<std::byte> state)
+bool RaftNode::CompactThroughApplied(std::vector<std::byte> state, RaftOutput& output)
 {
     // Only applied state may be discarded. An entry above `_lastApplied` has not
     // reached the application, so the snapshot handed in does not describe it --
@@ -192,11 +248,43 @@ bool RaftNode::CompactThroughApplied(std::vector<std::byte> state)
     if (_lastApplied <= _log.SnapshotIndex())
         return false;
 
+    // The member set is captured BEFORE the log is cut, because afterwards there
+    // may be no configuration entry left to re-derive it from -- which is exactly
+    // the case this record exists to answer.
+    auto members = _members;
+
     if (!_log.Compact(_lastApplied))
         return false;
 
+    _snapshotMembers = std::move(members);
     _snapshotState = std::move(state);
+
+    // Emitted rather than written here, so the driver orders it against the other
+    // durability writes. The log's own contract requires it: those entries are
+    // already gone from memory, so a restart recovering neither them nor the state
+    // they produced comes back missing committed data.
+    output.saveSnapshot = CurrentSnapshot();
     return true;
+}
+
+void RaftNode::AdvanceFollowerProgress(NodeId const& follower, LogIndex reported)
+{
+    // Never move a match index backwards. Responses arrive out of order, and an
+    // older one carrying a smaller index would un-acknowledge entries this
+    // follower has already confirmed -- and since match indices are what decide
+    // commitment, that can only end with a committed entry treated as
+    // uncommitted.
+    //
+    // Clamped to this leader's own log as well. A follower cannot hold more than
+    // was sent to it, so a larger number is nonsense -- but taken at face value it
+    // pushes `nextIndex` past the end, and every subsequent AppendEntries then
+    // names a `prevLogIndex` that does not exist, is rejected, and walks back one
+    // index per round trip: that peer never converges again. It reaches
+    // `AdvanceCommitIndex` too, where only `TermAt` returning nullopt for a
+    // phantom index prevents committing one.
+    auto& match = _matchIndex[follower];
+    match = std::max(match, std::min(reported, _log.LastIndex()));
+    _nextIndex[follower] = match.Advanced(1);
 }
 
 void RaftNode::AdvanceCommitIndex()
@@ -340,20 +428,28 @@ void RaftNode::RefreshConfiguration()
     // change can be rolled back by a truncation -- so this is not a value that
     // only ever moves in one direction, and a node that treated it as one would
     // keep a configuration the cluster has discarded.
-    for (auto index = _log.LastIndex().value; index >= 1; --index)
+    if (auto const index = LatestConfigurationIndex(); index != LogIndex::BeforeFirst())
     {
-        auto const* const entry = _log.EntryAt(LogIndex { .value = index });
-        if (entry == nullptr || entry->kind != EntryKind::Configuration)
-            continue;
-
-        auto decoded = Membership::Decode(entry->payload);
-        if (decoded.has_value() && !decoded->empty())
-            AdoptMembers(*std::move(decoded));
-        return;
+        auto const* const entry = _log.EntryAt(index);
+        if (entry != nullptr)
+        {
+            // Validated on the way in, as at every other adoption point: this
+            // entry reached the log over the wire from a peer, and a member set
+            // carrying a duplicate or an empty id would make `Quorum()` count
+            // something that cannot vote.
+            if (auto decoded = Membership::Decode(entry->payload);
+                decoded.has_value() && Membership::Validate(*decoded).has_value())
+                AdoptMembers(*std::move(decoded));
+            return;
+        }
     }
 
-    // No configuration entry: the bootstrap set is the active one.
-    AdoptMembers(_config.members);
+    // No configuration entry left in the log. What the snapshot recorded, if there
+    // is one, and only otherwise the bootstrap set -- a compacted log has no entry
+    // to re-derive from, so falling straight back to the bootstrap set is how a
+    // node forgets a membership change it took part in, silently and only after a
+    // restart.
+    AdoptMembers(_snapshotMembers.empty() ? _config.members : _snapshotMembers);
 }
 
 void RaftNode::StepDown(Term term, TimePoint now, RaftOutput& output)
@@ -534,27 +630,26 @@ RaftOutput RaftNode::Tick(TimePoint now)
 
 LogIndex RaftNode::LatestConfigurationIndex() const
 {
-    for (auto index = _log.LastIndex().value; index >= 1; --index)
+    // Downward from the end, and stopping at the log's own first index rather
+    // than at 1: below the compaction boundary there is nothing to read, and a
+    // scan that ran to 1 anyway would report "no configuration" for a log that
+    // simply no longer holds the entry.
+    for (auto const value: std::views::iota(_log.FirstIndex().value, _log.LastIndex().value + 1) | std::views::reverse)
     {
-        auto const* const entry = _log.EntryAt(LogIndex { .value = index });
+        auto const index = LogIndex { .value = value };
+        auto const* const entry = _log.EntryAt(index);
         if (entry != nullptr && entry->kind == EntryKind::Configuration)
-            return LogIndex { .value = index };
+            return index;
     }
     return LogIndex::BeforeFirst();
 }
 
 bool RaftNode::HasUncommittedConfiguration() const
 {
-    // Any configuration entry above the commit index. Scanned downward and
-    // stopped at the commit index rather than walked whole, because everything
-    // at or below it is settled by definition.
-    for (auto index = _log.LastIndex().value; index > _commitIndex.value; --index)
-    {
-        auto const* const entry = _log.EntryAt(LogIndex { .value = index });
-        if (entry != nullptr && entry->kind == EntryKind::Configuration)
-            return true;
-    }
-    return false;
+    // Derived rather than scanned for separately: "the newest configuration sits
+    // above the commit index" is the same question, and two scans answering it
+    // independently are two places for the rule to drift.
+    return LatestConfigurationIndex() > _commitIndex;
 }
 
 std::expected<RaftNode::Proposal, ConsensusError> RaftNode::ProposeMembership(std::vector<NodeId> members, TimePoint now)
@@ -725,11 +820,15 @@ void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoin
     // applied -- so both indices move to it.
     _commitIndex = request.lastIncludedIndex;
     _lastApplied = request.lastIncludedIndex;
+    _snapshotMembers = request.members;
     _snapshotState = request.state;
 
-    output.restoreSnapshot = SnapshotRestore { .lastIncludedIndex = request.lastIncludedIndex,
-                                               .lastIncludedTerm = request.lastIncludedTerm,
-                                               .state = request.state };
+    // Persisted before the acknowledgement below, under the rule the log and the
+    // vote already obey. A follower that acknowledged index N and came back from a
+    // restart holding nothing would retract an acknowledgement the leader may
+    // already have counted towards commitment.
+    output.saveSnapshot = CurrentSnapshot();
+    output.restoreSnapshot = output.saveSnapshot;
 
     reply(AppendResult::Accepted, request.lastIncludedIndex);
 }
@@ -742,14 +841,10 @@ void RaftNode::OnInstallSnapshotResponse(InstallSnapshotResponse const& response
     if (response.result != AppendResult::Accepted)
         return;
 
-    // Progress moves by exactly the rule an AppendEntries response uses, rather
-    // than by a second one of its own: a match index only ever increases, because
-    // un-acknowledging a confirmed entry can only end with a committed entry
-    // treated as uncommitted.
-    auto const clamped = std::min(response.matchIndex, _log.LastIndex());
-    auto& match = _matchIndex[response.followerId];
-    match = std::max(match, clamped);
-    _nextIndex[response.followerId] = match.Advanced(1);
+    // By exactly the rule an AppendEntries response uses, and through the same
+    // function rather than a second copy of it -- which is what the comment here
+    // used to claim while being one.
+    AdvanceFollowerProgress(response.followerId, response.matchIndex);
 
     AdvanceCommitIndex();
     ApplyCommitted(output);
@@ -996,21 +1091,7 @@ void RaftNode::OnAppendEntriesResponse(AppendEntriesResponse const& response, Ti
         return;
     }
 
-    // Never move a match index backwards. Responses arrive out of order, and an
-    // older one carrying a smaller index would un-acknowledge entries this
-    // follower has already confirmed -- and since match indices are what decide
-    // commitment, that can only end with a committed entry treated as
-    // uncommitted.
-    // Clamped to this leader's own log as well. A follower cannot hold more than
-    // was sent to it, so a larger number is nonsense -- but taken at face value it
-    // pushes `nextIndex` past the end, and every subsequent AppendEntries then
-    // names a `prevLogIndex` that does not exist, is rejected, and walks back one
-    // index per round trip: that peer never converges again. It reaches
-    // `AdvanceCommitIndex` too, where only `TermAt` returning nullopt for a
-    // phantom index prevents committing one.
-    auto& match = _matchIndex[response.followerId];
-    match = std::max(match, std::min(response.matchIndex, _log.LastIndex()));
-    _nextIndex[response.followerId] = match.Advanced(1);
+    AdvanceFollowerProgress(response.followerId, response.matchIndex);
 
     AdvanceCommitIndex();
     ApplyCommitted(output);

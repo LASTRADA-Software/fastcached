@@ -4,6 +4,7 @@
 #include <FastCache/Consensus/IRaftStorage.hpp>
 
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 namespace FastCache::Consensus
@@ -32,9 +33,10 @@ class InMemoryRaftStorage final: public IRaftStorage
     /// two goes wrong.
     struct FailurePlan
     {
-        std::size_t failNthSaveState { 0 }; ///< Fail this SaveState call.
-        std::size_t failNthSaveLog { 0 };   ///< Fail this SaveLog call.
-        std::size_t failNthLoad { 0 };      ///< Fail this Load call.
+        std::size_t failNthSaveState { 0 };    ///< Fail this SaveState call.
+        std::size_t failNthSaveLog { 0 };      ///< Fail this SaveLog call.
+        std::size_t failNthSaveSnapshot { 0 }; ///< Fail this SaveSnapshot call.
+        std::size_t failNthLoad { 0 };         ///< Fail this Load call.
     };
 
     InMemoryRaftStorage() = default;
@@ -48,6 +50,7 @@ class InMemoryRaftStorage final: public IRaftStorage
 
     [[nodiscard]] std::expected<void, ConsensusError> SaveState(PersistentState const& state) override;
     [[nodiscard]] std::expected<void, ConsensusError> SaveLog(LogAppend const& append) override;
+    [[nodiscard]] std::expected<void, ConsensusError> SaveSnapshot(RaftSnapshot const& snapshot) override;
     [[nodiscard]] std::expected<RecoveredState, ConsensusError> Load() override;
 
     /// How many entries are currently stored. For assertions about truncation.
@@ -57,14 +60,26 @@ class InMemoryRaftStorage final: public IRaftStorage
         return _entries.size();
     }
 
+    /// The snapshot currently held, if any. For assertions about durability.
+    /// @return The stored snapshot.
+    [[nodiscard]] std::optional<RaftSnapshot> const& StoredSnapshot() const noexcept
+    {
+        return _snapshot;
+    }
+
   private:
     FailurePlan _plan;
     std::size_t _saveStateCalls { 0 };
     std::size_t _saveLogCalls { 0 };
+    std::size_t _saveSnapshotCalls { 0 };
     std::size_t _loadCalls { 0 };
 
     PersistentState _state;
     std::vector<LogEntry> _entries;
+
+    /// Index of `_entries[0]`; above 1 once a snapshot has trimmed the prefix.
+    LogIndex _firstIndex { .value = 1 };
+    std::optional<RaftSnapshot> _snapshot;
 };
 
 } // namespace FastCache::Consensus

@@ -2,7 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/Task.hpp>
-#include <FastCache/Consensus/RaftOutput.hpp>
+#include <FastCache/Consensus/IRaftMessageSink.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/IListener.hpp>
 
@@ -12,33 +12,6 @@
 
 namespace FastCache::Consensus
 {
-
-/// Where a message that arrived from a peer is handed on.
-///
-/// An interface rather than a `std::function`, for the reason the project
-/// prefers seams generally and one specific to this shape: the sink is a
-/// long-lived collaborator holding a `RaftDriver`, and a closure would capture
-/// whatever enclosing scope built it and keep that alive for the server's
-/// lifetime.
-class IRaftMessageSink
-{
-  public:
-    IRaftMessageSink() = default;
-    IRaftMessageSink(IRaftMessageSink const&) = delete;
-    IRaftMessageSink(IRaftMessageSink&&) = delete;
-    IRaftMessageSink& operator=(IRaftMessageSink const&) = delete;
-    IRaftMessageSink& operator=(IRaftMessageSink&&) = delete;
-    virtual ~IRaftMessageSink() = default;
-
-    /// Act on one message from a peer.
-    ///
-    /// Returns nothing: the wire is one-way and best-effort, so there is no
-    /// reply to produce and nothing the reader could do with a refusal. A node
-    /// that disagrees answers by sending its own message, not by failing this
-    /// call.
-    /// @param message The decoded message.
-    virtual void Deliver(RaftMessage message) = 0;
-};
 
 /// Limits a peer connection is held to.
 struct PeerServerOptions
@@ -131,7 +104,6 @@ class RaftPeerServer
     /// Serve one peer connection until it closes or desynchronizes.
     /// @param socket The accepted connection.
     /// @return Task that resolves when the connection ends.
-    [[nodiscard]] Task<void> ServeConnection(std::unique_ptr<ISocket> socket);
 
     IListener& _listener;
     IRaftMessageSink& _sink;

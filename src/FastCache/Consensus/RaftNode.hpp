@@ -196,8 +196,23 @@ class RaftNode
     /// configuration is captured alongside, because a follower catching up from
     /// this snapshot has no entries left to learn it from.
     /// @param state The application's serialized state as of `LastApplied()`.
+    /// @param output Receives the snapshot to make durable.
     /// @return True when the log was compacted.
-    bool CompactThroughApplied(std::vector<std::byte> state);
+    ///
+    /// The snapshot leaves through `output` rather than being written here, for
+    /// the reason every other durability write does: the entries it replaces are
+    /// gone from memory the moment this returns, so a node that discarded them
+    /// without recording what they produced comes back from a restart missing
+    /// committed state.
+    bool CompactThroughApplied(std::vector<std::byte> state, RaftOutput& output);
+
+    /// The snapshot this node currently holds, as a durable record.
+    ///
+    /// Composed from the log's own boundary rather than stored beside it: the log
+    /// already owns where the snapshot ends, and a second copy of that pair is a
+    /// second thing that can come to disagree with it.
+    /// @return The record.
+    [[nodiscard]] RaftSnapshot CurrentSnapshot() const;
 
     /// The last index this node's snapshot covers, or `BeforeFirst()`.
     /// @return The snapshot point.
@@ -308,6 +323,15 @@ class RaftNode
     /// Send each peer the AppendEntries it is owed.
     void ReplicateToPeers(RaftOutput& output) const;
 
+    /// Record how far a follower has confirmed it matches, and where to send next.
+    ///
+    /// One function rather than one per response type: an AppendEntries and an
+    /// InstallSnapshot both establish a match index by the same rule, and two
+    /// copies of a rule this delicate are two places for it to drift.
+    /// @param follower Which peer answered.
+    /// @param reported The match index it claims, before clamping.
+    void AdvanceFollowerProgress(NodeId const& follower, LogIndex reported);
+
     /// Advance the commit index if a quorum has caught up (§5.4.2).
     void AdvanceCommitIndex();
 
@@ -387,6 +411,15 @@ class RaftNode
     /// would otherwise be counted twice, and two counted votes from one node is a
     /// quorum that does not exist.
     std::unordered_set<NodeId> _votesGranted;
+
+    /// The configuration as of the snapshot.
+    ///
+    /// The fall-back for `RefreshConfiguration` when the retained log holds no
+    /// configuration entry — which is precisely what compaction produces. Without
+    /// it the fall-back is the *bootstrap* set, so a node that took part in a
+    /// membership change and then compacted would forget it, silently and only
+    /// after a restart.
+    std::vector<NodeId> _snapshotMembers;
 
     /// The application state the log's discarded prefix produced.
     ///

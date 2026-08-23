@@ -25,20 +25,19 @@ namespace
     /// before the first suspension and then outlives every frame that could have
     /// kept it alive. `RaftDriver::Run` takes its reactor the same way, for the
     /// same reason.
+    /// `ISocket::Write` is write-all by contract -- "Resolves with the byte count
+    /// actually written (== buffer.size() on success)" -- so the count is checked
+    /// rather than looped over. A resume loop here would be dead code that reads as
+    /// a statement about the interface, and a reader who believed it would write
+    /// partial-write handling at every other call site too; the three that already
+    /// exist just check the count.
     /// @param socket The connected peer socket; never null.
     /// @param bytes The framed message.
     /// @return Whether every byte reached the socket.
-    [[nodiscard]] Task<bool> WriteAll(ISocket* socket, std::span<std::byte const> bytes)
+    [[nodiscard]] Task<bool> WriteFrame(ISocket* socket, std::span<std::byte const> bytes)
     {
-        std::size_t sent = 0;
-        while (sent < bytes.size())
-        {
-            auto const written = co_await socket->Write(bytes.subspan(sent));
-            if (!written.has_value() || *written == 0)
-                co_return false;
-            sent += *written;
-        }
-        co_return true;
+        auto const written = co_await socket->Write(bytes);
+        co_return written.has_value() && *written == bytes.size();
     }
 
 } // namespace
@@ -218,7 +217,7 @@ void RaftPeerTransport::RunSender(Peer& peer) noexcept
         auto delivered = false;
         try
         {
-            delivered = SyncRun(WriteAll(socket.get(), frame));
+            delivered = SyncRun(WriteFrame(socket.get(), frame));
         }
         catch (std::exception const& error)
         {

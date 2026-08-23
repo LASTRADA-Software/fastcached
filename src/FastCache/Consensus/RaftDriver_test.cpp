@@ -49,6 +49,12 @@ class RecordingStorage final: public IRaftStorage
         return _inner.SaveLog(append);
     }
 
+    std::expected<void, ConsensusError> SaveSnapshot(RaftSnapshot const& snapshot) override
+    {
+        _journal.events.emplace_back("persist-snapshot");
+        return _inner.SaveSnapshot(snapshot);
+    }
+
     std::expected<RecoveredState, ConsensusError> Load() override
     {
         return _inner.Load();
@@ -143,6 +149,11 @@ class FailingStorage final: public IRaftStorage
     }
 
     std::expected<void, ConsensusError> SaveLog(LogAppend const& /*append*/) override
+    {
+        return std::unexpected { FastCache::StorageFailure("disk is gone") };
+    }
+
+    std::expected<void, ConsensusError> SaveSnapshot(RaftSnapshot const& /*snapshot*/) override
     {
         return std::unexpected { FastCache::StorageFailure("disk is gone") };
     }
