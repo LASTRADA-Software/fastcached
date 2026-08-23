@@ -130,7 +130,7 @@ TEST_CASE("A version outside the range is told what would have worked", "[distri
 
     auto const payload = PayloadOf(reply).subspan(1);
     auto const text = std::string { reinterpret_cast<char const*>(payload.data()), payload.size() };
-    CHECK(text.find("supported versions") != std::string::npos);
+    CHECK(text.contains("supported versions"));
 }
 
 TEST_CASE("A frame that is not this protocol is the one condition that closes", "[distributed][scheduler][protocol]")
