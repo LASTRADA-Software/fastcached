@@ -1706,6 +1706,41 @@ Consequences that are each load-bearing:
   cannot reach — and is refused only the fleet's CPU time, which is the thing
   membership pays for. Hence `NotAMember` rather than `Unauthenticated`: one is
   about a credential an endpoint requires, the other about contribution.
+  - **An empty member set refuses everybody, and "admit everybody" is a named type
+    somebody constructs.** `ClusterMembership` with nothing in it is the state of a
+    node whose discovery has not run, has the wrong key, or is misconfigured — and a
+    scheduler that answered "member" there would silently become an open one, which
+    is invisible from both ends because the fleet keeps working and merely serves
+    strangers too. `OpenMembership` is the right answer for one machine or a fleet
+    whose reachability is its boundary, but it is never a *default*: "no policy" and
+    "a policy that admits everybody" have to be the same explicit decision, which is
+    also why `Membership::Outsider` is the zero value. Matching is whole-string, not
+    by prefix — `10.0.0.1` must not admit `10.0.0.10` — and the port is part of the
+    identity, because the proof a peer gave covered the `(node, endpoint)` pair.
+  - **The identity is a HOST, and the two vocabularies are collapsed in the
+    constructor rather than left to each caller.** Discovery admits a peer at a
+    `(node, endpoint)` pair, so the obvious member set is endpoints — and matching a
+    caller against it would never succeed even once: a peer *connecting* to the
+    scheduler comes from an **ephemeral source port**, which is not its Raft endpoint,
+    so `ISocket::PeerAddress()` reports a bare host and there is nothing to compare a
+    port against. An endpoint-keyed set refuses every legitimate member while looking
+    entirely correct, and the fleet silently never distributes anything. So
+    `ClusterMembership` takes endpoints and stores their host parts, and `Classify`
+    takes a host; there is no way to publish one vocabulary and query the other. It
+    splits through `Core/HostPort` rather than locally, because `rfind(':')` on
+    `[::1]:7000` splits at the wrong colon — the defect that header exists to hold in
+    one place. An endpoint with no port is kept whole rather than dropped: a member the
+    set cannot represent must not silently stop being one. What this gives up is
+    recorded rather than hidden — two nodes behind one NAT are indistinguishable here,
+    which is acceptable because this refuses *strangers* rather than co-located peers,
+    and separating them needs a credential in the frame.
+  - **The oracle is a seam and not a call into `Cluster::PeerDirectory`.** The
+    dependency would run the wrong way — `Distributed` is the policy, `Cluster` is
+    one way of establishing the fact it needs — and the answer is *deployment*-shaped
+    rather than universal, which is what an interface is for. `Publish` is a setter
+    and one of the documented carve-outs to configuration-at-construction: membership
+    is precisely what changes while the object lives, and rebuilding the oracle per
+    join would mean handing a new one to a running server.
 - **Duplicate suppression is asked BEFORE capacity, and the order is the whole
   point.** `LeaseTable::Acquire` needs a worker id, so the code this was lifted from
   had to `Pick` first — which meant a second client missing the same key at a busy
