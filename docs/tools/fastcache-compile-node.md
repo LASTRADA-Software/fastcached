@@ -135,8 +135,45 @@ replaced on upgrade.
 
 ### macOS and Windows
 
-Run it in the foreground, or under whatever supervisor you already use. There is
-no `--install-service` yet on either platform — see *Not yet done* below.
+```sh
+fastcache-compile-node --install-service \
+    --scheduler=cache.internal:6675 \
+    --advertise=worker-01.internal:6676 \
+    --toolchain=/usr/bin/c++ \
+    --service-scope=user            # macOS: registers a launchd agent for you
+```
+
+Every other flag on that command line is **baked into the registration** and
+reused at every start, so this is also where a wrong one is expensive. Three
+things are therefore refused at install time rather than at the next boot:
+
+| Missing | Why it is refused here |
+|---|---|
+| `--advertise` | Without it the registration bakes in `{--bind}:{--port}`, and the default `0.0.0.0` is not an address a client can dial. Such a worker registers, heartbeats, is leased out, and is never reached — with no error at either end. |
+| `--scheduler` | The service would start and exit at every boot. |
+| `--toolchain` | The worker would register and then refuse every job sent to it. |
+
+`--requirepass` is refused too, for the reason it is on the daemon: a supervisor
+records launch arguments where every local account can read them, and for a
+worker that token is what the scheduler authenticates it *by*. Put it in a
+config file the service account can read, or set it with a supervisor override.
+
+**macOS scope.** `--service-scope=user` registers a LaunchAgent that runs as
+you, which is the per-developer case and works today. `--service-scope=system`
+registers a LaunchDaemon that must run as the unprivileged `fastcache-node`
+account — the same one the Linux unit uses — and **is refused until that account
+exists**, because a system job with no account named runs as *root*, and this
+process compiles input that arrived over the network. Creating it is packaging
+work that has not landed ([#87](https://github.com/LASTRADA-Software/fastcached/issues/87)).
+
+**Windows** registers an SCM service (auto-start, left stopped; `sc start
+FastCacheCompileNode`). The default service name is `FastCacheCompileNode`, not
+the daemon's `FastCached`, so a machine can run both without one install
+displacing the other.
+
+Remove a registration with `--uninstall-service` (and the same
+`--service-scope`, on macOS: which domain a job lives in is decided at install
+time and re-probing would boot out one that was never there).
 
 ## Capacity
 
@@ -247,9 +284,11 @@ For anything beyond a trusted build network, put mTLS in front of both ports.
 
 ## Not yet done
 
-- `--install-service` on macOS and Windows. The Linux units are shipped; the
-  other two need the daemon shell (a launchd agent needs a service account the
-  installer creates, and a Windows service needs a service-control handler).
+- The macOS package does not create the `fastcache-node` account, so
+  `--install-service --service-scope=system` refuses there
+  ([#87](https://github.com/LASTRADA-Software/fastcached/issues/87)).
+  `--service-scope=user` works, and is the right answer on a developer machine
+  anyway.
 - Host **CPU and memory utilization** are not reported. Size, slots and disk are;
   what the machine is doing *right now* is what resource-aware scheduling will
   need, and it lands with the scheduling policy that consumes it rather than

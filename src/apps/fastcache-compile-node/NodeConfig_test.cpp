@@ -170,3 +170,21 @@ TEST_CASE("NodeConfig: the worker's service name is not the daemon's", "[node][s
     Config const daemonCfg;
     CHECK(cfg.serviceName != daemonCfg.serviceName);
 }
+
+TEST_CASE("NodeConfig: a system-scope job names an unprivileged account", "[node][service]")
+{
+    // A system-scope launchd job with no UserName runs as ROOT, and this process
+    // compiles input that arrived over the network. Naming the account the Linux
+    // unit already uses puts the platform's existing "that account does not
+    // exist" guard in the way, so a macOS system-scope install refuses until the
+    // package creates it rather than silently succeeding as root.
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable());
+
+    CHECK(spec.serviceAccount == "fastcache-node");
+
+    // And not the daemon's: a worker runs a compiler on input from the network
+    // while fastcached owns the cache storage, so one account would let a
+    // compromised compile rewrite every cached object.
+    auto const daemonSpec = MakeDaemonServiceSpec(std::filesystem::path { "fastcached" }, Config {});
+    CHECK(spec.serviceAccount != daemonSpec.serviceAccount);
+}

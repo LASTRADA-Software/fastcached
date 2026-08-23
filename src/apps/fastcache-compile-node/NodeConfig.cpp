@@ -285,12 +285,17 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          .daemonFlag = "--daemon",
                          .displayName = "fastcache-compile-node",
                          .description = "fastcache-compile-node \u2014 a compile worker for fastcached",
-                         // Empty: a worker runs as whatever the supervisor's default
-                         // account is. It compiles code a client sent, so giving it a
-                         // dedicated unprivileged account is worth doing -- but the
-                         // package has to create that account first, and inventing one
-                         // here would register a service that cannot start.
-                         .serviceAccount = {},
+                         // Named rather than left empty, and the difference is not
+                         // cosmetic: a system-scope launchd job with no UserName runs
+                         // as ROOT, and this process compiles input that arrived over
+                         // the network. Naming the account the Linux unit already uses
+                         // (packaging/linux/fastcache-compile-node.sysusers) puts the
+                         // existing "that account does not exist" guard in the way, so
+                         // a macOS system-scope install REFUSES until the package
+                         // creates it -- rather than silently succeeding as root.
+                         // `--service-scope=user` works today and is the per-developer
+                         // case anyway: a user agent runs as the invoking account.
+                         .serviceAccount = "fastcache-node",
                          .ownedDirectories = std::move(owned),
                          .inlineCredential = cfg.token.empty() ? InlineCredential::Absent : InlineCredential::Present,
                          .configPath = {} };
