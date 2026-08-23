@@ -104,7 +104,7 @@ constexpr std::string_view ProgramVersion = FastCache::VersionString;
 [[nodiscard]] int SeedDefaultConfig(std::string const& templatePath)
 {
     FastCache::SystemConfigPathProbe const probe;
-    auto const destination = FastCache::SystemConfigPath(probe);
+    auto const destination = FastCache::SystemConfigPath(probe, FastCache::DaemonApplicationName);
     auto const seeded = destination.and_then([&](auto const& dest) {
         return FastCache::SeedConfigFile(templatePath, dest, FastCache::DirectoryPolicy::AdministratorsOnly);
     });
@@ -833,7 +833,8 @@ int main(int argc, char const* const* argv)
     // path baked into a service's launch arguments would outrank the file itself
     // forever, and InlineCredentialRejection would start naming a path nobody
     // typed.
-    auto const lookup = FastCache::EffectiveConfigPath(parsed->config.configPath, FastCache::SystemConfigPathProbe {});
+    auto const lookup = FastCache::EffectiveConfigPath(
+        parsed->config.configPath, FastCache::SystemConfigPathProbe {}, FastCache::DaemonApplicationName);
     auto const configPath = lookup.path.string();
 
     // A config that exists and is readable but was passed over anyway has to say

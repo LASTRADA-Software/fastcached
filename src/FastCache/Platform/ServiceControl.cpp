@@ -1180,7 +1180,7 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     // disagreeing about which configs count.
     SystemConfigPathProbe const probe;
     auto const packagedConfig = [&] {
-        auto const path = SystemConfigPath(probe);
+        auto const path = SystemConfigPath(probe, DaemonApplicationName);
         return path.has_value() && probe.IsReadableFile(*path) && probe.IsTrustedSystemLocation(*path)
                    ? *path
                    : std::filesystem::path {};

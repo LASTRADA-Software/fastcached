@@ -44,28 +44,28 @@ namespace
     /// deliberately can see: the startup banner names the file that was chosen.
 #if defined(_WIN32)
     constexpr auto Candidates = std::to_array<ConfigCandidate>({
-        { .display = "%APPDATA%\\fastcached\\fastcached.yaml",
+        { .display = "%APPDATA%\\{app}\\{app}.yaml",
           .baseVar = "APPDATA",
-          .suffix = "fastcached\\fastcached.yaml",
+          .suffix = "{app}\\{app}.yaml",
           .scope = ConfigScope::User },
-        { .display = "%ProgramData%\\fastcached\\fastcached.yaml",
+        { .display = "%ProgramData%\\{app}\\{app}.yaml",
           .baseVar = "ProgramData",
-          .suffix = "fastcached\\fastcached.yaml",
+          .suffix = "{app}\\{app}.yaml",
           .scope = ConfigScope::System },
     });
 #else
     constexpr auto Candidates = std::to_array<ConfigCandidate>({
-        { .display = "$XDG_CONFIG_HOME/fastcached/fastcached.yaml",
+        { .display = "$XDG_CONFIG_HOME/{app}/{app}.yaml",
           .baseVar = "XDG_CONFIG_HOME",
-          .suffix = "fastcached/fastcached.yaml",
+          .suffix = "{app}/{app}.yaml",
           .scope = ConfigScope::User },
-        { .display = "~/.config/fastcached/fastcached.yaml",
+        { .display = "~/.config/{app}/{app}.yaml",
           .baseVar = "HOME",
-          .suffix = ".config/fastcached/fastcached.yaml",
+          .suffix = ".config/{app}/{app}.yaml",
           .scope = ConfigScope::User },
-        { .display = FC_SYSCONF_DIR "/fastcached.yaml",
+        { .display = FC_SYSCONF_DIR "/{app}.yaml",
           .baseVar = "",
-          .suffix = FC_SYSCONF_DIR "/fastcached.yaml",
+          .suffix = FC_SYSCONF_DIR "/{app}.yaml",
           .scope = ConfigScope::System },
     });
 #endif
@@ -148,10 +148,35 @@ std::span<ConfigCandidate const> DefaultConfigCandidates() noexcept
     return Candidates;
 }
 
-std::optional<std::filesystem::path> ExpandConfigCandidate(ConfigCandidate const& candidate, IConfigPathProbe const& probe)
+std::string ExpandApplicationName(std::string_view pattern, std::string_view appName)
 {
+    std::string out;
+    out.reserve(pattern.size() + appName.size());
+
+    for (std::size_t at = 0; at < pattern.size();)
+    {
+        auto const found = pattern.find(ApplicationNameToken, at);
+        if (found == std::string_view::npos)
+        {
+            out.append(pattern.substr(at));
+            break;
+        }
+        out.append(pattern.substr(at, found - at));
+        out.append(appName);
+        at = found + ApplicationNameToken.size();
+    }
+
+    return out;
+}
+
+std::optional<std::filesystem::path> ExpandConfigCandidate(ConfigCandidate const& candidate,
+                                                           IConfigPathProbe const& probe,
+                                                           std::string_view appName)
+{
+    auto const suffix = ExpandApplicationName(candidate.suffix, appName);
+
     if (candidate.baseVar.empty())
-        return std::filesystem::path { candidate.suffix };
+        return std::filesystem::path { suffix };
 
     auto const base = probe.GetEnv(candidate.baseVar);
 
@@ -161,10 +186,10 @@ std::optional<std::filesystem::path> ExpandConfigCandidate(ConfigCandidate const
     if (!base.has_value() || base->empty())
         return std::nullopt;
 
-    return std::filesystem::path { *base } / candidate.suffix;
+    return std::filesystem::path { *base } / suffix;
 }
 
-ConfigLookup ResolveDefaultConfigPath(IConfigPathProbe const& probe)
+ConfigLookup ResolveDefaultConfigPath(IConfigPathProbe const& probe, std::string_view appName)
 {
     ConfigLookup lookup;
 
@@ -180,7 +205,7 @@ ConfigLookup ResolveDefaultConfigPath(IConfigPathProbe const& probe)
         if (candidate.scope == ConfigScope::System && !privileged)
             continue;
 
-        auto const path = ExpandConfigCandidate(candidate, probe);
+        auto const path = ExpandConfigCandidate(candidate, probe, appName);
         if (!path.has_value() || !probe.IsReadableFile(*path))
             continue; // absent or not ours to read: ordinary, and silent
 
@@ -209,23 +234,23 @@ ConfigLookup ResolveDefaultConfigPath(IConfigPathProbe const& probe)
     return lookup;
 }
 
-ConfigLookup EffectiveConfigPath(std::string_view named, IConfigPathProbe const& probe)
+ConfigLookup EffectiveConfigPath(std::string_view named, IConfigPathProbe const& probe, std::string_view appName)
 {
     if (!named.empty())
         return { .path = std::filesystem::path { named }, .rejected = {} };
 
-    return ResolveDefaultConfigPath(probe);
+    return ResolveDefaultConfigPath(probe, appName);
 }
 
-std::expected<std::filesystem::path, ConfigError> SystemConfigPath(IConfigPathProbe const& probe)
+std::expected<std::filesystem::path, ConfigError> SystemConfigPath(IConfigPathProbe const& probe, std::string_view appName)
 {
     // The row itself is a compile-time fact; only its base variable can be
     // missing, so that is the only thing left to report.
-    if (auto path = ExpandConfigCandidate(SystemRow, probe))
+    if (auto path = ExpandConfigCandidate(SystemRow, probe, appName))
         return *std::move(path);
 
     return std::unexpected(MakeConfigPathError(ConfigErrorCode::UndefinedVariable,
-                                               SystemRow.display,
+                                               ExpandApplicationName(SystemRow.display, appName),
                                                std::format("environment variable is not set: {}", SystemRow.baseVar)));
 }
 

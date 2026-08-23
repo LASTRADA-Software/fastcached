@@ -26,6 +26,27 @@ enum class ConfigScope : std::uint8_t
     System, ///< Machine-wide; the file the installer writes.
 };
 
+/// The token in a candidate's `display` and `suffix` standing for the
+/// application's name.
+///
+/// A literal substitution rather than `std::format`, deliberately. A display
+/// form already contains `%VAR%` on Windows and `$VAR` on POSIX, so adding a
+/// third meta-syntax whose braces are also `std::format`'s own grammar is how a
+/// path that happens to contain a brace becomes a thrown exception at startup.
+constexpr std::string_view ApplicationNameToken = "{app}";
+
+/// The daemon's name in the config lookup.
+constexpr std::string_view DaemonApplicationName = "fastcached";
+
+/// The compile worker's name in the config lookup.
+constexpr std::string_view NodeApplicationName = "fastcache-compile-node";
+
+/// Substitute @p appName for every ApplicationNameToken in @p pattern.
+/// @param pattern A candidate's `display` or `suffix`.
+/// @param appName Application whose configuration is being looked for.
+/// @return The pattern with the token replaced.
+[[nodiscard]] std::string ExpandApplicationName(std::string_view pattern, std::string_view appName);
+
 /// One candidate location probed for a config file when no `--config` is given.
 ///
 /// The table of these is the single source of truth for the lookup order, for
@@ -34,8 +55,11 @@ enum class ConfigScope : std::uint8_t
 struct ConfigCandidate
 {
     /// Human-readable form for `--help` and the docs, e.g.
-    /// `"~/.config/fastcached/fastcached.yaml"`. Spelled symbolically because
-    /// the real path is only known once the environment is read.
+    /// `"~/.config/{app}/{app}.yaml"`. Spelled symbolically because the real
+    /// path is only known once the environment is read, and carrying
+    /// ApplicationNameToken because more than one binary looks itself up here --
+    /// the rows used to hardcode `fastcached`, which is why the worker had no
+    /// discovered-config path to generalize onto.
     std::string_view display;
 
     /// Environment variable holding the base directory. Empty means `suffix`
@@ -44,7 +68,8 @@ struct ConfigCandidate
     /// case to fall back to `~/.config`.
     std::string_view baseVar;
 
-    /// Path appended to the resolved base (or used as-is when `baseVar` is empty).
+    /// Path appended to the resolved base (or used as-is when `baseVar` is
+    /// empty). Carries ApplicationNameToken, like `display`.
     std::string_view suffix;
 
     ConfigScope scope; ///< Which of the two roles this row fills.
@@ -110,10 +135,12 @@ class SystemConfigPathProbe final: public IConfigPathProbe
 /// Expand one candidate against the environment, without touching the disk.
 /// @param candidate Row to expand.
 /// @param probe Environment source.
+/// @param appName Application whose configuration is being looked for.
 /// @return The absolute path, or nullopt when the row's `baseVar` is unset or
 ///         empty (meaning this location does not apply to this process).
 [[nodiscard]] std::optional<std::filesystem::path> ExpandConfigCandidate(ConfigCandidate const& candidate,
-                                                                         IConfigPathProbe const& probe);
+                                                                         IConfigPathProbe const& probe,
+                                                                         std::string_view appName);
 
 /// A candidate the lookup passed over for a reason the operator has to hear.
 ///
@@ -157,9 +184,10 @@ struct ConfigLookup
 ///   would otherwise take root's configuration from them.
 ///
 /// @param probe Environment, filesystem and privilege source.
+/// @param appName Application whose configuration is being looked for.
 /// @return The first usable candidate, with an empty path when there is none,
 ///         plus anything rejected along the way.
-[[nodiscard]] ConfigLookup ResolveDefaultConfigPath(IConfigPathProbe const& probe);
+[[nodiscard]] ConfigLookup ResolveDefaultConfigPath(IConfigPathProbe const& probe, std::string_view appName);
 
 /// The config file a run should actually read.
 ///
@@ -174,9 +202,12 @@ struct ConfigLookup
 ///
 /// @param named The `--config` value, empty when the operator gave none.
 /// @param probe Environment and filesystem source.
+/// @param appName Application whose configuration is being looked for.
 /// @return The path to read — empty when there is none and the built-in
 ///         defaults apply — plus anything rejected along the way.
-[[nodiscard]] ConfigLookup EffectiveConfigPath(std::string_view named, IConfigPathProbe const& probe);
+[[nodiscard]] ConfigLookup EffectiveConfigPath(std::string_view named,
+                                               IConfigPathProbe const& probe,
+                                               std::string_view appName);
 
 /// Where an installer should write the machine-wide config.
 ///
@@ -187,10 +218,12 @@ struct ConfigLookup
 /// reassembling it out of exported table columns.
 ///
 /// @param probe Environment source.
+/// @param appName Application whose configuration is being written.
 /// @return The machine-wide path, whether or not it exists yet, or
 ///         `UndefinedVariable` when the location's base variable is unset
 ///         (only reachable where that location is environment-derived).
-[[nodiscard]] std::expected<std::filesystem::path, ConfigError> SystemConfigPath(IConfigPathProbe const& probe);
+[[nodiscard]] std::expected<std::filesystem::path, ConfigError> SystemConfigPath(IConfigPathProbe const& probe,
+                                                                                 std::string_view appName);
 
 /// What SeedConfigFile did.
 enum class SeedOutcome : std::uint8_t

@@ -27,11 +27,21 @@
 #endif
 
 using FastCache::ConfigCandidate;
+
+namespace
+{
+/// The application these cases look up.
+///
+/// The table's rows became patterns so a second binary can look itself up in
+/// them; every case here is still about the daemon, so it says so once.
+constexpr auto App = FastCache::DaemonApplicationName;
+} // namespace
 using FastCache::ConfigErrorCode;
 using FastCache::ConfigScope;
 using FastCache::DefaultConfigCandidates;
 using FastCache::DirectoryPolicy;
 using FastCache::EffectiveConfigPath;
+using FastCache::ExpandApplicationName;
 using FastCache::ExpandConfigCandidate;
 using FastCache::IConfigPathProbe;
 using FastCache::ResolveDefaultConfigPath;
@@ -129,7 +139,7 @@ class FakeProbe: public IConfigPathProbe
 {
     std::vector<std::filesystem::path> out;
     for (auto const& candidate: DefaultConfigCandidates())
-        if (auto const path = ExpandConfigCandidate(candidate, probe))
+        if (auto const path = ExpandConfigCandidate(candidate, probe, App))
             out.push_back(*path);
     return out;
 }
@@ -242,7 +252,7 @@ TEST_CASE("DefaultConfigPath: the first readable candidate wins", "[config][defa
     for (auto const& path: paths)
         probe.MakeReadable(path);
 
-    auto const resolved = ResolveDefaultConfigPath(probe);
+    auto const resolved = ResolveDefaultConfigPath(probe, App);
     REQUIRE(resolved.path == paths.front());
     REQUIRE(resolved.rejected.empty());
 }
@@ -260,7 +270,7 @@ TEST_CASE("DefaultConfigPath: a candidate that exists but cannot be read is skip
     // fall through it rather than fail to start.
     probe.MakeReadable(paths.back());
 
-    auto const resolved = ResolveDefaultConfigPath(probe);
+    auto const resolved = ResolveDefaultConfigPath(probe, App);
     REQUIRE(resolved.path == paths.back());
 
     // An unreadable candidate is ordinary, so nothing is reported about it.
@@ -273,7 +283,7 @@ TEST_CASE("DefaultConfigPath: no readable candidate resolves to nothing, not an 
     probe.SetAllBaseVars();
 
     // Nothing was marked readable, so the daemon runs on its built-in defaults.
-    REQUIRE(ResolveDefaultConfigPath(probe).path.empty());
+    REQUIRE(ResolveDefaultConfigPath(probe, App).path.empty());
 }
 
 TEST_CASE("EffectiveConfigPath: a named path is taken verbatim, readable or not", "[config][defaultpath]")
@@ -284,18 +294,18 @@ TEST_CASE("EffectiveConfigPath: a named path is taken verbatim, readable or not"
     // Nothing is marked readable, and the answer is still the named file: the
     // operator asserted it was there, so a typo has to fail loudly downstream
     // rather than silently start on a different location's settings.
-    REQUIRE(EffectiveConfigPath("/etc/typo.yaml", probe).path == std::filesystem::path { "/etc/typo.yaml" });
+    REQUIRE(EffectiveConfigPath("/etc/typo.yaml", probe, App).path == std::filesystem::path { "/etc/typo.yaml" });
 
     // ...and it outranks a discovered candidate that *is* readable.
     auto const paths = ExpandAll(probe);
     probe.MakeReadable(paths.front());
-    REQUIRE(EffectiveConfigPath("/etc/named.yaml", probe).path == std::filesystem::path { "/etc/named.yaml" });
+    REQUIRE(EffectiveConfigPath("/etc/named.yaml", probe, App).path == std::filesystem::path { "/etc/named.yaml" });
 
     // A named path is not trust-checked either: the operator pointed at that
     // file, which is theirs to decide, and second-guessing it would make
     // --config unusable for exactly the recovery case it exists for.
     probe.MakeUntrusted("/etc/named.yaml");
-    auto const named = EffectiveConfigPath("/etc/named.yaml", probe);
+    auto const named = EffectiveConfigPath("/etc/named.yaml", probe, App);
     REQUIRE(named.path == std::filesystem::path { "/etc/named.yaml" });
     REQUIRE(named.rejected.empty());
 }
@@ -307,11 +317,11 @@ TEST_CASE("EffectiveConfigPath: with no named path it discovers, and only when r
     probe.MakePrivileged(); // so every row, including the last, is in play
 
     // Nothing readable: an empty path, meaning the built-in defaults apply.
-    REQUIRE(EffectiveConfigPath("", probe).path.empty());
+    REQUIRE(EffectiveConfigPath("", probe, App).path.empty());
 
     auto const paths = ExpandAll(probe);
     probe.MakeReadable(paths.back());
-    REQUIRE(EffectiveConfigPath("", probe).path == paths.back());
+    REQUIRE(EffectiveConfigPath("", probe, App).path == paths.back());
 }
 
 TEST_CASE("DefaultConfigPath: a machine-wide candidate a non-admin could have written is refused",
@@ -327,7 +337,7 @@ TEST_CASE("DefaultConfigPath: a machine-wide candidate a non-admin could have wr
     // value_or rather than a dereference after REQUIRE: Catch2's macros are
     // opaque to clang-tidy's optional analysis, so an empty path is the way to
     // say "expansion failed" in a form it can follow. Same everywhere below.
-    auto const systemPath = ExpandConfigCandidate(*systemRow, probe).value_or(std::filesystem::path {});
+    auto const systemPath = ExpandConfigCandidate(*systemRow, probe, App).value_or(std::filesystem::path {});
     REQUIRE_FALSE(systemPath.empty());
 
     // Readable, and the only candidate there is — but in a directory anyone can
@@ -336,7 +346,7 @@ TEST_CASE("DefaultConfigPath: a machine-wide candidate a non-admin could have wr
     probe.MakeReadable(systemPath);
     probe.MakeUntrusted(systemPath);
 
-    auto const resolved = ResolveDefaultConfigPath(probe);
+    auto const resolved = ResolveDefaultConfigPath(probe, App);
     REQUIRE(resolved.path.empty()); // built-in defaults, not the planted file
 
     // And loudly: this is the one skip the operator has to be told about, since
@@ -357,7 +367,7 @@ TEST_CASE("DefaultConfigPath: an unprivileged process vouches for nothing, becau
 
     FakeProbe probe;
     probe.SetAllBaseVars();
-    auto const userPath = ExpandConfigCandidate(*userRow, probe).value_or(std::filesystem::path {});
+    auto const userPath = ExpandConfigCandidate(*userRow, probe, App).value_or(std::filesystem::path {});
     REQUIRE_FALSE(userPath.empty());
 
     // A per-user config lives in the account's own directory, so "someone other
@@ -367,7 +377,7 @@ TEST_CASE("DefaultConfigPath: an unprivileged process vouches for nothing, becau
     probe.MakeReadable(userPath);
     probe.MakeUntrusted(userPath);
 
-    auto const resolved = ResolveDefaultConfigPath(probe);
+    auto const resolved = ResolveDefaultConfigPath(probe, App);
     REQUIRE(resolved.path == userPath);
     REQUIRE(resolved.rejected.empty());
 }
@@ -380,7 +390,7 @@ TEST_CASE("DefaultConfigPath: an unprivileged process does not adopt the machine
 
     FakeProbe probe;
     probe.SetAllBaseVars();
-    auto const systemPath = ExpandConfigCandidate(*systemRow, probe).value_or(std::filesystem::path {});
+    auto const systemPath = ExpandConfigCandidate(*systemRow, probe, App).value_or(std::filesystem::path {});
     REQUIRE_FALSE(systemPath.empty());
 
     // Perfectly readable and perfectly trustworthy — the packaged /etc file is
@@ -392,7 +402,7 @@ TEST_CASE("DefaultConfigPath: an unprivileged process does not adopt the machine
     // defaults; the lookup must not undo that.
     probe.MakeReadable(systemPath);
 
-    auto const resolved = ResolveDefaultConfigPath(probe);
+    auto const resolved = ResolveDefaultConfigPath(probe, App);
     REQUIRE(resolved.path.empty());
 
     // Silently, too: nothing is wrong, the file simply belongs to another job.
@@ -407,7 +417,7 @@ TEST_CASE("DefaultConfigPath: a privileged process vouches for the per-user rows
     FakeProbe probe;
     probe.SetAllBaseVars();
     probe.MakePrivileged();
-    auto const userPath = ExpandConfigCandidate(*userRow, probe).value_or(std::filesystem::path {});
+    auto const userPath = ExpandConfigCandidate(*userRow, probe, App).value_or(std::filesystem::path {});
     REQUIRE_FALSE(userPath.empty());
 
     // $HOME and $XDG_CONFIG_HOME are inputs an unprivileged account frequently
@@ -418,7 +428,7 @@ TEST_CASE("DefaultConfigPath: a privileged process vouches for the per-user rows
     probe.MakeReadable(userPath);
     probe.MakeUntrusted(userPath);
 
-    auto const resolved = ResolveDefaultConfigPath(probe);
+    auto const resolved = ResolveDefaultConfigPath(probe, App);
     REQUIRE(resolved.path.empty());
     REQUIRE(resolved.rejected.size() == 1);
     REQUIRE(resolved.rejected.front().path == userPath);
@@ -434,7 +444,7 @@ TEST_CASE("DefaultConfigPath: an untrusted machine-wide row does not shadow a go
 
     auto const* const systemRow = SystemCandidate();
     REQUIRE(systemRow != nullptr);
-    auto const systemPath = ExpandConfigCandidate(*systemRow, probe).value_or(std::filesystem::path {});
+    auto const systemPath = ExpandConfigCandidate(*systemRow, probe, App).value_or(std::filesystem::path {});
     REQUIRE_FALSE(systemPath.empty());
 
     // Every candidate readable, the machine-wide one untrusted. The user row
@@ -444,7 +454,7 @@ TEST_CASE("DefaultConfigPath: an untrusted machine-wide row does not shadow a go
         probe.MakeReadable(path);
     probe.MakeUntrusted(systemPath);
 
-    auto const resolved = ResolveDefaultConfigPath(probe);
+    auto const resolved = ResolveDefaultConfigPath(probe, App);
     REQUIRE(resolved.path == paths.front());
     REQUIRE(resolved.rejected.empty());
 }
@@ -468,7 +478,7 @@ TEST_CASE("DefaultConfigPath: a base variable that is unset or empty skips its r
         probe.SetEnv(withVar->baseVar, "");
     }
 
-    REQUIRE(!ExpandConfigCandidate(*withVar, probe).has_value());
+    REQUIRE(!ExpandConfigCandidate(*withVar, probe, App).has_value());
 }
 
 TEST_CASE("DefaultConfigPath: a candidate with no base variable is used verbatim", "[config][defaultpath]")
@@ -481,7 +491,8 @@ TEST_CASE("DefaultConfigPath: a candidate with no base variable is used verbatim
     }
 
     FakeProbe const probe; // Deliberately empty: the row must not consult it.
-    REQUIRE(ExpandConfigCandidate(*absolute, probe) == std::optional { std::filesystem::path { absolute->suffix } });
+    REQUIRE(ExpandConfigCandidate(*absolute, probe, App)
+            == std::optional { std::filesystem::path { ExpandApplicationName(absolute->suffix, App) } });
 }
 
 TEST_CASE("DefaultConfigPath: SystemConfigPath names the machine-wide file even when absent", "[config][defaultpath]")
@@ -491,12 +502,12 @@ TEST_CASE("DefaultConfigPath: SystemConfigPath names the machine-wide file even 
 
     // Nothing is readable — an installer needs the destination precisely
     // because the file is not there yet.
-    auto const system = SystemConfigPath(probe);
+    auto const system = SystemConfigPath(probe, App);
     REQUIRE(system.has_value());
 
     auto const* const firstSystem = SystemCandidate();
     REQUIRE(firstSystem != nullptr);
-    REQUIRE(*system == ExpandConfigCandidate(*firstSystem, probe));
+    REQUIRE(*system == ExpandConfigCandidate(*firstSystem, probe, App));
 }
 
 TEST_CASE("DefaultConfigPath: SystemConfigPath reports the variable it could not expand", "[config][defaultpath]")
@@ -517,7 +528,7 @@ TEST_CASE("DefaultConfigPath: SystemConfigPath reports the variable it could not
     // A caller that wants to *write* a config has nowhere to go, so this is an
     // error with a diagnosis rather than an empty optional the caller has to
     // explain for itself.
-    auto const system = SystemConfigPath(probe);
+    auto const system = SystemConfigPath(probe, App);
     REQUIRE(!system.has_value());
     REQUIRE(system.error().code == ConfigErrorCode::UndefinedVariable);
     REQUIRE(system.error().context.contains(systemRow->baseVar));
@@ -525,8 +536,14 @@ TEST_CASE("DefaultConfigPath: SystemConfigPath reports the variable it could not
 
 TEST_CASE("DefaultConfigPath: the platform's locations are the ones the packaging installs", "[config][defaultpath]")
 {
+    // The rows carry `{app}` now, so the comparison expands them rather than
+    // matching the pattern -- what this case is about is the concrete locations
+    // the packaging installs into, which is what an operator and the .deb both
+    // have to agree on.
     auto const lists = [](std::string_view location) {
-        return FastCache::FindOrNull(DefaultConfigCandidates(), location, &ConfigCandidate::display) != nullptr;
+        return std::ranges::any_of(DefaultConfigCandidates(), [location](ConfigCandidate const& candidate) {
+            return ExpandApplicationName(candidate.display, App) == location;
+        });
     };
 
 #if defined(_WIN32)

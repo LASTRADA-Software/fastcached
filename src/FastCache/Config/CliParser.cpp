@@ -550,7 +550,9 @@ namespace
         {
             if (!out.empty())
                 out += '\n';
-            out += std::format("  {}", candidate.display);
+            // The rows carry `{app}` so a second binary can look itself up in the
+            // same table; help has to spell it out for this one.
+            out += std::format("  {}", ExpandApplicationName(candidate.display, DaemonApplicationName));
         }
         return out;
     }
