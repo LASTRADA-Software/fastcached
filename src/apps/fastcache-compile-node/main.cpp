@@ -11,6 +11,7 @@
 ///
 #include "AdminEndpoint.hpp"
 #include "NodeConfig.hpp"
+#include "SchedulerEndpoint.hpp"
 #include "WorkerServer.hpp"
 
 #include <FastCache/Async/Task.hpp>
@@ -431,6 +432,57 @@ constexpr int ExitOk = 0;
         logger.Logf(LogLevel::Info, "metrics endpoint on http://{}/metrics (and /healthz)", adminEndpoint->BoundEndpoint());
     }
 
+    // The fleet scheduler, when this node is the one running it. Off unless asked
+    // for: handing out other machines' CPU time is an operator's decision, not
+    // something they get by starting a worker.
+    //
+    // The three objects have to outlive the endpoint, which holds references into
+    // them, so they are declared here rather than inside the `if` -- and in
+    // construction order, since each takes the one before it.
+    SteadyClock schedulerClock;
+    Distributed::SchedulerService scheduler { schedulerClock, metrics };
+    Distributed::SchedulerProtocol schedulerProtocol { scheduler };
+    Distributed::OpenMembership openMembership;
+    Distributed::ClusterMembership listedMembership { cfg.fleetMembers };
+    std::unique_ptr<Node::SchedulerEndpoint> schedulerEndpoint;
+    if (!cfg.schedulerListen.empty())
+    {
+        // Which oracle is the operator's stated choice, never a fallback:
+        // `SchedulerPolicyRejection` has already refused the case where neither was
+        // given, so there is no branch here that guesses.
+        Distributed::IMembershipOracle const& membership =
+            cfg.fleetOpen ? static_cast<Distributed::IMembershipOracle const&>(openMembership) : listedMembership;
+
+        // Static leadership, and it is a placeholder said out loud rather than a
+        // silent one. Consensus is what will publish this -- `SetRole` exists for
+        // exactly that -- but until the node runs a `RaftDriver`, a scheduler that
+        // never became leader would refuse every verb with `NotLeader` and be
+        // indistinguishable from a permanent election. That is strictly worse than
+        // what `--listen-dispatch` did, and shipping it would break the rule that a
+        // replacement is never a regression on what it replaces.
+        scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+
+        // A bare port binds the WILDCARD here, unlike the admin endpoint's loopback:
+        // a scheduler no peer can dial is a scheduler that does nothing, so loopback
+        // would be a default that silently cannot work.
+        auto started = Node::SchedulerEndpoint::Start(cfg.schedulerListen, "0.0.0.0", schedulerProtocol, membership, logger);
+        if (!started.has_value())
+        {
+            // Fatal for the same reason the admin endpoint's is: an operator who asked
+            // for this is relying on it, and a node that started without it looks
+            // healthy to everything that would otherwise have noticed.
+            logger.Logf(LogLevel::Error, "--listen-scheduler {}; refusing to start", started.error());
+            return ExitUsage;
+        }
+
+        schedulerEndpoint = std::move(*started);
+        logger.Logf(LogLevel::Info,
+                    "scheduling for the fleet on {} ({})",
+                    schedulerEndpoint->BoundEndpoint(),
+                    cfg.fleetOpen ? std::string { "every caller admitted" }
+                                  : std::format("{} member host(s)", listedMembership.Size()));
+    }
+
     Cc::Credential const credential { .username = {}, .secret = cfg.token };
 
     // One registrar per toolchain, because REGISTER carries ONE fingerprint and
@@ -628,6 +680,16 @@ int main(int argc, char** argv)
         logger.Logf(LogLevel::Error,
                     "--toolchain is required; a worker with none would register and then refuse every job "
                     "the scheduler sent it");
+        return ExitUsage;
+    }
+
+    // Checked here rather than inside WorkerBody, for the reason the two above are:
+    // the POSIX host has already redirected stdout to /dev/null by the time the body
+    // runs, so a diagnosis printed there goes nowhere in the one deployment where a
+    // scheduler is most likely to be misconfigured.
+    if (auto const rejection = SchedulerPolicyRejection(cfg))
+    {
+        logger.Logf(LogLevel::Error, "{}", *rejection);
         return ExitUsage;
     }
 

@@ -190,7 +190,7 @@ TEST_CASE("A member registers over a real socket", "[node][scheduler]")
     REQUIRE_FALSE(reply.empty());
     auto const header = Wire::DecodeReplyHeader(reply);
     REQUIRE(header.has_value());
-    CHECK(header->status == Wire::Status::Ok);
+    CHECK(Unwrap(header).status == Wire::Status::Ok);
 }
 
 TEST_CASE("A stranger is refused the fleet over a real socket", "[node][scheduler]")

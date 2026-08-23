@@ -166,6 +166,32 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "public interface is an operator's decision, not a\n"
                          "default. /healthz is also the liveness probe this\n"
                          "worker otherwise has none of." },
+        { .primary = "--listen-scheduler",
+          .arity = Arity::Value,
+          .operand = "=[<address>:]<port>",
+          .apply = AssignFrom<&NodeConfig::schedulerListen, ParseText>(),
+          .description = "serve the fleet's scheduler verbs here; off unless\n"
+                         "given. Answered only while this node LEADS the\n"
+                         "cluster; a follower redirects to the leader and an\n"
+                         "election in progress refuses, both of which a client\n"
+                         "answers by compiling locally. A bare port binds the\n"
+                         "wildcard: peers have to reach it." },
+        { .primary = "--fleet-member",
+          .arity = Arity::Value,
+          .operand = "=<host>[:<port>]",
+          .apply = AppendFrom<&NodeConfig::fleetMembers, ParseText>(),
+          .description = "a peer this scheduler may hand work to; repeatable.\n"
+                         "Only the host is matched: a peer dials from an\n"
+                         "ephemeral port, so an endpoint is not something a\n"
+                         "connection can be compared against." },
+        { .primary = "--fleet-open",
+          .arity = Arity::None,
+          .apply = SetTrue<&NodeConfig::fleetOpen>(),
+          .description = "admit every caller to the fleet, not only\n"
+                         "--fleet-member hosts. For one machine, or a network\n"
+                         "that is already the boundary. Explicit because\n"
+                         "'no policy' and 'admit everybody' must be the same\n"
+                         "decision -- listing nobody refuses everybody." },
         { .primary = "--requirepass",
           .arity = Arity::Value,
           .operand = "=<secret>",
@@ -262,6 +288,11 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitIfSet("port", cfg.port, defaults.port);
     emitIfSet("slots", cfg.slots, defaults.slots);
     emitIfSet("admin-listen", cfg.adminListen, defaults.adminListen);
+    emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
+    if (cfg.fleetOpen)
+        argv.emplace_back("--fleet-open");
+    for (auto const& member: cfg.fleetMembers)
+        argv.push_back(std::format("--fleet-member={}", member));
     emitIfSet("log-level", LogLevelName(cfg.logLevel), LogLevelName(defaults.logLevel));
     emitPathIfSet("pidfile", cfg.pidfile);
 
@@ -321,6 +352,42 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
           .message = "--advertise is required to install a service: without it the registration bakes in "
                      "{--bind}:{--port}, and the default 0.0.0.0 is not an address a client can dial. Such a worker "
                      "registers, heartbeats, is leased out, and is never reached -- with no error at either end." },
+    });
+
+    for (auto const& rule: Rules)
+        if (rule.refuses(cfg))
+            return std::string { rule.message };
+
+    return std::nullopt;
+}
+
+std::optional<std::string> SchedulerPolicyRejection(NodeConfig const& cfg)
+{
+    // Separate from NodeServiceRejection because it is a *startup* rule rather than
+    // an install-time one: this misconfiguration is fatal every time the process
+    // runs, not only when a registration is written, and gating it on
+    // --install-service would let a hand-started scheduler make the same mistake.
+    struct Rule
+    {
+        bool (*refuses)(NodeConfig const&); ///< Whether this rule objects.
+        std::string_view message;           ///< What the operator is told, with the remedy.
+    };
+
+    constexpr auto Rules = std::to_array<Rule>({
+        { .refuses =
+              [](NodeConfig const& c) { return !c.schedulerListen.empty() && !c.fleetOpen && c.fleetMembers.empty(); },
+          .message = "--listen-scheduler needs --fleet-member or --fleet-open: a scheduler with an empty member set "
+                     "refuses every caller, which is the right default but not a working configuration. It would "
+                     "start, bind, log nothing wrong, and decline the whole fleet." },
+        { .refuses = [](NodeConfig const& c) { return c.fleetOpen && !c.fleetMembers.empty(); },
+          .message = "--fleet-open and --fleet-member contradict each other: one admits everybody and the other "
+                     "admits a list. Silently preferring either would make the narrower of the two a no-op an "
+                     "operator believes is in force." },
+        { .refuses =
+              [](NodeConfig const& c) { return c.schedulerListen.empty() && (c.fleetOpen || !c.fleetMembers.empty()); },
+          .message = "--fleet-member and --fleet-open describe who this node's scheduler admits, and it is not "
+                     "running one: add --listen-scheduler, or drop them. A policy nothing consults is a policy an "
+                     "operator believes is in force." },
     });
 
     for (auto const& rule: Rules)
