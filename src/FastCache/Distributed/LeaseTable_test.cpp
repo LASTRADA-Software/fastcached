@@ -8,26 +8,14 @@
 #include <optional>
 #include <string>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Distributed;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
-
-/// Unwrap an optional for assertion, yielding a default-constructed value when
-/// empty.
-///
-/// The same device CompileCacheHandler_test uses, for the same reason:
-/// clang-tidy's optional analysis cannot see a `has_value()` guard through
-/// Catch2's REQUIRE macro, so a direct `*x` after one reads as an unchecked
-/// access. Going through `value_or` is provably safe, and the preceding REQUIRE
-/// still fails the test first when the optional is empty — so the default is
-/// never actually observed.
-template <typename T>
-[[nodiscard]] T Unwrap(std::optional<T> const& value)
-{
-    return value.value_or(T {});
-}
 
 /// A lease table over a clock the test drives. Expiry is the whole behaviour
 /// here, so a real clock would make every case both slow and flaky.

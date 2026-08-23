@@ -18,26 +18,14 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace std::string_view_literals;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
-
-/// Unwrap an optional for assertion, yielding a default-constructed value when
-/// empty.
-///
-/// The same device the other test files use: clang-tidy's optional analysis
-/// cannot see a `has_value()` guard through Catch2's REQUIRE macro, so a direct
-/// `*x` after one reads as an unchecked access. `value_or` is provably safe, and
-/// the preceding REQUIRE still fails the test first when the optional is empty.
-/// @param value The optional to read.
-/// @return Its value, or a default-constructed one.
-template <typename T>
-[[nodiscard]] T Unwrap(std::optional<T> const& value)
-{
-    return value.value_or(T {});
-}
 
 /// A field list built from text, since text is what most fields carry.
 /// @param texts The field contents, in wire order.

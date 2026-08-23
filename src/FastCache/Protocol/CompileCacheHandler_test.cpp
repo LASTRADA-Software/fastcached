@@ -31,26 +31,15 @@
 #include <utility>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
+using FastCache::Testing::Unwrap;
 using PathCanon::Grammar;
 namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
-
-/// Unwrap an optional for assertion, yielding a default-constructed value when
-/// empty.
-///
-/// clang-tidy's optional analysis cannot see a `has_value()` guard through
-/// Catch2's REQUIRE macro, so a direct `*x` or `x.value()` after one is reported
-/// as an unchecked access. Going through `value_or` is provably safe, and the
-/// preceding REQUIRE still fails the test first when the optional is empty — so
-/// the default is never actually observed.
-template <typename T>
-[[nodiscard]] T Unwrap(std::optional<T> const& value)
-{
-    return value.value_or(T {});
-}
 
 /// Fixture: a paired in-memory socket, an engine over in-memory storage, and
 /// the compile-cache handler driving the server end.

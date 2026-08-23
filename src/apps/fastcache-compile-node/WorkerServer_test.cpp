@@ -17,19 +17,15 @@
 
 #include <CompileJob.hpp>
 #include <ScratchPathTestSupport.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::Unwrap;
 namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
-
-template <typename T>
-[[nodiscard]] T Unwrap(std::optional<T> const& value)
-{
-    return value.value_or(T {});
-}
 
 /// A runner that writes a canned object.
 class StubRunner final: public Cc::IProcessRunner

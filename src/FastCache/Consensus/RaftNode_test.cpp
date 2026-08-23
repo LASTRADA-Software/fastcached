@@ -11,9 +11,12 @@
 #include <variant>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Consensus;
 using namespace std::chrono_literals;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -41,21 +44,6 @@ constexpr auto Start = TimePoint {};
                         .electionTimeoutMin = ElectionMin,
                         .electionTimeoutMax = 300ms,
                         .heartbeatInterval = 50ms };
-}
-
-/// Unwrap an optional for assertion, yielding a default-constructed value when
-/// empty.
-///
-/// The same device LeaseTable_test and CompileCacheHandler_test use, for the same
-/// reason: clang-tidy's optional analysis cannot see a `has_value()` guard through
-/// Catch2's REQUIRE macro, so a direct `*x` after one reads as an unchecked
-/// access. Going through `value_or` is provably safe, and the preceding REQUIRE
-/// still fails the test first when the optional is empty — so the default is
-/// never actually observed.
-template <typename T>
-[[nodiscard]] T Unwrap(std::optional<T> const& value)
-{
-    return value.value_or(T {});
 }
 
 /// Build a node, failing the test if the configuration is refused.
