@@ -720,9 +720,10 @@ For anything beyond a trusted build network, put mTLS in front of every port.
   ([#87](https://github.com/LASTRADA-Software/fastcached/issues/87)).
   `--service-scope=user` works, and is the right answer on a developer machine
   anyway.
-- **A discovered node joins the cluster's *state*, not its quorum.** The leader
+- **A discovered node joins the cluster's *state*, not its quorum**
+  ([#97](https://github.com/LASTRADA-Software/fastcached/issues/97)). The leader
   records it, every node then serves it, and it survives a restart — but
   `RaftNode`'s own member set still comes from `--raft-peer` at startup, so the new
-  node does not yet vote and this node's transport does not yet dial it. What that
-  costs today is that a node discovered at runtime is admitted to the fleet without
-  taking part in electing its leader.
+  node does not yet vote and nobody dials it. What that costs today is that growing
+  a cluster's *consensus* still means restarting its members with a new
+  `--raft-peer` list; growing the *fleet* does not.
