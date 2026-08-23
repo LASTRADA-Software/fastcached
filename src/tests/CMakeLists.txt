@@ -126,6 +126,31 @@ set_tests_properties("compile-cache-install" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# FASTCACHE_AUTO_START staging (issue #90): the daemon binary comes from the
+# SAME release archive the launcher does, so this proves one download serves
+# both members rather than fetching (or failing to fetch) the archive twice.
+# Same file:// mirror technique as compile-cache-install, for the same
+# reasons — deterministic, offline, no GitHub rate-limit budget spent — and
+# deliberately not what proves a spawned daemon actually answers a real
+# connection: the mirror's stand-ins only answer --version, so that half is
+# compile-cache-daemon-start's job, below.
+add_test(
+    NAME "compile-cache-daemon-staging"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/compile-cache-daemon-staging"
+        "-DFASTCACHED_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        "-DFASTCACHED_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DFASTCACHED_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-daemon-staging.cmake"
+)
+set_tests_properties("compile-cache-daemon-staging" PROPERTIES
+    LABELS "hygiene"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    TIMEOUT 600
+)
+
+# ---------------------------------------------------------------------------
 # End-to-end distributed-compilation test. Needs THREE real processes -- a
 # scheduler, a worker and the launcher -- which is what makes it a script rather
 # than a Catch2 case. What it asserts is that an object compiled in another
@@ -206,6 +231,43 @@ else()
         )
         set_tests_properties("dist-compile-e2e-selftest" PROPERTIES TIMEOUT 120)
     endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# FASTCACHE_AUTO_START spawn+probe (issue #90), the real-binary counterpart to
+# compile-cache-daemon-staging above. That test proves the staging plumbing
+# with fake --version-only stand-ins; a fake has no socket to accept on, so it
+# cannot prove _fc_auto_start_fastcached actually starts something that
+# answers a real connection. This drives the real, freshly built fastcached
+# and fastcache-cc instead: a configure with no daemon reachable spawns one, a
+# real translation unit compiled through the configured launcher reports a
+# real MISS then a real HIT against it, and a second configure against the
+# same address finds that daemon rather than starting another.
+#
+# Registered here rather than beside the launcher for the same reason
+# dist-compile-e2e is: this needs the fastcached target, so it belongs after
+# src/apps has defined it. POSIX only for now, matching
+# check-compile-cache-install.cmake's and check-compile-cache-autoinstall.cmake's
+# own scoping — the process bookkeeping here is pidfile-based and POSIX's
+# --daemon has no Windows equivalent; Windows coverage of FASTCACHE_AUTO_START
+# is left as follow-up work.
+if(NOT WIN32 AND TARGET fastcached AND TARGET fastcache-cc)
+    add_test(
+        NAME "compile-cache-daemon-start"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-daemon-start.sh"
+            --fastcached "$<TARGET_FILE:fastcached>"
+            --launcher "$<TARGET_FILE:fastcache-cc>"
+            --compiler "${CMAKE_CXX_COMPILER}"
+            --source-dir "${CMAKE_SOURCE_DIR}"
+    )
+    # Starts a real daemon on a real port, same as dist-compile-e2e, so it must
+    # not race the other server-starting smoke tests.
+    set_tests_properties("compile-cache-daemon-start" PROPERTIES
+        LABELS "smoke"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 120
+    )
 endif()
 
 # ---------------------------------------------------------------------------

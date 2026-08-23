@@ -141,6 +141,14 @@ hour per address would otherwise be shared out among CI runners. Pinning
 `FASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE` at a mirror installs without reaching
 GitHub at all.
 
+Auto-installing the launcher alone still leaves a genuinely clean machine
+uncached, since `fastcache-cc` has nothing to talk to: `-DFASTCACHE_AUTO_START=ON`
+additionally stages and starts a `fastcached` daemon in the background — from
+the same release archive, persistently, off by default and independently of
+`FASTCACHE_AUTO_INSTALL` — when nothing answers at `FASTCACHE_ADDR`.
+`cmake/portable/README.md` covers it in full, including why it defaults off in
+CI as well as on a developer machine that has not opted in.
+
 `cmake/portable/README.md` documents the full option set, and is written for projects
 vendoring the module rather than building this one.
 

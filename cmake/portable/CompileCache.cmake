@@ -30,7 +30,13 @@
 #
 # When none of the three is installed, -DFASTCACHE_AUTO_INSTALL=ON fetches
 # fastcache-cc from GitHub Releases rather than leaving the build uncached; see
-# the block below. To disable everything: -DUSE_COMPILER_CACHE=OFF.
+# the block below. That alone still leaves a genuinely clean machine uncached,
+# because a launcher with no daemon to talk to caches nothing —
+# -DFASTCACHE_AUTO_START=ON additionally stages and starts a fastcached daemon
+# in the background when none answers at FASTCACHE_ADDR (issue #90); off by
+# default, and independently of auto-install, since starting a background
+# process is a bigger side effect than downloading a file and CI relies on no
+# daemon answering by default. To disable everything: -DUSE_COMPILER_CACHE=OFF.
 
 option(USE_COMPILER_CACHE
        "Use a compiler-cache launcher when one is available (fastcache-cc when a daemon answers, else sccache, else ccache) [default: ON]"
@@ -154,6 +160,26 @@ set(FASTCACHE_AUTO_INSTALL_VERSION "" CACHE STRING
 set(FASTCACHE_AUTO_INSTALL_TTL_HOURS "24" CACHE STRING
     "how long a resolved latest release is reused before the GitHub API is asked again")
 
+# Auto-installing the launcher alone leaves a genuinely clean machine exactly
+# where it started: fastcache-cc caches nothing unless a fastcached daemon
+# answers at FASTCACHE_ADDR, and nothing installs one. FASTCACHE_AUTO_START is
+# the separate opt-in that does — separate because starting a long-lived
+# background process from a `cmake` configure is a materially bigger side
+# effect than downloading a file, and a user who wants one but not the other
+# must be able to say so.
+#
+# Defaulting OFF is what keeps CI's existing, relied-upon behaviour intact:
+# several downstream projects run CI with no fastcached daemon reachable on
+# purpose, so a build transparently falls through to sccache. A default of ON
+# would remove that boundary for everyone who has not opted out, rather than
+# adding it only for those who opt in. No CI-environment sniffing backs this
+# up — an explicit -DFASTCACHE_AUTO_START=ON is trusted at face value, the
+# same way every other flag in this module is; guessing at "is this CI" from
+# environment variables would just be a second, less legible way to be wrong.
+option(FASTCACHE_AUTO_START
+       "Start a fetched fastcached daemon in the background when none answers at FASTCACHE_ADDR [default: OFF]"
+       OFF)
+
 # Where a fetched launcher is kept. Per user rather than per build tree, so the
 # second build tree on a machine costs nothing, and per version, so a new release
 # never overwrites a binary a configured tree still points at.
@@ -183,19 +209,34 @@ if(NOT DEFINED FASTCACHE_AUTO_INSTALL_DIR)
         "directory prebuilt fastcache-cc binaries are staged in, shared across repositories and build trees")
 endif()
 
+# Where an auto-started daemon keeps its cache. Persistent rather than
+# in-memory, so the cache survives the daemon being restarted (a reboot, a
+# manual kill) rather than starting cold every time — a subdirectory of the
+# same per-user tree the staged binaries live in (FASTCACHE_AUTO_INSTALL_DIR),
+# since both are per-machine, re-creatable state that a cache cleaner may take.
+if(NOT DEFINED FASTCACHE_AUTO_START_STORAGE_DIR)
+    set(FASTCACHE_AUTO_START_STORAGE_DIR "${FASTCACHE_AUTO_INSTALL_DIR}/daemon-storage" CACHE PATH
+        "storage directory for a daemon FASTCACHE_AUTO_START starts, so its cache survives a restart")
+endif()
+
 # Published-asset table, one row per (host system, host architecture) this
 # project releases a binary for. A host with no row is not an error — it simply
 # falls back, which is what every platform does today. Publishing a new platform
 # is a new row here and nothing below changes.
 #
-#   _fc_asset_<id>_system    CMAKE_HOST_SYSTEM_NAME this row serves
-#   _fc_asset_<id>_arch      host processor spellings mapping to this row
-#   _fc_asset_<id>_platform  asset-name infix, after "fastcached-<version>-"
-#   _fc_asset_<id>_ext       archive extension
-#   _fc_asset_<id>_member    path to the launcher inside the archive's top-level
-#                            directory, which differs per platform because the
-#                            packages install to different prefixes
-#   _fc_asset_<id>_exe       staged executable's filename
+#   _fc_asset_<id>_system        CMAKE_HOST_SYSTEM_NAME this row serves
+#   _fc_asset_<id>_arch          host processor spellings mapping to this row
+#   _fc_asset_<id>_platform      asset-name infix, after "fastcached-<version>-"
+#   _fc_asset_<id>_ext           archive extension
+#   _fc_asset_<id>_member        path to the launcher inside the archive's
+#                                top-level directory, which differs per
+#                                platform because the packages install to
+#                                different prefixes
+#   _fc_asset_<id>_exe           staged launcher's filename
+#   _fc_asset_<id>_daemon_member path to the daemon inside the same archive,
+#                                staged only when FASTCACHE_AUTO_START asks
+#                                for it — see _fc_auto_start_fastcached below
+#   _fc_asset_<id>_daemon_exe    staged daemon's filename
 set(_fc_asset_rows linux_x86_64 darwin_arm64 windows_amd64)
 
 set(_fc_asset_linux_x86_64_system "Linux")
@@ -204,6 +245,8 @@ set(_fc_asset_linux_x86_64_platform "Linux-x86_64")
 set(_fc_asset_linux_x86_64_ext "tar.gz")
 set(_fc_asset_linux_x86_64_member "usr/bin/fastcache-cc")
 set(_fc_asset_linux_x86_64_exe "fastcache-cc")
+set(_fc_asset_linux_x86_64_daemon_member "usr/bin/fastcached")
+set(_fc_asset_linux_x86_64_daemon_exe "fastcached")
 
 set(_fc_asset_darwin_arm64_system "Darwin")
 set(_fc_asset_darwin_arm64_arch arm64 aarch64)
@@ -211,6 +254,8 @@ set(_fc_asset_darwin_arm64_platform "Darwin-arm64")
 set(_fc_asset_darwin_arm64_ext "tar.gz")
 set(_fc_asset_darwin_arm64_member "opt/fastcached/bin/fastcache-cc")
 set(_fc_asset_darwin_arm64_exe "fastcache-cc")
+set(_fc_asset_darwin_arm64_daemon_member "opt/fastcached/bin/fastcached")
+set(_fc_asset_darwin_arm64_daemon_exe "fastcached")
 
 # The Windows archive is a plain ZIP rather than the MSI beside it: an installer
 # is not something this can open, and the launcher is one self-contained file
@@ -223,6 +268,8 @@ set(_fc_asset_windows_amd64_platform "Windows-AMD64")
 set(_fc_asset_windows_amd64_ext "zip")
 set(_fc_asset_windows_amd64_member "bin/fastcache-cc.exe")
 set(_fc_asset_windows_amd64_exe "fastcache-cc.exe")
+set(_fc_asset_windows_amd64_daemon_member "bin/fastcached.exe")
+set(_fc_asset_windows_amd64_daemon_exe "fastcached.exe")
 
 # Pick the row serving this host.
 # @param outVar Receives the row id, or empty when no binary is published for it.
@@ -317,20 +364,22 @@ function(_fc_auto_install_release_json outVar reasonVar)
     set(${reasonVar} "" PARENT_SCOPE)
 endfunction()
 
-# Download and stage a prebuilt fastcache-cc for this host.
-# @param outVar Set to the staged executable's path, or empty on any failure.
-# @param reasonVar Set to a short diagnostic when outVar is empty.
-function(_fc_auto_install_fastcache_cc outVar reasonVar)
-    set(${outVar} "" PARENT_SCOPE)
-
-    # An empty address is the documented way to opt out of fastcache-cc, so
-    # fetching it would quietly override an instruction not to use it. Reported
-    # rather than skipped: asking for the fetch and getting nothing, with no word
-    # about why, is the silent fall-through the rest of this module avoids.
-    if(NOT FASTCACHE_ADDR)
-        set(${reasonVar} "FASTCACHE_ADDR is empty, which opts out of fastcache-cc" PARENT_SCOPE)
-        return()
-    endif()
+# Resolve which release row, version and (when not pinned) release-metadata
+# JSON an auto-install should use — the part of _fc_auto_install_fastcache_cc
+# that has nothing to do with the launcher specifically. Split out so
+# _fc_auto_start_fastached (below) resolves to the *same* release the launcher
+# did rather than asking the GitHub API a second time and risking a different
+# "latest" answering the two calls of one configure.
+#
+# @param rowVar Set to the asset-table row id for this host.
+# @param versionVar Set to the resolved version, a bare numeric triple.
+# @param jsonVar Set to the release metadata, or empty when the version was
+#                pinned.
+# @param reasonVar Set to a short diagnostic when resolution fails.
+function(_fc_auto_install_resolve_release rowVar versionVar jsonVar reasonVar)
+    set(${rowVar} "" PARENT_SCOPE)
+    set(${versionVar} "" PARENT_SCOPE)
+    set(${jsonVar} "" PARENT_SCOPE)
 
     _fc_auto_install_select_row(_row)
     if(NOT _row)
@@ -365,7 +414,39 @@ function(_fc_auto_install_fastcache_cc outVar reasonVar)
         set(${reasonVar} "'${_version}' is not a numeric X.Y.Z version" PARENT_SCOPE)
         return()
     endif()
-    set(_version "${CMAKE_MATCH_1}")
+
+    set(${rowVar} "${_row}" PARENT_SCOPE)
+    set(${versionVar} "${CMAKE_MATCH_1}" PARENT_SCOPE)
+    set(${jsonVar} "${_json}" PARENT_SCOPE)
+    set(${reasonVar} "" PARENT_SCOPE)
+endfunction()
+
+# Download and stage a prebuilt fastcache-cc for this host.
+# @param outVar Set to the staged executable's path, or empty on any failure.
+# @param reasonVar Set to a short diagnostic when outVar is empty.
+function(_fc_auto_install_fastcache_cc outVar reasonVar)
+    set(${outVar} "" PARENT_SCOPE)
+
+    # An empty address is the documented way to opt out of fastcache-cc, so
+    # fetching it would quietly override an instruction not to use it. Reported
+    # rather than skipped: asking for the fetch and getting nothing, with no word
+    # about why, is the silent fall-through the rest of this module avoids.
+    if(NOT FASTCACHE_ADDR)
+        set(${reasonVar} "FASTCACHE_ADDR is empty, which opts out of fastcache-cc" PARENT_SCOPE)
+        return()
+    endif()
+
+    _fc_auto_install_resolve_release(_row _version _json _why)
+    if(NOT _row)
+        set(${reasonVar} "${_why}" PARENT_SCOPE)
+        return()
+    endif()
+
+    # Cached for the lifetime of this configure so a later auto-start of the
+    # daemon (from the very same release) resolves nothing a second time.
+    set(_FASTCACHE_RESOLVED_ROW "${_row}" CACHE INTERNAL "")
+    set(_FASTCACHE_RESOLVED_VERSION "${_version}" CACHE INTERNAL "")
+    set(_FASTCACHE_RESOLVED_JSON "${_json}" CACHE INTERNAL "")
 
     # Keyed by platform as well as version. A home directory is not always local
     # to one machine — a shared or synchronised $HOME is normal — and two hosts of
@@ -403,14 +484,23 @@ function(_fc_auto_install_fastcache_cc outVar reasonVar)
     set(${reasonVar} "" PARENT_SCOPE)
 endfunction()
 
-# Fetch one published archive and stage the launcher out of it.
+# Fetch one published archive into the shared per-build-tree download cache and
+# unpack it, without staging anything out of it yet. Split out of
+# _fc_auto_install_download (below) so that staging the launcher and staging
+# the daemon from the *same* release — the ordinary case, since both binaries
+# live in one archive — costs one download and one unpack rather than two:
+# fetching a several-megabyte archive twice in one configure for two files it
+# already contains would be a needless round trip on every clean machine.
+#
 # @param row Asset-table row id describing this host.
 # @param version Release version, a bare numeric triple.
 # @param json Release metadata, or empty when the version was pinned.
-# @param stagedDir Directory the launcher is placed in.
+# @param unpackDirVar Set to the directory the archive was unpacked into
+#                      (its "${_stem}/..." layout preserved), on success.
 # @param reasonVar Set to a short diagnostic on failure, empty on success.
-function(_fc_auto_install_download row version json stagedDir reasonVar)
+function(_fc_auto_install_fetch_archive row version json unpackDirVar reasonVar)
     set(${reasonVar} "" PARENT_SCOPE)
+    set(${unpackDirVar} "" PARENT_SCOPE)
     set(_row "${row}")
     set(_version "${version}")
     set(_json "${json}")
@@ -456,7 +546,7 @@ function(_fc_auto_install_download row version json stagedDir reasonVar)
         set(_url "${FASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE}/${FASTCACHE_AUTO_INSTALL_REPO}/releases/download/v${_version}/${_assetName}")
     endif()
 
-    message(STATUS "[cache] Fetching fastcache-cc ${_version} for ${_fc_asset_${_row}_platform}")
+    message(STATUS "[cache] Fetching the fastcached ${_version} release archive for ${_fc_asset_${_row}_platform}")
 
     set(_work "${CMAKE_BINARY_DIR}/CMakeFiles/fastcache-download")
     set(_archive "${_work}/${_assetName}")
@@ -489,9 +579,25 @@ function(_fc_auto_install_download row version json stagedDir reasonVar)
     file(MAKE_DIRECTORY "${_unpack}")
     file(ARCHIVE_EXTRACT INPUT "${_archive}" DESTINATION "${_unpack}")
 
-    set(_member "${_unpack}/${_stem}/${_fc_asset_${_row}_member}")
+    set(${unpackDirVar} "${_unpack}/${_stem}" PARENT_SCOPE)
+endfunction()
+
+# Copy one member out of an already-unpacked archive into a staging directory.
+# Split out so the launcher and the daemon — two members of one archive — are
+# each placed with the same race-safe move-into-place sequence, without
+# duplicating it.
+#
+# @param unpackDir Directory _fc_auto_install_fetch_archive unpacked into.
+# @param member Path to the executable inside unpackDir.
+# @param exe Filename to give the staged copy.
+# @param stagedDir Directory the executable is placed in.
+# @param reasonVar Set to a short diagnostic on failure, empty on success.
+function(_fc_auto_install_stage_member unpackDir member exe stagedDir reasonVar)
+    set(${reasonVar} "" PARENT_SCOPE)
+
+    set(_member "${unpackDir}/${member}")
     if(NOT EXISTS "${_member}")
-        set(${reasonVar} "${_assetName} does not contain ${_fc_asset_${_row}_member}" PARENT_SCOPE)
+        set(${reasonVar} "the archive does not contain ${member}" PARENT_SCOPE)
         return()
     endif()
 
@@ -501,7 +607,7 @@ function(_fc_auto_install_download row version json stagedDir reasonVar)
     # tree, so the two racers cannot pick the same one either.
     string(SHA256 _treeHash "${CMAKE_BINARY_DIR}")
     string(SUBSTRING "${_treeHash}" 0 12 _treeHash)
-    set(_pending "${stagedDir}/.staging-${_treeHash}")
+    set(_pending "${stagedDir}/.staging-${_treeHash}-${exe}")
     file(MAKE_DIRECTORY "${stagedDir}")
     file(REMOVE "${_pending}")
     file(COPY_FILE "${_member}" "${_pending}" RESULT _copyFailed)
@@ -511,13 +617,270 @@ function(_fc_auto_install_download row version json stagedDir reasonVar)
     endif()
     file(CHMOD "${_pending}"
          PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
-    file(RENAME "${_pending}" "${stagedDir}/${_fc_asset_${_row}_exe}" RESULT _renameFailed)
-    if(_renameFailed AND NOT EXISTS "${stagedDir}/${_fc_asset_${_row}_exe}")
+    file(RENAME "${_pending}" "${stagedDir}/${exe}" RESULT _renameFailed)
+    if(_renameFailed AND NOT EXISTS "${stagedDir}/${exe}")
         # Losing the race is success; failing to write at all is not.
-        set(${reasonVar} "cannot stage the launcher (${_renameFailed})" PARENT_SCOPE)
+        set(${reasonVar} "cannot stage ${exe} (${_renameFailed})" PARENT_SCOPE)
         return()
     endif()
     file(REMOVE "${_pending}")
+endfunction()
+
+# Fetch one published archive and stage the launcher out of it. Thin wrapper
+# over the two functions above, kept so every existing caller (and the
+# existing diagnostics they depend on) is unaffected by the split.
+# @param row Asset-table row id describing this host.
+# @param version Release version, a bare numeric triple.
+# @param json Release metadata, or empty when the version was pinned.
+# @param stagedDir Directory the launcher is placed in.
+# @param reasonVar Set to a short diagnostic on failure, empty on success.
+function(_fc_auto_install_download row version json stagedDir reasonVar)
+    set(${reasonVar} "" PARENT_SCOPE)
+
+    _fc_auto_install_fetch_archive("${row}" "${version}" "${json}" _unpackDir _why)
+    if(_why)
+        set(${reasonVar} "${_why}" PARENT_SCOPE)
+        return()
+    endif()
+
+    _fc_auto_install_stage_member(
+        "${_unpackDir}" "${_fc_asset_${row}_member}" "${_fc_asset_${row}_exe}"
+        "${stagedDir}" _why)
+    if(_why)
+        set(${reasonVar} "${_why}" PARENT_SCOPE)
+        return()
+    endif()
+endfunction()
+
+# Split from the connect attempt below only by host/port parsing, itself
+# already done once for FASTCACHE_ADDR — kept as its own function so the race
+# check (does *anything* answer) and the future probe share no code by
+# accident growing shared state.
+#
+# @param addr host:port to parse (FASTCACHE_ADDR's own shape).
+# @param hostVar Set to the host part.
+# @param portVar Set to the port part.
+function(_fc_split_host_port addr hostVar portVar)
+    # IPv6 in brackets ("[::1]:6674") is the one shape a naive last-colon split
+    # gets wrong, so the bracket form is matched first.
+    if(addr MATCHES "^\\[(.+)\\]:([0-9]+)$")
+        set(${hostVar} "${CMAKE_MATCH_1}" PARENT_SCOPE)
+        set(${portVar} "${CMAKE_MATCH_2}" PARENT_SCOPE)
+    elseif(addr MATCHES "^(.+):([0-9]+)$")
+        set(${hostVar} "${CMAKE_MATCH_1}" PARENT_SCOPE)
+        set(${portVar} "${CMAKE_MATCH_2}" PARENT_SCOPE)
+    else()
+        set(${hostVar} "${addr}" PARENT_SCOPE)
+        set(${portVar} "" PARENT_SCOPE)
+    endif()
+endfunction()
+
+# Is anything at all answering at FASTCACHE_ADDR? Deliberately cheaper and
+# less discerning than _fc_probe_fastcache_cc: that probe needs a real
+# compiler invocation and answers "does the CACHE work", which is not the
+# question here. This only answers "would starting a daemon collide with one
+# already running" — ours from an earlier configure, or someone else's — so
+# two configures racing on the same port must not both attempt a bind. Losing
+# this race is deliberately not a failure case: whichever configure's spawn
+# loses treats the winner's daemon as its own, which is exactly what
+# _fc_probe_fastcache_cc then evaluates.
+#
+# CMake has no raw-socket primitive, so this shells out to the daemon binary
+# itself with --version against the address — the one operation every
+# fastcached build already exposes for exactly this kind of check — rather
+# than reaching for a platform-specific netcat/Test-NetConnection that may not
+# be installed either. A future fastcached could grow a lighter "are you
+# there" ping; until then this costs one short-lived process.
+#
+# @param outVar Set to TRUE when something answers, FALSE otherwise.
+function(_fc_daemon_answering addr outVar)
+    set(${outVar} FALSE PARENT_SCOPE)
+    _fc_split_host_port("${addr}" _host _port)
+    if(NOT _port)
+        return()
+    endif()
+    # A tiny C program would be a fifth language in a module that promises to
+    # stay stock CMake; `cmake -E` has no TCP-connect verb either. The staged
+    # fastcache-cc's own probe path already proves connectivity end-to-end at
+    # negligible cost (it fails fast, ~10ms, against a closed port), so reuse
+    # it here instead of inventing a second way to ask the same question.
+    if(NOT FASTCACHE_CC)
+        return()
+    endif()
+    set(_dir "${CMAKE_BINARY_DIR}/CMakeFiles/fastcache-probe")
+    file(MAKE_DIRECTORY "${_dir}")
+    set(_src "${_dir}/portcheck.cpp")
+    if(NOT EXISTS "${_src}")
+        file(WRITE "${_src}" "int fastcachePortCheck() { return 0; }\n")
+    endif()
+    if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        set(_args /nologo /c "${_src}" "/Fo${_dir}/portcheck.obj")
+    else()
+        set(_args -c "${_src}" -o "${_dir}/portcheck.o")
+    endif()
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env
+                "FASTCACHE_ADDR=${addr}"
+                "FASTCACHE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+                "FASTCACHE_BINARY_DIR=${CMAKE_BINARY_DIR}"
+                "FASTCACHE_VERBOSE=1"
+                "FASTCACHE_NO_STATS=1"
+                "FASTCACHE_TIMEOUT_MS=500"
+                "${FASTCACHE_CC}" "${CMAKE_CXX_COMPILER}" ${_args}
+        WORKING_DIRECTORY "${_dir}"
+        TIMEOUT 3
+        RESULT_VARIABLE _rc
+        OUTPUT_QUIET
+        ERROR_VARIABLE _err)
+    if(_err MATCHES "fastcache-cc: (HIT|MISS) key=")
+        set(${outVar} TRUE PARENT_SCOPE)
+    endif()
+endfunction()
+
+# Stage and start a fastcached daemon in the background when FASTCACHE_ADDR is
+# otherwise unreachable, so FASTCACHE_AUTO_INSTALL's launcher has something to
+# talk to on a genuinely clean machine (issue #90). Nothing here may fail a
+# configure, exactly like _fc_auto_install_fastcache_cc: every failure is one
+# status line and a fall-through to the probe finding no daemon, which is the
+# behaviour without FASTCACHE_AUTO_START at all.
+function(_fc_auto_start_fastcached)
+    _fc_daemon_answering("${FASTCACHE_ADDR}" _answering)
+    if(_answering)
+        # Ours from an earlier configure, or a pre-existing daemon started by
+        # hand — either way there is nothing to start, and starting a second
+        # one would only fight the first for the port.
+        return()
+    endif()
+
+    _fc_split_host_port("${FASTCACHE_ADDR}" _bindHost _bindPort)
+    if(NOT _bindPort)
+        message(STATUS "[cache] Not starting a daemon: FASTCACHE_ADDR '${FASTCACHE_ADDR}' has no port")
+        return()
+    endif()
+
+    # Reuse the launcher's own resolved release when this configure already
+    # auto-installed one, rather than asking the GitHub API a second time —
+    # which could, on a second call, resolve to a *different* "latest" than
+    # the launcher just staged, if a release published in between the two
+    # calls. Falling through to a fresh resolution below still works when the
+    # launcher came from PATH and resolved nothing.
+    if(DEFINED _FASTCACHE_RESOLVED_ROW AND _FASTCACHE_RESOLVED_ROW)
+        set(_row "${_FASTCACHE_RESOLVED_ROW}")
+        set(_version "${_FASTCACHE_RESOLVED_VERSION}")
+        set(_json "${_FASTCACHE_RESOLVED_JSON}")
+    else()
+        _fc_auto_install_resolve_release(_row _version _json _why)
+        if(NOT _row)
+            message(STATUS "[cache] Not starting a daemon: ${_why}")
+            return()
+        endif()
+    endif()
+
+    if(NOT _fc_asset_${_row}_daemon_member)
+        message(STATUS "[cache] Not starting a daemon: no fastcached binary is published for ${_fc_asset_${_row}_platform}")
+        return()
+    endif()
+
+    set(_stagedDir "${FASTCACHE_AUTO_INSTALL_DIR}/${_version}/${_fc_asset_${_row}_platform}")
+    set(_staged "${_stagedDir}/${_fc_asset_${_row}_daemon_exe}")
+
+    if(NOT EXISTS "${_staged}")
+        _fc_auto_install_fetch_archive("${_row}" "${_version}" "${_json}" _unpackDir _why)
+        if(NOT _unpackDir)
+            message(STATUS "[cache] Not starting a daemon: ${_why}")
+            return()
+        endif()
+        _fc_auto_install_stage_member(
+            "${_unpackDir}" "${_fc_asset_${_row}_daemon_member}" "${_fc_asset_${_row}_daemon_exe}"
+            "${_stagedDir}" _why)
+        if(_why)
+            message(STATUS "[cache] Not starting a daemon: ${_why}")
+            return()
+        endif()
+    endif()
+
+    file(MAKE_DIRECTORY "${FASTCACHE_AUTO_START_STORAGE_DIR}")
+
+    # Bind whatever host FASTCACHE_ADDR actually named — including a LAN
+    # address someone deliberately pointed a shared daemon at — and default
+    # only when it named none, since FASTCACHE_ADDR's own default
+    # (127.0.0.1:6674, set near the top of this file) is loopback-only and an
+    # auto-started daemon should not be reachable from the network by
+    # surprise.
+    set(_bindArg "${_bindHost}")
+    if(NOT _bindArg)
+        set(_bindArg "127.0.0.1")
+    endif()
+
+    set(_daemonArgs
+        "--bind=${_bindArg}"
+        "--port=${_bindPort}"
+        "--storage=${FASTCACHE_AUTO_START_STORAGE_DIR}")
+
+    if(CMAKE_HOST_WIN32)
+        # No double-fork equivalent outside the SCM path (see AGENT.md on
+        # --daemon and launchd/SCM supervisors) — this is a plain background
+        # process, not a registered service, so `cmake -E env` launches it
+        # directly. execute_process has no detach flag of its own; started
+        # this way the child is not joined to cmake's own console and outlives
+        # the configure once cmake exits, which is standard Windows
+        # child-process behaviour for a process that does not inherit the
+        # parent's console. --pidfile is POSIX-daemon-mode only (ServiceControl
+        # names it so explicitly) and is never written by the plain
+        # ForegroundHost this runs under here, so it is omitted rather than
+        # passed for a file that would never appear.
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E env "${_staged}" ${_daemonArgs}
+            RESULT_VARIABLE _rc
+            TIMEOUT 5
+            OUTPUT_QUIET ERROR_QUIET)
+    else()
+        # --daemon double-forks and the parent exits immediately once the
+        # child has detached, so execute_process returns right away with the
+        # daemon already backgrounded — this is the one place in the whole
+        # module that flag is the right tool, as opposed to a *service*
+        # registration, which --daemon must never be combined with (see
+        # AGENT.md: "the supervisor's launch arguments must not pass
+        # --daemon"). A well-known --pidfile is what turns "who started this"
+        # into an answerable question — for an operator who wants to stop a
+        # daemon this module left running (its own stated lifetime: until the
+        # machine reboots or a human kills it), and for a test that needs to
+        # clean one up without a PID execute_process never hands back, since
+        # --daemon double-forks.
+        set(_pidfile "${FASTCACHE_AUTO_START_STORAGE_DIR}/fastcached.pid")
+        execute_process(
+            COMMAND "${_staged}" --daemon ${_daemonArgs} "--pidfile=${_pidfile}"
+            RESULT_VARIABLE _rc
+            TIMEOUT 5
+            OUTPUT_QUIET ERROR_QUIET)
+    endif()
+    if(NOT _rc EQUAL 0)
+        message(STATUS "[cache] Not starting a daemon: fastcached exited immediately (${_rc})")
+        return()
+    endif()
+
+    # The daemon forks/spawns and returns before it is necessarily listening
+    # yet, so give it a short, bounded window to come up rather than letting
+    # the very next thing that runs (the probe) be the first and only check —
+    # a poll loop rather than a fixed sleep, since a fast machine should not
+    # pay a worst-case wait. _fc_daemon_answering itself costs ~10ms once the
+    # daemon is up, so ten attempts is a bounded ~1s beyond whatever the
+    # daemon itself needed to bind.
+    set(_upAttempt 0)
+    set(_up FALSE)
+    while(_upAttempt LESS 10 AND NOT _up)
+        _fc_daemon_answering("${FASTCACHE_ADDR}" _up)
+        if(NOT _up)
+            execute_process(COMMAND "${CMAKE_COMMAND}" -E sleep 0.1)
+        endif()
+        math(EXPR _upAttempt "${_upAttempt} + 1")
+    endwhile()
+
+    if(_up)
+        message(STATUS "[cache] Auto-started fastcached (${_staged}) listening on ${FASTCACHE_ADDR}, storage=${FASTCACHE_AUTO_START_STORAGE_DIR}")
+    else()
+        message(STATUS "[cache] Started fastcached (${_staged}) but it is not answering on ${FASTCACHE_ADDR} yet; the probe below will report the outcome")
+    endif()
 endfunction()
 
 # Only when there is nothing else to use. A launcher the user installed is a
@@ -536,6 +899,17 @@ if(USE_COMPILER_CACHE
     else()
         message(STATUS "[cache] Not auto-installing fastcache-cc: ${_fc_auto_why_not}")
     endif()
+endif()
+
+# Belongs after auto-install rather than inside it: starting a daemon is
+# useful whether fastcache-cc came from PATH or was just staged above, and
+# either way FASTCACHE_CC has to be a real path before _fc_daemon_answering
+# can shell out to it to test the port.
+if(USE_COMPILER_CACHE
+   AND FASTCACHE_AUTO_START
+   AND FASTCACHE_CC
+   AND FASTCACHE_ADDR)
+    _fc_auto_start_fastcached()
 endif()
 
 # Ask fastcache-cc itself whether the cache works, by compiling one tiny
