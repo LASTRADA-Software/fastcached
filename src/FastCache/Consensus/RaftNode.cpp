@@ -146,10 +146,57 @@ AppendEntriesRequest RaftNode::MakeAppendEntriesFor(NodeId const& peer) const
                                   .leaderCommit = _commitIndex };
 }
 
+bool RaftNode::NeedsSnapshot(NodeId const& peer) const
+{
+    auto const found = _nextIndex.find(peer);
+    if (found == _nextIndex.end())
+        return false;
+
+    // The entry BEFORE the one this peer needs is what an AppendEntries names as
+    // `prevLogTerm`, so the boundary index itself is still serviceable -- the log
+    // keeps that one term precisely so it is. Only a peer needing something below
+    // it is unreachable by replication.
+    return found->second <= _log.SnapshotIndex();
+}
+
+InstallSnapshotRequest RaftNode::MakeInstallSnapshotFor() const
+{
+    return InstallSnapshotRequest { .term = _currentTerm,
+                                    .leaderId = _config.self,
+                                    .lastIncludedIndex = _log.SnapshotIndex(),
+                                    .lastIncludedTerm = _log.SnapshotTerm(),
+                                    .members = _members,
+                                    .state = _snapshotState };
+}
+
 void RaftNode::ReplicateToPeers(RaftOutput& output) const
 {
     for (auto const& peer: _peers)
-        output.messages.push_back(OutboundMessage { .to = peer, .message = MakeAppendEntriesFor(peer) });
+    {
+        // A follower whose next entry has been compacted away cannot be caught up
+        // by replication: the entries it asks for are gone from this log, so the
+        // only thing left to send is the state they produced.
+        if (NeedsSnapshot(peer))
+            output.messages.push_back(OutboundMessage { .to = peer, .message = MakeInstallSnapshotFor() });
+        else
+            output.messages.push_back(OutboundMessage { .to = peer, .message = MakeAppendEntriesFor(peer) });
+    }
+}
+
+bool RaftNode::CompactThroughApplied(std::vector<std::byte> state)
+{
+    // Only applied state may be discarded. An entry above `_lastApplied` has not
+    // reached the application, so the snapshot handed in does not describe it --
+    // compacting past that point would replace entries with a state that never
+    // included them.
+    if (_lastApplied <= _log.SnapshotIndex())
+        return false;
+
+    if (!_log.Compact(_lastApplied))
+        return false;
+
+    _snapshotState = std::move(state);
+    return true;
 }
 
 void RaftNode::AdvanceCommitIndex()
@@ -620,6 +667,8 @@ RaftOutput RaftNode::Receive(RaftMessage const& message, TimePoint now)
                    [&](RequestVoteResponse const& response) { OnRequestVoteResponse(response, now, output); },
                    [&](AppendEntriesRequest const& request) { OnAppendEntries(request, now, output); },
                    [&](AppendEntriesResponse const& response) { OnAppendEntriesResponse(response, now, output); },
+                   [&](InstallSnapshotRequest const& request) { OnInstallSnapshot(request, now, output); },
+                   [&](InstallSnapshotResponse const& response) { OnInstallSnapshotResponse(response, now, output); },
                },
                message);
 
@@ -633,6 +682,77 @@ bool RaftNode::IsPreVoteExempt(RaftMessage const& message) noexcept
 
     auto const* const response = std::get_if<PreVoteResponse>(&message);
     return response != nullptr && response->decision == VoteDecision::Granted;
+}
+
+void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoint now, RaftOutput& output)
+{
+    auto const reply = [&](AppendResult result, LogIndex matchIndex) {
+        output.messages.push_back(OutboundMessage {
+            .to = request.leaderId,
+            .message = InstallSnapshotResponse {
+                .term = _currentTerm, .result = result, .matchIndex = matchIndex, .followerId = _config.self } });
+    };
+
+    if (request.term < _currentTerm)
+    {
+        reply(AppendResult::Rejected, LogIndex::BeforeFirst());
+        return;
+    }
+
+    // A snapshot is a leader speaking, so it counts as hearing from one: without
+    // arming the timer here a follower being caught up would stand for election
+    // in the middle of it.
+    _knownLeader = request.leaderId;
+    _votesGranted.clear();
+    ArmElectionTimer(now);
+
+    // Already covered. A duplicate or reordered snapshot must not roll this node
+    // BACKWARDS -- it holds at least this much state already, and discarding its
+    // log to re-adopt an older point would lose entries it has acknowledged.
+    if (request.lastIncludedIndex <= _log.SnapshotIndex() || request.lastIncludedIndex <= _commitIndex)
+    {
+        reply(AppendResult::Accepted, _commitIndex);
+        return;
+    }
+
+    _log.ResetToSnapshot(request.lastIncludedIndex, request.lastIncludedTerm);
+
+    // The configuration travels with the snapshot because a follower catching up
+    // from it has no entries left to learn the member set from.
+    AdoptMembers(request.members);
+
+    // The snapshot IS committed state -- a leader only ever snapshots what it has
+    // applied -- so both indices move to it.
+    _commitIndex = request.lastIncludedIndex;
+    _lastApplied = request.lastIncludedIndex;
+    _snapshotState = request.state;
+
+    output.restoreSnapshot = SnapshotRestore { .lastIncludedIndex = request.lastIncludedIndex,
+                                               .lastIncludedTerm = request.lastIncludedTerm,
+                                               .state = request.state };
+
+    reply(AppendResult::Accepted, request.lastIncludedIndex);
+}
+
+void RaftNode::OnInstallSnapshotResponse(InstallSnapshotResponse const& response, TimePoint /*now*/, RaftOutput& output)
+{
+    if (_role != Role::Leader || response.term != _currentTerm || !IsMember(response.followerId))
+        return;
+
+    if (response.result != AppendResult::Accepted)
+        return;
+
+    // Progress moves by exactly the rule an AppendEntries response uses, rather
+    // than by a second one of its own: a match index only ever increases, because
+    // un-acknowledging a confirmed entry can only end with a committed entry
+    // treated as uncommitted.
+    auto const clamped = std::min(response.matchIndex, _log.LastIndex());
+    auto& match = _matchIndex[response.followerId];
+    match = std::max(match, clamped);
+    _nextIndex[response.followerId] = match.Advanced(1);
+
+    AdvanceCommitIndex();
+    ApplyCommitted(output);
 }
 
 void RaftNode::OnPreVote(PreVoteRequest const& request, TimePoint now, RaftOutput& output)

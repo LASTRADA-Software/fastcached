@@ -184,6 +184,35 @@ class RaftNode
     /// @return Where the entry landed and what to do, or why it was refused.
     [[nodiscard]] std::expected<Proposal, ConsensusError> ProposeMembership(std::vector<NodeId> members, TimePoint now);
 
+    /// Compact the log, keeping `state` as the snapshot that replaces it.
+    ///
+    /// The log carries cluster configuration and cluster state only, so it grows
+    /// slowly — but a log nobody ever trims is a restart that takes longer every
+    /// time, and a leader that has to keep every entry forever in case some
+    /// follower is behind.
+    ///
+    /// Only applied state may be discarded: entries above `LastApplied()` have
+    /// not reached the application, so a snapshot does not describe them. The
+    /// configuration is captured alongside, because a follower catching up from
+    /// this snapshot has no entries left to learn it from.
+    /// @param state The application's serialized state as of `LastApplied()`.
+    /// @return True when the log was compacted.
+    bool CompactThroughApplied(std::vector<std::byte> state);
+
+    /// The last index this node's snapshot covers, or `BeforeFirst()`.
+    /// @return The snapshot point.
+    [[nodiscard]] LogIndex SnapshotIndex() const noexcept
+    {
+        return _log.SnapshotIndex();
+    }
+
+    /// How far the application has been advanced.
+    /// @return The last applied index.
+    [[nodiscard]] LogIndex LastApplied() const noexcept
+    {
+        return _lastApplied;
+    }
+
     /// The member set this node is currently operating under.
     ///
     /// The latest configuration in its log, which is not necessarily a committed
@@ -309,6 +338,10 @@ class RaftNode
     void OnRequestVoteResponse(RequestVoteResponse const& response, TimePoint now, RaftOutput& output);
     void OnAppendEntries(AppendEntriesRequest const& request, TimePoint now, RaftOutput& output);
     void OnAppendEntriesResponse(AppendEntriesResponse const& response, TimePoint now, RaftOutput& output);
+    void OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoint now, RaftOutput& output);
+    void OnInstallSnapshotResponse(InstallSnapshotResponse const& response, TimePoint now, RaftOutput& output);
+    [[nodiscard]] bool NeedsSnapshot(NodeId const& peer) const;
+    [[nodiscard]] InstallSnapshotRequest MakeInstallSnapshotFor() const;
 
     /// The term carried by any message, so the §5.1 rule can be applied once.
     [[nodiscard]] static Term TermOf(RaftMessage const& message) noexcept;
@@ -354,6 +387,14 @@ class RaftNode
     /// would otherwise be counted twice, and two counted votes from one node is a
     /// quorum that does not exist.
     std::unordered_set<NodeId> _votesGranted;
+
+    /// The application state the log's discarded prefix produced.
+    ///
+    /// Held by the node rather than fetched from the application when needed,
+    /// because it must be shippable to a follower at the moment that follower
+    /// turns out to be behind — and asking the application for a snapshot *then*
+    /// would produce one as of a different index than the log was compacted to.
+    std::vector<std::byte> _snapshotState;
 
     /// The member set this node is operating under: the latest configuration in
     /// its log, or `_config.members` when the log holds none.

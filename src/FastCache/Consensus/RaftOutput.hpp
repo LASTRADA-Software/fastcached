@@ -35,7 +35,9 @@ using RaftMessage = std::variant<PreVoteRequest,
                                  RequestVoteRequest,
                                  RequestVoteResponse,
                                  AppendEntriesRequest,
-                                 AppendEntriesResponse>;
+                                 AppendEntriesResponse,
+                                 InstallSnapshotRequest,
+                                 InstallSnapshotResponse>;
 
 /// A change to the durable log: write `entries` at `fromIndex`, discarding
 /// anything already at or after it.
@@ -72,6 +74,19 @@ struct OutboundMessage
 {
     NodeId to;           ///< The member to send it to.
     RaftMessage message; ///< What to send.
+};
+
+/// A snapshot the application must adopt wholesale.
+///
+/// Emitted when a follower receives state covering more than its log holds. The
+/// application cannot replay its way there — the entries that would have taken
+/// it are gone from every node that compacted them — so it replaces its state
+/// rather than advancing it.
+struct SnapshotRestore
+{
+    LogIndex lastIncludedIndex {}; ///< The index the state is as of.
+    Term lastIncludedTerm {};      ///< Term of that index.
+    std::vector<std::byte> state;  ///< The application's own bytes, never interpreted here.
 };
 
 /// Everything a node wants done as a result of one event.
@@ -135,6 +150,13 @@ struct RaftOutput
     /// (`EntryKind::NoOp`) are committed like any other but never delivered, so
     /// the indices seen here can skip one.
     std::vector<AppliedEntry> applied;
+
+    /// State the application must adopt in place of its own; absent normally.
+    ///
+    /// Delivered instead of `applied` rather than alongside it: the two are
+    /// alternative ways to reach the same point, and handing over both would
+    /// have the application replay entries the snapshot already includes.
+    std::optional<SnapshotRestore> restoreSnapshot;
 };
 
 } // namespace FastCache::Consensus

@@ -290,4 +290,39 @@ struct AppendEntriesResponse
     NodeId followerId;      ///< Who answered.
 };
 
+/// A leader handing a follower state it can no longer replay from the log.
+///
+/// Needed because a log that is compacted is a log a leader can no longer send
+/// from: once the entries a lagging follower asks for have been discarded, the
+/// only way to catch it up is to give it the state those entries produced.
+///
+/// Sent whole rather than chunked. That is a deliberate bound on what this log
+/// may hold, not an oversight: it carries cluster configuration and cluster
+/// state — never cache entries, which is the decision this whole feature rests
+/// on — so a snapshot of it is kilobytes. A design that streamed would need
+/// offsets, resumption and a partial-state file on the receiver, all to move
+/// something smaller than one compile's output.
+struct InstallSnapshotRequest
+{
+    Term term {};                  ///< The leader's term.
+    NodeId leaderId;               ///< So a follower can redirect a client.
+    LogIndex lastIncludedIndex {}; ///< Last index the snapshot covers.
+    Term lastIncludedTerm {};      ///< Term of that index.
+    std::vector<NodeId> members;   ///< The configuration as of that index.
+    std::vector<std::byte> state;  ///< The application's own bytes, never interpreted.
+};
+
+/// A follower's answer to a snapshot.
+///
+/// Carries `matchIndex` rather than a bare acceptance so the leader can move
+/// `nextIndex` forward exactly as an AppendEntries response does, instead of
+/// keeping a second rule for how progress advances.
+struct InstallSnapshotResponse
+{
+    Term term {};           ///< The follower's current term.
+    AppendResult result {}; ///< Whether the snapshot was taken on.
+    LogIndex matchIndex {}; ///< How far the follower now matches.
+    NodeId followerId;      ///< Who answered.
+};
+
 } // namespace FastCache::Consensus

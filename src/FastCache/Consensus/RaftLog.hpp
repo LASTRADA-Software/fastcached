@@ -59,11 +59,72 @@ class RaftLog
     /// moment there is no prior state to protect, because whatever this node knew
     /// is exactly what is being handed back. Every subsequent change still goes
     /// through `Append` or `TryAppend`.
-    /// @param entries The stored entries, in index order from 1.
-    explicit RaftLog(std::vector<LogEntry> entries) noexcept:
-        _entries { std::move(entries) }
+    /// @param entries The stored entries, in index order from `firstIndex`.
+    /// @param firstIndex Index of `entries[0]`; 1 for a log that was never
+    ///        compacted.
+    /// @param precedingTerm Term of the entry at `firstIndex - 1`, which the
+    ///        snapshot covers and this log no longer holds.
+    explicit RaftLog(std::vector<LogEntry> entries,
+                     LogIndex firstIndex = LogIndex { .value = 1 },
+                     Term precedingTerm = Term::None()) noexcept:
+        _entries { std::move(entries) },
+        _firstIndex { firstIndex.value == 0 ? LogIndex { .value = 1 } : firstIndex },
+        _precedingTerm { precedingTerm }
     {
     }
+
+    /// Index of the first entry this log physically holds.
+    ///
+    /// Above `LogIndex::BeforeFirst() + 1` once the log has been compacted:
+    /// everything below is covered by a snapshot and is gone. A leader whose
+    /// follower needs an index below this cannot replicate to it and must send
+    /// the snapshot instead.
+    /// @return The first index held.
+    [[nodiscard]] LogIndex FirstIndex() const noexcept
+    {
+        return _firstIndex;
+    }
+
+    /// The last index covered by the snapshot, i.e. `FirstIndex() - 1`.
+    /// @return The snapshot point.
+    [[nodiscard]] LogIndex SnapshotIndex() const noexcept
+    {
+        return _firstIndex.Prev();
+    }
+
+    /// Term of the entry at `SnapshotIndex()`.
+    ///
+    /// Kept even though the entry itself is gone, because it is what an
+    /// AppendEntries covering the boundary names as `prevLogTerm` — without it a
+    /// leader could not prove its log matches at the one index the follower
+    /// cannot look up.
+    /// @return The preceding term.
+    [[nodiscard]] Term SnapshotTerm() const noexcept
+    {
+        return _precedingTerm;
+    }
+
+    /// Discard every entry at or below `through`, keeping its term.
+    ///
+    /// The log carries cluster configuration and cluster state, so it grows
+    /// slowly — but not never, and a log nobody ever trims is a restart that
+    /// takes longer every time it happens.
+    ///
+    /// Refuses to discard anything not yet covered: the caller must have made a
+    /// snapshot through `through` durable first, or compaction would throw away
+    /// the only copy of entries a follower still needs.
+    /// @param through Last index to discard; must be at or below `LastIndex()`.
+    /// @return True when the log was compacted.
+    bool Compact(LogIndex through) noexcept;
+
+    /// Replace the whole log with a snapshot boundary.
+    ///
+    /// What a follower does when it receives a snapshot covering more than its
+    /// log holds: everything it had is either included in the snapshot or from a
+    /// term that lost, so there is nothing to keep.
+    /// @param lastIncludedIndex Last index the snapshot covers.
+    /// @param lastIncludedTerm Term of that index.
+    void ResetToSnapshot(LogIndex lastIncludedIndex, Term lastIncludedTerm) noexcept;
 
     /// Index of the last entry, or `LogIndex::BeforeFirst()` when empty.
     /// @return The last index.
@@ -166,8 +227,20 @@ class RaftLog
     /// @return True when `index` is in `[1, LastIndex()]`.
     [[nodiscard]] bool Holds(LogIndex index) const noexcept;
 
-    /// Entry at log index `i + 1`; the log is one-based and this vector is not.
+    /// Position of `index` within `_entries`, valid only when `Holds(index)`.
+    /// @param index The log index.
+    /// @return The vector offset.
+    [[nodiscard]] std::size_t Offset(LogIndex index) const noexcept;
+
+    /// Entries from `_firstIndex` onward; the log is one-based and may have been
+    /// compacted, so a vector position is not a log index.
     std::vector<LogEntry> _entries;
+
+    /// Index of `_entries[0]`. One until the log is compacted.
+    LogIndex _firstIndex { .value = 1 };
+
+    /// Term of the entry at `_firstIndex - 1`, which the snapshot covers.
+    Term _precedingTerm {};
 };
 
 } // namespace FastCache::Consensus

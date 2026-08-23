@@ -56,6 +56,7 @@ class RecordingStorage final: public IRaftStorage
 
   private:
     Journal& _journal;
+    std::vector<std::byte> _state;
     InMemoryRaftStorage _inner;
 };
 
@@ -98,6 +99,28 @@ class RecordingMachine final: public IRaftStateMachine
         _applied.push_back(entry);
     }
 
+    [[nodiscard]] std::vector<std::byte> TakeSnapshot() override
+    {
+        _journal.events.emplace_back("snapshot");
+        return _state;
+    }
+
+    void RestoreSnapshot(std::span<std::byte const> state) override
+    {
+        _journal.events.emplace_back("restore");
+        _state.assign(state.begin(), state.end());
+
+        // A restore REPLACES: anything applied before it is described by the
+        // snapshot, so keeping it would double-count.
+        _applied.clear();
+    }
+
+    /// @return The state a restore installed, for assertions.
+    [[nodiscard]] std::vector<std::byte> const& State() const noexcept
+    {
+        return _state;
+    }
+
     /// @return Everything applied so far, in order.
     [[nodiscard]] std::vector<AppliedEntry> const& Applied() const noexcept
     {
@@ -107,6 +130,7 @@ class RecordingMachine final: public IRaftStateMachine
   private:
     Journal& _journal;
     std::vector<AppliedEntry> _applied;
+    std::vector<std::byte> _state;
 };
 
 /// Storage whose every write fails, for the stop-on-failure case.

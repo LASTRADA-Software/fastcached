@@ -68,8 +68,16 @@ std::expected<void, ConsensusError> RaftDriver::Deliver(RaftOutput output)
 
     // Last: peers cannot make progress until the messages are out, and applying
     // is local.
-    for (auto const& entry: output.applied)
-        _application.Apply(entry);
+    //
+    // A restore REPLACES rather than advances, so it is delivered instead of the
+    // applied entries and not alongside them -- the snapshot already includes
+    // everything up to its index, and replaying entries over it would re-apply
+    // what it contains.
+    if (output.restoreSnapshot.has_value())
+        _application.RestoreSnapshot(output.restoreSnapshot->state);
+    else
+        for (auto const& entry: output.applied)
+            _application.Apply(entry);
 
     return {};
 }

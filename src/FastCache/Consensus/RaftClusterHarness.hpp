@@ -16,6 +16,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -175,6 +176,19 @@ class RaftClusterHarness
         void Apply(AppliedEntry const& entry) override
         {
             _harness.RecordApplied(_who, entry);
+        }
+
+        [[nodiscard]] std::vector<std::byte> TakeSnapshot() override
+        {
+            return {};
+        }
+
+        void RestoreSnapshot(std::span<std::byte const> state) override
+        {
+            std::ignore = state;
+            // Nothing to restore: this machine records what it was told rather
+            // than holding state, and the safety properties the harness checks
+            // are about the LOG, which the node has already replaced.
         }
 
       private:

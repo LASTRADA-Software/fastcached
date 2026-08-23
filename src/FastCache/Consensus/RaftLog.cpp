@@ -10,12 +10,45 @@ namespace FastCache::Consensus
 
 LogIndex RaftLog::LastIndex() const noexcept
 {
-    return LogIndex { .value = _entries.size() };
+    return SnapshotIndex().Advanced(_entries.size());
 }
 
 Term RaftLog::LastTerm() const noexcept
 {
-    return _entries.empty() ? Term::None() : _entries.back().term;
+    // With every entry compacted away the last term is still known: it is the
+    // snapshot's. Reporting `Term::None()` there would make a fully compacted
+    // node look like a fresh one to §5.4.1, so any candidate would out-rank it.
+    return _entries.empty() ? _precedingTerm : _entries.back().term;
+}
+
+std::size_t RaftLog::Offset(LogIndex index) const noexcept
+{
+    return index.value - _firstIndex.value;
+}
+
+bool RaftLog::Compact(LogIndex through) noexcept
+{
+    // Nothing below the current boundary, and nothing this log does not hold: a
+    // caller asking to discard past the end is asking to forget entries it has
+    // no snapshot for.
+    if (through < _firstIndex || through > LastIndex())
+        return false;
+
+    auto const term = TermAt(through);
+    if (!term.has_value())
+        return false;
+
+    _entries.erase(_entries.begin(), _entries.begin() + static_cast<std::ptrdiff_t>(Offset(through) + 1));
+    _firstIndex = through.Advanced(1);
+    _precedingTerm = *term;
+    return true;
+}
+
+void RaftLog::ResetToSnapshot(LogIndex lastIncludedIndex, Term lastIncludedTerm) noexcept
+{
+    _entries.clear();
+    _firstIndex = lastIncludedIndex.Advanced(1);
+    _precedingTerm = lastIncludedTerm;
 }
 
 bool RaftLog::IsEmpty() const noexcept
@@ -25,28 +58,36 @@ bool RaftLog::IsEmpty() const noexcept
 
 bool RaftLog::Holds(LogIndex index) const noexcept
 {
-    return index != LogIndex::BeforeFirst() && index <= LastIndex();
+    return index >= _firstIndex && index <= LastIndex();
 }
 
 std::optional<Term> RaftLog::TermAt(LogIndex index) const noexcept
 {
+    // The snapshot boundary answers even though its entry is gone. That one index
+    // is what an AppendEntries spanning the boundary names as `prevLogTerm`, so
+    // without it a leader could not prove its log matches at the only index the
+    // follower is unable to look up -- and every append across the boundary would
+    // be refused forever.
+    if (index == SnapshotIndex() && index != LogIndex::BeforeFirst())
+        return _precedingTerm;
+
     if (!Holds(index))
         return std::nullopt;
-    return _entries[index.value - 1].term;
+    return _entries[Offset(index)].term;
 }
 
 LogEntry const* RaftLog::EntryAt(LogIndex index) const noexcept
 {
     if (!Holds(index))
         return nullptr;
-    return &_entries[index.value - 1];
+    return &_entries[Offset(index)];
 }
 
 std::vector<LogEntry> RaftLog::EntriesFrom(LogIndex first) const
 {
     if (!Holds(first))
         return {};
-    return { _entries.begin() + static_cast<std::ptrdiff_t>(first.value - 1), _entries.end() };
+    return { _entries.begin() + static_cast<std::ptrdiff_t>(Offset(first)), _entries.end() };
 }
 
 LogIndex RaftLog::Append(LogEntry entry)
@@ -81,9 +122,12 @@ bool RaftLog::CandidateIsAtLeastAsUpToDate(LogIndex candidateLastIndex, Term can
 
 void RaftLog::TruncateFrom(LogIndex from) noexcept
 {
+    // `Holds` already excludes anything the snapshot covers, so a truncation can
+    // never reach into it -- which is right: those entries are committed by
+    // definition, since a snapshot is only ever taken of committed state.
     if (!Holds(from))
         return;
-    _entries.erase(_entries.begin() + static_cast<std::ptrdiff_t>(from.value - 1), _entries.end());
+    _entries.erase(_entries.begin() + static_cast<std::ptrdiff_t>(Offset(from)), _entries.end());
 }
 
 RaftLog::AppendOutcome RaftLog::TryAppend(LogIndex prevIndex, Term prevTerm, std::span<LogEntry const> entries)

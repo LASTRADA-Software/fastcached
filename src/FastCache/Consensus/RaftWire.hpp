@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Consensus/RaftOutput.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Core/Errors/ConsensusError.hpp>
@@ -107,12 +108,14 @@ inline constexpr std::size_t HeaderSize = 7;
 /// type as well as not carrying a valid magic.
 enum class MessageType : std::uint8_t
 {
-    RequestVote = 0x01,           ///< Candidate asking for a vote (§5.2).
-    RequestVoteResponse = 0x02,   ///< A voter's answer.
-    AppendEntries = 0x03,         ///< Leader replicating; a heartbeat when empty (§5.3).
-    AppendEntriesResponse = 0x04, ///< A follower's answer.
-    PreVote = 0x05,               ///< Asking whether an election could be won (thesis §9.6).
-    PreVoteResponse = 0x06,       ///< A voter's answer to that question.
+    RequestVote = 0x01,             ///< Candidate asking for a vote (§5.2).
+    RequestVoteResponse = 0x02,     ///< A voter's answer.
+    AppendEntries = 0x03,           ///< Leader replicating; a heartbeat when empty (§5.3).
+    AppendEntriesResponse = 0x04,   ///< A follower's answer.
+    PreVote = 0x05,                 ///< Asking whether an election could be won (thesis §9.6).
+    PreVoteResponse = 0x06,         ///< A voter's answer to that question.
+    InstallSnapshot = 0x07,         ///< State a compacted log can no longer replay.
+    InstallSnapshotResponse = 0x08, ///< A follower's answer to that.
 };
 
 /// What one message type needs, as a row rather than as a branch.
@@ -135,6 +138,8 @@ inline constexpr std::array MessageTable {
     MessageDescriptor { .type = MessageType::AppendEntriesResponse, .name = "AppendEntriesResponse", .fieldCount = 4 },
     MessageDescriptor { .type = MessageType::PreVote, .name = "PreVote", .fieldCount = 4 },
     MessageDescriptor { .type = MessageType::PreVoteResponse, .name = "PreVoteResponse", .fieldCount = 3 },
+    MessageDescriptor { .type = MessageType::InstallSnapshot, .name = "InstallSnapshot", .fieldCount = 6 },
+    MessageDescriptor { .type = MessageType::InstallSnapshotResponse, .name = "InstallSnapshotResponse", .fieldCount = 4 },
 };
 
 /// How many fields one log entry encodes as: term, kind, payload.
@@ -443,6 +448,28 @@ namespace Detail
                                           std::span<std::byte const> { commit },    std::span<std::byte const> { entries } };
                 return Detail::Frame<MessageType::AppendEntries>(version, fields);
             }
+            else if constexpr (std::is_same_v<T, InstallSnapshotRequest>)
+            {
+                auto const term = Detail::CounterField(m.term);
+                auto const lastIndex = Detail::CounterField(m.lastIncludedIndex);
+                auto const lastTerm = Detail::CounterField(m.lastIncludedTerm);
+                auto const members = Membership::Encode(m.members);
+                std::array const fields { std::span<std::byte const> { term },      WireFields::AsBytes(m.leaderId),
+                                          std::span<std::byte const> { lastIndex }, std::span<std::byte const> { lastTerm },
+                                          std::span<std::byte const> { members },   std::span<std::byte const> { m.state } };
+                return Detail::Frame<MessageType::InstallSnapshot>(version, fields);
+            }
+            else if constexpr (std::is_same_v<T, InstallSnapshotResponse>)
+            {
+                auto const term = Detail::CounterField(m.term);
+                auto const result = Detail::EnumField(m.result);
+                auto const match = Detail::CounterField(m.matchIndex);
+                std::array const fields { std::span<std::byte const> { term },
+                                          std::span<std::byte const> { result },
+                                          std::span<std::byte const> { match },
+                                          WireFields::AsBytes(m.followerId) };
+                return Detail::Frame<MessageType::InstallSnapshotResponse>(version, fields);
+            }
             else
             {
                 static_assert(std::is_same_v<T, AppendEntriesResponse>);
@@ -574,6 +601,39 @@ namespace Detail
                                                         .prevLogTerm = Term { .value = *prevTerm },
                                                         .entries = *std::move(entries),
                                                         .leaderCommit = LogIndex { .value = *commit } } };
+        }
+        case MessageType::InstallSnapshot: {
+            auto const term = WireFields::FromBigEndian<std::uint64_t>((*fields)[0]);
+            auto const lastIndex = WireFields::FromBigEndian<std::uint64_t>((*fields)[2]);
+            auto const lastTerm = WireFields::FromBigEndian<std::uint64_t>((*fields)[3]);
+            if (!term.has_value() || !lastIndex.has_value() || !lastTerm.has_value())
+                return malformed("a counter field is not eight bytes");
+
+            auto members = Membership::Decode((*fields)[4]);
+            if (!members.has_value())
+                return malformed("the member list is malformed");
+
+            return RaftMessage { InstallSnapshotRequest {
+                .term = Term { .value = *term },
+                .leaderId = NodeId { WireFields::AsStringView((*fields)[1]) },
+                .lastIncludedIndex = LogIndex { .value = *lastIndex },
+                .lastIncludedTerm = Term { .value = *lastTerm },
+                .members = *std::move(members),
+                .state = std::vector<std::byte> { (*fields)[5].begin(), (*fields)[5].end() } } };
+        }
+        case MessageType::InstallSnapshotResponse: {
+            auto const term = WireFields::FromBigEndian<std::uint64_t>((*fields)[0]);
+            auto const result = Detail::DecodeEnum<AppendResult>((*fields)[1]);
+            auto const match = WireFields::FromBigEndian<std::uint64_t>((*fields)[2]);
+            if (!term.has_value() || !match.has_value())
+                return malformed("a counter field is not eight bytes");
+            if (!result.has_value())
+                return malformed("the append result names no known outcome");
+            return RaftMessage { Consensus::InstallSnapshotResponse {
+                .term = Term { .value = *term },
+                .result = *result,
+                .matchIndex = LogIndex { .value = *match },
+                .followerId = NodeId { WireFields::AsStringView((*fields)[3]) } } };
         }
         case MessageType::AppendEntriesResponse: {
             auto const term = WireFields::FromBigEndian<std::uint64_t>((*fields)[0]);
