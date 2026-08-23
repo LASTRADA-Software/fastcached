@@ -30,7 +30,29 @@ namespace FastCache::Cluster
 struct ClusterMember
 {
     Consensus::NodeId id; ///< Stable identity; what consensus counts.
-    std::string endpoint; ///< host:port peers reach this node's scheduler on.
+
+    /// host:port this member's consensus port answers on.
+    ///
+    /// Always present -- a member with no address is the thing this struct exists to
+    /// make impossible -- and always dialable, because it is what every other member
+    /// opens a socket to.
+    std::string raftEndpoint;
+
+    /// host:port clients reach the fleet on while this member LEADS; may be empty.
+    ///
+    /// **A second endpoint rather than one**, and the reason is a defect this pairing
+    /// closes rather than a generality. `NotLeader` carries a redirect, and the one
+    /// address recorded here used to be the consensus port -- so a follower answered
+    /// "ask the leader, at its Raft peer port", and a client that took the advice
+    /// spoke the scheduler protocol at a socket that has never heard of it. Two
+    /// ports, two facts, and collapsing them made every redirect in a real cluster
+    /// point somewhere nothing could be done with.
+    ///
+    /// Empty is legitimate and means "this member has not said". Only a *leader's*
+    /// matters, and a leader announces its own record on election -- so the value is
+    /// absent exactly for the members whose value nobody needs, and a bootstrap peer
+    /// that has never led carries none rather than carrying a guess.
+    std::string schedulerEndpoint;
 
     [[nodiscard]] friend bool operator==(ClusterMember const&, ClusterMember const&) = default;
 };
@@ -102,17 +124,32 @@ struct ClusterState
 
     [[nodiscard]] friend bool operator==(ClusterState const&, ClusterState const&) = default;
 
-    /// The endpoint recorded for `id`, if any.
+    /// The consensus endpoint recorded for `id`, if any.
     /// @param id The member.
-    /// @return Its endpoint, or nullopt when it is not a member.
-    [[nodiscard]] std::optional<std::string> EndpointOf(std::string_view id) const;
+    /// @return Its Raft endpoint, or nullopt when it is not a member.
+    [[nodiscard]] std::optional<std::string> RaftEndpointOf(std::string_view id) const;
+
+    /// Where clients reach the fleet while `id` leads, if it has said.
+    ///
+    /// Absent for a member that is not known **and** for one that has never
+    /// announced itself, which are deliberately the same answer here: both mean
+    /// there is nowhere to send a client, and a caller that told them apart would
+    /// have nothing different to do about it.
+    /// @param id The member.
+    /// @return Its scheduler endpoint, or nullopt.
+    [[nodiscard]] std::optional<std::string> SchedulerEndpointOf(std::string_view id) const;
 
     /// The value of `name`, if it has been set.
     /// @param name The setting.
     /// @return Its value, or nullopt when nobody set it.
     [[nodiscard]] std::optional<std::string> SettingOf(std::string_view name) const;
 
-    /// Every member's endpoint, in id order.
+    /// Every member's consensus endpoint, in id order.
+    ///
+    /// The Raft one rather than the scheduler one, because this feeds
+    /// `Distributed::ClusterMembership`, which matches on the HOST part and admits a
+    /// peer whatever port it dialed from. Both endpoints name the same host, and only
+    /// this one is guaranteed to be there at all.
     /// @return The endpoints, which is what `Distributed::ClusterMembership` takes.
     [[nodiscard]] std::vector<std::string> Endpoints() const;
 };
@@ -141,8 +178,20 @@ struct Command
     /// The member id for `AddMember`/`RemoveMember`, the setting name for
     /// `SetSetting`.
     std::string key;
-    /// The endpoint for `AddMember`, the value for `SetSetting`, empty otherwise.
+    /// The consensus endpoint for `AddMember`, the value for `SetSetting`, empty
+    /// otherwise.
     std::string value;
+
+    /// `AddMember` only: where clients reach the fleet while this member leads.
+    ///
+    /// Applied **wholesale**, so an empty one clears whatever was recorded rather
+    /// than leaving it. That is the right way round: a member is re-admitted when its
+    /// record has changed, and a node that moved has moved both ports -- keeping the
+    /// old scheduler endpoint would redirect clients to an address that member no
+    /// longer answers, which is worse than redirecting them nowhere. Refused for the
+    /// other two verbs, because a field a verb ignores is a field somebody
+    /// misunderstood.
+    std::string schedulerEndpoint;
 
     [[nodiscard]] friend bool operator==(Command const&, Command const&) = default;
 };

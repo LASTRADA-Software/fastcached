@@ -17,11 +17,14 @@ namespace
 /// A command, spelled once so the cases below vary only what they are about.
 /// @param kind What it does.
 /// @param key The member id or setting name.
-/// @param value The endpoint or setting value.
+/// @param value The consensus endpoint or setting value.
+/// @param scheduler Where clients reach this member while it leads.
 /// @return The command.
-[[nodiscard]] Command Cmd(CommandKind kind, std::string key, std::string value = {})
+[[nodiscard]] Command Cmd(CommandKind kind, std::string key, std::string value = {}, std::string scheduler = {})
 {
-    return Command { .kind = kind, .key = std::move(key), .value = std::move(value) };
+    return Command {
+        .kind = kind, .key = std::move(key), .value = std::move(value), .schedulerEndpoint = std::move(scheduler)
+    };
 }
 } // namespace
 
@@ -81,11 +84,11 @@ TEST_CASE("Applying is total, and admitting a known member moves it", "[cluster]
     // which the cluster has agreed it does not exist.
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.9:6675"));
     CHECK(state.members.size() == 2);
-    CHECK(Unwrap(state.EndpointOf("n1")) == "10.0.0.9:6675");
+    CHECK(Unwrap(state.RaftEndpointOf("n1")) == "10.0.0.9:6675");
 
     Apply(state, Cmd(CommandKind::RemoveMember, "n1"));
     CHECK(state.members.size() == 1);
-    CHECK_FALSE(state.EndpointOf("n1").has_value());
+    CHECK_FALSE(state.RaftEndpointOf("n1").has_value());
 
     // Removing something that is not there is a no-op rather than a fault, for the
     // same reason: by the time this runs the cluster has already agreed to it.
@@ -168,4 +171,84 @@ TEST_CASE("Endpoints come back in the order a membership oracle wants", "[cluste
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
 
     CHECK(state.Endpoints() == std::vector<std::string> { "10.0.0.1:6675", "10.0.0.2:6675" });
+}
+
+TEST_CASE("A member carries the port a client speaks to, not only the one peers do", "[cluster][state]")
+{
+    // The defect this pairing closes. `NotLeader` carries a redirect, and while one
+    // address was recorded it was the CONSENSUS port -- so a follower answered "ask
+    // the leader, at its Raft peer port" and a client that took the advice spoke the
+    // scheduler protocol at a socket that has never heard of it. Two ports, two
+    // facts.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
+
+    CHECK(Unwrap(state.RaftEndpointOf("n1")) == "10.0.0.1:6675");
+    CHECK(Unwrap(state.SchedulerEndpointOf("n1")) == "10.0.0.1:7000");
+
+    // A member that has never announced one is absent rather than empty, because a
+    // caller has nothing different to do about "not a member" and "nowhere to send
+    // you" -- both mean the client compiles locally.
+    Apply(state, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"));
+    CHECK(Unwrap(state.RaftEndpointOf("n2")) == "10.0.0.2:6675");
+    CHECK_FALSE(state.SchedulerEndpointOf("n2").has_value());
+    CHECK_FALSE(state.SchedulerEndpointOf("nobody").has_value());
+
+    // `Endpoints()` stays the consensus ones: it feeds the fleet's membership oracle,
+    // which keys on the HOST, and only this endpoint is guaranteed to be there.
+    CHECK(state.Endpoints() == std::vector<std::string> { "10.0.0.1:6675", "10.0.0.2:6675" });
+}
+
+TEST_CASE("Re-admitting a member replaces its whole record", "[cluster][state]")
+{
+    // Wholesale, and that is the right way round: a record is re-proposed when it has
+    // changed, and a node that moved moved both of its ports -- so keeping a
+    // scheduler endpoint the command did not repeat would redirect clients at an
+    // address that member no longer answers, which is worse than redirecting them
+    // nowhere at all.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
+    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.9:6675"));
+
+    REQUIRE(state.members.size() == 1);
+    CHECK(Unwrap(state.RaftEndpointOf("n1")) == "10.0.0.9:6675");
+    CHECK_FALSE(state.SchedulerEndpointOf("n1").has_value());
+}
+
+TEST_CASE("A verb that has no scheduler endpoint may not carry one", "[cluster][state]")
+{
+    // A field a verb ignores is a field somebody misunderstood, and the refusal is at
+    // the proposer because that is the only place anything can be refused.
+    CHECK(Validate(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000")).has_value());
+    CHECK_FALSE(Validate(Cmd(CommandKind::RemoveMember, "n1", {}, "10.0.0.1:7000")).has_value());
+    CHECK_FALSE(Validate(Cmd(CommandKind::SetSetting, "upstream", "c:1", "10.0.0.1:7000")).has_value());
+}
+
+TEST_CASE("A member's two endpoints survive a snapshot apart", "[cluster][state][wire]")
+{
+    // Members are triples and settings are pairs, so the boundary between them is
+    // arithmetic rather than a delimiter -- and getting it wrong reads every member's
+    // scheduler endpoint as the next member's id, which decodes and produces a state
+    // nothing would report as wrong.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
+    Apply(state, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"));
+    Apply(state, Cmd(CommandKind::SetSetting, "upstream", "cache.internal:6674"));
+    Apply(state, Cmd(CommandKind::SetSetting, "fleet-open", "1"));
+
+    auto const restored = DecodeState(Encode(state));
+    REQUIRE(restored.has_value());
+    CHECK(Unwrap(restored) == state);
+    CHECK(Unwrap(restored).members.size() == 2);
+    CHECK(Unwrap(restored).settings.size() == 2);
+}
+
+TEST_CASE("An AddMember round-trips both of its endpoints", "[cluster][state][wire]")
+{
+    // Every field a different value, so a transposition cannot survive -- the arm
+    // this verb gained is the one a copied encoder gets wrong.
+    auto const original = Cmd(CommandKind::AddMember, "n7", "10.0.0.7:6675", "10.0.0.7:7000");
+    auto const decoded = DecodeCommand(Encode(original));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded) == original);
 }

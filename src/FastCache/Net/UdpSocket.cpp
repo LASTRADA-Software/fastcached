@@ -58,12 +58,10 @@ namespace
             != 0)
             return {};
 
-        // Bracketed when the host itself contains a colon, so the result round
-        // trips through `SplitHostPort` -- which is the whole reason that parser
-        // is shared rather than an `rfind(':')` at each caller.
-        std::string const text { host.data() };
-        return text.contains(':') ? std::format("[{}]:{}", text, service.data())
-                                  : std::format("{}:{}", text, service.data());
+        // Through the shared formatter, so the result round trips through
+        // `SplitHostPort` -- which is the whole reason that pair is shared rather
+        // than an `rfind(':')` and a bracket rule at each caller.
+        return FormatHostPort(std::string_view { host.data() }, std::string_view { service.data() });
     }
 
     /// A blocking UDP socket.

@@ -18,7 +18,18 @@ namespace
     /// it rather than read it as this build's arrangement. A snapshot is the one
     /// thing that outlives a process, so a format that could not say which one wrote
     /// it would make an upgrade a silent corruption.
-    constexpr std::uint8_t StateVersion = 1;
+    constexpr std::uint8_t StateVersion = 2;
+
+    /// Fields one member occupies in an encoded state: id, Raft, scheduler.
+    ///
+    /// Named because the decoder's arithmetic is otherwise three unexplained
+    /// threes, and getting one of them wrong reads every member's scheduler
+    /// endpoint as the next member's id -- which decodes, and produces a state
+    /// nothing would report as wrong.
+    constexpr std::size_t MemberFields = 3;
+
+    /// Fields one setting occupies: name, value.
+    constexpr std::size_t SettingFields = 2;
 
     /// Keep a sorted-by-key vector's ordering after an insertion.
     /// @param entries The vector to sort.
@@ -30,10 +41,18 @@ namespace
     }
 } // namespace
 
-std::optional<std::string> ClusterState::EndpointOf(std::string_view id) const
+std::optional<std::string> ClusterState::RaftEndpointOf(std::string_view id) const
 {
     auto const it = std::ranges::find(members, id, &ClusterMember::id);
-    return it != members.end() ? std::optional { it->endpoint } : std::nullopt;
+    return it != members.end() ? std::optional { it->raftEndpoint } : std::nullopt;
+}
+
+std::optional<std::string> ClusterState::SchedulerEndpointOf(std::string_view id) const
+{
+    auto const it = std::ranges::find(members, id, &ClusterMember::id);
+    if (it == members.end() || it->schedulerEndpoint.empty())
+        return std::nullopt;
+    return it->schedulerEndpoint;
 }
 
 std::optional<std::string> ClusterState::SettingOf(std::string_view name) const
@@ -47,20 +66,22 @@ std::vector<std::string> ClusterState::Endpoints() const
     std::vector<std::string> out;
     out.reserve(members.size());
     for (auto const& member: members)
-        out.push_back(member.endpoint);
+        out.push_back(member.raftEndpoint);
     return out;
 }
 
 std::vector<std::byte> Encode(Command const& command)
 {
     auto const header = std::array { static_cast<std::byte>(StateVersion), static_cast<std::byte>(command.kind) };
-    return WireFields::Encode(
-        { std::span<std::byte const> { header }, WireFields::AsBytes(command.key), WireFields::AsBytes(command.value) });
+    return WireFields::Encode({ std::span<std::byte const> { header },
+                                WireFields::AsBytes(command.key),
+                                WireFields::AsBytes(command.value),
+                                WireFields::AsBytes(command.schedulerEndpoint) });
 }
 
 std::optional<Command> DecodeCommand(std::span<std::byte const> payload)
 {
-    auto const fields = WireFields::SplitExactly(payload, 3);
+    auto const fields = WireFields::SplitExactly(payload, 4);
     if (!fields.has_value())
         return std::nullopt;
 
@@ -78,7 +99,8 @@ std::optional<Command> DecodeCommand(std::span<std::byte const> payload)
 
     return Command { .kind = static_cast<CommandKind>(kindRaw),
                      .key = std::string { WireFields::AsStringView((*fields)[1]) },
-                     .value = std::string { WireFields::AsStringView((*fields)[2]) } };
+                     .value = std::string { WireFields::AsStringView((*fields)[2]) },
+                     .schedulerEndpoint = std::string { WireFields::AsStringView((*fields)[3]) } };
 }
 
 std::vector<std::byte> Encode(ClusterState const& state)
@@ -96,7 +118,8 @@ std::vector<std::byte> Encode(ClusterState const& state)
     for (auto const& member: state.members)
     {
         fields.push_back(WireFields::AsBytes(member.id));
-        fields.push_back(WireFields::AsBytes(member.endpoint));
+        fields.push_back(WireFields::AsBytes(member.raftEndpoint));
+        fields.push_back(WireFields::AsBytes(member.schedulerEndpoint));
     }
     for (auto const& setting: state.settings)
     {
@@ -109,10 +132,7 @@ std::vector<std::byte> Encode(ClusterState const& state)
 std::optional<ClusterState> DecodeState(std::span<std::byte const> bytes)
 {
     auto const fields = WireFields::SplitAll(bytes);
-    // Two leading fields, then pairs. An odd remainder is a truncated snapshot, which
-    // must be refused rather than read as a member with an empty endpoint -- that
-    // member would then be replicated onward as an address nobody can dial.
-    if (!fields.has_value() || fields->size() < 2 || (fields->size() - 2) % 2 != 0)
+    if (!fields.has_value() || fields->size() < 2)
         return std::nullopt;
 
     if ((*fields)[0].size() != 1 || static_cast<std::uint8_t>((*fields)[0][0]) != StateVersion)
@@ -122,22 +142,28 @@ std::optional<ClusterState> DecodeState(std::span<std::byte const> bytes)
     if (!memberCount.has_value())
         return std::nullopt;
 
-    auto const pairs = (fields->size() - 2) / 2;
-    if (*memberCount > pairs)
+    // Members first as triples, settings after as pairs, and BOTH shapes are checked
+    // against what actually arrived. A truncated snapshot must be refused rather than
+    // read as a member with an empty endpoint -- that member would be replicated
+    // onward as an address nobody can dial -- and a declared member count larger than
+    // the fields present is the same fault stated by the other end.
+    auto const rest = fields->size() - 2;
+    auto const memberSpan = static_cast<std::size_t>(*memberCount) * MemberFields;
+    if (memberSpan > rest || (rest - memberSpan) % SettingFields != 0)
         return std::nullopt;
+
+    auto const at = [&](std::size_t index) {
+        return std::string { WireFields::AsStringView((*fields)[2 + index]) };
+    };
 
     ClusterState state;
     state.members.reserve(*memberCount);
-    state.settings.reserve(pairs - *memberCount);
-    for (std::size_t pair = 0; pair < pairs; ++pair)
-    {
-        auto const first = WireFields::AsStringView((*fields)[2 + (pair * 2)]);
-        auto const second = WireFields::AsStringView((*fields)[3 + (pair * 2)]);
-        if (pair < *memberCount)
-            state.members.push_back(ClusterMember { .id = std::string { first }, .endpoint = std::string { second } });
-        else
-            state.settings.push_back(Setting { .name = std::string { first }, .value = std::string { second } });
-    }
+    state.settings.reserve((rest - memberSpan) / SettingFields);
+    for (std::size_t index = 0; index < memberSpan; index += MemberFields)
+        state.members.push_back(
+            ClusterMember { .id = at(index), .raftEndpoint = at(index + 1), .schedulerEndpoint = at(index + 2) });
+    for (std::size_t index = memberSpan; index < rest; index += SettingFields)
+        state.settings.push_back(Setting { .name = at(index), .value = at(index + 1) });
     return state;
 }
 
@@ -149,13 +175,20 @@ void Apply(ClusterState& state, Command const& command)
             // Update in place when the id is already known. One verb for "join" and
             // "moved" because they are one intention, and removing first would leave a
             // window in which the cluster has agreed the node does not exist.
+            auto const admitted = ClusterMember { .id = command.key,
+                                                  .raftEndpoint = command.value,
+                                                  .schedulerEndpoint = command.schedulerEndpoint };
             auto const it = std::ranges::find(state.members, command.key, &ClusterMember::id);
             if (it != state.members.end())
             {
-                it->endpoint = command.value;
+                // Wholesale, both endpoints. A record is re-proposed only when it has
+                // changed, and a node that moved moved both of its ports -- so keeping
+                // a scheduler endpoint the command did not repeat would redirect
+                // clients at an address that member no longer answers.
+                *it = admitted;
                 return;
             }
-            state.members.push_back(ClusterMember { .id = command.key, .endpoint = command.value });
+            state.members.push_back(admitted);
             SortByKey(state.members, &ClusterMember::id);
             return;
         }
@@ -193,9 +226,13 @@ std::expected<void, ConsensusError> Validate(Command const& command)
             return {};
 
         case CommandKind::RemoveMember:
+            if (!command.schedulerEndpoint.empty())
+                return std::unexpected(InvalidConfiguration("a removal carries no scheduler endpoint"));
             return {};
 
         case CommandKind::SetSetting:
+            if (!command.schedulerEndpoint.empty())
+                return std::unexpected(InvalidConfiguration("a setting carries no scheduler endpoint"));
             // Refused HERE rather than ignored at each applier. A key nobody knows
             // would otherwise be replicated to every node, snapshotted, carried across
             // restarts and do nothing -- with the only symptom being that the thing

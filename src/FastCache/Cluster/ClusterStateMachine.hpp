@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <shared_mutex>
 #include <span>
 #include <vector>
 
@@ -53,17 +54,36 @@ class ClusterStateMachine final: public Consensus::IRaftStateMachine
     void RestoreSnapshot(std::span<std::byte const> state) override;
 
     /// The state as of the last applied entry.
-    [[nodiscard]] ClusterState const& State() const noexcept
-    {
-        return _state;
-    }
+    ///
+    /// **By value, and that is not a copy nobody needed.** Entries are applied on
+    /// whichever thread the driver advanced the node from, while this is read by
+    /// whoever wants to know what the cluster currently says -- a different thread
+    /// by construction, since the driver's own observer is called from inside
+    /// `Deliver` and so is not somewhere a caller can do its own work. A reference
+    /// would hand that caller a member being rewritten underneath it. The state is
+    /// a member list and a handful of settings, so the copy costs nothing next to
+    /// the replication round that produced it.
+    [[nodiscard]] ClusterState State() const;
 
   private:
     /// Tell the observer, if there is one.
-    void Publish() const;
+    ///
+    /// Takes the state by value from the caller rather than reading `_state`, so it
+    /// can be called with the lock released. An observer runs arbitrary code -- it
+    /// republishes the fleet's membership oracle, which takes a lock of its own --
+    /// and calling it under this one would order two unrelated locks.
+    /// @param state What to report.
+    void Publish(ClusterState const& state) const;
 
     ILogger& _logger;
     Observer _observer;
+
+    /// Guards `_state` against the reader above.
+    ///
+    /// Shared rather than exclusive because reads outnumber writes by whatever the
+    /// reconcile interval divided by the rate of cluster configuration changes is
+    /// -- which for a healthy fleet is every read against no writes at all.
+    mutable std::shared_mutex _mutex;
     ClusterState _state;
 };
 

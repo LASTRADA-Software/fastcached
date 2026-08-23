@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <ranges>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -18,6 +19,25 @@ using FastCache::Testing::Unwrap;
 
 namespace
 {
+/// A command, spelled once so a field added to `Command` lands in one place.
+///
+/// The alternative -- a literal per case -- is what this file had, and adding the
+/// scheduler endpoint made every one of them a compile error under
+/// `-Wmissing-designated-field-initializers`. That diagnostic is doing its job:
+/// each of those literals WOULD have silently defaulted a field it never
+/// mentioned.
+/// @param kind What it does.
+/// @param key The member id or setting name.
+/// @param value The consensus endpoint or setting value.
+/// @param scheduler Where clients reach this member while it leads.
+/// @return The command.
+[[nodiscard]] Command Cmd(CommandKind kind, std::string key, std::string value = {}, std::string scheduler = {})
+{
+    return Command {
+        .kind = kind, .key = std::move(key), .value = std::move(value), .schedulerEndpoint = std::move(scheduler)
+    };
+}
+
 /// One applied entry carrying a command.
 /// @param index Where it sits in the log.
 /// @param command The change.
@@ -40,11 +60,11 @@ TEST_CASE("Committed entries become the cluster's state", "[cluster][statemachin
 {
     Watched watched;
 
-    watched.machine.Apply(Entry(1, Command { .kind = CommandKind::AddMember, .key = "n1", .value = "10.0.0.1:6675" }));
-    watched.machine.Apply(Entry(2, Command { .kind = CommandKind::AddMember, .key = "n2", .value = "10.0.0.2:6675" }));
+    watched.machine.Apply(Entry(1, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675")));
+    watched.machine.Apply(Entry(2, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675")));
 
     CHECK(watched.machine.State().members.size() == 2);
-    CHECK(Unwrap(watched.machine.State().EndpointOf("n2")) == "10.0.0.2:6675");
+    CHECK(Unwrap(watched.machine.State().RaftEndpointOf("n2")) == "10.0.0.2:6675");
 
     // The observer fires on every change rather than on a timer, because the window
     // between "the cluster agreed" and "this node acts on it" is a window in which
@@ -63,10 +83,10 @@ TEST_CASE("Re-applying a prefix reaches the same state", "[cluster][statemachine
     Watched replayed;
 
     std::vector const log {
-        Command { .kind = CommandKind::AddMember, .key = "n1", .value = "10.0.0.1:6675" },
-        Command { .kind = CommandKind::SetSetting, .key = "upstream", .value = "cache.internal:6674" },
-        Command { .kind = CommandKind::AddMember, .key = "n2", .value = "10.0.0.2:6675" },
-        Command { .kind = CommandKind::RemoveMember, .key = "n1", .value = {} },
+        Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"),
+        Cmd(CommandKind::SetSetting, "upstream", "cache.internal:6674"),
+        Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"),
+        Cmd(CommandKind::RemoveMember, "n1"),
     };
 
     std::uint64_t index = 0;
@@ -101,15 +121,15 @@ TEST_CASE("An entry this build cannot decode is skipped, not fatal", "[cluster][
     CHECK(std::ranges::any_of(records, [](auto const& record) { return record.message.contains("cannot decode"); }));
 
     // And the ordering is intact: the next entry applies normally.
-    machine.Apply(Entry(2, Command { .kind = CommandKind::AddMember, .key = "n1", .value = "10.0.0.1:6675" }));
+    machine.Apply(Entry(2, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675")));
     CHECK(machine.State().members.size() == 1);
 }
 
 TEST_CASE("A snapshot round-trips through the machine", "[cluster][statemachine]")
 {
     Watched source;
-    source.machine.Apply(Entry(1, Command { .kind = CommandKind::AddMember, .key = "n1", .value = "10.0.0.1:6675" }));
-    source.machine.Apply(Entry(2, Command { .kind = CommandKind::SetSetting, .key = "fleet-open", .value = "1" }));
+    source.machine.Apply(Entry(1, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675")));
+    source.machine.Apply(Entry(2, Cmd(CommandKind::SetSetting, "fleet-open", "1")));
 
     Watched restored;
     restored.machine.RestoreSnapshot(source.machine.TakeSnapshot());
@@ -126,8 +146,8 @@ TEST_CASE("A snapshot round-trips through the machine", "[cluster][statemachine]
 TEST_CASE("A snapshot replaces, and an unreadable one changes nothing", "[cluster][statemachine]")
 {
     Watched watched;
-    watched.machine.Apply(Entry(1, Command { .kind = CommandKind::AddMember, .key = "n1", .value = "10.0.0.1:6675" }));
-    watched.machine.Apply(Entry(2, Command { .kind = CommandKind::AddMember, .key = "n2", .value = "10.0.0.2:6675" }));
+    watched.machine.Apply(Entry(1, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675")));
+    watched.machine.Apply(Entry(2, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675")));
 
     SECTION("replace, never merge")
     {
@@ -136,7 +156,7 @@ TEST_CASE("A snapshot replaces, and an unreadable one changes nothing", "[cluste
         // which for a membership set means counting a node that is gone towards
         // quorum, and a quorum counted over the wrong set is two leaders.
         ClusterState smaller;
-        Apply(smaller, Command { .kind = CommandKind::AddMember, .key = "n3", .value = "10.0.0.3:6675" });
+        Apply(smaller, Cmd(CommandKind::AddMember, "n3", "10.0.0.3:6675"));
 
         watched.machine.RestoreSnapshot(Encode(smaller));
         REQUIRE(watched.machine.State().members.size() == 1);

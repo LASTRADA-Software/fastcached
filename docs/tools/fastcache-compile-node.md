@@ -271,6 +271,29 @@ A node must name itself among its own peers, and it is refused at startup if it
 does not — such a node could never win a vote and could never be voted for, so it
 would stand for election forever against a cluster that has never heard of it.
 
+### Two ports, and why a member records both
+
+`--raft-peer` names the **consensus** port. A client that is redirected to the
+leader needs the **scheduler** port, which is a different number, so a member
+carries both — and that is a correctness matter rather than a convenience. A
+follower refusing a client answers `NotLeader` *with the leader's endpoint*, and
+while only one address was recorded that endpoint was the consensus one: the client
+took the advice and spoke the scheduler protocol at a socket that has never heard of
+it.
+
+Only the *leader's* scheduler port matters, and only the node itself knows it — no
+peer ever dials it, so there is nothing to learn it from. So **a node announces its
+own record when it becomes leader**, and the address it announces is the host from
+its own `--raft-peer` entry with the port its scheduler surface actually bound.
+Neither half can supply the other: `--listen-scheduler=6675` binds the wildcard,
+which no client can dial, while the consensus endpoint is dialable by construction
+and names the wrong port.
+
+A member that has never led carries no scheduler endpoint, which is not a fault:
+there is nowhere to redirect to a node that does not lead, and a follower answering
+`NotLeader` with nothing is exactly the "an election is in progress" case a client
+already handles by compiling locally.
+
 ### What the log carries
 
 Cluster configuration and nothing else: **who is a member, where they answer**, and

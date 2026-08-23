@@ -466,7 +466,7 @@ TEST_CASE("An applied log is traded for a snapshot once enough has piled up", "[
                         storage,
                         transport,
                         machine,
-                        RaftDriver::CompactionPolicy { .appliedEntriesBeforeCompaction = Threshold } };
+                        CompactionPolicy { .appliedEntriesBeforeCompaction = Threshold } };
 
     REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
     REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
@@ -554,7 +554,7 @@ TEST_CASE("A snapshot that cannot be written stops the driver", "[consensus][raf
                         storage,
                         transport,
                         machine,
-                        RaftDriver::CompactionPolicy { .appliedEntriesBeforeCompaction = 2 } };
+                        CompactionPolicy { .appliedEntriesBeforeCompaction = 2 } };
 
     REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
     REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));

@@ -41,6 +41,7 @@ target_sources(FastCache
         Cluster/ClusterState.cpp
         Cluster/ClusterStateMachine.cpp
         Cluster/DiscoveryService.cpp
+        Cluster/MembershipPolicy.cpp
         Cluster/PeerDirectory.cpp
         Net/InMemoryDatagram.cpp
         Net/UdpSocket.cpp

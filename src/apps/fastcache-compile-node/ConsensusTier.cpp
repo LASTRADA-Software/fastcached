@@ -6,8 +6,10 @@
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Net/BlockingConnector.hpp>
 
+#include <algorithm>
 #include <array>
 #include <format>
+#include <mutex>
 #include <utility>
 
 namespace FastCache::Node
@@ -122,10 +124,38 @@ std::optional<Cluster::ClusterMember> ParsePeerSpec(std::string_view spec)
     if (!SplitHostPort(endpoint).has_value())
         return std::nullopt;
 
-    return Cluster::ClusterMember { .id = std::string { id }, .endpoint = std::string { endpoint } };
+    // Every field named, including the one this token cannot carry. A member's
+    // scheduler endpoint is a port peers never connect to, so nothing an operator
+    // types about a PEER could supply it -- the node announces its own. Saying so
+    // with `{}` rather than leaving it out is what keeps a field added to the
+    // middle of the struct from becoming a silent zero here.
+    return Cluster::ClusterMember { .id = std::string { id },
+                                    .raftEndpoint = std::string { endpoint },
+                                    .schedulerEndpoint = {} };
 }
 
-ConsensusTier::ConsensusTier(NodeConfig const& cfg,
+std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::string_view schedulerBound)
+{
+    // Nothing to advertise when this node serves no scheduler surface, which is a
+    // legitimate shape: a member that contributes CPU and consensus without handing
+    // out anybody's work. Recording an endpoint for it would redirect clients at a
+    // port nothing is listening on.
+    if (schedulerBound.empty() || raftEndpoint.empty())
+        return {};
+
+    auto const scheduler = SplitHostPort(schedulerBound);
+    auto const consensus = SplitHostPort(raftEndpoint);
+    if (!scheduler.has_value() || !consensus.has_value())
+        return {};
+
+    // A v6 host arrives from `SplitHostPort` without its brackets, and every
+    // consumer of this string splits it again -- so it has to go back the way it
+    // came or the next split takes the wrong colon. That is the defect
+    // `Core/HostPort` exists to hold in one place, and this is one of the places.
+    return FormatHostPort(consensus->first, scheduler->second);
+}
+
+ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                              Consensus::FileRaftStorage storage,
                              std::unique_ptr<IListener> listener,
                              std::string boundEndpoint,
@@ -145,15 +175,14 @@ ConsensusTier::ConsensusTier(NodeConfig const& cfg,
                    } },
     _listener { std::move(listener) },
     _onRole { std::move(onRole) },
-    _boundEndpoint { std::move(boundEndpoint) }
+    _boundEndpoint { std::move(boundEndpoint) },
+    _self { std::move(self) },
+    _desired { { _self } }
 {
-    (void) cfg;
 }
 
-std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(NodeConfig const& cfg,
-                                                                                RoleObserver onRole,
-                                                                                MembersObserver onMembers,
-                                                                                ILogger& logger)
+std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
+    NodeConfig const& cfg, std::string_view schedulerBound, RoleObserver onRole, MembersObserver onMembers, ILogger& logger)
 {
     // The bootstrap set, and this node must be in it. A node whose own id names no
     // member could never win a vote and could never be voted for -- it would stand
@@ -204,7 +233,14 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     if (!storage.has_value())
         return std::unexpected { std::format("cannot open {}: {}", stateDirectory.string(), storage.error().context) };
 
-    auto tier = std::unique_ptr<ConsensusTier> { new ConsensusTier { cfg,
+    // The record this node announces about itself, and the only place both of its
+    // addresses are known at once: the consensus one is what an operator typed and
+    // every peer dials, and the scheduler one is a port nobody connects to and so
+    // nobody could otherwise learn.
+    auto announced = *self;
+    announced.schedulerEndpoint = AdvertisedSchedulerEndpoint(self->raftEndpoint, schedulerBound);
+
+    auto tier = std::unique_ptr<ConsensusTier> { new ConsensusTier { std::move(announced),
                                                                      *std::move(storage),
                                                                      std::move(listener),
                                                                      std::format("{}:{}", endpoint->first, endpoint->second),
@@ -239,12 +275,12 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
         // and the string could disagree about which of a v6 address's colons is the
         // port separator, which is the defect `Core/HostPort` exists to hold in one
         // place.
-        auto const split = SplitHostPort(member.endpoint);
+        auto const split = SplitHostPort(member.raftEndpoint);
         if (!split.has_value())
-            return std::unexpected { std::format("{} is not a dialable endpoint for {}", member.endpoint, member.id) };
+            return std::unexpected { std::format("{} is not a dialable endpoint for {}", member.raftEndpoint, member.id) };
         auto const port = ParseTcpPort(split->second);
         if (!port.has_value())
-            return std::unexpected { std::format("{} names no usable port for {}", member.endpoint, member.id) };
+            return std::unexpected { std::format("{} names no usable port for {}", member.raftEndpoint, member.id) };
 
         // This node itself is deliberately included. `RaftPeerTransport` refuses a
         // message addressed to `self` rather than looping it through a socket, so
@@ -280,7 +316,7 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
         _storage,
         *_transport,
         _application,
-        Consensus::RaftDriver::CompactionPolicy { .appliedEntriesBeforeCompaction = CompactAfterEntries });
+        Consensus::CompactionPolicy { .appliedEntriesBeforeCompaction = CompactAfterEntries });
 
     // Pushed, not polled. A poll interval is a window in which this node has stopped
     // leading and is still handing out other machines' capacity, and the driver knows
@@ -310,6 +346,24 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
         PlatformReactor reactor { clock };
         SyncRun(_driver->Run(&reactor));
     } };
+
+    // Third thread, and it is the one that can afford to be: it holds no socket and
+    // does nothing at all in the ordinary case. What it may NOT do is run on either
+    // of the other two -- a proposal is a durability write and a broadcast, and both
+    // of those loops exist precisely to not be held up by one.
+    _reconcileThread = std::jthread { [this](std::stop_token stop) {
+        while (!stop.stop_requested())
+        {
+            Reconcile();
+
+            // Interruptible, rather than a sleep this loop would have to wake from
+            // on its own schedule. A stop that had to wait out a full interval makes
+            // teardown look hung, which this repository has already paid for once as
+            // a `systemctl stop` that escalated to SIGKILL.
+            auto guard = std::unique_lock { _wakeMutex };
+            (void) _wake.wait_for(guard, stop, ReconcileInterval, [&stop] { return stop.stop_requested(); });
+        }
+    } };
     return {};
 }
 
@@ -327,6 +381,12 @@ ConsensusTier::~ConsensusTier()
         _driver->Stop();
     if (_transport != nullptr)
         _transport->Stop();
+
+    // Asked to stop and then woken, in that order: `request_stop` is what the
+    // predicate reads, and notifying before it would leave the loop re-checking a
+    // flag nobody had set yet and going back to sleep for a full interval.
+    _reconcileThread.request_stop();
+    _wake.notify_all();
 }
 
 std::expected<Consensus::LogIndex, ConsensusError> ConsensusTier::Propose(Cluster::Command const& command)
@@ -340,14 +400,71 @@ std::expected<Consensus::LogIndex, ConsensusError> ConsensusTier::Propose(Cluste
     return _driver->Propose(Cluster::Encode(command), std::chrono::steady_clock::now());
 }
 
-Cluster::ClusterState const& ConsensusTier::State() const noexcept
+Cluster::ClusterState ConsensusTier::State() const
 {
     return _application.State();
+}
+
+void ConsensusTier::Desire(std::span<Cluster::ClusterMember const> records)
+{
+    auto const guard = std::unique_lock { _desiredMutex };
+    for (auto const& record: records)
+    {
+        // Replaced rather than appended when the id is already desired, so a caller
+        // handing over the same peers on every pass of its own loop grows nothing --
+        // and so a peer that MOVED supersedes its own older record instead of
+        // sitting beside it, which would make the reconciler propose two addresses
+        // for one node in a fixed order forever.
+        auto const it = std::ranges::find(_desired, record.id, &Cluster::ClusterMember::id);
+        if (it != _desired.end())
+            *it = record;
+        else
+            _desired.push_back(record);
+    }
+}
+
+void ConsensusTier::Reconcile()
+{
+    // Only a leader may propose, and asking here rather than letting `Propose`
+    // refuse is what keeps a follower from logging a `NotLeader` every interval for
+    // as long as it is a follower -- which is most of a healthy cluster's life.
+    if (!_leads.load(std::memory_order_relaxed))
+        return;
+
+    auto desired = std::vector<Cluster::ClusterMember> {};
+    {
+        auto const guard = std::unique_lock { _desiredMutex };
+        desired = _desired;
+    }
+
+    // Outside the lock, both the decision and the proposals: a proposal is a
+    // durability write and a broadcast, and holding a lock across one would stall
+    // whoever is discovering peers behind whoever is writing to a disk.
+    for (auto const& command: Cluster::MembershipProposals(_application.State(), desired))
+    {
+        auto const proposed = Propose(command);
+        if (!proposed.has_value())
+        {
+            // One line and out. The commonest reason is that leadership moved
+            // between the check above and here, which is not a fault and is not
+            // repaired by trying the rest of the list against the same lost term.
+            _logger.Logf(LogLevel::Info, "cluster: cannot record {} right now: {}", command.key, proposed.error().context);
+            return;
+        }
+
+        _logger.Logf(LogLevel::Info,
+                     "cluster: recorded {} at {}{}",
+                     command.key,
+                     command.value,
+                     command.schedulerEndpoint.empty() ? std::string {}
+                                                       : std::format(", scheduler {}", command.schedulerEndpoint));
+    }
 }
 
 void ConsensusTier::PublishRole(Consensus::Role role, std::optional<Consensus::NodeId> const& knownLeader)
 {
     auto const scheduled = SchedulerRoleFor(role, knownLeader);
+    _leads.store(scheduled == Distributed::SchedulerRole::Leader, std::memory_order_relaxed);
 
     // The endpoint rather than the id, because a client redirects to an ADDRESS. The
     // replicated state is what knows the mapping, which is the second reason a member
@@ -355,7 +472,7 @@ void ConsensusTier::PublishRole(Consensus::Role role, std::optional<Consensus::N
     // where it is, which is a redirect nobody can follow.
     auto leaderEndpoint = std::string {};
     if (scheduled != Distributed::SchedulerRole::Leader && knownLeader.has_value())
-        leaderEndpoint = _application.State().EndpointOf(*knownLeader).value_or(std::string {});
+        leaderEndpoint = _application.State().SchedulerEndpointOf(*knownLeader).value_or(std::string {});
 
     _logger.Logf(LogLevel::Info,
                  "consensus: this node is now {}{}",
@@ -375,8 +492,14 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
     if (cfg.nodeId.empty())
         return std::unique_ptr<ConsensusTier> {};
 
+    // What the surface BOUND rather than what was asked for, because `--listen-
+    // scheduler=0` means "pick a port" and an endpoint echoing `:0` back names
+    // nothing a client could dial.
+    auto const schedulerBound = schedulerTier != nullptr ? schedulerTier->BoundEndpoint() : std::string {};
+
     return ConsensusTier::Start(
         cfg,
+        schedulerBound,
         [&schedulerTier](Distributed::SchedulerRole role, std::string_view leaderEndpoint) {
             // Null when this node runs no scheduler surface, which is a legitimate
             // shape: a member that contributes CPU and consensus without handing out

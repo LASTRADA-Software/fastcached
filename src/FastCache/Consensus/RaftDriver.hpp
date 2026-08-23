@@ -20,6 +20,34 @@
 namespace FastCache::Consensus
 {
 
+/// When a `RaftDriver` trades its log for a snapshot of what the log produced.
+///
+/// The policy is the caller's because the cost it balances is: a snapshot is the
+/// *whole* application state written out, so trimming often makes a small log
+/// expensive, and trimming never makes a long-lived node re-read its entire
+/// history at every restart and keep every entry in memory in between. Only
+/// whoever knows how large that state is can say where the crossover sits.
+///
+/// **At namespace scope rather than nested in `RaftDriver`, and that is forced.**
+/// A defaulted constructor parameter of a type nested in the same class is
+/// rejected by both compilers this project builds with, for reasons that read as
+/// opposites: GCC will not convert `{}` to an incomplete nested aggregate, and
+/// clang refuses `= CompactionPolicy {}` because the nested type's own default
+/// member initializer is not available inside the enclosing class definition.
+/// Neither is a bug; the type is simply not complete there. Hoisting it makes
+/// both spellings legal, and MSVC accepted every one of them, so a local build
+/// would have reported this tree green.
+struct CompactionPolicy
+{
+    /// Applied entries above the snapshot that provoke one; zero never does.
+    ///
+    /// Measured from the snapshot boundary rather than from the log's length,
+    /// because those differ on a follower whose leader has already trimmed further
+    /// than it has applied -- and it is the *unsnapshotted* part that a restart has
+    /// to replay.
+    std::uint64_t appliedEntriesBeforeCompaction { 0 };
+};
+
 /// Carries out what a `RaftNode` asks for, in the order the algorithm requires.
 ///
 /// The node decides and the driver acts; this is the only place the two meet, so
@@ -75,24 +103,6 @@ class RaftDriver
     /// on.
     using RoleObserver = std::function<void(Role role, std::optional<NodeId> const& knownLeader)>;
 
-    /// When the log is traded for a snapshot of what it produced.
-    ///
-    /// The policy is the caller's because the cost it balances is: a snapshot is
-    /// the *whole* application state written out, so trimming often makes a small
-    /// log expensive, and trimming never makes a long-lived node re-read its entire
-    /// history at every restart and keep every entry in memory in between. Only
-    /// whoever knows how large that state is can say where the crossover sits.
-    struct CompactionPolicy
-    {
-        /// Applied entries above the snapshot that provoke one; zero never does.
-        ///
-        /// Measured from the snapshot boundary rather than from the log's length,
-        /// because those differ on a follower whose leader has already trimmed
-        /// further than it has applied -- and it is the *unsnapshotted* part that a
-        /// restart has to replay.
-        std::uint64_t appliedEntriesBeforeCompaction { 0 };
-    };
-
     /// @param node The state machine to drive; taken by value and owned.
     /// @param storage Where durable state goes; must outlive this driver.
     /// @param transport How peers are reached; must outlive this driver.
@@ -107,7 +117,7 @@ class RaftDriver
                IRaftStorage& storage,
                IRaftTransport& transport,
                IRaftStateMachine& application,
-               CompactionPolicy compaction = CompactionPolicy {}) noexcept;
+               CompactionPolicy compaction = {}) noexcept;
 
     /// Install the role observer.
     ///

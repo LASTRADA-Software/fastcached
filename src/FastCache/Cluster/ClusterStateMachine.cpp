@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/ClusterStateMachine.hpp>
 
+#include <mutex>
+#include <shared_mutex>
 #include <utility>
 
 namespace FastCache::Cluster
@@ -32,13 +34,25 @@ void ClusterStateMachine::Apply(Consensus::AppliedEntry const& entry)
         return;
     }
 
-    Cluster::Apply(_state, *command);
-    Publish();
+    auto published = ClusterState {};
+    {
+        auto const guard = std::unique_lock { _mutex };
+        Cluster::Apply(_state, *command);
+        published = _state;
+    }
+    Publish(published);
 }
 
 std::vector<std::byte> ClusterStateMachine::TakeSnapshot()
 {
+    auto const guard = std::shared_lock { _mutex };
     return Encode(_state);
+}
+
+ClusterState ClusterStateMachine::State() const
+{
+    auto const guard = std::shared_lock { _mutex };
+    return _state;
 }
 
 void ClusterStateMachine::RestoreSnapshot(std::span<std::byte const> state)
@@ -59,14 +73,19 @@ void ClusterStateMachine::RestoreSnapshot(std::span<std::byte const> state)
     // folding it into what this machine already holds would keep members the cluster
     // has since removed -- which for a membership set means counting a node that is
     // gone towards quorum.
-    _state = *std::move(restored);
-    Publish();
+    auto published = ClusterState {};
+    {
+        auto const guard = std::unique_lock { _mutex };
+        _state = *std::move(restored);
+        published = _state;
+    }
+    Publish(published);
 }
 
-void ClusterStateMachine::Publish() const
+void ClusterStateMachine::Publish(ClusterState const& state) const
 {
     if (_observer)
-        _observer(_state);
+        _observer(state);
 }
 
 } // namespace FastCache::Cluster
