@@ -46,8 +46,7 @@ TEST_CASE("A member is admitted by host, whatever port it dials from", "[distrib
     CHECK(cluster.Classify("10.0.0.1:7000") == Membership::Outsider);
 }
 
-TEST_CASE("An IPv6 endpoint keeps its address rather than its last colon group",
-          "[distributed][membership]")
+TEST_CASE("An IPv6 endpoint keeps its address rather than its last colon group", "[distributed][membership]")
 {
     // `rfind(':')` on `[::1]:7000` splits at the wrong colon and yields a host of
     // `[::1]` or worse -- the exact defect `Core/HostPort` exists to hold in one

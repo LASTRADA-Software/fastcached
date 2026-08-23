@@ -373,12 +373,11 @@ namespace
         // names where the scheduler went, because a refusal that cannot say what
         // would have worked cannot be acted on.
         std::string const message = op == Wire::Op::Compile
-                                 ? "this endpoint is a cache and does not execute compiles; send the job to the "
-                                   "worker endpoint the lease named"
-                                 : "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
-                                   "fastcache-compile-node --listen-scheduler and point clients at it";
-        co_return co_await ReplyError(socket, Wire::ErrorCode::DispatchNotPermitted, message) ? Next::Continue
-                                                                                             : Next::Abort;
+                                        ? "this endpoint is a cache and does not execute compiles; send the job to the "
+                                          "worker endpoint the lease named"
+                                        : "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
+                                          "fastcache-compile-node --listen-scheduler and point clients at it";
+        co_return co_await ReplyError(socket, Wire::ErrorCode::DispatchNotPermitted, message) ? Next::Continue : Next::Abort;
     }
 
 } // namespace

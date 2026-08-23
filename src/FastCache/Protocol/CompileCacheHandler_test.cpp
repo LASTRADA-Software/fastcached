@@ -1091,8 +1091,7 @@ TEST_CASE("A gated verb keeps the operator's cap, not the AUTH ceiling", "[compi
 
 // --- distributed execution: answered, never served ---------------------------
 
-TEST_CASE("The cache refuses every scheduling verb, and says where they went",
-          "[compile-cache][handler][distributed]")
+TEST_CASE("The cache refuses every scheduling verb, and says where they went", "[compile-cache][handler][distributed]")
 {
     // `fastcached` is a cache and nothing else. The fleet's scheduler moved to
     // `fastcache-compile-node --listen-scheduler`, because handing out capacity is a

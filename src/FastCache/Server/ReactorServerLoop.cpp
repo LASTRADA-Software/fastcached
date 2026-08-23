@@ -228,7 +228,7 @@ namespace
 
         // One listening socket per BindConfig; each acceptor thread owns one.
         std::vector<Detail::NativeSocket> listenSocks;
-        std::vector<bool> bindTls;           // parallel to listenSocks
+        std::vector<bool> bindTls; // parallel to listenSocks
         listenSocks.reserve(options.binds.size());
         bindTls.reserve(options.binds.size());
         for (auto const& bind: options.binds)
@@ -420,7 +420,7 @@ namespace
                 // Without this a handler cannot tell which listener a frame arrived on,
                 // and "which surfaces are exposed where" stops being configurable.
                 auto session = options.session;
-                    session.reactor = reactors[i].get();
+                session.reactor = reactors[i].get();
                 session.metrics = metrics;
                 servers.push_back(std::make_unique<Server>(*listeners.back(),
                                                            engine,
