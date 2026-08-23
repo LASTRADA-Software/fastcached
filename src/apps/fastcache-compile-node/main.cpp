@@ -14,13 +14,16 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Net/InheritedListener.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Server/AdminHttpServer.hpp>
 
 #include <algorithm>
 #include <array>
@@ -61,6 +64,16 @@ struct NodeConfig
     /// a job ends up running against something nobody chose.
     std::vector<std::string> toolchains;
     std::uint32_t slots { 0 }; ///< 0 means "one per hardware thread".
+
+    /// Where the admin endpoint listens, or empty to leave it off.
+    ///
+    /// One string rather than the daemon's address/port/enabled triple, because a
+    /// worker has one reason to want this and an empty value is already the "off"
+    /// it would otherwise need a flag for. Defaults to off, and to loopback when a
+    /// bare port is given: a scrape endpoint reachable from the network is the
+    /// operator's decision, not this program's.
+    std::string adminListen;
+
     std::string token;
     std::string user;
     LogLevel logLevel { LogLevel::Info };
@@ -325,6 +338,15 @@ struct ToolchainEntry
                          "Advertised to the scheduler AND enforced here: a worker\n"
                          "that accepted more would be fuller and slower than the\n"
                          "scheduler believes, at the same moment." },
+        { .primary = "--admin-listen",
+          .arity = Arity::Value,
+          .operand = "=[<address>:]<port>",
+          .apply = AssignFrom<&NodeConfig::adminListen, ParseText>(),
+          .description = "serve /metrics and /healthz here; off unless given.\n"
+                         "A bare port binds loopback: a scrape endpoint on a\n"
+                         "public interface is an operator's decision, not a\n"
+                         "default. /healthz is also the liveness probe this\n"
+                         "worker otherwise has none of." },
         { .primary = "--requirepass",
           .arity = Arity::Value,
           .operand = "=<secret>",
@@ -535,6 +557,71 @@ int main(int argc, char** argv)
 
     Node::WorkerServer server { listenerRef, protocol, slots, metrics, logger };
 
+    // The admin endpoint, when the operator asked for one. Off by default and on
+    // loopback for a bare port: a scrape surface reachable from the network is a
+    // decision, not a default.
+    //
+    // The same `AdminHttpServer` the daemon runs, over the same renderer. A second
+    // implementation for a process with no cache is what `MetricsSnapshot::storage`
+    // being optional exists to avoid -- and it brings `/healthz`, which this worker
+    // has never had: a supervisor could tell that the process was alive and not
+    // that it was answering.
+    std::unique_ptr<BlockingListener> adminListener;
+    std::unique_ptr<AdminHttpServer> adminServer;
+    std::jthread adminThread;
+    if (!cfg.adminListen.empty())
+    {
+        auto const endpoint = ParseEndpoint(cfg.adminListen, "127.0.0.1");
+        if (!endpoint.has_value())
+        {
+            logger.Logf(LogLevel::Error,
+                        "--admin-listen '{}' is not [<address>:]<port>; refusing to start rather than "
+                        "serving metrics somewhere nobody asked for",
+                        cfg.adminListen);
+            return 2;
+        }
+
+        adminListener = BlockingListener::Bind(endpoint->first, endpoint->second);
+        if (!adminListener || !adminListener->IsBound())
+        {
+            // Fatal rather than a warning, unlike the daemon's: an operator who
+            // asked a *worker* for an endpoint is almost always wiring a probe to
+            // it, and a worker that starts without one looks healthy to everything
+            // that would have noticed.
+            logger.Logf(LogLevel::Error,
+                        "cannot bind the admin endpoint on {}:{} ({})",
+                        endpoint->first,
+                        endpoint->second,
+                        adminListener ? adminListener->BindError() : std::string_view { "null listener" });
+            return 2;
+        }
+
+        // Bounded, so a stalled scraper cannot wedge the single-threaded endpoint.
+        adminListener->SetTimeouts(std::chrono::milliseconds { 500 }, std::chrono::seconds { 2 });
+
+        auto const startedAt = std::chrono::steady_clock::now();
+        adminServer = std::make_unique<AdminHttpServer>(
+            *adminListener,
+            metrics,
+            [startedAt] {
+                // No storage: a worker has no cache, and reporting a
+                // default-constructed one would state an empty unbounded cache as
+                // a fact.
+                return MetricsSnapshot {
+                    .storage = std::nullopt,
+                    .uptime = Uptime { std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - startedAt) },
+                };
+            },
+            logger);
+
+        adminThread = std::jthread { [&adminServer] { SyncRun(adminServer->Run()); } };
+        logger.Logf(LogLevel::Info,
+                    "metrics endpoint on http://{}:{}/metrics (and /healthz)",
+                    endpoint->first,
+                    endpoint->second);
+    }
+
     Cc::Credential const credential { .username = {}, .secret = cfg.token };
 
     // One registrar per toolchain, because REGISTER carries ONE fingerprint and
@@ -638,6 +725,12 @@ int main(int argc, char** argv)
                 toolchains.size());
 
     SyncRun(server.Run());
+
+    // Unblocks the admin accept loop so its jthread can join -- without this the
+    // destructor's implicit join waits on a thread parked in accept(), and a worker
+    // that stops cleanly would hang instead. The same reason the daemon does it.
+    if (adminServer)
+        adminServer->Shutdown();
 
     // No deregistration is sent, and that is a decision rather than a gap. There is
     // no such verb: the scheduler learns a worker is gone by its heartbeat lapsing,

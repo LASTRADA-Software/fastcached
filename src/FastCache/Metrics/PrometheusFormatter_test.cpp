@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <format>
+#include <optional>
 #include <string>
 
 using namespace FastCache;
@@ -110,4 +111,26 @@ TEST_CASE("A counter's exported name is unique", "[metrics][prometheus]")
         INFO("counter " << row.prometheusName);
         CHECK(matches == 1);
     }
+}
+
+TEST_CASE("A process with no cache renders no cache metrics", "[metrics][prometheus]")
+{
+    // `fastcache-compile-node` serves this same endpoint and has no storage. A
+    // default-constructed `StorageStats` would report `fastcached_items 0` and
+    // `fastcached_bytes_limit 0` -- an empty, unbounded cache -- which a dashboard
+    // reads as a fact rather than as an absence. Absent means absent.
+    AtomicMetricsSink metrics;
+    metrics.Increment(IMetricsSink::Counter::WorkerJobsCompleted, 3);
+
+    auto const body = RenderPrometheus(metrics, MetricsSnapshot { .storage = std::nullopt, .uptime = Uptime { 9s } });
+
+    CHECK_FALSE(body.contains("fastcached_items"));
+    CHECK_FALSE(body.contains("fastcached_bytes_limit"));
+    CHECK_FALSE(body.contains("fastcached_cmd_get_total"));
+
+    // What it does carry: every sink counter, and the uptime every process has.
+    CHECK(body.contains("fastcache_worker_jobs_completed_total 3\n"));
+    CHECK(body.contains("fastcached_uptime_seconds 9\n"));
+    for (auto const& row: CounterTable)
+        CHECK(body.contains(std::format("# TYPE {} ", row.prometheusName)));
 }

@@ -5,6 +5,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <chrono>
+#include <optional>
 #include <string>
 
 namespace FastCache
@@ -24,7 +25,16 @@ struct Uptime
 /// no clock.
 struct MetricsSnapshot
 {
-    StorageStats storage {};
+    /// The cache's own statistics, absent in a process that has no cache.
+    ///
+    /// Optional rather than a default-constructed `StorageStats`, because a
+    /// worker has no storage and zeroes are not the truth about it: a scrape
+    /// reporting `fastcached_items 0` and `fastcached_bytes_limit 0` says the
+    /// cache is empty and unbounded, which an alert or a dashboard will read as
+    /// a fact rather than as an absence. `fastcache-compile-node` runs the same
+    /// `AdminHttpServer` and shares this renderer, so the alternative was a
+    /// second renderer that drifts from this one.
+    std::optional<StorageStats> storage;
     Uptime uptime {};
 };
 

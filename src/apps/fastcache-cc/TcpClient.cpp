@@ -5,6 +5,7 @@
 // WSAStartup, so the socket loops themselves are written once.
 
 #include "ITcpClient.hpp"
+#include <FastCache/Core/HostPort.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -184,27 +185,6 @@ namespace
             std::ignore = ::setsockopt(fd, SOL_SOCKET, option, &tv, sizeof(tv));
 #endif
         }
-    }
-
-    /// Split "host:port" into its parts, honouring the bracketed IPv6 form
-    /// `[::1]:6674` — an unbracketed rfind(':') would split an IPv6 literal at
-    /// its last group separator instead.
-    /// @param hostPort The endpoint string.
-    /// @return (host, port) or nullopt when no port is present.
-    [[nodiscard]] std::optional<std::pair<std::string, std::string>> SplitHostPort(std::string_view hostPort)
-    {
-        if (!hostPort.empty() && hostPort.front() == '[')
-        {
-            auto const close = hostPort.find(']');
-            if (close == std::string_view::npos || close + 1 >= hostPort.size() || hostPort[close + 1] != ':')
-                return std::nullopt;
-            return std::pair { std::string { hostPort.substr(1, close - 1) }, std::string { hostPort.substr(close + 2) } };
-        }
-
-        auto const colon = hostPort.rfind(':');
-        if (colon == std::string_view::npos || colon + 1 >= hostPort.size())
-            return std::nullopt;
-        return std::pair { std::string { hostPort.substr(0, colon) }, std::string { hostPort.substr(colon + 1) } };
     }
 
     /// A connected socket, closed on destruction.

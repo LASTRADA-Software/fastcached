@@ -28,6 +28,10 @@ namespace
         std::uint64_t value;
     };
 
+    /// How many rows `AppendStorageMetrics` emits, for the one `reserve`.
+    /// A loose estimate by design — it only sizes a buffer.
+    constexpr std::size_t StorageMetricCount = 24;
+
     /// Append one metric's three exposition lines to `out`.
     /// @param out Destination.
     /// @param metric What to render.
@@ -39,15 +43,18 @@ namespace
 
 } // namespace
 
-std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
+/// Render the metrics a cache's own statistics carry.
+///
+/// Separate from the sink's counters because the two have different *sources*,
+/// not because they render differently: these come from `StorageStats`, which is
+/// authoritative for command and capacity numbers, and a process without a cache
+/// has none of them. The rendering itself is `Append` either way.
+/// @param out Destination.
+/// @param stats The cache's statistics.
+static void AppendStorageMetrics(std::string& out, StorageStats const& stats)
 {
     using enum MetricType;
-    auto const& stats = snapshot.storage;
 
-    // Command and capacity metrics come from the storage snapshot, which is the
-    // authoritative source for them; the sink's own counters are rendered from
-    // `CounterTable` below rather than restated here, because a row that had to
-    // be added in two places is a row that gets added in one.
     auto const table = std::array {
         Metric {
             .name = "fastcached_cmd_get_total", .help = "GET commands processed.", .type = Counter, .value = stats.cmdGet },
@@ -143,19 +150,24 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
                  .help = "Configured byte budget (0 = unbounded).",
                  .type = Gauge,
                  .value = static_cast<std::uint64_t>(stats.bytesLimit) },
-        Metric { .name = "fastcached_uptime_seconds",
-                 .help = "Seconds since the daemon started.",
-                 .type = Gauge,
-                 .value = static_cast<std::uint64_t>(snapshot.uptime.value.count()) },
     };
 
+    for (auto const& metric: table)
+        Append(out, metric);
+}
+
+std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
+{
     std::string out;
     // Each metric renders ~3 lines (HELP/TYPE/value); ~200 bytes is a generous
     // per-row estimate, so one reserve avoids the handful of reallocations the
     // += loop would otherwise do on every scrape.
-    out.reserve((table.size() + CounterTable.size()) * 200);
-    for (auto const& metric: table)
-        Append(out, metric);
+    out.reserve((StorageMetricCount + CounterTable.size() + 1) * 200);
+
+    // Only when there is a cache. A worker running this same endpoint would
+    // otherwise report an empty, unbounded one — zeroes that read as facts.
+    if (snapshot.storage.has_value())
+        AppendStorageMetrics(out, *snapshot.storage);
 
     // Every counter the sink knows, without exception. Exporting the *table*
     // rather than a hand-picked subset is the whole point: seven of the eleven
@@ -167,6 +179,14 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
                         .help = row.help,
                         .type = row.type,
                         .value = metrics.Read(row.counter) });
+
+    // Uptime is neither the cache's nor the sink's: every process that serves
+    // this endpoint has one, and a worker's is as useful as a daemon's.
+    Append(out,
+           Metric { .name = "fastcached_uptime_seconds",
+                    .help = "Seconds since the process started.",
+                    .type = MetricType::Gauge,
+                    .value = static_cast<std::uint64_t>(snapshot.uptime.value.count()) });
 
     return out;
 }
