@@ -99,6 +99,22 @@ struct SchedulerReply
                                 .message = {},
                                 .payload = std::move(payload) };
     }
+
+    /// A refusal that does not reach the service at all.
+    ///
+    /// The decode failures belong here rather than to `SchedulerService::Refuse`,
+    /// which counts what it refuses: a frame that never decoded is not a fleet
+    /// condition, and the `RefusalTable` row for `MalformedFrame` says so with
+    /// `std::nullopt` for exactly this reason.
+    /// @param message Overrides the table default when non-empty.
+    /// @return The refusal.
+    [[nodiscard]] static SchedulerReply Malformed(std::string message = {})
+    {
+        return SchedulerReply { .status = CompileCacheWire::Status::Error,
+                                .error = CompileCacheWire::ErrorCode::MalformedFrame,
+                                .message = std::move(message),
+                                .payload = {} };
+    }
 };
 
 /// The fleet scheduler: who may compile where, and on whose behalf.

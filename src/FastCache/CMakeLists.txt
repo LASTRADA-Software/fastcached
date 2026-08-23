@@ -46,6 +46,7 @@ target_sources(FastCache
         Distributed/LeaseTable.cpp
         Distributed/WorkerRegistry.cpp
         Distributed/SchedulerService.cpp
+        Distributed/SchedulerProtocol.cpp
         Core/BufferPool.cpp
         Metrics/PrometheusFormatter.cpp
         Net/BlockingConnector.cpp
