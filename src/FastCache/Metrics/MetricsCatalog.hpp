@@ -153,6 +153,41 @@ inline constexpr std::array<CounterDescriptor, static_cast<std::size_t>(IMetrics
       .prometheusName = "fastcache_worker_bytes_returned_total",
       .help = "Reply payload bytes written back to clients.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheHits,
+      .prometheusName = "fastcache_node_cache_hits_total",
+      .help = "Objects served from this node's own tier, without touching the network.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheMisses,
+      .prometheusName = "fastcache_node_cache_misses_total",
+      .help = "Objects this node's own tier did not hold.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheUpstreamHits,
+      .prometheusName = "fastcache_node_cache_upstream_hits_total",
+      .help = "Objects the shared cache answered after a local miss. High against a low "
+              "local hit rate means the local tier is too small for this machine's working "
+              "set -- a different problem from a fleet that is missing a lot.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheFillFailures,
+      .prometheusName = "fastcache_node_cache_fill_failures_total",
+      .help = "Values the shared cache supplied that the local tier refused. Costs a future "
+              "round trip rather than a build; a sustained rate means the tier is "
+              "misconfigured and silently doing nothing.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheStoreFailures,
+      .prometheusName = "fastcache_node_cache_store_failures_total",
+      .help = "Local writes that failed. Unlike a fill failure this one is reported to the "
+              "client: it is the write that must not be lost.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheUpstreamStores,
+      .prometheusName = "fastcache_node_cache_upstream_stores_total",
+      .help = "Objects this node offered to the shared cache and it accepted.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheUpstreamStoreFailures,
+      .prometheusName = "fastcache_node_cache_upstream_store_failures_total",
+      .help = "Objects the shared cache would not take. Best-effort by contract -- the local "
+              "write already succeeded -- so this says the FLEET is unreachable, not that "
+              "this node is broken.",
+      .type = MetricType::Counter },
 } };
 
 /// Whether `CounterTable` has exactly one row per enumerator, in order.
