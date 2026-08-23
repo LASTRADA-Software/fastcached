@@ -1789,6 +1789,67 @@ something an operator types it names no port anyone could dial. The two rules ar
 tension, and the node's tests find a free port by binding a probe and releasing it, the
 idiom `AdminEndpoint_test` already uses.
 
+**A node caches for itself, and what that saves is the round trip rather than the
+compile.** The shared `fastcached` holds every object, so a second copy on the node
+looks redundant — it is not, because a developer who rebuilds one tree twenty times a
+day pays the network twenty times for objects that never left their machine, and on a
+slow or lossy link that is the difference between a cache that helps and one that
+hurts. `Node::LocalCache` is pure over an injected `IStorage`, an `ICacheUpstream` and
+a clock, so every rule below is a unit test rather than a socket and a sleep. Four
+rules, none of them the obvious one:
+
+- **A local hit does not consult the upstream at all**, and the test asserts *zero*
+  calls rather than few, because "few" is not the property. Revalidating would have
+  moved the round trip rather than removed it, and it is unnecessary by construction:
+  an object key is a digest over the preprocessed text, the arguments, the compiler
+  identity and the dependency set, so a key that matches names the same object.
+- **A local miss populates the tier**, or this is a proxy and the second build is
+  exactly as slow as the first. A failure to populate is *not* a failure to serve —
+  the value is in hand and the caller is owed it.
+- **A store writes local FIRST, then offers upstream.** The local write must not fail
+  for a reason the network chose; the upstream offer is best-effort by contract, so
+  its answer is **counted rather than returned** — a client retrying on it would be
+  retrying something already durable where it matters.
+- **An unreachable upstream is a MISS, not an error.** Every caller compiles either
+  way, so distinguishing them would give a build a failure mode it does not need. The
+  distinction lives in a counter, where it is actionable. `NoUpstream` is a named type
+  rather than a null pointer, so "this node has no shared cache" is a decision
+  somebody made rather than a pointer nobody set.
+
+`NoExpiry` is `TimePoint::max()` and **not** a default-constructed `TimePoint`: the
+storage tests `entry.expiry <= now`, so zero means "expired before any clock reading"
+rather than "no deadline" — every write landed and was unreadable, a cache that
+silently stores nothing while reporting success on every write. `CacheEngine` already
+spelled it the same way, which is what makes this a drift rather than a discovery.
+
+- **`FASTCACHE_ADDR` is deliberately NOT defaulted to the local node.** Unset means the
+  cache is off, and it stays that way: defaulting to localhost would make every build
+  on a machine without a node pay a failed connect per translation unit, in silence —
+  the exact cost `USE_COMPILER_CACHE` probes at configure time to avoid. Pointing it at
+  the node is one line of configuration, and it is better written by an operator than
+  assumed by a tool.
+- **One accept loop serves all three of the node's framed surfaces.** `FrameEndpoint`
+  over an `IFrameResponder`; a second and third accept loop would be near-copies of a
+  listener, a shutdown order and a poll timeout. An interface rather than a
+  `std::function`, because a responder outlives the endpoint and a closure would keep
+  its whole enclosing scope alive with it. Three things the seam keeps per-surface that
+  one constant would have flattened: the **payload cap** (64 KiB for scheduler verbs,
+  256 MiB for a cache STORE carrying an object file — sizing both large hands an
+  unauthenticated peer a way to make the *scheduler* allocate megabytes, sizing both
+  small silently stops caching this machine's largest translation units); the **default
+  bind**, which is inverted between them (wildcard for the scheduler, because one no
+  peer can dial does nothing; loopback for the cache, because a node's private cache
+  reachable from the network is a decision); and **whether the peer's identity is
+  consulted at all**, which only the scheduler does.
+- **Each surface is one owned object, and the reason is not tidiness.**
+  `SchedulerTier` and `CacheTier` each hold a *reference chain* — endpoint → responder
+  → protocol → service, and endpoint → responder → proxy → cache → storage + upstream
+  — so as locals in a function body their declaration order is load-bearing and
+  silently so: getting it wrong is a dangling reference rather than a compile error. As
+  members it is checked by the language. `WorkerBody` also reached a cognitive
+  complexity of 67 against clang-tidy's 60 with both inline, and extracting only one of
+  them left 62 — the number was pointing at two coherent decisions, not one.
+
 `scripts/dist-compile-e2e.sh` asserts the consequence rather than the mechanism:
 that a worker's object is **byte-identical** to a locally compiled one. That single
 assertion is what fails if either rule is broken, and it is the whole soundness
