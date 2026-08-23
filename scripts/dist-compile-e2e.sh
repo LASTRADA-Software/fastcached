@@ -255,27 +255,54 @@ fingerprint="$("$launcher" --print-toolchain-fingerprint "$compiler")" \
     || fail "the launcher could not compute a toolchain fingerprint"
 [[ -n "$fingerprint" ]] || fail "the launcher reported an empty toolchain fingerprint"
 
-# --- start the daemon --------------------------------------------------------
-# Two listeners: the cache surface and the dispatch surface. They are separate
-# because they have different trust postures -- the cache may reasonably be open
-# on a build LAN, while the surface that makes a compiler RUN on another machine
-# must be switched on deliberately and firewalled separately. `--bind` is
-# deliberately not used: it is mutually exclusive with the --listen family.
+# --- start the cache ---------------------------------------------------------
+# One listener now, and only the cache. `fastcached` used to carry the scheduler
+# as well, on a second `--listen-dispatch` endpoint; that flag is gone. The two
+# have opposite deployment shapes -- a cache is shared infrastructure somebody
+# operates, while handing out capacity is a decision only ONE node may make at a
+# time -- and nothing in the cache daemon can establish which node that is. So
+# the scheduler moved to where leadership lives, which is the compile node.
+#
+# `--bind` is deliberately not used: it is mutually exclusive with --listen.
 cache_port="$(free_port)"
-dispatch_port="$(free_port)"
 
-"$fastcached" --listen="127.0.0.1:${cache_port}" --listen-dispatch="127.0.0.1:${dispatch_port}" \
+"$fastcached" --listen="127.0.0.1:${cache_port}" \
     --storage-max-value=64M --log-level=info \
     > "${workdir}/daemon.log" 2>&1 &
 daemon_pid=$!
 pids+=("$daemon_pid")
 wait_for_port "$cache_port" "$daemon_pid" "daemon" "${workdir}/daemon.log"
-wait_for_port "$dispatch_port" "$daemon_pid" "daemon (dispatch listener)" "${workdir}/daemon.log"
-
-grep -q "distributed execution enabled" "${workdir}/daemon.log" \
-    || { cat "${workdir}/daemon.log" >&2; fail "daemon did not enable distributed execution"; }
 
 export FASTCACHE_ADDR="127.0.0.1:${cache_port}"
+
+# --- start the scheduler -----------------------------------------------------
+# A compile node running the fleet's scheduler. --fleet-open because every peer
+# here is loopback -- and because the policy has to be STATED: a node with no
+# member list refuses everybody, which is the right default and not a working
+# configuration, so it is refused at startup rather than discovered later as a
+# fleet that silently distributes nothing.
+#
+# It names a toolchain nothing here compiles with, deliberately. Every node is
+# both a peer and a possible scheduler, so it always registers as a worker too --
+# and a second MATCHING worker would make "which worker ran this job" a race,
+# which the cases below assert against by reading one worker's counters. That a
+# scheduler CAN also take work is the point of the architecture; it is simply not
+# what these cases are measuring.
+dispatch_port="$(free_port)"
+sched_worker_port="$(free_port)"
+
+"$node" --listen-scheduler="127.0.0.1:${dispatch_port}" --fleet-open \
+    --scheduler="127.0.0.1:${dispatch_port}" \
+    --bind=127.0.0.1 --port="$sched_worker_port" \
+    --advertise="127.0.0.1:${sched_worker_port}" \
+    --toolchain="scheduler-only=${compiler}" --slots=1 --log-level=debug \
+    > "${workdir}/scheduler.log" 2>&1 &
+scheduler_pid=$!
+pids+=("$scheduler_pid")
+wait_for_port "$dispatch_port" "$scheduler_pid" "scheduler" "${workdir}/scheduler.log"
+
+grep -q "scheduling for the fleet" "${workdir}/scheduler.log" \
+    || { cat "${workdir}/scheduler.log" >&2; fail "node did not start its scheduler"; }
 
 # --- start a worker ----------------------------------------------------------
 worker_port="$(free_port)"
@@ -432,16 +459,31 @@ echo "   worker metrics moved: ${completed} job(s), ${millis}ms, ${bytes} bytes 
 
 # --- 3: a worker for a different toolchain is never chosen -------------------
 echo "== case 3: fingerprint isolation"
-# A second daemon and a second worker, so the mismatched worker is the ONLY one
-# registered. Reusing the first scheduler would leave the matching worker
-# available and the case would pass without testing anything.
+# A second cache and a second SCHEDULER, so the mismatched worker is the ONLY
+# one registered with it. Reusing the first scheduler would leave the matching
+# worker available and the case would pass without testing anything.
+#
+# The scheduler node names a toolchain nothing here uses, for the same reason:
+# a scheduler that also served the real compiler would be a second matching
+# worker, which is exactly what this case must not have.
 iso_cache_port="$(free_port)"
 iso_dispatch_port="$(free_port)"
-"$fastcached" --listen="127.0.0.1:${iso_cache_port}" --listen-dispatch="127.0.0.1:${iso_dispatch_port}" \
+iso_sched_worker_port="$(free_port)"
+"$fastcached" --listen="127.0.0.1:${iso_cache_port}" \
     --log-level=info > "${workdir}/iso-daemon.log" 2>&1 &
 iso_daemon_pid=$!
 pids+=("$iso_daemon_pid")
-wait_for_port "$iso_dispatch_port" "$iso_daemon_pid" "isolation daemon" "${workdir}/iso-daemon.log"
+wait_for_port "$iso_cache_port" "$iso_daemon_pid" "isolation daemon" "${workdir}/iso-daemon.log"
+
+"$node" --listen-scheduler="127.0.0.1:${iso_dispatch_port}" --fleet-open \
+    --scheduler="127.0.0.1:${iso_dispatch_port}" \
+    --bind=127.0.0.1 --port="$iso_sched_worker_port" \
+    --advertise="127.0.0.1:${iso_sched_worker_port}" \
+    --toolchain="also-not-the-compiler-this-client-uses=${compiler}" \
+    --slots=1 --log-level=debug > "${workdir}/iso-scheduler.log" 2>&1 &
+iso_scheduler_pid=$!
+pids+=("$iso_scheduler_pid")
+wait_for_port "$iso_dispatch_port" "$iso_scheduler_pid" "isolation scheduler" "${workdir}/iso-scheduler.log"
 
 iso_worker_port="$(free_port)"
 "$node" --scheduler="127.0.0.1:${iso_dispatch_port}" \
@@ -535,11 +577,26 @@ echo "== case 6: concurrency beyond the fleet's slot count"
 # is that pressure produces neither a hang nor a wrong object.
 cap_cache_port="$(free_port)"
 cap_dispatch_port="$(free_port)"
-"$fastcached" --listen="127.0.0.1:${cap_cache_port}" --listen-dispatch="127.0.0.1:${cap_dispatch_port}" \
+cap_sched_worker_port="$(free_port)"
+"$fastcached" --listen="127.0.0.1:${cap_cache_port}" \
     --log-level=info > "${workdir}/cap-daemon.log" 2>&1 &
 cap_daemon_pid=$!
 pids+=("$cap_daemon_pid")
-wait_for_port "$cap_dispatch_port" "$cap_daemon_pid" "capacity daemon" "${workdir}/cap-daemon.log"
+wait_for_port "$cap_cache_port" "$cap_daemon_pid" "capacity daemon" "${workdir}/cap-daemon.log"
+
+# The scheduler node names a toolchain nothing here compiles with, deliberately.
+# Every node is both a peer and a possible scheduler, so it always registers as a
+# worker too -- and a second MATCHING worker would give this fleet two slots when
+# the whole point of the case is that it has one.
+"$node" --listen-scheduler="127.0.0.1:${cap_dispatch_port}" --fleet-open \
+    --scheduler="127.0.0.1:${cap_dispatch_port}" \
+    --bind=127.0.0.1 --port="$cap_sched_worker_port" \
+    --advertise="127.0.0.1:${cap_sched_worker_port}" \
+    --toolchain="not-the-compiler-under-test=${compiler}" \
+    --slots=1 --log-level=debug > "${workdir}/cap-scheduler.log" 2>&1 &
+cap_scheduler_pid=$!
+pids+=("$cap_scheduler_pid")
+wait_for_port "$cap_dispatch_port" "$cap_scheduler_pid" "capacity scheduler" "${workdir}/cap-scheduler.log"
 
 cap_worker_port="$(free_port)"
 "$node" --scheduler="127.0.0.1:${cap_dispatch_port}" \

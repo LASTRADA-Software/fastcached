@@ -3,8 +3,6 @@
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
-#include <FastCache/Distributed/LeaseTable.hpp>
-#include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
@@ -346,145 +344,6 @@ namespace
         co_return Next::Continue;
     }
 
-    /// Whether this connection may be served distributed-execution verbs at all.
-    ///
-    /// Two conditions, and both must hold. The listener's role mask is the
-    /// operator's statement about this endpoint; the registry and lease table being
-    /// wired is this daemon's. Either missing is a refusal, and the same refusal:
-    /// a client cannot act differently on "you did not enable it here" than on "this
-    /// build has no scheduler", and both mean compile locally.
-    /// @param session The connection's session context.
-    /// @return True when dispatch verbs may be answered.
-    [[nodiscard]] bool DispatchEnabled(SessionContext const& session) noexcept
-    {
-        return HasRole(session.listenerRoles, ListenerRole::Dispatch) && session.workers != nullptr
-               && session.leases != nullptr;
-    }
-
-    /// Handle one REGISTER: admit a worker to the fleet.
-    /// @param socket Client socket.
-    /// @param session The connection's session context.
-    /// @param payload The request payload, by value (see HandleStore).
-    /// @return Whether the command loop should continue or abort.
-    /// Count one dispatch outcome, when anything is collecting them.
-    ///
-    /// The null check lives here rather than at each call site: a scheduler must
-    /// schedule whether or not it is being scraped, and four copies of the same
-    /// guard is four chances for one of them to be forgotten -- which would be a
-    /// crash on the path this counter exists to observe.
-    void Count(SessionContext const& session, IMetricsSink::Counter counter) noexcept
-    {
-        if (session.metrics != nullptr)
-            session.metrics->Increment(counter);
-    }
-
-    [[nodiscard]] Task<Next> HandleRegister(ISocket* socket, SessionContext session, std::vector<std::byte> payload)
-    {
-        auto const fields = Wire::DecodeRegisterPayload(payload);
-        if (!fields.has_value())
-            co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
-
-        // A worker with no slots would register, match every lease for its
-        // toolchain, and never be picked -- indistinguishable at the client from a
-        // fleet that is permanently busy. Refuse it where it can be explained.
-        if (fields->slots == 0)
-            co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, "a worker must offer at least one slot")
-                ? Next::Continue
-                : Next::Abort;
-
-        auto const id = session.workers->Register(
-            Distributed::WorkerRegistration { .fingerprint = Wire::AsStringView(fields->fingerprint),
-                                              .endpoint = Wire::AsStringView(fields->endpoint),
-                                              .slots = fields->slots,
-                                              .codecs = fields->acceptedCodecs });
-        // Counted as an event, not as fleet size. This interface is counter-only,
-        // so it cannot express a gauge -- and the event turns out to be the more
-        // useful number anyway: a rate that stays high means workers keep
-        // re-registering, which is what a fleet whose heartbeats are not arriving
-        // looks like from the scheduler's side.
-        Count(session, IMetricsSink::Counter::DispatchWorkerRegistrations);
-        auto const reply = Wire::AsBytes(id);
-        co_return co_await Reply(socket, Wire::Status::Ok, std::vector<std::byte> { reply.begin(), reply.end() })
-            ? Next::Continue
-            : Next::Abort;
-    }
-
-    /// Handle one HEARTBEAT: refresh liveness and correct the load count.
-    /// @param socket Client socket.
-    /// @param session The connection's session context.
-    /// @param payload The request payload, by value.
-    /// @return Whether the command loop should continue or abort.
-    [[nodiscard]] Task<Next> HandleHeartbeat(ISocket* socket, SessionContext session, std::vector<std::byte> payload)
-    {
-        auto const fields = Wire::DecodeHeartbeatPayload(payload);
-        if (!fields.has_value())
-            co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
-
-        // An unknown id is answered, not ignored: it means the scheduler restarted
-        // or expired this worker, and the worker's correct response is to register
-        // again. Silence would leave it heartbeating into a void forever while the
-        // fleet ran without it.
-        if (!session.workers->Heartbeat(Wire::AsStringView(fields->workerId), fields->inFlight))
-            co_return co_await ReplyError(socket, Wire::ErrorCode::UnknownLease, "unknown worker; register again")
-                ? Next::Continue
-                : Next::Abort;
-
-        co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
-    }
-
-    /// Handle one LEASE: pick a worker and authorize one job on it.
-    /// @param socket Client socket.
-    /// @param session The connection's session context.
-    /// @param payload The request payload, by value.
-    /// @return Whether the command loop should continue or abort.
-    [[nodiscard]] Task<Next> HandleLease(ISocket* socket, SessionContext session, std::vector<std::byte> payload)
-    {
-        auto const fields = Wire::DecodeLeasePayload(payload);
-        if (!fields.has_value())
-            co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
-
-        auto const picked = session.workers->Pick(Wire::AsStringView(fields->fingerprint));
-        if (!picked.has_value())
-        {
-            // The scheduler's own words reach the client, which reports them: an
-            // empty fleet for a toolchain and a busy one are different operator
-            // problems even though both end in a local compile.
-            auto const noWorker = picked.error() == Distributed::PickError::NoWorker;
-            // Counted apart, because they are different operator problems: no
-            // worker means the fleet is misconfigured (a fingerprint nobody
-            // serves), no capacity means it is too small. Summing them would hide
-            // the first behind the second exactly when a fleet is busy.
-            Count(session,
-                  noWorker ? IMetricsSink::Counter::DispatchLeasesNoWorker
-                           : IMetricsSink::Counter::DispatchLeasesNoCapacity);
-            auto const code = noWorker ? Wire::ErrorCode::NoWorker : Wire::ErrorCode::NoCapacity;
-            co_return co_await ReplyError(socket, code, {}) ? Next::Continue : Next::Abort;
-        }
-
-        auto const lease = session.leases->Acquire(Wire::AsStringView(fields->key), picked->id);
-        if (!lease.has_value())
-        {
-            // Not a failure: duplicate-work suppression refusing the second of many
-            // clients that missed the same key, each of which compiles locally.
-            Count(session, IMetricsSink::Counter::DispatchLeasesDuplicate);
-            co_return co_await ReplyError(socket, Wire::ErrorCode::AlreadyInFlight, {}) ? Next::Continue : Next::Abort;
-        }
-
-        // Accounted only once the lease exists. Counting at Pick would inflate the
-        // load of a worker whose key turned out to be already in flight, and the
-        // correction would not arrive until its next heartbeat.
-        session.workers->JobStarted(picked->id);
-        Count(session, IMetricsSink::Counter::DispatchLeasesGranted);
-
-        // The worker's codecs travel with the grant so the client can choose one for
-        // the preprocessed payload it is about to send -- without a negotiation round
-        // trip, and without guessing at something the worker cannot decode after the
-        // whole payload has already crossed the network.
-        auto const grant = Wire::EncodeLeaseGrant(
-            Wire::LeaseGrant { .endpoint = picked->endpoint, .leaseToken = lease->token, .workerCodecs = picked->codecs });
-        co_return co_await Reply(socket, Wire::Status::Ok, grant) ? Next::Continue : Next::Abort;
-    }
-
     /// Answer one distributed-execution verb, or refuse it when this endpoint does
     /// not serve them.
     ///
@@ -499,45 +358,27 @@ namespace
     /// @param op The verb, already resolved against the table.
     /// @param payload The request payload, by value (see HandleStore).
     /// @return Whether the command loop should continue or abort.
-    [[nodiscard]] Task<Next> HandleDistributed(ISocket* socket,
-                                               SessionContext session,
-                                               Wire::Op op,
-                                               std::vector<std::byte> payload)
+    [[nodiscard]] Task<Next> HandleDistributed(ISocket* socket, Wire::Op op)
     {
-        // COMPILE is a WORKER's verb and this daemon is not a worker: it schedules,
-        // `fastcache-compile-node` executes. Refused even on a dispatch listener,
-        // and with its own message, because "you sent the job to the scheduler
-        // instead of to the worker it named" is a client bug that would otherwise
-        // present as an unexplained refusal.
-        if (op == Wire::Op::Compile)
-            co_return co_await ReplyError(socket,
-                                          Wire::ErrorCode::DispatchNotPermitted,
-                                          "this endpoint schedules compiles but does not execute them; send the job "
-                                          "to the worker endpoint the lease named")
-                ? Next::Continue
-                : Next::Abort;
-
-        if (!DispatchEnabled(session))
-            co_return co_await ReplyError(socket, Wire::ErrorCode::DispatchNotPermitted, {}) ? Next::Continue : Next::Abort;
-
-        switch (op)
-        {
-            case Wire::Op::Register:
-                co_return co_await HandleRegister(socket, session, std::move(payload));
-            case Wire::Op::Heartbeat:
-                co_return co_await HandleHeartbeat(socket, session, std::move(payload));
-            case Wire::Op::Lease:
-                co_return co_await HandleLease(socket, session, std::move(payload));
-            case Wire::Op::Store:
-            case Wire::Op::Fetch:
-            case Wire::Op::Auth:
-            case Wire::Op::Compile:
-                break;
-        }
-        // Unreachable through the command loop, which routes only the four verbs
-        // above here. Refusing rather than asserting keeps the failure mode of a
-        // future mis-route a typed reply instead of a crash.
-        co_return co_await ReplyError(socket, Wire::ErrorCode::UnknownOpcode, {}) ? Next::Continue : Next::Abort;
+        // Answered, never served. `fastcached` is a cache and nothing else: the fleet's
+        // scheduler moved to `fastcache-compile-node --listen-scheduler`, because
+        // handing out capacity is a decision only one node may make at a time and
+        // nothing here can establish which node that is.
+        //
+        // These verbs keep their place in `OpTable` and keep getting a typed refusal
+        // rather than being dropped, and both halves matter. A client built against an
+        // older daemon must learn WHY its scheduling stopped working -- a closed
+        // connection is indistinguishable from a dead host, and an unknown opcode
+        // would say the daemon is too old when it is in fact too new. The message
+        // names where the scheduler went, because a refusal that cannot say what
+        // would have worked cannot be acted on.
+        std::string const message = op == Wire::Op::Compile
+                                 ? "this endpoint is a cache and does not execute compiles; send the job to the "
+                                   "worker endpoint the lease named"
+                                 : "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
+                                   "fastcache-compile-node --listen-scheduler and point clients at it";
+        co_return co_await ReplyError(socket, Wire::ErrorCode::DispatchNotPermitted, message) ? Next::Continue
+                                                                                             : Next::Abort;
     }
 
 } // namespace
@@ -733,13 +574,15 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
                 next = co_await HandleAuth(socket, policy, std::move(*payload), &credentialAccepted);
                 break;
 
-            // Distributed execution. All four route through one function, which is
-            // where the endpoint-role gate lives; see HandleDistributed.
+            // Distributed execution, which this daemon does not do. The payload is
+            // read and discarded rather than left on the socket: the refusal is a
+            // reply, so the connection has to stay in sync for whatever the client
+            // pipelined behind it.
             case Wire::Op::Register:
             case Wire::Op::Heartbeat:
             case Wire::Op::Lease:
             case Wire::Op::Compile:
-                next = co_await HandleDistributed(socket, session, descriptor->code, std::move(*payload));
+                next = co_await HandleDistributed(socket, descriptor->code);
                 break;
         }
 

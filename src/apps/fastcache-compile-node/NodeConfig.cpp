@@ -120,7 +120,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::Value,
           .operand = "=<host:port>",
           .apply = AssignFrom<&NodeConfig::scheduler, ParseText>(),
-          .description = "the scheduler's --listen-dispatch endpoint. Required: a\n"
+          .description = "the scheduler's --listen-scheduler endpoint. Required: a\n"
                          "worker nothing knows about serves nobody." },
         { .primary = "--advertise",
           .arity = Arity::Value,
