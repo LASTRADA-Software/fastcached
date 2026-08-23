@@ -4,6 +4,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -155,6 +156,61 @@ enum class AppendResult : std::uint8_t
     Rejected = 0, ///< Term too old, or the consistency check at `prevLogIndex` failed.
     Accepted,     ///< The follower's log now matches the leader's through the entries sent.
 };
+
+/// The largest enumerator of an enum that travels on the wire or on disk.
+///
+/// A trait rather than an argument each decoder passes, because "what is the
+/// highest `EntryKind`?" is a property of the enum and not of the call site. The
+/// primary template is deliberately **left undefined**, so a new wire enum that
+/// forgets its bound is a compile error at the decode site rather than a decoder
+/// that silently accepts every byte.
+///
+/// The alternative — and what this replaced — was each decoder naming the current
+/// highest enumerator itself, which `RaftWire` and `FileRaftStorage` were both
+/// doing for `EntryKind`. Adding a kind then means finding every site, and a
+/// missed one does not fail to compile: it *rejects* every frame or log record
+/// carrying the new kind, which reads as corruption rather than as an omission.
+/// @tparam E The enumeration.
+template <typename E>
+struct WireEnumBound;
+
+/// `EntryKind`'s bound. Raise it in lock-step with the last enumerator.
+template <>
+struct WireEnumBound<EntryKind>
+{
+    static constexpr EntryKind Highest = EntryKind::NoOp;
+};
+
+/// `VoteDecision`'s bound.
+template <>
+struct WireEnumBound<VoteDecision>
+{
+    static constexpr VoteDecision Highest = VoteDecision::Granted;
+};
+
+/// `AppendResult`'s bound.
+template <>
+struct WireEnumBound<AppendResult>
+{
+    static constexpr AppendResult Highest = AppendResult::Accepted;
+};
+
+/// Turn a byte that arrived from a peer or from disk into an enumerator.
+///
+/// Casting an arbitrary byte into an enumeration produces a value no `switch`
+/// handles and no invariant covers, and the byte is not this process's to trust —
+/// so an out-of-range one is a malformed record to refuse, never a precondition
+/// to assert on.
+/// @tparam E The enumeration, which must specialize `WireEnumBound`.
+/// @param raw The byte as read.
+/// @return The enumerator, or nullopt when the byte names none.
+template <typename E>
+[[nodiscard]] constexpr std::optional<E> DecodeWireEnum(std::uint8_t raw) noexcept
+{
+    if (raw > static_cast<std::uint8_t>(WireEnumBound<E>::Highest))
+        return std::nullopt;
+    return static_cast<E>(raw);
+}
 
 /// Candidate asking for a vote (Raft §5.2, §5.4.1).
 struct RequestVoteRequest

@@ -20,6 +20,15 @@ enum class ConsensusErrorCode : std::uint8_t
     InvalidConfiguration = 0, ///< The cluster configuration is not self-consistent.
     NotLeader,                ///< Only a leader may accept a proposal; see `knownLeader`.
     StorageFailure,           ///< Durable state could not be written or read back.
+
+    // Peer-wire decode failures. Three rather than one because a reader's
+    // correct response differs: an unknown message type or an unsupported
+    // version is a peer running another build, which is stepped over and logged
+    // once, while a malformed frame means this reader and that sender disagree
+    // about the bytes and the connection is no longer trustworthy.
+    MalformedFrame,     ///< The payload does not match the shape its type declares.
+    UnknownMessageType, ///< A type byte this build does not know; skip the frame.
+    UnsupportedVersion, ///< A frame version outside the range this build decodes.
 };
 
 /// Structured consensus error.
@@ -80,6 +89,41 @@ struct ConsensusError
 [[nodiscard]] inline ConsensusError StorageFailure(std::string_view context)
 {
     return ConsensusError { .code = ConsensusErrorCode::StorageFailure,
+                            .context = std::string { context },
+                            .knownLeader = std::nullopt };
+}
+
+/// Build a `MalformedFrame` error.
+/// @param context Which message, and what about it did not parse.
+/// @return The error.
+[[nodiscard]] inline ConsensusError MalformedWireFrame(std::string_view context)
+{
+    return ConsensusError { .code = ConsensusErrorCode::MalformedFrame,
+                            .context = std::string { context },
+                            .knownLeader = std::nullopt };
+}
+
+/// Build an `UnknownMessageType` error.
+///
+/// Separate from `MalformedFrame` because it is the *expected* condition in a
+/// fleet that is mid-upgrade: the frame is well-formed and simply says something
+/// this build has no opinion about, so the reader steps over it and carries on.
+/// Reporting it as malformed would make a rolling upgrade look like corruption.
+/// @param context Which type code, in terms a log line can carry.
+/// @return The error.
+[[nodiscard]] inline ConsensusError UnknownWireMessage(std::string_view context)
+{
+    return ConsensusError { .code = ConsensusErrorCode::UnknownMessageType,
+                            .context = std::string { context },
+                            .knownLeader = std::nullopt };
+}
+
+/// Build an `UnsupportedVersion` error.
+/// @param context The offending version and the range that would have worked.
+/// @return The error.
+[[nodiscard]] inline ConsensusError UnsupportedWireVersion(std::string_view context)
+{
+    return ConsensusError { .code = ConsensusErrorCode::UnsupportedVersion,
                             .context = std::string { context },
                             .knownLeader = std::nullopt };
 }

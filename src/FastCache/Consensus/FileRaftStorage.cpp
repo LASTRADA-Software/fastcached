@@ -157,12 +157,16 @@ namespace
         entry.term = Term { .value = ReadBigEndian<std::uint64_t>(raw.subspan(cursor)) };
         cursor += sizeof(std::uint64_t);
 
-        auto const kind = static_cast<std::uint8_t>(raw[cursor]);
+        // The range check is `DecodeWireEnum`'s, whose bound lives beside the
+        // enum, so this reader and `RaftWire`'s cannot disagree about the highest
+        // kind -- a disagreement that would not fail to compile but would reject
+        // every record carrying a newly added one.
+        auto const kind = DecodeWireEnum<EntryKind>(static_cast<std::uint8_t>(raw[cursor]));
         cursor += 1;
-        if (kind > static_cast<std::uint8_t>(EntryKind::NoOp))
+        if (!kind.has_value())
             return std::nullopt;
 
-        entry.kind = static_cast<EntryKind>(kind);
+        entry.kind = *kind;
 
         auto const payloadLength = ReadBigEndian<std::uint32_t>(raw.subspan(cursor));
         cursor += sizeof(std::uint32_t);
