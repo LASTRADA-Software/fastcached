@@ -157,6 +157,12 @@ TimePoint RaftNode::NextDeadline() const noexcept
     return TraitsOf(_role).timer == TimerKind::Election ? _electionDeadline : _heartbeatDeadline;
 }
 
+void RaftNode::NoteLeaderContact(TimePoint now)
+{
+    _lastLeaderContact = now;
+    ArmElectionTimer(now);
+}
+
 void RaftNode::ArmElectionTimer(TimePoint now)
 {
     auto const low = static_cast<std::uint64_t>(_config.electionTimeoutMin.count());
@@ -799,7 +805,7 @@ void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoin
     // in the middle of it.
     _knownLeader = request.leaderId;
     _votesGranted.clear();
-    ArmElectionTimer(now);
+    NoteLeaderContact(now);
 
     // Already covered. A duplicate or reordered snapshot must not roll this node
     // BACKWARDS -- it holds at least this much state already, and discarding its
@@ -877,9 +883,23 @@ void RaftNode::OnPreVote(PreVoteRequest const& request, TimePoint now, RaftOutpu
     // this node must not have heard from a leader recently. A cluster with a
     // healthy leader refuses every pre-vote, so a partitioned node gets no
     // quorum, never increments its term, and cannot disturb anything when it
-    // returns. `_electionDeadline` is where "recently" already lives: it is
-    // re-armed by every AppendEntries this node accepts.
-    if (now < _electionDeadline)
+    // returns.
+    //
+    // Asked of `_lastLeaderContact` and **not** of `_electionDeadline`, which is
+    // the shorter spelling and the one this started as. That deadline is re-armed
+    // when this node begins its own pre-vote round, so a node that just started
+    // campaigning answers "yes, recently" for a full timeout and refuses every
+    // peer asking the same question at the same moment. That is the ordinary case
+    // in a cluster whose nodes time out together, and it cost a five-node cluster
+    // some forty election rounds to elect anyone -- slow enough to read as a
+    // livelock, and fast enough to pass wherever the draw sequence happened to
+    // stagger the timeouts.
+    //
+    // The window is `electionTimeoutMin` rather than this node's own randomized
+    // deadline: "is there a live leader" is a fact about the cluster, and every
+    // node should answer it the same way at the same instant, which a per-node
+    // jittered value does not.
+    if (_lastLeaderContact.has_value() && now - *_lastLeaderContact < _config.electionTimeoutMin)
     {
         reply(VoteDecision::Denied);
         return;
@@ -1015,7 +1035,7 @@ void RaftNode::OnAppendEntries(AppendEntriesRequest const& request, TimePoint no
     _role = Role::Follower;
     _knownLeader = request.leaderId;
     _votesGranted.clear();
-    ArmElectionTimer(now);
+    NoteLeaderContact(now);
 
     auto const outcome = _log.TryAppend(request.prevLogIndex, request.prevLogTerm, request.entries);
     if (outcome.result == AppendResult::Accepted)

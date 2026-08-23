@@ -298,6 +298,15 @@ class RaftNode
     /// Win the election and start heartbeating.
     void BecomeLeader(TimePoint now, RaftOutput& output);
 
+    /// Record that a leader was heard from, and arm the election timer.
+    ///
+    /// The two together, and only where a leader actually spoke — an accepted
+    /// AppendEntries or InstallSnapshot. Arming *alone* is what this node does
+    /// when it stands for election or grants a vote, and neither of those is
+    /// contact from a leader.
+    /// @param now Current time.
+    void NoteLeaderContact(TimePoint now);
+
     /// Arm the election timer with a freshly drawn randomized timeout.
     ///
     /// Re-drawn every time rather than drawn once per node, because a fixed
@@ -388,6 +397,16 @@ class RaftNode
     std::optional<NodeId> _votedFor;
     std::optional<NodeId> _knownLeader;
     RaftLog _log;
+
+    /// When a leader was last heard from; absent until one is.
+    ///
+    /// Deliberately **not** `_electionDeadline`, which is the obvious place to
+    /// look and answers a different question. That deadline is re-armed when this
+    /// node starts its own pre-vote round, so a node using it to answer "have I
+    /// heard from a leader recently?" answers *yes* for a full timeout after it
+    /// began campaigning — and that question is the whole of pre-vote's
+    /// disruption check. Nodes racing then refused each other almost every round.
+    std::optional<TimePoint> _lastLeaderContact;
 
     TimePoint _electionDeadline {};
     TimePoint _heartbeatDeadline {};

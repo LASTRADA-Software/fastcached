@@ -208,6 +208,54 @@ These constraints are load-bearing and have each already been a bug:
     derived rather than scanned for separately.** They are the same question, and
     two backward scans answering it independently are two places for the rule to
     drift.
+- **A seeded draw must be the same on every platform, or a seeded harness is not
+  reproducible.** `std::mt19937_64` is specified bit-for-bit by the standard;
+  `std::uniform_int_distribution` is **not** — how it reduces the engine's output
+  to a range is the implementation's business, and libstdc++ and libc++ do it
+  differently. `SystemRandomSource`'s fixed-seed constructor exists so a failure
+  can be replayed, and `RaftClusterHarness` seeds one per node so a whole cluster's
+  adversarial schedule is reproducible; both promises held only within one standard
+  library. The harness therefore ran a **different** schedule on macOS than on
+  Linux and Windows, and three cluster cases failed there and nowhere else — in CI,
+  at `-O3`, where nothing local reproduces it. `UniformInRange` now does the range
+  reduction itself, and a golden vector pins it. The same argument `Core/MurmurHash3`
+  makes about its digest and `PathCanon::AsciiLower` about locale: a value this
+  codebase relies on being identical everywhere cannot come from something allowed
+  to vary. Two consequences:
+  - **It takes the HIGH bits of the engine draw, and that is not a detail.**
+    Masking the low bits is the shorter spelling and was the first version. Mersenne
+    Twister seeded with *adjacent* values produces correlated low-order output for
+    its first draws, and the harness seeds its nodes `base + 0`, `base + 1`, … — so
+    five nodes drew near-identical first election timeouts, campaigned together and
+    split the vote, round after round. Election jitter exists precisely to
+    decorrelate those draws; sourcing it from the one part of the output that is
+    correlated across neighbouring seeds defeats the mechanism it feeds.
+  - **The three tests it was masking were a real defect, not bad luck.** See the
+    next entry — which is the reason a harness like this is worth its cost at all.
+- **Pre-vote asks whether a LEADER is live, so it must not be answered from this
+  node's own election timer.** `OnPreVote` refused when `now < _electionDeadline`,
+  and that deadline is re-armed when the node *starts its own pre-vote round*. So a
+  node that had just begun campaigning answered "yes, I heard from a leader
+  recently" for a full timeout and refused every peer that timed out alongside it —
+  which is the ordinary case in a cluster whose nodes are meant to race. Nothing
+  fails and nothing is unsafe: a five-node cluster simply took some **forty**
+  election rounds to elect anybody where one should do, which reads as a livelock
+  in a cluster test and is invisible to a unit test that only ever has one
+  candidate. Measured at 994 harness steps before and 20–23 after. `_lastLeaderContact`
+  is now its own field, set only where a leader actually spoke — an accepted
+  AppendEntries or InstallSnapshot — through `NoteLeaderContact`, while standing for
+  election and granting a vote still arm the timer alone. The window is
+  `electionTimeoutMin` rather than the node's own randomized deadline, because "is
+  there a live leader" is a fact about the cluster that every node should answer
+  the same way at the same instant. Both halves are tested: a campaigning node
+  still grants, and a node that has just heard from a leader still refuses —
+  losing the second while fixing the first would trade a slow election for the
+  disruption pre-vote exists to prevent. The residual, unchanged by this and
+  recorded deliberately: a **leader** never hears from a leader, so its own
+  `_lastLeaderContact` ages out and it grants a challenger's pre-vote — exactly as
+  it did before, since a leader arms no election timer either. Refusing there is
+  CheckQuorum or a leader lease, which `RaftCluster_test` already names as a
+  separate mechanism and which nothing here needs yet.
 - **A round-trip test that omits a message type omits the arm most likely to be
   wrong.** Five of `RaftWire`'s eight encoder arms are near-copies of another —
   PreVote of RequestVote, `InstallSnapshotResponse` of `AppendEntriesResponse` —
@@ -1502,6 +1550,18 @@ down across a suspend point.
 - **C-style loops are forbidden.** Use range-based `for`, `std::views::iota`, and other range views for generation/transformation.
 - **`std::span`** for arrays and contiguous sequences.
 - **`auto` type deduction** for readability; **structured bindings** for tuple-like returns.
+- **A local gate cannot see a configuration it does not build.** The default agent
+  preset is `clang-debug`: one compiler, one standard library, `-O0`, sanitizers on.
+  CI is four more — GCC at `-O3`, clang-cl, MSVC, and clang against **libc++** on
+  macOS — and each of the three defects that reached CI on the Raft branch was
+  invisible to every configuration below it. GCC 14 at `-O3` reports
+  `-Wnull-dereference` inside `std::optional::value_or` where clang does not;
+  clang-tidy 22 knows checks clang-tidy 20 has never heard of; and libc++'s
+  `uniform_int_distribution` is a different function from libstdc++'s. Before
+  pushing a change that touches a header everything includes, a randomness or
+  timing seam, or anything a test harness's determinism rests on, build **at least
+  one release configuration and one non-clang compiler** locally —
+  `cmake --preset gcc-release` and `clang-release` both exist and both run in WSL.
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins.** Both jobs
   run the `$CLANG_TOOLS_VERSION` binary (`.github/workflows/build.yml`), and successive LLVM
   releases do not agree with each other: the style job compares against a *newer formatter*,

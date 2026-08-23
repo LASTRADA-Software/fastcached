@@ -2,8 +2,10 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <utility>
@@ -112,21 +114,91 @@ class SystemRandomSource final: public IRandomSource
 
     /// Construct with a fixed seed, so a failure that depended on a particular
     /// draw sequence can be replayed outside the test double.
+    ///
+    /// The sequence is the same on **every platform**, which is what makes that
+    /// promise worth anything — see `UniformInRange` for what it costs to keep.
     /// @param seed Value to seed the engine with.
     explicit SystemRandomSource(std::uint64_t seed) noexcept:
         _engine { seed }
     {
     }
 
+    /// Draw from `[lowInclusive, highInclusive]`, identically on every platform.
+    ///
+    /// ## Why the reduction is written out rather than left to the library
+    ///
+    /// `std::mt19937_64` is specified bit-for-bit by the standard.
+    /// `std::uniform_int_distribution` is **not**: how it reduces the engine's
+    /// output to a range is entirely up to the implementation, and libstdc++ and
+    /// libc++ do it differently. Two machines seeded identically therefore draw
+    /// *different sequences*, which makes the fixed-seed constructor above — whose
+    /// whole purpose is replaying a failure — a promise that holds only within one
+    /// standard library.
+    ///
+    /// That is not theoretical. `RaftClusterHarness` seeds this per node to get a
+    /// reproducible schedule of election timeouts, and its own documentation calls
+    /// that harness the closest available oracle for a hand-written consensus
+    /// implementation. It ran one schedule on Linux and Windows and a different one
+    /// on macOS, so three cluster cases that pass everywhere else failed there —
+    /// on libc++, at `-O3`, in CI, where nothing local reproduces it. A test suite
+    /// whose adversarial schedule depends on which standard library built it is not
+    /// testing the same thing twice; it is testing two different things and
+    /// reporting one of them as a regression.
+    ///
+    /// The same argument `Core/MurmurHash3` already makes about its digest, and
+    /// `PathCanon::AsciiLower` about locale: a value this codebase relies on being
+    /// identical everywhere cannot be sourced from something that is allowed to
+    /// vary.
+    ///
+    /// ## The method
+    ///
+    /// Take the **high** bits of an engine draw, enough of them to cover the span,
+    /// and reject anything above it. Unbiased by construction, needs no 128-bit
+    /// multiply, and is obvious enough to be checked by reading. It costs under
+    /// two engine draws on average, against a draw rate measured in seconds.
+    ///
+    /// The high bits specifically, and that is not a detail. Masking the **low**
+    /// bits is the shorter spelling and was the first version; it is wrong here
+    /// because `std::mt19937_64` seeded with *adjacent* values produces correlated
+    /// low-order output for its first draws, and `RaftClusterHarness` seeds its
+    /// nodes with exactly that — `base + 0`, `base + 1`, … so each node gets its
+    /// own stream. Five nodes then drew near-identical first election timeouts,
+    /// stood for election together, split the vote, and repeated: the cluster
+    /// livelocked and the test reported "no leader in 200 steps". Election jitter
+    /// exists precisely to decorrelate those draws, so sourcing it from the one
+    /// part of the engine's output that is correlated across neighbouring seeds
+    /// defeats the mechanism it feeds.
+    /// @param lowInclusive Smallest value that may be returned.
+    /// @param highInclusive Largest value; an inverted range collapses to the low.
+    /// @return A value in the normalized range.
     [[nodiscard]] std::uint64_t UniformInRange(std::uint64_t lowInclusive, std::uint64_t highInclusive) override
     {
-        auto const high = NormalizeHigh(lowInclusive, highInclusive);
+        auto const span = NormalizeHigh(lowInclusive, highInclusive) - lowInclusive;
+
         // The lock is not free, but a draw happens once per election timeout —
         // that is, at a rate measured in seconds — so it is not on any hot path,
         // and the alternative is a data race the contract above promises not to
         // have.
         std::scoped_lock const lock { _mutex };
-        return std::uniform_int_distribution<std::uint64_t> { lowInclusive, high }(_engine);
+
+        // The whole 64-bit range: every draw is in it, so masking would loop on a
+        // condition that is never true and the mask itself would overflow.
+        if (span == std::numeric_limits<std::uint64_t>::max())
+            return _engine();
+
+        // A single value: no draw is needed, and the shift below would be by 64,
+        // which is undefined.
+        if (span == 0)
+            return lowInclusive;
+
+        auto const shift = static_cast<unsigned>(std::countl_zero(span));
+        auto draw = std::uint64_t { 0 };
+        do
+        {
+            draw = _engine() >> shift;
+        } while (draw > span);
+
+        return lowInclusive + draw;
     }
 
   private:

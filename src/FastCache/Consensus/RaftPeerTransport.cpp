@@ -90,7 +90,7 @@ void RaftPeerTransport::Stop() noexcept
     for (auto& [id, peer]: _peers)
     {
         {
-            std::lock_guard const guard { peer->mutex };
+            std::scoped_lock const guard { peer->mutex };
             peer->outbox.clear();
         }
         peer->wake.notify_all();
@@ -138,7 +138,7 @@ void RaftPeerTransport::Send(NodeId const& to, RaftMessage message)
 
     auto& peer = *found->second;
     {
-        std::lock_guard const guard { peer.mutex };
+        std::scoped_lock const guard { peer.mutex };
         // The OLDEST is dropped, not the newest. What is waiting behind a dead
         // connection is stale by definition, and for a follower the newest
         // AppendEntries subsumes every older one -- so keeping the newest is what

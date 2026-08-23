@@ -107,6 +107,15 @@ inline constexpr std::size_t HeaderSize = WireFrame::HeaderSize;
 /// type as well as not carrying a valid magic.
 enum class MessageType : std::uint8_t
 {
+    /// Not a message, and never a `MessageTable` row.
+    ///
+    /// Exists so a default-constructed `MessageDescriptor` and a zeroed buffer
+    /// name the same not-a-message rather than a value outside the enumeration —
+    /// which is what `bugprone-invalid-enum-default-initialization` objects to,
+    /// and it is right to: an enum whose zero means nothing still gets zeroed.
+    /// Validity is decided by the table either way, so `FindMessage(0)` finds no
+    /// row exactly as it did before this enumerator existed.
+    Invalid = 0x00,
     RequestVote = 0x01,             ///< Candidate asking for a vote (§5.2).
     RequestVoteResponse = 0x02,     ///< A voter's answer.
     AppendEntries = 0x03,           ///< Leader replicating; a heartbeat when empty (§5.3).
@@ -124,9 +133,9 @@ enum class MessageType : std::uint8_t
 /// agree on, and it is exactly what drifts when each states it separately.
 struct MessageDescriptor
 {
-    MessageType type {};       ///< The wire code.
-    std::string_view name;     ///< For a log line naming what was refused.
-    std::size_t fieldCount {}; ///< How many top-level fields the payload holds.
+    MessageType type { MessageType::Invalid }; ///< The wire code.
+    std::string_view name;                     ///< For a log line naming what was refused.
+    std::size_t fieldCount {};                 ///< How many top-level fields the payload holds.
 };
 
 /// Every message type this build knows. Adding one is adding a row.
@@ -639,6 +648,12 @@ namespace Detail
                                                          .matchIndex = LogIndex { .value = *match },
                                                          .followerId = NodeId { WireFields::AsStringView((*fields)[3]) } } };
         }
+        case MessageType::Invalid:
+            // Never a `MessageTable` row, so `FindMessage` cannot return one — but
+            // named rather than swept up by a `default:`, because this switch has
+            // none: a message type added without a decoder arm must be a compile
+            // error here, and one `default:` would silence every one of them.
+            break;
     }
 
     // Unreachable: `descriptor` came from the table, so its type is one of the

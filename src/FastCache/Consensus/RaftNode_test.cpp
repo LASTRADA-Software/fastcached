@@ -1234,3 +1234,72 @@ TEST_CASE("A pre-vote from a node with a stale log is refused", "[consensus][raf
     REQUIRE(replies.size() == 1);
     CHECK(replies[0].decision == VoteDecision::Denied);
 }
+
+TEST_CASE("Standing for election does not make a node refuse its peers' pre-votes", "[consensus][raft][prevote]")
+{
+    // Pre-vote asks "is there a live leader?", and a node that has just begun its
+    // own campaign must still answer honestly. Keying that on `_electionDeadline`
+    // — which starting a campaign re-arms — makes it answer "yes, I heard from a
+    // leader" for a full timeout, so peers timing out at the same instant refuse
+    // each other. Nothing fails; elections just take some forty rounds instead of
+    // one, which reads as a livelock in a cluster test and as nothing at all in a
+    // unit test that only ever has one candidate.
+    ScriptedRandomSource random { { 0 } };
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+
+    // Time out and start a pre-vote round of its own, which re-arms the deadline.
+    auto const own = node.Tick(At(ElectionMin.count()));
+    REQUIRE(node.CurrentRole() == Role::PreCandidate);
+    REQUIRE_FALSE(MessagesOfType<PreVoteRequest>(own).empty());
+
+    // A peer that timed out at the same moment now asks. This node has heard from
+    // no leader at all, so it must grant.
+    auto const answer = node.Receive(PreVoteRequest { .term = node.CurrentTerm().Next(),
+                                                      .candidateId = "n3",
+                                                      .lastLogIndex = LogIndex::BeforeFirst(),
+                                                      .lastLogTerm = Term::None() },
+                                     At(ElectionMin.count()));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(answer);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Granted);
+}
+
+TEST_CASE("A node that has just heard from a leader refuses a pre-vote", "[consensus][raft][prevote]")
+{
+    // The other half, and the reason the check exists at all: a partitioned node
+    // rejoining must not be able to depose a healthy leader. Losing this while
+    // fixing the case above would trade a slow election for an unstable cluster.
+    ScriptedRandomSource random { { 0 } };
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+
+    (void) node.Receive(AppendEntriesRequest { .term = Term { .value = 1 },
+                                               .leaderId = "n1",
+                                               .prevLogIndex = LogIndex::BeforeFirst(),
+                                               .prevLogTerm = Term::None(),
+                                               .entries = {},
+                                               .leaderCommit = LogIndex::BeforeFirst() },
+                        At(10));
+
+    auto const answer = node.Receive(PreVoteRequest { .term = Term { .value = 2 },
+                                                      .candidateId = "n3",
+                                                      .lastLogIndex = LogIndex::BeforeFirst(),
+                                                      .lastLogTerm = Term::None() },
+                                     At(20));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(answer);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Denied);
+
+    // And once the leader has been silent for a full minimum timeout, it grants —
+    // otherwise a dead leader could never be replaced.
+    auto const later = node.Receive(PreVoteRequest { .term = Term { .value = 2 },
+                                                     .candidateId = "n3",
+                                                     .lastLogIndex = LogIndex::BeforeFirst(),
+                                                     .lastLogTerm = Term::None() },
+                                    At(10 + ElectionMin.count()));
+
+    auto const granted = MessagesOfType<PreVoteResponse>(later);
+    REQUIRE(granted.size() == 1);
+    CHECK(granted[0].decision == VoteDecision::Granted);
+}
