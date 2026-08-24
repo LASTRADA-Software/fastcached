@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <string_view>
 #include <vector>
@@ -93,6 +94,27 @@ namespace
                   "test client option table is malformed: a row is undocumented, a value flag has no operand, "
                   "a row does nothing, or a spelling is claimed twice");
 
+    /// The sub-command `name` selects, if any.
+    ///
+    /// By VALUE rather than by iterator, and that is not a style choice: the
+    /// iterator of a `std::array` is a raw pointer on libstdc++ and libc++ and a
+    /// class type on MSVC, so no single spelling of `auto` compiles everywhere --
+    /// `auto const` is what MSVC needs and what clang-tidy's
+    /// `readability-qualified-auto` rejects, and `auto const* const` is the reverse
+    /// and does not compile with MSVC at all. Returning the row sidesteps the
+    /// disagreement instead of picking a side of it. (The neighbouring lookup over
+    /// `TestClientOptions()` has no such problem: that is a `std::span`, whose
+    /// iterator is a class type on all three.)
+    /// @param name The token as typed.
+    /// @return The matching row, or nullopt.
+    [[nodiscard]] constexpr std::optional<SubCommand> FindSubCommand(std::string_view name)
+    {
+        for (auto const& command: SubCommands)
+            if (command.name == name)
+                return command;
+        return std::nullopt;
+    }
+
     /// Render one sub-command's invocation form.
     /// @param command The sub-command.
     /// @return The left column of its usage line.
@@ -124,8 +146,8 @@ std::expected<Args, ConfigError> ParseArgs(std::span<char const* const> argv)
     if (query != std::ranges::end(TestClientOptions()))
         return Args { .action = Action::ShowHelp };
 
-    auto const command = std::ranges::find_if(SubCommands, [head](SubCommand const& c) { return c.name == head; });
-    if (command == std::ranges::end(SubCommands))
+    auto const command = FindSubCommand(head);
+    if (!command.has_value())
         return std::unexpected(
             ArgvError(ConfigErrorCode::UnknownKey, std::string { head }, "unknown sub-command (expected store|fetch)"));
 
