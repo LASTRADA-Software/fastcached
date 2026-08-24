@@ -82,6 +82,26 @@ namespace Detail
     /// @param socket The freshly accepted or connected stream socket.
     void ArmNoSigPipe(NativeSocket socket) noexcept;
 
+    /// The `::send` flags a raw sender must pass to complete the suppression
+    /// `ArmNoSigPipe` starts.
+    ///
+    /// The two halves are one rule and neither is sufficient alone: on macOS and
+    /// the BSDs `SO_NOSIGPIPE` arms the descriptor and this is 0, while on Linux
+    /// there is nothing to arm and `MSG_NOSIGNAL` per send is the whole of the
+    /// protection. A caller that arms and then passes `0` is therefore correct on
+    /// one platform and fatally wrong on the other -- which is what `HealthProbe`
+    /// did, so `fastcached --healthcheck` against a peer that hung up mid-request
+    /// died of signal 13 on Linux instead of reporting the peer unhealthy.
+    ///
+    /// A function rather than a constant because the value is a platform macro,
+    /// and this header deliberately keeps the platform socket headers out --
+    /// `NativeSocket` is a `uintptr_t` here for the same reason.
+    ///
+    /// `EpollSocket` passes `MSG_NOSIGNAL` literally instead, which is equivalent:
+    /// it is compiled only where that macro exists.
+    /// @return Flags to OR into every `::send` on a socket this layer owns.
+    [[nodiscard]] int NoSignalSendFlags() noexcept;
+
     /// Put a socket into non-blocking mode.
     ///
     /// One definition because there were four -- two in `BlockingConnector.cpp`

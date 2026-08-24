@@ -108,6 +108,11 @@ namespace Detail
         // WSAGetLastError like any other failure.
     }
 
+    int NoSignalSendFlags() noexcept
+    {
+        return SendFlags;
+    }
+
     void ArmCloseOnExec(NativeSocket /*socket*/) noexcept
     {
         // Windows has no per-descriptor close-on-exec: handle inheritance is
@@ -235,6 +240,11 @@ namespace Detail
     #else
         ::signal(SIGPIPE, SIG_IGN);
     #endif
+    }
+
+    int NoSignalSendFlags() noexcept
+    {
+        return SendFlags;
     }
 
     void ArmCloseOnExec(NativeSocket socket) noexcept
