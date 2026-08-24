@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Net/InMemoryDatagram.hpp>
 
-#include <algorithm>
 #include <utility>
 
 namespace FastCache

@@ -2,7 +2,6 @@
 #pragma once
 
 #include <FastCache/Net/NetError.hpp>
-#include <FastCache/Net/SocketAddress.hpp>
 
 #include <chrono>
 #include <compare>
