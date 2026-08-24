@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "WorkerServer.hpp"
 
-#include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <utility>
 #include <vector>

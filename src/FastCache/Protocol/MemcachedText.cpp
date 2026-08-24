@@ -5,7 +5,7 @@
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
-#include <FastCache/Net/Framing/LineReader.hpp>
+#include <FastCache/Protocol/Framing/LineReader.hpp>
 #include <FastCache/Protocol/MemcachedMeta.hpp>
 #include <FastCache/Protocol/MemcachedShared.hpp>
 #include <FastCache/Protocol/MemcachedText.hpp>

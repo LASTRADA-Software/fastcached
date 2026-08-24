@@ -32,16 +32,17 @@ namespace FastCache::WireFields
 /// protocol that shares it — which is the point, and is why the encoder and the
 /// splitter live side by side rather than in the two files that use them.
 ///
-/// ## Why `Core/` and not `Net/Framing/`
+/// ## Why `Core/` and not `Protocol/Framing/`
 ///
-/// `Net/Framing/` is where the *stream* readers live, and they are compiled into
-/// the library. This is a pure byte-level transform with no socket, no clock and
-/// no state, and it has to be includable from `Protocol/CompileCacheWire.hpp` —
-/// which `fastcache-cc` compiles in **without linking `FastCache`**, so an
-/// include of anything under `Net/` there breaks the launcher's link rather than
-/// merely its build. Sitting in `Core/` beside `Endian.hpp` and `Bytes.hpp`,
-/// header-only and dependency-free, is what keeps that constraint satisfiable
-/// rather than merely stated. Anything added here must keep both properties.
+/// `Protocol/Framing/` is where the *stream* readers live, and they are compiled
+/// into the library. This is a pure byte-level transform with no socket, no clock
+/// and no state, and it has to be includable from `Protocol/CompileCacheWire.hpp`
+/// — which `fastcache-cc` compiles in **without linking `FastCache`**, so an
+/// include of anything that needs a translation unit there breaks the launcher's
+/// link rather than merely its build. Sitting in `Core/` beside `Endian.hpp` and
+/// `Bytes.hpp`, header-only and dependency-free, is what keeps that constraint
+/// satisfiable rather than merely stated. Anything added here must keep both
+/// properties.
 ///
 /// ## What it deliberately does not do
 ///

@@ -6,7 +6,7 @@
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
-#include <FastCache/Net/Framing/LineReader.hpp>
+#include <FastCache/Protocol/Framing/LineReader.hpp>
 #include <FastCache/Protocol/MemcachedBinary.hpp>
 #include <FastCache/Protocol/MemcachedShared.hpp>
 

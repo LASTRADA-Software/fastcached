@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/Profiling.hpp>
-#include <FastCache/Net/Framing/LineReader.hpp>
+#include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <cstddef>
 #include <cstring>

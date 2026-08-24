@@ -17,8 +17,7 @@ src/FastCache/
                 IAdmissionControl, SocketAddress, BlockingSocket (Winsock + POSIX),
                 EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
                 TlsSocket/TlsContext (OpenSSL decorator, optional),
-                InMemoryTransport (paired pipes + InMemoryListener),
-                Framing/LineReader (line and length-prefixed)
+                InMemoryTransport (paired pipes + InMemoryListener)
   Cache/        IStorage atomic primitives, CacheEntry, CacheEngine,
                 InMemoryLruStorage, CowTreeStorage (CoW B+tree, src/CowTree),
                 LayeredStorage (L1 LRU over L2 disk), ShardedStorage
@@ -33,7 +32,8 @@ src/FastCache/
                 key map that suppresses duplicate work). Both pure with respect
                 to I/O, so every capacity and expiry rule is a ManualClock unit
                 test rather than a sleep.
-  Protocol/     IProtocolHandler, ProtocolAutodetect, MemcachedText,
+  Protocol/     IProtocolHandler, ProtocolAutodetect,
+                Framing/ByteReader (line and length-prefixed), MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
                 RedisResp (RESP2/RESP3: strings, keys, pub/sub, streams,
                 MULTI/EXEC), PubSubRegistry, StreamWaiterRegistry,

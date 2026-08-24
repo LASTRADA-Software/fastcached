@@ -24,8 +24,7 @@ src/FastCache/
                 IAsyncAddressResolver + ThreadedAddressResolver,
                 TcpClient (the ONE TCP client), SocketAddress, BlockingSocket,
                 the reactor sockets, TLS, InMemoryTransport, InheritedListener
-                (socket activation), HealthProbe, IAdmissionControl,
-                Framing/ByteReader
+                (socket activation), HealthProbe, IAdmissionControl
   Cli/          UsageDoc (usage text as data) and Options (the one parse loop).
                 Dependency-free by design, so fastcache-cc compiles it in rather
                 than linking the library
@@ -45,10 +44,11 @@ src/FastCache/
                 settings every member must agree on
   Distributed/  WorkerRegistry, LeaseTable and SchedulerService — the fleet's
                 capacity decisions, all pure with respect to I/O
-  Protocol/     IProtocolHandler, ProtocolAutodetect, MemcachedText,
-                MemcachedMeta, MemcachedBinary, RedisResp, CompileCacheHandler
-                (the 0xFC executor) and CompileCacheWire (header-only and
-                dependency-free, shared verbatim by every binary)
+  Protocol/     IProtocolHandler, ProtocolAutodetect, Framing/ByteReader,
+                MemcachedText, MemcachedMeta, MemcachedBinary, RedisResp,
+                CompileCacheHandler (the 0xFC executor) and CompileCacheWire
+                (header-only and dependency-free, shared verbatim by every
+                binary)
   Server/       Connection (per-client coroutine), Server, ReactorServerLoop
   Platform/     IDaemonHost, ISignalSource, DaemonControls, CpuAffinity,
                 HostMemory, HostInfo, ServiceControl (ServiceSpec), Terminal,

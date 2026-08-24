@@ -4,9 +4,9 @@
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <cstddef>
 #include <cstdint>
