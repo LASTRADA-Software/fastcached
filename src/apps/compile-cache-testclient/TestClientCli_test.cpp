@@ -37,7 +37,10 @@ TEST_CASE("a sub-command and a port is the minimum accepted line", "[testclient]
     CHECK(parsed->port == 1234);
     CHECK(parsed->host == "127.0.0.1");
     CHECK(parsed->prefetchGroup == "default");
-    CHECK(parsed->compiler == "cl");
+    // Per-platform, because a default naming a compiler the host does not have
+    // is a default nobody can use. Asserted against the same constant the option
+    // table renders, so the two cannot drift.
+    CHECK(parsed->compiler == DefaultCompiler);
 }
 
 TEST_CASE("fetch selects its own action", "[testclient][cli]")

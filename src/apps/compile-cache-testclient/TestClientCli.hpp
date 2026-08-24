@@ -8,9 +8,23 @@
 #include <expected>
 #include <span>
 #include <string>
+#include <string_view>
 
 namespace FastCache::TestClient
 {
+
+/// The compiler `--compiler` defaults to.
+///
+/// Per-platform because the tool now drives either family and a default naming a
+/// compiler the host does not have is a default nobody can use: `cl` is not on a
+/// Linux box, and `cc` is not on a stock Windows one. Which spellings each family
+/// takes is `main.cpp`'s driver table; this is only the starting point.
+constexpr std::string_view DefaultCompiler =
+#if defined(_WIN32)
+    "cl";
+#else
+    "cc";
+#endif
 
 /// What the test client was asked to do.
 enum class Action : std::uint8_t
@@ -23,16 +37,16 @@ enum class Action : std::uint8_t
 /// A parsed command line.
 struct Args
 {
-    Action action { Action::Store };         ///< The sub-command.
-    std::string host { "127.0.0.1" };        ///< Daemon host.
-    std::uint16_t port { 0 };                ///< Daemon port; required.
-    std::string key {};                      ///< Cache key.
-    std::string prefetchGroup { "default" }; ///< Prefetch group id.
-    std::string srcRoot {};                  ///< Checkout source root.
-    std::string buildTree {};                ///< Build output root.
-    std::string compiler { "cl" };           ///< Compiler to drive (cl or clang-cl).
-    std::string source {};                   ///< Source file to compile.
-    std::string object {};                   ///< Object path: output for store, expected-write for fetch.
+    Action action { Action::Store };          ///< The sub-command.
+    std::string host { "127.0.0.1" };         ///< Daemon host.
+    std::uint16_t port { 0 };                 ///< Daemon port; required.
+    std::string key {};                       ///< Cache key.
+    std::string prefetchGroup { "default" };  ///< Prefetch group id.
+    std::string srcRoot {};                   ///< Checkout source root.
+    std::string buildTree {};                 ///< Build output root.
+    std::string compiler { DefaultCompiler }; ///< Compiler to drive; see DefaultCompiler.
+    std::string source {};                    ///< Source file to compile.
+    std::string object {};                    ///< Object path: output for store, expected-write for fetch.
 };
 
 /// The accepted options, in the order `--help` documents them.

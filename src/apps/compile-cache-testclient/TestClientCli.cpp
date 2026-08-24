@@ -70,9 +70,10 @@ namespace
           .description = "build output root" },
         { .primary = "--compiler",
           .arity = Arity::Value,
-          .operand = " <cl|clang-cl>",
+          .operand = " <compiler>",
           .apply = AssignFrom<&Args::compiler, ParseText>(),
-          .description = "compiler to drive (default cl)" },
+          .description = "compiler to drive; MSVC and GNU driver spellings are\n"
+                         "both understood (default cl on Windows, cc elsewhere)" },
         { .primary = "--source",
           .arity = Arity::Value,
           .operand = " <file>",

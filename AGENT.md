@@ -17,7 +17,10 @@ src/FastCache/
                 platform reactors (EpollReactor / IocpReactor / KqueueReactor)
   Net/          ISocket, IListener, IConnector (the outbound counterpart to
                 IListener; BlockingConnector dials non-blocking so its timeout
-                means something), IoAwaitable, IAdmissionControl, SocketAddress,
+                means something), TcpClient (the ONE TCP client: ConnectTcp plus
+                the coroutine SendAll/RecvExactly loops, which three separate
+                copies of this code each used to carry),
+                IoAwaitable, IAdmissionControl, SocketAddress,
                 BlockingSocket (Winsock + POSIX),
                 EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
                 InMemoryTransport (paired pipes + InMemoryListener),
@@ -164,7 +167,17 @@ src/apps/
                             shape it follows.
   compile-cache-testclient/ low-level `0xFC` protocol probe + cross-depth
                             validation (FASTCACHED_BUILD_TESTCLIENT, default
-                            OFF — test infrastructure, never installed)
+                            OFF — test infrastructure, never installed, but
+                            built by the `linux` and `clang-tidy` CI jobs for the
+                            reason `fastcache-bench` is: a target nothing
+                            compiles is a target that rots, and this one had
+                            rotted all the way to not building on POSIX). Drives
+                            either driver family off a two-row table, and gets
+                            its socket, its process spawning and its
+                            dependency-path check from the same code the daemon
+                            and launcher use — a tool that exists to prove
+                            the canonicalization contract proves nothing if it
+                            reimplements either side of it
   fastcache-bench/          in-process storage micro-benchmarks
                             (FASTCACHED_BUILD_BENCHMARKS, default OFF — test
                             infrastructure, never installed). Catch2 benchmarks
@@ -783,6 +796,84 @@ These constraints are load-bearing and have each already been a bug:
     identical either way so the outcome alone cannot tell the two apart. The client must
     still consume the AUTH reply even when it intends to ignore it; skipping it strands a
     frame and the next command reads the previous one's answer.
+- **Three implementations of one TCP client, and the rot was in the one nobody
+  built.** `Net/BlockingConnector` dialled non-blocking through `getaddrinfo` and
+  was coroutine-aware; `fastcache-cc` carried a synchronous `Cc::ITcpClient` with
+  its own `SetIoTimeouts` copied from `Net/BlockingSocket` and a comment saying it
+  could not be shared; and `compile-cache-testclient` carried a hand-written class
+  that was `inet_pton(AF_INET)`-only (so a hostname could never work), unbounded,
+  unprotected against SIGPIPE while STOREing whole object files, and **did not
+  compile on POSIX at all** (issue #84). The third was invisible because
+  `FASTCACHED_BUILD_TESTCLIENT` defaults OFF and no job turned it on, so nothing
+  ever discovered that two of its methods named functions that did not exist
+  there. `Net/TcpClient` is now the only one. Consequences that are each
+  load-bearing:
+  - **`Net` must not depend on `Core`, so `ConnectTcp` takes host and port
+    separately.** `Net` is meant to be liftable out of this codebase, so it does
+    not reach into `Core/HostPort` for a grammar its caller can apply first —
+    which also keeps the one parser one parser, since `rfind(':')` picks the wrong
+    colon in `[::1]:7000`. The join lives one layer up in `Cc::DialEndpoint`,
+    because six call sites across the launcher and the node were otherwise about
+    to write it out separately. It refuses a **bare port**, which
+    `ParseEndpoint` would accept by supplying a default host: that is right for a
+    bind address an operator types and wrong for a dial, where text with no host
+    is a misconfiguration and quietly trying loopback turns a typo into a
+    connection to whatever happens to be listening locally.
+  - **The partial-transfer loops are coroutines because `ISocket::Read`/`Write`
+    are awaitables, and synchronous callers drive them with `SyncRun`.** That is
+    sound over a blocking socket and nowhere else: such a socket resolves every
+    awaitable inline, so the task is never left suspended, which is the one thing
+    `SyncRun` refuses to read from. `RaftPeerTransport` already relied on exactly
+    this. Over a *reactor* socket the awaitable really does suspend and `SyncRun`
+    throws — the defect `cluster-e2e` found the first time consensus was run.
+  - **`IConnector::Connect` grew an `ioTimeout`, with no default argument.** A
+    dial that succeeds says the peer accepted and nothing about whether it will
+    ever answer, and a peer that accepts and then goes quiet parks the calling
+    thread forever — which for the launcher turns an optional cache into a
+    build-stopping dependency. Bounding it has to happen before the first read, so
+    it belongs where the socket is minted rather than in a step every caller has to
+    remember. No default, because a default argument on a virtual binds statically
+    and would silently differ between a call through the base and one through the
+    derived type.
+  - **The launcher still does not LINK `FastCache`, and that rule survived
+    intact.** The four `Net` rows added to `_fc_cc_core` reach only
+    `Async/Task.hpp`, `Core/Errors/NetError.hpp` and `Core/Profiling.hpp`, all
+    header-only and all std-only, so the launcher stays free of yaml-cpp, OpenSSL
+    and the reactor and can still link the CRT statically.
+  - **`std::array`'s iterator is a raw pointer on libstdc++ and libc++ and a class
+    on MSVC**, so `readability-qualified-auto` asks for `auto const* const` while
+    MSVC cannot deduce it — no spelling of `auto` satisfies both. The lookup
+    returns the row by value instead of picking a side. Found by building Windows
+    immediately after Linux rather than in CI a phase later, the same ordering that
+    the `ParsePort` entry above exists to argue for.
+
+- **A daemon that ignores SIGPIPE process-wide hands that decision to every
+  program it launches.** `Detail::EnsureNetworkInitialised` did
+  `::signal(SIGPIPE, SIG_IGN)` the first time anything touched the network, which
+  keeps a broken-pipe write from killing a server and is wrong for any process that
+  also spawns a child: an ignored disposition is **inherited across exec**.
+  `fastcache-compile-node` links this library, listens on a socket and then runs a
+  compiler per job, so it was handing every one of those compilers a disposition
+  they never asked for — which is precisely what `fastcache-cc` is documented
+  as having to avoid, for the same reason, reached by a different route. Nothing
+  in the parent misbehaves, which is why it went unnoticed. Suppression is
+  per socket now (`Detail::ArmNoSigPipe`: `SO_NOSIGPIPE` on macOS and the BSDs,
+  `MSG_NOSIGNAL` per send elsewhere, process-wide only where neither exists),
+  applied at each implementation's single construction funnel. Two things worth
+  keeping:
+  - **Removing a process-wide safety net exposes every raw sender that was
+    leaning on it, and they had to be found by grep rather than by test.**
+    `EpollSocket` already passed `MSG_NOSIGNAL` on all three of its sends;
+    `KqueueSocket` passed `0` on all three and so needed its descriptor armed;
+    `HealthProbe` owns a bare socket and needed the same. `Stats.cpp` writes a
+    regular file and the reactors' self-pipes are internal, reachable only through
+    a lifetime bug a stray write would already be.
+  - **Both regression cases were verified by reintroducing the defect.** Removing
+    the send flag terminates the test binary with **signal 13**, exactly as issue
+    #68 records for the launcher; restoring the process-wide ignore fails the
+    disposition assertion instead. A regression test for a fatal signal that
+    cannot be seen to fail is worth nothing.
+
 - **A compile-cache frame declares its own length, so a rejection can be a reply
   instead of a close.** The pre-1 header was `[magic][op]` with no length, and
   that is what made every refusal — bad magic, unknown opcode, oversize field —
