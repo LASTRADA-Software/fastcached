@@ -11,7 +11,6 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/BlockingConnector.hpp>
 
 #include <expected>
 #include <memory>
@@ -20,6 +19,8 @@
 
 namespace FastCache::Node
 {
+
+class NodeIoLoop;
 
 /// The node's cache surface: storage, upstream, read-through logic, protocol and
 /// listener, owned as one thing.
@@ -52,6 +53,7 @@ class CacheTier
     /// @param logger Where to announce the bound address.
     /// @return The running tier, or why it could not be served.
     [[nodiscard]] static std::expected<std::unique_ptr<CacheTier>, std::string> Start(
+        NodeIoLoop& io,
         NodeConfig const& cfg,
         Distributed::IMembershipOracle const& membership,
         IClock& clock,
@@ -72,8 +74,7 @@ class CacheTier
     }
 
   private:
-    CacheTier(std::unique_ptr<BlockingConnector> upstreamConnector,
-              std::unique_ptr<IStorage> storage,
+    CacheTier(std::unique_ptr<IStorage> storage,
               std::unique_ptr<ICacheUpstream> upstream,
               Distributed::IMembershipOracle const& membership,
               IClock& clock,
@@ -82,19 +83,6 @@ class CacheTier
     // Declaration order IS construction order, and every one of these is referenced
     // by the one below it. Reordering them is a dangling reference, which is why
     // they live here rather than as locals somebody has to keep in the right order.
-    /// How `RemoteUpstream` dials the shared cache.
-    ///
-    /// Owned here and declared before `_upstream`, which holds a reference to it.
-    /// A `unique_ptr` rather than a value because the upstream is built BEFORE the
-    /// tier -- it is a constructor argument -- so the connector has to exist at a
-    /// stable address first and be moved in without moving what the reference
-    /// names.
-    ///
-    /// Blocking, because `FrameServer` still serves its connections one at a time
-    /// on a thread of its own -- so this blocks that thread and nothing else. It
-    /// becomes a `PlatformConnector` when that loop moves onto a reactor.
-    std::unique_ptr<BlockingConnector> _upstreamConnector;
-
     std::unique_ptr<IStorage> _storage;
     std::unique_ptr<ICacheUpstream> _upstream;
     LocalCache _cache;
@@ -127,6 +115,7 @@ class CacheTier
 /// @param logger Where the bound address, or the tolerated failure, is announced.
 /// @return The tier, a null tier meaning "carry on without one", or the fatal reason.
 [[nodiscard]] std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
+    NodeIoLoop& io,
     NodeConfig const& cfg,
     Distributed::IMembershipOracle const& membership,
     IClock& clock,

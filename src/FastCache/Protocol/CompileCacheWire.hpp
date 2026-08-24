@@ -242,6 +242,21 @@ enum class ErrorCode : std::uint8_t
     /// can act on.
     InvalidClusterChange = 0x16,
 
+    /// This endpoint is already serving as much as it will serve at once.
+    ///
+    /// Emphatically NOT `NoCapacity`, which is a statement about the FLEET -- every
+    /// matching worker being full of this build's own work. This one is about a
+    /// single node's own front door: it has reached its concurrent-request cap or
+    /// its in-flight byte budget, and the same client asking again in a moment will
+    /// very likely be served. Reporting one under the other's code would send an
+    /// operator shopping for machines when the answer is to raise a local bound, or
+    /// the reverse -- the same argument `Withdrawn` makes for splitting off its own
+    /// case.
+    ///
+    /// A refusal a client answers by compiling locally, like every other code in
+    /// this range.
+    EndpointBusy = 0x17,
+
     /// This node runs no cluster, so there is nothing to administer.
     ///
     /// Distinct from `NotLeader`, and the difference is what an operator does
@@ -459,6 +474,9 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::InvalidClusterChange,
                       .name = "invalid-cluster-change",
                       .defaultMessage = "the cluster cannot accept that change" },
+    ErrorDescriptor { .code = ErrorCode::EndpointBusy,
+                      .name = "endpoint-busy",
+                      .defaultMessage = "this endpoint is serving all it will serve at once" },
 };
 
 /// Verbs that legitimately carry no fields at all.

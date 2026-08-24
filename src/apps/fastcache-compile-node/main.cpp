@@ -15,6 +15,7 @@
 #include "ConsensusTier.hpp"
 #include "DiscoveryTier.hpp"
 #include "NodeConfig.hpp"
+#include "NodeIoLoop.hpp"
 #include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
 #include "WorkerServer.hpp"
@@ -502,6 +503,17 @@ constexpr int ExitOk = 0;
     // The three objects have to outlive the endpoint, which holds references into
     // them, so they are declared here rather than inside the `if` -- and in
     // construction order, since each takes the one before it.
+    // The reactor both framed surfaces share, and the connector over it.
+    //
+    // Declared BEFORE the tiers and therefore destroyed AFTER them, which is exactly
+    // right and is why it is a local here rather than something each tier owns: a
+    // tier's destructor closes its listener and its open connections by posting onto
+    // this reactor, so the reactor has to still be running when that happens.
+    //
+    // It is NOT started yet. Every endpoint binds and adopts first, so that when the
+    // thread does begin there is a listener behind every port a client might dial.
+    Node::NodeIoLoop nodeIo;
+
     // The two framed surfaces this node may serve besides its worker port, each
     // owned as one object. Both are off unless asked for: handing out other machines'
     // CPU time, and caching to this machine's disk, are decisions an operator makes
@@ -512,7 +524,7 @@ constexpr int ExitOk = 0;
     std::unique_ptr<Node::SchedulerTier> schedulerTier;
     if (!cfg.schedulerListen.empty())
     {
-        auto started = Node::SchedulerTier::Start(cfg, membership.Oracle(), schedulerClock, metrics, logger);
+        auto started = Node::SchedulerTier::Start(nodeIo, cfg, membership.Oracle(), schedulerClock, metrics, logger);
         if (!started.has_value())
         {
             // Fatal for the same reason the admin endpoint's is: an operator who asked
@@ -564,7 +576,7 @@ constexpr int ExitOk = 0;
     // `--raft-peer` list an operator typed, which is the ordinary deployment.
     auto const discoveryTier = std::move(*discoveryOrRefusal);
 
-    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(cfg, membership.Oracle(), cacheClock, metrics, logger);
+    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(nodeIo, cfg, membership.Oracle(), cacheClock, metrics, logger);
     if (!cacheTierOrRefusal.has_value())
     {
         logger.Logf(LogLevel::Error, "--listen-cache {}; refusing to start", cacheTierOrRefusal.error());
@@ -574,6 +586,14 @@ constexpr int ExitOk = 0;
     // `--listen-cache`, and a DEFAULT address that was already taken, as reasons to
     // carry on without a tier rather than as failures. Both have been logged.
     auto const cacheTier = std::move(*cacheTierOrRefusal);
+
+    // Both surfaces have bound and adopted, so the loop can start accepting. Doing
+    // it here rather than at construction is the ordering `ConsensusTier::Launch`
+    // already uses, and for the same reason: a client that dials the instant a port
+    // is bound must not find a listener nobody is accepting on.
+    //
+    // A node with neither surface enabled adopts nothing and starts no thread.
+    nodeIo.Start();
 
     Cc::Credential const credential { .username = {}, .secret = cfg.token };
 

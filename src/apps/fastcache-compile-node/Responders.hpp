@@ -50,6 +50,25 @@ class SchedulerResponder final: public IFrameResponder
         return 64ULL * 1024ULL;
     }
 
+    /// Hundreds, because a scheduler verb is kilobytes.
+    ///
+    /// The spread against the cache surface below is the whole reason this is a
+    /// per-responder column: at 64 KiB a request, 256 at once is 16 MiB, which is
+    /// nothing. Sizing this like the cache's would refuse a busy fleet for no
+    /// reason; sizing the cache's like this would let 256 object files be in flight
+    /// at once.
+    [[nodiscard]] std::size_t MaxConcurrentRequests() const noexcept override
+    {
+        return 256;
+    }
+
+    /// 16 MiB: the connection cap times the request cap, so the byte budget never
+    /// refuses anything the connection cap would have allowed.
+    [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
+    {
+        return 256ULL * 64ULL * 1024ULL;
+    }
+
   private:
     Distributed::SchedulerProtocol& _protocol;
     Distributed::IMembershipOracle const& _membership;
@@ -99,6 +118,30 @@ class CacheResponder final: public IFrameResponder
     /// shared cache would accept would silently stop caching this machine's largest
     /// translation units, which are exactly the ones worth caching.
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
+    {
+        return 256ULL * 1024ULL * 1024ULL;
+    }
+
+    /// Eight, because a cache STORE carries a whole object file.
+    ///
+    /// This surface is the one the concurrency change is FOR -- a slow upstream used
+    /// to stall every local `fastcache-cc` behind it -- so it must serve several at
+    /// once. But it is also the one where "several at once" is expensive, and the
+    /// serialized loop was bounding peak memory to a single request by accident.
+    /// Eight parallel translation units is a wide build; the byte budget below is
+    /// what actually stops it becoming eight times the per-request maximum.
+    [[nodiscard]] std::size_t MaxConcurrentRequests() const noexcept override
+    {
+        return 8;
+    }
+
+    /// 256 MiB across all of them, which is deliberately ONE request's worth.
+    ///
+    /// So the common case -- eight ordinary objects of a few megabytes -- runs fully
+    /// in parallel, while a single 256 MiB monster still cannot be joined by seven
+    /// more. That keeps this endpoint's peak footprint where the serialized loop
+    /// used to hold it, without reintroducing the serialization.
+    [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
     {
         return 256ULL * 1024ULL * 1024ULL;
     }

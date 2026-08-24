@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheTier.hpp"
+#include "NodeIoLoop.hpp"
 #include "RemoteUpstream.hpp"
 
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
@@ -28,13 +29,11 @@ namespace
     constexpr std::chrono::milliseconds UpstreamConnectTimeout { 1'000 };
 } // namespace
 
-CacheTier::CacheTier(std::unique_ptr<BlockingConnector> upstreamConnector,
-                     std::unique_ptr<IStorage> storage,
+CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
                      std::unique_ptr<ICacheUpstream> upstream,
                      Distributed::IMembershipOracle const& membership,
                      IClock& clock,
                      IMetricsSink& metrics):
-    _upstreamConnector { std::move(upstreamConnector) },
     _storage { std::move(storage) },
     _upstream { std::move(upstream) },
     _cache { *_storage, *_upstream, clock, metrics },
@@ -43,7 +42,8 @@ CacheTier::CacheTier(std::unique_ptr<BlockingConnector> upstreamConnector,
 {
 }
 
-std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConfig const& cfg,
+std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLoop& io,
+                                                                        NodeConfig const& cfg,
                                                                         Distributed::IMembershipOracle const& membership,
                                                                         IClock& clock,
                                                                         IMetricsSink& metrics,
@@ -52,30 +52,26 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConf
     // An absent upstream is a named type rather than a null pointer: one developer's
     // machine has no shared cache, and that configuration should not cost every call
     // site a branch.
-    // Created before the upstream that references it, and at a stable address, so
-    // moving it into the tier below does not move what that reference names.
-    auto upstreamConnector = std::make_unique<BlockingConnector>(
-        DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = UpstreamIoTimeout });
-
     std::unique_ptr<ICacheUpstream> upstream;
     if (cfg.upstream.empty())
         upstream = std::make_unique<NoUpstream>();
     else
-        // A BLOCKING connector and no reactor, for now. `FrameServer` still
-        // serves its connections one at a time on a thread of its own, so this
-        // dial blocks that thread and nothing else -- which is the serialization
-        // defect this tier still has, not one this change introduces. Moving it
-        // onto a reactor is what `NodeIoLoop` is for, and at that point this
-        // becomes a `PlatformConnector` and the reactor stops being null.
+        // The loop's own connector, so this dial SUSPENDS rather than blocking. It
+        // is the point of the whole exercise: this call happens inside a cache
+        // answer, and answering used to be serialized -- so one upstream that took
+        // five seconds held every local `fastcache-cc` behind it.
+        //
+        // The reactor is passed too, because with a reactor socket `SO_RCVTIMEO`
+        // is inert: the per-operation ceiling is a `DeadlineTimer` that closes the
+        // socket, which bounds the whole exchange rather than one call.
         upstream = std::make_unique<RemoteUpstream>(cfg.upstream,
                                                     Cc::Credential { .username = {}, .secret = cfg.token },
-                                                    *upstreamConnector,
-                                                    /*reactor*/ nullptr,
+                                                    io.Connector(),
+                                                    &io.Reactor(),
                                                     UpstreamConnectTimeout,
                                                     UpstreamIoTimeout);
 
     auto tier = std::unique_ptr<CacheTier> { new CacheTier {
-        std::move(upstreamConnector),
         std::make_unique<InMemoryLruStorage>(static_cast<std::size_t>(cfg.cacheMemoryBytes)),
         std::move(upstream),
         membership,
@@ -86,7 +82,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConf
     // surface `fastcache-cc` on this machine talks to, and a node's private cache
     // reachable from the network is a decision rather than something an operator gets
     // by typing a port.
-    auto started = FrameEndpoint::Start(cfg.cacheListen, "127.0.0.1", tier->_responder, "cache", logger);
+    auto started = FrameEndpoint::Start(io, cfg.cacheListen, "127.0.0.1", tier->_responder, "cache", logger);
     if (!started.has_value())
         return std::unexpected { started.error() };
 
@@ -100,6 +96,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConf
 }
 
 std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
+    NodeIoLoop& io,
     NodeConfig const& cfg,
     Distributed::IMembershipOracle const& membership,
     IClock& clock,
@@ -111,7 +108,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
     if (cfg.cacheListen.empty())
         return std::unique_ptr<CacheTier> {};
 
-    auto started = CacheTier::Start(cfg, membership, clock, metrics, logger);
+    auto started = CacheTier::Start(io, cfg, membership, clock, metrics, logger);
     if (started.has_value())
         return std::move(*started);
 

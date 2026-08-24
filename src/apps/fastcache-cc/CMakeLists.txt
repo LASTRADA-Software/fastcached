@@ -21,7 +21,9 @@
 # The remaining CRC32C users are all daemon-side page and record checksums.
 
 set(_fc_cc_core
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Async/DeadlineTimer.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Async/EpollReactor.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Async/InterruptibleSleep.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Async/IocpReactor.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Async/KqueueReactor.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Cli/UsageDoc.cpp"
@@ -32,10 +34,14 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingSocket.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingConnector.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/ConnectFlow.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/EpollConnector.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/EpollSocket.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/IocpConnector.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/IocpSocket.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/KqueueConnector.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/KqueueSocket.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/TcpClient.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/ThreadedAddressResolver.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
 
@@ -108,6 +114,7 @@ set(_fc_cc_sources
     LauncherCli.cpp
     CacheKey.cpp
     CacheProtocol.cpp
+    ReactorExchange.cpp
     Dispatch.cpp
     EndpointDial.cpp
     DependencyOutput.cpp
@@ -144,6 +151,20 @@ endif()
 if(WIN32)
     target_link_libraries(fastcache-cc PRIVATE ws2_32)
 endif()
+
+# `Net/ThreadedAddressResolver.cpp` runs `getaddrinfo` on a pool of its own, because
+# it takes no timeout and a wedged resolver would otherwise stall every translation
+# unit in the build. That is the one thing this launcher genuinely needs a thread
+# for, and it needs the platform's thread support linked to get it.
+#
+# NOT a departure from the rule this file exists to protect. That rule is about not
+# linking FastCache and therefore not dragging in yaml-cpp, OpenSSL or the reactor's
+# transitive world; the C++ standard library's own threading support is not that
+# kind of dependency, and a static launcher still links no third-party code. It is
+# named explicitly rather than left to glibc folding pthread into libc since 2.34 --
+# that happens to work on the distributions CI uses and is not something to rely on.
+find_package(Threads REQUIRED)
+target_link_libraries(fastcache-cc PRIVATE Threads::Threads)
 # The reactor and its platform sockets are compiled in so the launcher can dial
 # without blocking -- see Net/IConnector.hpp. They cost no new library: the
 # reactor headers reach only Async/IReactor.hpp and Core/Clock.hpp, both
@@ -208,6 +229,10 @@ if(FASTCACHED_BUILD_TESTS)
         LauncherCli_test.cpp
         CacheKey_test.cpp
         CacheProtocol_test.cpp
+        ReactorExchange_test.cpp
+        # Test infrastructure, and on THIS target only: the shipped launcher must
+        # not carry a test double, and `_fc_cc_core` is what it is built from.
+        "${CMAKE_SOURCE_DIR}/src/FastCache/Async/TestReactor.cpp"
         Dispatch_test.cpp
         EndpointDial_test.cpp
         DependencyOutput_test.cpp
@@ -229,7 +254,7 @@ if(FASTCACHED_BUILD_TESTS)
         # ${_fc_cc_core} rows and links FastCache no more than the launcher does.
         target_compile_definitions(fastcache-cc-tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
     endif()
-    target_link_libraries(fastcache-cc-tests PRIVATE Catch2::Catch2)
+    target_link_libraries(fastcache-cc-tests PRIVATE Catch2::Catch2 Threads::Threads)
     if(FASTCACHED_ENABLE_COMPRESSION AND _fc_cc_zstd AND _fc_cc_lz4)
         target_link_libraries(fastcache-cc-tests PRIVATE ${_fc_cc_zstd} ${_fc_cc_lz4})
         target_compile_definitions(fastcache-cc-tests PRIVATE FC_COMPRESSION_ENABLED=1)

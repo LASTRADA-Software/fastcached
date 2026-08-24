@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeIoLoop.hpp"
 #include "SchedulerTier.hpp"
 
 #include <format>
@@ -31,6 +32,7 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership, I
 }
 
 std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
+    NodeIoLoop& io,
     NodeConfig const& cfg,
     Distributed::IMembershipOracle const& membership,
     IClock& clock,
@@ -42,7 +44,7 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     // A bare port binds the WILDCARD here, the opposite of the cache surface's
     // loopback: a scheduler no peer can dial is a scheduler that does nothing, so
     // loopback would be a default that silently cannot work.
-    auto started = FrameEndpoint::Start(cfg.schedulerListen, "0.0.0.0", tier->_responder, "scheduler", logger);
+    auto started = FrameEndpoint::Start(io, cfg.schedulerListen, "0.0.0.0", tier->_responder, "scheduler", logger);
     if (!started.has_value())
         return std::unexpected { started.error() };
 
