@@ -42,11 +42,7 @@ src/FastCache/
                 IoAwaitable, IAdmissionControl, SocketAddress,
                 BlockingSocket (Winsock + POSIX),
                 EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
-                InMemoryTransport (paired pipes + InMemoryListener),
-                InheritedListener (systemd socket activation: LISTEN_FDS/
-                LISTEN_PID parsing is pure and unit-tested; adoption applies
-                close-on-exec and the shutdown timeouts, which are parameters
-                rather than the caller's job)
+                InMemoryTransport (paired pipes + InMemoryListener)
   Cli/          UsageDoc (usage text as data: sections of aligned rows and
                 prose, rendered with an ANSI palette) and Options (OptionSpec
                 row type, the matching rules, the one parse loop). Dependency-
@@ -126,6 +122,10 @@ src/FastCache/
                 arguments, under which name and account -- the seam that lets one
                 implementation of "install this as a service" serve more than one
                 binary), Terminal,
+                InheritedListener (systemd socket activation: LISTEN_FDS/
+                LISTEN_PID parsing is pure and unit-tested; adoption applies
+                close-on-exec and the shutdown timeouts, which are parameters
+                rather than the caller's job),
                 Environment (the one place the process environment is read),
                 FileTrust (could only an administrator have put a file here?)
   Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader,

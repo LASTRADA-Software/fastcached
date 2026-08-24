@@ -23,8 +23,8 @@ src/FastCache/
                 for a reactor thread, sharing ConnectFlow and ReactorDial),
                 IAsyncAddressResolver + ThreadedAddressResolver,
                 TcpClient (the ONE TCP client), SocketAddress, BlockingSocket,
-                the reactor sockets, TLS, InMemoryTransport, InheritedListener
-                (socket activation), HealthProbe, IAdmissionControl
+                the reactor sockets, TLS, InMemoryTransport, HealthProbe,
+                IAdmissionControl
   Cli/          UsageDoc (usage text as data) and Options (the one parse loop).
                 Dependency-free by design, so fastcache-cc compiles it in rather
                 than linking the library
@@ -52,6 +52,7 @@ src/FastCache/
   Server/       Connection (per-client coroutine), Server, ReactorServerLoop
   Platform/     IDaemonHost, ISignalSource, DaemonControls, CpuAffinity,
                 HostMemory, HostInfo, ServiceControl (ServiceSpec), Terminal,
+                InheritedListener (systemd socket activation),
                 Environment (the one place the environment is read), FileTrust
   Config/       Config, CliParser + CliOptions (the one flag table), ByteSize,
                 YamlReader, ConfigReloader, EnvExpand, DefaultConfigPath

@@ -57,7 +57,6 @@ target_sources(FastCache
         Net/BlockingConnector.cpp
         Net/BlockingSocket.cpp
         Net/ConnectFlow.cpp
-        Net/InheritedListener.cpp
         Net/HealthProbe.cpp
         Net/EpollConnector.cpp
         Net/EpollSocket.cpp
@@ -75,6 +74,7 @@ target_sources(FastCache
         Platform/HostInfo.cpp
         Platform/HostLoad.cpp
         Platform/HostMemory.cpp
+        Platform/InheritedListener.cpp
         Platform/PosixDaemonHost.cpp
         Platform/ServiceControl.cpp
         Platform/Terminal.cpp

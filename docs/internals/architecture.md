@@ -45,7 +45,8 @@ src/FastCache/
                 ReactorServerLoop (the server driver), AdminHttpServer
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
                 ISignalSource, DaemonControls (process-wide stop/reload flags),
-                CpuAffinity, HostMemory, ServiceControl, Terminal
+                CpuAffinity, HostMemory, ServiceControl, Terminal,
+                InheritedListener (systemd socket activation)
   Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader
   Metrics/      IMetricsSink + AtomicMetricsSink, PrometheusFormatter
 ```
