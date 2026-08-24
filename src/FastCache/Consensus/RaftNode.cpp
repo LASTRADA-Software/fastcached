@@ -889,6 +889,24 @@ void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoin
         return;
     }
 
+    // The same membership test `OnAppendEntries` applies, and for a stronger
+    // reason than it has. Everything below publishes `_knownLeader`, discards this
+    // node's log, adopts a member set from the message and overwrites the
+    // application's whole state -- so a node that skipped this let anything able to
+    // reach the port replace the cluster's configuration on it, with a term above
+    // this one being the only thing to supply. The check was on the AppendEntries
+    // path and not this one, which is the asymmetry rather than the rule: a guard
+    // that a second entry point does not apply is not a guard.
+    //
+    // `HasCluster()` for the same reason as there: a node waiting to be admitted
+    // has no member set to test against, and refusing would make it unjoinable by
+    // exactly the message that catches it up.
+    if (HasCluster() && !IsMember(request.leaderId))
+    {
+        reply(AppendResult::Rejected, LogIndex::BeforeFirst());
+        return;
+    }
+
     // A snapshot is a leader speaking, so it counts as hearing from one: without
     // arming the timer here a follower being caught up would stand for election
     // in the middle of it.
