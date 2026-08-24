@@ -45,21 +45,39 @@ TEST_CASE("A configuration must name this node among its members", "[consensus][
     CHECK(result.error().context.contains("n9"));
 }
 
-TEST_CASE("An empty identity or member set is refused", "[consensus][raft][config]")
+TEST_CASE("An empty identity is refused", "[consensus][raft][config]")
 {
-    SECTION("no identity")
-    {
-        auto config = Sound();
-        config.self.clear();
-        CHECK_FALSE(config.Validate().has_value());
-    }
+    auto config = Sound();
+    config.self.clear();
+    CHECK_FALSE(config.Validate().has_value());
+}
 
-    SECTION("no members")
-    {
-        auto config = Sound();
-        config.members.clear();
-        CHECK_FALSE(config.Validate().has_value());
-    }
+TEST_CASE("An empty member set is a node with no cluster, not a broken one", "[consensus][raft][config]")
+{
+    // The shape a machine has while it waits to be admitted to a running fleet.
+    // Refusing it -- which this used to do -- is what made "add a node" mean
+    // "restart every node with a longer --raft-peer list", because the only
+    // startable alternative bootstraps a one-member cluster of its own, and a node
+    // that has elected itself can never be admitted to somebody else's.
+    auto config = Sound();
+    config.members.clear();
+    CHECK(config.Validate().has_value());
+}
+
+TEST_CASE("A node with no cluster is still held to its timings", "[consensus][raft][config]")
+{
+    // The member-set rules do not apply to a set that does not exist; everything
+    // else still does. A joiner arms an election timer from the moment it starts
+    // -- it declines to act on it, but the moment it is admitted it will -- so an
+    // inverted range accepted here would be one nobody discovers until then.
+    auto config = Sound();
+    config.members.clear();
+    config.electionTimeoutMin = 300ms;
+    config.electionTimeoutMax = 150ms;
+
+    auto const result = config.Validate();
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == ConsensusErrorCode::InvalidConfiguration);
 }
 
 TEST_CASE("A duplicated member is refused", "[consensus][raft][config]")

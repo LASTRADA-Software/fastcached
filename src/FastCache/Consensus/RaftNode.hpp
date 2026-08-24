@@ -91,8 +91,12 @@ class RaftNode
     /// the precondition is one an omission can skip, and the resulting failures
     /// are silent rather than loud — a `self` outside `members` makes `Peers()`
     /// return every member while `Quorum()` still assumes this node is one of
-    /// them, so the node counts a self-vote it is not entitled to; an empty
-    /// `members` gives a quorum of one and the node elects itself instantly.
+    /// them, so the node counts a self-vote it is not entitled to.
+    ///
+    /// An empty `members` is the one shape that is legal rather than refused: it
+    /// says this node has no cluster and is waiting to be admitted to one. It
+    /// would elect itself instantly on a quorum of one if it stood at all, which
+    /// is exactly why it does not — see `HasCluster`.
     ///
     /// Everything the node needs is supplied here and fixed afterwards, so there
     /// is no window in which a node exists but does not yet know who it is.
@@ -237,6 +241,37 @@ class RaftNode
     [[nodiscard]] std::vector<NodeId> const& ActiveMembers() const noexcept
     {
         return _members;
+    }
+
+    /// Whether this node belongs to a cluster at all.
+    ///
+    /// False for a node started with an empty `RaftConfig::members` and never yet
+    /// admitted to one — a machine brought up to be added to a running fleet. It
+    /// is a *waiting* state rather than a broken one, and three rules follow from
+    /// it, each of which is the difference between joining and never joining:
+    ///
+    ///   - **It never stands for election.** With no members the quorum arithmetic
+    ///     answers one, so a node that campaigned would elect itself, hold a term
+    ///     and a log of its own, and stop being admissible at all — see
+    ///     `RaftConfig::members`. `NextDeadline` reports that nothing falls due,
+    ///     rather than naming a deadline `Tick` would have to decline to act on;
+    ///     the timer is re-armed by the leader contact that admits it.
+    ///   - **It accepts `AppendEntries` and `InstallSnapshot` from any leader**,
+    ///     because the membership test that guards those has nothing to test
+    ///     against: the only way to learn a configuration is to be sent one. The
+    ///     protection that test provides is not given up, it is not yet available
+    ///     — and there is nothing here to protect, since such a node holds no
+    ///     committed state, has never voted and is counted by nobody. The moment
+    ///     it adopts a configuration the guard applies again, permanently.
+    ///   - **It grants no votes**, for the same arithmetic reason read the other
+    ///     way: `IsMember` is false for every candidate, so a node with no cluster
+    ///     refuses every request. Nobody counts its answer anyway.
+    ///
+    /// @return True once a configuration — bootstrapped or replicated — is in
+    ///         force.
+    [[nodiscard]] bool HasCluster() const noexcept
+    {
+        return !_members.empty();
     }
 
     /// How often a leader speaks when it has nothing to say.

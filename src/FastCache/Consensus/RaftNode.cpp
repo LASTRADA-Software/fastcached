@@ -154,6 +154,17 @@ LogIndex RaftNode::CommitIndex() const noexcept
 
 TimePoint RaftNode::NextDeadline() const noexcept
 {
+    // Nothing ever falls due on a node with no cluster, so it says so rather than
+    // naming a deadline `Tick` would then have to decline to act on. Standing
+    // would win -- an empty member set puts the quorum at one -- and a node that
+    // has won can never afterwards be admitted to somebody else's cluster; see
+    // `HasCluster`. Answering here rather than branching in `Tick` keeps the role
+    // table the single answer to "what is this node waiting for", and it costs the
+    // joiner not even the timer draw. The driver bounds its own sleep by the
+    // heartbeat interval regardless, so this cannot park a loop forever.
+    if (!HasCluster())
+        return TimePoint::max();
+
     return TraitsOf(_role).timer == TimerKind::Election ? _electionDeadline : _heartbeatDeadline;
 }
 
@@ -1098,7 +1109,12 @@ void RaftNode::OnAppendEntries(AppendEntriesRequest const& request, TimePoint no
     // that can reach the port -- must not be able to hold the cluster in follower
     // state indefinitely and point its clients at a machine the configuration
     // does not contain.
-    if (!IsMember(request.leaderId))
+    //
+    // Asked only of a node that HAS a configuration. One that does not is
+    // waiting to be admitted, and the only way it can learn a member set is to be
+    // sent one -- so refusing here would make a node unjoinable by exactly the
+    // message that joins it. See `HasCluster` for why that gives nothing away.
+    if (HasCluster() && !IsMember(request.leaderId))
     {
         reply(AppendResult::Rejected, LogIndex::BeforeFirst());
         return;

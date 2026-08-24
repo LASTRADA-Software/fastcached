@@ -191,10 +191,27 @@ std::expected<LogIndex, ConsensusError> RaftDriver::Propose(std::vector<std::byt
     if (_failure.has_value())
         return std::unexpected { *_failure };
 
-    auto proposed = _node.Propose(std::move(payload), now);
+    return Land(_node.Propose(std::move(payload), now));
+}
+
+std::expected<LogIndex, ConsensusError> RaftDriver::ProposeMembership(std::vector<NodeId> members, TimePoint now)
+{
+    auto const guard = std::scoped_lock { _mutex };
+    if (_failure.has_value())
+        return std::unexpected { *_failure };
+
+    return Land(_node.ProposeMembership(std::move(members), now));
+}
+
+std::expected<LogIndex, ConsensusError> RaftDriver::Land(std::expected<RaftNode::Proposal, ConsensusError> proposed)
+{
     if (!proposed.has_value())
         return std::unexpected { proposed.error() };
 
+    // The index is read BEFORE the output is moved from, which is the whole reason
+    // this is one function rather than two: a proposal is a durability write and a
+    // broadcast, and the value the caller wants lives in the object being handed
+    // to the delivery step.
     auto const index = proposed->index;
     if (auto done = Deliver(std::move(proposed->output)); !done.has_value())
         return std::unexpected { done.error() };

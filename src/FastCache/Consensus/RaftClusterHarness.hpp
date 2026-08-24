@@ -85,6 +85,21 @@ class RaftClusterHarness
     /// @param who Which node.
     void Restart(NodeId const& who);
 
+    /// Bring up a machine that has no cluster, on the same network.
+    ///
+    /// The shape a node being added to a running fleet actually has: an empty
+    /// configuration, an empty log, and nothing to do until somebody's leader
+    /// speaks to it. It is reachable from every existing node from this moment,
+    /// which is the point — being reachable is what a bootstrap list buys the
+    /// others, and admission is what has to supply it here.
+    ///
+    /// Deliberately **not** added to the harness's bootstrap set: that set is what
+    /// `Restart` reconstructs a configuration from, and a joiner's configuration
+    /// after a restart must come from its own log rather than from a list nobody
+    /// gave it.
+    /// @param who The new node's id; must not already exist.
+    void Join(NodeId const& who);
+
     /// Every node currently claiming to be leader.
     /// @return Their ids.
     [[nodiscard]] std::vector<NodeId> Leaders() const;
@@ -101,6 +116,11 @@ class RaftClusterHarness
     /// @param payload The bytes.
     /// @return Where it landed, or nullopt when nobody leads.
     [[nodiscard]] std::optional<LogIndex> ProposeOnLeader(std::vector<std::byte> payload);
+
+    /// Offer a new member set through whichever node leads.
+    /// @param members The proposed member set.
+    /// @return Where it landed, or nullopt when nobody leads or it was refused.
+    [[nodiscard]] std::optional<LogIndex> ProposeMembershipOnLeader(std::vector<NodeId> members);
 
     /// @param who Which node.
     /// @return That node's view.
@@ -129,6 +149,14 @@ class RaftClusterHarness
         std::unique_ptr<IRaftTransport> transport;
         std::unique_ptr<IRaftStateMachine> machine;
         std::unique_ptr<RaftDriver> driver;
+
+        /// The member set this node was started with, empty for a joiner.
+        ///
+        /// Recorded per node rather than taken from the harness, because a
+        /// restart has to reconstruct the configuration *this* node was given —
+        /// and a joiner was given none, so reading the harness's list would hand
+        /// it a bootstrap set on its second start that it never had on its first.
+        std::vector<NodeId> bootstrap;
 
         /// What this node has applied, in order. The state machine's whole job.
         std::vector<AppliedEntry> applied;
@@ -203,8 +231,19 @@ class RaftClusterHarness
     /// is one that can drift -- a restarted node quietly running different
     /// timeouts would change what the simulation is testing without saying so.
     /// @param who Which member the configuration is for.
+    /// @param bootstrap That member's own bootstrap set; empty for a joiner.
     /// @return The configuration.
-    [[nodiscard]] RaftConfig ConfigFor(NodeId const& who) const;
+    [[nodiscard]] static RaftConfig ConfigFor(NodeId const& who, std::vector<NodeId> bootstrap);
+
+    /// Build one node's whole world and put it on the network.
+    ///
+    /// One definition of "a node in this harness", called by both the constructor
+    /// and `Join`. Two copies would let the next per-node collaborator be wired
+    /// into bootstrap nodes and silently absent from joiners — a difference in
+    /// exactly the dimension this harness exists to compare.
+    /// @param who The node's id.
+    /// @param bootstrap Its bootstrap member set; empty for a joiner.
+    void AddNode(NodeId const& who, std::vector<NodeId> bootstrap);
 
     void Enqueue(NodeId const& from, NodeId const& to, RaftMessage message);
     void RecordApplied(NodeId const& who, AppliedEntry const& entry);
@@ -218,6 +257,11 @@ class RaftClusterHarness
     /// Drives delay and loss decisions. Seeded fixed, so a failure is replayable
     /// from the same seed rather than being a flake to re-run.
     SystemRandomSource _network { 0x5EED };
+
+    /// The constructor's seed stagger, kept so `Join` can continue the same
+    /// series rather than start a second one that could collide with it.
+    std::uint64_t _seedOffset { 1 };
+
     std::vector<NodeId> _members;
     std::vector<std::unique_ptr<Member>> _nodes;
     std::vector<InFlight> _wire;
@@ -254,34 +298,41 @@ class RaftClusterHarness
 // translation unit here would never be compiled.
 
 inline RaftClusterHarness::RaftClusterHarness(std::vector<NodeId> members, std::uint64_t seedOffset):
+    _seedOffset { seedOffset },
     _members { std::move(members) }
 {
-    for (auto index = std::size_t { 0 }; index < _members.size(); ++index)
-    {
-        auto member = std::make_unique<Member>();
-        member->id = _members[index];
-        member->storage = std::make_unique<InMemoryRaftStorage>();
-        member->transport = std::make_unique<QueueingTransport>(*this, member->id);
-        member->machine = std::make_unique<RecordingMachine>(*this, member->id);
-
-        // A distinct seed per node, because the whole point of a randomized
-        // election timeout is that two nodes do not draw the same one -- and a
-        // cluster whose members all drew identically would split its vote, retry,
-        // and split it again for as long as the test ran.
-        member->random = std::make_unique<SystemRandomSource>((seedOffset * 1000) + index);
-
-        auto node = RaftNode::Create(ConfigFor(member->id), *member->random, _clock.Now());
-        member->driver =
-            std::make_unique<RaftDriver>(std::move(node).value(), *member->storage, *member->transport, *member->machine);
-
-        _nodes.push_back(std::move(member));
-    }
+    for (auto const& id: _members)
+        AddNode(id, _members);
 }
 
-inline RaftConfig RaftClusterHarness::ConfigFor(NodeId const& who) const
+inline void RaftClusterHarness::AddNode(NodeId const& who, std::vector<NodeId> bootstrap)
+{
+    auto member = std::make_unique<Member>();
+    member->id = who;
+    member->storage = std::make_unique<InMemoryRaftStorage>();
+    member->transport = std::make_unique<QueueingTransport>(*this, member->id);
+    member->machine = std::make_unique<RecordingMachine>(*this, member->id);
+
+    // A distinct seed per node, because the whole point of a randomized election
+    // timeout is that two nodes do not draw the same one -- and a cluster whose
+    // members all drew identically would split its vote, retry, and split it again
+    // for as long as the test ran. Indexed by the node count rather than by a loop
+    // variable, so a node joining later continues the same series instead of
+    // starting a second one that could collide with it.
+    member->random = std::make_unique<SystemRandomSource>((_seedOffset * 1000) + _nodes.size());
+    member->bootstrap = std::move(bootstrap);
+
+    auto node = RaftNode::Create(ConfigFor(member->id, member->bootstrap), *member->random, _clock.Now());
+    member->driver =
+        std::make_unique<RaftDriver>(std::move(node).value(), *member->storage, *member->transport, *member->machine);
+
+    _nodes.push_back(std::move(member));
+}
+
+inline RaftConfig RaftClusterHarness::ConfigFor(NodeId const& who, std::vector<NodeId> bootstrap)
 {
     return RaftConfig { .self = who,
-                        .members = _members,
+                        .members = std::move(bootstrap),
                         .electionTimeoutMin = std::chrono::milliseconds { 150 },
                         .electionTimeoutMax = std::chrono::milliseconds { 300 },
                         .heartbeatInterval = std::chrono::milliseconds { 50 } };
@@ -567,6 +618,19 @@ inline std::optional<LogIndex> RaftClusterHarness::ProposeOnLeader(std::vector<s
     return *proposed;
 }
 
+inline std::optional<LogIndex> RaftClusterHarness::ProposeMembershipOnLeader(std::vector<NodeId> members)
+{
+    auto const leader = Leader();
+    if (!leader.has_value())
+        return std::nullopt;
+
+    auto const proposed = Find(*leader).driver->ProposeMembership(std::move(members), _clock.Now());
+    if (!proposed.has_value())
+        return std::nullopt;
+
+    return *proposed;
+}
+
 inline void RaftClusterHarness::Restart(NodeId const& who)
 {
     auto& member = Find(who);
@@ -575,9 +639,22 @@ inline void RaftClusterHarness::Restart(NodeId const& who)
     if (!recovered.has_value())
         return;
 
-    auto node = RaftNode::Create(ConfigFor(member.id), *member.random, _clock.Now(), std::move(recovered).value());
+    auto node =
+        RaftNode::Create(ConfigFor(member.id, member.bootstrap), *member.random, _clock.Now(), std::move(recovered).value());
     member.driver =
         std::make_unique<RaftDriver>(std::move(node).value(), *member.storage, *member.transport, *member.machine);
+}
+
+inline void RaftClusterHarness::Join(NodeId const& who)
+{
+    for (auto const& node: _nodes)
+        if (node->id == who)
+            throw std::invalid_argument { "cluster member already exists: " + who };
+
+    // The same construction every bootstrap node gets, differing in exactly one
+    // thing: no bootstrap set. Anything else that differed would be a difference in
+    // the very dimension this harness exists to compare.
+    AddNode(who, {});
 }
 
 } // namespace FastCache::Consensus
