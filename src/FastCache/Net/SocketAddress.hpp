@@ -136,9 +136,16 @@ namespace Detail
     ///
     /// Answered with `inet_pton` for both families rather than by inspecting the
     /// characters, so there is one definition of "literal" and it is the
-    /// platform's own. A scoped literal (`fe80::1%eth0`) is deliberately NOT
-    /// numeric here: `inet_pton` rejects the zone suffix, so it falls through to
-    /// the resolver, which is the component that knows what to do with it.
+    /// platform's own.
+    ///
+    /// Which means a **scoped** literal (`fe80::1%eth0`) is platform-dependent, and
+    /// that is fine: glibc's `inet_pton` rejects the zone suffix and macOS's accepts
+    /// it, so the same text is a name on one host and a literal on the next. Either
+    /// answer produces a working dial -- one goes straight to `connect`, the other
+    /// through the resolver, which also understands zones -- so this deliberately
+    /// does not force them to agree. What must never happen is the other direction:
+    /// a NAME reported as a literal would be handed to `connect` as an address and
+    /// could not resolve at all, which is why the tests pin that half strictly.
     ///
     /// @param host Host text, unbracketed.
     /// @return true when `host` parses as an IPv4 or IPv6 literal.

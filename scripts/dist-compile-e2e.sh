@@ -805,5 +805,77 @@ echo "   a dedicated worker sized itself to ${sizing_slots} slot(s) with no --sl
 
 stop_and_require_exit "$sizing_pid" "the self-sizing worker" 15
 
+# --- case 11: a black-holed upstream does not stall the node's own clients -----
+#
+# THE regression case for the reason the node's cache tier moved onto a reactor.
+# `RemoteUpstream` dials from inside a cache answer, and answering used to be
+# serialized -- so one upstream that never responded held every local
+# `fastcache-cc` behind it for the full per-operation ceiling, one after another.
+# A node with an unreachable shared cache had an unusable port of its own.
+#
+# 192.0.2.1 is RFC 5737 documentation space: it BLACK-HOLES rather than refusing,
+# which is the distinction that matters. A refused connect returns at once and
+# would not reproduce this at all.
+#
+# What is ASSERTED here is correctness -- both objects are produced, and the node
+# survives an upstream that never answers -- and the elapsed time is only REPORTED.
+# That split is deliberate. Measured, two concurrent clients take ~3s and two
+# serialized ones would take ~4s: the gap is one connect ceiling, which is thinner
+# than the variance of a shared CI runner, so a threshold there would be a test that
+# fails for reasons about the machine. This repository has already paid for that
+# class of failure.
+#
+# The concurrency itself is proven deterministically instead, by
+# `FrameEndpoint_test`'s held-answer case -- which was verified by serving inline
+# again and watching only it fail. What this case adds is the integration: a real
+# node, a real black hole, and two real launchers.
+echo "== case 11: a black-holed upstream does not stall a second client"
+
+blackhole_node_port="$(free_port)"
+blackhole_worker_port="$(free_port)"
+
+# `--scheduler` is required whenever a worker surface is configured -- a worker
+# nothing knows about serves nobody, and the node refuses to start rather than
+# looking healthy. It points at the scheduler this run already has.
+"$node" --listen-cache="127.0.0.1:${blackhole_node_port}" --cache-memory=64m     --upstream="192.0.2.1:6674"     --scheduler="127.0.0.1:${dispatch_port}"     --bind=127.0.0.1 --port="$blackhole_worker_port"     --advertise="127.0.0.1:${blackhole_worker_port}"     --toolchain="blackhole-node=${compiler}" --slots=1 --log-level=info     > "${workdir}/blackhole-node.log" 2>&1 &
+blackhole_node_pid=$!
+pids+=("$blackhole_node_pid")
+wait_for_port "$blackhole_node_port" "$blackhole_node_pid" "black-hole node" "${workdir}/blackhole-node.log"
+
+write_source "${proj}/eleven_a.cpp" "caseelevena"
+write_source "${proj}/eleven_b.cpp" "caseelevenb"
+
+blackhole_started=$(date +%s)
+(
+    export FASTCACHE_ADDR="127.0.0.1:${blackhole_node_port}"
+    unset FASTCACHE_SCHEDULER
+    run_launcher "${workdir}/case11-a.log" -std=c++17 -O1 -c "${proj}/eleven_a.cpp" -o "${proj}/build/eleven_a.o"
+) &
+blackhole_a=$!
+(
+    export FASTCACHE_ADDR="127.0.0.1:${blackhole_node_port}"
+    unset FASTCACHE_SCHEDULER
+    run_launcher "${workdir}/case11-b.log" -std=c++17 -O1 -c "${proj}/eleven_b.cpp" -o "${proj}/build/eleven_b.o"
+) &
+blackhole_b=$!
+
+wait "$blackhole_a" || { cat "${workdir}/case11-a.log" >&2; fail "the first compile through the black-holed node failed"; }
+wait "$blackhole_b" || { cat "${workdir}/case11-b.log" >&2; fail "the second compile through the black-holed node failed"; }
+blackhole_elapsed=$(( $(date +%s) - blackhole_started ))
+
+# Both objects exist, which is the part that must hold whatever the timing: an
+# unreachable shared cache costs a miss, never a failed build.
+[[ -s "${proj}/build/eleven_a.o" ]] || fail "the first object was not produced"
+[[ -s "${proj}/build/eleven_b.o" ]] || fail "the second object was not produced"
+
+# A ceiling loose enough to be about hanging rather than about speed: this is here
+# so a node that wedges outright on an unreachable upstream fails the case instead
+# of running until ctest's own timeout with nothing to say why.
+if (( blackhole_elapsed > 60 )); then
+    cat "${workdir}/blackhole-node.log" >&2
+    fail "two clients behind a black-holed upstream took ${blackhole_elapsed}s; the node appears wedged"
+fi
+echo "   both clients were served behind an unreachable upstream (${blackhole_elapsed}s)"
+
 echo
 echo "dist-compile E2E PASSED"

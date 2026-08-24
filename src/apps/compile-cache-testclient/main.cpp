@@ -162,7 +162,11 @@ constexpr auto DaemonTimeout = std::chrono::seconds { 30 };
 /// @return The connected socket; never null.
 [[nodiscard]] std::unique_ptr<ISocket> Dial(TestClient::Args const& a)
 {
-    auto socket = ConnectTcp(a.host, a.port, DaemonTimeout, DaemonTimeout);
+    // `SyncRun` because this tool has no reactor and `ConnectTcp` uses a blocking
+    // connector, whose task resolves inline and is therefore never left suspended --
+    // the precondition `SyncRun` states, and the same reasoning the two helpers
+    // below already carry.
+    auto socket = SyncRun(ConnectTcp(std::string { a.host }, a.port, DaemonTimeout, DaemonTimeout));
     if (!socket.has_value())
         Die("connect failed (" + socket.error().context + ") -- is fastcached running?");
     return std::move(*socket);

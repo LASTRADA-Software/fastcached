@@ -248,17 +248,25 @@ TEST_CASE("A peer that accepts and then goes quiet is bounded by the total budge
     // The reactor is driven by `Run()`, and `TestReactor::Run` returns as soon as
     // both queues drain -- so the clock has to be advanced from a task ON the
     // reactor rather than from here. This one does nothing else.
-    auto advance = [](TestReactor* loop, ManualClock* c) -> DetachedTask {
-        for (auto step = 0; step < 40; ++step)
-        {
-            co_await ResumeOn { *loop };
-            c->Advance(1s);
-        }
+    //
+    // ONE jump well past the deadline, not a run of small ones. The deadline is a
+    // bounded poll (`IReactor::Schedule` cannot be cancelled, so `DeadlineTimer`
+    // re-arms rather than parking once), which means a run of N advances only makes
+    // N steps of progress toward it -- so how far the clock has to move depends on
+    // the poll interval, a constant this test has no business knowing. Jumping past
+    // the deadline in one go lets the timer chew through the remaining steps inline
+    // and removes the dependency entirely. It also stopped this passing on Linux and
+    // failing on macOS, which is what a hidden dependency on step counting looks like.
+    auto advance = [](TestReactor* loop, ManualClock* c, std::chrono::milliseconds past) -> DetachedTask {
+        co_await ResumeOn { *loop };
+        c->Advance(past);
         co_return;
     };
-    advance(&reactor, &clock);
 
-    auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, {});
+    constexpr Cc::ExchangeBudget Budget {};
+    advance(&reactor, &clock, Budget.total * 4);
+
+    auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, Budget);
 
     CHECK(outcome.kind == Cc::CacheOutcomeKind::Transport);
     REQUIRE(connector.Peer() != nullptr);
