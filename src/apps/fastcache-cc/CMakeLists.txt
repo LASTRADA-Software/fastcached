@@ -45,8 +45,9 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
 
-# The four Net rows are the launcher's TCP client, and they are here rather than
-# in a copy of their own because a copy is exactly what went wrong: this tree had
+# The Net rows are the launcher's TCP client -- the blocking pair it dials with,
+# plus the reactor sockets and connectors that share its code -- and they are here
+# rather than in a copy of their own, because a copy is what went wrong: this tree had
 # three implementations of "dial, then send and receive whole messages", and the
 # one nobody compiled (compile-cache-testclient) was IPv4-literal-only, unbounded
 # and unprotected against SIGPIPE. See src/FastCache/Net/TcpClient.hpp.
