@@ -25,11 +25,25 @@ on:
 permissions:
   contents: read
 
-# Never cancel an in-flight deployment: a half-published site is worse than a
-# slightly stale one. Queue instead.
+# The group carries the ref, and that is what keeps a pull request's strict build
+# out of the deployment queue. A bare `pages` group is a single global lane over
+# both jobs below, so a documentation check could not start until every earlier
+# run had finished — and a run held at a concurrency gate creates *no job records
+# at all*, so the check does not appear on the pull request as queued, it does not
+# appear at all. That is indistinguishable from a workflow nobody triggered, which
+# is the shape it was found in: PR #88's Documentation check was missing for hours
+# while a master deploy held `pages` waiting for a runner, and the pull request
+# reported no documentation status of any kind rather than a pending one.
+#
+# `cancel-in-progress` stays false wherever this run can deploy. Every push to
+# master shares one group, so deployments still serialize and are still never
+# cancelled — a half-published site is worse than a slightly stale one. A pull
+# request only ever builds (the deploy job below is gated on the event), so
+# superseding one costs nothing and hands a runner slot back to the queue, which
+# is the same trade build.yml makes for the same reason.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: pages-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
