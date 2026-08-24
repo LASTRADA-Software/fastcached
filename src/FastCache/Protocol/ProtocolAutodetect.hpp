@@ -3,8 +3,8 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
-#include <FastCache/Core/Errors/NetError.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Net/NetError.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>

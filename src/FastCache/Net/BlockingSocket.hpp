@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Core/Errors/NetError.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Net/NetError.hpp>
 
 #include <chrono>
 #include <cstddef>

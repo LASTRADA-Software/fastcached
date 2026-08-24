@@ -4,8 +4,8 @@
 #if defined(__APPLE__)
 
     #include <FastCache/Async/KqueueReactor.hpp>
-    #include <FastCache/Core/Errors/NetError.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
+    #include <FastCache/Net/NetError.hpp>
     #include <FastCache/Net/SocketAddress.hpp>
 
     #include <sys/socket.h>

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Core/Errors/NetError.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/NetError.hpp>
 #include <FastCache/Net/SocketAddress.hpp>
 
 #include <atomic>

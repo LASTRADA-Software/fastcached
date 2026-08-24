@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
-#include <FastCache/Core/Errors/NetError.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Net/NetError.hpp>
 #include <FastCache/Protocol/ProtocolAutodetect.hpp>
 
 #include <cstddef>

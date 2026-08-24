@@ -180,7 +180,6 @@ target_sources(FastCache
         TYPE HEADERS
         BASE_DIRS "${CMAKE_SOURCE_DIR}/src"
         FILES
-            Core/Errors/NetError.hpp
             Core/Errors/ProtocolError.hpp
             Core/Errors/StorageError.hpp
             Core/Errors/ConfigError.hpp
@@ -192,4 +191,5 @@ target_sources(FastCache
             Core/Logger.hpp
             Core/BufferPool.hpp
             Core/Profiling.hpp
+            Net/NetError.hpp
 )

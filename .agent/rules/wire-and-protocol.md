@@ -167,7 +167,7 @@ Every rule below has already been a bug.
     derived type.
   - **The launcher still does not LINK `FastCache`, and that rule survived
     intact.** The four `Net` rows added to `_fc_cc_core` reach only
-    `Async/Task.hpp`, `Core/Errors/NetError.hpp` and `Core/Profiling.hpp`, all
+    `Net/NetError.hpp`, `Async/Task.hpp` and `Core/Profiling.hpp`, all
     header-only and all std-only, so the launcher stays free of yaml-cpp, OpenSSL
     and the reactor and can still link the CRT statically.
   - **`std::array`'s iterator is a raw pointer on libstdc++ and libc++ and a class
