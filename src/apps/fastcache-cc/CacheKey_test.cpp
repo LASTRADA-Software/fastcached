@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <ranges>
 #include <set>
 #include <span>
@@ -547,4 +548,93 @@ TEST_CASE("A relative object output is left exactly as the build system spelled 
 
     auto const gnu = Relativize({ "-obuild/u.o" }, "/home/dev/proj", "/home/dev/proj/build");
     CHECK(gnu[0] == "-obuild/u.o");
+}
+
+TEST_CASE("UnkeyableArgument refuses a drive-relative path that no root can tokenize")
+{
+    // Issue #104. `C:foo` resolves against drive C's own current directory, which
+    // no cache entry records — so the key filter drops it as toolchain and the
+    // replay guard skips it, and a header moved inside it is neither re-keyed nor
+    // noticed. The command line is where that is caught before direct mode can
+    // serve a manifest an older launcher recorded under the old rules.
+    FastCache::PathCanon::Layout const windows { .sourceRoot = R"(C:\src\proj)", .buildTree = R"(C:\src\proj\build)" };
+    auto const refuse = [&windows](std::vector<std::string> const& args) {
+        return UnkeyableArgument(std::span<std::string const> { args }, windows);
+    };
+
+    // Fused, in both introducer spellings an MSVC driver accepts. Reported as the
+    // whole argument: `/IC:foo` says which flag carries it, `C:foo` does not.
+    CHECK(refuse({ "/nologo", R"(/IC:foo)" }) == std::optional<std::string> { R"(/IC:foo)" });
+    CHECK(refuse({ R"(-IC:foo\bar)" }) == std::optional<std::string> { R"(-IC:foo\bar)" });
+
+    // Separated: the value is an argument of its own and is reached as a bare path.
+    CHECK(refuse({ "/I", R"(C:foo)" }) == std::optional<std::string> { R"(C:foo)" });
+
+    // A bare drive-relative source, which is the other way such a path reaches a
+    // driver: a quoted include resolves against the includer's directory, so every
+    // header of a drive-relative TU is reported drive-relative too.
+    CHECK(refuse({ "/c", R"(C:foo\u.cpp)" }) == std::optional<std::string> { R"(C:foo\u.cpp)" });
+
+    // A bare drive specifier IS the drive's current directory, so it is the
+    // degenerate spelling of the same thing rather than a root.
+    CHECK(refuse({ "/I", "C:" }) == std::optional<std::string> { "C:" });
+
+    // Every role, not just IncludeDir: filtering by role would be a second list to
+    // keep complete, and over-refusing costs only a lost cache.
+    CHECK(refuse({ R"(/FoC:foo\u.obj)" }) == std::optional<std::string> { R"(/FoC:foo\u.obj)" });
+
+    // The first one, so an operator is pointed at a single argument to fix.
+    CHECK(refuse({ R"(/IC:one)", R"(/IC:two)" }) == std::optional<std::string> { R"(/IC:one)" });
+}
+
+TEST_CASE("UnkeyableArgument leaves every path a root can place alone")
+{
+    FastCache::PathCanon::Layout const windows { .sourceRoot = R"(C:\src\proj)", .buildTree = R"(C:\src\proj\build)" };
+    auto const refuse = [&windows](std::vector<std::string> const& args) {
+        return UnkeyableArgument(std::span<std::string const> { args }, windows);
+    };
+
+    // Absolute under a root: the ordinary case, tokenized and keyed.
+    CHECK(refuse({ R"(/IC:\src\proj\inc)", R"(C:\src\proj\u.cpp)" }) == std::nullopt);
+
+    // Absolute under NEITHER root. Also neither keyed nor guarded — it is dropped
+    // as toolchain and skipped by the same guard — but that is the deliberate
+    // toolchain trade the compiler identity covers, not this defect. Refusing it
+    // would refuse every compile that reaches a system header.
+    CHECK(refuse({ R"(/IC:\Program Files\LLVM\include)" }) == std::nullopt);
+
+    // Relative: resolves against the compile's working directory, which is also
+    // the launcher's, so it names the same file on any machine running this build.
+    CHECK(refuse({ R"(/Iinc)", R"(src\u.cpp)", R"(/Fobuild\u.obj)" }) == std::nullopt);
+
+    // Not paths at all. `-DX=C:foo` matches no PathValueFlags() row and leads with
+    // an introducer, so it is never read as a bare path.
+    CHECK(refuse({ "/O2", "/std:c++20", "-Wall", R"(-DX=C:foo)" }) == std::nullopt);
+}
+
+TEST_CASE("UnkeyableArgument keeps a drive-relative ROOT working")
+{
+    // The case that makes this a root test rather than an anchor test. Under a
+    // drive-relative root the path canonicalizes to a token that is portable
+    // exactly because the consumer substitutes its own root — refusing on the
+    // anchor alone would silently un-key a whole layout that works today.
+    FastCache::PathCanon::Layout const driveRelative { .sourceRoot = R"(C:src\proj)", .buildTree = R"(C:src\proj\build)" };
+    std::vector<std::string> const under { R"(/IC:src\proj\inc)", R"(C:src\proj\u.cpp)" };
+    CHECK(UnkeyableArgument(std::span<std::string const> { under }, driveRelative) == std::nullopt);
+
+    // And the same layout still refuses one its roots cannot place.
+    std::vector<std::string> const outside { R"(/IC:elsewhere\inc)" };
+    CHECK(UnkeyableArgument(std::span<std::string const> { outside }, driveRelative)
+          == std::optional<std::string> { R"(/IC:elsewhere\inc)" });
+}
+
+TEST_CASE("UnkeyableArgument is inert under a POSIX layout")
+{
+    // `C:foo` is an ordinary relative file name on POSIX — AnchorForLayout says so,
+    // and the rule is decided by the LAYOUT and never by the host, so a Windows
+    // host must reach the same answer. A `/`-led argument is a path there, not an
+    // option, which is why the introducers are the layout's too.
+    FastCache::PathCanon::Layout const posix { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
+    std::vector<std::string> const args { "-IC:foo", "C:foo/u.cpp", "/usr/include/x.h", "-I/Infra/inc" };
+    CHECK(UnkeyableArgument(std::span<std::string const> { args }, posix) == std::nullopt);
 }

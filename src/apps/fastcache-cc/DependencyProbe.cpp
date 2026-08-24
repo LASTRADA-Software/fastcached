@@ -292,6 +292,42 @@ ProbeText SplitIncludeNotes(std::string_view text)
     return out;
 }
 
+bool IsDriveRelativeUnderNoRoot(std::string_view path, PathCanon::Layout const& layout)
+{
+    // Asked before anything is canonicalized, so a layout that cannot produce this
+    // anchor at all — every POSIX one — pays a single character comparison.
+    //
+    // A switch without a `default:`, as PortableForm's, IsCheckable's and
+    // ClassifyResolved's each are, so a fourth Anchor state is a compile error here
+    // rather than a silent `false` — which for this function means silently
+    // re-opening the stale-depfile serve it exists to close.
+    switch (PathCanon::AnchorForLayout(path, layout))
+    {
+        case PathCanon::Anchor::WorkingDirectory:
+            // Resolves against the compile's working directory, which is also the
+            // launcher's, so it is placeable and every other rule covers it.
+        case PathCanon::Anchor::Absolute:
+            // Names a fixed location: keyed under a root, and dropped as toolchain
+            // outside both — the deliberate trade the compiler identity covers.
+            return false;
+        case PathCanon::Anchor::DriveRelative:
+            break;
+    }
+
+    // RootToken, not a second spelling of the same Canonicalize-and-compare: this
+    // is the SAME question PortableForm asks one line above its own
+    // `PathDisposition::DriveRelative` return, and two spellings of it are two
+    // places for the rule to drift. What differs is only which input each is handed
+    // — a reported dependency path there, a command-line argument here.
+    //
+    // The path is NOT put through LexicalForm first, unlike PortableForm's. That
+    // matters only for an argument carrying `..` segments that would collapse into
+    // a root (`-IC:foo\..\src`), where this refuses a compile the root would have
+    // placed. Conservative in the safe direction, and unreachable without a
+    // drive-relative argument that also needs normalizing.
+    return !RootToken(std::string { path }, layout).has_value();
+}
+
 std::string DescribeDropped(DependencySet const& set)
 {
     std::string out;

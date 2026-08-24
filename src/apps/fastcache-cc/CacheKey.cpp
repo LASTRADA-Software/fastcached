@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheKey.hpp"
 #include "CmdLine.hpp"
+#include "DependencyProbe.hpp"
 #include "KeyDigest.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -53,11 +55,63 @@ namespace
         return resolve ? resolve(path) : std::string { path };
     }
 
-    /// Relativize one argument against both roots: if it is a bare path or a
-    /// path-valued flag whose fused value lies under the source root or the build
-    /// tree, replace the path portion with its canonical token; otherwise return
-    /// it unchanged. PathCanon prefers the longer-matching root, so a build tree
-    /// nested under the source root tokenizes to `<BUILDTREE>`.
+    /// One argument split into the part that is a path and the part in front of it.
+    struct PathPortion
+    {
+        std::string_view prefix; ///< The flag and its separator; empty for a bare path.
+        std::string_view path;   ///< The path the argument carries.
+    };
+
+    /// Isolate the path an argument carries, if it carries one.
+    ///
+    /// Spelled once because two callers need exactly this split and neither may
+    /// re-derive it: `RelativizeOne` rewrites the path portion, and
+    /// `UnkeyableArgument` classifies it. A second copy of "where does an `-I`
+    /// end and its value begin" is precisely how the object output came to be
+    /// relativized in its separated spelling and not in its fused one.
+    ///
+    /// Two shapes, in order:
+    ///
+    /// - **A fused path-valued flag**: `<flag><path>`, e.g. `/IC:\src\inc` and
+    ///   `/FoC:\src\build\u.obj`. Every role qualifies, because every one of these
+    ///   values is a path on the producing machine. These args are used for the
+    ///   KEY only and never to run a compiler, and the layout does not say which
+    ///   driver produced them, so every family's rows are offered. A row matched
+    ///   against another family's flag costs nothing — MSVC's `-MTd` (the static
+    ///   multithreaded runtime) against the GNU `-MT` row is the case to have in
+    ///   mind: the tail is not a path under either root, so canonicalization is a
+    ///   no-op and the argument comes back byte-for-byte. A *bare* occurrence,
+    ///   whose value is the next argument, carries no path of its own and is
+    ///   reported as such — that value arrives on its own iteration as a bare path.
+    /// - **A bare path argument**: a source file or a response path.
+    ///
+    /// What the LAYOUT decides is which introducers may match, and therefore which
+    /// arguments are bare paths at all — see IntroducersFor. A `/`-led spelling
+    /// under a POSIX layout must reach the bare-path shape, or a checkout rooted at
+    /// `/Infra` is mis-split at `/I`; and `-` introduces an option everywhere, so a
+    /// `-`-led argument is never a bare path.
+    ///
+    /// @param arg    The raw argument.
+    /// @param layout The layout whose path conventions apply.
+    /// @return The isolated path and its prefix, or nullopt when `arg` carries none.
+    [[nodiscard]] std::optional<PathPortion> PathPortionOf(std::string_view arg, PathCanon::Layout const& layout)
+    {
+        auto const introducers = IntroducersFor(layout);
+        if (auto const match = MatchPathValueFlag(arg, introducers, DriverFamily::Any);
+            match.has_value() && !match->value.empty())
+            return PathPortion { .prefix = match->prefix, .path = match->value };
+
+        if (!arg.empty() && !introducers.contains(arg.front()))
+            return PathPortion { .prefix = {}, .path = arg };
+
+        return std::nullopt;
+    }
+
+    /// Relativize one argument against both roots: if it carries a path that lies
+    /// under the source root or the build tree, replace that path with its
+    /// canonical token; otherwise return the argument unchanged. PathCanon prefers
+    /// the longer-matching root, so a build tree nested under the source root
+    /// tokenizes to `<BUILDTREE>`.
     ///
     /// An argument that does not tokenize comes back exactly as written, never in
     /// its reconciled spelling: reconciliation exists to make the ROOT TEST
@@ -71,51 +125,14 @@ namespace
                                             PathCanon::Layout const& layout,
                                             PathCanon::PathTransform const& resolve)
     {
-        // Fused path-valued flags: <flag><path>, e.g. `/IC:\src\inc` and
-        // `/FoC:\src\build\u.obj`. Every role is relativized, because every one
-        // of these values is a path on the producing machine and the key must
-        // carry none of them; the object output is the one that used to be
-        // missed, since only its SEPARATED spelling reached the bare-path branch
-        // below and a `/Fo<abs>` line therefore keyed per checkout.
-        //
-        // These args are used for the KEY only and never to run a compiler, and
-        // the layout does not say which driver produced them, so every family's
-        // rows are offered. A row matched against another family's flag costs
-        // nothing — MSVC's `-MTd` (the static multithreaded runtime) against the
-        // GNU `-MT` row is the case to have in mind: the tail is not a path under
-        // either root, canonicalization is a no-op, and the argument comes back
-        // byte-for-byte.
-        //
-        // What the LAYOUT does decide is which introducers may match — see
-        // IntroducersFor. A `/`-led spelling under a POSIX layout must fall
-        // through to the bare-path branch below, or a checkout rooted at
-        // `/Infra` is mis-split at `/I`.
-        if (auto const match = MatchPathValueFlag(arg, IntroducersFor(layout), DriverFamily::Any);
-            match.has_value() && !match->value.empty())
-        {
-            auto const path = Reconciled(resolve, match->value);
-            auto const canon = PathCanon::Canonicalize(path, layout);
-            if (canon.has_value() && *canon != path)
-                return std::string { match->prefix } + *canon;
+        auto const portion = PathPortionOf(arg, layout);
+        if (!portion.has_value())
             return std::string { arg };
-        }
 
-        // Bare path argument (a source file or a response path). Only rewrite when
-        // it actually lies under the source root (Canonicalize returns it verbatim
-        // otherwise, so a no-op change is left as-is).
-        //
-        // `-` introduces an option everywhere. `/` does so only under a Windows
-        // layout: on POSIX a leading slash is an ABSOLUTE PATH, and skipping
-        // those would leave the checkout path in the key — which is exactly
-        // what breaks cross-machine sharing, since two checkouts at different
-        // paths would then key differently despite identical content.
-        if (!arg.empty() && !IntroducersFor(layout).contains(arg.front()))
-        {
-            auto const path = Reconciled(resolve, arg);
-            auto const canon = PathCanon::Canonicalize(path, layout);
-            if (canon.has_value() && *canon != path)
-                return *canon;
-        }
+        auto const path = Reconciled(resolve, portion->path);
+        auto const canon = PathCanon::Canonicalize(path, layout);
+        if (canon.has_value() && *canon != path)
+            return std::string { portion->prefix } + *canon;
         return std::string { arg };
     }
 
@@ -132,6 +149,20 @@ std::vector<std::string> RelativizeArgs(std::span<std::string const> args,
     for (auto const& arg: args)
         out.push_back(RelativizeOne(arg, layout, resolve));
     return out;
+}
+
+std::optional<std::string> UnkeyableArgument(std::span<std::string const> args, PathCanon::Layout const& layout)
+{
+    for (auto const& arg: args)
+    {
+        auto const portion = PathPortionOf(arg, layout);
+        // Reported as the WHOLE argument rather than as the isolated path: it is
+        // what an operator has to find on their own command line to act on the
+        // refusal, and `/IC:foo` says which flag carries it while `C:foo` does not.
+        if (portion.has_value() && IsDriveRelativeUnderNoRoot(portion->path, layout))
+            return std::string { arg };
+    }
+    return std::nullopt;
 }
 
 std::string ComputeKey(KeyInputs const& inputs)

@@ -3,6 +3,7 @@
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -96,5 +97,44 @@ struct KeyInputs
                                                       std::string_view sourceRoot,
                                                       std::string_view buildTree,
                                                       PathCanon::PathTransform const& resolve = {});
+
+/// The first argument carrying a path this launcher can neither key nor guard, or
+/// nothing when the whole command line is safe to cache (issue #104).
+///
+/// The rule is `IsDriveRelativeUnderNoRoot`'s and is spelled once, there. What
+/// this adds is *where* it is asked: on the command line, before the launcher has
+/// done anything at all.
+///
+/// That placement is the substance rather than an optimization. The authoritative
+/// answer comes from the paths the compiler actually reported, but that is only
+/// known after the preprocess — and direct mode runs *before* it, validating a
+/// manifest whose entries came through the same filter and therefore dropped the
+/// very path in question. A manifest recorded by an older launcher would keep
+/// direct-hitting a stale object forever. Asking here steps out before the
+/// manifest is consulted at all, which retires those entries by making them
+/// unreachable rather than by bumping a schema tag and invalidating every entry on
+/// every platform for a clang-cl-only exposure.
+///
+/// What it cannot promise is completeness, which is why it is not the only ask:
+/// isolating an argument's path depends on `PathValueFlags()` recognising the
+/// flag, and `CouldNameAFile` records in as many words that such a list is what
+/// cannot be kept complete (`-isystem<path>`, `--sysroot=`, `-B`, a partial
+/// `@response-file`). `KeyDependencySet` asks the same question of what the
+/// compiler reported, where there is no list to be incomplete.
+///
+/// Every `PathValueFlags()` role is examined, not only `IncludeDir`. Filtering by
+/// role would be a second list to keep complete, and the only cost of examining
+/// one that could not have seeded a dependency path is a lost cache on a layout
+/// nothing common generates.
+///
+/// Which introducers may match, and therefore which arguments are bare paths, is
+/// the LAYOUT's answer and not the host's — see RelativizeArgs, whose walk this
+/// shares.
+///
+/// @param args   The raw compile arguments (excluding the compiler).
+/// @param layout This machine's roots, and the source of path conventions.
+/// @return The offending argument, verbatim, or nullopt when there is none.
+[[nodiscard]] std::optional<std::string> UnkeyableArgument(std::span<std::string const> args,
+                                                           PathCanon::Layout const& layout);
 
 } // namespace FastCache::Cc

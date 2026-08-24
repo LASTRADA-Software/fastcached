@@ -523,3 +523,38 @@ TEST_CASE("DescribeDropped renders every reason it can be given, in table order"
     CHECK(set.Reported() == 21);
     CHECK(DescribeDropped(set) == "2 empty, 3 unanchored, 4 drive-relative, 5 toolchain, 6 no canonical form");
 }
+
+TEST_CASE("IsDriveRelativeUnderNoRoot names the one shape that is neither keyed nor guarded")
+{
+    // Issue #104. The rule is a ROOT test that begins with an anchor test, and both
+    // halves are load-bearing in opposite directions: the anchor alone would un-key
+    // a drive-relative root, and the roots alone would refuse every toolchain header.
+    PathCanon::Layout const rooted { .sourceRoot = R"(C:\src\proj)", .buildTree = R"(C:\src\proj\build)" };
+
+    // Drive-relative under no root: refused.
+    CHECK(IsDriveRelativeUnderNoRoot(R"(C:foo\bar.hpp)", rooted));
+    CHECK(IsDriveRelativeUnderNoRoot("C:foo/bar.hpp", rooted));
+    // A bare drive specifier IS that drive's current directory.
+    CHECK(IsDriveRelativeUnderNoRoot("C:", rooted));
+    // A rooted root cannot prefix-match a drive-relative path, whichever drive.
+    CHECK(IsDriveRelativeUnderNoRoot(R"(C:src\proj\a.hpp)", rooted));
+
+    // Absolute, under a root and under neither: both keyed or dropped by rules that
+    // already cover them, so neither is this defect.
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot(R"(C:\src\proj\a.hpp)", rooted));
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot(R"(C:\Program Files\LLVM\include\x.h)", rooted));
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot(R"(\Windows\x.h)", rooted));
+    // Relative: resolved against the compile's working directory, so it is placeable.
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot(R"(inc\a.hpp)", rooted));
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot("", rooted));
+
+    // Under a drive-relative ROOT the same anchor tokenizes, and is kept.
+    PathCanon::Layout const driveRelative { .sourceRoot = R"(C:src\proj)", .buildTree = R"(C:src\build)" };
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot(R"(C:src\proj\a.hpp)", driveRelative));
+    CHECK(IsDriveRelativeUnderNoRoot(R"(C:elsewhere\b.hpp)", driveRelative));
+
+    // Inert under a POSIX layout, on either host: `C:foo` is an ordinary relative
+    // file name there, and the answer comes from the LAYOUT and never from the host.
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot("C:foo/bar.hpp", PosixLayout()));
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot("C:", PosixLayout()));
+}
