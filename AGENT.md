@@ -2722,14 +2722,18 @@ keeping:
   under `UniqueScratchPath(prefix)` now, and the destructor removes the *parent*
   so the unique level cannot leak.
 
-**And the gate runs `ctest --parallel`, because nothing else does.** CI invokes
-`ctest` bare in every job, no preset sets a job count, and `scripts/local-gate.sh`
-did not either -- which is why five separate authors could write this bug and no
-run anywhere would show it. The gate now passes `--parallel` (`getconf
+**And both CI and the gate run the tests in parallel now, because until this
+change nothing did.** `ctest` was invoked bare in every CI job, no preset set a
+job count, and `scripts/local-gate.sh` did not either -- which is why five
+separate authors could write this bug and no run anywhere would show it. CI sets
+`CTEST_PARALLEL_LEVEL` once in the workflow's `env:` rather than adding
+`--parallel` to each of the four `run:` lines, so an invocation added later is
+covered by construction; the gate passes `--parallel` explicitly (`getconf
 _NPROCESSORS_ONLN`, since it runs on macOS too; `FASTCACHE_GATE_JOBS` overrides).
 Tests that genuinely cannot share -- a daemon, a fixed port -- carry `RUN_SERIAL`,
 which `tls-smoke` was missing while every one of its neighbours had it. Measured
-on the full suite: 649s serial, 131s at `--parallel 8`, same 1965 tests.
+on the full suite: 649s serial, 131s at `--parallel 8`, same 1965 tests; Windows
+65s to 37s.
 
 Not every test is a Catch2 case. Script-driven tests are registered in
 `src/tests/CMakeLists.txt`: the `smoke`-labelled ones start a real daemon or

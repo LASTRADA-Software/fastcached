@@ -41,6 +41,20 @@ concurrency:
 
 env:
   CTEST_OUTPUT_ON_FAILURE: 1
+  # Every ctest invocation in this file, and any added later -- which is the
+  # reason it is an environment variable rather than a `--parallel` on each of
+  # the four `run:` lines that exist today.
+  #
+  # Four because that is what a GitHub-hosted runner has (macos-14 has three, and
+  # oversubscribing a suite of short single-threaded processes by one costs
+  # nothing). Safe because every TEST_CASE is already its own process and the
+  # tests that genuinely cannot share -- a daemon, a fixed port -- carry
+  # RUN_SERIAL; the fixtures that could not, because they named a scratch
+  # directory from a per-process counter, are what `tests/ScratchPath.hpp` fixed.
+  # Serial CI is also precisely why that bug survived five times.
+  #
+  # Measured locally on the full suite: 649s -> 131s at eight jobs.
+  CTEST_PARALLEL_LEVEL: 4
   CLANG_TOOLS_VERSION: "22"
   GCC_VERSION: "14"
   CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/CPM
