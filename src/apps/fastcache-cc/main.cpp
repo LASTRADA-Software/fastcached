@@ -1446,6 +1446,25 @@ void RecordManifest(Config const& cfg,
                          PathResolver().FilesystemCalls()));
         NoteIfRootsDoNotDescribeCompile(cfg, cmd.source, dependencies, reconciler);
 
+        // The one disposition that is not merely a drop. A drive-relative path under
+        // no root is keyed by nothing here and stat'ed by nothing in ReplayGuard, so
+        // a header moved inside it replays a depfile naming a file that is gone
+        // (issue #104). The note above has already said how many there were; this
+        // says what the launcher does about them.
+        //
+        // This is the AUTHORITATIVE ask: it reads what the compiler actually opened,
+        // where the command-line ask near the top of this function depends on
+        // `PathValueFlags()` recognising the flag that carried the path. Read off the
+        // tally rather than re-derived from the paths — `PortableForm` already
+        // classified every one of them, and a second walk asking the same question
+        // is a second place for the answer to drift.
+        if (dependencies.Count(Cc::PathDisposition::DriveRelative) != 0)
+        {
+            Decline("a reported dependency path is drive-relative under no root; not caching "
+                    "(neither keyed nor guarded)");
+            return std::nullopt;
+        }
+
         // Non-const so the preprocessed text can be MOVED out below rather than
         // copied. It was const, and `std::move` on a const member is a silent copy
         // -- of several megabytes, on the hot path of a parallel build, while the

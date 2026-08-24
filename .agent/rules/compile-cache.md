@@ -186,19 +186,71 @@ platforms.
     the manifest while recording (`HashFileContents` yields nothing) and fails to validate
     while reading — safe in both directions — so the stronger root question is worth asking,
     and dropping on the anchor alone would silently un-cover a project header, which is the
-    defect its own bullet below exists to close. The residual, recorded
-    deliberately: a drive-relative path under no root is then neither keyed nor guarded, so a
-    moved one would replay a stale depfile — reachable only when a build passes a
-    drive-relative `-I` *and* the driver echoes it unresolved (`cl` resolves through the
-    filesystem; clang-cl echoes what it was handed), and closing it would mean recording the
-    producing machine's per-drive cwd in the value, which is exactly the machine-specific
-    state the key exists to keep out. One diagnostic consequence: such a path dropping out of
-    the key made the launcher's `dependency set: 0 of M reported path(s) keyed` line
-    reachable for a second reason, so that fingerprint stopped identifying the #66 short-name
-    mismatch on its own. The two were then told apart only by whether the *root* was
-    short-name spelled, which requires knowing to ask — the opposite of what a fingerprint is
-    for. Closed by the counter carrying its *reasons* now; see the `PathDisposition` bullet
-    below.
+    defect its own bullet below exists to close.
+    - **What that left over is closed by refusing the compile, not by covering the path
+      (issue #104).** A drive-relative path under no root was dropped from the key AND skipped
+      by the replay guard — each filter right on its own terms, and nothing anywhere asking
+      whether SOMETHING covered the path. A header moved inside it does not re-key, so the
+      stale entry is still found, and nothing probes it, so nothing notices: a replayed depfile
+      naming a file that is gone, under a zero exit code. Covering it is not available — it
+      would mean recording the producing machine's per-drive cwd in the value, which is exactly
+      the machine-specific state the key exists to keep out — so the compile is refused
+      instead, the way a module interface unit is, and says so under `FASTCACHE_VERBOSE`. Five
+      things about its shape are load-bearing:
+      - **It is a ROOT test that begins with an anchor test, and both halves cut opposite
+        ways.** Refusing on the anchor alone would take a drive-relative *root* (`C:src\proj`)
+        out of the cache wholesale, and that layout is portable precisely because the consumer
+        substitutes its own root. Asking the roots alone would refuse every compile that
+        reaches a system header. The anchor comes first for a second reason as well:
+        `AnchorForLayout` never reports `DriveRelative` under a POSIX layout, so the whole rule
+        is inert there without a single canonicalization.
+      - **The question is asked TWICE, of two different inputs, and neither ask is redundant.**
+        The dependency-set ask is the authoritative one: it sees the paths the compiler actually
+        opened, so no list of flag spellings has to be complete for it to be right — which
+        matters, because `CouldNameAFile` already records in as many words that such a list is
+        what cannot be kept complete. `Cc::UnkeyableArgument` asks it of the command line
+        instead, and buys the ORDERING: direct mode runs before the preprocess and validates a
+        manifest whose entries came through the same filter and therefore dropped the very path
+        in question, so a manifest recorded by an older launcher would keep direct-hitting a
+        stale object forever. Asking before direct mode retires those entries by making them
+        unreachable.
+      - **The two asks share ONE classifier, and issue #105 is what made that possible.**
+        `PortableForm` already names this exact case `PathDisposition::DriveRelative`, so
+        `RunCached` reads that tally rather than walking the paths again — two spellings of
+        one classification are two places for it to drift, which is the defect
+        `DispositionTable` exists to prevent. `Cc::IsDriveRelativeUnderNoRoot` remains only for
+        the input the tally cannot answer for: an argument whose path the compiler never
+        reported. Both reach `RootToken`, so "did a root place this" has one definition and not
+        two. Note what #105 did and did not do here: it gave the drop its own NAME, which made
+        the fault legible and this fix expressible — naming a drop is not covering it, and on
+        its own the path still reached the key filter as a drop.
+      - **No schema tag moves**, and that is what the command-line ask bought. `objkey-v4` and
+        `manifest-v4` stay: nothing about the key's construction, the value's framing or its
+        canonicalization changed, and an affected compile simply stops consulting the cache.
+        Closing this by bumping instead would have re-keyed every entry on every platform for a
+        clang-cl-only exposure.
+      - **The regression test asserts the CONJUNCTION, because the defect was never inside a
+        filter.** A table of the shapes a driver can report, each declaring what covers it —
+        keyed, guarded, the toolchain stamp, or refused — and there is deliberately no
+        `Nothing` enumerator, because a row nothing covers is the defect rather than a fifth
+        kind of row. `ToolchainStamp` is a *claim* about content, true of a toolchain header at
+        a fixed address and false of a path nothing can place. Verified by neutering the
+        predicate and watching those two rows, and only them, change answer.
+      The residual is now the narrow one, and it is a DIRECT-MODE residual tracked as #111:
+      the authoritative ask runs after `TryDirectMode`, and the command-line ask can only
+      see a path an argument carries — so a drive-relative header that arrived some other
+      way (an `#include "C:foo/x.h"` written out in the source, a fused flag spelling
+      `PathValueFlags()` does not know) keeps direct-hitting a manifest an older launcher
+      recorded, which no tag moved to retire. Reachable only for a build already inside
+      the clang-cl-plus-drive-relative case AND holding a pre-fix manifest, and it
+      self-heals the first time that TU misses direct mode. Closing it is a `manifest-v5`
+      bump, which is the cheap direction of the one-way lock-step above.
+    - One diagnostic consequence of the drop that used to happen: the launcher's
+      `dependency set: 0 of M reported path(s) keyed` line was reachable for a second reason,
+      so that fingerprint stopped identifying the #66 short-name mismatch on its own. The two
+      were then told apart only by whether the *root* was short-name spelled, which requires
+      knowing to ask — the opposite of what a fingerprint is for. Closed by the counter
+      carrying its *reasons* now; see the `PathDisposition` bullet below.
     - **The ASCII rules are one rule each, and the drive-letter one had drifted into four.**
       Two of the four spellings tested it with `std::isalpha`, which is **locale-dependent** — in a codebase
       whose whole premise is that two machines derive the same key from the same content, a
@@ -767,9 +819,6 @@ without reopening the argument:
 
 ## Open work
 
-- **[#104](https://github.com/LASTRADA-Software/fastcached/issues/104)** — a
-  drive-relative path under no root is neither keyed nor guarded, so a moved one
-  replays a stale depfile. clang-cl only, and only for a drive-relative `-I`.
 - **[#105](https://github.com/LASTRADA-Software/fastcached/issues/105)** — the
   `dependency set: 0 of M` line now has two causes and fingerprints neither.
 - **[#64](https://github.com/LASTRADA-Software/fastcached/issues/64)** — a

@@ -345,6 +345,7 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
 | `connect failed` | The daemon is unreachable at `FASTCACHE_ADDR`. |
 | `preprocess failed` | The compiler rejected the preprocess probe; the line may use an unsupported option form. |
 | `uses __TIME__/__DATE__/__TIMESTAMP__` | Deliberate: the TU is non-deterministic and would never hit. Reported as *uncacheable*, not as an error. |
+| `... names a drive-relative path under no root`, `reported dependency path ... is drive-relative under no root` | Deliberate, and Windows-only. A path like `C:foo\bar.hpp` resolves against drive `C:`'s **own** current directory, which no cache entry records — so the launcher can neither key it (a header moved inside it would not re-key) nor check it on replay (there is no directory to `stat` it against). Caching such a compile could serve a stale dependency record under a zero exit code, so it is not cached at all. Reported as *uncacheable*, not as an error. Spell the path absolutely (`C:\foo\bar.hpp`), make it relative, or bring it under `FASTCACHE_SOURCE_DIR`/`FASTCACHE_BINARY_DIR`. The first message names the command-line argument that carries it; the second is the same rule applied to what the compiler reported. |
 | `daemon does not support authentication; the configured credential was ignored` | `FASTCACHE_TOKEN` is set but the daemon predates the AUTH verb. Caching works normally — the daemon steps over the verb it does not know and serves the command — but this traffic is **not** authenticated. Said once per invocation rather than per exchange. Upgrade the daemon, or unset the token if it was not meant to apply here. |
 | `rejected (unauthenticated): ...` | The daemon requires a credential. `authentication required` means none was sent — set `FASTCACHE_TOKEN`. `authentication failed` means one was sent and was wrong. The two are deliberately different messages because they are different mistakes. Either way the compile still runs locally and the build succeeds; only the caching is lost. |
 | `fetch exchange failed`, `fetch decoded malformed` | Transport or protocol trouble mid-request. Also how a `FASTCACHE_TIMEOUT_MS` expiry surfaces: a daemon that accepted the connection and then went quiet. If these appear in bulk and each compile stalls for the full timeout first, suspect a wedged daemon rather than a flaky network. |
@@ -358,6 +359,14 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
 - `__TIME__` / `__DATE__` / `__TIMESTAMP__` detection scans the source file
   text. Direct use is caught; use reached only *through a header* is not, so
   such a TU stays a permanent miss. Never incorrect — just never cached.
+- A Windows **drive-relative** path (`C:foo`) reaching a compile takes that
+  translation unit out of the cache entirely, rather than being ignored. Only
+  `clang-cl` echoes such a path back unresolved (`cl` resolves it through the
+  filesystem), and no common generator emits one, so in practice this costs
+  nothing — but where it does fire it costs the whole TU rather than one path,
+  deliberately: a partial answer here is the stale-dependency serve it exists to
+  prevent. The refusal is silent unless `FASTCACHE_VERBOSE` is set, and shows in
+  `--show-stats` as *uncacheable*.
 - Diagnostics-stream paths outside the include grammar are not yet localized.
 - Toolchain and system dependency paths are in neither the key nor the
   existence check, by design: they are the producing machine's spelling, the

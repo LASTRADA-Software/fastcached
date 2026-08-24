@@ -65,6 +65,21 @@ namespace FastCache::Cc
 ///   that cannot be examined counts as present. `PathCanon::Anchor` is what separates it
 ///   from a relative path (issue #65).
 ///
+///   What that skip used to leave is closed upstream rather than here. Under no root
+///   such a path is dropped from the KEY as well, so a header moved inside it was
+///   neither re-keyed nor probed; `Cc::IsDriveRelativeUnderNoRoot` refuses to cache
+///   such a compile at all (issue #104), so no entry written since carries one.
+///   Not *no* entry, though, and the difference is worth stating precisely: the
+///   authoritative refusal runs after `TryDirectMode`, and the earlier command-line
+///   one can only see a path an argument carries, so a pre-fix manifest for a TU
+///   whose drive-relative header arrived some other way — an `#include "C:foo/x.h"`
+///   written out in the source, a fused flag spelling `PathValueFlags()` does not
+///   know — stays direct-hittable, and no schema tag moved to retire it. That is the
+///   recorded residual, and this arm is why such a hit is not discarded instead: the
+///   probe would have no truthful answer to give.
+///
+///   Under a drive-relative *root* the path is keyed, which is what covers it there.
+///
 /// Pure: touches no filesystem.
 ///
 /// @param localizedRegions The decoded value's text regions, already localized to
