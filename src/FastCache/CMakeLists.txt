@@ -4,7 +4,9 @@
 
 target_sources(FastCache
     PRIVATE
+        Async/DeadlineTimer.cpp
         Async/EpollReactor.cpp
+        Async/InterruptibleSleep.cpp
         Async/IocpReactor.cpp
         Async/KqueueReactor.cpp
         Async/TestReactor.cpp
@@ -54,13 +56,18 @@ target_sources(FastCache
         Metrics/PrometheusFormatter.cpp
         Net/BlockingConnector.cpp
         Net/BlockingSocket.cpp
+        Net/ConnectFlow.cpp
         Net/InheritedListener.cpp
         Net/HealthProbe.cpp
+        Net/EpollConnector.cpp
         Net/EpollSocket.cpp
+        Net/IocpConnector.cpp
         Net/IocpSocket.cpp
+        Net/KqueueConnector.cpp
         Net/KqueueSocket.cpp
         Net/SocketAddress.cpp
         Net/TcpClient.cpp
+        Net/ThreadedAddressResolver.cpp
         Platform/CpuAffinity.cpp
         Platform/DaemonControls.cpp
         Platform/Environment.cpp

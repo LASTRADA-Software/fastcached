@@ -7,7 +7,6 @@
 // it at a throwaway directory so the developer's real statistics are never read
 // or written.
 
-#include "ScratchPathTestSupport.hpp"
 #include "Stats.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -19,6 +18,8 @@
 #include <optional>
 #include <string>
 #include <system_error>
+
+#include <tests/ScratchPath.hpp>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -38,27 +39,24 @@ class ScopedStateDir
   public:
     ScopedStateDir()
     {
-        // The shared helper, which this file's own comment used to explain at
-        // length. The explanation moved with it -- three later test files
-        // reintroduced exactly this bug while the fix sat here as a private
-        // helper, which is the argument for it not being private.
-        auto const unique = Test::UniqueScratchPath("fastcache-cc-test");
-        std::filesystem::create_directories(unique);
-        _dir = unique.string();
-
+        // The directory is the shared helper's job, which this file's own comment
+        // used to explain at length. The explanation moved with it -- three later
+        // test files reintroduced exactly that bug while the fix sat here as a
+        // private helper, and a fifth reintroduced it because the shared version
+        // was somewhere it could not include from.
         _previous = Current();
-        Set(_dir);
+        Set(_scratch.Path().string());
         static_cast<void>(ResetLog()); // start from a known-empty log
     }
 
     ~ScopedStateDir()
     {
+        // Only the environment: the directory goes with `_scratch`, and it must
+        // go AFTER this, which member order already guarantees.
         if (_previous.has_value())
             Set(*_previous);
         else
             Unset();
-        std::error_code ec;
-        std::filesystem::remove_all(_dir, ec);
     }
 
     ScopedStateDir(ScopedStateDir const&) = delete;
@@ -67,6 +65,8 @@ class ScopedStateDir
     ScopedStateDir& operator=(ScopedStateDir&&) = delete;
 
   private:
+    FastCache::Testing::ScratchDirectory _scratch { "fastcache-cc-test" };
+
 #if defined(_WIN32)
     static constexpr char const* VariableName = "LOCALAPPDATA";
 #else
@@ -97,7 +97,6 @@ class ScopedStateDir
 #endif
     }
 
-    std::string _dir;
     std::optional<std::string> _previous;
 };
 

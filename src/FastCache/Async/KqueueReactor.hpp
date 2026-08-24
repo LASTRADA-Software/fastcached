@@ -29,6 +29,19 @@ struct KqueueFdHandler
     void* owner { nullptr };
     void (*onReadable)(KqueueFdHandler* self) { nullptr };
     void (*onWritable)(KqueueFdHandler* self) { nullptr };
+
+    /// Invoked instead of the two above when kqueue reports EV_ERROR or EV_EOF.
+    ///
+    /// The member exists on both reactors' handlers so one dial implementation
+    /// can be written against either -- see Net/ReactorDial.hpp. kqueue needs it
+    /// less badly than epoll does, because a failed connect here fires
+    /// EVFILT_WRITE with EV_EOF and so reaches `onWritable` anyway; naming the
+    /// error explicitly is what lets a dial tell "the connect settled, go read
+    /// SO_ERROR" from "the socket became writable".
+    ///
+    /// Optional. A handler that leaves it null has the event delivered to the
+    /// filter's own callback, exactly as before.
+    void (*onError)(KqueueFdHandler* self) { nullptr };
 };
 
 /// macOS kqueue-based reactor. Same external shape as IocpReactor /
@@ -50,6 +63,7 @@ class KqueueReactor: public IReactor
     void Stop() noexcept override;
     void Submit(std::coroutine_handle<> handle) override;
     void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override;
+    [[nodiscard]] bool CancelPending(std::coroutine_handle<> handle) noexcept override;
     [[nodiscard]] IClock& Clock() noexcept override
     {
         return _clock;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -92,9 +93,7 @@ struct Credential
 /// @param frame A complete framed request.
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome.
-[[nodiscard]] CacheOutcome ExchangeFramed(ISocket& client,
-                                          std::vector<std::byte> const& frame,
-                                          Credential const& credential = {});
+[[nodiscard]] Task<CacheOutcome> ExchangeFramed(ISocket* client, std::vector<std::byte> frame, Credential credential = {});
 
 /// FETCH one key over an already-connected client.
 ///
@@ -113,7 +112,7 @@ struct Credential
 /// @param key The key to look up.
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome; `value` holds the stored bytes on a hit.
-[[nodiscard]] CacheOutcome CacheFetch(ISocket& client, std::string_view key, Credential const& credential = {});
+[[nodiscard]] Task<CacheOutcome> CacheFetch(ISocket* client, std::string_view key, Credential credential = {});
 
 /// STORE one entry over an already-connected client.
 ///
@@ -122,9 +121,9 @@ struct Credential
 /// @param request The fields to send.
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome; `kind == Hit` means the daemon acknowledged the write.
-[[nodiscard]] CacheOutcome CacheStore(ISocket& client,
-                                      CompileCacheWire::StoreRequest const& request,
-                                      Credential const& credential = {});
+[[nodiscard]] Task<CacheOutcome> CacheStore(ISocket* client,
+                                            CompileCacheWire::StoreRequest request,
+                                            Credential credential = {});
 
 /// Default ceiling on a value the launcher will offer to the daemon.
 ///

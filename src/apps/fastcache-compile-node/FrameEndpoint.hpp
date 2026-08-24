@@ -3,7 +3,6 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Net/IListener.hpp>
 
 #include <atomic>
@@ -13,10 +12,11 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <thread>
 
 namespace FastCache::Node
 {
+
+class NodeIoLoop;
 
 /// Answers one framed request.
 ///
@@ -40,11 +40,27 @@ class IFrameResponder
     IFrameResponder(IFrameResponder&&) = default;
     IFrameResponder& operator=(IFrameResponder&&) = default;
 
-    /// @param frame Header plus payload, exactly as received.
-    /// @param peer The connecting peer's host, for surfaces whose policy needs it.
-    /// @return The encoded reply, or empty to close without answering — which is
+    /// Answer one complete request frame.
+    ///
+    /// A `Task` because answering may now have to reach the network -- the cache
+    /// surface consults an upstream, and that dial suspends rather than blocking
+    /// the loop every other connection on this reactor is sharing. A responder
+    /// that needs nothing is still free to `co_return` without suspending, which
+    /// the scheduler's does; that costs a frame allocation and no round trip.
+    ///
+    /// @param frame The whole request, header included. A span rather than an
+    ///        owning vector because a cache STORE carries an object file and
+    ///        copying it here would double the peak footprint on the hot path of
+    ///        a parallel build. It must outlive the returned task -- the same
+    ///        contract `SendAll` states, and true by construction at the one call
+    ///        site, where the backing vector is a local of the calling coroutine.
+    /// @param peer The peer's host, for the surfaces whose policy needs one.
+    ///        Owned rather than a view: it is short, and every policy-bearing
+    ///        responder holds it across a suspension, so a view would make its
+    ///        lifetime a rule at each implementation instead of a fact.
+    /// @return The encoded reply, or empty to close without answering -- which is
     ///         only ever right when the peer is not speaking this protocol at all.
-    [[nodiscard]] virtual std::vector<std::byte> Answer(std::span<std::byte const> frame, std::string_view peer) = 0;
+    [[nodiscard]] virtual Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) = 0;
 
     /// Largest request this surface will buffer.
     ///
@@ -53,6 +69,27 @@ class IFrameResponder
     /// whole object file. Sizing both for the larger would hand an unauthenticated
     /// peer a way to make the scheduler allocate megabytes.
     [[nodiscard]] virtual std::size_t MaxRequestBytes() const noexcept = 0;
+
+    /// How many requests this surface will serve at once.
+    ///
+    /// A cap the serialized loop used to provide by accident. Serving one connection
+    /// at a time bounded peak memory to a single `MaxRequestBytes()` frame; serving
+    /// them concurrently -- which is the whole point of moving onto a reactor --
+    /// turns that into N of them. So the bound has to become explicit at the same
+    /// moment the serialization goes, or the fix opens a memory-exhaustion hole.
+    ///
+    /// Per-responder for the same reason `MaxRequestBytes` is, and the spread is
+    /// wider here rather than narrower: a scheduler verb is kilobytes and can afford
+    /// hundreds at once, while a cache STORE is megabytes and cannot.
+    [[nodiscard]] virtual std::size_t MaxConcurrentRequests() const noexcept = 0;
+
+    /// How many declared payload bytes may be in flight across all connections.
+    ///
+    /// The connection cap alone does not bound memory -- N connections each
+    /// declaring `MaxRequestBytes()` is still N times that. This is what actually
+    /// bounds it, and it is checkable at exactly the right moment: the header
+    /// declares its length before a single payload byte is read.
+    [[nodiscard]] virtual std::size_t MaxInFlightBytes() const noexcept = 0;
 };
 
 /// Accepts connections and answers each with one framed request.
@@ -82,36 +119,73 @@ class IFrameResponder
 class FrameServer
 {
   public:
-    /// How often a parked `Accept()` returns so the loop can observe `Shutdown()`.
-    ///
-    /// POSIX does not unblock a parked `accept()` when another thread closes the
-    /// listening socket, so this poll interval *is* the shutdown mechanism rather
-    /// than a tuning knob -- the lesson `WorkerServer` records having learned as a
-    /// 900-second CI timeout naming nothing.
-    static constexpr std::chrono::milliseconds AcceptPoll { 250 };
-
     /// How long one request may take to arrive before its socket is abandoned.
+    ///
+    /// This used to be `SO_RCVTIMEO`, applied to every accepted socket by
+    /// `BlockingListener::SetTimeouts`. A reactor socket has no such option -- its
+    /// reads suspend rather than block -- so without a replacement a client that
+    /// connects and sends half a header holds a descriptor and a coroutine frame
+    /// until the process dies. A slow-loris on the node's cache port, free.
     static constexpr std::chrono::milliseconds RequestTimeout { 5'000 };
 
+    /// How often the sweeper looks for connections past their deadline.
+    ///
+    /// ONE sweeper per server rather than one timer per connection, and that is the
+    /// difference between a bounded cost and a parked frame per client.
+    /// `IReactor::Schedule` cannot be cancelled, so a per-connection timer would
+    /// stay on the wheel for the full interval after its connection had already
+    /// finished -- the leak `Async/DeadlineTimer` documents at length.
+    static constexpr std::chrono::milliseconds SweepInterval { RequestTimeout / 4 };
+
+    /// @param io The loop this server accepts and answers on.
     /// @param listener Bound listener; must outlive the run.
     /// @param responder Answers each request; must outlive the run.
     /// @param what Names this surface in log lines, so three endpoints in one
     ///        process are distinguishable when one of them stops accepting.
     /// @param logger Shared logger.
-    FrameServer(IListener& listener, IFrameResponder& responder, std::string_view what, ILogger& logger) noexcept;
+    FrameServer(
+        NodeIoLoop& io, IListener& listener, IFrameResponder& responder, std::string_view what, ILogger& logger) noexcept;
+
+    FrameServer(FrameServer const&) = delete;
+    FrameServer(FrameServer&&) = delete;
+    FrameServer& operator=(FrameServer const&) = delete;
+    FrameServer& operator=(FrameServer&&) = delete;
+    ~FrameServer();
 
     /// Accept loop; returns when the listener is closed via `Shutdown()`.
+    ///
+    /// Each accepted connection is served by a `DetachedTask` of its own rather
+    /// than inline, which is the entire point: the cache surface consults an
+    /// upstream from inside its answer, and serving that inline is what made one
+    /// slow dial stall every other client of this node.
     [[nodiscard]] Task<void> Run();
 
-    /// Close the listener to unblock `Run()`.
+    /// Stop accepting, close what is open, and wait for the connections to end.
+    ///
+    /// Safe from any thread. The closes are POSTED onto the reactor rather than
+    /// done here, and that is not caution: on epoll and kqueue `ISocket::Close`
+    /// completes a parked awaitable by resuming its coroutine INLINE, so closing
+    /// from another thread would run this server's connection tasks there while the
+    /// reactor thread is still driving them. IOCP routes cancellation back through
+    /// the port and does not, which is exactly what would make it a race that
+    /// passes CI on Windows.
     void Shutdown() noexcept;
 
+    /// Report a loop that threw, without throwing. Called by the owning loop's
+    /// exception firewall.
+    void NoteLoopThrew() noexcept;
+
+    /// @return How many connections are being served right now. For tests.
+    [[nodiscard]] std::size_t InFlight() const noexcept;
+
+    /// @return How many declared payload bytes are in flight. For tests.
+    [[nodiscard]] std::size_t InFlightBytes() const noexcept;
+
+    /// Implementation detail; public so the .cpp's connection tasks can name it.
+    struct State;
+
   private:
-    IListener& _listener;
-    IFrameResponder& _responder;
-    std::string _what;
-    ILogger& _logger;
-    std::atomic<bool> _shuttingDown { false };
+    std::shared_ptr<State> _state;
 };
 
 /// The node's scheduler port: listener, server and the thread that serves them,
@@ -141,20 +215,24 @@ class FrameEndpoint
     /// @param what Names this surface in log lines.
     /// @param logger Where to announce the bound address.
     /// @return The running endpoint, or why it could not be served.
-    [[nodiscard]] static std::expected<std::unique_ptr<FrameEndpoint>, std::string> Start(std::string_view listenSpec,
+    /// @param io The loop this endpoint accepts and answers on. It must be
+    ///        `Start()`ed after every endpoint has been created, so the listener is
+    ///        bound and adopted before anything begins accepting.
+    [[nodiscard]] static std::expected<std::unique_ptr<FrameEndpoint>, std::string> Start(NodeIoLoop& io,
+                                                                                          std::string_view listenSpec,
                                                                                           std::string_view defaultHost,
                                                                                           IFrameResponder& responder,
                                                                                           std::string_view what,
                                                                                           ILogger& logger);
 
-    /// Stop serving and join the thread.
+    /// Stop serving. The loop's own thread is joined by `NodeIoLoop`.
     ~FrameEndpoint();
 
     FrameEndpoint(FrameEndpoint const&) = delete;
     FrameEndpoint& operator=(FrameEndpoint const&) = delete;
 
-    // Neither movable, for the reason `AdminEndpoint` gives: the serving thread holds
-    // a pointer to `_server`, and `_server` a reference to `_listener`.
+    // Neither movable, for the reason `AdminEndpoint` gives: the reactor holds
+    // pointers into `_server`, and `_server` a reference to `_listener`.
     FrameEndpoint(FrameEndpoint&&) = delete;
     FrameEndpoint& operator=(FrameEndpoint&&) = delete;
 
@@ -165,16 +243,20 @@ class FrameEndpoint
     }
 
   private:
-    FrameEndpoint(std::unique_ptr<BlockingListener> listener,
+    FrameEndpoint(NodeIoLoop& io,
+                  std::unique_ptr<IListener> listener,
                   IFrameResponder& responder,
                   std::string_view what,
                   std::string boundEndpoint,
                   ILogger& logger);
 
-    std::unique_ptr<BlockingListener> _listener;
+    /// `IListener` and not the platform type, deliberately: naming the concrete one
+    /// would drag `<windows.h>` into every header that includes this, and nothing
+    /// here needs more than Accept, Close and BoundPort -- the last of which is on
+    /// the interface now precisely so this could stop being concrete.
+    std::unique_ptr<IListener> _listener;
     std::unique_ptr<FrameServer> _server;
     std::string _boundEndpoint;
-    std::jthread _thread;
 };
 
 } // namespace FastCache::Node

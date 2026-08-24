@@ -4,10 +4,12 @@
 #include <FastCache/Async/IReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
 
+#include <atomic>
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <vector>
 
 namespace FastCache
@@ -32,6 +34,7 @@ class TestReactor: public IReactor
     void Stop() noexcept override;
     void Submit(std::coroutine_handle<> handle) override;
     void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override;
+    [[nodiscard]] bool CancelPending(std::coroutine_handle<> handle) noexcept override;
     [[nodiscard]] IClock& Clock() noexcept override;
 
     /// Resume every ready submission and every timer whose deadline has
@@ -64,7 +67,24 @@ class TestReactor: public IReactor
     void FireExpiredTimers();
 
     IClock& _clock;
-    bool _stopped { false };
+
+    /// Guards `_ready`, `_timers` and `_nextSequence`.
+    ///
+    /// `IReactor` documents Submit and Schedule as safe to call from any thread,
+    /// and this double did not honour that -- it touched a bare deque and a bare
+    /// vector. Nothing noticed while every producer was the test's own thread,
+    /// and the primitives this reactor now has to exercise (a resolver handing a
+    /// result back from a worker, a queue pushed from a producer thread) are
+    /// precisely the ones whose headline property is that they cross threads. A
+    /// test double that cannot be used the way its interface is documented is a
+    /// test double that quietly forces every such case onto a real reactor.
+    ///
+    /// It is never held across a `resume()`: a resumed coroutine may call
+    /// Submit, which is the same reason the platform reactors drain into a local
+    /// before resuming anything.
+    mutable std::mutex _mutex;
+
+    std::atomic<bool> _stopped { false };
     std::uint64_t _nextSequence { 0 };
     std::deque<std::coroutine_handle<>> _ready;
     std::vector<ScheduledEntry> _timers; ///< Min-heap by (deadline, sequence).

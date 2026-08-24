@@ -151,7 +151,11 @@ DispatchResult Dispatch(IEndpointDialer& dialer,
 
     auto const leaseFrame = Wire::EncodeLease(
         Wire::LeaseRequest { .fingerprint = request.fingerprint, .key = request.objectKey, .acceptedCodecs = accepted });
-    auto const leaseOutcome = ExchangeFramed(*scheduler, leaseFrame, credential);
+    // `SyncRun` because this path has no reactor: the dialer above hands back a
+    // blocking socket, whose awaitables resolve inline, so the task is never left
+    // suspended. That is the precondition `SyncRun` states, and it is why the
+    // dialer is typed on `BlockingConnector` rather than on `IConnector`.
+    auto const leaseOutcome = SyncRun(ExchangeFramed(scheduler.get(), leaseFrame, credential));
     if (leaseOutcome.kind == CacheOutcomeKind::Transport)
         return Refused(DispatchStatus::Unavailable, "lease exchange failed");
     if (!leaseOutcome.IsHit())
@@ -188,7 +192,7 @@ DispatchResult Dispatch(IEndpointDialer& dialer,
                                                                          .source = sourceField,
                                                                          .acceptedCodecs = accepted,
                                                                          .sourceName = BaseName(request.sourceName) });
-    auto const compileOutcome = ExchangeFramed(*worker, compileFrame, credential);
+    auto const compileOutcome = SyncRun(ExchangeFramed(worker.get(), compileFrame, credential));
     if (compileOutcome.kind == CacheOutcomeKind::Transport)
         return Refused(DispatchStatus::Unavailable, std::format("compile exchange with {} failed", endpoint));
     if (!compileOutcome.IsHit())
@@ -222,24 +226,31 @@ namespace
     class TcpDialer final: public IEndpointDialer
     {
       public:
-        explicit TcpDialer(std::chrono::milliseconds ioTimeout) noexcept:
-            _ioTimeout { ioTimeout }
+        TcpDialer(std::chrono::milliseconds connectTimeout, std::chrono::milliseconds ioTimeout) noexcept:
+            _connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = ioTimeout } },
+            _connectTimeout { connectTimeout }
         {
         }
 
         [[nodiscard]] std::unique_ptr<ISocket> Dial(std::string_view hostPort) override
         {
-            return DialEndpoint(hostPort, _ioTimeout);
+            return DialEndpointBlocking(_connector, hostPort, _connectTimeout);
         }
 
       private:
-        std::chrono::milliseconds _ioTimeout;
+        /// A BLOCKING connector, and the type is the contract: this dialer is used
+        /// from the launcher's main thread, which has no reactor, and the socket it
+        /// hands back is driven with `SyncRun`. The per-call send/recv ceiling lives
+        /// on the connector now, because that is the only kind of socket it means
+        /// anything to.
+        BlockingConnector _connector;
+        std::chrono::milliseconds _connectTimeout;
     };
 } // namespace
 
-std::unique_ptr<IEndpointDialer> MakeTcpDialer(std::chrono::milliseconds ioTimeout)
+std::unique_ptr<IEndpointDialer> MakeTcpDialer(std::chrono::milliseconds connectTimeout, std::chrono::milliseconds ioTimeout)
 {
-    return std::make_unique<TcpDialer>(ioTimeout);
+    return std::make_unique<TcpDialer>(connectTimeout, ioTimeout);
 }
 
 } // namespace FastCache::Cc

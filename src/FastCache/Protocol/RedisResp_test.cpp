@@ -3211,12 +3211,18 @@ namespace
 /// explicitly between the two phases.
 struct BlockingHarness
 {
-    FastCache::ManualClock clock;
-    FastCache::TestReactor reactor { clock };
+    // Declaration order is padding-driven as well as dependency-driven: `clock`
+    // must precede `reactor` and `engine`, and `storage` must precede `engine`,
+    // because those initializers bind to them. Within that constraint the
+    // members are ordered largest-alignment-first, which is what keeps
+    // clang-analyzer-optin.performance.Padding quiet -- it started reporting this
+    // struct when TestReactor grew the mutex its interface always promised.
     FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
     FastCache::CacheEngine engine { storage, clock };
-    FastCache::StreamWaiterRegistry waiters;
+    FastCache::TestReactor reactor { clock };
     FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    FastCache::StreamWaiterRegistry waiters;
     FastCache::RedisRespHandler handler;
     std::string reply;
 

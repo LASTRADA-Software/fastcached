@@ -74,11 +74,18 @@ namespace
         };
     }
 
-    void SetNonBlocking(int fd) noexcept
+    /// Non-blocking plus close-on-exec, for a descriptor this reactor will own.
+    ///
+    /// Both halves come from `Detail`. They used to be a local copy here and
+    /// another in `KqueueSocket.cpp`, and the two had already drifted -- only the
+    /// kqueue one set FD_CLOEXEC -- which is the drift a single definition
+    /// exists to stop. Close-on-exec matters because a process that both listens
+    /// and spawns children (the compile node spawns a compiler per job) otherwise
+    /// hands each child every open connection.
+    void PrepareOwnedFd(int fd) noexcept
     {
-        auto const flags = ::fcntl(fd, F_GETFL, 0);
-        if (flags >= 0)
-            ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        std::ignore = Detail::SetNonBlocking(static_cast<Detail::NativeSocket>(fd));
+        Detail::ArmCloseOnExec(static_cast<Detail::NativeSocket>(fd));
     }
 
     /// Per-`sendmsg` iovec batch cap. `IOV_MAX` is the kernel limit (1024 on
@@ -350,7 +357,7 @@ EpollSocket::EpollSocket(EpollReactor& reactor, int fd, std::string peerAddress)
     _fd { fd },
     _peerAddress { std::move(peerAddress) }
 {
-    SetNonBlocking(fd);
+    PrepareOwnedFd(fd);
     std::ignore = reactor.Attach(&_impl->handler);
 }
 
@@ -375,18 +382,38 @@ void EpollSocket::Close() noexcept
         // Fail whatever was parked. The interest is gone, so nothing will ever
         // complete these awaitables; leaving them set leaks the suspended
         // coroutine on abrupt teardown.
+        //
+        // Detached from the ops FIRST and completed afterwards, which is not
+        // tidiness: `Complete` resumes the parked coroutine, and a coroutine that
+        // owns this socket -- `ServePeer` holds it in a by-value `unique_ptr`
+        // parameter -- runs to its end and destroys it before `Complete` returns.
+        // So `this`, `_impl` and everything in it are freed part-way through this
+        // loop. Completing inside it read `_impl->writeOp` after the free, which
+        // ASan reports as a heap-use-after-free from `RaftPeerServer::Shutdown`;
+        // it went unseen for as long as the sanitizer preset was silently building
+        // without sanitizers.
+        std::array<IoAwaitable*, 2> parked { nullptr, nullptr };
+        std::size_t parkedCount = 0;
         for (auto* op: { &_impl->readOp, &_impl->writeOp })
         {
             if (op->awaitable == nullptr)
                 continue;
-            auto* awaitable = op->awaitable;
+            parked.at(parkedCount++) = op->awaitable;
             op->awaitable = nullptr;
             op->readBuffer = {};
             op->writeRemaining = {};
             op->ClearVectored();
-            awaitable->Complete(
-                std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
         }
+        _fd = -1;
+
+        // Past this point nothing may touch a member. The two awaitables live in
+        // their own coroutines' frames rather than in `_impl`, so they stay valid
+        // even once the first resume has taken the socket down.
+        for (auto* awaitable: parked)
+            if (awaitable != nullptr)
+                awaitable->Complete(
+                    std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+        return;
     }
     _fd = -1;
 }
@@ -661,6 +688,13 @@ bool EpollListener::IsBound() const noexcept
 std::string_view EpollListener::BindError() const noexcept
 {
     return _impl ? std::string_view { _impl->bindError } : std::string_view {};
+}
+
+std::uint16_t EpollListener::BoundPort() const noexcept
+{
+    if (!_impl || _impl->handler.fd < 0)
+        return 0;
+    return Detail::BoundPortOf(static_cast<Detail::NativeSocket>(_impl->handler.fd));
 }
 
 void EpollListener::Close() noexcept

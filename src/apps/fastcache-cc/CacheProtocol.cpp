@@ -52,41 +52,41 @@ namespace
     /// reader, and it always consumes a whole frame.
     /// @param client Connected transport.
     /// @return The outcome, with the payload attached.
-    [[nodiscard]] CacheOutcome RecvReply(ISocket& client)
+    [[nodiscard]] Task<CacheOutcome> RecvReply(ISocket* client)
     {
-        auto const headerBytes = SyncRun(FastCache::RecvExactly(&client, Wire::ReplyHeaderSize));
+        auto const headerBytes = co_await FastCache::RecvExactly(client, Wire::ReplyHeaderSize);
         if (!headerBytes.has_value())
-            return Plain(CacheOutcomeKind::Transport);
+            co_return Plain(CacheOutcomeKind::Transport);
 
         auto const header = Wire::DecodeReplyHeader(*headerBytes);
         if (!header.has_value())
-            return Plain(CacheOutcomeKind::Transport);
+            co_return Plain(CacheOutcomeKind::Transport);
 
         std::vector<std::byte> payload;
         if (header->payloadLength > 0)
         {
-            auto received = SyncRun(FastCache::RecvExactly(&client, header->payloadLength));
+            auto received = co_await FastCache::RecvExactly(client, header->payloadLength);
             if (!received.has_value())
-                return Plain(CacheOutcomeKind::Transport);
+                co_return Plain(CacheOutcomeKind::Transport);
             payload = std::move(*received);
         }
 
         switch (header->status)
         {
             case Wire::Status::Ok:
-                return Hit(std::move(payload));
+                co_return Hit(std::move(payload));
 
             case Wire::Status::Miss:
-                return Plain(CacheOutcomeKind::Miss);
+                co_return Plain(CacheOutcomeKind::Miss);
 
             case Wire::Status::Error: {
                 auto const decoded = Wire::DecodeErrorPayload(payload);
                 if (!decoded.has_value())
-                    return Plain(CacheOutcomeKind::Transport);
-                return Rejected(decoded->first, std::string { decoded->second });
+                    co_return Plain(CacheOutcomeKind::Transport);
+                co_return Rejected(decoded->first, std::string { decoded->second });
             }
         }
-        return Plain(CacheOutcomeKind::Transport);
+        co_return Plain(CacheOutcomeKind::Transport);
     }
 
     /// Send a framed request — optionally preceded by an AUTH frame in the SAME
@@ -117,32 +117,38 @@ namespace
     /// @param credential Credential to present ahead of it; none when unconfigured.
     /// @return The command's outcome, or the AUTH refusal when the credential was
     ///         rejected (the command's own reply is still drained first).
-    [[nodiscard]] CacheOutcome Exchange(ISocket& client, std::vector<std::byte> const& frame, Credential const& credential)
+    /// Parameters by VALUE, not by reference. clang-tidy enforces this on
+    /// coroutines and it is right to: the frame outlives the call expression, so
+    /// a reference would bind to storage the caller may already have destroyed.
+    /// It costs nothing here because every caller moves into it -- a STORE frame
+    /// carries a whole object file, and copying it would double the peak
+    /// footprint on the hot path of a parallel build.
+    [[nodiscard]] Task<CacheOutcome> Exchange(ISocket* client, std::vector<std::byte> frame, Credential credential)
     {
         if (!credential.Configured())
         {
-            if (!SyncRun(FastCache::SendAll(&client, frame)))
-                return Plain(CacheOutcomeKind::Transport);
-            return RecvReply(client);
+            if (!co_await FastCache::SendAll(client, frame))
+                co_return Plain(CacheOutcomeKind::Transport);
+            co_return co_await RecvReply(client);
         }
 
         auto const authFrame =
             Wire::EncodeAuth(Wire::AuthRequest { .username = credential.username, .secret = credential.secret });
-        if (!SyncRun(FastCache::SendAll(&client, authFrame)) || !SyncRun(FastCache::SendAll(&client, frame)))
-            return Plain(CacheOutcomeKind::Transport);
+        if (!co_await FastCache::SendAll(client, authFrame) || !co_await FastCache::SendAll(client, frame))
+            co_return Plain(CacheOutcomeKind::Transport);
 
         // Non-const so the returns below can move rather than copy: an outcome
         // can carry a whole cached object, and `performance-no-automatic-move`
         // rejects the const spelling outright.
-        auto authOutcome = RecvReply(client);
+        auto authOutcome = co_await RecvReply(client);
         if (authOutcome.kind == CacheOutcomeKind::Transport)
-            return authOutcome;
+            co_return authOutcome;
 
         // The command's reply is read even when AUTH was refused: the server
         // answers every request it read, so leaving it in the socket would strand
         // a frame and the next command on this connection would read this one's
         // answer.
-        auto commandOutcome = RecvReply(client);
+        auto commandOutcome = co_await RecvReply(client);
 
         // A daemon that predates the AUTH verb answers it `unknown-opcode` and —
         // because the framing was built to let a receiver step over a verb it does
@@ -160,7 +166,7 @@ namespace
         if (authOutcome.kind == CacheOutcomeKind::Rejected && authOutcome.code == Wire::ErrorCode::UnknownOpcode)
         {
             commandOutcome.credentialIgnored = true;
-            return commandOutcome;
+            co_return commandOutcome;
         }
 
         // Any other refusal is about the credential itself (wrong secret, an
@@ -168,15 +174,15 @@ namespace
         // act on; the command's own reply says only "unauthenticated", which
         // explains nothing.
         if (!authOutcome.IsHit())
-            return authOutcome;
-        return commandOutcome;
+            co_return authOutcome;
+        co_return commandOutcome;
     }
 
 } // namespace
 
-CacheOutcome ExchangeFramed(ISocket& client, std::vector<std::byte> const& frame, Credential const& credential)
+Task<CacheOutcome> ExchangeFramed(ISocket* client, std::vector<std::byte> frame, Credential credential)
 {
-    return Exchange(client, frame, credential);
+    co_return co_await Exchange(client, std::move(frame), std::move(credential));
 }
 
 std::string DescribeOutcome(CacheOutcome const& outcome)
@@ -199,14 +205,14 @@ std::string DescribeOutcome(CacheOutcome const& outcome)
     return "unknown outcome";
 }
 
-CacheOutcome CacheFetch(ISocket& client, std::string_view key, Credential const& credential)
+Task<CacheOutcome> CacheFetch(ISocket* client, std::string_view key, Credential credential)
 {
-    return Exchange(client, Wire::EncodeFetch(key), credential);
+    co_return co_await Exchange(client, Wire::EncodeFetch(key), std::move(credential));
 }
 
-CacheOutcome CacheStore(ISocket& client, Wire::StoreRequest const& request, Credential const& credential)
+Task<CacheOutcome> CacheStore(ISocket* client, Wire::StoreRequest request, Credential credential)
 {
-    return Exchange(client, Wire::EncodeStore(request), credential);
+    co_return co_await Exchange(client, Wire::EncodeStore(request), std::move(credential));
 }
 
 } // namespace FastCache::Cc

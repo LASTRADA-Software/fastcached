@@ -336,7 +336,19 @@ for index in 0 1 2; do
             sleep 0.2
         done
         kill -0 "${pids[$index]}" 2>/dev/null && fail "the leader did not exit within 15s of being asked to stop"
-        wait "${pids[$index]}" 2>/dev/null || true
+
+        # The exit STATUS, not merely the exit. It used to be discarded with
+        # `|| true`, which threw away the one signal that makes a whole class of
+        # defect visible: under a sanitizer build a coroutine frame nobody freed --
+        # the failure mode every part of the reactor migration is shaped to avoid --
+        # is reported by a non-zero exit and by nothing else. A node asked to stop
+        # must also stop CLEANLY.
+        leader_status=0
+        wait "${pids[$index]}" || leader_status=$?
+        # 143 is SIGTERM, which is how it was asked to stop.
+        if [[ $leader_status -ne 0 && $leader_status -ne 143 ]]; then
+            fail "the leader exited with status $leader_status after SIGTERM"
+        fi
         scheduler_ports[$index]=""
         break
     fi

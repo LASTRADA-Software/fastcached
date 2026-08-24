@@ -45,6 +45,7 @@ add_executable(fastcache-compile-node
     NodeConfig.cpp
     RemoteUpstream.cpp
     FrameEndpoint.cpp
+    NodeIoLoop.cpp
     WorkerServer.cpp
     ${_fc_node_shared}
 )
@@ -87,6 +88,7 @@ if(FASTCACHED_BUILD_TESTS)
         NodeConfig.cpp
         NodeConfig_test.cpp
         FrameEndpoint.cpp
+        NodeIoLoop.cpp
         FrameEndpoint_test.cpp
         WorkerServer.cpp
         WorkerServer_test.cpp

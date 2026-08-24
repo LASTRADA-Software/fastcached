@@ -99,7 +99,7 @@ TEST_CASE("A connector reaches a listener that is up", "[net][connector]")
     }
 
     BlockingConnector connector;
-    auto const socket = connector.Connect("127.0.0.1", listener->BoundPort(), 2s, 0ms);
+    auto const socket = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), 2s));
     REQUIRE(socket.has_value());
     CHECK(*socket != nullptr);
     CHECK_FALSE((*socket)->IsClosed());
@@ -132,7 +132,7 @@ TEST_CASE("A dial that cannot succeed fails within its timeout", "[net][connecto
     BlockingConnector connector;
 
     auto const started = std::chrono::steady_clock::now();
-    auto const socket = connector.Connect("127.0.0.1", port, Timeout, 0ms);
+    auto const socket = SyncRun(connector.Connect("127.0.0.1", port, Timeout));
     auto const elapsed = std::chrono::steady_clock::now() - started;
 
     REQUIRE_FALSE(socket.has_value());
@@ -156,7 +156,7 @@ TEST_CASE("A resolution failure is reported without dialling", "[net][connector]
     resolver.FailWith("scripted resolution failure");
 
     BlockingConnector connector { resolver };
-    auto const socket = connector.Connect("example.invalid", 1, 2s, 0ms);
+    auto const socket = SyncRun(connector.Connect("example.invalid", 1, 2s));
     REQUIRE_FALSE(socket.has_value());
     CHECK(socket.error().code == NetErrorCode::AddressNotAvail);
 
@@ -191,7 +191,11 @@ TEST_CASE("A dead first candidate does not condemn the host", "[net][connector]"
     resolver.PrependCandidate("127.0.0.1", deadPort);
 
     BlockingConnector connector { resolver };
-    auto const socket = connector.Connect("127.0.0.1", listener->BoundPort(), 2s, 0ms);
+    auto const socket = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), 2s));
+    // Report the reason rather than just "false": a dial has several ways to
+    // fail and a bare assertion names none of them, which is the difference
+    // between a diagnosis and an investigation.
+    INFO("dial outcome: " << (socket.has_value() ? std::string { "connected" } : socket.error().ToString()));
     REQUIRE(socket.has_value());
     CHECK(*socket != nullptr);
 }
@@ -202,7 +206,7 @@ TEST_CASE("A connector's failure carries the port it could not reach", "[net][co
     resolver.FailWith("nope");
 
     BlockingConnector connector { resolver };
-    auto const socket = connector.Connect("some-host", 6674, 1s, 0ms);
+    auto const socket = SyncRun(connector.Connect("some-host", 6674, 1s));
     REQUIRE_FALSE(socket.has_value());
     CHECK(socket.error().context.contains("some-host"));
     CHECK(socket.error().context.contains("6674"));

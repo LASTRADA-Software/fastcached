@@ -87,6 +87,7 @@ class EpollListener final: public IListener
 
     [[nodiscard]] AcceptAwaitable Accept() override;
     void Close() noexcept override;
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept override;
 
     [[nodiscard]] bool IsBound() const noexcept;
     [[nodiscard]] std::string_view BindError() const noexcept;

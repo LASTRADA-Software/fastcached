@@ -3,6 +3,9 @@
 
 #include "LocalCache.hpp"
 
+#include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Net/IConnector.hpp>
+
 #include <chrono>
 #include <string>
 #include <string_view>
@@ -37,17 +40,48 @@ class RemoteUpstream final: public ICacheUpstream
   public:
     /// @param endpoint `host:port` of the shared cache.
     /// @param credential Presented on every operation; empty when none is configured.
+    /// @param connector How to dial. Injected, and reactor-driven in production:
+    ///        this runs inside the node's cache endpoint, so a blocking dial here
+    ///        would stall every other connection sharing that loop -- which is
+    ///        precisely the defect this class used to cause.
+    /// @param connectTimeout Ceiling on the dial, resolution included. Separate
+    ///        from `ioTimeout` because they bound different things and neither
+    ///        implies the other; collapsing them gave this a five-second
+    ///        resolve-plus-connect budget nobody chose.
+    /// @param reactor Where the per-operation deadline is armed, or **nullptr**
+    ///        when the connector is a blocking one -- the same nullable-reactor
+    ///        convention `SleepUntil` and `IAsyncAddressResolver` use. With a
+    ///        blocking connector the socket's own `SO_RCVTIMEO` is the bound and
+    ///        arming a timer would be a second mechanism for one job; with a
+    ///        reactor connector that option is inert and the timer is the only
+    ///        thing that bounds anything.
     /// @param ioTimeout Per-operation ceiling. Bounded rather than generous: a node
     ///        waiting on an unreachable cache is a node not compiling, and the
     ///        fallback costs one local build.
-    RemoteUpstream(std::string endpoint, Cc::Credential credential, std::chrono::milliseconds ioTimeout) noexcept;
+    ///
+    ///        Armed as a `DeadlineTimer` that CLOSES the socket, rather than as
+    ///        `SO_RCVTIMEO` which is what it used to be. That is strictly more
+    ///        than the socket option gave: the option bounds a single call, so a
+    ///        peer dribbling one byte at a time could still take forever, while
+    ///        this bounds the whole exchange. It is also the only thing that
+    ///        works at all on a reactor socket, whose reads suspend rather than
+    ///        block.
+    RemoteUpstream(std::string endpoint,
+                   Cc::Credential credential,
+                   IConnector& connector,
+                   IReactor* reactor,
+                   std::chrono::milliseconds connectTimeout,
+                   std::chrono::milliseconds ioTimeout) noexcept;
 
-    [[nodiscard]] std::optional<std::vector<std::byte>> Fetch(std::string_view key) override;
-    [[nodiscard]] bool Store(std::string_view key, std::span<std::byte const> value) override;
+    [[nodiscard]] Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key) override;
+    [[nodiscard]] Task<bool> Store(std::string_view key, std::span<std::byte const> value) override;
 
   private:
     std::string _endpoint;
     Cc::Credential _credential;
+    IConnector& _connector;
+    IReactor* _reactor;
+    std::chrono::milliseconds _connectTimeout;
     std::chrono::milliseconds _ioTimeout;
 };
 

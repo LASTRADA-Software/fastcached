@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "FrameEndpoint.hpp"
+#include "NodeIoLoop.hpp"
 #include "Responders.hpp"
 
+#include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -55,6 +57,21 @@ struct Fleet
     Distributed::ClusterMembership membership { { "127.0.0.1:7000" } };
     SchedulerResponder responder { protocol, membership };
     NullLogger logger;
+
+    /// The reactor every endpoint in a case accepts on.
+    ///
+    /// Declared LAST so it is destroyed FIRST, which is the wrong way round for a
+    /// production wiring and exactly right here: a case owns its endpoint as a local
+    /// that outlives the fixture, so the reactor must still be turning when that
+    /// endpoint's destructor posts its closes onto it. `Serve()` below is what makes
+    /// the ordering explicit at each use.
+    NodeIoLoop io;
+
+    /// Start the loop once every endpoint in this case has bound and adopted.
+    void Serve()
+    {
+        io.Start();
+    }
 };
 
 /// A port nothing is listening on right now.
@@ -79,7 +96,7 @@ struct Fleet
 [[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port, std::span<std::byte const> frame)
 {
     BlockingConnector connector;
-    auto socket = connector.Connect("127.0.0.1", port, 5s, 0ms);
+    auto socket = SyncRun(connector.Connect("127.0.0.1", port, 5s));
     REQUIRE(socket.has_value());
 
     // One coroutine for the whole exchange: `SyncRun` drives a `Task`, so the awaits
@@ -118,7 +135,8 @@ struct Fleet
 TEST_CASE("An unparseable --listen-scheduler is refused, not guessed at", "[node][scheduler]")
 {
     Fleet fleet;
-    auto const started = FrameEndpoint::Start("not-a-port", "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto const started =
+        FrameEndpoint::Start(fleet.io, "not-a-port", "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
 
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains("not-a-port"));
@@ -133,7 +151,8 @@ TEST_CASE("An endpoint that cannot bind reports why", "[node][scheduler]")
     // test passes on Linux and macOS and fails on Windows (issue #85).
     Fleet fleet;
     auto const unreachable = std::string { "192.0.2.1:6674" };
-    auto const started = FrameEndpoint::Start(unreachable, "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto const started =
+        FrameEndpoint::Start(fleet.io, unreachable, "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
 
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains(unreachable));
@@ -151,12 +170,20 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
     auto const port = probe->BoundPort();
     probe.reset();
 
-    // Destroyed on another thread and waited for with a deadline, deliberately: a test
-    // that HANGS when the order is wrong reports a defect as a suite timeout naming
+    auto started =
+        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    REQUIRE(started.has_value());
+    fleet.Serve();
+
+    // Destroyed on ANOTHER thread and waited for with a deadline, deliberately, and
+    // that is sharper now than it was: shutdown posts its closes onto the reactor and
+    // then waits for the connections to end, so a stop issued from a thread that is
+    // not the reactor's is the ordinary case and the one that must not hang. A test
+    // that hangs when the order is wrong reports a defect as a suite timeout naming
     // nothing, which this repository has already paid for once.
     auto stopped = std::async(std::launch::async, [&] {
-        auto started = FrameEndpoint::Start(std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
-        return started.has_value();
+        started->reset();
+        return true;
     });
 
     REQUIRE(stopped.wait_for(15s) == std::future_status::ready);
@@ -176,8 +203,13 @@ TEST_CASE("A member registers over a real socket", "[node][scheduler]")
     // host reaches the oracle, and that a reply comes back framed.
     Fleet fleet;
     auto const port = FreePort();
-    auto started = FrameEndpoint::Start(std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto started =
+        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
     REQUIRE(started.has_value());
+
+    // Bound and adopted; now let the loop accept. Separating the two is the ordering
+    // production uses, and it is what lets several endpoints share one reactor.
+    fleet.Serve();
 
     // The endpoint reports what it actually bound, which is what makes `0` usable
     // elsewhere and what a log line has to say to be worth printing.
@@ -207,8 +239,13 @@ TEST_CASE("This machine is admitted whatever the member list says", "[node][sche
     fleet.membership.Publish({ "10.0.0.1:7000" });
 
     auto const port = FreePort();
-    auto started = FrameEndpoint::Start(std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto started =
+        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
     REQUIRE(started.has_value());
+
+    // Bound and adopted; now let the loop accept. Separating the two is the ordering
+    // production uses, and it is what lets several endpoints share one reactor.
+    fleet.Serve();
 
     // The endpoint reports what it actually bound, which is what makes `0` usable
     // elsewhere and what a log line has to say to be worth printing.
@@ -232,9 +269,9 @@ TEST_CASE("A stranger is refused the fleet", "[node][scheduler]")
 
     auto const frame = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
 
-    CHECK(ErrorOf(fleet.responder.Answer(frame, "10.9.9.9")) == Wire::ErrorCode::NotAMember);
+    CHECK(ErrorOf(SyncRun(fleet.responder.Answer(frame, "10.9.9.9"))) == Wire::ErrorCode::NotAMember);
     // And a listed peer gets past the gate to the fleet's own answer.
-    CHECK(ErrorOf(fleet.responder.Answer(frame, "10.0.0.1")) == Wire::ErrorCode::NoWorker);
+    CHECK(ErrorOf(SyncRun(fleet.responder.Answer(frame, "10.0.0.1"))) == Wire::ErrorCode::NoWorker);
 }
 
 TEST_CASE("An oversize frame is refused with both numbers, and never buffered", "[node][scheduler]")
@@ -247,8 +284,13 @@ TEST_CASE("An oversize frame is refused with both numbers, and never buffered", 
     // the DECLARED length, so the bytes are never taken.
     Fleet fleet;
     auto const port = FreePort();
-    auto started = FrameEndpoint::Start(std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto started =
+        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
     REQUIRE(started.has_value());
+
+    // Bound and adopted; now let the loop accept. Separating the two is the ordering
+    // production uses, and it is what lets several endpoints share one reactor.
+    fleet.Serve();
 
     // The endpoint reports what it actually bound, which is what makes `0` usable
     // elsewhere and what a log line has to say to be worth printing.
@@ -268,4 +310,124 @@ TEST_CASE("An oversize frame is refused with both numbers, and never buffered", 
     auto const payload = std::span<std::byte const> { reply }.subspan(Wire::ReplyHeaderSize + 1);
     auto const text = std::string { reinterpret_cast<char const*>(payload.data()), payload.size() };
     CHECK(text.contains(std::to_string(fleet.responder.MaxRequestBytes())));
+}
+
+namespace
+{
+
+/// A responder that can be held mid-answer, so a case can be inside the window
+/// where one client is being served and another arrives.
+///
+/// Held with a latch rather than a sleep: a sleep makes the case a race against
+/// the machine, and the property here is ordering rather than timing.
+class HoldableResponder final: public IFrameResponder
+{
+  public:
+    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> /*frame*/, std::string /*peer*/) override
+    {
+        _entered.fetch_add(1, std::memory_order_acq_rel);
+        while (_held.load(std::memory_order_acquire))
+            co_await FastCache::SleepFor(*_reactor, std::chrono::milliseconds { 1 });
+        _answered.fetch_add(1, std::memory_order_acq_rel);
+        co_return Wire::EncodeReply(Wire::Status::Miss, {});
+    }
+
+    [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
+    {
+        return 64ULL * 1024ULL;
+    }
+
+    [[nodiscard]] std::size_t MaxConcurrentRequests() const noexcept override
+    {
+        return _concurrent;
+    }
+
+    [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
+    {
+        return _budget;
+    }
+
+    void UseReactor(FastCache::IReactor& reactor) noexcept
+    {
+        _reactor = &reactor;
+    }
+
+    void Hold(bool held) noexcept
+    {
+        _held.store(held, std::memory_order_release);
+    }
+
+    void Limit(std::size_t concurrent, std::size_t budget) noexcept
+    {
+        _concurrent = concurrent;
+        _budget = budget;
+    }
+
+    [[nodiscard]] std::size_t Entered() const noexcept
+    {
+        return _entered.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] std::size_t Answered() const noexcept
+    {
+        return _answered.load(std::memory_order_acquire);
+    }
+
+  private:
+    FastCache::IReactor* _reactor { nullptr };
+    std::atomic<bool> _held { false };
+    std::atomic<std::size_t> _entered { 0 };
+    std::atomic<std::size_t> _answered { 0 };
+    std::size_t _concurrent { 8 };
+    std::size_t _budget { 0 };
+};
+
+/// A FETCH frame, the smallest thing the cache surface answers.
+[[nodiscard]] std::vector<std::byte> Fetch(std::string_view key)
+{
+    return Wire::EncodeFetch(key);
+}
+
+} // namespace
+
+TEST_CASE("A held answer does not stop another client being served", "[node][frame]")
+{
+    // THE regression case for the defect this whole migration exists to remove.
+    // Answering used to happen inline in the accept loop, so a cache answer that
+    // consulted a slow upstream held every other local client behind it -- one
+    // unreachable shared cache made the node's own port unusable.
+    //
+    // Verified by serving connections inline again and watching only this fail.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", responder, "cache", fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    // First client: reaches the responder and is held there.
+    auto first = std::async(std::launch::async, [port] { return Exchange(port, Fetch("first")); });
+    for (auto spin = 0; spin < 2000 && responder.Entered() == 0; ++spin)
+        std::this_thread::sleep_for(1ms);
+    REQUIRE(responder.Entered() == 1);
+    REQUIRE(responder.Answered() == 0);
+
+    // Second client, while the first is still held. It must reach the responder --
+    // which is what serialization made impossible.
+    auto second = std::async(std::launch::async, [port] { return Exchange(port, Fetch("second")); });
+    for (auto spin = 0; spin < 2000 && responder.Entered() < 2; ++spin)
+        std::this_thread::sleep_for(1ms);
+    CHECK(responder.Entered() == 2);
+
+    responder.Hold(false);
+
+    // Bounded, so a regression reports as this assertion rather than as a suite
+    // timeout naming nothing.
+    REQUIRE(first.wait_for(15s) == std::future_status::ready);
+    REQUIRE(second.wait_for(15s) == std::future_status::ready);
+    CHECK_FALSE(first.get().empty());
+    CHECK_FALSE(second.get().empty());
 }

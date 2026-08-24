@@ -90,6 +90,31 @@ KqueueReactor::~KqueueReactor()
         ::close(_kq);
 }
 
+bool KqueueReactor::CancelPending(std::coroutine_handle<> handle) noexcept
+{
+    if (!handle)
+        return false;
+
+    {
+        std::scoped_lock const guard { _submitMutex };
+        if (auto const found = std::ranges::find(_pendingSubmits, handle); found != _pendingSubmits.end())
+        {
+            _pendingSubmits.erase(found);
+            return true;
+        }
+    }
+
+    std::scoped_lock const guard { _timerMutex };
+    auto const found = std::ranges::find(_timers, handle, &TimerEntry::handle);
+    if (found == _timers.end())
+        return false;
+    // Erased and re-heaped rather than popped: this entry is somewhere in the
+    // middle of the heap, not at its root.
+    _timers.erase(found);
+    std::ranges::make_heap(_timers, EntryGreater);
+    return true;
+}
+
 bool KqueueReactor::Attach(KqueueFdHandler* handler) const noexcept
 {
     // kqueue doesn't have a separate "add fd without filter" call; we
@@ -275,6 +300,15 @@ void KqueueReactor::Run()
             return;
         }
 
+        // One callback per HANDLER per batch, not per event. kqueue reports each
+        // filter separately, so one fd can appear twice here -- and the first
+        // callback resumes a coroutine that may free the object the handler is
+        // embedded in, which makes the second entry's `udata` dangle. Whatever is
+        // skipped is re-reported on the next kevent(), because these filters are
+        // level-triggered, so the cost is one extra loop turn.
+        std::array<void*, Batch> serviced {};
+        std::size_t servicedCount = 0;
+
         for (int i = 0; i < n; ++i)
         {
             auto const& ev = events[i];
@@ -288,11 +322,26 @@ void KqueueReactor::Run()
                 }
                 continue;
             }
+            auto const alreadyServiced =
+                std::ranges::find(serviced.begin(), serviced.begin() + static_cast<std::ptrdiff_t>(servicedCount), ev.udata)
+                != serviced.begin() + static_cast<std::ptrdiff_t>(servicedCount);
+            if (alreadyServiced)
+                continue;
+
             auto* handler = static_cast<KqueueFdHandler*>(ev.udata);
-            if (ev.filter == EVFILT_READ && handler->onReadable)
-                handler->onReadable(handler);
-            else if (ev.filter == EVFILT_WRITE && handler->onWritable)
-                handler->onWritable(handler);
+
+            // EV_ERROR/EV_EOF go to `onError` when the owner named one; otherwise
+            // they fall through to the filter's own callback, which is what a
+            // socket and a listener both want.
+            auto* const callback = ((ev.flags & (EV_ERROR | EV_EOF)) != 0 && handler->onError != nullptr) ? handler->onError
+                                   : ev.filter == EVFILT_READ  ? handler->onReadable
+                                   : ev.filter == EVFILT_WRITE ? handler->onWritable
+                                                               : nullptr;
+            if (callback == nullptr)
+                continue;
+
+            serviced[servicedCount++] = ev.udata;
+            callback(handler);
         }
 
         DrainPendingSubmits();

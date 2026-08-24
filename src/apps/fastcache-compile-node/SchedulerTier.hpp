@@ -19,6 +19,8 @@
 namespace FastCache::Node
 {
 
+class NodeIoLoop;
+
 /// The node's scheduler surface: service, protocol, membership, responder and
 /// listener, owned as one thing.
 ///
@@ -37,6 +39,7 @@ class SchedulerTier
     /// @param logger Where to announce the bound address.
     /// @return The running tier, or why it could not be served.
     [[nodiscard]] static std::expected<std::unique_ptr<SchedulerTier>, std::string> Start(
+        NodeIoLoop& io,
         NodeConfig const& cfg,
         Distributed::IMembershipOracle const& membership,
         IClock& clock,

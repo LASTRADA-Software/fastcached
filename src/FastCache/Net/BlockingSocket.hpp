@@ -82,6 +82,39 @@ namespace Detail
     /// @param socket The freshly accepted or connected stream socket.
     void ArmNoSigPipe(NativeSocket socket) noexcept;
 
+    /// Put a socket into non-blocking mode.
+    ///
+    /// One definition because there were four -- two in `BlockingConnector.cpp`
+    /// (one per platform) and one each in `EpollSocket.cpp` and
+    /// `KqueueSocket.cpp` -- and the connectors would have made a fifth. The
+    /// same argument `TranslateSocketError` records: there must be exactly one
+    /// answer to a question the whole layer asks.
+    ///
+    /// @param socket The socket handle to switch.
+    /// @return true when the mode was applied; false leaves the socket blocking,
+    ///         which for a caller about to park on readiness is fatal rather
+    ///         than cosmetic and must not be ignored.
+    [[nodiscard]] bool SetNonBlocking(NativeSocket socket) noexcept;
+
+    /// Put a socket back into blocking mode.
+    /// @param socket The socket handle to switch.
+    /// @return true when the mode was applied.
+    [[nodiscard]] bool SetBlocking(NativeSocket socket) noexcept;
+
+    /// Mark a socket close-on-exec, so a child process does not inherit it.
+    ///
+    /// The accept path already gets this from `SOCK_CLOEXEC`; a *dialled* socket
+    /// is created by a plain `::socket` and does not. It matters because
+    /// `fastcache-compile-node` spawns a compiler for every job, and a compiler
+    /// holding an open peer connection keeps it alive after the worker is gone --
+    /// the same shape of defect `AdoptInheritedListeners` records for the
+    /// listening socket, reached from the outbound side.
+    ///
+    /// Best-effort, and a no-op on Windows, where handle inheritance is opt-in
+    /// per `CreateProcess` call rather than per descriptor.
+    /// @param socket The socket handle to mark.
+    void ArmCloseOnExec(NativeSocket socket) noexcept;
+
     /// Build a `NetError` from a platform code and a description of the attempt.
     /// @param code A `WSAGetLastError()` / `errno` value.
     /// @param context What was being attempted, for the message.
@@ -111,6 +144,84 @@ namespace Detail
     /// a thread parked in AcceptRaw().
     /// @param socket The handle to close.
     void CloseNativeSocket(NativeSocket socket) noexcept;
+
+    /// Owns a native socket handle until it is either released or destroyed.
+    ///
+    /// A dial has half a dozen ways to fail between `::socket` and handing the
+    /// handle to an `ISocket`, and every one of them has to close it. Written out
+    /// by hand that is a `CloseNativeSocket` call per early return -- five of them
+    /// in `BlockingConnector::DialOne` alone -- and the one that gets forgotten is
+    /// a descriptor leak in the error path, which is the path that runs when a
+    /// peer is down and therefore the path that runs repeatedly.
+    ///
+    /// Deliberately minimal: it is a scope guard for a handle mid-construction,
+    /// not a socket abstraction. `ISocket` is that.
+    class OwnedNativeSocket
+    {
+      public:
+        /// @param socket Handle to take ownership of; may be `InvalidSocket`.
+        explicit OwnedNativeSocket(NativeSocket socket) noexcept:
+            _socket { socket }
+        {
+        }
+
+        OwnedNativeSocket(OwnedNativeSocket const&) = delete;
+        OwnedNativeSocket& operator=(OwnedNativeSocket const&) = delete;
+
+        OwnedNativeSocket(OwnedNativeSocket&& other) noexcept:
+            _socket { other.Release() }
+        {
+        }
+
+        OwnedNativeSocket& operator=(OwnedNativeSocket&& other) noexcept
+        {
+            if (this != &other)
+            {
+                Reset();
+                _socket = other.Release();
+            }
+            return *this;
+        }
+
+        ~OwnedNativeSocket()
+        {
+            Reset();
+        }
+
+        /// @return The handle, still owned here.
+        [[nodiscard]] NativeSocket Get() const noexcept
+        {
+            return _socket;
+        }
+
+        /// @return Whether a real handle is held.
+        [[nodiscard]] bool Valid() const noexcept
+        {
+            return _socket != InvalidSocket;
+        }
+
+        /// Give up ownership without closing.
+        /// @return The handle, now the caller's responsibility.
+        [[nodiscard]] NativeSocket Release() noexcept
+        {
+            auto const socket = _socket;
+            _socket = InvalidSocket;
+            return socket;
+        }
+
+        /// Close now, if anything is held. Idempotent.
+        void Reset() noexcept
+        {
+            if (_socket != InvalidSocket)
+            {
+                CloseNativeSocket(_socket);
+                _socket = InvalidSocket;
+            }
+        }
+
+      private:
+        NativeSocket _socket { InvalidSocket };
+    };
 
     /// Apply receive/send timeouts (SO_RCVTIMEO / SO_SNDTIMEO) to a socket.
     /// A non-positive duration leaves the OS default (no timeout) in place.
@@ -234,7 +345,7 @@ class BlockingListener final: public IListener
     /// own four ports.
     /// @return The bound port in host byte order, or 0 when not bound or when
     ///         the OS would not report it.
-    [[nodiscard]] std::uint16_t BoundPort() const noexcept;
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept override;
 
   private:
     BlockingListener() = default;

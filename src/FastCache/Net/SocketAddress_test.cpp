@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -277,4 +278,87 @@ TEST_CASE("BindAndListen forces dual-stack (IPV6_V6ONLY=0) on an IPv6 wildcard b
     REQUIRE(rc == 0);
     REQUIRE(v6only == 0); // dual-stack: the "::" socket also accepts IPv4 clients
     CloseRaw(bound->socket);
+}
+
+TEST_CASE("IsNumericHost recognises literals and rejects names", "[net][resolve]")
+{
+    // A table rather than a run of CHECKs: the point of the helper is that one
+    // definition answers for every shape, and a table is what makes a new shape
+    // a row. The expectation column carries the reason where it is not obvious.
+    struct Row
+    {
+        std::string_view host;
+        bool numeric;
+        std::string_view why;
+    };
+
+    constexpr std::array<Row, 11> Rows { {
+        { .host = "127.0.0.1",
+          .numeric = true,
+          .why = "the launcher's default, and the case that must never reach a thread" },
+        { .host = "0.0.0.0",
+          .numeric = true,
+          .why = "a literal even though it is not dialable; the dial guard refuses it elsewhere" },
+        { .host = "203.0.113.7", .numeric = true, .why = "ordinary IPv4" },
+        { .host = "::1", .numeric = true, .why = "IPv6 loopback" },
+        { .host = "::", .numeric = true, .why = "IPv6 wildcard" },
+        { .host = "2001:db8::1", .numeric = true, .why = "ordinary IPv6" },
+        { .host = "localhost", .numeric = false, .why = "a name, even though it almost always resolves to a literal" },
+        { .host = "cache.example.com", .numeric = false, .why = "a name" },
+        { .host = "", .numeric = false, .why = "no host at all" },
+        { .host = "127.0.0.1:6674",
+          .numeric = false,
+          .why = "a host:port pair is not a host; splitting is the caller's job" },
+        { .host = "[::1]",
+          .numeric = false,
+          .why = "brackets are endpoint grammar, and Connect is documented as taking them off" },
+    } };
+
+    for (auto const& row: Rows)
+    {
+        INFO(row.host << " -- " << row.why);
+        CHECK(FastCache::Detail::IsNumericHost(row.host) == row.numeric);
+    }
+}
+
+TEST_CASE("BoundPortOf reports the port the kernel chose, not the one asked for", "[net][listener]")
+{
+    // Binding port 0 is how every script-driven test here allocates a port, and
+    // the value it needs back is the kernel's choice. Before this helper only
+    // BlockingListener could answer, so a caller holding an IListener could not.
+    auto listener = FastCache::BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(listener != nullptr);
+    if (!listener->IsBound())
+        SKIP("cannot bind loopback here");
+
+    auto const port = listener->BoundPort();
+    CHECK(port != 0);
+
+    // And it is stable: the question is about the socket, not about the call.
+    CHECK(listener->BoundPort() == port);
+}
+
+TEST_CASE("BoundPortOf reports 0 for a handle that is not bound", "[net][listener]")
+{
+    CHECK(FastCache::Detail::BoundPortOf(FastCache::Detail::InvalidSocket) == 0);
+}
+
+TEST_CASE("A scoped IPv6 literal is classified by the platform, and either answer works", "[net][resolve]")
+{
+    // Left OUT of the table above because the two platforms genuinely disagree:
+    // glibc's `inet_pton` rejects the zone suffix and macOS's accepts it. Found the
+    // way such things are -- green on Linux and Windows, red on macOS.
+    //
+    // Neither answer is wrong. A literal goes straight to `connect`; a name goes to
+    // the resolver, which also understands zones. So what is asserted here is the
+    // half that MUST hold -- the classification is stable -- rather than a value
+    // that would make the suite fail for a reason about the host.
+    constexpr std::string_view Scoped = "fe80::1%eth0";
+    auto const first = FastCache::Detail::IsNumericHost(Scoped);
+    CHECK(FastCache::Detail::IsNumericHost(Scoped) == first);
+
+    // And the direction that would actually break IS pinned: a name must never be
+    // reported as a literal, because it would then be handed to `connect` as an
+    // address rather than looked up.
+    CHECK_FALSE(FastCache::Detail::IsNumericHost("fe80-scoped.example.com"));
 }

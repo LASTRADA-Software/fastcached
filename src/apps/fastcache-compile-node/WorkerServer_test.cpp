@@ -17,11 +17,13 @@
 #include <vector>
 
 #include <CompileJob.hpp>
-#include <ScratchPathTestSupport.hpp>
+#include <StubObjectTestSupport.hpp>
+#include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::ScratchDirectory;
 using FastCache::Testing::Unwrap;
 namespace Wire = FastCache::CompileCacheWire;
 
@@ -63,6 +65,12 @@ class OneShotListener final: public IListener
                                                 NetError { .code = NetErrorCode::Eof, .systemCode = 0, .context = {} } } };
     }
     void Close() noexcept override {}
+
+    /// @return 0: these fakes hand back scripted sockets and never bind.
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept override
+    {
+        return 0;
+    }
 
   private:
     std::unique_ptr<ISocket> _socket;
@@ -113,6 +121,12 @@ class IdleListener final: public IListener
         _closed = true;
     }
 
+    /// @return 0: these fakes hand back scripted sockets and never bind.
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept override
+    {
+        return 0;
+    }
+
     /// How many times the loop has asked for a connection.
     [[nodiscard]] int Polls() const noexcept
     {
@@ -135,7 +149,7 @@ class IdleListener final: public IListener
 struct Fixture
 {
     StubRunner runner;
-    std::filesystem::path scratch;
+    ScratchDirectory scratch { "fc-ws" };
     Cc::CompileJobRunner jobs;
     AtomicMetricsSink metrics;
     Cc::WorkerProtocol protocol;
@@ -147,26 +161,15 @@ struct Fixture
     Distributed::OpenMembership membership;
 
     Fixture():
-        scratch { Cc::Test::UniqueScratchPath("fc-ws") },
-        jobs { runner, (std::filesystem::create_directories(scratch), scratch), { { "gcc-13", "g++" } } },
+        jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } },
         protocol { jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics }
     {
-    }
-    ~Fixture()
-    {
-        std::error_code ignored;
-        std::filesystem::remove_all(scratch, ignored);
     }
     Fixture(Fixture const&) = delete;
     Fixture& operator=(Fixture const&) = delete;
     Fixture(Fixture&&) = delete;
     Fixture& operator=(Fixture&&) = delete;
-
-    static int& Counter()
-    {
-        static int counter = 0;
-        return counter;
-    }
+    ~Fixture() = default;
 };
 
 [[nodiscard]] std::vector<std::byte> CompileFrame(std::string_view fingerprint = "gcc-13")

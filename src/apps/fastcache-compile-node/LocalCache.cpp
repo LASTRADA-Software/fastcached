@@ -31,7 +31,7 @@ LocalCache::LocalCache(IStorage& local, ICacheUpstream& upstream, IClock& clock,
 {
 }
 
-std::optional<std::vector<std::byte>> LocalCache::Fetch(std::string_view key)
+Task<std::optional<std::vector<std::byte>>> LocalCache::Fetch(std::string_view key)
 {
     if (auto const hit = _local.Get(key, _clock.Now()); hit.has_value() && hit->found)
     {
@@ -43,17 +43,17 @@ std::optional<std::vector<std::byte>> LocalCache::Fetch(std::string_view key)
         // rather than removed it.
         _metrics.Increment(IMetricsSink::Counter::NodeCacheHits);
         auto const bytes = hit->entry.ValueBytes();
-        return std::vector<std::byte> { bytes.begin(), bytes.end() };
+        co_return std::vector<std::byte> { bytes.begin(), bytes.end() };
     }
 
     _metrics.Increment(IMetricsSink::Counter::NodeCacheMisses);
 
-    auto fetched = _upstream.Fetch(key);
+    auto fetched = co_await _upstream.Fetch(key);
     if (!fetched.has_value())
         // A miss and an unreachable upstream are one answer here, deliberately: the
         // caller compiles either way. Which of the two it was is an operator's
         // question, and the upstream implementation counts it.
-        return std::nullopt;
+        co_return std::nullopt;
 
     _metrics.Increment(IMetricsSink::Counter::NodeCacheUpstreamHits);
 
@@ -66,10 +66,10 @@ std::optional<std::vector<std::byte>> LocalCache::Fetch(std::string_view key)
     if (auto const stored = _local.Set(key, *fetched, NoFlags, NoExpiry); !stored.has_value())
         _metrics.Increment(IMetricsSink::Counter::NodeCacheFillFailures);
 
-    return fetched;
+    co_return fetched;
 }
 
-bool LocalCache::Store(std::string_view key, std::span<std::byte const> value)
+Task<bool> LocalCache::Store(std::string_view key, std::span<std::byte const> value)
 {
     // Local FIRST, and it is the write that must not be lost: it is what makes this
     // machine's next build fast, and it must not fail for a reason the network chose.
@@ -77,19 +77,19 @@ bool LocalCache::Store(std::string_view key, std::span<std::byte const> value)
     if (!stored.has_value())
     {
         _metrics.Increment(IMetricsSink::Counter::NodeCacheStoreFailures);
-        return false;
+        co_return false;
     }
 
     // Then offer it to the fleet, best-effort by contract. A shared cache that cannot
     // be reached costs the fleet one entry and costs this machine nothing -- so the
     // answer is counted rather than returned, because a client that retried on it
     // would be retrying something already durable where it matters.
-    if (_upstream.Store(key, value))
+    if (co_await _upstream.Store(key, value))
         _metrics.Increment(IMetricsSink::Counter::NodeCacheUpstreamStores);
     else
         _metrics.Increment(IMetricsSink::Counter::NodeCacheUpstreamStoreFailures);
 
-    return true;
+    co_return true;
 }
 
 } // namespace FastCache::Node

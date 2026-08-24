@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheTier.hpp"
+#include "NodeIoLoop.hpp"
 #include "RemoteUpstream.hpp"
 
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
@@ -18,6 +19,14 @@ namespace
     /// Bounded rather than generous, and short: a node waiting on an unreachable
     /// shared cache is a node not compiling, and the fall-back costs one local build.
     constexpr std::chrono::milliseconds UpstreamIoTimeout { 5'000 };
+
+    /// Ceiling on OPENING the upstream connection, name resolution included.
+    ///
+    /// Separate from the I/O ceiling above, and much shorter. The two used to be
+    /// one value passed twice, which gave the dial a five-second
+    /// resolve-plus-connect budget nobody chose: five seconds is a sensible
+    /// per-operation bound and a very long time to wait for a TCP handshake.
+    constexpr std::chrono::milliseconds UpstreamConnectTimeout { 1'000 };
 } // namespace
 
 CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
@@ -33,7 +42,8 @@ CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
 {
 }
 
-std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConfig const& cfg,
+std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLoop& io,
+                                                                        NodeConfig const& cfg,
                                                                         Distributed::IMembershipOracle const& membership,
                                                                         IClock& clock,
                                                                         IMetricsSink& metrics,
@@ -46,8 +56,20 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConf
     if (cfg.upstream.empty())
         upstream = std::make_unique<NoUpstream>();
     else
-        upstream = std::make_unique<RemoteUpstream>(
-            cfg.upstream, Cc::Credential { .username = {}, .secret = cfg.token }, UpstreamIoTimeout);
+        // The loop's own connector, so this dial SUSPENDS rather than blocking. It
+        // is the point of the whole exercise: this call happens inside a cache
+        // answer, and answering used to be serialized -- so one upstream that took
+        // five seconds held every local `fastcache-cc` behind it.
+        //
+        // The reactor is passed too, because with a reactor socket `SO_RCVTIMEO`
+        // is inert: the per-operation ceiling is a `DeadlineTimer` that closes the
+        // socket, which bounds the whole exchange rather than one call.
+        upstream = std::make_unique<RemoteUpstream>(cfg.upstream,
+                                                    Cc::Credential { .username = {}, .secret = cfg.token },
+                                                    io.Connector(),
+                                                    &io.Reactor(),
+                                                    UpstreamConnectTimeout,
+                                                    UpstreamIoTimeout);
 
     auto tier = std::unique_ptr<CacheTier> { new CacheTier {
         std::make_unique<InMemoryLruStorage>(static_cast<std::size_t>(cfg.cacheMemoryBytes)),
@@ -60,7 +82,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConf
     // surface `fastcache-cc` on this machine talks to, and a node's private cache
     // reachable from the network is a decision rather than something an operator gets
     // by typing a port.
-    auto started = FrameEndpoint::Start(cfg.cacheListen, "127.0.0.1", tier->_responder, "cache", logger);
+    auto started = FrameEndpoint::Start(io, cfg.cacheListen, "127.0.0.1", tier->_responder, "cache", logger);
     if (!started.has_value())
         return std::unexpected { started.error() };
 
@@ -74,6 +96,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConf
 }
 
 std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
+    NodeIoLoop& io,
     NodeConfig const& cfg,
     Distributed::IMembershipOracle const& membership,
     IClock& clock,
@@ -85,7 +108,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
     if (cfg.cacheListen.empty())
         return std::unique_ptr<CacheTier> {};
 
-    auto started = CacheTier::Start(cfg, membership, clock, metrics, logger);
+    auto started = CacheTier::Start(io, cfg, membership, clock, metrics, logger);
     if (started.has_value())
         return std::move(*started);
 

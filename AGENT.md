@@ -13,13 +13,28 @@ src/FastCache/
                 beside Clock and for the same reason), Logger, BufferPool,
                 Bytes, Endian, Crc32c, MurmurHash3 (128-bit key digest),
                 StringHash, Owner, Profiling (Tracy wrappers)
-  Async/        Task<T>, Cancellation, ResumeOn, IReactor + TestReactor and the
-                platform reactors (EpollReactor / IocpReactor / KqueueReactor)
+  Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
+                InterruptibleSleepUntil (a bounded wait a stop can interrupt),
+                DeadlineTimer (the same shape with a callback, for a timeout that
+                must tear an operation down rather than merely stop waiting for
+                it -- and which retires its own frame through
+                IReactor::CancelPending rather than waiting out a poll),
+                AsyncQueue (MPSC, bounded, closable: what replaces a condition
+                variable once the consumer is a coroutine), IReactor
+                (Run/Stop/Submit/Schedule/CancelPending -- the last being how a
+                parked frame is ever reclaimed) + TestReactor and the platform
+                reactors (EpollReactor / IocpReactor / KqueueReactor)
   Net/          ISocket, IListener, IConnector (the outbound counterpart to
-                IListener; BlockingConnector dials non-blocking so its timeout
-                means something), TcpClient (the ONE TCP client: ConnectTcp plus
-                the coroutine SendAll/RecvExactly loops, which three separate
-                copies of this code each used to carry),
+                IListener, coroutine-shaped: BlockingConnector for threads that
+                may block, PlatformConnector -> EpollConnector /
+                KqueueConnector / IocpConnector for a reactor thread, with
+                ConnectFlow the platform-free half all four share and
+                ReactorDial one body for the two readiness backends),
+                IAsyncAddressResolver + ThreadedAddressResolver (getaddrinfo has
+                no async form and no timeout, so it gets a fixed pool; a literal
+                address never reaches it), TcpClient (the ONE TCP client:
+                ConnectTcp plus the coroutine SendAll/RecvExactly loops, which
+                three separate copies of this code each used to carry),
                 IoAwaitable, IAdmissionControl, SocketAddress,
                 BlockingSocket (Winsock + POSIX),
                 EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
@@ -49,7 +64,8 @@ src/FastCache/
                 RaftLog::Compact's precondition satisfiable at all) /
                 IRaftTransport / IRaftStateMachine / IRaftMessageSink seams, plus
                 RaftWire (the 0xFA peer frame), RaftPeerTransport (outbound,
-                a thread per peer), RaftPeerServer (inbound, on the reactor)
+                one coroutine per peer on the reactor), RaftPeerServer (inbound,
+                also on the reactor)
                 and RaftMembership (the member set as a log entry) — Raft,
                 split into a pure state machine and a coroutine driver that
                 carries out what it asks for. RaftNode reads no clock, opens no
@@ -297,8 +313,8 @@ These constraints are load-bearing and have each already been a bug:
     from exactly one of its two peers. Nothing crashes and nothing logs a fault; the
     fleet simply never becomes ready. Hence `Net/PlatformListener.hpp`, and hence the
     two loops sharing one reactor rather than owning a thread each.
-  - **`RaftPeerTransport::Start()` was called by nobody.** The outbound side owns a
-    thread per peer and starts them on request, so every node came up, listened,
+  - **`RaftPeerTransport::Start()` was called by nobody.** The outbound side owned a
+    thread per peer then, started on request, so every node came up, listened,
     ticked its own timers and sent *nothing*. Three nodes sat at `undecided` forever
     with no error anywhere — the exact shape of failure this list keeps recording,
     and invisible to a single-node cluster, which elects itself with no messages at
@@ -797,6 +813,144 @@ These constraints are load-bearing and have each already been a bug:
     identical either way so the outcome alone cannot tell the two apart. The client must
     still consume the AUTH reply even when it intends to ignore it; skipping it strands a
     frame and the next command reads the previous one's answer.
+- **A synchronous dial spends a thread the caller does not own, and the argument
+  for it reasoned about the wrong thing.** `IConnector::Connect` blocked, and its
+  header defended that at length: the caller has nothing to do until the
+  connection exists, so a coroutine "would buy the ability to interleave work
+  that does not exist", with one rule holding it up -- **a reactor thread never
+  calls this**. Three things were wrong with it, and the third had already
+  shipped:
+  - **The caller has nothing to do; the THREAD has thousands of other
+    connections.** The argument described one caller's own work and silently
+    ignored whose thread it was spending. That is the same mistake, in the same
+    direction, that `Net/PlatformListener.hpp` records for the accept side.
+  - **The rule was not free, it was paid for.** `RaftPeerTransport` owned a
+    thread per peer *because of this interface*, and it could not be made safe:
+    thread-per-peer is only expressible over a blocking socket, because the write
+    was driven by `SyncRun` -- which this list already records throwing the
+    instant its task really suspends. So the decision pinned one component's
+    outbound half to `BlockingSocket` for good while its inbound half was already
+    on the reactor: two socket implementations in one class, chosen by direction.
+  - **It hid a hang that killed nodes.** The transport passes no I/O timeout,
+    deliberately, so over a blocking socket there is no `SO_SNDTIMEO` and a peer
+    that accepts and then stops reading parks the sender inside `::send` once the
+    buffer fills. `Stop()` cleared the outbox, notified a condition variable the
+    sender was not waiting on, and joined it unconditionally -- and the socket was
+    a LOCAL of the sender, so nothing else could reach it to close it.
+    `~RaftPeerTransport` blocked forever and the node died to SIGKILL, which is
+    the `systemctl stop` escalation this list already records once, reached from
+    the outbound side.
+
+  And the rule never covered the worst case anyway: `connectTimeout` bounds the
+  dial, while **name resolution runs first and is bounded by nothing**, because
+  `getaddrinfo` takes no timeout. For `fastcache-cc` that is every translation
+  unit in a build waiting on a wedged resolver with no knob anywhere.
+  Consequences that are each load-bearing:
+  - **`Connect` takes `std::string` by value, not `string_view`.** A coroutine
+    frame outlives the call expression, so a view names storage the caller may
+    already have destroyed -- the hazard `Net/TcpClient.hpp` records for reference
+    parameters, reached by another route. clang-tidy enforces the reference half
+    (`cppcoreguidelines-avoid-reference-coroutine-parameters`) and cannot see the
+    view half, which is why it is written down. The copy is one the threaded
+    resolver needed anyway.
+  - **`ioTimeout` left the interface.** It is `SO_RCVTIMEO`, which bounds a
+    *blocking* syscall and is inert on a socket whose reads suspend -- so keeping
+    it would hand every reactor caller a bound that does not exist, which is worse
+    than having none. It survives as `BlockingConnectorOptions::ioTimeout`. A
+    reactor caller arms a `DeadlineTimer` that closes the socket instead, which is
+    strictly *more* than the option gave: the option bounds one call, so a peer
+    dribbling a byte at a time could still take forever.
+  - **The budget is divided across candidates, and both halves are needed.**
+    Giving every candidate the full timeout means a caller asking for two seconds
+    waits four -- a bound that multiplies by however many addresses a name happens
+    to have is not a bound. Giving the FIRST candidate all of it defeats the
+    fallback whenever that candidate black-holes rather than refuses, which is the
+    AAAA-on-a-machine-with-no-IPv6 case trying every candidate exists for. Found
+    on Windows, where a closed loopback port is silently *dropped* rather than
+    reset: the dead candidate consumed the whole budget and the real one was never
+    tried. The test had been passing only because each candidate previously got a
+    fresh timeout.
+  - **`DialEndpointBlocking` takes a `BlockingConnector&`, never an
+    `IConnector&`.** Every remaining `SyncRun` is sound only because the socket
+    underneath resolves inline, and the failure when it does not is a
+    `std::logic_error` thrown from inside a heartbeat thread. A comment saying so
+    is a rule somebody breaks; the type is the rule.
+  - **A literal address never reaches a resolver thread.** Every internal dial
+    here is to one -- Raft peers, `127.0.0.1:6674`, an endpoint discovery proved --
+    and the launcher makes one per translation unit, so a thread hand-off on that
+    path would be a real regression. It is also what lets the whole connect path be
+    tested without a thread existing. The pool is fixed at two (never one per dial;
+    never sized to cores, since this is I/O-bound) and its queue is bounded and
+    *refused* rather than waited on, which is the same shape as the pre-auth
+    payload cap.
+
+- **Four defects sat between the reactor and a dial that could work, and three of
+  them were already latent.**
+  - **`EpollReactor` routed only `EPOLLIN` and `EPOLLOUT`, and dropped
+    `EPOLLERR`/`EPOLLHUP`.** Those arrive whether or not they were requested, and a
+    failed connect can be reported with neither direction set -- so the dial would
+    never be told, and because the fd is level-triggered it would be re-reported on
+    the very next iteration: a hang AND a loop spinning at 100% CPU, with nothing
+    logged at either end. `EpollFdHandler::onError` is where an error goes now, and
+    `SelectEpollCallback` is a pure function precisely so the rule is unit-testable
+    without a socket or a way to provoke a kernel error.
+  - **That same loop read `handler->onWritable` after `onReadable` may have freed
+    the object the handler lives in.** It services at most one callback per fd per
+    iteration now; level-triggering re-reports whatever was skipped, so the cost is
+    one extra turn.
+  - **`TestReactor::Submit`/`Schedule` touched bare containers** while `IReactor`
+    documents both as callable from any thread. Nothing noticed while every
+    producer was the test's own thread -- and every primitive added here crosses
+    threads by definition, so a double that cannot be used the way its interface
+    reads forces each of those cases onto a real reactor, where nothing is
+    deterministic.
+  - **`IListener` had no `BoundPort()`**, so only `BlockingListener` could answer
+    "which port did I actually get" -- the question every caller binding port 0 has
+    to ask, and the one every script-driven test here relies on.
+
+- **The dial's own residuals are recorded rather than dressed up.**
+  - **The handler detach in `SettleDial` guards the reactor's loop against a spin,
+    NOT the socket built afterwards.** It looks as though it should guard both: the
+    socket's constructor attaches the same fd, epoll refuses that with `EEXIST`,
+    and the failure is ignored. But `UpdateInterest` uses `EPOLL_CTL_MOD` with a
+    fresh `ev.data.ptr`, so the socket's first armed read overwrites the stale
+    registration. Verified by removing the detach and watching the byte-transfer
+    case still pass. Claiming otherwise would send the next reader looking for a
+    bug that is not there.
+  - **A loopback connect completes INLINE, so the readiness path is unreachable
+    from an ordinary test.** `::connect` returns 0 and the whole
+    attach/park/settle block is skipped, which means a dial test that stops at
+    "connected" exercises none of it. Provoking it needs a filled accept queue.
+  - **On IOCP an accept must be awaited while it is outstanding.**
+    `IocpListener::Accept` issues `AcceptEx` immediately but records the awaitable
+    only in its suspend callback, so a completion arriving before anyone awaits is
+    dropped and the accept never resolves. Arming the accept before a dial and
+    awaiting it after -- which reads naturally and works on epoll -- deadlocks.
+  - **Both connector tests move BYTES, and arrange the read to park.** `Read` tries
+    the syscall before suspending, so a read finding data or EOF already waiting
+    would be answered perfectly well by a socket the reactor was never told about.
+    Only a read with nothing to return proves the registration exists -- and on
+    Windows only a real transfer proves `SO_UPDATE_CONNECT_CONTEXT` was applied,
+    without which the socket is connected and every ordinary call on it fails.
+
+- **`ConnectEx` needs two steps `AcceptEx` does not, and neither had precedent
+  here.** The socket must be `bind`-ed to the wildcard of its family before the
+  call, or it fails with `WSAEINVAL` and names nothing; and
+  `SO_UPDATE_CONNECT_CONTEXT` must be applied afterwards, or the handle's context
+  stays unset and `getpeername`, `shutdown` and the ordinary calls all fail on a
+  socket that is genuinely connected. The extension pointer is cached in a two-row
+  table keyed by family, because a connector -- unlike a listener, which has one
+  family -- dials whichever the resolver hands it. `IocpSocket` therefore takes an
+  `IocpAttachment`: `ConnectEx` requires the port association BEFORE the operation
+  is issued, and a second `CreateIoCompletionPort` on an associated handle fails,
+  so without it the constructor would report `IsAttached() == false` and tell the
+  caller to abandon a connection that works. And **`overlapped.Internal` is an
+  NTSTATUS, not a WSA code**: the reactor hands it over as-is, so `0xC0000236`
+  (refused) falls through every `WSAE*` row onto `SystemError` -- useless to a
+  connector whose job is to tell refused from unreachable. `WSAGetOverlappedResult`
+  is the documented conversion. The same wart affects IOCP reads and writes today
+  and is left alone deliberately: their `Dispatch` cannot reach the socket handle.
+
 - **Three implementations of one TCP client, and the rot was in the one nobody
   built.** `Net/BlockingConnector` dialled non-blocking through `getaddrinfo` and
   was coroutine-aware; `fastcache-cc` carried a synchronous `Cc::ITcpClient` with
@@ -2064,6 +2218,90 @@ spelled it the same way, which is what makes this a drift rather than a discover
   the exact cost `USE_COMPILER_CACHE` probes at configure time to avoid. Pointing it at
   the node is one line of configuration, and it is better written by an operator than
   assumed by a tool.
+- **A cache answer that dials must not be serialized behind the accept loop.**
+  `FrameEndpoint` owned a thread and served its connections ONE AT A TIME, and
+  `RemoteUpstream` dials the shared cache from inside a cache answer -- so a single
+  upstream that took five seconds held every local `fastcache-cc` behind it, one
+  after another. A node whose shared cache was unreachable had an unusable port of
+  its own, and nothing anywhere said so: every client eventually got a correct
+  answer, just far too late. `NodeIoLoop` is the reactor both framed surfaces now
+  accept on, with a `DetachedTask` per connection. Six consequences, each
+  load-bearing:
+  - **The payload cap became a PER-CONNECTION cap the moment serialization went.**
+    Serving one at a time bounded peak memory to a single `MaxRequestBytes()` frame
+    by accident; serving them concurrently makes it N of them. So
+    `MaxConcurrentRequests()` and `MaxInFlightBytes()` are columns on the responder,
+    and they had to land in the same commit as the detach -- a fix that opens a
+    memory-exhaustion hole is not a fix. The spread is the point: 256 concurrent at
+    64 KiB for the scheduler, 8 for the cache with a 256 MiB total budget that is
+    deliberately ONE request's worth, so eight ordinary objects run in parallel while
+    a single 256 MiB monster still cannot be joined by seven more.
+  - **The request deadline was otherwise silently lost.** It used to be
+    `SO_RCVTIMEO`, applied to every accepted socket by `BlockingListener::SetTimeouts`.
+    A reactor socket has no such option -- its reads suspend rather than block -- so
+    without a replacement a client that connects and sends half a header holds a
+    descriptor and a coroutine frame until the process dies. A free slow-loris on the
+    node's cache port, created by the change that removed the stall. One sweeper per
+    server on a bounded tick, NOT a timer per connection: `IReactor::Schedule` cannot
+    be cancelled, so a per-connection timer would stay on the wheel for the full
+    interval after its connection had finished.
+  - **Every close is posted onto the reactor.** On epoll and kqueue `ISocket::Close`
+    completes a parked awaitable by resuming its coroutine INLINE, so closing from
+    the stopping thread would run the server's connection tasks there while the
+    reactor thread is still driving them. IOCP routes cancellation back through the
+    port and does not -- which is exactly what makes it a race that passes CI on
+    Windows and corrupts state on the other two.
+  - **`Shutdown()` waits for the LOOPS, not only the connections**, and the first cut
+    did not. `~FrameServer` then freed state the accept loop and the sweeper still
+    pointed into: SIGSEGV, plus a port still bound after the endpoint claimed to have
+    stopped. The state is shared with the loops now. Found by the endpoint's own
+    destruction test, which is the one that exists to catch exactly this.
+  - **The reactor is stopped by its loops, when the last one ends** -- the sweeper
+    counted among them, because a frame parked on the timer wheel is precisely what
+    `IReactor::Run` must not return over. And `NodeIoLoop` is declared BEFORE the
+    tiers in `WorkerBody`, so it is destroyed after them: a tier's destructor posts
+    its closes onto this reactor, which therefore has to still be running.
+  - **It is NOT consensus's reactor.** A cache answer now awaits a dial with a
+    multi-second ceiling, and putting that in front of the Raft heartbeat timer would
+    be this same defect moved one layer over -- the failure this list already names as
+    nine role changes in twelve seconds. It is also the only node header that includes
+    `PlatformReactor.hpp`, which is what keeps `<windows.h>` out of everything that
+    includes `FrameEndpoint.hpp`; the endpoint holds an `IListener` rather than the
+    platform type, which is what `IListener::BoundPort()` was added for.
+
+- **`EndpointBusy` is not `NoCapacity`, and the split is for whoever reads it.**
+  `NoCapacity` is a statement about the FLEET -- every matching worker full of this
+  build's own work, which an operator answers by buying machines. `EndpointBusy` is
+  one node's own front door: it has hit its concurrent-request cap or its in-flight
+  byte budget, and the same client asking again shortly will very likely be served.
+  Reporting either under the other's code sends an operator to fix something that was
+  never wrong, which is the same argument `Withdrawn` already makes for splitting off
+  its own case.
+
+- **The launcher runs its cache exchange on a reactor of its own, and gets a bounded
+  name lookup for it.** `main.cpp`'s private `TcpClient` is gone -- fifty lines in a
+  file that is in no test target, existing only to give four sites an
+  optional-shaped `Connect` and to `SyncRun` two loops. What it bought is not
+  latency: the launcher is one-shot per translation unit and has nothing to
+  interleave. It is that `getaddrinfo` takes no timeout, so `FASTCACHE_ADDR` pointing
+  at a name whose resolver is wedged used to stall every translation unit in the
+  build with no knob anywhere. Three things about `ReactorExchange`:
+  - **One reactor per exchange, asserted rather than documented.** `IReactor::Run`
+    returns only on `Stop()` and no reactor here clears that flag, so a reused
+    instance performs the first exchange and silently skips every later one -- which
+    the launcher answers by compiling locally, making every build slower with nothing
+    anywhere saying why.
+  - **The deadline CLOSES the socket rather than stopping the reactor.** Stopping
+    would leave the coroutine parked on a read nobody completes: a leaked frame and a
+    leaked descriptor, once per translation unit. Its test asserts the close, and
+    fails without the timer.
+  - **`Threads::Threads` is linked and named.** The resolver pool is the one thing
+    this launcher genuinely needs a thread for. Not a departure from the rule this
+    binary exists to protect -- that rule is about not linking `FastCache` and
+    therefore not dragging in yaml-cpp, OpenSSL and the reactor's transitive world --
+    and it is named rather than left to glibc folding pthread into libc since 2.34,
+    which happens to work on the distributions CI uses.
+
 - **One accept loop serves all three of the node's framed surfaces.** `FrameEndpoint`
   over an `IFrameResponder`; a second and third accept loop would be near-copies of a
   listener, a shutdown order and a poll timeout. An interface rather than a
@@ -2262,6 +2500,83 @@ down across a suspend point.
   timing seam, or anything a test harness's determinism rests on, build **at least
   one release configuration and one non-clang compiler** locally —
   `cmake --preset gcc-release` and `clang-release` both exist and both run in WSL.
+- **`Close()` can be the last thing that runs on a socket, so it must touch no member
+  after it completes an awaitable.** `EpollSocket::Close` walked `{readOp, writeOp}`
+  and completed each parked awaitable inside the loop. Completing one resumes the
+  coroutine that was waiting on it -- and a coroutine that OWNS the socket
+  (`ServePeer` holds it in a by-value `unique_ptr` parameter) then runs to its end and
+  destroys it, so the loop's next iteration reads `_impl->writeOp` out of freed
+  memory. Reported by ASan as a heap-use-after-free from `RaftPeerServer::Shutdown`,
+  which is the one caller that closes accepted connections from outside their own
+  coroutines. The awaitables are detached from the ops first and completed last now,
+  with `_fd` cleared before them. Two things worth keeping: the parked awaitables live
+  in their coroutines' own frames rather than in `_impl`, which is what makes it safe
+  to complete the second after the first has taken the socket down; and the same edit
+  went to `KqueueSocket::Close`, which was a copy of the same loop and had the same
+  defect on a platform where nothing had ever run a sanitizer either.
+- **A wait that cannot be cancelled is a frame that cannot be freed, so `Schedule`
+  grew a counterpart.** `IReactor` could park a coroutine on a deadline and had no
+  way to take it back, which is why `DeadlineTimer` and `InterruptibleSleepUntil`
+  poll in bounded steps rather than parking once: a disarmed timer then retires at
+  its next tick instead of never. What that still leaves is a frame parked *during*
+  the tick, and a reactor destroyed in that window frees nothing --
+  `IReactor::Run` returns with its timer heap exactly as it was, deliberately. One
+  leaked coroutine frame **per dial and per cache exchange**, harmless in a daemon
+  that outlives them and fatal for `fastcache-cc`, where an ASan build then exits
+  non-zero and turns every cached compile into a failed one.
+  `IReactor::CancelPending` closes it: `Disarm()` takes the timer's own handle back
+  off the reactor and destroys it there and then. Five things are load-bearing:
+  - **The return value is an ownership transfer, not a status.** `true` means THIS
+    call removed the handle, so the caller is now the only one who may resume it;
+    `false` means the reactor still has it -- running, or already queued -- and the
+    caller must not touch it. That is what makes the race against a timer firing
+    concurrently decidable instead of a guess, and it is decided under the same lock
+    the timer heap is popped under.
+  - **The frame is DESTROYED, not resumed, and that is the difference between
+    fixing the leak and moving it.** Resuming only queues it, and the caller that
+    disarms is typically about to stop the reactor on its very next line --
+    `ReactorExchange` does exactly that -- so the queued handle would never run. The
+    first version resumed, and ASan reported the same leak in the same place.
+  - **`DeadlineTimer` had to stop awaiting a nested `Task`.** Awaiting one parks the
+    INNER coroutine's handle, so the handle the timer recorded would not be the one
+    `CancelPending` has to name. Its wait is written out against `SleepUntil`
+    directly, and the handle is captured by an awaitable whose `await_suspend`
+    returns `false` -- recorded on the way past, without suspending, so it is
+    available even in the window before the first hop onto the reactor. It is also
+    what makes destroying it sound: the handle is the whole chain, and a
+    `DetachedTask` leaves no awaiter holding it.
+  - **The first attempt was for the reactor to free what it still held at teardown,
+    and it is unsound.** `Submit` and `Schedule` convey no ownership: a `Task` local
+    in a test parks its handle and then destroys its own frame at scope exit, so the
+    reactor -- destroyed afterwards -- destroyed it a second time. ASan named it
+    immediately, which is the argument for the sanitizer fix below in one line.
+  - **IOCP cancels timers and not submissions**, because a submission there is a
+    completion packet already posted to the kernel and no call takes one back. It
+    answers `false` for that case, which is the honest answer under the rule above.
+- **A sanitizer that is on in the cache is not a sanitizer that is on in the build.**
+  `cmake/portable/Sanitizers.cmake` initialised `SANITIZER_COMPILE_OPTIONS` to `""`
+  as a normal variable, published the real flags through
+  `set(... CACHE INTERNAL ...)`, and then `list(APPEND)`ed one more flag to the same
+  name. Under **CMP0126 NEW** -- which `cmake_minimum_required(3.28)` selects -- a
+  cache `set` no longer removes a normal variable of that name, so the empty one
+  keeps shadowing the cache. The append therefore starts from nothing and
+  `add_compile_options` receives `-fno-sanitize-recover=undefined` and no
+  `-fsanitize=` at all, while `CMakeCache.txt` says
+  `ENABLE_SANITIZER_ADDRESS:BOOL=ON` and the configure log prints
+  `[Sanitizers] Enabling: address,undefined`. Every signal an author would check says
+  yes; not one object is instrumented -- and not on a re-configure, on a **completely
+  fresh build directory**, which is what CI makes. So the project's sanitizer gate had
+  never run: not locally, and not in the `clang-tidy` job that ends with
+  `ctest --preset clang-debug`. Turning it on found a heap-use-after-free in
+  `EpollSocket::Close`, a leaked coroutine frame per dial that `IReactor::CancelPending`
+  now prevents, and a plain use-after-free in a test fake that had been passing 300
+  consecutive runs.
+  The flags are assembled in locals and published once now. Two things to keep: the
+  check that actually answers the question is `grep -o -- '-fsanitize=[a-z,]*'` **on
+  `build.ninja`**, since the cache and the log are precisely the two places that lie;
+  and this is the same class as the `USE_COMPILER_CACHE` configure probe -- a tool
+  that silently does nothing is worse than one that is off, because the second is
+  visible.
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins.** Both jobs
   run the `$CLANG_TOOLS_VERSION` binary (`.github/workflows/build.yml`), and successive LLVM
   releases do not agree with each other: the style job compares against a *newer formatter*,
@@ -2360,7 +2675,9 @@ PDB is a second artefact no hit can reproduce).
 
 Catch2 tests live next to the implementation files, so `Foo.cpp` has a `Foo_test.cpp`. A `test_main.cpp` serves as the entry point.
 
-`src/tests/Unwrap.hpp` holds the one helper every test target shares.
+`src/tests/` holds the helpers every test target shares -- `Unwrap.hpp` and
+`ScratchPath.hpp` -- and they are there rather than beside one caller for the same
+reason, which the second one learnt the hard way (see below).
 clang-tidy's `bugprone-unchecked-optional-access` cannot see a `has_value()`
 guard through Catch2's `REQUIRE`, so a plain `*x` after one is a **build failure**
 under `WarningsAsErrors` — `Unwrap(x)` goes through `value_or`, which is provably
@@ -2373,6 +2690,50 @@ header-only and includes only `<optional>`, so the launcher's and worker's test
 binaries can use it without linking `FastCache`. `std::expected` is **not**
 covered by that check, so a `*result` after `REQUIRE(result.has_value())` stays as
 it is — routing it through `Unwrap` does not even compile.
+
+**A per-process counter is not unique, because every `TEST_CASE` is a process.**
+`catch_discover_tests` registers each case as its own ctest test, so a fixture that
+names a scratch directory from a `static` counter hands the same path to every
+concurrent case -- and the constructors of these fixtures all begin with
+`remove_all`, which turns a name collision into **deleted data**: the second case
+wipes the files the first is still reading. `tests/ScratchPath.hpp` is the one
+definition now (`UniqueScratchPath`, pid + counter, and the RAII
+`ScratchDirectory` over it), and four things about how it got there are worth
+keeping:
+
+- **It has been written five times.** The first fix was private to
+  `Stats_test.cpp`; three later files reintroduced it; and the fifth,
+  `RaftStorage_test.cpp`, failed ten cases under `ctest -j 8`. Its class comment
+  claimed exactly the guarantee it had -- "two cases running in one binary cannot
+  collide" -- and that scope is the bug.
+- **The fifth one happened because the shared fix was somewhere it could not be
+  included from.** `UniqueScratchPath` lived in `src/apps/fastcache-cc/`, which
+  `FastCacheTest` does not have on its include path, so the one suite that could
+  not reach it re-derived it. A helper is shared only if it sits where everything
+  that needs it can include from; `src` is on all three test targets' paths, which
+  is why this and `tests/Unwrap.hpp` live together.
+- **The constructor's `remove_all` is safe only because the name carries the
+  pid.** What it can then reach is this process's own leftovers or a dead
+  process's -- never a live peer's. Removing something you did not create is the
+  step that made a collision destructive rather than merely confusing.
+- **A caller-supplied name becomes a child of a unique parent, not the whole
+  name.** `ScratchTree`/`ScopedTree` take names like `"cache-hit"` and one that is
+  itself a nested path, and those names are what a reader recognises; they hang
+  under `UniqueScratchPath(prefix)` now, and the destructor removes the *parent*
+  so the unique level cannot leak.
+
+**And both CI and the gate run the tests in parallel now, because until this
+change nothing did.** `ctest` was invoked bare in every CI job, no preset set a
+job count, and `scripts/local-gate.sh` did not either -- which is why five
+separate authors could write this bug and no run anywhere would show it. CI sets
+`CTEST_PARALLEL_LEVEL` once in the workflow's `env:` rather than adding
+`--parallel` to each of the four `run:` lines, so an invocation added later is
+covered by construction; the gate passes `--parallel` explicitly (`getconf
+_NPROCESSORS_ONLN`, since it runs on macOS too; `FASTCACHE_GATE_JOBS` overrides).
+Tests that genuinely cannot share -- a daemon, a fixed port -- carry `RUN_SERIAL`,
+which `tls-smoke` was missing while every one of its neighbours had it. Measured
+on the full suite: 649s serial, 131s at `--parallel 8`, same 1965 tests; Windows
+65s to 37s.
 
 Not every test is a Catch2 case. Script-driven tests are registered in
 `src/tests/CMakeLists.txt`: the `smoke`-labelled ones start a real daemon or

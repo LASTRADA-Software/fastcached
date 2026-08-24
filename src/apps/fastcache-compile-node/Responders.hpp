@@ -26,10 +26,16 @@ class SchedulerResponder final: public IFrameResponder
     {
     }
 
-    [[nodiscard]] std::vector<std::byte> Answer(std::span<std::byte const> frame, std::string_view peer) override
+    /// @copydoc IFrameResponder::Answer
+    ///
+    /// Never suspends. The scheduler answers from its own tables -- a decision
+    /// layer kept pure so every capacity and expiry rule is a `ManualClock` unit
+    /// test -- so this is a one-line adapter, and a responder that costs a frame
+    /// allocation and no round trip is a legitimate thing to be.
+    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override
     {
-        return _protocol.Answer(frame,
-                                Distributed::CallerContext { .membership = _membership.Classify(peer), .peerId = peer });
+        co_return _protocol.Answer(frame,
+                                   Distributed::CallerContext { .membership = _membership.Classify(peer), .peerId = peer });
     }
 
     /// Kilobytes, not megabytes.
@@ -42,6 +48,25 @@ class SchedulerResponder final: public IFrameResponder
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
     {
         return 64ULL * 1024ULL;
+    }
+
+    /// Hundreds, because a scheduler verb is kilobytes.
+    ///
+    /// The spread against the cache surface below is the whole reason this is a
+    /// per-responder column: at 64 KiB a request, 256 at once is 16 MiB, which is
+    /// nothing. Sizing this like the cache's would refuse a busy fleet for no
+    /// reason; sizing the cache's like this would let 256 object files be in flight
+    /// at once.
+    [[nodiscard]] std::size_t MaxConcurrentRequests() const noexcept override
+    {
+        return 256;
+    }
+
+    /// 16 MiB: the connection cap times the request cap, so the byte budget never
+    /// refuses anything the connection cap would have allowed.
+    [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
+    {
+        return 256ULL * 64ULL * 1024ULL;
     }
 
   private:
@@ -72,15 +97,19 @@ class CacheResponder final: public IFrameResponder
     {
     }
 
-    [[nodiscard]] std::vector<std::byte> Answer(std::span<std::byte const> frame, std::string_view peer) override
+    /// @copydoc IFrameResponder::Answer
+    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override
     {
         // Refused as a *reply*, never by closing: a client that cannot tell a policy
         // refusal from a dead host retries forever and reports a flaky network, which
         // is the failure the declared frame length exists to make avoidable.
+        //
+        // Answered before any suspension, deliberately: a stranger must not be able
+        // to make this node dial its upstream.
         if (_membership.Classify(peer) != Distributed::Membership::Member)
-            return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::NotAMember,
-                                                      "this node serves its cache to its own machine and its cluster");
-        return _proxy.Answer(frame);
+            co_return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::NotAMember,
+                                                         "this node serves its cache to its own machine and its cluster");
+        co_return co_await _proxy.Answer(frame);
     }
 
     /// Megabytes, because a STORE carries a whole object file.
@@ -89,6 +118,30 @@ class CacheResponder final: public IFrameResponder
     /// shared cache would accept would silently stop caching this machine's largest
     /// translation units, which are exactly the ones worth caching.
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
+    {
+        return 256ULL * 1024ULL * 1024ULL;
+    }
+
+    /// Eight, because a cache STORE carries a whole object file.
+    ///
+    /// This surface is the one the concurrency change is FOR -- a slow upstream used
+    /// to stall every local `fastcache-cc` behind it -- so it must serve several at
+    /// once. But it is also the one where "several at once" is expensive, and the
+    /// serialized loop was bounding peak memory to a single request by accident.
+    /// Eight parallel translation units is a wide build; the byte budget below is
+    /// what actually stops it becoming eight times the per-request maximum.
+    [[nodiscard]] std::size_t MaxConcurrentRequests() const noexcept override
+    {
+        return 8;
+    }
+
+    /// 256 MiB across all of them, which is deliberately ONE request's worth.
+    ///
+    /// So the common case -- eight ordinary objects of a few megabytes -- runs fully
+    /// in parallel, while a single 256 MiB monster still cannot be joined by seven
+    /// more. That keeps this endpoint's peak footprint where the serialized loop
+    /// used to hold it, without reintroducing the serialization.
+    [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
     {
         return 256ULL * 1024ULL * 1024ULL;
     }

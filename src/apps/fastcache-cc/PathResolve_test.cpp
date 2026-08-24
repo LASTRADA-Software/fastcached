@@ -10,6 +10,8 @@
 #include <string_view>
 #include <system_error>
 
+#include <tests/ScratchPath.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Cc;
 
@@ -22,18 +24,24 @@ class ScratchTree
 {
   public:
     explicit ScratchTree(std::string_view name):
-        _root { std::filesystem::temp_directory_path()
-                / std::filesystem::path { std::string { "fc-resolve-" } + std::string { name } } }
+        // A unique PARENT with the caller's name hung under it, rather than the name
+        // alone. The name is what a reader recognises and one of them is itself a
+        // nested path, so it stays exactly as written; what changes is that it can no
+        // longer be the whole story. `temp / "<fixed>"` is the same directory in every
+        // concurrent test process -- see `tests/ScratchPath.hpp` for the five times
+        // that has been paid for.
+        _base { FastCache::Testing::UniqueScratchPath("fc-resolve") },
+        _root { _base / std::filesystem::path { std::string { name } } }
     {
         std::error_code ec;
-        std::filesystem::remove_all(_root, ec);
         std::filesystem::create_directories(_root, ec);
     }
 
     ~ScratchTree()
     {
+        // The BASE, not the root: the root may be nested inside it.
         std::error_code ec;
-        std::filesystem::remove_all(_root, ec);
+        std::filesystem::remove_all(_base, ec);
     }
 
     ScratchTree(ScratchTree const&) = delete;
@@ -47,6 +55,7 @@ class ScratchTree
     }
 
   private:
+    std::filesystem::path _base;
     std::filesystem::path _root;
 };
 
@@ -96,7 +105,10 @@ TEST_CASE("A path that does not exist comes back usable rather than empty")
     // not been created yet, or an argument that was never a path, has to survive
     // this call unchanged in every way that matters to a prefix test.
     auto const resolver = MakePathResolver();
-    auto const absent = (std::filesystem::temp_directory_path() / "fc-resolve-absent" / "nope.hpp").string();
+    // `UniqueScratchPath` creates nothing, which is exactly what a case about an
+    // absent path wants -- and it cannot be made to exist by a leftover from an
+    // older run, which a fixed name could.
+    auto const absent = (FastCache::Testing::UniqueScratchPath("fc-resolve-absent") / "nope.hpp").string();
     auto const resolved = resolver->Resolve(absent);
     CHECK_FALSE(resolved.empty());
     CHECK(std::filesystem::path { resolved }.filename() == "nope.hpp");

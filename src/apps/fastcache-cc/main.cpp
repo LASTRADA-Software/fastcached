@@ -43,6 +43,7 @@
 #include "IProcessRunner.hpp"
 #include "LauncherCli.hpp"
 #include "PathResolve.hpp"
+#include "ReactorExchange.hpp"
 #include "ReplayGuard.hpp"
 #include "RootReconciler.hpp"
 #include "Stats.hpp"
@@ -104,6 +105,15 @@ namespace Wire = FastCache::CompileCacheWire;
 /// Default per-call socket deadline, overridable with FASTCACHE_TIMEOUT_MS.
 constexpr std::chrono::milliseconds DefaultIoTimeout { 10000 };
 
+/// Default ceiling on OPENING a connection, name resolution included.
+///
+/// A second rather than the I/O timeout's ten, because they bound different
+/// things: a cache that has not accepted within a second is one this build is
+/// better off without, and a name lookup that hangs would otherwise stall every
+/// translation unit with nothing to say why. They used to be one value passed
+/// twice.
+constexpr std::chrono::milliseconds DefaultConnectTimeout { 1000 };
+
 struct Config
 {
     std::string addr;
@@ -130,6 +140,7 @@ struct Config
     /// default keeps a wedged daemon from hanging a build while staying far
     /// above any healthy round-trip, including multi-megabyte objects.
     std::chrono::milliseconds ioTimeout { DefaultIoTimeout };
+    std::chrono::milliseconds connectTimeout { DefaultConnectTimeout };
     /// Largest encoded value the launcher will offer to the daemon; 0 = no
     /// limit. See Cc::IsStorableSize for why this is a client-side policy.
     std::size_t maxStoreBytes { Cc::DefaultMaxStoreBytes };
@@ -232,6 +243,7 @@ struct Config
     c.stats = !EnvSet(Cc::EnvName::NoStats);
     c.direct = !EnvSet(Cc::EnvName::NoDirect);
     c.ioTimeout = EnvMillis(Cc::EnvName::TimeoutMs, DefaultIoTimeout);
+    c.connectTimeout = EnvMillis(Cc::EnvName::ConnectTimeoutMs, DefaultConnectTimeout);
     // A username without a token is not a credential, and `Credential::Configured`
     // keys on the secret alone — so an operator who sets only FASTCACHE_USER gets
     // the same unauthenticated behaviour they had before, rather than an AUTH
@@ -500,57 +512,13 @@ void ReplayStreams(std::string_view out, std::string_view err)
     return out.good();
 }
 
-// --- TCP client -------------------------------------------------------------
-
-/// Thin owning wrapper over the library's `ISocket`, so call sites keep the
-/// `TcpClient::Connect(addr)` -> optional shape they already use.
-///
-/// The socket's own I/O is coroutine-shaped, and this flow is not, so the two
-/// helpers below drive it with `SyncRun`. That is sound here and nowhere else:
-/// a blocking socket resolves every awaitable inline, so the task is never left
-/// suspended -- which is the one thing `SyncRun` refuses to read from. The same
-/// reasoning is written out at `RaftPeerTransport::WriteFrame`.
-class TcpClient
+/// The deadlines this invocation runs every cache exchange under.
+/// @param cfg The launcher's configuration.
+/// @return The budget.
+[[nodiscard]] Cc::ExchangeBudget BudgetOf(Config const& cfg)
 {
-  public:
-    /// Connect to `hostPort`.
-    /// @param hostPort "host:port"; hostnames and [::1]:port are accepted.
-    /// @param ioTimeout Per-call send/recv deadline; 0 disables it.
-    /// @return A connected client, or nullopt when unreachable.
-    [[nodiscard]] static std::optional<TcpClient> Connect(std::string_view hostPort, std::chrono::milliseconds ioTimeout)
-    {
-        auto socket = Cc::DialEndpoint(hostPort, ioTimeout);
-        if (socket == nullptr)
-            return std::nullopt;
-        return TcpClient { std::move(socket) };
-    }
-
-    /// @see FastCache::SendAll
-    [[nodiscard]] bool SendAll(std::span<std::byte const> bytes)
-    {
-        return SyncRun(FastCache::SendAll(_impl.get(), bytes));
-    }
-
-    /// @see FastCache::RecvExactly
-    [[nodiscard]] std::optional<std::vector<std::byte>> RecvExactly(std::size_t count)
-    {
-        return SyncRun(FastCache::RecvExactly(_impl.get(), count));
-    }
-
-    /// The underlying seam, for the framing helpers in CacheProtocol.
-    [[nodiscard]] ISocket& Transport() noexcept
-    {
-        return *_impl;
-    }
-
-  private:
-    explicit TcpClient(std::unique_ptr<ISocket> impl):
-        _impl { std::move(impl) }
-    {
-    }
-
-    std::unique_ptr<ISocket> _impl;
-};
+    return Cc::ExchangeBudget { .connect = cfg.connectTimeout, .total = cfg.ioTimeout };
+}
 
 /// The grammar to tag the include-bearing stream with, per compiler flavor.
 [[nodiscard]] PathCanon::Grammar IncludeGrammar()
@@ -820,11 +788,7 @@ struct SourceProbe
 /// @return The stored bytes on hit.
 [[nodiscard]] std::optional<std::vector<std::byte>> FetchRaw(Config const& cfg, std::string const& key)
 {
-    auto client = TcpClient::Connect(cfg.addr, cfg.ioTimeout);
-    if (!client.has_value())
-        return std::nullopt;
-
-    auto outcome = Cc::CacheFetch(client->Transport(), key, cfg.credential);
+    auto outcome = Cc::RunOneExchange(cfg.addr, Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
     NoteIfCredentialIgnored(outcome);
     if (!outcome.IsHit())
     {
@@ -848,20 +812,17 @@ struct SourceProbe
 /// @param body The bytes to store.
 void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key, std::string_view body)
 {
-    auto client = TcpClient::Connect(addr, cfg.ioTimeout);
-    if (!client.has_value())
-        return;
-
     // Check the outcome rather than discarding it: a rejected STORE is silent
     // otherwise, and a manifest that never lands makes direct mode look simply
     // ineffective.
-    auto const outcome = Cc::CacheStore(client->Transport(),
-                                        Wire::StoreRequest { .key = key,
-                                                             .prefetchGroup = cfg.prefetchGroup,
-                                                             .srcRoot = cfg.srcRoot,
-                                                             .buildTree = cfg.buildTree,
-                                                             .value = Wire::AsBytes(body) },
-                                        cfg.credential);
+    auto const outcome = Cc::RunOneExchange(addr,
+                                            Wire::EncodeStore(Wire::StoreRequest { .key = key,
+                                                                                   .prefetchGroup = cfg.prefetchGroup,
+                                                                                   .srcRoot = cfg.srcRoot,
+                                                                                   .buildTree = cfg.buildTree,
+                                                                                   .value = Wire::AsBytes(body) }),
+                                            cfg.credential,
+                                            BudgetOf(cfg));
     NoteIfCredentialIgnored(outcome);
     WarnIfRejected(outcome, "STORE (raw)", key);
 }
@@ -1271,7 +1232,7 @@ void RecordManifest(Config const& cfg,
     auto const fingerprint =
         Cc::CachedToolchainFingerprint(ProcessRunner(), cmd.compiler, toolchainStamp, Cc::DriverOf(cmd.flavor));
 
-    auto const dialer = Cc::MakeTcpDialer(cfg.ioTimeout);
+    auto const dialer = Cc::MakeTcpDialer(cfg.connectTimeout, cfg.ioTimeout);
     auto const outcome = Cc::Dispatch(*dialer,
                                       Cc::DispatchRequest { .schedulerEndpoint = cfg.schedulerAddr,
                                                             .fingerprint = fingerprint,
@@ -1461,13 +1422,7 @@ void RecordManifest(Config const& cfg,
 
     // FETCH.
     {
-        auto client = TcpClient::Connect(cfg.addr, cfg.ioTimeout);
-        if (!client.has_value())
-        {
-            Warn("connect failed");
-            return std::nullopt;
-        }
-        auto const outcome = Cc::CacheFetch(client->Transport(), key, cfg.credential);
+        auto const outcome = Cc::RunOneExchange(cfg.addr, Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
         NoteIfCredentialIgnored(outcome);
         if (outcome.kind == Cc::CacheOutcomeKind::Transport)
         {
@@ -1615,25 +1570,21 @@ void RecordManifest(Config const& cfg,
         return code;
     }
 
-    auto client = TcpClient::Connect(cfg.addr, cfg.ioTimeout);
-    if (!client.has_value())
-    {
-        // Same reasoning as above: the compile succeeded, so this remains a MISS.
-        Note("connect failed for store");
-        return code; // compile already succeeded; just skip caching
-    }
     // Best-effort store: a failure here must never fail the build (the compile
     // already succeeded). Surface the outcome under verbose so store rejections
     // (e.g. a value over the server's --storage-max-value) are diagnosable — and
     // now with the daemon's own reason, which the bare acknowledgement byte the
-    // old framing carried could never express.
-    auto const outcome = Cc::CacheStore(client->Transport(),
-                                        Wire::StoreRequest { .key = key,
-                                                             .prefetchGroup = cfg.prefetchGroup,
-                                                             .srcRoot = cfg.srcRoot,
-                                                             .buildTree = cfg.buildTree,
-                                                             .value = std::span<std::byte const> { encoded } },
-                                        cfg.credential);
+    // old framing carried could never express. An unreachable daemon lands here as
+    // a transport failure, which reads the same way it always did.
+    auto const outcome =
+        Cc::RunOneExchange(cfg.addr,
+                           Wire::EncodeStore(Wire::StoreRequest { .key = key,
+                                                                  .prefetchGroup = cfg.prefetchGroup,
+                                                                  .srcRoot = cfg.srcRoot,
+                                                                  .buildTree = cfg.buildTree,
+                                                                  .value = std::span<std::byte const> { encoded } }),
+                           cfg.credential,
+                           BudgetOf(cfg));
     NoteIfCredentialIgnored(outcome);
     if (outcome.IsHit())
         Note(std::format("STORED key={} bytes={}", key, encoded.size()));

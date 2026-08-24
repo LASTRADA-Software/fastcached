@@ -224,7 +224,7 @@ bool WorkerRegistrar::Register(ISocket& scheduler, Credential const& credential)
                                                                     .slots = _slots,
                                                                     .acceptedCodecs = _acceptedCodecs,
                                                                     .capacity = _capacity });
-    auto const outcome = ExchangeFramed(scheduler, frame, credential);
+    auto const outcome = SyncRun(ExchangeFramed(&scheduler, frame, credential));
     if (!outcome.IsHit())
         return false;
 
@@ -241,7 +241,7 @@ bool WorkerRegistrar::Heartbeat(ISocket& scheduler,
         return false; // never registered; nothing to refresh
 
     auto const frame = Wire::EncodeHeartbeat(_workerId, inFlight, load);
-    auto const outcome = ExchangeFramed(scheduler, frame, credential);
+    auto const outcome = SyncRun(ExchangeFramed(&scheduler, frame, credential));
     if (outcome.IsHit())
         return true;
 

@@ -160,7 +160,7 @@ TEST_CASE("CacheFetch sends exactly what the wire module specifies")
     // what makes client and server agree by construction: both sides frame
     // through the same function, so they cannot drift apart independently.
     ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Miss, {}) };
-    (void) CacheFetch(client, "the-key");
+    (void) SyncRun(CacheFetch(&client, "the-key"));
 
     CHECK(client.Sent() == Wire::EncodeFetch("the-key"));
 }
@@ -170,7 +170,7 @@ TEST_CASE("CacheFetch returns the payload on a hit")
     auto const stored = std::vector<std::byte> { std::byte { 0xDE }, std::byte { 0xAD } };
     ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Ok, stored) };
 
-    auto const outcome = CacheFetch(client, "k");
+    auto const outcome = SyncRun(CacheFetch(&client, "k"));
     CHECK(outcome.kind == CacheOutcomeKind::Hit);
     CHECK(outcome.IsHit());
     CHECK(outcome.value == stored);
@@ -184,13 +184,13 @@ TEST_CASE("CacheFetch reports a version rejection distinctly from a miss")
     // slower with no explanation.
     auto const missOutcome = [] {
         ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Miss, {}) };
-        return CacheFetch(client, "k");
+        return SyncRun(CacheFetch(&client, "k"));
     }();
 
     auto const rejectedOutcome = [] {
         ScriptedTcpClient client { Wire::EncodeErrorReply(Wire::ErrorCode::UnsupportedVersion,
                                                           "unsupported wire version 2; this server speaks 1..1") };
-        return CacheFetch(client, "k");
+        return SyncRun(CacheFetch(&client, "k"));
     }();
 
     CHECK(missOutcome.kind == CacheOutcomeKind::Miss);
@@ -219,12 +219,12 @@ TEST_CASE("CacheStore drains a refusal by its declared length")
 
     ScriptedTcpClient client { reply };
     auto const value = std::vector<std::byte> { std::byte { 0x01 } };
-    auto const outcome = CacheStore(client,
-                                    Wire::StoreRequest { .key = "k",
-                                                         .prefetchGroup = "c",
-                                                         .srcRoot = "/s",
-                                                         .buildTree = "/b",
-                                                         .value = std::span<std::byte const> { value } });
+    auto const outcome = SyncRun(CacheStore(&client,
+                                            Wire::StoreRequest { .key = "k",
+                                                                 .prefetchGroup = "c",
+                                                                 .srcRoot = "/s",
+                                                                 .buildTree = "/b",
+                                                                 .value = std::span<std::byte const> { value } }));
 
     CHECK(outcome.kind == CacheOutcomeKind::Rejected);
     CHECK(outcome.code == Wire::ErrorCode::StorageWriteFailed);
@@ -239,7 +239,7 @@ TEST_CASE("CacheStore sends exactly what the wire module specifies")
     };
 
     ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Ok, {}) };
-    auto const outcome = CacheStore(client, request);
+    auto const outcome = SyncRun(CacheStore(&client, request));
 
     CHECK(outcome.kind == CacheOutcomeKind::Hit);
     CHECK(client.Sent() == Wire::EncodeStore(request));
@@ -252,13 +252,13 @@ TEST_CASE("A transport failure is not mistaken for a miss or a refusal")
     SECTION("send fails")
     {
         FailingTcpClient client;
-        CHECK(CacheFetch(client, "k").kind == CacheOutcomeKind::Transport);
+        CHECK(SyncRun(CacheFetch(&client, "k")).kind == CacheOutcomeKind::Transport);
     }
 
     SECTION("the peer closes before a full reply header")
     {
         ScriptedTcpClient client { std::vector<std::byte> { std::byte { 0x01 } } };
-        CHECK(CacheFetch(client, "k").kind == CacheOutcomeKind::Transport);
+        CHECK(SyncRun(CacheFetch(&client, "k")).kind == CacheOutcomeKind::Transport);
     }
 
     SECTION("the peer declares more payload than it sends")
@@ -266,7 +266,7 @@ TEST_CASE("A transport failure is not mistaken for a miss or a refusal")
         auto truncated = Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte>(8, std::byte { 0x11 }));
         truncated.resize(truncated.size() - 2);
         ScriptedTcpClient client { truncated };
-        CHECK(CacheFetch(client, "k").kind == CacheOutcomeKind::Transport);
+        CHECK(SyncRun(CacheFetch(&client, "k")).kind == CacheOutcomeKind::Transport);
     }
 }
 
@@ -328,7 +328,7 @@ TEST_CASE("An unconfigured credential changes nothing on the wire")
     // send byte-for-byte what it always sent. Anything else would make upgrading
     // the launcher a wire change for every daemon in a fleet.
     ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Miss, {}) };
-    (void) CacheFetch(client, "the-key", Credential {});
+    (void) SyncRun(CacheFetch(&client, "the-key", Credential {}));
 
     CHECK(client.Sent() == Wire::EncodeFetch("the-key"));
 }
@@ -339,7 +339,7 @@ TEST_CASE("A username without a secret is not a credential")
     // Sending an AUTH carrying an empty secret would be refused by every server
     // that requires one, turning a harmless typo into a build with no cache.
     ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Miss, {}) };
-    (void) CacheFetch(client, "k", Credential { .username = "bob", .secret = "" });
+    (void) SyncRun(CacheFetch(&client, "k", Credential { .username = "bob", .secret = "" }));
 
     CHECK(client.Sent() == Wire::EncodeFetch("k"));
 }
@@ -356,7 +356,7 @@ TEST_CASE("A credential is pipelined ahead of the command, with no round trip be
     ScriptedTcpClient client { Replies(
         { Wire::EncodeReply(Wire::Status::Ok, {}), Wire::EncodeReply(Wire::Status::Miss, {}) }) };
 
-    auto const outcome = CacheFetch(client, "k", Token("s3cret"));
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Token("s3cret")));
     CHECK(outcome.kind == CacheOutcomeKind::Miss);
 
     auto expected = Wire::EncodeAuth(Wire::AuthRequest { .username = "", .secret = "s3cret" });
@@ -379,7 +379,7 @@ TEST_CASE("A hit behind a credential is served, and both replies are consumed")
     auto const script = Replies({ Wire::EncodeReply(Wire::Status::Ok, {}), Wire::EncodeReply(Wire::Status::Ok, stored) });
     ScriptedTcpClient client { script };
 
-    auto const outcome = CacheFetch(client, "k", Token("s3cret"));
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Token("s3cret")));
     REQUIRE(outcome.IsHit());
     CHECK(outcome.value == stored);
     CHECK(client.Cursor() == script.size());
@@ -395,7 +395,7 @@ TEST_CASE("A rejected credential surfaces as the credential's refusal, not the c
                                   Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, {}) });
     ScriptedTcpClient client { script };
 
-    auto const outcome = CacheFetch(client, "k", Token("wrong"));
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Token("wrong")));
     REQUIRE(outcome.kind == CacheOutcomeKind::Rejected);
     CHECK(outcome.code == Wire::ErrorCode::Unauthenticated);
     CHECK(outcome.message == "authentication failed");
@@ -417,7 +417,7 @@ TEST_CASE("CacheStore presents the credential the same way CacheFetch does")
                                               .srcRoot = "/src",
                                               .buildTree = "/build",
                                               .value = std::span<std::byte const> { body } };
-    auto const outcome = CacheStore(client, request, Token("s3cret", "bob"));
+    auto const outcome = SyncRun(CacheStore(&client, request, Token("s3cret", "bob")));
     CHECK(outcome.IsHit());
 
     auto expected = Wire::EncodeAuth(Wire::AuthRequest { .username = "bob", .secret = "s3cret" });
@@ -439,7 +439,7 @@ TEST_CASE("A daemon that dies after the AUTH reply is a transport failure, not a
     // replies and got one, so there is no command outcome to report.
     ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Ok, {}) };
 
-    auto const outcome = CacheFetch(client, "k", Token("s3cret"));
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Token("s3cret")));
     CHECK(outcome.kind == CacheOutcomeKind::Transport);
     CHECK_FALSE(outcome.IsHit());
 }
@@ -460,7 +460,7 @@ TEST_CASE("A daemon predating the AUTH verb still serves the command behind it")
     ScriptedTcpClient client { Replies({ Wire::EncodeErrorReply(Wire::ErrorCode::UnknownOpcode, "unknown opcode 0x03"),
                                          Wire::EncodeReply(Wire::Status::Ok, stored) }) };
 
-    auto const outcome = CacheFetch(client, "k", Token("s3cret"));
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Token("s3cret")));
     REQUIRE(outcome.IsHit());
     CHECK(outcome.value == stored);
 
@@ -478,7 +478,7 @@ TEST_CASE("An ordinary refusal is not mistaken for an absent AUTH verb")
     ScriptedTcpClient client { Replies({ Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, "authentication failed"),
                                          Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, {}) }) };
 
-    auto const outcome = CacheFetch(client, "k", Token("wrong"));
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Token("wrong")));
     CHECK(outcome.kind == CacheOutcomeKind::Rejected);
     CHECK(outcome.code == Wire::ErrorCode::Unauthenticated);
     CHECK_FALSE(outcome.credentialIgnored);
@@ -490,6 +490,6 @@ TEST_CASE("An uncredentialed exchange never reports an ignored credential")
     // it", not "no AUTH frame was involved". A launcher with no token configured
     // asked for nothing and must say nothing.
     ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Miss, {}) };
-    auto const outcome = CacheFetch(client, "k", Credential {});
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Credential {}));
     CHECK_FALSE(outcome.credentialIgnored);
 }

@@ -25,6 +25,22 @@ namespace FastCache
 /// structs (one for Read, one for Write) — only one of each may be in
 /// flight at a time. The buffer passed to Read/Write must outlive the
 /// awaitable.
+/// Whether a socket handed to `IocpSocket` has already been associated with the
+/// reactor's completion port.
+///
+/// It exists because `ConnectEx` requires the association to happen BEFORE the
+/// operation is issued, so the connector must do it itself. A second
+/// `CreateIoCompletionPort` on an already-associated handle fails, and the
+/// constructor would then report `IsAttached() == false` for a connection that
+/// is perfectly good -- telling the caller to abandon a socket that works.
+///
+/// Defaulted to `Attach`, so the accept path is byte-identical to what it was.
+enum class IocpAttachment : std::uint8_t
+{
+    Attach,         ///< The constructor associates the handle.
+    AlreadyAttached ///< The caller has; the constructor must not repeat it.
+};
+
 class IocpSocket final: public ISocket
 {
   public:
@@ -34,7 +50,12 @@ class IocpSocket final: public ISocket
     /// @param native Native SOCKET handle.
     /// @param peerAddress Printable peer host captured at accept time, or ""
     ///        when unknown. Surfaced via PeerAddress() for `--log-source`.
-    IocpSocket(IocpReactor& reactor, std::uintptr_t native, std::string peerAddress = {}) noexcept;
+    /// @param attachment Whether this constructor should associate the handle
+    ///        with the completion port, or the caller already has.
+    IocpSocket(IocpReactor& reactor,
+               std::uintptr_t native,
+               std::string peerAddress = {},
+               IocpAttachment attachment = IocpAttachment::Attach) noexcept;
     ~IocpSocket() override;
 
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
@@ -98,6 +119,7 @@ class IocpListener final: public IListener
 
     [[nodiscard]] AcceptAwaitable Accept() override;
     void Close() noexcept override;
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept override;
 
     [[nodiscard]] bool IsBound() const noexcept;
     [[nodiscard]] std::string_view BindError() const noexcept;

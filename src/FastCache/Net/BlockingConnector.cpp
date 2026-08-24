@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Net/BlockingConnector.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/ConnectFlow.hpp>
 
 #include <chrono>
 #include <cstring>
 #include <format>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -42,25 +44,6 @@ namespace
         return code == WSAEWOULDBLOCK || code == WSAEINPROGRESS;
     }
 
-    /// Put a socket into non-blocking mode.
-    /// @param s The socket.
-    /// @return True on success.
-    [[nodiscard]] bool SetNonBlocking(Detail::NativeSocket s) noexcept
-    {
-        u_long mode = 1;
-        return ::ioctlsocket(static_cast<SOCKET>(s), FIONBIO, &mode) == 0;
-    }
-
-    /// Put a socket back into blocking mode, which is what `BlockingSocket`'s
-    /// reads and writes expect.
-    /// @param s The socket.
-    /// @return True on success.
-    [[nodiscard]] bool SetBlocking(Detail::NativeSocket s) noexcept
-    {
-        u_long mode = 0;
-        return ::ioctlsocket(static_cast<SOCKET>(s), FIONBIO, &mode) == 0;
-    }
-
     /// Wait for a connecting socket to become writable, or for the deadline.
     /// @param s The connecting socket.
     /// @param timeout How long to wait; non-positive waits indefinitely.
@@ -89,18 +72,6 @@ namespace
     [[nodiscard]] bool ConnectInProgress(int code) noexcept
     {
         return code == EINPROGRESS;
-    }
-
-    [[nodiscard]] bool SetNonBlocking(Detail::NativeSocket s) noexcept
-    {
-        auto const flags = ::fcntl(static_cast<int>(s), F_GETFL, 0);
-        return flags >= 0 && ::fcntl(static_cast<int>(s), F_SETFL, flags | O_NONBLOCK) == 0;
-    }
-
-    [[nodiscard]] bool SetBlocking(Detail::NativeSocket s) noexcept
-    {
-        auto const flags = ::fcntl(static_cast<int>(s), F_GETFL, 0);
-        return flags >= 0 && ::fcntl(static_cast<int>(s), F_SETFL, flags & ~O_NONBLOCK) == 0;
     }
 
     [[nodiscard]] int WaitWritable(Detail::NativeSocket s, std::chrono::milliseconds timeout) noexcept
@@ -134,7 +105,7 @@ namespace
         if (native == Detail::InvalidSocket)
             return std::unexpected { Detail::MakeNetError(Detail::LastNetworkError(), "socket() failed") };
 
-        if (!SetNonBlocking(native))
+        if (!Detail::SetNonBlocking(native))
         {
             auto const code = Detail::LastNetworkError();
             Detail::CloseNativeSocket(native);
@@ -204,7 +175,7 @@ namespace
             }
         }
 
-        if (!SetBlocking(native))
+        if (!Detail::SetBlocking(native))
         {
             auto const code = Detail::LastNetworkError();
             Detail::CloseNativeSocket(native);
@@ -217,47 +188,68 @@ namespace
 
 } // namespace
 
-BlockingConnector::BlockingConnector(IAddressResolver& resolver) noexcept:
-    _resolver { resolver }
+BlockingConnector::BlockingConnector(IAddressResolver& resolver, BlockingConnectorOptions options, IClock* clock) noexcept:
+    _resolver { resolver },
+    _options { options },
+    _clock { clock != nullptr ? *clock : _ownClock }
 {
 }
 
-std::expected<std::unique_ptr<ISocket>, NetError> BlockingConnector::Connect(std::string_view host,
-                                                                             std::uint16_t port,
-                                                                             std::chrono::milliseconds connectTimeout,
-                                                                             std::chrono::milliseconds ioTimeout)
+namespace
+{
+
+    /// What one candidate attempt needs to know beyond the endpoint itself.
+    struct BlockingDialState
+    {
+        IClock* clock { nullptr };
+        std::chrono::milliseconds ioTimeout { 0 };
+        std::string const* host { nullptr };
+        std::uint16_t port { 0 };
+    };
+
+    /// `Detail::DialStep` over the blocking dial.
+    ///
+    /// A coroutine that never suspends, which is what keeps `SyncRun` sound over
+    /// the whole flow. `deadline` is the TOTAL budget, so what this attempt gets
+    /// is whatever is left of it -- that is what makes a two-candidate host cost
+    /// one budget rather than two.
+    Task<SocketResult> BlockingDial(void* state, ResolvedEndpoint endpoint, TimePoint deadline)
+    {
+        auto const& dial = *static_cast<BlockingDialState*>(state);
+
+        auto remaining = std::chrono::milliseconds { 0 };
+        if (dial.clock != nullptr && deadline != TimePoint::max())
+        {
+            auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - dial.clock->Now());
+            // Never zero: DialOne reads a non-positive timeout as "wait forever",
+            // so handing it an exhausted budget would remove the bound entirely at
+            // exactly the moment it matters most.
+            remaining = left > std::chrono::milliseconds { 0 } ? left : std::chrono::milliseconds { 1 };
+        }
+
+        auto dialed = DialOne(endpoint, remaining);
+        if (!dialed.has_value())
+            co_return std::unexpected(dialed.error());
+
+        // Armed BEFORE the socket is handed over, so there is no window in which
+        // it is reachable and unbounded.
+        Detail::SetIoTimeouts(*dialed, dial.ioTimeout, dial.ioTimeout);
+        co_return std::make_unique<BlockingSocket>(*dialed, std::format("{}:{}", *dial.host, dial.port));
+    }
+
+} // namespace
+
+Task<SocketResult> BlockingConnector::Connect(std::string host, std::uint16_t port, std::chrono::milliseconds connectTimeout)
 {
     Detail::EnsureNetworkInitialised();
 
-    auto const resolved = _resolver.Resolve(host, port);
-    if (!resolved.has_value())
-        return std::unexpected { NetError { .code = NetErrorCode::AddressNotAvail,
-                                            .systemCode = 0,
-                                            .context =
-                                                std::format("could not resolve {}:{}: {}", host, port, resolved.error()) } };
+    BlockingDialState state { .clock = &_clock, .ioTimeout = _options.ioTimeout, .host = &host, .port = port };
 
-    // Every candidate is tried in preference order, and the LAST failure is what
-    // is reported. A host with both an AAAA and an A record on a machine with no
-    // IPv6 route fails the first and succeeds the second, and a dial that gave up
-    // after one would report that as the peer being down.
-    auto failure = NetError { .code = NetErrorCode::AddressNotAvail,
-                              .systemCode = 0,
-                              .context = std::format("no usable address for {}:{}", host, port) };
-
-    for (auto const& endpoint: *resolved)
-    {
-        auto dialed = DialOne(endpoint, connectTimeout);
-        if (dialed.has_value())
-        {
-            // Bound every later blocking call before the socket is handed over, so
-            // there is no window in which it is reachable and unbounded.
-            Detail::SetIoTimeouts(*dialed, ioTimeout, ioTimeout);
-            return std::make_unique<BlockingSocket>(*dialed, std::format("{}:{}", host, port));
-        }
-        failure = std::move(dialed.error());
-    }
-
-    return std::unexpected { std::move(failure) };
+    // `reactor` is null: this connector is for threads that may block, and a null
+    // reactor is what tells the shared flow and the inline resolver never to
+    // suspend. That is the property `SyncRun` rests on.
+    co_return co_await Detail::RunConnectFlow(
+        &_resolver, /*reactor*/ nullptr, &_clock, std::move(host), port, connectTimeout, &BlockingDial, &state);
 }
 
 } // namespace FastCache

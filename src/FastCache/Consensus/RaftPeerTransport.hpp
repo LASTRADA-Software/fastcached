@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Async/AsyncQueue.hpp>
+#include <FastCache/Async/Cancellation.hpp>
+#include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Consensus/IRaftTransport.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -8,13 +12,10 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -64,32 +65,67 @@ struct PeerTransportOptions
     /// would otherwise accumulate an hour of heartbeats, and the memory that
     /// costs is memory the compile cache wanted.
     std::size_t maxQueuedPerPeer { 256 };
+
+    /// Longest a sender may sit in a backoff it cannot be woken from.
+    ///
+    /// Teardown lag, in one number. `IReactor::Schedule` cannot be cancelled, so
+    /// a backoff is slept in steps of this length with the stop re-read at each
+    /// one: a stop is observed within this bound rather than after
+    /// `reconnectBackoff`, which is what keeps shutdown independent of how
+    /// unreachable a peer happens to be. Costs one wake-up per bound per
+    /// unreachable peer, each of which loads one atomic and re-parks.
+    std::chrono::milliseconds stopWakeBound { 50 };
 };
 
-/// `IRaftTransport` over real sockets, one sender thread per peer.
+/// `IRaftTransport` over real sockets, one coroutine per peer on the reactor.
 ///
-/// ## Why a thread per peer rather than the reactor
+/// ## This used to be a thread per peer, and the note said why
 ///
-/// The reactor exists so the number of concurrent *clients* is bounded by memory
-/// rather than by a worker count — thousands of them, none of which this process
-/// dialled. Peers are the opposite: a handful, known by name at configuration
-/// time, and reached by dialling. Dialling is the operation the reactor has no
-/// seam for, and adding non-blocking connect to three backends to save five
-/// threads would be paying the cost in the wrong currency.
+/// It said the reactor exists for thousands of clients this process did not
+/// dial, while peers are a handful known at configuration time -- and that
+/// "dialling is the operation the reactor has no seam for, and adding
+/// non-blocking connect to three backends to save five threads would be paying
+/// the cost in the wrong currency". Three things were wrong with that.
 ///
-/// The rule that matters is the one this preserves: **no reactor thread ever
-/// blocks**. Each peer's sender owns its dial, its socket and its backoff, and
-/// the reactor never sees any of it.
+/// The seam is not hypothetical and consensus is not paying for it:
+/// `IConnector` is coroutine-shaped and `PlatformConnector` implements it on all
+/// three backends, built for the launcher and the health probe.
+///
+/// It was never about saving threads. Thread-per-peer is only *expressible* over
+/// a blocking socket, because the write was driven by `SyncRun` -- and this
+/// codebase already records, as the first of five defects found the first time
+/// consensus was run, that `SyncRun` throws the instant its task really
+/// suspends. So the decision pinned the outbound half of this component to
+/// `BlockingSocket` for good while the inbound half was already on the reactor:
+/// two socket implementations in one class, chosen by direction.
+///
+/// And it hid a hang. The transport passes no I/O timeout, deliberately -- see
+/// `dialTimeout` -- so over a blocking socket there is no `SO_SNDTIMEO`, and a
+/// peer that accepts and then stops reading parks the sender in `::send` once the
+/// socket buffer fills. `Stop()` cleared the outbox, notified the condition
+/// variable, and then joined a thread that was not waiting on it. The socket was
+/// a local of the sender, so nothing else could close it. `~RaftPeerTransport`
+/// blocked forever and the node died to SIGKILL.
+///
+/// The rule the old note leaned on is **preserved, not abandoned**: no reactor
+/// thread ever blocks. Nothing in the new sender blocks; it suspends. What
+/// changes is that one component now has one lifecycle model, one socket
+/// implementation, and closes what it opened.
 ///
 /// ## Send never blocks and may drop
 ///
 /// `Send` appends to a bounded queue and returns. It does not wait for a
 /// connection, a write, or an acknowledgement, because a driver that waited
 /// would let one unreachable follower stall a leader that has a quorum without
-/// it — turning a fault Raft tolerates into one it does not. When the queue is
-/// full the **oldest** message is dropped rather than the newest: what is
-/// waiting behind a dead connection is stale by definition, and the newest
-/// AppendEntries subsumes every older one for that peer.
+/// it -- turning a fault Raft tolerates into one it does not. When the queue is
+/// full the **oldest** message is dropped rather than the newest: what is waiting
+/// behind a dead connection is stale by definition, and the newest AppendEntries
+/// subsumes every older one for that peer.
+///
+/// It also never resumes the sender inline. `Send` is reached from
+/// `RaftDriver::Deliver`, which holds the driver's mutex, and a queue that
+/// resumed its consumer there would run the sender's next step inside that lock
+/// -- see `AsyncQueue`, where that invariant lives.
 class RaftPeerTransport final: public IRaftTransport
 {
   public:
@@ -97,11 +133,15 @@ class RaftPeerTransport final: public IRaftTransport
     /// @param self This node's own id, so a message addressed to it is refused
     ///        rather than looped through a socket.
     /// @param peers Where each other member can be reached.
-    /// @param connector How to dial; injected so tests need no network.
+    /// @param reactor The loop every sender runs on. Named before the connector
+    ///        because the connector's sockets are pinned to it.
+    /// @param connector How to dial; injected so tests need no network. Must be
+    ///        one whose sockets belong to `reactor`.
     /// @param logger Where connection state changes are reported.
     /// @param options Timeouts and queue bound.
     RaftPeerTransport(NodeId self,
                       std::vector<PeerEndpoint> peers,
+                      IReactor& reactor,
                       IConnector& connector,
                       ILogger& logger,
                       PeerTransportOptions options = {});
@@ -111,19 +151,48 @@ class RaftPeerTransport final: public IRaftTransport
     RaftPeerTransport& operator=(RaftPeerTransport const&) = delete;
     RaftPeerTransport& operator=(RaftPeerTransport&&) = delete;
 
-    /// Stops every sender and joins it. Safe to call after `Stop()`.
+    /// Stops every sender and waits for it. Safe to call after `Stop()`.
     ~RaftPeerTransport() override;
 
     /// Begin dialling peers. Idempotent.
+    ///
+    /// Each sender is a **lazy** `Task` submitted to the reactor rather than a
+    /// `DetachedTask`, and that is not a style choice: a detached task starts
+    /// eagerly on whichever thread constructed it, which here is whatever calls
+    /// `Start()` -- typically before the reactor's own thread exists. Submitting
+    /// a lazy task means the body's first instruction runs on the reactor thread,
+    /// which is what makes "a peer's socket is touched only from the reactor"
+    /// true, and everything else here follows from that.
     void Start();
 
-    /// Stop every sender and join. Idempotent, and called by the destructor.
+    /// Ask every sender to finish, without waiting. Any thread, including the
+    /// reactor's.
     ///
-    /// Bounded by construction: a sender waits on a condition variable rather
-    /// than sleeping, so a stop is observed at once rather than after the
-    /// backoff elapses. An unbounded wait here would make shutdown depend on how
-    /// unreachable a peer happens to be.
+    /// Three things, in this order, because each closes a different suspension
+    /// point: cancel the stop token (which wakes every backoff within
+    /// `stopWakeBound`), close every outbox (which wakes a sender parked on
+    /// `Pop` at once), and close every live socket **on the reactor's thread**
+    /// (which is the only thing that completes a parked write, since no I/O
+    /// timeout is armed). The last must be on that thread because on epoll and
+    /// kqueue `ISocket::Close` completes a parked awaitable by resuming its
+    /// coroutine inline -- so closing from elsewhere would run a sender on the
+    /// wrong thread. IOCP routes cancellation back through the port and does
+    /// not, which is exactly what would make that a bug visible only on POSIX.
+    void RequestStop() noexcept;
+
+    /// `RequestStop()`, then wait for every sender to finish. Idempotent, and
+    /// called by the destructor.
+    ///
+    /// **Must not be called from the reactor's thread**: it waits for coroutines
+    /// that can only progress there. Bounded rather than indefinite, because a
+    /// stuck peer must not turn a stop into a hang -- the shape this transport
+    /// used to have.
     void Stop() noexcept;
+
+    /// @return How many peer senders have not yet finished. For teardown
+    ///         assertions; a production caller reading this is asking a question
+    ///         whose answer is stale before it returns.
+    [[nodiscard]] std::size_t SendersRunning() const noexcept;
 
     /// @copydoc IRaftTransport::Send
     void Send(NodeId const& to, RaftMessage message) override;
@@ -148,28 +217,57 @@ class RaftPeerTransport final: public IRaftTransport
     }
 
   private:
-    /// One peer's outbox and the thread that drains it.
+    /// One peer's outbox and the coroutine that drains it.
     ///
-    /// Each peer owns its mutex rather than sharing one: a leader sends to every
-    /// follower in the same output, and a single lock would serialize those
-    /// appends behind whichever peer's sender happened to hold it.
+    /// Non-movable, because it owns an `AsyncQueue` (which holds a mutex) and a
+    /// `Task`. The `unique_ptr` indirection in `_peers` is therefore
+    /// load-bearing rather than incidental -- worth saying, because flattening
+    /// the map to hold `Peer` by value is the obvious tidy-up and it does not
+    /// compile.
     struct Peer
     {
         PeerEndpoint endpoint;                     ///< Where to dial.
-        std::mutex mutex;                          ///< Guards `outbox`.
-        std::condition_variable wake;              ///< Signalled on a new message or on stop.
-        std::deque<std::vector<std::byte>> outbox; ///< Framed messages awaiting the wire.
-        std::jthread worker;                       ///< Drains `outbox`; joined by `Stop`.
+        AsyncQueue<std::vector<std::byte>> outbox; ///< Framed messages awaiting the wire.
+
+        /// The live connection, or null.
+        ///
+        /// **Reactor-thread only.** Written by this peer's sender and read by the
+        /// shutdown closer, which hops onto the reactor before touching it -- so
+        /// there is nothing here to synchronise. That is the property the lazy
+        /// `Task` in `Start()` buys.
+        std::unique_ptr<ISocket> socket;
+
+        /// The sender. Lazy, so it cannot start on whichever thread called
+        /// `Start()`.
+        Task<void> sender;
+
+        /// @param where Where to dial.
+        /// @param reactor Loop the outbox posts wake-ups to.
+        /// @param options Queue bound and overflow policy.
+        Peer(PeerEndpoint where, IReactor& reactor, AsyncQueueOptions options):
+            endpoint { std::move(where) },
+            outbox { reactor, options }
+        {
+        }
     };
 
-    /// Drain one peer's outbox until stopped.
-    /// @param peer The peer to serve.
-    void RunSender(Peer& peer) noexcept;
+    /// Note that a sender has finished. Reactor thread only.
+    void NoteSenderFinished() noexcept;
+
+    /// Report a sender that threw, without throwing. Reactor thread only.
+    /// @param peer Which peer's sender it was.
+    void NoteSenderThrew(NodeId const& peer) noexcept;
+
+    friend struct PeerSenderAccess;
 
     NodeId _self;
+    IReactor& _reactor;
     IConnector& _connector;
     ILogger& _logger;
     PeerTransportOptions _options;
+
+    /// Cancelled by `RequestStop`; observed by every backoff and loop condition.
+    CancellationSource _stop;
 
     /// Peers by id. Built once at construction and never mutated afterwards, so
     /// `Send` reads it without a lock; membership changes replace the transport
@@ -177,9 +275,19 @@ class RaftPeerTransport final: public IRaftTransport
     std::map<NodeId, std::unique_ptr<Peer>> _peers;
 
     std::atomic<bool> _running { false };
-    std::atomic<bool> _stopping { false };
     std::atomic<std::uint64_t> _dropped { 0 };
     std::atomic<std::size_t> _connected { 0 };
+
+    /// How many senders are still running. The cross-thread view of the same
+    /// question `Task::IsReady` answers, which cannot be asked from another
+    /// thread while the reactor may be resuming it.
+    std::atomic<std::size_t> _sendersRunning { 0 };
+
+    /// The reactor's own thread, recorded the first time a sender runs, so
+    /// `Stop()` can assert it is not being called from there -- a wait for
+    /// coroutines that only that thread can advance. Turns a hang into a failed
+    /// assertion in the debug preset for the price of one comparison.
+    std::atomic<std::thread::id> _reactorThread {};
 };
 
 } // namespace FastCache::Consensus

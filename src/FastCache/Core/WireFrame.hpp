@@ -89,6 +89,20 @@ struct Header
 inline void PutHeader(
     std::span<std::byte> out, std::byte magic, Version version, std::uint8_t kindRaw, std::uint32_t payloadLength) noexcept
 {
+    // The precondition, enforced rather than only documented -- which is what
+    // `DecodeHeader` below already does for the same one.
+    //
+    // It is also load-bearing for the BUILD. GCC 14 at -O3, inlining this through
+    // `RaftWire::Detail::Frame`, cannot prove the span is non-empty and reports
+    // `-Wnull-dereference` on all three stores; clang emits nothing at any level.
+    // With `PEDANTIC_COMPILER_WERROR` that is a failed build on one compiler only,
+    // which is exactly the shape AGENT.md keeps a local gcc-release gate for.
+    // Stating the bound teaches the optimizer what the comment already claimed,
+    // so this is a real guard rather than a silencer -- and it never fires: every
+    // caller sizes its buffer first.
+    if (out.size() < HeaderSize)
+        return;
+
     out[0] = magic;
     out[1] = static_cast<std::byte>(version);
     out[2] = static_cast<std::byte>(kindRaw);

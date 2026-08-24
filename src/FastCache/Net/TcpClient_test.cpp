@@ -221,7 +221,7 @@ TEST_CASE("ConnectTcp reports why a dial failed", "[net][tcpclient]")
     // schedule, which is the whole reason the dial is non-blocking underneath.
     constexpr auto Timeout = 300ms;
     auto const started = std::chrono::steady_clock::now();
-    auto const socket = ConnectTcp("192.0.2.1", 9, Timeout, 0ms);
+    auto const socket = SyncRun(ConnectTcp("192.0.2.1", 9, Timeout, 0ms));
     auto const elapsed = std::chrono::steady_clock::now() - started;
 
     REQUIRE_FALSE(socket.has_value());
@@ -244,7 +244,7 @@ TEST_CASE("RecvExactly gives up on a peer that accepts and then goes silent", "[
     }
 
     constexpr auto IoTimeout = 300ms;
-    auto client = ConnectTcp("127.0.0.1", listener->BoundPort(), 2s, IoTimeout);
+    auto client = SyncRun(ConnectTcp("127.0.0.1", listener->BoundPort(), 2s, IoTimeout));
     REQUIRE(client.has_value());
 
     // Accept and then do nothing at all -- the connection is up, and silent.
@@ -273,7 +273,7 @@ TEST_CASE("A socket with a timeout armed still transfers normally", "[net][tcpcl
         return;
     }
 
-    auto client = ConnectTcp("127.0.0.1", listener->BoundPort(), 2s, 5s);
+    auto client = SyncRun(ConnectTcp("127.0.0.1", listener->BoundPort(), 2s, 5s));
     REQUIRE(client.has_value());
     auto accepted = SyncRun(AcceptOne(listener.get()));
     REQUIRE(accepted.has_value());

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Net/SocketAddress.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <expected>
 #include <format>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -256,6 +258,48 @@ namespace Detail
         // The address family lives in the first field of every sockaddr variant.
         endpoint.family = reinterpret_cast<struct sockaddr const*>(sockaddr)->sa_family;
         return endpoint;
+    }
+
+    bool IsNumericHost(std::string_view host) noexcept
+    {
+        if (host.empty())
+            return false;
+
+        // inet_pton needs a NUL-terminated string, and a host is short.
+        std::string const text { host };
+
+        // The two families in a table rather than two ifs, so a third (there is
+        // none today) is a row. Storage is sized for the larger of the two.
+        constexpr std::array<int, 2> Families { AF_INET, AF_INET6 };
+        std::array<std::byte, sizeof(in6_addr)> scratch {};
+        return std::ranges::any_of(
+            Families, [&](int family) noexcept { return ::inet_pton(family, text.c_str(), scratch.data()) == 1; });
+    }
+
+    std::uint16_t BoundPortOf(NativeSocket socket) noexcept
+    {
+        if (socket == InvalidSocket)
+            return 0;
+
+        sockaddr_storage storage {};
+#if defined(_WIN32)
+        auto length = static_cast<int>(sizeof(storage));
+        auto const handle = static_cast<SOCKET>(socket);
+#else
+        auto length = static_cast<socklen_t>(sizeof(storage));
+        auto const handle = static_cast<int>(socket);
+#endif
+        if (::getsockname(handle, reinterpret_cast<sockaddr*>(&storage), &length) != 0)
+            return 0;
+
+        // Read the port out of whichever family the socket actually is: the two
+        // sockaddr layouts put it at different offsets, and reading the wrong one
+        // yields a plausible-looking number rather than an error.
+        if (storage.ss_family == AF_INET)
+            return ntohs(reinterpret_cast<sockaddr_in const*>(&storage)->sin_port);
+        if (storage.ss_family == AF_INET6)
+            return ntohs(reinterpret_cast<sockaddr_in6 const*>(&storage)->sin6_port);
+        return 0;
     }
 
     std::string PeerAddressOf(NativeSocket socket) noexcept

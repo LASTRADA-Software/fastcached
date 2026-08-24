@@ -124,6 +124,46 @@ namespace Detail
     ///         or exceeds ResolvedEndpoint::StorageSize.
     [[nodiscard]] ResolvedEndpoint EndpointFromSockaddr(void const* sockaddr, std::uint32_t length) noexcept;
 
+    /// Is this host text a literal address rather than a name to be looked up?
+    ///
+    /// The question exists so a dial to a literal never reaches a resolver
+    /// thread, and that is load-bearing rather than an optimisation: every
+    /// internal dial in this codebase is to a literal -- Raft peers, the
+    /// launcher's `127.0.0.1:6674`, an endpoint discovery proved -- and the
+    /// launcher makes one per translation unit, thousands of times per build. It
+    /// is also what lets the whole connect path be tested without a thread
+    /// existing.
+    ///
+    /// Answered with `inet_pton` for both families rather than by inspecting the
+    /// characters, so there is one definition of "literal" and it is the
+    /// platform's own.
+    ///
+    /// Which means a **scoped** literal (`fe80::1%eth0`) is platform-dependent, and
+    /// that is fine: glibc's `inet_pton` rejects the zone suffix and macOS's accepts
+    /// it, so the same text is a name on one host and a literal on the next. Either
+    /// answer produces a working dial -- one goes straight to `connect`, the other
+    /// through the resolver, which also understands zones -- so this deliberately
+    /// does not force them to agree. What must never happen is the other direction:
+    /// a NAME reported as a literal would be handed to `connect` as an address and
+    /// could not resolve at all, which is why the tests pin that half strictly.
+    ///
+    /// @param host Host text, unbracketed.
+    /// @return true when `host` parses as an IPv4 or IPv6 literal.
+    [[nodiscard]] bool IsNumericHost(std::string_view host) noexcept;
+
+    /// Query a bound socket's local port with ::getsockname.
+    ///
+    /// The one implementation of "which port did I actually get", which is a
+    /// question every listener has to answer and only `BlockingListener` could:
+    /// a bind to port 0 means "pick a free one", so the port an operator, a log
+    /// line or a test needs is the one the kernel chose and not the one that was
+    /// asked for.
+    ///
+    /// @param socket A bound socket handle.
+    /// @return The local port in host byte order, or 0 when the handle is
+    ///         invalid, unbound, or of a family that has no port.
+    [[nodiscard]] std::uint16_t BoundPortOf(NativeSocket socket) noexcept;
+
     /// Query a connected socket's remote peer with ::getpeername and format it
     /// as a printable host string. Used by the Windows multi-reactor acceptor,
     /// whose AcceptRaw hands off a raw connected handle without a captured peer.

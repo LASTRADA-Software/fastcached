@@ -50,6 +50,27 @@ class IReactor
     /// @param handle Coroutine to resume.
     virtual void Schedule(TimePoint deadline, std::coroutine_handle<> handle) = 0;
 
+    /// Take a handle back off this reactor while it is still waiting to be resumed.
+    ///
+    /// The counterpart `Submit` and `Schedule` were missing, and its absence had a
+    /// price: a wait built on `Schedule` could not be ended early, so anything that
+    /// wanted to stop waiting had to poll in bounded steps and leave a frame parked
+    /// in between -- and a reactor destroyed during one of those steps never freed
+    /// it. One leaked coroutine frame per disarmed deadline, which is per dial and
+    /// per cache exchange.
+    ///
+    /// Ownership is the whole contract: returning `true` means THIS CALL removed the
+    /// handle, so the caller is now the only one who may resume or destroy it.
+    /// `false` means the reactor no longer had it -- it is running, already resumed,
+    /// or was never here -- and the caller must not touch it. That makes the race
+    /// against a timer firing concurrently decidable rather than a guess.
+    /// @param handle A handle previously given to `Submit` or `Schedule`.
+    /// @return True when this call took it back; false when it was not there to
+    ///         take. An implementation that cannot retract a submission (IOCP posts
+    ///         it to the kernel) answers false for that case and still cancels
+    ///         timers.
+    [[nodiscard]] virtual bool CancelPending(std::coroutine_handle<> handle) noexcept = 0;
+
     /// @return The clock used by this reactor for all deadline checks. Tests
     /// can downcast to ManualClock and Advance() to drive timers; production
     /// code uses SteadyClock.

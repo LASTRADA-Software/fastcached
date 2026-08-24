@@ -20,6 +20,8 @@
 namespace FastCache::Node
 {
 
+class NodeIoLoop;
+
 /// The node's cache surface: storage, upstream, read-through logic, protocol and
 /// listener, owned as one thing.
 ///
@@ -51,6 +53,7 @@ class CacheTier
     /// @param logger Where to announce the bound address.
     /// @return The running tier, or why it could not be served.
     [[nodiscard]] static std::expected<std::unique_ptr<CacheTier>, std::string> Start(
+        NodeIoLoop& io,
         NodeConfig const& cfg,
         Distributed::IMembershipOracle const& membership,
         IClock& clock,
@@ -112,6 +115,7 @@ class CacheTier
 /// @param logger Where the bound address, or the tolerated failure, is announced.
 /// @return The tier, a null tier meaning "carry on without one", or the fatal reason.
 [[nodiscard]] std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
+    NodeIoLoop& io,
     NodeConfig const& cfg,
     Distributed::IMembershipOracle const& membership,
     IClock& clock,
