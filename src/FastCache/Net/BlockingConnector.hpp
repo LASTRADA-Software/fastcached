@@ -37,7 +37,8 @@ class BlockingConnector final: public IConnector
     /// @copydoc IConnector::Connect
     [[nodiscard]] std::expected<std::unique_ptr<ISocket>, NetError> Connect(std::string_view host,
                                                                             std::uint16_t port,
-                                                                            std::chrono::milliseconds timeout) override;
+                                                                            std::chrono::milliseconds connectTimeout,
+                                                                            std::chrono::milliseconds ioTimeout) override;
 
   private:
     IAddressResolver& _resolver;

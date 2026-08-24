@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProtocol.hpp"
 #include "ClusterAdminCli.hpp"
-#include "ITcpClient.hpp"
+#include "EndpointDial.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -118,7 +118,7 @@ std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg, C
     if (cfg.scheduler.empty())
         return std::unexpected { std::string { "--scheduler names where to ask; a cluster command needs one" } };
 
-    auto client = Cc::ConnectTcp(cfg.scheduler, DialTimeout);
+    auto client = Cc::DialEndpoint(cfg.scheduler, DialTimeout);
     if (client == nullptr)
         return std::unexpected { std::format("cannot reach the scheduler at {}", cfg.scheduler) };
 

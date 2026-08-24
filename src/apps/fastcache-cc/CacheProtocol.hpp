@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "ITcpClient.hpp"
-
+#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
@@ -93,7 +92,7 @@ struct Credential
 /// @param frame A complete framed request.
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome.
-[[nodiscard]] CacheOutcome ExchangeFramed(ITcpClient& client,
+[[nodiscard]] CacheOutcome ExchangeFramed(ISocket& client,
                                           std::vector<std::byte> const& frame,
                                           Credential const& credential = {});
 
@@ -114,7 +113,7 @@ struct Credential
 /// @param key The key to look up.
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome; `value` holds the stored bytes on a hit.
-[[nodiscard]] CacheOutcome CacheFetch(ITcpClient& client, std::string_view key, Credential const& credential = {});
+[[nodiscard]] CacheOutcome CacheFetch(ISocket& client, std::string_view key, Credential const& credential = {});
 
 /// STORE one entry over an already-connected client.
 ///
@@ -123,7 +122,7 @@ struct Credential
 /// @param request The fields to send.
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome; `kind == Hit` means the daemon acknowledged the write.
-[[nodiscard]] CacheOutcome CacheStore(ITcpClient& client,
+[[nodiscard]] CacheOutcome CacheStore(ISocket& client,
                                       CompileCacheWire::StoreRequest const& request,
                                       Credential const& credential = {});
 

@@ -224,7 +224,8 @@ BlockingConnector::BlockingConnector(IAddressResolver& resolver) noexcept:
 
 std::expected<std::unique_ptr<ISocket>, NetError> BlockingConnector::Connect(std::string_view host,
                                                                              std::uint16_t port,
-                                                                             std::chrono::milliseconds timeout)
+                                                                             std::chrono::milliseconds connectTimeout,
+                                                                             std::chrono::milliseconds ioTimeout)
 {
     Detail::EnsureNetworkInitialised();
 
@@ -245,9 +246,14 @@ std::expected<std::unique_ptr<ISocket>, NetError> BlockingConnector::Connect(std
 
     for (auto const& endpoint: *resolved)
     {
-        auto dialed = DialOne(endpoint, timeout);
+        auto dialed = DialOne(endpoint, connectTimeout);
         if (dialed.has_value())
+        {
+            // Bound every later blocking call before the socket is handed over, so
+            // there is no window in which it is reachable and unbounded.
+            Detail::SetIoTimeouts(*dialed, ioTimeout, ioTimeout);
             return std::make_unique<BlockingSocket>(*dialed, std::format("{}:{}", host, port));
+        }
         failure = std::move(dialed.error());
     }
 

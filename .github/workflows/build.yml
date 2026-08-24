@@ -157,8 +157,17 @@ jobs:
       # by hand from bench/inproc_bench.py. It is not installed and runs no test
       # — this is purely so a refactor of CacheEngine, LruMode or
       # InMemoryLruStorage cannot silently rot a target nothing else compiles.
+      #
+      # The test client is on for exactly the same reason, and it is why that
+      # reason is worth stating twice: it is also default-OFF, no job built it,
+      # and it had silently stopped compiling on POSIX altogether — send and
+      # recv undeclared, a shell-string popen, and a `store` hardcoded to MSVC
+      # flags (issue #84). A target nothing compiles is a target that rots, and
+      # that is what it looks like when nobody notices.
       - name: "Configure"
-        run: cmake --preset ${{ matrix.preset }} -DFASTCACHED_ENABLE_TLS=ON -DFASTCACHED_BUILD_BENCHMARKS=ON
+        run: >-
+          cmake --preset ${{ matrix.preset }} -DFASTCACHED_ENABLE_TLS=ON
+          -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
 
       - name: "Build"
         run: cmake --build --preset ${{ matrix.preset }}
@@ -225,8 +234,14 @@ jobs:
       # and benchmarks on for the same reason: fastcache-bench is first-party
       # source, so "fix clang-tidy at the source" has to apply to it too, and
       # this is the only job that runs clang-tidy at all.
+      #
+      # The test client likewise, and here it matters most: three of the five
+      # errors that made issue #84 were clang-tidy findings rather than compile
+      # failures, so this is the only job in the workflow that can see them.
       - name: "Configure"
-        run: cmake --preset clang-debug -DFASTCACHED_ENABLE_TLS=ON -DFASTCACHED_BUILD_BENCHMARKS=ON
+        run: >-
+          cmake --preset clang-debug -DFASTCACHED_ENABLE_TLS=ON
+          -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
 
       - name: "Build (runs clang-tidy via CMAKE_CXX_CLANG_TIDY)"
         run: cmake --build --preset clang-debug

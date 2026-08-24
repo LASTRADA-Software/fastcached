@@ -60,6 +60,7 @@ target_sources(FastCache
         Net/IocpSocket.cpp
         Net/KqueueSocket.cpp
         Net/SocketAddress.cpp
+        Net/TcpClient.cpp
         Platform/CpuAffinity.cpp
         Platform/DaemonControls.cpp
         Platform/Environment.cpp

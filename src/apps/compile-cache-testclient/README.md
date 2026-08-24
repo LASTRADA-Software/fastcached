@@ -5,12 +5,21 @@ is the **reference localizer**: it links the same `PathCanon` / `CompileValue`
 code the server uses, so the canonicalization parity contract is exercised,
 not reimplemented.
 
-Test infrastructure, not a shipped product — not built by default:
+Test infrastructure, not a shipped product — not built by default, but built by
+the `linux` and `clang-tidy` CI jobs so that it cannot quietly stop compiling the
+way it had (issue #84):
 
 ```sh
 cmake --preset clang-debug -DFASTCACHED_BUILD_TESTCLIENT=ON
 cmake --build --preset clang-debug --target compile-cache-testclient
 ```
+
+It drives either compiler family — MSVC spellings plus `/showIncludes`, or GNU
+spellings plus `-MD -MF` — and tags the stored region with whichever grammar
+produced it. Its socket, its process spawning and its dependency-path check are
+all the same code the daemon and the launcher use, which is the point: this tool
+exists to prove the canonicalization contract, so re-implementing either side of
+it here would prove nothing.
 
 **User documentation lives in the docs site**, so there is one source of truth:
 [compile-cache-testclient reference](../../../docs/tools/compile-cache-testclient.md)

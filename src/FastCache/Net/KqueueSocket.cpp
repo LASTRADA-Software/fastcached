@@ -340,6 +340,12 @@ KqueueSocket::KqueueSocket(KqueueReactor& reactor, int fd, std::string peerAddre
     _peerAddress { std::move(peerAddress) }
 {
     SetNonBlocking(fd);
+    // This socket sends with no flags, so the suppression has to be armed on the
+    // descriptor. Every platform with kqueue has SO_NOSIGPIPE, which is what
+    // ArmNoSigPipe uses there -- and it is the only thing standing between a peer
+    // that hangs up mid-write and a fatal signal, since this library no longer
+    // takes a process-wide SIGPIPE disposition it would leak to spawned children.
+    Detail::ArmNoSigPipe(fd);
     std::ignore = reactor.Attach(&_impl->handler);
 }
 

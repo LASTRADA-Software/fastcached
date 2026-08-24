@@ -96,7 +96,17 @@ namespace Detail
         {
             return ::closesocket(static_cast<SOCKET>(s));
         }
+
+        /// Extra `::send` flags needed to keep a write to a broken pipe from
+        /// raising a signal. Windows has no SIGPIPE, so there is nothing to add.
+        constexpr int SendFlags = 0;
     } // namespace
+
+    void ArmNoSigPipe(NativeSocket /*socket*/) noexcept
+    {
+        // Windows has no SIGPIPE: a write to a broken pipe is reported through
+        // WSAGetLastError like any other failure.
+    }
 
     void EnsureNetworkInitialised()
     {
@@ -120,8 +130,6 @@ namespace Detail
 
     namespace
     {
-        std::atomic<bool> posixInitialised { false };
-
         [[nodiscard]] NetErrorCode TranslateErrorImpl(int code) noexcept
         {
             switch (code)
@@ -163,16 +171,60 @@ namespace Detail
         {
             return ::close(s);
         }
+
+        // Writing to a socket whose peer has closed raises SIGPIPE, and SIGPIPE's
+        // default disposition terminates the process. Suppressed PER SOCKET, and
+        // that is the whole content of this block: the obvious spelling is one
+        // `::signal(SIGPIPE, SIG_IGN)` at start-up, which is what this file used to
+        // do, and it is wrong for any process that also spawns a child. An ignored
+        // disposition is *inherited across exec*, so a process-wide ignore silently
+        // changes how every program the process launches behaves --
+        // `fastcache-compile-node` links this library, opens sockets and then runs a
+        // compiler per job, so it was handing every one of those compilers a SIGPIPE
+        // disposition they never asked for. The suppression belongs to the socket
+        // that needs it.
+        //
+        // Which mechanism, in order of preference:
+        //   * `SO_NOSIGPIPE` (macOS, the BSDs) -- a socket option set once, so every
+        //     later send is covered without threading a flag through. Present since
+        //     macOS 10.2, so it is the safe choice there even on an SDK new enough
+        //     to also declare MSG_NOSIGNAL: that macro comes from the SDK headers
+        //     while `CMAKE_OSX_DEPLOYMENT_TARGET` lets the binary run on an older
+        //     kernel, and a flag the kernel does not know fails the send.
+        //   * `MSG_NOSIGNAL` (Linux, Solaris, AIX) -- a per-send flag; there is no
+        //     socket option to set.
+        //   * neither: fall back to the process-wide ignore, with the cost above.
+        //     No platform this builds on lands here.
+    #if defined(SO_NOSIGPIPE)
+        constexpr int SendFlags = 0;
+    #elif defined(MSG_NOSIGNAL)
+        constexpr int SendFlags = MSG_NOSIGNAL;
+    #else
+        constexpr int SendFlags = 0;
+    #endif
     } // namespace
+
+    void ArmNoSigPipe([[maybe_unused]] NativeSocket socket) noexcept
+    {
+    #if defined(SO_NOSIGPIPE)
+        int const on = 1;
+        std::ignore = ::setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+    #elif defined(MSG_NOSIGNAL)
+            // Nothing to arm: the suppression rides on each `::send` instead, through
+            // `SendFlags`. A reactor socket that does its own sending has to pass that
+            // flag itself -- `EpollSocket` does.
+    #else
+        ::signal(SIGPIPE, SIG_IGN);
+    #endif
+    }
 
     void EnsureNetworkInitialised()
     {
-        if (posixInitialised.load(std::memory_order_acquire))
-            return;
-        // Ignore SIGPIPE — broken-pipe writes should surface as EPIPE, not
-        // kill the process.
-        ::signal(SIGPIPE, SIG_IGN);
-        posixInitialised.store(true, std::memory_order_release);
+        // Nothing to do: BSD sockets need no process-wide start-up, and SIGPIPE is
+        // suppressed per socket by ArmNoSigPipe above rather than by a disposition
+        // this process would then leak to every child it execs. The function still
+        // exists because Winsock genuinely does need it, and a caller that had to
+        // ask which platform it was on would be the defect this seam removes.
     }
 
 #endif
@@ -267,6 +319,10 @@ BlockingSocket::BlockingSocket(Detail::NativeSocket native, std::string peerAddr
     _native { native },
     _peerAddress { std::move(peerAddress) }
 {
+    // Both routes to a connected socket -- BlockingListener::Accept and
+    // BlockingConnector::Connect -- construct through here, so this is the one
+    // place the per-socket SIGPIPE suppression has to be applied.
+    Detail::ArmNoSigPipe(_native);
 }
 
 BlockingSocket::~BlockingSocket()
@@ -313,7 +369,7 @@ IoAwaitable BlockingSocket::Write(std::span<std::byte const> buffer)
         auto const n = ::send(static_cast<int>(_native),
                               reinterpret_cast<char const*>(buffer.data()) + written,
                               static_cast<Detail::IoLen>(buffer.size() - written),
-                              0);
+                              Detail::SendFlags);
         if (n < 0)
             return IoAwaitable { std::unexpected(MakeSystemError("send")) };
         written += static_cast<std::size_t>(n);
@@ -343,7 +399,7 @@ IoAwaitable BlockingSocket::WriteVectored(std::span<std::span<std::byte const> c
             auto const n = ::send(static_cast<int>(_native),
                                   reinterpret_cast<char const*>(seg.data()) + written,
                                   static_cast<Detail::IoLen>(seg.size() - written),
-                                  0);
+                                  Detail::SendFlags);
             if (n < 0)
                 return IoAwaitable { std::unexpected(MakeSystemError("send")) };
             written += static_cast<std::size_t>(n);

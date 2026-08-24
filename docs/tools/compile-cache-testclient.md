@@ -10,6 +10,10 @@ about how a path is canonicalized, this is what catches it.
 
 ## Building
 
+Not built by default. It *is* built by the `linux` and `clang-tidy` CI jobs,
+though, so that it cannot quietly stop compiling — which is exactly what happened
+before (issue #84).
+
 ```sh
 cmake --preset clang-debug -DFASTCACHED_BUILD_TESTCLIENT=ON
 cmake --build --preset clang-debug --target compile-cache-testclient
@@ -37,21 +41,37 @@ something silently ignored.
 | `--key` | empty |
 | `--prefetch-group` | `default` |
 | `--srcroot`, `--buildtree` | empty |
-| `--compiler` | `cl` |
+| `--compiler` | `cl` on Windows, `cc` elsewhere |
 | `--source` | empty |
 | `--out` | store: a temp path; fetch: skip writing when empty |
 
 ### `store`
 
-Runs a real compiler with `/showIncludes /c`, captures the object file and the
-include output, frames them as a `CompileValue`, and STOREs it through a running
+Compiles the source, captures the object file and the compiler's dependency
+record, frames them as a `CompileValue`, and STOREs it through a running
 `fastcached` — carrying the *producer's* source-root and build-tree layout.
+
+Both driver families work, and the difference is not cosmetic: an MSVC driver is
+asked for `/showIncludes` and reports on its own output, while a GNU driver is
+asked for `-MD -MF` and writes a depfile. The stored region is tagged with
+whichever grammar produced it (`PathCanon` knows both), so a value stored by
+either can be localized by either. The family is chosen from the `--compiler`
+name, not from the host — `clang-cl` takes MSVC spellings on Linux too.
 
 ### `fetch`
 
 FETCHes the canonical value, **localizes** every path to the *consumer's*
 layout, optionally writes the object out, and verifies that each localized
-header path resolves on disk. A path that does not resolve is a failure.
+dependency path resolves on disk. A path that does not resolve is a failure.
+
+Which paths are checked comes from the launcher's own
+`Cc::ReplayedDependencyPaths`, so this tool asks exactly the question a real
+cache hit asks. That matters in both directions: it understands a depfile as
+well as `/showIncludes` (a scanner that knew only the latter reported
+`includePathsChecked=0` on POSIX and validated nothing while still exiting 0),
+and it does *not* report a toolchain path outside both roots, or a canonical
+token the region walker declined to localize, as missing — neither is this
+build's to have.
 
 ## Exit codes
 

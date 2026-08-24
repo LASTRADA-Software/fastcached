@@ -217,7 +217,7 @@ WorkerRegistrar::WorkerRegistrar(std::string fingerprint,
 {
 }
 
-bool WorkerRegistrar::Register(ITcpClient& scheduler, Credential const& credential)
+bool WorkerRegistrar::Register(ISocket& scheduler, Credential const& credential)
 {
     auto const frame = Wire::EncodeRegister(Wire::RegisterRequest { .fingerprint = _fingerprint,
                                                                     .endpoint = _endpoint,
@@ -232,7 +232,7 @@ bool WorkerRegistrar::Register(ITcpClient& scheduler, Credential const& credenti
     return !_workerId.empty();
 }
 
-bool WorkerRegistrar::Heartbeat(ITcpClient& scheduler,
+bool WorkerRegistrar::Heartbeat(ISocket& scheduler,
                                 std::uint32_t inFlight,
                                 Wire::LoadFields const& load,
                                 Credential const& credential)

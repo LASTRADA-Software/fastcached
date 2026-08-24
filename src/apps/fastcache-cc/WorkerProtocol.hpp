@@ -3,9 +3,9 @@
 
 #include "CacheProtocol.hpp"
 #include "CompileJob.hpp"
-#include "ITcpClient.hpp"
 
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
@@ -83,7 +83,7 @@ class WorkerProtocol
 ///
 /// Separate from `WorkerProtocol` because it is the one part of a worker that
 /// *initiates*: everything else answers. Split out so the answering half stays pure
-/// and this half can be driven against a scripted `ITcpClient`.
+/// and this half can be driven against a scripted `ISocket`.
 class WorkerRegistrar
 {
   public:
@@ -105,7 +105,7 @@ class WorkerRegistrar
     /// @param scheduler Connected transport; not owned.
     /// @param credential Credential to present.
     /// @return True when the scheduler accepted; the assigned id is kept internally.
-    [[nodiscard]] bool Register(ITcpClient& scheduler, Credential const& credential = {});
+    [[nodiscard]] bool Register(ISocket& scheduler, Credential const& credential = {});
 
     /// Report liveness and current load.
     ///
@@ -118,7 +118,7 @@ class WorkerRegistrar
     /// @param load What else this machine has to say about itself right now.
     /// @param credential Credential to present.
     /// @return True when accepted; false means "register again".
-    [[nodiscard]] bool Heartbeat(ITcpClient& scheduler,
+    [[nodiscard]] bool Heartbeat(ISocket& scheduler,
                                  std::uint32_t inFlight,
                                  CompileCacheWire::LoadFields const& load = {},
                                  Credential const& credential = {});

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "Dispatch.hpp"
+#include "EndpointDial.hpp"
 
 #include <FastCache/Core/Compression.hpp>
 
@@ -226,9 +227,9 @@ namespace
         {
         }
 
-        [[nodiscard]] std::unique_ptr<ITcpClient> Dial(std::string_view hostPort) override
+        [[nodiscard]] std::unique_ptr<ISocket> Dial(std::string_view hostPort) override
         {
-            return ConnectTcp(hostPort, _ioTimeout);
+            return DialEndpoint(hostPort, _ioTimeout);
         }
 
       private:

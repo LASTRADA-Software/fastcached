@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProtocol.hpp"
 
+#include <FastCache/Async/Task.hpp>
+#include <FastCache/Net/TcpClient.hpp>
+
 #include <format>
 #include <utility>
 
@@ -49,9 +52,9 @@ namespace
     /// reader, and it always consumes a whole frame.
     /// @param client Connected transport.
     /// @return The outcome, with the payload attached.
-    [[nodiscard]] CacheOutcome RecvReply(ITcpClient& client)
+    [[nodiscard]] CacheOutcome RecvReply(ISocket& client)
     {
-        auto const headerBytes = client.RecvExactly(Wire::ReplyHeaderSize);
+        auto const headerBytes = SyncRun(FastCache::RecvExactly(&client, Wire::ReplyHeaderSize));
         if (!headerBytes.has_value())
             return Plain(CacheOutcomeKind::Transport);
 
@@ -62,7 +65,7 @@ namespace
         std::vector<std::byte> payload;
         if (header->payloadLength > 0)
         {
-            auto received = client.RecvExactly(header->payloadLength);
+            auto received = SyncRun(FastCache::RecvExactly(&client, header->payloadLength));
             if (!received.has_value())
                 return Plain(CacheOutcomeKind::Transport);
             payload = std::move(*received);
@@ -114,20 +117,18 @@ namespace
     /// @param credential Credential to present ahead of it; none when unconfigured.
     /// @return The command's outcome, or the AUTH refusal when the credential was
     ///         rejected (the command's own reply is still drained first).
-    [[nodiscard]] CacheOutcome Exchange(ITcpClient& client,
-                                        std::vector<std::byte> const& frame,
-                                        Credential const& credential)
+    [[nodiscard]] CacheOutcome Exchange(ISocket& client, std::vector<std::byte> const& frame, Credential const& credential)
     {
         if (!credential.Configured())
         {
-            if (!client.SendAll(frame))
+            if (!SyncRun(FastCache::SendAll(&client, frame)))
                 return Plain(CacheOutcomeKind::Transport);
             return RecvReply(client);
         }
 
         auto const authFrame =
             Wire::EncodeAuth(Wire::AuthRequest { .username = credential.username, .secret = credential.secret });
-        if (!client.SendAll(authFrame) || !client.SendAll(frame))
+        if (!SyncRun(FastCache::SendAll(&client, authFrame)) || !SyncRun(FastCache::SendAll(&client, frame)))
             return Plain(CacheOutcomeKind::Transport);
 
         // Non-const so the returns below can move rather than copy: an outcome
@@ -173,7 +174,7 @@ namespace
 
 } // namespace
 
-CacheOutcome ExchangeFramed(ITcpClient& client, std::vector<std::byte> const& frame, Credential const& credential)
+CacheOutcome ExchangeFramed(ISocket& client, std::vector<std::byte> const& frame, Credential const& credential)
 {
     return Exchange(client, frame, credential);
 }
@@ -198,12 +199,12 @@ std::string DescribeOutcome(CacheOutcome const& outcome)
     return "unknown outcome";
 }
 
-CacheOutcome CacheFetch(ITcpClient& client, std::string_view key, Credential const& credential)
+CacheOutcome CacheFetch(ISocket& client, std::string_view key, Credential const& credential)
 {
     return Exchange(client, Wire::EncodeFetch(key), credential);
 }
 
-CacheOutcome CacheStore(ITcpClient& client, Wire::StoreRequest const& request, Credential const& credential)
+CacheOutcome CacheStore(ISocket& client, Wire::StoreRequest const& request, Credential const& credential)
 {
     return Exchange(client, Wire::EncodeStore(request), credential);
 }

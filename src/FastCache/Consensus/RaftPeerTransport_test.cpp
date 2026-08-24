@@ -123,11 +123,13 @@ class ScriptedConnector final: public IConnector
     /// @copydoc IConnector::Connect
     [[nodiscard]] std::expected<std::unique_ptr<ISocket>, NetError> Connect(std::string_view host,
                                                                             std::uint16_t port,
-                                                                            std::chrono::milliseconds timeout) override
+                                                                            std::chrono::milliseconds connectTimeout,
+                                                                            std::chrono::milliseconds ioTimeout) override
     {
         std::ignore = host;
         std::ignore = port;
-        std::ignore = timeout;
+        std::ignore = connectTimeout;
+        std::ignore = ioTimeout;
         _attempts.fetch_add(1, std::memory_order_relaxed);
         if (_refuse.load(std::memory_order_relaxed))
             return std::unexpected { NetError {

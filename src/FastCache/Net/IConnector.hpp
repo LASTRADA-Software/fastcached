@@ -54,14 +54,31 @@ class IConnector
     virtual ~IConnector() = default;
 
     /// Open a connection to `host:port`.
+    ///
+    /// The two timeouts bound different things and neither implies the other. A
+    /// dial that succeeds says the peer accepted, and nothing at all about whether
+    /// it will ever answer: a peer that accepts and then goes quiet parks the
+    /// calling thread forever, which for the launcher turns an optional cache into
+    /// a build-stopping dependency. Bounding that is the *socket's* business and it
+    /// has to be arranged before the first read, so it belongs here rather than in
+    /// a step every caller has to remember -- the same reasoning that puts
+    /// `ArmNoSigPipe` at the point a socket is constructed.
+    ///
     /// @param host Hostname or literal address, IPv4 or IPv6.
     /// @param port TCP port in host byte order.
-    /// @param timeout How long to wait before giving up. A non-positive value
-    ///        leaves the platform default in place, which may be minutes.
+    /// @param connectTimeout How long to wait for the dial before giving up. A
+    ///        non-positive value leaves the platform default in place, which may
+    ///        be minutes.
+    /// @param ioTimeout Per-call deadline for each later blocking send/recv on the
+    ///        returned socket; non-positive leaves it unbounded. Note this is per
+    ///        call and not a deadline for a whole transfer: a peer that dribbles
+    ///        bytes slower than the timeout can still take longer. It bounds the
+    ///        failure mode that matters, which is a peer that stops entirely.
     /// @return The connected socket, or why the attempt did not succeed.
     [[nodiscard]] virtual std::expected<std::unique_ptr<ISocket>, NetError> Connect(std::string_view host,
                                                                                     std::uint16_t port,
-                                                                                    std::chrono::milliseconds timeout) = 0;
+                                                                                    std::chrono::milliseconds connectTimeout,
+                                                                                    std::chrono::milliseconds ioTimeout) = 0;
 };
 
 } // namespace FastCache

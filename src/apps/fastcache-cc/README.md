@@ -25,7 +25,7 @@ unavailable — so it can never break a build.
 | `DirectManifest.*` | Direct mode: the header manifest that avoids preprocessing. |
 | `Stats.*` | The invocation log and its report renderer. |
 | `IProcessRunner.hpp`, `ProcessRunner.cpp` | Process-spawn seam; Windows and POSIX implementations. |
-| `ITcpClient.hpp`, `TcpClient.cpp` | Socket seam; Winsock and BSD-socket implementations. |
+| `EndpointDial.hpp`, `EndpointDial.cpp` | Turns `"host:port"` into a connected `ISocket`. The socket itself is the library's `Net/TcpClient`; this is only the join between `Core/HostPort` and it, which `Net` must not make itself. |
 
 Built by default (`FASTCACHED_BUILD_LAUNCHER=ON`) and installed alongside
 `fastcached`.

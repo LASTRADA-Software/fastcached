@@ -60,6 +60,7 @@
 
 #include <CompileJob.hpp>
 #include <Dispatch.hpp>
+#include <EndpointDial.hpp>
 #include <ToolchainProbe.hpp>
 #include <WorkerProtocol.hpp>
 
@@ -605,7 +606,7 @@ constexpr int ExitOk = 0;
     std::jthread const heartbeat { [&](std::stop_token const& stop) {
         while (!stop.stop_requested())
         {
-            auto client = Cc::ConnectTcp(cfg.scheduler, std::chrono::milliseconds { 10'000 });
+            auto client = Cc::DialEndpoint(cfg.scheduler, std::chrono::milliseconds { 10'000 });
             if (client == nullptr)
                 logger.Logf(LogLevel::Warn, "scheduler {} unreachable", cfg.scheduler);
             else

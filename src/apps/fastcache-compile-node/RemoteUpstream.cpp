@@ -3,7 +3,7 @@
 
 #include <utility>
 
-#include <ITcpClient.hpp>
+#include <EndpointDial.hpp>
 
 namespace FastCache::Node
 {
@@ -18,8 +18,8 @@ RemoteUpstream::RemoteUpstream(std::string endpoint, Cc::Credential credential, 
 
 std::optional<std::vector<std::byte>> RemoteUpstream::Fetch(std::string_view key)
 {
-    auto client = Cc::ConnectTcp(_endpoint, _ioTimeout);
-    if (!client)
+    auto client = Cc::DialEndpoint(_endpoint, _ioTimeout);
+    if (client == nullptr)
         // Unreachable is a miss. `LocalCache` documents why: the caller compiles
         // either way, and a build that could FAIL because a cache was down is the
         // one outcome this subsystem must never produce.
@@ -33,8 +33,8 @@ std::optional<std::vector<std::byte>> RemoteUpstream::Fetch(std::string_view key
 
 bool RemoteUpstream::Store(std::string_view key, std::span<std::byte const> value)
 {
-    auto client = Cc::ConnectTcp(_endpoint, _ioTimeout);
-    if (!client)
+    auto client = Cc::DialEndpoint(_endpoint, _ioTimeout);
+    if (client == nullptr)
         return false;
 
     // The roots travel empty. A node is forwarding an object another machine already
