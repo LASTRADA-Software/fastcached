@@ -200,7 +200,7 @@ this is worth checking before concluding the cache does not help. With
    TU, relativize checkout-rooted arguments against `SOURCE_DIR`/`BINARY_DIR`,
    and hash `(compiler id + preprocessed text + relativized args + dependency
    paths)` into a 128-bit key — MurmurHash3 x64_128, which is 128 bits of
-   *strength* and not merely 128 bits wide; see the note in `AGENT.md` on why
+   *strength* and not merely 128 bits wide; see the note in `.agent/rules/compile-cache.md` on why
    the four-CRC construction it replaced was not. The dependency set comes from
    that same preprocess run — `-MD` into a scratch depfile for GNU drivers,
    `/showIncludes` for MSVC ones — which costs about 1.5% of it, because the

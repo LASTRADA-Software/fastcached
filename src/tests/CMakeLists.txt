@@ -164,8 +164,8 @@ set_tests_properties("compile-cache-daemon-staging" PROPERTIES
 # src/apps/fastcache-cc is configured the fastcache-compile-node target does not
 # exist yet and a $<TARGET_FILE:> guard on it silently skips the test. src/tests
 # is added after src/apps (see the top-level CMakeLists), so every target this
-# needs is defined by the time this runs -- which is also why AGENT.md names this
-# file as the home for script-driven tests.
+# needs is defined by the time this runs -- which is also why
+# .agent/rules/testing.md names this file as the home for script-driven tests.
 #
 # Both platforms run it, but they do NOT assert the same contract, and that is
 # stated rather than left as an apparent omission. The Windows script covers the

@@ -103,7 +103,8 @@ bool IsAcceptableJobArgument(std::string_view arg)
         return false;
 
     // One introducer is skipped before the separator is looked for, exactly as
-    // `CouldNameAFile` does on the client -- and for the reason AGENT.md records: `/`
+    // `CouldNameAFile` does on the client -- and for the reason
+    // .agent/rules/compile-cache.md records: `/`
     // starts an option for an MSVC driver and an absolute path everywhere else.
     // Testing the raw argument refuses `/O2` and therefore every MSVC job, which the
     // test asserting `/O2` is acceptable is what caught.

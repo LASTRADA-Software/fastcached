@@ -1,0 +1,163 @@
+# Build system, toolchain and language pitfalls
+
+Rules about the things that differ between compilers, standard libraries, hosts
+and tool versions — and about the local gate that exists to catch them before CI
+does.
+
+Read this before changing a header everything includes, a randomness or timing
+seam, `cmake/portable/CompileCache.cmake`, or anything a test harness's
+determinism rests on.
+
+## The local gate
+
+`scripts/local-gate.sh` is the gate. Run it before pushing.
+
+- **A local gate cannot see a configuration it does not build, and advice nobody
+  runs is not a gate.** `scripts/local-gate.sh` is that advice as a script:
+  clang-format at the pinned version, then `clang-debug` and `gcc-release`, refusing
+  to run `ctest` against a build that did not complete. It exists because this
+  paragraph was already here and was skipped twice in one branch -- once for a GCC
+  `-Wnull-dereference` through an inlined `memcpy` that clang emits at no level, and
+  once for a clang-tidy check the binary on `PATH` had never heard of. Both cost a
+  full CI cycle for a configuration the developer already had.
+
+  The default agent
+  preset is `clang-debug`: one compiler, one standard library, `-O0`, sanitizers on.
+  CI is four more — GCC at `-O3`, clang-cl, MSVC, and clang against **libc++** on
+  macOS — and each of the three defects that reached CI on the Raft branch was
+  invisible to every configuration below it. GCC 14 at `-O3` reports
+  `-Wnull-dereference` inside `std::optional::value_or` where clang does not;
+  clang-tidy 22 knows checks clang-tidy 20 has never heard of; and libc++'s
+  `uniform_int_distribution` is a different function from libstdc++'s. Before
+  pushing a change that touches a header everything includes, a randomness or
+  timing seam, or anything a test harness's determinism rests on, build **at least
+  one release configuration and one non-clang compiler** locally —
+  `cmake --preset gcc-release` and `clang-release` both exist and both run in WSL.
+- **`clang-format` and `clang-tidy` after every change — at the version CI pins.** Both jobs
+  run the `$CLANG_TOOLS_VERSION` binary (`.github/workflows/build.yml`), and successive LLVM
+  releases do not agree with each other: the style job compares against a *newer formatter*,
+  and the clang-tidy job enables *checks that did not exist* in an older one. So a tree that is
+  clean under whichever binary happens to be on `PATH` can still be rejected — a red build for
+  code nobody mis-wrote, and one no local run catches unless it uses the same version. Name the
+  version explicitly rather than relying on `PATH`:
+  `git ls-files '*.h' '*.hpp' '*.cpp' | xargs clang-format-$V --dry-run --Werror --style=file`,
+  and `-DCMAKE_CXX_CLANG_TIDY=clang-tidy-$V` **in a build directory of its own**. Found three
+  times in one branch: four files reformatted by 22 after 20 had passed them, four
+  `find(...) != npos` tests that only 22 reports as `readability-container-contains`, and five
+  `std::lock_guard`s that only 22 reports as `modernize-use-scoped-lock`. **The preset alone is
+  not that sweep**, and that is the trap: `clang-debug` sets `CMAKE_CXX_CLANG_TIDY=clang-tidy`,
+  which on a machine carrying both resolves to whichever `PATH` finds first — 20 in this
+  project's WSL image, where 22 sits right beside it as `clang-tidy-22`. So a `clang-debug`
+  build reports "clang-tidy clean" in exactly the way that means nothing, and the version it
+  used is printed nowhere. Configure a second build directory naming the version, and run that.
+- **A sanitizer that is on in the cache is not a sanitizer that is on in the build.**
+  `cmake/portable/Sanitizers.cmake` initialised `SANITIZER_COMPILE_OPTIONS` to `""`
+  as a normal variable, published the real flags through
+  `set(... CACHE INTERNAL ...)`, and then `list(APPEND)`ed one more flag to the same
+  name. Under **CMP0126 NEW** -- which `cmake_minimum_required(3.28)` selects -- a
+  cache `set` no longer removes a normal variable of that name, so the empty one
+  keeps shadowing the cache. The append therefore starts from nothing and
+  `add_compile_options` receives `-fno-sanitize-recover=undefined` and no
+  `-fsanitize=` at all, while `CMakeCache.txt` says
+  `ENABLE_SANITIZER_ADDRESS:BOOL=ON` and the configure log prints
+  `[Sanitizers] Enabling: address,undefined`. Every signal an author would check says
+  yes; not one object is instrumented -- and not on a re-configure, on a **completely
+  fresh build directory**, which is what CI makes. So the project's sanitizer gate had
+  never run: not locally, and not in the `clang-tidy` job that ends with
+  `ctest --preset clang-debug`. Turning it on found a heap-use-after-free in
+  `EpollSocket::Close`, a leaked coroutine frame per dial that `IReactor::CancelPending`
+  now prevents, and a plain use-after-free in a test fake that had been passing 300
+  consecutive runs.
+  The flags are assembled in locals and published once now. Two things to keep: the
+  check that actually answers the question is `grep -o -- '-fsanitize=[a-z,]*'` **on
+  `build.ninja`**, since the cache and the log are precisely the two places that lie;
+  and this is the same class as the `USE_COMPILER_CACHE` configure probe -- a tool
+  that silently does nothing is worse than one that is off, because the second is
+  visible.
+## Language and ABI pitfalls
+
+- **A return type is not part of a function's name on Linux, and MSVC's mangling
+  hides that.** `Core/HostPort.hpp` added an `inline FastCache::ParsePort(
+  std::string_view)` returning `std::optional<std::uint16_t>` while
+  `Config/CliParser` already had a `FastCache::ParsePort(std::string_view)`
+  returning `std::expected<std::uint16_t, ConfigError>`. That is **not an
+  overload**, and no compiler can say so: each translation unit sees exactly one
+  of the two declarations, so both compile, and the Itanium ABI does not encode a
+  return type in a free function's mangled name -- so both definitions claim the
+  identical symbol, the linker keeps `CliParser`'s strong one over the header's
+  weak inline, and every caller of the header version silently reaches the other.
+  It reads an `expected` as an `optional`: a SIGSEGV on the first call, from code
+  that is correct in isolation. Renamed to `ParseTcpPort`, with the reason at the
+  declaration. Three things worth keeping:
+  - **Windows cannot find this and will report the tree as green.** MSVC's
+    mangling *does* include the return type, so the two are distinct symbols
+    there and both link. This branch had 1730 passing MSVC tests at the moment
+    Linux was segfaulting, which is the whole argument for running the Linux
+    gate locally rather than discovering it in CI a phase later.
+  - **A standalone reproducer will not reproduce it**, because the bug is in the
+    *link*, not the code: the same calls compiled against the header alone are
+    correct and pass under ASan. What identified it was `nm -C` on the library
+    object, showing a strong `T FastCache::ParsePort(...)` that the test binary
+    had no business resolving to.
+  - **The two implementations were not merged**, deliberately. The CLI's version
+    distinguishes "not a number" from "out of range" because an operator needs
+    to be told which; an `optional` cannot carry that. Collapsing them to share
+    one body would trade a real diagnostic for a de-duplication nobody asked for
+    -- the same reasoning that keeps the dispatch counters split.
+
+- **`main` is not exempt from cognitive complexity, and the fix is extraction rather
+  than a raised threshold.** The node's `main` reached 70 against clang-tidy's limit
+  of 60 as the admin endpoint was wired in. Both blocks that came out --
+  `AdminEndpoint::Start` and `AdoptActivatedListener` -- are coherent decisions with
+  one answer each, which is why the number was a symptom worth listening to rather
+  than a rule to argue with. The six bare `return 2`s it left behind became
+  `ExitUsage` for the same reason: seven copies of a magic exit code is the
+  table-shaped defect this list keeps recording.
+## Line endings
+
+Line endings are LF everywhere, and that is a `.gitattributes` rule
+(`* text=auto eol=lf`) rather than an instruction to set `core.autocrlf`. The
+config is per-clone and per-developer, so without the rule two people editing one
+file disagree about what a line ending is — and the disagreement is invisible
+until a diff comes back as *every line changed* for a two-line edit, which is how
+it was found. Stored content was already LF, so the rule changed nothing that is
+committed, only what lands on disk at checkout. `*.sh` keeps a row of its own even
+though the general rule covers it, because the consequence there is specific: a
+CRLF shebang makes the kernel look for an interpreter whose name ends in a
+carriage return, so such a script does not misbehave — it fails to start at all.
+## The portable compile-cache module
+
+- **`cmake/portable/CompileCache.cmake` must stay stock-CMake-only, and must never fail a
+  configure.** Same constraint as `Cli/UsageDoc` and `Protocol/CompileCacheWire`,
+  for the same reason: the file is *meant* to be copied verbatim into other
+  projects, so a dependency on anything else here breaks it where nobody in this
+  repository would notice. It is also included at `CMakeLists.txt:164`, before CPM
+  is bootstrapped at `:183`, so `CPMAddPackage`/`FetchContent` are not available to
+  it even locally — the `FASTCACHE_AUTO_INSTALL` fetch therefore uses bare
+  `file(DOWNLOAD)`. Not with `EXPECTED_HASH`, which aborts the configure on a
+  mismatch *even when `STATUS` is captured* (measured); the SHA-256 the release
+  publishes is compared by hand instead, which is the same guarantee without the
+  abort. Every other way the fetch can fail — unpublished platform, no network, a
+  binary that will not run here — ends the same way, in one `message(STATUS)` and a
+  fall-through, because a project that vendored this file to get a *faster* build
+  must not lose the ability to build at all when GitHub is unreachable.
+  `ctest -R compile-cache` covers both halves offline, the decline paths through a
+  sandbox and the install path through a `file://` mirror.
+## `USE_COMPILER_CACHE` in full
+
+`USE_COMPILER_CACHE` (default ON, `cmake/portable/CompileCache.cmake`) fronts the compiler
+with our own `fastcache-cc` when it is on `PATH` and a daemon answers — at
+`127.0.0.1:6674` by default, or wherever `FASTCACHE_ADDR=host:port` points;
+`FASTCACHE_SOURCE_DIR`/`FASTCACHE_BINARY_DIR` are injected from the source and build
+trees. Configure proves the cache works by compiling one tiny file through the
+launcher (~0.1 s) and requiring a `HIT`/`MISS`, because a launcher that cannot
+reach its daemon still compiles fine and would otherwise cost every TU a failed
+connect in silence. When nothing answers it falls back to `sccache`. When
+*nothing* is installed, `-DFASTCACHE_AUTO_INSTALL=ON` (default OFF) fetches a
+prebuilt `fastcache-cc` for the host from the latest stable release instead,
+staged per user so a machine downloads it once; `cmake/README.md` is the note
+for projects vendoring the module. A cache hit reproduces only the object file,
+so with either launcher active the module scan and precompiled headers are
+turned off and MSVC debug info is forced to `/Z7`
+(a modmap flag makes the launcher's preprocess step fail, and a PCH or shared
+PDB is a second artefact no hit can reproduce).
