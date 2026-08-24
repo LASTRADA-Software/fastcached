@@ -66,6 +66,31 @@ EpollReactor::~EpollReactor()
         ::close(_epollFd);
 }
 
+bool EpollReactor::CancelPending(std::coroutine_handle<> handle) noexcept
+{
+    if (!handle)
+        return false;
+
+    {
+        std::scoped_lock const guard { _submitMutex };
+        if (auto const found = std::ranges::find(_pendingSubmits, handle); found != _pendingSubmits.end())
+        {
+            _pendingSubmits.erase(found);
+            return true;
+        }
+    }
+
+    std::scoped_lock const guard { _timerMutex };
+    auto const found = std::ranges::find(_timers, handle, &TimerEntry::handle);
+    if (found == _timers.end())
+        return false;
+    // Erased and re-heaped rather than popped: this entry is somewhere in the
+    // middle of the heap, not at its root.
+    _timers.erase(found);
+    std::ranges::make_heap(_timers, EntryGreater);
+    return true;
+}
+
 bool EpollReactor::Attach(EpollFdHandler* handler) const noexcept
 {
     if (!handler || handler->fd < 0 || _epollFd < 0)

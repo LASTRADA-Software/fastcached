@@ -7,6 +7,7 @@
 #include <FastCache/Core/Clock.hpp>
 
 #include <chrono>
+#include <coroutine>
 #include <memory>
 
 namespace FastCache
@@ -28,12 +29,13 @@ namespace FastCache
 /// - **A late fire must be harmless.** The state is shared with the timer's own
 ///   coroutine and outlives this object, so a fire after the owner is gone reads
 ///   valid memory and does nothing.
-/// - **The wait is bounded and re-armed rather than parked once at the
-///   deadline.** A dial that succeeds in 2 ms against a 30 s budget would
-///   otherwise leave a frame on the reactor's timer heap for the remaining 30 s,
-///   and `IReactor::Run` returns with its heap exactly as it was — a coroutine
-///   nobody resumes and nobody frees. `InterruptibleSleepUntil` is where that
-///   reasoning lives; this type is the callback-shaped face of it.
+/// - **Disarming takes the wait back off the reactor rather than waiting it out.**
+///   A dial that succeeds in 2 ms against a 30 s budget would otherwise leave a
+///   frame on the reactor's timer heap, and `IReactor::Run` returns with its heap
+///   exactly as it was — a coroutine nobody resumes and nobody frees, once per
+///   dial. `IReactor::CancelPending` is what retires the frame immediately; the
+///   bounded poll below stays as the fallback for a reactor that cannot retract a
+///   pending resumption.
 ///
 /// The callback is a function pointer plus a `void*` rather than a
 /// `std::function`, matching `EpollFdHandler`, `IocpCompletion::dispatch` and
@@ -77,7 +79,7 @@ class DeadlineTimer
     DeadlineTimer& operator=(DeadlineTimer const&) = delete;
     DeadlineTimer& operator=(DeadlineTimer&&) = delete;
 
-    /// Disarms; the timer's own coroutine then ends within one poll interval.
+    /// Disarms, which also ends the timer's own coroutine.
     ~DeadlineTimer();
 
     /// Prevent the callback from running.
@@ -98,6 +100,9 @@ class DeadlineTimer
     {
         Callback onExpired { nullptr };
         void* state { nullptr };
+        /// The timer coroutine's own handle while it waits, so `Disarm()` can take
+        /// it back off the reactor. Cleared by that coroutine on its way out.
+        std::coroutine_handle<> parked {};
         /// Plain `bool`, not atomic: both writers (the owner and the timer
         /// coroutine) run on the reactor's thread, and saying so here is what
         /// makes that a stated precondition rather than an assumption.
@@ -105,6 +110,10 @@ class DeadlineTimer
     };
 
   private:
+    /// Only to cancel the wait on disarm. The timer must not outlive it, which
+    /// every user satisfies by construction: the timer is a local of a coroutine
+    /// running ON this reactor.
+    IReactor* _reactor;
     CancellationSource _disarm;
     std::shared_ptr<State> _shared;
 };

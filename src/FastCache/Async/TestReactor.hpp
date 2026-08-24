@@ -34,6 +34,7 @@ class TestReactor: public IReactor
     void Stop() noexcept override;
     void Submit(std::coroutine_handle<> handle) override;
     void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override;
+    [[nodiscard]] bool CancelPending(std::coroutine_handle<> handle) noexcept override;
     [[nodiscard]] IClock& Clock() noexcept override;
 
     /// Resume every ready submission and every timer whose deadline has

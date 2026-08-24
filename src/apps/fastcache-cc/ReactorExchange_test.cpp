@@ -34,6 +34,24 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 
+/// What a scripted peer did, kept where the TEST can still read it.
+///
+/// Not fields on the peer, and that is the whole point: the socket a connector
+/// hands over is owned by the coroutine frame that dialled it, so it is destroyed
+/// the moment that frame finishes -- which for a case asserting what the exchange
+/// did to the socket is *before* the assertion runs. A raw back-pointer therefore
+/// reads freed memory, and freed memory usually still says what it said: this file
+/// passed 300 consecutive runs on one platform and failed every run on another,
+/// and adding one `int` member to the peer was enough to flip the first. The log
+/// outlives the socket, so every claim below is about memory somebody still owns.
+struct PeerLog
+{
+    std::size_t sent { 0 };   ///< Bytes the exchange handed the peer.
+    int reads { 0 };          ///< Reads the exchange issued, parked ones included.
+    bool closed { false };    ///< Whether `Close()` was called.
+    bool destroyed { false }; ///< Whether the peer was freed -- i.e. the dialling frame finished.
+};
+
 /// A socket that answers with scripted bytes, or never answers at all.
 class ScriptedPeer final: public ISocket
 {
@@ -41,13 +59,26 @@ class ScriptedPeer final: public ISocket
     /// @param reply What a read should hand back, byte by byte. Empty means the
     ///        peer accepts and then says nothing -- the case a dial timeout cannot
     ///        catch and only an exchange budget can.
-    explicit ScriptedPeer(std::vector<std::byte> reply) noexcept:
-        _reply { std::move(reply) }
+    /// @param log Where to record what happened; must outlive this peer.
+    ScriptedPeer(std::vector<std::byte> reply, PeerLog& log) noexcept:
+        _reply { std::move(reply) },
+        _log { &log }
     {
     }
 
+    ~ScriptedPeer() override
+    {
+        _log->destroyed = true;
+    }
+
+    ScriptedPeer(ScriptedPeer const&) = delete;
+    ScriptedPeer(ScriptedPeer&&) = delete;
+    ScriptedPeer& operator=(ScriptedPeer const&) = delete;
+    ScriptedPeer& operator=(ScriptedPeer&&) = delete;
+
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
     {
+        _log->reads += 1;
         if (_closed)
             return IoAwaitable { std::unexpected(
                 NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = "closed" }) };
@@ -73,7 +104,7 @@ class ScriptedPeer final: public ISocket
 
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override
     {
-        _sent.insert(_sent.end(), buffer.begin(), buffer.end());
+        _log->sent += buffer.size();
         return IoAwaitable { IoResult { buffer.size() } };
     }
 
@@ -82,16 +113,15 @@ class ScriptedPeer final: public ISocket
     {
         std::size_t total = 0;
         for (auto const& segment: segments)
-        {
-            _sent.insert(_sent.end(), segment.begin(), segment.end());
             total += segment.size();
-        }
+        _log->sent += total;
         return IoAwaitable { IoResult { total } };
     }
 
     void Close() noexcept override
     {
         _closed = true;
+        _log->closed = true;
         // Completing the parked read is what `Close` MEANS on a reactor socket, and
         // it is the whole mechanism the exchange budget relies on.
         if (auto* const parked = std::exchange(_parked, nullptr); parked != nullptr)
@@ -104,14 +134,9 @@ class ScriptedPeer final: public ISocket
         return _closed;
     }
 
-    [[nodiscard]] bool WasClosed() const noexcept
-    {
-        return _closed;
-    }
-
   private:
     std::vector<std::byte> _reply;
-    std::vector<std::byte> _sent;
+    PeerLog* _log;
     std::size_t _offset { 0 };
     IoAwaitable* _parked { nullptr };
     bool _closed { false };
@@ -137,8 +162,7 @@ class ScriptedConnector final: public IConnector
             co_return std::unexpected(
                 NetError { .code = NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" });
 
-        auto peer = std::make_unique<ScriptedPeer>(_reply);
-        _peer = peer.get();
+        auto peer = std::make_unique<ScriptedPeer>(_reply, _log);
         co_return peer;
     }
 
@@ -167,15 +191,20 @@ class ScriptedConnector final: public IConnector
         return _lastPort;
     }
 
-    [[nodiscard]] ScriptedPeer* Peer() const noexcept
+    /// What the peer this connector handed out did.
+    ///
+    /// A log rather than the peer itself: the socket belongs to the frame that
+    /// dialled it and is gone by the time a case asks. See `PeerLog`.
+    /// @return The record, valid for this connector's lifetime.
+    [[nodiscard]] PeerLog const& Log() const noexcept
     {
-        return _peer;
+        return _log;
     }
 
   private:
     std::vector<std::byte> _reply;
     std::string _lastHost;
-    ScriptedPeer* _peer { nullptr };
+    PeerLog _log;
     int _dials { 0 };
     std::uint16_t _lastPort { 0 };
     bool _refuse { false };
@@ -264,16 +293,37 @@ TEST_CASE("A peer that accepts and then goes quiet is bounded by the total budge
     };
 
     constexpr Cc::ExchangeBudget Budget {};
+    auto const start = clock.Now();
     advance(&reactor, &clock, Budget.total * 4);
 
     auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, Budget);
 
+    // Every step, in the order it happens, because the last claim alone cannot say
+    // which of them did not: "the peer was never closed" is the same observation
+    // whether the reactor never ran, the exchange never wrote, or the deadline never
+    // fired.
+    auto const& log = connector.Log();
+    INFO("dials=" << connector.Dials() << " sent=" << log.sent << " reads=" << log.reads << " closed=" << log.closed
+                  << " destroyed=" << log.destroyed << " advanced="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count() << "ms"
+                  << " pendingSubmissions=" << reactor.PendingSubmissions() << " pendingTimers=" << reactor.PendingTimers());
+    CHECK(connector.Dials() == 1);
+    // The reactor ran at all: the advance task is the first thing in its queue.
+    CHECK(clock.Now() > start);
+    // The exchange got past the dial and wrote its request...
+    CHECK(log.sent > 0);
+    // ...and then parked on a read nobody was ever going to answer.
+    CHECK(log.reads > 0);
+
     CHECK(outcome.kind == Cc::CacheOutcomeKind::Transport);
-    REQUIRE(connector.Peer() != nullptr);
     // Closed rather than merely abandoned. A budget that only stopped WAITING would
     // leave the coroutine parked on a read nobody completes, which is a leaked frame
     // and a leaked descriptor on a path the launcher walks once per translation unit.
-    CHECK(connector.Peer()->WasClosed());
+    CHECK(log.closed);
+    // And the frame that owned the socket finished, which is the other half of the
+    // same claim: a budget that closed the socket but left the coroutine parked would
+    // still leak, and the socket's own destructor is what says it did not.
+    CHECK(log.destroyed);
 }
 
 TEST_CASE("A reactor exchange runs once")

@@ -14,14 +14,16 @@ src/FastCache/
                 Bytes, Endian, Crc32c, MurmurHash3 (128-bit key digest),
                 StringHash, Owner, Profiling (Tracy wrappers)
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
-                InterruptibleSleepUntil (a bounded wait a stop can interrupt,
-                because IReactor::Schedule cannot be cancelled), DeadlineTimer
-                (the same mechanism with a callback, for a timeout that must tear
-                an operation down rather than merely stop waiting for it),
+                InterruptibleSleepUntil (a bounded wait a stop can interrupt),
+                DeadlineTimer (the same shape with a callback, for a timeout that
+                must tear an operation down rather than merely stop waiting for
+                it -- and which retires its own frame through
+                IReactor::CancelPending rather than waiting out a poll),
                 AsyncQueue (MPSC, bounded, closable: what replaces a condition
-                variable once the consumer is a coroutine), IReactor +
-                TestReactor and the platform reactors (EpollReactor /
-                IocpReactor / KqueueReactor)
+                variable once the consumer is a coroutine), IReactor
+                (Run/Stop/Submit/Schedule/CancelPending -- the last being how a
+                parked frame is ever reclaimed) + TestReactor and the platform
+                reactors (EpollReactor / IocpReactor / KqueueReactor)
   Net/          ISocket, IListener, IConnector (the outbound counterpart to
                 IListener, coroutine-shaped: BlockingConnector for threads that
                 may block, PlatformConnector -> EpollConnector /
@@ -2498,6 +2500,83 @@ down across a suspend point.
   timing seam, or anything a test harness's determinism rests on, build **at least
   one release configuration and one non-clang compiler** locally —
   `cmake --preset gcc-release` and `clang-release` both exist and both run in WSL.
+- **`Close()` can be the last thing that runs on a socket, so it must touch no member
+  after it completes an awaitable.** `EpollSocket::Close` walked `{readOp, writeOp}`
+  and completed each parked awaitable inside the loop. Completing one resumes the
+  coroutine that was waiting on it -- and a coroutine that OWNS the socket
+  (`ServePeer` holds it in a by-value `unique_ptr` parameter) then runs to its end and
+  destroys it, so the loop's next iteration reads `_impl->writeOp` out of freed
+  memory. Reported by ASan as a heap-use-after-free from `RaftPeerServer::Shutdown`,
+  which is the one caller that closes accepted connections from outside their own
+  coroutines. The awaitables are detached from the ops first and completed last now,
+  with `_fd` cleared before them. Two things worth keeping: the parked awaitables live
+  in their coroutines' own frames rather than in `_impl`, which is what makes it safe
+  to complete the second after the first has taken the socket down; and the same edit
+  went to `KqueueSocket::Close`, which was a copy of the same loop and had the same
+  defect on a platform where nothing had ever run a sanitizer either.
+- **A wait that cannot be cancelled is a frame that cannot be freed, so `Schedule`
+  grew a counterpart.** `IReactor` could park a coroutine on a deadline and had no
+  way to take it back, which is why `DeadlineTimer` and `InterruptibleSleepUntil`
+  poll in bounded steps rather than parking once: a disarmed timer then retires at
+  its next tick instead of never. What that still leaves is a frame parked *during*
+  the tick, and a reactor destroyed in that window frees nothing --
+  `IReactor::Run` returns with its timer heap exactly as it was, deliberately. One
+  leaked coroutine frame **per dial and per cache exchange**, harmless in a daemon
+  that outlives them and fatal for `fastcache-cc`, where an ASan build then exits
+  non-zero and turns every cached compile into a failed one.
+  `IReactor::CancelPending` closes it: `Disarm()` takes the timer's own handle back
+  off the reactor and destroys it there and then. Five things are load-bearing:
+  - **The return value is an ownership transfer, not a status.** `true` means THIS
+    call removed the handle, so the caller is now the only one who may resume it;
+    `false` means the reactor still has it -- running, or already queued -- and the
+    caller must not touch it. That is what makes the race against a timer firing
+    concurrently decidable instead of a guess, and it is decided under the same lock
+    the timer heap is popped under.
+  - **The frame is DESTROYED, not resumed, and that is the difference between
+    fixing the leak and moving it.** Resuming only queues it, and the caller that
+    disarms is typically about to stop the reactor on its very next line --
+    `ReactorExchange` does exactly that -- so the queued handle would never run. The
+    first version resumed, and ASan reported the same leak in the same place.
+  - **`DeadlineTimer` had to stop awaiting a nested `Task`.** Awaiting one parks the
+    INNER coroutine's handle, so the handle the timer recorded would not be the one
+    `CancelPending` has to name. Its wait is written out against `SleepUntil`
+    directly, and the handle is captured by an awaitable whose `await_suspend`
+    returns `false` -- recorded on the way past, without suspending, so it is
+    available even in the window before the first hop onto the reactor. It is also
+    what makes destroying it sound: the handle is the whole chain, and a
+    `DetachedTask` leaves no awaiter holding it.
+  - **The first attempt was for the reactor to free what it still held at teardown,
+    and it is unsound.** `Submit` and `Schedule` convey no ownership: a `Task` local
+    in a test parks its handle and then destroys its own frame at scope exit, so the
+    reactor -- destroyed afterwards -- destroyed it a second time. ASan named it
+    immediately, which is the argument for the sanitizer fix below in one line.
+  - **IOCP cancels timers and not submissions**, because a submission there is a
+    completion packet already posted to the kernel and no call takes one back. It
+    answers `false` for that case, which is the honest answer under the rule above.
+- **A sanitizer that is on in the cache is not a sanitizer that is on in the build.**
+  `cmake/portable/Sanitizers.cmake` initialised `SANITIZER_COMPILE_OPTIONS` to `""`
+  as a normal variable, published the real flags through
+  `set(... CACHE INTERNAL ...)`, and then `list(APPEND)`ed one more flag to the same
+  name. Under **CMP0126 NEW** -- which `cmake_minimum_required(3.28)` selects -- a
+  cache `set` no longer removes a normal variable of that name, so the empty one
+  keeps shadowing the cache. The append therefore starts from nothing and
+  `add_compile_options` receives `-fno-sanitize-recover=undefined` and no
+  `-fsanitize=` at all, while `CMakeCache.txt` says
+  `ENABLE_SANITIZER_ADDRESS:BOOL=ON` and the configure log prints
+  `[Sanitizers] Enabling: address,undefined`. Every signal an author would check says
+  yes; not one object is instrumented -- and not on a re-configure, on a **completely
+  fresh build directory**, which is what CI makes. So the project's sanitizer gate had
+  never run: not locally, and not in the `clang-tidy` job that ends with
+  `ctest --preset clang-debug`. Turning it on found a heap-use-after-free in
+  `EpollSocket::Close`, a leaked coroutine frame per dial that `IReactor::CancelPending`
+  now prevents, and a plain use-after-free in a test fake that had been passing 300
+  consecutive runs.
+  The flags are assembled in locals and published once now. Two things to keep: the
+  check that actually answers the question is `grep -o -- '-fsanitize=[a-z,]*'` **on
+  `build.ninja`**, since the cache and the log are precisely the two places that lie;
+  and this is the same class as the `USE_COMPILER_CACHE` configure probe -- a tool
+  that silently does nothing is worse than one that is off, because the second is
+  visible.
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins.** Both jobs
   run the `$CLANG_TOOLS_VERSION` binary (`.github/workflows/build.yml`), and successive LLVM
   releases do not agree with each other: the style job compares against a *newer formatter*,

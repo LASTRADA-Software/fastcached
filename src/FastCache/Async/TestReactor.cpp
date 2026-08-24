@@ -58,6 +58,28 @@ void TestReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
     std::ranges::push_heap(_timers, EntryGreater);
 }
 
+bool TestReactor::CancelPending(std::coroutine_handle<> handle) noexcept
+{
+    if (!handle)
+        return false;
+    std::scoped_lock const guard { _mutex };
+
+    if (auto const found = std::ranges::find(_ready, handle); found != _ready.end())
+    {
+        _ready.erase(found);
+        return true;
+    }
+
+    auto const found = std::ranges::find(_timers, handle, &ScheduledEntry::handle);
+    if (found == _timers.end())
+        return false;
+    // Erased and re-heaped rather than popped: this entry is somewhere in the
+    // middle of the heap, not at its root.
+    _timers.erase(found);
+    std::ranges::make_heap(_timers, EntryGreater);
+    return true;
+}
+
 IClock& TestReactor::Clock() noexcept
 {
     return _clock;

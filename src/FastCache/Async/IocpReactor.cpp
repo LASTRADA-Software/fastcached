@@ -64,6 +64,27 @@ IocpReactor::~IocpReactor()
     }
 }
 
+bool IocpReactor::CancelPending(std::coroutine_handle<> handle) noexcept
+{
+    if (!handle)
+        return false;
+
+    // Timers only, and the omission is the platform's rather than a shortcut: a
+    // submission here is a completion packet already posted to the kernel, and
+    // there is no call that takes one back out. So a handle waiting on the port
+    // answers false -- the honest answer, since the caller must not resume what
+    // the reactor is still going to.
+    std::scoped_lock const guard { _timerMutex };
+    auto const found = std::ranges::find(_timers, handle, &TimerEntry::handle);
+    if (found == _timers.end())
+        return false;
+    // Erased and re-heaped rather than popped: this entry is somewhere in the
+    // middle of the heap, not at its root.
+    _timers.erase(found);
+    std::ranges::make_heap(_timers, EntryGreater);
+    return true;
+}
+
 bool IocpReactor::AttachHandle(void* handle) noexcept
 {
     if (!_iocp || !handle)

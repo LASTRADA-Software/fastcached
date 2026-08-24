@@ -369,18 +369,38 @@ void KqueueSocket::Close() noexcept
         // Fail whatever was parked. The filters are gone, so nothing will ever
         // complete these awaitables; leaving them set leaks the suspended
         // coroutine on abrupt teardown. Mirrors KqueueListener::Close.
+        //
+        // Detached from the ops FIRST and completed afterwards, which is not
+        // tidiness: `Complete` resumes the parked coroutine, and a coroutine that
+        // owns this socket -- `ServePeer` holds it in a by-value `unique_ptr`
+        // parameter -- runs to its end and destroys it before `Complete` returns.
+        // So `this`, `_impl` and everything in it are freed part-way through this
+        // loop. Completing inside it read `_impl->writeOp` after the free, which
+        // ASan reports as a heap-use-after-free from `RaftPeerServer::Shutdown`;
+        // it went unseen for as long as the sanitizer preset was silently building
+        // without sanitizers.
+        std::array<IoAwaitable*, 2> parked { nullptr, nullptr };
+        std::size_t parkedCount = 0;
         for (auto* op: { &_impl->readOp, &_impl->writeOp })
         {
             if (op->awaitable == nullptr)
                 continue;
-            auto* awaitable = op->awaitable;
+            parked.at(parkedCount++) = op->awaitable;
             op->awaitable = nullptr;
             op->readBuffer = {};
             op->writeRemaining = {};
             op->ClearVectored();
-            awaitable->Complete(
-                std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
         }
+        _fd = -1;
+
+        // Past this point nothing may touch a member. The two awaitables live in
+        // their own coroutines' frames rather than in `_impl`, so they stay valid
+        // even once the first resume has taken the socket down.
+        for (auto* awaitable: parked)
+            if (awaitable != nullptr)
+                awaitable->Complete(
+                    std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+        return;
     }
     _fd = -1;
 }
