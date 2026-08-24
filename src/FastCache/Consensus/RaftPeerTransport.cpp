@@ -172,7 +172,12 @@ void RaftPeerTransport::RunSender(Peer& peer) noexcept
     {
         if (socket == nullptr)
         {
-            auto dialed = _connector.Connect(peer.endpoint.host, peer.endpoint.port, _options.dialTimeout);
+            // No I/O bound, which is what this transport did before the parameter
+            // existed. Adding one is a real improvement -- a peer that accepts and
+            // then stalls parks this thread -- but it changes when a peer is
+            // declared dead, so it is its own decision rather than a side effect.
+            auto dialed = _connector.Connect(
+                peer.endpoint.host, peer.endpoint.port, _options.dialTimeout, std::chrono::milliseconds { 0 });
             if (!dialed.has_value())
             {
                 // Logged at Debug, not Warn. A peer being down is the ordinary
