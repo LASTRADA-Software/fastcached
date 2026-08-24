@@ -16,6 +16,8 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,6 +31,31 @@ struct PeerEndpoint
     NodeId id;                ///< The member this address belongs to.
     std::string host;         ///< Hostname or literal address.
     std::uint16_t port { 0 }; ///< TCP port of that node's peer listener.
+};
+
+/// What learning a peer did.
+///
+/// Named rather than reported as a `bool`, because a caller reconciling a member
+/// set against what it already dials wants to log the two interesting cases and
+/// say nothing at all about the third — and "a peer that moved" and "a peer nobody
+/// knew" are different sentences to an operator reading why a cluster changed
+/// shape.
+enum class PeerChange : std::uint8_t
+{
+    Added = 0,   ///< A peer nobody knew; its sender starts now.
+    Readdressed, ///< A known peer that has moved; the live connection is dropped.
+    Unchanged,   ///< Already known, at exactly this address.
+
+    /// This node's own record, which a member set always contains.
+    ///
+    /// Its own row rather than a shared "refused", because it is the one outcome a
+    /// caller must stay silent about: a reconciler hands over the whole member set
+    /// on every pass, so folding it in with the row below would make a healthy
+    /// fleet log its own id once a second forever -- or make an operator suppress
+    /// the line that says the transport is shutting down.
+    Self,
+
+    Stopping, ///< The transport is stopping; nothing new is dialled.
 };
 
 /// How long the transport waits and how much it will hold, in one place.
@@ -165,6 +192,44 @@ class RaftPeerTransport final: public IRaftTransport
     /// true, and everything else here follows from that.
     void Start();
 
+    /// Learn where a peer answers, or that it has moved. Any thread.
+    ///
+    /// **This is what makes a cluster growable at all.** The member set used to be
+    /// fixed at construction, so a node the cluster agreed to admit at runtime was
+    /// one nobody dialled — counted towards a quorum it could never contribute to,
+    /// which is a cluster that stops forming one. Adding a peer here is the other
+    /// half of `RaftNode::ProposeMembership`, and neither is safe without the
+    /// other.
+    ///
+    /// Idempotent, so the natural caller — a reconciler comparing the cluster's
+    /// replicated member set against what this node dials, on every pass of its own
+    /// loop — hands over the same peers repeatedly and grows nothing.
+    ///
+    /// A peer that has **moved** keeps its outbox and its queued messages and is
+    /// simply dialled somewhere else: its live connection is closed, so the next
+    /// write fails, the sender backs off exactly as it does for any dropped
+    /// connection, and it redials the new address. Replacing the peer outright
+    /// would mean destroying a coroutine frame the reactor may still point into,
+    /// which is the one thing that cannot be done from here.
+    ///
+    /// The redial therefore happens at the next *message* rather than at once: a
+    /// sender parked on its outbox is not woken by a socket closing under it. That
+    /// costs a member nothing — the next heartbeat is one interval away — and a
+    /// peer nobody is sending to does not care which address it is not being sent
+    /// to.
+    ///
+    /// A peer is never *forgotten*, and that is deliberate. A member removed from
+    /// the configuration is sent nothing, so its sender parks on an outbox nobody
+    /// pushes to and costs one idle connection until this process restarts. Ending
+    /// it early needs a per-peer cancellation and a sweep for frames that have
+    /// finished, which is machinery bought for a socket.
+    /// @param where The peer and where it answers.
+    /// @return What this did.
+    PeerChange Learn(PeerEndpoint where);
+
+    /// @return How many peers this transport currently dials, self excluded.
+    [[nodiscard]] std::size_t PeerCount() const noexcept;
+
     /// Ask every sender to finish, without waiting. Any thread, including the
     /// reactor's.
     ///
@@ -226,7 +291,15 @@ class RaftPeerTransport final: public IRaftTransport
     /// compile.
     struct Peer
     {
-        PeerEndpoint endpoint;                     ///< Where to dial.
+        /// Where to dial.
+        ///
+        /// The `id` is fixed at construction — it is this peer's key in `_peers` —
+        /// while `host` and `port` are guarded by `_peersMutex`, because a peer
+        /// that moves is re-addressed in place rather than replaced. A sender reads
+        /// them through `AddressOf` rather than directly, so the copy it dials with
+        /// is taken under that lock and the `co_await` is not.
+        PeerEndpoint endpoint;
+
         AsyncQueue<std::vector<std::byte>> outbox; ///< Framed messages awaiting the wire.
 
         /// The live connection, or null.
@@ -251,6 +324,20 @@ class RaftPeerTransport final: public IRaftTransport
         }
     };
 
+    /// Where `peer` currently answers, read under `_peersMutex`.
+    ///
+    /// By value, because the point is to stop holding the lock before the dial
+    /// suspends. A sender that read `peer->endpoint` directly would be racing
+    /// `Learn`, which re-addresses a peer that has moved.
+    /// @param peer Whose address to read.
+    /// @return A copy of it.
+    [[nodiscard]] PeerEndpoint AddressOf(Peer const& peer) const;
+
+    /// Submit `peer`'s sender to the reactor and count it. `_peersMutex` must be
+    /// held.
+    /// @param peer The peer to start dialling.
+    void StartSender(Peer& peer);
+
     /// Note that a sender has finished. Reactor thread only.
     void NoteSenderFinished() noexcept;
 
@@ -269,12 +356,51 @@ class RaftPeerTransport final: public IRaftTransport
     /// Cancelled by `RequestStop`; observed by every backoff and loop condition.
     CancellationSource _stop;
 
-    /// Peers by id. Built once at construction and never mutated afterwards, so
-    /// `Send` reads it without a lock; membership changes replace the transport
-    /// rather than mutating it under a running sender.
+    /// Guards `_peers`, each peer's `host`/`port`, and `_lifecycle`.
+    ///
+    /// `_peers` used to be built at construction and never touched again, so
+    /// everything read it unlocked — and a cluster could not grow, because the one
+    /// thing this class could not do was learn a member the cluster had just
+    /// agreed to admit. It is now written by `Learn` from whatever thread
+    /// reconciles the member set, and read by `Send` from the driver's, so the
+    /// map needs a lock.
+    ///
+    /// **Shared**, for the reason `Distributed::MembershipOracle` gives for the
+    /// identical shape: the readers are `Send` (once per peer per heartbeat, and
+    /// reached while the driver's own mutex is held) and each sender's dial, while
+    /// the writer is a reconciler pass that on a healthy fleet changes nothing.
+    /// Serializing those readers against each other over a map none of them
+    /// modifies would put the reactor's thread in front of the driver's for no
+    /// reason at all.
+    ///
+    /// Held only across the map operation, and never across a push, a dial, a write
+    /// or a socket close: `ISocket::Close` resumes a parked sender *inline* on epoll
+    /// and kqueue, so a lock held across it would be held across arbitrary sender
+    /// code — with `Send`, and therefore the driver's mutex, waiting behind it.
+    /// Taking a `Peer*` under the lock and using it outside is safe because a peer
+    /// is never *erased*: the pointer a lookup hands back stays valid for this
+    /// transport's life.
+    mutable std::shared_mutex _peersMutex;
+
+    /// Peers by id, self excluded.
     std::map<NodeId, std::unique_ptr<Peer>> _peers;
 
-    std::atomic<bool> _running { false };
+    /// Where this transport is in its life, read and written under `_peersMutex`.
+    ///
+    /// One value rather than a `bool` beside the cancellation token, because `Learn`
+    /// has one question with three answers: a peer added before `Start` must be
+    /// submitted by `Start`, one added after must submit itself, and one added after
+    /// a stop must be refused — otherwise it is either never dialled, dialled twice,
+    /// or left as a sender nobody ever finishes. Deciding that against two variables
+    /// guarded by different things is an interlock held together by a comment.
+    enum class Lifecycle : std::uint8_t
+    {
+        Idle = 0, ///< Constructed; `Start` has not run.
+        Running,  ///< Senders are submitted as peers are learned.
+        Stopping, ///< `RequestStop` has run; nothing new is dialled.
+    };
+
+    Lifecycle _lifecycle { Lifecycle::Idle };
     std::atomic<std::uint64_t> _dropped { 0 };
     std::atomic<std::size_t> _connected { 0 };
 

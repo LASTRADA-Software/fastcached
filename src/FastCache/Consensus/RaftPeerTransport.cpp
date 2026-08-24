@@ -8,10 +8,14 @@
 #include <cassert>
 #include <chrono>
 #include <format>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace FastCache::Consensus
 {
@@ -77,16 +81,20 @@ struct PeerSenderAccess
     {
       public:
         /// @param transport Whose counter to hold.
-        /// @param peer Which peer, for the log lines.
-        Session(RaftPeerTransport* transport, RaftPeerTransport::Peer* peer) noexcept:
+        /// @param where Which peer and where it was reached, for the log lines. A
+        ///        snapshot the caller already holds rather than the `Peer` itself,
+        ///        because that peer's address is guarded by `_peersMutex` and this
+        ///        is not the place to take it. Only the id outlives this
+        ///        constructor: the address is a fact about the session that has
+        ///        just begun, and by the time it ends it may no longer be where
+        ///        that peer answers.
+        Session(RaftPeerTransport* transport, PeerEndpoint const& where) noexcept:
             _transport { transport },
-            _peer { peer }
+            _peerId { where.id }
         {
             _transport->_connected.fetch_add(1, std::memory_order_relaxed);
-            _transport->_logger.Log(
-                LogLevel::Info,
-                std::format(
-                    "raft: connected to peer {} at {}:{}", _peer->endpoint.id, _peer->endpoint.host, _peer->endpoint.port));
+            _transport->_logger.Log(LogLevel::Info,
+                                    std::format("raft: connected to peer {} at {}:{}", where.id, where.host, where.port));
         }
 
         Session(Session const&) = delete;
@@ -97,12 +105,12 @@ struct PeerSenderAccess
         ~Session()
         {
             _transport->_connected.fetch_sub(1, std::memory_order_relaxed);
-            _transport->_logger.Log(LogLevel::Info, std::format("raft: peer {} disconnected", _peer->endpoint.id));
+            _transport->_logger.Log(LogLevel::Info, std::format("raft: peer {} disconnected", _peerId));
         }
 
       private:
         RaftPeerTransport* _transport;
-        RaftPeerTransport::Peer* _peer;
+        NodeId _peerId;
     };
 
     /// One connection's life: dial, serve, end.
@@ -111,8 +119,15 @@ struct PeerSenderAccess
     /// One peer's whole life. Ends only on a stop.
     static Task<void> RunSender(RaftPeerTransport* self, RaftPeerTransport::Peer* peer);
 
-    /// Close every live peer socket, on the reactor's thread.
-    static DetachedTask CloseSockets(RaftPeerTransport* self);
+    /// Close live peer sockets, on the reactor's thread.
+    ///
+    /// One peer or all of them: a shutdown ends every session, and a peer that has
+    /// moved needs exactly its own dropped so its sender redials the new address.
+    /// One function rather than two, because what makes this correct is the thread
+    /// it runs on and that argument is the same either way.
+    /// @param self The transport.
+    /// @param only Which peer, or nullopt for every one.
+    static DetachedTask CloseSockets(RaftPeerTransport* self, std::optional<NodeId> only);
 };
 
 Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* self, RaftPeerTransport::Peer* peer)
@@ -122,18 +137,22 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     // side effect of dialling. What is new is that it is no longer dangerous --
     // a write with no timeout used to be uninterruptible, and now closing the
     // socket completes it.
-    auto dialed = co_await self->_connector.Connect(peer->endpoint.host, peer->endpoint.port, self->_options.dialTimeout);
+    //
+    // Read once, before the dial, and used for the whole session: a peer that
+    // moves mid-session has its socket closed under it, so the session ends and the
+    // next one reads the new address here.
+    auto const where = self->AddressOf(*peer);
+
+    auto dialed = co_await self->_connector.Connect(where.host, where.port, self->_options.dialTimeout);
     if (!dialed.has_value())
     {
         // Debug, not Warn. A peer being down is the ordinary condition Raft is
         // built for, and one line per backoff interval per peer at Warn would
         // bury the messages that do need reading.
-        self->_logger.Log(LogLevel::Debug,
-                          std::format("raft: could not reach peer {} at {}:{}: {}",
-                                      peer->endpoint.id,
-                                      peer->endpoint.host,
-                                      peer->endpoint.port,
-                                      dialed.error().context));
+        self->_logger.Log(
+            LogLevel::Debug,
+            std::format(
+                "raft: could not reach peer {} at {}:{}: {}", where.id, where.host, where.port, dialed.error().context));
         co_return Outcome::Retry;
     }
 
@@ -148,7 +167,20 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     }
 
     peer->socket = std::move(dialed.value());
-    Session const session { self, peer };
+
+    // A re-address that landed while this dial was in flight closed a socket that
+    // did not exist yet, so it closed nothing -- and this connection is to the
+    // address the peer has just stopped answering on. Nothing else would notice:
+    // the session below is long-lived and never re-reads the address, so the peer
+    // would be served at its old address until that connection happened to break.
+    if (auto const current = self->AddressOf(*peer); current.host != where.host || current.port != where.port)
+    {
+        peer->socket->Close();
+        peer->socket.reset();
+        co_return Outcome::Retry;
+    }
+
+    Session const session { self, where };
 
     while (true)
     {
@@ -215,7 +247,7 @@ Task<void> PeerSenderAccess::RunSender(RaftPeerTransport* self, RaftPeerTranspor
     co_return;
 }
 
-DetachedTask PeerSenderAccess::CloseSockets(RaftPeerTransport* self)
+DetachedTask PeerSenderAccess::CloseSockets(RaftPeerTransport* self, std::optional<NodeId> only)
 {
     // The hop is the point. On epoll and kqueue `ISocket::Close` completes a
     // parked awaitable by resuming its coroutine INLINE, so closing from the
@@ -224,9 +256,32 @@ DetachedTask PeerSenderAccess::CloseSockets(RaftPeerTransport* self)
     // not, which is precisely what would make this a bug that passes CI on
     // Windows and corrupts state on Linux and macOS.
     co_await ResumeOn { self->_reactor };
-    for (auto& [id, peer]: self->_peers)
-        if (peer->socket != nullptr)
-            peer->socket->Close();
+
+    // Collected under the lock, closed outside it, and the split is the point.
+    // `Close` resumes a parked sender INLINE on epoll and kqueue -- on this thread,
+    // which is the whole reason for the hop above -- so a lock held across it is a
+    // lock held across arbitrary sender code, with `Send` and therefore the driver's
+    // mutex waiting behind it. `Peer::socket` is reactor-thread-only, so nothing but
+    // the map lookup needs the lock at all.
+    auto closing = std::vector<ISocket*> {};
+    {
+        auto const guard = std::shared_lock { self->_peersMutex };
+        if (only.has_value())
+        {
+            if (auto const found = self->_peers.find(*only); found != self->_peers.end())
+                closing.push_back(found->second->socket.get());
+        }
+        else
+        {
+            closing.reserve(self->_peers.size());
+            for (auto& [id, peer]: self->_peers)
+                closing.push_back(peer->socket.get());
+        }
+    }
+
+    for (auto* const socket: closing)
+        if (socket != nullptr)
+            socket->Close();
     co_return;
 }
 
@@ -243,16 +298,103 @@ RaftPeerTransport::RaftPeerTransport(NodeId self,
     _options { options }
 {
     for (auto& endpoint: peers)
+        Learn(std::move(endpoint));
+}
+
+PeerChange RaftPeerTransport::Learn(PeerEndpoint where)
+{
+    if (where.id == _self)
+        // A node does not dial itself; `Send` refuses a message addressed here for
+        // the same reason. Answering rather than silently skipping means a caller
+        // handing over a whole member set does not have to filter it, and the rule
+        // stays in one place.
+        return PeerChange::Self;
+
+    auto const id = where.id;
     {
-        if (endpoint.id == _self)
-            continue;
-        auto id = endpoint.id;
-        _peers.emplace(std::move(id),
-                       std::make_unique<Peer>(std::move(endpoint),
-                                              _reactor,
-                                              AsyncQueueOptions { .capacity = _options.maxQueuedPerPeer,
-                                                                  .overflow = AsyncQueueOverflow::DropOldest }));
+        auto const guard = std::unique_lock { _peersMutex };
+
+        // A peer added after a stop would have a sender nobody ever finishes. This
+        // and the submission below read the one value under the one lock, which is
+        // what keeps a peer learned around `Start` or `RequestStop` from being
+        // dialled twice or never dialled at all.
+        if (_lifecycle == Lifecycle::Stopping)
+            return PeerChange::Stopping;
+
+        auto const found = _peers.find(id);
+        if (found == _peers.end())
+        {
+            auto const inserted =
+                _peers.emplace(id,
+                               std::make_unique<Peer>(std::move(where),
+                                                      _reactor,
+                                                      AsyncQueueOptions { .capacity = _options.maxQueuedPerPeer,
+                                                                          .overflow = AsyncQueueOverflow::DropOldest }));
+            if (_lifecycle == Lifecycle::Running)
+                StartSender(*inserted.first->second);
+
+            return PeerChange::Added;
+        }
+
+        auto& peer = *found->second;
+        if (peer.endpoint.host == where.host && peer.endpoint.port == where.port)
+            return PeerChange::Unchanged;
+
+        // Re-addressed in place, keeping the outbox and whatever is queued in it.
+        // Replacing the peer would mean destroying a coroutine frame the reactor
+        // may still point into, which is undefined behaviour rather than a tidy-up.
+        // The id is not touched: it is this peer's key in the map, and it is the
+        // one field a sender reads without the lock.
+        peer.endpoint.host = std::move(where.host);
+        peer.endpoint.port = where.port;
+
+        // Only while a sender is actually running, and the guard is about lifetime
+        // rather than efficiency: `CloseSockets` is a detached task, so submitting
+        // one nothing will ever resume leaks its frame, and one resumed after this
+        // transport is destroyed dereferences it. A live sender is what makes the
+        // reactor a loop that is being driven -- and with none there is no socket to
+        // close either, since a peer learned before `Start` has never dialled. The
+        // same guard `RequestStop` uses, for the same reason.
+        //
+        // Submitted INSIDE the lock, which is what makes the guard mean anything:
+        // `RequestStop` takes this same lock exclusively, so it cannot slip between
+        // the test and the submission. Safe because `ResumeOn` never resumes inline
+        // -- it suspends and posts -- so nothing here runs on the reactor's thread,
+        // and the frame's first lock acquisition happens after this scope ends.
+        if (_lifecycle == Lifecycle::Running && _sendersRunning.load(std::memory_order_acquire) != 0)
+            // The sender is parked either in its own dial, in a write, or on its
+            // outbox; closing the socket ends the second at once, is a no-op for the
+            // first -- which `ServeOnce` catches when its dial resolves -- and the
+            // third ends at the next message, which for a member is the next
+            // heartbeat.
+            PeerSenderAccess::CloseSockets(this, id);
     }
+
+    return PeerChange::Readdressed;
+}
+
+std::size_t RaftPeerTransport::PeerCount() const noexcept
+{
+    auto const guard = std::shared_lock { _peersMutex };
+    return _peers.size();
+}
+
+PeerEndpoint RaftPeerTransport::AddressOf(Peer const& peer) const
+{
+    auto const guard = std::shared_lock { _peersMutex };
+    return peer.endpoint;
+}
+
+void RaftPeerTransport::StartSender(Peer& peer)
+{
+    peer.sender = PeerSenderAccess::RunSender(this, &peer);
+    _sendersRunning.fetch_add(1, std::memory_order_acq_rel);
+
+    // Submitted rather than started: see `Start()`'s doc comment for why the task
+    // is lazy and what depends on it. Submitting under `_peersMutex` is safe for
+    // exactly that reason -- the body's first instruction runs on the reactor
+    // thread, so nothing here runs it inline.
+    _reactor.Submit(peer.sender.Native());
 }
 
 RaftPeerTransport::~RaftPeerTransport()
@@ -262,27 +404,36 @@ RaftPeerTransport::~RaftPeerTransport()
 
 void RaftPeerTransport::Start()
 {
-    auto expected = false;
-    if (!_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+    // The state is moved and the senders submitted under one lock, so `Learn` sees
+    // either `Idle` (this loop will pick the new peer up) or `Running` (this loop is
+    // done, and `Learn` submits its own). Between those, on a bare atomic, a peer
+    // learned in the window would be submitted twice.
+    auto const guard = std::unique_lock { _peersMutex };
+    if (_lifecycle != Lifecycle::Idle)
         return;
 
+    _lifecycle = Lifecycle::Running;
     for (auto& [id, peer]: _peers)
-    {
-        peer->sender = PeerSenderAccess::RunSender(this, peer.get());
-        _sendersRunning.fetch_add(1, std::memory_order_acq_rel);
-        // Submitted rather than started: see `Start()`'s doc comment for why the
-        // task is lazy and what depends on it.
-        _reactor.Submit(peer->sender.Native());
-    }
+        StartSender(*peer);
 }
 
 void RaftPeerTransport::RequestStop() noexcept
 {
     _stop.Cancel();
-    for (auto& [id, peer]: _peers)
-        peer->outbox.Close();
+
+    // `Stopping` and the outbox closures under one lock, so a `Learn` racing this
+    // either finishes first -- and has its outbox closed by the loop below -- or
+    // sees `Stopping` and refuses. Closing an outbox takes only that queue's own
+    // lock, which nothing here holds in the other order.
+    {
+        auto const guard = std::unique_lock { _peersMutex };
+        _lifecycle = Lifecycle::Stopping;
+        for (auto& [id, peer]: _peers)
+            peer->outbox.Close();
+    }
+
     if (_sendersRunning.load(std::memory_order_acquire) != 0)
-        PeerSenderAccess::CloseSockets(this);
+        PeerSenderAccess::CloseSockets(this, std::nullopt);
 }
 
 void RaftPeerTransport::Stop() noexcept
@@ -294,10 +445,7 @@ void RaftPeerTransport::Stop() noexcept
     // itself, drain the senders with `RequestStop()`, and then let the destructor
     // call this without tripping the check below.
     if (_sendersRunning.load(std::memory_order_acquire) == 0)
-    {
-        _running.store(false, std::memory_order_release);
         return;
-    }
 
     // Only now: waiting for coroutines that can only progress on the reactor's
     // thread, FROM that thread, is a deadlock. Asserting turns it into a failed
@@ -328,11 +476,10 @@ void RaftPeerTransport::Stop() noexcept
                     std::format("raft: {} peer sender(s) did not finish within {} ms; leaking their frames",
                                 stuck,
                                 Ceiling.count() * 1000));
+        auto const guard = std::unique_lock { _peersMutex };
         for (auto& [id, peer]: _peers)
             std::ignore = peer->sender.Release();
     }
-
-    _running.store(false, std::memory_order_release);
 }
 
 std::size_t RaftPeerTransport::SendersRunning() const noexcept
@@ -368,8 +515,19 @@ void RaftPeerTransport::Send(NodeId const& to, RaftMessage message)
         return;
     }
 
-    auto const found = _peers.find(to);
-    if (found == _peers.end())
+    Peer* target = nullptr;
+    {
+        // The lookup is under the lock and the push below is not. A peer is only
+        // ever added or re-addressed, never erased, so the pointer stays valid for
+        // this transport's life -- which is what lets the queue's own lock be taken
+        // outside this one rather than nested inside it.
+        auto const guard = std::shared_lock { _peersMutex };
+        auto const found = _peers.find(to);
+        if (found != _peers.end())
+            target = found->second.get();
+    }
+
+    if (target == nullptr)
     {
         _dropped.fetch_add(1, std::memory_order_relaxed);
         _logger.Log(LogLevel::Debug, std::format("raft: no endpoint configured for peer {}", to));
@@ -389,7 +547,7 @@ void RaftPeerTransport::Send(NodeId const& to, RaftMessage message)
     // Never resumes the sender inline -- see `AsyncQueue`. This matters here
     // specifically because `Send` is reached from `RaftDriver::Deliver`, which
     // holds the driver's mutex.
-    auto const pushed = found->second->outbox.Push(std::move(frame));
+    auto const pushed = target->outbox.Push(std::move(frame));
     _dropped.fetch_add(pushed.displaced, std::memory_order_relaxed);
 }
 
