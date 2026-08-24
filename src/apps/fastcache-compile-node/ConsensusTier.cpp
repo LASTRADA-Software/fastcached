@@ -4,7 +4,7 @@
 #include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Net/BlockingConnector.hpp>
+#include <FastCache/Net/PlatformConnector.hpp>
 
 #include <algorithm>
 #include <array>
@@ -165,7 +165,7 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                              ILogger& logger):
     _logger { logger },
     _storage { std::move(storage) },
-    _connector { std::make_unique<BlockingConnector>() },
+    _connector { std::make_unique<PlatformConnector>(_reactor, _resolver, _clock) },
     _application { logger, [this](Cluster::ClusterState const& state) { OnStateChanged(state); } },
     _onRole { std::move(onRole) },
     _boundEndpoint { std::move(boundEndpoint) },
@@ -291,7 +291,8 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
         peers.push_back(Consensus::PeerEndpoint { .id = member.id, .host = split->first, .port = *port });
     }
 
-    _transport = std::make_unique<Consensus::RaftPeerTransport>(cfg.nodeId, std::move(peers), *_connector, _logger);
+    _transport =
+        std::make_unique<Consensus::RaftPeerTransport>(cfg.nodeId, std::move(peers), _reactor, *_connector, _logger);
 
     auto recovered = _storage.Load();
     if (!recovered.has_value())
@@ -402,12 +403,23 @@ ConsensusTier::~ConsensusTier()
     // loop observes its stop when its current wait expires, which is bounded by the
     // heartbeat interval. The `jthread` joins in its own destructor after that, in
     // reverse declaration order, which is what the member ordering buys.
+    // The transport goes FIRST, and the order is load-bearing. The reactor is
+    // stopped when the second of the two COUNTED loops finishes, and peer senders
+    // are not counted -- so if the tick loop ended while a sender were still
+    // parked, the reactor would return with that frame suspended and nobody would
+    // ever resume or free it. Draining the senders while the reactor is still
+    // running means that by the time either counted loop ends there is nothing
+    // else parked on it.
+    //
+    // Stopping it early is safe: `Send` after a stop is already a no-op, and the
+    // driver keeps ticking against a transport that drops for at most one
+    // heartbeat interval, which `IRaftTransport` is best-effort about anyway.
+    if (_transport != nullptr)
+        _transport->Stop();
     if (_peerServer != nullptr)
         _peerServer->Shutdown();
     if (_driver != nullptr)
         _driver->Stop();
-    if (_transport != nullptr)
-        _transport->Stop();
 
     // Asked to stop and then woken, in that order: `request_stop` is what the
     // predicate reads, and notifying before it would leave the loop re-checking a

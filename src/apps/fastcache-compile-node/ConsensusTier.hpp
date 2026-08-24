@@ -18,6 +18,7 @@
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Net/PlatformListener.hpp>
+#include <FastCache/Net/ThreadedAddressResolver.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -314,6 +315,20 @@ class ConsensusTier final: public Distributed::IClusterAdmin
 
     Consensus::FileRaftStorage _storage;
     std::unique_ptr<IRandomSource> _random;
+
+    /// Name resolution for the peer dials, off the reactor thread.
+    ///
+    /// Declared before `_connector`, which holds a reference to it. Threaded
+    /// rather than inline because `getaddrinfo` takes no timeout: a peer named by
+    /// hostname whose resolver is wedged would otherwise park the reactor -- and
+    /// this reactor also carries the election timers and every peer reader, so
+    /// that is the whole cluster's liveness. A peer named by literal address,
+    /// which is the ordinary case, never reaches a thread at all.
+    ThreadedAddressResolver _resolver;
+
+    /// Reactor-driven, so a dial suspends rather than blocking the loop that
+    /// carries the election timers. Declared after `_reactor` and `_resolver`
+    /// because it references both.
     std::unique_ptr<IConnector> _connector;
     std::unique_ptr<Consensus::RaftPeerTransport> _transport;
     Cluster::ClusterStateMachine _application;
