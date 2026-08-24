@@ -18,7 +18,8 @@ namespace
     /// A table rather than three `case` labels so the membership test below is
     /// derived from it: a verb that reaches this class without a row is refused
     /// rather than served, which is the direction a mistake has to fail in.
-    constexpr std::array SchedulerOps { Wire::Op::Register, Wire::Op::Heartbeat, Wire::Op::Lease };
+    constexpr std::array SchedulerOps { Wire::Op::Register,      Wire::Op::Heartbeat,  Wire::Op::Lease,
+                                        Wire::Op::ClusterStatus, Wire::Op::ClusterSet, Wire::Op::ClusterForget };
 
     /// Whether this scheduler serves @p op at all.
     /// @param op The verb, already resolved against `OpTable`.
@@ -147,6 +148,28 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                   Wire::LeaseRequest { .fingerprint = Wire::AsStringView(fields->fingerprint),
                                                        .key = Wire::AsStringView(fields->key),
                                                        .acceptedCodecs = fields->acceptedCodecs });
+        }
+        case Wire::Op::ClusterStatus:
+            // A payload that is not empty is still refused, and by the same rule as
+            // every other verb: the table says this one carries no fields, so
+            // `SplitFields` accepts nothing but an empty payload. A request with
+            // something in it is a client this build does not understand.
+            if (!Wire::SplitFields(payload, Wire::OpFieldCount(Wire::Op::ClusterStatus)).has_value())
+                return SchedulerReply::Malformed();
+            return _service.ClusterStatus(caller);
+
+        case Wire::Op::ClusterSet: {
+            auto const fields = Wire::DecodeClusterSetPayload(payload);
+            if (!fields.has_value())
+                return SchedulerReply::Malformed();
+            return _service.ClusterSet(caller, Wire::AsStringView(fields->name), Wire::AsStringView(fields->value));
+        }
+
+        case Wire::Op::ClusterForget: {
+            auto const memberId = Wire::DecodeClusterForgetPayload(payload);
+            if (!memberId.has_value())
+                return SchedulerReply::Malformed();
+            return _service.ClusterForget(caller, Wire::AsStringView(*memberId));
         }
         default:
             // Unreachable: `IsSchedulerVerb` has already refused everything else.

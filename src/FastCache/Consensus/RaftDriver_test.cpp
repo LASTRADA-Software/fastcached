@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <format>
+#include <ranges>
 #include <string>
 #include <utility>
 #include <vector>
@@ -418,6 +420,64 @@ TEST_CASE("Run ticks the node on the reactor's timer", "[consensus][raft][driver
     (void) reactor.Drain();
 }
 
+TEST_CASE("A node elected between ticks still heartbeats on time", "[consensus][raft][driver]")
+{
+    // Invisible to every other case in this file and to `RaftClusterHarness`,
+    // because both advance a node by calling `Tick` directly. `Run` parks on a
+    // deadline read BEFORE it suspends, and `SleepUntil` cannot be cancelled --
+    // while `Receive`, which in production arrives from a peer-reader coroutine on
+    // the same reactor, can move that deadline EARLIER: a candidate that wins goes
+    // from an election
+    // deadline up to `electionTimeoutMax` away to a heartbeat deadline one
+    // interval away. Sleeping to the stale value delays the new leader's second
+    // heartbeat past the shortest election timeout a follower can draw, that
+    // follower elects itself, and the cluster does it again one term later.
+    // Measured on three real nodes before the bound went in: nine role changes in
+    // twelve seconds with nothing else wrong.
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    RecordingMachine machine { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    ManualClock clock;
+    TestReactor reactor { clock };
+
+    RaftDriver driver {
+        std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine
+    };
+
+    auto loop = driver.Run(&reactor);
+    reactor.Submit(loop.Native());
+    (void) reactor.Drain();
+
+    clock.Advance(150ms);
+    (void) reactor.Drain();
+    REQUIRE(CarryPreVote(driver, clock.Now()));
+    REQUIRE(driver.Node().CurrentRole() == Role::Candidate);
+
+    // The vote that carries the election, delivered while the loop is parked --
+    // which is exactly how it arrives in production.
+    REQUIRE(
+        driver
+            .Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+                     clock.Now())
+            .has_value());
+    REQUIRE(driver.Node().CurrentRole() == Role::Leader);
+
+    // Everything the election itself produced, including the first heartbeat a
+    // new leader sends immediately. What is asserted is the SECOND one.
+    auto const afterElection = transport.Sent().size();
+
+    clock.Advance(50ms);
+    (void) reactor.Drain();
+    CHECK(transport.Sent().size() > afterElection);
+
+    driver.Stop();
+    clock.Advance(400ms);
+    (void) reactor.Drain();
+}
+
 TEST_CASE("Stop ends the run loop", "[consensus][raft][driver]")
 {
     Journal journal;
@@ -444,4 +504,124 @@ TEST_CASE("Stop ends the run loop", "[consensus][raft][driver]")
     // Nothing is left parked, so the loop actually finished rather than
     // rescheduling itself forever.
     CHECK(reactor.PendingTimers() == 0);
+}
+
+TEST_CASE("An applied log is traded for a snapshot once enough has piled up", "[consensus][raft][driver]")
+{
+    // The residual this closes: `CompactThroughApplied` existed and nothing called
+    // it, so a long-lived cluster's log grew without bound and every restart
+    // replayed the whole of it. Slowly -- cluster configuration changes are rare by
+    // construction -- but "slowly" is not "never".
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    RecordingMachine machine { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    constexpr auto Threshold = std::uint64_t { 4 };
+
+    RaftDriver driver { std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(),
+                        storage,
+                        transport,
+                        machine,
+                        CompactionPolicy { .appliedEntriesBeforeCompaction = Threshold } };
+
+    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(driver.Node().CurrentRole() == Role::Leader);
+
+    // Driven to one short of the threshold rather than by a hand-counted number of
+    // proposals: a new leader appends a no-op of its own term, which is applied
+    // like any other entry and is exactly the sort of implementation detail a
+    // counted assertion would silently encode. A single-node cluster is its own
+    // quorum, so each proposal commits and applies at once.
+    auto step = 0;
+    auto const unsnapshotted = [&driver] {
+        return driver.Node().LastApplied().value - driver.Node().Log().SnapshotIndex().value;
+    };
+
+    while (unsnapshotted() + 1 < Threshold)
+    {
+        REQUIRE(driver.Propose(FastCache::BytesFromString(std::format("e{}", step)), TimePoint {} + 200ms).has_value());
+        ++step;
+    }
+
+    CHECK(std::ranges::find(journal.events, "persist-snapshot") == journal.events.end());
+    CHECK(driver.Node().Log().SnapshotIndex() == LogIndex::BeforeFirst());
+
+    // One more crosses it.
+    REQUIRE(driver.Propose(FastCache::BytesFromString("crossing"), TimePoint {} + 210ms).has_value());
+
+    // The snapshot is asked of the application and made durable, and the log below
+    // it is gone -- which is the point: what a restart replays is now bounded.
+    CHECK(std::ranges::find(journal.events, "snapshot") != journal.events.end());
+    CHECK(std::ranges::find(journal.events, "persist-snapshot") != journal.events.end());
+    CHECK(driver.Node().Log().SnapshotIndex() == driver.Node().LastApplied());
+    CHECK(driver.Node().Log().FirstIndex() == driver.Node().LastApplied().Advanced(1));
+
+    // And the node carries on from there rather than refusing its own next append
+    // as a gap -- the failure a trimmed log invites, and the reason the boundary is
+    // recovered rather than assumed.
+    auto const after = driver.Propose(FastCache::BytesFromString("after"), TimePoint {} + 220ms);
+    REQUIRE(after.has_value());
+    CHECK(driver.Node().Log().LastIndex() == *after);
+}
+
+TEST_CASE("A driver told nothing about compaction never discards anything", "[consensus][raft][driver]")
+{
+    // The default, and it is the safe one deliberately: a log that grows is
+    // wasteful, while a snapshot taken from a machine whose `TakeSnapshot` means
+    // nothing yet is wrong.
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    RecordingMachine machine { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    RaftDriver driver {
+        std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(), storage, transport, machine
+    };
+
+    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+
+    for (auto const step: std::views::iota(0, 8))
+        REQUIRE(driver.Propose(FastCache::BytesFromString(std::format("e{}", step)), TimePoint {} + 200ms).has_value());
+
+    CHECK(std::ranges::find(journal.events, "snapshot") == journal.events.end());
+    CHECK(driver.Node().Log().SnapshotIndex() == LogIndex::BeforeFirst());
+}
+
+TEST_CASE("A snapshot that cannot be written stops the driver", "[consensus][raft][driver]")
+{
+    // Compaction discards the entries from memory the moment it succeeds, so a
+    // node that carried on after failing to record what they produced would come
+    // back from a restart missing committed state. It is the same latch every other
+    // durability failure gets, and it is reported rather than swallowed because a
+    // caller that treated maintenance as best-effort would never learn.
+    Journal journal;
+    InMemoryRaftStorage storage { InMemoryRaftStorage::FailurePlan { .failNthSaveSnapshot = 1 } };
+    RecordingTransport transport { journal };
+    RecordingMachine machine { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    // Two, not one: the no-op a new leader appends is applied during the election
+    // itself, so a threshold of one would fall due before there is a proposal to
+    // attribute the refusal to.
+    RaftDriver driver { std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(),
+                        storage,
+                        transport,
+                        machine,
+                        CompactionPolicy { .appliedEntriesBeforeCompaction = 2 } };
+
+    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+
+    auto const proposed = driver.Propose(FastCache::BytesFromString("one"), TimePoint {} + 200ms);
+    REQUIRE(!proposed.has_value());
+    REQUIRE(driver.Failure().has_value());
+
+    // Latched: the next call refuses with the same error rather than pretending
+    // this node is still taking part.
+    CHECK(!driver.Tick(TimePoint {} + 400ms).has_value());
 }

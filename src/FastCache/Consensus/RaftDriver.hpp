@@ -11,12 +11,43 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <vector>
 
 namespace FastCache::Consensus
 {
+
+/// When a `RaftDriver` trades its log for a snapshot of what the log produced.
+///
+/// The policy is the caller's because the cost it balances is: a snapshot is the
+/// *whole* application state written out, so trimming often makes a small log
+/// expensive, and trimming never makes a long-lived node re-read its entire
+/// history at every restart and keep every entry in memory in between. Only
+/// whoever knows how large that state is can say where the crossover sits.
+///
+/// **At namespace scope rather than nested in `RaftDriver`, and that is forced.**
+/// A defaulted constructor parameter of a type nested in the same class is
+/// rejected by both compilers this project builds with, for reasons that read as
+/// opposites: GCC will not convert `{}` to an incomplete nested aggregate, and
+/// clang refuses `= CompactionPolicy {}` because the nested type's own default
+/// member initializer is not available inside the enclosing class definition.
+/// Neither is a bug; the type is simply not complete there. Hoisting it makes
+/// both spellings legal, and MSVC accepted every one of them, so a local build
+/// would have reported this tree green.
+struct CompactionPolicy
+{
+    /// Applied entries above the snapshot that provoke one; zero never does.
+    ///
+    /// Measured from the snapshot boundary rather than from the log's length,
+    /// because those differ on a follower whose leader has already trimmed further
+    /// than it has applied -- and it is the *unsnapshotted* part that a restart has
+    /// to replay.
+    std::uint64_t appliedEntriesBeforeCompaction { 0 };
+};
 
 /// Carries out what a `RaftNode` asks for, in the order the algorithm requires.
 ///
@@ -42,6 +73,21 @@ namespace FastCache::Consensus
 /// messages are out, so doing it first would add the application's latency to the
 /// replication path and buy nothing.
 ///
+/// ## Why it holds a lock
+///
+/// The node is advanced from more than one thread by construction, and not by
+/// accident: the timer loop ticks it, a peer reader hands it messages, and
+/// whatever wants to change the cluster's own configuration proposes on its own
+/// schedule. `RaftNode` is a plain state machine with no synchronization of its
+/// own -- that is what makes it testable -- so the serialization has to live
+/// here, at the one place all three routes meet.
+///
+/// Held across the durability writes and the sends, which is the point rather
+/// than an oversight: those are exactly the steps whose ORDER the algorithm
+/// depends on, and a second thread interleaving a vote between a node's persist
+/// and its reply is the crash-restart double vote spelled with threads instead
+/// of a power cut. Never held across a suspension: `Run` awaits outside it.
+///
 /// ## What a storage failure does
 ///
 /// It stops the driver. Everything else in this system falls back to a local
@@ -53,11 +99,50 @@ namespace FastCache::Consensus
 class RaftDriver
 {
   public:
+    /// Told this node's role whenever it changes, and never otherwise.
+    ///
+    /// **Pushed rather than polled**, because the alternatives are both worse. A
+    /// caller polling `Node().CurrentRole()` needs a thread and an interval, and the
+    /// interval is a window during which this node has stopped leading and is still
+    /// handing out other machines' capacity. `RaftNode` deliberately reports
+    /// transitions as *state* rather than as events -- a node that emitted one per
+    /// transition would make its own callers order-dependent -- so the observation
+    /// belongs here, at the one place that knows when a step has been taken.
+    ///
+    /// Called from whichever thread advanced the node: the timer loop for an
+    /// election timeout, the transport's reader for a message that deposed it. An
+    /// implementation must therefore be safe to call from either, and must not block
+    /// -- it is on the path that also has to send the next heartbeat.
+    ///
+    /// The leader id travels with the role because a follower's whole use for one is
+    /// to redirect, and a refusal that cannot say who to ask instead cannot be acted
+    /// on.
+    using RoleObserver = std::function<void(Role role, std::optional<NodeId> const& knownLeader)>;
+
     /// @param node The state machine to drive; taken by value and owned.
     /// @param storage Where durable state goes; must outlive this driver.
     /// @param transport How peers are reached; must outlive this driver.
     /// @param application What committed entries are handed to; must outlive this.
-    RaftDriver(RaftNode node, IRaftStorage& storage, IRaftTransport& transport, IRaftStateMachine& application) noexcept;
+    /// @param compaction When to trim the log; defaults to never.
+    ///
+    /// The default is "never" so that a caller which has not thought about
+    /// compaction gets the behaviour that cannot lose anything -- a log that grows
+    /// is wasteful, and a snapshot taken by a machine whose `TakeSnapshot` is not
+    /// yet meaningful is wrong.
+    RaftDriver(RaftNode node,
+               IRaftStorage& storage,
+               IRaftTransport& transport,
+               IRaftStateMachine& application,
+               CompactionPolicy compaction = {}) noexcept;
+
+    /// Install the role observer.
+    ///
+    /// A setter and not a constructor parameter, which is one of the documented
+    /// carve-outs: the natural owner of the observer is the object that owns the
+    /// driver, and it cannot pass `this` to a member it is still constructing.
+    /// Called once, before `Run`.
+    /// @param observer Told about role changes; may be empty to stop observing.
+    void ObserveRole(RoleObserver observer);
 
     /// Advance time, doing whatever falls due.
     /// @param now The current instant.
@@ -76,18 +161,22 @@ class RaftDriver
     /// @return Where it landed, or why it was refused.
     [[nodiscard]] std::expected<LogIndex, ConsensusError> Propose(std::vector<std::byte> payload, TimePoint now);
 
-    /// @return The node being driven, for inspection.
+    /// The node being driven, for inspection.
+    ///
+    /// **Not synchronized**, and it cannot be: a reference outlives any lock this
+    /// could take. For tests and for a caller that knows no other thread is
+    /// advancing this driver.
+    /// @return The node.
     [[nodiscard]] RaftNode const& Node() const noexcept;
-
-    /// @return When `Tick` must next be called.
-    [[nodiscard]] TimePoint NextDeadline() const noexcept;
 
     /// The failure that stopped this driver, if one did.
     ///
     /// Latched: once storage has failed, every later call refuses with the same
     /// error rather than pretending the node is still participating.
+    /// By value, because reading it takes the same lock everything else here does
+    /// -- a reference would hand the caller a member another thread may be writing.
     /// @return The failure, or nullopt.
-    [[nodiscard]] std::optional<ConsensusError> const& Failure() const noexcept;
+    [[nodiscard]] std::optional<ConsensusError> Failure() const;
 
     /// Drive the node's timers on a reactor until stopped or broken.
     ///
@@ -108,7 +197,7 @@ class RaftDriver
     /// Ask `Run` to finish. Safe to call before it starts, and from any thread.
     ///
     /// The loop observes this when its current wait expires, so teardown can lag
-    /// by up to `electionTimeoutMax`. That is a deliberate limit rather than an
+    /// by one heartbeat interval. That is a deliberate limit rather than an
     /// oversight: waking the wait early needs a reactor-side cancellation this
     /// library does not have yet, and a supervisor that cannot wait stops the
     /// reactor as well. The flag is atomic because the natural caller is a signal
@@ -116,13 +205,50 @@ class RaftDriver
     void Stop() noexcept;
 
   private:
-    /// Perform one output in the required order.
+    /// Perform one output in the required order; `_mutex` must be held.
     [[nodiscard]] std::expected<void, ConsensusError> Deliver(RaftOutput output);
+
+    /// How long `Run` may sleep, given the node's own next deadline.
+    ///
+    /// Bounded rather than taken from the node alone; the reason is at the
+    /// definition and it is the difference between a cluster that settles and one
+    /// that re-elects every second.
+    /// @param now The instant the sleep starts from.
+    /// @return The instant to wake at.
+    [[nodiscard]] TimePoint SleepDeadline(TimePoint now) const;
+
+    /// Report the role if it has moved since the last report.
+    void PublishRoleIfChanged();
+
+    /// Trade the applied prefix of the log for a snapshot, if enough has piled up.
+    ///
+    /// Runs after the outputs rather than as one of them, because it is
+    /// maintenance rather than something the algorithm asked for -- but it is
+    /// ordered here, in the driver, for the reason every other durability write is:
+    /// the entries are gone from memory the moment `CompactThroughApplied` returns,
+    /// so a node that discarded them without first recording what they produced
+    /// comes back from a restart missing committed state.
+    /// @return Nothing, or the storage failure that stopped this node.
+    [[nodiscard]] std::expected<void, ConsensusError> CompactIfDue();
+
+    /// Serializes every route into `_node`. See the class comment.
+    mutable std::mutex _mutex;
 
     RaftNode _node;
     IRaftStorage& _storage;
     IRaftTransport& _transport;
     IRaftStateMachine& _application;
+    CompactionPolicy _compaction;
+    RoleObserver _onRole;
+
+    /// What was last reported, so an unchanged role is not re-announced.
+    ///
+    /// Seeded to the node's role at construction rather than to a sentinel, so a
+    /// node that recovered as a follower and stays one reports nothing -- an
+    /// observer that fired once at startup for no transition would make "the role
+    /// changed" mean two different things.
+    Role _reportedRole;
+    std::optional<NodeId> _reportedLeader;
 
     /// Written only by the loop thread, so it needs no synchronization of its
     /// own — unlike `_stopped`, which any thread may set.

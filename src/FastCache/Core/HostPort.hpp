@@ -3,6 +3,7 @@
 
 #include <charconv>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -154,6 +155,36 @@ namespace FastCache
     if (!port.has_value())
         return std::nullopt;
     return std::pair { std::string { defaultHost }, *port };
+}
+
+/// Join a host and a port into text `SplitHostPort` reads back.
+///
+/// The inverse of the parser, and it lives beside it for the reason the parser
+/// lives here at all: a v6 host has to be bracketed or the next `rfind(':')` takes
+/// the wrong colon, and a rule spelled at each caller is a rule that comes to
+/// disagree with itself. Two places already spelled it -- `UdpSocket` for what a
+/// datagram's sender is called, `ServiceControl` for what goes into a registered
+/// command line -- which is precisely the count at which this file's own header
+/// comment says a private helper has become a rule with two authors.
+///
+/// A host that is already bracketed is left alone, so joining what `SplitHostPort`
+/// produced and joining what an operator typed give the same answer.
+/// @param host The host, bracketed or not.
+/// @param port The port, as text.
+/// @return `host:port`, with the host bracketed when it needs to be.
+[[nodiscard]] inline std::string FormatHostPort(std::string_view host, std::string_view port)
+{
+    auto const bracketed = host.contains(':') && !host.starts_with('[');
+    return bracketed ? std::format("[{}]:{}", host, port) : std::format("{}:{}", host, port);
+}
+
+/// Join a host and a numeric port.
+/// @param host The host, bracketed or not.
+/// @param port The port.
+/// @return `host:port`, with the host bracketed when it needs to be.
+[[nodiscard]] inline std::string FormatHostPort(std::string_view host, std::uint16_t port)
+{
+    return FormatHostPort(host, std::format("{}", port));
 }
 
 } // namespace FastCache

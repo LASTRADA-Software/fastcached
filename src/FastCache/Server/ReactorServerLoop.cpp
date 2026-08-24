@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Net/SocketAddress.hpp>
 #include <FastCache/Platform/CpuAffinity.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
@@ -22,14 +24,11 @@
 #include <vector>
 
 #if defined(_WIN32)
-    #include <FastCache/Async/IocpReactor.hpp>
     #include <FastCache/Async/ResumeOn.hpp>
     #include <FastCache/Net/IocpSocket.hpp>
 #elif defined(__linux__)
-    #include <FastCache/Async/EpollReactor.hpp>
     #include <FastCache/Net/EpollSocket.hpp>
 #elif defined(__APPLE__)
-    #include <FastCache/Async/KqueueReactor.hpp>
     #include <FastCache/Net/KqueueSocket.hpp>
 #endif
 
@@ -37,19 +36,6 @@
 
 namespace FastCache
 {
-
-#if defined(_WIN32)
-using PlatformReactor = IocpReactor;
-using PlatformListener = IocpListener;
-#elif defined(__linux__)
-using PlatformReactor = EpollReactor;
-using PlatformListener = EpollListener;
-#elif defined(__APPLE__)
-using PlatformReactor = KqueueReactor;
-using PlatformListener = KqueueListener;
-#else
-    #error "No reactor implementation for this platform"
-#endif
 
 namespace
 {

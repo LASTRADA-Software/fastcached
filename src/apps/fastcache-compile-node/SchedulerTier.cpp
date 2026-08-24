@@ -17,12 +17,16 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership, I
     // cache with no scheduler at all.
     _responder { _protocol, membership }
 {
-    // Static leadership, and it is a placeholder said out loud rather than a silent
-    // one. Consensus is what will publish this -- `SetRole` exists for exactly that --
-    // but until the node runs a `RaftDriver`, a scheduler that never became leader
-    // would refuse every verb with `NotLeader` and be indistinguishable from a
-    // permanent election. That is strictly worse than what `--listen-dispatch` did,
-    // and a replacement must never be a regression on what it replaces.
+    // Standalone leadership, which is now a DEFAULT rather than a placeholder. A node
+    // with no `--node-id` runs no consensus and is the only scheduler there is: it
+    // hands out its own machine's slots and nobody else's, which is exactly right for
+    // the one-machine deployment and is what most people run.
+    //
+    // With consensus configured, `ConsensusTier` calls `SetRole` the moment the
+    // driver decides anything, and this initial value is superseded before the first
+    // lease. It is deliberately not `Undecided`: a node that refused every verb until
+    // an election completed would be strictly worse than what it replaces at exactly
+    // the moment somebody is watching it start.
     _service.SetRole(Distributed::SchedulerRole::Leader, {});
 }
 

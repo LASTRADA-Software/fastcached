@@ -10,6 +10,7 @@
 #include <FastCache/Core/IRandomSource.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -236,6 +237,21 @@ class RaftNode
     [[nodiscard]] std::vector<NodeId> const& ActiveMembers() const noexcept
     {
         return _members;
+    }
+
+    /// How often a leader speaks when it has nothing to say.
+    ///
+    /// Published because the driver has to bound its own sleep by it: it parks on
+    /// a deadline read before it suspends, and a peer reader can move that deadline
+    /// *earlier* — a candidate that wins on the vote it delivers goes from an
+    /// election deadline up to `electionTimeoutMax` away to a heartbeat deadline
+    /// one interval away. Not exposed as the whole `RaftConfig`
+    /// on purpose: this is the one timing fact anything outside needs, and a
+    /// wholesale accessor is an invitation to take a second one.
+    /// @return The configured heartbeat interval.
+    [[nodiscard]] std::chrono::milliseconds HeartbeatInterval() const noexcept
+    {
+        return _config.heartbeatInterval;
     }
 
     /// When the driver must next call `Tick`.

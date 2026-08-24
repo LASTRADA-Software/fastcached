@@ -248,6 +248,186 @@ protocol.
 On a shared multi-user machine, "local" means every account on it. That is the same
 trust level the daemon assumes; use `--requirepass` if it is not the one you want.
 
+## A cluster, and who leads it
+
+Run one node and it leads itself: it schedules for its own machine, nobody else's,
+and that needs no configuration. That is the common deployment and the default.
+
+Run several and exactly one of them must schedule at a time. Without consensus
+every node believes it does — and two nodes handing out the same machine's slots is
+not a degraded fleet, it is the one thing the architecture says only one node may
+do. So a fleet gives each node an identity and tells it who its peers are:
+
+```sh
+fastcache-compile-node     --node-id=n1 --listen-raft=6680     --raft-peer=n1=10.0.0.1:6680     --raft-peer=n2=10.0.0.2:6680     --raft-peer=n3=10.0.0.3:6680     --listen-scheduler=6675 --advertise=10.0.0.1:6676     --toolchain=/usr/bin/g++
+```
+
+Each peer is an **identity and an address in one token**, because they are one
+fact. A member id with no address is a node the cluster counts towards every quorum
+and cannot reach: the fleet is then one node short of forming one, and nothing says
+why.
+
+A node must name itself among its own peers, and it is refused at startup if it
+does not — such a node could never win a vote and could never be voted for, so it
+would stand for election forever against a cluster that has never heard of it.
+
+### Two ports, and why a member records both
+
+`--raft-peer` names the **consensus** port. A client that is redirected to the
+leader needs the **scheduler** port, which is a different number, so a member
+carries both — and that is a correctness matter rather than a convenience. A
+follower refusing a client answers `NotLeader` *with the leader's endpoint*, and
+while only one address was recorded that endpoint was the consensus one: the client
+took the advice and spoke the scheduler protocol at a socket that has never heard of
+it.
+
+Only the *leader's* scheduler port matters, and only the node itself knows it — no
+peer ever dials it, so there is nothing to learn it from. So **a node announces its
+own record when it becomes leader**, and the address it announces is the host from
+its own `--raft-peer` entry with the port its scheduler surface actually bound.
+Neither half can supply the other: `--listen-scheduler=6675` binds the wildcard,
+which no client can dial, while the consensus endpoint is dialable by construction
+and names the wrong port.
+
+A member that has never led carries no scheduler endpoint, which is not a fault:
+there is nowhere to redirect to a node that does not lead, and a follower answering
+`NotLeader` with nothing is exactly the "an election is in progress" case a client
+already handles by compiling locally.
+
+### What the log carries
+
+Cluster configuration and nothing else: **who is a member, where they answer**, and
+the handful of settings every member must agree on. Not the cache — a log is
+replicated to every member and kept until it is snapshotted, and multi-megabyte
+objects written constantly are the opposite of what belongs in one. Cached objects
+live in the `fastcached` this state merely names.
+
+| Setting | Means |
+| --- | --- |
+| `upstream` | host:port of the shared `fastcached` every member reads through to |
+| `fleet-open` | `1` to admit every caller to the fleet, `0` for members only |
+
+A key the build does not know is **refused when it is proposed**, not stored. The
+alternative is a typo replicated to every node, snapshotted, carried across
+restarts — and doing nothing, with the only symptom being that the thing you
+configured did not happen.
+
+### Membership at runtime
+
+`--raft-peer` is the **bootstrap** set. Once the cluster is running, membership is
+a replicated log entry, and that is what makes a node admitted at runtime survive a
+restart without anybody editing a config file on every other machine.
+
+The agreed member set becomes the fleet's admission policy directly, so a node the
+cluster admitted is served by all three surfaces at once — its compile port, the
+scheduler, and every member's cache tier. `--fleet-member` is the answer before a
+cluster exists; this is the answer once one does.
+
+### Changing it while it runs
+
+The log carries the cluster's configuration so it can be changed without editing a
+file on every machine and restarting them. Three flags ask a running cluster
+directly, and each exits when it has an answer:
+
+```sh
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-status
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-set=upstream=cache.internal:6674
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-forget=n3
+```
+
+`--cluster-status` prints the members, the settings, and **every key this build
+knows** — because the question an operator usually has is "what *can* I set", and a
+report listing only what somebody had already set would answer it wrongly by
+omission.
+
+**They go through the same gate as everything else on that port**, which for a read
+is worth stating: a follower's copy of the state is perfectly valid and merely
+older, so `--cluster-status` could have been answered by any member. Refusing and
+naming the leader keeps one rule for the whole surface — a verb added without the
+gate is the regression the arrangement exists to make impossible — and it sends you
+to the node you would have needed anyway to change anything. A follower answers with
+where to ask instead:
+
+```
+fastcache-compile-node: this node does not lead the cluster; ask --scheduler=10.0.0.2:6675 instead
+```
+
+**A non-member is refused too**, and here anti-leeching is not about capacity: a
+stranger who could set `upstream` would point the whole fleet's cache at a host of
+their choosing.
+
+**A node running no cluster says so** rather than answering as though it had one. A
+single node started without `--node-id` leads itself and has no replicated state,
+which is a different fact from "ask somebody else" — being sent elsewhere would have
+you looking for a node that does not exist.
+
+**A change is reported as accepted, not as committed.** The leader appends the entry
+and answers; whether a majority has taken it is not something it knows yet. Ask for
+the status again to see the result — which is the round trip you were going to make
+anyway.
+
+**`--cluster-forget` is the one membership change nothing automatic makes.**
+Discovery only ever adds, for the reason below, so removing a machine that has left
+for good is a decision somebody makes on purpose.
+
+### Finding peers instead of typing them
+
+`--raft-peer` works and needs no network magic, but it means editing a file on every
+machine each time one joins. `--discovery` replaces the editing with a broadcast:
+
+```sh
+head -c 32 /dev/urandom | base64 > /etc/fastcached/cluster.key   # once, per fleet
+chmod 600 /etc/fastcached/cluster.key                            # then copy it around
+
+fastcache-compile-node \
+    --node-id=n1 --listen-raft=6680 --raft-peer=n1=10.0.0.1:6680 \
+    --discovery=255.255.255.255:6681 \
+    --cluster-key-file=/etc/fastcached/cluster.key \
+    --cluster-id=build-farm \
+    --listen-scheduler=6675 --toolchain=/usr/bin/g++
+```
+
+Every node still names **itself** in `--raft-peer`, because that is the address its
+peers dial and only it knows it. What it no longer has to name is anybody else.
+
+**The key authenticates a handshake; it never travels in a beacon.** A beacon says
+what a node *is* — cluster, id, consensus endpoint — and nothing derived from the
+key, because a broadcast reaches every listener on the segment and anything
+key-derived in one hands them what they need to join. The key appears only inside an
+HMAC over a nonce the challenger chose, and that MAC covers the `(node, endpoint)`
+**pair**: signing the nonce alone would let anyone who observed one valid proof
+replay its tag with a different endpoint substituted, admitting a legitimate node id
+at an attacker's address.
+
+**`--cluster-key-file` is a file and not a flag**, and that is the whole reason it
+exists in that shape. A command line is readable through `ps` on every POSIX system,
+and a service's arguments end up in a unit file or a registry key that more accounts
+can read than can read a mode-0600 file. A leaked key admits a node, an admitted node
+is assigned compile jobs, and the objects it returns are cached fleet-wide — so it is
+object injection into everybody's build.
+
+**`--cluster-id` is routing, not authentication.** It is plain text in every beacon,
+so treating it as a credential would be the mistake. What it buys is that two
+unrelated fleets on one segment ignore each other, which holds even when somebody
+shares a key across fleets — which they should not.
+
+**Discovery never changes membership by itself.** It answers who proved the key and
+where they answer; the *leader* proposes, and only the leader, because admitting a
+node is a Raft decision. Every node on the segment sees the same peers and all but
+one of them do nothing about it.
+
+**It never proposes a removal either.** A peer vanishes from a broadcast for reasons
+that are almost never "it left" — a lost datagram, a switch rebooting, a laptop
+closed for an hour — and a cluster that re-computed its membership from reachability
+could shrink itself below a majority and never come back. Raft already tolerates a
+member that does not answer. Removing one stays an operator decision.
+
+### Where its state lives
+
+`--cluster-dir`, defaulting to `fastcache-cluster/<node-id>`. Durable by necessity
+rather than by preference: a node that answered a vote and forgot it would vote
+twice in one term after a restart, which is two leaders in one term.
+
 ## Running it as a service
 
 ### Linux
@@ -540,7 +720,10 @@ For anything beyond a trusted build network, put mTLS in front of every port.
   ([#87](https://github.com/LASTRADA-Software/fastcached/issues/87)).
   `--service-scope=user` works, and is the right answer on a developer machine
   anyway.
-- Host **CPU and memory utilization** are not reported. Size, slots and disk are;
-  what the machine is doing *right now* is what resource-aware scheduling will
-  need, and it lands with the scheduling policy that consumes it rather than
-  ahead of it.
+- **A discovered node joins the cluster's *state*, not its quorum**
+  ([#97](https://github.com/LASTRADA-Software/fastcached/issues/97)). The leader
+  records it, every node then serves it, and it survives a restart — but
+  `RaftNode`'s own member set still comes from `--raft-peer` at startup, so the new
+  node does not yet vote and nobody dials it. What that costs today is that growing
+  a cluster's *consensus* still means restarting its members with a new
+  `--raft-peer` list; growing the *fleet* does not.

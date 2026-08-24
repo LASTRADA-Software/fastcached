@@ -13,6 +13,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace FastCache::Node
@@ -26,6 +27,38 @@ namespace FastCache::Node
 /// extracted for -- and what is derived here is a *service registration*, where
 /// a value that cannot survive its own parser produces a worker that registers
 /// cleanly and then never starts again.
+/// What the operator asked this process to do to the cluster, if anything.
+///
+/// An `enum class` and not three booleans, because the three are mutually
+/// exclusive: a command line naming two of them is a mistake somebody made rather
+/// than a request, and `None` -- the ordinary case, a worker starting up -- has to
+/// be one of the states rather than "all three happen to be false".
+enum class ClusterAction : std::uint8_t
+{
+    None = 0, ///< Serve, rather than administer.
+    Status,   ///< Print what the cluster has agreed.
+    Set,      ///< Change one replicated setting.
+    Forget,   ///< Remove a member.
+};
+
+/// One cluster-administration request, as parsed from the command line.
+struct ClusterRequest
+{
+    ClusterAction action { ClusterAction::None };
+    std::string key;   ///< The setting name for `Set`, the member id for `Forget`.
+    std::string value; ///< The setting's new value; empty otherwise.
+};
+
+/// Split `name=value` as `--cluster-set` takes it.
+///
+/// At the FIRST `=`, so a value may contain one and a name may not -- the same
+/// rule `ParsePeerSpec` applies and for the same reason. Splitting at the last one
+/// would read `upstream=cache=1:6674` as a setting called `upstream=cache`, which
+/// is refused as unknown while naming something the operator did not type.
+/// @param text What the operator wrote.
+/// @return The pair, or nullopt when it is not one.
+[[nodiscard]] std::optional<std::pair<std::string, std::string>> ParseSettingAssignment(std::string_view text);
+
 struct NodeConfig
 {
     std::string scheduler; ///< host:port of the scheduler's dispatch endpoint.
@@ -143,6 +176,71 @@ struct NodeConfig
     std::string user;
     LogLevel logLevel { LogLevel::Info };
 
+    /// This node's identity in the cluster, or empty to run without consensus.
+    ///
+    /// The switch for the whole consensus tier, and empty is the default because the
+    /// common deployment is one machine. A node alone leads trivially -- it schedules
+    /// for itself and nobody else -- and requiring an operator to configure a
+    /// one-member cluster to get that would be ceremony for the ordinary case.
+    ///
+    /// Given, it must appear in the cluster with an endpoint, which is what
+    /// `--raft-peer` supplies.
+    std::string nodeId;
+
+    /// Where this node answers its peers' Raft traffic.
+    ///
+    /// A bare port binds the WILDCARD, like `--listen-scheduler` and unlike
+    /// `--listen-cache`: peers are on other machines by definition, so a loopback
+    /// default would be one that silently cannot work.
+    std::string raftListen;
+
+    /// The cluster's members as `id=host:port`; repeatable.
+    ///
+    /// Both halves in one token because they are one fact. A member id without an
+    /// address is a node the cluster counts towards quorum and cannot reach -- the
+    /// residual `RaftMembership` recorded, and the reason `Cluster::ClusterMember`
+    /// pairs them.
+    ///
+    /// This is the BOOTSTRAP set only. Once the cluster is running, membership is a
+    /// replicated log entry and this list is not consulted again -- which is what
+    /// makes a node that was admitted at runtime survive a restart without anybody
+    /// editing a config file on every other machine.
+    std::vector<std::string> raftPeers;
+
+    /// Where consensus keeps its durable state, empty for a default beside the cache.
+    ///
+    /// Durable by necessity rather than by preference: a node that answered a vote
+    /// and forgot it would vote twice in one term after a restart, which is two
+    /// leaders in one term.
+    std::filesystem::path clusterDir;
+
+    /// Which fleet this node belongs to, for discovery.
+    ///
+    /// Routing, not authentication, and saying so keeps it honest: it is plain
+    /// text in every beacon, so treating it as a credential would be the mistake.
+    /// What it buys is that two unrelated fleets on one segment ignore each other,
+    /// which holds even when somebody shares a key across fleets -- which they
+    /// should not.
+    std::string clusterId { "fastcache" };
+
+    /// Where discovery beacons go, empty to leave discovery off.
+    ///
+    /// Off by default because a cluster does not need it: `--raft-peer` is a list
+    /// an operator typed, and that works. Discovery is what makes a *changing*
+    /// fleet possible -- a machine that joins without anybody editing a file on
+    /// every other machine.
+    std::string discoveryAddress;
+
+    /// File holding the cluster's pre-shared key.
+    ///
+    /// A path rather than the key itself, and that is a security decision rather
+    /// than a convenience: a command line is readable through `ps` on every POSIX
+    /// system and through the process list on Windows, and a service's arguments
+    /// end up in a unit file or a registry key that more accounts can read than
+    /// can read a mode-0600 file. A leaked key admits a node, and an admitted node
+    /// returns objects the whole fleet then caches.
+    std::filesystem::path clusterKeyFile;
+
     /// The name the platform's supervisor keys this worker's registration on.
     ///
     /// Distinct from the daemon's `FastCached` by default, because the two are
@@ -170,6 +268,14 @@ struct NodeConfig
     bool uninstallService { false }; ///< Remove that registration and exit.
     bool help { false };
     bool version { false };
+
+    /// What to do to the cluster instead of serving, when anything.
+    ///
+    /// A mode rather than a serving option, like `--install-service`: the process
+    /// asks one question of a running cluster and exits. It is deliberately NOT
+    /// part of a service registration -- a worker that administered the cluster at
+    /// every boot would replay one operator's decision forever.
+    ClusterRequest cluster;
 };
 
 /// What this machine offers the fleet, from its configuration and its hardware.
@@ -231,7 +337,7 @@ struct NodeConfig
 /// @return An explanatory message when the install must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg);
 
-/// Why this worker's scheduler configuration cannot work, if it cannot.
+/// Why this worker's configuration cannot work, if it cannot.
 ///
 /// A *startup* rule rather than an install-time one, and the split is deliberate:
 /// each of these is fatal every time the process runs, not only when a registration
@@ -243,7 +349,7 @@ struct NodeConfig
 /// at the one moment an operator is watching.
 /// @param cfg The parsed configuration.
 /// @return The refusal and its remedy, or nullopt when the configuration can work.
-[[nodiscard]] std::optional<std::string> SchedulerPolicyRejection(NodeConfig const& cfg);
+[[nodiscard]] std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg);
 
 /// Render the usage text from the same rows the parser matches.
 /// @param color Whether to emit ANSI colour.

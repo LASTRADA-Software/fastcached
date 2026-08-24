@@ -11,6 +11,9 @@
 ///
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
+#include "ClusterAdminCli.hpp"
+#include "ConsensusTier.hpp"
+#include "DiscoveryTier.hpp"
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
@@ -397,7 +400,10 @@ constexpr int ExitOk = 0;
     // the cache below -- and it outlives every one of them. A node that answered "is
     // this peer one of ours" differently at two of its surfaces would admit a peer to
     // the fleet and refuse it the objects that fleet produced, or worse, the reverse.
-    Node::NodeMembership const membership { cfg };
+    // Not `const`: consensus republishes the member set into it while the node runs,
+    // which is the whole point of membership being a replicated log entry rather than
+    // a command-line list.
+    Node::NodeMembership membership { cfg };
 
     // No lease validation, and it is recorded here rather than left looking like a
     // stub. `WorkerServer` gates the port on membership, so what reaches this
@@ -513,6 +519,40 @@ constexpr int ExitOk = 0;
     //
     // Five collaborators in a reference chain, owned as one object rather than as
     // locals whose declaration ORDER is load-bearing and silently so.
+    // Consensus, when the operator configured a cluster. It is what turns the
+    // scheduler tier's standalone leadership into a real one: without it, every node
+    // in a fleet believes it schedules, and two nodes handing out the same machine's
+    // slots is the one thing the architecture says only one may do.
+    //
+    // Started AFTER the scheduler tier, because its observers push into it, and
+    // declared after too, so it is destroyed first and cannot call into a tier that
+    // has gone.
+    auto consensusOrRefusal = Node::StartConsensusOrExplain(cfg, schedulerTier, membership, logger);
+    if (!consensusOrRefusal.has_value())
+    {
+        logger.Logf(LogLevel::Error, "--node-id {}; refusing to start", consensusOrRefusal.error());
+        return ExitUsage;
+    }
+    // May legitimately be null: no `--node-id` means this node leads alone.
+    auto const consensusTier = std::move(*consensusOrRefusal);
+
+    // Discovery, when the operator configured it. Declared AFTER consensus and so
+    // destroyed before it, because its observer pushes into the tier above: a
+    // discovery loop outliving the thing it hands peers to is a dangling reference
+    // that only fires while a node is shutting down.
+    auto discoveryOrRefusal = Node::StartDiscoveryOrExplain(cfg, consensusTier, logger);
+    if (!discoveryOrRefusal.has_value())
+    {
+        // Fatal, like the other two surfaces an operator has to ask for: a node that
+        // started without the discovery it was told to run looks healthy to a fleet
+        // that will never hear from it.
+        logger.Logf(LogLevel::Error, "--discovery {}; refusing to start", discoveryOrRefusal.error());
+        return ExitUsage;
+    }
+    // May legitimately be null: no `--discovery` means the cluster is the
+    // `--raft-peer` list an operator typed, which is the ordinary deployment.
+    auto const discoveryTier = std::move(*discoveryOrRefusal);
+
     auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(cfg, membership.Oracle(), cacheClock, metrics, logger);
     if (!cacheTierOrRefusal.has_value())
     {
@@ -733,6 +773,22 @@ int main(int argc, char** argv)
         return result.exitCode;
     }
 
+    // A question asked OF a running cluster, rather than a worker starting up.
+    // After the service block, because an installation is about this machine and
+    // this is about somebody else's; before the `--scheduler` and `--toolchain`
+    // checks, because a cluster command needs the first and not the second.
+    if (cfg.cluster.action != ClusterAction::None)
+    {
+        auto const answer = RunClusterAdmin(cfg, cfg.cluster);
+        if (!answer.has_value())
+        {
+            std::cerr << "fastcache-compile-node: " << answer.error() << '\n';
+            return ExitUsage;
+        }
+        std::cout << *answer;
+        return ExitOk;
+    }
+
     // Both are refused at startup rather than at the first job. A worker missing
     // either would register (or fail to) and then refuse everything, which presents
     // to an operator as "distribution does not work" rather than as a misconfigured
@@ -754,7 +810,7 @@ int main(int argc, char** argv)
     // the POSIX host has already redirected stdout to /dev/null by the time the body
     // runs, so a diagnosis printed there goes nowhere in the one deployment where a
     // scheduler is most likely to be misconfigured.
-    if (auto const rejection = SchedulerPolicyRejection(cfg))
+    if (auto const rejection = StartupPolicyRejection(cfg))
     {
         logger.Logf(LogLevel::Error, "{}", *rejection);
         return ExitUsage;

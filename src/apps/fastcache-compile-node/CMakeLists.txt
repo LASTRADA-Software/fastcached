@@ -37,6 +37,9 @@ add_executable(fastcache-compile-node
     AdminEndpoint.cpp
     CacheProxy.cpp
     CacheTier.cpp
+    ClusterAdminCli.cpp
+    ConsensusTier.cpp
+    DiscoveryTier.cpp
     SchedulerTier.cpp
     LocalCache.cpp
     NodeConfig.cpp
@@ -69,9 +72,15 @@ if(FASTCACHED_BUILD_TESTS)
         AdminEndpoint.cpp
         AdminEndpoint_test.cpp
         CacheProxy.cpp
-    CacheTier.cpp
-    SchedulerTier.cpp
         CacheProxy_test.cpp
+        CacheTier.cpp
+        ClusterAdminCli.cpp
+        ClusterAdminCli_test.cpp
+        ConsensusTier.cpp
+        ConsensusTier_test.cpp
+        DiscoveryTier.cpp
+        DiscoveryTier_test.cpp
+        SchedulerTier.cpp
         LocalCache.cpp
         LocalCache_test.cpp
         RemoteUpstream.cpp

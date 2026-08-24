@@ -58,8 +58,9 @@ namespace FastCache::Distributed
 /// by handing it a frame and reading the answer -- with no listener, no reactor and
 /// no cluster.
 ///
-/// A scheduler answers exactly three verbs: `Register`, `Heartbeat` and `Lease`.
-/// Everything else -- `Store` and `Fetch` above all -- is refused with
+/// A scheduler answers the three dispatch verbs -- `Register`, `Heartbeat` and
+/// `Lease` -- and the three that administer the cluster it leads. Everything else
+/// -- `Store` and `Fetch` above all -- is refused with
 /// `DispatchNotPermitted`, because a scheduler is not a cache. That refusal is a
 /// *reply* and not a close: a client that sent a cache verb to the scheduler's port
 /// learns which, rather than seeing a dropped connection it cannot tell from a dead

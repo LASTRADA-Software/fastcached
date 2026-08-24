@@ -9,6 +9,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <vector>
 
 namespace FastCache::Consensus
 {
@@ -34,6 +36,21 @@ struct PeerServerOptions
     std::size_t maxConnections { 64 };
 };
 
+/// The connections a `RaftPeerServer` has accepted and not yet finished with.
+///
+/// Raw pointers into sockets the per-connection task owns, registered as it
+/// starts and removed as it ends -- so this never outlives what it points at, and
+/// closing one is always closing a socket that is still there.
+struct OpenConnections
+{
+    /// Guards `sockets`. The accept loop and each ending connection touch it from
+    /// the reactor's thread while `Shutdown` touches it from whoever is tearing
+    /// the node down.
+    std::mutex mutex;
+
+    std::vector<ISocket*> sockets; ///< One per connection currently being served.
+};
+
 /// Accepts peer connections and turns their frames into `RaftMessage`s.
 ///
 /// The inbound counterpart to `RaftPeerTransport`. It runs on the reactor like
@@ -56,14 +73,22 @@ struct PeerServerOptions
 ///   frames begin, so there is nothing to resynchronize to and every later byte
 ///   is a guess.
 ///
-/// ## The listener must be able to wake
+/// ## The listener must be a REACTOR listener
+///
+/// Not a preference. A blocking listener makes `co_await Accept()` and every
+/// `co_await` inside the per-connection task complete synchronously, so that
+/// task -- a `DetachedTask` precisely so several peers can be read at once --
+/// runs to completion inline and the accept loop never reaches its next
+/// iteration. One peer is then served and no other is ever accepted: in a
+/// three-node cluster each node reads from exactly one of its two peers, votes
+/// and heartbeats from the third never arrive, and nobody is ever elected.
+/// Nothing crashes and nothing logs a fault, which is why it survived until a
+/// fixture started three real processes.
 ///
 /// `Run` returns when the listener stops yielding connections, which `Shutdown`
-/// arranges by closing it. POSIX does **not** unblock a parked `accept()` when
-/// another thread closes the listening socket, so a blocking listener must have
-/// had `SetTimeouts` applied by whoever bound it — otherwise a stop hangs until
-/// the supervisor escalates to SIGKILL, which is exactly the defect
-/// `WorkerServer::Run` records having shipped once.
+/// arranges by closing it -- a reactor listener completes its parked accept with
+/// `Cancelled` when it is closed, which is the wake-up a blocking one would need
+/// `SetTimeouts` for.
 class RaftPeerServer
 {
   public:
@@ -78,7 +103,13 @@ class RaftPeerServer
     /// @return Task that resolves when the loop exits.
     [[nodiscard]] Task<void> Run();
 
-    /// Stop accepting, so `Run()` returns.
+    /// Stop accepting and close what is already accepted, so `Run()` returns.
+    ///
+    /// The connections matter as much as the listener. A peer's read is parked on
+    /// the reactor, and `IReactor::Run` returns with its parked work exactly where
+    /// it was -- so a connection nobody closed is a coroutine frame nobody ever
+    /// resumes and nobody ever frees. Closing the socket completes that read with
+    /// `Cancelled`, which is how the frame reaches its own end.
     void Shutdown() noexcept;
 
     /// How many frames were stepped over because this build did not know them.
@@ -109,6 +140,8 @@ class RaftPeerServer
     IRaftMessageSink& _sink;
     ILogger& _logger;
     PeerServerOptions _options;
+
+    OpenConnections _open;
 
     std::atomic<bool> _shuttingDown { false };
     std::atomic<std::size_t> _active { 0 };

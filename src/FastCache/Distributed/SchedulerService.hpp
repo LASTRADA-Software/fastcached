@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -157,6 +158,22 @@ class SchedulerService
     /// @param leaderEndpoint Where the leader is, when one is known; empty otherwise.
     void SetRole(SchedulerRole role, std::string_view leaderEndpoint);
 
+    /// Give this scheduler a cluster to administer.
+    ///
+    /// A setter for the reason `SetRole` is one, and a different one: consensus
+    /// cannot be constructed before the scheduler surface it drives, because it
+    /// needs the port that surface bound in order to announce where clients reach
+    /// this node. So the two are wired in the only order that exists.
+    ///
+    /// Left unset, the three cluster verbs are refused with `NoCluster` -- which
+    /// is the honest answer for a single node started without `--node-id`: it
+    /// leads itself and has no replicated state for anybody to change.
+    /// @param admin The cluster; must outlive this service.
+    void AdministerWith(IClusterAdmin& admin) noexcept
+    {
+        _admin = &admin;
+    }
+
     /// This node's current standing.
     /// @return The role last published.
     [[nodiscard]] SchedulerRole Role() const noexcept
@@ -182,6 +199,35 @@ class SchedulerService
     /// @param request The toolchain, the object key and the client's codecs.
     /// @return `Ok` carrying an encoded `LeaseGrant`, or a refusal.
     [[nodiscard]] SchedulerReply Lease(CallerContext const& caller, CompileCacheWire::LeaseRequest const& request);
+
+    /// Report what the cluster has agreed.
+    ///
+    /// Behind the same gate as everything else here, which for a *read* is worth
+    /// stating: a follower's copy is perfectly valid and merely older, so this
+    /// could have answered from any member. Refusing and naming the leader keeps
+    /// one rule for the whole surface -- a verb added without the gate is the
+    /// regression the arrangement exists to make impossible -- and it sends the
+    /// operator to the node they would need anyway to change anything.
+    /// @param caller Who is asking.
+    /// @return `Ok` carrying the encoded state, or a refusal.
+    [[nodiscard]] SchedulerReply ClusterStatus(CallerContext const& caller);
+
+    /// Change one replicated setting.
+    /// @param caller Who is asking.
+    /// @param name A key from `Cluster::SettingTable`.
+    /// @param value What to set it to.
+    /// @return `Ok` once the entry is appended, or a refusal.
+    [[nodiscard]] SchedulerReply ClusterSet(CallerContext const& caller, std::string_view name, std::string_view value);
+
+    /// Remove a member from the cluster.
+    ///
+    /// The one membership change nothing automatic makes: discovery only ever
+    /// adds, because a peer vanishes from a broadcast far more often than it
+    /// leaves. Removing is an operator's decision and this is where they make it.
+    /// @param caller Who is asking.
+    /// @param memberId Who to remove.
+    /// @return `Ok` once the entry is appended, or a refusal.
+    [[nodiscard]] SchedulerReply ClusterForget(CallerContext const& caller, std::string_view memberId);
 
     /// The registry, for the admin endpoint and for tests.
     [[nodiscard]] WorkerRegistry const& Workers() const noexcept
@@ -211,11 +257,22 @@ class SchedulerService
     /// @return The refusal.
     [[nodiscard]] SchedulerReply Refuse(CompileCacheWire::ErrorCode code, std::string message = {}) const;
 
+    /// Offer a validated command to the cluster and render what came back.
+    ///
+    /// One place rather than one per verb, because the mapping from a consensus
+    /// refusal to a wire code is the same for every change and is a table.
+    /// @param command The change.
+    /// @return `Ok`, or the refusal with its reason.
+    [[nodiscard]] SchedulerReply Offer(Cluster::Command const& command);
+
     IMetricsSink& _metrics;
     WorkerRegistry _workers;
     LeaseTable _leases;
     SchedulerRole _role { SchedulerRole::Undecided };
     std::string _leaderEndpoint {};
+
+    /// The cluster, when this node runs one. Null is a legitimate state.
+    IClusterAdmin* _admin { nullptr };
 };
 
 } // namespace FastCache::Distributed

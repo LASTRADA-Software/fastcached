@@ -292,7 +292,11 @@ TEST_CASE("Every op descriptor is unique and well-formed")
     for (auto const& row: OpTable)
     {
         CHECK_FALSE(row.name.empty());
-        CHECK(row.fieldCount > 0);
+        // A zero count is legitimate only for a verb that asks nothing, and the
+        // header `static_assert`s the two tables against each other -- so this is
+        // the same rule stated where a reader of the table integrity case will
+        // look for it.
+        CHECK((row.fieldCount > 0 || CarriesNoFields(row.code)));
         CHECK(row.legalStatuses != 0);
         CHECK(FindOp(static_cast<std::uint8_t>(row.code)) == &row);
     }

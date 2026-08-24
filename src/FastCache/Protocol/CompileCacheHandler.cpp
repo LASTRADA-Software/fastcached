@@ -39,6 +39,73 @@ namespace
     /// drop name the same thing.
     constexpr std::string_view ProtocolLabel = "compile-cache";
 
+    /// One verb this daemon does not serve, and what its client is told instead.
+    struct RelocatedVerb
+    {
+        Wire::Op op;          ///< The verb.
+        Wire::ErrorCode code; ///< What the client acts on.
+        std::string_view why; ///< Where the work went, in words a person can follow.
+    };
+
+    /// Every verb that lives somewhere else now.
+    ///
+    /// A **table** rather than a conditional chain, and it earns that as soon as
+    /// there are three answers: the scheduler moved to one binary, compiles to
+    /// another, and a cluster exists in neither. A chain of ternaries is how the
+    /// third answer comes to be the second one's, and a refusal that names the wrong
+    /// destination is worse than one that names none.
+    ///
+    /// A cluster verb is refused with `NoCluster` rather than `DispatchNotPermitted`
+    /// because those are different facts: one says this endpoint does not hand out
+    /// capacity, the other that there is no replicated state here to read or change.
+    /// A client told the first would go looking for a scheduler; told the second, it
+    /// knows the question does not apply.
+    constexpr std::array RelocatedVerbs {
+        RelocatedVerb { .op = Wire::Op::Register,
+                        .code = Wire::ErrorCode::DispatchNotPermitted,
+                        .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
+                               "fastcache-compile-node --listen-scheduler and point clients at it" },
+        RelocatedVerb { .op = Wire::Op::Heartbeat,
+                        .code = Wire::ErrorCode::DispatchNotPermitted,
+                        .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
+                               "fastcache-compile-node --listen-scheduler and point clients at it" },
+        RelocatedVerb { .op = Wire::Op::Lease,
+                        .code = Wire::ErrorCode::DispatchNotPermitted,
+                        .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
+                               "fastcache-compile-node --listen-scheduler and point clients at it" },
+        RelocatedVerb { .op = Wire::Op::Compile,
+                        .code = Wire::ErrorCode::DispatchNotPermitted,
+                        .why = "this endpoint is a cache and does not execute compiles; send the job to the worker "
+                               "endpoint the lease named" },
+        RelocatedVerb { .op = Wire::Op::ClusterStatus,
+                        .code = Wire::ErrorCode::NoCluster,
+                        .why = "this endpoint is a cache and belongs to no cluster; ask a "
+                               "fastcache-compile-node --listen-scheduler instead" },
+        RelocatedVerb { .op = Wire::Op::ClusterSet,
+                        .code = Wire::ErrorCode::NoCluster,
+                        .why = "this endpoint is a cache and belongs to no cluster; ask a "
+                               "fastcache-compile-node --listen-scheduler instead" },
+        RelocatedVerb { .op = Wire::Op::ClusterForget,
+                        .code = Wire::ErrorCode::NoCluster,
+                        .why = "this endpoint is a cache and belongs to no cluster; ask a "
+                               "fastcache-compile-node --listen-scheduler instead" },
+    };
+
+    /// What to answer `op` with.
+    ///
+    /// A verb reaching here without a row is answered with the generic refusal
+    /// rather than served, which is the direction a mistake has to fail in -- the
+    /// same reason the command loop's `switch` carries no `default:`.
+    /// @param op The verb.
+    /// @return The refusal.
+    [[nodiscard]] constexpr RelocatedVerb RefusalFor(Wire::Op op) noexcept
+    {
+        for (auto const& row: RelocatedVerbs)
+            if (row.op == op)
+                return row;
+        return RelocatedVerb { .op = op, .code = Wire::ErrorCode::DispatchNotPermitted, .why = {} };
+    }
+
     /// How far past `maxPayloadBytes` an over-cap frame may still be drained so
     /// that its refusal can be a *reply* rather than a dropped connection.
     ///
@@ -372,12 +439,8 @@ namespace
         // would say the daemon is too old when it is in fact too new. The message
         // names where the scheduler went, because a refusal that cannot say what
         // would have worked cannot be acted on.
-        std::string const message = op == Wire::Op::Compile
-                                        ? "this endpoint is a cache and does not execute compiles; send the job to the "
-                                          "worker endpoint the lease named"
-                                        : "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
-                                          "fastcache-compile-node --listen-scheduler and point clients at it";
-        co_return co_await ReplyError(socket, Wire::ErrorCode::DispatchNotPermitted, message) ? Next::Continue : Next::Abort;
+        auto const refusal = RefusalFor(op);
+        co_return co_await ReplyError(socket, refusal.code, std::string { refusal.why }) ? Next::Continue : Next::Abort;
     }
 
 } // namespace
@@ -573,14 +636,17 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
                 next = co_await HandleAuth(socket, policy, std::move(*payload), &credentialAccepted);
                 break;
 
-            // Distributed execution, which this daemon does not do. The payload is
-            // read and discarded rather than left on the socket: the refusal is a
-            // reply, so the connection has to stay in sync for whatever the client
-            // pipelined behind it.
+            // Distributed execution and cluster administration, neither of which
+            // this daemon does. The payload is read and discarded rather than left
+            // on the socket: the refusal is a reply, so the connection has to stay
+            // in sync for whatever the client pipelined behind it.
             case Wire::Op::Register:
             case Wire::Op::Heartbeat:
             case Wire::Op::Lease:
             case Wire::Op::Compile:
+            case Wire::Op::ClusterStatus:
+            case Wire::Op::ClusterSet:
+            case Wire::Op::ClusterForget:
                 next = co_await HandleDistributed(socket, descriptor->code);
                 break;
         }

@@ -50,6 +50,29 @@ class SchedulerTier
     SchedulerTier(SchedulerTier&&) = delete;
     SchedulerTier& operator=(SchedulerTier&&) = delete;
 
+    /// Tell the scheduler what this node is, and who leads if it does not.
+    ///
+    /// The seam consensus drives. Without a `--node-id` nobody ever calls it and the
+    /// constructor's standalone leadership stands, which is what one machine wants.
+    /// @param role What this node is now.
+    /// @param leaderEndpoint Where the leader answers, empty when nobody leads.
+    void SetRole(Distributed::SchedulerRole role, std::string_view leaderEndpoint)
+    {
+        _service.SetRole(role, leaderEndpoint);
+    }
+
+    /// Give this surface a cluster to administer.
+    ///
+    /// The second seam consensus drives, and it is a setter for the same reason
+    /// `SetRole` is: consensus is constructed after this surface, because it needs
+    /// the port this one bound. Left uncalled, the cluster verbs answer
+    /// `NoCluster`, which is what a node running no cluster should say.
+    /// @param admin The cluster; must outlive this tier.
+    void Administer(Distributed::IClusterAdmin& admin) noexcept
+    {
+        _service.AdministerWith(admin);
+    }
+
     /// The address the scheduler surface bound.
     [[nodiscard]] std::string const& BoundEndpoint() const noexcept
     {

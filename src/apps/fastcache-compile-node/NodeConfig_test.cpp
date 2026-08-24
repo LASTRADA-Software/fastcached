@@ -120,6 +120,12 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         // emitting the secret would publish it to exactly the accounts it exists
         // to keep out. InlineCredentialRejection reports the omission instead.
         "--requirepass",
+        // One-shot questions asked OF a running cluster, not state a worker runs
+        // with. A registration carrying one would replay a single operator
+        // decision at every boot, forever.
+        "--cluster-status",
+        "--cluster-set",
+        "--cluster-forget",
     });
 
     // A configuration in which no field holds its default, so every emitter fires.
@@ -142,6 +148,13 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.cacheDir = "cache";
     cfg.cacheListen = "127.0.0.1:6679";
     cfg.upstream = "cache.internal:6674";
+    cfg.nodeId = "n1";
+    cfg.raftListen = "0.0.0.0:6680";
+    cfg.raftPeers = { "n1=10.0.0.4:6680", "n2=10.0.0.5:6680" };
+    cfg.clusterDir = "cluster";
+    cfg.clusterId = "fleet-a";
+    cfg.discoveryAddress = "255.255.255.255:6681";
+    cfg.clusterKeyFile = "cluster.key";
     cfg.logLevel = LogLevel::Debug;
     cfg.pidfile = "worker.pid";
 
@@ -279,7 +292,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig cfg;
         cfg.schedulerListen = "0.0.0.0:6678";
 
-        auto const refusal = SchedulerPolicyRejection(cfg);
+        auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
         CHECK(Unwrap(refusal).contains("--fleet-member"));
         CHECK(Unwrap(refusal).contains("--fleet-open"));
@@ -301,7 +314,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         cfg.upstream = "cache.internal:6674";
         cfg.fleetMembers = { "10.0.0.1:6676" };
 
-        REQUIRE(SchedulerPolicyRejection(cfg).has_value());
+        REQUIRE(StartupPolicyRejection(cfg).has_value());
     }
 
     SECTION("a policy with nothing to consult it")
@@ -312,7 +325,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig cfg;
         cfg.fleetMembers = { "10.0.0.1:6676" };
 
-        auto const refusal = SchedulerPolicyRejection(cfg);
+        auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
         CHECK(Unwrap(refusal).contains("--listen-scheduler"));
     }
@@ -322,16 +335,16 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig listed;
         listed.schedulerListen = "0.0.0.0:6678";
         listed.fleetMembers = { "10.0.0.1:6676" };
-        CHECK_FALSE(SchedulerPolicyRejection(listed).has_value());
+        CHECK_FALSE(StartupPolicyRejection(listed).has_value());
 
         NodeConfig open;
         open.schedulerListen = "0.0.0.0:6678";
         open.fleetOpen = true;
-        CHECK_FALSE(SchedulerPolicyRejection(open).has_value());
+        CHECK_FALSE(StartupPolicyRejection(open).has_value());
 
         // And a worker running no scheduler at all -- by far the common case -- is
         // untouched by any of this.
-        CHECK_FALSE(SchedulerPolicyRejection(NodeConfig {}).has_value());
+        CHECK_FALSE(StartupPolicyRejection(NodeConfig {}).has_value());
     }
 }
 

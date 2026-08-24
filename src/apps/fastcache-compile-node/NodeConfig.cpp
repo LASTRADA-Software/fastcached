@@ -120,6 +120,42 @@ namespace
         return std::optional<std::uint32_t> { value };
     }
 
+    /// An applier for a flag that names a cluster action AND carries its operand.
+    ///
+    /// Neither `SelectOutcome` nor `AssignFrom` covers this on its own: one sets
+    /// the action and the other the operand, and a row using either would leave
+    /// the other half to a second row nobody would remember to add. `Status` takes
+    /// no operand at all, which is why the operand handling is a compile-time
+    /// branch rather than a runtime one -- a `--cluster-status` row that quietly
+    /// stored an empty key would be a row whose arity and whose applier disagreed.
+    /// @return The applier, usable as an OptionSpec::apply in a `constexpr` table.
+    template <ClusterAction Action>
+    [[nodiscard]] constexpr auto SelectClusterAction() noexcept
+    {
+        return [](auto& result, std::string_view value) -> std::expected<void, ConfigError> {
+            auto& request = TargetOf<&NodeConfig::cluster>(result);
+            request.action = Action;
+
+            if constexpr (Action == ClusterAction::Set)
+            {
+                auto assignment = ParseSettingAssignment(value);
+                if (!assignment.has_value())
+                    return std::unexpected(
+                        ArgvError(ConfigErrorCode::ParseError, "cluster-set", std::format("not <name>=<value>: {}", value)));
+                request.key = std::move(assignment->first);
+                request.value = std::move(assignment->second);
+            }
+            else if constexpr (Action == ClusterAction::Forget)
+            {
+                if (value.empty())
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "cluster-forget", "names no member"));
+                request.key = std::string { value };
+            }
+
+            return {};
+        };
+    }
+
     /// A byte count for the local cache tier, accepting the k/m/g suffixes the
     /// daemon's own size flags do.
     ///
@@ -185,6 +221,19 @@ namespace
     }
 } // namespace
 
+std::optional<std::pair<std::string, std::string>> ParseSettingAssignment(std::string_view text)
+{
+    auto const split = text.find('=');
+    if (split == std::string_view::npos)
+        return std::nullopt;
+
+    auto name = std::string { text.substr(0, split) };
+    if (name.empty())
+        return std::nullopt;
+
+    return std::pair { std::move(name), std::string { text.substr(split + 1) } };
+}
+
 std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
 {
     static constexpr auto options = std::to_array<OptionSpec<NodeConfig>>({
@@ -249,6 +298,80 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "node class reserves. 0 is a real answer and is not the\n"
                          "same as omitting the flag. Ignored when --slots names\n"
                          "a number, which is the operator's answer already." },
+        { .primary = "--node-id",
+          .arity = Arity::Value,
+          .operand = "=<id>",
+          .apply = AssignFrom<&NodeConfig::nodeId, ParseText>(),
+          .description = "this node's identity in the cluster. Giving it turns\n"
+                         "consensus ON; without it this node leads alone,\n"
+                         "which is right for one machine and is the default." },
+        { .primary = "--listen-raft",
+          .arity = Arity::Value,
+          .operand = "=[<address>:]<port>",
+          .apply = AssignFrom<&NodeConfig::raftListen, ParseText>(),
+          .description = "where peers reach this node's consensus port. A bare\n"
+                         "port binds the WILDCARD: peers are on other machines\n"
+                         "by definition, so loopback would silently not work." },
+        { .primary = "--raft-peer",
+          .arity = Arity::Value,
+          .operand = "=<id>=<host>:<port>",
+          .apply = AppendFrom<&NodeConfig::raftPeers, ParseText>(),
+          .description = "a cluster member and where it answers; repeatable.\n"
+                         "Both halves in one token because a member id with\n"
+                         "no address is a node counted towards quorum and\n"
+                         "unreachable. This is the BOOTSTRAP set only:\n"
+                         "membership is replicated once the cluster runs." },
+        { .primary = "--cluster-dir",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&NodeConfig::clusterDir, ParsePathValue>(),
+          .description = "where consensus keeps its durable state. A node\n"
+                         "that answered a vote and forgot it votes twice in\n"
+                         "one term after a restart, which is two leaders." },
+        { .primary = "--cluster-status",
+          .arity = Arity::None,
+          .apply = SelectClusterAction<ClusterAction::Status>(),
+          .description = "ask the cluster at --scheduler what it has agreed,\n"
+                         "print it and exit. Answered by the LEADER; a\n"
+                         "follower says who to ask instead." },
+        { .primary = "--cluster-set",
+          .arity = Arity::Value,
+          .operand = "=<name>=<value>",
+          .apply = SelectClusterAction<ClusterAction::Set>(),
+          .description = "change one replicated cluster setting and exit.\n"
+                         "Every member then agrees on it, and it survives\n"
+                         "their restarts. --cluster-status lists the keys." },
+        { .primary = "--cluster-forget",
+          .arity = Arity::Value,
+          .operand = "=<node-id>",
+          .apply = SelectClusterAction<ClusterAction::Forget>(),
+          .description = "remove a member from the cluster and exit. The one\n"
+                         "membership change nothing automatic makes:\n"
+                         "discovery only ever adds, because a peer goes\n"
+                         "quiet far more often than it leaves." },
+        { .primary = "--cluster-id",
+          .arity = Arity::Value,
+          .operand = "=<name>",
+          .apply = AssignFrom<&NodeConfig::clusterId, ParseText>(),
+          .description = "which fleet this node belongs to. Plain text in every\n"
+                         "beacon and NOT a credential: what it buys is that two\n"
+                         "unrelated fleets on one segment ignore each other." },
+        { .primary = "--discovery",
+          .arity = Arity::Value,
+          .operand = "=<address>:<port>",
+          .apply = AssignFrom<&NodeConfig::discoveryAddress, ParseText>(),
+          .description = "announce this node on the segment and listen for peers\n"
+                         "here; off unless given. Needs --node-id and\n"
+                         "--cluster-key-file. Without it a cluster is exactly\n"
+                         "the --raft-peer list an operator typed." },
+        { .primary = "--cluster-key-file",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&NodeConfig::clusterKeyFile, ParsePathValue>(),
+          .description = "the cluster's pre-shared key. A FILE and not a flag:\n"
+                         "a command line is readable through ps, and a key that\n"
+                         "leaks admits a node whose objects the whole fleet\n"
+                         "then caches." },
         { .primary = "--admin-listen",
           .arity = Arity::Value,
           .operand = "=[<address>:]<port>",
@@ -441,6 +564,18 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
     emitIfSet("cache-memory", cfg.cacheMemoryBytes, defaults.cacheMemoryBytes);
     emitIfSet("listen-cache", cfg.cacheListen, defaults.cacheListen);
+    emitIfSet("node-id", cfg.nodeId, defaults.nodeId);
+    emitIfSet("listen-raft", cfg.raftListen, defaults.raftListen);
+    emitPathIfSet("cluster-dir", cfg.clusterDir.string());
+    emitIfSet("cluster-id", cfg.clusterId, defaults.clusterId);
+    emitIfSet("discovery", cfg.discoveryAddress, defaults.discoveryAddress);
+    emitPathIfSet("cluster-key-file", cfg.clusterKeyFile.string());
+    // Repeatable, so one token per peer rather than one joined value -- for the
+    // reason the toolchains are: a service that came back knowing fewer members than
+    // it was installed with would present as a cluster that stopped forming quorum,
+    // not as a packaging bug.
+    for (auto const& peer: cfg.raftPeers)
+        argv.push_back(std::format("--raft-peer={}", peer));
     emitIfSet("upstream", cfg.upstream, defaults.upstream);
     emitPathIfSet("cache-dir", cfg.cacheDir.string());
     if (cfg.fleetOpen)
@@ -515,7 +650,7 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
     return std::nullopt;
 }
 
-std::optional<std::string> SchedulerPolicyRejection(NodeConfig const& cfg)
+std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
 {
     // Separate from NodeServiceRejection because it is a *startup* rule rather than
     // an install-time one: this misconfiguration is fatal every time the process
@@ -542,6 +677,18 @@ std::optional<std::string> SchedulerPolicyRejection(NodeConfig const& cfg)
           .message = "--fleet-member and --fleet-open describe who this node's scheduler admits, and it is not "
                      "running one: add --listen-scheduler, or drop them. A policy nothing consults is a policy an "
                      "operator believes is in force." },
+        { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && c.nodeId.empty(); },
+          .message = "--discovery needs --node-id: discovery finds peers for a CLUSTER, and without an id this "
+                     "node is not in one. It would broadcast, be answered, prove the key and have nowhere to "
+                     "put the answer." },
+        { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && c.clusterKeyFile.empty(); },
+          .message = "--discovery needs --cluster-key-file: a beacon is unauthenticated by construction, so the "
+                     "key is the only thing separating a peer from anything else on the segment. With none, no "
+                     "peer can ever be admitted and this node would announce itself forever to no effect." },
+        { .refuses = [](NodeConfig const& c) { return !c.clusterKeyFile.empty() && c.discoveryAddress.empty(); },
+          .message = "--cluster-key-file is read by discovery and nothing else, and --discovery is not set. A "
+                     "secret an operator went to the trouble of provisioning, being read by nobody, is exactly "
+                     "the silent no-op this list exists to refuse." },
     });
 
     for (auto const& rule: Rules)

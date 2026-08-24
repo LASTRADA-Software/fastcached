@@ -234,6 +234,48 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# A three-node cluster, elected and administered for real.
+#
+# Every consensus rule this repository has is asserted against a simulated
+# cluster in one process, which is the right place for them -- a scripted
+# partition is not something three real processes can be made to reproduce. What
+# a simulation cannot reach is the wire, the transport, the timers and the
+# operator's own command line all having their first say at once, and this is
+# where those meet: three processes elect a leader, a follower's refusal names an
+# endpoint that a client then successfully dials, a setting replicates, and the
+# cluster re-forms after its leader is killed.
+#
+# POSIX only for now. The properties are platform-independent and the fixture is
+# not -- it wants a shell, `/dev/tcp` and process control -- so a Windows
+# counterpart is a translation rather than new coverage, and the unit tests carry
+# the rules on both.
+#
+# Registered here rather than beside the node for the reason dist-compile-e2e is:
+# `src/apps` walks its app table in order, so a test registered next to one
+# binary cannot name one that comes later -- and a `$<TARGET_FILE:>` guard on a
+# target that does not exist yet does not fail, it silently skips the test
+# forever.
+if(NOT WIN32)
+    if(NOT TARGET fastcache-compile-node)
+        message(STATUS "cluster-e2e: compile node not built — skipping")
+    else()
+        add_test(
+            NAME "cluster-e2e"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/cluster-e2e.sh"
+                --node "$<TARGET_FILE:fastcache-compile-node>"
+        )
+        # Starts three nodes that hold six ports between them and drives an
+        # election, so it must not race the other server-starting smoke tests.
+        set_tests_properties("cluster-e2e" PROPERTIES
+            LABELS "smoke"
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE
+            TIMEOUT 300
+        )
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # FASTCACHE_AUTO_START spawn+probe (issue #90), the real-binary counterpart to
 # compile-cache-daemon-staging above. That test proves the staging plumbing
 # with fake --version-only stand-ins; a fake has no socket to accept on, so it

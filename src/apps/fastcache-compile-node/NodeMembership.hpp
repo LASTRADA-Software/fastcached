@@ -5,6 +5,9 @@
 
 #include <FastCache/Distributed/MembershipOracle.hpp>
 
+#include <string>
+#include <vector>
+
 namespace FastCache::Node
 {
 
@@ -37,6 +40,22 @@ class NodeMembership
     NodeMembership(NodeMembership&&) = delete;
     NodeMembership& operator=(NodeMembership&&) = delete;
     ~NodeMembership() = default;
+
+    /// Replace the listed member set with what the cluster agreed.
+    ///
+    /// The seam consensus drives, and it does nothing under `--fleet-open` -- which
+    /// is right rather than an oversight: that flag says "admit everybody", and a
+    /// replicated member set narrows nothing an operator has already opened.
+    ///
+    /// `--fleet-member` is the BOOTSTRAP answer and this is the running one, so a
+    /// node admitted at runtime is served without anybody editing a config file on
+    /// every other machine. Safe to call from the consensus thread while surfaces
+    /// classify callers on theirs.
+    /// @param endpoints The cluster's members, as `host:port`.
+    void Publish(std::vector<std::string> const& endpoints)
+    {
+        _listed.Publish(endpoints);
+    }
 
     /// The oracle every surface on this node consults.
     ///
