@@ -33,7 +33,8 @@ namespace Detail
     constexpr NativeSocket InvalidSocket = -1;
 #endif
 
-    /// One-time Winsock startup / Linux SIGPIPE setup. Idempotent.
+    /// One-time Winsock startup. Idempotent, and a no-op away from Windows —
+    /// SIGPIPE is handled per socket by `ArmNoSigPipe` below.
     void EnsureNetworkInitialised();
 
     /// The last error the socket API reported on this thread.
@@ -56,6 +57,30 @@ namespace Detail
     /// @param code A `WSAGetLastError()` / `errno` value.
     /// @return The category it belongs to.
     [[nodiscard]] NetErrorCode TranslateSocketError(int code) noexcept;
+
+    /// Keep a write to this socket's broken pipe from raising a fatal signal.
+    ///
+    /// Declared here rather than kept private to `BlockingSocket.cpp` for the same
+    /// reason `TranslateSocketError` is: there must be exactly one answer, and a
+    /// second socket implementation needs it. Every stream socket this library
+    /// hands out must be armed at the point it is constructed.
+    ///
+    /// **Per socket, never process-wide.** The short spelling is one
+    /// `::signal(SIGPIPE, SIG_IGN)` at start-up, and it is wrong for any process
+    /// that also spawns a child: an ignored disposition is *inherited across exec*,
+    /// so it stops being a property of this program and becomes a property of every
+    /// program it launches. `fastcache-compile-node` links this library, listens on
+    /// a socket and then runs a compiler per job, so it was handing every one of
+    /// those compilers a disposition they never asked for — the same defect
+    /// `fastcache-cc` is documented as having to avoid, reached by another route.
+    ///
+    /// On Linux this is a no-op and `MSG_NOSIGNAL` on each `::send` carries the
+    /// suppression instead, so a socket implementation that sends for itself must
+    /// pass that flag rather than relying on this call.
+    ///
+    /// Best-effort: a `setsockopt` failure is ignored.
+    /// @param socket The freshly accepted or connected stream socket.
+    void ArmNoSigPipe(NativeSocket socket) noexcept;
 
     /// Build a `NetError` from a platform code and a description of the attempt.
     /// @param code A `WSAGetLastError()` / `errno` value.

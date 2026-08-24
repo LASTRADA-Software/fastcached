@@ -98,6 +98,13 @@ bool HttpHealthProbe(std::string_view host, std::uint16_t port, std::string_view
     // SO_RCVTIMEO/SO_SNDTIMEO helper as the admin listener.
     Detail::SetIoTimeouts(static_cast<Detail::NativeSocket>(socket), ProbeTimeout, ProbeTimeout);
 
+    // This probe owns a raw socket rather than a BlockingSocket, so it has to arm
+    // the per-socket SIGPIPE suppression itself -- there is no process-wide
+    // disposition standing behind it any more, deliberately (see ArmNoSigPipe).
+    // An admin endpoint that closes while the request is still going out is the
+    // ordinary case for a wedged daemon, which is exactly when a health check runs.
+    Detail::ArmNoSigPipe(static_cast<Detail::NativeSocket>(socket));
+
     auto const request =
         std::string { "GET " } + std::string { path } + " HTTP/1.0\r\nHost: " + hostStr + "\r\nConnection: close\r\n\r\n";
     bool ok = false;
