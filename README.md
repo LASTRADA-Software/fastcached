@@ -355,6 +355,10 @@ for tuning are on the
 See [`AGENT.md`](AGENT.md) for the architecture, error taxonomy, coding
 guidelines, and how to build and test the project.
 
+Before changing a subsystem, read the matching file in
+[`.agent/rules/`](.agent/rules/) — the constraints recorded there have each already
+been a bug, and most of them fail silently.
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).

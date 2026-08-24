@@ -296,8 +296,8 @@ inline RaftClusterHarness::Member& RaftClusterHarness::Find(NodeId const& who)
     // Loudly, rather than falling back to the first node. A silent fallback makes
     // `Restart("n4")` on a three-node cluster restart n1 and the case pass while
     // asserting nothing about what it named -- a vacuous test indistinguishable
-    // from a real one, which is the failure shape AGENT.md already records for the
-    // Windows cross-depth e2e case.
+    // from a real one, which is the failure shape .agent/rules/compile-cache.md
+    // already records for the Windows cross-depth e2e case.
     throw std::out_of_range { "no such cluster member: " + who };
 }
 

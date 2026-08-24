@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# The gate AGENT.md asks for, as a script rather than as a paragraph.
+# The gate .agent/rules/build-and-toolchain.md asks for, as a script rather than
+# as a paragraph.
 #
 # "Build at least one release configuration and one non-clang compiler locally
 # before pushing" is advice that has to be remembered, and this branch has twice

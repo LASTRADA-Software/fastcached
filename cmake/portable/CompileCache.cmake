@@ -820,8 +820,9 @@ function(_fc_auto_start_fastcached)
         "--storage=${FASTCACHE_AUTO_START_STORAGE_DIR}")
 
     if(CMAKE_HOST_WIN32)
-        # No double-fork equivalent outside the SCM path (see AGENT.md on
-        # --daemon and launchd/SCM supervisors) — this is a plain background
+        # No double-fork equivalent outside the SCM path (see
+        # .agent/rules/platform-service-and-config.md on --daemon and
+        # launchd/SCM supervisors) — this is a plain background
         # process, not a registered service, so `cmake -E env` launches it
         # directly. execute_process has no detach flag of its own; started
         # this way the child is not joined to cmake's own console and outlives
@@ -842,8 +843,9 @@ function(_fc_auto_start_fastcached)
         # daemon already backgrounded — this is the one place in the whole
         # module that flag is the right tool, as opposed to a *service*
         # registration, which --daemon must never be combined with (see
-        # AGENT.md: "the supervisor's launch arguments must not pass
-        # --daemon"). A well-known --pidfile is what turns "who started this"
+        # .agent/rules/platform-service-and-config.md: "the supervisor's launch
+        # arguments must not pass --daemon"). A well-known --pidfile is what
+        # turns "who started this"
         # into an answerable question — for an operator who wants to stop a
         # daemon this module left running (its own stated lifetime: until the
         # machine reboots or a human kills it), and for a test that needs to
