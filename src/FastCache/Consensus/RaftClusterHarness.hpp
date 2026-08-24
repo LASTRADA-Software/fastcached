@@ -517,11 +517,12 @@ inline std::optional<NodeId> RaftClusterHarness::Leader() const
 {
     // The highest-term leader, not "the one leader", because more than one node
     // can truthfully report itself leader at the same moment. A leader cut off
-    // from its peers does not find out it has been deposed -- plain Raft has no
-    // rule that makes it step down, and adding one (CheckQuorum, or a leader
-    // lease) is a separate mechanism this library does not yet have. What still
-    // holds is the guarantee that matters: the stale one cannot commit anything,
-    // because committing needs a quorum it cannot reach.
+    // from its peers does not find out it has been deposed -- nothing here makes
+    // it step down. It does track whether a majority still answers it, which is
+    // how it decides a challenger's pre-vote, but stepping down on that answer --
+    // or holding a leader lease -- is a separate mechanism this library does not
+    // have. What still holds is the guarantee that matters: the stale one cannot
+    // commit anything, because committing needs a quorum it cannot reach.
     //
     // This is not a loophole in Election Safety, which is per *term*: the stale
     // leader holds an older term than the one the majority elected.

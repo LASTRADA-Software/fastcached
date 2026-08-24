@@ -1303,3 +1303,174 @@ TEST_CASE("A node that has just heard from a leader refuses a pre-vote", "[conse
     REQUIRE(granted.size() == 1);
     CHECK(granted[0].decision == VoteDecision::Granted);
 }
+
+TEST_CASE("A leader that still hears from a quorum refuses a pre-vote", "[consensus][raft][prevote]")
+{
+    // The hole the follower-side check leaves. `_lastLeaderContact` is set only
+    // where a leader spoke to this node, and a leader never hears from a leader --
+    // so it ages out on the one node best placed to refuse, and the node whose own
+    // quorum proves the cluster is healthy was the only one that granted.
+    //
+    // A leader answers from that quorum instead: CheckQuorum, decided from the
+    // responses it already receives rather than from a clock it must trust.
+    Fixture fix;
+    (void) fix.ElectAsLeader();
+    REQUIRE(fix.node.CurrentRole() == Role::Leader);
+
+    // Deliberately far enough past the election that the contact `BecomeLeader`
+    // seeded from the votes has aged out: what refuses below is this response and
+    // nothing left over from winning.
+    (void) fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
+                                                    .result = AppendResult::Accepted,
+                                                    .matchIndex = LogIndex { .value = 1 },
+                                                    .followerId = "n2" },
+                            At(400));
+
+    // n3 lost contact with the leader alone -- an asymmetric partition, a
+    // saturated link, a paused process -- and campaigns. Its log is current, so
+    // the liveness question is the only thing left that can refuse.
+    auto const answer = fix.node.Receive(PreVoteRequest { .term = Term { .value = 2 },
+                                                          .candidateId = "n3",
+                                                          .lastLogIndex = LogIndex { .value = 1 },
+                                                          .lastLogTerm = Term { .value = 1 } },
+                                         At(500));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(answer);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Denied);
+}
+
+TEST_CASE("A leader that has lost its quorum grants a pre-vote", "[consensus][raft][prevote]")
+{
+    // The other half, and it is not optional: a leader that refused without
+    // tracking whether it still HAS a quorum is a partitioned leader blocking its
+    // own replacement forever. Losing this while fixing the case above trades a
+    // spurious election for a cluster that can never hold another one.
+    Fixture fix;
+    (void) fix.ElectAsLeader();
+    REQUIRE(fix.node.CurrentRole() == Role::Leader);
+
+    // Nobody has answered since the election, which was exactly a minimum timeout
+    // ago -- so no peer is live and this node alone is not a majority of three.
+    auto const answer = fix.node.Receive(PreVoteRequest { .term = Term { .value = 2 },
+                                                          .candidateId = "n3",
+                                                          .lastLogIndex = LogIndex { .value = 1 },
+                                                          .lastLogTerm = Term { .value = 1 } },
+                                         At(ElectionMin.count() * 2));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(answer);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Granted);
+}
+
+TEST_CASE("A leader counts a rejected AppendEntries response as contact", "[consensus][raft][prevote]")
+{
+    // A rejection says the follower's log disagrees, not that the follower is
+    // gone -- it answered. Hooking the record onto `AdvanceFollowerProgress`,
+    // which only the accepted branch reaches, is the obvious spelling and would
+    // make a leader repairing a divergent follower believe it had lost the very
+    // quorum that is talking to it.
+    Fixture fix;
+    (void) fix.ElectAsLeader();
+
+    (void) fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
+                                                    .result = AppendResult::Rejected,
+                                                    .matchIndex = LogIndex::BeforeFirst(),
+                                                    .followerId = "n2" },
+                            At(400));
+
+    auto const answer = fix.node.Receive(PreVoteRequest { .term = Term { .value = 2 },
+                                                          .candidateId = "n3",
+                                                          .lastLogIndex = LogIndex { .value = 1 },
+                                                          .lastLogTerm = Term { .value = 1 } },
+                                         At(500));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(answer);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Denied);
+}
+
+TEST_CASE("A leader counts an InstallSnapshot response as contact", "[consensus][raft][prevote]")
+{
+    // The second of the two ways a follower answers, and the arm a single-case
+    // test would omit -- a follower far enough behind is caught up by snapshot and
+    // says so on this message and no other, so a leader that counted only
+    // AppendEntries would lose its quorum precisely while repairing it.
+    Fixture fix;
+    (void) fix.ElectAsLeader();
+
+    (void) fix.node.Receive(InstallSnapshotResponse { .term = Term { .value = 1 },
+                                                      .result = AppendResult::Accepted,
+                                                      .matchIndex = LogIndex { .value = 1 },
+                                                      .followerId = "n2" },
+                            At(400));
+
+    auto const answer = fix.node.Receive(PreVoteRequest { .term = Term { .value = 2 },
+                                                          .candidateId = "n3",
+                                                          .lastLogIndex = LogIndex { .value = 1 },
+                                                          .lastLogTerm = Term { .value = 1 } },
+                                         At(500));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(answer);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Denied);
+}
+
+TEST_CASE("A leader hearing from less than a quorum grants a pre-vote", "[consensus][raft][prevote]")
+{
+    // What refuses is a majority, not "somebody answered". A leader reachable by
+    // one node out of four is a leader the cluster has to be able to replace, and
+    // counting any contact at all would let it veto that from inside a minority.
+    ScriptedRandomSource random { { 0 } };
+    auto config = ThreeNodes();
+    config.members = { "n1", "n2", "n3", "n4", "n5" }; // quorum 3
+    RaftNode node = MakeNode(config, random);
+
+    DriveToCandidate(node, At(ElectionMin.count()));
+    for (auto const* const voter: { "n2", "n3" })
+        (void) node.Receive(
+            RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = voter },
+            At(ElectionMin.count()));
+    REQUIRE(node.CurrentRole() == Role::Leader);
+
+    // One follower of four still answering, long enough after the election that
+    // the votes that carried it no longer count: two live members against a
+    // quorum of three.
+    (void) node.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
+                                                .result = AppendResult::Accepted,
+                                                .matchIndex = LogIndex { .value = 1 },
+                                                .followerId = "n2" },
+                        At(400));
+
+    auto const answer = node.Receive(PreVoteRequest { .term = Term { .value = 2 },
+                                                      .candidateId = "n3",
+                                                      .lastLogIndex = LogIndex { .value = 1 },
+                                                      .lastLogTerm = Term { .value = 1 } },
+                                     At(500));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(answer);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Granted);
+}
+
+TEST_CASE("A leader refuses a pre-vote before its first heartbeat is answered", "[consensus][raft][prevote]")
+{
+    // Winning an election IS contact from a quorum -- those votes were cast just
+    // now -- so `BecomeLeader` seeds the record from them. Without that a new
+    // leader answers "I have no quorum" until the first heartbeat comes back,
+    // granting pre-votes for a round trip at the moment the cluster is least able
+    // to afford another election.
+    Fixture fix;
+    (void) fix.ElectAsLeader();
+    REQUIRE(fix.node.CurrentRole() == Role::Leader);
+
+    auto const answer = fix.node.Receive(PreVoteRequest { .term = Term { .value = 2 },
+                                                          .candidateId = "n3",
+                                                          .lastLogIndex = LogIndex { .value = 1 },
+                                                          .lastLogTerm = Term { .value = 1 } },
+                                         At(ElectionMin.count() + 10));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(answer);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Denied);
+}

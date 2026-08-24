@@ -323,6 +323,38 @@ class RaftNode
     /// @param now Current time.
     void NoteLeaderContact(TimePoint now);
 
+    /// Record that a follower answered this leader.
+    ///
+    /// Both response types and both of their outcomes, which is why this is
+    /// called ahead of the branch rather than from `AdvanceFollowerProgress`: a
+    /// rejection says the follower's log disagrees, not that the follower is
+    /// gone. Counting only accepted responses would make a leader lose the quorum
+    /// it is in the middle of repairing.
+    /// @param follower Which peer answered.
+    /// @param now Current time.
+    void NoteFollowerContact(NodeId const& follower, TimePoint now);
+
+    /// Whether a majority of the cluster has answered this leader recently.
+    ///
+    /// CheckQuorum, and the only question a leader can honestly answer about
+    /// whether a leader is live: it is one, so it asks whether it still leads
+    /// anything. Decided from responses it already receives rather than from a
+    /// lease, which would need a clock-drift bound nothing else here assumes.
+    /// @param now Current time.
+    /// @return True while enough members are still answering.
+    [[nodiscard]] bool HasQuorumContact(TimePoint now) const;
+
+    /// Whether some leader is live, as far as this node can tell.
+    ///
+    /// The whole of pre-vote's disruption check, and the two roles answer it from
+    /// different evidence. A follower or candidate knows a leader is live because
+    /// one spoke to it; a leader knows because a majority answers it. Asking a
+    /// leader the follower's question is what left the node best placed to refuse
+    /// a challenger as the only one that never did.
+    /// @param now Current time.
+    /// @return True while a leader is demonstrably live.
+    [[nodiscard]] bool HasLiveLeader(TimePoint now) const;
+
     /// Arm the election timer with a freshly drawn randomized timeout.
     ///
     /// Re-drawn every time rather than drawn once per node, because a fixed
@@ -440,6 +472,19 @@ class RaftNode
     /// `matchIndex` is a fact that only ever increases. Committing on the
     /// optimistic one would commit an entry nobody has acknowledged.
     std::unordered_map<NodeId, LogIndex> _matchIndex;
+
+    /// Per-peer: when it last answered this leader. Empty for anyone else.
+    ///
+    /// The leader's counterpart to `_lastLeaderContact`, and it exists for the
+    /// same reason that one does not answer here: a leader never hears from a
+    /// leader, so the field every other role reads is permanently stale on the
+    /// one node whose own quorum proves the cluster is healthy.
+    ///
+    /// Absence is what a peer that has not answered *since this leadership began*
+    /// looks like, so it must not be seeded with anything but real contact --
+    /// which is why `BecomeLeader` clears it and fills it from the votes that
+    /// were actually cast rather than from the peer list.
+    std::unordered_map<NodeId, TimePoint> _followerContact;
 
     /// Voters that granted this node their vote in the current term, itself
     /// included. A set rather than a counter because a retransmitted response

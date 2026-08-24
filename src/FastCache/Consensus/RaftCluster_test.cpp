@@ -121,10 +121,12 @@ TEST_CASE("A minority partition cannot elect or commit", "[consensus][raft][clus
     // not about who calls themselves leader.
     //
     // An isolated node that was already leader keeps reporting itself leader:
-    // plain Raft has no rule that deposes it, and adding one (CheckQuorum, a
-    // leader lease) is a separate mechanism. An isolated *follower* keeps standing
-    // for election and keeps losing. Either way the guarantee is the same and it
-    // is the one asserted here: nothing the minority does can be committed.
+    // nothing here deposes it. A leader does now track whether a majority still
+    // answers it -- that is what lets it refuse a challenger's pre-vote -- but
+    // ACTING on that answer by stepping down is a separate mechanism, as is a
+    // leader lease. An isolated *follower* keeps standing for election and keeps
+    // losing. Either way the guarantee is the same and it is the one asserted
+    // here: nothing the minority does can be committed.
     RaftClusterHarness cluster { { "n1", "n2", "n3" } };
     REQUIRE(SettleOnLeader(cluster));
 
