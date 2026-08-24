@@ -311,8 +311,8 @@ These constraints are load-bearing and have each already been a bug:
     from exactly one of its two peers. Nothing crashes and nothing logs a fault; the
     fleet simply never becomes ready. Hence `Net/PlatformListener.hpp`, and hence the
     two loops sharing one reactor rather than owning a thread each.
-  - **`RaftPeerTransport::Start()` was called by nobody.** The outbound side owns a
-    thread per peer and starts them on request, so every node came up, listened,
+  - **`RaftPeerTransport::Start()` was called by nobody.** The outbound side owned a
+    thread per peer then, started on request, so every node came up, listened,
     ticked its own timers and sent *nothing*. Three nodes sat at `undecided` forever
     with no error anywhere — the exact shape of failure this list keeps recording,
     and invisible to a single-node cluster, which elects itself with no messages at
@@ -2216,6 +2216,90 @@ spelled it the same way, which is what makes this a drift rather than a discover
   the exact cost `USE_COMPILER_CACHE` probes at configure time to avoid. Pointing it at
   the node is one line of configuration, and it is better written by an operator than
   assumed by a tool.
+- **A cache answer that dials must not be serialized behind the accept loop.**
+  `FrameEndpoint` owned a thread and served its connections ONE AT A TIME, and
+  `RemoteUpstream` dials the shared cache from inside a cache answer -- so a single
+  upstream that took five seconds held every local `fastcache-cc` behind it, one
+  after another. A node whose shared cache was unreachable had an unusable port of
+  its own, and nothing anywhere said so: every client eventually got a correct
+  answer, just far too late. `NodeIoLoop` is the reactor both framed surfaces now
+  accept on, with a `DetachedTask` per connection. Six consequences, each
+  load-bearing:
+  - **The payload cap became a PER-CONNECTION cap the moment serialization went.**
+    Serving one at a time bounded peak memory to a single `MaxRequestBytes()` frame
+    by accident; serving them concurrently makes it N of them. So
+    `MaxConcurrentRequests()` and `MaxInFlightBytes()` are columns on the responder,
+    and they had to land in the same commit as the detach -- a fix that opens a
+    memory-exhaustion hole is not a fix. The spread is the point: 256 concurrent at
+    64 KiB for the scheduler, 8 for the cache with a 256 MiB total budget that is
+    deliberately ONE request's worth, so eight ordinary objects run in parallel while
+    a single 256 MiB monster still cannot be joined by seven more.
+  - **The request deadline was otherwise silently lost.** It used to be
+    `SO_RCVTIMEO`, applied to every accepted socket by `BlockingListener::SetTimeouts`.
+    A reactor socket has no such option -- its reads suspend rather than block -- so
+    without a replacement a client that connects and sends half a header holds a
+    descriptor and a coroutine frame until the process dies. A free slow-loris on the
+    node's cache port, created by the change that removed the stall. One sweeper per
+    server on a bounded tick, NOT a timer per connection: `IReactor::Schedule` cannot
+    be cancelled, so a per-connection timer would stay on the wheel for the full
+    interval after its connection had finished.
+  - **Every close is posted onto the reactor.** On epoll and kqueue `ISocket::Close`
+    completes a parked awaitable by resuming its coroutine INLINE, so closing from
+    the stopping thread would run the server's connection tasks there while the
+    reactor thread is still driving them. IOCP routes cancellation back through the
+    port and does not -- which is exactly what makes it a race that passes CI on
+    Windows and corrupts state on the other two.
+  - **`Shutdown()` waits for the LOOPS, not only the connections**, and the first cut
+    did not. `~FrameServer` then freed state the accept loop and the sweeper still
+    pointed into: SIGSEGV, plus a port still bound after the endpoint claimed to have
+    stopped. The state is shared with the loops now. Found by the endpoint's own
+    destruction test, which is the one that exists to catch exactly this.
+  - **The reactor is stopped by its loops, when the last one ends** -- the sweeper
+    counted among them, because a frame parked on the timer wheel is precisely what
+    `IReactor::Run` must not return over. And `NodeIoLoop` is declared BEFORE the
+    tiers in `WorkerBody`, so it is destroyed after them: a tier's destructor posts
+    its closes onto this reactor, which therefore has to still be running.
+  - **It is NOT consensus's reactor.** A cache answer now awaits a dial with a
+    multi-second ceiling, and putting that in front of the Raft heartbeat timer would
+    be this same defect moved one layer over -- the failure this list already names as
+    nine role changes in twelve seconds. It is also the only node header that includes
+    `PlatformReactor.hpp`, which is what keeps `<windows.h>` out of everything that
+    includes `FrameEndpoint.hpp`; the endpoint holds an `IListener` rather than the
+    platform type, which is what `IListener::BoundPort()` was added for.
+
+- **`EndpointBusy` is not `NoCapacity`, and the split is for whoever reads it.**
+  `NoCapacity` is a statement about the FLEET -- every matching worker full of this
+  build's own work, which an operator answers by buying machines. `EndpointBusy` is
+  one node's own front door: it has hit its concurrent-request cap or its in-flight
+  byte budget, and the same client asking again shortly will very likely be served.
+  Reporting either under the other's code sends an operator to fix something that was
+  never wrong, which is the same argument `Withdrawn` already makes for splitting off
+  its own case.
+
+- **The launcher runs its cache exchange on a reactor of its own, and gets a bounded
+  name lookup for it.** `main.cpp`'s private `TcpClient` is gone -- fifty lines in a
+  file that is in no test target, existing only to give four sites an
+  optional-shaped `Connect` and to `SyncRun` two loops. What it bought is not
+  latency: the launcher is one-shot per translation unit and has nothing to
+  interleave. It is that `getaddrinfo` takes no timeout, so `FASTCACHE_ADDR` pointing
+  at a name whose resolver is wedged used to stall every translation unit in the
+  build with no knob anywhere. Three things about `ReactorExchange`:
+  - **One reactor per exchange, asserted rather than documented.** `IReactor::Run`
+    returns only on `Stop()` and no reactor here clears that flag, so a reused
+    instance performs the first exchange and silently skips every later one -- which
+    the launcher answers by compiling locally, making every build slower with nothing
+    anywhere saying why.
+  - **The deadline CLOSES the socket rather than stopping the reactor.** Stopping
+    would leave the coroutine parked on a read nobody completes: a leaked frame and a
+    leaked descriptor, once per translation unit. Its test asserts the close, and
+    fails without the timer.
+  - **`Threads::Threads` is linked and named.** The resolver pool is the one thing
+    this launcher genuinely needs a thread for. Not a departure from the rule this
+    binary exists to protect -- that rule is about not linking `FastCache` and
+    therefore not dragging in yaml-cpp, OpenSSL and the reactor's transitive world --
+    and it is named rather than left to glibc folding pthread into libc since 2.34,
+    which happens to work on the distributions CI uses.
+
 - **One accept loop serves all three of the node's framed surfaces.** `FrameEndpoint`
   over an `IFrameResponder`; a second and third accept loop would be near-copies of a
   listener, a shutdown order and a poll timeout. An interface rather than a
