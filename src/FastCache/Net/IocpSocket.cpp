@@ -117,7 +117,10 @@ struct IocpSocket::Impl
     }
 };
 
-IocpSocket::IocpSocket(IocpReactor& reactor, std::uintptr_t native, std::string peerAddress) noexcept:
+IocpSocket::IocpSocket(IocpReactor& reactor,
+                       std::uintptr_t native,
+                       std::string peerAddress,
+                       IocpAttachment attachment) noexcept:
     _impl { std::make_unique<Impl>(reactor, static_cast<SOCKET>(native)) },
     _native { native },
     _peerAddress { std::move(peerAddress) }
@@ -125,7 +128,14 @@ IocpSocket::IocpSocket(IocpReactor& reactor, std::uintptr_t native, std::string 
     // Record whether the IOCP association succeeded. If it didn't, no
     // completion will ever be dequeued for this socket; callers must check
     // IsAttached() and abandon the connection instead of awaiting forever.
-    _attached = reactor.AttachHandle(reinterpret_cast<void*>(static_cast<std::uintptr_t>(_impl->native)));
+    //
+    // A caller that already associated the handle says so rather than letting
+    // this repeat it: a second CreateIoCompletionPort on the same handle fails,
+    // and reporting that as "not attached" would condemn a working connection.
+    // `ConnectEx` forces that order, because it requires the association before
+    // the operation is issued.
+    _attached = attachment == IocpAttachment::AlreadyAttached
+                || reactor.AttachHandle(reinterpret_cast<void*>(static_cast<std::uintptr_t>(_impl->native)));
 }
 
 IocpSocket::~IocpSocket()

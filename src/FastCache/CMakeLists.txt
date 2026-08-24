@@ -61,6 +61,7 @@ target_sources(FastCache
         Net/HealthProbe.cpp
         Net/EpollConnector.cpp
         Net/EpollSocket.cpp
+        Net/IocpConnector.cpp
         Net/IocpSocket.cpp
         Net/KqueueConnector.cpp
         Net/KqueueSocket.cpp
