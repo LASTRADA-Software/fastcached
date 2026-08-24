@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "Dispatch.hpp"
-#include "ScratchPathTestSupport.hpp"
+#include "StubObjectTestSupport.hpp"
 #include "WorkerProtocol.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -40,32 +41,21 @@ class StubRunner final: public IProcessRunner
 struct Fixture
 {
     StubRunner runner;
-    std::filesystem::path scratch;
+    FastCache::Testing::ScratchDirectory scratch { "fc-wp" };
     CompileJobRunner jobs;
     AtomicMetricsSink metrics;
     WorkerProtocol worker;
 
     Fixture():
-        scratch { Test::UniqueScratchPath("fc-wp") },
-        jobs { runner, (std::filesystem::create_directories(scratch), scratch), { { "gcc-13", "g++" } } },
+        jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } },
         worker { jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics }
     {
-    }
-    ~Fixture()
-    {
-        std::error_code ignored;
-        std::filesystem::remove_all(scratch, ignored);
     }
     Fixture(Fixture const&) = delete;
     Fixture& operator=(Fixture const&) = delete;
     Fixture(Fixture&&) = delete;
     Fixture& operator=(Fixture&&) = delete;
-
-    static int& Counter()
-    {
-        static int counter = 0;
-        return counter;
-    }
+    ~Fixture() = default;
 };
 
 /// A well-formed COMPILE frame.
@@ -160,9 +150,8 @@ TEST_CASE("An unauthorized lease is refused before the payload is even decoded",
     // Checked before decompression, let alone compilation: an unauthorized peer
     // must not be able to make this worker do the expensive part.
     StubRunner runner;
-    auto const scratch = std::filesystem::temp_directory_path() / "fc-wp-deny";
-    std::filesystem::create_directories(scratch);
-    CompileJobRunner jobs { runner, scratch, { { "gcc-13", "g++" } } };
+    FastCache::Testing::ScratchDirectory const scratch { "fc-wp-deny" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
     AtomicMetricsSink metrics;
     WorkerProtocol worker {
         jobs, [](std::string_view, std::string_view) { return false; }, { Wire::IdentityCodec }, metrics
@@ -171,9 +160,6 @@ TEST_CASE("An unauthorized lease is refused before the payload is even decoded",
     auto const answer = worker.Answer(CompileFrame());
     REQUIRE(answer.has_value());
     CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::UnknownLease);
-
-    std::error_code ignored;
-    std::filesystem::remove_all(scratch, ignored);
 }
 
 TEST_CASE("A fingerprint this worker does not serve is refused as a mismatch", "[worker-protocol]")

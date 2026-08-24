@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include <tests/ScratchPath.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Cc;
 
@@ -44,18 +46,27 @@ std::vector<TextRegion> Value(std::string stdoutText, std::string stderrText, st
 /// tree behind that makes the next run pass for the wrong reason.
 struct ScopedTree
 {
+    std::filesystem::path base;
     std::filesystem::path root;
 
     explicit ScopedTree(std::string_view name):
-        root { std::filesystem::temp_directory_path() / name }
+        // A unique PARENT with the caller's name hung under it, rather than the name
+        // alone. The name is what a reader recognises and one of them is itself a
+        // nested path, so it stays exactly as written; what changes is that it can no
+        // longer be the whole story. `temp / "<fixed>"` is the same directory in every
+        // concurrent test process -- see `tests/ScratchPath.hpp` for the five times
+        // that has been paid for.
+        base { FastCache::Testing::UniqueScratchPath("fc-replayguard") },
+        root { base / name }
     {
-        std::filesystem::remove_all(root);
         std::filesystem::create_directories(root);
     }
 
     ~ScopedTree()
     {
-        std::filesystem::remove_all(root);
+        // The BASE, not the root: the root may be nested inside it.
+        std::error_code ignored;
+        std::filesystem::remove_all(base, ignored);
     }
 
     ScopedTree(ScopedTree const&) = delete;

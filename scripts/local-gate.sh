@@ -73,8 +73,19 @@ run_preset() {
         fail "$preset build (full log: $log)"
     fi
 
-    echo "== $preset: test"
-    if ! ctest --preset "$preset" > "$log" 2>&1; then
+    # Parallel, and that is the point rather than the speed. Every TEST_CASE is
+    # its own process under catch_discover_tests, so a fixture that names a
+    # scratch directory from a per-process counter hands two concurrent cases the
+    # same path and the second wipes the first. That bug has been written five
+    # times in this repository and nothing has ever run the tests in the shape
+    # that shows it -- CI does not, and neither did this gate. The tests that
+    # genuinely cannot share (a daemon, a fixed port) carry RUN_SERIAL.
+    #
+    # getconf rather than nproc: this gate runs on macOS too.
+    local jobs="${FASTCACHE_GATE_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
+
+    echo "== $preset: test (--parallel $jobs)"
+    if ! ctest --preset "$preset" --parallel "$jobs" > "$log" 2>&1; then
         grep -E '\*\*\*Failed|\*\*\*Timeout|tests passed' "$log" | head -30
         fail "$preset tests (full log: $log)"
     fi

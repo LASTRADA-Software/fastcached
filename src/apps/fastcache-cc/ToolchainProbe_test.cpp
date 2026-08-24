@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include <tests/ScratchPath.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Cc;
 
@@ -44,17 +46,23 @@ class ScratchTree
 {
   public:
     explicit ScratchTree(std::string_view name):
-        _root { std::filesystem::temp_directory_path()
-                / std::filesystem::path { std::string { "fc-tcp-" } + std::string { name } } }
+        // A unique PARENT with the caller's name hung under it, rather than the name
+        // alone. The name is what a reader recognises and one of them is itself a
+        // nested path, so it stays exactly as written; what changes is that it can no
+        // longer be the whole story. `temp / "<fixed>"` is the same directory in every
+        // concurrent test process -- see `tests/ScratchPath.hpp` for the five times
+        // that has been paid for.
+        _base { FastCache::Testing::UniqueScratchPath("fc-tcp") },
+        _root { _base / std::filesystem::path { std::string { name } } }
     {
         std::error_code ec;
-        std::filesystem::remove_all(_root, ec);
         std::filesystem::create_directories(_root, ec);
     }
     ~ScratchTree()
     {
+        // The BASE, not the root: the root may be nested inside it.
         std::error_code ec;
-        std::filesystem::remove_all(_root, ec);
+        std::filesystem::remove_all(_base, ec);
     }
     ScratchTree(ScratchTree const&) = delete;
     ScratchTree& operator=(ScratchTree const&) = delete;
@@ -77,6 +85,7 @@ class ScratchTree
     }
 
   private:
+    std::filesystem::path _base;
     std::filesystem::path _root;
 };
 

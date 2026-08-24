@@ -2675,7 +2675,9 @@ PDB is a second artefact no hit can reproduce).
 
 Catch2 tests live next to the implementation files, so `Foo.cpp` has a `Foo_test.cpp`. A `test_main.cpp` serves as the entry point.
 
-`src/tests/Unwrap.hpp` holds the one helper every test target shares.
+`src/tests/` holds the helpers every test target shares -- `Unwrap.hpp` and
+`ScratchPath.hpp` -- and they are there rather than beside one caller for the same
+reason, which the second one learnt the hard way (see below).
 clang-tidy's `bugprone-unchecked-optional-access` cannot see a `has_value()`
 guard through Catch2's `REQUIRE`, so a plain `*x` after one is a **build failure**
 under `WarningsAsErrors` — `Unwrap(x)` goes through `value_or`, which is provably
@@ -2688,6 +2690,46 @@ header-only and includes only `<optional>`, so the launcher's and worker's test
 binaries can use it without linking `FastCache`. `std::expected` is **not**
 covered by that check, so a `*result` after `REQUIRE(result.has_value())` stays as
 it is — routing it through `Unwrap` does not even compile.
+
+**A per-process counter is not unique, because every `TEST_CASE` is a process.**
+`catch_discover_tests` registers each case as its own ctest test, so a fixture that
+names a scratch directory from a `static` counter hands the same path to every
+concurrent case -- and the constructors of these fixtures all begin with
+`remove_all`, which turns a name collision into **deleted data**: the second case
+wipes the files the first is still reading. `tests/ScratchPath.hpp` is the one
+definition now (`UniqueScratchPath`, pid + counter, and the RAII
+`ScratchDirectory` over it), and four things about how it got there are worth
+keeping:
+
+- **It has been written five times.** The first fix was private to
+  `Stats_test.cpp`; three later files reintroduced it; and the fifth,
+  `RaftStorage_test.cpp`, failed ten cases under `ctest -j 8`. Its class comment
+  claimed exactly the guarantee it had -- "two cases running in one binary cannot
+  collide" -- and that scope is the bug.
+- **The fifth one happened because the shared fix was somewhere it could not be
+  included from.** `UniqueScratchPath` lived in `src/apps/fastcache-cc/`, which
+  `FastCacheTest` does not have on its include path, so the one suite that could
+  not reach it re-derived it. A helper is shared only if it sits where everything
+  that needs it can include from; `src` is on all three test targets' paths, which
+  is why this and `tests/Unwrap.hpp` live together.
+- **The constructor's `remove_all` is safe only because the name carries the
+  pid.** What it can then reach is this process's own leftovers or a dead
+  process's -- never a live peer's. Removing something you did not create is the
+  step that made a collision destructive rather than merely confusing.
+- **A caller-supplied name becomes a child of a unique parent, not the whole
+  name.** `ScratchTree`/`ScopedTree` take names like `"cache-hit"` and one that is
+  itself a nested path, and those names are what a reader recognises; they hang
+  under `UniqueScratchPath(prefix)` now, and the destructor removes the *parent*
+  so the unique level cannot leak.
+
+**And the gate runs `ctest --parallel`, because nothing else does.** CI invokes
+`ctest` bare in every job, no preset sets a job count, and `scripts/local-gate.sh`
+did not either -- which is why five separate authors could write this bug and no
+run anywhere would show it. The gate now passes `--parallel` (`getconf
+_NPROCESSORS_ONLN`, since it runs on macOS too; `FASTCACHE_GATE_JOBS` overrides).
+Tests that genuinely cannot share -- a daemon, a fixed port -- carry `RUN_SERIAL`,
+which `tls-smoke` was missing while every one of its neighbours had it. Measured
+on the full suite: 649s serial, 131s at `--parallel 8`, same 1965 tests.
 
 Not every test is a Catch2 case. Script-driven tests are registered in
 `src/tests/CMakeLists.txt`: the `smoke`-labelled ones start a real daemon or

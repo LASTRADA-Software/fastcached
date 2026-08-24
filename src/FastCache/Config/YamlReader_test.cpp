@@ -8,14 +8,20 @@
 #include <string>
 #include <string_view>
 
+#include <tests/ScratchPath.hpp>
+
 namespace
 {
 
+/// The directory is per PROCESS and removed with it, not a fixed path shared by
+/// every test binary on the machine. It used to be `temp / "fastcached-test"`,
+/// which two cases writing the same stem would collide on -- and which nothing
+/// ever cleaned up, so it grew without bound. Static rather than per call so the
+/// several files a case writes stay together.
 std::filesystem::path WriteTempYaml(std::string_view stem, std::string_view content)
 {
-    auto path = std::filesystem::temp_directory_path() / "fastcached-test";
-    std::filesystem::create_directories(path);
-    path /= std::string { stem } + ".yaml";
+    static FastCache::Testing::ScratchDirectory const scratch { "fastcached-yaml-test" };
+    auto path = scratch.Path() / (std::string { stem } + ".yaml");
     std::ofstream out { path };
     out << content;
     return path;

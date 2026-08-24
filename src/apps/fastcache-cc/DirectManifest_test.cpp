@@ -19,6 +19,8 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/ScratchPath.hpp>
+
 using namespace FastCache::Cc;
 using FastCache::Cc::Test::DigestQuarters;
 using FastCache::Cc::Test::SplitMix64;
@@ -300,8 +302,8 @@ TEST_CASE("Build then validate a manifest against real files on disk")
     // The end-to-end invalidation contract, exercised against the filesystem rather
     // than fixtures: a manifest validates while the headers are untouched, and stops
     // validating the moment one of them changes or disappears.
-    auto const root = std::filesystem::temp_directory_path() / "fc-direct-test";
-    std::filesystem::remove_all(root);
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-test" };
+    auto const& root = scratch.Path();
     std::filesystem::create_directories(root / "src");
 
     auto const headerPath = root / "src" / "header.hpp";
@@ -363,8 +365,8 @@ TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC
     // editing a .cpp's own body while leaving every header untouched is invisible
     // to ValidateManifest, and a direct-mode hit replays a stale object forever
     // (see issue #49 / issue #51).
-    auto const root = std::filesystem::temp_directory_path() / "fc-direct-source-edit";
-    std::filesystem::remove_all(root);
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-source-edit" };
+    auto const& root = scratch.Path();
     std::filesystem::create_directories(root / "src");
 
     auto const headerPath = root / "src" / "header.hpp";
@@ -420,8 +422,8 @@ TEST_CASE("BuildManifest records a relative dependency path instead of dropping 
     // code, which is the whole failure class direct mode's revalidation exists to
     // prevent. Cc::IsCheckable and Cc::PortableForm both order this correctly and
     // say so in comments; this was the third consumer and did not.
-    auto const root = std::filesystem::temp_directory_path() / "fc-direct-relative";
-    std::filesystem::remove_all(root);
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-relative" };
+    auto const& root = scratch.Path();
     std::filesystem::create_directories(root / "src");
 
     auto const headerPath = root / "src" / "header.hpp";
@@ -479,8 +481,8 @@ TEST_CASE("BuildManifest records a relatively-named translation unit (issue #57)
     // relative to the build directory, so `cmd.source` arrived relative, was
     // classified as toolchain, and was dropped -- reopening issues #49/#51, whose
     // whole fix was to make the TU part of what a manifest revalidates.
-    auto const root = std::filesystem::temp_directory_path() / "fc-direct-relative-tu";
-    std::filesystem::remove_all(root);
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-relative-tu" };
+    auto const& root = scratch.Path();
     std::filesystem::create_directories(root / "src");
     std::filesystem::create_directories(root / "out");
 
@@ -580,8 +582,8 @@ TEST_CASE("AnchorWorkingDirectory re-spells a symlinked cwd in the layout's voca
     // prefix with the root it is actually inside -- and a relative path resolved
     // against it then canonicalizes to nothing, silently costing the build direct
     // mode. Found by the end-to-end test on macOS, whose `/var` is a symlink.
-    auto const base = std::filesystem::temp_directory_path() / "fc-direct-anchor";
-    std::filesystem::remove_all(base);
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-anchor" };
+    auto const& base = scratch.Path();
     std::filesystem::create_directories(base / "real" / "sub");
 
     std::error_code ec;
@@ -612,8 +614,8 @@ TEST_CASE("AnchorWorkingDirectory prefers the longest root and passes through th
     // The same rule CanonicalizeOne applies: a build tree nested inside the source
     // root must anchor to the build tree, or the tail spliced back on would be
     // relative to the wrong one.
-    auto const base = std::filesystem::temp_directory_path() / "fc-direct-anchor-longest";
-    std::filesystem::remove_all(base);
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-anchor-longest" };
+    auto const& base = scratch.Path();
     std::filesystem::create_directories(base / "proj" / "out" / "build");
     std::filesystem::create_directories(base / "elsewhere");
 
@@ -686,8 +688,8 @@ TEST_CASE("BuildManifest normalizes '..' segments and mixed separators to one to
     // collapse to a single canonical token, or an entry recorded through one
     // spelling would never validate against the other — which is exactly what made
     // manifests come out empty before this was handled.
-    auto const root = std::filesystem::temp_directory_path() / "fc-direct-normalize";
-    std::filesystem::remove_all(root);
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-normalize" };
+    auto const& root = scratch.Path();
     std::filesystem::create_directories(root / "src" / "a");
     std::filesystem::create_directories(root / "src" / "b");
 
@@ -733,8 +735,8 @@ TEST_CASE("BuildManifest normalizes '..' segments and mixed separators to one to
 
 TEST_CASE("BuildManifest drops toolchain headers and deduplicates project headers")
 {
-    auto const root = std::filesystem::temp_directory_path() / "fc-direct-dedup";
-    std::filesystem::remove_all(root);
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-dedup" };
+    auto const& root = scratch.Path();
     std::filesystem::create_directories(root / "src");
 
     auto const headerPath = root / "src" / "shared.hpp";
@@ -928,8 +930,8 @@ TEST_CASE("A GNU depfile drives a manifest exactly as showIncludes notes do")
     // The point of parsing depfiles at all: on POSIX the GNU drivers report
     // dependencies ONLY here, so without this direct mode can never populate —
     // it would pay for a manifest lookup on every compile and never hit.
-    auto const root = std::filesystem::temp_directory_path() / "fc-direct-depfile";
-    std::filesystem::remove_all(root);
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-depfile" };
+    auto const& root = scratch.Path();
     std::filesystem::create_directories(root / "src");
 
     auto const headerPath = root / "src" / "dep.hpp";
@@ -1087,8 +1089,8 @@ TEST_CASE("HashFileContents separates equal-length contents and reports unreadab
     // interrupted, and this case asserts that `absent.hpp` is ABSENT -- so a
     // leftover of that name would make it fail for a reason that has nothing to
     // do with hashing.
-    auto const dir = std::filesystem::temp_directory_path() / "fc-direct-hashfile";
-    std::filesystem::remove_all(dir);
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-hashfile" };
+    auto const& dir = scratch.Path();
     std::filesystem::create_directories(dir);
 
     auto const write = [&](std::string_view name, std::string_view contents) {

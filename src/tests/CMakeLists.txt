@@ -348,7 +348,14 @@ if(FASTCACHED_ENABLE_TLS)
                 --key "${CMAKE_SOURCE_DIR}/testdata/tls/server.key"
         )
     endif()
-    set_tests_properties("tls-smoke" PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
+    # RUN_SERIAL for the reason every other daemon-starting test here carries it:
+    # this one binds a port and spawns fastcached, so under `ctest --parallel` it
+    # would race the sccache smokes and compile-cache-daemon-start for it.
+    set_tests_properties("tls-smoke" PROPERTIES
+        LABELS "smoke"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+    )
 endif()
 
 if(SCCACHE)

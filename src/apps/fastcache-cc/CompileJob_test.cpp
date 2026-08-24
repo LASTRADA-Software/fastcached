@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CompileJob.hpp"
-#include "ScratchPathTestSupport.hpp"
+#include "StubObjectTestSupport.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -12,7 +12,10 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/ScratchPath.hpp>
+
 using namespace FastCache::Cc;
+using FastCache::Testing::ScratchDirectory;
 
 namespace
 {
@@ -66,30 +69,6 @@ class ScriptedRunner final: public IProcessRunner
 };
 
 /// A scratch root that cleans itself up.
-struct ScratchDir
-{
-    std::filesystem::path path;
-
-    ScratchDir()
-    {
-        // UniqueScratchPath, not a bare counter: every TEST_CASE is its own
-        // PROCESS under catch_discover_tests, so a per-process counter hands two
-        // concurrent cases the same directory and the second wipes the first.
-        path = Test::UniqueScratchPath("fc-jobtest");
-        std::error_code ignored;
-        std::filesystem::remove_all(path, ignored);
-        std::filesystem::create_directories(path);
-    }
-    ~ScratchDir()
-    {
-        std::error_code ignored;
-        std::filesystem::remove_all(path, ignored);
-    }
-    ScratchDir(ScratchDir const&) = delete;
-    ScratchDir& operator=(ScratchDir const&) = delete;
-    ScratchDir(ScratchDir&&) = delete;
-    ScratchDir& operator=(ScratchDir&&) = delete;
-};
 
 [[nodiscard]] CompileJob Job(std::vector<std::string> args = { "-O2" })
 {
@@ -107,8 +86,8 @@ TEST_CASE("A worker takes its compiler from its own configuration, never from th
     // not a hardening detail, but the difference between a build accelerator and a
     // remote shell.
     ScriptedRunner runner;
-    ScratchDir scratch;
-    CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "/opt/real/g++" } } };
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
 
     REQUIRE(jobs.Run(Job()).has_value());
     REQUIRE_FALSE(runner.Argv().empty());
@@ -120,8 +99,8 @@ TEST_CASE("An unknown fingerprint is refused, never served with a default", "[co
     // The scheduler should not have sent it, but a client that reached this port
     // directly did not go through scheduling at all.
     ScriptedRunner runner;
-    ScratchDir scratch;
-    CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "/opt/real/g++" } } };
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
 
     auto job = Job();
     job.fingerprint = "clang-19";
@@ -135,8 +114,8 @@ TEST_CASE("An unknown fingerprint is refused, never served with a default", "[co
 TEST_CASE("A worker with no toolchains serves nothing", "[compile-job]")
 {
     ScriptedRunner runner;
-    ScratchDir scratch;
-    CompileJobRunner jobs { runner, scratch.path, {} };
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), {} };
     CHECK(jobs.Run(Job()).error() == JobRefusal::UnknownFingerprint);
     CHECK(jobs.Fingerprints().empty());
 }
@@ -148,8 +127,8 @@ TEST_CASE("An argument that could name a file is refused by the worker too", "[c
     // worker from a client that is not honest. Trusting the client's check would
     // mean the worker is secured by code running on the caller's machine.
     ScriptedRunner runner;
-    ScratchDir scratch;
-    CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "/opt/real/g++" } } };
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
 
     for (auto const& hostile: { "-fplugin=/tmp/evil.so", "@/tmp/args.rsp", "--sysroot=/", R"(-IC:\x)" })
     {
@@ -168,8 +147,8 @@ TEST_CASE("The worker decides where a byte lands, whatever the client asked to c
     // nothing encoded. What it may decide is the NAME; what it may never decide is
     // the directory.
     ScriptedRunner runner;
-    ScratchDir scratch;
-    CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "g++" } } };
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
 
     auto job = Job();
     job.sourceName = "../../../etc/passwd.cpp";
@@ -179,7 +158,7 @@ TEST_CASE("The worker decides where a byte lands, whatever the client asked to c
     // directory may not. So the assertion is containment, not absence: every path
     // on the command line lies under this worker's own scratch root, and no
     // parent-directory segment survived to take one back out of it.
-    auto const root = std::filesystem::weakly_canonical(scratch.path).generic_string();
+    auto const root = std::filesystem::weakly_canonical(scratch.Path()).generic_string();
     for (auto const& arg: runner.Argv())
     {
         INFO("argv entry: " << arg);
@@ -196,8 +175,8 @@ TEST_CASE("The worker gives its scratch file the name the client asked for", "[c
     // name and nothing else -- seven bytes on clang-cl, and the reason this travels
     // at all.
     ScriptedRunner runner;
-    ScratchDir scratch;
-    CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "g++" } } };
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
 
     auto job = Job();
     job.sourceName = "Widget.cpp";
@@ -209,8 +188,8 @@ TEST_CASE("The worker gives its scratch file the name the client asked for", "[c
 TEST_CASE("A successful compile returns the object the compiler wrote", "[compile-job]")
 {
     ScriptedRunner runner;
-    ScratchDir scratch;
-    CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "g++" } } };
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
 
     auto const result = jobs.Run(Job());
     REQUIRE(result.has_value());
@@ -225,8 +204,8 @@ TEST_CASE("A failing compile returns its diagnostics and no object", "[compile-j
     ScriptedRunner runner;
     runner.ScriptExit(1);
     runner.ScriptStderr("error: no");
-    ScratchDir scratch;
-    CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "g++" } } };
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
 
     auto const result = jobs.Run(Job());
     REQUIRE(result.has_value());
@@ -242,8 +221,8 @@ TEST_CASE("A compiler that cannot be spawned is not a failed compile", "[compile
     // send the job somewhere else rather than fail the build.
     ScriptedRunner runner;
     runner.ScriptExit(-1);
-    ScratchDir scratch;
-    CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "g++" } } };
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
 
     auto const result = jobs.Run(Job());
     REQUIRE_FALSE(result.has_value());
@@ -255,8 +234,8 @@ TEST_CASE("A compiler claiming success but writing nothing is refused", "[compil
     // Returned as an empty object, the client would write it to disk and cache it.
     ScriptedRunner runner;
     runner.ScriptNoObject();
-    ScratchDir scratch;
-    CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "g++" } } };
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
 
     auto const result = jobs.Run(Job());
     REQUIRE_FALSE(result.has_value());
@@ -267,15 +246,15 @@ TEST_CASE("Each job gets its own scratch directory, and it is removed", "[compil
 {
     // A worker leaking a directory per job fills its disk during a long build.
     ScriptedRunner runner;
-    ScratchDir scratch;
-    CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "g++" } } };
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
 
     REQUIRE(jobs.Run(Job()).has_value());
     auto const first = runner.Argv();
     REQUIRE(jobs.Run(Job()).has_value());
     CHECK(first != runner.Argv()); // a different scratch path each time
 
-    CHECK(std::filesystem::is_empty(scratch.path));
+    CHECK(std::filesystem::is_empty(scratch.Path()));
 }
 
 TEST_CASE("SafeSourceName keeps a name that is one, and replaces every name that is not", "[compile-job]")
@@ -350,8 +329,8 @@ TEST_CASE("The output flag follows the worker's own driver family", "[compile-jo
     SECTION("an MSVC toolchain gets /Fo, fused")
     {
         ScriptedRunner runner;
-        ScratchDir scratch;
-        CompileJobRunner jobs { runner, scratch.path, { { "msvc", R"(C:\MSVC\bin\cl.exe)" } } };
+        ScratchDirectory scratch { "fc-jobtest" };
+        CompileJobRunner jobs { runner, scratch.Path(), { { "msvc", R"(C:\MSVC\bin\cl.exe)" } } };
 
         auto job = Job({});
         job.fingerprint = "msvc";
@@ -367,8 +346,8 @@ TEST_CASE("The output flag follows the worker's own driver family", "[compile-jo
     SECTION("a GNU toolchain still gets -o")
     {
         ScriptedRunner runner;
-        ScratchDir scratch;
-        CompileJobRunner jobs { runner, scratch.path, { { "gcc-13", "/opt/real/g++" } } };
+        ScratchDirectory scratch { "fc-jobtest" };
+        CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
 
         (void) jobs.Run(Job({}));
 

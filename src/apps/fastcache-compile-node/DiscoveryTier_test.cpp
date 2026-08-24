@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include <tests/ScratchPath.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Node;
 using namespace std::chrono_literals;
@@ -162,9 +164,8 @@ TEST_CASE("Two fleets on one segment ignore each other", "[node][discovery]")
 
 TEST_CASE("A key file is read, trimmed, and refused when it is too short", "[node][discovery]")
 {
-    auto const dir = std::filesystem::temp_directory_path() / "fastcache-discovery-key-test";
-    std::filesystem::remove_all(dir);
-    std::filesystem::create_directories(dir);
+    FastCache::Testing::ScratchDirectory const scratch { "fastcache-discovery-key-test" };
+    auto const& dir = scratch.Path();
 
     SECTION("a generated key, with the newline an editor left on it")
     {
