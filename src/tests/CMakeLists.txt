@@ -67,6 +67,34 @@ set_tests_properties("repository-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# The Net boundary. Fails when anything under Net/ or Async/ includes a FastCache
+# header from outside the standalone unit those two form, or when one of the
+# three dependency-free leaf headers they are allowed to reach stops being
+# dependency-free. scripts/check-net-boundary.cmake carries the table and the
+# reason each row is in it, and prints the whole table on failure.
+#
+# Net/ is meant to be lifted out of this tree and upstreamed, and that is a
+# property of the include graph -- which drifts in silence. Nothing fails, nothing
+# warns, and the edge is found by whoever attempts the lift: issue #100 counted
+# ten that had accumulated exactly that way, none of which any test could see.
+#
+# Not labelled "smoke", for the reason repository-hygiene is not: it starts no
+# daemon, opens no socket and needs no compiler, so it belongs in the default
+# `ctest` set and must survive `ctest -LE smoke`. It finishes in milliseconds.
+# Unlike repository-hygiene it has no skip path at all -- it reads the source
+# tree, which is present in an exported tarball exactly as it is in a checkout.
+add_test(
+    NAME "net-boundary"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-net-boundary.cmake"
+)
+set_tests_properties("net-boundary" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # Compiler-cache auto-install fallback. Configures the tiny fixture project in
 # compile-cache-fixture/ once per way the fetch can be declined, and requires
 # each one to end in a status message and a clean fall-through.

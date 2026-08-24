@@ -88,6 +88,13 @@ choose its own exit code before CMake 3.29 (`cmake_language(EXIT)`) and this
 project supports 3.28, so a `SKIP_RETURN_CODE` it could never return would be dead
 configuration.
 
+`net-boundary` is the second of those and takes the same shape, with one
+difference worth stating: it has **no skip path at all**. `repository-hygiene`
+asks the git index, which an exported source tarball does not have; this reads the
+source tree, which such a tarball contains exactly as a checkout does. A skip
+condition it could never meet would be the dead configuration the paragraph above
+argues against.
+
 **Which CMakeLists registers a script-driven test is load-bearing, not filing.**
 `src/apps` walks its app table *in order*, so a test registered beside one binary
 cannot name a binary that comes later in that table: at the point

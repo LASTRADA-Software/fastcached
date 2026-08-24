@@ -1,0 +1,302 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The Net boundary: `Net/` and `Async/` must reach nothing but each other and a
+# named handful of leaf headers.
+#
+# `src/FastCache/Net/` is meant to be lifted out of this codebase and upstreamed
+# into contour as a standalone library. That is a property of the *include graph*,
+# and an include graph drifts silently: nothing fails, nothing warns, and the edge
+# is only discovered by whoever tries the lift. Issue #100 counted ten such edges
+# that had accumulated exactly that way.
+#
+# Why a scan rather than a target that compiles the set. Compiling it would mean a
+# second full build of `Net/` + `Async/` against a staged include root, in every
+# configuration, on every platform -- and a staged root copied at configure time
+# goes stale the moment a header changes, which is precisely when the answer
+# matters. This reads the same include graph the compiler would, from the sources
+# themselves, in milliseconds. Given the project's separate rule that public
+# headers are self-contained, a set closed under inclusion is a set that compiles
+# standalone, which is the property being claimed.
+#
+# Runs as `cmake -P`, for the reasons check-repository-hygiene.cmake states at
+# length: this compares strings and reports, so a .sh + .ps1 pair would be two
+# implementations of one rule differing only in syntax, and cmake is the one tool
+# guaranteed present.
+#
+# Usage:
+#   cmake -DFASTCACHED_SOURCE_DIR=<dir> -P scripts/check-net-boundary.cmake
+#
+# Exit codes: 0 = the boundary holds. 1 = at least one edge crosses it.
+
+# ---------------------------------------------------------------------------
+# What the standalone unit IS. One row per directory whose sources are scanned
+# AND which those sources may include from:
+#
+#   <path under src/FastCache>|<why it travels with Net>
+#
+# Adding a row here widens what gets upstreamed, so it is meant to be a decision
+# somebody makes in review rather than something that happens by include.
+#
+# No row may contain a ';' -- these are CMake lists, and a semicolon inside a row
+# would split it into two.
+set(FastCachedNetStandaloneDirs
+    "Net|The library itself: sockets, listeners, connectors, framing, TLS."
+    "Async|The coroutine and event-loop vocabulary ISocket is expressed IN. ISocket::Read and Write return Task<T>, IoAwaitable is the reactor's completion hook, and EpollSocket / IocpSocket / KqueueSocket are the reactors' own I/O side -- there is no Net without it. Moving that vocabulary into Net/ instead would leave Async/ unusable without Net/, or duplicate Task."
+)
+
+# ---------------------------------------------------------------------------
+# Individual headers the unit may also include. Every one of these is checked
+# below to contain no FastCache include of its own, which is what makes the row
+# safe: a leaf that grew a dependency would drag the whole of Core/ back across
+# the boundary while this check still passed.
+#
+#   <path under src/FastCache>|<why it travels with Net>
+set(FastCachedNetStandaloneLeaves
+    "Core/Clock.hpp|IClock and TimePoint -- the injected time seam every deadline in Net/ and every timer in Async/ is expressed in. A Net that carried its own clock interface would fragment the one seam the entire codebase injects."
+    "Core/Ranges.hpp|FindOrNull -- a toolchain-portability shim, not a domain type. std::array's iterator is a raw pointer on libstdc++ and libc++ and a class on the MSVC STL, so a call site that stores one has no portable spelling. KqueueReactor is the caller."
+    "Core/Profiling.hpp|The FC_ZONE_* Tracy macros, which expand to (void) 0 unless the build defined FC_TRACY_ENABLED. Macros only -- no types and no code. Dropping the three socket.* zones would cost the documented profiling breakdown to remove a header that carries nothing."
+)
+
+# ---------------------------------------------------------------------------
+# Test sources are deliberately out of scope, and the reason is not laziness:
+# what gets lifted is the library, and a test may legitimately reach for a
+# fixture anywhere in this tree. Net/HealthProbe_test.cpp drives the daemon's own
+# AdminHttpServer, which is the entire point of that case -- gating it would
+# force either a second AdminHttpServer fake inside Net/ or the loss of the one
+# test that proves the probe works against the real thing.
+set(FastCachedNetStandaloneTestSuffix "_test.cpp")
+
+# Which files count as source. Wider than the two extensions this tree happens to
+# use today, because a file this does not scan is a hole that reports green: a
+# `Net/Foo.h` or a generated `Net/Foo.hpp.in` would be compiled by the build and
+# invisible here. `.hpp.in` is not hypothetical -- `Core/Version.hpp.in` is a live
+# convention in this tree.
+set(FastCachedNetStandaloneSourceGlobs
+    "*.hpp" "*.h" "*.hh" "*.hxx" "*.inl" "*.ipp"
+    "*.cpp" "*.cc" "*.cxx" "*.hpp.in" "*.h.in"
+)
+
+# ---------------------------------------------------------------------------
+
+if(NOT DEFINED FASTCACHED_SOURCE_DIR)
+    message(FATAL_ERROR
+        "FASTCACHED_SOURCE_DIR is not set. Invoke this script as: cmake "
+        "-DFASTCACHED_SOURCE_DIR=<source root> -P ${CMAKE_CURRENT_LIST_FILE}")
+endif()
+
+set(sourceRoot "${FASTCACHED_SOURCE_DIR}/src/FastCache")
+if(NOT IS_DIRECTORY "${sourceRoot}")
+    message(FATAL_ERROR "'${sourceRoot}' is not a directory. Is FASTCACHED_SOURCE_DIR the source root?")
+endif()
+
+# Split a "path|reason" table into two parallel lists, so the reason can be
+# printed beside the rule it explains rather than being a comment nobody reads.
+function(fastcached_split_rows rows pathsOut reasonsOut)
+    set(paths "")
+    set(reasons "")
+    foreach(row IN LISTS ${rows})
+        string(FIND "${row}" "|" separator)
+        if(separator EQUAL -1)
+            message(FATAL_ERROR "Malformed row (no '|'): ${row}")
+        endif()
+        string(SUBSTRING "${row}" 0 ${separator} rowPath)
+        math(EXPR reasonStart "${separator} + 1")
+        string(SUBSTRING "${row}" ${reasonStart} -1 rowReason)
+        list(APPEND paths "${rowPath}")
+        list(APPEND reasons "${rowReason}")
+    endforeach()
+    set(${pathsOut} "${paths}" PARENT_SCOPE)
+    set(${reasonsOut} "${reasons}" PARENT_SCOPE)
+endfunction()
+
+fastcached_split_rows(FastCachedNetStandaloneDirs standaloneDirs standaloneDirReasons)
+fastcached_split_rows(FastCachedNetStandaloneLeaves standaloneLeaves standaloneLeafReasons)
+
+# ---------------------------------------------------------------------------
+# Every in-tree include in one file, as paths relative to src/FastCache -- so
+# `#include <FastCache/Core/Clock.hpp>` yields `Core/Clock.hpp`.
+#
+# It reads EVERY `#include` rather than only the ones already spelled
+# `<FastCache/...>`, because the spellings it would otherwise skip are exactly the
+# ones that break the boundary while still reporting green:
+#
+#   * `#include "../Core/Logger.hpp"` -- a relative escape, and the likeliest real
+#     drift: it compiles, it links, and it looks local.
+#   * `#include "FastCache/Core/Logger.hpp"` -- quoted rather than angled. Not this
+#     tree's convention, which is exactly why nothing would notice a first one.
+#   * `#include <FastCache/Net/../Core/Logger.hpp>` -- a `..` that matches an
+#     allowed prefix and then walks straight out of it.
+#
+# So a quoted include, and a `..` anywhere in an angled one, are both REPORTED
+# rather than read as something this check can resolve. That is failing closed: a
+# spelling it cannot classify is refused instead of waved through, the same choice
+# the compile-cache opcode table makes about an opcode it does not know. A plain
+# `<vector>` or `<openssl/ssl.h>` names nothing in this tree and is not its business.
+#
+# @param filePath File to read.
+# @param includesOut Set to the list of in-tree include targets, relative to
+#        src/FastCache. A spelling that cannot be classified is returned verbatim
+#        behind a `!` marker, which the caller reports as its own violation.
+function(fastcached_fastcache_includes filePath includesOut)
+    file(STRINGS "${filePath}" lines REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]")
+    set(includes "")
+    foreach(line IN LISTS lines)
+        set(target "")
+        set(quoted FALSE)
+        if(line MATCHES "^[ \t]*#[ \t]*include[ \t]*<([^>]+)>")
+            set(target "${CMAKE_MATCH_1}")
+        elseif(line MATCHES "^[ \t]*#[ \t]*include[ \t]*\"([^\"]+)\"")
+            set(target "${CMAKE_MATCH_1}")
+            set(quoted TRUE)
+        endif()
+
+        if(target STREQUAL "")
+            continue()
+        endif()
+
+        if(quoted)
+            list(APPEND includes "!a quoted include, which this tree does not use: \"${target}\"")
+        elseif(target MATCHES "(^|/)\.\.(/|$)")
+            list(APPEND includes "!an include that walks out with '..': <${target}>")
+        elseif(target MATCHES "^FastCache/")
+            string(REGEX REPLACE "^FastCache/" "" relative "${target}")
+            list(APPEND includes "${relative}")
+        endif()
+    endforeach()
+    set(${includesOut} "${includes}" PARENT_SCOPE)
+endfunction()
+
+# ---------------------------------------------------------------------------
+# Half one: each leaf really is a leaf.
+set(leafViolations "")
+foreach(leaf IN LISTS standaloneLeaves)
+    set(leafPath "${sourceRoot}/${leaf}")
+    if(NOT EXISTS "${leafPath}")
+        list(APPEND leafViolations "  ${leaf}\n      is named in the leaf table but does not exist")
+    else()
+        fastcached_fastcache_includes("${leafPath}" leafIncludes)
+        if(NOT leafIncludes STREQUAL "")
+            # Markers and real includes alike: a leaf that reaches anything, by
+            # any spelling, has stopped being a leaf.
+            string(REPLACE "!" "" leafIncludeList "${leafIncludes}")
+            list(JOIN leafIncludeList ", " leafIncludeText)
+            list(APPEND leafViolations
+                "  ${leaf}\n      travels with Net/ only because it depends on nothing, and it now includes: ${leafIncludeText}")
+        endif()
+    endif()
+endforeach()
+
+# ---------------------------------------------------------------------------
+# Half two: nothing in the unit reaches outside it.
+set(scannedCount 0)
+set(edgeViolations "")
+set(missingUnits "")
+
+foreach(dir IN LISTS standaloneDirs)
+    if(NOT IS_DIRECTORY "${sourceRoot}/${dir}")
+        list(APPEND missingUnits "  ${dir}/\n      is named in the unit table but is not a directory")
+        continue()
+    endif()
+
+    set(unitGlobs "")
+    foreach(glob IN LISTS FastCachedNetStandaloneSourceGlobs)
+        list(APPEND unitGlobs "${sourceRoot}/${dir}/${glob}")
+    endforeach()
+    file(GLOB_RECURSE unitSources LIST_DIRECTORIES false ${unitGlobs})
+
+    # A directory that contributes nothing is a renamed or mistyped row, and the
+    # whole check would then pass by scanning nothing at all -- which is the one
+    # failure mode a boundary test must not be allowed to have.
+    if(unitSources STREQUAL "")
+        list(APPEND missingUnits "  ${dir}/\n      exists but holds no source this check knows how to read")
+    endif()
+    foreach(unitSource IN LISTS unitSources)
+        string(LENGTH "${FastCachedNetStandaloneTestSuffix}" suffixLength)
+        string(LENGTH "${unitSource}" sourceLength)
+        if(sourceLength GREATER suffixLength)
+            math(EXPR suffixStart "${sourceLength} - ${suffixLength}")
+            string(SUBSTRING "${unitSource}" ${suffixStart} -1 tail)
+            if(tail STREQUAL "${FastCachedNetStandaloneTestSuffix}")
+                continue()
+            endif()
+        endif()
+
+        math(EXPR scannedCount "${scannedCount} + 1")
+        file(RELATIVE_PATH relativeSource "${sourceRoot}" "${unitSource}")
+        fastcached_fastcache_includes("${unitSource}" sourceIncludes)
+
+        foreach(included IN LISTS sourceIncludes)
+            # A spelling the scanner refused to resolve. Reported as itself
+            # rather than tested against the table, which it is not a path for.
+            if(included MATCHES "^!")
+                string(REGEX REPLACE "^!" "" complaint "${included}")
+                list(APPEND edgeViolations "  ${relativeSource}\n      has ${complaint}")
+                continue()
+            endif()
+
+            set(allowed FALSE)
+            foreach(allowedDir IN LISTS standaloneDirs)
+                if(included MATCHES "^${allowedDir}/")
+                    set(allowed TRUE)
+                    break()
+                endif()
+            endforeach()
+            if(NOT allowed)
+                list(FIND standaloneLeaves "${included}" leafPosition)
+                if(NOT leafPosition EQUAL -1)
+                    set(allowed TRUE)
+                endif()
+            endif()
+            if(NOT allowed)
+                list(APPEND edgeViolations "  ${relativeSource}\n      includes FastCache/${included}")
+            endif()
+        endforeach()
+    endforeach()
+endforeach()
+
+# ---------------------------------------------------------------------------
+if(NOT leafViolations STREQUAL "" OR NOT edgeViolations STREQUAL "" OR NOT missingUnits STREQUAL "")
+    set(report "")
+    if(NOT missingUnits STREQUAL "")
+        list(JOIN missingUnits "\n" missingReport)
+        string(APPEND report "The standalone unit is not where this check expects it:\n${missingReport}\n")
+    endif()
+    if(NOT edgeViolations STREQUAL "")
+        list(JOIN edgeViolations "\n" edgeReport)
+        string(APPEND report "Include(s) reach outside the Net standalone unit:\n${edgeReport}\n")
+    endif()
+    if(NOT leafViolations STREQUAL "")
+        list(JOIN leafViolations "\n" leafReport)
+        string(APPEND report "Leaf header(s) are no longer dependency-free:\n${leafReport}\n")
+    endif()
+
+    set(rulebook "")
+    set(index 0)
+    foreach(dir IN LISTS standaloneDirs)
+        list(GET standaloneDirReasons ${index} reason)
+        string(APPEND rulebook "  ${dir}/\n      ${reason}\n")
+        math(EXPR index "${index} + 1")
+    endforeach()
+    set(index 0)
+    foreach(leaf IN LISTS standaloneLeaves)
+        list(GET standaloneLeafReasons ${index} reason)
+        string(APPEND rulebook "  ${leaf}\n      ${reason}\n")
+        math(EXPR index "${index} + 1")
+    endforeach()
+
+    message(FATAL_ERROR
+        "${report}"
+        "src/FastCache/Net/ is meant to be lifted out of this tree and upstreamed, "
+        "so it and everything that travels with it may include only:\n\n"
+        "${rulebook}\n"
+        "Close the edge rather than widening the table: push the dependency up to a "
+        "caller (Cc::DialEndpoint is the precedent), or move the file to the layer "
+        "that owns it. Widen the table only for a header that depends on nothing at "
+        "all, and say in its row why it has to travel.\n"
+        "The table lives in ${CMAKE_CURRENT_LIST_FILE}.")
+endif()
+
+list(LENGTH standaloneDirs dirCount)
+list(LENGTH standaloneLeaves leafCount)
+message("net boundary: ${scannedCount} source(s) across ${dirCount} directory/directories "
+        "reach only themselves plus ${leafCount} dependency-free leaf header(s)")

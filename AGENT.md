@@ -187,8 +187,10 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   the gate runs before the payload is buffered.
 - A pre-auth verb carries its own payload ceiling, `static_assert`ed so a new one
   cannot reopen the hole by omission.
-- `Net/` must not depend on `Core/`, and `CompileCacheWire.hpp` must stay
-  header-only and dependency-free — the launcher does not link `FastCache`.
+- `Net/` must not depend on `Core/`. `Async/` travels with it, plus three named
+  dependency-free leaf headers; `ctest -R net-boundary` enforces the table.
+- `CompileCacheWire.hpp` must stay header-only and dependency-free — the launcher
+  does not link `FastCache`.
 - SIGPIPE is suppressed per socket, never process-wide: an ignored disposition is
   inherited across exec.
 - There is exactly one TCP client, `Net/TcpClient`. Do not write a second.
@@ -423,8 +425,8 @@ Catch2 tests live next to the implementation files, so `Foo.cpp` has a `Foo_test
 
 Not every test is a Catch2 case: script-driven tests are registered in
 `src/tests/CMakeLists.txt`, the `smoke`-labelled ones reporting a missing
-prerequisite as skipped. `ctest -R repository-hygiene` needs no daemon, socket or
-compiler and runs in the default set.
+prerequisite as skipped. `ctest -R repository-hygiene` and `ctest -R net-boundary`
+need no daemon, socket or compiler and run in the default set.
 
 The rules that have each already cost a debugging session — bounded waits, where a
 script-driven test must be registered, per-run port allocation, and the shared
