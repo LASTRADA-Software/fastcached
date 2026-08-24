@@ -211,10 +211,14 @@ void EpollReactor::Run()
                 continue;
             }
             auto* handler = static_cast<EpollFdHandler*>(ev.data.ptr);
-            if ((ev.events & EPOLLIN) && handler->onReadable)
-                handler->onReadable(handler);
-            if ((ev.events & EPOLLOUT) && handler->onWritable)
-                handler->onWritable(handler);
+
+            // Exactly one callback, chosen by SelectEpollCallback -- see the rules
+            // recorded there. In short: an error must be routed somewhere or a
+            // level-triggered fd is re-reported forever and the loop spins, and a
+            // second callback must not run because the first may have resumed a
+            // coroutine that freed the object `handler` lives in.
+            if (auto* const callback = SelectEpollCallback(*handler, ev.events); callback != nullptr)
+                callback(handler);
         }
 
         DrainPendingSubmits();

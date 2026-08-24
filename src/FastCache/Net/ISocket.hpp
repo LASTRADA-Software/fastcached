@@ -19,6 +19,16 @@ namespace FastCache
 /// transferred (or 0 on EOF for reads); `error` is the failure cause.
 using IoResult = std::expected<std::size_t, NetError>;
 
+/// A connected socket, or why one could not be produced.
+///
+/// One name because accept and connect answer the same question and their
+/// results are the same type. `IListener.hpp`'s `AcceptResult` is an alias of
+/// this, so a helper that consumes one consumes the other -- and so a connect
+/// path needs no result-carrying awaitable of its own, which would have been a
+/// verbatim copy of `AcceptAwaitable`.
+class ISocket;
+using SocketResult = std::expected<std::unique_ptr<ISocket>, NetError>;
+
 /// Awaitable returned by ISocket::Read / Write. Completion-shaped: the
 /// reactor / transport gets to know about the operation, suspends the
 /// coroutine, and resumes with an IoResult.

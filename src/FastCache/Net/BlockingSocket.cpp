@@ -108,6 +108,25 @@ namespace Detail
         // WSAGetLastError like any other failure.
     }
 
+    void ArmCloseOnExec(NativeSocket /*socket*/) noexcept
+    {
+        // Windows has no per-descriptor close-on-exec: handle inheritance is
+        // decided per CreateProcess call, and a socket is not inheritable unless
+        // it is asked for.
+    }
+
+    bool SetNonBlocking(NativeSocket socket) noexcept
+    {
+        u_long mode = 1;
+        return ::ioctlsocket(static_cast<SOCKET>(socket), FIONBIO, &mode) == 0;
+    }
+
+    bool SetBlocking(NativeSocket socket) noexcept
+    {
+        u_long mode = 0;
+        return ::ioctlsocket(static_cast<SOCKET>(socket), FIONBIO, &mode) == 0;
+    }
+
     void EnsureNetworkInitialised()
     {
         if (winsockInitialised.load(std::memory_order_acquire))
@@ -216,6 +235,30 @@ namespace Detail
     #else
         ::signal(SIGPIPE, SIG_IGN);
     #endif
+    }
+
+    void ArmCloseOnExec(NativeSocket socket) noexcept
+    {
+        auto const flags = ::fcntl(static_cast<int>(socket), F_GETFD, 0);
+        if (flags < 0)
+            return;
+        std::ignore = ::fcntl(static_cast<int>(socket), F_SETFD, flags | FD_CLOEXEC);
+    }
+
+    bool SetNonBlocking(NativeSocket socket) noexcept
+    {
+        auto const flags = ::fcntl(static_cast<int>(socket), F_GETFL, 0);
+        if (flags < 0)
+            return false;
+        return ::fcntl(static_cast<int>(socket), F_SETFL, flags | O_NONBLOCK) == 0;
+    }
+
+    bool SetBlocking(NativeSocket socket) noexcept
+    {
+        auto const flags = ::fcntl(static_cast<int>(socket), F_GETFL, 0);
+        if (flags < 0)
+            return false;
+        return ::fcntl(static_cast<int>(socket), F_SETFL, flags & ~O_NONBLOCK) == 0;
     }
 
     void EnsureNetworkInitialised()
@@ -452,28 +495,7 @@ void BlockingListener::Close() noexcept
 
 std::uint16_t BlockingListener::BoundPort() const noexcept
 {
-    if (_native == Detail::InvalidSocket)
-        return 0;
-
-    sockaddr_storage storage {};
-#if defined(_WIN32)
-    auto length = static_cast<int>(sizeof(storage));
-    auto const handle = static_cast<SOCKET>(_native);
-#else
-    auto length = static_cast<socklen_t>(sizeof(storage));
-    auto const handle = static_cast<int>(_native);
-#endif
-    if (::getsockname(handle, reinterpret_cast<sockaddr*>(&storage), &length) != 0)
-        return 0;
-
-    // Read the port out of whichever family the socket actually is: the two
-    // sockaddr layouts put it at different offsets, and reading the wrong one
-    // yields a plausible-looking number rather than an error.
-    if (storage.ss_family == AF_INET)
-        return ntohs(reinterpret_cast<sockaddr_in const*>(&storage)->sin_port);
-    if (storage.ss_family == AF_INET6)
-        return ntohs(reinterpret_cast<sockaddr_in6 const*>(&storage)->sin6_port);
-    return 0;
+    return Detail::BoundPortOf(_native);
 }
 
 void BlockingListener::SetTimeouts(std::chrono::milliseconds acceptPoll, std::chrono::milliseconds ioTimeout) noexcept

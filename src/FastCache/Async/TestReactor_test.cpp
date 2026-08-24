@@ -6,7 +6,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
+#include <barrier>
 #include <chrono>
+#include <coroutine>
+#include <cstddef>
+#include <thread>
+#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -60,6 +66,15 @@ FastCache::Task<void> WaitUntil(FastCache::IReactor* reactor, FastCache::TimePoi
 {
     co_await SleepAwaitable { .reactor = reactor, .deadline = deadline };
     *fired = true;
+    co_return;
+}
+
+/// A task that does nothing but record that it ran. Lazy, so handing its handle
+/// to the reactor from a producer thread is the only thing that advances it --
+/// which is exactly the crossing under test.
+FastCache::Task<void> Increment(std::atomic<int>* resumed)
+{
+    resumed->fetch_add(1, std::memory_order_relaxed);
     co_return;
 }
 
@@ -163,4 +178,59 @@ TEST_CASE("TestReactor::Stop short-circuits the loop", "[reactor]")
 
     // Stop() requested before Run(): no ticks happen.
     REQUIRE(counter == 0);
+}
+
+TEST_CASE("TestReactor accepts Submit and Schedule from many threads", "[reactor]")
+{
+    // `IReactor` documents both as safe to call from any thread, and this double
+    // did not honour that -- it touched a bare deque and a bare vector. Nothing
+    // noticed while every producer was the test's own thread. The primitives
+    // built on top of this reactor (a resolver handing a result back from a
+    // worker pool, a queue pushed by a producer thread) cross threads by
+    // definition, so a double that cannot be used that way forces every one of
+    // those cases onto a real platform reactor, where nothing is deterministic.
+    //
+    // Run under TSan this fails outright before the mutex; without a sanitizer it
+    // corrupts the containers and shows up as a crash inside Tick() naming
+    // nothing. The barrier maximises the overlap so the unguarded version does
+    // not get away with it.
+    FastCache::ManualClock clock;
+    FastCache::TestReactor reactor { clock };
+
+    constexpr std::size_t Producers = 8;
+    constexpr std::size_t PerProducer = 64;
+
+    std::atomic<int> resumed { 0 };
+    std::vector<FastCache::Task<void>> tasks;
+    tasks.reserve(Producers * PerProducer);
+    for (std::size_t i = 0; i < Producers * PerProducer; ++i)
+        tasks.push_back(Increment(&resumed));
+
+    std::barrier start { static_cast<std::ptrdiff_t>(Producers) };
+    std::vector<std::jthread> threads;
+    threads.reserve(Producers);
+    for (std::size_t p = 0; p < Producers; ++p)
+    {
+        threads.emplace_back([&, p] {
+            start.arrive_and_wait();
+            for (std::size_t i = 0; i < PerProducer; ++i)
+            {
+                auto& task = tasks[(p * PerProducer) + i];
+                // Half through the ready queue and half through the timer heap,
+                // because they are two containers and only one of them being
+                // guarded would still pass a test that used either alone.
+                if ((i % 2) == 0)
+                    reactor.Submit(task.Native());
+                else
+                    reactor.Schedule(clock.Now(), task.Native());
+            }
+        });
+    }
+    threads.clear(); // join every producer
+
+    REQUIRE(reactor.PendingSubmissions() + reactor.PendingTimers() == Producers * PerProducer);
+    reactor.Drain();
+    REQUIRE(resumed.load() == static_cast<int>(Producers * PerProducer));
+    REQUIRE(reactor.PendingSubmissions() == 0);
+    REQUIRE(reactor.PendingTimers() == 0);
 }

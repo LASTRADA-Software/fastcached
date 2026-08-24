@@ -79,7 +79,7 @@ struct Fleet
 [[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port, std::span<std::byte const> frame)
 {
     BlockingConnector connector;
-    auto socket = connector.Connect("127.0.0.1", port, 5s, 0ms);
+    auto socket = SyncRun(connector.Connect("127.0.0.1", port, 5s));
     REQUIRE(socket.has_value());
 
     // One coroutine for the whole exchange: `SyncRun` drives a `Task`, so the awaits

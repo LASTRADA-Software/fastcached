@@ -121,20 +121,22 @@ class ScriptedConnector final: public IConnector
     }
 
     /// @copydoc IConnector::Connect
-    [[nodiscard]] std::expected<std::unique_ptr<ISocket>, NetError> Connect(std::string_view host,
-                                                                            std::uint16_t port,
-                                                                            std::chrono::milliseconds connectTimeout,
-                                                                            std::chrono::milliseconds ioTimeout) override
+    ///
+    /// A coroutine that never suspends, mirroring `BlockingConnector`: the
+    /// transport still drives it with `SyncRun`, and a fake that suspended would
+    /// make these cases assert something no production connector does.
+    [[nodiscard]] Task<SocketResult> Connect(std::string host,
+                                             std::uint16_t port,
+                                             std::chrono::milliseconds connectTimeout) override
     {
         std::ignore = host;
         std::ignore = port;
         std::ignore = connectTimeout;
-        std::ignore = ioTimeout;
         _attempts.fetch_add(1, std::memory_order_relaxed);
         if (_refuse.load(std::memory_order_relaxed))
-            return std::unexpected { NetError {
+            co_return std::unexpected { NetError {
                 .code = NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" } };
-        return std::make_unique<RecordingSocket>(_record);
+        co_return std::make_unique<RecordingSocket>(_record);
     }
 
   private:

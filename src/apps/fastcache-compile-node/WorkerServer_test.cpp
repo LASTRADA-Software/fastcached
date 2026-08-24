@@ -64,6 +64,12 @@ class OneShotListener final: public IListener
     }
     void Close() noexcept override {}
 
+    /// @return 0: these fakes hand back scripted sockets and never bind.
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept override
+    {
+        return 0;
+    }
+
   private:
     std::unique_ptr<ISocket> _socket;
 };
@@ -111,6 +117,12 @@ class IdleListener final: public IListener
     void Close() noexcept override
     {
         _closed = true;
+    }
+
+    /// @return 0: these fakes hand back scripted sockets and never bind.
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept override
+    {
+        return 0;
     }
 
     /// How many times the loop has asked for a connection.

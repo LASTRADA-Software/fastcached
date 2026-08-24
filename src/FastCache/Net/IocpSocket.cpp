@@ -485,6 +485,13 @@ std::string_view IocpListener::BindError() const noexcept
     return _impl ? std::string_view { _impl->bindError } : std::string_view {};
 }
 
+std::uint16_t IocpListener::BoundPort() const noexcept
+{
+    if (!_impl || _impl->listenSock == INVALID_SOCKET)
+        return 0;
+    return Detail::BoundPortOf(static_cast<Detail::NativeSocket>(_impl->listenSock));
+}
+
 void IocpListener::Close() noexcept
 {
     if (!_impl)

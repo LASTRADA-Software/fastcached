@@ -74,14 +74,13 @@ namespace
         };
     }
 
-    void SetNonBlocking(int fd) noexcept
+    /// Non-blocking plus close-on-exec, for a descriptor this reactor will own.
+    /// See the twin in EpollSocket.cpp: both halves now come from `Detail`, and
+    /// the two local copies they replace had already drifted apart.
+    void PrepareOwnedFd(int fd) noexcept
     {
-        auto const flags = ::fcntl(fd, F_GETFL, 0);
-        if (flags >= 0)
-            ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        auto const fdflags = ::fcntl(fd, F_GETFD, 0);
-        if (fdflags >= 0)
-            ::fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC);
+        std::ignore = Detail::SetNonBlocking(static_cast<Detail::NativeSocket>(fd));
+        Detail::ArmCloseOnExec(static_cast<Detail::NativeSocket>(fd));
     }
 
     /// Per-`sendmsg` iovec batch cap (see EpollSocket for the rationale).
@@ -339,7 +338,7 @@ KqueueSocket::KqueueSocket(KqueueReactor& reactor, int fd, std::string peerAddre
     _fd { fd },
     _peerAddress { std::move(peerAddress) }
 {
-    SetNonBlocking(fd);
+    PrepareOwnedFd(fd);
     // This socket sends with no flags, so the suppression has to be armed on the
     // descriptor. Every platform with kqueue has SO_NOSIGPIPE, which is what
     // ArmNoSigPipe uses there -- and it is the only thing standing between a peer
@@ -596,7 +595,7 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
         awaitable->Complete(std::unexpected(MakePosixError(errno, "accept")));
         return;
     }
-    SetNonBlocking(fd);
+    PrepareOwnedFd(fd);
     Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(fd));
     auto* awaitable = impl->pending;
     impl->pending = nullptr;
@@ -629,7 +628,7 @@ std::unique_ptr<KqueueListener> KqueueListener::Bind(KqueueReactor& reactor,
     }
 
     auto const fd = static_cast<int>(bound->socket);
-    SetNonBlocking(fd);
+    PrepareOwnedFd(fd);
     listener->_impl->handler.fd = fd;
     return listener;
 }
@@ -642,6 +641,13 @@ bool KqueueListener::IsBound() const noexcept
 std::string_view KqueueListener::BindError() const noexcept
 {
     return _impl ? std::string_view { _impl->bindError } : std::string_view {};
+}
+
+std::uint16_t KqueueListener::BoundPort() const noexcept
+{
+    if (!_impl || _impl->handler.fd < 0)
+        return 0;
+    return Detail::BoundPortOf(static_cast<Detail::NativeSocket>(_impl->handler.fd));
 }
 
 void KqueueListener::Close() noexcept
@@ -670,7 +676,7 @@ AcceptAwaitable KqueueListener::Accept()
     auto const fd = ::accept(_impl->handler.fd, reinterpret_cast<sockaddr*>(&client), &len);
     if (fd >= 0)
     {
-        SetNonBlocking(fd);
+        PrepareOwnedFd(fd);
         // Same tuning as the reactor-driven accept path (Impl::OnReadable):
         // without it, connections accepted through this fast path keep the
         // default send buffer and Nagle, so large replies park far sooner and

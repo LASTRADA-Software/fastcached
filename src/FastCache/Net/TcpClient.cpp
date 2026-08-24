@@ -16,13 +16,16 @@
 namespace FastCache
 {
 
-std::expected<std::unique_ptr<ISocket>, NetError> ConnectTcp(std::string_view host,
-                                                             std::uint16_t port,
-                                                             std::chrono::milliseconds connectTimeout,
-                                                             std::chrono::milliseconds ioTimeout)
+Task<SocketResult> ConnectTcp(std::string host,
+                              std::uint16_t port,
+                              std::chrono::milliseconds connectTimeout,
+                              std::chrono::milliseconds ioTimeout)
 {
-    BlockingConnector connector;
-    return connector.Connect(host, port, connectTimeout, ioTimeout);
+    // The connector outlives the await because it is a local of THIS coroutine's
+    // frame, not of the call expression -- which is the whole reason this is a
+    // coroutine rather than a function returning the connector's task.
+    BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = ioTimeout } };
+    co_return co_await connector.Connect(std::move(host), port, connectTimeout);
 }
 
 Task<bool> SendAll(ISocket* socket, std::span<std::byte const> bytes)

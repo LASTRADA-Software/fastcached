@@ -74,11 +74,18 @@ namespace
         };
     }
 
-    void SetNonBlocking(int fd) noexcept
+    /// Non-blocking plus close-on-exec, for a descriptor this reactor will own.
+    ///
+    /// Both halves come from `Detail`. They used to be a local copy here and
+    /// another in `KqueueSocket.cpp`, and the two had already drifted -- only the
+    /// kqueue one set FD_CLOEXEC -- which is the drift a single definition
+    /// exists to stop. Close-on-exec matters because a process that both listens
+    /// and spawns children (the compile node spawns a compiler per job) otherwise
+    /// hands each child every open connection.
+    void PrepareOwnedFd(int fd) noexcept
     {
-        auto const flags = ::fcntl(fd, F_GETFL, 0);
-        if (flags >= 0)
-            ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        std::ignore = Detail::SetNonBlocking(static_cast<Detail::NativeSocket>(fd));
+        Detail::ArmCloseOnExec(static_cast<Detail::NativeSocket>(fd));
     }
 
     /// Per-`sendmsg` iovec batch cap. `IOV_MAX` is the kernel limit (1024 on
@@ -350,7 +357,7 @@ EpollSocket::EpollSocket(EpollReactor& reactor, int fd, std::string peerAddress)
     _fd { fd },
     _peerAddress { std::move(peerAddress) }
 {
-    SetNonBlocking(fd);
+    PrepareOwnedFd(fd);
     std::ignore = reactor.Attach(&_impl->handler);
 }
 
@@ -661,6 +668,13 @@ bool EpollListener::IsBound() const noexcept
 std::string_view EpollListener::BindError() const noexcept
 {
     return _impl ? std::string_view { _impl->bindError } : std::string_view {};
+}
+
+std::uint16_t EpollListener::BoundPort() const noexcept
+{
+    if (!_impl || _impl->handler.fd < 0)
+        return 0;
+    return Detail::BoundPortOf(static_cast<Detail::NativeSocket>(_impl->handler.fd));
 }
 
 void EpollListener::Close() noexcept

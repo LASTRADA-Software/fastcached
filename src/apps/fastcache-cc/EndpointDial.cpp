@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -27,7 +28,10 @@ std::unique_ptr<ISocket> DialEndpoint(std::string_view hostPort, std::chrono::mi
     if (!port.has_value())
         return nullptr;
 
-    auto socket = FastCache::ConnectTcp(split->first, *port, ioTimeout, ioTimeout);
+    // `SyncRun` because this launcher has no reactor and `ConnectTcp` uses a
+    // blocking connector, whose task resolves inline and is therefore never left
+    // suspended -- the precondition `SyncRun` states.
+    auto socket = SyncRun(FastCache::ConnectTcp(std::string { split->first }, *port, ioTimeout, ioTimeout));
     if (!socket.has_value())
         return nullptr;
     return std::move(*socket);

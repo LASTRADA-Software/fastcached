@@ -176,8 +176,17 @@ void RaftPeerTransport::RunSender(Peer& peer) noexcept
             // existed. Adding one is a real improvement -- a peer that accepts and
             // then stalls parks this thread -- but it changes when a peer is
             // declared dead, so it is its own decision rather than a side effect.
-            auto dialed = _connector.Connect(
-                peer.endpoint.host, peer.endpoint.port, _options.dialTimeout, std::chrono::milliseconds { 0 });
+            // `SyncRun` over the dial, which is sound for exactly the reason
+            // this transport still owns a thread per peer: the injected connector
+            // is a blocking one, so its task resolves inline and is never left
+            // suspended. A reactor connector here would throw, and the fix for
+            // that is to move this loop onto the reactor rather than to keep
+            // driving it from a thread.
+            //
+            // The socket is still handed back with no I/O bound, as before -- see
+            // the note above. That is what makes `Stop()` unable to wake a sender
+            // parked in `::send`, and it is why this loop is next in line to move.
+            auto dialed = SyncRun(_connector.Connect(peer.endpoint.host, peer.endpoint.port, _options.dialTimeout));
             if (!dialed.has_value())
             {
                 // Logged at Debug, not Warn. A peer being down is the ordinary

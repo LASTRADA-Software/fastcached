@@ -21,6 +21,9 @@
 # The remaining CRC32C users are all daemon-side page and record checksums.
 
 set(_fc_cc_core
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Async/EpollReactor.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Async/IocpReactor.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Async/KqueueReactor.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Cli/UsageDoc.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/PathCanon.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/CompileValue.cpp"
@@ -28,6 +31,10 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/SocketAddress.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingSocket.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingConnector.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/ConnectFlow.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/EpollSocket.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/IocpSocket.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/KqueueSocket.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/TcpClient.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
@@ -137,6 +144,25 @@ endif()
 if(WIN32)
     target_link_libraries(fastcache-cc PRIVATE ws2_32)
 endif()
+# The reactor and its platform sockets are compiled in so the launcher can dial
+# without blocking -- see Net/IConnector.hpp. They cost no new library: the
+# reactor headers reach only Async/IReactor.hpp and Core/Clock.hpp, both
+# header-only and std-only, and the socket sources reach only NetError.hpp,
+# BlockingSocket.hpp and SocketAddress.hpp, which were already here. All six are
+# listed unconditionally and guard themselves with a file-scope #if, exactly as
+# src/FastCache/CMakeLists.txt lists them.
+#
+# WIN32_LEAN_AND_MEAN / NOMINMAX / _WIN32_WINNT are NOT optional and NOT
+# inherited: they are PUBLIC on the FastCache target, and this binary
+# deliberately does not link FastCache. Without them the Windows build fails
+# outright, because Net/IocpSocket.hpp -> Async/IocpReactor.hpp -> <windows.h>
+# pulls in winsock.h BEFORE Net/IocpSocket.cpp includes <winsock2.h> -- the
+# classic redefinition. Platform/Terminal.cpp already includes <windows.h> here
+# and survives only because nothing in that translation unit also wants winsock2.
+if(WIN32)
+    target_compile_definitions(fastcache-cc PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+endif()
+
 
 if(FASTCACHED_STATIC_LAUNCHER AND MSVC)
     # CMP0091: MSVC_RUNTIME_LIBRARY selects /MT(d) vs /MD(d). Static so the CRT is
@@ -198,6 +224,11 @@ if(FASTCACHED_BUILD_TESTS)
         ${_fc_cc_core}
     )
     target_include_directories(fastcache-cc-tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+    if(WIN32)
+        # Same reason as the launcher's: this target compiles the same
+        # ${_fc_cc_core} rows and links FastCache no more than the launcher does.
+        target_compile_definitions(fastcache-cc-tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+    endif()
     target_link_libraries(fastcache-cc-tests PRIVATE Catch2::Catch2)
     if(FASTCACHED_ENABLE_COMPRESSION AND _fc_cc_zstd AND _fc_cc_lz4)
         target_link_libraries(fastcache-cc-tests PRIVATE ${_fc_cc_zstd} ${_fc_cc_lz4})

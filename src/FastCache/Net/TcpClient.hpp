@@ -57,17 +57,23 @@ namespace FastCache
 /// it: it constructs the platform connector itself, so a caller that needs to
 /// inject a different one should use `IConnector::Connect` directly.
 ///
-/// @param host Hostname or literal address, IPv4 or IPv6 (unbracketed).
+/// @param host Hostname or literal address, IPv4 or IPv6 (unbracketed). By
+///        value, for the coroutine-frame reason `IConnector::Connect` records.
 /// @param port TCP port in host byte order.
 /// @param connectTimeout How long to wait for the dial; non-positive leaves the
 ///        platform default, which can run to minutes.
 /// @param ioTimeout Per-call deadline for each later blocking send/recv;
 ///        non-positive leaves it unbounded.
 /// @return The connected socket, or why the attempt did not succeed.
-[[nodiscard]] std::expected<std::unique_ptr<ISocket>, NetError> ConnectTcp(std::string_view host,
-                                                                           std::uint16_t port,
-                                                                           std::chrono::milliseconds connectTimeout,
-                                                                           std::chrono::milliseconds ioTimeout);
+///
+/// A `Task` because `IConnector::Connect` is one. Nothing here ever suspends --
+/// `BlockingConnector` resolves inline and waits with a syscall -- so a
+/// synchronous caller drives it with `SyncRun`, exactly as it already drives
+/// `SendAll` and `RecvExactly` over the socket this hands back.
+[[nodiscard]] Task<SocketResult> ConnectTcp(std::string host,
+                                            std::uint16_t port,
+                                            std::chrono::milliseconds connectTimeout,
+                                            std::chrono::milliseconds ioTimeout);
 
 /// Write every byte of `bytes`, looping over partial writes.
 ///

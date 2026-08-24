@@ -166,6 +166,14 @@ class InMemoryListener final: public IListener
     [[nodiscard]] AcceptAwaitable Accept() override;
     void Close() noexcept override;
 
+    /// @return 0 always: this transport is a pair of in-process pipes and has no
+    ///         TCP port. Nothing that uses it asks -- the tests built on it dial
+    ///         through `ConnectClient()` rather than through an address.
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept override
+    {
+        return 0;
+    }
+
     /// Make a connected pair, retain the server side internally so the next
     /// Accept() resolves to it, and return the client side for the test.
     /// @param maxBytesInFlight Per-direction backpressure cap.
