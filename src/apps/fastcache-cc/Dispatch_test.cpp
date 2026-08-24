@@ -20,7 +20,7 @@ namespace
 {
 
 /// One scripted peer: replays canned replies and records what it was sent.
-class ScriptedPeer final: public ITcpClient
+class ScriptedPeer final: public ISocket
 {
   public:
     explicit ScriptedPeer(std::vector<std::byte> replies, std::vector<std::byte>* sentSink):
@@ -29,21 +29,37 @@ class ScriptedPeer final: public ITcpClient
     {
     }
 
-    bool SendAll(std::span<std::byte const> bytes) override
+    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> bytes) override
     {
         if (_sent != nullptr)
             _sent->insert(_sent->end(), bytes.begin(), bytes.end());
-        return true;
+        return IoAwaitable { IoResult { bytes.size() } };
     }
 
-    std::optional<std::vector<std::byte>> RecvExactly(std::size_t count) override
+    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
     {
-        if (_replies.size() - _cursor < count)
-            return std::nullopt;
-        std::vector<std::byte> out { _replies.begin() + static_cast<std::ptrdiff_t>(_cursor),
-                                     _replies.begin() + static_cast<std::ptrdiff_t>(_cursor + count) };
-        _cursor += count;
-        return out;
+        // A read of zero is EOF, which is how a peer that ran out of script tells
+        // RecvExactly the frame was short.
+        auto const take = std::min(_replies.size() - _cursor, buffer.size());
+        std::copy_n(_replies.begin() + static_cast<std::ptrdiff_t>(_cursor), take, buffer.begin());
+        _cursor += take;
+        return IoAwaitable { IoResult { take } };
+    }
+
+    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> /*segments*/,
+                                            std::shared_ptr<void const> /*keepAlive*/ = {}) override
+    {
+        return IoAwaitable { IoResult { 0 } };
+    }
+
+    void Close() noexcept override {}
+    [[nodiscard]] bool IsClosed() const noexcept override
+    {
+        return false;
+    }
+    [[nodiscard]] std::string PeerAddress() const override
+    {
+        return "scripted";
     }
 
   private:
@@ -64,7 +80,7 @@ class ScriptedDialer final: public IEndpointDialer
         _scripts.emplace(std::move(endpoint), std::move(replies));
     }
 
-    std::unique_ptr<ITcpClient> Dial(std::string_view hostPort) override
+    std::unique_ptr<ISocket> Dial(std::string_view hostPort) override
     {
         _dialled.emplace_back(hostPort);
         auto const it = _scripts.find(std::string { hostPort });

@@ -39,8 +39,8 @@
 #include "DependencyProbe.hpp"
 #include "DirectManifest.hpp"
 #include "Dispatch.hpp"
+#include "EndpointDial.hpp"
 #include "IProcessRunner.hpp"
-#include "ITcpClient.hpp"
 #include "LauncherCli.hpp"
 #include "PathResolve.hpp"
 #include "ReplayGuard.hpp"
@@ -50,6 +50,7 @@
 
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
+#include <FastCache/Net/TcpClient.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -501,9 +502,14 @@ void ReplayStreams(std::string_view out, std::string_view err)
 
 // --- TCP client -------------------------------------------------------------
 
-/// Thin owning wrapper over the injected ITcpClient seam, so call sites keep
-/// the `TcpClient::Connect(addr)` -> optional shape they already use while the
-/// platform socket code lives behind the interface.
+/// Thin owning wrapper over the library's `ISocket`, so call sites keep the
+/// `TcpClient::Connect(addr)` -> optional shape they already use.
+///
+/// The socket's own I/O is coroutine-shaped, and this flow is not, so the two
+/// helpers below drive it with `SyncRun`. That is sound here and nowhere else:
+/// a blocking socket resolves every awaitable inline, so the task is never left
+/// suspended -- which is the one thing `SyncRun` refuses to read from. The same
+/// reasoning is written out at `RaftPeerTransport::WriteFrame`.
 class TcpClient
 {
   public:
@@ -513,37 +519,37 @@ class TcpClient
     /// @return A connected client, or nullopt when unreachable.
     [[nodiscard]] static std::optional<TcpClient> Connect(std::string_view hostPort, std::chrono::milliseconds ioTimeout)
     {
-        auto impl = Cc::ConnectTcp(hostPort, ioTimeout);
-        if (impl == nullptr)
+        auto socket = Cc::DialEndpoint(hostPort, ioTimeout);
+        if (socket == nullptr)
             return std::nullopt;
-        return TcpClient { std::move(impl) };
+        return TcpClient { std::move(socket) };
     }
 
-    /// @see Cc::ITcpClient::SendAll
+    /// @see FastCache::SendAll
     [[nodiscard]] bool SendAll(std::span<std::byte const> bytes)
     {
-        return _impl->SendAll(bytes);
+        return SyncRun(FastCache::SendAll(_impl.get(), bytes));
     }
 
-    /// @see Cc::ITcpClient::RecvExactly
+    /// @see FastCache::RecvExactly
     [[nodiscard]] std::optional<std::vector<std::byte>> RecvExactly(std::size_t count)
     {
-        return _impl->RecvExactly(count);
+        return SyncRun(FastCache::RecvExactly(_impl.get(), count));
     }
 
     /// The underlying seam, for the framing helpers in CacheProtocol.
-    [[nodiscard]] Cc::ITcpClient& Transport() noexcept
+    [[nodiscard]] ISocket& Transport() noexcept
     {
         return *_impl;
     }
 
   private:
-    explicit TcpClient(std::unique_ptr<Cc::ITcpClient> impl):
+    explicit TcpClient(std::unique_ptr<ISocket> impl):
         _impl { std::move(impl) }
     {
     }
 
-    std::unique_ptr<Cc::ITcpClient> _impl;
+    std::unique_ptr<ISocket> _impl;
 };
 
 /// The grammar to tag the include-bearing stream with, per compiler flavor.

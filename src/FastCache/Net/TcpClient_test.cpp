@@ -9,6 +9,7 @@
 // real loopback socket transfers small buffers in one call, so the partial path
 // -- the only interesting one -- would never execute.
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Net/TcpClient.hpp>
 
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <cstddef>
 #include <deque>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -125,6 +127,17 @@ class ScriptedSocket final: public ISocket
     return bytes;
 }
 
+/// Await one accept. A blocking listener resolves it synchronously, so `SyncRun`
+/// is the right driver -- the task is never left suspended, which is the one
+/// thing `SyncRun` refuses to read from. A pointer because a coroutine parameter
+/// must not be a reference.
+/// @param listener The bound listener.
+/// @return The accepted socket, or the accept error.
+[[nodiscard]] Task<AcceptResult> AcceptOne(BlockingListener* listener)
+{
+    co_return co_await listener->Accept();
+}
+
 } // namespace
 
 TEST_CASE("SendAll keeps writing until the whole buffer is gone", "[net][tcpclient]")
@@ -214,4 +227,61 @@ TEST_CASE("ConnectTcp reports why a dial failed", "[net][tcpclient]")
     REQUIRE_FALSE(socket.has_value());
     CAPTURE(socket.error().context);
     CHECK(elapsed < Timeout * 20);
+}
+
+TEST_CASE("RecvExactly gives up on a peer that accepts and then goes silent", "[net][tcpclient]")
+{
+    // The property `ioTimeout` exists for, and the reason it is applied where the
+    // socket is minted rather than left to the caller. A dial that succeeds says
+    // only that the peer accepted; a peer that then never answers parks the
+    // calling thread forever, which for the launcher turns an optional cache into
+    // a build-stopping dependency.
+    auto listener = BlockingListener::Bind("127.0.0.1", 0);
+    if (listener == nullptr || !listener->IsBound())
+    {
+        SUCCEED("no loopback listener available on this host");
+        return;
+    }
+
+    constexpr auto IoTimeout = 300ms;
+    auto client = ConnectTcp("127.0.0.1", listener->BoundPort(), 2s, IoTimeout);
+    REQUIRE(client.has_value());
+
+    // Accept and then do nothing at all -- the connection is up, and silent.
+    auto accepted = SyncRun(AcceptOne(listener.get()));
+    REQUIRE(accepted.has_value());
+
+    auto const started = std::chrono::steady_clock::now();
+    auto const got = SyncRun(RecvExactly(client->get(), 16));
+    auto const elapsed = std::chrono::steady_clock::now() - started;
+
+    CHECK_FALSE(got.has_value());
+    // Generously bounded: the assertion is "it returned at all", not a latency
+    // measurement, so a loaded CI runner cannot make this flaky.
+    CHECK(elapsed < std::chrono::seconds { 15 });
+}
+
+TEST_CASE("A socket with a timeout armed still transfers normally", "[net][tcpclient]")
+{
+    // Guards the obvious over-correction: a timeout somehow applied as an
+    // immediate deadline would fail every transfer and silently disable caching
+    // everywhere, and the case above would still pass.
+    auto listener = BlockingListener::Bind("127.0.0.1", 0);
+    if (listener == nullptr || !listener->IsBound())
+    {
+        SUCCEED("no loopback listener available on this host");
+        return;
+    }
+
+    auto client = ConnectTcp("127.0.0.1", listener->BoundPort(), 2s, 5s);
+    REQUIRE(client.has_value());
+    auto accepted = SyncRun(AcceptOne(listener.get()));
+    REQUIRE(accepted.has_value());
+
+    auto const payload = Payload(4);
+    CHECK(SyncRun(SendAll(client->get(), std::span<std::byte const> { payload })));
+
+    auto const got = SyncRun(RecvExactly(accepted->get(), payload.size()));
+    REQUIRE(got.has_value());
+    CHECK(Testing::Unwrap(got) == payload);
 }

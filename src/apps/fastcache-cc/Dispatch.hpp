@@ -2,8 +2,8 @@
 #pragma once
 
 #include "CacheProtocol.hpp"
-#include "ITcpClient.hpp"
 
+#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
@@ -20,7 +20,7 @@ namespace FastCache::Cc
 
 /// Opens connections to endpoints named at runtime.
 ///
-/// The launcher's existing `ITcpClient` is one *connected* peer, which was enough
+/// The library's `ISocket` is one *connected* peer, which was enough
 /// while there was only ever one address to reach. Distribution talks to two —
 /// the scheduler, and then whichever worker the scheduler names — so the act of
 /// connecting becomes the thing that has to be injected. Tests hand out scripted
@@ -38,7 +38,7 @@ class IEndpointDialer
     /// Connect to `hostPort`.
     /// @param hostPort The endpoint, e.g. "10.0.0.7:6676".
     /// @return A connected client, or nullptr when it could not be reached.
-    [[nodiscard]] virtual std::unique_ptr<ITcpClient> Dial(std::string_view hostPort) = 0;
+    [[nodiscard]] virtual std::unique_ptr<ISocket> Dial(std::string_view hostPort) = 0;
 };
 
 /// How a dispatch attempt ended.

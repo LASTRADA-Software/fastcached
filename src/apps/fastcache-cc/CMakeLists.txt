@@ -25,8 +25,24 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/PathCanon.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/CompileValue.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Compression.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/SocketAddress.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingSocket.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingConnector.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/TcpClient.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
+
+# The four Net rows are the launcher's TCP client, and they are here rather than
+# in a copy of their own because a copy is exactly what went wrong: this tree had
+# three implementations of "dial, then send and receive whole messages", and the
+# one nobody compiled (compile-cache-testclient) was IPv4-literal-only, unbounded
+# and unprotected against SIGPIPE. See src/FastCache/Net/TcpClient.hpp.
+#
+# They cost the launcher nothing it was avoiding. The rule this file exists to
+# protect is that fastcache-cc does not LINK FastCache -- so it stays free of
+# yaml-cpp, OpenSSL and the reactor, and can link the CRT statically -- and these
+# four reach only Async/Task.hpp, Core/Errors/NetError.hpp and Core/Profiling.hpp,
+# all header-only and all std-only. ws2_32 was already linked below.
 
 # Core/Compression.cpp is the one row here that is NOT dependency-free, and it is a
 # deliberate exception to the rule the comment above states.
@@ -69,14 +85,15 @@ if(FASTCACHED_ENABLE_COMPRESSION)
     endif()
 endif()
 
-# The launcher's own reusable pieces. Process spawning and the TCP client are
-# reached through interfaces (IProcessRunner / ITcpClient) so the flow logic
-# stays platform-free and testable against fakes on every host.
+# The launcher's own reusable pieces. Process spawning is reached through an
+# interface (IProcessRunner) so the flow logic stays platform-free and testable
+# against fakes on every host; the TCP side reaches the library's ISocket seam
+# through the Net rows above.
 # CacheProtocol.cpp is here rather than in main.cpp on purpose: main.cpp is in
 # no test target, so while the wire framing lived there it had no unit coverage
 # at all -- the only thing exercising it was the end-to-end script, which needs
 # a daemon and a compiler. As its own translation unit it can be driven against
-# a scripted ITcpClient, which is what lets "a rejected version is reported
+# a scripted ISocket, which is what lets "a rejected version is reported
 # distinctly from a miss" be a test rather than a hope.
 set(_fc_cc_sources
     CmdLine.cpp
@@ -85,6 +102,7 @@ set(_fc_cc_sources
     CacheKey.cpp
     CacheProtocol.cpp
     Dispatch.cpp
+    EndpointDial.cpp
     DependencyOutput.cpp
     DependencyProbe.cpp
     DirectManifest.cpp
@@ -95,7 +113,6 @@ set(_fc_cc_sources
     ToolchainFingerprint.cpp
     ToolchainProbe.cpp
     ProcessRunner.cpp
-    TcpClient.cpp
     WorkerProtocol.cpp)
 
 # Fully static, copy-anywhere binary: statically link the MSVC C++ runtime so
@@ -166,6 +183,7 @@ if(FASTCACHED_BUILD_TESTS)
         CacheKey_test.cpp
         CacheProtocol_test.cpp
         Dispatch_test.cpp
+        EndpointDial_test.cpp
         DependencyOutput_test.cpp
         DependencyProbe_test.cpp
         DirectManifest_test.cpp
@@ -176,7 +194,6 @@ if(FASTCACHED_BUILD_TESTS)
         Stats_test.cpp
         ToolchainFingerprint_test.cpp
         ToolchainProbe_test.cpp
-        TcpClient_test.cpp
         WorkerProtocol_test.cpp
         ${_fc_cc_core}
     )

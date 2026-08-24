@@ -19,13 +19,17 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 
-/// An ITcpClient that replays canned reply bytes and records what was sent.
+/// An ISocket that replays canned reply bytes and records what was sent.
 ///
-/// TcpClient_test drives a real loopback peer, which is right for asserting
-/// timeouts but cannot pose as a daemon of the wrong version. This fake can, and
-/// it exposes its read cursor so a test can prove the client consumed exactly
-/// one reply frame and no more.
-class ScriptedTcpClient final: public ITcpClient
+/// `Net/TcpClient_test` drives the transfer loops themselves and
+/// `Net/BlockingSocket_test` drives a real loopback peer; neither can pose as a
+/// daemon of the wrong version. This fake can, and it exposes its read cursor so
+/// a test can prove the client consumed exactly one reply frame and no more.
+///
+/// It takes and returns whole buffers in one call, which is what makes the trace
+/// below readable -- the partial-transfer behaviour is `SendAll`/`RecvExactly`'s
+/// own business and is tested where those live.
+class ScriptedTcpClient final: public ISocket
 {
   public:
     /// @param replies The bytes the "daemon" will return, in order.
@@ -34,26 +38,46 @@ class ScriptedTcpClient final: public ITcpClient
     {
     }
 
-    bool SendAll(std::span<std::byte const> bytes) override
+    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> bytes) override
     {
         ++_sendCalls;
         _trace.push_back('S');
         _sent.insert(_sent.end(), bytes.begin(), bytes.end());
-        return true;
+        return IoAwaitable { IoResult { bytes.size() } };
     }
 
-    std::optional<std::vector<std::byte>> RecvExactly(std::size_t count) override
+    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
     {
         // Recorded before the short-read check: an attempted read is still a read
         // for the purpose of "did this client wait for a reply mid-conversation".
         if (_trace.empty() || _trace.back() != 'R')
             _trace.push_back('R');
-        if (_replies.size() - _cursor < count)
-            return std::nullopt;
-        std::vector<std::byte> out { _replies.begin() + static_cast<std::ptrdiff_t>(_cursor),
-                                     _replies.begin() + static_cast<std::ptrdiff_t>(_cursor + count) };
-        _cursor += count;
-        return out;
+        auto const available = _replies.size() - _cursor;
+        auto const take = std::min(available, buffer.size());
+        // Zero is EOF, which is how RecvExactly learns the peer ran out -- the
+        // same thing the old fake said by returning nullopt on a short read.
+        std::copy_n(_replies.begin() + static_cast<std::ptrdiff_t>(_cursor), take, buffer.begin());
+        _cursor += take;
+        return IoAwaitable { IoResult { take } };
+    }
+
+    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> /*segments*/,
+                                            std::shared_ptr<void const> /*keepAlive*/ = {}) override
+    {
+        return IoAwaitable { IoResult { 0 } };
+    }
+
+    void Close() noexcept override
+    {
+        _closed = true;
+    }
+    [[nodiscard]] bool IsClosed() const noexcept override
+    {
+        return _closed;
+    }
+    [[nodiscard]] std::string PeerAddress() const override
+    {
+        return "scripted";
     }
 
     /// Everything the client wrote.
@@ -95,19 +119,36 @@ class ScriptedTcpClient final: public ITcpClient
     std::size_t _cursor { 0 };
     std::size_t _sendCalls { 0 };
     std::string _trace;
+    bool _closed { false };
 };
 
-/// A client whose socket fails on send.
-class FailingTcpClient final: public ITcpClient
+/// A client whose socket fails on every call.
+class FailingTcpClient final: public ISocket
 {
   public:
-    bool SendAll(std::span<std::byte const> /*bytes*/) override
+    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> /*bytes*/) override
+    {
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::ConnReset, .systemCode = 0, .context = "scripted write failure" }) };
+    }
+    [[nodiscard]] IoAwaitable Read(std::span<std::byte> /*buffer*/) override
+    {
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::ConnReset, .systemCode = 0, .context = "scripted read failure" }) };
+    }
+    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> /*segments*/,
+                                            std::shared_ptr<void const> /*keepAlive*/ = {}) override
+    {
+        return IoAwaitable { IoResult { 0 } };
+    }
+    void Close() noexcept override {}
+    [[nodiscard]] bool IsClosed() const noexcept override
     {
         return false;
     }
-    std::optional<std::vector<std::byte>> RecvExactly(std::size_t /*count*/) override
+    [[nodiscard]] std::string PeerAddress() const override
     {
-        return std::nullopt;
+        return "failing";
     }
 };
 
