@@ -135,12 +135,13 @@ src/apps/
                             misses→compile→STORE, and falls back safely on any
                             cache error. Config via `FASTCACHE_*` env, wired
                             through `CMAKE_<LANG>_COMPILER_LAUNCHER`. Platform
-                            work sits behind `IProcessRunner` / `ITcpClient` /
+                            work sits behind `IProcessRunner` / `Net/ISocket` /
                             `IPathResolver` (the last collapsing every spelling
                             of one location — 8.3, `subst`, junctions, symlinks
                             — to one, memoized per directory),
                             so main.cpp's flow logic is platform-free. Compiles
-                            in `Cli/UsageDoc.cpp` plus `Platform/Environment.cpp`
+                            in `Cli/UsageDoc.cpp`, the four `Net/` rows that are
+                            its TCP client, plus `Platform/Environment.cpp`
                             and `Platform/Terminal.cpp` (see `_fc_cc_core`), so
                             its help renders and colorizes exactly like the
                             daemon's without linking the library. `Cli/Options`

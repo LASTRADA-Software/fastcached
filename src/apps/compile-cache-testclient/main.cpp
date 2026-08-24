@@ -23,17 +23,14 @@
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
-#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
