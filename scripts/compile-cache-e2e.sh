@@ -56,7 +56,7 @@ set -euo pipefail
 
 fastcached=""
 launcher=""
-port="21713"
+port=""
 compiler="${CXX:-c++}"
 
 while [[ $# -gt 0 ]]; do
@@ -101,6 +101,34 @@ export FASTCACHE_PREFETCH_GROUP="e2e"
 
 fail() { echo "compile-cache E2E FAILED: $*" >&2; exit 1; }
 
+# Find a port nothing is listening on, exactly as `dist-compile-e2e` and
+# `cluster-e2e` do -- and for the reason they record: a fixed port is one more way
+# to collide with whatever else is running on this machine, and the failure reads
+# as "the cache is broken" when it means "something else was listening".
+#
+# This test is worse than most when that happens, because its readiness probe
+# cannot tell its own daemon from a stranger's: the probe connects, the daemon
+# this script started has already exited because the port was taken, and the run
+# proceeds against somebody else's cache. Both halves of that show up as a claim
+# about caching -- a first compile reported as a HIT, or a second one that was not
+# served -- with nothing anywhere naming the port.
+#
+# A connect probe, not a bind probe: bind-then-close leaves the port in TIME_WAIT,
+# and the daemon that follows would then be the one that cannot have it.
+free_port() {
+    local candidate
+    for _ in $(seq 1 200); do
+        candidate=$(( 20000 + RANDOM % 20000 ))
+        if ! (exec 3<>"/dev/tcp/127.0.0.1/${candidate}") 2>/dev/null; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    fail "could not find a free port"
+}
+
+[[ -n "$port" ]] || port="$(free_port)"
+
 # --- start the daemon -------------------------------------------------------
 # The value cap must exceed the object size; the default 16 MiB is ample for
 # these tiny fixtures, but pass it explicitly so the flag stays exercised.
@@ -120,6 +148,15 @@ for _ in $(seq 1 100); do
     sleep 0.2
 done
 [[ -n "$ready" ]] || { cat "${workdir}/daemon.log" >&2; fail "daemon never listened on port ${port}"; }
+
+# Something answered; make sure it is OURS. The loop above breaks the moment the
+# port is connectable, which a daemon somebody else left behind satisfies just as
+# well -- and this script would then spend its whole run asserting things about a
+# cache it does not control.
+kill -0 "$server_pid" 2>/dev/null || {
+    cat "${workdir}/daemon.log" >&2
+    fail "something else is listening on port ${port}: our daemon is gone"
+}
 
 export FASTCACHE_ADDR="127.0.0.1:${port}"
 
@@ -908,7 +945,7 @@ fi
 #   c) the right credential still HITs, i.e. authenticating did not cost the
 #      cache its function. A gate that refused everybody would pass (a) and (b).
 echo "== authentication =="
-authport=$((port + 1))
+authport="$(free_port)"
 authdir="${workdir}/authproj"
 mkdir -p "${authdir}/build"
 cat > "${authdir}/a.cpp" <<'EOF'
@@ -929,6 +966,10 @@ for _ in $(seq 1 100); do
     sleep 0.2
 done
 [[ -n "$authready" ]] || { cat "${workdir}/auth-daemon.log" >&2; fail "authenticating daemon never listened"; }
+kill -0 "$auth_pid" 2>/dev/null || {
+    cat "${workdir}/auth-daemon.log" >&2
+    fail "something else is listening on port ${authport}: our authenticating daemon is gone"
+}
 
 (
     export FASTCACHE_ADDR="127.0.0.1:${authport}"
