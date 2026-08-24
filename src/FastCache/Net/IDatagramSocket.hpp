@@ -5,7 +5,9 @@
 #include <FastCache/Net/SocketAddress.hpp>
 
 #include <chrono>
+#include <compare>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <span>
 #include <string>
@@ -14,20 +16,48 @@
 namespace FastCache
 {
 
+/// Where a datagram came from, or is going to.
+///
+/// Host and port kept **apart**, and that pairing is the whole reason this type
+/// exists rather than a `std::string` holding `host:port`. Joining the two is a
+/// grammar -- an IPv6 literal has to be bracketed or the next `rfind(':')` takes
+/// the wrong colon -- and `Core/HostPort` is the one place this codebase spells
+/// it. `Net` may not reach `Core`, because it is meant to be lifted out of this
+/// tree, so a socket that took the joined text would have to own a second copy of
+/// that grammar in order to hand the halves to `getaddrinfo`. The stream side
+/// already answers this the same way: `ConnectTcp(host, port)` and
+/// `IAddressResolver::Resolve(host, port)` both take the pair apart, for exactly
+/// this reason. A caller that wants text joins it one layer up.
+struct DatagramAddress
+{
+    /// Address or hostname, unbracketed -- `192.0.2.7`, `::1`, `broadcast`.
+    std::string host;
+
+    /// Port in host byte order. Zero is a legitimate value here, unlike in a CLI
+    /// endpoint: it is what a socket asks for when the kernel should choose, and
+    /// what a bus address that names no port carries.
+    std::uint16_t port { 0 };
+
+    /// Ordered, not merely comparable, so this type can BE a map key rather than
+    /// being flattened into one. A defaulted `<=>` implicitly declares `==` too,
+    /// which is what the equality comparisons against a sentinel rely on.
+    /// @param other Address to compare against.
+    /// @return Host first, then port.
+    [[nodiscard]] auto operator<=>(DatagramAddress const& other) const = default;
+};
+
 /// One datagram, and who sent it.
 struct ReceivedDatagram
 {
     std::vector<std::byte> payload; ///< The bytes, exactly as they arrived.
 
-    /// The sender's address as text, `host:port`.
+    /// The sender's address, as the kernel reports it.
     ///
-    /// Text rather than a parsed structure because every consumer of it either
-    /// logs it or hands it back to a connector, and both want the string. What a
-    /// beacon *claims* about itself travels in the payload; this is what the
-    /// kernel says, and the two are deliberately separate -- a peer that
+    /// What a beacon *claims* about itself travels in the payload; this is what
+    /// the kernel says, and the two are deliberately separate -- a peer that
     /// advertises an address it does not answer on is the failure discovery
     /// exists to make visible, not one to paper over by trusting the payload.
-    std::string from;
+    DatagramAddress from;
 };
 
 /// Why a receive returned nothing.
@@ -67,9 +97,10 @@ class IDatagramSocket
     /// survive loss -- beacons repeat -- so a caller that treated a successful
     /// send as delivery would be wrong about the one thing UDP does not promise.
     /// @param payload The whole message.
-    /// @param to Destination as `host:port`.
+    /// @param to Destination.
     /// @return Nothing, or why the local stack refused it.
-    [[nodiscard]] virtual std::expected<void, NetError> Send(std::span<std::byte const> payload, std::string_view to) = 0;
+    [[nodiscard]] virtual std::expected<void, NetError> Send(std::span<std::byte const> payload,
+                                                             DatagramAddress const& to) = 0;
 
     /// Wait for one datagram.
     ///
@@ -86,9 +117,13 @@ class IDatagramSocket
     /// Stop the socket, so a parked Receive returns Closed at its next poll.
     virtual void Close() noexcept = 0;
 
-    /// The address this socket actually bound, as `host:port`.
-    /// @return The bound address, empty when it is not bound.
-    [[nodiscard]] virtual std::string BoundEndpoint() const = 0;
+    /// The address this socket actually bound.
+    ///
+    /// Read back from the socket rather than echoed from what was asked for: a
+    /// bind to port 0 means "the kernel chooses", and a caller that has to tell a
+    /// peer where to answer needs the answer.
+    /// @return The bound address; an empty host when it is not bound.
+    [[nodiscard]] virtual DatagramAddress BoundAddress() const = 0;
 };
 
 } // namespace FastCache

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/DiscoveryService.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/InMemoryDatagram.hpp>
@@ -32,6 +33,28 @@ namespace
     return out;
 }
 
+/// The bus address a `host:port` endpoint names -- see `DatagramAddress` for why
+/// the two halves travel apart below this layer.
+///
+/// Named for what it takes, because `InMemoryDatagram_test`'s `AtHost` takes a
+/// bare host and supplies a port: both end up in one test binary, and two
+/// same-named helpers whose contracts differ by an invisible `:7000` is how a
+/// case comes to address nowhere at all.
+/// @param endpoint `host:port` text.
+/// @return The two halves apart.
+[[nodiscard]] DatagramAddress AtEndpoint(std::string_view endpoint)
+{
+    // Asserted rather than defaulted. An endpoint this cannot split would
+    // otherwise become `{"", 0}`, which is a perfectly valid bus address that
+    // simply matches no inbox -- so every datagram aimed at it would be
+    // discarded exactly as UDP discards one addressed to nobody, and the case
+    // would fail as "the peer never answered" instead of "the test said the
+    // wrong thing".
+    auto const parsed = ParseEndpoint(endpoint, "");
+    REQUIRE(parsed.has_value());
+    return DatagramAddress { .host = Unwrap(parsed).first, .port = Unwrap(parsed).second };
+}
+
 /// One node on the segment: its socket, directory and service.
 ///
 /// Bundled because a discovery node is exactly these three over one clock,
@@ -47,7 +70,7 @@ struct Node
          std::string endpoint,
          std::string cluster,
          std::string const& key):
-        socket { bus.Open(endpoint) },
+        socket { bus.Open(AtEndpoint(endpoint)) },
         directory { clock, cluster, id },
         service { *socket,
                   clock,
@@ -56,7 +79,7 @@ struct Node
                   DiscoveryConfig { .clusterId = std::move(cluster),
                                     .nodeId = std::move(id),
                                     .raftEndpoint = std::move(endpoint),
-                                    .beaconAddress = std::string { DatagramBus::BroadcastAddress },
+                                    .beaconAddress = DatagramBus::BroadcastAddress(),
                                     .presharedKey = Key(key) },
                   logger }
     {
@@ -149,13 +172,13 @@ TEST_CASE("A proof nobody asked for is refused", "[cluster][discovery][service]"
     NullLogger logger;
 
     Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", "secret" };
-    auto intruder = bus.Open("10.0.0.9:7000");
+    auto intruder = bus.Open(AtEndpoint("10.0.0.9:7000"));
 
     DiscoveryWire::Challenge const invented { .clusterId = "prod", .nonce = {} };
     auto const tag = DiscoveryWire::ExpectedProofTag(Key("secret"), invented, "ghost", "10.0.0.9:7000");
     REQUIRE(intruder
                 ->Send(DiscoveryWire::EncodeProof({ .nodeId = "ghost", .raftEndpoint = "10.0.0.9:7000", .tag = tag }),
-                       "10.0.0.1:7000")
+                       AtEndpoint("10.0.0.1:7000"))
                 .has_value());
 
     // Even holding the real key, a proof against a self-chosen nonce is refused:
@@ -190,12 +213,12 @@ TEST_CASE("A challenge is spent once", "[cluster][discovery][service]")
     auto const tag = DiscoveryWire::ExpectedProofTag(Key("secret"), Unwrap(proofDatagram), "alice", "10.0.0.1:7000");
     auto const proof = DiscoveryWire::EncodeProof({ .nodeId = "alice", .raftEndpoint = "10.0.0.1:7000", .tag = tag });
 
-    REQUIRE(alice.socket->Send(proof, "10.0.0.2:7000").has_value());
+    REQUIRE(alice.socket->Send(proof, AtEndpoint("10.0.0.2:7000")).has_value());
     CHECK(bob.service.PumpOnce(1ms) == DiscoveryEvent::PeerAuthenticated);
     CHECK(bob.service.PendingChallenges() == 0);
 
     // The replay finds no outstanding challenge and is refused.
-    REQUIRE(alice.socket->Send(proof, "10.0.0.2:7000").has_value());
+    REQUIRE(alice.socket->Send(proof, AtEndpoint("10.0.0.2:7000")).has_value());
     CHECK(bob.service.PumpOnce(1ms) == DiscoveryEvent::ProofRejected);
 }
 
@@ -233,7 +256,7 @@ TEST_CASE("Discovery survives a lost beacon", "[cluster][discovery][service]")
     Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", "secret" };
     Node bob { bus, clock, random, logger, "bob", "10.0.0.2:7000", "prod", "secret" };
 
-    bus.DropNext("10.0.0.2:7000", 1);
+    bus.DropNext(AtEndpoint("10.0.0.2:7000"), 1);
 
     REQUIRE(alice.service.SendBeacon());
     CHECK(bob.service.PumpOnce(1ms) == DiscoveryEvent::Nothing); // lost
@@ -258,7 +281,7 @@ TEST_CASE("A challenge expires rather than accumulating", "[cluster][discovery][
     NullLogger logger;
 
     Node watcher { bus, clock, random, logger, "watcher", "10.0.0.1:7000", "prod", "secret" };
-    auto noisy = bus.Open("10.0.0.9:7000");
+    auto noisy = bus.Open(AtEndpoint("10.0.0.9:7000"));
 
     auto const beacon =
         DiscoveryWire::EncodeBeacon({ .clusterId = "prod", .nodeId = "noisy", .raftEndpoint = "10.0.0.9:7000" });
@@ -267,7 +290,7 @@ TEST_CASE("A challenge expires rather than accumulating", "[cluster][discovery][
     // adding to it.
     for (auto attempt = 0; attempt < 5; ++attempt)
     {
-        REQUIRE(noisy->Send(beacon, "10.0.0.1:7000").has_value());
+        REQUIRE(noisy->Send(beacon, AtEndpoint("10.0.0.1:7000")).has_value());
         REQUIRE(watcher.service.PumpOnce(1ms) == DiscoveryEvent::PeerSeen);
     }
     CHECK(watcher.service.PendingChallenges() == 1);

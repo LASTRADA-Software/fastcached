@@ -27,10 +27,15 @@ struct DiscoveryConfig
     /// Where beacons are sent.
     ///
     /// A parameter rather than a constant so a test can point a whole segment at
-    /// `DatagramBus::BroadcastAddress` and a deployment at a real broadcast or
+    /// `DatagramBus::BroadcastAddress()` and a deployment at a real broadcast or
     /// multicast address -- which subnet to shout on is a site's decision and
     /// not this layer's.
-    std::string beaconAddress;
+    ///
+    /// Host and port apart rather than `host:port` text, because that is the
+    /// shape `IDatagramSocket` takes -- see `DatagramAddress`. `--discovery` is
+    /// split in `DiscoveryTier::Start`, which is where that value is validated
+    /// and where the two error messages it can produce are worth telling apart.
+    DatagramAddress beaconAddress;
 
     /// The cluster's pre-shared key.
     ///
@@ -124,7 +129,7 @@ class DiscoveryService
     /// Ask a peer to prove it holds the key.
     /// @param peer Who to challenge.
     /// @param replyTo Where to send it.
-    void IssueChallenge(DiscoveryWire::Beacon const& peer, std::string_view replyTo);
+    void IssueChallenge(DiscoveryWire::Beacon const& peer, DatagramAddress const& replyTo);
 
     IDatagramSocket& _socket;
     IClock& _clock;

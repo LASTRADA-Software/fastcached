@@ -5,10 +5,10 @@
 
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace FastCache
@@ -33,12 +33,17 @@ class DatagramBus
     /// A name rather than a real broadcast address: what matters to the layer
     /// above is "everyone on the segment sees this", and encoding a subnet here
     /// would make the double model a routing detail it has no opinion about.
-    static constexpr std::string_view BroadcastAddress = "broadcast:0";
+    /// @return The sentinel destination.
+    [[nodiscard]] static DatagramAddress const& BroadcastAddress()
+    {
+        static DatagramAddress const address { .host = "broadcast", .port = 0 };
+        return address;
+    }
 
     /// Attach a socket at @p endpoint.
     /// @param endpoint The address other sockets reach it by.
     /// @return The socket; it detaches on destruction.
-    [[nodiscard]] std::unique_ptr<IDatagramSocket> Open(std::string endpoint);
+    [[nodiscard]] std::unique_ptr<IDatagramSocket> Open(DatagramAddress endpoint);
 
     /// Drop the next @p count datagrams sent to @p endpoint.
     ///
@@ -47,7 +52,7 @@ class DatagramBus
     /// survive, and the one a global drop rate cannot express.
     /// @param endpoint Whose inbox to starve.
     /// @param count How many datagrams to discard.
-    void DropNext(std::string_view endpoint, std::size_t count);
+    void DropNext(DatagramAddress const& endpoint, std::size_t count);
 
     /// How many datagrams have been placed on the bus, delivered or dropped.
     /// @return The count.
@@ -58,17 +63,17 @@ class DatagramBus
 
     /// Place @p payload in every inbox @p to names.
     /// @param payload The datagram.
-    /// @param to A specific endpoint, or BroadcastAddress.
+    /// @param to A specific endpoint, or BroadcastAddress().
     /// @param from Who sent it.
-    void Deliver(std::span<std::byte const> payload, std::string_view to, std::string_view from);
+    void Deliver(std::span<std::byte const> payload, DatagramAddress const& to, DatagramAddress const& from);
 
     /// Register an inbox.
     /// @param endpoint Its address.
-    void Attach(std::string const& endpoint);
+    void Attach(DatagramAddress const& endpoint);
 
     /// Remove an inbox.
     /// @param endpoint Its address.
-    void Detach(std::string const& endpoint);
+    void Detach(DatagramAddress const& endpoint);
 
     /// One socket's queue.
     struct Inbox
@@ -80,7 +85,10 @@ class DatagramBus
 
     mutable std::mutex _mutex;
     std::condition_variable _arrived;
-    std::unordered_map<std::string, Inbox> _inboxes;
+    /// Keyed by the address itself. An ordered map rather than a hashed one only
+    /// because `DatagramAddress` is ordered and specialising `std::hash` for it
+    /// would be more code than a segment of a handful of sockets can justify.
+    std::map<DatagramAddress, Inbox> _inboxes;
     std::size_t _sendCount { 0 };
 };
 

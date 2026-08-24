@@ -151,6 +151,21 @@ namespace Detail
     /// @return true when `host` parses as an IPv4 or IPv6 literal.
     [[nodiscard]] bool IsNumericHost(std::string_view host) noexcept;
 
+    /// Read the port out of a raw sockaddr.
+    ///
+    /// The one implementation of "which port is this", spelled once because the
+    /// two sockaddr layouts put it at different offsets and reading the wrong one
+    /// yields a plausible-looking number rather than an error -- so a second copy
+    /// of the family switch would be a second chance to get that silently wrong.
+    /// Takes the bytes rather than a socket because the two callers have
+    /// different things in hand: a listener has a handle to ask `getsockname`,
+    /// while a datagram receive is handed the sender's address by `recvfrom` and
+    /// has no socket to ask about it at all.
+    /// @param sockaddr Pointer to a sockaddr / sockaddr_in / sockaddr_in6.
+    /// @param length Valid byte count of the sockaddr (a socklen_t value).
+    /// @return The port in host byte order, or 0 for a family that has no port.
+    [[nodiscard]] std::uint16_t PortOfSockaddr(void const* sockaddr, std::uint32_t length) noexcept;
+
     /// Query a bound socket's local port with ::getsockname.
     ///
     /// The one implementation of "which port did I actually get", which is a
