@@ -42,22 +42,22 @@ class ScriptedUpstream final: public ICacheUpstream
     std::size_t stores { 0 };
     bool reachable { true };
 
-    [[nodiscard]] std::optional<std::vector<std::byte>> Fetch(std::string_view key) override
+    [[nodiscard]] Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key) override
     {
         ++fetches;
         if (!reachable)
-            return std::nullopt;
+            co_return std::nullopt;
         auto const it = entries.find(std::string { key });
-        return it == entries.end() ? std::nullopt : std::optional { it->second };
+        co_return it == entries.end() ? std::nullopt : std::optional { it->second };
     }
 
-    [[nodiscard]] bool Store(std::string_view key, std::span<std::byte const> value) override
+    [[nodiscard]] Task<bool> Store(std::string_view key, std::span<std::byte const> value) override
     {
         ++stores;
         if (!reachable)
-            return false;
+            co_return false;
         entries[std::string { key }] = std::vector<std::byte> { value.begin(), value.end() };
-        return true;
+        co_return true;
     }
 };
 
@@ -91,10 +91,10 @@ TEST_CASE("A local hit never touches the network", "[node][cache]")
     // names the same object by construction, so there is nothing the shared cache
     // could tell us that we do not already know.
     Fixture fix;
-    REQUIRE(fix.cache.Store("k1", Bytes("object-one")));
+    REQUIRE(SyncRun(fix.cache.Store("k1", Bytes("object-one"))));
     auto const storesAfterWrite = fix.upstream.stores;
 
-    auto const hit = fix.cache.Fetch("k1");
+    auto const hit = SyncRun(fix.cache.Fetch("k1"));
     REQUIRE(hit.has_value());
     CHECK(Unwrap(hit) == Bytes("object-one"));
 
@@ -111,14 +111,14 @@ TEST_CASE("A local miss reads through and fills the local tier", "[node][cache]"
     Fixture fix;
     fix.upstream.entries["k2"] = Bytes("object-two");
 
-    auto const first = fix.cache.Fetch("k2");
+    auto const first = SyncRun(fix.cache.Fetch("k2"));
     REQUIRE(first.has_value());
     CHECK(Unwrap(first) == Bytes("object-two"));
     CHECK(fix.upstream.fetches == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamHits) == 1);
 
     // The second lookup is local, which is the whole point of having filled it.
-    auto const second = fix.cache.Fetch("k2");
+    auto const second = SyncRun(fix.cache.Fetch("k2"));
     REQUIRE(second.has_value());
     CHECK(Unwrap(second) == Bytes("object-two"));
     CHECK(fix.upstream.fetches == 1);
@@ -134,7 +134,7 @@ TEST_CASE("An unreachable shared cache is a miss, not a failure", "[node][cache]
     fix.upstream.entries["k3"] = Bytes("object-three");
     fix.upstream.reachable = false;
 
-    CHECK_FALSE(fix.cache.Fetch("k3").has_value());
+    CHECK_FALSE(SyncRun(fix.cache.Fetch("k3")).has_value());
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheMisses) == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamHits) == 0);
 }
@@ -146,12 +146,12 @@ TEST_CASE("A store writes locally first, then offers upstream", "[node][cache]")
     // best-effort by contract.
     Fixture fix;
 
-    REQUIRE(fix.cache.Store("k4", Bytes("object-four")));
+    REQUIRE(SyncRun(fix.cache.Store("k4", Bytes("object-four"))));
     CHECK(fix.upstream.stores == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStores) == 1);
 
     // Readable locally with no network call.
-    auto const hit = fix.cache.Fetch("k4");
+    auto const hit = SyncRun(fix.cache.Fetch("k4"));
     REQUIRE(hit.has_value());
     CHECK(fix.upstream.fetches == 0);
 }
@@ -164,12 +164,12 @@ TEST_CASE("A store survives a shared cache that will not take it", "[node][cache
     Fixture fix;
     fix.upstream.reachable = false;
 
-    CHECK(fix.cache.Store("k5", Bytes("object-five")));
+    CHECK(SyncRun(fix.cache.Store("k5", Bytes("object-five"))));
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStoreFailures) == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheStoreFailures) == 0);
 
     // And it is still served locally, which is what "costs this machine nothing" means.
-    auto const hit = fix.cache.Fetch("k5");
+    auto const hit = SyncRun(fix.cache.Fetch("k5"));
     REQUIRE(hit.has_value());
     CHECK(Unwrap(hit) == Bytes("object-five"));
 }
@@ -186,11 +186,11 @@ TEST_CASE("A node with no shared cache still caches locally", "[node][cache]")
     NoUpstream none;
     LocalCache cache { local, none, clock, metrics };
 
-    CHECK(cache.Store("k6", Bytes("object-six")));
-    auto const hit = cache.Fetch("k6");
+    CHECK(SyncRun(cache.Store("k6", Bytes("object-six"))));
+    auto const hit = SyncRun(cache.Fetch("k6"));
     REQUIRE(hit.has_value());
     CHECK(Unwrap(hit) == Bytes("object-six"));
 
     // A key nobody stored is simply a miss -- not an error, and not a hang.
-    CHECK_FALSE(cache.Fetch("never-stored").has_value());
+    CHECK_FALSE(SyncRun(cache.Fetch("never-stored")).has_value());
 }

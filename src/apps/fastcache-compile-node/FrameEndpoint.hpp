@@ -40,11 +40,27 @@ class IFrameResponder
     IFrameResponder(IFrameResponder&&) = default;
     IFrameResponder& operator=(IFrameResponder&&) = default;
 
-    /// @param frame Header plus payload, exactly as received.
-    /// @param peer The connecting peer's host, for surfaces whose policy needs it.
-    /// @return The encoded reply, or empty to close without answering — which is
+    /// Answer one complete request frame.
+    ///
+    /// A `Task` because answering may now have to reach the network -- the cache
+    /// surface consults an upstream, and that dial suspends rather than blocking
+    /// the loop every other connection on this reactor is sharing. A responder
+    /// that needs nothing is still free to `co_return` without suspending, which
+    /// the scheduler's does; that costs a frame allocation and no round trip.
+    ///
+    /// @param frame The whole request, header included. A span rather than an
+    ///        owning vector because a cache STORE carries an object file and
+    ///        copying it here would double the peak footprint on the hot path of
+    ///        a parallel build. It must outlive the returned task -- the same
+    ///        contract `SendAll` states, and true by construction at the one call
+    ///        site, where the backing vector is a local of the calling coroutine.
+    /// @param peer The peer's host, for the surfaces whose policy needs one.
+    ///        Owned rather than a view: it is short, and every policy-bearing
+    ///        responder holds it across a suspension, so a view would make its
+    ///        lifetime a rule at each implementation instead of a fact.
+    /// @return The encoded reply, or empty to close without answering -- which is
     ///         only ever right when the peer is not speaking this protocol at all.
-    [[nodiscard]] virtual std::vector<std::byte> Answer(std::span<std::byte const> frame, std::string_view peer) = 0;
+    [[nodiscard]] virtual Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) = 0;
 
     /// Largest request this surface will buffer.
     ///

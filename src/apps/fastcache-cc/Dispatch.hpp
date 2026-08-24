@@ -131,8 +131,10 @@ struct DispatchRequest
 [[nodiscard]] std::vector<std::string> DecodeArgs(std::span<std::byte const> field);
 
 /// Create the dialer that opens real TCP connections.
-/// @param ioTimeout Per-call send/recv deadline, as `ConnectTcp` takes.
+/// @param connectTimeout Deadline for opening a connection, resolution included.
+/// @param ioTimeout Per-call send/recv deadline, armed on the connector.
 /// @return A dialer; never null.
-[[nodiscard]] std::unique_ptr<IEndpointDialer> MakeTcpDialer(std::chrono::milliseconds ioTimeout);
+[[nodiscard]] std::unique_ptr<IEndpointDialer> MakeTcpDialer(std::chrono::milliseconds connectTimeout,
+                                                             std::chrono::milliseconds ioTimeout);
 
 } // namespace FastCache::Cc

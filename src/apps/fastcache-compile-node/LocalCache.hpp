@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -40,7 +41,7 @@ class ICacheUpstream
     /// them apart would have nothing useful to do with the distinction. Whether the
     /// upstream was *reachable* is reported separately, as a counter, because that
     /// is an operator's question rather than a build's.
-    [[nodiscard]] virtual std::optional<std::vector<std::byte>> Fetch(std::string_view key) = 0;
+    [[nodiscard]] virtual Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key) = 0;
 
     /// Offer one object to the shared cache.
     ///
@@ -49,7 +50,7 @@ class ICacheUpstream
     /// @param key The object key.
     /// @param value The encoded compile value.
     /// @return Whether the shared cache took it.
-    [[nodiscard]] virtual bool Store(std::string_view key, std::span<std::byte const> value) = 0;
+    [[nodiscard]] virtual Task<bool> Store(std::string_view key, std::span<std::byte const> value) = 0;
 };
 
 /// An upstream that is not there.
@@ -61,14 +62,22 @@ class ICacheUpstream
 class NoUpstream final: public ICacheUpstream
 {
   public:
-    [[nodiscard]] std::optional<std::vector<std::byte>> Fetch(std::string_view /*key*/) override
+    /// @copydoc ICacheUpstream::Fetch
+    ///
+    /// A coroutine that never suspends, so a node with no shared cache pays one
+    /// small frame allocation per local miss and no round trip. Kept as a real
+    /// implementation rather than reverting to a null pointer, for the reason
+    /// this class exists: "there is no upstream" should be a decision somebody
+    /// made, not a pointer nobody set.
+    [[nodiscard]] Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view /*key*/) override
     {
-        return std::nullopt;
+        co_return std::nullopt;
     }
 
-    [[nodiscard]] bool Store(std::string_view /*key*/, std::span<std::byte const> /*value*/) override
+    /// @copydoc ICacheUpstream::Store
+    [[nodiscard]] Task<bool> Store(std::string_view /*key*/, std::span<std::byte const> /*value*/) override
     {
-        return false;
+        co_return false;
     }
 };
 
@@ -118,7 +127,7 @@ class LocalCache
     /// Look one key up, reading through to the shared cache on a local miss.
     /// @param key The object key.
     /// @return The value, or nullopt when neither tier has it.
-    [[nodiscard]] std::optional<std::vector<std::byte>> Fetch(std::string_view key);
+    [[nodiscard]] Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key);
 
     /// Store one object locally, then offer it to the shared cache.
     /// @param key The object key.
@@ -126,7 +135,7 @@ class LocalCache
     /// @return Whether the LOCAL write succeeded. The upstream's answer is counted,
     ///         not returned: a client that retried on it would be retrying something
     ///         that is already durable where it matters.
-    [[nodiscard]] bool Store(std::string_view key, std::span<std::byte const> value);
+    [[nodiscard]] Task<bool> Store(std::string_view key, std::span<std::byte const> value);
 
   private:
     IStorage& _local;

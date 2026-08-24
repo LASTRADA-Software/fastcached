@@ -95,7 +95,10 @@ Task<void> FrameServer::Run()
                 std::vector<std::byte> frame { header->begin(), header->end() };
                 frame.insert(frame.end(), payload->begin(), payload->end());
 
-                if (auto const reply = _responder.Answer(frame, peer); !reply.empty())
+                // Awaited: answering may reach the network now -- the cache
+                // surface consults an upstream -- and that suspends rather than
+                // blocking this loop.
+                if (auto const reply = co_await _responder.Answer(frame, peer); !reply.empty())
                     (void) co_await WriteAll(socket.get(), reply);
             }
         }

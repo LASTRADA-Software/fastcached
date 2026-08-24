@@ -11,6 +11,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Net/BlockingConnector.hpp>
 
 #include <expected>
 #include <memory>
@@ -71,7 +72,8 @@ class CacheTier
     }
 
   private:
-    CacheTier(std::unique_ptr<IStorage> storage,
+    CacheTier(std::unique_ptr<BlockingConnector> upstreamConnector,
+              std::unique_ptr<IStorage> storage,
               std::unique_ptr<ICacheUpstream> upstream,
               Distributed::IMembershipOracle const& membership,
               IClock& clock,
@@ -80,6 +82,19 @@ class CacheTier
     // Declaration order IS construction order, and every one of these is referenced
     // by the one below it. Reordering them is a dangling reference, which is why
     // they live here rather than as locals somebody has to keep in the right order.
+    /// How `RemoteUpstream` dials the shared cache.
+    ///
+    /// Owned here and declared before `_upstream`, which holds a reference to it.
+    /// A `unique_ptr` rather than a value because the upstream is built BEFORE the
+    /// tier -- it is a constructor argument -- so the connector has to exist at a
+    /// stable address first and be moved in without moving what the reference
+    /// names.
+    ///
+    /// Blocking, because `FrameServer` still serves its connections one at a time
+    /// on a thread of its own -- so this blocks that thread and nothing else. It
+    /// becomes a `PlatformConnector` when that loop moves onto a reactor.
+    std::unique_ptr<BlockingConnector> _upstreamConnector;
+
     std::unique_ptr<IStorage> _storage;
     std::unique_ptr<ICacheUpstream> _upstream;
     LocalCache _cache;

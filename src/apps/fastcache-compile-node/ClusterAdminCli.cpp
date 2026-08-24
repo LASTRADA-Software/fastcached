@@ -118,7 +118,12 @@ std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg, C
     if (cfg.scheduler.empty())
         return std::unexpected { std::string { "--scheduler names where to ask; a cluster command needs one" } };
 
-    auto client = Cc::DialEndpoint(cfg.scheduler, DialTimeout);
+    // A one-shot CLI on the process main thread: no reactor exists here, so this
+    // legitimately blocks. `DialEndpointBlocking` takes a `BlockingConnector` by
+    // type rather than an `IConnector`, which is what keeps that fact checkable
+    // rather than a comment.
+    BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = DialTimeout } };
+    auto client = Cc::DialEndpointBlocking(connector, cfg.scheduler, DialTimeout);
     if (client == nullptr)
         return std::unexpected { std::format("cannot reach the scheduler at {}", cfg.scheduler) };
 
@@ -127,8 +132,8 @@ std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg, C
     // credential pipelining and the "a daemon that does not know AUTH still served
     // the command" fall-through are each subtle enough that two implementations
     // would differ, and the one that differed would be the untested one.
-    auto const outcome =
-        Cc::ExchangeFramed(*client, EncodeClusterRequest(request), Cc::Credential { .username = {}, .secret = cfg.token });
+    auto const outcome = SyncRun(Cc::ExchangeFramed(
+        client.get(), EncodeClusterRequest(request), Cc::Credential { .username = {}, .secret = cfg.token }));
 
     if (outcome.kind == Cc::CacheOutcomeKind::Transport)
         return std::unexpected { std::format("the scheduler at {} did not answer", cfg.scheduler) };

@@ -8,12 +8,15 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 
 namespace FastCache::Cc
 {
 
-std::unique_ptr<ISocket> DialEndpoint(std::string_view hostPort, std::chrono::milliseconds ioTimeout)
+Task<std::unique_ptr<ISocket>> DialEndpoint(IConnector* connector,
+                                            std::string_view hostPort,
+                                            std::chrono::milliseconds connectTimeout)
 {
     // `SplitHostPort` and not `ParseEndpoint`, deliberately: the latter accepts a
     // bare port and supplies a default host, which is right for a *bind* address
@@ -23,18 +26,27 @@ std::unique_ptr<ISocket> DialEndpoint(std::string_view hostPort, std::chrono::mi
     // refusing rather than a request to try this machine.
     auto const split = SplitHostPort(hostPort);
     if (!split.has_value())
-        return nullptr;
+        co_return nullptr;
     auto const port = ParseTcpPort(split->second);
     if (!port.has_value())
-        return nullptr;
+        co_return nullptr;
 
-    // `SyncRun` because this launcher has no reactor and `ConnectTcp` uses a
-    // blocking connector, whose task resolves inline and is therefore never left
-    // suspended -- the precondition `SyncRun` states.
-    auto socket = SyncRun(FastCache::ConnectTcp(std::string { split->first }, *port, ioTimeout, ioTimeout));
+    auto socket = co_await connector->Connect(std::string { split->first }, *port, connectTimeout);
     if (!socket.has_value())
-        return nullptr;
-    return std::move(*socket);
+        co_return nullptr;
+    co_return std::move(*socket);
+}
+
+/// @copydoc DialEndpointBlocking
+std::unique_ptr<ISocket> DialEndpointBlocking(BlockingConnector& connector,
+                                              std::string_view hostPort,
+                                              std::chrono::milliseconds connectTimeout)
+{
+    // Sound because the parameter is a `BlockingConnector` and not an
+    // `IConnector`: that connector resolves inline and waits with a syscall, so
+    // its task is never left suspended, which is exactly what `SyncRun` requires.
+    // Over a reactor connector this would throw.
+    return SyncRun(DialEndpoint(&connector, hostPort, connectTimeout));
 }
 
 } // namespace FastCache::Cc

@@ -3,6 +3,7 @@
 
 #include "LocalCache.hpp"
 
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
@@ -43,7 +44,7 @@ class CacheProxy
     /// @param frame Header plus payload, exactly as received.
     /// @return The encoded reply; empty only when the peer is not speaking this
     ///         protocol at all, which is the one condition that must close.
-    [[nodiscard]] std::vector<std::byte> Answer(std::span<std::byte const> frame);
+    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame);
 
   private:
     LocalCache& _cache;

@@ -26,10 +26,16 @@ class SchedulerResponder final: public IFrameResponder
     {
     }
 
-    [[nodiscard]] std::vector<std::byte> Answer(std::span<std::byte const> frame, std::string_view peer) override
+    /// @copydoc IFrameResponder::Answer
+    ///
+    /// Never suspends. The scheduler answers from its own tables -- a decision
+    /// layer kept pure so every capacity and expiry rule is a `ManualClock` unit
+    /// test -- so this is a one-line adapter, and a responder that costs a frame
+    /// allocation and no round trip is a legitimate thing to be.
+    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override
     {
-        return _protocol.Answer(frame,
-                                Distributed::CallerContext { .membership = _membership.Classify(peer), .peerId = peer });
+        co_return _protocol.Answer(frame,
+                                   Distributed::CallerContext { .membership = _membership.Classify(peer), .peerId = peer });
     }
 
     /// Kilobytes, not megabytes.
@@ -72,15 +78,19 @@ class CacheResponder final: public IFrameResponder
     {
     }
 
-    [[nodiscard]] std::vector<std::byte> Answer(std::span<std::byte const> frame, std::string_view peer) override
+    /// @copydoc IFrameResponder::Answer
+    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override
     {
         // Refused as a *reply*, never by closing: a client that cannot tell a policy
         // refusal from a dead host retries forever and reports a flaky network, which
         // is the failure the declared frame length exists to make avoidable.
+        //
+        // Answered before any suspension, deliberately: a stranger must not be able
+        // to make this node dial its upstream.
         if (_membership.Classify(peer) != Distributed::Membership::Member)
-            return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::NotAMember,
-                                                      "this node serves its cache to its own machine and its cluster");
-        return _proxy.Answer(frame);
+            co_return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::NotAMember,
+                                                         "this node serves its cache to its own machine and its cluster");
+        co_return co_await _proxy.Answer(frame);
     }
 
     /// Megabytes, because a STORE carries a whole object file.

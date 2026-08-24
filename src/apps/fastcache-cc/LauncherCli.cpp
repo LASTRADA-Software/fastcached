@@ -176,6 +176,17 @@ namespace
                                 "Direct mode is on by default: it reaches a cached object by\n"
                                 "re-hashing the project headers a previous compile recorded,\n"
                                 "which is far cheaper than preprocessing the translation unit." },
+        EnvVarSpec { .name = EnvName::ConnectTimeoutMs,
+                     .summary = "Deadline, in milliseconds, for OPENING a connection to the\n"
+                                "daemon -- name resolution included (default 1000; 0 leaves\n"
+                                "the platform's own, which runs to minutes).\n"
+                                "\n"
+                                "Separate from FASTCACHE_TIMEOUT_MS because they bound\n"
+                                "different things and neither implies the other. This one is\n"
+                                "short on purpose: a cache that has not accepted within a\n"
+                                "second is one the build is better off without, and a name\n"
+                                "lookup that hangs would otherwise stall every translation\n"
+                                "unit with nothing to say why.\n" },
         EnvVarSpec { .name = EnvName::TimeoutMs,
                      .summary = "Per-call deadline, in milliseconds, for every send/recv to\n"
                                 "the daemon (default 10000; 0 disables it). A daemon that\n"

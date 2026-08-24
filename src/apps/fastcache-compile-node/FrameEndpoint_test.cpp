@@ -232,9 +232,9 @@ TEST_CASE("A stranger is refused the fleet", "[node][scheduler]")
 
     auto const frame = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
 
-    CHECK(ErrorOf(fleet.responder.Answer(frame, "10.9.9.9")) == Wire::ErrorCode::NotAMember);
+    CHECK(ErrorOf(SyncRun(fleet.responder.Answer(frame, "10.9.9.9"))) == Wire::ErrorCode::NotAMember);
     // And a listed peer gets past the gate to the fleet's own answer.
-    CHECK(ErrorOf(fleet.responder.Answer(frame, "10.0.0.1")) == Wire::ErrorCode::NoWorker);
+    CHECK(ErrorOf(SyncRun(fleet.responder.Answer(frame, "10.0.0.1"))) == Wire::ErrorCode::NoWorker);
 }
 
 TEST_CASE("An oversize frame is refused with both numbers, and never buffered", "[node][scheduler]")

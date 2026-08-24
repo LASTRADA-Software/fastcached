@@ -98,6 +98,16 @@ constexpr std::chrono::milliseconds AcceptPollInterval { 200 };
 /// inline.
 constexpr std::chrono::milliseconds RequestIoTimeout { 120'000 };
 
+/// Per-call send/recv ceiling on the heartbeat's own connection to the scheduler.
+///
+/// Was ten seconds passed as BOTH the dial bound and the I/O bound, which is the
+/// collapse `Cc::DialEndpoint` used to make: ten seconds is a reasonable ceiling
+/// on an exchange and a very long time to wait for a TCP handshake.
+constexpr std::chrono::milliseconds HeartbeatIoTimeout { 10'000 };
+
+/// Ceiling on OPENING that connection, name resolution included.
+constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
+
 /// How often the stop watcher looks at the stop flag.
 ///
 /// A signal handler may portably do almost nothing -- it sets a flag -- so
@@ -603,10 +613,16 @@ constexpr int ExitOk = 0;
     // worker is registered exactly as long as it keeps saying so, and a scheduler
     // that has forgotten it answers the heartbeat by telling it to register again.
     // Splitting them would need the two halves to agree about which owns recovery.
+    // A thread whose entire job is to block, which is the shape `IConnector`
+    // names as correct for a dialler that has no reactor. The connector is a
+    // `BlockingConnector` and is passed to `DialEndpointBlocking` by that type,
+    // so the `SyncRun` inside it is sound by construction rather than by comment.
+    BlockingConnector heartbeatConnector { DefaultAddressResolver(),
+                                           BlockingConnectorOptions { .ioTimeout = HeartbeatIoTimeout } };
     std::jthread const heartbeat { [&](std::stop_token const& stop) {
         while (!stop.stop_requested())
         {
-            auto client = Cc::DialEndpoint(cfg.scheduler, std::chrono::milliseconds { 10'000 });
+            auto client = Cc::DialEndpointBlocking(heartbeatConnector, cfg.scheduler, HeartbeatConnectTimeout);
             if (client == nullptr)
                 logger.Logf(LogLevel::Warn, "scheduler {} unreachable", cfg.scheduler);
             else

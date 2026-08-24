@@ -18,13 +18,23 @@ namespace
     /// Bounded rather than generous, and short: a node waiting on an unreachable
     /// shared cache is a node not compiling, and the fall-back costs one local build.
     constexpr std::chrono::milliseconds UpstreamIoTimeout { 5'000 };
+
+    /// Ceiling on OPENING the upstream connection, name resolution included.
+    ///
+    /// Separate from the I/O ceiling above, and much shorter. The two used to be
+    /// one value passed twice, which gave the dial a five-second
+    /// resolve-plus-connect budget nobody chose: five seconds is a sensible
+    /// per-operation bound and a very long time to wait for a TCP handshake.
+    constexpr std::chrono::milliseconds UpstreamConnectTimeout { 1'000 };
 } // namespace
 
-CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
+CacheTier::CacheTier(std::unique_ptr<BlockingConnector> upstreamConnector,
+                     std::unique_ptr<IStorage> storage,
                      std::unique_ptr<ICacheUpstream> upstream,
                      Distributed::IMembershipOracle const& membership,
                      IClock& clock,
                      IMetricsSink& metrics):
+    _upstreamConnector { std::move(upstreamConnector) },
     _storage { std::move(storage) },
     _upstream { std::move(upstream) },
     _cache { *_storage, *_upstream, clock, metrics },
@@ -42,14 +52,30 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConf
     // An absent upstream is a named type rather than a null pointer: one developer's
     // machine has no shared cache, and that configuration should not cost every call
     // site a branch.
+    // Created before the upstream that references it, and at a stable address, so
+    // moving it into the tier below does not move what that reference names.
+    auto upstreamConnector = std::make_unique<BlockingConnector>(
+        DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = UpstreamIoTimeout });
+
     std::unique_ptr<ICacheUpstream> upstream;
     if (cfg.upstream.empty())
         upstream = std::make_unique<NoUpstream>();
     else
-        upstream = std::make_unique<RemoteUpstream>(
-            cfg.upstream, Cc::Credential { .username = {}, .secret = cfg.token }, UpstreamIoTimeout);
+        // A BLOCKING connector and no reactor, for now. `FrameServer` still
+        // serves its connections one at a time on a thread of its own, so this
+        // dial blocks that thread and nothing else -- which is the serialization
+        // defect this tier still has, not one this change introduces. Moving it
+        // onto a reactor is what `NodeIoLoop` is for, and at that point this
+        // becomes a `PlatformConnector` and the reactor stops being null.
+        upstream = std::make_unique<RemoteUpstream>(cfg.upstream,
+                                                    Cc::Credential { .username = {}, .secret = cfg.token },
+                                                    *upstreamConnector,
+                                                    /*reactor*/ nullptr,
+                                                    UpstreamConnectTimeout,
+                                                    UpstreamIoTimeout);
 
     auto tier = std::unique_ptr<CacheTier> { new CacheTier {
+        std::move(upstreamConnector),
         std::make_unique<InMemoryLruStorage>(static_cast<std::size_t>(cfg.cacheMemoryBytes)),
         std::move(upstream),
         membership,

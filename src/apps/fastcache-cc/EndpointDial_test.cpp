@@ -10,16 +10,70 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace FastCache;
 using namespace std::chrono_literals;
 
+namespace
+{
+
+/// A connector that records what it was asked to dial and connects to nothing.
+///
+/// It is what turns these from "the result was nullptr" into the stronger claim
+/// the refusals are actually about: that a malformed endpoint reaches no
+/// connector at all. A nullptr can also mean "dialled and failed", which is a
+/// different fact -- and asserting the weaker one let the old version of this
+/// file make a real 300ms network attempt inside a unit suite.
+class RecordingConnector final: public IConnector
+{
+  public:
+    [[nodiscard]] Task<SocketResult> Connect(std::string host,
+                                             std::uint16_t port,
+                                             std::chrono::milliseconds /*connectTimeout*/) override
+    {
+        _dials.emplace_back(std::move(host), port);
+        co_return std::unexpected(
+            NetError { .code = NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" });
+    }
+
+    [[nodiscard]] std::size_t Dials() const noexcept
+    {
+        return _dials.size();
+    }
+
+    [[nodiscard]] std::pair<std::string, std::uint16_t> const& Last() const
+    {
+        return _dials.back();
+    }
+
+  private:
+    std::vector<std::pair<std::string, std::uint16_t>> _dials;
+};
+
+/// Drive one dial synchronously. Sound because the connector above never
+/// suspends, which is the same precondition `DialEndpointBlocking` encodes in its
+/// parameter type.
+[[nodiscard]] std::unique_ptr<ISocket> Dial(RecordingConnector& connector, std::string_view hostPort)
+{
+    return SyncRun(Cc::DialEndpoint(&connector, hostPort, 100ms));
+}
+
+} // namespace
+
 TEST_CASE("DialEndpoint refuses text that names no port")
 {
-    CHECK(Cc::DialEndpoint("no-colon-here", 100ms) == nullptr);
-    CHECK(Cc::DialEndpoint("", 100ms) == nullptr);
-    CHECK(Cc::DialEndpoint("host:", 100ms) == nullptr);
-    CHECK(Cc::DialEndpoint("host:notanumber", 100ms) == nullptr);
+    RecordingConnector connector;
+    CHECK(Dial(connector, "no-colon-here") == nullptr);
+    CHECK(Dial(connector, "") == nullptr);
+    CHECK(Dial(connector, "host:") == nullptr);
+    CHECK(Dial(connector, "host:notanumber") == nullptr);
+
+    // The point: nothing was dialled. A nullptr alone would also be produced by
+    // dialling and failing, which is a different outcome for a different reason.
+    CHECK(connector.Dials() == 0);
 }
 
 TEST_CASE("DialEndpoint refuses a bare port rather than assuming this machine")
@@ -29,20 +83,35 @@ TEST_CASE("DialEndpoint refuses a bare port rather than assuming this machine")
     // caller is dialling something it was configured with, so text with no host in
     // it is a misconfiguration. Silently trying loopback would turn a typo into a
     // connection to whatever happens to be listening on this machine.
-    CHECK(Cc::DialEndpoint("6674", 100ms) == nullptr);
+    RecordingConnector connector;
+    CHECK(Dial(connector, "6674") == nullptr);
+    CHECK(connector.Dials() == 0);
 }
 
 TEST_CASE("DialEndpoint refuses a port outside the 16-bit range")
 {
-    CHECK(Cc::DialEndpoint("127.0.0.1:65536", 100ms) == nullptr);
-    CHECK(Cc::DialEndpoint("127.0.0.1:-1", 100ms) == nullptr);
+    RecordingConnector connector;
+    CHECK(Dial(connector, "127.0.0.1:65536") == nullptr);
+    CHECK(Dial(connector, "127.0.0.1:-1") == nullptr);
+    CHECK(connector.Dials() == 0);
 }
 
-TEST_CASE("DialEndpoint reports an unreachable peer as no socket, not as a throw")
+TEST_CASE("DialEndpoint splits a well-formed endpoint and hands it over unbracketed")
 {
-    // RFC 5737 TEST-NET-1: not routable anywhere, so this is the "peer is down"
-    // path rather than a parse failure. Callers treat nullptr as "no cache" and
-    // fall back to compiling, which is the whole reason this returns a pointer
-    // instead of throwing.
-    CHECK(Cc::DialEndpoint("192.0.2.1:9", 300ms) == nullptr);
+    RecordingConnector connector;
+    CHECK(Dial(connector, "cache.example.com:6674") == nullptr); // the connector refuses
+    REQUIRE(connector.Dials() == 1);
+    CHECK(connector.Last().first == "cache.example.com");
+    CHECK(connector.Last().second == 6674);
+}
+
+TEST_CASE("DialEndpoint reports a refused peer as no socket, not as a throw")
+{
+    // Callers treat nullptr as "no cache" and fall back to compiling, which is the
+    // whole reason this returns a pointer instead of throwing. Asserted against a
+    // scripted refusal rather than a real unroutable address: the old version
+    // dialled RFC 5737 TEST-NET-1 and waited 300ms for it, inside a unit suite.
+    RecordingConnector connector;
+    CHECK(Dial(connector, "192.0.2.1:9") == nullptr);
+    CHECK(connector.Dials() == 1);
 }

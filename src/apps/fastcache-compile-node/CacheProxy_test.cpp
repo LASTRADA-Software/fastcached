@@ -75,11 +75,11 @@ TEST_CASE("A node stores and serves an object over the cache wire", "[node][cach
     // network -- including for objects this machine compiled minutes ago.
     Fixture fix;
 
-    auto const stored = fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
-        .key = "k1", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = Bytes("object-one") }));
+    auto const stored = SyncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
+        .key = "k1", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = Bytes("object-one") })));
     REQUIRE(StatusOf(stored) == Wire::Status::Ok);
 
-    auto const fetched = fix.proxy.Answer(Wire::EncodeFetch("k1"));
+    auto const fetched = SyncRun(fix.proxy.Answer(Wire::EncodeFetch("k1")));
     REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
     auto const payload = PayloadOf(fetched);
     CHECK(std::vector<std::byte> { payload.begin(), payload.end() } == Bytes("object-one"));
@@ -92,7 +92,7 @@ TEST_CASE("A miss is Miss, never Error", "[node][cacheproxy]")
     // zero-length payload rather than no payload, uniformly with every other reply.
     Fixture fix;
 
-    auto const reply = fix.proxy.Answer(Wire::EncodeFetch("never-stored"));
+    auto const reply = SyncRun(fix.proxy.Answer(Wire::EncodeFetch("never-stored")));
     REQUIRE(StatusOf(reply) == Wire::Status::Miss);
     CHECK(PayloadOf(reply).empty());
 }
@@ -105,11 +105,11 @@ TEST_CASE("A node's cache port refuses the other ports' verbs, as a reply", "[no
     Fixture fix;
 
     auto const lease = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
-    CHECK(ErrorOf(fix.proxy.Answer(lease)) == Wire::ErrorCode::DispatchNotPermitted);
+    CHECK(ErrorOf(SyncRun(fix.proxy.Answer(lease))) == Wire::ErrorCode::DispatchNotPermitted);
 
     auto const compile = Wire::EncodeCompile(Wire::CompileRequest {
         .leaseToken = "t", .fingerprint = "gcc-14", .args = {}, .source = {}, .acceptedCodecs = {}, .sourceName = "t.cpp" });
-    CHECK(ErrorOf(fix.proxy.Answer(compile)) == Wire::ErrorCode::DispatchNotPermitted);
+    CHECK(ErrorOf(SyncRun(fix.proxy.Answer(compile))) == Wire::ErrorCode::DispatchNotPermitted);
 }
 
 TEST_CASE("A frame that is not this protocol is the one condition that closes", "[node][cacheproxy]")
@@ -118,7 +118,7 @@ TEST_CASE("A frame that is not this protocol is the one condition that closes", 
 
     std::array<std::byte, Wire::RequestHeaderSize> frame {};
     WireFrame::PutHeader(frame, std::byte { 0x11 }, Wire::CurrentVersion, 0x01, 0);
-    CHECK(fix.proxy.Answer(frame).empty());
+    CHECK(SyncRun(fix.proxy.Answer(frame)).empty());
 }
 
 TEST_CASE("An unknown opcode is stepped over, not fatal", "[node][cacheproxy]")
@@ -127,7 +127,7 @@ TEST_CASE("An unknown opcode is stepped over, not fatal", "[node][cacheproxy]")
 
     std::array<std::byte, Wire::RequestHeaderSize> frame {};
     WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, 0xEE, 0);
-    CHECK(ErrorOf(fix.proxy.Answer(frame)) == Wire::ErrorCode::UnknownOpcode);
+    CHECK(ErrorOf(SyncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::UnknownOpcode);
 }
 
 TEST_CASE("The node's cache answers this machine and refuses a stranger", "[node][cache][membership]")
@@ -149,17 +149,17 @@ TEST_CASE("The node's cache answers this machine and refuses a stranger", "[node
 
     // A stranger is refused as a *reply*, never by closing: a client that cannot tell
     // a policy refusal from a dead host retries forever and reports a flaky network.
-    auto const refused = Wire::DecodeReplyHeader(responder.Answer(fetch, "10.9.9.9"));
+    auto const refused = Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, "10.9.9.9")));
     REQUIRE(refused.has_value());
     CHECK(Unwrap(refused).status == Wire::Status::Error);
 
     // This machine gets the cache's own answer -- a miss, since nothing is stored.
-    auto const local = Wire::DecodeReplyHeader(responder.Answer(fetch, "127.0.0.1"));
+    auto const local = Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, "127.0.0.1")));
     REQUIRE(local.has_value());
     CHECK(Unwrap(local).status == Wire::Status::Miss);
 
     // And so does a listed peer, which is what makes widening the bind usable at all.
-    auto const peer = Wire::DecodeReplyHeader(responder.Answer(fetch, "10.0.0.1"));
+    auto const peer = Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, "10.0.0.1")));
     REQUIRE(peer.has_value());
     CHECK(Unwrap(peer).status == Wire::Status::Miss);
 }
