@@ -517,14 +517,15 @@ class IStorage
     /// its bytes anywhere else, or that composes several, **must override this**;
     /// the ones in this tree do.
     ///
-    /// **The command and hit/miss counters here are each tier's own, and do not add
-    /// up to `Snapshot()`'s.** They cannot: a lower tier is consulted only when the
-    /// one above it missed, so a hundred reads with forty hits in L1 are a hundred
-    /// requests to the composite and a hundred and sixty across the two tiers. Both
-    /// are true and they answer different questions -- "is this cache serving" and
-    /// "is its mirror serving" -- so a consumer wanting the first reads `Snapshot()`
-    /// rather than summing these. What *does* sum is the capacity: items, bytes and
-    /// evictions describe disjoint storage.
+    /// **These are each tier's own numbers, and nothing here is meant to be summed
+    /// across tiers.** A composite's tiers overlap, in both directions.
+    /// `LayeredStorage` mirrors into L1 every entry it reads out of L2, so adding
+    /// the two item counts counts the mirrored entries twice; and L2 is consulted
+    /// only when L1 missed, so adding the two hit counts turns a hundred reads
+    /// served entirely from cache into a hundred and sixty requests at 62%. Both
+    /// tiers' figures are true, and they answer "is the mirror doing anything" and
+    /// "how full is the store" rather than "what does this cache hold" -- which is
+    /// what `Snapshot()` is for, and what a consumer wanting a total must call.
     /// @return One entry per tier this backend has, indexed by `StorageTier`.
     [[nodiscard]] virtual TieredStorageStats SnapshotTiers() const noexcept
     {

@@ -221,8 +221,9 @@ TEST_CASE("ShardedStorage sums its shards tier by tier", "[storage-tier][sharded
     CHECK_FALSE(At(tiers, StorageTier::Disk).has_value());
     CHECK(Unwrap(At(tiers, StorageTier::Memory)).itemCount == Keys);
     CHECK(Unwrap(At(tiers, StorageTier::Memory)).bytesLimit == ShardCount * PerShardBudget);
-    // The merged view agrees with the tiers it is made of, which is what a
-    // dashboard reading both would otherwise have to take on trust.
+    // Shards partition their keys, so here -- and only here -- the merged view
+    // equals the tier it is made of. A LAYERED cache does not have that property,
+    // because L1 mirrors L2; see `IStorage::SnapshotTiers`.
     CHECK(storage.Snapshot().itemCount == Unwrap(At(tiers, StorageTier::Memory)).itemCount);
 }
 

@@ -69,6 +69,20 @@ struct MetricsSnapshot
     /// second renderer that drifts from this one.
     std::optional<StorageStats> storage;
 
+    /// The same cache, split by the tier holding each number.
+    ///
+    /// Not a second source for what `storage` already says: `storage` is the
+    /// cache's answer about ITSELF, and a composite has to choose one tier's item
+    /// count to give it -- `LayeredStorage` gives L2's, so a node's whole
+    /// in-memory tier is missing from every scrape that reads only that field.
+    /// These are the numbers that choice discards.
+    ///
+    /// Every entry is optional and an absent one renders nothing at all, for the
+    /// reason `storage` is optional: a memory-only cache has no disk tier, and a
+    /// disk tier reporting zero bytes is a claim a dashboard draws as "empty".
+    /// A process with no cache leaves them all absent, which is the default.
+    TieredStorageStats storageTiers {};
+
     /// What this machine is and how much room it has, absent when the process has
     /// no reason to say.
     ///

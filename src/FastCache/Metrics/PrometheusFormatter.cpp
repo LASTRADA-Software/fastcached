@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 
@@ -40,6 +41,54 @@ namespace
         out += std::format(
             "# HELP {0} {1}\n# TYPE {0} {2}\n{0} {3}\n", metric.name, metric.help, TypeName(metric.type), metric.value);
     }
+
+    /// One per-tier metric: the series, and which `StorageStats` field feeds it.
+    ///
+    /// A projection rather than a value, because one row renders once per tier and
+    /// the tiers are not known where the table is written. The alternative — a
+    /// `Metric` per (series, tier) pair — would put the tier list in two places,
+    /// and a tier added to one and not the other is a series that silently is not
+    /// there, which is the failure `MetricsCatalog` exists to prevent.
+    struct TierMetric
+    {
+        std::string_view name;                                  ///< Series name, without the label.
+        std::string_view help;                                  ///< `# HELP` text.
+        MetricType type;                                        ///< Counter or gauge.
+        std::uint64_t (*project)(StorageStats const&) noexcept; ///< What to read off one tier.
+    };
+
+    /// The per-tier series, and only the ones that mean something per tier.
+    ///
+    /// **None of these is a fleet-wide total waiting to be summed**, and the
+    /// `tier` label is the only honest way to read them. `LayeredStorage` mirrors
+    /// every L2 entry it has touched into L1, so adding the two item counts counts
+    /// the mirrored entries twice; adding the two hit counts is worse still, since
+    /// L2 is consulted only when L1 missed. What each row answers is "how is THIS
+    /// tier doing" — is the mirror populated, is the disk tier near its budget,
+    /// which tier is evicting — and the cache's own totals stay on the
+    /// unlabelled `fastcached_*` series `Snapshot()` feeds.
+    ///
+    /// The hit/miss split is left out entirely rather than published with that
+    /// caveat: it is the number a dashboard is most likely to sum, and a cache
+    /// serving every read would come out at 62%.
+    constexpr std::array TierMetricTable {
+        TierMetric { .name = "fastcached_tier_items",
+                     .help = "Live entries this tier holds.",
+                     .type = MetricType::Gauge,
+                     .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.itemCount); } },
+        TierMetric { .name = "fastcached_tier_bytes_used",
+                     .help = "Bytes this tier holds.",
+                     .type = MetricType::Gauge,
+                     .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.bytesUsed); } },
+        TierMetric { .name = "fastcached_tier_bytes_limit",
+                     .help = "This tier's configured byte budget (0 = unbounded).",
+                     .type = MetricType::Gauge,
+                     .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.bytesLimit); } },
+        TierMetric { .name = "fastcached_tier_evictions_total",
+                     .help = "Entries this tier dropped to stay within its budget.",
+                     .type = MetricType::Counter,
+                     .project = [](StorageStats const& s) noexcept { return s.evictions; } },
+    };
 
 } // namespace
 
@@ -198,6 +247,41 @@ static void AppendStorageMetrics(std::string& out, StorageStats const& stats)
         Append(out, metric);
 }
 
+/// Render one series per tier that exists, each sample carrying a `tier` label.
+///
+/// `# HELP` and `# TYPE` are emitted once per series, with the samples following:
+/// repeating them for every label value is what a parser rejects.
+///
+/// A tier the cache does not have contributes no line at all — not a zero. That
+/// is the rule `MetricsSnapshot::storage` is optional for, one level down: a
+/// dashboard reads `fastcached_tier_items{tier="disk"} 0` as a disk tier standing
+/// empty, which is a different claim from a node that has no disk tier.
+/// @param out Destination.
+/// @param tiers The cache's per-tier statistics.
+static void AppendTierMetrics(std::string& out, TieredStorageStats const& tiers)
+{
+    for (auto const& row: TierMetricTable)
+    {
+        auto wroteHeader = false;
+        // Driven by the TIER table, not by a hand-written list of labels — the
+        // rule this file already follows against `MetricsCatalog`, applied to the
+        // other axis. A tier added to `StorageTier` appears here by being a row
+        // rather than by somebody remembering a second place.
+        for (auto const& tierRow: StorageTierTable)
+        {
+            auto const& stats = tiers[static_cast<std::size_t>(tierRow.tier)];
+            if (!stats.has_value())
+                continue;
+            if (!wroteHeader)
+            {
+                out += std::format("# HELP {0} {1}\n# TYPE {0} {2}\n", row.name, row.help, TypeName(row.type));
+                wroteHeader = true;
+            }
+            out += std::format("{}{{tier=\"{}\"}} {}\n", row.name, tierRow.name, row.project(*stats));
+        }
+    }
+}
+
 std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
 {
     std::string out;
@@ -210,6 +294,11 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
     // otherwise report an empty, unbounded one — zeroes that read as facts.
     if (snapshot.storage.has_value())
         AppendStorageMetrics(out, *snapshot.storage);
+
+    // And the numbers that merged view had to discard. Independent of `storage`
+    // rather than nested under it: a cache reports both, a process without one
+    // reports neither, and neither field is derivable from the other.
+    AppendTierMetrics(out, snapshot.storageTiers);
 
     // And only when the process is a compile node. The daemon leaves this absent
     // rather than reporting cores it does not schedule against.
