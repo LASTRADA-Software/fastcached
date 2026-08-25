@@ -553,24 +553,184 @@ TEST_CASE("CanonicalSourceToken agrees whichever way the source is spelled")
     CHECK_FALSE(CanonicalSourceToken("/elsewhere/t.cpp", layout, "/w/build").has_value());
 }
 
-TEST_CASE("BuildManifest refuses rather than drops when a path cannot be anchored")
+TEST_CASE("BuildManifest tells its refusals apart and names the path (issue #68)")
 {
-    // The other half of the ordering. A path that is still relative after
-    // resolution names a file this build cannot identify, so recording a manifest
-    // without it would be the same silent stale serve by a different route --
-    // whereas refusing merely costs this compile direct mode. Reachable only when
-    // the working directory itself is unavailable, which is why it is a refusal and
-    // not a fallback.
+    // Refusals with nothing in common but the word "no". Each names a different
+    // thing to go and fix -- a working directory, a layout, a root spelled almost
+    // right, a file -- and the launcher has exactly one line in which to say which
+    // happened. Collapsed into one value they printed "uncanonicalizable source or
+    // include" for all of them alike, naming neither the cause nor the path, and a
+    // translation unit that silently stopped shortcutting had no other trace at all.
     FastCache::PathCanon::Layout const layout { .sourceRoot = "/w/src", .buildTree = "/w/build" };
 
-    auto const built = BuildManifest({ .sourcePath = "src/t.cpp",
-                                       .includePaths = { "src/header.hpp" },
-                                       .workingDirectory = "",
-                                       .toolchainStamp = "cc-test-1",
-                                       .objectKey = "objkey-1" },
-                                     layout);
-    REQUIRE_FALSE(built.has_value());
-    CHECK(built.error() == DirectError::NotCanonical);
+    auto const inputsWith = [&layout](std::string source, std::vector<std::string> includes, std::string cwd) {
+        return BuildManifest({ .sourcePath = std::move(source),
+                               .includePaths = std::move(includes),
+                               .workingDirectory = std::move(cwd),
+                               .toolchainStamp = "cc-test-1",
+                               .objectKey = "objkey-1" },
+                             layout);
+    };
+
+    SECTION("a source the working directory cannot place")
+    {
+        auto const built = inputsWith("src/t.cpp", {}, "");
+        REQUIRE_FALSE(built.has_value());
+        CHECK(built.error() == ManifestFailure { .fault = ManifestFault::Unanchored, .path = "src/t.cpp" });
+        CHECK(DescribeManifestFailure(built.error()) == "unanchored: src/t.cpp");
+    }
+
+    SECTION("a source under neither root")
+    {
+        // An ordinary `add_subdirectory(../shared shared)` layout, not a broken
+        // build -- so the note has to name the file rather than accuse the setup.
+        auto const built = inputsWith("/elsewhere/t.cpp", {}, "/w/build");
+        REQUIRE_FALSE(built.has_value());
+        CHECK(built.error() == ManifestFailure { .fault = ManifestFault::OutsideRoots, .path = "/elsewhere/t.cpp" });
+        CHECK(DescribeManifestFailure(built.error()) == "under no root: /elsewhere/t.cpp");
+    }
+
+    SECTION("a source that is rooted but looks vendored")
+    {
+        // IsToolchainHeader tests its markers BEFORE any root, deliberately, so a
+        // TU inside `vcpkg_installed/` under the build tree classifies as toolchain
+        // while being perfectly well rooted. Reporting that as "under no root"
+        // would send the reader to fix roots that are already correct -- the exact
+        // misdirection this vocabulary exists to remove.
+        std::string const vendored = "/w/build/vcpkg_installed/x64-linux/src/t.cpp";
+        auto const built = inputsWith(vendored, {}, "/w/build");
+        REQUIRE_FALSE(built.has_value());
+        CHECK(built.error() == ManifestFailure { .fault = ManifestFault::ToolchainLike, .path = vendored });
+        CHECK(DescribeManifestFailure(built.error()) == std::format("matches a toolchain marker: {}", vendored));
+    }
+
+    SECTION("a source under a root spelled almost right")
+    {
+        // `/w/src-other` prefix-matches `/w/src` character-wise, so IsToolchainHeader
+        // calls it project content, while Canonicalize's segment-wise test declines.
+        // Distinct from OutsideRoots precisely because the remedy is: the root is
+        // nearly correct, rather than the file being somewhere else entirely.
+        auto const built = inputsWith("/w/src-other/t.cpp", {}, "/w/build");
+        REQUIRE_FALSE(built.has_value());
+        CHECK(built.error() == ManifestFailure { .fault = ManifestFault::Uncanonical, .path = "/w/src-other/t.cpp" });
+        CHECK(DescribeManifestFailure(built.error()) == "no canonical form: /w/src-other/t.cpp");
+    }
+}
+
+TEST_CASE("BuildManifest names the offending DEPENDENCY, not the source (issue #68)")
+{
+    // The source has to be real here: BuildManifest records the TU before it looks
+    // at a single dependency, so a fictitious source would refuse first and every
+    // case below would be testing the wrong path. Which is itself the property under
+    // test -- the refusal must send the reader to the file that was actually wrong,
+    // and reporting the source would send them to the one file that was fine.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-fault-dep" };
+    auto const& root = scratch.Path();
+    std::filesystem::create_directories(root / "src");
+
+    auto const sourcePath = root / "src" / "t.cpp";
+    {
+        std::ofstream out { sourcePath, std::ios::binary };
+        out << "int main() { return 0; }\n";
+    }
+
+    // Rooted at `<root>/src` rather than at `<root>`, so the near-miss path below
+    // lies under neither root. Under a root of `<root>` it would canonicalize
+    // perfectly and the section would be testing Unreadable by another name.
+    FastCache::PathCanon::Layout const layout { .sourceRoot = (root / "src").string(),
+                                                .buildTree = (root / "out").string() };
+    auto const build = [&](std::vector<std::string> includes, std::string cwd) {
+        return BuildManifest({ .sourcePath = sourcePath.string(),
+                               .includePaths = std::move(includes),
+                               .workingDirectory = std::move(cwd),
+                               .toolchainStamp = "cc-test-1",
+                               .objectKey = "objkey-1" },
+                             layout);
+    };
+
+    SECTION("one the working directory cannot place")
+    {
+        // Refused, not dropped, and this is the case that says so: a path still
+        // relative after resolution names a file this build cannot identify, so
+        // recording a manifest without it would be the same silent stale serve by
+        // another route -- whereas refusing merely costs this compile direct mode.
+        // Reachable only when the working directory itself is unavailable, which is
+        // why it is a refusal and not a fallback.
+        //
+        // Spelled through std::filesystem so the separator is the one this layout
+        // uses -- these roots are the host's, and the reported path comes back in
+        // the layout's own vocabulary.
+        auto const relative = (std::filesystem::path { "sub" } / "header.hpp").string();
+        auto const built = build({ relative }, "");
+        REQUIRE_FALSE(built.has_value());
+        CHECK(built.error() == ManifestFailure { .fault = ManifestFault::Unanchored, .path = relative });
+    }
+
+    SECTION("one under a root spelled almost right")
+    {
+        // `<root>/src-other` prefix-matches the source root character-wise, so
+        // IsToolchainHeader calls it project content, while Canonicalize's
+        // segment-wise test declines. Classified before it is opened, so it need not
+        // exist -- which is what separates this from Unreadable below.
+        auto const stray = (root / "src-other" / "generated.hpp").string();
+        auto const built = build({ stray }, root.string());
+        REQUIRE_FALSE(built.has_value());
+        CHECK(built.error() == ManifestFailure { .fault = ManifestFault::Uncanonical, .path = stray });
+    }
+
+    SECTION("one that canonicalizes but cannot be read")
+    {
+        // The other cause the old single message covered. A path with a perfectly
+        // good token that cannot be opened -- a generated header not yet written, a
+        // permission, a race -- is a different problem from one with no canonical
+        // form, and it used to arrive as `Malformed`: the same value DecodeManifest
+        // returns for corrupt bytes off the wire.
+        auto const missing = (root / "src" / "never-written.hpp").string();
+        auto const built = build({ missing }, root.string());
+        REQUIRE_FALSE(built.has_value());
+        CHECK(built.error() == ManifestFailure { .fault = ManifestFault::Unreadable, .path = missing });
+    }
+
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("CanonicalSourceToken's refusal carries the path and the reason (issue #68)")
+{
+    // The refusal a real build actually meets. RecordManifest asks here first and
+    // returns before BuildManifest ever runs, so a source with no token used to cost
+    // a translation unit direct mode permanently while printing nothing whatsoever
+    // -- not even under FASTCACHE_VERBOSE.
+    FastCache::PathCanon::Layout const layout { .sourceRoot = "/w/src", .buildTree = "/w/build" };
+
+    auto const outsideRoots = CanonicalSourceToken("/elsewhere/t.cpp", layout, "/w/build");
+    REQUIRE_FALSE(outsideRoots.has_value());
+    CHECK(outsideRoots.error() == ManifestFailure { .fault = ManifestFault::OutsideRoots, .path = "/elsewhere/t.cpp" });
+
+    auto const unanchored = CanonicalSourceToken("src/t.cpp", layout, "");
+    REQUIRE_FALSE(unanchored.has_value());
+    CHECK(unanchored.error() == ManifestFailure { .fault = ManifestFault::Unanchored, .path = "src/t.cpp" });
+
+    auto const uncanonical = CanonicalSourceToken("/w/src-other/t.cpp", layout, "/w/build");
+    REQUIRE_FALSE(uncanonical.has_value());
+    CHECK(uncanonical.error() == ManifestFailure { .fault = ManifestFault::Uncanonical, .path = "/w/src-other/t.cpp" });
+}
+
+TEST_CASE("DescribeManifestFailure renders every fault it can be given")
+{
+    // Walks the table rather than naming four faults, so a fifth appended to
+    // ManifestFault fails here unless it was given a word to be printed as -- the
+    // failure mode a refusal that renders as `": /some/path"` would otherwise be.
+    for (auto const& row: FaultTable)
+    {
+        CHECK_FALSE(row.label.empty());
+        CHECK(DescribeManifestFailure({ .fault = row.fault, .path = "/w/src/t.cpp" })
+              == std::format("{}: /w/src/t.cpp", row.label));
+    }
+
+    // `Last` is the table's length rather than a fault, so it indexes one past the
+    // end. Nothing constructs a failure carrying it, which is precisely why an
+    // unguarded read there would never be noticed.
+    CHECK(DescribeManifestFailure({ .fault = ManifestFault::Last, .path = "/w/src/t.cpp" }) == "unknown: /w/src/t.cpp");
 }
 
 TEST_CASE("AnchorWorkingDirectory re-spells a symlinked cwd in the layout's vocabulary")

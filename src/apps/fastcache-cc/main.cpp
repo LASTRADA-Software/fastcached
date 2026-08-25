@@ -1003,6 +1003,19 @@ struct MaterializedHit
     return 0;
 }
 
+/// Report that this compile gets no direct-mode manifest, and why.
+///
+/// One spelling for all three refusals, so a build log shows the same sentence
+/// whichever of them fired and only the parenthesised reason differs — which is
+/// what makes the reason the thing a reader's eye lands on. Verbose-gated like
+/// every other launcher diagnostic; NoteIfRootsDoNotDescribeCompile carries why
+/// that call was made, unmade and deliberately made again.
+/// @param reason Why no manifest is being recorded.
+void NoteNoManifest(std::string_view reason)
+{
+    Note(std::format("not recording a direct-mode manifest ({})", reason));
+}
+
 /// Record the direct-mode manifest for a compile whose object bytes are already
 /// stored, so the next compile of this TU can skip preprocessing.
 ///
@@ -1039,7 +1052,15 @@ void RecordManifest(Config const& cfg,
     auto const resolvedSource = reconciler.Directory(cmd.source);
     auto const canonicalSource = Cc::CanonicalSourceToken(resolvedSource, layout, workingDirectoryText);
     if (!canonicalSource.has_value())
+    {
+        // Said out loud, because this is the refusal a real build meets and it used
+        // to return in complete silence -- not even under FASTCACHE_VERBOSE. A
+        // source with no canonical token can never key a manifest, so direct mode is
+        // off for this translation unit permanently while the compile goes on
+        // succeeding: nothing else in the log so much as mentions it (issue #68).
+        NoteNoManifest(Cc::DescribeManifestFailure(canonicalSource.error()));
         return;
+    }
 
     // Either stream may carry the notes (clang-cl uses stdout, cl uses stderr);
     // parse both rather than guessing which compiler produced this value.
@@ -1064,7 +1085,7 @@ void RecordManifest(Config const& cfg,
     // ordinary preprocessed key) is strictly better than recording something.
     if (includes.empty())
     {
-        Note("compile reported no dependencies; not recording a direct-mode manifest");
+        NoteNoManifest("the compile reported no dependencies");
         return;
     }
 
@@ -1093,8 +1114,12 @@ void RecordManifest(Config const& cfg,
                                             layout);
     if (!manifest.has_value())
     {
-        if (invocation.verbose)
-            std::cerr << "fastcache-cc: manifest not built (uncanonicalizable source or include)\n";
+        // One path and one reason, the shape the replay guard's STALE HIT note uses
+        // and for the same reason: "why does this TU never cache" is otherwise a
+        // whole investigation, and the answer is one path. This said
+        // "uncanonicalizable source or include" for every refusal alike, which named
+        // neither the file nor which of them it was (issue #68).
+        NoteNoManifest(Cc::DescribeManifestFailure(manifest.error()));
         return;
     }
 
@@ -1164,6 +1189,13 @@ void RecordManifest(Config const& cfg,
     auto const canonicalSource =
         Cc::CanonicalSourceToken(reconciler.Directory(cmd.source), layout, workingDirectory.string());
     if (!canonicalSource.has_value())
+        // Deliberately silent, unlike RecordManifest's identical guard. Being the
+        // same derivation from the same inputs, this refuses exactly when the
+        // recording side does and for exactly the same reason -- so a note here
+        // would print every such fact twice per translation unit, which is the
+        // per-TU noise the #66 gating reversal was about. The recording side is
+        // where a refusal gets said, because that is the side that had something to
+        // record.
         return giveUp();
 
     auto const manifestKey = Cc::ComputeManifestKey(*canonicalSource, relativizedArgs, toolchainStamp);

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/CompileCache/PathCanon.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 
 #include <cstdint>
 #include <expected>
@@ -68,13 +69,119 @@ struct DirectManifest
     [[nodiscard]] friend bool operator==(DirectManifest const&, DirectManifest const&) = default;
 };
 
-/// Failure modes of manifest encoding/decoding and validation.
+/// Failure modes of manifest DECODING: what is wrong with a stored byte string.
+///
+/// Deliberately not the vocabulary a refusal to BUILD one speaks. Those two
+/// failures share no audience: this one names bytes that came back from the
+/// daemon, `ManifestFault` names a path on this machine's disk. They were one enum
+/// until issue #68, and the conflation is half of why a build refusal could not say
+/// what it was — `Malformed` meant both "the encoded form is invalid" and "a file
+/// could not be read", so the two printed identically.
 enum class DirectError : std::uint8_t
 {
     Malformed,      ///< Encoded bytes are structurally invalid.
     UnknownVersion, ///< Encoded with a manifest version this build cannot read.
-    NotCanonical,   ///< A path could not be canonicalized (outside every root).
 };
+
+/// Why one path stopped a manifest being built.
+///
+/// A DIAGNOSTIC vocabulary, not a decision: nothing branches on it, and every
+/// enumerator refuses the manifest just as completely as the next. They exist so a
+/// refusal can be *named*, because it is the only account a translation unit that
+/// silently never caches ever gets (issue #68).
+///
+/// Five rather than the two the refusal paths happen to have, and the split is the
+/// point: each names a different thing to go and fix. `Unanchored` is a working
+/// directory, `OutsideRoots` is a layout, `ToolchainLike` is a TU somewhere nobody
+/// expected to compile from, `Uncanonical` is a root spelled almost right,
+/// `Unreadable` is a file. `PathDisposition` in DependencyProbe.hpp draws
+/// the same lines for the key's dependency set, for the same reason (issue #105) —
+/// separate because a manifest's outcomes are not a key's: there is no `Keyed` and
+/// no `Toolchain` here, since a toolchain header is dropped rather than refused,
+/// and a key never opens the file it is classifying so it has no `Unreadable`.
+enum class ManifestFault : std::uint8_t
+{
+    Unanchored,    ///< Still relative after ResolveAgainst: the working directory could
+                   ///< not place it, so the file it names is unknown.
+    OutsideRoots,  ///< Absolute and under neither root, so it has no portable form. An
+                   ///< ordinary layout for a TU (`add_subdirectory(../shared)`), which
+                   ///< is why this is a refusal to shortcut and not a fault in the build.
+    ToolchainLike, ///< Under a root, but matching one of `IsToolchainHeader`'s markers
+                   ///< -- a TU inside a vendored tree such as `vcpkg_installed/`. Split
+                   ///< from OutsideRoots because the roots are fine and saying otherwise
+                   ///< sends an operator to fix what is not broken.
+    Uncanonical,   ///< Rooted by IsToolchainHeader's character-wise prefix test, but
+                   ///< Canonicalize's segment-wise one declined -- `/x/build-other/a.h`
+                   ///< against a `/x/build` root. A root spelled almost right.
+    Unreadable,    ///< Could not be read, so it could not be hashed. A manifest entry
+                   ///< is only worth recording if its content hash is real.
+    Last,          ///< Not a fault, and has no row: the table's length.
+};
+
+/// One row per fault: the enumerator, and the word the note uses for it.
+struct FaultRow
+{
+    ManifestFault fault;    ///< The refusal this row names.
+    std::string_view label; ///< How the launcher's note spells it.
+};
+
+/// The fault table, in enumerator order so a fault indexes its own row.
+///
+/// A table rather than a `switch`, for the reason `DependencyProbe`'s
+/// `DispositionTable` and `Metrics/MetricsCatalog` are ones: a refusal that can be
+/// returned but not named renders as nothing, which is the defect this whole
+/// vocabulary exists to close. Declared through `Core/EnumTable.hpp`, which is
+/// where that idiom lives once (issue #112).
+///
+/// `EnumTable` is what gets the length right, and the length is the half that has
+/// to be. A fault appended after `Unreadable` while `Last` still ended the enum
+/// would leave a table one row short that a `size() == Unreadable + 1` assert
+/// happily accepts — and `DescribeManifestFailure` indexes this by the enumerator,
+/// so the new fault would read one past the end. Taking the extent from the enum
+/// instead makes the missing row value-initialize to `{ Unanchored, "" }` at a
+/// non-zero index, which `RowsInEnumeratorOrder` rejects.
+inline constexpr EnumTable<ManifestFault, FaultRow> FaultTable { {
+    { .fault = ManifestFault::Unanchored, .label = "unanchored" },
+    { .fault = ManifestFault::OutsideRoots, .label = "under no root" },
+    { .fault = ManifestFault::ToolchainLike, .label = "matches a toolchain marker" },
+    { .fault = ManifestFault::Uncanonical, .label = "no canonical form" },
+    { .fault = ManifestFault::Unreadable, .label = "unreadable" },
+} };
+
+static_assert(RowsInEnumeratorOrder(FaultTable, &FaultRow::fault),
+              "FaultTable must hold one row per ManifestFault, in enumerator order -- the order is what lets a fault "
+              "index its own row");
+
+/// One refusal to build a manifest: what went wrong, and the path it went wrong on.
+///
+/// The path is what makes this worth carrying. A manifest refusal is invisible from
+/// every other direction — the compile succeeds, the object still caches under the
+/// ordinary preprocessed key, and only the shortcut is quietly gone — so "why does
+/// this TU never cache" is otherwise a whole investigation, and the answer is one
+/// path. The same reasoning `Cc::MissingReplayedDependency`'s note is built on.
+struct ManifestFailure
+{
+    ManifestFault fault; ///< Which refusal this was.
+
+    /// The offending path, as `ResolveAgainst` left it — the value the
+    /// classification actually rejected, rather than the spelling it arrived in.
+    /// For `OutsideRoots` and `Uncanonical` that is what the reader has to compare
+    /// against the roots; for `Unanchored` resolution changed nothing, so it is
+    /// still recognisably what the driver reported.
+    std::string path;
+
+    [[nodiscard]] friend bool operator==(ManifestFailure const&, ManifestFailure const&) = default;
+};
+
+/// Render a refusal as one path and one reason, for the launcher's note.
+///
+/// Lives here rather than in main.cpp because main.cpp is in no test target, the
+/// lesson `CacheProtocol.cpp`, `RootReconciler.cpp` and `DescribeDropped` are each
+/// recorded as having been extracted for.
+///
+/// @param failure The refusal to describe.
+/// @return `"no canonical form: /x/build-other/a.h"`.
+[[nodiscard]] std::string DescribeManifestFailure(ManifestFailure const& failure);
 
 /// Serialize a manifest to a portable byte string. Entries are emitted in their
 /// stored order, so callers that want determinism should keep `entries` sorted
@@ -355,12 +462,16 @@ struct ManifestInputs
 /// @param sourcePath       The TU's source path as the command line spelled it.
 /// @param layout           This build's roots.
 /// @param workingDirectory The directory the compile ran in.
-/// @return The `<SRCROOT>`/`<BUILDTREE>` token, or NotCanonical when the source
-///         lies under neither root (direct mode is then unavailable for this TU,
-///         which is the safe outcome — the ordinary preprocessed key still works).
-[[nodiscard]] std::expected<std::string, DirectError> CanonicalSourceToken(std::string_view sourcePath,
-                                                                           PathCanon::Layout const& layout,
-                                                                           std::string_view workingDirectory);
+/// @return The `<SRCROOT>`/`<BUILDTREE>` token, or a ManifestFailure naming the
+///         resolved source and why it has no token (direct mode is then unavailable
+///         for this TU, which is the safe outcome — the ordinary preprocessed key
+///         still works). It carries the path because this is the refusal a real
+///         build meets: `RecordManifest` asks here first and returns before
+///         BuildManifest ever runs, so without it the commonest reason a TU never
+///         caches has nowhere to be said (issue #68).
+[[nodiscard]] std::expected<std::string, ManifestFailure> CanonicalSourceToken(std::string_view sourcePath,
+                                                                               PathCanon::Layout const& layout,
+                                                                               std::string_view workingDirectory);
 
 /// Build a manifest from one compile's source and include set.
 ///
@@ -391,13 +502,19 @@ struct ManifestInputs
 /// introduce a second kind of entry into a format whose portability rests on every
 /// path in it being a token.
 ///
+/// Every refusal names the path it refused over, and no two refusals share a
+/// reason. Both halves are load-bearing and neither is decoration: the compile
+/// succeeds either way, so this note is the only thing standing between an operator
+/// and bisecting a build to find out why one translation unit stopped shortcutting
+/// (issue #68).
+///
 /// @param inputs This compile's source, dependencies, working directory, stamp and
 ///               object key.
 /// @param layout This build's roots.
-/// @return The manifest, or DirectError when the source or an entry cannot be
-///         canonicalized, or when a file could not be read.
-[[nodiscard]] std::expected<DirectManifest, DirectError> BuildManifest(ManifestInputs const& inputs,
-                                                                       PathCanon::Layout const& layout);
+/// @return The manifest, or a ManifestFailure naming the offending path and which
+///         of the four faults it was.
+[[nodiscard]] std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs const& inputs,
+                                                                           PathCanon::Layout const& layout);
 
 /// Re-check every entry against the filesystem.
 ///

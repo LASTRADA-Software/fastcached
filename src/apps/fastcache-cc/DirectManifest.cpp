@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <optional>
 #include <ranges>
@@ -171,7 +173,7 @@ namespace
                 // when it cannot, so probing `C:foo` against the wrong anchor would
                 // discard every hit carrying it. A manifest entry is OPENED rather
                 // than probed, and an unreadable one is a refusal on the recording
-                // side (HashFileContents yields nothing -> Malformed) and a
+                // side (HashFileContents yields nothing -> Unreadable) and a
                 // non-validation on the reading side -- safe both ways. So the
                 // stronger question is worth asking: under a drive-relative root
                 // (`C:src\proj`) such a path canonicalizes to a token that is
@@ -568,21 +570,59 @@ std::string AnchorWorkingDirectory(std::string_view directory, PathCanon::Layout
     return normalized;
 }
 
-std::expected<std::string, DirectError> CanonicalSourceToken(std::string_view sourcePath,
-                                                             PathCanon::Layout const& layout,
-                                                             std::string_view workingDirectory)
+std::string DescribeManifestFailure(ManifestFailure const& failure)
 {
-    auto const resolved = ResolveAgainst(sourcePath, workingDirectory, layout);
-    if (ClassifyResolved(resolved, layout) != PathRole::Project)
-        return std::unexpected(DirectError::NotCanonical);
+    // Indexed rather than searched: the table is one row per enumerator in
+    // enumerator order, and the `RowsInEnumeratorOrder` static_assert beside
+    // FaultTable is what makes that a fact rather than a hope.
+    //
+    // `Last` is the one value that indexes past the end, being the table's length
+    // rather than a fault, so it is answered rather than dereferenced. Nothing
+    // constructs a failure carrying it -- which is exactly why the read would go
+    // unnoticed if it ever did.
+    auto const index = static_cast<std::size_t>(failure.fault);
+    auto const label = index < FaultTable.size() ? FaultTable[index].label : std::string_view { "unknown" };
+    return std::format("{}: {}", label, failure.path);
+}
+
+std::expected<std::string, ManifestFailure> CanonicalSourceToken(std::string_view sourcePath,
+                                                                 PathCanon::Layout const& layout,
+                                                                 std::string_view workingDirectory)
+{
+    auto resolved = ResolveAgainst(sourcePath, workingDirectory, layout);
+    switch (ClassifyResolved(resolved, layout))
+    {
+        case PathRole::Unanchored:
+            return std::unexpected(ManifestFailure { .fault = ManifestFault::Unanchored, .path = std::move(resolved) });
+        case PathRole::Toolchain: {
+            // Two different facts arrive here, and reporting them as one would be
+            // the misdirection this whole vocabulary exists to remove.
+            // `IsToolchainHeader` tests its markers BEFORE any root -- deliberately,
+            // so a vendored tree nested under the build tree stays toolchain content
+            // -- so this branch is reached both by a path under neither root and by
+            // a rooted path that merely looks vendored, which `vcpkg_installed/`
+            // inside the build tree is. Calling the second "under no root" sends an
+            // operator to fix roots that are already correct.
+            //
+            // The root question is therefore asked again in this one branch, which
+            // is the same correction `PathDisposition::DriveRelative` makes and for
+            // the same reason. Canonicalizing IS that question: a token comes out
+            // only for a path under a root.
+            auto const rooted = ProjectToken(resolved, layout).has_value();
+            return std::unexpected(ManifestFailure {
+                .fault = rooted ? ManifestFault::ToolchainLike : ManifestFault::OutsideRoots, .path = std::move(resolved) });
+        }
+        case PathRole::Project:
+            break;
+    }
 
     auto token = ProjectToken(resolved, layout);
     if (!token.has_value())
-        return std::unexpected(DirectError::NotCanonical);
+        return std::unexpected(ManifestFailure { .fault = ManifestFault::Uncanonical, .path = std::move(resolved) });
     return *std::move(token);
 }
 
-std::expected<DirectManifest, DirectError> BuildManifest(ManifestInputs const& inputs, PathCanon::Layout const& layout)
+std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs const& inputs, PathCanon::Layout const& layout)
 {
     DirectManifest manifest { .toolchainStamp = inputs.toolchainStamp, .objectKey = inputs.objectKey, .entries = {} };
 
@@ -596,10 +636,10 @@ std::expected<DirectManifest, DirectError> BuildManifest(ManifestInputs const& i
     if (!sourceToken.has_value())
         return std::unexpected(sourceToken.error());
 
-    auto const record = [&manifest](std::string token, std::string const& resolved) -> std::expected<void, DirectError> {
+    auto const record = [&manifest](std::string token, std::string const& resolved) -> std::expected<void, ManifestFailure> {
         auto hash = HashFileContents(resolved);
         if (hash.empty())
-            return std::unexpected(DirectError::Malformed);
+            return std::unexpected(ManifestFailure { .fault = ManifestFault::Unreadable, .path = resolved });
         manifest.entries.push_back({ .canonicalPath = std::move(token), .contentHash = std::move(hash) });
         return {};
     };
@@ -622,11 +662,11 @@ std::expected<DirectManifest, DirectError> BuildManifest(ManifestInputs const& i
                 // unknown -- and a dropped project header is the silent stale serve
                 // this whole classification exists to prevent. Refusing costs this
                 // compile direct mode; the ordinary preprocessed key still serves it.
-                return std::unexpected(DirectError::NotCanonical);
+                return std::unexpected(ManifestFailure { .fault = ManifestFault::Unanchored, .path = resolved });
             case PathRole::Project: {
                 auto token = ProjectToken(resolved, layout);
                 if (!token.has_value())
-                    return std::unexpected(DirectError::NotCanonical);
+                    return std::unexpected(ManifestFailure { .fault = ManifestFault::Uncanonical, .path = resolved });
                 if (auto const stored = record(*std::move(token), resolved); !stored.has_value())
                     return std::unexpected(stored.error());
                 break;
