@@ -190,6 +190,42 @@ fastcached.exe --uninstall-service
 Pass `--config=C:\path\to\fastcached.yaml` only to point the service at a file
 *other* than the default location.
 
+### What it runs as
+
+The service logs on as the **virtual account** `NT SERVICE\FastCached`. The SCM
+derives that from the service name and manages it itself, so there is no account
+to create and no password to keep. Told nothing, `CreateService` would use
+LocalSystem, which has unrestricted access to every local resource and is a
+member of the local Administrators group — more than a cache daemon listening on
+a socket has any use for.
+
+It can still read `C:\ProgramData\fastcached\fastcached.yaml`, because that
+directory grants `BUILTIN\Users` read and execute. It deliberately cannot *write*
+there: a service that cannot rewrite its own configuration cannot be talked into
+loading a different one.
+
+**If you set `storage_path`, the account needs access to it.** `--install-service`
+hands over whatever `storage_path` is configured at the time it runs, so seeding
+the config first and installing second needs nothing extra.
+
+If you add or move `storage_path` afterwards, grant it from an elevated prompt:
+
+```powershell
+icacls "D:\fastcached\cache" /grant "NT SERVICE\FastCached":(OI)(CI)F
+```
+
+Note that re-running `--install-service` does **not** repair it: registering a
+service that already exists is refused before the handover happens, so the grant
+never runs. Either use `icacls`, or `--uninstall-service` first — which stops the
+service, so `icacls` is the less disruptive of the two.
+
+A daemon that cannot open its storage says so at startup and prints this command
+with your own paths and service name filled in; without `storage_path` it is
+memory-only and needs no directory at all.
+
+Renaming the service with `--service-name` renames the account with it, since the
+SCM derives one from the other.
+
 `--install-service` records the flags it was given on the command line into
 the service's command line (values from a `--config` file stay in the file)
 and makes path arguments absolute — a service starts with its

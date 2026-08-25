@@ -68,9 +68,30 @@ readable and silently ignored. Every rule below has already been one of them.
     itself with the whole machine while the macOS spec was carefully naming an
     unprivileged account for the same binary. It names
     `WindowsLogonAccount::VirtualAccount` now: `NT SERVICE\<serviceName>`, created by
-    the SCM itself, no account to make and no password to keep. The daemon stays
-    LocalSystem deliberately -- its `%ProgramData%` access list grants `BU` read and
-    execute only, so moving it is a separate change with its own ACL work.
+    the SCM itself, no account to make and no password to keep. **Both** services name
+    one; neither has any use for the local Administrators group. The daemon can still
+    read what it needs, because the `%ProgramData%\fastcached` access list grants
+    `BUILTIN\Users` read and execute and a virtual account is an Authenticated User --
+    and what it can no longer do is WRITE there, which is the point: a service that
+    cannot rewrite its own configuration cannot be made to load a different one.
+  - **The daemon's storage is granted from the MERGED config, and that is not the
+    `--install-service` rule below being broken.** `storage_path` is read from YAML at
+    every start, so a registration built from the command line cannot see it -- and the
+    daemon no longer runs as an account that can write wherever it likes. `main.cpp`'s
+    install branch therefore adds `effective.storagePath` to `ownedDirectories`.
+    Nothing from the merged config is *registered*: this contributes a directory to
+    hand over, never a flag to bake in, so the hazard that rule exists for -- a path in
+    `ProgramArguments` outranking the very file it came from, forever -- cannot arise.
+    Only what is configured, never a speculative default: a daemon with no
+    `storage_path` is memory-only and needs no directory at all. An operator who adds
+    one *after* installing gets a permission failure naming the account and the
+    `icacls` line, because at that point nothing has handed the directory over -- and
+    the message must not tell them to re-run `--install-service`, which returns on
+    `ERROR_SERVICE_EXISTS` *before* the grant loop and would repair nothing. The
+    startup hint is gated on an actual write probe rather than on the error text,
+    because three of the four storage failures report a string from the storage layer
+    rather than an `error_code`, and because a localized "permission denied" is not
+    something to build advice on.
   - **A virtual account cannot write what an administrator created, so the install
     grants it.** LocalSystem never noticed, which is why nothing on the Windows path
     had ever needed the equivalent of the launchd `chown`. Two things about the

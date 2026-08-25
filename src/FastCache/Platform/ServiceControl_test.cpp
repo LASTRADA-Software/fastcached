@@ -203,13 +203,13 @@ TEST_CASE("ServiceControl: the launchd label is reverse-DNS and lowercased", "[p
 
 TEST_CASE("ServiceControl: the SCM logon identity is named, not implied", "[platform][service][scm]")
 {
-    // Naming nobody is LocalSystem, the most privileged identity on the machine.
-    // The daemon keeps it -- changing that is a separate decision, with its own
-    // %ProgramData% access-list work -- and says so rather than leaving it implied.
+    // Naming nobody is LocalSystem: unrestricted access to every local resource and
+    // a member of the local Administrators group. Neither of this project's services
+    // has any use for that, so neither leaves it to the default.
     FastCache::Config const cfg {};
     auto const daemon = SpecFor("fastcached", cfg);
-    REQUIRE(daemon.windowsLogon == FastCache::WindowsLogonAccount::LocalSystem);
-    REQUIRE(!FastCache::WindowsLogonName(daemon).has_value());
+    REQUIRE(daemon.windowsLogon == FastCache::WindowsLogonAccount::VirtualAccount);
+    REQUIRE(Unwrap(FastCache::WindowsLogonName(daemon)) == "NT SERVICE\\FastCached");
 
     // A virtual account is derived from the service name by the SCM itself, so the
     // spelling has to match the name exactly or the service logs on as nobody.

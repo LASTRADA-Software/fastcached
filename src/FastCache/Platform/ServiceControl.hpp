@@ -159,9 +159,9 @@ struct ServiceSpec
     /// Which identity the Windows SCM should log this service on as.
     ///
     /// Defaults to `LocalSystem` because that is what the SCM does when told
-    /// nothing, and saying so is better than leaving it implied -- the daemon
-    /// relies on it, and changing that is a separate decision with its own
-    /// `%ProgramData%` access-list work.
+    /// nothing, so the default states the platform's behaviour rather than this
+    /// project's preference. **Both** of this project's services override it:
+    /// neither has any use for unrestricted access to the machine.
     ///
     /// `serviceAccount` does not answer this: it holds a POSIX account name that
     /// must already exist, which is not a thing the SCM takes.

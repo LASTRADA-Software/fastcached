@@ -356,7 +356,21 @@ ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, Config c
                          // per-user cache under this name. WithScopeDefaults may
                          // therefore fill in a --config or --storage the operator
                          // left unset; a service naming nothing gets neither.
-                         .applicationName = std::string { DaemonApplicationName } };
+                         .applicationName = std::string { DaemonApplicationName },
+                         // Named rather than left to the SCM's default, which is
+                         // LocalSystem: unrestricted access to every local resource
+                         // and a member of the local Administrators group. A cache
+                         // daemon listening on a socket has no use for any of it.
+                         //
+                         // The account costs nothing to create because the SCM
+                         // derives it from the service name and manages it itself,
+                         // and it can already read what it needs: the
+                         // %ProgramData%\fastcached access list grants BUILTIN\Users
+                         // read and execute, and a virtual account is an
+                         // Authenticated User. What it cannot do is WRITE there,
+                         // which is the point -- a service that cannot rewrite its
+                         // own configuration cannot be made to load a different one.
+                         .windowsLogon = WindowsLogonAccount::VirtualAccount };
 }
 
 std::optional<std::string> InlineCredentialRejection(ServiceSpec const& spec)
