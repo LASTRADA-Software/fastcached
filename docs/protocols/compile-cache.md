@@ -77,7 +77,7 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x03` | malformed-frame | The fields do not exactly fill the declared payload. |
 | `0x04` | payload-too-large | The declared payload exceeds the session cap. |
 | `0x05` | malformed-value | A STORE payload is not a decodable compile-value. |
-| `0x06` | canonicalization-failed | A text region's paths could not be canonicalized. |
+| `0x06` | *(reserved)* | Never sent. Was `canonicalization-failed`, for a failure `PathCanon` could not produce; removed in issues #59/#69. The number is burnt so it is never reused with a different meaning. |
 | `0x07` | storage-write-failed | The cache engine refused the write. |
 | `0x08` | unauthenticated | A credential is required and has not been accepted on this connection. |
 | `0x09` | no-worker | No registered worker matches the requested toolchain. |
