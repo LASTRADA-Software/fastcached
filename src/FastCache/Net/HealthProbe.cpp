@@ -98,17 +98,21 @@ bool HttpHealthProbe(std::string_view host, std::uint16_t port, std::string_view
     // SO_RCVTIMEO/SO_SNDTIMEO helper as the admin listener.
     Detail::SetIoTimeouts(static_cast<Detail::NativeSocket>(socket), ProbeTimeout, ProbeTimeout);
 
-    // This probe owns a raw socket rather than a BlockingSocket, so it has to arm
-    // the per-socket SIGPIPE suppression itself -- there is no process-wide
-    // disposition standing behind it any more, deliberately (see ArmNoSigPipe).
-    // An admin endpoint that closes while the request is still going out is the
-    // ordinary case for a wedged daemon, which is exactly when a health check runs.
+    // This probe owns a raw socket rather than a BlockingSocket, so it has to
+    // suppress SIGPIPE itself -- there is no process-wide disposition standing
+    // behind it any more, deliberately (see ArmNoSigPipe). An admin endpoint that
+    // closes while the request is still going out is the ordinary case for a
+    // wedged daemon, which is exactly when a health check runs.
+    //
+    // BOTH halves, because either alone is a platform away from useless: the
+    // arming is what works where `SO_NOSIGPIPE` exists, and the send flag is the
+    // whole of the protection on Linux, where there is nothing to arm.
     Detail::ArmNoSigPipe(static_cast<Detail::NativeSocket>(socket));
 
     auto const request =
         std::string { "GET " } + std::string { path } + " HTTP/1.0\r\nHost: " + hostStr + "\r\nConnection: close\r\n\r\n";
     bool ok = false;
-    if (::send(socket, request.data(), SendLen(request.size()), 0) >= 0)
+    if (::send(socket, request.data(), SendLen(request.size()), Detail::NoSignalSendFlags()) >= 0)
     {
         std::array<char, 256> buffer {};
         auto const received = ::recv(socket, buffer.data(), SendLen(buffer.size() - 1), 0);

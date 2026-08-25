@@ -14,6 +14,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #if !defined(_WIN32)
+    #include <sys/socket.h>
+
     #include <csignal>
 #endif
 
@@ -171,3 +173,34 @@ TEST_CASE("A connected pair still round-trips bytes", "[net][socket]")
     REQUIRE(written.has_value());
     CHECK(*written == payload.size());
 }
+
+#if !defined(_WIN32)
+TEST_CASE("Suppression is either armed on the socket or carried in the send flags", "[net][socket]")
+{
+    // The two halves of per-socket SIGPIPE suppression are one rule, and which
+    // half does the work flips between platforms: `SO_NOSIGPIPE` arms the
+    // descriptor on macOS and the BSDs, while on Linux there is nothing to arm and
+    // `MSG_NOSIGNAL` on every send is the whole of the protection.
+    //
+    // So a raw sender that arms and then passes `0` is correct on one platform and
+    // fatally wrong on the other -- and it reads as correct on both, because the
+    // arming call is right there. `HealthProbe` did exactly that: on Linux
+    // `fastcached --healthcheck` against a peer that hung up mid-request died of
+    // signal 13 instead of reporting the peer unhealthy, which for a Docker
+    // HEALTHCHECK or a systemd probe is the one answer a health check must be able
+    // to give.
+    //
+    // Asserted against the platform macro rather than through a hung-up peer,
+    // because the consequence is not reproducible on demand: the probe sends one
+    // small request, and a single small write after a hang-up is routinely
+    // *accepted* -- it takes the peer's RST and a second write to break the pipe,
+    // which is why the case above needs kilobytes to provoke it. A regression test
+    // that only sometimes sees the signal is the thing this repository already
+    // records as worth nothing, so this pins the invariant the fix restored.
+    #if defined(SO_NOSIGPIPE)
+    SUCCEED("SO_NOSIGPIPE arms the descriptor here, so a raw sender needs no extra flag");
+    #else
+    CHECK(Detail::NoSignalSendFlags() == MSG_NOSIGNAL);
+    #endif
+}
+#endif

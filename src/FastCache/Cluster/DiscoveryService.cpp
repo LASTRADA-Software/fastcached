@@ -31,7 +31,7 @@ bool DiscoveryService::SendBeacon()
     return _socket.Send(datagram, _config.beaconAddress).has_value();
 }
 
-void DiscoveryService::IssueChallenge(DiscoveryWire::Beacon const& peer, std::string_view replyTo)
+void DiscoveryService::IssueChallenge(DiscoveryWire::Beacon const& peer, DatagramAddress const& replyTo)
 {
     DiscoveryWire::Challenge challenge { .clusterId = _config.clusterId, .nonce = {} };
 

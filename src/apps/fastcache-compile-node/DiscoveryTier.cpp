@@ -121,7 +121,7 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     auto config = Cluster::DiscoveryConfig { .clusterId = cfg.clusterId,
                                              .nodeId = cfg.nodeId,
                                              .raftEndpoint = std::string { raftEndpoint },
-                                             .beaconAddress = cfg.discoveryAddress,
+                                             .beaconAddress = DatagramAddress { .host = beacon->first, .port = *port },
                                              .presharedKey = *std::move(key),
                                              .beaconInterval = Cluster::DiscoveryConfig {}.beaconInterval,
                                              .challengeLifetime = Cluster::DiscoveryConfig {}.challengeLifetime };
@@ -136,6 +136,18 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     logger.Logf(
         LogLevel::Info, "discovery on {} for cluster {}, announcing {}", tier->BoundEndpoint(), cfg.clusterId, raftEndpoint);
     return tier;
+}
+
+std::string DiscoveryTier::BoundEndpoint() const
+{
+    auto const bound = _socket->BoundAddress();
+    // An empty host is what `BoundAddress` reports for a socket it could not name,
+    // and joining that yields `:0` -- which reads as an endpoint rather than as
+    // the absence of one, in the log line an operator checks to see where
+    // discovery came up.
+    if (bound.host.empty())
+        return {};
+    return FormatHostPort(bound.host, bound.port);
 }
 
 DiscoveryTier::~DiscoveryTier()

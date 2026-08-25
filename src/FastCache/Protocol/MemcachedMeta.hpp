@@ -3,8 +3,8 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
-#include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <span>
 #include <string_view>

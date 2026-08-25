@@ -119,11 +119,13 @@ class DiscoveryTier
     /// @return False when the socket has closed and the loop should end.
     bool Step(std::chrono::milliseconds timeout);
 
-    /// Where this node's discovery socket bound.
-    [[nodiscard]] std::string BoundEndpoint() const
-    {
-        return _socket->BoundEndpoint();
-    }
+    /// Where this node's discovery socket bound, as text for a log line.
+    ///
+    /// The join lives above the socket for the reason `Cc::DialEndpoint` exists
+    /// -- see `DatagramAddress`. Out of line so that reason does not make
+    /// `Core/HostPort.hpp` a dependency of everything including this header.
+    /// @return `host:port`, bracketed when the host is an IPv6 literal.
+    [[nodiscard]] std::string BoundEndpoint() const;
 
     /// How many peers have proved they hold the cluster key.
     /// @return The count.

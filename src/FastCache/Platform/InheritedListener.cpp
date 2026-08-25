@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Net/BlockingSocket.hpp>
-#include <FastCache/Net/InheritedListener.hpp>
 #include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/InheritedListener.hpp>
 
 #include <charconv>
 #include <cstdlib>

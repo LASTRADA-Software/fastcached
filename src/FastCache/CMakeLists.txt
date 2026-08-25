@@ -57,7 +57,6 @@ target_sources(FastCache
         Net/BlockingConnector.cpp
         Net/BlockingSocket.cpp
         Net/ConnectFlow.cpp
-        Net/InheritedListener.cpp
         Net/HealthProbe.cpp
         Net/EpollConnector.cpp
         Net/EpollSocket.cpp
@@ -75,12 +74,13 @@ target_sources(FastCache
         Platform/HostInfo.cpp
         Platform/HostLoad.cpp
         Platform/HostMemory.cpp
+        Platform/InheritedListener.cpp
         Platform/PosixDaemonHost.cpp
         Platform/ServiceControl.cpp
         Platform/Terminal.cpp
         Platform/WindowsServiceHost.cpp
         Net/InMemoryTransport.cpp
-        Net/Framing/LineReader.cpp
+        Protocol/Framing/LineReader.cpp
         Protocol/CompileCacheHandler.cpp
         Protocol/MemcachedBinary.cpp
         Protocol/MemcachedMeta.cpp
@@ -180,7 +180,6 @@ target_sources(FastCache
         TYPE HEADERS
         BASE_DIRS "${CMAKE_SOURCE_DIR}/src"
         FILES
-            Core/Errors/NetError.hpp
             Core/Errors/ProtocolError.hpp
             Core/Errors/StorageError.hpp
             Core/Errors/ConfigError.hpp
@@ -192,4 +191,5 @@ target_sources(FastCache
             Core/Logger.hpp
             Core/BufferPool.hpp
             Core/Profiling.hpp
+            Net/NetError.hpp
 )

@@ -5,9 +5,9 @@
 #include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <algorithm>
 #include <format>

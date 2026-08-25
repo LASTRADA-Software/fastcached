@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
-#include <FastCache/Net/Framing/LineReader.hpp>
+#include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <chrono>
 #include <cstddef>

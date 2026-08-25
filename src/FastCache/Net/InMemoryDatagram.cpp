@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Net/InMemoryDatagram.hpp>
 
-#include <algorithm>
 #include <utility>
 
 namespace FastCache
@@ -14,7 +13,7 @@ class InMemoryDatagramSocket final: public IDatagramSocket
     /// Attach to @p bus at @p endpoint.
     /// @param bus The segment.
     /// @param endpoint This socket's address.
-    InMemoryDatagramSocket(DatagramBus& bus, std::string endpoint):
+    InMemoryDatagramSocket(DatagramBus& bus, DatagramAddress endpoint):
         _bus { bus },
         _endpoint { std::move(endpoint) }
     {
@@ -31,7 +30,7 @@ class InMemoryDatagramSocket final: public IDatagramSocket
     InMemoryDatagramSocket& operator=(InMemoryDatagramSocket const&) = delete;
     InMemoryDatagramSocket& operator=(InMemoryDatagramSocket&&) = delete;
 
-    std::expected<void, NetError> Send(std::span<std::byte const> payload, std::string_view to) override
+    std::expected<void, NetError> Send(std::span<std::byte const> payload, DatagramAddress const& to) override
     {
         _bus.Deliver(payload, to, _endpoint);
         return {};
@@ -69,37 +68,37 @@ class InMemoryDatagramSocket final: public IDatagramSocket
         _bus._arrived.notify_all();
     }
 
-    [[nodiscard]] std::string BoundEndpoint() const override
+    [[nodiscard]] DatagramAddress BoundAddress() const override
     {
         return _endpoint;
     }
 
   private:
     DatagramBus& _bus;
-    std::string _endpoint;
+    DatagramAddress _endpoint;
 };
 
-std::unique_ptr<IDatagramSocket> DatagramBus::Open(std::string endpoint)
+std::unique_ptr<IDatagramSocket> DatagramBus::Open(DatagramAddress endpoint)
 {
     return std::make_unique<InMemoryDatagramSocket>(*this, std::move(endpoint));
 }
 
-void DatagramBus::Attach(std::string const& endpoint)
+void DatagramBus::Attach(DatagramAddress const& endpoint)
 {
     std::scoped_lock const lock { _mutex };
     _inboxes[endpoint];
 }
 
-void DatagramBus::Detach(std::string const& endpoint)
+void DatagramBus::Detach(DatagramAddress const& endpoint)
 {
     std::scoped_lock const lock { _mutex };
     _inboxes.erase(endpoint);
 }
 
-void DatagramBus::DropNext(std::string_view endpoint, std::size_t count)
+void DatagramBus::DropNext(DatagramAddress const& endpoint, std::size_t count)
 {
     std::scoped_lock const lock { _mutex };
-    _inboxes[std::string { endpoint }].dropsRemaining += count;
+    _inboxes[endpoint].dropsRemaining += count;
 }
 
 std::size_t DatagramBus::SendCount() const
@@ -108,7 +107,7 @@ std::size_t DatagramBus::SendCount() const
     return _sendCount;
 }
 
-void DatagramBus::Deliver(std::span<std::byte const> payload, std::string_view to, std::string_view from)
+void DatagramBus::Deliver(std::span<std::byte const> payload, DatagramAddress const& to, DatagramAddress const& from)
 {
     {
         std::scoped_lock const lock { _mutex };
@@ -124,14 +123,13 @@ void DatagramBus::Deliver(std::span<std::byte const> payload, std::string_view t
                 --inbox.dropsRemaining;
                 return;
             }
-            inbox.queue.push_back(
-                ReceivedDatagram { .payload = { payload.begin(), payload.end() }, .from = std::string { from } });
+            inbox.queue.push_back(ReceivedDatagram { .payload = { payload.begin(), payload.end() }, .from = from });
         };
 
-        if (to == BroadcastAddress)
+        if (to == BroadcastAddress())
             for (auto& [address, inbox]: _inboxes)
                 deliverTo(inbox);
-        else if (auto found = _inboxes.find(std::string { to }); found != _inboxes.end())
+        else if (auto found = _inboxes.find(to); found != _inboxes.end())
             deliverTo(found->second);
         // A datagram to an endpoint nobody holds is silently discarded, which is
         // what UDP does. Reporting it would give the layer above a delivery

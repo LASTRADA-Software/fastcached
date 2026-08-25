@@ -9,7 +9,7 @@
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
-#include <FastCache/Net/Framing/LineReader.hpp>
+#include <FastCache/Protocol/Framing/LineReader.hpp>
 #include <FastCache/Protocol/IPubSubRegistry.hpp>
 #include <FastCache/Protocol/IStreamWaiterRegistry.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>

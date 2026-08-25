@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/SocketAddress.hpp>
 #include <FastCache/Net/UdpSocket.hpp>
 
 #include <array>
@@ -39,29 +39,42 @@ namespace
     /// then fails to decode, which is the right outcome: it is not ours.
     constexpr std::size_t MaxDatagram = 8192;
 
-    /// Render a sockaddr as `host:port`.
+    /// Read a sockaddr back as a host and a port.
+    ///
+    /// The two halves stay apart all the way out, so nothing here joins them --
+    /// see `DatagramAddress`.
+    ///
+    /// The port comes from `Detail::PortOfSockaddr`, which is where this codebase
+    /// already keeps the family switch, rather than from `getnameinfo`: the
+    /// sockaddr holds it as a 16-bit field, so asking for it as decimal text and
+    /// parsing it back would be a round trip through a string with a range check
+    /// that cannot fail.
+    ///
+    /// The host still comes from `getnameinfo` rather than the `inet_ntop` behind
+    /// `FormatPeerAddress`, and that is deliberate: `getnameinfo` appends the
+    /// `%scope` suffix for a link-local IPv6 address and `inet_ntop` does not.
+    /// This address is handed straight back to `Send`, so an address that lost its
+    /// zone would resolve to something unroutable -- which is the one thing a
+    /// reply-to-the-sender must not do.
     /// @param storage The address.
     /// @param length Its length.
-    /// @return Text, empty when it cannot be rendered.
-    [[nodiscard]] std::string FormatPeer(sockaddr_storage const& storage, socklen_t length)
+    /// @return The address, with an empty host when it cannot be rendered.
+    [[nodiscard]] DatagramAddress DatagramAddressOf(sockaddr_storage const& storage, socklen_t length)
     {
         std::array<char, NI_MAXHOST> host {};
-        std::array<char, NI_MAXSERV> service {};
 
         if (::getnameinfo(reinterpret_cast<sockaddr const*>(&storage),
                           length,
                           host.data(),
                           static_cast<unsigned>(host.size()),
-                          service.data(),
-                          static_cast<unsigned>(service.size()),
-                          NI_NUMERICHOST | NI_NUMERICSERV)
+                          nullptr,
+                          0,
+                          NI_NUMERICHOST)
             != 0)
             return {};
 
-        // Through the shared formatter, so the result round trips through
-        // `SplitHostPort` -- which is the whole reason that pair is shared rather
-        // than an `rfind(':')` and a bracket rule at each caller.
-        return FormatHostPort(std::string_view { host.data() }, std::string_view { service.data() });
+        return DatagramAddress { .host = std::string { host.data() },
+                                 .port = Detail::PortOfSockaddr(&storage, static_cast<std::uint32_t>(length)) };
     }
 
     /// A blocking UDP socket.
@@ -70,8 +83,8 @@ namespace
       public:
         /// Take ownership of an already-bound socket.
         /// @param socket The native handle.
-        /// @param bound What it bound, as text.
-        UdpSocket(Detail::NativeSocket socket, std::string bound) noexcept:
+        /// @param bound What it bound.
+        UdpSocket(Detail::NativeSocket socket, DatagramAddress bound) noexcept:
             _socket { socket },
             _bound { std::move(bound) }
         {
@@ -88,21 +101,33 @@ namespace
         UdpSocket& operator=(UdpSocket const&) = delete;
         UdpSocket& operator=(UdpSocket&&) = delete;
 
-        std::expected<void, NetError> Send(std::span<std::byte const> payload, std::string_view to) override
+        std::expected<void, NetError> Send(std::span<std::byte const> payload, DatagramAddress const& to) override
         {
-            auto const split = SplitHostPort(to);
-            if (!split.has_value())
+            // An empty host names nothing, and the two platforms disagree about
+            // that rather than both refusing it: `getaddrinfo("", ...)` is
+            // `EAI_NONAME` on glibc and **succeeds** on Winsock, resolving to the
+            // local host. So a reply addressed to a sender this process could not
+            // render would be refused here and quietly sent to loopback there.
+            // Refused explicitly, which is also what splitting `host:port` used to
+            // do for the same input on every platform.
+            if (to.host.empty())
                 return std::unexpected { NetError { .code = NetErrorCode::AddressNotAvail,
-                                                    .context = std::format("not host:port: {}", to) } };
+                                                    .context = "no host to send to" } };
 
             addrinfo hints {};
             hints.ai_family = AF_UNSPEC;
             hints.ai_socktype = SOCK_DGRAM;
+            // The port arrives as a number now rather than as whatever text a
+            // caller wrote, so saying so skips the /etc/services lookup this
+            // would otherwise have to rule out first.
+            hints.ai_flags = AI_NUMERICSERV;
 
+            auto const service = std::to_string(to.port);
             addrinfo* resolved = nullptr;
-            if (::getaddrinfo(split->first.c_str(), split->second.c_str(), &hints, &resolved) != 0 || resolved == nullptr)
+            if (::getaddrinfo(to.host.c_str(), service.c_str(), &hints, &resolved) != 0 || resolved == nullptr)
                 return std::unexpected { NetError { .code = NetErrorCode::AddressNotAvail,
-                                                    .context = std::format("cannot resolve {}", to) } };
+                                                    .context =
+                                                        std::format("cannot resolve {} port {}", to.host, to.port) } };
 
             auto const sent = ::sendto(_socket,
                                        reinterpret_cast<char const*>(payload.data()),
@@ -117,7 +142,8 @@ namespace
             ::freeaddrinfo(resolved);
 
             if (sent < 0)
-                return std::unexpected { Detail::MakeNetError(Detail::LastNetworkError(), std::format("sendto {}", to)) };
+                return std::unexpected { Detail::MakeNetError(Detail::LastNetworkError(),
+                                                              std::format("sendto {} port {}", to.host, to.port)) };
 
             // A short send on a datagram socket is not a partial write to retry:
             // the kernel places a datagram whole or not at all, so anything else
@@ -161,7 +187,7 @@ namespace
                 return std::unexpected { DatagramWait::TimedOut };
 
             buffer.resize(static_cast<std::size_t>(received));
-            return ReceivedDatagram { .payload = std::move(buffer), .from = FormatPeer(from, fromLength) };
+            return ReceivedDatagram { .payload = std::move(buffer), .from = DatagramAddressOf(from, fromLength) };
         }
 
         void Close() noexcept override
@@ -169,7 +195,7 @@ namespace
             _closed.store(true, std::memory_order_release);
         }
 
-        [[nodiscard]] std::string BoundEndpoint() const override
+        [[nodiscard]] DatagramAddress BoundAddress() const override
         {
             return _bound;
         }
@@ -191,7 +217,7 @@ namespace
         }
 
         Detail::NativeSocket _socket;
-        std::string _bound;
+        DatagramAddress _bound;
         std::atomic<bool> _closed { false };
     };
 } // namespace
@@ -208,7 +234,9 @@ std::unique_ptr<IDatagramSocket> OpenUdpSocket(std::string_view bindAddress, std
     addrinfo hints {};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_flags = AI_PASSIVE;
+    // Numeric for the same reason `Send`'s is: the service is `std::to_string` of
+    // a `std::uint16_t` and can never be a name.
+    hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
 
     auto const portText = std::to_string(port);
     addrinfo* resolved = nullptr;
@@ -234,13 +262,15 @@ std::unique_ptr<IDatagramSocket> OpenUdpSocket(std::string_view bindAddress, std
         if (::bind(handle, candidate->ai_addr, static_cast<socklen_t>(candidate->ai_addrlen)) == 0)
         {
             // Read back what was actually bound rather than echoing what was
-            // asked for: port 0 means "the kernel chooses", and a caller that has
-            // to tell a peer where to answer needs the answer.
+            // asked for -- see IDatagramSocket::BoundAddress. Through the same
+            // decoder the receive path uses, so the port comes from the one
+            // family switch `Detail::BoundPortOf` also delegates to; calling that
+            // instead would ask the kernel the same question a second time.
             sockaddr_storage actual {};
             socklen_t actualLength = sizeof(actual);
-            auto bound = std::string {};
+            auto bound = DatagramAddress {};
             if (::getsockname(handle, reinterpret_cast<sockaddr*>(&actual), &actualLength) == 0)
-                bound = FormatPeer(actual, actualLength);
+                bound = DatagramAddressOf(actual, actualLength);
 
             ::freeaddrinfo(resolved);
             return std::make_unique<UdpSocket>(handle, std::move(bound));

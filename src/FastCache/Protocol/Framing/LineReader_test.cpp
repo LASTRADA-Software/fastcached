@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Net/Framing/LineReader.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
+#include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 

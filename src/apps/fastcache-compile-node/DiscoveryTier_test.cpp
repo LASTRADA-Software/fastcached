@@ -39,7 +39,7 @@ namespace
     return Cluster::DiscoveryConfig { .clusterId = "fleet",
                                       .nodeId = nodeId,
                                       .raftEndpoint = nodeId + ".local:6675",
-                                      .beaconAddress = std::string { DatagramBus::BroadcastAddress },
+                                      .beaconAddress = DatagramBus::BroadcastAddress(),
                                       .presharedKey = std::move(key),
                                       .beaconInterval = 15s,
                                       .challengeLifetime = 30s };
@@ -60,7 +60,7 @@ struct Peer
     /// @param key The cluster key it holds.
     Peer(DatagramBus& bus, std::string const& nodeId, std::vector<std::byte> key):
         tier { DiscoveryTier::Over(
-            bus.Open(nodeId + ":6677"),
+            bus.Open(DatagramAddress { .host = nodeId, .port = 6677 }),
             ConfigFor(nodeId, std::move(key)),
             [this](std::span<Cluster::DesiredMember const> peers) { seen.assign(peers.begin(), peers.end()); },
             logger) }
@@ -150,7 +150,8 @@ TEST_CASE("Two fleets on one segment ignore each other", "[node][discovery]")
     NullLogger otherLogger;
     auto otherConfig = ConfigFor("n2", TestKey());
     otherConfig.clusterId = "somebody-elses";
-    auto const theirs = DiscoveryTier::Over(bus.Open("n2:6677"), std::move(otherConfig), {}, otherLogger);
+    auto const theirs = DiscoveryTier::Over(
+        bus.Open(DatagramAddress { .host = "n2", .port = 6677 }), std::move(otherConfig), {}, otherLogger);
 
     for (auto round = 0; round < 6; ++round)
     {

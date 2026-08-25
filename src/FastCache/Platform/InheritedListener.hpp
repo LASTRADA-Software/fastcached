@@ -15,6 +15,14 @@ namespace FastCache
 
 /// Socket activation: adopting listening sockets a supervisor already bound.
 ///
+/// It lives in `Platform/` and not in `Net/`, where it used to sit, because what
+/// it integrates with is a service supervisor rather than a network: it reads the
+/// process environment, checks a pid, and applies close-on-exec. That it hands
+/// back `IListener`s does not make it a network primitive -- `Platform/` depending
+/// on `Net/` is the direction that was always intended, while the reverse put
+/// `Net/`'s only reach into `Platform/Environment.hpp` across the boundary `Net/`
+/// has to be severable along if it is ever lifted out of this tree.
+///
 /// A socket-activated service does not bind its own port. The supervisor binds
 /// and listens first, then starts the service only when a connection arrives, and
 /// hands the already-listening descriptors over. Two things follow that are worth

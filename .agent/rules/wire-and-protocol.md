@@ -124,6 +124,63 @@ Every rule below has already been a bug.
     identical either way so the outcome alone cannot tell the two apart. The client must
     still consume the AUTH reply even when it intends to ignore it; skipping it strands a
     frame and the next command reads the previous one's answer.
+## The Net boundary
+
+- **`Net/` is meant to be lifted out of this tree, so what it may include is a
+  table and a test rather than an intention.** The constraint was already written
+  down -- "`Net` must not depend on `Core`, so `ConnectTcp` takes host and port
+  separately" -- and honoured for *new* code, while ten edges that predated it sat
+  there untouched (issue #100). That is the shape the constraint will always fail
+  in: an include graph drifts in silence. Nothing fails, nothing warns, no test
+  goes red, and the edge is discovered by whoever finally attempts the lift.
+  `ctest -R net-boundary` is the answer, and four things about it are
+  load-bearing:
+  - **`Async/` travels WITH `Net/`, and that decision had to come first.**
+    `ISocket::Read`/`Write` return `Task<T>`, `IoAwaitable` is the reactor's
+    completion hook, and `EpollSocket`/`IocpSocket`/`KqueueSocket` are the
+    reactors' own I/O side -- there is no `Net` without the awaitable vocabulary.
+    Moving that vocabulary into `Net/` instead is the alternative, and it is worse
+    twice over: it leaves `Async/` -- a general coroutine and event-loop library --
+    unusable without `Net/`, or it duplicates `Task`.
+  - **Three `Core/` leaf headers travel too, each a row with a reason, and the
+    check verifies they are still leaves.** `Core/Clock.hpp` (`IClock` and
+    `TimePoint`, which every deadline in `Net/` and every timer in `Async/` is
+    expressed in -- carrying a second clock interface would fragment the one seam
+    the whole codebase injects), `Core/Ranges.hpp` (`FindOrNull`, a toolchain
+    shim rather than a domain type) and `Core/Profiling.hpp` (the `FC_ZONE_*`
+    macros, which expand to `(void) 0` and carry no code at all). The row is only
+    safe while the header depends on nothing, so the check reads each one and
+    fails if it has grown a `FastCache/` include: a leaf that quietly gained one
+    would drag the whole of `Core/` back across the boundary while still passing.
+  - **An edge is closed by moving the file to the layer that owns it, not by
+    widening the table.** `Core/Errors/NetError.hpp` became `Net/NetError.hpp` --
+    it is `Net`'s own taxonomy and sat in `Core/Errors/` only because that is
+    where the taxonomies were shelved. `Net/Framing/LineReader` became
+    `Protocol/Framing/LineReader`: it fails with `ProtocolError`, its caps are a
+    session's caps, and its own doc lists the protocol handlers as its callers.
+    `Net/InheritedListener` became `Platform/InheritedListener`: it reads the
+    environment and checks a pid, and handing back an `IListener` does not make
+    socket activation a network primitive. In all three the dependency was
+    pointing the wrong way round, and moving the file makes `Protocol -> Net` and
+    `Platform -> Net` the directions that were always intended.
+  - **The check is a scan of the include graph, deliberately, and not a target
+    that compiles the set.** Compiling it means a second full build of `Net/` +
+    `Async/` in every configuration on every platform, and a staged include root
+    copied at configure time goes stale exactly when a header changes -- which is
+    the moment the answer matters. The scan reads the same graph the compiler
+    would, from the sources, in milliseconds; combined with this project's
+    separate rule that public headers are self-contained, a set closed under
+    inclusion is a set that compiles standalone. It was verified by running it
+    against the tree as it stood before this work, where it names all ten edges.
+  - **Test sources are out of scope and that is a decision, not an oversight.**
+    What gets lifted is the library. `Net/HealthProbe_test.cpp` drives the
+    daemon's own `AdminHttpServer`, which is the entire point of that case;
+    gating it would force either a second `AdminHttpServer` fake inside `Net/` or
+    the loss of the one test that proves the probe works against the real thing.
+    (This is also why the issue's own edge count was high: it counted `_test.cpp`
+    files, so `Core/Bytes.hpp` and `Core/Logger.hpp` appeared on the list while
+    never being reachable from production `Net/` code at all.)
+
 ## Sockets
 
 - **Three implementations of one TCP client, and the rot was in the one nobody
@@ -167,7 +224,7 @@ Every rule below has already been a bug.
     derived type.
   - **The launcher still does not LINK `FastCache`, and that rule survived
     intact.** The four `Net` rows added to `_fc_cc_core` reach only
-    `Async/Task.hpp`, `Core/Errors/NetError.hpp` and `Core/Profiling.hpp`, all
+    `Net/NetError.hpp`, `Async/Task.hpp` and `Core/Profiling.hpp`, all
     header-only and all std-only, so the launcher stays free of yaml-cpp, OpenSSL
     and the reactor and can still link the CRT statically.
   - **`std::array`'s iterator is a raw pointer on libstdc++ and libc++ and a class

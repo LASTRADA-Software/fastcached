@@ -45,8 +45,9 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
 
-# The four Net rows are the launcher's TCP client, and they are here rather than
-# in a copy of their own because a copy is exactly what went wrong: this tree had
+# The Net rows are the launcher's TCP client -- the blocking pair it dials with,
+# plus the reactor sockets and connectors that share its code -- and they are here
+# rather than in a copy of their own, because a copy is what went wrong: this tree had
 # three implementations of "dial, then send and receive whole messages", and the
 # one nobody compiled (compile-cache-testclient) was IPv4-literal-only, unbounded
 # and unprotected against SIGPIPE. See src/FastCache/Net/TcpClient.hpp.
@@ -54,7 +55,7 @@ set(_fc_cc_core
 # They cost the launcher nothing it was avoiding. The rule this file exists to
 # protect is that fastcache-cc does not LINK FastCache -- so it stays free of
 # yaml-cpp, OpenSSL and the reactor, and can link the CRT statically -- and these
-# four reach only Async/Task.hpp, Core/Errors/NetError.hpp and Core/Profiling.hpp,
+# four reach only Net/NetError.hpp, Async/Task.hpp and Core/Profiling.hpp,
 # all header-only and all std-only. ws2_32 was already linked below.
 
 # Core/Compression.cpp is the one row here that is NOT dependency-free, and it is a

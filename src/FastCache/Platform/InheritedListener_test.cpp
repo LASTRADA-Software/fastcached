@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Net/InheritedListener.hpp>
+#include <FastCache/Platform/InheritedListener.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 

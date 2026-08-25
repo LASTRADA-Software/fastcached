@@ -9,6 +9,15 @@
 namespace FastCache
 {
 
+/// @file NetError.hpp
+/// `Net`'s own error taxonomy, and it lives in `Net/` rather than beside the
+/// other four in `Core/Errors/` for one reason: `Net` is meant to be lifted out
+/// of this codebase and upstreamed, so it may not reach into `Core/`. Grouping
+/// the taxonomies by the fact that they are taxonomies put the widest edge in
+/// the tree — thirteen `Net` sources — across the very boundary that has to be
+/// severable. Every other error type stays where it is; each of those belongs to
+/// a layer that is not going anywhere.
+
 /// Categories of network-layer errors surfaced through std::expected.
 /// Kept intentionally small — protocol-level failures use ProtocolError.
 enum class NetErrorCode : std::uint8_t

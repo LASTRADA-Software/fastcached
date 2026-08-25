@@ -15,6 +15,16 @@
 namespace FastCache
 {
 
+/// @file LineReader.hpp
+/// This reader lives in `Protocol/` and not in `Net/`, which is where it used to
+/// sit. Three things say which layer owns it, and they all say the same one: it
+/// fails with `ProtocolError`, its two caps are protocol caps a session
+/// configures, and its own list of callers below is the set of protocol
+/// handlers. Sitting in `Net/` it was that layer's only reach back into
+/// `Core/Errors/ProtocolError.hpp` -- a dependency pointing from the transport
+/// at a layer above it, across the boundary `Net/` has to be severable along.
+/// `Protocol/` depending on `Net/` is the direction that was always intended.
+
 /// Buffered byte reader on top of an ISocket. Supplies both line-delimited
 /// (`ReadLine`) and length-prefixed (`ReadExactly`) reads while sharing a
 /// single internal buffer — so bytes that landed in the same TCP segment as

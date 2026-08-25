@@ -4,8 +4,8 @@
 #if defined(_WIN32)
 
     #include <FastCache/Async/IocpReactor.hpp>
-    #include <FastCache/Core/Errors/NetError.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
+    #include <FastCache/Net/NetError.hpp>
     #include <FastCache/Net/SocketAddress.hpp>
 
     #include <winsock2.h>

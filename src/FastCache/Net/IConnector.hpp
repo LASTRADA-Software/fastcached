@@ -2,8 +2,8 @@
 #pragma once
 
 #include <FastCache/Async/Task.hpp>
-#include <FastCache/Core/Errors/NetError.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Net/NetError.hpp>
 
 #include <chrono>
 #include <cstdint>

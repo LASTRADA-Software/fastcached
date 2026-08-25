@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Core/Errors/NetError.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/NetError.hpp>
 #include <FastCache/Net/SocketAddress.hpp>
 
 #include <atomic>
@@ -106,6 +106,11 @@ namespace Detail
     {
         // Windows has no SIGPIPE: a write to a broken pipe is reported through
         // WSAGetLastError like any other failure.
+    }
+
+    int NoSignalSendFlags() noexcept
+    {
+        return SendFlags;
     }
 
     void ArmCloseOnExec(NativeSocket /*socket*/) noexcept
@@ -235,6 +240,11 @@ namespace Detail
     #else
         ::signal(SIGPIPE, SIG_IGN);
     #endif
+    }
+
+    int NoSignalSendFlags() noexcept
+    {
+        return SendFlags;
     }
 
     void ArmCloseOnExec(NativeSocket socket) noexcept

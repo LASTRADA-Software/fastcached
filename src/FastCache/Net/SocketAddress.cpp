@@ -276,6 +276,22 @@ namespace Detail
             Families, [&](int family) noexcept { return ::inet_pton(family, text.c_str(), scratch.data()) == 1; });
     }
 
+    std::uint16_t PortOfSockaddr(void const* sockaddr, std::uint32_t length) noexcept
+    {
+        if (sockaddr == nullptr || length < sizeof(struct sockaddr))
+            return 0;
+
+        // Read the port out of whichever family this actually is: the two
+        // sockaddr layouts put it at different offsets, and reading the wrong one
+        // yields a plausible-looking number rather than an error.
+        auto const family = reinterpret_cast<struct sockaddr const*>(sockaddr)->sa_family;
+        if (family == AF_INET && length >= sizeof(sockaddr_in))
+            return ntohs(reinterpret_cast<sockaddr_in const*>(sockaddr)->sin_port);
+        if (family == AF_INET6 && length >= sizeof(sockaddr_in6))
+            return ntohs(reinterpret_cast<sockaddr_in6 const*>(sockaddr)->sin6_port);
+        return 0;
+    }
+
     std::uint16_t BoundPortOf(NativeSocket socket) noexcept
     {
         if (socket == InvalidSocket)
@@ -292,14 +308,7 @@ namespace Detail
         if (::getsockname(handle, reinterpret_cast<sockaddr*>(&storage), &length) != 0)
             return 0;
 
-        // Read the port out of whichever family the socket actually is: the two
-        // sockaddr layouts put it at different offsets, and reading the wrong one
-        // yields a plausible-looking number rather than an error.
-        if (storage.ss_family == AF_INET)
-            return ntohs(reinterpret_cast<sockaddr_in const*>(&storage)->sin_port);
-        if (storage.ss_family == AF_INET6)
-            return ntohs(reinterpret_cast<sockaddr_in6 const*>(&storage)->sin6_port);
-        return 0;
+        return PortOfSockaddr(&storage, static_cast<std::uint32_t>(length));
     }
 
     std::string PeerAddressOf(NativeSocket socket) noexcept
