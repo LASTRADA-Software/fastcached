@@ -182,6 +182,40 @@ wait_for_port() {
     fail "${what} never listened on port ${port}"
 }
 
+# Wait for a line to appear in a log, the way `wait_for_port` waits for a listener.
+#
+# A bound port does NOT mean a process has finished announcing itself. Every tier
+# here binds its listener and logs what it bound *afterwards*, because the message
+# names the endpoint and the endpoint is not known until the bind returns. So a
+# `grep` run straight after `wait_for_port` is a race -- and one that widens
+# exactly where it is least welcome: under a sanitizer, or with the log on a slow
+# filesystem, the gap between the two stops being instant. It reported "node did
+# not start its scheduler" about a node that started its scheduler perfectly well
+# a millisecond later, and it did so in roughly half of full-suite runs while
+# passing every time the test was run alone.
+#
+# Liveness is checked as `wait_for_port` checks it, so a process that dies is
+# reported as having died rather than as never having got round to it. Two of the
+# three hand-written poll loops this replaces did not check that at all.
+#
+# @param 1 the text to wait for
+# @param 2 pid
+# @param 3 what it is, for the message
+# @param 4 the log to watch
+wait_for_log() {
+    local marker="$1" pid="$2" what="$3" logfile="$4"
+    for _ in $(seq 1 100); do
+        if grep -q "$marker" "$logfile"; then return 0; fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            cat "$logfile" >&2
+            fail "${what} exited before logging: ${marker}"
+        fi
+        sleep 0.2
+    done
+    cat "$logfile" >&2
+    fail "${what} never logged: ${marker}"
+}
+
 # Stop a process and require it to actually exit, within a bound.
 #
 # `kill` then a bare `wait` is the obvious spelling and it HANGS when the signal
@@ -309,8 +343,7 @@ scheduler_pid=$!
 pids+=("$scheduler_pid")
 wait_for_port "$dispatch_port" "$scheduler_pid" "scheduler" "${workdir}/scheduler.log"
 
-grep -q "scheduling for the fleet" "${workdir}/scheduler.log" \
-    || { cat "${workdir}/scheduler.log" >&2; fail "node did not start its scheduler"; }
+wait_for_log "scheduling for the fleet" "$scheduler_pid" "scheduler" "${workdir}/scheduler.log"
 
 # --- start a worker ----------------------------------------------------------
 worker_port="$(free_port)"
@@ -347,16 +380,7 @@ done
     || fail "worker and launcher disagree on the toolchain fingerprint: '${worker_fingerprint}' vs '${fingerprint}'"
 echo "== toolchain fingerprint agreed by launcher and worker"
 
-registered=""
-for _ in $(seq 1 100); do
-    if grep -q "registered" "${workdir}/worker.log"; then registered=1; break; fi
-    if ! kill -0 "$worker_pid" 2>/dev/null; then
-        cat "${workdir}/worker.log" >&2
-        fail "worker exited before registering"
-    fi
-    sleep 0.2
-done
-[[ -n "$registered" ]] || { cat "${workdir}/worker.log" >&2; fail "worker never registered with the scheduler"; }
+wait_for_log "registered" "$worker_pid" "worker" "${workdir}/worker.log"
 
 # --- the worker's own admin endpoint -----------------------------------------
 #
@@ -501,12 +525,7 @@ iso_worker_port="$(free_port)"
 iso_worker_pid=$!
 pids+=("$iso_worker_pid")
 wait_for_port "$iso_worker_port" "$iso_worker_pid" "isolation worker" "${workdir}/iso-worker.log"
-for _ in $(seq 1 100); do
-    grep -q "registered" "${workdir}/iso-worker.log" && break
-    sleep 0.2
-done
-grep -q "registered" "${workdir}/iso-worker.log" \
-    || { cat "${workdir}/iso-worker.log" >&2; fail "the isolation worker never registered"; }
+wait_for_log "registered" "$iso_worker_pid" "isolation worker" "${workdir}/iso-worker.log"
 
 write_source "${proj}/three.cpp" "casethree"
 "$compiler" -std=c++17 -O1 -c "${proj}/three.cpp" -o "${proj}/build/three-ref.o" \
@@ -614,12 +633,7 @@ cap_worker_port="$(free_port)"
 cap_worker_pid=$!
 pids+=("$cap_worker_pid")
 wait_for_port "$cap_worker_port" "$cap_worker_pid" "capacity worker" "${workdir}/cap-worker.log"
-for _ in $(seq 1 100); do
-    grep -q "registered" "${workdir}/cap-worker.log" && break
-    sleep 0.2
-done
-grep -q "registered" "${workdir}/cap-worker.log" \
-    || { cat "${workdir}/cap-worker.log" >&2; fail "the capacity worker never registered"; }
+wait_for_log "registered" "$cap_worker_pid" "capacity worker" "${workdir}/cap-worker.log"
 
 cap_pids=()
 for i in 1 2 3 4; do
