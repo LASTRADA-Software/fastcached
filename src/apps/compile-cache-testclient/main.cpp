@@ -90,7 +90,14 @@ struct DriverSpec
     std::string_view compileOnly;     ///< Compile, do not link.
     std::string_view dependencyFlag;  ///< Ask for the dependency record.
     std::string_view dependencyValue; ///< Fused with the depfile path, or empty.
-    PathCanon::Grammar grammar;       ///< The grammar the record is written in.
+    /// Suppress the driver's banner, or empty when it has none.
+    ///
+    /// Not cosmetic on an MSVC driver: its dependency record IS its output, so a
+    /// banner printed there is stored inside the `ShowIncludes` region and
+    /// travels with the value. A GNU driver writes the record to a file and has
+    /// nothing to suppress, which is why this is a column and not a constant.
+    std::string_view quietFlag;
+    PathCanon::Grammar grammar; ///< The grammar the record is written in.
 };
 
 /// MSVC drivers report includes as `/showIncludes` notes on their output; GNU
@@ -100,24 +107,33 @@ constexpr auto MsvcDriver = DriverSpec { .objectFlag = "/Fo",
                                          .compileOnly = "/c",
                                          .dependencyFlag = "/showIncludes",
                                          .dependencyValue = {},
+                                         .quietFlag = "/nologo",
                                          .grammar = PathCanon::Grammar::ShowIncludes };
 
 constexpr auto GnuDriver = DriverSpec { .objectFlag = "-o",
                                         .compileOnly = "-c",
                                         .dependencyFlag = "-MD",
                                         .dependencyValue = "-MF",
+                                        .quietFlag = {},
                                         .grammar = PathCanon::Grammar::GccDepfile };
 
 /// Pick the driver family from the compiler's name.
 ///
 /// By name and not by host: this tool is pointed at whatever `--compiler` says,
 /// and `clang-cl` on Linux takes MSVC spellings exactly as it does on Windows.
+///
+/// Matched on the STEM, and `clang-cl` is asked about before `cl` -- the same
+/// longest-stem-first rule `CmdLine::NamePatterns` follows, and for the same
+/// reason. A bare `starts_with("cl")` also matches `clang` and `clang++`, which
+/// take GNU spellings: such a compiler would be driven with `/c /showIncludes
+/// /Fo<path>`, every one of which it reads as an input file name, so `store`
+/// would fail on the most ordinary POSIX invocation there is.
 /// @param compiler The `--compiler` value, as typed.
 /// @return The spellings that compiler accepts.
 [[nodiscard]] DriverSpec DriverFor(std::string_view compiler)
 {
-    auto const leaf = std::filesystem::path { compiler }.filename().string();
-    return leaf.starts_with("cl") || leaf.starts_with("clang-cl") ? MsvcDriver : GnuDriver;
+    auto const stem = std::filesystem::path { compiler }.stem().string();
+    return stem.starts_with("clang-cl") || stem == "cl" ? MsvcDriver : GnuDriver;
 }
 
 /// Run a compiler, capturing stdout and stderr together.
@@ -134,7 +150,12 @@ constexpr auto GnuDriver = DriverSpec { .objectFlag = "-o",
     if (runner == nullptr)
         Die("failed to create a process runner");
     auto run = runner->RunCaptureCombined(argv);
-    if (run.exitCode < 0)
+    // `== -1` and not `< 0`, which is the convention `CompileRun` states and every
+    // other caller follows: a Windows process that dies of a structured exception
+    // reports its status as a NEGATIVE exit code (0xC0000005 arrives as
+    // -1073741819), so `< 0` calls a compiler that ran and crashed a spawn failure
+    // and throws away the diagnostics it captured on the way down.
+    if (run.exitCode == -1)
         Die("failed to spawn compiler: " + argv.front());
     return { run.exitCode, std::move(run.out) };
 }
@@ -232,7 +253,11 @@ int DoStore(TestClient::Args const& a)
     auto const driver = DriverFor(a.compiler);
     auto const depPath = std::filesystem::path { objPath }.replace_extension(".d");
 
-    std::vector<std::string> argv { a.compiler, std::string { driver.compileOnly }, std::string { driver.dependencyFlag } };
+    std::vector<std::string> argv { a.compiler };
+    if (!driver.quietFlag.empty())
+        argv.emplace_back(driver.quietFlag);
+    argv.emplace_back(driver.compileOnly);
+    argv.emplace_back(driver.dependencyFlag);
     if (driver.dependencyValue.empty())
         argv.emplace_back(std::string { driver.objectFlag } + objPath.string());
     else
