@@ -193,10 +193,12 @@ platforms.
     filesystem; clang-cl echoes what it was handed), and closing it would mean recording the
     producing machine's per-drive cwd in the value, which is exactly the machine-specific
     state the key exists to keep out. One diagnostic consequence: such a path dropping out of
-    the key makes the launcher's `dependency set: 0 of M reported path(s) keyed` line
-    reachable for a second reason, so that fingerprint no longer identifies the #66 short-name
-    mismatch on its own — the two are told apart by whether the *root* is short-name spelled,
-    and separating them in the counter itself is left as the follow-up it is.
+    the key made the launcher's `dependency set: 0 of M reported path(s) keyed` line
+    reachable for a second reason, so that fingerprint stopped identifying the #66 short-name
+    mismatch on its own. The two were then told apart only by whether the *root* was
+    short-name spelled, which requires knowing to ask — the opposite of what a fingerprint is
+    for. Closed by the counter carrying its *reasons* now; see the `PathDisposition` bullet
+    below.
     - **The ASCII rules are one rule each, and the drive-letter one had drifted into four.**
       Two of the four spellings tested it with `std::isalpha`, which is **locale-dependent** — in a codebase
       whose whole premise is that two machines derive the same key from the same content, a
@@ -364,12 +366,73 @@ platforms.
     a replayed note that kept the driver's mixed separators (`...\src\inc/h1.h`) was never
     tokenized, where a localized one is uniformly native (`...\src\inc\h1.h`); and the
     launcher's `dependency set: N of M reported path(s) keyed` line reads `0 of M` with M
-    non-zero — the probe reported paths and every one was filtered out, which is a
-    different fault from `0 of 0` (a driver that reports nothing on the preprocess line).
+    non-zero and every one of them counted `toolchain` — the probe reported paths and every
+    one was filtered out, which is a different fault from `0 of 0` (a driver that reports
+    nothing on the preprocess line) and, since the reasons were added, from a set that was
+    `drive-relative` or `unanchored` instead.
     `run-launcher-e2e.ps1` therefore puts its scratch trees beside the **build tree**
     rather than under `%TEMP%`; it does not try to expand a short name, because nothing
     dependably does — `Resolve-Path`, `Get-Item` and `[IO.Path]::GetFullPath` all preserve
     it, and `Scripting.FileSystemObject` was tried and echoed it back unchanged.
+  - **A drop that cannot say WHY it dropped is a counter, not a fingerprint.** `0 of M` was
+    the fingerprint of the bullet above, and it was worth having precisely because #66 is
+    silent from every other direction. Issue #65 then gave the same line a second cause — a
+    drive-relative path under no root also drops — after which it identified neither: the two
+    were tellable apart only by whether the *root* was short-name spelled, which requires
+    knowing to ask, the opposite of what a fingerprint is for. `Cc::PathDisposition` names
+    each outcome of the filter and the note reports the ones that happened, so
+    `0 of 12 keyed (12 toolchain)` and `0 of 12 keyed (9 toolchain, 3 drive-relative)` are
+    different lines (issue #105). It changes no key input and moves no schema tag; the key
+    was right either way. Consequences that are each load-bearing:
+    - **A table, sized from a `Last` sentinel and guarded by a `consteval` coverage check**,
+      the shape `WorkerProtocol`'s `RefusalTable` and `Metrics/MetricsCatalog` already carry:
+      a disposition that can be counted but not named is a drop that renders as nothing, which
+      is the whole defect. The *sizing* is the half that has to be right, and `RefusalTable`'s
+      spelling is the one not to copy — a length asserted against the final enumerator **by
+      name** accepts a table one row short the moment an enumerator is appended after it, and
+      the tally is indexed by the enumerator, so the new disposition writes one past the end.
+      Derived from `Last`, the missing row value-initializes to `{ Keyed, "" }` at a non-zero
+      index and the coverage check rejects it. Verified by adding an enumerator without a row
+      and watching the build stop.
+    - **`IsToolchainHeader` was deliberately NOT split**, though the issue's illustration
+      implies it. It is the one rule three callers must agree on, and separating "a marker
+      matched" from "under neither root" does not isolate #66 anyway: under a short-name root
+      a genuine `/usr/include` header and a project header both land outside the roots, so
+      the split adds a column without adding a fingerprint. What separates the faults is
+      anchor-shaped (`Unanchored`, `DriveRelative`) against content-shaped (`Toolchain`).
+      The non-split is not free, though, and the bullet below is its price paid in full
+      rather than recorded as a residual.
+    - **A drive-relative path is reported as drive-relative only when it is also under no
+      root, and the second half is what makes it precise.** Under no root the anchor is the
+      only fact that says what to change, and calling it `toolchain` is the very word a
+      short-name root produces — reporting it would re-collapse the two. Under a
+      drive-relative *root* the path canonicalizes, so a marker match there is ordinary
+      vendored content and `toolchain` is true; reporting THAT as drive-relative would put
+      the loudest reading of the new vocabulary on a healthy build, which is the same defect
+      from the other side. `IsToolchainHeader` cannot separate them — it tests its markers
+      before any root, deliberately — so the root question is asked again in that one
+      branch, and only for a drive-relative path. That is the price of not splitting the
+      classifier, and it is one extra root test on a shape no ordinary build produces: the
+      toolchain drop, 476 of a real translation unit's 635 paths, still costs exactly one.
+    - **`Uncanonical` is a third root-spelling fault that had no name at all.**
+      `IsToolchainHeader`'s prefix match is character-wise and `Canonicalize`'s is
+      segment-wise, so `/x/build-other/a.h` is project content to the first and under no root
+      to the second. A root off by a suffix, and while both counted as "toolchain" it was
+      indistinguishable from an ordinary system header — though it is the one of the three an
+      operator repairs by editing a root.
+    - **The tally counts reported OCCURRENCES**, so it sums to `M` while the keyed set is
+      what survived sort-and-deduplicate. `/showIncludes` repeats a header once per inclusion
+      site, so the two genuinely differ on every real translation unit and the note's numbers
+      do **not** add up there — which the operator documentation says out loud, because a
+      reader who assumes they should goes hunting for paths that vanished. `Reported()` is
+      derived from the tally rather than carried beside it, because two counters for one fact
+      are two counters that drift.
+    - **The renderer lives in `DependencyProbe.cpp` rather than `main.cpp`**, the lesson
+      `CacheProtocol.cpp` and `RootReconciler.cpp` are each recorded as having been extracted
+      for, and each collapse was reintroduced to check the cases can see it: folding
+      `DriveRelative` back into `Toolchain` fails exactly one case with `"2 toolchain"`,
+      folding `Uncanonical` in fails exactly one other, and labelling a vendored tree under a
+      drive-relative root by its anchor fails exactly one third with `"2 drive-relative"`.
   - **The reconciliation translates the emitted paths INTO the build's spelling; it does
     not respell the roots (issue #66).** There are two spellings of every root and the
     launcher needs both, for opposite reasons. **Matching** must use the spelling the

@@ -243,6 +243,42 @@ written: every dependency path it records that this machine is answerable for
 must exist. A hit that fails the check is discarded and the compile runs for
 real, which re-stores the entry with a correct record.
 
+### Reading the `dependency set:` line
+
+Every preprocessed compile reports, under `FASTCACHE_VERBOSE`, what became of the
+paths the driver named:
+
+```
+fastcache-cc: dependency set: 61 of 635 reported path(s) keyed (476 toolchain; 60 filesystem call(s))
+```
+
+`M` is what the probe reported, `N` is the key's own dependency set, and the words
+before the semicolon say why the rest did not reach it.
+
+**They will usually not add up, and that is not a fault.** `M` and the drop counts
+are per reported *occurrence*; `N` is the set after deduplication. `/showIncludes`
+names a header once per inclusion site, so the 159 occurrences left after the 476
+drops above are 61 distinct files. A GNU depfile names each header once, so on
+those drivers the numbers do sum. What always holds is that the reasons account
+for every path that did not reach the key:
+
+| Reason | What it means |
+|--------|---------------|
+| `toolchain` | Under neither root, or inside a vendored tree. The ordinary bulk of any compile: the compiler identity in the key already covers this content collectively. |
+| `drive-relative` | A Windows `C:foo` path under neither root. It resolves against that drive's own current directory — per-process state on the producing machine that no cache entry can record. One under a drive-relative *root* is keyed like any other, or counted `toolchain` if it is vendored content. |
+| `unanchored` | Relative, with no working directory to resolve it against. |
+| `no canonical form` | Under a root by character prefix but not by path segment: a root spelled almost right, such as `/x/build-other` against `/x/build`. |
+| `empty` | The driver named an empty path. |
+
+`0 of M` with M non-zero is the line to act on, and the reason says which repair.
+Every path counted `toolchain` means the configured roots match nothing the
+compiler echoed back — on Windows usually an 8.3 short name in one of them, which
+is otherwise entirely silent: the key is empty, the replay guard has nothing to
+check, and the stored value keeps this machine's absolute paths. `drive-relative`
+or `unanchored` point at the build's own spelling of its include paths instead.
+`0 of 0` is a different fault: the driver reported nothing at all on the
+preprocess line.
+
 ## Statistics
 
 Each compile is its own short-lived process, so aggregation cannot live in

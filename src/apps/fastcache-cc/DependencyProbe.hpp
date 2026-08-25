@@ -3,6 +3,12 @@
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <numeric>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -60,6 +66,132 @@ struct ProbeText
 /// @return The stream without its note lines, and the paths those notes named,
 ///         in emission order with duplicates preserved.
 [[nodiscard]] ProbeText SplitIncludeNotes(std::string_view text);
+
+/// What became of one path the probe reported.
+///
+/// The filter below has one way to keep a path and five ways to drop it, and for
+/// a long time the launcher's note reported only how many of each there were in
+/// total. `0 of M` was meant to be the fingerprint of the issue #66 short-name
+/// root mismatch — a root spelled with an 8.3 component prefix-matches nothing
+/// `cl` echoes back, so every path classifies as outside both roots — and that
+/// mattered because #66 is silent from every other direction: the key is quietly
+/// empty, the replay guard quietly skips, and the stored value quietly keeps the
+/// producing machine's absolute paths. Issue #65 gave the same line a second
+/// cause (a drive-relative path under no root also drops), after which it
+/// fingerprinted neither. Naming the reason is what separates them again
+/// (issue #105).
+///
+/// A DIAGNOSTIC vocabulary, not a decision: nothing here changes which paths
+/// reach the key, and the enumerators exist so a drop has somewhere to be counted
+/// rather than so a caller can branch on one.
+enum class PathDisposition : std::uint8_t
+{
+    Keyed,         ///< Canonicalized to a token and hashed.
+    Empty,         ///< The driver reported an empty path; there is nothing to classify.
+    Unanchored,    ///< Relative, and the working directory could not place it.
+    DriveRelative, ///< Anchored to a drive's own current directory AND under no root, so
+                   ///< nothing here can place it. Both halves are required: a path under
+                   ///< a drive-relative ROOT canonicalizes to a portable token, so it is
+                   ///< Keyed — or, inside a vendored tree, the Toolchain it genuinely is.
+    Toolchain,     ///< Under neither root, or matching a toolchain marker: content the
+                   ///< compiler identity in the key already covers collectively.
+    Uncanonical,   ///< Rooted by IsToolchainHeader's character-wise prefix test, but
+                   ///< Canonicalize's segment-wise one declined — `/x/build-other/a.h`
+                   ///< against a `/x/build` root. A root spelled almost right.
+    Last,          ///< Not a disposition, and has no row: the table's length.
+};
+
+/// One row per disposition: the enumerator, and the word the note uses for it.
+struct DispositionRow
+{
+    PathDisposition disposition; ///< The outcome this row names.
+    std::string_view label;      ///< How the launcher's note spells it.
+};
+
+/// The disposition table, in enumerator order so a disposition indexes its own row.
+///
+/// A table rather than a `switch`, for the reason `Metrics/MetricsCatalog` is one:
+/// a disposition that can be counted but not named is a drop that renders as
+/// nothing, which is the defect this whole change exists to close.
+///
+/// Sized from `Last` rather than from a literal or from the final enumerator by
+/// name, and that is the half that has to be right. An enumerator appended after
+/// `Uncanonical` while `Last` still ended the enum would leave a table one row
+/// short that a `size() == Uncanonical + 1` assert happily accepts — and
+/// `KeyDependencySet` indexes `tally` by the enumerator, so the new disposition
+/// writes one past the end. Deriving the length instead makes the missing row
+/// value-initialize to `{ Keyed, "" }` at a non-zero index, which the coverage
+/// check below rejects. `MetricsCatalog` sizes `CounterTable` from `Counter::Last`
+/// for exactly this reason.
+inline constexpr std::array<DispositionRow, static_cast<std::size_t>(PathDisposition::Last)> DispositionTable { {
+    { .disposition = PathDisposition::Keyed, .label = "keyed" },
+    { .disposition = PathDisposition::Empty, .label = "empty" },
+    { .disposition = PathDisposition::Unanchored, .label = "unanchored" },
+    { .disposition = PathDisposition::DriveRelative, .label = "drive-relative" },
+    { .disposition = PathDisposition::Toolchain, .label = "toolchain" },
+    { .disposition = PathDisposition::Uncanonical, .label = "no canonical form" },
+} };
+
+/// Whether the table has one row per enumerator, in order.
+/// @return True when every `PathDisposition` has its own row.
+[[nodiscard]] consteval bool CoversEveryDisposition() noexcept
+{
+    return std::ranges::all_of(std::views::iota(std::size_t { 0 }, DispositionTable.size()), [](std::size_t index) {
+        return static_cast<std::size_t>(DispositionTable[index].disposition) == index;
+    });
+}
+
+static_assert(CoversEveryDisposition(),
+              "DispositionTable must hold one row per PathDisposition, in enumerator order -- the order is what lets "
+              "a disposition index its own tally slot and its own row");
+
+/// The portable dependency set, and why each path that is not in it is not.
+struct DependencySet
+{
+    /// The tokens the key hashes: sorted, deduplicated.
+    std::vector<std::string> keyed;
+
+    /// One count per PathDisposition, indexed by the enumerator.
+    ///
+    /// Counted per reported OCCURRENCE, so the whole tally sums to what the probe
+    /// reported — while `keyed` is the set after sort and deduplication, which is
+    /// smaller whenever a header was reached from more than one inclusion site.
+    /// `/showIncludes` repeats one per site, hundreds of notes for a few dozen
+    /// files, so the two genuinely differ on every real translation unit. The
+    /// launcher's note has always reported the deduplicated count against the raw
+    /// one; this states the relationship rather than introducing it.
+    std::array<std::size_t, DispositionTable.size()> tally {};
+
+    /// How many reported paths reached one disposition.
+    /// @param disposition The outcome to read.
+    /// @return The count.
+    [[nodiscard]] std::size_t Count(PathDisposition disposition) const noexcept
+    {
+        return tally[static_cast<std::size_t>(disposition)];
+    }
+
+    /// How many paths the probe reported, derived from the tally rather than
+    /// carried beside it: two counters for one fact are two counters that drift.
+    /// @return The sum of every row.
+    [[nodiscard]] std::size_t Reported() const noexcept
+    {
+        return std::accumulate(tally.begin(), tally.end(), std::size_t { 0 });
+    }
+};
+
+/// Render the reasons paths did not reach the key, for the launcher's note.
+///
+/// Walks DispositionTable in order, skipping `Keyed` — which the note's own
+/// `N of M` prefix already reports — and every row that counted nothing, so a
+/// healthy compile says only what happened. Empty when nothing was dropped.
+///
+/// Lives here rather than in main.cpp because main.cpp is in no test target, the
+/// lesson `CacheProtocol.cpp` and `RootReconciler.cpp` are each recorded as having
+/// been extracted for.
+///
+/// @param set A classified dependency set.
+/// @return `"9 toolchain, 3 drive-relative"`, or an empty string.
+[[nodiscard]] std::string DescribeDropped(DependencySet const& set);
 
 /// Reduce a probe's raw dependency paths to the portable set the key hashes.
 ///
@@ -165,9 +297,12 @@ struct ProbeText
 ///                         classify is a path it cannot hash portably, and the
 ///                         launcher's `dependency set: N of M` note is what makes
 ///                         that visible instead of silent.
-/// @return The portable dependency set, sorted, without duplicates.
-[[nodiscard]] std::vector<std::string> KeyDependencySet(std::span<std::string const> rawPaths,
-                                                        PathCanon::Layout const& layout,
-                                                        std::string_view workingDirectory);
+/// @return The portable dependency set — sorted, without duplicates — beside a
+///         per-reason tally of everything that did not reach it. The tally is
+///         what makes `0 of M` say WHY rather than merely how many, which two
+///         separate faults had come to render identically (issue #105).
+[[nodiscard]] DependencySet KeyDependencySet(std::span<std::string const> rawPaths,
+                                             PathCanon::Layout const& layout,
+                                             std::string_view workingDirectory);
 
 } // namespace FastCache::Cc

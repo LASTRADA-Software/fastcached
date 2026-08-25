@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <span>
 #include <string>
 #include <string_view>
@@ -24,11 +25,20 @@ PathCanon::Layout PosixLayout()
 /// about spawns the compiler.
 constexpr std::string_view PosixWorkingDirectory = "/home/dev/proj/build";
 
+/// The whole classified result: the tokens and the tally of what was dropped.
+DependencySet Classified(std::vector<std::string> const& raw,
+                         PathCanon::Layout const& layout,
+                         std::string_view workingDirectory = PosixWorkingDirectory)
+{
+    return KeyDependencySet(std::span<std::string const> { raw }, layout, workingDirectory);
+}
+
+/// Just the tokens, for the cases that are about the filter rather than the note.
 std::vector<std::string> KeySet(std::vector<std::string> const& raw,
                                 PathCanon::Layout const& layout,
                                 std::string_view workingDirectory = PosixWorkingDirectory)
 {
-    return KeyDependencySet(std::span<std::string const> { raw }, layout, workingDirectory);
+    return Classified(raw, layout, workingDirectory).keyed;
 }
 } // namespace
 
@@ -243,6 +253,28 @@ TEST_CASE("A drive-relative path under a drive-relative root is still keyed")
     CHECK(out == std::vector<std::string> { "<SRCROOT>/a.hpp" });
 }
 
+TEST_CASE("A vendored tree under a drive-relative root is toolchain, not drive-relative")
+{
+    // The mirror of the case above, and the reason the drive-relative label is
+    // not simply "the anchor was DriveRelative". `IsToolchainHeader` tests its
+    // markers BEFORE any root, deliberately — a vcpkg tree nested under the build
+    // tree is toolchain content even though it canonicalizes — so under a
+    // drive-relative root every such path is both drive-relative and toolchain.
+    // Only one of those says what to change, and here it is toolchain: the path
+    // canonicalizes, so its anchor costs the build nothing. Reporting it as
+    // drive-relative would put the loudest reading of this vocabulary on a
+    // perfectly healthy build — the same defect issue #105 closes, from the other
+    // side. The sibling below it, under NO root, must still read drive-relative.
+    PathCanon::Layout const layout { .sourceRoot = R"(C:src\proj)", .buildTree = R"(C:src\build)" };
+    auto const set = Classified(
+        { R"(C:src\build\vcpkg_installed\x64\include\zlib.h)", R"(C:elsewhere\b.hpp)" }, layout, R"(C:src\build)");
+
+    CHECK(set.keyed.empty());
+    CHECK(set.Count(PathDisposition::Toolchain) == 1);
+    CHECK(set.Count(PathDisposition::DriveRelative) == 1);
+    CHECK(DescribeDropped(set) == "1 drive-relative, 1 toolchain");
+}
+
 TEST_CASE("KeyDependencySet is insensitive to where a vendored tree sits")
 {
     // The regression (issue #64). A vendored or relocatable toolchain reached
@@ -368,4 +400,126 @@ TEST_CASE("KeyDependencySet drops a toolchain tree nested under the build tree")
 
     REQUIRE(out.size() == 1);
     CHECK(out[0] == "<BUILDTREE>/generated/config.hpp");
+}
+
+// --- the drop tally, and the note that renders it (issue #105) ---------------
+//
+// `0 of M` was the fingerprint of ONE fault: issue #66's short-name root, which
+// prefix-matches nothing `cl` echoes back, so every reported path classifies as
+// outside both roots. That mattered because #66 is silent from every other
+// direction — the key is quietly empty, the replay guard quietly skips, and the
+// stored value quietly keeps the producing machine's absolute paths. Issue #65
+// gave the same line a second cause, after which it fingerprinted neither. The
+// cases below hold the two apart, which is the whole of what the tally buys.
+
+TEST_CASE("Every path outside both roots is tallied as toolchain")
+{
+    // The #66 shape: nothing is keyed and every reason is the same one. It is what
+    // the drive-relative case below must NOT render as, and vice versa — a tally
+    // that reported one word for both would leave the line exactly as ambiguous as
+    // the bare counts it replaces.
+    auto const set = Classified({ "/usr/include/c++/16/vector", "/opt/sdk/a.h", "/elsewhere/b.h" }, PosixLayout());
+
+    CHECK(set.keyed.empty());
+    CHECK(set.Reported() == 3);
+    CHECK(set.Count(PathDisposition::Toolchain) == 3);
+    CHECK(set.Count(PathDisposition::DriveRelative) == 0);
+    CHECK(DescribeDropped(set) == "3 toolchain");
+}
+
+TEST_CASE("A drive-relative path is tallied as drive-relative, not as toolchain")
+{
+    // Both are true of it — it is anchored to drive C's own current directory AND
+    // it lies under no root — and only the first is worth an operator's attention,
+    // because only the first says what to change. Reporting it as toolchain is the
+    // collapse issue #105 exists to undo: it is the same word the case above
+    // produces, so the two faults would keep rendering as one line.
+    PathCanon::Layout const windows { .sourceRoot = R"(C:\src\proj)", .buildTree = R"(C:\src\proj\build)" };
+    auto const set =
+        Classified({ R"(C:foo\bar.hpp)", R"(C:\Program Files\MSVC\include\vector)" }, windows, R"(C:\src\proj\build)");
+
+    CHECK(set.keyed.empty());
+    CHECK(set.Count(PathDisposition::DriveRelative) == 1);
+    CHECK(set.Count(PathDisposition::Toolchain) == 1);
+    CHECK(DescribeDropped(set) == "1 drive-relative, 1 toolchain");
+}
+
+TEST_CASE("A relative path with no working directory is tallied as unanchored")
+{
+    // A third reading of `0 of M`, and a third repair: the launcher was given no
+    // working directory to resolve against, so a path it cannot place is dropped
+    // rather than guessed at. The absolute sibling is unaffected, which is what
+    // makes the pair diagnostic rather than just small.
+    auto const set = Classified({ "../inc/a.hpp", "/home/dev/proj/inc/b.hpp" }, PosixLayout(), "");
+
+    CHECK(set.keyed == std::vector<std::string> { "<SRCROOT>/inc/b.hpp" });
+    CHECK(set.Count(PathDisposition::Keyed) == 1);
+    CHECK(set.Count(PathDisposition::Unanchored) == 1);
+    CHECK(DescribeDropped(set) == "1 unanchored");
+}
+
+TEST_CASE("A root spelled almost right is tallied as having no canonical form")
+{
+    // The two root tests disagree here, and neither is wrong: IsToolchainHeader's
+    // prefix match is character-wise, so `/x/build-other` looks like project
+    // content under `/x/build`, while Canonicalize's is segment-wise and declines.
+    // Dropped either way — but it is a root off by a suffix rather than a system
+    // header, and folding it into "toolchain" would hide the only fault of the
+    // three the operator fixes by editing a root.
+    PathCanon::Layout const layout { .sourceRoot = "/x/src", .buildTree = "/x/build" };
+    auto const set = Classified({ "/x/build-other/a.h", "/x/build/gen/b.h" }, layout, "/x/build");
+
+    CHECK(set.keyed == std::vector<std::string> { "<BUILDTREE>/gen/b.h" });
+    CHECK(set.Count(PathDisposition::Uncanonical) == 1);
+    CHECK(set.Count(PathDisposition::Toolchain) == 0);
+    CHECK(DescribeDropped(set) == "1 no canonical form");
+}
+
+TEST_CASE("An empty reported path is tallied rather than silently skipped")
+{
+    auto const set = Classified({ "", "/home/dev/proj/a.hpp" }, PosixLayout());
+
+    CHECK(set.Count(PathDisposition::Empty) == 1);
+    CHECK(DescribeDropped(set) == "1 empty");
+}
+
+TEST_CASE("The tally counts reported occurrences while the keyed set is deduplicated")
+{
+    // The two numbers on the note answer different questions and the difference is
+    // real on every translation unit: /showIncludes repeats a header once per
+    // inclusion site, so `keyed` is far smaller than the occurrences that produced
+    // it. Tallying after deduplication would make the reasons stop accounting for
+    // what the probe reported, and the line's own arithmetic would not close.
+    auto const set = Classified({ "/home/dev/proj/a.hpp", "/home/dev/proj/a.hpp", "/usr/include/vector" }, PosixLayout());
+
+    CHECK(set.keyed == std::vector<std::string> { "<SRCROOT>/a.hpp" });
+    CHECK(set.Count(PathDisposition::Keyed) == 2);
+    CHECK(set.Reported() == 3);
+}
+
+TEST_CASE("DescribeDropped says nothing when nothing was dropped")
+{
+    // A healthy compile reports what happened, not an enumeration of what did not.
+    auto const set = Classified({ "/home/dev/proj/a.hpp" }, PosixLayout());
+
+    CHECK(set.Count(PathDisposition::Keyed) == 1);
+    CHECK(DescribeDropped(set).empty());
+}
+
+TEST_CASE("DescribeDropped renders every reason it can be given, in table order")
+{
+    // Asserted over the TABLE rather than against a list written out beside it: a
+    // hand-written list of expected reasons is the very thing that goes stale, and
+    // it would have to be updated by the same person who forgot the renderer. Each
+    // row gets a DISTINCT count, because a table of near-identical rows makes "this
+    // row renders its neighbour's count" the likely slip and equal values would let
+    // it through. Keyed is deliberately absent from the output: the note's own
+    // `N of M` prefix already reports it.
+    DependencySet set;
+    std::size_t next = 1;
+    for (auto const& row: DispositionTable)
+        set.tally[static_cast<std::size_t>(row.disposition)] = next++;
+
+    CHECK(set.Reported() == 21);
+    CHECK(DescribeDropped(set) == "2 empty, 3 unanchored, 4 drive-relative, 5 toolchain, 6 no canonical form");
 }
