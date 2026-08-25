@@ -60,6 +60,26 @@ readable and silently ignored. Every rule below has already been one of them.
     `--cache-dir` or `--cluster-dir` gets directories root created for an account
     that is not root, so they must change hands too -- and only those, never a
     parent.
+  - **`serviceAccount` does not answer the SCM, so `windowsLogon` does.** The two
+    supervisors take different *kinds* of answer: launchd wants an account name that
+    must already exist, while the SCM derives a per-service identity from the
+    service's own name. `CreateService` passed `nullptr` for `lpServiceStartName`,
+    which is **LocalSystem** -- so on Windows `fastcache-compile-node` registered
+    itself with the whole machine while the macOS spec was carefully naming an
+    unprivileged account for the same binary. It names
+    `WindowsLogonAccount::VirtualAccount` now: `NT SERVICE\<serviceName>`, created by
+    the SCM itself, no account to make and no password to keep. The daemon stays
+    LocalSystem deliberately -- its `%ProgramData%` access list grants `BU` read and
+    execute only, so moving it is a separate change with its own ACL work.
+  - **A virtual account cannot write what an administrator created, so the install
+    grants it.** LocalSystem never noticed, which is why nothing on the Windows path
+    had ever needed the equivalent of the launchd `chown`. Two things about the
+    grant: `NT SERVICE\<name>` does not resolve until the service exists, so it runs
+    **after** `CreateService` (before it, `SetEntriesInAcl` fails with
+    `ERROR_NONE_MAPPED`); and the entry is *added* to the existing list rather than
+    replacing it, or the directory becomes one only the service can repair. A grant
+    that fails is reported and the registration kept -- an operator can fix an ACL,
+    but not a registration that was rolled back.
   - **`BuildServiceArgv` stays hand-written per binary.** An `OptionSpec` says how
     to *parse* a flag and carries no way to read a value back out, so "emit every
     field that differs from its default" cannot be written once generically. Each

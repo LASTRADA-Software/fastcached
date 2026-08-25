@@ -281,6 +281,12 @@ TEST_CASE("NodeConfig: a system-scope job names an unprivileged account", "[node
     // compromised compile rewrite every cached object.
     auto const daemonSpec = MakeDaemonServiceSpec(std::filesystem::path { "fastcached" }, Config {});
     CHECK(spec.serviceAccount != daemonSpec.serviceAccount);
+
+    // The same decision for the other supervisor. Told nothing, the Windows SCM
+    // logs a service on as LocalSystem, which is the machine -- so the worker names
+    // a virtual account there for exactly the reason it names an account here.
+    CHECK(spec.windowsLogon == WindowsLogonAccount::VirtualAccount);
+    CHECK(Unwrap(WindowsLogonName(spec)) == "NT SERVICE\\FastCacheCompileNode");
 }
 
 TEST_CASE("NodeConfig: the worker's launchd label is what the packaging removes", "[node][service]")

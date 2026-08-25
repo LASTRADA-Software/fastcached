@@ -10,6 +10,7 @@
 #include <concepts>
 #include <filesystem>
 #include <format>
+#include <memory>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #if defined(_WIN32)
+    #include <aclapi.h>
     #include <windows.h>
 #elif defined(__APPLE__)
     #include <sys/stat.h>
@@ -702,6 +704,21 @@ namespace
 
 } // namespace
 
+std::optional<std::string> WindowsLogonName(ServiceSpec const& spec)
+{
+    // The SCM derives the virtual account from the service name itself and creates
+    // it on demand, so this is a spelling rather than a lookup -- and it is why a
+    // virtual account needs no password and no installer step. It only resolves
+    // AFTER CreateService has run; nothing may ACL against it before then.
+    if (spec.windowsLogon == WindowsLogonAccount::VirtualAccount)
+        return std::format("NT SERVICE\\{}", spec.serviceName);
+
+    // LocalSystem is spelled by naming nobody. Returning "LocalSystem" would also
+    // work, but nullopt keeps the one caller passing the literal nullptr the API
+    // documents rather than a string that has to be right.
+    return std::nullopt;
+}
+
 std::filesystem::path DefaultLogDirectory(std::string_view label, ServiceScope scope, std::filesystem::path const& home)
 {
     if (scope == ServiceScope::User)
@@ -792,6 +809,86 @@ namespace
     {
         return std::format("access denied {}; run from an elevated (Administrator) prompt", action);
     }
+
+    /// Frees a `LocalAlloc`ed block, so the ACL paths below cannot leak one on an
+    /// early return. There are two such blocks per call and four ways out.
+    struct LocalDeleter
+    {
+        /// @param block Block to release; null is a no-op, as LocalFree allows.
+        void operator()(void* block) const noexcept
+        {
+            (void) ::LocalFree(block);
+        }
+    };
+    using LocalPtr = std::unique_ptr<void, LocalDeleter>;
+
+    /// Give @p account full control of @p directory, creating it if absent.
+    ///
+    /// The Windows counterpart of the `chown` the launchd path does, and needed for
+    /// the same reason: a service that no longer runs as the machine's most
+    /// privileged identity cannot write a directory the installer created as an
+    /// administrator. LocalSystem never noticed because LocalSystem can write
+    /// anywhere.
+    ///
+    /// The entry is ADDED to the existing list rather than replacing it, so an
+    /// administrator keeps the access they had -- a replaced list is how a
+    /// directory becomes one only the service can repair.
+    ///
+    /// @param directory Directory to create and grant access to.
+    /// @param account Trustee name, e.g. `NT SERVICE\FastCacheCompileNode`. It
+    ///        resolves only once the service exists, so call this after
+    ///        CreateService.
+    /// @return An explanatory message on failure, else nullopt.
+    [[nodiscard]] std::optional<std::string> GrantDirectoryAccess(std::filesystem::path const& directory,
+                                                                  std::string const& account)
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(directory, ec);
+        if (ec && !std::filesystem::is_directory(directory))
+            return std::format("could not create {}: {}", directory.string(), ec.message());
+
+        auto path = directory.string();
+
+        PACL current = nullptr;
+        PSECURITY_DESCRIPTOR rawDescriptor = nullptr;
+        if (auto const rc = ::GetNamedSecurityInfoA(path.c_str(),
+                                                    SE_FILE_OBJECT,
+                                                    DACL_SECURITY_INFORMATION,
+                                                    nullptr,
+                                                    nullptr,
+                                                    &current,
+                                                    nullptr,
+                                                    &rawDescriptor);
+            rc != ERROR_SUCCESS)
+            return std::format("could not read the access list of {} (error {})", path, rc);
+        LocalPtr const descriptor { rawDescriptor };
+
+        // A copy: EXPLICIT_ACCESS takes a mutable pointer, and the API is ANSI here
+        // to match the rest of this file's SCM calls.
+        auto trustee = account;
+
+        EXPLICIT_ACCESS_A entry {};
+        entry.grfAccessPermissions = GENERIC_ALL;
+        entry.grfAccessMode = GRANT_ACCESS;
+        // Inherited by what the service later creates inside, or the grant covers
+        // the directory and nothing the service puts in it.
+        entry.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        entry.Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+        entry.Trustee.TrusteeType = TRUSTEE_IS_USER;
+        entry.Trustee.ptstrName = trustee.data();
+
+        PACL rawUpdated = nullptr;
+        if (auto const rc = ::SetEntriesInAclA(1, &entry, current, &rawUpdated); rc != ERROR_SUCCESS)
+            return std::format("could not grant '{}' access to {} (error {})", account, path, rc);
+        LocalPtr const updated { rawUpdated };
+
+        if (auto const rc = ::SetNamedSecurityInfoA(
+                path.data(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, rawUpdated, nullptr);
+            rc != ERROR_SUCCESS)
+            return std::format("could not apply the access list of {} (error {})", path, rc);
+
+        return std::nullopt;
+    }
 } // namespace
 
 ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scope*/)
@@ -804,6 +901,7 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scop
         return { .exitCode = 1, .message = "could not determine the fastcached executable path" };
 
     auto const commandLine = BuildServiceCommandLine(spec);
+    auto const logonName = WindowsLogonName(spec);
 
     SC_HANDLE const manager = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (manager == nullptr)
@@ -825,7 +923,14 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scop
                                              nullptr,
                                              nullptr,
                                              nullptr,
-                                             nullptr,
+                                             // lpServiceStartName. Naming nobody is
+                                             // LocalSystem -- the whole machine --
+                                             // which fastcache-compile-node must
+                                             // not have: it compiles input that
+                                             // arrived over the network.
+                                             logonName ? logonName->c_str() : nullptr,
+                                             // No password. A virtual account has
+                                             // none, and LocalSystem takes none.
                                              nullptr);
     if (service == nullptr)
     {
@@ -847,6 +952,27 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scop
 
     CloseServiceHandle(service);
     CloseServiceHandle(manager);
+
+    // Only now: `NT SERVICE\<name>` does not resolve until the service exists, so
+    // a grant attempted before CreateService fails to translate the trustee.
+    //
+    // Reported rather than fatal, and the registration is left in place. A service
+    // that is registered and cannot write one directory is recoverable by an
+    // operator with `icacls`; one that was rolled back because of it leaves them
+    // nothing to repair. This mirrors the launchd path, where a chown that fails
+    // is `(void)`-discarded -- except that this says so.
+    std::string warnings;
+    if (logonName)
+        for (auto const& owned: spec.ownedDirectories)
+            if (auto const denial = GrantDirectoryAccess(owned, *logonName))
+                warnings += std::format("\nwarning: {}", *denial);
+
+    if (!warnings.empty())
+        return { .exitCode = 0,
+                 .message = std::format("installed service '{}' (auto-start); start it now with: sc start {}{}",
+                                        spec.serviceName,
+                                        spec.serviceName,
+                                        warnings) };
 
     return { .exitCode = 0,
              .message = std::format("installed service '{}' (auto-start); start it now with: sc start {}",

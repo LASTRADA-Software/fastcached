@@ -699,7 +699,16 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          // registration would then be a job that answers its own
                          // command line with "unrecognised argument" at every
                          // start -- reported installed, dead at every boot.
-                         .applicationName = {} };
+                         .applicationName = {},
+                         // The Windows half of the same decision `serviceAccount`
+                         // makes for launchd. Told nothing, the SCM logs a service
+                         // on as LocalSystem -- the whole machine -- and this one
+                         // compiles input that arrived over the network. A virtual
+                         // account gives it a per-service SID, no group membership
+                         // and no machine credentials on the network, and the SCM
+                         // creates it from the service name with no account for the
+                         // installer to make and no password to keep.
+                         .windowsLogon = WindowsLogonAccount::VirtualAccount };
 }
 
 std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)

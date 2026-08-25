@@ -624,6 +624,18 @@ FastCacheCompileNode`). The default service name is `FastCacheCompileNode`, not
 the daemon's `FastCached`, so a machine can run both without one install
 displacing the other.
 
+It logs on as the **virtual account** `NT SERVICE\FastCacheCompileNode`, for the
+reason the macOS job runs as `fastcache-node`: told no account, the SCM would use
+LocalSystem, and a process that compiles input arriving over the network should
+not have the machine. The SCM derives that account from the service name and
+creates it itself — there is nothing to create and no password to keep.
+
+Because it is no longer LocalSystem, a `--cache-dir` or `--cluster-dir` you name
+is granted to that account at install time; the grant is reported if it fails and
+the registration is kept, so you can repair it with `icacls` rather than being
+left with nothing. If you rename the service with `--service-name`, the account
+follows the new name.
+
 Remove a registration with `--uninstall-service` (and the same
 `--service-scope`, on macOS: which domain a job lives in is decided at install
 time and re-probing would boot out one that was never there).

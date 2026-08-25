@@ -15,6 +15,10 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
+using FastCache::Testing::Unwrap;
+
 namespace
 {
 /// The `ServiceSpec` the daemon would register for @p cfg.
@@ -195,6 +199,32 @@ TEST_CASE("ServiceControl: the launchd label is reverse-DNS and lowercased", "[p
 
     cfg.serviceName = "FastCachedSmoke";
     REQUIRE(FastCache::LaunchdLabel(SpecFor("fastcached", cfg)) == "software.lastrada.fastcachedsmoke");
+}
+
+TEST_CASE("ServiceControl: the SCM logon identity is named, not implied", "[platform][service][scm]")
+{
+    // Naming nobody is LocalSystem, the most privileged identity on the machine.
+    // The daemon keeps it -- changing that is a separate decision, with its own
+    // %ProgramData% access-list work -- and says so rather than leaving it implied.
+    FastCache::Config const cfg {};
+    auto const daemon = SpecFor("fastcached", cfg);
+    REQUIRE(daemon.windowsLogon == FastCache::WindowsLogonAccount::LocalSystem);
+    REQUIRE(!FastCache::WindowsLogonName(daemon).has_value());
+
+    // A virtual account is derived from the service name by the SCM itself, so the
+    // spelling has to match the name exactly or the service logs on as nobody.
+    FastCache::ServiceSpec worker {};
+    worker.serviceName = "FastCacheCompileNode";
+    worker.windowsLogon = FastCache::WindowsLogonAccount::VirtualAccount;
+
+    auto const name = FastCache::WindowsLogonName(worker);
+    REQUIRE(name.has_value());
+    REQUIRE(Unwrap(name) == "NT SERVICE\\FastCacheCompileNode");
+
+    // It follows --service-name, because that is what the SCM derives it from: a
+    // fixed string here would name an identity a renamed service does not have.
+    worker.serviceName = "FastCacheCompileNodeSmoke";
+    REQUIRE(Unwrap(FastCache::WindowsLogonName(worker)) == "NT SERVICE\\FastCacheCompileNodeSmoke");
 }
 
 TEST_CASE("ServiceControl: a system job's log directory is its own", "[platform][service][launchd]")

@@ -40,6 +40,27 @@ enum class InlineCredential : std::uint8_t
     Present, ///< A credential was typed alongside `--install-service`.
 };
 
+/// Which identity the Windows SCM logs a service on as.
+///
+/// The Windows counterpart of `ServiceSpec::serviceAccount`, and separate from it
+/// because the two supervisors take different *kinds* of answer: launchd wants an
+/// account name that must already exist, while the SCM derives a per-service
+/// identity from the service's own name and needs no account created at all. One
+/// string field could not mean both, and a spec has to answer both supervisors.
+enum class WindowsLogonAccount : std::uint8_t
+{
+    /// `lpServiceStartName = nullptr`: the SCM default, **LocalSystem** -- the
+    /// most privileged identity on the machine. Correct only for a service that
+    /// genuinely needs it.
+    LocalSystem,
+
+    /// `NT SERVICE\<serviceName>`: a virtual account the SCM creates on demand for
+    /// a `SERVICE_WIN32_OWN_PROCESS` service. It has a per-service SID, no
+    /// password, no group membership and no machine credentials on the network --
+    /// the Windows answer to "this process should not have the whole machine".
+    VirtualAccount,
+};
+
 /// A service to register, described independently of which binary runs it.
 ///
 /// This is the seam that lets one implementation of "install this as a service"
@@ -134,6 +155,17 @@ struct ServiceSpec
     /// which is exactly the shape this file refuses at install time. The name was
     /// hardcoded to the daemon's before, so every spec got the daemon's defaults.
     std::string applicationName;
+
+    /// Which identity the Windows SCM should log this service on as.
+    ///
+    /// Defaults to `LocalSystem` because that is what the SCM does when told
+    /// nothing, and saying so is better than leaving it implied -- the daemon
+    /// relies on it, and changing that is a separate decision with its own
+    /// `%ProgramData%` access-list work.
+    ///
+    /// `serviceAccount` does not answer this: it holds a POSIX account name that
+    /// must already exist, which is not a thing the SCM takes.
+    WindowsLogonAccount windowsLogon { WindowsLogonAccount::LocalSystem };
 };
 
 /// Resolve the absolute path of the running executable.
@@ -287,6 +319,19 @@ struct ServiceSpec
 [[nodiscard]] std::string BuildLaunchdPlist(ServiceSpec const& spec,
                                             ServiceScope scope,
                                             std::filesystem::path const& logDirectory);
+
+/// The account name to hand `CreateService` as `lpServiceStartName`.
+///
+/// Pure and platform-independent so it is asserted everywhere rather than only on
+/// a Windows runner -- the same reason BuildLaunchdPlist is. The alternative was a
+/// derivation visible only inside `#if defined(_WIN32)`, and this file has already
+/// paid for that once.
+///
+/// @param spec Service to name; `serviceName` is what a virtual account derives
+///        from, so the two cannot disagree.
+/// @return `NT SERVICE\<serviceName>` for a virtual account; `nullopt` for
+///         LocalSystem, which is spelled by passing no name at all.
+[[nodiscard]] std::optional<std::string> WindowsLogonName(ServiceSpec const& spec);
 
 /// Where a launchd job writes its stdout/stderr.
 ///
