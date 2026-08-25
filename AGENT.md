@@ -196,6 +196,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   does not link `FastCache`.
 - SIGPIPE is suppressed per socket, never process-wide: an ignored disposition is
   inherited across exec.
+- A listening socket claims its address exclusively — `SO_EXCLUSIVEADDRUSE` on
+  Windows, where `SO_REUSEADDR` lets a second process take a port already being
+  served. Sharing a port is `ReusePort::Yes`, and only that.
 - There is exactly one TCP client, `Net/TcpClient`. Do not write a second.
 - A synchronous dial spends a thread the caller does not own — a reactor thread
   dials through `PlatformConnector`, never `BlockingConnector`.

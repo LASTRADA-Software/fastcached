@@ -84,14 +84,15 @@ fault.
     `CacheProtocol.cpp` and `RootReconciler.cpp` are each recorded as having been
     extracted for, so the wiring lives in `AdminEndpoint.cpp` where its tests can
     reach it.
-  - **"Bind a port twice" is not a portable way to test a bind failure.**
-    `SocketAddress.cpp` sets `SO_REUSEADDR` unconditionally, which on POSIX only
-    skips `TIME_WAIT` but on **Windows lets a second socket bind an address already
-    in use** -- so the obvious test passes on Linux and macOS and fails on Windows.
-    The case provokes the refusal with an address no host holds (RFC 5737
-    `192.0.2.1`) instead. That the option means two different things on the two
-    platforms is a real defect in its own right and is filed as issue #85, not fixed
-    here.
+  - **A bind failure is provoked with an address no host holds, not by taking a
+    port twice.** RFC 5737 `192.0.2.1` is refused on every platform and needs no
+    second listener kept alive for the duration; that a port already being served
+    is refused belongs where the option refusing it is set, and is asserted there
+    (`SocketAddress_test.cpp`). It was not always refused: `SocketAddress.cpp` set
+    `SO_REUSEADDR` unconditionally, which on POSIX only skips `TIME_WAIT` but on
+    **Windows lets a second socket bind an address a live one already holds** -- so
+    until issue #85 any process on the box could take this endpoint's port and
+    answer the scrapes an operator was told to trust.
   - **The stop test is bounded rather than allowed to hang.** A case that deadlocks
     when the destruction order is reversed reports the defect as a suite timeout
     naming nothing, which this repository has already paid for once

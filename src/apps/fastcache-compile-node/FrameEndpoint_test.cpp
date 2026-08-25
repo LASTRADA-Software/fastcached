@@ -145,10 +145,10 @@ TEST_CASE("An unparseable --listen-scheduler is refused, not guessed at", "[node
 TEST_CASE("An endpoint that cannot bind reports why", "[node][scheduler]")
 {
     // Provoked with an address this host does not hold -- 192.0.2.1 is RFC 5737
-    // documentation space -- rather than by binding a port twice. `SocketAddress.cpp`
-    // sets SO_REUSEADDR unconditionally, which on POSIX only skips TIME_WAIT but on
-    // Windows lets a second socket bind an address already in use, so the obvious
-    // test passes on Linux and macOS and fails on Windows (issue #85).
+    // documentation space -- rather than by binding a port twice, which needs a
+    // second listener kept alive for the duration and asserts nothing this does not.
+    // That a port already being served is refused belongs where the option refusing
+    // it is set, and is asserted there (SocketAddress_test.cpp, issue #85).
     Fleet fleet;
     auto const unreachable = std::string { "192.0.2.1:6674" };
     auto const started =

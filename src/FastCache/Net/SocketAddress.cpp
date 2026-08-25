@@ -82,6 +82,30 @@ namespace
         return std::string { ::gai_strerror(code) };
     }
 #endif
+
+    /// The socket option that keeps a listening address to the process that
+    /// bound it. One intent, two spellings -- and each platform's *other*
+    /// spelling means something actively wrong here:
+    ///
+    ///   POSIX    SO_REUSEADDR only lets a bind step over a TIME_WAIT left by a
+    ///            DEAD socket; a live listener still holds the address alone.
+    ///   Windows  SO_REUSEADDR lets a second socket bind an address a LIVE
+    ///            socket already holds -- the documented reason
+    ///            SO_EXCLUSIVEADDRUSE exists.
+    ///
+    /// Measured on Windows 11: with this option on both sockets the second bind
+    /// is refused with WSAEADDRINUSE, and a fresh process still rebinds a
+    /// listening port whose crashed predecessor's accepted connections are in
+    /// TIME_WAIT -- so the restart the old SO_REUSEADDR comment reached for is
+    /// not given up in exchange. Sharing a port on purpose stays a separate,
+    /// opt-in question: SO_REUSEPORT below.
+    ///
+    /// Issue #85 and .agent/rules/wire-and-protocol.md carry what it cost.
+#if defined(_WIN32)
+    constexpr int ExclusiveBindOption = SO_EXCLUSIVEADDRUSE;
+#else
+    constexpr int ExclusiveBindOption = SO_REUSEADDR;
+#endif
 } // namespace
 
 namespace Detail
@@ -196,9 +220,21 @@ namespace Detail
                 continue;
             }
 
-            // SO_REUSEADDR so restart-after-crash rebinds without TIME_WAIT delay.
-            int reuse = 1;
-            ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
+            // Claim the address exclusively -- see ExclusiveBindOption for what
+            // that is spelled as here and why the other spelling is a hole.
+            // Unlike the best-effort options below, a failure is fatal to this
+            // candidate: the option carries a security property, and a daemon
+            // that silently came up shareable is worse than one that visibly
+            // did not come up at all.
+            int const exclusive = 1;
+            if (::setsockopt(
+                    sock, SOL_SOCKET, ExclusiveBindOption, reinterpret_cast<char const*>(&exclusive), sizeof(exclusive))
+                != 0)
+            {
+                lastError = std::format("cannot claim {}:{} exclusively: {}", host, port, LastSocketError());
+                CloseSocket(static_cast<NativeSocket>(sock));
+                continue;
+            }
 
             // SO_REUSEPORT lets N reactor threads each bind a listener on the
             // same port; the kernel then load-balances new connections across
