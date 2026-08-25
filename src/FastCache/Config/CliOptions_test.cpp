@@ -263,7 +263,7 @@ TEST_CASE("a value flag at the end of argv names itself in the error", "[config]
     }
 }
 
-TEST_CASE("--help wins over whatever follows it", "[config][cli][options]")
+TEST_CASE("A --help wins over whatever follows it", "[config][cli][options]")
 {
     std::array<char const*, 2> const argv { "--help", "--nonsense" };
     auto const parsed = ParseCli(argv);

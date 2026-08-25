@@ -95,6 +95,34 @@ set_tests_properties("net-boundary" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Test-name hygiene. Fails when a Catch2 case is named something the CTest
+# registration cannot hand back to the runner.
+#
+# `catch_discover_tests` registers each case as `add_test(NAME <case> COMMAND
+# <exe> <case>)`, so the name arrives at Catch2 as a command-line ARGUMENT and a
+# leading `-` is read as an option rather than as a test spec. A recognised one
+# makes CTest report a pass for a case that never ran; an unrecognised one makes
+# it report a failure the case does not have, which then passes when run by hand.
+# Both were live in this tree, and the first had been silently not running since
+# the day it was written.
+#
+# Not labelled "smoke", for the reason the two above are not: it reads source
+# files and reports, so it belongs in the default `ctest` set and must survive
+# `ctest -LE smoke`. It finishes in milliseconds and, like net-boundary, has no
+# skip path -- the source tree is present in an exported tarball exactly as it is
+# in a checkout.
+add_test(
+    NAME "test-name-hygiene"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-test-names.cmake"
+)
+set_tests_properties("test-name-hygiene" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # Compiler-cache auto-install fallback. Configures the tiny fixture project in
 # compile-cache-fixture/ once per way the fetch can be declined, and requires
 # each one to end in a status message and a clean fall-through.

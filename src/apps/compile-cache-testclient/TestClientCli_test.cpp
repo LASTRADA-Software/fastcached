@@ -114,7 +114,7 @@ TEST_CASE("an out-of-range port is rejected", "[testclient][cli]")
     CHECK(parsed.error().code == ConfigErrorCode::OutOfRange);
 }
 
-TEST_CASE("--help works with and without a sub-command", "[testclient][cli]")
+TEST_CASE("A --help works with and without a sub-command", "[testclient][cli]")
 {
     auto const bare = Parse({ "--help" });
     REQUIRE(bare.has_value());
