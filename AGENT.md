@@ -247,6 +247,9 @@ what differs between compilers, standard libraries, hosts and tool versions.
   a configure.
 - A sanitizer that is on in the cache is not one that is on in the build — a tool
   that silently does nothing is worse than one that is visibly off.
+- A table indexed by an enumerator is `EnumTable<Enum, Row>` + `RowsInEnumeratorOrder`.
+  A length anchored on an enumerator by name is a guard that fires only when
+  nothing is wrong.
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
@@ -329,6 +332,12 @@ across the codebase. Concretely:
   set of named things is usually a table in disguise; express it as data
   (a descriptor array, a lookup map, a dispatch table) and drive it with a
   range-based loop or `std::ranges` pipeline.
+- **A table indexed by an enumerator is `EnumTable<Enum, Row>`, guarded by
+  `RowsInEnumeratorOrder`** (`Core/EnumTable.hpp`). The enum states its own count
+  with a trailing `Last`, the table takes its extent from that, and one
+  `static_assert` checks the extent and every row's position. Never anchor the
+  length on an enumerator by name — that guard fires only when nothing is wrong.
+  See [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md).
 
 As with DI, **adhere to this unless there is a very strong, explicitly
 justified reason not to.** When in doubt, ask: "if a sixth case showed up

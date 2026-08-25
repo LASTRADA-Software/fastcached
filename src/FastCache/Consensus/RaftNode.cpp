@@ -23,29 +23,7 @@ namespace
     {
         using Handlers::operator()...;
     };
-} // namespace
 
-RoleTraits const& TraitsOf(Role role) noexcept
-{
-    // A range-based scan rather than `std::ranges::find`, because the iterator
-    // type of a `std::array` is a raw pointer in libstdc++ and libc++ but a class
-    // type in MSVC's standard library. Holding it in an `auto` variable therefore
-    // cannot be spelled to satisfy both: clang-tidy's readability-qualified-auto
-    // requires `auto const*` where it deduces a pointer, and that exact spelling
-    // fails to deduce on MSVC. Not naming the iterator at all sidesteps a
-    // difference that says nothing about this function.
-    for (auto const& row: RoleTable)
-        if (row.role == role)
-            return row;
-
-    // Unreachable: every enumerator has a row and `Role` has no other values.
-    // Returning the first row rather than dereferencing past the end keeps that
-    // true by construction if a row is ever removed by accident.
-    return RoleTable.front();
-}
-
-namespace
-{
     /// Term of the entry just below a recovered log's first index.
     ///
     /// `Term::None()` for a log that starts at 1: there is no entry below it, and

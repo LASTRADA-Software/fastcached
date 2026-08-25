@@ -4,6 +4,7 @@
 #include "WorkerProtocol.hpp"
 
 #include <FastCache/Core/Compression.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 
 #include <algorithm>
 #include <array>
@@ -66,31 +67,22 @@ namespace
     /// executed -- were indistinguishable from either end. Found the hard way,
     /// diagnosing a CI failure that reported the one thing it could not possibly
     /// be.
-    constexpr auto RefusalTable = std::array {
-        RefusalDescriptor { .refusal = JobRefusal::UnknownFingerprint,
-                            .code = Wire::ErrorCode::FingerprintMismatch,
-                            .counter = IMetricsSink::Counter::WorkerJobsRefusedUnknownFingerprint },
-        RefusalDescriptor { .refusal = JobRefusal::RejectedArgument,
-                            .code = Wire::ErrorCode::MalformedFrame,
-                            .counter = IMetricsSink::Counter::WorkerJobsRefusedRejectedArgument },
-        RefusalDescriptor { .refusal = JobRefusal::ScratchUnavailable,
-                            .code = Wire::ErrorCode::WorkerScratchUnavailable,
-                            .counter = IMetricsSink::Counter::WorkerJobsRefusedScratchUnavailable },
-        RefusalDescriptor { .refusal = JobRefusal::SpawnFailed,
-                            .code = Wire::ErrorCode::WorkerSpawnFailed,
-                            .counter = IMetricsSink::Counter::WorkerJobsRefusedSpawnFailed },
-    };
+    constexpr EnumTable<JobRefusal, RefusalDescriptor> RefusalTable { {
+        { .refusal = JobRefusal::UnknownFingerprint,
+          .code = Wire::ErrorCode::FingerprintMismatch,
+          .counter = IMetricsSink::Counter::WorkerJobsRefusedUnknownFingerprint },
+        { .refusal = JobRefusal::RejectedArgument,
+          .code = Wire::ErrorCode::MalformedFrame,
+          .counter = IMetricsSink::Counter::WorkerJobsRefusedRejectedArgument },
+        { .refusal = JobRefusal::ScratchUnavailable,
+          .code = Wire::ErrorCode::WorkerScratchUnavailable,
+          .counter = IMetricsSink::Counter::WorkerJobsRefusedScratchUnavailable },
+        { .refusal = JobRefusal::SpawnFailed,
+          .code = Wire::ErrorCode::WorkerSpawnFailed,
+          .counter = IMetricsSink::Counter::WorkerJobsRefusedSpawnFailed },
+    } };
 
-    /// Whether the table has one row per enumerator, in order.
-    /// @return True when every `JobRefusal` has its own row.
-    [[nodiscard]] consteval bool CoversEveryRefusal() noexcept
-    {
-        return std::ranges::all_of(std::views::iota(std::size_t { 0 }, RefusalTable.size()), [](std::size_t index) {
-            return static_cast<std::size_t>(RefusalTable[index].refusal) == index;
-        });
-    }
-
-    static_assert(RefusalTable.size() == static_cast<std::size_t>(JobRefusal::SpawnFailed) + 1 && CoversEveryRefusal(),
+    static_assert(RowsInEnumeratorOrder(RefusalTable, &RefusalDescriptor::refusal),
                   "RefusalTable must hold one row per JobRefusal, in enumerator order");
 
     /// The row describing `refusal`.
