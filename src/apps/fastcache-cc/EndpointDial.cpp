@@ -27,6 +27,16 @@ Task<std::unique_ptr<ISocket>> DialEndpoint(IConnector* connector,
     auto const split = SplitHostPort(hostPort);
     if (!split.has_value())
         co_return nullptr;
+    // An EMPTY host is that same misconfiguration reached by a different
+    // spelling -- `:6674` and `[]:6674` both split cleanly and name nobody, so the
+    // guard above does not see them. `Detail::RunConnectFlow` refuses an empty
+    // host, so nothing is reachable through this; what it buys is that the
+    // refusal is THIS layer's, which is the difference between "no connector was
+    // asked" and "a connector was asked and said no". The distinction is the one
+    // `EndpointDial_test`'s `RecordingConnector` exists to make, and it matters
+    // for a caller holding a connector that does not share the funnel.
+    if (split->first.empty())
+        co_return nullptr;
     auto const port = ParseTcpPort(split->second);
     if (!port.has_value())
         co_return nullptr;
