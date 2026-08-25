@@ -147,6 +147,7 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     // field a value differing from its default so every emitter fires.
     cfg.cacheMemoryBytes = 512 * 1024 * 1024;
     cfg.cacheDir = "cache";
+    cfg.cacheDiskBytes = 40ULL * 1024 * 1024 * 1024;
     cfg.cacheListen = "127.0.0.1:6679";
     cfg.upstream = "cache.internal:6674";
     cfg.nodeId = "n1";

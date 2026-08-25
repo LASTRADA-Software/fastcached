@@ -149,6 +149,15 @@ struct NodeConfig
     /// objects, small enough that nobody notices it.
     std::uint64_t cacheMemoryBytes { 256ULL * 1024ULL * 1024ULL };
 
+    /// Bytes the on-disk half may hold. 0 means "grow as needed".
+    ///
+    /// Only consulted when `cacheDir` names a path; without one there is no disk
+    /// tier for a budget to bound. Unbounded by default, matching the daemon's
+    /// `--storage-max-disk` -- a cache asked to survive restarts is usually asked
+    /// to keep what it has -- but a node runs on somebody's workstation, so this
+    /// is the flag that exists because that default is not always the right one.
+    std::uint64_t cacheDiskBytes { 0 };
+
     /// Where this node serves cache verbs to its local clients; empty turns it off.
     ///
     /// Defaults to the address `fastcache-cc` already looks at when nobody sets

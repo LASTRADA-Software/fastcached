@@ -3,11 +3,20 @@
 #include "NodeIoLoop.hpp"
 #include "RemoteUpstream.hpp"
 
+#include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Cache/LayeredStorage.hpp>
+#include <FastCache/Cache/ShardedStorage.hpp>
 #include <FastCache/Config/ByteSize.hpp>
 
 #include <chrono>
+#include <cstddef>
+#include <filesystem>
+#include <format>
+#include <string_view>
+#include <system_error>
 #include <utility>
+#include <vector>
 
 namespace FastCache::Node
 {
@@ -27,6 +36,97 @@ namespace
     /// resolve-plus-connect budget nobody chose: five seconds is a sensible
     /// per-operation bound and a very long time to wait for a TCP handshake.
     constexpr std::chrono::milliseconds UpstreamConnectTimeout { 1'000 };
+
+    /// What the on-disk tier's B+tree is called inside `--cache-dir`.
+    ///
+    /// A file inside the directory rather than the directory itself, because the
+    /// operator named a place to keep a cache and this tier is entitled to put more
+    /// than one thing there later. It also keeps `--cache-dir` safe to point at a
+    /// path that does not exist yet, which is what an operator will do.
+    constexpr std::string_view DiskStoreFileName = "objects.cow";
+
+    /// Largest single object the on-disk tier accepts.
+    ///
+    /// `CowTreeStorage`'s own default is 1 MiB, which is right for the memcached
+    /// values it was written for and wrong here by an order of magnitude: a
+    /// compile object for a template-heavy translation unit is routinely several,
+    /// and refusing exactly the objects most worth not rebuilding would be a cache
+    /// that quietly works least where it matters most. 256 MiB is what the daemon's
+    /// `--storage-max-value` defaults to, and the page size is a fixed 16 KiB
+    /// regardless -- a large value spills to overflow pages rather than widening
+    /// every page in the file.
+    constexpr std::size_t DiskMaxValueBytes = 256ULL * 1024ULL * 1024ULL;
+
+    /// Open the on-disk half of the tier under `--cache-dir`.
+    /// @param cfg The parsed configuration; `cacheDir` must not be empty.
+    /// @return The store, or why it could not be opened.
+    [[nodiscard]] std::expected<std::unique_ptr<IStorage>, std::string> OpenDiskTier(NodeConfig const& cfg)
+    {
+        auto error = std::error_code {};
+        std::filesystem::create_directories(cfg.cacheDir, error);
+        if (error)
+            return std::unexpected { std::format("cannot create {}: {}", cfg.cacheDir.string(), error.message()) };
+
+        // ONE process per directory, and nothing here enforces it. The page store
+        // takes no inter-process lock: on Windows it opens with `FILE_SHARE_READ`,
+        // so a second node is refused outright, and on POSIX it does not lock at
+        // all, so two would write the same meta pages and corrupt the tree in
+        // silence. The daemon's `--storage` has exactly this property (issue #135)
+        // and it is stated here because `--cache-dir` is the flag most likely to be
+        // copied between two nodes on one machine.
+        CowTreeStorage::Options options;
+        options.path = cfg.cacheDir / DiskStoreFileName;
+        options.maxBytes = static_cast<std::size_t>(cfg.cacheDiskBytes);
+        options.maxValueBytes = DiskMaxValueBytes;
+        auto opened = CowTreeStorage::Open(options);
+        if (!opened.has_value())
+            return std::unexpected { std::format("cannot open {}: {}", options.path.string(), opened.error().ToString()) };
+        return std::move(*opened);
+    }
+
+    /// Assemble the storage the operator asked for.
+    ///
+    /// The on-disk half does its reads and writes on the reactor thread the node's
+    /// framed surfaces share, so a page split or a batched flush stalls every other
+    /// connection on that loop for its duration -- issue #136. Opt-in, and this
+    /// flag did nothing at all before, so nothing regresses; it is stated because
+    /// it is the property somebody profiling a slow node will need.
+    ///
+    /// Two independent halves, each present only when it was configured: the
+    /// in-memory one when `--cache-memory` is non-zero, the on-disk one when
+    /// `--cache-dir` names a path. Both together are the `LayeredStorage` the
+    /// daemon's `--storage` builds -- an LRU mirror over a canonical B+tree.
+    ///
+    /// Whatever comes out is wrapped in a single-shard `ShardedStorage`, and that
+    /// wrapper is not about sharding. It is the lock: this tier is mutated on the
+    /// reactor thread and its statistics are read by the heartbeat thread and by
+    /// whatever scrapes `/metrics`, and `Snapshot()` on these backends writes a
+    /// `mutable` member. The daemon reaches for the same wrapper for the same
+    /// reason, which is why its `useShardingWrapper` includes `metricsEnabled`.
+    /// @param cfg The parsed configuration; at least one half must be configured.
+    /// @return The storage, or why the on-disk half could not be opened.
+    [[nodiscard]] std::expected<std::unique_ptr<IStorage>, std::string> BuildStorage(NodeConfig const& cfg)
+    {
+        std::unique_ptr<IStorage> storage;
+        if (!cfg.cacheDir.empty())
+        {
+            auto disk = OpenDiskTier(cfg);
+            if (!disk.has_value())
+                return std::unexpected { std::move(disk.error()) };
+            storage = std::move(*disk);
+        }
+
+        if (cfg.cacheMemoryBytes != 0)
+        {
+            auto memory = std::make_unique<InMemoryLruStorage>(static_cast<std::size_t>(cfg.cacheMemoryBytes));
+            storage = storage == nullptr ? std::unique_ptr<IStorage> { std::move(memory) }
+                                         : std::make_unique<LayeredStorage>(std::move(memory), std::move(storage));
+        }
+
+        std::vector<std::unique_ptr<IStorage>> shards;
+        shards.push_back(std::move(storage));
+        return std::make_unique<ShardedStorage>(std::move(shards));
+    }
 } // namespace
 
 CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
@@ -44,6 +144,7 @@ CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
 
 std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLoop& io,
                                                                         NodeConfig const& cfg,
+                                                                        std::unique_ptr<IStorage> storage,
                                                                         Distributed::IMembershipOracle const& membership,
                                                                         IClock& clock,
                                                                         IMetricsSink& metrics,
@@ -71,12 +172,8 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
                                                     UpstreamConnectTimeout,
                                                     UpstreamIoTimeout);
 
-    auto tier = std::unique_ptr<CacheTier> { new CacheTier {
-        std::make_unique<InMemoryLruStorage>(static_cast<std::size_t>(cfg.cacheMemoryBytes)),
-        std::move(upstream),
-        membership,
-        clock,
-        metrics } };
+    auto tier =
+        std::unique_ptr<CacheTier> { new CacheTier { std::move(storage), std::move(upstream), membership, clock, metrics } };
 
     // Loopback for a bare port, the OPPOSITE of the scheduler's wildcard: this is the
     // surface `fastcache-cc` on this machine talks to, and a node's private cache
@@ -87,10 +184,20 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
         return std::unexpected { started.error() };
 
     tier->_endpoint = std::move(*started);
+    // Each half named separately, and an absent one said out loud. "256m in
+    // memory, no disk" and "no memory, 10g on disk" are different deployments and
+    // an operator reading one startup line has to be able to tell which they got.
     logger.Logf(LogLevel::Info,
-                "local cache on {} ({}, upstream {})",
+                "local cache on {} (memory {}, disk {}, upstream {})",
                 tier->BoundEndpoint(),
-                FormatByteSize(static_cast<std::size_t>(cfg.cacheMemoryBytes)),
+                cfg.cacheMemoryBytes == 0 ? std::string { "off" }
+                                          : FormatByteSize(static_cast<std::size_t>(cfg.cacheMemoryBytes)),
+                cfg.cacheDir.empty()
+                    ? std::string { "off" }
+                    : std::format("{} at {}",
+                                  cfg.cacheDiskBytes == 0 ? std::string { "unbounded" }
+                                                          : FormatByteSize(static_cast<std::size_t>(cfg.cacheDiskBytes)),
+                                  cfg.cacheDir.string()),
                 cfg.upstream.empty() ? std::string { "none" } : cfg.upstream);
     return tier;
 }
@@ -108,7 +215,33 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
     if (cfg.cacheListen.empty())
         return std::unique_ptr<CacheTier> {};
 
-    auto started = CacheTier::Start(io, cfg, membership, clock, metrics, logger);
+    // Neither half configured, which is what `--cache-memory 0` means without a
+    // `--cache-dir` beside it: there is nothing to keep objects in, so there is no
+    // tier. Said out loud rather than left to produce a cache port answering out of
+    // nothing.
+    if (cfg.cacheMemoryBytes == 0 && cfg.cacheDir.empty())
+    {
+        logger.Logf(LogLevel::Info, "--cache-memory 0 and no --cache-dir; serving no local cache tier");
+        return std::unique_ptr<CacheTier> {};
+    }
+
+    // Built HERE rather than inside `Start`, because the two failures below are not
+    // equally tolerable and only this function can tell them apart. A store that
+    // will not open is always fatal -- the operator named a path, and carrying on
+    // with a memory-only cache would silently deliver less than they configured --
+    // while a port that will not bind is fatal only when they typed it. Building
+    // inside `Start` collapsed both into one string, so a bad `--cache-dir` on a
+    // node using the DEFAULT cache port would have been logged as a warning and
+    // stepped over.
+    // Each failure names the flag that caused it. They leave through one return
+    // type, so without this a bad `--cache-dir` reached the operator as
+    // "--listen-cache cannot create /var/lib/...: permission denied" -- which
+    // sends them to check a port.
+    auto storage = BuildStorage(cfg);
+    if (!storage.has_value())
+        return std::unexpected { std::format("--cache-dir {}", storage.error()) };
+
+    auto started = CacheTier::Start(io, cfg, std::move(*storage), membership, clock, metrics, logger);
     if (started.has_value())
         return std::move(*started);
 
@@ -118,7 +251,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
     // `fastcached` would otherwise refuse to start over a convenience nobody
     // requested. Typed, it is a promise, and a broken promise is fatal.
     if (cfg.cacheListen != NodeConfig {}.cacheListen)
-        return std::unexpected { started.error() };
+        return std::unexpected { std::format("--listen-cache {}", started.error()) };
 
     // Never silent. The launcher will reach whatever else holds that port -- very
     // likely the daemon -- so the build still works, but "the cache quietly did less

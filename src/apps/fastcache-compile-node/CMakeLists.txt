@@ -75,6 +75,7 @@ if(FASTCACHED_BUILD_TESTS)
         CacheProxy.cpp
         CacheProxy_test.cpp
         CacheTier.cpp
+        CacheTier_test.cpp
         ClusterAdminCli.cpp
         ClusterAdminCli_test.cpp
         ConsensusTier.cpp
