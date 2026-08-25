@@ -1608,3 +1608,107 @@ TEST_CASE("A node with no cluster grants no votes", "[consensus][raft][membershi
     CHECK(replies[0].decision == VoteDecision::Denied);
     CHECK_FALSE(node.VotedFor().has_value());
 }
+
+TEST_CASE("A deposed leader reports the term that deposed it and who carried it", "[consensus][raft][diagnostics]")
+{
+    // The one transition this node did not decide for itself, and the one a log
+    // dump could not previously explain: role lines said leadership moved and
+    // nothing said why, so an intermittent election was diagnosable from its logs
+    // or not at all -- which is issue #117.
+    Fixture fixture;
+    (void) fixture.ElectAsLeader();
+    REQUIRE(fixture.node.CurrentRole() == Role::Leader);
+
+    auto const output = fixture.node.Receive(AppendEntriesRequest { .term = Term { .value = 2 },
+                                                                    .leaderId = "n3",
+                                                                    .prevLogIndex = LogIndex::BeforeFirst(),
+                                                                    .prevLogTerm = Term::None(),
+                                                                    .entries = {},
+                                                                    .leaderCommit = LogIndex::BeforeFirst() },
+                                             At(200));
+
+    REQUIRE(output.adoptedTerm.has_value());
+    auto const& adopted = Unwrap(output.adoptedTerm);
+    CHECK(adopted.previousTerm == Term { .value = 1 });
+    CHECK(adopted.previousRole == Role::Leader);
+    CHECK(adopted.from == "n3");
+}
+
+TEST_CASE("The sender a step-down names is read from whichever field carries it", "[consensus][raft][diagnostics]")
+{
+    // Every message identifies its sender and no two spell it the same way, so
+    // the attribution is only as good as its least-used arm. A response is the
+    // one that gets forgotten: the §5.1 rule applies to answers as well as
+    // requests, and the field is `voterId` or `followerId` rather than the
+    // `leaderId` the obvious case reads.
+    auto const senders = std::vector<std::pair<RaftMessage, NodeId>> {
+        { RequestVoteRequest { .term = Term { .value = 4 },
+                               .candidateId = "candidate-node",
+                               .lastLogIndex = LogIndex::BeforeFirst(),
+                               .lastLogTerm = Term::None() },
+          "candidate-node" },
+        { RequestVoteResponse { .term = Term { .value = 4 }, .decision = VoteDecision::Denied, .voterId = "voter-node" },
+          "voter-node" },
+        { AppendEntriesResponse { .term = Term { .value = 4 },
+                                  .result = AppendResult::Rejected,
+                                  .matchIndex = LogIndex::BeforeFirst(),
+                                  .followerId = "follower-node" },
+          "follower-node" },
+        { InstallSnapshotResponse { .term = Term { .value = 4 },
+                                    .result = AppendResult::Rejected,
+                                    .matchIndex = LogIndex::BeforeFirst(),
+                                    .followerId = "snapshot-follower" },
+          "snapshot-follower" },
+    };
+
+    for (auto const& [message, expected]: senders)
+    {
+        Fixture fixture;
+        auto const output = fixture.node.Receive(message, At(10));
+
+        REQUIRE(output.adoptedTerm.has_value());
+        CHECK(Unwrap(output.adoptedTerm).from == expected);
+    }
+}
+
+TEST_CASE("A step-down is reported only when a higher term actually arrived", "[consensus][raft][diagnostics]")
+{
+    // The report is the *cause* of a demotion, so anything that leaves the term
+    // alone must not produce one -- otherwise a reader chasing an election storm
+    // is handed a line per heartbeat. The pre-vote exemptions matter most here:
+    // both carry a term above this node's and neither demotes anybody.
+    Fixture fixture;
+
+    SECTION("a heartbeat of the node's own term")
+    {
+        (void) fixture.StandForElection();
+        auto const output = fixture.node.Receive(AppendEntriesRequest { .term = Term { .value = 1 },
+                                                                        .leaderId = "n2",
+                                                                        .prevLogIndex = LogIndex::BeforeFirst(),
+                                                                        .prevLogTerm = Term::None(),
+                                                                        .entries = {},
+                                                                        .leaderCommit = LogIndex::BeforeFirst() },
+                                                 At(200));
+        CHECK_FALSE(output.adoptedTerm.has_value());
+    }
+
+    SECTION("a pre-vote request asking about a term nobody has entered")
+    {
+        auto const output = fixture.node.Receive(PreVoteRequest { .term = Term { .value = 9 },
+                                                                  .candidateId = "n2",
+                                                                  .lastLogIndex = LogIndex::BeforeFirst(),
+                                                                  .lastLogTerm = Term::None() },
+                                                 At(200));
+        CHECK_FALSE(output.adoptedTerm.has_value());
+        CHECK(fixture.node.CurrentTerm() == Term {});
+    }
+
+    SECTION("a granted pre-vote response echoing that term")
+    {
+        (void) fixture.node.Tick(At(ElectionMin.count()));
+        auto const output = fixture.node.Receive(
+            PreVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+            At(ElectionMin.count()));
+        CHECK_FALSE(output.adoptedTerm.has_value());
+    }
+}

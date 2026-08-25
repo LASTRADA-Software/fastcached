@@ -356,7 +356,16 @@ class RaftNode
     /// request. A leader that ignores a higher term arriving on an
     /// AppendEntriesResponse keeps believing it leads a term the cluster has
     /// moved past, and goes on answering clients as though it did.
-    void StepDown(Term term, TimePoint now, RaftOutput& output);
+    ///
+    /// Reports itself through `output.adoptedTerm`, naming `from`. That is the
+    /// only place the cause of a step-down is known: by the time a driver sees
+    /// the new role, the term and role it replaced are gone and the message that
+    /// carried it has been handled.
+    /// @param term The higher term to adopt.
+    /// @param from The peer whose message carried it.
+    /// @param now Current time.
+    /// @param output Where the report and any durable state are collected.
+    void StepDown(Term term, NodeId const& from, TimePoint now, RaftOutput& output);
 
     /// Win the election and start heartbeating.
     void BecomeLeader(TimePoint now, RaftOutput& output);
@@ -473,6 +482,18 @@ class RaftNode
 
     /// The term carried by any message, so the §5.1 rule can be applied once.
     [[nodiscard]] static Term TermOf(RaftMessage const& message) noexcept;
+
+    /// Who sent a message, so the §5.1 rule can say what disturbed this node.
+    ///
+    /// Every message carries exactly one member id and it is always the sender —
+    /// but spelled four different ways, so this cannot be the one-line `std::visit`
+    /// `TermOf` is. Detected rather than enumerated: eight near-identical arms
+    /// differing only in a field name is the copy-paste this codebase treats as a
+    /// defect, and a ninth message type naming its sender something else fails to
+    /// compile here rather than going quietly unattributed.
+    /// @param message The message being received.
+    /// @return The sender's id.
+    [[nodiscard]] static NodeId SenderOf(RaftMessage const& message);
 
     RaftConfig _config;
 

@@ -56,6 +56,36 @@ namespace FastCache::Node
 /// @return The endpoint to advertise, empty when there is nothing to advertise.
 [[nodiscard]] std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::string_view schedulerBound);
 
+/// The line announcing what this node has become.
+///
+/// The **term** is what makes a dump readable after the fact. Without it the log
+/// says leadership moved and nothing about how often, so an election that
+/// reproduces once in N CI runs is diagnosable from its logs or not at all --
+/// which is what issue #117 was, and why nobody could tell whether the algorithm
+/// or the fixture was wrong.
+///
+/// A free function for the reason `AdvertisedSchedulerEndpoint` is: the wording
+/// is the diagnostic, and a rendering reachable only from a running tier is one
+/// no case can read.
+/// @param role What this node is, in the scheduler's vocabulary.
+/// @param term The consensus term it is playing it in.
+/// @param leaderEndpoint Where its leader answers; empty when there is none or
+///        when this node is it.
+/// @return The line, without a level or a newline.
+[[nodiscard]] std::string DescribeRole(Distributed::SchedulerRole role,
+                                       Consensus::Term term,
+                                       std::string_view leaderEndpoint);
+
+/// The line explaining a demotion that a peer's higher term caused.
+///
+/// Named with the CONSENSUS role rather than the scheduler's, because
+/// `pre-candidate` and `candidate` both read as `undecided` there and which of
+/// them was demoted is most of the answer.
+/// @param adopted The term this node has just adopted.
+/// @param cause What it was, and who carried the term.
+/// @return The line, without a level or a newline.
+[[nodiscard]] std::string DescribeTermAdoption(Consensus::Term adopted, Consensus::TermAdoption const& cause);
+
 /// Consensus, running.
 ///
 /// **What this replaces is the reason it exists.** Until now every node called
@@ -268,9 +298,11 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     /// for an election timeout, from a peer reader for a message that deposed this
     /// node. It does the one thing consensus cannot: turn a leader's *id* into the
     /// *address* a client redirects to, which only the replicated state knows.
-    /// @param role What consensus says this node is.
-    /// @param knownLeader Who it believes leads, if anybody.
-    void PublishRole(Consensus::Role role, std::optional<Consensus::NodeId> const& knownLeader);
+    /// It is also where a deposition is reported, because the driver's report is
+    /// the only thing that carries *why* -- and the answer is gone by the time
+    /// anyone could ask the node.
+    /// @param change What consensus says this node is now, and what moved it.
+    void PublishRole(Consensus::RaftDriver::RoleChange const& change);
 
     /// Tell the scheduler what this node is, if that has changed since last time.
     ///
@@ -383,7 +415,13 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     MembersObserver _onMembers;
 
     /// What consensus last said, so a state change can be re-read against it.
+    ///
+    /// The term is carried for the log line rather than for any decision: a role
+    /// without one says leadership moved and nothing about how often, which is the
+    /// difference between a dump that can be read after an intermittent election
+    /// and one that cannot.
     Consensus::Role _lastRole { Consensus::Role::Follower };
+    Consensus::Term _lastTerm {};
     std::optional<Consensus::NodeId> _lastLeader;
 
     /// What the scheduler was last told, so an unchanged answer is not re-announced.
@@ -393,6 +431,15 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     /// leader this node already knew about.
     Distributed::SchedulerRole _publishedRole { Distributed::SchedulerRole::Undecided };
     std::string _publishedEndpoint;
+
+    /// What the LOG was last told, which is deliberately a different question.
+    ///
+    /// The scheduler needs to hear a role and an address and has no use for a term;
+    /// a reader of the log needs the term most of all, because three roles collapse
+    /// to two here and a node campaigning round after round is `Undecided` with no
+    /// endpoint every single time. Sharing one suppression test between the two
+    /// makes the storm silent to keep the scheduler quiet.
+    Consensus::Term _publishedTerm {};
 
     /// Whether the scheduler has been told anything at all yet.
     ///

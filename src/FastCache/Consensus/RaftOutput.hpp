@@ -76,6 +76,25 @@ struct OutboundMessage
     RaftMessage message; ///< What to send.
 };
 
+/// A peer's higher term arrived and demoted this node (§5.1).
+///
+/// The one event in this algorithm that ends a leadership without this node
+/// deciding anything, and until it was reported a log dump could show only
+/// *that* leadership moved. Which peer carried the term is the half that names a
+/// disruptor; the previous term and role are what tell an election storm apart
+/// from one node returning from a partition.
+///
+/// Carried out through the output channel rather than logged where it happens,
+/// for the reason `persist` is: `RaftNode` holds no logger, reads no clock and
+/// is a pure function of (state, event) — a diagnostic that reached out from
+/// inside it would be the one side effect a simulation could not observe.
+struct TermAdoption
+{
+    Term previousTerm {}; ///< What this node held before adopting.
+    Role previousRole {}; ///< What it was playing, so a deposed leader stands out.
+    NodeId from;          ///< The peer whose message carried the higher term.
+};
+
 /// A snapshot the application must adopt wholesale.
 ///
 /// Emitted when a follower receives state covering more than its log holds. The
@@ -171,6 +190,17 @@ struct RaftOutput
     /// alternative ways to reach the same point, and handing over both would
     /// have the application replay entries the snapshot already includes.
     std::optional<RaftSnapshot> restoreSnapshot;
+
+    /// Why this node's role moved, when a peer's higher term moved it; absent
+    /// otherwise.
+    ///
+    /// Nothing to *do*, unlike every field above it — which is the point of
+    /// putting it here rather than inventing a second channel. A driver that
+    /// ignores it is still correct; one that reports it turns "leadership moved"
+    /// into "leadership moved because n3 arrived holding term 2", which is the
+    /// difference between a log that can be read after the fact and one that
+    /// cannot.
+    std::optional<TermAdoption> adoptedTerm;
 };
 
 } // namespace FastCache::Consensus

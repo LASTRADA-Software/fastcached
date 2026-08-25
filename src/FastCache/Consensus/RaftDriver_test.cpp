@@ -8,15 +8,20 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Consensus;
 using namespace std::chrono_literals;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -624,4 +629,131 @@ TEST_CASE("A snapshot that cannot be written stops the driver", "[consensus][raf
     // Latched: the next call refuses with the same error rather than pretending
     // this node is still taking part.
     CHECK(!driver.Tick(TimePoint {} + 400ms).has_value());
+}
+
+TEST_CASE("A role change is reported with the term it happened in", "[consensus][raft][driver]")
+{
+    // Nothing covered `ObserveRole` at all, which is how the daemon's role line
+    // came to carry no term: the observer is the only route the fact travels, and
+    // an untested route is one that can quietly stop carrying anything.
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    RecordingMachine machine { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    RaftDriver driver {
+        std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine
+    };
+
+    auto reported = std::vector<RaftDriver::RoleChange> {};
+    driver.ObserveRole([&reported](RaftDriver::RoleChange const& change) { reported.push_back(change); });
+
+    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(
+        driver
+            .Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+                     TimePoint {} + 150ms)
+            .has_value());
+
+    REQUIRE_FALSE(reported.empty());
+    CHECK(reported.back().role == Role::Leader);
+    CHECK(reported.back().term == Term { .value = 1 });
+    CHECK(reported.back().knownLeader == std::optional<NodeId> { "n1" });
+    CHECK_FALSE(reported.back().cause.has_value());
+}
+
+TEST_CASE("A deposition is reported with the peer that caused it", "[consensus][raft][driver]")
+{
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    RecordingMachine machine { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    RaftDriver driver {
+        std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine
+    };
+
+    auto reported = std::vector<RaftDriver::RoleChange> {};
+    driver.ObserveRole([&reported](RaftDriver::RoleChange const& change) { reported.push_back(change); });
+
+    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(
+        driver
+            .Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+                     TimePoint {} + 150ms)
+            .has_value());
+    reported.clear();
+
+    REQUIRE(driver
+                .Receive(AppendEntriesRequest { .term = Term { .value = 2 },
+                                                .leaderId = "n3",
+                                                .prevLogIndex = LogIndex::BeforeFirst(),
+                                                .prevLogTerm = Term::None(),
+                                                .entries = {},
+                                                .leaderCommit = LogIndex::BeforeFirst() },
+                         TimePoint {} + 200ms)
+                .has_value());
+
+    REQUIRE(reported.size() == 1);
+    CHECK(reported[0].role == Role::Follower);
+    CHECK(reported[0].term == Term { .value = 2 });
+    REQUIRE(reported[0].cause.has_value());
+    auto const& cause = Unwrap(reported[0].cause);
+    CHECK(cause.from == "n3");
+    CHECK(cause.previousRole == Role::Leader);
+    CHECK(cause.previousTerm == Term { .value = 1 });
+}
+
+TEST_CASE("A term that moves without the role moving is still reported", "[consensus][raft][driver]")
+{
+    // The case a report keyed on (role, leader) alone cannot see, and the one
+    // somebody reads a dump to find. A node being disturbed by a peer that keeps
+    // campaigning is a follower knowing no leader before and after each round, so
+    // keying on those two says nothing at all while the term climbs -- which is
+    // exactly the storm issue #117's dump could not be read for.
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    RecordingMachine machine { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    RaftDriver driver {
+        std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine
+    };
+
+    auto reported = std::vector<RaftDriver::RoleChange> {};
+    driver.ObserveRole([&reported](RaftDriver::RoleChange const& change) { reported.push_back(change); });
+
+    // Two campaigns by a peer, well inside this node's own election timeout so it
+    // never stands for anything itself. It is a follower with no known leader
+    // throughout -- the state it started in -- and only the term moves.
+    for (auto const term: { std::uint64_t { 2 }, std::uint64_t { 3 } })
+        REQUIRE(driver
+                    .Receive(RequestVoteRequest { .term = Term { .value = term },
+                                                  .candidateId = "n2",
+                                                  .lastLogIndex = LogIndex::BeforeFirst(),
+                                                  .lastLogTerm = Term::None() },
+                             TimePoint {} + 10ms)
+                    .has_value());
+
+    // Collected with a loop rather than `std::ranges::to`, which this repository
+    // uses nowhere else and which does not compile under clang against
+    // libstdc++ 14 -- one of the standard libraries CI builds against.
+    auto terms = std::vector<std::uint64_t> {};
+    for (auto const& change: reported)
+        terms.push_back(change.term.value);
+
+    CHECK(terms == std::vector<std::uint64_t> { 2, 3 });
+
+    for (auto const& change: reported)
+    {
+        CHECK(change.role == Role::Follower);
+        CHECK_FALSE(change.knownLeader.has_value());
+        REQUIRE(change.cause.has_value());
+        CHECK(Unwrap(change.cause).from == "n2");
+    }
 }

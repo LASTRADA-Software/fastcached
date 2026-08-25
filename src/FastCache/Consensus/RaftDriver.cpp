@@ -20,6 +20,7 @@ RaftDriver::RaftDriver(RaftNode node,
     _application { application },
     _compaction { compaction },
     _reportedRole { _node.CurrentRole() },
+    _reportedTerm { _node.CurrentTerm() },
     _reportedLeader { _node.KnownLeader() }
 {
 }
@@ -29,17 +30,19 @@ void RaftDriver::ObserveRole(RoleObserver observer)
     _onRole = std::move(observer);
 }
 
-void RaftDriver::PublishRoleIfChanged()
+void RaftDriver::PublishRoleIfChanged(std::optional<TermAdoption> const& cause)
 {
     auto const role = _node.CurrentRole();
+    auto const term = _node.CurrentTerm();
     auto const& leader = _node.KnownLeader();
-    if (role == _reportedRole && leader == _reportedLeader)
+    if (role == _reportedRole && term == _reportedTerm && leader == _reportedLeader)
         return;
 
     _reportedRole = role;
+    _reportedTerm = term;
     _reportedLeader = leader;
     if (_onRole)
-        _onRole(role, leader);
+        _onRole(RoleChange { .role = role, .term = term, .knownLeader = leader, .cause = cause });
 }
 
 RaftNode const& RaftDriver::Node() const noexcept
@@ -123,7 +126,7 @@ std::expected<void, ConsensusError> RaftDriver::Deliver(RaftOutput output)
     // acting on a leadership this node had not yet established -- and if a storage
     // write above fails, the early return means it is never told at all, which is
     // correct: a node whose durable state would not write has not become anything.
-    PublishRoleIfChanged();
+    PublishRoleIfChanged(output.adoptedTerm);
 
     // And only now is there anything to compact: the entries this step applied are
     // what moved `LastApplied` past the snapshot boundary.
