@@ -366,4 +366,9 @@ StorageStats TracingStorage::Snapshot() const noexcept
     return _inner.Snapshot();
 }
 
+TieredStorageStats TracingStorage::SnapshotTiers() const noexcept
+{
+    return _inner.SnapshotTiers();
+}
+
 } // namespace FastCache

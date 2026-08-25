@@ -132,6 +132,7 @@ class NotifyingStorage final: public IStorage
     std::size_t PurgeExpired(TimePoint now) override;
     void Resize(std::size_t newMaxBytes) override;
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
+    [[nodiscard]] TieredStorageStats SnapshotTiers() const noexcept override;
     [[nodiscard]] bool SupportsSharedRead() const noexcept override;
     void PromoteOnRead(std::string_view key, TimePoint now) override;
 

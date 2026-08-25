@@ -390,30 +390,24 @@ StorageStats ShardedStorage::Snapshot() const noexcept
     for (auto const& shard: _shards)
     {
         std::unique_lock const lock { shard->mu };
-        auto const s = shard->storage->Snapshot();
-        aggregate.itemCount += s.itemCount;
-        aggregate.bytesUsed += s.bytesUsed;
-        aggregate.bytesLimit += s.bytesLimit;
-        aggregate.evictions += s.evictions;
-        aggregate.cmdGet += s.cmdGet;
-        aggregate.cmdSet += s.cmdSet;
-        aggregate.cmdTouch += s.cmdTouch;
-        aggregate.cmdFlush += s.cmdFlush;
-        aggregate.getHits += s.getHits;
-        aggregate.getMisses += s.getMisses;
-        aggregate.deleteHits += s.deleteHits;
-        aggregate.deleteMisses += s.deleteMisses;
-        aggregate.incrHits += s.incrHits;
-        aggregate.incrMisses += s.incrMisses;
-        aggregate.decrHits += s.decrHits;
-        aggregate.decrMisses += s.decrMisses;
-        aggregate.touchHits += s.touchHits;
-        aggregate.touchMisses += s.touchMisses;
-        aggregate.casHits += s.casHits;
-        aggregate.casMisses += s.casMisses;
-        aggregate.casBadval += s.casBadval;
-        aggregate.evictedUnfetched += s.evictedUnfetched;
-        aggregate.expiredUnfetched += s.expiredUnfetched;
+        // Summed by walking the field table rather than by twenty-three `+=`
+        // lines, one per field. The hand-written list had already drifted --
+        // `writeErrors` was added to `StorageStats` and never added here -- and
+        // it only failed to matter because the decorator that populates it wraps
+        // this class rather than its shards. A sum that is right by where a
+        // wrapper happens to sit is one field's worth of luck.
+        AddInto(aggregate, shard->storage->Snapshot());
+    }
+    return aggregate;
+}
+
+TieredStorageStats ShardedStorage::SnapshotTiers() const noexcept
+{
+    TieredStorageStats aggregate {};
+    for (auto const& shard: _shards)
+    {
+        std::unique_lock const lock { shard->mu };
+        AddInto(aggregate, shard->storage->SnapshotTiers());
     }
     return aggregate;
 }

@@ -140,6 +140,16 @@ class WriteErrorReportingStorage final: public IStorage
     ///         of persistence-class write failures observed by this decorator.
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
 
+    /// @return The inner storage's tiers, unchanged.
+    ///
+    /// `writeErrors` is deliberately NOT stamped onto them. This decorator sees a
+    /// refusal and not which store refused, so any tier it picked would be a
+    /// guess -- and stating the same count on every tier would be worse still,
+    /// because folding two tiered snapshots together sums them field by field and
+    /// would count one decorator's failures once per tier it wraps. The number
+    /// belongs to the composite, which is where `Snapshot()` reports it.
+    [[nodiscard]] TieredStorageStats SnapshotTiers() const noexcept override;
+
   private:
     /// Classify, count, and log a value write whose result is an error. A
     /// persistence-class failure (see the class comment) increments the counter

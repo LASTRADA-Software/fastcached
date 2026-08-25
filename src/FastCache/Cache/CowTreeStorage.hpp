@@ -207,6 +207,14 @@ class CowTreeStorage final: public IStorage
     std::size_t PurgeExpired(TimePoint now) override;
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
 
+    /// This tier's statistics, reported as the DISK tier.
+    ///
+    /// Overridden rather than left to the default, which describes a backend that
+    /// is one in-memory tier. A CoW tree that reported itself as memory would put a
+    /// node's whole on-disk cache under the label an operator reads as RAM.
+    /// @return One entry, at `StorageTier::Disk`.
+    [[nodiscard]] TieredStorageStats SnapshotTiers() const noexcept override;
+
     /// Reconfigure the byte budget at runtime. Evicts as needed.
     void Resize(std::size_t newMaxBytes) override;
 

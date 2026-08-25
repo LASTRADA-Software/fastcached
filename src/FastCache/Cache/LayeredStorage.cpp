@@ -355,6 +355,24 @@ StorageStats LayeredStorage::Snapshot() const noexcept
     return l2Stats;
 }
 
+TieredStorageStats LayeredStorage::SnapshotTiers() const noexcept
+{
+    // Each tier answers for itself, so the mirror above and the canonical store
+    // below land under their own labels rather than one being patched over the
+    // other. Which label each takes is that store's own answer -- an L2 that is a
+    // CoW tree says disk, one that is another in-memory cache says memory -- so a
+    // test double standing in for the disk tier is not mislabelled here.
+    //
+    // Deliberately WITHOUT this composite's `_stats` patched over them, which is
+    // the one thing `Snapshot()` above does and this must not. Those counters
+    // describe reads of the pair; these describe reads of each store, and L2 sees
+    // only what L1 missed. Adding the two tiers' hit/miss together therefore does
+    // not give the composite's, and is not meant to -- see `IStorage::SnapshotTiers`.
+    auto tiers = _l1->SnapshotTiers();
+    AddInto(tiers, _l2->SnapshotTiers());
+    return tiers;
+}
+
 void LayeredStorage::Resize(std::size_t newL1MaxBytes)
 {
     _l1->Resize(newL1MaxBytes);
