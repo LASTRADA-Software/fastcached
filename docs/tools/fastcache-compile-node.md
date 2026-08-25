@@ -597,12 +597,21 @@ worker that token is what the scheduler authenticates it *by*. Put it in a
 config file the service account can read, or set it with a supervisor override.
 
 **macOS scope.** `--service-scope=user` registers a LaunchAgent that runs as
-you, which is the per-developer case and works today. `--service-scope=system`
-registers a LaunchDaemon that must run as the unprivileged `fastcache-node`
-account — the same one the Linux unit uses — and **is refused until that account
-exists**, because a system job with no account named runs as *root*, and this
-process compiles input that arrived over the network. Creating it is packaging
-work that has not landed ([#87](https://github.com/LASTRADA-Software/fastcached/issues/87)).
+you, which is the per-developer case. `--service-scope=system` registers a
+LaunchDaemon that runs as the unprivileged `fastcache-node` account — the same
+one the Linux unit uses — because a system job with no account named runs as
+*root*, and this process compiles input that arrived over the network.
+
+The `.pkg` creates that account, from its **Runtime** component, so it is there
+whichever launchd choice you made for `fastcached` itself. Installing from a
+tarball or a source build does not create it, and the registration is then
+refused with a message saying so rather than registering a job launchd would
+accept and never spawn.
+
+Neither scope bakes a `--config` or `--storage` into the registration: this
+worker takes neither flag, and a registration carrying one is a job that answers
+its own command line with `unrecognised argument` at every start. Everything the
+worker needs is on the `--install-service` command line itself.
 
 **Windows** registers an SCM service (auto-start, left stopped; `sc start
 FastCacheCompileNode`). The default service name is `FastCacheCompileNode`, not
@@ -830,11 +839,3 @@ For anything beyond a trusted build network, put mTLS in front of every port.
     differ by the clock alone. The POSIX fixture asserts strict byte-identity and
     should — GCC and clang embed nothing path-dependent without `-g`. If your
     build compares object bytes across machines, compare sections.
-
-## Not yet done
-
-- The macOS package does not create the `fastcache-node` account, so
-  `--install-service --service-scope=system` refuses there
-  ([#87](https://github.com/LASTRADA-Software/fastcached/issues/87)).
-  `--service-scope=user` works, and is the right answer on a developer machine
-  anyway.

@@ -197,9 +197,9 @@ sudo /opt/fastcached/bin/fastcached-uninstall
 A `.pkg` has no built-in uninstaller — `pkgutil --forget` only drops the
 receipt and deletes nothing — so that script ships as part of the package.
 It stops and unregisters the launchd jobs, removes `/opt/fastcached`, the
-`PATH` entry and the symlinks, deletes the `_fastcached` account, and
-forgets the receipts. Your own cache and logs under `~/Library` are left
-alone.
+`PATH` entry and the symlinks, deletes the `_fastcached` and
+`fastcache-node` accounts, and forgets the receipts. Your own cache and
+logs under `~/Library` are left alone.
 
 Apple Silicon only. On an Intel Mac, build from source.
 

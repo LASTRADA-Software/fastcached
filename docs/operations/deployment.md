@@ -87,6 +87,13 @@ The system scope needs the `_fastcached` service account, which the `.pkg`
 creates; installing from a tarball or a source build fails with a message
 saying so rather than registering a job launchd cannot spawn.
 
+The `.pkg` creates a second account, `fastcache-node`, for
+`fastcache-compile-node`. It is deliberately not shared with `_fastcached`: a
+worker runs a compiler on input that arrived over the network while `fastcached`
+owns the cache storage, so one account would let a compromised compile rewrite
+every cached object. It comes from the package's Runtime component, so it is
+present whichever launchd choice you made here, and the uninstaller removes both.
+
 Every flag you pass **on the command line** alongside `--install-service` is
 baked into the job's `ProgramArguments`, exactly as on Windows. Values read
 from a `--config` file are not: they stay in the file, so editing it and

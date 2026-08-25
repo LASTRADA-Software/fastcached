@@ -659,7 +659,18 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     for (auto const& toolchain: cfg.toolchains)
         argv.push_back(std::format("--toolchain={}", toolchain));
 
+    // Directories root will create for an account that is not root. Without the
+    // handover the worker's first write fails with EACCES, which launchd surfaces
+    // only as a job that exits over and over -- the same reason the daemon hands
+    // over its --storage.
+    //
+    // Only what the operator actually named, never a parent: `--cache-dir=/var/db/fc`
+    // must not reassign /var/db, shared with other system services, to an
+    // unprivileged compile account.
     std::vector<std::filesystem::path> owned;
+    for (auto const& directory: { cfg.cacheDir, cfg.clusterDir })
+        if (!directory.empty())
+            owned.emplace_back(directory);
 
     return ServiceSpec { .serviceName = cfg.serviceName,
                          .exePath = exePath,
@@ -680,7 +691,15 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          .serviceAccount = "fastcache-node",
                          .ownedDirectories = std::move(owned),
                          .inlineCredential = cfg.token.empty() ? InlineCredential::Absent : InlineCredential::Present,
-                         .configPath = {} };
+                         .configPath = {},
+                         // Empty, and load-bearing: this worker is configured
+                         // entirely from argv and NodeOptions() has neither
+                         // `--config` nor `--storage`. Naming an application here
+                         // would invite WithScopeDefaults to bake one in, and the
+                         // registration would then be a job that answers its own
+                         // command line with "unrecognised argument" at every
+                         // start -- reported installed, dead at every boot.
+                         .applicationName = {} };
 }
 
 std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)

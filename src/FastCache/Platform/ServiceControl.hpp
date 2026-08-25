@@ -118,6 +118,22 @@ struct ServiceSpec
     /// instead. It is not a hint that the combination is safe -- see
     /// `InlineCredentialRejection`.
     std::string configPath;
+
+    /// The application name this service's *files* are looked up under -- its
+    /// machine-wide configuration and its per-user cache -- or **empty** when the
+    /// service keeps neither.
+    ///
+    /// Empty is a real answer, not a missing one, and `WithScopeDefaults` turns on
+    /// it: a service named here is file-configured, so the installer may fill in a
+    /// `--config` or `--storage` the operator left unset. One that names nothing
+    /// is configured entirely from argv, and must be given neither.
+    ///
+    /// `fastcache-compile-node` is the second kind. Its parser rejects both flags,
+    /// so a registration carrying either produced a job that refused its own
+    /// command line at every start -- reported installed, dead at every boot,
+    /// which is exactly the shape this file refuses at install time. The name was
+    /// hardcoded to the daemon's before, so every spec got the daemon's defaults.
+    std::string applicationName;
 };
 
 /// Resolve the absolute path of the running executable.
@@ -271,6 +287,31 @@ struct ServiceSpec
 [[nodiscard]] std::string BuildLaunchdPlist(ServiceSpec const& spec,
                                             ServiceScope scope,
                                             std::filesystem::path const& logDirectory);
+
+/// Fill in the per-scope path arguments the operator left unset.
+///
+/// Pure, and declared here rather than kept private to the launchd
+/// implementation, for the reason BuildLaunchdPlist is: it decides what goes into
+/// a registration, so it has to be assertable on every platform. While it was
+/// private to the `__APPLE__` block no test could reach it, and it spent that
+/// time handing every service the *daemon's* defaults -- including one whose
+/// parser rejects them.
+///
+/// Decides nothing about the environment: `home` and `packagedConfig` are probed
+/// by the composition root and passed in, so the policy is testable against
+/// values that need not exist.
+///
+/// @param spec Service as described from the command line.
+/// @param scope Domain being installed into.
+/// @param home The invoking user's home directory.
+/// @param packagedConfig The machine-wide config file, empty when it is absent,
+///        unreadable or untrusted.
+/// @return @p spec with the storage and config arguments filled in where this
+///         service has such files at all -- see `ServiceSpec::applicationName`.
+[[nodiscard]] ServiceSpec WithScopeDefaults(ServiceSpec spec,
+                                            ServiceScope scope,
+                                            std::filesystem::path const& home,
+                                            std::filesystem::path const& packagedConfig);
 
 /// Outcome of a service-control operation.
 struct ServiceControlResult

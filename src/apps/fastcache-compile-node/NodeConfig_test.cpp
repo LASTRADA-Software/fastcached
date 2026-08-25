@@ -303,6 +303,66 @@ TEST_CASE("NodeConfig: the worker's launchd label is what the packaging removes"
     CHECK(LaunchdLabel(spec) == std::string_view { FASTCACHED_MACOS_NODE_LABEL });
 }
 
+TEST_CASE("NodeConfig: the worker's registration survives its own parser", "[node][service]")
+{
+    // Every flag baked into a registration is re-read by this binary at the next
+    // start, so one it cannot parse is a service that registers cleanly and then
+    // fails forever. The worker takes NO config file and NO storage directory --
+    // NodeOptions() has neither flag -- and the installer used to fill both in
+    // from the daemon's defaults, because the application name was hardcoded.
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable());
+    CHECK(spec.applicationName.empty());
+
+    // The assertion that matters is not "the field is empty" but what the field
+    // makes the installer do, so drive the installer's own function -- on every
+    // platform, which is the half that was missing while it lived inside the
+    // macOS block.
+    for (auto const scope: { ServiceScope::User, ServiceScope::System })
+    {
+        auto const filled =
+            WithScopeDefaults(spec, scope, std::filesystem::path { "/Users/jo" },
+                              std::filesystem::path { "/opt/fastcached/etc/fastcached.yaml" });
+
+        // Every argument must be one this binary's own parser accepts.
+        for (auto const& argument: filled.arguments)
+        {
+            auto const flag = argument.substr(0, argument.find('='));
+            INFO("registered flag: " << argument);
+            CHECK(std::ranges::any_of(NodeOptions(), [&flag](auto const& option) {
+                return option.primary == flag || option.alias == flag;
+            }));
+        }
+    }
+}
+
+TEST_CASE("NodeConfig: a system-scope job owns the directories it was given", "[node][service]")
+{
+    // A system-scope worker runs as an unprivileged account and root created these
+    // directories, so without the handover its first write fails with EACCES --
+    // which launchd surfaces only as a job that exits over and over. The daemon
+    // has always handed over its --storage for exactly this reason.
+    auto cfg = Installable();
+    cfg.cacheDir = std::filesystem::path { "/var/cache/fastcache-node" };
+    cfg.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
+
+    CHECK(std::ranges::contains(spec.ownedDirectories, cfg.cacheDir));
+    CHECK(std::ranges::contains(spec.ownedDirectories, cfg.clusterDir));
+
+    // Only what the operator named, never a parent: handing over /var/cache would
+    // reassign a directory shared with other services to an unprivileged compile
+    // account, silently, under a message saying the service had been installed.
+    CHECK(std::ranges::none_of(spec.ownedDirectories, [](std::filesystem::path const& owned) {
+        return owned == std::filesystem::path { "/var/cache" } || owned == std::filesystem::path { "/var/lib" };
+    }));
+
+    // A worker given neither hands over nothing, rather than a path nobody asked
+    // for -- the mirror of the rule above.
+    CHECK(MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable())
+              .ownedDirectories.empty());
+}
+
 TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[node][scheduler][policy]")
 {
     // Every rule here describes a configuration that would START SUCCESSFULLY and

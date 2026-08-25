@@ -218,7 +218,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A service to register is a `ServiceSpec`; what it runs as is part of it, and an
   empty `serviceAccount` means **root**.
 - `--install-service` registers the *command-line* config, never the merged one.
-- Whatever reaches a supervisor must survive this project's own parser round trip.
+- Whatever reaches a supervisor must survive this project's own parser round trip
+  — including the flags the *installer itself* adds, which are the daemon's only
+  when the spec names an application.
 - A config the operator named is strict; one the daemon found is skipped when
   absent, unreadable or untrusted.
 - A machine-wide config is obeyed only when only an administrator could have

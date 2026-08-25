@@ -197,6 +197,88 @@ TEST_CASE("ServiceControl: the launchd label is reverse-DNS and lowercased", "[p
     REQUIRE(FastCache::LaunchdLabel(SpecFor("fastcached", cfg)) == "software.lastrada.fastcachedsmoke");
 }
 
+TEST_CASE("ServiceControl: scope defaults are filled in for a file-configured service",
+          "[platform][service][launchd]")
+{
+    FastCache::Config const cfg {};
+    auto const spec = SpecFor("fastcached", cfg);
+    REQUIRE(!spec.applicationName.empty());
+
+    SECTION("a user agent gets a cache under the invoking account's home")
+    {
+        // Kept in-memory it would lose the whole cache at every logout, which for
+        // a compile cache is most of the value -- and launchd expands neither `~`
+        // nor `$HOME` in ProgramArguments, so the concrete path has to be resolved
+        // at install time.
+        auto const filled = WithScopeDefaults(spec, ServiceScope::User, "/Users/jo", {});
+
+        // The tail is spelled out -- `fastcached` in it is the applicationName,
+        // which is the point -- while the separator between home and it is left
+        // to the platform, because this case runs everywhere and only macOS
+        // renders it with a slash.
+        auto const expected = std::filesystem::path { "/Users/jo" } / "Library/Caches/fastcached/cache";
+        REQUIRE(std::ranges::contains(filled.arguments, std::format("--storage={}", expected.string())));
+        REQUIRE(std::ranges::contains(filled.ownedDirectories, expected));
+    }
+
+    SECTION("a config the operator named is never overridden by a storage default")
+    {
+        // A CLI value outranks YAML in Merge, so injecting --storage alongside
+        // --config would pin the cache location and make every later storage_path
+        // edit a silent no-op.
+        FastCache::Config named {};
+        named.configPath = "/etc/fastcached/fastcached.yaml";
+        auto const filled = WithScopeDefaults(SpecFor("fastcached", named), ServiceScope::User, "/Users/jo", {});
+
+        REQUIRE(std::ranges::none_of(filled.arguments,
+                                     [](std::string const& a) { return a.starts_with("--storage="); }));
+    }
+
+    SECTION("a system daemon is pointed at the packaged config")
+    {
+        auto const filled =
+            WithScopeDefaults(spec, ServiceScope::System, "/Users/jo", "/opt/fastcached/etc/fastcached.yaml");
+
+        REQUIRE(std::ranges::contains(filled.arguments, "--config=/opt/fastcached/etc/fastcached.yaml"));
+        // ServiceAccountReadDenial validates this, so leaving it empty would
+        // demote an install-time error to a silent fall-through to defaults.
+        REQUIRE(filled.configPath == "/opt/fastcached/etc/fastcached.yaml");
+    }
+
+    SECTION("an absent packaged config points launchd at nothing")
+    {
+        auto const filled = WithScopeDefaults(spec, ServiceScope::System, "/Users/jo", {});
+
+        REQUIRE(std::ranges::none_of(filled.arguments, [](std::string const& a) { return a.starts_with("--config="); }));
+    }
+}
+
+TEST_CASE("ServiceControl: a service that keeps no files is given no path flags", "[platform][service][launchd]")
+{
+    // The registration has to survive the registered binary's OWN parser.
+    // `fastcache-compile-node` is configured entirely from argv and accepts
+    // neither flag, so a default baked in here produced a job that answered its
+    // own command line with "unrecognised argument" at every start -- registered,
+    // reported installed, and dead at every boot. The application name was
+    // hardcoded to the daemon's, so every spec got the daemon's defaults.
+    //
+    // Asserted against a bare spec rather than the worker's, because this file
+    // must not depend on an app target: what is being pinned is the rule, and
+    // NodeConfig_test.cpp pins that the worker actually claims it.
+    FastCache::ServiceSpec argvOnly {};
+    argvOnly.serviceName = "ArgvOnly";
+    argvOnly.applicationName = {};
+
+    for (auto const scope: { ServiceScope::User, ServiceScope::System })
+    {
+        auto const filled = WithScopeDefaults(argvOnly, scope, "/Users/jo", "/opt/fastcached/etc/fastcached.yaml");
+
+        CHECK(filled.arguments.empty());
+        CHECK(filled.configPath.empty());
+        CHECK(filled.ownedDirectories.empty());
+    }
+}
+
 TEST_CASE("ServiceControl: the plist path follows the scope", "[platform][service][launchd]")
 {
     FastCache::Config const cfg {};

@@ -25,13 +25,17 @@
 #                           welcome and read-me panes shipped once, while the
 #                           .txt license looked fine and disguised it.
 #   4. Service runs       — the selected launchd job is registered and serving.
-#   4b. Worker account    — the compile worker's account exists whichever launchd
-#                           choice was made, because the worker's scope has
-#                           nothing to do with fastcached's (issue #87).
+#   4b. Worker installs   — the compile worker's account exists whichever launchd
+#                           choice was made, and a system-scope worker
+#                           registration is accepted, names that unprivileged
+#                           account, and carries only flags the worker's own
+#                           parser accepts. Refused outright before #87.
 #   5. Config survives    — an edit made after install is still there after a
 #                           reinstall of the same package.
 #   6. Uninstall is total — no files, no job, no PATH entry, no receipts, and
-#                           neither account.
+#                           neither account. Including the worker job from 4b,
+#                           which the package never installed but whose binary it
+#                           is about to delete.
 #
 # --scope selects which launchd choice the installer is driven with:
 #
@@ -89,6 +93,7 @@ readonly PATHS_D="/etc/paths.d/fastcached"
 # derivations are pinned cross-platform by `ctest -R service-accounts` and by
 # NodeConfig_test.cpp.
 readonly NODE_ACCOUNT="fastcache-node"
+readonly NODE_LABEL="software.lastrada.fastcachecompilenode"
 
 workdir="$(mktemp -d)"
 cleanup() {
@@ -348,6 +353,57 @@ else
     fi
 fi
 
+# --- 4b. a system-scope worker registration must be possible ---------------
+# The package registers no worker of its own -- it has no scheduler address or
+# toolchain list to register one WITH, and NodeServiceRejection refuses a
+# registration missing either. What it provides is the account, and this is the
+# assertion that the account is actually usable for what it exists for.
+#
+# Run in both scopes, because the account comes from the Runtime component: an
+# operator who took the installer's default (the per-user agent for fastcached)
+# must still be able to install a system-wide worker.
+#
+# Before #87 this refused with "the 'fastcache-node' service account does not
+# exist", which is the correct behaviour given no account -- a system launchd job
+# naming no UserName runs as ROOT, and this process compiles input that arrived
+# over the network. So the assertion is on the refusal being GONE, and on the
+# registration naming the unprivileged account rather than defaulting to root.
+echo "== checking a system-scope worker registration"
+node_plist="/Library/LaunchDaemons/${NODE_LABEL}.plist"
+
+# Captured, not discarded: the refusal this used to produce is a precise sentence
+# naming the account, and swallowing it would turn a diagnosis into "exit 1".
+if ! node_log="$(sudo "${PREFIX}/bin/fastcache-compile-node" --install-service --service-scope=system \
+        --scheduler=127.0.0.1:6675 \
+        --advertise=127.0.0.1:6676 \
+        --toolchain=/usr/bin/cc 2>&1)"; then
+    fail "worker --install-service --service-scope=system was refused: ${node_log}"
+fi
+
+[[ -f "$node_plist" ]] || fail "worker install reported success but wrote no ${node_plist}"
+
+# The whole point of the account. A plist with no UserName is a job that runs as
+# root, and launchd would accept that silently.
+grep -q "<string>${NODE_ACCOUNT}</string>" "$node_plist" \
+    || fail "the worker plist does not name ${NODE_ACCOUNT}; a system job with no UserName runs as root"
+
+# Every flag in ProgramArguments is re-read by the worker at the next start, so
+# one its own parser rejects is a job that registers and then fails forever. The
+# installer used to bake in the DAEMON's --config and --storage for any service,
+# and the worker accepts neither -- so this is the assertion that the
+# registration survives its own parser, at the level where it actually matters.
+for rejected in --config --storage; do
+    ! grep -q -- "$rejected" "$node_plist" \
+        || fail "the worker plist carries ${rejected}, which fastcache-compile-node does not accept"
+done
+
+# Deliberately LEFT REGISTERED. Step 6 then exercises the uninstaller against a
+# worker the package never installed, which is the only case there is: the
+# uninstaller removes ${PREFIX}, so a job it walked past would be left
+# bootstrapped against a deleted executable, with nothing on disk able to reach
+# it afterwards.
+echo "   worker registered as ${NODE_ACCOUNT}"
+
 # --- 5. an operator edit must survive a reinstall --------------------------
 echo "== reinstalling over an edited config"
 readonly MARKER="# fastcached-e2e-marker"
@@ -375,6 +431,12 @@ done
 ! sudo launchctl print "system/${LABEL}" >/dev/null 2>&1 || fail "system daemon still registered"
 [[ ! -e "/Library/LaunchDaemons/${LABEL}.plist" ]] || fail "system plist left behind"
 [[ -z "$(pkgutil --pkgs | grep "^${LABEL}" || true)" ]] || fail "package receipts left behind"
+
+# The worker job registered in step 4b, which the package itself never installs.
+# The uninstaller has to know about it anyway: it deletes ${PREFIX}, so anything
+# it leaves bootstrapped now points at an executable that is gone.
+! sudo launchctl print "system/${NODE_LABEL}" >/dev/null 2>&1 || fail "worker job still registered"
+[[ ! -e "/Library/LaunchDaemons/${NODE_LABEL}.plist" ]] || fail "worker plist left behind"
 
 # A stale service account is what makes a reinstall pick a *different* uid next
 # time, silently orphaning the state directory it used to own. Both accounts:

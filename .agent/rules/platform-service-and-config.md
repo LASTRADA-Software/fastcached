@@ -34,10 +34,32 @@ readable and silently ignored. Every rule below has already been one of them.
     launchd job with no `UserName` runs as root, and `fastcache-compile-node`
     compiles input that arrived over the network. Naming `fastcache-node` -- the
     account the Linux unit already uses -- puts the existing "that account does not
-    exist" guard in the way, so a macOS system-scope install **refuses** until the
-    package creates it rather than silently succeeding with root privileges
-    (issue #87). It is deliberately not the daemon's `_fastcached`: one account
-    would let a compromised compile rewrite every cached object.
+    exist" guard in the way, so a macOS system-scope install refuses rather than
+    silently succeeding with root privileges. It is deliberately not the daemon's
+    `_fastcached`: one account would let a compromised compile rewrite every cached
+    object. **The package creates it** (issue #87), from the *Runtime* component and
+    not the LaunchDaemon one -- which launchd choice an operator made for
+    `fastcached` says nothing about whether they will run a worker, and the
+    installer's default is the per-user agent. One spelling reaches the binary, the
+    packaging and the Linux unit; `ctest -R service-accounts` fails on every
+    platform when they drift, because the failure itself is macOS-only and silent.
+  - **An empty `applicationName` means "configured entirely from argv", and
+    `WithScopeDefaults` must then bake in nothing.** It used to look the machine-wide
+    config up under `DaemonApplicationName` unconditionally, so *every* spec got the
+    *daemon's* defaults: a worker registration was handed `--config=` (system) or
+    `--storage=` (user), and `NodeOptions()` has neither flag. That is the
+    supervisor-must-survive-its-own-parser rule below, produced by the installer
+    itself -- the job registered, reported success, and answered `unrecognised
+    argument` at every boot. On a packaged macOS system it was worse than that: the
+    daemon's config is `0640 root:_fastcached`, so `ServiceAccountReadDenial`
+    refused the worker install for a reason that had nothing to do with the worker.
+    `WithScopeDefaults` was private to the `__APPLE__` block for all of this, which
+    is exactly why no test saw it; it is declared in the header now, like
+    `BuildLaunchdPlist`, and asserted on every platform.
+  - **`ownedDirectories` is not just the daemon's `--storage`.** A worker given
+    `--cache-dir` or `--cluster-dir` gets directories root created for an account
+    that is not root, so they must change hands too -- and only those, never a
+    parent.
   - **`BuildServiceArgv` stays hand-written per binary.** An `OptionSpec` says how
     to *parse* a flag and carries no way to read a value back out, so "emit every
     field that differs from its default" cannot be written once generically. Each
