@@ -119,6 +119,17 @@ set(FASTCACHED_MACOS_NODE_ACCOUNT    "fastcache-node")
 # this name. It names only a job an operator installed by hand.
 set(FASTCACHED_MACOS_NODE_LABEL      "software.lastrada.fastcachecompilenode")
 
+# The tools symlinked into /usr/local/bin. /etc/paths.d only takes effect for
+# LOGIN shells, so these are what make the tools reachable from an already-open
+# terminal, from `ssh host cmd`, and from fish -- which never reads /etc/profile.
+#
+# One list, substituted into both the postinstall that creates the links and the
+# uninstaller that removes them. They were two hand-written lists, and the file's
+# own comment records what that cost: "The uninstaller has the mirror of this
+# guard; this is the half that went missing." A tool added to one and not the
+# other is either a link nothing removes or a link nothing creates.
+set(FASTCACHED_MACOS_LINKED_TOOLS "fastcached fastcache-cc fastcache-compile-node")
+
 # The machine-wide configuration directory. Declared here, not in packaging/,
 # for the same scoping reason as the macOS variables above: packaging/ installs
 # the file into it and src/FastCache/ compiles the very same path into the

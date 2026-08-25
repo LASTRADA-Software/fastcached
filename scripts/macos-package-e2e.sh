@@ -238,9 +238,12 @@ pkgutil --pkgs | grep -q "^${LABEL}\." \
     || fail "no package receipt starts with ${LABEL}; the uninstaller would never find them"
 
 # The symlinks are what make the tools reachable in a shell that is already
-# open, and in fish, which never reads /etc/paths.d.
-[[ -L /usr/local/bin/fastcached ]]   || fail "no /usr/local/bin/fastcached symlink"
-[[ -L /usr/local/bin/fastcache-cc ]] || fail "no /usr/local/bin/fastcache-cc symlink"
+# open, and in fish, which never reads /etc/paths.d. Every tool, including the
+# worker: /etc/paths.d takes effect only for LOGIN shells, so without a link the
+# command an operator is told to run is not on PATH where they will run it.
+for tool in fastcached fastcache-cc fastcache-compile-node; do
+    [[ -L "/usr/local/bin/${tool}" ]] || fail "no /usr/local/bin/${tool} symlink"
+done
 
 # --- 4. the selected launchd job must be registered and serving -------------
 echo "== checking the launchd registration"
@@ -365,8 +368,9 @@ uninstall_log="$(sudo "${PREFIX}/bin/fastcached-uninstall" 2>&1)" \
 
 [[ ! -e "$PREFIX" ]]  || fail "$PREFIX still present"
 [[ ! -e "$PATHS_D" ]] || fail "$PATHS_D still present"
-[[ ! -e /usr/local/bin/fastcached ]]   || fail "/usr/local/bin/fastcached symlink left behind"
-[[ ! -e /usr/local/bin/fastcache-cc ]] || fail "/usr/local/bin/fastcache-cc symlink left behind"
+for tool in fastcached fastcache-cc fastcache-compile-node; do
+    [[ ! -e "/usr/local/bin/${tool}" ]] || fail "/usr/local/bin/${tool} symlink left behind"
+done
 ! registered_agent_domain >/dev/null || fail "user agent still registered in $(registered_agent_domain)"
 ! sudo launchctl print "system/${LABEL}" >/dev/null 2>&1 || fail "system daemon still registered"
 [[ ! -e "/Library/LaunchDaemons/${LABEL}.plist" ]] || fail "system plist left behind"

@@ -61,7 +61,11 @@ mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" || true
 # the user with no fastcache-cc at all. The uninstaller has the mirror of this
 # guard; this is the half that went missing.
 mkdir -p /usr/local/bin || true
-for tool in fastcached fastcache-cc; do
+for tool in @FASTCACHED_MACOS_LINKED_TOOLS@; do
+    # A tool this build did not produce gets no link. `ln -sfn` is perfectly
+    # happy to create a dangling one, and the shell would then find a name on
+    # PATH that cannot be executed -- worse than the name simply not being there.
+    [ -e "${PREFIX}/bin/${tool}" ] || continue
     link="/usr/local/bin/${tool}"
     if [ -e "$link" ] || [ -L "$link" ]; then
         if [ ! -L "$link" ] || [ "$(readlink "$link")" != "${PREFIX}/bin/${tool}" ]; then

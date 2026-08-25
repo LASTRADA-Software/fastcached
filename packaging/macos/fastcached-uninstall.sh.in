@@ -105,7 +105,7 @@ done
 rm -f /etc/paths.d/fastcached || true
 # Only remove the symlinks if they still point into our prefix: someone may have
 # replaced them with a Homebrew install, and deleting that would be rude.
-for tool in fastcached fastcache-cc; do
+for tool in @FASTCACHED_MACOS_LINKED_TOOLS@; do
     link="/usr/local/bin/${tool}"
     if [ -L "$link" ] && [ "$(readlink "$link")" = "${PREFIX}/bin/${tool}" ]; then
         rm -f "$link" || true
