@@ -264,8 +264,10 @@ TEST_CASE("A node with no cluster says so rather than pretending", "[node][clust
     // and an operator sent elsewhere would go looking for a node that does not exist.
     Fixture fixture;
 
-    for (auto const& request: std::array {
-             Ask(ClusterAction::Status), Ask(ClusterAction::Set, "upstream", "x"), Ask(ClusterAction::Forget, "n3") })
+    for (auto const& request: std::array { Ask(ClusterAction::Status),
+                                           Ask(ClusterAction::Set, "upstream", "x"),
+                                           Ask(ClusterAction::Forget, "n3"),
+                                           Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680") })
     {
         auto const reply = fixture.Ask(request);
         CHECK(StatusOf(reply) == Wire::Status::Error);
@@ -353,4 +355,62 @@ TEST_CASE("A status request carrying anything is malformed", "[node][clusteradmi
     auto const reply = fixture.protocol.Answer(frame, Insider);
     CHECK(StatusOf(reply) == Wire::Status::Error);
     CHECK(ErrorOf(reply) == Wire::ErrorCode::MalformedFrame);
+}
+
+TEST_CASE("A member can be admitted, which is what --cluster-forget had no counterpart for", "[node][clusteradmin]")
+{
+    // Nothing anywhere could put a member INTO the replicated state without
+    // `--discovery`, so a fleet with a typed peer list could shrink and never grow:
+    // adding a machine meant editing `--raft-peer` on every other machine and
+    // restarting them, which is the cost this whole change exists to remove.
+    FakeCluster cluster;
+    Fixture fixture;
+    fixture.service.AdministerWith(cluster);
+
+    auto const reply = fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680"));
+    CHECK(StatusOf(reply) == Wire::Status::Ok);
+
+    REQUIRE(cluster.proposed.size() == 1);
+    CHECK(cluster.proposed[0] == Cmd(Cluster::CommandKind::AddMember, "n4", "10.0.0.4:6680"));
+
+    // The scheduler endpoint is deliberately empty: a member announces its own once
+    // elected, and a value typed here about somebody else would be a guess that
+    // outranks what they say about themselves.
+    CHECK(cluster.proposed[0].schedulerEndpoint.empty());
+}
+
+TEST_CASE("Admitting takes the same token --raft-peer does", "[node][clusteradmin]")
+{
+    // One grammar for "this member, at this address", because a second spelling of
+    // one thing is a second thing to get wrong -- and the operator has already
+    // typed this one into `--raft-peer` on the machine being added.
+    auto const cfg = ParsedFrom({ "--cluster-admit=n4=10.0.0.4:6680" });
+    CHECK(cfg.cluster.action == ClusterAction::Admit);
+    CHECK(cfg.cluster.key == "n4");
+    CHECK(cfg.cluster.value == "10.0.0.4:6680");
+}
+
+TEST_CASE("An admission with no dialable address is refused where it is typed", "[node][clusteradmin]")
+{
+    // An id with no address a peer can dial is a node the cluster counts towards
+    // quorum and never reaches, and the command line is the one place an operator
+    // is watching. Both shapes: nothing after the id, and something that is not a
+    // host and a port.
+    for (auto const* const spec: { "--cluster-admit=n4", "--cluster-admit=n4=", "--cluster-admit=n4=nowhere" })
+    {
+        INFO("spec: " << spec);
+        NodeConfig cfg;
+        std::vector<char const*> const args { spec };
+        CHECK_FALSE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { args }, cfg).has_value());
+    }
+}
+
+TEST_CASE("An admission is reported as accepted, never as committed", "[node][clusteradmin]")
+{
+    // The leader appends the entry and answers; whether a majority has taken it is
+    // not something it knows yet, and a tool that said otherwise would be the one
+    // kind of report that must not be wrong.
+    auto const rendered = InterpretClusterReply(ClusterAction::Admit, {});
+    REQUIRE(rendered.has_value());
+    CHECK(rendered->contains("accepted"));
 }

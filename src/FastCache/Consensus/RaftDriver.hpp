@@ -173,6 +173,23 @@ class RaftDriver
     /// @return Where the entry landed, or why it was refused.
     [[nodiscard]] std::expected<LogIndex, ConsensusError> ProposeMembership(std::vector<NodeId> members, TimePoint now);
 
+    /// What consensus counts, and how far it has agreed.
+    ///
+    /// Both under one lock, because the caller compares them and two acquisitions
+    /// would let a configuration change land between them — reading a member set
+    /// from before it and a commit index from after, which is a pair that never
+    /// existed. By value for the reason `Failure` is: `Node()` hands back a
+    /// reference to a member the timer loop and a peer reader are both free to
+    /// move.
+    struct Progress
+    {
+        std::vector<NodeId> members; ///< The member set this node operates under.
+        LogIndex commitIndex;        ///< How far its log is committed.
+    };
+
+    /// @return The member set and commit index, read together.
+    [[nodiscard]] Progress CurrentProgress() const;
+
     /// The node being driven, for inspection.
     ///
     /// **Not synchronized**, and it cannot be: a reference outlives any lock this

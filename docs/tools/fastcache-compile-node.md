@@ -323,6 +323,54 @@ cluster admitted is served by all three surfaces at once — its compile port, t
 scheduler, and every member's cache tier. `--fleet-member` is the answer before a
 cluster exists; this is the answer once one does.
 
+**It reaches consensus too.** The leader moves the *quorum* to match the member set
+one machine at a time, so a node the cluster admitted votes, is counted, and is
+dialled by the peers that admitted it. Growing a cluster no longer means restarting
+its existing members with a longer `--raft-peer` list — only the new machine is
+started, and only it names anybody.
+
+### Adding a machine to a running cluster
+
+Two commands, on two machines. The joining node is started with `--raft-join`:
+
+```sh
+fastcache-compile-node \
+    --node-id=n4 --raft-join \
+    --listen-raft=6680 \
+    --raft-peer=n4=10.0.0.4:6680 \
+    --raft-peer=n1=10.0.0.1:6680 --raft-peer=n2=10.0.0.2:6680 --raft-peer=n3=10.0.0.3:6680 \
+    --listen-scheduler=6675 --advertise=10.0.0.4:6676 \
+    --toolchain=/usr/bin/g++
+```
+
+and any member of the cluster is then told to admit it:
+
+```sh
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-admit=n4=10.0.0.4:6680
+```
+
+**`--raft-join` is not optional and its absence is not a smaller mistake.** Without
+it that command line bootstraps a cluster *of n4*: it elects itself, takes a term
+and a log of its own, and afterwards refuses `AppendEntries` from every leader its
+own configuration does not name. A cluster that admitted such a node would be
+counting towards its quorum a machine that answers nobody, and two clusters cannot
+be merged by any local rule — so the joining node must never form one.
+
+**Under `--raft-join` the `--raft-peer` list means something else**: these are nodes
+this one can *reach*, not a cluster it belongs to. It still needs the cluster's
+addresses, and that is load-bearing rather than convenient. A leader admitting a new
+member starts replicating at its own last index; the joiner's log is empty and
+refuses that; and the leader only walks back to the beginning when the refusal
+reaches it. A joiner that cannot send one is admitted, dialled, and permanently
+silent.
+
+With `--discovery` the same node names only itself, because discovery supplies the
+addresses — see below.
+
+**Nothing about the existing members changes.** They are not restarted, their
+command lines are not edited, and the new member survives *their* restarts as well
+as its own, because it is a log entry rather than a flag.
+
 ### Changing it while it runs
 
 The log carries the cluster's configuration so it can be changed without editing a
@@ -332,6 +380,7 @@ directly, and each exits when it has an answer:
 ```sh
 fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-status
 fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-set=upstream=cache.internal:6674
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-admit=n4=10.0.0.4:6680
 fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-forget=n3
 ```
 
@@ -366,9 +415,23 @@ and answers; whether a majority has taken it is not something it knows yet. Ask 
 the status again to see the result — which is the round trip you were going to make
 anyway.
 
+**`--cluster-admit` takes the same token `--raft-peer` does**, and for the same
+reason: an id with no address is a node the cluster counts towards quorum and never
+reaches. One verb covers adding a member and recording that one has *moved*, because
+they are one intention — a node that moved has the same identity and a new address,
+and making an operator remove it first would leave a window in which the cluster has
+agreed it does not exist.
+
 **`--cluster-forget` is the one membership change nothing automatic makes.**
 Discovery only ever adds, for the reason below, so removing a machine that has left
-for good is a decision somebody makes on purpose.
+for good is a decision somebody makes on purpose. It takes the member out of the
+quorum as well as out of the fleet — but only a member that was **admitted at
+runtime**, which is what tells "the operator forgot it" apart from "nobody ever
+wrote it down". A member a machine names in its own `--raft-peer` list is a member
+by that operator's assertion: forgetting it removes the record every surface reads,
+and the quorum goes on counting it. Taking a *typed* member out of the quorum means
+dropping it from `--raft-peer` on the machines that name it and restarting them —
+a leader never proposes removing a member its own bootstrap list asserts.
 
 ### Finding peers instead of typing them
 
@@ -415,6 +478,13 @@ shares a key across fleets — which they should not.
 where they answer; the *leader* proposes, and only the leader, because admitting a
 node is a Raft decision. Every node on the segment sees the same peers and all but
 one of them do nothing about it.
+
+**A node joining a discovered fleet still needs `--raft-join`**, and needs nothing
+else: discovery supplies the addresses that a typed join has to list by hand. One
+node bootstraps the cluster and the rest join it — and exactly one, because two
+nodes that each bootstrapped a cluster of themselves cannot be merged. A membership
+change proposed against such a node never commits, and the leader says so once the
+wait becomes unreasonable rather than leaving it to be inferred.
 
 **It never proposes a removal either.** A peer vanishes from a broadcast for reasons
 that are almost never "it left" — a lost datagram, a switch rebooting, a laptop
@@ -720,10 +790,3 @@ For anything beyond a trusted build network, put mTLS in front of every port.
   ([#87](https://github.com/LASTRADA-Software/fastcached/issues/87)).
   `--service-scope=user` works, and is the right answer on a developer machine
   anyway.
-- **A discovered node joins the cluster's *state*, not its quorum**
-  ([#97](https://github.com/LASTRADA-Software/fastcached/issues/97)). The leader
-  records it, every node then serves it, and it survives a restart — but
-  `RaftNode`'s own member set still comes from `--raft-peer` at startup, so the new
-  node does not yet vote and nobody dials it. What that costs today is that growing
-  a cluster's *consensus* still means restarting its members with a new
-  `--raft-peer` list; growing the *fleet* does not.

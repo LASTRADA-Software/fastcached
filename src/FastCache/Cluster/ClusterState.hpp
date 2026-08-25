@@ -57,6 +57,27 @@ struct ClusterMember
     [[nodiscard]] friend bool operator==(ClusterMember const&, ClusterMember const&) = default;
 };
 
+/// Parse one `<id>=<host>:<port>` member specification.
+///
+/// The grammar an operator types, in the one place the type it produces lives. It
+/// has two callers that must not disagree — `--raft-peer` names a member at
+/// startup and `--cluster-admit` names one at runtime, and the documentation tells
+/// an operator to copy the same token between them — so a second implementation
+/// would be two flags accepting different token sets for one concept, with only one
+/// of them being what the transport actually dials.
+///
+/// Split at the **first** `=`, so an endpoint may contain one and an id may not.
+/// The other way round makes `n1=host=1:6675` parse as an id of `n1=host`, which is
+/// an id no operator wrote and which would silently never match a vote.
+///
+/// The endpoint must be one a peer can dial, which takes both halves of what a
+/// dialer asks: a bare port names no machine, and `host:0` names no port, and a
+/// member recorded either way is one the cluster counts towards quorum and cannot
+/// reach.
+/// @param spec The token as an operator wrote it.
+/// @return The member, or nullopt when the token is not one.
+[[nodiscard]] std::optional<ClusterMember> ParseMemberSpec(std::string_view spec);
+
 /// A setting every member of the cluster must agree on.
 ///
 /// A **table** rather than an open string map, so an unknown key is refused at the

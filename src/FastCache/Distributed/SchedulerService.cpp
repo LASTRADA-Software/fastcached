@@ -220,6 +220,26 @@ SchedulerReply SchedulerService::ClusterForget(CallerContext const& caller, std:
         .kind = Cluster::CommandKind::RemoveMember, .key = std::string { memberId }, .value = {}, .schedulerEndpoint = {} });
 }
 
+SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
+                                              std::string_view memberId,
+                                              std::string_view raftEndpoint)
+{
+    if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+    if (_admin == nullptr)
+        return Refuse(Wire::ErrorCode::NoCluster);
+
+    // `schedulerEndpoint` left empty, which `AddMember` applies wholesale -- so
+    // re-admitting a member that has moved clears whatever it had announced, and it
+    // announces the new one on its next election. That is the right way round: a
+    // node that moved has moved both ports, and keeping the old scheduler endpoint
+    // would redirect clients to an address that member no longer answers.
+    return Offer(Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                                    .key = std::string { memberId },
+                                    .value = std::string { raftEndpoint },
+                                    .schedulerEndpoint = {} });
+}
+
 SchedulerReply SchedulerService::Refuse(Wire::ErrorCode code, std::string message) const
 {
     if (auto const counter = CounterFor(code); counter.has_value())

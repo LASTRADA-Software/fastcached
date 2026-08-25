@@ -203,6 +203,12 @@ std::expected<LogIndex, ConsensusError> RaftDriver::ProposeMembership(std::vecto
     return Land(_node.ProposeMembership(std::move(members), now));
 }
 
+RaftDriver::Progress RaftDriver::CurrentProgress() const
+{
+    auto const guard = std::scoped_lock { _mutex };
+    return Progress { .members = _node.ActiveMembers(), .commitIndex = _node.CommitIndex() };
+}
+
 std::expected<LogIndex, ConsensusError> RaftDriver::Land(std::expected<RaftNode::Proposal, ConsensusError> proposed)
 {
     if (!proposed.has_value())

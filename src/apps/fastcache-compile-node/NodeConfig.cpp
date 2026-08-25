@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeConfig.hpp"
 
+#include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
@@ -150,6 +151,22 @@ namespace
                 if (value.empty())
                     return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "cluster-forget", "names no member"));
                 request.key = std::string { value };
+            }
+            else if constexpr (Action == ClusterAction::Admit)
+            {
+                // The same grammar `--raft-peer` takes, through the same function:
+                // an operator adding a member types the token they would have put in
+                // that flag, the documentation tells them so, and a second
+                // implementation would be two flags accepting different token sets
+                // for one concept -- with only one of them being what the transport
+                // actually dials.
+                auto member = Cluster::ParseMemberSpec(value);
+                if (!member.has_value())
+                    return std::unexpected(ArgvError(
+                        ConfigErrorCode::ParseError, "cluster-admit", std::format("not <id>=<host>:<port>: {}", value)));
+
+                request.key = std::move(member->id);
+                request.value = std::move(member->raftEndpoint);
             }
 
             return {};
@@ -321,6 +338,17 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "no address is a node counted towards quorum and\n"
                          "unreachable. This is the BOOTSTRAP set only:\n"
                          "membership is replicated once the cluster runs." },
+        { .primary = "--raft-join",
+          .arity = Arity::None,
+          .apply = SetTrue<&NodeConfig::raftJoin>(),
+          .description = "start with NO cluster and wait to be admitted to one.\n"
+                         "--raft-peer then lists nodes this one can REACH rather\n"
+                         "than a cluster it belongs to -- itself, and whoever\n"
+                         "will admit it, because a joiner has to be able to\n"
+                         "answer the leader before it can learn where that\n"
+                         "leader is. Without this flag a node bootstraps a\n"
+                         "cluster of itself, elects itself, and can never\n"
+                         "afterwards be admitted to anybody else's." },
         { .primary = "--cluster-dir",
           .arity = Arity::Value,
           .operand = "=<path>",
@@ -341,6 +369,16 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .description = "change one replicated cluster setting and exit.\n"
                          "Every member then agrees on it, and it survives\n"
                          "their restarts. --cluster-status lists the keys." },
+        { .primary = "--cluster-admit",
+          .arity = Arity::Value,
+          .operand = "=<id>=<host>:<port>",
+          .apply = SelectClusterAction<ClusterAction::Admit>(),
+          .description = "add a member to the cluster and exit, or record that\n"
+                         "one has moved. Both halves in one token for the\n"
+                         "reason --raft-peer takes both: an id with no address\n"
+                         "is counted towards quorum and never reached. The\n"
+                         "member itself must have been started with\n"
+                         "--raft-join." },
         { .primary = "--cluster-forget",
           .arity = Arity::Value,
           .operand = "=<node-id>",
@@ -578,6 +616,8 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
         argv.push_back(std::format("--raft-peer={}", peer));
     emitIfSet("upstream", cfg.upstream, defaults.upstream);
     emitPathIfSet("cache-dir", cfg.cacheDir.string());
+    if (cfg.raftJoin)
+        argv.emplace_back("--raft-join");
     if (cfg.fleetOpen)
         argv.emplace_back("--fleet-open");
     for (auto const& member: cfg.fleetMembers)
@@ -677,6 +717,14 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--fleet-member and --fleet-open describe who this node's scheduler admits, and it is not "
                      "running one: add --listen-scheduler, or drop them. A policy nothing consults is a policy an "
                      "operator believes is in force." },
+        { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.nodeId.empty(); },
+          .message = "--raft-join needs --node-id: a node waiting to be admitted to a cluster still has to have an "
+                     "identity, because that is what the cluster admits and what every vote is counted against. "
+                     "Without one it would listen forever and could never be named." },
+        { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.raftPeers.empty(); },
+          .message = "--raft-join needs --raft-peer: at least this node's own address, which is the half only it "
+                     "knows, and normally the cluster's as well. A joiner cannot answer the leader that admits it "
+                     "without one, and it cannot learn any address until it has answered." },
         { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && c.nodeId.empty(); },
           .message = "--discovery needs --node-id: discovery finds peers for a CLUSTER, and without an id this "
                      "node is not in one. It would broadcast, be answered, prove the key and have nowhere to "

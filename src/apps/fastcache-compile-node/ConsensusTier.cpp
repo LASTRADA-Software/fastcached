@@ -78,6 +78,29 @@ namespace
         return RoleNames[static_cast<std::size_t>(role)];
     }
 
+    /// One member's address, as something the transport can dial.
+    ///
+    /// The pair `SplitHostPort` and `ParseTcpPort` make, in the one place: the two
+    /// callers here turn the same text into the same thing at startup and again on
+    /// every reconcile pass, and a second spelling would let a bare port or a
+    /// bracketed v6 address be dialable in one of them and not the other.
+    /// @param id Whose address it is.
+    /// @param endpoint The `host:port` text.
+    /// @return The peer, or nullopt when the text names none.
+    [[nodiscard]] std::optional<Consensus::PeerEndpoint> PeerEndpointFor(Consensus::NodeId const& id,
+                                                                         std::string_view endpoint)
+    {
+        auto const split = SplitHostPort(endpoint);
+        if (!split.has_value())
+            return std::nullopt;
+
+        auto const port = ParseTcpPort(split->second);
+        if (!port.has_value())
+            return std::nullopt;
+
+        return Consensus::PeerEndpoint { .id = id, .host = split->first, .port = *port };
+    }
+
     /// This node's role, in the scheduler's vocabulary.
     ///
     /// Three roles collapse to two here and the third is the interesting one.
@@ -98,43 +121,6 @@ namespace
         return Distributed::SchedulerRole::Undecided;
     }
 } // namespace
-
-/// One `id=host:port` peer specification, parsed.
-///
-/// A free function rather than a lambda so the rule can be tested: `NodeConfig_test`
-/// reaches it, and `main.cpp` -- where this would otherwise live -- is in no test
-/// target.
-/// @param spec The token as an operator wrote it.
-/// @return The member, or nullopt when it is not one.
-std::optional<Cluster::ClusterMember> ParsePeerSpec(std::string_view spec)
-{
-    // Split at the FIRST `=`, so an endpoint may contain one and an id may not. The
-    // other way round would make `n1=host=1:6675` parse as an id of `n1=host`, which
-    // is an id no operator wrote and which would silently never match a vote.
-    auto const split = spec.find('=');
-    if (split == std::string_view::npos)
-        return std::nullopt;
-
-    auto const id = spec.substr(0, split);
-    auto const endpoint = spec.substr(split + 1);
-    if (id.empty() || endpoint.empty())
-        return std::nullopt;
-
-    // The endpoint must be one a peer can dial, which is what `ParseEndpoint` with no
-    // default host answers: a bare port names no machine, and a member recorded that
-    // way is one the cluster counts towards quorum and cannot reach.
-    if (!SplitHostPort(endpoint).has_value())
-        return std::nullopt;
-
-    // Every field named, including the one this token cannot carry. A member's
-    // scheduler endpoint is a port peers never connect to, so nothing an operator
-    // types about a PEER could supply it -- the node announces its own. Saying so
-    // with `{}` rather than leaving it out is what keeps a field added to the
-    // middle of the struct from becoming a silent zero here.
-    return Cluster::ClusterMember { .id = std::string { id },
-                                    .raftEndpoint = std::string { endpoint },
-                                    .schedulerEndpoint = {} };
-}
 
 std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::string_view schedulerBound)
 {
@@ -191,7 +177,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     std::vector<Cluster::ClusterMember> members;
     for (auto const& spec: cfg.raftPeers)
     {
-        auto parsed = ParsePeerSpec(spec);
+        auto parsed = Cluster::ParseMemberSpec(spec);
         if (!parsed.has_value())
             return std::unexpected { std::format("--raft-peer={} is not <id>=<host>:<port>", spec) };
         members.push_back(*std::move(parsed));
@@ -199,9 +185,24 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
 
     auto const self = std::ranges::find(members, cfg.nodeId, &Cluster::ClusterMember::id);
     if (self == members.end())
-        return std::unexpected { std::format("--node-id={} names no --raft-peer; this node must be a member of its own "
-                                             "cluster, with the endpoint its peers dial",
+        return std::unexpected { std::format("--node-id={} names no --raft-peer; this node must name the endpoint its "
+                                             "peers dial, whether it bootstraps a cluster or joins one",
                                              cfg.nodeId) };
+
+    // `--raft-join` takes the SAME tokens and means something else by them: these
+    // are the nodes this one can REACH, not the cluster it is a member of. So the
+    // bootstrap set is empty and the node waits to be admitted -- which is the only
+    // shape a cluster can admit, because a node that bootstrapped itself has
+    // elected itself and afterwards refuses every leader its own configuration does
+    // not name.
+    //
+    // It still dials all of them, and that is not an optimization: the leader
+    // admitting a joiner starts replicating at its own last index, the joiner's log
+    // is empty, and the leader only walks back to the beginning when the joiner
+    // REFUSES. A joiner that could not send that refusal is admitted, dialled, and
+    // permanently silent -- which is what the end-to-end case found the first time
+    // this was tried with a one-entry list.
+    auto const bootstrap = cfg.raftJoin ? std::vector<Cluster::ClusterMember> {} : members;
 
     // The wildcard for a bare port, like the scheduler's and unlike the cache's:
     // peers are on other machines by definition, so a loopback default would be one
@@ -234,20 +235,22 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
                                                                      std::move(onMembers),
                                                                      logger } };
 
-    if (auto started = tier->Launch(cfg, members, endpoint->first, endpoint->second); !started.has_value())
+    if (auto started = tier->Launch(cfg, members, bootstrap, endpoint->first, endpoint->second); !started.has_value())
         return std::unexpected { started.error() };
 
     logger.Logf(LogLevel::Info,
-                "consensus on {} as {} ({} member(s), state in {})",
+                "consensus on {} as {} ({}, state in {})",
                 tier->BoundEndpoint(),
                 cfg.nodeId,
-                members.size(),
+                bootstrap.empty() ? std::string { "no cluster yet; waiting to be admitted" }
+                                  : std::format("{} member(s)", bootstrap.size()),
                 stateDirectory.string());
     return tier;
 }
 
 std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
-                                                       std::vector<Cluster::ClusterMember> const& members,
+                                                       std::vector<Cluster::ClusterMember> const& dialable,
+                                                       std::vector<Cluster::ClusterMember> const& bootstrap,
                                                        std::string_view bindAddress,
                                                        std::uint16_t bindPort)
 {
@@ -265,31 +268,40 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
                                              bindPort,
                                              _listener ? _listener->BindError() : std::string_view { "null listener" }) };
 
+    // Two lists out of two, and the split is the whole of how a node joins. Who
+    // this node DIALS is everything its operator named; who consensus COUNTS is
+    // the bootstrap set, which is empty for a node waiting to be admitted. A
+    // joiner that dialled only itself could never answer the leader that admits
+    // it -- and it cannot learn that leader's address from the replicated state,
+    // because receiving the state is what answering makes possible.
     std::vector<Consensus::PeerEndpoint> peers;
-    std::vector<Consensus::NodeId> ids;
-    peers.reserve(members.size());
-    ids.reserve(members.size());
-    for (auto const& member: members)
+    peers.reserve(dialable.size());
+    for (auto const& member: dialable)
     {
-        ids.push_back(member.id);
-        // Already checked by `ParsePeerSpec`, so this cannot fail -- but it is split
-        // again rather than carried, because carrying it would mean the parsed form
-        // and the string could disagree about which of a v6 address's colons is the
-        // port separator, which is the defect `Core/HostPort` exists to hold in one
-        // place.
-        auto const split = SplitHostPort(member.raftEndpoint);
-        if (!split.has_value())
+        // Already checked by `ParseMemberSpec`, so this cannot fail -- but it is
+        // split again rather than carried, because carrying it would mean the parsed
+        // form and the string could disagree about which of a v6 address's colons is
+        // the port separator, which is the defect `Core/HostPort` exists to hold in
+        // one place.
+        auto where = PeerEndpointFor(member.id, member.raftEndpoint);
+        if (!where.has_value())
             return std::unexpected { std::format("{} is not a dialable endpoint for {}", member.raftEndpoint, member.id) };
-        auto const port = ParseTcpPort(split->second);
-        if (!port.has_value())
-            return std::unexpected { std::format("{} names no usable port for {}", member.raftEndpoint, member.id) };
 
         // This node itself is deliberately included. `RaftPeerTransport` refuses a
         // message addressed to `self` rather than looping it through a socket, so
         // filtering here would duplicate a rule it already enforces -- and doing it
         // in two places is how they come to disagree about which node is which.
-        peers.push_back(Consensus::PeerEndpoint { .id = member.id, .host = split->first, .port = *port });
+        peers.push_back(*std::move(where));
     }
+
+    _bootstrapIds.reserve(bootstrap.size());
+    for (auto const& member: bootstrap)
+        _bootstrapIds.push_back(member.id);
+
+    // A copy rather than moving `_bootstrapIds` into the configuration: the member
+    // is what the reconciler compares against for the whole life of this node, and
+    // `RaftConfig` owns its own list from here.
+    auto ids = _bootstrapIds;
 
     _transport =
         std::make_unique<Consensus::RaftPeerTransport>(cfg.nodeId, std::move(peers), _reactor, *_connector, _logger);
@@ -480,22 +492,34 @@ void ConsensusTier::NoteLoopFinished() noexcept
 
 void ConsensusTier::Reconcile()
 {
-    // Only a leader may propose, and asking here rather than letting `Propose`
-    // refuse is what keeps a follower from logging a `NotLeader` every interval for
-    // as long as it is a follower -- which is most of a healthy cluster's life.
-    if (!_leads.load(std::memory_order_relaxed))
-        return;
+    auto const state = _application.State();
 
+    // Every node, leader or not, and BEFORE anything is proposed. A member the
+    // cluster agreed to admit has to be dialable by everybody -- the leader
+    // replicates to it and every other member sends it votes -- and a member
+    // counted towards a quorum that nobody dials is a cluster that stops forming
+    // one.
+    // Snapshotted once for the whole pass. Two reads would be two different values
+    // -- discovery lands on its own interval -- so a leader could dial one set and
+    // propose from another.
     auto desired = std::vector<Cluster::DesiredMember> {};
     {
         auto const guard = std::unique_lock { _desiredMutex };
         desired = _desired;
     }
 
+    LearnMembers(state, desired);
+
+    // Only a leader may propose, and asking here rather than letting `Propose`
+    // refuse is what keeps a follower from logging a `NotLeader` every interval for
+    // as long as it is a follower -- which is most of a healthy cluster's life.
+    if (!_leads.load(std::memory_order_relaxed))
+        return;
+
     // Outside the lock, both the decision and the proposals: a proposal is a
     // durability write and a broadcast, and holding a lock across one would stall
     // whoever is discovering peers behind whoever is writing to a disk.
-    for (auto const& command: Cluster::MembershipProposals(_application.State(), desired))
+    for (auto const& command: Cluster::MembershipProposals(state, desired))
     {
         auto const proposed = Propose(command);
         if (!proposed.has_value())
@@ -514,6 +538,96 @@ void ConsensusTier::Reconcile()
                      command.schedulerEndpoint.empty() ? std::string {}
                                                        : std::format(", scheduler {}", command.schedulerEndpoint));
     }
+
+    // Against the state read at the top, which is deliberately the APPLIED one: a
+    // member reaches it only after its record has committed, so the address is
+    // agreed before the id is counted. That ordering is what lets every other node
+    // learn where the new member answers before it is asked to vote for anybody.
+    ReconcileQuorum(state);
+}
+
+void ConsensusTier::LearnMembers(Cluster::ClusterState const& state, std::span<Cluster::DesiredMember const> desired)
+{
+    auto const learn = [this](Consensus::NodeId const& id, std::string const& endpoint) {
+        auto const where = PeerEndpointFor(id, endpoint);
+        if (!where.has_value())
+            return;
+
+        auto const change = _transport->Learn(*where);
+
+        // Only the two that changed something. `Unchanged` is what a healthy fleet
+        // answers on every pass forever, and `Self` is this node's own record, which
+        // a member set always contains -- reporting either would bury the two lines
+        // that say the cluster's shape moved.
+        if (change == Consensus::PeerChange::Added)
+            _logger.Logf(LogLevel::Info, "raft: now dialling peer {} at {}", id, endpoint);
+        else if (change == Consensus::PeerChange::Readdressed)
+            _logger.Logf(LogLevel::Info, "raft: peer {} moved to {}", id, endpoint);
+    };
+
+    for (auto const& member: state.members)
+        learn(member.id, member.raftEndpoint);
+
+    // And what discovery has proved, which the state may not hold yet -- or ever,
+    // on a node that is not the leader and so proposes nothing. A peer that has
+    // answered the key challenge is one this node has every reason to dial: for a
+    // node waiting to be admitted it is the ONLY route to an address, and without
+    // it such a node cannot answer the leader that admits it.
+    //
+    // Only where the state is silent, and the precedence is the point rather than
+    // the saving. The two can disagree about one peer's address -- a node that
+    // moved, seen by discovery before the change is agreed -- and learning both
+    // would re-address it twice and drop its connection twice, once per pass,
+    // forever. What the cluster has AGREED wins over what one node believes.
+    for (auto const& member: desired)
+        if (std::ranges::find(state.members, member.id, &Cluster::ClusterMember::id) == state.members.end())
+            learn(member.id, member.raftEndpoint);
+}
+
+void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
+{
+    // Both under one lock, because they are compared: two reads would let a
+    // configuration change land between them and produce a pair that never existed.
+    auto const progress = _driver->CurrentProgress();
+
+    // One change at a time, and only once the last has been agreed. `RaftNode`
+    // refuses a second while one is in flight, so proposing anyway would cost a
+    // refusal per interval -- and the wait itself is the diagnostic that matters,
+    // because a configuration naming a member that will never acknowledge this
+    // leader never commits and is otherwise completely silent.
+    if (_quorumProposedAt > progress.commitIndex)
+    {
+        ++_quorumWaited;
+
+        // Once, at a round number of passes, rather than every pass: a wait that
+        // logs per interval is a wait an operator filters out.
+        if (_quorumWaited == QuorumProposalPatience)
+            _logger.Logf(LogLevel::Warn,
+                         "cluster: the membership change at index {} has not committed after {} seconds; a member it "
+                         "names may not accept this node as its leader",
+                         _quorumProposedAt.value,
+                         (QuorumProposalPatience * ReconcileInterval).count() / 1000);
+        return;
+    }
+
+    _quorumWaited = 0;
+
+    auto change = Cluster::NextQuorumChange(state, progress.members, _self.id, _bootstrapIds);
+    if (!change.has_value())
+        return;
+
+    auto const proposed = _driver->ProposeMembership(*change, std::chrono::steady_clock::now());
+    if (!proposed.has_value())
+    {
+        // One line and out, exactly as above: the commonest reason is that
+        // leadership moved between the two, which is not a fault.
+        _logger.Logf(LogLevel::Info, "cluster: cannot change the quorum right now: {}", proposed.error().context);
+        return;
+    }
+
+    _quorumProposedAt = *proposed;
+    _logger.Logf(
+        LogLevel::Info, "cluster: proposing a quorum of {} member(s) at index {}", change->size(), _quorumProposedAt.value);
 }
 
 void ConsensusTier::PublishRole(Consensus::Role role, std::optional<Consensus::NodeId> const& knownLeader)

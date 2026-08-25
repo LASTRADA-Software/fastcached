@@ -126,6 +126,7 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         "--cluster-status",
         "--cluster-set",
         "--cluster-forget",
+        "--cluster-admit",
     });
 
     // A configuration in which no field holds its default, so every emitter fires.
@@ -151,6 +152,11 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.nodeId = "n1";
     cfg.raftListen = "0.0.0.0:6680";
     cfg.raftPeers = { "n1=10.0.0.4:6680", "n2=10.0.0.5:6680" };
+    // Every field differs from its default, so every emitter fires -- which is the
+    // narrow question this case asks. Alongside two peers is a legitimate joiner:
+    // under `--raft-join` that list is who this node can REACH rather than who it
+    // is a cluster with.
+    cfg.raftJoin = true;
     cfg.clusterDir = "cluster";
     cfg.clusterId = "fleet-a";
     cfg.discoveryAddress = "255.255.255.255:6681";
@@ -330,6 +336,34 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         CHECK(Unwrap(refusal).contains("--listen-scheduler"));
     }
 
+    SECTION("a joiner with no identity")
+    {
+        // The cluster admits an ID and counts every vote against one. A node waiting
+        // to be admitted without one would listen forever and could never be named.
+        NodeConfig cfg;
+        cfg.raftJoin = true;
+        cfg.raftPeers = { "n1=10.0.0.4:6680" };
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--node-id"));
+    }
+
+    SECTION("a joiner naming nothing at all")
+    {
+        // Its own address is the half only it knows -- and without the cluster's it
+        // cannot answer the leader that admits it, which is what makes the leader
+        // walk its replication back to an empty log. Admitted, dialled, and
+        // permanently silent.
+        NodeConfig cfg;
+        cfg.raftJoin = true;
+        cfg.nodeId = "n4";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--raft-peer"));
+    }
+
     SECTION("the working shapes are accepted")
     {
         NodeConfig listed;
@@ -341,6 +375,14 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         open.schedulerListen = "0.0.0.0:6678";
         open.fleetOpen = true;
         CHECK_FALSE(StartupPolicyRejection(open).has_value());
+
+        // A joiner names itself and the cluster it is asking to join: under
+        // `--raft-join` that list is who it can REACH rather than who it counts.
+        NodeConfig joiner;
+        joiner.raftJoin = true;
+        joiner.nodeId = "n4";
+        joiner.raftPeers = { "n4=10.0.0.4:6680", "n1=10.0.0.1:6680", "n2=10.0.0.2:6680" };
+        CHECK_FALSE(StartupPolicyRejection(joiner).has_value());
 
         // And a worker running no scheduler at all -- by far the common case -- is
         // untouched by any of this.

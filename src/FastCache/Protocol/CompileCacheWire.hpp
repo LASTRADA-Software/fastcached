@@ -154,6 +154,7 @@ enum class Op : std::uint8_t
     ClusterStatus = 0x08, ///< Operator asks what the cluster has agreed.
     ClusterSet = 0x09,    ///< Operator changes a replicated setting.
     ClusterForget = 0x0A, ///< Operator removes a member.
+    ClusterAdmit = 0x0B,  ///< Operator adds a member, or moves one.
 };
 
 /// Reply status, the first byte of every reply.
@@ -390,6 +391,12 @@ inline constexpr std::array OpTable {
     OpDescriptor { .code = Op::ClusterForget,
                    .name = "cluster-forget",
                    .fieldCount = 1, // member id
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = false,
+                   .maxPayload = MaxControlPayload },
+    OpDescriptor { .code = Op::ClusterAdmit,
+                   .name = "cluster-admit",
+                   .fieldCount = 2, // member id, consensus endpoint
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = false,
                    .maxPayload = MaxControlPayload },
@@ -1456,6 +1463,47 @@ struct ClusterSetView
     if (!fields.has_value())
         return std::nullopt;
     return (*fields)[0];
+}
+
+/// An operator adding a member to the cluster, or moving one.
+struct ClusterAdmitRequest
+{
+    std::string_view memberId;     ///< Stable identity; what consensus counts.
+    std::string_view raftEndpoint; ///< host:port its consensus port answers on.
+};
+
+/// The same, as views into a received payload.
+struct ClusterAdmitView
+{
+    std::span<std::byte const> memberId;
+    std::span<std::byte const> raftEndpoint;
+};
+
+/// Frame a CLUSTER-ADMIT request.
+///
+/// Two fields and not one: an id with no address is a node the cluster counts
+/// towards quorum and cannot reach, which is the defect `Cluster::ClusterMember`
+/// exists to make unrepresentable. The scheduler endpoint is deliberately absent —
+/// a member announces its own, and nothing an operator types about somebody else
+/// could supply it.
+/// @param request Who to admit, and where it answers.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeClusterAdmit(ClusterAdmitRequest const& request,
+                                                               WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::ClusterAdmit, { AsBytes(request.memberId), AsBytes(request.raftEndpoint) });
+}
+
+/// Split a CLUSTER-ADMIT payload.
+/// @param payload The bytes following the request header.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<ClusterAdmitView> DecodeClusterAdmitPayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::ClusterAdmit));
+    if (!fields.has_value())
+        return std::nullopt;
+    return ClusterAdmitView { .memberId = (*fields)[0], .raftEndpoint = (*fields)[1] };
 }
 
 /// Frame a COMPILE request.
