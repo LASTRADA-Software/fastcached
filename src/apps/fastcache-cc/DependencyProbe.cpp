@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <format>
 #include <optional>
 #include <span>
 #include <string>
@@ -94,18 +95,58 @@ namespace
         return joined;
     }
 
-    /// The portable form of one raw dependency path, or nothing when this machine
+    /// One reported path's outcome: what became of it, and its token if it was kept.
+    struct Classification
+    {
+        PathDisposition disposition; ///< Why it was kept, or why it was not.
+        std::string token;           ///< The form to hash; empty unless `disposition` is Keyed.
+    };
+
+    /// Drop a path, naming the reason so the launcher's note can report it.
+    /// @param disposition Why this path does not reach the key.
+    /// @return The classification.
+    [[nodiscard]] Classification Dropped(PathDisposition disposition)
+    {
+        return { .disposition = disposition, .token = {} };
+    }
+
+    /// The canonical token for a path under one of the layout's roots.
+    ///
+    /// Spelled once because two questions need it and they must not answer
+    /// differently: what to hash, and — for a drive-relative path — whether the
+    /// layout can place it at all. `Canonicalize` returns its input verbatim for a
+    /// path it did not rewrite, so inequality, not the spelling of a sentinel
+    /// PathCanon keeps private, is what says a token was produced.
+    ///
+    /// @param path   A normalized, `/`-separated path.
+    /// @param layout This machine's roots.
+    /// @return The token, or nothing when the path lies under no root.
+    [[nodiscard]] std::optional<std::string> RootToken(std::string const& path, PathCanon::Layout const& layout)
+    {
+        auto canon = PathCanon::Canonicalize(path, layout);
+        if (canon.has_value() && *canon != path)
+            return std::move(*canon);
+        return std::nullopt;
+    }
+
+    /// The portable form of one raw dependency path, or the reason this machine
     /// must not hash it. See the header for why each branch is load-bearing.
+    ///
+    /// Every `return` names a PathDisposition rather than merely yielding nothing.
+    /// The branches were always distinct; only the reporting collapsed them, which
+    /// is what left `0 of M` unable to tell a short-name root (issue #66) from an
+    /// unanchorable path (issue #65) — see PathDisposition (issue #105).
+    ///
     /// @param raw              A dependency path as the compiler spelled it.
     /// @param layout           This machine's roots.
     /// @param workingDirectory What a relative path resolves against.
-    /// @return The form to hash, or an empty string to drop the path.
-    [[nodiscard]] std::string PortableForm(std::string_view raw,
-                                           PathCanon::Layout const& layout,
-                                           std::string_view workingDirectory)
+    /// @return The form to hash, or the reason the path was dropped.
+    [[nodiscard]] Classification PortableForm(std::string_view raw,
+                                              PathCanon::Layout const& layout,
+                                              std::string_view workingDirectory)
     {
         if (raw.empty())
-            return {};
+            return Dropped(PathDisposition::Empty);
 
         auto folded = Folded(raw);
 
@@ -122,7 +163,11 @@ namespace
         // Absolute would have been resolved against the working directory instead.
         // Measured on libc++, and the same shape of host coupling as the UNC root
         // above.
-        switch (PathCanon::AnchorForLayout(folded, layout))
+        //
+        // Kept rather than merely branched on, because it is also half of what the
+        // note reports a later drop AS: see the toolchain branch below.
+        auto const anchor = PathCanon::AnchorForLayout(folded, layout);
+        switch (anchor)
         {
             case PathCanon::Anchor::WorkingDirectory:
                 // RESOLVED, never kept for its spelling: the tests below ask what a
@@ -137,7 +182,7 @@ namespace
                 // `workingDirectory` alone, so one rule covers an empty directory
                 // and a relative one alike.
                 if (PathCanon::AnchorForLayout(folded, layout) == PathCanon::Anchor::WorkingDirectory)
-                    return {};
+                    return Dropped(PathDisposition::Unanchored);
                 break;
             case PathCanon::Anchor::DriveRelative:
             case PathCanon::Anchor::Absolute:
@@ -153,16 +198,18 @@ namespace
                 //
                 // Beyond that, root membership is the stronger test and is left to
                 // decide: a drive-relative path under no root cannot prefix-match a
-                // rooted root (`c:foo/...` against `c:/src`), so it is dropped as
-                // toolchain anyway — while one under a *drive-relative* root
-                // canonicalizes to a token that is portable precisely because the
-                // consumer substitutes its own root. Returning early here would
-                // silently drop that second case, which was kept before issue #65.
+                // rooted root (`c:foo/...` against `c:/src`), so it is dropped
+                // regardless — while one under a *drive-relative* root canonicalizes
+                // to a token that is portable precisely because the consumer
+                // substitutes its own root. Returning early here would silently drop
+                // that second case, which was kept before issue #65.
                 break;
         }
 
         // One lexical pass, whichever branch produced the text.
         auto const path = LexicalForm(folded);
+
+        bool const driveRelative = anchor == PathCanon::Anchor::DriveRelative;
 
         // The classifier the manifest and the replay guard already use, so all
         // three agree on what "toolchain" means — including a vcpkg tree nested
@@ -172,14 +219,41 @@ namespace
         // branch it came down — which is the case about which the three genuinely do
         // agree (see the header for where they part on the ones that are).
         if (IsToolchainHeader(path, layout))
-            return {};
+        {
+            // Which of two true things a dropped drive-relative path is REPORTED
+            // as, and the root question is what decides. Such a path is anchored to
+            // a drive's own current directory — per-process state on the producing
+            // machine, portable to nothing — and it may also be content the
+            // toolchain stamp covers. Under NO root only the first says what to
+            // change, and calling it toolchain there is precisely the collapse
+            // issue #105 exists to undo: that is the word a short-name root
+            // produces too, so the two faults would keep rendering as one line.
+            // Under a drive-relative root the path canonicalizes, so a marker match
+            // is ordinary vendored content and toolchain is the true answer —
+            // reporting THAT as drive-relative would be the loudest possible
+            // reading of this vocabulary on a healthy build, which is the same
+            // defect from the other side. `IsToolchainHeader` cannot separate the
+            // two on its own (it tests its markers before any root, deliberately),
+            // and splitting it is not worth a fourth spelling of the toolchain rule
+            // — so the root question is asked here instead, and only for the
+            // drive-relative path no ordinary build produces at all. The toolchain
+            // drop is 476 of a real translation unit's 635 paths and still costs
+            // exactly one root test.
+            if (driveRelative && !RootToken(path, layout).has_value())
+                return Dropped(PathDisposition::DriveRelative);
+            return Dropped(PathDisposition::Toolchain);
+        }
 
-        // Canonicalize returns its input verbatim for a path it did not rewrite,
-        // so inequality — not the spelling of a sentinel PathCanon keeps private —
-        // is what says a token was produced.
-        if (auto canon = PathCanon::Canonicalize(path, layout); canon.has_value() && *canon != path)
-            return *std::move(canon);
-        return {};
+        if (auto token = RootToken(path, layout); token.has_value())
+            return { .disposition = PathDisposition::Keyed, .token = *std::move(token) };
+
+        // Under no root, and the two ways to arrive there are different repairs.
+        // `Uncanonical` means the two root tests disagreed: IsToolchainHeader's
+        // prefix match is character-wise and Canonicalize's is segment-wise, so
+        // `/x/build-other/a.h` is project content to the first and under no root to
+        // the second — a root spelled almost right, which folding into "toolchain"
+        // would make indistinguishable from an ordinary system header.
+        return Dropped(driveRelative ? PathDisposition::DriveRelative : PathDisposition::Uncanonical);
     }
 } // namespace
 
@@ -218,26 +292,53 @@ ProbeText SplitIncludeNotes(std::string_view text)
     return out;
 }
 
-std::vector<std::string> KeyDependencySet(std::span<std::string const> rawPaths,
-                                          PathCanon::Layout const& layout,
-                                          std::string_view workingDirectory)
+std::string DescribeDropped(DependencySet const& set)
+{
+    std::string out;
+    for (auto const& row: DispositionTable)
+    {
+        // `Keyed` is what the note's own `N of M` prefix already reports, and a
+        // reason that counted nothing is a reason this compile did not have — a
+        // healthy build should say what happened, not enumerate what did not.
+        if (row.disposition == PathDisposition::Keyed)
+            continue;
+        auto const count = set.Count(row.disposition);
+        if (count == 0)
+            continue;
+        if (!out.empty())
+            out += ", ";
+        out += std::format("{} {}", count, row.label);
+    }
+    return out;
+}
+
+DependencySet KeyDependencySet(std::span<std::string const> rawPaths,
+                               PathCanon::Layout const& layout,
+                               std::string_view workingDirectory)
 {
     // Folded and normalized once, not per path: it arrives in whatever form the
     // caller's platform spells a current directory, and the join below is a byte
     // concatenation that assumes both sides already agree on a separator.
     auto const base = LexicalForm(Folded(workingDirectory));
 
-    std::vector<std::string> out;
-    out.reserve(rawPaths.size());
+    DependencySet out;
+    out.keyed.reserve(rawPaths.size());
     for (auto const& raw: rawPaths)
-        if (auto portable = PortableForm(raw, layout, base); !portable.empty())
-            out.push_back(std::move(portable));
+    {
+        auto classified = PortableForm(raw, layout, base);
+        // Tallied per reported OCCURRENCE, before the deduplication below, so the
+        // whole tally sums to what the probe reported and the note's reasons
+        // account for every path it counted.
+        ++out.tally[static_cast<std::size_t>(classified.disposition)];
+        if (classified.disposition == PathDisposition::Keyed)
+            out.keyed.push_back(std::move(classified.token));
+    }
 
     // Byte-wise, so the order is a property of the data rather than of the
     // machine's locale — two machines must produce the same key from the same set.
-    std::ranges::sort(out);
-    auto const duplicates = std::ranges::unique(out);
-    out.erase(duplicates.begin(), duplicates.end());
+    std::ranges::sort(out.keyed);
+    auto const duplicates = std::ranges::unique(out.keyed);
+    out.keyed.erase(duplicates.begin(), duplicates.end());
     return out;
 }
 

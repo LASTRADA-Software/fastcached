@@ -379,18 +379,20 @@ void WarnIfRejected(Cc::CacheOutcome const& outcome, std::string_view what, std:
 /// that reported nothing on the preprocess line, a different fault this message
 /// would misdescribe.
 ///
-/// @param cfg        Launcher config, for the roots to name.
-/// @param sourcePath The translation unit, as the build system spelled it.
-/// @param keyed      How many reported paths reached the key.
-/// @param reported   The paths the probe reported, already reconciled.
-/// @param reconciler Decides whether the source has a portable form at all.
+/// @param cfg          Launcher config, for the roots to name.
+/// @param sourcePath   The translation unit, as the build system spelled it.
+/// @param dependencies The classified dependency set, which carries both counts
+///                     this condition needs. Passed whole rather than as a keyed
+///                     count beside the raw path vector, so the two cannot be
+///                     derived twice and come to disagree — the reason
+///                     `DependencySet::Reported` exists at all.
+/// @param reconciler   Decides whether the source has a portable form at all.
 void NoteIfRootsDoNotDescribeCompile(Config const& cfg,
                                      std::string_view sourcePath,
-                                     std::size_t keyed,
-                                     std::vector<std::string> const& reported,
+                                     Cc::DependencySet const& dependencies,
                                      Cc::RootReconciler& reconciler)
 {
-    if (keyed != 0 || reported.empty() || reconciler.IsInTree(sourcePath))
+    if (!dependencies.keyed.empty() || dependencies.Reported() == 0 || reconciler.IsInTree(sourcePath))
         return;
 
     // The roots next to the source they fail to contain: the mismatch is only
@@ -1383,6 +1385,33 @@ void RecordManifest(Config const& cfg,
         // resolved against the compile's working directory first, so it is
         // classified by the file it names rather than by how the driver spelled it.
         // See DependencyProbe.hpp, where each half of that filter is justified.
+        auto dependencies = Cc::KeyDependencySet(probe->dependencyPaths, layout, workingDirectory.string());
+
+        // Both counts, because they answer different questions and only the pair
+        // is diagnostic. An empty set means a moved header cannot re-key — the
+        // property this whole input exists for, failing silently — and "the probe
+        // reported nothing" (a driver that does not report on the preprocess line)
+        // is a different defect from "every reported path was filtered out" (paths
+        // the layout does not recognise as its own). Named for the same reason the
+        // STALE HIT note names its path: otherwise this is a whole investigation.
+        //
+        // And the pair alone stopped being enough. `0 of M` was the fingerprint of
+        // one fault (issue #66's short-name root, where nothing prefix-matches what
+        // the driver echoes back) until issue #65 gave it a second (a drive-relative
+        // path, which is anchored to nothing this machine can place). The reasons
+        // are what tell those apart now; the counts alone told neither (issue #105).
+        // Rendered by DescribeDropped rather than here, because main.cpp is in no
+        // test target. Semicolon-separated from the filesystem-call count, which is
+        // not a path count and must not read as another entry in the list.
+        auto const dropped = Cc::DescribeDropped(dependencies);
+        Note(std::format("dependency set: {} of {} reported path(s) keyed ({}{}{} filesystem call(s))",
+                         dependencies.keyed.size(),
+                         dependencies.Reported(),
+                         dropped,
+                         dropped.empty() ? "" : "; ",
+                         PathResolver().FilesystemCalls()));
+        NoteIfRootsDoNotDescribeCompile(cfg, cmd.source, dependencies, reconciler);
+
         // Non-const so the preprocessed text can be MOVED out below rather than
         // copied. It was const, and `std::move` on a const member is a silent copy
         // -- of several megabytes, on the hot path of a parallel build, while the
@@ -1392,20 +1421,8 @@ void RecordManifest(Config const& cfg,
             .compilerId = toolchainStamp,
             .preprocessed = std::move(probe->preprocessed),
             .relativizedArgs = relativizedArgs,
-            .dependencyPaths = Cc::KeyDependencySet(probe->dependencyPaths, layout, workingDirectory.string()),
+            .dependencyPaths = std::move(dependencies.keyed),
         };
-        // Both counts, because they answer different questions and only the pair
-        // is diagnostic. An empty set means a moved header cannot re-key — the
-        // property this whole input exists for, failing silently — and "the probe
-        // reported nothing" (a driver that does not report on the preprocess line)
-        // is a different defect from "every reported path was filtered out" (paths
-        // the layout does not recognise as its own). Named for the same reason the
-        // STALE HIT note names its path: otherwise this is a whole investigation.
-        Note(std::format("dependency set: {} of {} reported path(s) keyed ({} filesystem call(s))",
-                         inputs.dependencyPaths.size(),
-                         probe->dependencyPaths.size(),
-                         PathResolver().FilesystemCalls()));
-        NoteIfRootsDoNotDescribeCompile(cfg, cmd.source, inputs.dependencyPaths.size(), probe->dependencyPaths, reconciler);
         key = Cc::ComputeKey(inputs);
 
         // Moved out AFTER the key is computed, so the key path pays nothing: by
