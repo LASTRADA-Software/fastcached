@@ -18,16 +18,14 @@ TEST_CASE("Canonicalize rewrites a source-root path to a SRCROOT token")
 {
     Layout const layout { .sourceRoot = R"(C:\ci\deep\runner\src)", .buildTree = R"(C:\ci\deep\runner\build)" };
     auto const token = PathCanon::Canonicalize(R"(C:\ci\deep\runner\src\include\foo.h)", layout);
-    REQUIRE(token.has_value());
-    CHECK(*token == "<SRCROOT>/include/foo.h");
+    CHECK(token == "<SRCROOT>/include/foo.h");
 }
 
 TEST_CASE("Canonicalize prefers the longest (build-tree) root when nested under source root")
 {
     Layout const layout { .sourceRoot = R"(C:\src)", .buildTree = R"(C:\src\build)" };
     auto const token = PathCanon::Canonicalize(R"(C:\src\build\gen\config.h)", layout);
-    REQUIRE(token.has_value());
-    CHECK(*token == "<BUILDTREE>/gen/config.h");
+    CHECK(token == "<BUILDTREE>/gen/config.h");
 }
 
 TEST_CASE("Localize is the inverse of Canonicalize under a different layout")
@@ -35,21 +33,17 @@ TEST_CASE("Localize is the inverse of Canonicalize under a different layout")
     Layout const producer { .sourceRoot = R"(C:\ci\deep\runner\src)", .buildTree = R"(C:\ci\deep\runner\build)" };
     Layout const consumer { .sourceRoot = R"(D:\project)", .buildTree = R"(D:\project\build)" };
     auto const token = PathCanon::Canonicalize(R"(C:\ci\deep\runner\src\include\foo.h)", producer);
-    REQUIRE(token.has_value());
-    auto const local = PathCanon::Localize(*token, consumer);
-    REQUIRE(local.has_value());
-    CHECK(*local == R"(D:\project\include\foo.h)");
+    auto const local = PathCanon::Localize(token, consumer);
+    CHECK(local == R"(D:\project\include\foo.h)");
 }
 
 TEST_CASE("A path under neither root round-trips verbatim")
 {
     Layout const layout { .sourceRoot = R"(C:\src)", .buildTree = R"(C:\build)" };
     auto const token = PathCanon::Canonicalize(R"(C:\Windows\Kits\10\um\windows.h)", layout);
-    REQUIRE(token.has_value());
-    CHECK(*token == R"(C:\Windows\Kits\10\um\windows.h)");
-    auto const local = PathCanon::Localize(*token, layout);
-    REQUIRE(local.has_value());
-    CHECK(*local == R"(C:\Windows\Kits\10\um\windows.h)");
+    CHECK(token == R"(C:\Windows\Kits\10\um\windows.h)");
+    auto const local = PathCanon::Localize(token, layout);
+    CHECK(local == R"(C:\Windows\Kits\10\um\windows.h)");
 }
 
 TEST_CASE("Root match is on a segment boundary, not a bare prefix")
@@ -57,17 +51,15 @@ TEST_CASE("Root match is on a segment boundary, not a bare prefix")
     // sourceRoot C:\srclib must NOT match a path under C:\src\...
     Layout const layout { .sourceRoot = R"(C:\srclib)", .buildTree = R"(C:\build)" };
     auto const token = PathCanon::Canonicalize(R"(C:\src\other\x.h)", layout);
-    REQUIRE(token.has_value());
-    CHECK(*token == R"(C:\src\other\x.h)");
+    CHECK(token == R"(C:\src\other\x.h)");
 }
 
 TEST_CASE("Matching is case-insensitive on Windows drive and path")
 {
     Layout const layout { .sourceRoot = R"(C:\Ci\Deep\Src)", .buildTree = R"(C:\Ci\Deep\Build)" };
     auto const token = PathCanon::Canonicalize(R"(c:\ci\deep\src\A.H)", layout);
-    REQUIRE(token.has_value());
     // Tail preserves the ORIGINAL bytes' case; only separators normalize.
-    CHECK(*token == "<SRCROOT>/A.H");
+    CHECK(token == "<SRCROOT>/A.H");
 }
 
 // ---------------------------------------------------------------------------
@@ -81,8 +73,7 @@ TEST_CASE("CanonicalizeRegion rewrites only the path in a /showIncludes line")
                            R"(C:\ci\deep\src\include\foo.h)"
                            "\r\n";
     auto const out = PathCanon::CanonicalizeRegion(in, Grammar::ShowIncludes, layout);
-    REQUIRE(out.has_value());
-    CHECK(*out == "Note: including file: <SRCROOT>/include/foo.h\r\n");
+    CHECK(out == "Note: including file: <SRCROOT>/include/foo.h\r\n");
 }
 
 TEST_CASE("LocalizeRegion round-trips a showIncludes block across layouts")
@@ -96,12 +87,10 @@ TEST_CASE("LocalizeRegion round-trips a showIncludes block across layouts")
                            R"(C:\ci\deep\src\b.h)"
                            "\r\n";
     auto const canon = PathCanon::CanonicalizeRegion(in, Grammar::ShowIncludes, producer);
-    REQUIRE(canon.has_value());
-    auto const local = PathCanon::LocalizeRegion(*canon, Grammar::ShowIncludes, consumer);
-    REQUIRE(local.has_value());
-    CHECK(local->contains(R"(D:\project\a.h)"));
-    CHECK(local->contains(R"(D:\project\b.h)"));
-    CHECK_FALSE(local->contains(R"(ci\deep)"));
+    auto const local = PathCanon::LocalizeRegion(canon, Grammar::ShowIncludes, consumer);
+    CHECK(local.contains(R"(D:\project\a.h)"));
+    CHECK(local.contains(R"(D:\project\b.h)"));
+    CHECK_FALSE(local.contains(R"(ci\deep)"));
 }
 
 TEST_CASE("A non-path showIncludes line is preserved verbatim")
@@ -109,8 +98,7 @@ TEST_CASE("A non-path showIncludes line is preserved verbatim")
     Layout const layout { .sourceRoot = R"(C:\src)", .buildTree = R"(C:\build)" };
     std::string const in = "some unrelated compiler note\r\n";
     auto const out = PathCanon::CanonicalizeRegion(in, Grammar::ShowIncludes, layout);
-    REQUIRE(out.has_value());
-    CHECK(*out == in);
+    CHECK(out == in);
 }
 
 TEST_CASE("CanonicalizeRegion leaves a final line without newline intact")
@@ -120,8 +108,7 @@ TEST_CASE("CanonicalizeRegion leaves a final line without newline intact")
     std::string const in = "Note: including file: "
                            R"(C:\ci\deep\src\z.h)";
     auto const out = PathCanon::CanonicalizeRegion(in, Grammar::ShowIncludes, layout);
-    REQUIRE(out.has_value());
-    CHECK(*out == "Note: including file: <SRCROOT>/z.h");
+    CHECK(out == "Note: including file: <SRCROOT>/z.h");
 }
 
 TEST_CASE("MsvcDiagnostics rewrites the leading path of a diagnostic line")
@@ -130,8 +117,7 @@ TEST_CASE("MsvcDiagnostics rewrites the leading path of a diagnostic line")
     std::string const in = R"(C:\ci\deep\src\a.cpp(42): warning C4100: unreferenced)"
                            "\r\n";
     auto const out = PathCanon::CanonicalizeRegion(in, Grammar::MsvcDiagnostics, layout);
-    REQUIRE(out.has_value());
-    CHECK(*out == "<SRCROOT>/a.cpp(42): warning C4100: unreferenced\r\n");
+    CHECK(out == "<SRCROOT>/a.cpp(42): warning C4100: unreferenced\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -145,14 +131,13 @@ TEST_CASE("GccDepfile canonicalizes both the target and every dependency")
     constexpr std::string_view depFile = "/home/ci/build/a.o: /home/ci/src/a.cpp /home/ci/src/a.hpp\n";
 
     auto const canonical = PathCanon::CanonicalizeRegion(depFile, Grammar::GccDepfile, layout);
-    REQUIRE(canonical.has_value());
     // Every checkout-rooted path becomes a token; nothing machine-specific left.
-    CHECK_FALSE(canonical->contains("/home/ci"));
-    CHECK(canonical->contains("<BUILDTREE>"));
-    CHECK(canonical->contains("<SRCROOT>"));
+    CHECK_FALSE(canonical.contains("/home/ci"));
+    CHECK(canonical.contains("<BUILDTREE>"));
+    CHECK(canonical.contains("<SRCROOT>"));
     // The rule syntax itself is untouched.
-    CHECK(canonical->contains(": "));
-    CHECK(canonical->ends_with("\n"));
+    CHECK(canonical.contains(": "));
+    CHECK(canonical.ends_with("\n"));
 }
 
 TEST_CASE("GccDepfile round-trips a depfile into a different checkout")
@@ -168,20 +153,18 @@ TEST_CASE("GccDepfile round-trips a depfile into a different checkout")
                                          "  /build/deep/a/b/c/src/hdr.hpp\n";
 
     auto const canonical = PathCanon::CanonicalizeRegion(depFile, Grammar::GccDepfile, producer);
-    REQUIRE(canonical.has_value());
-    auto const localized = PathCanon::LocalizeRegion(*canonical, Grammar::GccDepfile, consumer);
-    REQUIRE(localized.has_value());
+    auto const localized = PathCanon::LocalizeRegion(canonical, Grammar::GccDepfile, consumer);
 
-    CHECK(localized->contains("/s/out/t.o"));
-    CHECK(localized->contains("/s/t.cpp"));
-    CHECK(localized->contains("/s/hdr.hpp"));
+    CHECK(localized.contains("/s/out/t.o"));
+    CHECK(localized.contains("/s/t.cpp"));
+    CHECK(localized.contains("/s/hdr.hpp"));
     // The producer's layout must be entirely gone.
-    CHECK_FALSE(localized->contains("/build/deep"));
+    CHECK_FALSE(localized.contains("/build/deep"));
     // A path under neither root (a system header) is not ours to rewrite.
-    CHECK(localized->contains("/usr/include/stdc-predef.h"));
+    CHECK(localized.contains("/usr/include/stdc-predef.h"));
     // Continuations survive: a depfile whose line structure changed could stop
     // parsing as a rule at all.
-    CHECK(localized->contains("\\\n"));
+    CHECK(localized.contains("\\\n"));
 }
 
 TEST_CASE("GccDepfile preserves escaped spaces inside a path")
@@ -193,11 +176,9 @@ TEST_CASE("GccDepfile preserves escaped spaces inside a path")
                                          "\n";
 
     auto const canonical = PathCanon::CanonicalizeRegion(depFile, Grammar::GccDepfile, layout);
-    REQUIRE(canonical.has_value());
-    auto const localized = PathCanon::LocalizeRegion(*canonical, Grammar::GccDepfile, layout);
-    REQUIRE(localized.has_value());
+    auto const localized = PathCanon::LocalizeRegion(canonical, Grammar::GccDepfile, layout);
     // Byte-identical round-trip through the same layout.
-    CHECK(*localized == depFile);
+    CHECK(localized == depFile);
 }
 
 TEST_CASE("GccDepfile keeps a Windows drive letter out of the rule separator")
@@ -209,13 +190,11 @@ TEST_CASE("GccDepfile keeps a Windows drive letter out of the rule separator")
                                          "\n";
 
     auto const canonical = PathCanon::CanonicalizeRegion(depFile, Grammar::GccDepfile, layout);
-    REQUIRE(canonical.has_value());
-    CHECK(canonical->contains("<BUILDTREE>"));
-    CHECK(canonical->contains("<SRCROOT>"));
+    CHECK(canonical.contains("<BUILDTREE>"));
+    CHECK(canonical.contains("<SRCROOT>"));
 
-    auto const localized = PathCanon::LocalizeRegion(*canonical, Grammar::GccDepfile, layout);
-    REQUIRE(localized.has_value());
-    CHECK(*localized == depFile);
+    auto const localized = PathCanon::LocalizeRegion(canonical, Grammar::GccDepfile, layout);
+    CHECK(localized == depFile);
 }
 
 TEST_CASE("GccDepfile leaves a depfile with no in-tree paths untouched")
@@ -224,8 +203,7 @@ TEST_CASE("GccDepfile leaves a depfile with no in-tree paths untouched")
     constexpr std::string_view depFile = "/other/a.o: /other/a.cpp /usr/include/stdio.h\n";
 
     auto const canonical = PathCanon::CanonicalizeRegion(depFile, Grammar::GccDepfile, layout);
-    REQUIRE(canonical.has_value());
-    CHECK(*canonical == depFile);
+    CHECK(canonical == depFile);
 }
 
 TEST_CASE("GccDepfile preserves the phony rules -MP emits")
@@ -236,10 +214,8 @@ TEST_CASE("GccDepfile preserves the phony rules -MP emits")
                                          "/s/a.hpp:\n";
 
     auto const canonical = PathCanon::CanonicalizeRegion(depFile, Grammar::GccDepfile, layout);
-    REQUIRE(canonical.has_value());
-    auto const localized = PathCanon::LocalizeRegion(*canonical, Grammar::GccDepfile, layout);
-    REQUIRE(localized.has_value());
-    CHECK(*localized == depFile);
+    auto const localized = PathCanon::LocalizeRegion(canonical, Grammar::GccDepfile, layout);
+    CHECK(localized == depFile);
 }
 
 // ---------------------------------------------------------------------------
@@ -340,8 +316,7 @@ TEST_CASE("A drive-relative root still makes a Windows layout, and still canonic
     // why the key filter leaves such a path to the root tests instead of dropping
     // it on the anchor alone.
     auto const token = PathCanon::Canonicalize(R"(C:src\proj\a.hpp)", layout);
-    REQUIRE(token.has_value());
-    CHECK(*token == "<SRCROOT>/a.hpp");
+    CHECK(token == "<SRCROOT>/a.hpp");
 }
 
 // ---------------------------------------------------------------------------
@@ -375,14 +350,11 @@ TEST_CASE("RewritePaths reconciles a showIncludes path so the roots can then mat
     constexpr std::string_view region = "Note: including file:  C:\\Users\\RUNNER~1\\src\\inc\\h1.h\r\n";
 
     auto const unreconciled = PathCanon::CanonicalizeRegion(region, Grammar::ShowIncludes, layout);
-    REQUIRE(unreconciled.has_value());
-    CHECK(*unreconciled == region); // nothing matched: the defect this exists to end
+    CHECK(unreconciled == region); // nothing matched: the defect this exists to end
 
     auto const reconciled = PathCanon::RewritePaths(region, Grammar::ShowIncludes, DealiasShortName);
-    REQUIRE(reconciled.has_value());
-    auto const canonical = PathCanon::CanonicalizeRegion(*reconciled, Grammar::ShowIncludes, layout);
-    REQUIRE(canonical.has_value());
-    CHECK(*canonical == "Note: including file:  <SRCROOT>/inc/h1.h\r\n");
+    auto const canonical = PathCanon::CanonicalizeRegion(reconciled, Grammar::ShowIncludes, layout);
+    CHECK(canonical == "Note: including file:  <SRCROOT>/inc/h1.h\r\n");
 }
 
 TEST_CASE("RewritePaths leaves the non-path parts of every grammar byte-for-byte")
@@ -392,15 +364,13 @@ TEST_CASE("RewritePaths leaves the non-path parts of every grammar byte-for-byte
     constexpr std::string_view notes = "char const* s = \"Note: including file: x\";\n"
                                        "Note: including file: C:\\Users\\RUNNER~1\\src\\a.h\n";
     auto const rewritten = PathCanon::RewritePaths(notes, Grammar::ShowIncludes, DealiasShortName);
-    REQUIRE(rewritten.has_value());
-    CHECK(*rewritten
+    CHECK(rewritten
           == "char const* s = \"Note: including file: x\";\n"
              "Note: including file: C:\\Users\\runneradmin\\src\\a.h\n");
 
     constexpr std::string_view diagnostic = "C:\\Users\\RUNNER~1\\src\\a.cpp(12,3): warning C4100: unused\n";
     auto const diag = PathCanon::RewritePaths(diagnostic, Grammar::MsvcDiagnostics, DealiasShortName);
-    REQUIRE(diag.has_value());
-    CHECK(*diag == "C:\\Users\\runneradmin\\src\\a.cpp(12,3): warning C4100: unused\n");
+    CHECK(diag == "C:\\Users\\runneradmin\\src\\a.cpp(12,3): warning C4100: unused\n");
 }
 
 TEST_CASE("RewritePaths reaches every token of a depfile, target included")
@@ -411,8 +381,7 @@ TEST_CASE("RewritePaths reaches every token of a depfile, target included")
     constexpr std::string_view depFile = "C:\\Users\\RUNNER~1\\src\\a.o: C:\\Users\\RUNNER~1\\src\\a.cpp\\\n"
                                          "  C:\\Users\\RUNNER~1\\src\\inc\\h1.h\n";
     auto const rewritten = PathCanon::RewritePaths(depFile, Grammar::GccDepfile, DealiasShortName);
-    REQUIRE(rewritten.has_value());
-    CHECK(*rewritten
+    CHECK(rewritten
           == "C:\\Users\\runneradmin\\src\\a.o: C:\\Users\\runneradmin\\src\\a.cpp\\\n"
              "  C:\\Users\\runneradmin\\src\\inc\\h1.h\n");
 }
@@ -437,8 +406,7 @@ TEST_CASE("RewritePaths lets a transform preserve one span and rewrite its neigh
                                          "C:\\Users\\RUNNER~1\\src\\inc\\h1.h:\n";
 
     auto const rewritten = PathCanon::RewritePaths(depFile, Grammar::GccDepfile, preserveObject);
-    REQUIRE(rewritten.has_value());
-    CHECK(*rewritten
+    CHECK(rewritten
           == "C:\\Users\\RUNNER~1\\src\\a.o: C:\\Users\\runneradmin\\src\\a.cpp\\\n"
              "  C:\\Users\\runneradmin\\src\\inc\\h1.h\n"
              "\n"
@@ -447,7 +415,7 @@ TEST_CASE("RewritePaths lets a transform preserve one span and rewrite its neigh
     // The dependency on the `\`-continued line is reached too. gcc wraps at ~76
     // columns, so a walker that stopped at the first line would exempt most of a
     // real depfile rather than none of it.
-    CHECK(rewritten->contains(R"(  C:\Users\runneradmin\src\inc\h1.h)"));
+    CHECK(rewritten.contains(R"(  C:\Users\runneradmin\src\inc\h1.h)"));
 }
 
 TEST_CASE("RewritePaths with an identity transform is a byte-exact no-op")
@@ -461,11 +429,9 @@ TEST_CASE("RewritePaths with an identity transform is a byte-exact no-op")
                                          "\n"
                                          "/s/a.hpp:\n";
     auto const rewritten = PathCanon::RewritePaths(depFile, Grammar::GccDepfile, identity);
-    REQUIRE(rewritten.has_value());
-    CHECK(*rewritten == depFile);
+    CHECK(rewritten == depFile);
 
     constexpr std::string_view notes = "Note: including file: /s/inc/h1.h\r\nunrelated\n";
     auto const notesOut = PathCanon::RewritePaths(notes, Grammar::ShowIncludes, identity);
-    REQUIRE(notesOut.has_value());
-    CHECK(*notesOut == notes);
+    CHECK(notesOut == notes);
 }

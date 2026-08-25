@@ -217,9 +217,9 @@ struct DependencySet
 /// is *not* refused — that layout is portable precisely because the consumer
 /// substitutes its own root, and refusing it would un-key a layout that works.
 ///
-/// Inequality against the input is what says a token was produced, never a
-/// sentinel spelling PathCanon keeps private — the same test `PortableForm`,
-/// `ProjectToken` and `RootReconciler::Translate` each apply.
+/// Inequality against the input is what says a token was produced — the same test
+/// `PortableForm`, `ProjectToken` and `RootReconciler::Translate` each apply. It is
+/// the ONLY test there is: nothing in PathCanon can fail (issues #59, #69).
 ///
 /// Pure: touches no filesystem. A drive-relative path is one of the few a
 /// filesystem could not place anyway.

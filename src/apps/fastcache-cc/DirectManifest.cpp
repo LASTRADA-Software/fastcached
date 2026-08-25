@@ -194,11 +194,11 @@ namespace
     {
         auto canonical = PathCanon::Canonicalize(resolved, layout);
         // Canonicalize returns its input verbatim for a path it did not rewrite, so
-        // inequality -- not a sentinel PathCanon keeps private -- is what says a
-        // token was produced.
-        if (!canonical.has_value() || *canonical == resolved)
+        // inequality is what says a token was produced -- and it is the only test
+        // there is, nothing in PathCanon being able to fail.
+        if (canonical == resolved)
             return std::nullopt;
-        return *std::move(canonical);
+        return canonical;
     }
 
 } // namespace
@@ -656,7 +656,7 @@ bool ValidateManifest(DirectManifest const& manifest, PathCanon::Layout const& l
     // cannot equal a recorded hash — so removal invalidates the manifest too.
     return std::ranges::all_of(manifest.entries, [&layout](DirectManifest::Entry const& entry) {
         auto const localized = PathCanon::Localize(entry.canonicalPath, layout);
-        return localized.has_value() && HashFileContents(*localized) == entry.contentHash;
+        return HashFileContents(localized) == entry.contentHash;
     });
 }
 

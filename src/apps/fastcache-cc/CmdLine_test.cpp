@@ -433,7 +433,7 @@ TEST_CASE("Every path-valued flag row is spelled with a known introducer")
 {
     // The table drives matching by introducer, so a row whose spelling begins
     // with anything else could never match and would be dead configuration —
-    // the mistake PathCanon::CanonError already records.
+    // the mistake `header-state-v1` records: a thing declared with no work to do.
     for (PathValueFlag const& row: PathValueFlags())
     {
         INFO("row: " << row.spelling);

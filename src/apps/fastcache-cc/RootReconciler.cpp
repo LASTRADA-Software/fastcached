@@ -5,7 +5,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 namespace FastCache::Cc
@@ -61,11 +60,10 @@ void RootReconciler::All(std::vector<std::string>& paths)
 
 std::string RootReconciler::Region(std::string_view text, PathCanon::Grammar grammar, std::span<std::string const> preserve)
 {
-    auto rewritten = PathCanon::RewritePaths(text, grammar, [this, preserve](std::string_view span) {
+    return PathCanon::RewritePaths(text, grammar, [this, preserve](std::string_view span) {
         auto const named = std::ranges::find(preserve, span) != preserve.end();
         return named ? std::string { span } : Path(span);
     });
-    return rewritten.has_value() ? *std::move(rewritten) : std::string { text };
 }
 
 bool RootReconciler::IsInTree(std::string_view path)
@@ -84,8 +82,7 @@ bool RootReconciler::IsInTree(std::string_view path)
             break;
     }
     auto const reconciled = Directory(path);
-    auto const token = PathCanon::Canonicalize(reconciled, _asGiven);
-    return token.has_value() && *token != reconciled;
+    return PathCanon::Canonicalize(reconciled, _asGiven) != reconciled;
 }
 
 std::string RootReconciler::Translate(std::string_view original, Depth depth)
@@ -103,18 +100,17 @@ std::string RootReconciler::Translate(std::string_view original, Depth depth)
     // Reconciliation is therefore a no-op in every configuration that already
     // worked, which is also why it re-keys nothing and needs no schema bump.
     //
-    // Inequality, not a sentinel spelling PathCanon keeps private, is what says a
-    // root matched — the same test DependencyProbe's PortableForm uses.
-    if (auto const asIs = PathCanon::Canonicalize(original, _asGiven); asIs.has_value() && *asIs != original)
+    // Inequality is what says a root matched — the same test DependencyProbe's
+    // PortableForm uses, and the only one there is: PathCanon cannot fail.
+    if (PathCanon::Canonicalize(original, _asGiven) != original)
         return std::string { original };
 
     // Only now is the filesystem worth asking.
     auto const resolved = depth == Depth::Whole ? _resolver.ResolveDirectory(original) : _resolver.Resolve(original);
     auto const token = PathCanon::Canonicalize(resolved, _resolved);
-    if (!token.has_value() || *token == resolved)
+    if (token == resolved)
         return std::string { original };
-    auto localized = PathCanon::Localize(*token, _asGiven);
-    return localized.has_value() ? *std::move(localized) : std::string { original };
+    return PathCanon::Localize(token, _asGiven);
 }
 
 } // namespace FastCache::Cc

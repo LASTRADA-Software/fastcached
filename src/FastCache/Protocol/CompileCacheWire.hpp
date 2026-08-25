@@ -180,14 +180,20 @@ enum class Status : std::uint8_t
 /// contract.
 enum class ErrorCode : std::uint8_t
 {
-    UnsupportedVersion = 0x01,     ///< Request version outside this build's range.
-    UnknownOpcode = 0x02,          ///< Opcode not in `OpTable`.
-    MalformedFrame = 0x03,         ///< Fields do not exactly fill the declared payload.
-    PayloadTooLarge = 0x04,        ///< Declared payload exceeds the session's cap.
-    MalformedValue = 0x05,         ///< STORE payload is not a decodable compile-value.
-    CanonicalizationFailed = 0x06, ///< A text region's paths could not be canonicalized.
-    StorageWriteFailed = 0x07,     ///< The cache engine refused the write.
-    Unauthenticated = 0x08,        ///< A credential is required and has not been accepted.
+    UnsupportedVersion = 0x01, ///< Request version outside this build's range.
+    UnknownOpcode = 0x02,      ///< Opcode not in `OpTable`.
+    MalformedFrame = 0x03,     ///< Fields do not exactly fill the declared payload.
+    PayloadTooLarge = 0x04,    ///< Declared payload exceeds the session's cap.
+    MalformedValue = 0x05,     ///< STORE payload is not a decodable compile-value.
+
+    // 0x06 is RETIRED and must never be reassigned -- see `RetiredErrorCodes`
+    // below, which makes that a build failure rather than a hope. It was
+    // `CanonicalizationFailed`, answering a `PathCanon` failure that no code path
+    // could produce: a documented status no server could ever send, removed with
+    // `CanonError` itself (issues #59, #69).
+
+    StorageWriteFailed = 0x07, ///< The cache engine refused the write.
+    Unauthenticated = 0x08,    ///< A credential is required and has not been accepted.
 
     // Distributed execution. Every one of these is a REFUSAL the client answers by
     // compiling locally, never by failing: the client is holding the source and has
@@ -440,9 +446,6 @@ inline constexpr std::array ErrorTable {
         .code = ErrorCode::PayloadTooLarge, .name = "payload-too-large", .defaultMessage = "payload too large" },
     ErrorDescriptor {
         .code = ErrorCode::MalformedValue, .name = "malformed-value", .defaultMessage = "malformed compile-value frame" },
-    ErrorDescriptor { .code = ErrorCode::CanonicalizationFailed,
-                      .name = "canonicalization-failed",
-                      .defaultMessage = "path canonicalization failed" },
     ErrorDescriptor {
         .code = ErrorCode::StorageWriteFailed, .name = "storage-write-failed", .defaultMessage = "storage write failed" },
     ErrorDescriptor {
@@ -485,6 +488,40 @@ inline constexpr std::array ErrorTable {
                       .name = "endpoint-busy",
                       .defaultMessage = "this endpoint is serving all it will serve at once" },
 };
+
+/// Wire bytes that once meant something and must never mean anything again.
+///
+/// A retired code cannot simply be freed. Peers are built against different
+/// revisions of this header, so a launcher compiled before the retirement still
+/// maps the byte to its old name -- and a NEW meaning assigned to it would be
+/// reported by that peer as the old one, which is the single worst way for a
+/// refusal to be wrong. `ErrorCode` is already non-dense (`NoCluster = 0x15` is
+/// declared after `EndpointBusy = 0x17`), so an author picking the next free
+/// number by scanning the enum has no reason to suspect this one is different.
+///
+/// A row here rather than a comment for the reason `PreAuthVerbsAreBounded` is a
+/// `static_assert`: getting it wrong is silent everywhere it matters and visible
+/// nowhere, so the build is the only place it can be caught.
+inline constexpr std::array<std::uint8_t, 1> RetiredErrorCodes { 0x06 };
+
+/// Whether the error table has kept clear of every retired byte.
+///
+/// Checks the TABLE rather than the enum, because the table is what a reuse must
+/// touch to be usable: `Describe` answers an untabled code with nullptr, so an
+/// enumerator alone renders as "unknown" and cannot impersonate the retired
+/// meaning. Nothing in C++23 can enumerate an enum's values anyway.
+///
+/// @return True when no `ErrorTable` row claims a retired byte.
+[[nodiscard]] consteval bool NoRetiredErrorCodeIsReused() noexcept
+{
+    return std::ranges::none_of(ErrorTable, [](ErrorDescriptor const& row) {
+        return std::ranges::contains(RetiredErrorCodes, static_cast<std::uint8_t>(row.code));
+    });
+}
+
+static_assert(NoRetiredErrorCodeIsReused(),
+              "a retired wire code must never be reassigned -- a peer built against an older header still reports it "
+              "under its old name (0x06 was canonicalization-failed; see issues #59, #69)");
 
 /// Verbs that legitimately carry no fields at all.
 ///

@@ -23,8 +23,8 @@ namespace FastCache
 /// hot-swap a CPU architecture. Live CPU and memory *utilization* are the other
 /// half of what #81 lists, and they are deliberately absent until PR 8 — the
 /// resource-aware scheduling policy — needs them. A sampler with no consumer is a
-/// component whose behaviour nothing checks, which is the mistake
-/// `PathCanon::CanonError` already records under a different name.
+/// component whose behaviour nothing checks, which is the mistake `header-state-v1`
+/// already records under a different name.
 struct HostFacts
 {
     /// Operating system name, e.g. "Linux", "Windows", "macOS".

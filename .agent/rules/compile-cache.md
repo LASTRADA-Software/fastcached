@@ -712,7 +712,8 @@ platforms.
   is what a *direct hit* revalidates against, so a collision there does not miss, it
   decides an edited header is unchanged. `header-state-v1` deliberately did **not**
   move, because nothing is stored under it and a version with no work to do is the
-  mistake `PathCanon::CanonError` already records. Domain separation between the
+  mistake `PathCanon::CanonError` *was* — an error type no code path could produce,
+  deleted by issues #59/#69 along with the wire status `0x06` it fed. Domain separation between the
   three key spaces is now the leading schema tag rather than the salts, and each piece
   of a key is **length-prefixed** (`kind`, big-endian `u64` length, bytes) rather than
   terminated by a separator byte. That second half is not cosmetic, and it was found
