@@ -853,11 +853,30 @@ try {
         $fingerprint = (& $Launcher --print-toolchain-fingerprint $ccPath) | Select-Object -First 1
         if (-not $fingerprint) { throw "the launcher reported no toolchain fingerprint for $cc" }
 
+        # Slots enough that background CPU cannot withdraw all of them.
+        #
+        # `AvailableSlots` reduces a worker's ceiling by the cores its machine is
+        # busy with OUTSIDE this fleet -- `cpuBusyPermille * logicalCores / 1000`,
+        # less this fleet's own in-flight jobs -- so a worker offering two slots on
+        # a many-core machine withdraws both as soon as a few percent of that
+        # machine is doing something else. This fixture IS that something else: it
+        # runs local reference compiles on the same box, and on CI the rest of the
+        # suite runs beside it. The dispatch then comes back `rejected (withdrawn)`
+        # and the case fails as "the compile was not dispatched to a worker", which
+        # reads as a fault in dispatch and is a fault in the fixture's sizing.
+        #
+        # Offering the whole machine puts the ceiling at cores-minus-external,
+        # which reaches zero only when the host really is saturated -- and is what
+        # a node dedicating this machine to the fleet would advertise anyway. The
+        # `--slots=1` workers elsewhere in this file are deliberate and stay: their
+        # cases are ABOUT a worker having exactly one.
+        $workerSlots = [Environment]::ProcessorCount
+
         $workerLog = Join-Path $scratch "worker.log"
         $worker = Start-Background $Node @(
             $NoLocalCache,
             "--scheduler=127.0.0.1:$dispatchPort", "--bind=127.0.0.1", "--port=$workerPort",
-            "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=2",
+            "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=$workerSlots",
             "--log-level=debug") $workerLog
         $procs += $worker
         Wait-ForPort $workerPort $worker "worker" $workerLog
