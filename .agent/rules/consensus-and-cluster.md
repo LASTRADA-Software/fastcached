@@ -516,3 +516,12 @@ Every rule below has already been a bug.
     could rewrite the cluster's configuration on a node, with a term above its own as
     the only thing to supply — while the identical attempt over `AppendEntries` was
     refused. A guard a second entry point does not apply is not a guard.
+
+## Open work
+
+- **[#126](https://github.com/LASTRADA-Software/fastcached/issues/126)** — the
+  beacon is a broadcast but the challenge and the proof are unicast to
+  `received->from`, and only one of two sockets sharing a UDP port receives a
+  unicast (measured on Windows 11 and Linux; which one differs between them). Two
+  nodes on one host therefore see each other's beacons and silently never finish
+  proving the key.

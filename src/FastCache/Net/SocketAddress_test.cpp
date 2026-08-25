@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <expected>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -101,6 +102,18 @@ class FakeAddressResolver final: public FastCache::IAddressResolver
     std::vector<FastCache::ResolvedEndpoint> _endpoints;
     std::string _error;
 };
+
+/// Bind 127.0.0.1:`port` through BindAndListen, the way a production listener
+/// does.
+/// @param port Port to ask for; 0 asks the kernel for an ephemeral one.
+/// @param reusePort Passed through, so a case can hold a port shareably.
+/// @return What BindAndListen answered.
+[[nodiscard]] std::expected<FastCache::Detail::BoundListener, std::string> BindLoopback(
+    std::uint16_t port, FastCache::ReusePort reusePort = FastCache::ReusePort::No)
+{
+    FakeAddressResolver resolver { std::vector { MakeV4Endpoint("127.0.0.1", port) } };
+    return FastCache::Detail::BindAndListen(resolver, "127.0.0.1", port, /*backlog*/ 16, /*extraTypeFlags*/ 0, reusePort);
+}
 
 } // namespace
 
@@ -202,6 +215,62 @@ TEST_CASE("BindAndListen reports failure when no candidate is bindable", "[net][
     auto const bound = FastCache::Detail::BindAndListen(resolver, "192.0.2.1", 0, /*backlog*/ 16, /*extraTypeFlags*/ 0);
     REQUIRE_FALSE(bound.has_value());
 }
+
+TEST_CASE("BindAndListen keeps its address to itself while it is listening", "[net][bind][exclusive]")
+{
+    // A listening address is not shareable, and saying so takes a different
+    // option on each platform. POSIX SO_REUSEADDR only lets a bind step over a
+    // TIME_WAIT left by a *dead* socket; Windows SO_REUSEADDR lets a second
+    // socket bind an address a *live* one already holds -- so setting it there
+    // let any process on the box take the port fastcached was already serving,
+    // with which of the two answered a given connection left undefined
+    // (issue #85). For a compile cache reached without a credential that is
+    // object injection into everybody's build.
+    //
+    // Both sides go through BindAndListen on purpose: that is the production
+    // shape -- one daemon already serving, a second asking for the same port --
+    // and it is the option BindAndListen sets that has to refuse it.
+    auto held = BindLoopback(0);
+    REQUIRE(held.has_value());
+
+    auto const port = FastCache::Detail::BoundPortOf(held->socket);
+    REQUIRE(port != 0);
+
+    auto const taken = BindLoopback(port);
+    // CHECK rather than REQUIRE so the cleanup below still runs when this
+    // regresses: a failure should be a failure, not also a leaked listener the
+    // rest of the suite has to work around.
+    CHECK_FALSE(taken.has_value());
+    if (taken.has_value())
+        CloseRaw(taken->socket);
+
+    CloseRaw(held->socket);
+}
+
+#if defined(SO_REUSEPORT)
+TEST_CASE("ReusePort::Yes still lets several listeners share one port", "[net][bind][reuseport]")
+{
+    // Exclusivity is the default, not the only setting. The POSIX multi-reactor
+    // binds one listener per reactor on the same {address, port} and lets the
+    // kernel load-balance across them (ReactorServerLoop's RunMultiReactorPosix),
+    // so a change that made every bind exclusive would present as a daemon that
+    // refuses to start with --threads greater than one. Windows has no
+    // SO_REUSEPORT and reaches that shape another way -- one listener per bind,
+    // handing raw sockets to N IOCP reactors -- so there is nothing to assert
+    // there.
+    auto held = BindLoopback(0, FastCache::ReusePort::Yes);
+    REQUIRE(held.has_value());
+
+    auto const port = FastCache::Detail::BoundPortOf(held->socket);
+    REQUIRE(port != 0);
+
+    auto shared = BindLoopback(port, FastCache::ReusePort::Yes);
+    REQUIRE(shared.has_value());
+
+    CloseRaw(shared->socket);
+    CloseRaw(held->socket);
+}
+#endif
 
 TEST_CASE("FormatPeerAddress renders the host without the port", "[net][peer]")
 {

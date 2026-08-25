@@ -261,6 +261,47 @@ Every rule below has already been a bug.
     disposition assertion instead. A regression test for a fatal signal that
     cannot be seen to fail is worth nothing.
 
+- **A listening socket claims its address, and the option that says so is spelled
+  differently on each platform.** `Detail::BindAndListen` set `SO_REUSEADDR`
+  unconditionally, commented "so restart-after-crash rebinds without TIME_WAIT
+  delay" -- POSIX reasoning about an option that does not mean the same thing on
+  Windows. On POSIX it only lets a bind step over a `TIME_WAIT` left by a **dead**
+  socket, and a live listener still holds its address alone; on Windows it lets a
+  second socket bind an address a **live** socket already holds, which is the
+  documented reason `SO_EXCLUSIVEADDRUSE` exists. So on Windows any process on the
+  box -- unprivileged -- could bind the port `fastcached`, a compile node, or
+  either one's admin endpoint was already serving, with which of the two answered a
+  given connection undefined: for a compile cache reached without a credential that
+  is object injection into everybody's build, and for `/metrics` it is a scrape
+  surface an attacker can answer (issue #85). It is `ExclusiveBindOption` now --
+  one intent, each platform's own spelling. Four things worth keeping:
+  - **The `TIME_WAIT` concern the old comment raised is not what was traded away.**
+    Measured on Windows 11, across processes: a fresh process rebinds a listening
+    port while a connection its crashed predecessor accepted is still in
+    `TIME_WAIT`. A listening socket that never accepted does not enter `TIME_WAIT`
+    itself, which is what the comment had actually been reasoning about.
+  - **Sharing a port on purpose is still opt-in, and it is a different option.**
+    `ReusePort::Yes` (`SO_REUSEPORT`, POSIX only) is what lets N reactor threads
+    bind one port and have the kernel load-balance across them. Exclusivity is the
+    default, not the only setting, and both halves are asserted -- the second bind
+    refused, and two `ReusePort::Yes` listeners sharing.
+  - **A `setsockopt` carrying a security property is not best-effort.** It fails
+    the candidate rather than being ignored the way `TCP_NODELAY` and
+    `IPV6_V6ONLY` are: a daemon that silently came up shareable is worse than one
+    that visibly did not come up at all.
+  - **The discovery beacon's UDP socket keeps `SO_REUSEADDR`, and it is a
+    different question rather than the same one answered differently.**
+    `OpenUdpSocket` binds the wildcard on the *shared* beacon port so every node
+    on the segment hears the broadcast, and claiming that port exclusively would
+    let the first process on a host lock every other one out of hearing beacons
+    at all. What sharing it does **not** already buy is two nodes on one host
+    completing the handshake: measured on Windows 11 and on Linux, two
+    `SO_REUSEADDR` sockets on one port both receive a broadcast and only one
+    receives a unicast -- and the challenge and the proof are both unicast to
+    `received->from` (`DiscoveryService.cpp`). Co-hosted nodes therefore see each
+    other's beacons and silently never finish proving the key. That is a defect
+    in discovery, not in the bind option, and it is not this change's to fix.
+
 - **A platform socket error is classified in one place.** `Detail::TranslateError`
   in `BlockingSocket.cpp` mapped ten conditions onto `NetErrorCode`;
   `BlockingConnector` then grew a three-condition copy of it, so `EACCES` — a

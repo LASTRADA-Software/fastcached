@@ -92,9 +92,17 @@ namespace Detail
         int family { 0 };                      ///< AF_INET / AF_INET6 of the bound socket.
     };
 
-    /// Resolve `host`/`port`, then create + SO_REUSEADDR + bind + listen the
-    /// first resolved candidate that succeeds. This is the single home for the
-    /// socket-bind syscall sequence the platform listeners share.
+    /// Resolve `host`/`port`, then create + claim-exclusively + bind + listen
+    /// the first resolved candidate that succeeds. This is the single home for
+    /// the socket-bind syscall sequence the platform listeners share.
+    ///
+    /// The listener owns its address: on every platform, a second socket asking
+    /// for the same {address, port} is refused. The one way to share one is for
+    /// both to ask for `ReusePort::Yes`, and only where the platform has
+    /// SO_REUSEPORT (see the parameter below). Saying "mine" takes a different
+    /// socket option on each platform -- SocketAddress.cpp's
+    /// `ExclusiveBindOption` carries which, and why the obvious one is a hole on
+    /// Windows.
     /// @param resolver Injected resolver (the DI seam over getaddrinfo).
     /// @param host Bind host (IPv4/IPv6 literal or hostname).
     /// @param port TCP port in host byte order.

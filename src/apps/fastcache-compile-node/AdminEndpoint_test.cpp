@@ -89,11 +89,10 @@ TEST_CASE("An endpoint that cannot bind reports why", "[node][admin]")
     //
     // Provoked with an address this host does not hold -- 192.0.2.1 is RFC 5737
     // TEST-NET-1, reserved for documentation and assigned to no interface -- rather
-    // than by taking a port twice. The obvious version of this test binds a port and
-    // then asks the endpoint for the same one, and it PASSES ON POSIX AND FAILS ON
-    // WINDOWS: `SocketAddress.cpp` sets SO_REUSEADDR unconditionally, which on POSIX
-    // only skips TIME_WAIT but on Windows lets a second socket bind an address that
-    // is already in use. An unassigned address is refused by both.
+    // than by taking a port twice, which needs a second listener kept alive for the
+    // duration and asserts nothing this does not. That a port already being served
+    // is refused belongs where the option refusing it is set, and is asserted there
+    // ("BindAndListen keeps its address to itself while it is listening", issue #85).
     AtomicMetricsSink metrics;
     NullLogger logger;
 
