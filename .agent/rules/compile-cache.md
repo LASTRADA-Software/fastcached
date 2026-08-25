@@ -485,6 +485,45 @@ platforms.
       `DriveRelative` back into `Toolchain` fails exactly one case with `"2 toolchain"`,
       folding `Uncanonical` in fails exactly one other, and labelling a vendored tree under a
       drive-relative root by its anchor fails exactly one third with `"2 drive-relative"`.
+  - **A manifest refusal names the path it refused over, and the same rule reaches the
+    manifest a release after it reached the key.** `BuildManifest` returns
+    `ManifestFailure` — a `ManifestFault` and the offending path — and every refusal
+    inside it fills in both. The reasoning is `PathDisposition`'s exactly, arriving late
+    only because the manifest side looked less silent than it was: a refusal here costs a
+    translation unit direct mode **permanently** while the compile succeeds, the object
+    still caches under the ordinary preprocessed key, and nothing else in the log mentions
+    it — so "why does this TU never cache" is a whole investigation and the answer is one
+    path (issue #68). Three things that are each load-bearing:
+    - **The commonest refusal was not `BuildManifest`'s at all.** `RecordManifest` asks
+      `CanonicalSourceToken` first and returned in **complete** silence when it declined,
+      before `BuildManifest` ran — so a TU under neither root, which is an ordinary
+      `add_subdirectory(../shared shared)` layout, produced no line even under
+      `FASTCACHE_VERBOSE`. Giving `BuildManifest`'s error a path while leaving that guard
+      alone would have fixed the case an operator almost never reaches. Issue #57 closed
+      pointing straight at it.
+    - **Five faults, not the two the refusal paths happen to have.** `Unanchored` is a
+      working directory, `OutsideRoots` is a layout, `ToolchainLike` is a TU nobody
+      expected to compile from, `Uncanonical` is a root spelled almost
+      right, `Unreadable` is a file — each names a different thing to go and repair, which
+      is what a fingerprint is for. `ToolchainLike` exists because `IsToolchainHeader`
+      tests its markers before any root, so "toolchain" and "under no root" arrive as one
+      answer -- the root question is asked again in that one branch, the same correction
+      `PathDisposition::DriveRelative` makes. `Unreadable` in particular had been sharing
+      `DirectError::Malformed` with "these bytes off the wire are corrupt", so the two
+      printed identically; `DirectError` is now decode-only and the two vocabularies do not
+      meet. The table is an `EnumTable` checked by `RowsInEnumeratorOrder`, the same
+      declaration `DispositionTable` uses — this landed while the branch was in review and
+      is the seventh table to reach it, which is the point of there being one (issue #112).
+      `DescribeManifestFailure` lives in `DirectManifest.cpp` for the same reason
+      `DescribeDropped` does — `main.cpp` is in no test target — and keeps its own bounds
+      check anyway, because `Last` is the extent and so still indexes one past the end.
+    - **`TryDirectMode`'s identical guard stays silent, deliberately.** It is the same
+      derivation from the same inputs as the recording side, so it refuses exactly when
+      `RecordManifest` does and for exactly the same reason: a note there prints every such
+      fact twice per translation unit. And the whole diagnostic stays verbose-gated, which
+      is the #66 reversal below holding rather than being re-litigated — the issue asked for
+      it ungated, and a source outside both roots is still an ordinary layout rather than a
+      fault. What changed is that the gate now has something worth reading behind it.
   - **The reconciliation translates the emitted paths INTO the build's spelling; it does
     not respell the roots (issue #66).** There are two spellings of every root and the
     launcher needs both, for opposite reasons. **Matching** must use the spelling the
