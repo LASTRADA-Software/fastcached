@@ -150,6 +150,48 @@ bool DrainUntil(FastCache::TestReactor& reactor, std::optional<FastCache::Resolv
     return false;
 }
 
+/// Unblocks and joins a thread running `ThreadedAddressResolver::Stop()`, however
+/// the case around it ends.
+///
+/// Not tidiness, and the same trap ScriptedResolver's destructor records, reached
+/// from the other side: a Catch2 `REQUIRE` firing between the thread's start and
+/// its join unwinds into `std::thread`'s destructor while it is still joinable,
+/// and that calls `std::terminate()`. One reportable assertion failure would
+/// become an abort of the whole binary naming nothing.
+///
+/// Releasing the gate FIRST is what lets the join finish at all: `Stop()` is
+/// waiting on the worker that the gate is holding. Declare this after the thread,
+/// so it is destroyed before it.
+class GateReleasingJoin
+{
+  public:
+    /// @param inner   The gate holding the worker `Stop()` is waiting on.
+    /// @param stopper The thread running `Stop()`.
+    GateReleasingJoin(ScriptedResolver& inner, std::thread& stopper) noexcept:
+        _inner { inner },
+        _stopper { stopper }
+    {
+    }
+
+    GateReleasingJoin(GateReleasingJoin const&) = delete;
+    GateReleasingJoin(GateReleasingJoin&&) = delete;
+    GateReleasingJoin& operator=(GateReleasingJoin const&) = delete;
+    GateReleasingJoin& operator=(GateReleasingJoin&&) = delete;
+
+    ~GateReleasingJoin()
+    {
+        // Both idempotent, so the case may still do this itself on the happy path
+        // where the ordering is part of what it is asserting.
+        _inner.Release();
+        if (_stopper.joinable())
+            _stopper.join();
+    }
+
+  private:
+    ScriptedResolver& _inner;
+    std::thread& _stopper;
+};
+
 } // namespace
 
 TEST_CASE("A literal host never reaches the pool", "[net][resolve]")
@@ -295,10 +337,32 @@ TEST_CASE("Stopping resumes a queued lookup rather than stranding it", "[net][re
     reactor.Drain();
     REQUIRE_FALSE(queued.has_value());
 
-    // Let the in-flight lookup finish so the join can complete; the QUEUED one is
-    // what must come back rather than be stranded.
+    // Stop() has to observe the queued lookup STILL QUEUED, and it cannot run on
+    // this thread to do it: Stop() joins the pool, and the only worker is not free
+    // to be joined until this thread releases the lookup it is held inside. So
+    // Stop() goes on a thread of its own, and the in-flight lookup is released
+    // only once Stop() has drained the queue -- observable from here because
+    // settling the abandoned lookup Submits its waiter, and TestReactor guards
+    // both Submit and PendingSubmissions with the same mutex.
+    //
+    // Releasing BEFORE Stop() is a race rather than an ordering, and it is the one
+    // this case exists to be sure of: the worker wakes, finds `stopping` still
+    // false and the queue non-empty, dequeues the very job Stop() was about to
+    // cancel, and answers it RESOLVED -- so the assertion below reads `.error()`
+    // off a success. Idle machines win that race nearly always, which is why it
+    // passed here and failed on three loaded CI runners at once.
+    std::thread stopper { [&resolver] { resolver.Stop(); } };
+    GateReleasingJoin const finish { inner, stopper }; // after `stopper`, so destroyed before it
+
+    for (auto attempt = 0; attempt < 2000 && reactor.PendingSubmissions() == 0; ++attempt)
+        std::this_thread::sleep_for(1ms);
+    REQUIRE(reactor.PendingSubmissions() == 1); // the abandoned lookup, settled by Stop()
+
+    // Explicit here as well as in `finish`, because the REST of this case depends
+    // on the ordering: the in-flight lookup is only settled once the gate opens,
+    // and the drain below asserts that it was.
     inner.Release();
-    resolver.Stop();
+    stopper.join();
 
     REQUIRE(DrainUntil(reactor, queued));
     REQUIRE(FastCache::Testing::Unwrap(queued).error().code == FastCache::NetErrorCode::Cancelled);
