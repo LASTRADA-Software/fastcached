@@ -822,8 +822,6 @@ without reopening the argument:
 - **[#111](https://github.com/LASTRADA-Software/fastcached/issues/111)** — a manifest
   recorded before #104 can still direct-hit a drive-relative compile, because the
   authoritative refusal runs after `TryDirectMode`. Closed by a `manifest-v5` bump.
-- **[#105](https://github.com/LASTRADA-Software/fastcached/issues/105)** — the
-  `dependency set: 0 of M` line now has two causes and fingerprints neither.
 - **[#64](https://github.com/LASTRADA-Software/fastcached/issues/64)** — a
   relative include-dir argument still reaches the key verbatim through
   `RelativizeArgs`, so two build trees at different depths key apart on the
