@@ -7,6 +7,7 @@
 #include <FastCache/Consensus/RaftOutput.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 
 #include <array>
@@ -46,17 +47,28 @@ struct RoleTraits
 /// discovery needs when a machine joins a running cluster. Adding it should be a
 /// row plus whatever columns it forces, not an edit to every function that asks
 /// what role this node is playing.
-inline constexpr std::array<RoleTraits, 4> RoleTable { {
+inline constexpr EnumTable<Role, RoleTraits> RoleTable { {
     { .role = Role::Follower, .name = "follower", .timer = TimerKind::Election },
     { .role = Role::PreCandidate, .name = "pre-candidate", .timer = TimerKind::Election },
     { .role = Role::Candidate, .name = "candidate", .timer = TimerKind::Election },
     { .role = Role::Leader, .name = "leader", .timer = TimerKind::Heartbeat },
 } };
 
+static_assert(RowsInEnumeratorOrder(RoleTable, &RoleTraits::role),
+              "RoleTable must hold one row per Role, in enumerator order -- the order is what lets a role index its "
+              "own row instead of being searched for");
+
 /// The row describing `role`.
+///
+/// An index rather than a search: `RoleTable` is `static_assert`ed to hold one row
+/// per enumerator in enumerator order, so the row for a role is at the role's own
+/// position and there is nothing to look for.
 /// @param role The role to look up.
 /// @return Its traits.
-[[nodiscard]] RoleTraits const& TraitsOf(Role role) noexcept;
+[[nodiscard]] constexpr RoleTraits const& TraitsOf(Role role) noexcept
+{
+    return RoleTable[static_cast<std::size_t>(role)];
+}
 
 /// One Raft node, as a deterministic state machine.
 ///

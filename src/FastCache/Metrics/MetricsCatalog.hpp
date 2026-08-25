@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
-#include <algorithm>
-#include <array>
+#include <cstddef>
 #include <cstdint>
-#include <ranges>
 #include <string_view>
 
 namespace FastCache
@@ -60,10 +59,11 @@ struct CounterDescriptor
 
 /// One row per `IMetricsSink::Counter`, in enumerator order.
 ///
-/// The order is not load-bearing for correctness — `DescriptorOf` indexes — but
-/// keeping it aligned with the enum is what makes a missing row visible to a
-/// reader as well as to the `static_assert`.
-inline constexpr std::array<CounterDescriptor, static_cast<std::size_t>(IMetricsSink::Counter::Last)> CounterTable { {
+/// The order IS load-bearing: `DescriptorOf` indexes, so row *i* has to be the row
+/// for enumerator *i*. `RowsInEnumeratorOrder` is what enforces that, and writing
+/// the rows out in the enum's own order is what makes a missing one visible to a
+/// reader as well.
+inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTable { {
     { .counter = IMetricsSink::Counter::ConnectionsTotal,
       .prometheusName = "fastcached_connections_total",
       .help = "Connections accepted since start.",
@@ -203,21 +203,12 @@ inline constexpr std::array<CounterDescriptor, static_cast<std::size_t>(IMetrics
       .type = MetricType::Counter },
 } };
 
-/// Whether `CounterTable` has exactly one row per enumerator, in order.
-///
-/// Checked at compile time below rather than by a test, because the failure this
-/// prevents is a counter that exports nothing — which no test asserts the absence
-/// of unless somebody thinks to write one for the counter they just added, and
-/// that is precisely the step that was missed.
-/// @return True when every enumerator has its own row.
-[[nodiscard]] consteval bool CoversEveryCounter() noexcept
-{
-    return std::ranges::all_of(std::views::iota(std::size_t { 0 }, CounterTable.size()), [](std::size_t index) {
-        return static_cast<std::size_t>(CounterTable[index].counter) == index;
-    });
-}
-
-static_assert(CoversEveryCounter(), "CounterTable must hold one row per IMetricsSink::Counter, in enumerator order");
+// Checked at compile time rather than by a test, because the failure this prevents
+// is a counter that exports nothing — which no test asserts the absence of unless
+// somebody thinks to write one for the counter they just added, and that is
+// precisely the step that was missed.
+static_assert(RowsInEnumeratorOrder(CounterTable, &CounterDescriptor::counter),
+              "CounterTable must hold one row per IMetricsSink::Counter, in enumerator order");
 
 /// The row describing `counter`.
 ///

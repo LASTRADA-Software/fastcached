@@ -113,6 +113,54 @@ determinism rests on.
   than a rule to argue with. The six bare `return 2`s it left behind became
   `ExitUsage` for the same reason: seven copies of a magic exit code is the
   table-shaped defect this list keeps recording.
+
+- **A `static_assert` that anchors a table's length on an enumerator BY NAME is a
+  guard that fires only when nothing is wrong.** Casting an enumerator to an index
+  is safe exactly while the table holds one row per enumerator in enumerator order,
+  and this tree used to spell that rule five ways across eight tables -- of which
+  **six failed open in the one situation the rule exists for**. Four were anchored
+  by name:
+
+  ```cpp
+  static_assert(Table.size() == static_cast<std::size_t>(Enum::TheLastOneToday) + 1);
+  ```
+
+  Append an enumerator and *forget* the row: `size()` still equals
+  `TheLastOneToday + 1`, so it compiles, and the lookup then reads past the end --
+  reproduced verbatim under ASan as a `global-buffer-overflow` four bytes past
+  `RefusalTable`. Append one and *remember* the row: the size is now one greater
+  and the assert fails. It is inverted, and nothing about reading it says so. Two
+  more tables had no length tie at all, and one of those, `Consensus::RoleTable`,
+  was reached by a linear scan that fell back to `RoleTable.front()` -- so a
+  missing row returned a **follower's** traits for a leader, silently, which is
+  worse than the crash. `Core/EnumTable.hpp` is the one spelling now: `Last`
+  states the enum's own count, `EnumTable<Enum, Row>` takes its extent from that
+  so a short table cannot be *declared*, and `RowsInEnumeratorOrder(table,
+  &Row::member)` checks the extent and every row's position in one assert.
+  Consequences that are each load-bearing:
+  - **The row carries the enumerator it describes, and that is what makes the
+    order checkable at all.** A bare array of values can only have its length
+    asserted -- which is why the three bare ones (`RoleNames`,
+    `ProposalRefusals`, `PickErrorTable`) recorded their order in trailing
+    comments no compiler reads. Giving them struct rows is not decoration; it is
+    the difference between a checked invariant and a documented hope.
+  - **`Last` is a cost to measure, not to assume.** It was free for these six
+    because nothing in the tree switches over any of them -- grepped, not
+    guessed. Adding a sentinel to an enum whose callers deliberately omit
+    `default:` turns every one of those `switch`es into a build error, and this
+    codebase omits `default:` on purpose in several places (`PathCanon::Anchor`,
+    `DirectManifest::PathRole`) precisely so a new state is a compile error. That
+    trade has to be made rather than inherited.
+  - **A proved order turns the lookup into an index rather than a search.**
+    `TraitsOf` scanned `RoleTable` and carried an eight-line comment re-deriving
+    the `std::array`-iterator portability argument that `Core/Ranges.hpp` already
+    documents; with the position guaranteed there is nothing to search for, and
+    the comment went with the scan.
+  - **The guard was verified by reintroducing the defect at all six sites.** One
+    throwaway enumerator appended with no row, and each of the six now fails to
+    compile naming its own table. A completeness guard that has never been seen
+    to fail is exactly the thing this entry is about.
+
 ## Line endings
 
 Line endings are LF everywhere, and that is a `.gitattributes` rule

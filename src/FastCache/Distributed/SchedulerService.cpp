@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 
 #include <algorithm>
@@ -78,6 +79,13 @@ namespace
 
     static_assert(RefusalsAreDisjoint(), "a refusal either moves a counter or is listed as moving none, never both");
 
+    /// What a consensus refusal becomes on the wire.
+    struct ProposalRefusalRow
+    {
+        ConsensusErrorCode code;  ///< What consensus said.
+        Wire::ErrorCode reported; ///< What the client is told.
+    };
+
     /// One row per `ConsensusErrorCode`, in enumerator order: the wire code it
     /// becomes when a proposal is refused.
     ///
@@ -88,16 +96,16 @@ namespace
     /// exist because a reader disagreed with a sender about some bytes, and no
     /// bytes are involved here -- so they map to the generic refusal, which is the
     /// closed-by-default answer rather than a claim about what happened.
-    constexpr std::array ProposalRefusals {
-        Wire::ErrorCode::InvalidClusterChange, // InvalidConfiguration
-        Wire::ErrorCode::NotLeader,            // NotLeader
-        Wire::ErrorCode::StorageWriteFailed,   // StorageFailure
-        Wire::ErrorCode::InvalidClusterChange, // MalformedFrame
-        Wire::ErrorCode::InvalidClusterChange, // UnknownMessageType
-        Wire::ErrorCode::InvalidClusterChange, // UnsupportedVersion
-    };
+    constexpr EnumTable<ConsensusErrorCode, ProposalRefusalRow> ProposalRefusals { {
+        { .code = ConsensusErrorCode::InvalidConfiguration, .reported = Wire::ErrorCode::InvalidClusterChange },
+        { .code = ConsensusErrorCode::NotLeader, .reported = Wire::ErrorCode::NotLeader },
+        { .code = ConsensusErrorCode::StorageFailure, .reported = Wire::ErrorCode::StorageWriteFailed },
+        { .code = ConsensusErrorCode::MalformedFrame, .reported = Wire::ErrorCode::InvalidClusterChange },
+        { .code = ConsensusErrorCode::UnknownMessageType, .reported = Wire::ErrorCode::InvalidClusterChange },
+        { .code = ConsensusErrorCode::UnsupportedVersion, .reported = Wire::ErrorCode::InvalidClusterChange },
+    } };
 
-    static_assert(ProposalRefusals.size() == static_cast<std::size_t>(ConsensusErrorCode::UnsupportedVersion) + 1,
+    static_assert(RowsInEnumeratorOrder(ProposalRefusals, &ProposalRefusalRow::code),
                   "ProposalRefusals must hold one row per ConsensusErrorCode, in enumerator order");
 
     /// The wire code a consensus refusal is reported as.
@@ -105,8 +113,15 @@ namespace
     /// @return The wire code.
     [[nodiscard]] constexpr Wire::ErrorCode WireCodeFor(ConsensusErrorCode code) noexcept
     {
-        return ProposalRefusals[static_cast<std::size_t>(code)];
+        return ProposalRefusals[static_cast<std::size_t>(code)].reported;
     }
+
+    /// What a pick refusal becomes on the wire.
+    struct PickErrorRow
+    {
+        PickError error;          ///< Why no worker could be chosen.
+        Wire::ErrorCode reported; ///< What the client is told.
+    };
 
     /// One row per `PickError`, in enumerator order: the wire code it becomes.
     ///
@@ -114,13 +129,13 @@ namespace
     /// one: the mapping is the whole of what a client and an operator are told, and
     /// a `PickError` added without a row here would silently arrive as whichever
     /// arm an `if` happened to fall through to.
-    constexpr std::array PickErrorTable {
-        Wire::ErrorCode::NoWorker,
-        Wire::ErrorCode::NoCapacity,
-        Wire::ErrorCode::Withdrawn,
-    };
+    constexpr EnumTable<PickError, PickErrorRow> PickErrorTable { {
+        { .error = PickError::NoWorker, .reported = Wire::ErrorCode::NoWorker },
+        { .error = PickError::NoCapacity, .reported = Wire::ErrorCode::NoCapacity },
+        { .error = PickError::Withdrawn, .reported = Wire::ErrorCode::Withdrawn },
+    } };
 
-    static_assert(PickErrorTable.size() == static_cast<std::size_t>(PickError::Withdrawn) + 1,
+    static_assert(RowsInEnumeratorOrder(PickErrorTable, &PickErrorRow::error),
                   "PickErrorTable must hold one row per PickError, in enumerator order");
 
     /// The wire code a pick refusal is reported as.
@@ -128,7 +143,7 @@ namespace
     /// @return The code to answer with.
     [[nodiscard]] constexpr Wire::ErrorCode WireCodeFor(PickError error) noexcept
     {
-        return PickErrorTable[static_cast<std::size_t>(error)];
+        return PickErrorTable[static_cast<std::size_t>(error)].reported;
     }
 
     /// The counter a refusal moves, if any.

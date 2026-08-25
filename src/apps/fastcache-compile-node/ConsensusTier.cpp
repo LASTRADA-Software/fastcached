@@ -3,6 +3,7 @@
 
 #include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Net/PlatformConnector.hpp>
 
@@ -56,26 +57,38 @@ namespace
         ILogger& _logger;
     };
 
+    /// One row per role: the role, and what a log line calls it.
+    struct RoleNameRow
+    {
+        Distributed::SchedulerRole role; ///< The role this row names.
+        std::string_view name;           ///< What a log line calls it.
+    };
+
     /// What to call a role in a log line.
     ///
     /// A table rather than a conditional chain, which is what clang-tidy's
     /// `readability-avoid-nested-conditional-operator` is really asking for and what
     /// this codebase asks for anyway: a fourth role is a row here rather than another
     /// `?:` somebody threads through an existing expression.
-    constexpr std::array RoleNames {
-        std::string_view { "a follower" }, // Follower = 0
-        std::string_view { "undecided" },  // Undecided
-        std::string_view { "the leader" }, // Leader
-    };
+    ///
+    /// The row carries the role it names rather than leaving it to a trailing
+    /// comment, which is what lets the order be checked at all: a bare array of
+    /// names can only have its length asserted, and a length asserted against the
+    /// last enumerator by name is the guard that fires only when nothing is wrong.
+    constexpr EnumTable<Distributed::SchedulerRole, RoleNameRow> RoleNames { {
+        { .role = Distributed::SchedulerRole::Follower, .name = "a follower" },
+        { .role = Distributed::SchedulerRole::Undecided, .name = "undecided" },
+        { .role = Distributed::SchedulerRole::Leader, .name = "the leader" },
+    } };
 
-    static_assert(RoleNames.size() == static_cast<std::size_t>(Distributed::SchedulerRole::Leader) + 1,
+    static_assert(RowsInEnumeratorOrder(RoleNames, &RoleNameRow::role),
                   "RoleNames must hold one row per SchedulerRole, in enumerator order");
 
     /// @param role The role.
     /// @return Its name.
     [[nodiscard]] constexpr std::string_view RoleName(Distributed::SchedulerRole role) noexcept
     {
-        return RoleNames[static_cast<std::size_t>(role)];
+        return RoleNames[static_cast<std::size_t>(role)].name;
     }
 
     /// One member's address, as something the transport can dial.

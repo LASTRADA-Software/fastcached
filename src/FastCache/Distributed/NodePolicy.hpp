@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/EnumTable.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -25,6 +27,7 @@ enum class NodeClass : std::uint8_t
     Workstation = 0,
     /// Nobody works at this machine. It may be driven to its slot limit.
     Dedicated,
+    Last, ///< Not a class, and has no row: `NodeClassTable`'s length.
 };
 
 /// One row per class: what it is called, and how much of the machine is not ours.
@@ -47,26 +50,16 @@ struct NodeClassTraits
 /// reserve is that the machine stays usable while it contributes. It is a default
 /// rather than a rule -- `--reserve-cores` overrides it -- but a default nobody
 /// changes is the one most people run.
-inline constexpr std::array<NodeClassTraits, 2> NodeClassTable {
-    NodeClassTraits { .nodeClass = NodeClass::Workstation, .name = "workstation", .reservedCores = 2 },
-    NodeClassTraits { .nodeClass = NodeClass::Dedicated, .name = "dedicated", .reservedCores = 0 },
-};
+inline constexpr EnumTable<NodeClass, NodeClassTraits> NodeClassTable { {
+    { .nodeClass = NodeClass::Workstation, .name = "workstation", .reservedCores = 2 },
+    { .nodeClass = NodeClass::Dedicated, .name = "dedicated", .reservedCores = 0 },
+} };
 
-/// Whether `NodeClassTable` has exactly one row per enumerator, in order.
-///
-/// The completeness check the table exists to make possible: a class added to the
-/// enum without a row is a build failure rather than a machine that is silently
-/// driven by whichever row happened to sort first.
-/// @return True when the table covers the enum in order.
-[[nodiscard]] consteval bool NodeClassTableIsComplete() noexcept
-{
-    for (auto index = std::size_t { 0 }; index < NodeClassTable.size(); ++index)
-        if (static_cast<std::size_t>(NodeClassTable[index].nodeClass) != index)
-            return false;
-    return true;
-}
-
-static_assert(NodeClassTableIsComplete(), "NodeClassTable must hold one row per NodeClass, in enumerator order");
+// The completeness check the table exists to make possible: a class added to the
+// enum without a row is a build failure rather than a machine that is silently
+// driven by whichever row happened to sort first.
+static_assert(RowsInEnumeratorOrder(NodeClassTable, &NodeClassTraits::nodeClass),
+              "NodeClassTable must hold one row per NodeClass, in enumerator order");
 
 /// Look a class up by the name an operator spelled.
 /// @param name The spelling from the command line.

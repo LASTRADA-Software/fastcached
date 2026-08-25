@@ -29,6 +29,7 @@ enum class ConsensusErrorCode : std::uint8_t
     MalformedFrame,     ///< The payload does not match the shape its type declares.
     UnknownMessageType, ///< A type byte this build does not know; skip the frame.
     UnsupportedVersion, ///< A frame version outside the range this build decodes.
+    Last,               ///< Not a code, and has no row: the length of a table keyed by one.
 };
 
 /// Structured consensus error.

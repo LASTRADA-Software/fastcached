@@ -35,6 +35,7 @@ enum class SchedulerRole : std::uint8_t
     Undecided,
     /// This node leads and may hand out capacity.
     Leader,
+    Last, ///< Not a role, and has no row: the length of a table keyed by one.
 };
 
 /// Whether the peer asking has earned the fleet's capacity.

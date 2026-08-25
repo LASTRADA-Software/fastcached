@@ -37,6 +37,7 @@ enum class PickError : std::uint8_t
     /// this into that one would send an operator shopping for hardware they already
     /// own, and hide a fleet-wide full disk behind a number that looks like growth.
     Withdrawn,
+    Last, ///< Not a refusal, and has no row: the length of a table keyed by one.
 };
 
 /// One registered worker, as the registry sees it.

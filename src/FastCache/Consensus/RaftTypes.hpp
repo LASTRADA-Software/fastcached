@@ -139,6 +139,7 @@ enum class Role : std::uint8_t
     PreCandidate, ///< Asking whether an election could be won, without starting one.
     Candidate,    ///< Standing for election in its current term.
     Leader,       ///< Replicating entries and sending heartbeats.
+    Last,         ///< Not a role, and has no row: `RoleTable`'s length.
 };
 
 /// Whether a vote was granted, as an `enum class` rather than a `bool`.

@@ -43,6 +43,7 @@ enum class JobRefusal : std::uint8_t
     /// The compiler could not be spawned at all. Distinct from a compiler that ran
     /// and rejected the code: only the latter is the client's answer.
     SpawnFailed,
+    Last, ///< Not a refusal, and has no row: `RefusalTable`'s length.
 };
 
 /// What a completed job produced.
