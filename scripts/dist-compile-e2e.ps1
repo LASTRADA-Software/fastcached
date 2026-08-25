@@ -62,11 +62,10 @@ param(
     [string]$Fastcached = "$PSScriptRoot/../out/build/clangcl-debug/target/fastcached.exe",
     [string]$Node       = "$PSScriptRoot/../out/build/clangcl-debug/target/fastcache-compile-node.exe",
     [string]$Launcher   = "$PSScriptRoot/../out/build/clangcl-debug/target/fastcache-cc.exe",
-    # Fixed rather than probed. The POSIX fixture allocates because it needs four
-    # ports and shares a runner with several other socket-using tests; this needs
-    # three and is RUN_SERIAL, and a fixed base keeps the failure mode ("something
-    # else holds 21730") legible instead of intermittent.
-    [int]$BasePort      = 21730,
+    # Zero allocates a free block per run, which is the default; a non-zero value
+    # pins one, which is what somebody reproducing a failure wants. See
+    # `Get-FreePortBlock` for why the fixed default had to go.
+    [int]$BasePort      = 0,
     # Exercise the object comparison against synthetic COFF input and exit.
     #
     # The comparison is the one piece of this fixture with logic of its own, and a
@@ -114,6 +113,64 @@ $NoLocalCache = "--listen-cache="
 # handles that now, but a fixture whose roots are ambiguous is testing the
 # reconciliation as well as its own property.
 $scratch = Join-Path (Split-Path (Split-Path $Launcher -Parent) -Parent) "dist-e2e"
+
+# How many consecutive ports the run needs, counted from `$BasePort`.
+#
+# Eight, and the highest offset actually used is +7 (`$isoSchedWorker`). A block
+# rather than eight independent draws because every port below is spelled as an
+# offset from the base, and that arithmetic is what a reader checks against this
+# number.
+$PortsNeeded = 8
+
+# Find a block of `$count` consecutive ports nothing is answering on.
+#
+# A connect probe, not a bind probe, for the reason the POSIX fixture's
+# `free_port` gives: bind-then-close leaves the port in TIME_WAIT on some
+# systems, and the caller is about to hand it to a *different* process anyway, so
+# the only question this can honestly answer is "is anything answering here right
+# now". Racy in principle; the test is RUN_SERIAL and the range is wide.
+#
+# It replaces a fixed base of 21730, which was defended on the grounds that a
+# fixed port keeps the failure mode legible. It does the opposite, and what makes
+# it worse here than for an ordinary fixture is WHAT holds the port: another
+# `fastcached` -- leaked from an earlier run, or left by a sibling worktree. A
+# daemon of the same kind does not refuse the connection; it answers. So the run
+# proceeds against a cache that is not empty, the launcher's lookup returns a HIT
+# for an object this run has not stored, the compile is served instead of
+# dispatched, and the fixture reports "the compile was not dispatched to a
+# worker" -- a message about distribution, produced by a port collision, with
+# nothing anywhere naming a port. Observed exactly that way, twice, with
+# `fastcache-cc: HIT` in the transcript on a run whose own daemon had just
+# started.
+function Get-FreePortBlock([int]$count) {
+    foreach ($attempt in 1..200) {
+        # Below the ephemeral range and clear of the block's own width.
+        $base = Get-Random -Minimum 20000 -Maximum 39000
+        $free = $true
+        foreach ($offset in 0..($count - 1)) {
+            $client = [System.Net.Sockets.TcpClient]::new()
+            try {
+                # Throws when nothing is listening, which is the answer we want.
+                $client.Connect('127.0.0.1', $base + $offset)
+                $free = $false
+            } catch {
+                # Refused: free.
+            } finally {
+                $client.Dispose()
+            }
+            if (-not $free) { break }
+        }
+        if ($free) { return $base }
+    }
+    throw "could not find $count consecutive free ports"
+}
+
+# Not under `-SelfTest`, which drives no process and opens no socket -- which is
+# precisely why CMake keeps it in the DEFAULT ctest set rather than labelling it
+# `smoke`. Probing here would give that case eight connect attempts it has no use
+# for, and a way to fail ("could not find 8 consecutive free ports") on a machine
+# whose ports are none of its business.
+if (-not $SelfTest -and $BasePort -eq 0) { $BasePort = Get-FreePortBlock $PortsNeeded }
 
 $cachePort    = $BasePort
 $dispatchPort = $BasePort + 1
