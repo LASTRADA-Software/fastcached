@@ -319,18 +319,18 @@ TEST_CASE("NodeConfig: the worker's registration survives its own parser", "[nod
     // macOS block.
     for (auto const scope: { ServiceScope::User, ServiceScope::System })
     {
-        auto const filled =
-            WithScopeDefaults(spec, scope, std::filesystem::path { "/Users/jo" },
-                              std::filesystem::path { "/opt/fastcached/etc/fastcached.yaml" });
+        auto const filled = WithScopeDefaults(spec,
+                                              scope,
+                                              std::filesystem::path { "/Users/jo" },
+                                              std::filesystem::path { "/opt/fastcached/etc/fastcached.yaml" });
 
         // Every argument must be one this binary's own parser accepts.
         for (auto const& argument: filled.arguments)
         {
             auto const flag = argument.substr(0, argument.find('='));
             INFO("registered flag: " << argument);
-            CHECK(std::ranges::any_of(NodeOptions(), [&flag](auto const& option) {
-                return option.primary == flag || option.alias == flag;
-            }));
+            CHECK(std::ranges::any_of(
+                NodeOptions(), [&flag](auto const& option) { return option.primary == flag || option.alias == flag; }));
         }
     }
 }
@@ -359,8 +359,7 @@ TEST_CASE("NodeConfig: a system-scope job owns the directories it was given", "[
 
     // A worker given neither hands over nothing, rather than a path nobody asked
     // for -- the mirror of the rule above.
-    CHECK(MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable())
-              .ownedDirectories.empty());
+    CHECK(MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable()).ownedDirectories.empty());
 }
 
 TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[node][scheduler][policy]")

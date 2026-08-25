@@ -155,7 +155,14 @@ launchctl kickstart -k gui/$UID/software.lastrada.fastcached
 tail -f ~/Library/Logs/fastcached/software.lastrada.fastcached.err.log
 ```
 
-The system daemon logs to `/opt/fastcached/var/log/` instead.
+The system daemon logs to `/opt/fastcached/var/log/<label>/` instead — a
+directory per job, because that directory is owned by the account the job runs
+as and a machine may run both `fastcached` and `fastcache-compile-node`
+system-wide:
+
+```sh
+tail -f /opt/fastcached/var/log/software.lastrada.fastcached/software.lastrada.fastcached.err.log
+```
 
 There is no reload equivalent to `systemctl reload`: send `SIGHUP` to the
 pid `launchctl print` reports, or kickstart the job.

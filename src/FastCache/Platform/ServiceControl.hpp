@@ -288,6 +288,32 @@ struct ServiceSpec
                                             ServiceScope scope,
                                             std::filesystem::path const& logDirectory);
 
+/// Where a launchd job writes its stdout/stderr.
+///
+/// System scope gets a directory of its **own**, named by the job's label,
+/// because `InstallService` hands that directory to the account the job runs as
+/// -- and a machine may run more than one of this project's services system-wide.
+/// While it was one shared directory each install chowned the other's to its own
+/// account, so registering the compile worker reassigned the daemon's and a
+/// package reinstall reassigned it back.
+///
+/// User scope keeps the flat directory: nothing is chowned there and the files
+/// inside are already named by the label, so two agents cannot collide. Giving it
+/// a subdirectory would move a path an operator already has open in `tail -f` and
+/// buy nothing.
+///
+/// Declared here rather than kept private to the launchd implementation for the
+/// reason WithScopeDefaults below is: it decides a path that ends up in a plist
+/// and in a chown, so it has to be assertable on every platform.
+///
+/// @param label The job's launchd label, from LaunchdLabel.
+/// @param scope Which domain the job belongs to.
+/// @param home The invoking user's home directory; used only for User scope.
+/// @return Directory the job's `.out.log` and `.err.log` live in.
+[[nodiscard]] std::filesystem::path DefaultLogDirectory(std::string_view label,
+                                                        ServiceScope scope,
+                                                        std::filesystem::path const& home);
+
 /// Fill in the per-scope path arguments the operator left unset.
 ///
 /// Pure, and declared here rather than kept private to the launchd

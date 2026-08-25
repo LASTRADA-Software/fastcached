@@ -593,8 +593,14 @@ things are therefore refused at install time rather than at the next boot:
 
 `--requirepass` is refused too, for the reason it is on the daemon: a supervisor
 records launch arguments where every local account can read them, and for a
-worker that token is what the scheduler authenticates it *by*. Put it in a
-config file the service account can read, or set it with a supervisor override.
+worker that token is what the scheduler authenticates it *by*.
+
+Where it goes instead is a supervisor override, not a config file — this worker
+reads no configuration file at all. On Linux that is `FASTCACHE_NODE_ARGS` in
+`/etc/fastcached/compile-node.env`, which systemd reads and the worker never
+sees on a world-readable command line. macOS and Windows have no equivalent
+today, so a worker that needs a token is run there in the foreground rather than
+registered as a service.
 
 **macOS scope.** `--service-scope=user` registers a LaunchAgent that runs as
 you, which is the per-developer case. `--service-scope=system` registers a

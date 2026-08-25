@@ -197,8 +197,29 @@ TEST_CASE("ServiceControl: the launchd label is reverse-DNS and lowercased", "[p
     REQUIRE(FastCache::LaunchdLabel(SpecFor("fastcached", cfg)) == "software.lastrada.fastcachedsmoke");
 }
 
-TEST_CASE("ServiceControl: scope defaults are filled in for a file-configured service",
-          "[platform][service][launchd]")
+TEST_CASE("ServiceControl: a system job's log directory is its own", "[platform][service][launchd]")
+{
+    // InstallService hands this directory to the account the job runs as, and a
+    // machine may run both fastcached and fastcache-compile-node system-wide.
+    // One shared directory meant each install chowned the other's to itself:
+    // registering the worker took the daemon's, and a package reinstall took it
+    // back.
+    auto const daemon = FastCache::DefaultLogDirectory("software.lastrada.fastcached", ServiceScope::System, "/Users/jo");
+    auto const worker =
+        FastCache::DefaultLogDirectory("software.lastrada.fastcachecompilenode", ServiceScope::System, "/Users/jo");
+
+    REQUIRE(daemon != worker);
+    REQUIRE(daemon.filename() == "software.lastrada.fastcached");
+    // A machine-wide job must not reach into anybody's home directory.
+    REQUIRE(!daemon.string().contains("/Users/jo"));
+
+    // A per-user agent is not chowned and its files are already label-named, so
+    // it keeps the flat directory an operator may have open in `tail -f`.
+    auto const agent = FastCache::DefaultLogDirectory("software.lastrada.fastcached", ServiceScope::User, "/Users/jo");
+    REQUIRE(agent == std::filesystem::path { "/Users/jo" } / "Library/Logs/fastcached");
+}
+
+TEST_CASE("ServiceControl: scope defaults are filled in for a file-configured service", "[platform][service][launchd]")
 {
     FastCache::Config const cfg {};
     auto const spec = SpecFor("fastcached", cfg);
@@ -230,8 +251,7 @@ TEST_CASE("ServiceControl: scope defaults are filled in for a file-configured se
         named.configPath = "/etc/fastcached/fastcached.yaml";
         auto const filled = WithScopeDefaults(SpecFor("fastcached", named), ServiceScope::User, "/Users/jo", {});
 
-        REQUIRE(std::ranges::none_of(filled.arguments,
-                                     [](std::string const& a) { return a.starts_with("--storage="); }));
+        REQUIRE(std::ranges::none_of(filled.arguments, [](std::string const& a) { return a.starts_with("--storage="); }));
     }
 
     SECTION("a system daemon is pointed at the packaged config")

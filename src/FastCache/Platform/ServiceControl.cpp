@@ -684,6 +684,31 @@ namespace
     }
 } // namespace
 
+namespace
+{
+/// Root of the macOS package payload, e.g. `/opt/fastcached`.
+///
+/// Handed down from FASTCACHED_MACOS_PREFIX by src/FastCache/CMakeLists.txt
+/// so the daemon's idea of its own install tree cannot drift from the one
+/// the installer actually lays down. The fallback matters for builds that
+/// compile this file outside the package configuration (a plain
+/// `cmake --install --prefix /usr/local`, or the test binary on a
+/// non-Apple CI toolchain), where no prefix has been chosen.
+#if defined(FC_MACOS_PREFIX)
+    constexpr std::string_view MacOsPrefix = FC_MACOS_PREFIX;
+#else
+    constexpr std::string_view MacOsPrefix = "/opt/fastcached";
+#endif
+
+} // namespace
+
+std::filesystem::path DefaultLogDirectory(std::string_view label, ServiceScope scope, std::filesystem::path const& home)
+{
+    if (scope == ServiceScope::User)
+        return home / "Library/Logs/fastcached";
+    return std::filesystem::path { MacOsPrefix } / "var/log" / label;
+}
+
 ServiceSpec WithScopeDefaults(ServiceSpec spec,
                               ServiceScope scope,
                               std::filesystem::path const& home,
@@ -883,28 +908,6 @@ namespace
         if (auto const* const pw = ::getpwuid(::getuid()); pw != nullptr && pw->pw_dir != nullptr)
             return std::filesystem::path { pw->pw_dir };
         return {};
-    }
-
-    /// Root of the macOS package payload, e.g. `/opt/fastcached`.
-    ///
-    /// Handed down from FASTCACHED_MACOS_PREFIX by src/FastCache/CMakeLists.txt
-    /// so the daemon's idea of its own install tree cannot drift from the one
-    /// the installer actually lays down. The fallback matters for builds that
-    /// compile this file outside the package configuration (a plain
-    /// `cmake --install --prefix /usr/local`, or the test binary on a
-    /// non-Apple CI toolchain), where no prefix has been chosen.
-    #if defined(FC_MACOS_PREFIX)
-    constexpr std::string_view MacOsPrefix = FC_MACOS_PREFIX;
-    #else
-    constexpr std::string_view MacOsPrefix = "/opt/fastcached";
-    #endif
-
-    /// Where a job in @p scope writes its stdout/stderr.
-    [[nodiscard]] std::filesystem::path DefaultLogDirectory(ServiceScope scope, std::filesystem::path const& home)
-    {
-        if (scope == ServiceScope::User)
-            return home / "Library/Logs/fastcached";
-        return std::filesystem::path { MacOsPrefix } / "var/log";
     }
 
     /// Whether a launchctl invocation's own diagnostics reach the terminal.
@@ -1215,7 +1218,7 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     auto const effective = WithScopeDefaults(spec, scope, home, packagedConfig);
     auto const label = LaunchdLabel(effective);
     auto const plistPath = LaunchdPlistPath(effective, scope, home);
-    auto const logDirectory = DefaultLogDirectory(scope, home);
+    auto const logDirectory = DefaultLogDirectory(label, scope, home);
 
     if (scope == ServiceScope::System && !effective.configPath.empty())
         if (auto const denial = ServiceAccountReadDenial(effective.serviceAccount, effective.configPath))

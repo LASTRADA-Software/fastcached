@@ -21,9 +21,23 @@ ACCOUNT="@FASTCACHED_MACOS_SERVICE_ACCOUNT@"
 # which is also what creates the worker's account from the Runtime component.
 fastcached_create_account "$ACCOUNT" "fastcached daemon"
 
-mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" || true
+# The daemon's cache, and ONLY that. This used to be `chown -R ${PREFIX}/var`,
+# which also swept up ${PREFIX}/var/log -- where every system-scope service now
+# has a directory of its own, owned by the account that service runs as. A
+# reinstall therefore took the compile worker's log directory away from it and
+# gave it to the daemon, which is precisely the ownership tug-of-war the per-job
+# directories exist to end.
+#
+# var/log itself is left to root: each service's own --install-service creates
+# its subdirectory under it and hands that one over. var/ likewise, since
+# traversing it needs no ownership.
+#
+# The cache is chowned here rather than left to --install-service because the
+# packaged registration passes only --config: storage_path lives in the YAML, so
+# the spec has no ownedDirectories to hand over.
+mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" "${PREFIX}/var/cache" || true
 if [ -n "${FASTCACHED_ACCOUNT_UID:-}" ] && [ -n "${FASTCACHED_ACCOUNT_GID:-}" ]; then
-    /usr/sbin/chown -R "${FASTCACHED_ACCOUNT_UID}:${FASTCACHED_ACCOUNT_GID}" "${PREFIX}/var" || true
+    /usr/sbin/chown -R "${FASTCACHED_ACCOUNT_UID}:${FASTCACHED_ACCOUNT_GID}" "${PREFIX}/var/cache" || true
 fi
 
 # The daemon drops to ${ACCOUNT} before it opens its config, so the file has to

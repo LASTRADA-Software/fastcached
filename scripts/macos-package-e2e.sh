@@ -417,6 +417,16 @@ reinstall_log="$(sudo installer -pkg "$pkg" -applyChoiceChangesXML "$choices" -t
 sudo grep -qF "$MARKER" "${PREFIX}/etc/fastcached.yaml" \
     || fail "reinstall overwrote the operator's fastcached.yaml"
 
+# And it must not have taken the worker's log directory with it. Every
+# system-scope job has one of its own, owned by the account that job runs as; a
+# `chown -R` over the whole of ${PREFIX}/var during the daemon's postinstall
+# would quietly hand the worker's to _fastcached, leaving it unable to write its
+# own logs with nothing reporting why.
+node_log_owner="$(stat -f %Su "${PREFIX}/var/log/${NODE_LABEL}" 2>/dev/null || true)"
+if [[ "$node_log_owner" != "$NODE_ACCOUNT" ]]; then
+    fail "after the reinstall ${PREFIX}/var/log/${NODE_LABEL} is owned by '${node_log_owner:-<absent>}', expected ${NODE_ACCOUNT}"
+fi
+
 # --- 6. uninstall must leave nothing ---------------------------------------
 echo "== uninstalling"
 uninstall_log="$(sudo "${PREFIX}/bin/fastcached-uninstall" 2>&1)" \
