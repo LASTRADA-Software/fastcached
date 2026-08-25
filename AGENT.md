@@ -177,6 +177,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - Absence from `ClusterState` is not removal: a `--raft-peer` member is in the
   configuration and in no state, so a member named in the bootstrap set is never
   proposed for removal, and a node given no bootstrap set proposes none at all.
+- A cluster that has elected is not one that has formed. Until every member
+  attaches, pre-vote refuses nothing and any stall re-elects — assert leadership
+  stability only after formation, and log the term or nothing explains it.
 
 **[`.agent/rules/wire-and-protocol.md`](.agent/rules/wire-and-protocol.md)** —
 framing, the auth gate, sockets, dialling and coroutine lifetime. Before

@@ -375,6 +375,47 @@ Every rule below has already been a bug.
     also the answer to why the defect survived being written down as a residual —
     the harness that found five other consensus defects could not have found this
     one.
+- **A cluster that has ELECTED is not a cluster that has FORMED, and only the
+  second one is stable (issue #117).** While a member's process is still
+  connecting, the remaining two carry the whole quorum — so a leader's
+  `HasQuorumContact` degenerates into "has that ONE follower answered inside
+  `electionTimeoutMin`". The arithmetic then guarantees the protection is absent
+  rather than merely unlucky: a follower campaigns only after its own draw from
+  [`electionTimeoutMin`, `electionTimeoutMax`] has elapsed *with no contact*, so
+  by the instant it asks, the leader's evidence about it is at least that old and
+  therefore always stale. The leader grants, and any transient stall — a
+  saturated link, a paused process, the `fsync` a proposal takes under the
+  driver's mutex — re-elects a cluster with nothing wrong with it. Consequences:
+  - **Nothing about this belongs in the algorithm.** A leader that refused anyway
+    is the partitioned leader vetoing its own replacement forever, which the
+    entry above rejects for exactly this reason. Pre-vote and CheckQuorum failing
+    open here is them working; the cluster genuinely has no fault tolerance left
+    until every member attaches, and re-electing is the correct response to
+    losing the only link it has.
+  - **So the property a fixture may assert is leadership stability of a FORMED
+    cluster.** `cluster-e2e.sh` asserted "elects once and never moves" from the
+    moment `find_leader` saw any node answer, which is the weaker fact, and it
+    reported an algorithm behaving exactly as specified as a defect. It now waits
+    until one node answers as leader *and* the other two redirect to that same
+    endpoint — a follower can only name it once it has taken an `AppendEntries`
+    from that leader and the leader's own record has committed, which also means
+    the leader holds that follower's answer and its quorum has slack again.
+  - **Asked, never scraped, and re-derived every pass.** A log line proves less
+    than an answer and keeps passing once the answer stops matching it, and
+    leadership may legitimately move *during* formation — so the endpoint is
+    taken from the pass that succeeds rather than checked against whichever one
+    `find_leader` happened to see first.
+  - **A role line with no term cannot answer any of this, which is why the first
+    change was diagnostic.** The artifact showed three nodes moving between roles
+    and nothing else: no term, and no record of what deposed anybody. An
+    intermittent election is diagnosable from its logs or not at all, so
+    `RaftOutput` now carries a `TermAdoption` — the term and role being replaced
+    and the peer that carried the higher one — and the driver's role report
+    carries the term, with the term part of what counts as a *change*. That last
+    detail is load-bearing: a node disturbed round after round by a campaigning
+    peer is a follower knowing no leader before and after each one, so a report
+    keyed on (role, leader) alone is silent during precisely the storm somebody
+    is reading the dump for.
 - **A round-trip test that omits a message type omits the arm most likely to be
   wrong.** Five of `RaftWire`'s eight encoder arms are near-copies of another —
   PreVote of RequestVote, `InstallSnapshotResponse` of `AppendEntriesResponse` —

@@ -99,6 +99,37 @@ struct CompactionPolicy
 class RaftDriver
 {
   public:
+    /// Everything an observer is told when this node's role moves.
+    ///
+    /// One report rather than a parameter per fact, so the next thing worth
+    /// reporting is a field here instead of another positional argument at every
+    /// call site and in every observer.
+    struct RoleChange
+    {
+        Role role {}; ///< What this node is playing now.
+
+        /// The term it is playing it in.
+        ///
+        /// Carried because a role alone cannot be read after the fact: it says
+        /// leadership moved and nothing about how often, and an intermittent
+        /// election is diagnosable from its logs or not at all.
+        Term term {};
+
+        /// Who it believes leads, if anybody.
+        ///
+        /// It travels with the role because a follower's whole use for one is to
+        /// redirect, and a refusal that cannot say who to ask instead cannot be
+        /// acted on.
+        std::optional<NodeId> knownLeader;
+
+        /// Why, when a peer's higher term caused this; absent otherwise.
+        ///
+        /// A change this node decided for itself -- winning an election, timing out
+        /// -- has no cause to name, and the two are worth telling apart: one is this
+        /// node acting and the other is something being done to it.
+        std::optional<TermAdoption> cause;
+    };
+
     /// Told this node's role whenever it changes, and never otherwise.
     ///
     /// **Pushed rather than polled**, because the alternatives are both worse. A
@@ -113,11 +144,7 @@ class RaftDriver
     /// election timeout, the transport's reader for a message that deposed it. An
     /// implementation must therefore be safe to call from either, and must not block
     /// -- it is on the path that also has to send the next heartbeat.
-    ///
-    /// The leader id travels with the role because a follower's whole use for one is
-    /// to redirect, and a refusal that cannot say who to ask instead cannot be acted
-    /// on.
-    using RoleObserver = std::function<void(Role role, std::optional<NodeId> const& knownLeader)>;
+    using RoleObserver = std::function<void(RoleChange const& change)>;
 
     /// @param node The state machine to drive; taken by value and owned.
     /// @param storage Where durable state goes; must outlive this driver.
@@ -257,7 +284,8 @@ class RaftDriver
     [[nodiscard]] TimePoint SleepDeadline(TimePoint now) const;
 
     /// Report the role if it has moved since the last report.
-    void PublishRoleIfChanged();
+    /// @param cause What a step-down reported, if this step had one.
+    void PublishRoleIfChanged(std::optional<TermAdoption> const& cause);
 
     /// Trade the applied prefix of the log for a snapshot, if enough has piled up.
     ///
@@ -286,7 +314,15 @@ class RaftDriver
     /// node that recovered as a follower and stays one reports nothing -- an
     /// observer that fired once at startup for no transition would make "the role
     /// changed" mean two different things.
+    ///
+    /// The **term** is part of what counts as changed, and that is not decoration.
+    /// A node campaigning round after round without winning stays a candidate with
+    /// no known leader the whole time, so a report keyed on (role, leader) alone
+    /// says nothing at all during exactly the storm somebody is trying to read
+    /// afterwards. A cluster that is working changes term never, so watching it
+    /// costs nothing and speaks only when something is wrong.
     Role _reportedRole;
+    Term _reportedTerm;
     std::optional<NodeId> _reportedLeader;
 
     /// Written only by the loop thread, so it needs no synchronization of its

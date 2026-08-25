@@ -135,6 +135,23 @@ namespace
     }
 } // namespace
 
+std::string DescribeRole(Distributed::SchedulerRole role, Consensus::Term term, std::string_view leaderEndpoint)
+{
+    return std::format("consensus: this node is now {} in term {}{}",
+                       RoleName(role),
+                       term.value,
+                       leaderEndpoint.empty() ? std::string {} : std::format(" of {}", leaderEndpoint));
+}
+
+std::string DescribeTermAdoption(Consensus::Term adopted, Consensus::TermAdoption const& cause)
+{
+    return std::format("consensus: term {} arrived from {}; this node was {} in term {}",
+                       adopted.value,
+                       cause.from,
+                       Consensus::TraitsOf(cause.previousRole).name,
+                       cause.previousTerm.value);
+}
+
 std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::string_view schedulerBound)
 {
     // Nothing to advertise when this node serves no scheduler surface, which is a
@@ -350,9 +367,13 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // leading and is still handing out other machines' capacity, and the driver knows
     // the moment it happens -- see `RaftDriver::RoleObserver`, and note it may call
     // this from either the timer thread or a peer reader.
-    _driver->ObserveRole([this](Consensus::Role role, std::optional<Consensus::NodeId> const& knownLeader) {
-        PublishRole(role, knownLeader);
-    });
+    _driver->ObserveRole([this](Consensus::RaftDriver::RoleChange const& change) { PublishRole(change); });
+
+    // Read from the node rather than left at its default, because a node recovered
+    // from storage comes back at whatever term it had reached. Only the term can
+    // differ -- a recovered node is always a follower knowing no leader -- so this
+    // changes what the first line SAYS and not what it announces.
+    _lastTerm = _driver->Node().CurrentTerm();
 
     // Announced BEFORE anything starts, and unconditionally. Until consensus says
     // otherwise this node is `Undecided`, which is what a node in a cluster that
@@ -643,10 +664,18 @@ void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
         LogLevel::Info, "cluster: proposing a quorum of {} member(s) at index {}", change->size(), _quorumProposedAt.value);
 }
 
-void ConsensusTier::PublishRole(Consensus::Role role, std::optional<Consensus::NodeId> const& knownLeader)
+void ConsensusTier::PublishRole(Consensus::RaftDriver::RoleChange const& change)
 {
-    _lastRole = role;
-    _lastLeader = knownLeader;
+    // The cause first, and unconditionally: a higher term arriving is an event
+    // rather than a state, so the suppression `Republish` applies -- which exists
+    // to stop an unchanged *announcement* being repeated -- would be the wrong
+    // question to ask about it.
+    if (change.cause.has_value())
+        _logger.Log(LogLevel::Info, DescribeTermAdoption(change.term, *change.cause));
+
+    _lastRole = change.role;
+    _lastTerm = change.term;
+    _lastLeader = change.knownLeader;
     Republish();
 }
 
@@ -678,18 +707,29 @@ void ConsensusTier::Republish()
     // log a role line on every committed entry -- and an observer told the same
     // thing repeatedly is one whose callers cannot use "I was told" to mean
     // anything.
-    if (_published && scheduled == _publishedRole && leaderEndpoint == _publishedEndpoint)
+    //
+    // Two tests rather than one, because the log and the scheduler are asking
+    // different questions. A node campaigning round after round without winning is
+    // `Undecided` with no endpoint every time, so a single test leaves the one
+    // condition somebody reads a dump to find completely silent; a term that moved
+    // is therefore worth a line even when the announcement did not change. The
+    // scheduler still hears only real changes -- it has no use for a term, and
+    // re-announcing an unchanged role is what the paragraph above forbids.
+    auto const announcementMoved = !_published || scheduled != _publishedRole || leaderEndpoint != _publishedEndpoint;
+    if (!announcementMoved && _lastTerm == _publishedTerm)
         return;
 
     _published = true;
+    _publishedTerm = _lastTerm;
+
+    _logger.Log(LogLevel::Info, DescribeRole(scheduled, _lastTerm, leaderEndpoint));
+
+    if (!announcementMoved)
+        return;
+
     _publishedRole = scheduled;
     _publishedEndpoint = leaderEndpoint;
     _leads.store(scheduled == Distributed::SchedulerRole::Leader, std::memory_order_relaxed);
-
-    _logger.Logf(LogLevel::Info,
-                 "consensus: this node is now {}{}",
-                 RoleName(scheduled),
-                 leaderEndpoint.empty() ? std::string {} : std::format(" of {}", leaderEndpoint));
 
     if (_onRole)
         _onRole(scheduled, leaderEndpoint);

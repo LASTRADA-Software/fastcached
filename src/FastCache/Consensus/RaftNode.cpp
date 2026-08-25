@@ -435,6 +435,26 @@ Term RaftNode::TermOf(RaftMessage const& message) noexcept
     return std::visit([](auto const& concrete) { return concrete.term; }, message);
 }
 
+NodeId RaftNode::SenderOf(RaftMessage const& message)
+{
+    // Four names for one fact, so the visitor asks which one this message has
+    // rather than being written out once per message type. The final `else` is
+    // not a default: a type carrying none of these four fails to compile, which
+    // is the whole reason to detect rather than enumerate.
+    return std::visit(
+        [](auto const& concrete) -> NodeId const& {
+            if constexpr (requires { concrete.candidateId; })
+                return concrete.candidateId;
+            else if constexpr (requires { concrete.voterId; })
+                return concrete.voterId;
+            else if constexpr (requires { concrete.leaderId; })
+                return concrete.leaderId;
+            else
+                return concrete.followerId;
+        },
+        message);
+}
+
 bool RaftNode::IsMember(NodeId const& id) const
 {
     return std::ranges::find(_members, id) != _members.end();
@@ -502,8 +522,13 @@ void RaftNode::RefreshConfiguration()
     AdoptMembers(_snapshotMembers.empty() ? _config.members : _snapshotMembers);
 }
 
-void RaftNode::StepDown(Term term, TimePoint now, RaftOutput& output)
+void RaftNode::StepDown(Term term, NodeId const& from, TimePoint now, RaftOutput& output)
 {
+    // Reported BEFORE anything is overwritten, which is the only moment both
+    // halves exist: the term and role being left behind are about to be gone, and
+    // the peer that carried the new term is known only to the caller.
+    output.adoptedTerm = TermAdoption { .previousTerm = _currentTerm, .previousRole = _role, .from = from };
+
     // Whether the election timer is re-armed depends on what this node was, and
     // getting it wrong in either direction costs liveness.
     //
@@ -825,7 +850,7 @@ RaftOutput RaftNode::Receive(RaftMessage const& message, TimePoint now)
     {
         auto const incomingTerm = TermOf(message);
         if (incomingTerm > _currentTerm)
-            StepDown(incomingTerm, now, output);
+            StepDown(incomingTerm, SenderOf(message), now, output);
     }
 
     std::visit(Overloaded {

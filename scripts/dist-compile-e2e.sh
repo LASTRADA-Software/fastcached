@@ -346,12 +346,32 @@ wait_for_port "$dispatch_port" "$scheduler_pid" "scheduler" "${workdir}/schedule
 wait_for_log "scheduling for the fleet" "$scheduler_pid" "scheduler" "${workdir}/scheduler.log"
 
 # --- start a worker ----------------------------------------------------------
+
+# Slots enough that background CPU cannot withdraw all of them.
+#
+# `AvailableSlots` reduces a worker's ceiling by the cores its machine is busy
+# with OUTSIDE this fleet -- `cpuBusyPermille * logicalCores / 1000`, less this
+# fleet's own in-flight jobs -- so a worker offering two slots on a many-core
+# machine withdraws both as soon as a few percent of that machine is doing
+# something else. This fixture IS that something else: it runs local reference
+# compiles on the same box, and on CI the rest of the suite runs beside it. The
+# dispatch then comes back `rejected (withdrawn)` and the case fails as "the
+# compile was not dispatched to a worker", which reads as a fault in dispatch and
+# is a fault in the fixture's sizing.
+#
+# Offering the whole machine puts the ceiling at cores-minus-external, which
+# reaches zero only when the host really is saturated -- and is what a node
+# dedicating this machine to the fleet would advertise anyway. The `--slots=1`
+# workers elsewhere in this file are deliberate and stay: their cases are ABOUT
+# a worker having exactly one.
+worker_slots="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
+
 worker_port="$(free_port)"
 worker_admin_port="$(free_port)"
 "$node" "$no_local_cache" --scheduler="127.0.0.1:${dispatch_port}" \
     --bind=127.0.0.1 --port="$worker_port" --advertise="127.0.0.1:${worker_port}" \
     --admin-listen="$worker_admin_port" \
-    --toolchain="${compiler}" --slots=2 --log-level=debug \
+    --toolchain="${compiler}" --slots="$worker_slots" --log-level=debug \
     > "${workdir}/worker.log" 2>&1 &
 worker_pid=$!
 pids+=("$worker_pid")

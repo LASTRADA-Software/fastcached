@@ -54,3 +54,36 @@ TEST_CASE("An IPv6 advertisement is bracketed, so it splits back the way it went
     CHECK(Unwrap(split).first == "2001:db8::1");
     CHECK(Unwrap(split).second == "7000");
 }
+
+TEST_CASE("A role line names the term it happened in", "[node][consensus]")
+{
+    // Issue #117: the dump of an intermittent election showed three nodes moving
+    // between roles and gave no way to tell one re-election from five, because the
+    // line carried no term at all.
+    using FastCache::Distributed::SchedulerRole;
+
+    CHECK(DescribeRole(SchedulerRole::Leader, FastCache::Consensus::Term { .value = 4 }, "")
+          == "consensus: this node is now the leader in term 4");
+
+    CHECK(DescribeRole(SchedulerRole::Follower, FastCache::Consensus::Term { .value = 4 }, "127.0.0.1:6674")
+          == "consensus: this node is now a follower in term 4 of 127.0.0.1:6674");
+
+    // A node that knows no leader has no endpoint to name, and the line must not
+    // grow an empty " of " where one would go -- that reads as a redirect to
+    // nowhere rather than as an election in progress.
+    CHECK(DescribeRole(SchedulerRole::Undecided, FastCache::Consensus::Term { .value = 5 }, "")
+          == "consensus: this node is now undecided in term 5");
+}
+
+TEST_CASE("A demotion names the term, the peer, and what this node was", "[node][consensus]")
+{
+    // The three facts the CI dump was missing. The role is the CONSENSUS one:
+    // `pre-candidate` and `candidate` both read as `undecided` to the scheduler,
+    // and a deposed LEADER is the case worth spotting at a glance.
+    auto const cause = FastCache::Consensus::TermAdoption { .previousTerm = FastCache::Consensus::Term { .value = 1 },
+                                                            .previousRole = FastCache::Consensus::Role::Leader,
+                                                            .from = "n3" };
+
+    CHECK(DescribeTermAdoption(FastCache::Consensus::Term { .value = 2 }, cause)
+          == "consensus: term 2 arrived from n3; this node was leader in term 1");
+}

@@ -17,6 +17,13 @@
 #                            the transport and the timers all get their first say.
 #                            The second half is what catches leadership that never
 #                            settles, which a single poll cannot see.
+#
+#                            Asserted only once the cluster is FORMED, which is a
+#                            stronger fact than "a leader exists" and the one this
+#                            property is actually true of. A cluster still waiting
+#                            for its last member re-elects on any hiccup by design
+#                            — see `wait_for_formation`, and issue #117 for the
+#                            three CI runs spent proving the algorithm right.
 #   2. Redirect is usable — a follower's refusal names the leader's SCHEDULER port,
 #                          and dialling that endpoint works. This is the defect the
 #                          two-endpoint member record exists to close: while one
@@ -216,8 +223,113 @@ find_leader() {
     fail "no node ever answered a cluster question; the cluster never elected a leader"
 }
 
-find_leader
-echo "cluster E2E: leader answers at ${leader_endpoint}"
+# The endpoint a refusal tells a client to ask instead, or empty when it names
+# none.
+#
+# One spelling of the grammar rather than three. The three callers below ask the
+# same question of the same answer -- is the cluster formed, does a follower's
+# redirect work, has the admitted node been replicated to -- and a parse that
+# drifted in one of them would make that caller quietly stop matching while still
+# looking like it asserted something.
+#
+# Empty is a real answer rather than a parse failure: `NotLeader` with no address
+# is what an election in progress looks like, and every caller has to tell that
+# apart from an address it can dial.
+# @param 1 the answer to read
+named_endpoint() {
+    printf '%s' "$1" | sed -n 's/.*--scheduler=\([^ ]*\) instead.*/\1/p'
+}
+
+# Block until the cluster is FORMED, which is a stronger fact than "a leader
+# exists" and the one every assertion below actually rests on (issue #117).
+#
+# A three-node cluster whose third process is still connecting is running on a
+# bare two-of-three quorum, and there the leader's CheckQuorum test degenerates
+# into "has that ONE follower answered inside electionTimeoutMin". A follower
+# only campaigns after its own randomized timeout -- drawn from
+# [electionTimeoutMin, electionTimeoutMax] -- has elapsed with no contact, so by
+# the time it asks, the leader's evidence about it is necessarily at least that
+# old and therefore always stale. The leader grants, and the cluster re-elects.
+# Pre-vote refuses nothing in that window, structurally rather than occasionally,
+# and no fix belongs in the algorithm: a leader that refused anyway would be a
+# partitioned leader vetoing its own replacement forever.
+#
+# So "elects once and never moves" is true of a formed cluster and false of one
+# that has merely elected -- and `find_leader` returns the instant ANY node
+# answers, which is the weaker fact. Asserting stability from there is what put
+# `round 5: expected exactly one node to answer, got 0` into CI against an
+# algorithm that was behaving exactly as specified.
+#
+# Formed is asked for, not scraped, for the reason `find_leader` gives: one node
+# answers as leader and the other two REDIRECT to that same endpoint. A follower
+# can only name it once it has taken an AppendEntries from that leader and the
+# leader's own record has committed -- which also means the leader is holding
+# that follower's answer, so its quorum has slack again. Waiting for a log line
+# would prove less and would keep passing if the answer stopped matching it.
+#
+# Leadership may legitimately move while this waits, so the endpoint is
+# re-derived on every pass rather than checked against the one `find_leader`
+# happened to see.
+# Over the LIVE slots, honouring the blanked-slot convention `find_leader` uses,
+# and counting how many there are rather than assuming three. A stopped node's
+# port is blanked, so a hard-coded `0 1 2` would dial `127.0.0.1:` and report a
+# cluster that had in fact formed as one that never did -- which is the whole
+# failure mode this function exists to stop misdiagnosing.
+#
+# It subsumes `find_leader`, so it is called INSTEAD of one rather than after it:
+# both poll the same nodes for ~30s, and spending two budgets on the failing path
+# is 450 extra client spawns and a real chance of hitting the fixture's own
+# CTest timeout, which would replace the diagnosis below with an opaque kill.
+# The two outcomes it has to tell apart are kept by remembering whether anything
+# ever answered as leader at all.
+wait_for_formation() {
+    local index endpoint answer named led followers live everLed=0
+    for _ in $(seq 1 150); do
+        led=""
+        named=""
+        followers=0
+        live=0
+        for index in "${!scheduler_ports[@]}"; do
+            [[ -n "${scheduler_ports[$index]}" ]] || continue
+            live=$(( live + 1 ))
+            endpoint="127.0.0.1:${scheduler_ports[$index]}"
+            answer="$(cluster "$endpoint" --cluster-status)"
+            case "$answer" in
+                *"known settings:"*)
+                    everLed=1
+                    # Two at once is a cluster mid-handover rather than a formed
+                    # one, so neither is adopted and the pass is abandoned.
+                    [[ -z "$led" ]] || { led=""; break; }
+                    led="$endpoint"
+                    ;;
+                *"ask --scheduler="*)
+                    followers=$(( followers + 1 ))
+                    endpoint="$(named_endpoint "$answer")"
+                    if [[ -z "$named" ]]; then
+                        named="$endpoint"
+                    elif [[ "$named" != "$endpoint" ]]; then
+                        named="disagreed"
+                    fi
+                    ;;
+            esac
+        done
+
+        if [[ -n "$led" && "$followers" -eq $(( live - 1 )) && "$named" == "$led" ]]; then
+            leader_endpoint="$led"
+            return 0
+        fi
+        sleep 0.2
+    done
+
+    # Two different faults, and telling them apart is most of the value: nothing
+    # ever led at all, or something led and the rest never came to name it.
+    [[ "$everLed" -eq 1 ]] ||
+        fail "no node ever answered a cluster question; the cluster never elected a leader"
+    fail "the cluster elected but never formed: one leader and every other node naming it never held at once"
+}
+
+wait_for_formation
+echo "cluster E2E: the cluster is formed, and led from ${leader_endpoint}"
 
 # --- 1. exactly one leader, and it stays -------------------------------------
 
@@ -228,8 +340,12 @@ echo "cluster E2E: leader answers at ${leader_endpoint}"
 # never settles, and the two-leader window shows up later as some other assertion
 # failing for no visible reason. That is exactly how the driver's stale sleep
 # reached CI: `find_leader` and one count both passed, and the follower check two
-# steps later found a second leader. With all three processes alive and nothing
-# else wrong, a healthy cluster elects once and never moves.
+# steps later found a second leader.
+#
+# The precondition above is what makes this legitimate to assert at all: a FORMED
+# cluster with all three processes alive and nothing else wrong elects once and
+# never moves. One that has merely elected re-elects on any hiccup, by design --
+# see `wait_for_formation`.
 for round in $(seq 1 15); do
     answered=0
     who=""
@@ -267,7 +383,7 @@ redirect_from() {
         answer="$(cluster "$endpoint" --cluster-status)"
         case "$answer" in
             *"ask --scheduler="*)
-                printf '%s' "$answer" | sed -n 's/.*--scheduler=\([^ ]*\) instead.*/\1/p'
+                named_endpoint "$answer"
                 return 0
                 ;;
             *"known settings:"*)
@@ -387,15 +503,42 @@ answer="$(cluster "$leader_endpoint" --cluster-admit="n4=127.0.0.1:${raft_ports[
 #     anything at all is n4 being counted -- which is the half issue #97 is about
 #     and the half `--cluster-status` on the leader could never show, since that
 #     reports the fleet's member set rather than the quorum.
+#
+# What is NOT asserted is *which* node leads, and that is deliberate for the
+# reason `wait_for_formation` exists at all: admission puts the cluster back into
+# the state that has no slack -- the quorum grows to three of four while n4 is
+# still attaching -- so a re-election here is legitimate. Pinning the endpoint
+# recorded before admission would fail this bounded wait after 30s with "never
+# learned who leads" for a node that had learned perfectly well, which is issue
+# #117 one section later. So the endpoint n4 names is taken from n4, and then
+# checked to be a leader by asking it.
+#
+# And n4 WINNING that election proves the same property more directly, so it is
+# accepted too: leading means a quorum of the configuration voted for it, which a
+# node outside the configuration cannot obtain and a node that bootstrapped alone
+# could not have won against the others. Reading only its redirect would tolerate
+# exactly one of the two legitimate outcomes and hang out the full 30s on the
+# other -- the same shape of precondition error, and it would have been a hard one
+# to see, because n4 winning here is rare.
 joined=0
 for _ in $(seq 1 150); do
     answer="$(cluster "127.0.0.1:${scheduler_ports[3]}" --cluster-status)"
-    [[ "$answer" == *"$leader_endpoint"* ]] && { joined=1; break; }
+    named="$(named_endpoint "$answer")"
+    if [[ "$answer" == *"known settings:"* ]]; then
+        leader_endpoint="127.0.0.1:${scheduler_ports[3]}"
+        joined=1
+        break
+    fi
+    if [[ -n "$named" && "$(cluster "$named" --cluster-status)" == *"known settings:"* ]]; then
+        leader_endpoint="$named"
+        joined=1
+        break
+    fi
     sleep 0.2
 done
 [[ "$joined" -eq 1 ]] ||
     fail "the admitted node never learned who leads, so it was never replicated to: ${answer}"
-echo "cluster E2E: an admitted node is replicated to, which is being counted"
+echo "cluster E2E: an admitted node is replicated to, which is being counted, and it names ${leader_endpoint}"
 
 # --- 5. a member can be removed ----------------------------------------------
 
