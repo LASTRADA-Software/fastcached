@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
@@ -8,6 +9,32 @@
 
 namespace FastCache::Cluster
 {
+
+std::optional<ClusterMember> ParseMemberSpec(std::string_view spec)
+{
+    auto const split = spec.find('=');
+    if (split == std::string_view::npos)
+        return std::nullopt;
+
+    auto const id = spec.substr(0, split);
+    auto const endpoint = spec.substr(split + 1);
+    if (id.empty() || endpoint.empty())
+        return std::nullopt;
+
+    // Both halves of the question a dialer asks. A split alone is not enough:
+    // `10.0.0.4:0` splits and names no port anybody can connect to, so a member
+    // accepted on that basis is one the cluster counts and never reaches.
+    auto const parts = SplitHostPort(endpoint);
+    if (!parts.has_value() || !ParseTcpPort(parts->second).has_value())
+        return std::nullopt;
+
+    // Every field named, including the one this token cannot carry. A member's
+    // scheduler endpoint is a port peers never connect to, so nothing an operator
+    // types about a PEER could supply it -- the node announces its own. Saying so
+    // with `{}` rather than leaving it out is what keeps a field added to the
+    // middle of the struct from becoming a silent zero here.
+    return ClusterMember { .id = std::string { id }, .raftEndpoint = std::string { endpoint }, .schedulerEndpoint = {} };
+}
 
 namespace
 {

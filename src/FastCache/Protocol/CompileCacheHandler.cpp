@@ -89,6 +89,10 @@ namespace
                         .code = Wire::ErrorCode::NoCluster,
                         .why = "this endpoint is a cache and belongs to no cluster; ask a "
                                "fastcache-compile-node --listen-scheduler instead" },
+        RelocatedVerb { .op = Wire::Op::ClusterAdmit,
+                        .code = Wire::ErrorCode::NoCluster,
+                        .why = "this endpoint is a cache and belongs to no cluster; ask a "
+                               "fastcache-compile-node --listen-scheduler instead" },
     };
 
     /// What to answer `op` with.
@@ -647,6 +651,7 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             case Wire::Op::ClusterStatus:
             case Wire::Op::ClusterSet:
             case Wire::Op::ClusterForget:
+            case Wire::Op::ClusterAdmit:
                 next = co_await HandleDistributed(socket, descriptor->code);
                 break;
         }

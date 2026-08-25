@@ -229,6 +229,27 @@ class SchedulerService
     /// @return `Ok` once the entry is appended, or a refusal.
     [[nodiscard]] SchedulerReply ClusterForget(CallerContext const& caller, std::string_view memberId);
 
+    /// Add a member to the cluster, or record that one has moved.
+    ///
+    /// The counterpart `ClusterForget` had none of, and its absence was the reason
+    /// a fleet without `--discovery` could shrink and never grow: nothing anywhere
+    /// could put a member into the replicated state, so `--raft-peer` stayed the
+    /// only answer and growing a cluster meant restarting every machine in it.
+    ///
+    /// One verb for adding and for moving, because they are one intention — a node
+    /// that moved has the same identity and a new address, and making an operator
+    /// remove it first would leave a window in which the cluster has agreed it does
+    /// not exist. The scheduler endpoint is not a parameter: a member announces its
+    /// own once elected, and a value typed here about somebody else would be a
+    /// guess that outranks what they say about themselves.
+    /// @param caller Who is asking.
+    /// @param memberId The member's identity.
+    /// @param raftEndpoint host:port its consensus port answers on.
+    /// @return Accepted, or why it was refused.
+    [[nodiscard]] SchedulerReply ClusterAdmit(CallerContext const& caller,
+                                              std::string_view memberId,
+                                              std::string_view raftEndpoint);
+
     /// The registry, for the admin endpoint and for tests.
     [[nodiscard]] WorkerRegistry const& Workers() const noexcept
     {

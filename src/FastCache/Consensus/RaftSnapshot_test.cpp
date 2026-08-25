@@ -263,6 +263,64 @@ TEST_CASE("A follower adopts a snapshot it cannot replay to", "[consensus][raft]
     CHECK(replies[0].matchIndex == LogIndex { .value = 9 });
 }
 
+TEST_CASE("A snapshot from outside the configuration is refused", "[consensus][raft][snapshot]")
+{
+    // Everything `OnInstallSnapshot` goes on to do is destructive: it publishes a
+    // leader clients are redirected to, discards this node's log, adopts a member
+    // set out of the message and replaces the application's whole state. So an
+    // unguarded one let anything able to reach the peer port rewrite the cluster's
+    // configuration on this node, with a term above its own as the only thing to
+    // supply -- while the identical attempt over `AppendEntries` was refused.
+    ScriptedRandomSource random { { 0 } };
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+
+    auto const output = node.Receive(InstallSnapshotRequest { .term = Term { .value = 9 },
+                                                              .leaderId = "stranger",
+                                                              .lastIncludedIndex = LogIndex { .value = 9 },
+                                                              .lastIncludedTerm = Term { .value = 3 },
+                                                              .members = { "stranger" },
+                                                              .state = BytesFromString("planted") },
+                                     At(10));
+
+    auto const replies = MessagesOfType<InstallSnapshotResponse>(output);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].result == AppendResult::Rejected);
+
+    // Nothing was adopted: not the log point, not the member set, not the state.
+    CHECK(node.Log().SnapshotIndex() == LogIndex::BeforeFirst());
+    CHECK(node.CommitIndex() == LogIndex::BeforeFirst());
+    CHECK(node.ActiveMembers() == std::vector<NodeId> { "n1", "n2", "n3" });
+    CHECK_FALSE(output.restoreSnapshot.has_value());
+    CHECK_FALSE(node.KnownLeader().has_value());
+}
+
+TEST_CASE("A node with no cluster adopts the snapshot that catches it up", "[consensus][raft][snapshot]")
+{
+    // The other half of the same rule. A machine waiting to be admitted has no
+    // member set to test a leader against, and a leader far enough ahead catches it
+    // up with a snapshot rather than with entries -- so refusing here would make a
+    // node unjoinable by exactly the message that joins it.
+    ScriptedRandomSource random { { 0 } };
+    auto joining = ThreeNodes("n4");
+    joining.members.clear();
+    auto node = std::move(RaftNode::Create(std::move(joining), random, TimePoint {})).value();
+    REQUIRE_FALSE(node.HasCluster());
+
+    auto const output = node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
+                                                              .leaderId = "n1",
+                                                              .lastIncludedIndex = LogIndex { .value = 9 },
+                                                              .lastIncludedTerm = Term { .value = 3 },
+                                                              .members = { "n1", "n2", "n3", "n4" },
+                                                              .state = BytesFromString("caught-up") },
+                                     At(10));
+
+    auto const replies = MessagesOfType<InstallSnapshotResponse>(output);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].result == AppendResult::Accepted);
+    CHECK(node.HasCluster());
+    CHECK(node.ActiveMembers().size() == 4);
+}
+
 TEST_CASE("A stale snapshot does not roll a follower backwards", "[consensus][raft][snapshot]")
 {
     // A duplicate or reordered snapshot must not discard a log holding MORE than

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Consensus/RaftNode.hpp>
 #include <FastCache/Core/Bytes.hpp>
 
@@ -44,6 +45,46 @@ constexpr auto Start = TimePoint {};
                         .electionTimeoutMin = ElectionMin,
                         .electionTimeoutMax = 300ms,
                         .heartbeatInterval = 50ms };
+}
+
+/// A configuration for a machine that has no cluster and is waiting to be
+/// admitted to one.
+///
+/// `ThreeNodes` with its member set taken away, rather than the same literals
+/// typed again: the timings then cannot come to differ from every other case in
+/// this file while a comment still claims they match.
+/// @return The configuration.
+[[nodiscard]] RaftConfig NoCluster()
+{
+    auto config = ThreeNodes("joiner");
+    config.members.clear();
+    return config;
+}
+
+/// Admit `node` into a cluster by replicating the configuration entry that names
+/// it.
+///
+/// The message a leader actually sends, spelled once: the cases below differ in
+/// which member set arrives and what they then assert, and a second copy of a
+/// nine-field designated initializer is the shape a transposed field hides in.
+/// @param node The node being admitted.
+/// @param leaderId Who is speaking.
+/// @param members The configuration the entry carries.
+/// @param term The leader's term.
+/// @param at When it arrives.
+/// @return What the node answered.
+[[nodiscard]] RaftOutput AdmitBy(
+    RaftNode& node, NodeId const& leaderId, std::vector<NodeId> const& members, Term term, TimePoint at)
+{
+    return node.Receive(AppendEntriesRequest { .term = term,
+                                               .leaderId = leaderId,
+                                               .prevLogIndex = LogIndex::BeforeFirst(),
+                                               .prevLogTerm = Term::None(),
+                                               .entries = { LogEntry { .term = term,
+                                                                       .kind = EntryKind::Configuration,
+                                                                       .payload = Membership::Encode(members) } },
+                                               .leaderCommit = LogIndex::BeforeFirst() },
+                        at);
 }
 
 /// Build a node, failing the test if the configuration is refused.
@@ -1473,4 +1514,97 @@ TEST_CASE("A leader refuses a pre-vote before its first heartbeat is answered", 
     auto const replies = MessagesOfType<PreVoteResponse>(answer);
     REQUIRE(replies.size() == 1);
     CHECK(replies[0].decision == VoteDecision::Denied);
+}
+
+TEST_CASE("A node with no cluster never stands for election", "[consensus][raft][membership]")
+{
+    // The rule that makes a node joinable at all. An empty member set puts the
+    // quorum at one, so a node that campaigned would win instantly -- and a node
+    // that has won holds a term and a log of its own and refuses every leader its
+    // configuration does not name, which is a node no cluster can ever admit.
+    ScriptedRandomSource random { { 0 } };
+    auto node = MakeNode(NoCluster(), random);
+
+    REQUIRE_FALSE(node.HasCluster());
+
+    for (auto elapsed = ElectionMin.count(); elapsed <= ElectionMin.count() * 10; elapsed += ElectionMin.count())
+    {
+        auto const output = node.Tick(At(elapsed));
+        CHECK(output.messages.empty());
+        CHECK_FALSE(output.persist.has_value());
+    }
+
+    CHECK(node.CurrentRole() == Role::Follower);
+    CHECK(node.CurrentTerm() == Term::None());
+    CHECK_FALSE(node.VotedFor().has_value());
+}
+
+TEST_CASE("A node with no cluster is admitted by the first leader that speaks to it", "[consensus][raft][membership]")
+{
+    // The membership test that guards AppendEntries has nothing to test against
+    // here, and the only way to learn a member set is to be sent one -- so
+    // refusing would make a node unjoinable by exactly the message that joins it.
+    ScriptedRandomSource random { { 0 } };
+    auto node = MakeNode(NoCluster(), random);
+
+    auto const admitted = std::vector<NodeId> { "n1", "n2", "n3", "joiner" };
+    auto const output = AdmitBy(node, "n1", admitted, Term { .value = 7 }, At(10));
+
+    auto const replies = MessagesOfType<AppendEntriesResponse>(output);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].result == AppendResult::Accepted);
+
+    CHECK(node.HasCluster());
+    CHECK(node.ActiveMembers() == admitted);
+    REQUIRE(node.KnownLeader().has_value());
+    CHECK(Unwrap(node.KnownLeader()) == "n1");
+}
+
+TEST_CASE("Once admitted, a node refuses a leader its configuration does not name", "[consensus][raft][membership]")
+{
+    // The guard is not given up, it was merely not yet available. The moment a
+    // configuration is in force it applies again and permanently -- otherwise a
+    // decommissioned node still running could hold this one in follower state and
+    // point its clients at a machine the cluster does not contain.
+    ScriptedRandomSource random { { 0 } };
+    auto node = MakeNode(NoCluster(), random);
+
+    (void) AdmitBy(node, "n1", { "n1", "joiner" }, Term { .value = 7 }, At(10));
+    REQUIRE(node.HasCluster());
+
+    // The stranger speaks in the term this node already holds, so §5.1's
+    // "a higher term always demotes" rule is not what refuses it -- the
+    // membership test is, which is the rule this case is about.
+    auto const output = node.Receive(AppendEntriesRequest { .term = Term { .value = 7 },
+                                                            .leaderId = "stranger",
+                                                            .prevLogIndex = LogIndex::BeforeFirst(),
+                                                            .prevLogTerm = Term::None(),
+                                                            .entries = {},
+                                                            .leaderCommit = LogIndex::BeforeFirst() },
+                                     At(20));
+
+    auto const replies = MessagesOfType<AppendEntriesResponse>(output);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].result == AppendResult::Rejected);
+    REQUIRE(node.KnownLeader().has_value());
+    CHECK(Unwrap(node.KnownLeader()) == "n1");
+}
+
+TEST_CASE("A node with no cluster grants no votes", "[consensus][raft][membership]")
+{
+    // Nobody counts its answer -- it is in no member set -- so granting would buy
+    // nothing and would record a durable vote for a cluster it has not joined.
+    ScriptedRandomSource random { { 0 } };
+    auto node = MakeNode(NoCluster(), random);
+
+    auto const output = node.Receive(RequestVoteRequest { .term = Term { .value = 1 },
+                                                          .candidateId = "n1",
+                                                          .lastLogIndex = LogIndex::BeforeFirst(),
+                                                          .lastLogTerm = Term::None() },
+                                     At(10));
+
+    auto const replies = MessagesOfType<RequestVoteResponse>(output);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Denied);
+    CHECK_FALSE(node.VotedFor().has_value());
 }

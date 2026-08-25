@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Consensus/RaftConfig.hpp>
+#include <FastCache/Consensus/RaftMembership.hpp>
 
 #include <algorithm>
 #include <format>
-#include <ranges>
 
 namespace FastCache::Consensus
 {
@@ -13,19 +13,28 @@ std::expected<void, ConsensusError> RaftConfig::Validate() const
     if (self.empty())
         return std::unexpected { InvalidConfiguration("this node has no identity: `self` is empty") };
 
-    if (members.empty())
-        return std::unexpected { InvalidConfiguration("the cluster has no members") };
+    // An empty member set is accepted, and it is not "no configuration was
+    // supplied": it is a node waiting to be admitted to a cluster it has not
+    // joined yet. The two rules below are about the shape of a member set, so they
+    // have nothing to say about one that does not exist. What still applies is
+    // everything else -- `self` above, because a node with no identity cannot be
+    // admitted either, and the timings below, because a node with no cluster still
+    // arms an election timer it declines to act on.
+    if (!members.empty())
+    {
+        if (std::ranges::find(members, self) == members.end())
+            return std::unexpected { InvalidConfiguration(
+                std::format("`self` ({}) is not among the cluster members", self)) };
 
-    if (std::ranges::find(members, self) == members.end())
-        return std::unexpected { InvalidConfiguration(std::format("`self` ({}) is not among the cluster members", self)) };
-
-    // A duplicate member would be counted twice toward a quorum, so a "majority"
-    // could be one physical node agreeing with itself -- which is Election Safety
-    // gone, from a typo in a member list.
-    auto sorted = members;
-    std::ranges::sort(sorted);
-    if (auto const duplicate = std::ranges::adjacent_find(sorted); duplicate != sorted.end())
-        return std::unexpected { InvalidConfiguration(std::format("member {} is listed more than once", *duplicate)) };
+        // What makes a member set usable is one rule, and `Membership::Validate`
+        // is where it lives -- the same one `ProposeMembership` applies to a set
+        // arriving through the log. A second copy here was already not equivalent:
+        // it refused a duplicate and accepted an empty id, so a bootstrap list
+        // containing `""` started a node that would have refused the identical set
+        // had a peer proposed it.
+        if (auto valid = Membership::Validate(members); !valid.has_value())
+            return std::unexpected { valid.error() };
+    }
 
     if (electionTimeoutMin <= std::chrono::milliseconds::zero())
         return std::unexpected { InvalidConfiguration("the election timeout minimum must be positive") };

@@ -161,6 +161,35 @@ class RaftDriver
     /// @return Where it landed, or why it was refused.
     [[nodiscard]] std::expected<LogIndex, ConsensusError> Propose(std::vector<std::byte> payload, TimePoint now);
 
+    /// Offer the cluster a new member set, one member added or removed.
+    ///
+    /// `RaftNode::ProposeMembership` reached through the same lock and the same
+    /// output ordering as `Propose`, and it needs its own entry point rather than
+    /// a caller doing it: a configuration change is a durability write followed by
+    /// a broadcast, so its output has to be delivered in order by whoever owns
+    /// that order.
+    /// @param members The proposed member set.
+    /// @param now The current instant.
+    /// @return Where the entry landed, or why it was refused.
+    [[nodiscard]] std::expected<LogIndex, ConsensusError> ProposeMembership(std::vector<NodeId> members, TimePoint now);
+
+    /// What consensus counts, and how far it has agreed.
+    ///
+    /// Both under one lock, because the caller compares them and two acquisitions
+    /// would let a configuration change land between them — reading a member set
+    /// from before it and a commit index from after, which is a pair that never
+    /// existed. By value for the reason `Failure` is: `Node()` hands back a
+    /// reference to a member the timer loop and a peer reader are both free to
+    /// move.
+    struct Progress
+    {
+        std::vector<NodeId> members; ///< The member set this node operates under.
+        LogIndex commitIndex;        ///< How far its log is committed.
+    };
+
+    /// @return The member set and commit index, read together.
+    [[nodiscard]] Progress CurrentProgress() const;
+
     /// The node being driven, for inspection.
     ///
     /// **Not synchronized**, and it cannot be: a reference outlives any lock this
@@ -207,6 +236,16 @@ class RaftDriver
   private:
     /// Perform one output in the required order; `_mutex` must be held.
     [[nodiscard]] std::expected<void, ConsensusError> Deliver(RaftOutput output);
+
+    /// Carry out what a proposal asked for and report where it landed.
+    ///
+    /// The tail both proposal entry points share, so the ordering they claim to
+    /// have in common is a fact rather than an assertion: the index is read before
+    /// the output is moved from, and a delivery failure replaces the index rather
+    /// than being reported alongside one. `_mutex` must be held.
+    /// @param proposed What the node answered.
+    /// @return Where the entry landed, or why there is none.
+    [[nodiscard]] std::expected<LogIndex, ConsensusError> Land(std::expected<RaftNode::Proposal, ConsensusError> proposed);
 
     /// How long `Run` may sleep, given the node's own next deadline.
     ///

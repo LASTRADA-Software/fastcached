@@ -39,14 +39,20 @@ enum class ClusterAction : std::uint8_t
     Status,   ///< Print what the cluster has agreed.
     Set,      ///< Change one replicated setting.
     Forget,   ///< Remove a member.
+    Admit,    ///< Add a member, or record that one has moved.
 };
 
 /// One cluster-administration request, as parsed from the command line.
 struct ClusterRequest
 {
     ClusterAction action { ClusterAction::None };
-    std::string key;   ///< The setting name for `Set`, the member id for `Forget`.
-    std::string value; ///< The setting's new value; empty otherwise.
+
+    /// The setting name for `Set`, the member id for `Forget` and `Admit`.
+    std::string key;
+
+    /// The setting's new value for `Set`, the consensus endpoint for `Admit`,
+    /// empty otherwise.
+    std::string value;
 };
 
 /// Split `name=value` as `--cluster-set` takes it.
@@ -263,6 +269,27 @@ struct NodeConfig
     /// a scheduler that quietly served strangers would look identical to a healthy one
     /// from both ends.
     bool fleetOpen { false };
+
+    /// Start with no cluster and wait to be admitted to one.
+    ///
+    /// The shape a machine being added to a running fleet has to have, and the only
+    /// one that can be added at all. Without it a node named in `--raft-peer`
+    /// bootstraps a cluster of its own: it elects itself, takes a term and a log,
+    /// and afterwards refuses `AppendEntries` from every leader its configuration
+    /// does not name — so the cluster that admitted it would be counting towards
+    /// quorum a node that answers nobody. Two clusters cannot be merged by any local
+    /// rule, which is why the joining node must never form one.
+    ///
+    /// It changes what `--raft-peer` MEANS rather than how much of it there is:
+    /// those entries become nodes this one can reach rather than a cluster it
+    /// belongs to. It still needs the cluster's addresses, because a leader
+    /// admitting a member starts replicating at its own last index and only walks
+    /// back to the beginning when the joiner's refusal reaches it.
+    ///
+    /// Additive rather than a change of meaning for the flag's absence: every
+    /// existing deployment bootstraps, and inverting that would turn the documented
+    /// single-node cluster into a node waiting forever for an invitation.
+    bool raftJoin { false };
     bool daemon { false };           ///< Fork into the background / run under the SCM.
     bool installService { false };   ///< Register with the platform's supervisor and exit.
     bool uninstallService { false }; ///< Remove that registration and exit.

@@ -154,6 +154,17 @@ LogIndex RaftNode::CommitIndex() const noexcept
 
 TimePoint RaftNode::NextDeadline() const noexcept
 {
+    // Nothing ever falls due on a node with no cluster, so it says so rather than
+    // naming a deadline `Tick` would then have to decline to act on. Standing
+    // would win -- an empty member set puts the quorum at one -- and a node that
+    // has won can never afterwards be admitted to somebody else's cluster; see
+    // `HasCluster`. Answering here rather than branching in `Tick` keeps the role
+    // table the single answer to "what is this node waiting for", and it costs the
+    // joiner not even the timer draw. The driver bounds its own sleep by the
+    // heartbeat interval regardless, so this cannot park a loop forever.
+    if (!HasCluster())
+        return TimePoint::max();
+
     return TraitsOf(_role).timer == TimerKind::Election ? _electionDeadline : _heartbeatDeadline;
 }
 
@@ -878,6 +889,24 @@ void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoin
         return;
     }
 
+    // The same membership test `OnAppendEntries` applies, and for a stronger
+    // reason than it has. Everything below publishes `_knownLeader`, discards this
+    // node's log, adopts a member set from the message and overwrites the
+    // application's whole state -- so a node that skipped this let anything able to
+    // reach the port replace the cluster's configuration on it, with a term above
+    // this one being the only thing to supply. The check was on the AppendEntries
+    // path and not this one, which is the asymmetry rather than the rule: a guard
+    // that a second entry point does not apply is not a guard.
+    //
+    // `HasCluster()` for the same reason as there: a node waiting to be admitted
+    // has no member set to test against, and refusing would make it unjoinable by
+    // exactly the message that catches it up.
+    if (HasCluster() && !IsMember(request.leaderId))
+    {
+        reply(AppendResult::Rejected, LogIndex::BeforeFirst());
+        return;
+    }
+
     // A snapshot is a leader speaking, so it counts as hearing from one: without
     // arming the timer here a follower being caught up would stand for election
     // in the middle of it.
@@ -1098,7 +1127,12 @@ void RaftNode::OnAppendEntries(AppendEntriesRequest const& request, TimePoint no
     // that can reach the port -- must not be able to hold the cluster in follower
     // state indefinitely and point its clients at a machine the configuration
     // does not contain.
-    if (!IsMember(request.leaderId))
+    //
+    // Asked only of a node that HAS a configuration. One that does not is
+    // waiting to be admitted, and the only way it can learn a member set is to be
+    // sent one -- so refusing here would make a node unjoinable by exactly the
+    // message that joins it. See `HasCluster` for why that gives nothing away.
+    if (HasCluster() && !IsMember(request.leaderId))
     {
         reply(AppendResult::Rejected, LogIndex::BeforeFirst());
         return;

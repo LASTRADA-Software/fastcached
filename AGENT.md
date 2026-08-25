@@ -168,6 +168,14 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   inside it.
 - A seeded draw must be identical on every standard library — `UniformInRange`,
   never `std::uniform_int_distribution`.
+- A node being admitted must never have bootstrapped a cluster of itself, so
+  `RaftConfig::members` may legally be **empty** and `--raft-join` is what starts a
+  machine that way. Who a node dials is not who it counts.
+- The quorum follows the replicated state, one change at a time, additions before
+  removals — and a member is never counted before every node can dial it.
+- Absence from `ClusterState` is not removal: a `--raft-peer` member is in the
+  configuration and in no state, so a member named in the bootstrap set is never
+  proposed for removal, and a node given no bootstrap set proposes none at all.
 
 **[`.agent/rules/wire-and-protocol.md`](.agent/rules/wire-and-protocol.md)** —
 framing, the auth gate, sockets, dialling and coroutine lifetime. Before

@@ -252,3 +252,58 @@ TEST_CASE("An AddMember round-trips both of its endpoints", "[cluster][state][wi
     REQUIRE(decoded.has_value());
     CHECK(Unwrap(decoded) == original);
 }
+
+TEST_CASE("A peer is an identity and an address, in one token", "[cluster][state]")
+{
+    // Both halves together because they are one fact. A member id with no address is
+    // a node the cluster counts towards quorum and cannot reach -- the residual
+    // `RaftMembership` recorded, and the reason a member carries its endpoint at all.
+    auto const peer = ParseMemberSpec("n1=10.0.0.1:6680");
+    REQUIRE(peer.has_value());
+    CHECK(Unwrap(peer).id == "n1");
+    CHECK(Unwrap(peer).raftEndpoint == "10.0.0.1:6680");
+}
+
+TEST_CASE("A peer specification splits at the first separator", "[cluster][state]")
+{
+    // The endpoint may contain an `=` and the identity may not. Splitting at the LAST
+    // one instead would read `n1=host=1:6675` as an id of `n1=host` -- an id no
+    // operator wrote, which would then silently never match a vote and leave the
+    // cluster one member short of a quorum it thinks it has.
+    auto const odd = ParseMemberSpec("n1=weird=host:6680");
+    REQUIRE(odd.has_value());
+    CHECK(Unwrap(odd).id == "n1");
+    CHECK(Unwrap(odd).raftEndpoint == "weird=host:6680");
+}
+
+TEST_CASE("A peer with no dialable address is refused", "[cluster][state]")
+{
+    // Refused at startup, where an operator is watching. A member recorded with an
+    // address nobody can dial registers, is counted towards every quorum, and is
+    // never reached -- the fleet is then one node short of forming one and nothing
+    // says why.
+    CHECK_FALSE(ParseMemberSpec("n1").has_value());
+    CHECK_FALSE(ParseMemberSpec("n1=").has_value());
+    CHECK_FALSE(ParseMemberSpec("=10.0.0.1:6680").has_value());
+    CHECK_FALSE(ParseMemberSpec("n1=10.0.0.1").has_value());
+    CHECK_FALSE(ParseMemberSpec("").has_value());
+
+    // A port is not a port because it parsed as a number. `0` means "pick one" to
+    // a bind and names nothing to a dial, so a member recorded with it is counted
+    // towards every quorum and never reached -- which is the same failure as an
+    // address with no port at all, arrived at by looking like one.
+    CHECK_FALSE(ParseMemberSpec("n1=10.0.0.1:0").has_value());
+    CHECK_FALSE(ParseMemberSpec("n1=10.0.0.1:99999").has_value());
+    CHECK_FALSE(ParseMemberSpec("n1=10.0.0.1:http").has_value());
+}
+
+TEST_CASE("An IPv6 peer keeps its address rather than its last colon group", "[cluster][state]")
+{
+    // Split through `Core/HostPort`, which is the whole reason that header exists: a
+    // naive `rfind(':')` takes `[::1]:6680` apart at the wrong colon and yields a
+    // host of `[::` and a port of `1]`.
+    auto const peer = ParseMemberSpec("n1=[2001:db8::1]:6680");
+    REQUIRE(peer.has_value());
+    CHECK(Unwrap(peer).id == "n1");
+    CHECK(Unwrap(peer).raftEndpoint == "[2001:db8::1]:6680");
+}

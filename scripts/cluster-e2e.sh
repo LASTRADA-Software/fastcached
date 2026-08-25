@@ -203,7 +203,7 @@ find_leader() {
     leader_endpoint=""
     local index answer
     for _ in $(seq 1 150); do
-        for index in 0 1 2; do
+        for index in "${!scheduler_ports[@]}"; do
             [[ -n "${scheduler_ports[$index]}" ]] || continue
             answer="$(cluster "127.0.0.1:${scheduler_ports[$index]}" --cluster-status)"
             if [[ "$answer" == *"known settings:"* ]]; then
@@ -318,17 +318,96 @@ answer="$(cluster "$leader_endpoint" --cluster-set=upsteam=typo)"
 [[ "$answer" == *"upsteam"* ]] || fail "a typo'd setting was not refused by name: ${answer}"
 echo "cluster E2E: an unknown setting is refused by name"
 
-# --- 4. a member can be removed ----------------------------------------------
+# --- 4. a machine joins the running cluster ----------------------------------
+
+# The property issue #97 is about, and it is only true end to end: the harness can
+# admit a node into a simulated cluster, and what it cannot reach is the wire, the
+# transport, the peer table and the operator's command line all having their first
+# say at once.
+#
+# n4 starts with `--raft-join`, which changes what its `--raft-peer` list MEANS:
+# these are nodes it can reach, not a cluster it belongs to. That is the only
+# shape a cluster can admit -- without it a node bootstraps a cluster of itself,
+# elects itself, and afterwards refuses `AppendEntries` from every leader its own
+# configuration does not name, so the cluster that admitted it would count towards
+# quorum a node that answers nobody.
+#
+# It is given the cluster's addresses as well as its own, and that is load-bearing
+# rather than convenient: the leader starts replicating at its own last index, an
+# empty log refuses that, and the leader only walks back to the beginning when the
+# refusal reaches it. A joiner that could not send one was admitted, dialled, and
+# permanently silent -- which is what this case found the first time it was run.
+raft_ports+=("$(free_port)")
+scheduler_ports+=("$(free_port)")
+
+"$node" \
+    --node-id=n4 \
+    --raft-join \
+    --listen-raft="127.0.0.1:${raft_ports[3]}" \
+    --raft-peer="n4=127.0.0.1:${raft_ports[3]}" "${peers[@]}" \
+    --cluster-dir="${workdir}/n4" \
+    --listen-scheduler="127.0.0.1:${scheduler_ports[3]}" \
+    --fleet-open \
+    --listen-cache= \
+    --scheduler="127.0.0.1:${scheduler_ports[3]}" \
+    --toolchain="/bin/sh" \
+    --port="$(free_port)" \
+    --advertise="127.0.0.1:1" \
+    --log-level=info \
+    > "${workdir}/n4.log" 2>&1 &
+pids+=("$!")
+node_logs[3]="${workdir}/n4.log"
+wait_for_port "${scheduler_ports[3]}" "$!" "n4"
+
+# It is running and it leads nothing, which is the first half of the property: a
+# node waiting to be admitted must not have formed a cluster of its own. Asked of
+# the node itself, because "no cluster" is exactly what it should answer.
+answer="$(cluster "127.0.0.1:${scheduler_ports[3]}" --cluster-status)"
+[[ "$answer" != *"known settings:"* ]] || fail "a joining node answered as a leader; it bootstrapped its own cluster"
+echo "cluster E2E: a joining node leads nothing"
+
+answer="$(cluster "$leader_endpoint" --cluster-admit="n4=127.0.0.1:${raft_ports[3]}")"
+[[ "$answer" == *"accepted"* ]] || fail "the leader refused to admit a member: ${answer}"
+
+# Admission is two steps and this waits for the second. The record commits first,
+# which is what teaches every node where n4 answers; only then does the leader
+# propose counting it, because a member counted towards a quorum before anything
+# can dial it is a cluster that stops forming one.
+#
+# Asserted on n4 rather than on the leader, and by ASKING rather than by reading a
+# log: the leader accepting a command proves nothing about the machine it names.
+#
+# The question put to n4 is `--cluster-status`, and its REFUSAL is the assertion --
+# a follower answers "ask that endpoint instead", and the endpoint comes from the
+# replicated state. Which makes one answer carry the whole property:
+#
+#   * n4 knows who leads and where its scheduler answers, and neither is on its
+#     command line, so it can only have been replicated to;
+#   * a leader replicates only to members of its CONFIGURATION, so n4 receiving
+#     anything at all is n4 being counted -- which is the half issue #97 is about
+#     and the half `--cluster-status` on the leader could never show, since that
+#     reports the fleet's member set rather than the quorum.
+joined=0
+for _ in $(seq 1 150); do
+    answer="$(cluster "127.0.0.1:${scheduler_ports[3]}" --cluster-status)"
+    [[ "$answer" == *"$leader_endpoint"* ]] && { joined=1; break; }
+    sleep 0.2
+done
+[[ "$joined" -eq 1 ]] ||
+    fail "the admitted node never learned who leads, so it was never replicated to: ${answer}"
+echo "cluster E2E: an admitted node is replicated to, which is being counted"
+
+# --- 5. a member can be removed ----------------------------------------------
 
 answer="$(cluster "$leader_endpoint" --cluster-forget=n3)"
 [[ "$answer" == *"accepted"* ]] || fail "the leader refused to forget a member: ${answer}"
 echo "cluster E2E: a member can be removed"
 
-# --- 5. leadership survives losing the leader --------------------------------
+# --- 6. leadership survives losing the leader --------------------------------
 
 # A cluster that formed once and could not re-form is one that works until the
-# first reboot. Two of three remain, which is still a majority.
-for index in 0 1 2; do
+# first reboot. Three of four remain, which is still a majority.
+for index in 0 1 2 3; do
     if [[ "127.0.0.1:${scheduler_ports[$index]}" == "$leader_endpoint" ]]; then
         kill "${pids[$index]}" >/dev/null 2>&1 || true
         for _ in $(seq 1 75); do

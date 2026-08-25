@@ -104,7 +104,12 @@ rule and names only `fastcached`, which the table happens to reach first.)
 them. It needs four, and four more fixed ports is four more ways to collide with
 whatever else a CI runner is doing — a failure that reads as "distribution is
 broken" when it means "something else was listening". `cluster-e2e` does the same
-with the six it needs.
+with the twelve its four nodes need, and so does `compile-cache-e2e` with the two
+its daemons need — which had a fixed port and failed under a parallel `ctest` as
+"the first compile was not a MISS", i.e. as a defect in the launcher's key rather
+than as a stranger answering. It also re-checks that the daemon still running is
+the one it started, because a port that was free at `bind` time says nothing about
+who holds it a second later.
 
 ## What `cluster-e2e` covers
 
@@ -112,12 +117,14 @@ with the six it needs.
 disjoint from the unit tests rather than a slower repeat of them: three real
 processes elect a leader and *keep* that leader for three seconds of polling, a
 follower's refusal names an endpoint that a client then successfully dials, a
-setting replicates, a member is removed, and the cluster re-forms after its leader
-is killed. The stability half is not padding: a cluster that re-elects on a timer
-has exactly one leader at almost every instant, so a single poll passes against
-leadership that never settles. Every one of those is a property of the wire,
-the transport, the timers and the command line meeting at once — which
-`RaftClusterHarness` cannot reach precisely because it replaces all four. It is
-POSIX-only for now: the properties are platform-independent and the fixture is not,
-so a Windows counterpart would be a translation rather than new coverage.
+setting replicates, a member is removed, a fourth machine started with no cluster
+at all is admitted and answers a question only the replicated state can answer, and
+the cluster re-forms after its leader is killed. The stability half is not
+padding: a cluster that re-elects on a timer has exactly one leader at almost every
+instant, so a single poll passes against leadership that never settles. Every one
+of those is a property of the wire, the transport, the timers and the command line
+meeting at once — which `RaftClusterHarness` cannot reach precisely because it
+replaces all four. It is POSIX-only for now: the properties are
+platform-independent and the fixture is not, so a Windows counterpart would be a
+translation rather than new coverage.
 

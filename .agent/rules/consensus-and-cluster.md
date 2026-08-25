@@ -388,9 +388,90 @@ Every rule below has already been a bug.
   field-by-field checks are what the copied arms already survived. A row without an
   exemplar fails the case rather than going quietly untested, and the enum sweep is
   kept separate precisely so the exemplars' values can stay distinct.
-## Open work
-
-- **[#97](https://github.com/LASTRADA-Software/fastcached/issues/97)** — a node
-  admitted by discovery joins the cluster's *state* but not its *quorum*:
-  `RaftNode::ProposeMembership` still takes ids alone, and
-  `RaftPeerTransport`'s peer list is fixed at construction.
+- **A member the cluster admits must be countable AND dialable, and doing one half
+  is worse than doing neither.** Membership reached the replicated state and stopped
+  there: `RaftNode`'s member set came from `--raft-peer` at startup and never moved,
+  and `RaftPeerTransport`'s peer table was fixed at construction — so a node admitted
+  at runtime was served by every surface, voted in none, and was dialled by nobody.
+  Growing a cluster's *consensus* still meant restarting its members with a longer
+  bootstrap list (issue #97). Closing it is three pieces, and each of the last two was
+  found by running the thing rather than by reasoning about it:
+  - **A node that bootstrapped itself can never be admitted, so a joining node must
+    not bootstrap.** With `--raft-peer` naming it, a new machine elects itself, takes
+    a term and a log, and afterwards refuses `AppendEntries` from every leader its own
+    configuration does not name — and two clusters cannot be merged by any local rule.
+    So `RaftConfig::members` may be **empty**, meaning "no cluster yet": such a node
+    never stands (`NextDeadline` reports that nothing falls due, rather than naming a
+    deadline `Tick` would have to decline to act on), grants no votes, and accepts
+    `AppendEntries` and `InstallSnapshot` from **any** leader — because the membership
+    test that guards those has nothing to test against and the only way to learn a
+    member set is to be sent one. It gives nothing away: the node holds no committed
+    state, has never voted, and is counted by nobody. The moment it adopts a
+    configuration the guard applies again, permanently.
+  - **Who a node DIALS is not who it COUNTS, and a joiner needs the first without the
+    second.** The obvious spelling — `--raft-join` takes this node's own address and
+    nothing else — deadlocks, and the end-to-end case is what said so. A leader
+    admitting a member starts replicating at its own last index; the joiner's log is
+    empty and refuses; and the leader only walks `nextIndex` back to the beginning
+    when that refusal arrives. A joiner whose transport knew no peer could not send
+    it, so it was admitted, dialled, and permanently silent — with nothing logged
+    anywhere. `--raft-peer` under `--raft-join` therefore populates the transport and
+    not the configuration, and `LearnMembers` also teaches the transport what
+    *discovery* has proved, which is the only route to an address for a node that has
+    not been replicated to yet.
+  - **Absence in the replicated state does not mean removal.** `--raft-peer` puts a
+    member in the configuration and nothing puts it in `ClusterState`, so on a cluster
+    whose peers were typed rather than discovered the leader's own record is all the
+    state holds. Read as "everybody else was forgotten", the reconciler proposed
+    removing every peer, one commit at a time, until a healthy three-node cluster was
+    one node counting only itself and refusing the other two as strangers — measured,
+    once, on the first run of the end-to-end case. `NextQuorumChange` therefore takes
+    the **bootstrap set** — the ids this node was started with, which `ConsensusTier`
+    keeps for its whole life — and never proposes removing one of them: that is the
+    fact which tells "the operator forgot it" from "nobody ever wrote it down".
+    Deliberately the command line rather than a record of what this process has
+    observed, and the difference is a restart: an observation is rebuilt from live
+    members only, so a fleet restarted after a removal would count a forgotten member
+    forever, with a correct-looking member set and nothing logged. A node given no
+    bootstrap set at all — a `--raft-join` joiner — therefore proposes **no** removal
+    whatsoever, which is the same rule read at its limit rather than an exception to
+    it: it fails closed, counting a member too many rather than too few. Taking a
+    typed member out of the quorum stays the operator's decision, made by editing that
+    `--raft-peer` line.
+  - **`--cluster-admit` is the counterpart `--cluster-forget` never had.** Nothing
+    could put a member *into* the replicated state without `--discovery`, so a typed
+    fleet could shrink and never grow. It carries `<id>=<host>:<port>` — the same
+    token `--raft-peer` takes, because a second spelling of one thing is a second
+    thing to get wrong — and no scheduler endpoint, because a member announces its own
+    once elected and a value typed about somebody else would outrank what they say
+    about themselves.
+  - **The quorum follows the state, never the other way round, and one step at a
+    time.** Additions come first: growing before shrinking keeps the quorum reachable
+    through a replacement, where the other order passes through a configuration
+    smaller than either endpoint. A member with no dialable address is never added —
+    the quorum would grow and the votes to satisfy it could never arrive — while one
+    already counted is never dropped for an unreadable one, since shrinking a quorum
+    over a typo is how a cluster stops being able to elect. And the reconciler
+    proposes nothing while its last change is uncommitted, reporting the wait once it
+    becomes unreasonable: a configuration naming a member that will not accept this
+    leader never commits, and from both ends that looks exactly like a cluster which
+    is merely busy.
+  - **`RaftPeerTransport::Learn` re-addresses in place and never forgets.** A peer
+    that moved keeps its outbox and its queued messages; replacing it would destroy a
+    coroutine frame the reactor may still point into. Its live socket is closed, so
+    the next write fails and the sender redials — at the next *message*, because a
+    sender parked on its outbox is not woken by a socket closing under it, which costs
+    a member nothing and a silent peer less. A member removed from the configuration
+    keeps an idle sender until the process restarts, which is a socket rather than a
+    fault: ending it early needs a per-peer cancellation and a sweep for finished
+    frames. The map is guarded by a **shared** mutex, for the reason
+    `Distributed::MembershipOracle` gives, and nothing is held across
+    `ISocket::Close` — which resumes a parked sender inline on epoll and kqueue, so a
+    lock held across it is a lock held across arbitrary sender code with `Send`, and
+    therefore the driver's mutex, waiting behind it.
+  - **`OnInstallSnapshot` had no membership guard at all**, which was an asymmetry
+    rather than a policy: it discards the log, adopts a member set out of the message
+    and replaces the application's whole state, so a stranger who could reach the port
+    could rewrite the cluster's configuration on a node, with a term above its own as
+    the only thing to supply — while the identical attempt over `AppendEntries` was
+    refused. A guard a second entry point does not apply is not a guard.

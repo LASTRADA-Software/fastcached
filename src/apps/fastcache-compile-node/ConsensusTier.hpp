@@ -38,17 +38,6 @@
 namespace FastCache::Node
 {
 
-/// One `id=host:port` peer specification, parsed.
-///
-/// Exposed rather than hidden in the `.cpp` because the rule it applies is worth
-/// checking and `main.cpp` -- the only other place it could live -- is in no test
-/// target. What it decides is which half of the token is the identity consensus
-/// counts and which is the address peers dial, and getting that wrong produces a
-/// cluster whose members never match a vote.
-/// @param spec The token as an operator wrote it.
-/// @return The member, or nullopt when the token is not one.
-[[nodiscard]] std::optional<Cluster::ClusterMember> ParsePeerSpec(std::string_view spec);
-
 /// Where clients should be told to reach this node's scheduler.
 ///
 /// The HOST comes from this node's own consensus endpoint and the PORT from what
@@ -136,6 +125,17 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     /// both -- an election already costs longer than that -- and the loop does
     /// nothing at all in the ordinary case where the state already agrees.
     static constexpr std::chrono::milliseconds ReconcileInterval { 1000 };
+
+    /// Reconcile passes a proposed quorum change may wait before it is reported.
+    ///
+    /// Not a timeout: nothing is retried or abandoned, because a configuration entry
+    /// cannot be withdrawn once appended. What it bounds is *silence*. The change
+    /// that never commits is the one naming a member which will not accept this node
+    /// as its leader — two nodes each bootstrapped as a cluster of one, discovering
+    /// each other — and from both ends that looks exactly like a cluster which is
+    /// simply busy. Thirty seconds is long against a replication round and short
+    /// against an operator's patience.
+    static constexpr std::uint32_t QuorumProposalPatience { 30 };
 
     /// Told this node's role whenever consensus changes it.
     ///
@@ -245,12 +245,20 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     /// references to members that do not exist until the constructor has run, which
     /// is the same reason the reference chain is member-ordered rather than local.
     /// @param cfg The parsed configuration.
-    /// @param members The bootstrap member set, already parsed and validated.
+    /// @param dialable Every peer this node knows an address for. What the
+    ///        transport is built from, and **not** the same list as @p bootstrap:
+    ///        a node waiting to be admitted has to be able to answer the leader
+    ///        that admits it, and cannot learn where that leader is until it has
+    ///        answered one. Everything it needs is on its own command line, and
+    ///        nothing else can supply it.
+    /// @param bootstrap The member set consensus starts under; empty for a node
+    ///        waiting to be admitted.
     /// @param bindAddress Where the peer port binds.
     /// @param bindPort The peer port.
     /// @return Nothing on success, or the fatal reason.
     [[nodiscard]] std::expected<void, std::string> Launch(NodeConfig const& cfg,
-                                                          std::vector<Cluster::ClusterMember> const& members,
+                                                          std::vector<Cluster::ClusterMember> const& dialable,
+                                                          std::vector<Cluster::ClusterMember> const& bootstrap,
                                                           std::string_view bindAddress,
                                                           std::uint16_t bindPort);
 
@@ -288,6 +296,29 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     /// `RaftDriver::RoleObserver` says in as many words that an observer must not
     /// block, being on the path that still has to send the next heartbeat.
     void Reconcile();
+
+    /// Teach the transport where every member of the cluster answers.
+    ///
+    /// Runs on **every** node rather than only the leader, and that is the whole
+    /// difference between this and everything else the reconciler does. A member is
+    /// admitted by one node and has to be dialled by all of them: the leader
+    /// replicates to it, and every other member sends it votes. A follower that
+    /// waited to become leader before learning an address would be a follower whose
+    /// votes go nowhere.
+    /// @param state The cluster's state as this node last applied it.
+    /// @param desired What this node believes should be present, snapshotted once
+    ///        by the caller: taking it twice in one pass would let discovery land
+    ///        between, so a leader would dial one set and propose from another.
+    void LearnMembers(Cluster::ClusterState const& state, std::span<Cluster::DesiredMember const> desired);
+
+    /// Move the quorum one step towards the cluster's member set.
+    ///
+    /// Leader only, and one member at a time -- see `Cluster::NextQuorumChange` for
+    /// which step and why. Called after `LearnMembers`, because a member counted
+    /// towards a quorum before anything can dial it is a cluster that stops forming
+    /// one.
+    /// @param state The cluster's state as this node last applied it.
+    void ReconcileQuorum(Cluster::ClusterState const& state);
 
     /// Record that one of the two reactor loops has ended.
     ///
@@ -381,6 +412,36 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     /// the vector operations and never across a proposal.
     mutable std::mutex _desiredMutex;
     std::vector<Cluster::DesiredMember> _desired;
+
+    /// The member ids this node was started with, which it never proposes removing.
+    ///
+    /// What tells "the operator forgot this member" apart from "nobody ever wrote it
+    /// down" -- see `Cluster::NextQuorumChange`, which shrinks a healthy cluster to
+    /// one node without it. Taken from the command line rather than from what this
+    /// process has observed, because the difference is a restart: an observation is
+    /// rebuilt from live members only, so a fleet restarted after a removal would
+    /// count a forgotten member forever.
+    ///
+    /// Empty for a node started with `--raft-join`, which asserts nothing about who
+    /// is a member -- so every member of the cluster it joins is one it may later be
+    /// told to forget.
+    std::vector<Consensus::NodeId> _bootstrapIds;
+
+    /// Where the last configuration change this node proposed landed.
+    ///
+    /// Read against the commit index to answer one question: has the previous change
+    /// been agreed? `RaftNode` refuses a second while one is in flight, so without
+    /// this the reconciler would propose one per interval and log a refusal per
+    /// interval for as long as replication took. What it also catches is the case
+    /// that never resolves -- a configuration naming a member that will never
+    /// acknowledge this leader -- which is otherwise completely silent, so the wait
+    /// is reported once it becomes unreasonable rather than left to be inferred.
+    ///
+    /// Reconciler thread only; nothing else reads it.
+    Consensus::LogIndex _quorumProposedAt {};
+
+    /// How many passes the current proposal has been waiting, for that one report.
+    std::uint32_t _quorumWaited { 0 };
 
     /// Whether this node may propose at all, as the observer last reported it.
     ///

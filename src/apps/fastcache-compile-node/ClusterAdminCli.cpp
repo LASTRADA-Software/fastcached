@@ -47,6 +47,9 @@ std::vector<std::byte> EncodeClusterRequest(ClusterRequest const& request)
             return Wire::EncodeClusterSet(Wire::ClusterSetRequest { .name = request.key, .value = request.value });
         case ClusterAction::Forget:
             return Wire::EncodeClusterForget(request.key);
+        case ClusterAction::Admit:
+            return Wire::EncodeClusterAdmit(
+                Wire::ClusterAdmitRequest { .memberId = request.key, .raftEndpoint = request.value });
     }
 
     return {};
@@ -104,6 +107,7 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
 
         case ClusterAction::Set:
         case ClusterAction::Forget:
+        case ClusterAction::Admit:
             // Appended, not committed, and the wording says so: the leader cannot know
             // the difference until a majority answers, and claiming otherwise would be
             // the one thing a report like this must not do.

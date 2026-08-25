@@ -4,15 +4,21 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
+
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Consensus;
 using namespace std::chrono_literals;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -28,6 +34,27 @@ void RequireNoViolations(RaftClusterHarness const& cluster)
         FAIL_CHECK(violation);
 
     REQUIRE(cluster.Violations().empty());
+}
+
+/// The four nodes a membership case ends up with.
+constexpr std::array Everyone { "n1", "n2", "n3", "n4" };
+
+/// The furthest any of `who` has committed.
+///
+/// The commit index rather than what a node calls itself, for the reason "A
+/// minority partition cannot elect or commit" gives: a partitioned leader goes on
+/// reporting itself leader, so the only thing a quorum test can assert is what was
+/// decided.
+/// @param cluster The cluster to read.
+/// @param who Which nodes to consider.
+/// @return The highest commit index among them.
+[[nodiscard]] LogIndex HighestCommitIndex(RaftClusterHarness const& cluster, std::span<char const* const> who)
+{
+    auto highest = LogIndex::BeforeFirst();
+    for (auto const* const id: who)
+        highest = std::max(highest, cluster.At(id).driver->Node().CommitIndex());
+
+    return highest;
 }
 
 /// Step until a single leader exists, or give up.
@@ -308,5 +335,106 @@ TEST_CASE("A long adversarial run violates nothing", "[consensus][raft][cluster]
     // would pass this while proving nothing at all.
     CHECK(proposals > 0);
     REQUIRE(SettleOnLeader(cluster, 400));
+    RequireNoViolations(cluster);
+}
+
+TEST_CASE("A machine with no cluster is admitted into a running one", "[consensus][raft][cluster][membership]")
+{
+    // Growing a cluster's *consensus*, which used to mean restarting every member
+    // with a longer bootstrap list. The joiner is brought up with no configuration
+    // at all: it is reachable, it does nothing, and admission is what gives it
+    // both a member set and a leader.
+    RaftClusterHarness cluster { { "n1", "n2", "n3" } };
+    REQUIRE(SettleOnLeader(cluster));
+
+    auto const committed = Unwrap(cluster.ProposeOnLeader(FastCache::BytesFromString("before")));
+    cluster.Run(60);
+
+    cluster.Join("n4");
+    cluster.Run(30);
+
+    // It has done nothing on its own, which is the property that makes it
+    // admissible: a node that had elected itself would hold a term and a log of
+    // its own and refuse every leader its configuration does not name.
+    CHECK_FALSE(cluster.At("n4").driver->Node().HasCluster());
+    CHECK(cluster.At("n4").driver->Node().CurrentRole() == Role::Follower);
+    CHECK(cluster.Leaders().size() == 1);
+
+    REQUIRE(cluster.ProposeMembershipOnLeader({ "n1", "n2", "n3", "n4" }).has_value());
+    cluster.Run(120);
+
+    CHECK(cluster.At("n4").driver->Node().HasCluster());
+    CHECK(cluster.At("n4").driver->Node().ActiveMembers().size() == 4);
+
+    // Caught up rather than merely counted. A member the cluster admits and never
+    // fills in is one that would win an election holding nothing, which is
+    // precisely the Leader Completeness violation the harness watches for.
+    CHECK(cluster.At("n4").driver->Node().Log().LastIndex() >= committed);
+    RequireNoViolations(cluster);
+
+    SECTION("and it then counts towards the quorum")
+    {
+        // The leader plus exactly one of the other originals: two of the four, a
+        // majority of the THREE the cluster was bootstrapped with and not of the
+        // four it now has. That shape is the only one that proves anything -- were
+        // n4 still uncounted, this side would commit; because it is counted, it
+        // cannot. A split three against one passes identically under both member
+        // sets and so says nothing about which one the arithmetic used.
+        //
+        // Built around whoever leads rather than named, because a side that cannot
+        // elect keeps the leader it already had: a fixed pair proves the property
+        // only in the runs where the leader happens to land in it.
+        auto const ceiling = HighestCommitIndex(cluster, Everyone);
+        auto side = std::set<NodeId> { Unwrap(cluster.Leader()) };
+        for (auto const* const id: { "n1", "n2", "n3" })
+            if (side.size() < 2)
+                side.insert(id);
+
+        cluster.Partition(side);
+
+        // Proposing is what makes the assertion say something: a leader with
+        // nothing to replicate commits nothing either way, so a case that only
+        // waited would pass against any member set at all.
+        REQUIRE(cluster.ProposeOnLeader(FastCache::BytesFromString("split")).has_value());
+        cluster.Run(400);
+
+        // Not "unchanged": a follower that was behind may still catch up to what
+        // was committed before the split, which is progress rather than a new
+        // decision. What may not happen is anything ABOVE that point.
+        CHECK(HighestCommitIndex(cluster, Everyone) == ceiling);
+        RequireNoViolations(cluster);
+
+        // And the positive half, so the case cannot pass by the cluster being
+        // wedged: healed, four of four commit again -- the entry stranded above
+        // included.
+        cluster.Heal();
+        REQUIRE(SettleOnLeader(cluster, 400));
+        REQUIRE(cluster.ProposeOnLeader(FastCache::BytesFromString("after")).has_value());
+        cluster.Run(300);
+        CHECK(HighestCommitIndex(cluster, Everyone) > ceiling);
+        RequireNoViolations(cluster);
+    }
+}
+
+TEST_CASE("An admitted member survives its own restart", "[consensus][raft][cluster][membership]")
+{
+    // The whole point of putting membership in the log rather than on a command
+    // line. The joiner was started with no bootstrap set and has none to fall back
+    // on, so a restart that did not re-derive its configuration from its own log
+    // would come back with no cluster and wait to be admitted a second time.
+    RaftClusterHarness cluster { { "n1", "n2", "n3" } };
+    REQUIRE(SettleOnLeader(cluster));
+
+    cluster.Join("n4");
+    cluster.Run(30);
+    REQUIRE(cluster.ProposeMembershipOnLeader({ "n1", "n2", "n3", "n4" }).has_value());
+    cluster.Run(120);
+    REQUIRE(cluster.At("n4").driver->Node().HasCluster());
+
+    cluster.Restart("n4");
+    CHECK(cluster.At("n4").driver->Node().HasCluster());
+    CHECK(cluster.At("n4").driver->Node().ActiveMembers().size() == 4);
+
+    cluster.Run(200);
     RequireNoViolations(cluster);
 }

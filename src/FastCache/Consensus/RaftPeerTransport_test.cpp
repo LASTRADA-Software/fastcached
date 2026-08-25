@@ -3,6 +3,7 @@
 // The outbound transport. Every case here drives a scripted connector rather
 // than a socket: the properties worth pinning are about queueing, dropping and
 // shutdown, and a real network would make each of them a race.
+#include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
@@ -16,6 +17,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -69,6 +72,14 @@ class RecordingSocket final: public ISocket
 
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override
     {
+        // A closed socket refuses, as every real one does. Recording the write
+        // instead would let the transport go on feeding a connection it has
+        // dropped -- and "the peer moved, so its connection was closed" is a case
+        // whose whole observable consequence is the write that then fails.
+        if (_closed)
+            return IoAwaitable { std::unexpected {
+                NetError { .code = NetErrorCode::ConnReset, .systemCode = 0, .context = "socket closed" } } };
+
         std::scoped_lock const guard { _record->mutex };
         if (_record->failWrites)
             return IoAwaitable { std::unexpected {
@@ -137,8 +148,10 @@ class ScriptedConnector final: public IConnector
 {
   public:
     /// @param record Shared write log handed to every socket produced.
-    explicit ScriptedConnector(std::shared_ptr<RecordingSocket::Record> record) noexcept:
-        _record { std::move(record) }
+    /// @param reactor Where a delayed dial parks; must outlive the connector.
+    ScriptedConnector(std::shared_ptr<RecordingSocket::Record> record, IReactor& reactor) noexcept:
+        _record { std::move(record) },
+        _reactor { reactor }
     {
     }
 
@@ -149,25 +162,55 @@ class ScriptedConnector final: public IConnector
         _refuse.store(refuse, std::memory_order_relaxed);
     }
 
+    /// Park every subsequent dial for this long before it resolves.
+    ///
+    /// The one thing a connector that answers inline cannot produce: the window in
+    /// which a dial is in flight. `PlatformConnector` really does suspend there, and
+    /// a peer that moves during that window is a case with no other way in.
+    /// @param delay How long to park; zero answers inline as before.
+    void DelayDial(std::chrono::milliseconds delay) noexcept
+    {
+        _delay.store(delay.count(), std::memory_order_relaxed);
+    }
+
     /// @return How many dials have been attempted.
     [[nodiscard]] std::size_t Attempts() const noexcept
     {
         return _attempts.load(std::memory_order_relaxed);
     }
 
+    /// Where the last dial was aimed.
+    ///
+    /// Recorded because a peer that MOVED is otherwise invisible: it keeps its id,
+    /// its outbox and its sender, and the only observable difference is the address
+    /// the next dial names.
+    /// @return `host:port`, or empty before any dial.
+    [[nodiscard]] std::string LastTarget() const
+    {
+        std::scoped_lock const guard { _targetMutex };
+        return _lastTarget;
+    }
+
     /// @copydoc IConnector::Connect
     ///
-    /// A coroutine that never suspends, mirroring `BlockingConnector`: the
-    /// transport still drives it with `SyncRun`, and a fake that suspended would
-    /// make these cases assert something no production connector does.
+    /// Answers inline unless `DelayDial` says otherwise, which is what keeps the
+    /// cases that are not about dialling free of clock arithmetic. It *can* park,
+    /// because `PlatformConnector` does: a dial in flight is a real state, and the
+    /// transport has to behave when a peer moves during one.
     [[nodiscard]] Task<SocketResult> Connect(std::string host,
                                              std::uint16_t port,
                                              std::chrono::milliseconds connectTimeout) override
     {
-        std::ignore = host;
-        std::ignore = port;
         std::ignore = connectTimeout;
         _attempts.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::scoped_lock const guard { _targetMutex };
+            _lastTarget = std::format("{}:{}", host, port);
+        }
+
+        if (auto const delay = _delay.load(std::memory_order_relaxed); delay > 0)
+            co_await SleepUntil(&_reactor, _reactor.Clock().Now() + std::chrono::milliseconds { delay });
+
         if (_refuse.load(std::memory_order_relaxed))
             co_return std::unexpected { NetError {
                 .code = NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" } };
@@ -176,8 +219,12 @@ class ScriptedConnector final: public IConnector
 
   private:
     std::shared_ptr<RecordingSocket::Record> _record;
+    IReactor& _reactor;
     std::atomic<bool> _refuse { false };
+    std::atomic<std::int64_t> _delay { 0 };
     std::atomic<std::size_t> _attempts { 0 };
+    mutable std::mutex _targetMutex;
+    std::string _lastTarget;
 };
 
 /// A vote response, the smallest message that round-trips.
@@ -208,15 +255,35 @@ struct Harness
     std::shared_ptr<RecordingSocket::Record> record { std::make_shared<RecordingSocket::Record>() };
     ManualClock clock;
     TestReactor reactor { clock };
-    ScriptedConnector connector { record };
+    ScriptedConnector connector { record, reactor };
     NullLogger logger;
     std::unique_ptr<RaftPeerTransport> transport;
+
+    /// Make the peer's socket refuse or accept writes.
+    /// @param fail Whether writes should fail.
+    void FailWrites(bool fail)
+    {
+        std::scoped_lock const guard { record->mutex };
+        record->failWrites = fail;
+    }
+
+    /// Build the transport over one peer, without starting it.
+    ///
+    /// Split from `Start` because a peer learned BEFORE the start is one of the
+    /// cases worth pinning, and a case that wired its own clock, reactor,
+    /// connector and logger to reach that state would be a third copy of this
+    /// fixture to keep in step.
+    /// @param options Timeouts and queue bound.
+    void Build(PeerTransportOptions options = {})
+    {
+        transport = std::make_unique<RaftPeerTransport>(NodeId { "n1" }, OnePeer(), reactor, connector, logger, options);
+    }
 
     /// Build the transport over one peer and start its sender.
     /// @param options Timeouts and queue bound.
     void Start(PeerTransportOptions options = {})
     {
-        transport = std::make_unique<RaftPeerTransport>(NodeId { "n1" }, OnePeer(), reactor, connector, logger, options);
+        Build(options);
         transport->Start();
         reactor.Drain();
     }
@@ -309,7 +376,7 @@ TEST_CASE("A message for this node itself is not sent anywhere", "[consensus][ra
     auto record = std::make_shared<RecordingSocket::Record>();
     ManualClock clock;
     TestReactor reactor { clock };
-    ScriptedConnector connector { record };
+    ScriptedConnector connector { record, reactor };
     NullLogger logger;
 
     std::vector<PeerEndpoint> peers { PeerEndpoint { .id = "n1", .host = "self", .port = 1 },
@@ -540,11 +607,218 @@ TEST_CASE("Stop is idempotent and safe before Start", "[consensus][raft][transpo
     auto record = std::make_shared<RecordingSocket::Record>();
     ManualClock clock;
     TestReactor reactor { clock };
-    ScriptedConnector connector { record };
+    ScriptedConnector connector { record, reactor };
     NullLogger logger;
 
     RaftPeerTransport transport { "n1", OnePeer(), reactor, connector, logger };
     transport.Stop();
     transport.Stop();
     CHECK(transport.SendersRunning() == 0);
+}
+
+TEST_CASE("A peer learned after the start is dialled and served", "[consensus][raft][transport]")
+{
+    // What makes a cluster growable. The member set used to be fixed at
+    // construction, so a node the cluster agreed to admit at runtime was one nobody
+    // dialled -- counted towards a quorum it could never contribute to, which is a
+    // cluster that stops forming one.
+    Harness harness;
+    harness.Start();
+    REQUIRE(harness.transport->PeerCount() == 1);
+
+    // Refused outright before it is learned, which is what the case has to rule out.
+    harness.transport->Send("n3", Vote(1));
+    CHECK(harness.transport->DroppedMessages() == 1);
+
+    CHECK(harness.transport->Learn(PeerEndpoint { .id = "n3", .host = "elsewhere", .port = 7 }) == PeerChange::Added);
+    CHECK(harness.transport->PeerCount() == 2);
+    harness.reactor.Drain();
+
+    harness.transport->Send("n3", Vote(2));
+    harness.reactor.Drain();
+
+    CHECK(harness.transport->DroppedMessages() == 1);
+    CHECK(harness.Writes() == 1);
+    CHECK(harness.connector.LastTarget() == "elsewhere:7");
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A peer learned before the start is dialled when it starts", "[consensus][raft][transport]")
+{
+    // The other side of one state read under one lock. A peer added in the window
+    // around `Start` must be submitted exactly once -- never, and it is silently
+    // undialled; twice, and two senders share one outbox.
+    Harness harness;
+    harness.Build();
+
+    CHECK(harness.transport->Learn(PeerEndpoint { .id = "n3", .host = "later", .port = 9 }) == PeerChange::Added);
+    CHECK(harness.transport->SendersRunning() == 0);
+
+    harness.transport->Start();
+    harness.reactor.Drain();
+
+    CHECK(harness.transport->SendersRunning() == 2);
+    CHECK(harness.transport->ConnectedPeers() == 2);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("Learning a peer that has not moved changes nothing", "[consensus][raft][transport]")
+{
+    // The natural caller is a reconciler comparing the cluster's member set against
+    // what this node dials, on every pass of its own loop. If an unchanged record
+    // dropped the connection, a healthy fleet would redial every peer once per pass
+    // forever.
+    Harness harness;
+    harness.Start();
+
+    auto const dials = harness.connector.Attempts();
+    CHECK(harness.transport->Learn(PeerEndpoint { .id = "n2", .host = "unused", .port = 1 }) == PeerChange::Unchanged);
+    harness.reactor.Drain();
+
+    CHECK(harness.transport->PeerCount() == 1);
+    CHECK(harness.connector.Attempts() == dials);
+    CHECK(harness.transport->ConnectedPeers() == 1);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A peer that moved is redialled at its new address", "[consensus][raft][transport]")
+{
+    // Re-addressed in place rather than replaced: the outbox and whatever is queued
+    // in it survive, because replacing the peer would mean destroying a coroutine
+    // frame the reactor may still point into.
+    Harness harness;
+    harness.Start();
+    REQUIRE(harness.connector.LastTarget() == "unused:1");
+
+    CHECK(harness.transport->Learn(PeerEndpoint { .id = "n2", .host = "moved", .port = 2 }) == PeerChange::Readdressed);
+    harness.reactor.Drain();
+
+    // The socket is closed and the session is not yet over, which is the honest
+    // shape rather than a shortcoming to hide: the sender is parked on its outbox,
+    // and closing a socket does not wake a queue. Nothing is lost by that -- a peer
+    // nobody is sending to does not care which address it is not being sent to.
+    CHECK(harness.transport->ConnectedPeers() == 1);
+
+    // The next message is what discovers it. That write fails on the closed
+    // socket, so it is dropped and counted, and the sender backs off exactly as it
+    // does for any dropped connection.
+    auto const dropped = harness.transport->DroppedMessages();
+    harness.transport->Send("n2", Vote(3));
+    harness.reactor.Drain();
+    CHECK(harness.transport->DroppedMessages() == dropped + 1);
+    CHECK(harness.Writes() == 0);
+    CHECK(harness.transport->ConnectedPeers() == 0);
+
+    harness.clock.Advance(1s);
+    harness.reactor.Drain();
+
+    // And the redial names the new address, which is the whole property.
+    CHECK(harness.transport->PeerCount() == 1);
+    CHECK(harness.connector.LastTarget() == "moved:2");
+    CHECK(harness.transport->ConnectedPeers() == 1);
+
+    harness.transport->Send("n2", Vote(4));
+    harness.reactor.Drain();
+    CHECK(harness.Writes() == 1);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A peer that moves during a dial is not served at its old address", "[consensus][raft][transport]")
+{
+    // The window nothing else closes. Dropping a moved peer's connection can only
+    // close a socket that exists, and during a dial there is none -- so a
+    // re-address that lands here used to be lost outright, and the session that
+    // followed would serve the peer at the address it had just stopped answering
+    // on until that connection happened to break.
+    constexpr auto DialTime = 500ms;
+
+    Harness harness;
+    harness.Start();
+    REQUIRE(harness.transport->ConnectedPeers() == 1);
+
+    // Drop the connection so the sender redials, and make that dial park.
+    harness.connector.DelayDial(DialTime);
+    harness.FailWrites(true);
+    harness.transport->Send("n2", Vote(1));
+    harness.reactor.Drain();
+    REQUIRE(harness.transport->ConnectedPeers() == 0);
+
+    harness.clock.Advance(1s);
+    harness.reactor.Drain();
+
+    // In flight now: the dial has been made and has not resolved.
+    auto const dialing = harness.connector.Attempts();
+    REQUIRE(harness.connector.LastTarget() == "unused:1");
+
+    CHECK(harness.transport->Learn(PeerEndpoint { .id = "n2", .host = "moved", .port = 5 }) == PeerChange::Readdressed);
+
+    // The dial resolves -- at the address the peer has just stopped answering on.
+    // It must be discarded rather than served: nothing else would ever notice,
+    // because the session it would open never re-reads the address.
+    harness.FailWrites(false);
+    harness.connector.DelayDial(0ms);
+    harness.clock.Advance(DialTime);
+    harness.reactor.Drain();
+    CHECK(harness.transport->ConnectedPeers() == 0);
+    CHECK(harness.connector.Attempts() == dialing);
+
+    harness.clock.Advance(1s);
+    harness.reactor.Drain();
+    CHECK(harness.connector.LastTarget() == "moved:5");
+    CHECK(harness.transport->ConnectedPeers() == 1);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("Learning before the start does not queue work on an unrun reactor", "[consensus][raft][transport]")
+{
+    // A re-address hops onto the reactor to close the moved peer's socket, and a
+    // detached task submitted to a loop nobody drives is a frame nobody ever frees
+    // -- or, worse, one resumed after this transport is gone. Before `Start` there
+    // is no socket to close either, so there is nothing to submit.
+    Harness harness;
+    harness.Build();
+
+    CHECK(harness.transport->Learn(PeerEndpoint { .id = "n2", .host = "moved", .port = 6 }) == PeerChange::Readdressed);
+    CHECK(harness.reactor.PendingSubmissions() == 0);
+
+    // And the new address is the one it dials when it does start.
+    harness.transport->Start();
+    harness.reactor.Drain();
+    CHECK(harness.connector.LastTarget() == "moved:6");
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("This node is never learned as a peer of itself", "[consensus][raft][transport]")
+{
+    // A caller handing over a whole member set does not have to filter it out, for
+    // the reason `Send` tolerates its own id: the rule lives in one place rather
+    // than at each call site.
+    Harness harness;
+    harness.Start();
+
+    CHECK(harness.transport->Learn(PeerEndpoint { .id = "n1", .host = "self", .port = 1 }) == PeerChange::Self);
+    CHECK(harness.transport->PeerCount() == 1);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A peer learned after a stop is refused", "[consensus][raft][transport]")
+{
+    // Otherwise its sender is submitted to a reactor nobody will drain again and
+    // counted in `SendersRunning`, so `Stop` waits five seconds for a coroutine
+    // that cannot run and then leaks its frame -- reported as a stuck peer, caused
+    // by a race in teardown.
+    Harness harness;
+    harness.Start();
+    harness.RequestStopAndDrain();
+
+    CHECK(harness.transport->Learn(PeerEndpoint { .id = "n3", .host = "late", .port = 3 }) == PeerChange::Stopping);
+    CHECK(harness.transport->PeerCount() == 1);
+    CHECK(harness.transport->SendersRunning() == 0);
 }
