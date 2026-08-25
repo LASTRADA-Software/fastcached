@@ -88,6 +88,21 @@ TEST_CASE("DialEndpoint refuses a bare port rather than assuming this machine")
     CHECK(connector.Dials() == 0);
 }
 
+TEST_CASE("DialEndpoint refuses an empty host, which is a bare port respelled")
+{
+    // `:6674` and `[]:6674` split cleanly into an empty host and a valid port, so
+    // the bare-port case above does not cover them. `Detail::RunConnectFlow`
+    // refuses an empty host, so production is not reachable through this -- but
+    // that makes the refusal a property of the connector, and this file's claim is
+    // the stronger one: a malformed endpoint reaches no connector at all. Asserted
+    // on `Dials()` for exactly that reason; a nullptr alone would be satisfied by
+    // handing the empty host over and having it refused a layer down.
+    RecordingConnector connector;
+    CHECK(Dial(connector, ":6674") == nullptr);
+    CHECK(Dial(connector, "[]:6674") == nullptr);
+    CHECK(connector.Dials() == 0);
+}
+
 TEST_CASE("DialEndpoint refuses a port outside the 16-bit range")
 {
     RecordingConnector connector;
