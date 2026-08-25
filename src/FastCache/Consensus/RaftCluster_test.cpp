@@ -438,3 +438,74 @@ TEST_CASE("An admitted member survives its own restart", "[consensus][raft][clus
     cluster.Run(200);
     RequireNoViolations(cluster);
 }
+
+TEST_CASE("A cluster formed on a bare quorum keeps its leader when the last member attaches",
+          "[consensus][raft][cluster][prevote]")
+{
+    // Issue #117: a leader elected while the third node was still connecting was
+    // deposed the moment that node appeared, and the report's first hypothesis was
+    // that the join path skipped pre-vote -- or that a leader's `HasQuorumContact`
+    // was somehow false at that instant.
+    //
+    // It is neither, and this case is what says so for the shape the artifact
+    // showed -- a member already in the configuration whose process has not
+    // finished connecting. `Tick` has exactly one election path and it is
+    // `StartPreVote`, so such a node has no un-gated `RequestVote` to raise the
+    // term with; pre-vote is what keeps its term from moving while it can reach
+    // nobody; and it therefore arrives BEHIND, which is a node the other two
+    // refuse on their logs alone. Admission through a committed configuration
+    // change is a different route and has its own cases below.
+    //
+    // Every other election in this file happens with all peers already reachable,
+    // so nothing covered the shape the failing artifact actually showed: a cluster
+    // that has ELECTED but not yet FORMED.
+    RaftClusterHarness cluster { { "n1", "n2", "n3" } };
+    auto const joiner = std::string { "n3" };
+
+    // n3 is in the configuration and unreachable -- a member whose process has not
+    // finished starting, which is what the fixture's third node was.
+    cluster.Partition({ "n1", "n2" });
+    REQUIRE(SettleOnLeader(cluster));
+    cluster.Run(60);
+
+    REQUIRE(cluster.Leader().has_value());
+    REQUIRE(cluster.TermOfLeader().has_value());
+    auto const leader = Unwrap(cluster.Leader());
+    auto const term = Unwrap(cluster.TermOfLeader());
+
+    // Reaching nobody, it can have won nothing -- and saying so by name is what
+    // keeps the rest of this case from silently swapping the roles of the two
+    // nodes it is about.
+    REQUIRE(leader != joiner);
+
+    // It really did campaign, which everything below rests on. Without this the
+    // case passes just as well against a joiner that never started a pre-vote
+    // round at all -- and then it covers nothing, because the question is what
+    // happens to a node that HAS been trying to elect itself.
+    auto const& isolated = cluster.At(joiner).driver->Node();
+    REQUIRE(isolated.CurrentRole() == Role::PreCandidate);
+
+    // Every one of those rounds left its term alone, which is the whole of
+    // pre-vote's purpose. A joiner that came back with an inflated one would
+    // depose the leader on arrival whatever else this case asserted.
+    CHECK(isolated.CurrentTerm() < term);
+
+    // It attaches.
+    cluster.Heal();
+    cluster.Run(400);
+
+    CHECK(cluster.Leader() == std::optional<NodeId> { leader });
+    CHECK(cluster.TermOfLeader() == std::optional<Term> { term });
+    CHECK(cluster.Leaders().size() == 1);
+
+    // And it joined rather than merely failing to disturb anybody: it follows the
+    // same leader, at the same term, having been caught up to what was committed
+    // while it was away.
+    auto const& attached = cluster.At(joiner).driver->Node();
+    CHECK(attached.CurrentRole() == Role::Follower);
+    CHECK(attached.CurrentTerm() == term);
+    CHECK(attached.KnownLeader() == std::optional<NodeId> { leader });
+    CHECK(attached.CommitIndex() == cluster.At(leader).driver->Node().CommitIndex());
+
+    RequireNoViolations(cluster);
+}
