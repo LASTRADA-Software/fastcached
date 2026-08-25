@@ -2,13 +2,12 @@
 #pragma once
 
 #include <FastCache/CompileCache/PathCanon.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <numeric>
-#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -114,16 +113,14 @@ struct DispositionRow
 /// a disposition that can be counted but not named is a drop that renders as
 /// nothing, which is the defect this whole change exists to close.
 ///
-/// Sized from `Last` rather than from a literal or from the final enumerator by
-/// name, and that is the half that has to be right. An enumerator appended after
-/// `Uncanonical` while `Last` still ended the enum would leave a table one row
-/// short that a `size() == Uncanonical + 1` assert happily accepts — and
-/// `KeyDependencySet` indexes `tally` by the enumerator, so the new disposition
-/// writes one past the end. Deriving the length instead makes the missing row
-/// value-initialize to `{ Keyed, "" }` at a non-zero index, which the coverage
-/// check below rejects. `MetricsCatalog` sizes `CounterTable` from `Counter::Last`
-/// for exactly this reason.
-inline constexpr std::array<DispositionRow, static_cast<std::size_t>(PathDisposition::Last)> DispositionTable { {
+/// `EnumTable` is what gets the length right, and the length is the half that has
+/// to be. An enumerator appended after `Uncanonical` while `Last` still ended the enum
+/// would leave a table one row short that a `size() == Uncanonical + 1` assert
+/// happily accepts — and `KeyDependencySet` indexes `tally` by the enumerator, so
+/// the new disposition writes one past the end. Deriving the length instead makes
+/// the missing row value-initialize to `{ Keyed, "" }` at a non-zero index, which
+/// `RowsInEnumeratorOrder` rejects.
+inline constexpr EnumTable<PathDisposition, DispositionRow> DispositionTable { {
     { .disposition = PathDisposition::Keyed, .label = "keyed" },
     { .disposition = PathDisposition::Empty, .label = "empty" },
     { .disposition = PathDisposition::Unanchored, .label = "unanchored" },
@@ -132,16 +129,7 @@ inline constexpr std::array<DispositionRow, static_cast<std::size_t>(PathDisposi
     { .disposition = PathDisposition::Uncanonical, .label = "no canonical form" },
 } };
 
-/// Whether the table has one row per enumerator, in order.
-/// @return True when every `PathDisposition` has its own row.
-[[nodiscard]] consteval bool CoversEveryDisposition() noexcept
-{
-    return std::ranges::all_of(std::views::iota(std::size_t { 0 }, DispositionTable.size()), [](std::size_t index) {
-        return static_cast<std::size_t>(DispositionTable[index].disposition) == index;
-    });
-}
-
-static_assert(CoversEveryDisposition(),
+static_assert(RowsInEnumeratorOrder(DispositionTable, &DispositionRow::disposition),
               "DispositionTable must hold one row per PathDisposition, in enumerator order -- the order is what lets "
               "a disposition index its own tally slot and its own row");
 
