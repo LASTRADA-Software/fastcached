@@ -261,6 +261,21 @@ The worker also reports what the machine **is** — `fastcache_node_logical_core
 `fastcache_node_slots_busy`. Those are gauges: "is this node pulling its weight"
 is not answerable without knowing how big it is.
 
+And what its **cache** is holding — `fastcached_items`, `fastcached_bytes_used`
+and `fastcached_bytes_limit` for the tier as a whole, plus a
+`fastcached_tier_*{tier="memory"|"disk"}` set for the split. A node whose cache is
+effectively empty sends every rebuild to the wire; one whose evictions climb while
+its hit rate falls has a budget too small for the tree it builds. Both are
+invisible from the scheduler's own counters, which only see the work that reached
+it. See [the node's own page](../tools/fastcache-compile-node.md#reading-it) for
+why these must not be summed across tiers.
+
+The same figures reach the **leader**, on each node's REGISTER and HEARTBEAT, so
+they are readable from one place rather than by scraping every machine. Note that
+a node started with two `--toolchain` flags is two registry entries against one
+machine and one cache: both carry the same figures, and anything summing them
+counts that cache twice.
+
 ### "No worker matches this toolchain"
 
 The commonest setup failure. A worker is matched only if its toolchain

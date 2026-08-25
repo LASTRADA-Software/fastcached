@@ -167,12 +167,39 @@ Four rules, and none of them is the obvious choice:
 `scripts/dist-compile-e2e.sh` asserts the first of those by **stopping the shared
 cache** and requiring the next compile to still hit, with a byte-correct object.
 
+### Two halves, each named separately
+
+The tier is an in-memory store, an on-disk store, or both — the same
+`LayeredStorage` the daemon's `--storage` builds, an LRU mirror over a canonical
+B+tree:
+
+| Configuration | What you get |
+|---|---|
+| `--cache-memory=8g` (the default is `256m`) | Memory only. Fast, and gone at restart. |
+| `--cache-dir=/var/cache/fastcache-node` | Both halves: the memory tier in front of a store that survives a restart. |
+| `--cache-memory=0 --cache-dir=…` | Disk only. |
+| `--cache-memory=0` and no `--cache-dir` | **No tier at all**, which is what a node that only compiles for others wants. |
+
+`--cache-disk` caps the on-disk half, which is otherwise allowed to grow as
+needed — the same default `--storage-max-disk` has on the daemon. On a build
+server that is usually right; on somebody's workstation it usually is not.
+
+!!! warning "One node per `--cache-dir`"
+
+    The store takes no inter-process lock. Two nodes pointed at one directory
+    corrupt it on POSIX and fail to start on Windows, and neither says why —
+    [issue #135](https://github.com/LASTRADA-Software/fastcached/issues/135). If a
+    machine runs several nodes, give each its own path.
+
+Its reads and writes happen on the reactor thread the node's framed surfaces
+share, so a large store can briefly delay other connections on it
+([#136](https://github.com/LASTRADA-Software/fastcached/issues/136)). Worth
+knowing before profiling a node that feels slow under load.
+
 ### `--upstream` may be empty
 
 That is the honest configuration for one developer's machine, not a broken one: the
-tier caches locally and never tries to reach a fleet. `--cache-memory=0` turns the
-local cache off, which is what a node that only compiles for others wants; a node
-that serves this machine's builds should keep it.
+tier caches locally and never tries to reach a fleet.
 
 ### Reading it
 
@@ -192,6 +219,27 @@ A high **upstream**-hit rate against a low **local**-hit rate means the tier is 
 small for this machine's working set — a different problem from a fleet that is
 missing a lot, and a different fix. An upstream *store* failure says the fleet is
 unreachable; a local store failure says this node is broken.
+
+Beside them, what the tier is holding. `fastcached_items`, `fastcached_bytes_used`
+and `fastcached_bytes_limit` describe the cache as a whole, and a per-tier set
+carries the split a merged view cannot:
+
+| Series | Says |
+|---|---|
+| `fastcached_tier_items{tier="memory"\|"disk"}` | Live entries in that tier. |
+| `fastcached_tier_bytes_used{tier=…}` | Bytes it holds. |
+| `fastcached_tier_bytes_limit{tier=…}` | Its budget; `0` means unbounded. |
+| `fastcached_tier_evictions_total{tier=…}` | Entries it dropped to stay inside that budget. |
+
+**Do not sum across tiers.** The memory tier mirrors what it reads out of the disk
+tier, so adding the two item counts counts the mirrored entries twice — and the
+unlabelled `fastcached_*` series above are already the cache's own totals. What
+each label answers is "how is *this* tier doing": whether the mirror is populated,
+which tier is evicting, how close the disk half is to `--cache-disk`.
+
+A tier the node does not run emits **no line at all** rather than a zero. A
+memory-only node has no `tier="disk"` series, which is a different claim from a
+disk tier standing empty.
 
 ### It answers where `fastcache-cc` already looks
 

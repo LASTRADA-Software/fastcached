@@ -66,6 +66,27 @@ fault.
   the mirror-image reason, and **names the field to do it** (`.host = std::nullopt`)
   rather than letting it default: a designated initializer that skips a field added
   to the middle of a struct is a warning at best and a silent zero at worst.
+- **A merged snapshot is one tier's answer standing in for all of them, so the
+  split is reported too.** `LayeredStorage::Snapshot()` returns its canonical lower
+  tier's item count, bytes and budget with the composite's own hit/miss patched over
+  them and only the evictions summed — so with `--storage`, or with the node's
+  `--cache-dir`, the in-memory tier an operator sized has never appeared on a scrape
+  at all. `IStorage::SnapshotTiers()` answers per tier, and three rules travel with
+  it:
+  - **Absent is not zero, one level below `MetricsSnapshot::storage`.** A tier the
+    cache does not have renders **no line**, not a zero and not a bare `# HELP` with
+    no sample beneath it. `fastcached_tier_items{tier="disk"} 0` says a disk tier is
+    standing empty, and a memory-only node has no such tier to be empty.
+  - **The label values come from `StorageTierTable`, not from a hand-written list.**
+    Same rule the counters follow against `MetricsCatalog`, applied to the other
+    axis: a tier added to the enum reaches the scrape by being a row.
+  - **Nothing per-tier is a total waiting to be summed, and the ones that would
+    mislead are simply not published.** The memory tier mirrors what it reads out of
+    the disk tier, so adding item counts double-counts; and a lower tier is consulted
+    only when the one above it missed, so adding hit counts turns a cache serving
+    every read into one at 62%. Items, bytes, budget and evictions carry the `tier`
+    label; the hit/miss split stays on the unlabelled series, because it is the one a
+    dashboard is likeliest to add up.
 - **A worker's admin endpoint is off unless asked for, binds loopback for a bare
   port, and is FATAL when it cannot be served.** All three differ from the daemon's
   and each was chosen: a scrape surface reachable from the network is an operator's
