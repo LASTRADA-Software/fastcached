@@ -115,8 +115,8 @@ namespace
     /// Spelled once because two questions need it and they must not answer
     /// differently: what to hash, and — for a drive-relative path — whether the
     /// layout can place it at all. `Canonicalize` returns its input verbatim for a
-    /// path it did not rewrite, so inequality, not the spelling of a sentinel
-    /// PathCanon keeps private, is what says a token was produced.
+    /// path it did not rewrite, so inequality is what says a token was produced —
+    /// and it is the only test there is, nothing in PathCanon being able to fail.
     ///
     /// @param path   A normalized, `/`-separated path.
     /// @param layout This machine's roots.
@@ -124,8 +124,8 @@ namespace
     [[nodiscard]] std::optional<std::string> RootToken(std::string const& path, PathCanon::Layout const& layout)
     {
         auto canon = PathCanon::Canonicalize(path, layout);
-        if (canon.has_value() && *canon != path)
-            return std::move(*canon);
+        if (canon != path)
+            return canon;
         return std::nullopt;
     }
 

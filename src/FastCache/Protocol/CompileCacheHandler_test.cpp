@@ -682,9 +682,8 @@ TEST_CASE("Cross-depth: value stored from a deep layout localizes for a shallow 
 
     PathCanon::Layout const consumer { .sourceRoot = R"(D:\project)", .buildTree = R"(D:\project\build)" };
     auto const localized = PathCanon::LocalizeRegion(fetched.textRegions[0].bytes, Grammar::ShowIncludes, consumer);
-    REQUIRE(localized.has_value());
-    CHECK(localized->contains(R"(D:\project\inc\x.h)"));
-    CHECK_FALSE(localized->contains(R"(ci\deep)"));
+    CHECK(localized.contains(R"(D:\project\inc\x.h)"));
+    CHECK_FALSE(localized.contains(R"(ci\deep)"));
 }
 
 namespace

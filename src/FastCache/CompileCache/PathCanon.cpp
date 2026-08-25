@@ -454,17 +454,17 @@ Anchor AnchorForLayout(std::string_view path, Layout const& layout) noexcept
     return (path.front() == '\\' || path.front() == '/') ? Anchor::Absolute : Anchor::WorkingDirectory;
 }
 
-std::expected<std::string, CanonError> Canonicalize(std::string_view absolutePath, Layout const& layout)
+std::string Canonicalize(std::string_view absolutePath, Layout const& layout)
 {
     return CanonicalizeOne(absolutePath, layout);
 }
 
-std::expected<std::string, CanonError> Localize(std::string_view token, Layout const& layout)
+std::string Localize(std::string_view token, Layout const& layout)
 {
     return LocalizeOne(token, layout);
 }
 
-std::expected<std::string, CanonError> CanonicalizeRegion(std::string_view text, Grammar grammar, Layout const& layout)
+std::string CanonicalizeRegion(std::string_view text, Grammar grammar, Layout const& layout)
 {
     auto const xform = [&](std::string_view span) {
         return CanonicalizeOne(span, layout);
@@ -475,7 +475,7 @@ std::expected<std::string, CanonError> CanonicalizeRegion(std::string_view text,
     return RewriteRegion(text, grammar, xform);
 }
 
-std::expected<std::string, CanonError> RewritePaths(std::string_view text, Grammar grammar, PathTransform const& xform)
+std::string RewritePaths(std::string_view text, Grammar grammar, PathTransform const& xform)
 {
     // An absent transform is the identity, not a crash. std::function throws
     // std::bad_function_call when empty, and an empty PathTransform is an
@@ -492,7 +492,7 @@ std::expected<std::string, CanonError> RewritePaths(std::string_view text, Gramm
     return RewriteRegion(text, grammar, xform);
 }
 
-std::expected<std::string, CanonError> LocalizeRegion(std::string_view text, Grammar grammar, Layout const& layout)
+std::string LocalizeRegion(std::string_view text, Grammar grammar, Layout const& layout)
 {
     auto const xform = [&](std::string_view span) {
         return LocalizeOne(span, layout);

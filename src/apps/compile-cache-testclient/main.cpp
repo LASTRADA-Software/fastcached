@@ -337,10 +337,8 @@ int DoFetch(TestClient::Args const& a)
     localizedRegions.reserve(decoded->textRegions.size());
     for (auto const& region: decoded->textRegions)
     {
-        auto localized = PathCanon::LocalizeRegion(region.bytes, region.grammar, consumer);
-        if (!localized.has_value())
-            Die("localization failed");
-        localizedRegions.push_back({ .grammar = region.grammar, .bytes = std::move(*localized) });
+        localizedRegions.push_back(
+            { .grammar = region.grammar, .bytes = PathCanon::LocalizeRegion(region.bytes, region.grammar, consumer) });
     }
 
     // Through the launcher's own `ReplayedDependencyPaths` rather than a scanner

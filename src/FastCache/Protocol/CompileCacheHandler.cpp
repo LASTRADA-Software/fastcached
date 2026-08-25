@@ -180,19 +180,19 @@ namespace
 
     /// Canonicalize every text region of `value` in place using the producer's
     /// layout. The object blob is never touched.
+    ///
+    /// Cannot fail, and says so by returning nothing: a path under neither root is
+    /// echoed verbatim rather than refused, which is what lets a toolchain path
+    /// survive the round trip. This used to return `bool` and answer a false with
+    /// wire status `CanonicalizationFailed`, which no server could ever send
+    /// (issues #59, #69).
+    ///
     /// @param value    The decoded compile-value to rewrite.
     /// @param producer The producing machine's roots.
-    /// @return True when every region canonicalized; false leaves `value` partial.
-    [[nodiscard]] bool CanonicalizeRegions(CompileValue& value, PathCanon::Layout const& producer)
+    void CanonicalizeRegions(CompileValue& value, PathCanon::Layout const& producer)
     {
         for (auto& region: value.textRegions)
-        {
-            auto canon = PathCanon::CanonicalizeRegion(region.bytes, region.grammar, producer);
-            if (!canon.has_value())
-                return false;
-            region.bytes = std::move(*canon);
-        }
-        return true;
+            region.bytes = PathCanon::CanonicalizeRegion(region.bytes, region.grammar, producer);
     }
 
     /// Handle one STORE command: canonicalize with the producer's layout, store
@@ -223,9 +223,7 @@ namespace
 
         PathCanon::Layout const producer { .sourceRoot = BytesToString(fields->srcRoot),
                                            .buildTree = BytesToString(fields->buildTree) };
-        if (!CanonicalizeRegions(*decoded, producer))
-            co_return co_await ReplyError(socket, Wire::ErrorCode::CanonicalizationFailed, {}) ? Next::Continue
-                                                                                               : Next::Abort;
+        CanonicalizeRegions(*decoded, producer);
 
         auto const canonicalBytes = EncodeCompileValue(*decoded);
         auto const keyStr = BytesToString(fields->key);

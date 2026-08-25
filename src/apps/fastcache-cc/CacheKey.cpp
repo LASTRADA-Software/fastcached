@@ -131,8 +131,8 @@ namespace
 
         auto const path = Reconciled(resolve, portion->path);
         auto const canon = PathCanon::Canonicalize(path, layout);
-        if (canon.has_value() && *canon != path)
-            return std::string { portion->prefix } + *canon;
+        if (canon != path)
+            return std::string { portion->prefix } + canon;
         return std::string { arg };
     }
 

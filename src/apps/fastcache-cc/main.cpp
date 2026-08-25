@@ -931,9 +931,8 @@ struct MaterializedHit
     localized.reserve(decoded.textRegions.size());
     for (auto const& region: decoded.textRegions)
     {
-        auto rewritten = PathCanon::LocalizeRegion(region.bytes, region.grammar, layout);
         localized.push_back(
-            { .grammar = region.grammar, .bytes = rewritten.has_value() ? *std::move(rewritten) : region.bytes });
+            { .grammar = region.grammar, .bytes = PathCanon::LocalizeRegion(region.bytes, region.grammar, layout) });
     }
 
     // A depfile the compile did not ask for is not going to be written, so it must

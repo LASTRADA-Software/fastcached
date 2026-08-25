@@ -2,11 +2,34 @@
 #pragma once
 
 #include <cstdint>
-#include <expected>
 #include <functional>
 #include <string>
 #include <string_view>
 
+/// Rewriting absolute paths to portable tokens, and back.
+///
+/// **Nothing here can fail, and that is a contract rather than an accident.** A
+/// path under neither root is not an error: it is echoed verbatim, which is what
+/// lets a toolchain path survive a round trip unchanged. So every entry point
+/// returns a plain `std::string`, and the question a caller actually has — "was a
+/// token produced?" — is answered by comparing the result against the input, never
+/// by a sentinel this namespace keeps private. `DependencyProbe`'s `RootToken` is
+/// the canonical spelling of that test.
+///
+/// These functions returned `std::expected<std::string, CanonError>` until issues
+/// #59 and #69. No code path ever produced the error, so every `has_value()` check
+/// on a result read as a handled failure mode that was not one, and the wire status
+/// those checks fed (`CanonicalizationFailed`, `0x06`) was a documented part of the
+/// 0xFC protocol that no server could ever send.
+///
+/// **There is deliberately no version here either.** Canonical text only ever
+/// travels inside a CompileValue, whose container carries `CompileValueVersion` and
+/// is rejected on mismatch, so a change to the canonicalization spec is expressed by
+/// bumping that — and by the `objkey-v4` schema tag in the launcher's ComputeKey,
+/// which re-keys the cache so stale entries miss rather than being localized under
+/// rules they were not written by. A version here was declared once and never
+/// referenced by anything, because it had no work to do; `header-state-v1` is the
+/// same lesson, recorded in `.agent/rules/compile-cache.md`.
 namespace FastCache::PathCanon
 {
 
@@ -16,20 +39,6 @@ struct Layout
 {
     std::string sourceRoot; ///< Checkout root — becomes the `<SRCROOT>` sentinel.
     std::string buildTree;  ///< Build output root — becomes the `<BUILDTREE>` sentinel.
-};
-
-/// Failure modes of a canonicalize/localize call.
-///
-/// There is deliberately no version here. Canonical text only ever travels
-/// inside a CompileValue, whose container carries `CompileValueVersion` and is
-/// rejected on mismatch, so a change to the canonicalization spec is expressed
-/// by bumping that — and by the `objkey-v4` schema tag in the launcher's
-/// ComputeKey, which re-keys the cache so stale entries miss rather than being
-/// localized under rules they were not written by. A second version here was
-/// declared once and never referenced by anything, because it had no work to do.
-enum class CanonError : std::uint8_t
-{
-    Malformed, ///< Token/path is structurally invalid (e.g. an empty sentinel tail).
 };
 
 /// The line grammars that locate path spans inside captured compiler text
@@ -116,9 +125,9 @@ enum class Grammar : std::uint8_t
 /// question either caller puts to this is whether the path may be resolved
 /// against the compile's working directory, and for `\Windows\x.h` the answer is
 /// no, same as for `C:\Windows\x.h`. Splitting it out would add a state neither
-/// caller could do anything different with, which is the mistake CanonError's
-/// absent version field already records. `DriveRelative` earns its place by the
-/// opposite test: both callers *do* treat it differently from both neighbours.
+/// caller could do anything different with, which is the mistake `header-state-v1`
+/// records: a distinction with no work to do. `DriveRelative` earns its place by
+/// the opposite test: both callers *do* treat it differently from both neighbours.
 enum class Anchor : std::uint8_t
 {
     WorkingDirectory, ///< Relative: resolves against the compile's working directory.
@@ -161,15 +170,17 @@ enum class Anchor : std::uint8_t
 /// Rewrite a single absolute path to its canonical token form.
 /// @param absolutePath Native-form absolute path (as the compiler emitted it).
 /// @param layout       The producing machine's roots.
-/// @return The canonical token (`<SRCROOT>/...`, `<BUILDTREE>/...`, or the input
-///         verbatim when under neither root), or CanonError on a malformed input.
-[[nodiscard]] std::expected<std::string, CanonError> Canonicalize(std::string_view absolutePath, Layout const& layout);
+/// @return The canonical token (`<SRCROOT>/...`, `<BUILDTREE>/...`), or the input
+///         verbatim when under neither root — which is how a caller tells the two
+///         apart, there being nothing here that can fail.
+[[nodiscard]] std::string Canonicalize(std::string_view absolutePath, Layout const& layout);
 
 /// Rewrite a canonical token back to an absolute path for the given layout.
 /// @param token  A token previously produced by Canonicalize.
 /// @param layout The consuming machine's roots.
-/// @return The localized native-form absolute path, or CanonError.
-[[nodiscard]] std::expected<std::string, CanonError> Localize(std::string_view token, Layout const& layout);
+/// @return The localized native-form absolute path, or the token verbatim when it
+///         names no sentinel this layout knows.
+[[nodiscard]] std::string Localize(std::string_view token, Layout const& layout);
 
 /// Canonicalize every path span in a captured text region, per its grammar.
 /// Lines that do not match the grammar's shape are preserved byte-for-byte,
@@ -178,9 +189,7 @@ enum class Anchor : std::uint8_t
 /// @param grammar The grammar identifying path spans within `text`.
 /// @param layout  The producing machine's roots.
 /// @return The region with matched path spans replaced by canonical tokens.
-[[nodiscard]] std::expected<std::string, CanonError> CanonicalizeRegion(std::string_view text,
-                                                                        Grammar grammar,
-                                                                        Layout const& layout);
+[[nodiscard]] std::string CanonicalizeRegion(std::string_view text, Grammar grammar, Layout const& layout);
 
 /// The transform RewritePaths applies to one path span.
 using PathTransform = std::function<std::string(std::string_view)>;
@@ -210,9 +219,7 @@ using PathTransform = std::function<std::string(std::string_view)>;
 /// @param xform   Applied once per identified span; returning the span unchanged
 ///                is a byte-exact no-op.
 /// @return The rewritten region.
-[[nodiscard]] std::expected<std::string, CanonError> RewritePaths(std::string_view text,
-                                                                  Grammar grammar,
-                                                                  PathTransform const& xform);
+[[nodiscard]] std::string RewritePaths(std::string_view text, Grammar grammar, PathTransform const& xform);
 
 /// Localize every canonical token span in a captured text region, per its
 /// grammar. The inverse of CanonicalizeRegion.
@@ -220,8 +227,6 @@ using PathTransform = std::function<std::string(std::string_view)>;
 /// @param grammar The grammar identifying token spans within `text`.
 /// @param layout  The consuming machine's roots.
 /// @return The region with tokens replaced by localized native paths.
-[[nodiscard]] std::expected<std::string, CanonError> LocalizeRegion(std::string_view text,
-                                                                    Grammar grammar,
-                                                                    Layout const& layout);
+[[nodiscard]] std::string LocalizeRegion(std::string_view text, Grammar grammar, Layout const& layout);
 
 } // namespace FastCache::PathCanon
