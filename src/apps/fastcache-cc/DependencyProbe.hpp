@@ -193,6 +193,54 @@ struct DependencySet
 /// @return `"9 toolchain, 3 drive-relative"`, or an empty string.
 [[nodiscard]] std::string DescribeDropped(DependencySet const& set);
 
+/// Whether `path` is a Windows drive-relative path that no root can tokenize.
+///
+/// The one shape this launcher can neither key nor check, and therefore the one
+/// that makes a whole compile uncacheable (issue #104). `C:foo` resolves against
+/// drive C's *own* current directory, per-process state on the producing machine
+/// that no cache entry records. Two filters meet on it and each is right on its
+/// own terms (issue #65): `PortableForm` drops it, and `ReplayGuard`'s
+/// `IsCheckable` skips it because there is no working directory it could
+/// truthfully be stat'ed against. Nothing anywhere asked whether SOMETHING
+/// covered the path, and under no root nothing does — move a header spelled that
+/// way and the key does not change, so the stale entry is still found, and
+/// nothing probes it, so nothing notices: a replayed depfile naming a file that
+/// is gone, under a zero exit code.
+///
+/// So the compile is refused instead, the way a module interface unit is: it
+/// costs those builds the cache and cannot mis-serve. Resolving the path at
+/// capture time is the other direction and is rejected — it would record the
+/// producing machine's per-drive current directory in the value, which is exactly
+/// the machine-specific state a key exists to keep out.
+///
+/// **This is for a path no `PortableForm` classification covers**, which since
+/// issue #105 means the COMMAND LINE and nothing else. A reported dependency path
+/// already carries `PathDisposition::DriveRelative`, computed by the same rule one
+/// layer down, so `RunCached` reads that tally rather than asking again — two
+/// spellings of one classification are two places for it to drift, which is the
+/// defect `DispositionTable` above exists to prevent. What the tally cannot answer
+/// is a path the compiler never reported because the argument carrying it was
+/// never split out, and that is what `Cc::UnkeyableArgument` uses this for.
+///
+/// The anchor is asked FIRST, which is what makes it free everywhere it cannot
+/// fire: `AnchorForLayout` never reports `DriveRelative` under a POSIX layout, so
+/// the whole rule is inert there without a single canonicalization. Under a
+/// **drive-relative root** (`C:src\proj`) such a path canonicalizes to a token and
+/// is *not* refused — that layout is portable precisely because the consumer
+/// substitutes its own root, and refusing it would un-key a layout that works.
+///
+/// Inequality against the input is what says a token was produced, never a
+/// sentinel spelling PathCanon keeps private — the same test `PortableForm`,
+/// `ProjectToken` and `RootReconciler::Translate` each apply.
+///
+/// Pure: touches no filesystem. A drive-relative path is one of the few a
+/// filesystem could not place anyway.
+///
+/// @param path   A path as a compiler or a build system spelled it.
+/// @param layout This machine's roots, and the source of path conventions.
+/// @return True when this compile must not be cached because of `path`.
+[[nodiscard]] bool IsDriveRelativeUnderNoRoot(std::string_view path, PathCanon::Layout const& layout);
+
 /// Reduce a probe's raw dependency paths to the portable set the key hashes.
 ///
 /// **Which paths survive, and why the exclusion is load-bearing.** Every field of

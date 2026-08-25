@@ -977,8 +977,11 @@ function(_fc_probe_fastcache_cc outVar reasonVar)
     elseif(_err MATCHES "fastcache-cc: (HIT|MISS) key=")
         set(${outVar} TRUE PARENT_SCOPE)
         set(${reasonVar} "" PARENT_SCOPE)
-    elseif(_err MATCHES "fastcache-cc: cache unavailable \\(([^)]*)\\)")
-        set(${reasonVar} "${CMAKE_MATCH_1}" PARENT_SCOPE)
+    elseif(_err MATCHES "fastcache-cc: (cache unavailable|not caching) \\(([^)]*)\\)")
+        # Two lead-ins, because the launcher distinguishes "the cache let us down"
+        # from "this compile is deliberately not cacheable" and says which. Both
+        # end in a probe that did not cache, which is all this has to report.
+        set(${reasonVar} "${CMAKE_MATCH_2}" PARENT_SCOPE)
     else()
         set(${reasonVar} "no cache outcome reported" PARENT_SCOPE)
     endif()

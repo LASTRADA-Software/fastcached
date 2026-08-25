@@ -313,22 +313,61 @@ void Note(std::string_view reason)
         std::cerr << "fastcache-cc: " << reason << '\n';
 }
 
-/// Report that the cache could not serve this compile, and record why.
+/// Record that the cache did not serve this compile, and say why.
 ///
-/// Only for the fall-back path, where the launcher gives up on the cache and
-/// runs the real compiler: it OVERWRITES the recorded outcome. Once a HIT or
-/// MISS has been traced, use Note() instead.
-/// @param reason The fall-back reason, recorded as the statistics detail.
-void Warn(std::string_view reason)
+/// Only for the fall-back path, where the launcher runs the real compiler: it
+/// OVERWRITES the recorded outcome. Once a HIT or MISS has been traced, use
+/// Note() instead.
+///
+/// Reached through Warn or Decline rather than called directly, because the two
+/// facts it carries have to move together. A fall-back reason distinguishes
+/// "deliberately not cacheable" from "the cache let us down" — an operator acts
+/// on the second and cannot act on the first, so `--show-stats` separates them —
+/// and the LEAD-IN has to say the same thing the outcome does: "cache
+/// unavailable" is a claim about the cache and is simply untrue of a refusal,
+/// which is the "a refusal reported under the wrong reason sends an operator to
+/// fix something that was never wrong" rule this tree records elsewhere. Pairing
+/// them here is what stops a caller supplying one without the other.
+///
+/// The classification used to be derived by sniffing the reason text for a
+/// `uses __TIME__` prefix, which cannot survive a second deliberate reason: the
+/// next one is counted as a cache failure, inflating the very bucket somebody
+/// investigates.
+///
+/// @param leadIn  What kind of non-answer this is.
+/// @param reason  The fall-back reason, recorded as the statistics detail.
+/// @param outcome How `--show-stats` should bucket it.
+void RecordFallback(std::string_view leadIn, std::string_view reason, Cc::Outcome outcome)
 {
-    // A fall-back reason distinguishes "deliberately not cacheable" from "the
-    // cache let us down" — the two need different responses, so the statistics
-    // report separates them.
-    bool const deliberate = reason.starts_with("uses __TIME__");
-    invocation.outcome = deliberate ? Cc::Outcome::Uncacheable : Cc::Outcome::Unavailable;
+    invocation.outcome = outcome;
     invocation.outcomeDetail = reason;
     if (invocation.verbose)
-        std::cerr << "fastcache-cc: cache unavailable (" << reason << "); running real compiler\n";
+        std::cerr << "fastcache-cc: " << leadIn << " (" << reason << "); running real compiler\n";
+}
+
+/// Report that the cache could not serve this compile: it is reachable in
+/// principle and something went wrong.
+///
+/// @param reason The fall-back reason. A FIXED string: `--show-stats` tallies
+///               these, so one carrying a path or a key produces a row per
+///               compile instead of a row per cause. Variable detail goes in a
+///               Note() beside the call.
+void Warn(std::string_view reason)
+{
+    RecordFallback("cache unavailable", reason, Cc::Outcome::Unavailable);
+}
+
+/// Report that this compile is deliberately not cacheable.
+///
+/// The refusal half: the cache is working, and this translation unit is one the
+/// launcher will not cache — because it could never hit (a time macro), or
+/// because caching it could not be made truthful (a path that is neither keyed
+/// nor guarded, issue #104).
+///
+/// @param reason The refusal reason, under Warn's fixed-string rule.
+void Decline(std::string_view reason)
+{
+    RecordFallback("not caching", reason, Cc::Outcome::Uncacheable);
 }
 
 /// Emit a HIT/MISS trace line (stderr) when FASTCACHE_VERBOSE is set. Useful in
@@ -1306,6 +1345,24 @@ void RecordManifest(Config const& cfg,
     Cc::RootReconciler reconciler { cfg.srcRoot, cfg.buildTree, PathResolver() };
     PathCanon::Layout const& layout = reconciler.Layout();
 
+    // Asked before ANYTHING else the cache does, direct mode included, and that
+    // ordering is the point rather than the cost. A drive-relative path under no
+    // root is dropped from the key and skipped by the replay guard, so a header
+    // moved inside it is neither re-keyed nor noticed; the manifest a direct hit
+    // validates came through the same filter, so it dropped that path too. Asking
+    // here means such a build never consults an entry written under the old rules
+    // — which is what closes this without re-keying every cache on every platform
+    // (issue #104). See Cc::UnkeyableArgument for why this is not the only ask.
+    if (auto const unkeyable = Cc::UnkeyableArgument(argv.subspan(1), layout))
+    {
+        // The argument goes in a Note and not in the reason: the reason is what
+        // `--show-stats` tallies, and one carrying a path is a row per compile.
+        Note(std::format("drive-relative path under no root, in argument {}", *unkeyable));
+        Decline("a command-line path is drive-relative under no root; not caching "
+                "(neither keyed nor guarded)");
+        return std::nullopt;
+    }
+
     // Directory-flavoured, because an argument's own last component can be the
     // aliased one — an `-I` pointing at a symlinked include directory is the
     // ordinary case — and there are few enough arguments that resolving each
@@ -1374,7 +1431,7 @@ void RecordManifest(Config const& cfg,
         // its only cost is a permanent miss, never incorrectness.
         if (SourceReferencesVolatileMacro(cmd.source))
         {
-            Warn("uses __TIME__/__DATE__/__TIMESTAMP__; not caching (non-deterministic)");
+            Decline("uses __TIME__/__DATE__/__TIMESTAMP__; not caching (non-deterministic)");
             return std::nullopt;
         }
 
@@ -1411,6 +1468,25 @@ void RecordManifest(Config const& cfg,
                          dropped.empty() ? "" : "; ",
                          PathResolver().FilesystemCalls()));
         NoteIfRootsDoNotDescribeCompile(cfg, cmd.source, dependencies, reconciler);
+
+        // The one disposition that is not merely a drop. A drive-relative path under
+        // no root is keyed by nothing here and stat'ed by nothing in ReplayGuard, so
+        // a header moved inside it replays a depfile naming a file that is gone
+        // (issue #104). The note above has already said how many there were; this
+        // says what the launcher does about them.
+        //
+        // This is the AUTHORITATIVE ask: it reads what the compiler actually opened,
+        // where the command-line ask near the top of this function depends on
+        // `PathValueFlags()` recognising the flag that carried the path. Read off the
+        // tally rather than re-derived from the paths — `PortableForm` already
+        // classified every one of them, and a second walk asking the same question
+        // is a second place for the answer to drift.
+        if (dependencies.Count(Cc::PathDisposition::DriveRelative) != 0)
+        {
+            Decline("a reported dependency path is drive-relative under no root; not caching "
+                    "(neither keyed nor guarded)");
+            return std::nullopt;
+        }
 
         // Non-const so the preprocessed text can be MOVED out below rather than
         // copied. It was const, and `std::move` on a const member is a silent copy

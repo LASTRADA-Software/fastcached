@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DependencyProbe.hpp"
+#include "ReplayGuard.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
@@ -522,4 +525,127 @@ TEST_CASE("DescribeDropped renders every reason it can be given, in table order"
 
     CHECK(set.Reported() == 21);
     CHECK(DescribeDropped(set) == "2 empty, 3 unanchored, 4 drive-relative, 5 toolchain, 6 no canonical form");
+}
+
+TEST_CASE("IsDriveRelativeUnderNoRoot names the one shape that is neither keyed nor guarded")
+{
+    // Issue #104. The rule is a ROOT test that begins with an anchor test, and both
+    // halves are load-bearing in opposite directions: the anchor alone would un-key
+    // a drive-relative root, and the roots alone would refuse every toolchain header.
+    PathCanon::Layout const rooted { .sourceRoot = R"(C:\src\proj)", .buildTree = R"(C:\src\proj\build)" };
+
+    // Drive-relative under no root: refused.
+    CHECK(IsDriveRelativeUnderNoRoot(R"(C:foo\bar.hpp)", rooted));
+    CHECK(IsDriveRelativeUnderNoRoot("C:foo/bar.hpp", rooted));
+    // A bare drive specifier IS that drive's current directory.
+    CHECK(IsDriveRelativeUnderNoRoot("C:", rooted));
+    // A rooted root cannot prefix-match a drive-relative path, whichever drive.
+    CHECK(IsDriveRelativeUnderNoRoot(R"(C:src\proj\a.hpp)", rooted));
+
+    // Absolute, under a root and under neither: both keyed or dropped by rules that
+    // already cover them, so neither is this defect.
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot(R"(C:\src\proj\a.hpp)", rooted));
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot(R"(C:\Program Files\LLVM\include\x.h)", rooted));
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot(R"(\Windows\x.h)", rooted));
+    // Relative: resolved against the compile's working directory, so it is placeable.
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot(R"(inc\a.hpp)", rooted));
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot("", rooted));
+
+    // Under a drive-relative ROOT the same anchor tokenizes, and is kept.
+    PathCanon::Layout const driveRelative { .sourceRoot = R"(C:src\proj)", .buildTree = R"(C:src\build)" };
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot(R"(C:src\proj\a.hpp)", driveRelative));
+    CHECK(IsDriveRelativeUnderNoRoot(R"(C:elsewhere\b.hpp)", driveRelative));
+
+    // Inert under a POSIX layout, on either host: `C:foo` is an ordinary relative
+    // file name there, and the answer comes from the LAYOUT and never from the host.
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot("C:foo/bar.hpp", PosixLayout()));
+    CHECK_FALSE(IsDriveRelativeUnderNoRoot("C:", PosixLayout()));
+}
+
+TEST_CASE("Nothing a driver reports is left uncovered")
+{
+    // The regression case for issue #104, and it asks about the CONJUNCTION rather
+    // than about any one filter's answer, because the defect was never inside a
+    // filter. Each was right on its own terms and the gap was between them: the key
+    // filter dropped a drive-relative path under no root, and the replay guard
+    // skipped it because there is no working directory it could truthfully be
+    // stat'ed against. Nothing anywhere asked whether SOMETHING covered the path.
+    //
+    // Issue #105 gave that drop its own name, which is what makes this case
+    // expressible at all — but naming a drop is not covering it, and on its own
+    // `PathDisposition::DriveRelative` still reaches the key filter as a drop. What
+    // closes the hole is the launcher refusing the compile, and this asserts the
+    // property rather than the mechanism.
+    //
+    // `Coverage` names what covers each shape, and the point is what it does NOT
+    // have: there is no `Nothing`. A row is covered because a move re-keys it, or
+    // because a hit carrying it is re-probed, or because the compiler identity
+    // already stands for its content, or because the compile is not cached at all
+    // — and a shape that fits none of the four is the defect, not a fifth kind of
+    // row. `ToolchainStamp` in particular is a CLAIM about content, true of a
+    // toolchain header at a fixed address and false of a path nothing can place.
+    enum class Coverage : std::uint8_t
+    {
+        Keyed,          ///< In the keyed set, so a move is a different key.
+        Guarded,        ///< The replay guard probes it, so a move discards the hit.
+        ToolchainStamp, ///< A fixed address outside both roots; the compiler identity covers it.
+        Refused,        ///< Nothing can cover it, so this compile is not cached.
+    };
+
+    struct Shape
+    {
+        std::string_view what; ///< What a reader should recognise this row as.
+        std::string_view path; ///< The path as a driver would report it.
+        Coverage coverage;     ///< What is answerable for it.
+    };
+
+    PathCanon::Layout const windows { .sourceRoot = R"(C:\src\proj)", .buildTree = R"(C:\src\proj\build)" };
+    constexpr std::string_view WorkingDirectory = R"(C:\src\proj\build)";
+
+    constexpr std::array Shapes {
+        Shape { .what = "a project header", .path = R"(C:\src\proj\inc\a.hpp)", .coverage = Coverage::Keyed },
+        Shape { .what = "a generated header", .path = R"(C:\src\proj\build\gen\Config.hpp)", .coverage = Coverage::Keyed },
+        Shape { .what = "a relative project header", .path = R"(..\inc\rel.hpp)", .coverage = Coverage::Keyed },
+        // Resolves outside both roots, so the key drops it — and the guard keeps
+        // every relative path, which is the backstop issue #64 records for exactly
+        // this: a vendored header move no longer re-keys, and a hit naming the old
+        // path is discarded instead.
+        Shape { .what = "a relative vendored header",
+                .path = R"(..\..\vendor\sdk\include\foo.h)",
+                .coverage = Coverage::Guarded },
+        Shape { .what = "a toolchain header",
+                .path = R"(C:\Program Files\MSVC\include\vector)",
+                .coverage = Coverage::ToolchainStamp },
+        Shape { .what = "a drive-relative header", .path = R"(C:foo\bar.hpp)", .coverage = Coverage::Refused },
+        Shape { .what = "a bare drive specifier", .path = "C:", .coverage = Coverage::Refused },
+    };
+
+    for (auto const& shape: Shapes)
+    {
+        INFO(shape.what << ": " << shape.path);
+        std::vector<std::string> const raw { std::string { shape.path } };
+
+        // The guard reads a stored value's REGIONS, so the path is presented the way
+        // a replayed `/showIncludes` note presents it — through the same parser the
+        // launcher uses, rather than handed to the filter directly.
+        std::vector<TextRegion> const regions { { .grammar = PathCanon::Grammar::ShowIncludes,
+                                                  .bytes = "Note: including file: " + std::string { shape.path } + "\n" } };
+
+        auto const set = Classified(raw, windows, WorkingDirectory);
+
+        // Strongest first: a refusal makes the other questions moot, and a path that
+        // is both keyed and guarded is covered by the one that survives a move. The
+        // refusal is read off the tally, exactly as RunCached reads it.
+        auto const actual = [&] {
+            if (set.Count(PathDisposition::DriveRelative) != 0)
+                return Coverage::Refused;
+            if (!set.keyed.empty())
+                return Coverage::Keyed;
+            if (!ReplayedDependencyPaths(regions, windows).empty())
+                return Coverage::Guarded;
+            return Coverage::ToolchainStamp;
+        }();
+
+        CHECK(actual == shape.coverage);
+    }
 }
