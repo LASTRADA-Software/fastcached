@@ -341,6 +341,32 @@ TEST_CASE("NodeConfig: the worker's registration survives its own parser", "[nod
     }
 }
 
+TEST_CASE("NodeConfig: consensus state may not default to a relative path in a service", "[node][service]")
+{
+    // `fastcache-cluster/<node-id>` is a fine default for a worker an operator
+    // started in a directory they chose. A service has no such directory: the SCM
+    // starts it in C:\Windows\System32 and launchd in /, both writable only by the
+    // privileges this worker is deliberately not given. So the job would register,
+    // report success, and fail to open its own consensus state at every start --
+    // which is the shape refused here rather than at the next boot.
+    auto cfg = Installable();
+    cfg.raftListen = "0.0.0.0:6680";
+    cfg.nodeId = "n1";
+
+    REQUIRE(NodeServiceRejection(cfg).has_value());
+    CHECK(Unwrap(NodeServiceRejection(cfg)).contains("--cluster-dir"));
+
+    // Named, and it is accepted.
+    cfg.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    CHECK(!NodeServiceRejection(cfg).has_value());
+
+    // A worker running no consensus is unaffected: the flag it would need is one
+    // it has no use for.
+    auto plain = Installable();
+    plain.clusterDir.clear();
+    CHECK(!NodeServiceRejection(plain).has_value());
+}
+
 TEST_CASE("NodeConfig: a system-scope job owns the directories it was given", "[node][service]")
 {
     // A system-scope worker runs as an unprivileged account and root created these

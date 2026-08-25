@@ -731,6 +731,12 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
           .message = "--advertise is required to install a service: without it the registration bakes in "
                      "{--bind}:{--port}, and the default 0.0.0.0 is not an address a client can dial. Such a worker "
                      "registers, heartbeats, is leased out, and is never reached -- with no error at either end." },
+        { .refuses = [](NodeConfig const& c) { return !c.raftListen.empty() && c.clusterDir.empty(); },
+          .message = "--listen-raft needs --cluster-dir to install a service: consensus state otherwise lands in "
+                     "`fastcache-cluster/<node-id>` relative to the working directory, and a service does not "
+                     "inherit the installing shell's. It resolves under C:\\Windows\\System32 for the SCM and under "
+                     "/ for launchd -- writable only by the very privileges a worker is deliberately not given, so "
+                     "the job registers and then fails to open its own state at every start." },
     });
 
     for (auto const& rule: Rules)
