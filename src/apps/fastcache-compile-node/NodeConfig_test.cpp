@@ -283,6 +283,26 @@ TEST_CASE("NodeConfig: a system-scope job names an unprivileged account", "[node
     CHECK(spec.serviceAccount != daemonSpec.serviceAccount);
 }
 
+TEST_CASE("NodeConfig: the worker's launchd label is what the packaging removes", "[node][service]")
+{
+    // FASTCACHED_MACOS_NODE_LABEL in the top-level CMakeLists.txt is substituted
+    // into fastcached-uninstall.sh.in, which boots the job out and deletes its
+    // plist. It has to be this string, because the uninstaller also removes the
+    // binary that would otherwise answer for itself -- so a label that drifted
+    // would leave a job bootstrapped against a deleted executable, with nothing
+    // on disk left able to reach it.
+    //
+    // Compared against the PACKAGING's value, compiled in by this target's
+    // CMakeLists, rather than a literal repeated here. A literal would be a third
+    // copy that agrees with the derivation and drifts from the package in
+    // silence, which is the failure this assertion exists to prevent -- the
+    // derivation itself (LaunchdLabelPrefix + the lowercased service name) is
+    // already covered by ServiceControl_test.cpp.
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable());
+
+    CHECK(LaunchdLabel(spec) == std::string_view { FASTCACHED_MACOS_NODE_LABEL });
+}
+
 TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[node][scheduler][policy]")
 {
     // Every rule here describes a configuration that would START SUCCESSFULLY and

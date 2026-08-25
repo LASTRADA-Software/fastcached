@@ -93,6 +93,32 @@ set(FASTCACHED_MACOS_PREFIX "opt/fastcached"
 set(FASTCACHED_MACOS_BUNDLE_ID       "software.lastrada.fastcached")
 set(FASTCACHED_MACOS_SERVICE_ACCOUNT "_fastcached")
 
+# The compile worker's account, and deliberately NOT the daemon's above: a worker
+# runs a compiler on input that arrived over the network while fastcached owns the
+# cache storage, so one shared account would let a compromised compile rewrite
+# every cached object -- the reason packaging/linux/fastcache-compile-node.sysusers
+# declares its own too.
+#
+# Spelled exactly as that sysusers file and as MakeNodeServiceSpec's
+# `.serviceAccount` spell it, rather than following the macOS `_`-prefix
+# convention `_fastcached` does. The prefix's job is to keep the account out of
+# the login window, which `IsHidden 1` already does; what it would cost is a third
+# spelling of one name, across a binary, a package and a unit that never see each
+# other. `ctest -R service-accounts` fails when they drift apart, on every
+# platform -- because the failure mode is macOS-only and silent (issue #87).
+set(FASTCACHED_MACOS_NODE_ACCOUNT    "fastcache-node")
+
+# The worker's launchd label, on the same terms as FASTCACHED_MACOS_BUNDLE_ID
+# above: LaunchdLabelPrefix + the lowercased NodeConfig::serviceName default.
+# The uninstaller needs it because it removes the binary that would otherwise
+# answer for itself, and a job left bootstrapped against a deleted executable is
+# one nothing can reach afterwards. NodeConfig_test.cpp pins the derivation.
+#
+# NOT a package identifier: the installer registers no worker job (it has no
+# scheduler or toolchain to register one with), so no receipt is ever filed under
+# this name. It names only a job an operator installed by hand.
+set(FASTCACHED_MACOS_NODE_LABEL      "software.lastrada.fastcachecompilenode")
+
 # The machine-wide configuration directory. Declared here, not in packaging/,
 # for the same scoping reason as the macOS variables above: packaging/ installs
 # the file into it and src/FastCache/ compiles the very same path into the

@@ -123,6 +123,40 @@ set_tests_properties("test-name-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Service accounts. Fails when the account a binary compiles into its ServiceSpec
+# is not the one the macOS package creates, or is created by no postinstall, or is
+# never removed by the uninstaller.
+# scripts/check-service-accounts.cmake carries the table and the reason each row is
+# in it, and prints the whole table on failure.
+#
+# The failure it guards is silent AND macOS-only: launchd accepts a plist naming a
+# UserName it cannot resolve, bootstraps the job, and simply never spawns it -- so
+# the install-time refusal in ServiceControl.cpp is the only thing standing between
+# an operator and a service that reports installed and never runs. Issue #87 was the
+# other half of that refusal missing: `fastcache-compile-node` named `fastcache-node`
+# and the package created only `_fastcached`.
+#
+# Registered here rather than left to the macOS packaging job precisely because it
+# is macOS-only in effect: a check only one platform can run reports after the
+# mistake has been pushed. This one reads the source tree, so every platform runs it.
+#
+# Not labelled "smoke", for the reason repository-hygiene is not: it starts no
+# daemon, opens no socket and needs no compiler, so it belongs in the default
+# `ctest` set and must survive `ctest -LE smoke`. It finishes in milliseconds, and
+# like net-boundary it has no skip path -- the source tree it reads is present in an
+# exported tarball exactly as it is in a checkout.
+add_test(
+    NAME "service-accounts"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-service-accounts.cmake"
+)
+set_tests_properties("service-accounts" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # Compiler-cache auto-install fallback. Configures the tiny fixture project in
 # compile-cache-fixture/ once per way the fetch can be declined, and requires
 # each one to end in a status message and a clean fall-through.

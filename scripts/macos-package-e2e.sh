@@ -25,9 +25,13 @@
 #                           welcome and read-me panes shipped once, while the
 #                           .txt license looked fine and disguised it.
 #   4. Service runs       — the selected launchd job is registered and serving.
+#   4b. Worker account    — the compile worker's account exists whichever launchd
+#                           choice was made, because the worker's scope has
+#                           nothing to do with fastcached's (issue #87).
 #   5. Config survives    — an edit made after install is still there after a
 #                           reinstall of the same package.
-#   6. Uninstall is total — no files, no job, no PATH entry, no receipts.
+#   6. Uninstall is total — no files, no job, no PATH entry, no receipts, and
+#                           neither account.
 #
 # --scope selects which launchd choice the installer is driven with:
 #
@@ -78,6 +82,14 @@ readonly PREFIX="/opt/fastcached"
 readonly LABEL="software.lastrada.fastcached"
 readonly PATHS_D="/etc/paths.d/fastcached"
 
+# The compile worker's identity, spelled out rather than read from the build tree:
+# this script is handed a .pkg and nothing else, so every expected value here is a
+# literal on purpose -- an assertion that derived its expectation the same way the
+# code under test does would agree with it whatever either said. The matching
+# derivations are pinned cross-platform by `ctest -R service-accounts` and by
+# NodeConfig_test.cpp.
+readonly NODE_ACCOUNT="fastcache-node"
+
 workdir="$(mktemp -d)"
 cleanup() {
     sudo "${PREFIX}/bin/fastcached-uninstall" >/dev/null 2>&1 || true
@@ -108,6 +120,7 @@ payload="$(cd "${workdir}/expanded" && find . -path '*/Payload/*' -type f | sed 
 
 for expected in opt/fastcached/bin/fastcached \
                 opt/fastcached/bin/fastcache-cc \
+                opt/fastcached/bin/fastcache-compile-node \
                 opt/fastcached/bin/fastcached-uninstall \
                 opt/fastcached/etc/fastcached.yaml.default \
                 etc/paths.d/fastcached; do
@@ -201,10 +214,18 @@ echo "== installing (scope: ${scope})"
 install_log="$(sudo installer -pkg "$pkg" -applyChoiceChangesXML "$choices" -target / 2>&1)" \
     || fail "installer failed: $install_log"
 
-[[ -x "${PREFIX}/bin/fastcached" ]]           || fail "no ${PREFIX}/bin/fastcached"
-[[ -x "${PREFIX}/bin/fastcache-cc" ]]         || fail "no ${PREFIX}/bin/fastcache-cc"
-[[ -x "${PREFIX}/bin/fastcached-uninstall" ]] || fail "no uninstaller"
-[[ -f "${PREFIX}/etc/fastcached.yaml" ]]      || fail "postinstall did not seed fastcached.yaml"
+[[ -x "${PREFIX}/bin/fastcached" ]]             || fail "no ${PREFIX}/bin/fastcached"
+[[ -x "${PREFIX}/bin/fastcache-cc" ]]           || fail "no ${PREFIX}/bin/fastcache-cc"
+[[ -x "${PREFIX}/bin/fastcache-compile-node" ]] || fail "no ${PREFIX}/bin/fastcache-compile-node"
+[[ -x "${PREFIX}/bin/fastcached-uninstall" ]]   || fail "no uninstaller"
+[[ -f "${PREFIX}/etc/fastcached.yaml" ]]        || fail "postinstall did not seed fastcached.yaml"
+
+# The worker's account comes from the RUNTIME component, so it must exist
+# whichever launchd choice was made for fastcached -- including the per-user
+# agent, which is the installer's default and has nothing to do with the worker.
+# Asserted before the scope split below for exactly that reason (issue #87).
+dscl . -read "/Users/${NODE_ACCOUNT}" >/dev/null 2>&1 \
+    || fail "postinstall did not create the ${NODE_ACCOUNT} worker account"
 
 grep -qx "${PREFIX}/bin" "$PATHS_D" || fail "$PATHS_D does not name ${PREFIX}/bin"
 
@@ -352,7 +373,11 @@ uninstall_log="$(sudo "${PREFIX}/bin/fastcached-uninstall" 2>&1)" \
 [[ -z "$(pkgutil --pkgs | grep "^${LABEL}" || true)" ]] || fail "package receipts left behind"
 
 # A stale service account is what makes a reinstall pick a *different* uid next
-# time, silently orphaning the state directory it used to own.
-! dscl . -read /Users/_fastcached >/dev/null 2>&1 || fail "_fastcached account left behind"
+# time, silently orphaning the state directory it used to own. Both accounts:
+# the worker's is created by a different component than the daemon's, so a
+# removal that covered only one would leave no trace anybody would look for.
+for account in _fastcached "$NODE_ACCOUNT"; do
+    ! dscl . -read "/Users/${account}" >/dev/null 2>&1 || fail "${account} account left behind"
+done
 
 echo "macOS package E2E: all assertions held"

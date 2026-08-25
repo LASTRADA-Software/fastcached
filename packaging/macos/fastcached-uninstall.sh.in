@@ -9,8 +9,33 @@
 set -u
 
 PREFIX="/@FASTCACHED_MACOS_PREFIX@"
+
+# The PACKAGE identifier, which is what receipts are filed under -- not a launchd
+# label, though the daemon's happens to be the same string. Kept separate from the
+# JOBS table below because the two answer different questions: one is what macOS
+# recorded about this install, the other is what is registered with launchd.
 LABEL="@FASTCACHED_MACOS_BUNDLE_ID@"
-ACCOUNT="@FASTCACHED_MACOS_SERVICE_ACCOUNT@"
+
+# Every launchd job this package can leave behind, one row per line:
+#
+#   <binary under ${PREFIX}/bin>|<launchd label>
+#
+# Two rows, and the second is not hypothetical: the installer registers only
+# fastcached, but it now creates the account that lets an operator run
+# `fastcache-compile-node --install-service --service-scope=system` by hand. This
+# script removes ${PREFIX}, so a worker job left bootstrapped would point at an
+# executable that is gone -- registered, unspawnable, and with nothing left on
+# disk that knows how to remove it.
+JOBS="fastcached|@FASTCACHED_MACOS_BUNDLE_ID@
+fastcache-compile-node|@FASTCACHED_MACOS_NODE_LABEL@"
+
+# Every account the postinstalls create, one per line. A stale account is what
+# makes the next install pick a DIFFERENT uid, silently orphaning the state
+# directory the old one owned -- so removal is as much a part of this package as
+# creation, and `ctest -R service-accounts` fails when one is created and not
+# removed.
+ACCOUNTS="@FASTCACHED_MACOS_SERVICE_ACCOUNT@
+@FASTCACHED_MACOS_NODE_ACCOUNT@"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "fastcached-uninstall: must run as root; try: sudo $0" >&2
@@ -32,39 +57,48 @@ wait_for_job_gone() {
     done
 }
 
-# Deregistration goes through the daemon's own --uninstall-service when the
-# binary is still there, so "how fastcached talks to launchd" keeps one
-# implementation -- the same reason the postinstall drives --install-service.
-# The raw bootout below is the fallback for a broken or already-removed binary.
-if [ -x "${PREFIX}/bin/fastcached" ]; then
-    "${PREFIX}/bin/fastcached" --uninstall-service --service-scope=system >/dev/null 2>&1 || true
-fi
-
-# The system daemon first, then any per-user agent. Both are best-effort: a
-# scope that was never installed is not an error.
-/bin/launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
-wait_for_job_gone "system/${LABEL}"
-rm -f "/Library/LaunchDaemons/${LABEL}.plist" || true
-
-# Agents are per-user, and the installing user is not necessarily the one
-# running this. Walk every home directory that has one.
+# One pass per row of JOBS, so the worker is torn down on exactly the same terms
+# as the daemon rather than by a second copy of this that drifts from it.
 #
-# Both domains, in the same order ServiceControl's own teardown uses. Which one
-# an agent lives in was decided at install time: `gui/<uid>` needs an Aqua
-# session, so one registered over SSH or on a headless machine landed in
-# `user/<uid>` instead. Booting out only `gui/<uid>` left that job running --
-# and still holding 127.0.0.1:6674 -- while the plist below was deleted and
-# ${PREFIX} removed out from under its binary, with nothing left to reach it.
-for plist in /Users/*/Library/LaunchAgents/"${LABEL}".plist; do
-    [ -e "$plist" ] || continue
-    owner=$(/usr/bin/stat -f %Su "$plist" 2>/dev/null) || continue
-    owner_uid=$(/usr/bin/id -u "$owner" 2>/dev/null) || continue
-    for domain in "gui/${owner_uid}" "user/${owner_uid}"; do
-        /bin/launchctl asuser "$owner_uid" /usr/bin/sudo -u "$owner" \
-            /bin/launchctl bootout "${domain}/${LABEL}" >/dev/null 2>&1 || true
-        wait_for_job_gone "${domain}/${LABEL}"
+# IFS is set per-read rather than globally: the '|' split must not apply to the
+# `for plist in` glob below, which would otherwise stop matching a path.
+echo "$JOBS" | while IFS='|' read -r job_binary job_label; do
+    [ -n "$job_label" ] || continue
+
+    # Deregistration goes through the binary's own --uninstall-service when it is
+    # still there, so "how this project talks to launchd" keeps one
+    # implementation -- the same reason the postinstall drives --install-service.
+    # The raw bootout below is the fallback for a broken or already-removed binary.
+    if [ -x "${PREFIX}/bin/${job_binary}" ]; then
+        "${PREFIX}/bin/${job_binary}" --uninstall-service --service-scope=system >/dev/null 2>&1 || true
+    fi
+
+    # The system job first, then any per-user agent. Both are best-effort: a
+    # scope that was never installed is not an error.
+    /bin/launchctl bootout "system/${job_label}" >/dev/null 2>&1 || true
+    wait_for_job_gone "system/${job_label}"
+    rm -f "/Library/LaunchDaemons/${job_label}.plist" || true
+
+    # Agents are per-user, and the installing user is not necessarily the one
+    # running this. Walk every home directory that has one.
+    #
+    # Both domains, in the same order ServiceControl's own teardown uses. Which one
+    # an agent lives in was decided at install time: `gui/<uid>` needs an Aqua
+    # session, so one registered over SSH or on a headless machine landed in
+    # `user/<uid>` instead. Booting out only `gui/<uid>` left that job running --
+    # and still holding 127.0.0.1:6674 -- while the plist below was deleted and
+    # ${PREFIX} removed out from under its binary, with nothing left to reach it.
+    for plist in /Users/*/Library/LaunchAgents/"${job_label}".plist; do
+        [ -e "$plist" ] || continue
+        owner=$(/usr/bin/stat -f %Su "$plist" 2>/dev/null) || continue
+        owner_uid=$(/usr/bin/id -u "$owner" 2>/dev/null) || continue
+        for domain in "gui/${owner_uid}" "user/${owner_uid}"; do
+            /bin/launchctl asuser "$owner_uid" /usr/bin/sudo -u "$owner" \
+                /bin/launchctl bootout "${domain}/${job_label}" >/dev/null 2>&1 || true
+            wait_for_job_gone "${domain}/${job_label}"
+        done
+        rm -f "$plist" || true
     done
-    rm -f "$plist" || true
 done
 
 # --- PATH integration ----------------------------------------------------
@@ -87,11 +121,14 @@ if [ -d "$PREFIX" ] && [ ! -L "$PREFIX" ]; then
     rm -rf "$PREFIX" || true
 fi
 
-# --- service account -----------------------------------------------------
-if /usr/bin/dscl . -read "/Users/${ACCOUNT}" >/dev/null 2>&1; then
-    /usr/bin/dscl . -delete "/Users/${ACCOUNT}" >/dev/null 2>&1 || true
-    /usr/bin/dscl . -delete "/Groups/${ACCOUNT}" >/dev/null 2>&1 || true
-fi
+# --- service accounts ----------------------------------------------------
+echo "$ACCOUNTS" | while read -r account; do
+    [ -n "$account" ] || continue
+    if /usr/bin/dscl . -read "/Users/${account}" >/dev/null 2>&1; then
+        /usr/bin/dscl . -delete "/Users/${account}" >/dev/null 2>&1 || true
+        /usr/bin/dscl . -delete "/Groups/${account}" >/dev/null 2>&1 || true
+    fi
+done
 
 # --- receipts ------------------------------------------------------------
 # Last, so a failure above still leaves the receipts to diagnose from.
