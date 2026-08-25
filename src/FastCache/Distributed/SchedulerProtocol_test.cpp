@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
@@ -8,6 +9,7 @@
 
 #include <array>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -354,4 +356,173 @@ TEST_CASE("A heartbeat's load reaches the registry and changes what is picked", 
     CHECK(ErrorOf(refused) == Wire::ErrorCode::Withdrawn);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchLeasesWithdrawn) == 1);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchLeasesNoCapacity) == 0);
+}
+
+TEST_CASE("The two halves of the cache-capacity mapping agree", "[distributed][scheduler][protocol][cache]")
+{
+    // The transposition hazard here is of a different kind from cores and memory:
+    // the wire carries tiers by POSITION, because the wire header is compiled into
+    // `fastcache-cc` and cannot see `StorageTier`. Nothing but these two functions
+    // knows that index 1 is the disk tier, so a swap between them decodes perfectly
+    // and reports a node's RAM budget as its disk budget. A distinct value per tier
+    // is what makes such a swap visible at all.
+    NodeCacheCapacity original {};
+    original.tierBytesLimit[static_cast<std::size_t>(StorageTier::Memory)] = 256ULL << 20;
+    original.tierBytesLimit[static_cast<std::size_t>(StorageTier::Disk)] = 40ULL << 30;
+
+    auto const back = CacheCapacityFromWire(CacheCapacityToWire(original));
+    CHECK(back.tierBytesLimit == original.tierBytesLimit);
+    CHECK(back.tierBytesLimit[static_cast<std::size_t>(StorageTier::Memory)] == 256ULL << 20);
+    CHECK(back.tierBytesLimit[static_cast<std::size_t>(StorageTier::Disk)] == 40ULL << 30);
+}
+
+TEST_CASE("A node with no disk tier does not grow one on the wire", "[distributed][scheduler][protocol][cache]")
+{
+    // Absent is not zero, and a memory-only node is the default deployment. A disk
+    // budget of zero would be read as "on disk, unbounded", which is the opposite of
+    // what such a node is doing.
+    NodeCacheCapacity memoryOnly {};
+    memoryOnly.tierBytesLimit[static_cast<std::size_t>(StorageTier::Memory)] = 1024;
+
+    auto const back = CacheCapacityFromWire(CacheCapacityToWire(memoryOnly));
+    CHECK(back.tierBytesLimit[static_cast<std::size_t>(StorageTier::Memory)].has_value());
+    CHECK_FALSE(back.tierBytesLimit[static_cast<std::size_t>(StorageTier::Disk)].has_value());
+
+    // And a node with no cache at all stays that way through both directions.
+    auto const none = CacheCapacityFromWire(CacheCapacityToWire(NodeCacheCapacity {}));
+    for (auto const& tier: none.tierBytesLimit)
+        CHECK_FALSE(tier.has_value());
+}
+
+TEST_CASE("A configured-but-unbounded tier is not the same as no tier", "[distributed][scheduler][protocol][cache]")
+{
+    // The pair the optional exists to keep apart. A tier configured with no ceiling
+    // reports a budget of zero, which reads as "unbounded"; a node without that tier
+    // reports nothing at all. Flattening either into the other has a dashboard
+    // stating a fact the fleet never sent.
+    NodeCacheCapacity unbounded {};
+    unbounded.tierBytesLimit[static_cast<std::size_t>(StorageTier::Disk)] = 0;
+
+    auto const back = CacheCapacityFromWire(CacheCapacityToWire(unbounded));
+    REQUIRE(back.tierBytesLimit[static_cast<std::size_t>(StorageTier::Disk)].has_value());
+    CHECK(Unwrap(back.tierBytesLimit[static_cast<std::size_t>(StorageTier::Disk)]) == 0);
+    CHECK_FALSE(back.tierBytesLimit[static_cast<std::size_t>(StorageTier::Memory)].has_value());
+}
+
+TEST_CASE("The two halves of the cache-load mapping agree", "[distributed][scheduler][protocol][cache]")
+{
+    // Every value distinct across both tiers and all three fields, for the reason the
+    // capacity case gives: three same-width numbers per tier make a transposition
+    // decode perfectly.
+    NodeCacheLoad original {};
+    original.tiers[static_cast<std::size_t>(StorageTier::Memory)] =
+        CacheTierUsage { .itemCount = 11, .bytesUsed = 22, .evictions = 33 };
+    original.tiers[static_cast<std::size_t>(StorageTier::Disk)] =
+        CacheTierUsage { .itemCount = 44, .bytesUsed = 55, .evictions = 66 };
+    original.hits = 77;
+    original.misses = 88;
+
+    auto const back = CacheLoadFromWire(CacheLoadToWire(original));
+    auto const& memory = back.tiers[static_cast<std::size_t>(StorageTier::Memory)];
+    auto const& disk = back.tiers[static_cast<std::size_t>(StorageTier::Disk)];
+    REQUIRE(memory.has_value());
+    REQUIRE(disk.has_value());
+    CHECK(Unwrap(memory).itemCount == 11);
+    CHECK(Unwrap(memory).bytesUsed == 22);
+    CHECK(Unwrap(memory).evictions == 33);
+    CHECK(Unwrap(disk).itemCount == 44);
+    CHECK(Unwrap(disk).bytesUsed == 55);
+    CHECK(Unwrap(disk).evictions == 66);
+    CHECK(back.hits == 77);
+    CHECK(back.misses == 88);
+}
+
+TEST_CASE("A node that will not state its hit rate is not a node with no hits", "[distributed][scheduler][protocol][cache]")
+{
+    NodeCacheLoad quiet {};
+    quiet.tiers[static_cast<std::size_t>(StorageTier::Memory)] = CacheTierUsage { .itemCount = 5 };
+
+    auto const back = CacheLoadFromWire(CacheLoadToWire(quiet));
+    CHECK_FALSE(back.hits.has_value());
+    CHECK_FALSE(back.misses.has_value());
+    auto const& memory = back.tiers[static_cast<std::size_t>(StorageTier::Memory)];
+    REQUIRE(memory.has_value());
+    CHECK(Unwrap(memory).itemCount == 5);
+}
+
+TEST_CASE("The cache facts cross the wire inside REGISTER and HEARTBEAT", "[distributed][scheduler][protocol][cache]")
+{
+    // End to end through the framing rather than against the mappings alone. Every
+    // layer between the node and the registry could drop this in silence -- the
+    // encoder, the decoder, the nesting, the assignment into WorkerInfo -- and the
+    // symptom would be a leader reporting that no member has a cache, which is
+    // indistinguishable from a fleet of nodes that genuinely have none.
+    Fixture fixture;
+
+    NodeCacheCapacity budget {};
+    budget.tierBytesLimit[static_cast<std::size_t>(StorageTier::Memory)] = 256ULL << 20;
+    budget.tierBytesLimit[static_cast<std::size_t>(StorageTier::Disk)] = 8ULL << 30;
+
+    auto const registerFrame = Wire::EncodeRegister(
+        Wire::RegisterRequest { .fingerprint = "gcc-14",
+                                .endpoint = "10.0.0.2:7100",
+                                .slots = 0,
+                                .acceptedCodecs = {},
+                                .capacity = Wire::CapacityFields { .logicalCores = 8,
+                                                                   .totalMemoryBytes = 64ULL << 30,
+                                                                   .nodeClassRaw = 0,
+                                                                   .reservedCores = std::nullopt,
+                                                                   .cache = CacheCapacityToWire(budget) } });
+    REQUIRE(StatusOf(fixture.protocol.Answer(registerFrame, Insider)) == Wire::Status::Ok);
+
+    auto const registered = fixture.service.Workers().LiveWorkers();
+    REQUIRE(registered.size() == 1);
+    CHECK(registered[0].capacity.cache.tierBytesLimit == budget.tierBytesLimit);
+
+    NodeCacheLoad usage {};
+    usage.tiers[static_cast<std::size_t>(StorageTier::Memory)] =
+        CacheTierUsage { .itemCount = 900, .bytesUsed = 100ULL << 20, .evictions = 12 };
+    usage.hits = 4000;
+    usage.misses = 100;
+
+    auto const heartbeat = Wire::EncodeHeartbeat(
+        std::string { registered[0].id },
+        0,
+        Wire::LoadFields {
+            .cpuBusyPermille = 100, .availableMemoryBytes = 1, .freeScratchBytes = 2, .cache = CacheLoadToWire(usage) });
+    REQUIRE(StatusOf(fixture.protocol.Answer(heartbeat, Insider)) == Wire::Status::Ok);
+
+    auto const beating = fixture.service.Workers().LiveWorkers();
+    REQUIRE(beating.size() == 1);
+    auto const& memory = beating[0].load.cache.tiers[static_cast<std::size_t>(StorageTier::Memory)];
+    REQUIRE(memory.has_value());
+    CHECK(Unwrap(memory).itemCount == 900);
+    CHECK(beating[0].load.cache.hits == 4000);
+    CHECK(beating[0].load.cache.misses == 100);
+    // The budget is a REGISTRATION fact and survives a heartbeat that says nothing
+    // about it, which is the reason it does not travel on every one.
+    CHECK(beating[0].capacity.cache.tierBytesLimit == budget.tierBytesLimit);
+}
+
+TEST_CASE("A peer that predates the cache record still registers", "[distributed][scheduler][protocol][cache]")
+{
+    // The property the nesting exists for. An older node sends a capacity record of
+    // four fields and a load record of three; both must be accepted with the cache
+    // left at "did not say" rather than refused, or a fleet mid-upgrade stops
+    // distributing anything at all.
+    Fixture fixture;
+
+    auto const frame = Wire::EncodeRegister(Wire::RegisterRequest {
+        .fingerprint = "gcc-14",
+        .endpoint = "10.0.0.9:7100",
+        .slots = 0,
+        .acceptedCodecs = {},
+        .capacity = Wire::CapacityFields {
+            .logicalCores = 4, .totalMemoryBytes = 8ULL << 30, .nodeClassRaw = 0, .reservedCores = std::nullopt } });
+    REQUIRE(StatusOf(fixture.protocol.Answer(frame, Insider)) == Wire::Status::Ok);
+
+    auto const live = fixture.service.Workers().LiveWorkers();
+    REQUIRE(live.size() == 1);
+    for (auto const& tier: live[0].capacity.cache.tierBytesLimit)
+        CHECK_FALSE(tier.has_value());
 }

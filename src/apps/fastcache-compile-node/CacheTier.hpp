@@ -8,8 +8,10 @@
 #include "Responders.hpp"
 
 #include <FastCache/Cache/IStorage.hpp>
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <expected>
@@ -122,6 +124,32 @@ class CacheTier
     CacheResponder _responder;
     std::unique_ptr<FrameEndpoint> _endpoint;
 };
+
+/// What @p tier is configured to hold, in the vocabulary the fleet speaks.
+///
+/// Read off the tier that was actually built rather than off the configuration
+/// that asked for it, and the difference is the point: `--listen-cache` may have
+/// been taken, `--cache-memory 0` may have turned the memory half off, and a
+/// node that announced a budget it does not have would have the leader reporting
+/// a cache that is not there.
+///
+/// A registration fact, because a budget does not move while the process runs.
+/// @param tier The node's cache, or null when it has none.
+/// @return The per-tier budgets; every tier absent when @p tier is null.
+[[nodiscard]] Distributed::NodeCacheCapacity CacheCapacityOf(CacheTier const* tier);
+
+/// What @p tier holds right now, in the vocabulary the fleet speaks.
+///
+/// A heartbeat fact. The hit/miss split comes from the sink rather than from the
+/// storage, and deliberately: `LocalCache` counts a hit when it serves from this
+/// node's tier and a miss when it has to reach the shared cache, which is the
+/// question an operator is asking. The storage's own `getHits` counts something
+/// narrower -- reads of one tier -- and a lower tier is only consulted when the
+/// one above it missed, so those do not add up to the node's.
+/// @param tier The node's cache, or null when it has none.
+/// @param metrics Where `LocalCache` counted its hits and misses.
+/// @return What the cache holds; every tier absent when @p tier is null.
+[[nodiscard]] Distributed::NodeCacheLoad CacheLoadOf(CacheTier const* tier, IMetricsSink const& metrics);
 
 /// Start the node's cache tier, or explain why the node must not start at all.
 ///

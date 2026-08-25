@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Distributed/NodeLoadTestUtils.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
@@ -6,11 +7,16 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cstddef>
+#include <optional>
 #include <string>
+
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Distributed;
 using namespace FastCache::Distributed::Testing;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -358,4 +364,130 @@ TEST_CASE("A fleet that is unavailable is a different refusal from one that is s
         REQUIRE_FALSE(picked.has_value());
         CHECK(picked.error() == PickError::Withdrawn);
     }
+}
+
+TEST_CASE("One machine serving two toolchains is one node's cache", "[distributed][registry][cache]")
+{
+    // The registry keys on (fingerprint, endpoint), so a node started with two
+    // `--toolchain` flags is two entries against one machine -- deliberately, and
+    // documented at the node. Both heartbeat the SAME cache figures, because a cache
+    // is per node and not per toolchain. So anything summing a cache field across
+    // `LiveWorkers()` counts one node's objects and bytes twice, which on a fleet
+    // page reads as a cache holding double what it holds.
+    Fixture fixture;
+
+    NodeCacheCapacity budget {};
+    budget.tierBytesLimit[static_cast<std::size_t>(StorageTier::Memory)] = 256ULL << 20;
+    auto announce = Announce("gcc-14", "10.0.0.2:7100", 4);
+    announce.capacity.cache = budget;
+
+    auto const gcc = fixture.registry.Register(announce);
+    announce.fingerprint = "clang-20";
+    auto const clang = fixture.registry.Register(announce);
+    CHECK(gcc != clang);
+    CHECK(fixture.registry.LiveWorkers().size() == 2);
+
+    NodeLoad load {};
+    load.cache.tiers[static_cast<std::size_t>(StorageTier::Memory)] =
+        CacheTierUsage { .itemCount = 900, .bytesUsed = 100ULL << 20, .evictions = 3 };
+    load.cache.hits = 4000;
+    load.cache.misses = 100;
+    CHECK(fixture.registry.Heartbeat(gcc, load));
+    CHECK(fixture.registry.Heartbeat(clang, load));
+
+    auto const caches = fixture.registry.NodeCaches();
+    REQUIRE(caches.size() == 1);
+    CHECK(caches[0].endpoint == "10.0.0.2:7100");
+    auto const& memory = caches[0].load.tiers[static_cast<std::size_t>(StorageTier::Memory)];
+    REQUIRE(memory.has_value());
+    // 900 and not 1800, which is the whole point.
+    CHECK(Unwrap(memory).itemCount == 900);
+    CHECK(Unwrap(memory).bytesUsed == 100ULL << 20);
+    CHECK(caches[0].load.hits == 4000);
+    CHECK(caches[0].capacity.tierBytesLimit == budget.tierBytesLimit);
+}
+
+TEST_CASE("Two machines are two node caches", "[distributed][registry][cache]")
+{
+    // The other direction, so the dedup above cannot pass by collapsing everything:
+    // different endpoints are different nodes, whatever toolchains they serve.
+    Fixture fixture;
+    (void) fixture.registry.Register(Announce("gcc-14", "10.0.0.2:7100", 4));
+    (void) fixture.registry.Register(Announce("gcc-14", "10.0.0.3:7100", 4));
+
+    auto const caches = fixture.registry.NodeCaches();
+    REQUIRE(caches.size() == 2);
+    // Ordered by endpoint, so a snapshot is reproducible -- the property
+    // `LiveWorkers()` sorts for, applied to the key this view groups on.
+    CHECK(caches[0].endpoint == "10.0.0.2:7100");
+    CHECK(caches[1].endpoint == "10.0.0.3:7100");
+}
+
+TEST_CASE("A node that stopped heartbeating stops reporting a cache", "[distributed][registry][cache]")
+{
+    // A stale figure is worse than none: an operator reading a fleet page cannot
+    // tell "this node holds 900 objects" from "this node held 900 objects when it
+    // was last heard from, an hour ago".
+    Fixture fixture;
+    (void) fixture.registry.Register(Announce("gcc-14", "10.0.0.2:7100", 4));
+    CHECK(fixture.registry.NodeCaches().size() == 1);
+
+    fixture.clock.Advance(std::chrono::milliseconds { 2000 });
+    CHECK(fixture.registry.NodeCaches().empty());
+}
+
+TEST_CASE("A node with no cache reports no tiers rather than empty ones", "[distributed][registry][cache]")
+{
+    // Absent all the way through. A node running with `--cache-memory 0` and no
+    // `--cache-dir` has no cache at all, and a leader drawing zeroes for it would
+    // show a member whose cache is doing nothing -- a different claim, and one an
+    // operator would act on.
+    Fixture fixture;
+    (void) fixture.registry.Register(Announce("gcc-14", "10.0.0.2:7100", 4));
+
+    auto const caches = fixture.registry.NodeCaches();
+    REQUIRE(caches.size() == 1);
+    for (auto const& tier: caches[0].capacity.tierBytesLimit)
+        CHECK_FALSE(tier.has_value());
+    for (auto const& tier: caches[0].load.tiers)
+        CHECK_FALSE(tier.has_value());
+    CHECK_FALSE(caches[0].load.hits.has_value());
+}
+
+TEST_CASE("A sibling that just re-registered does not blank the node's cache", "[distributed][registry][cache]")
+{
+    // The entries of one node do NOT always agree, which is why picking between
+    // them arbitrarily is wrong. `Register` clears a worker's load -- a
+    // re-registering worker has restarted, so what it last reported is a reading
+    // from before that -- so a node whose gcc entry has just re-registered holds
+    // nothing there while its clang entry still holds last round's figures.
+    //
+    // Choosing the empty one reports that node as having no cache until the next
+    // heartbeat, and "no cache" is a claim an operator acts on. Worse, which entry
+    // got chosen depended on an unordered_map's iteration order, so it would have
+    // been intermittent.
+    Fixture fixture;
+    auto announce = Announce("gcc-14", "10.0.0.2:7100", 4);
+    auto const gcc = fixture.registry.Register(announce);
+    announce.fingerprint = "clang-20";
+    auto const clang = fixture.registry.Register(announce);
+
+    NodeLoad load {};
+    load.cache.tiers[static_cast<std::size_t>(StorageTier::Memory)] = CacheTierUsage { .itemCount = 900 };
+    load.cache.hits = 4000;
+    CHECK(fixture.registry.Heartbeat(gcc, load));
+    CHECK(fixture.registry.Heartbeat(clang, load));
+
+    // One entry re-registers, and its load is reset. It is also now the most
+    // recently seen, so "newest wins" alone would pick exactly the wrong one.
+    fixture.clock.Advance(std::chrono::milliseconds { 10 });
+    announce.fingerprint = "gcc-14";
+    CHECK(fixture.registry.Register(announce) == gcc);
+
+    auto const caches = fixture.registry.NodeCaches();
+    REQUIRE(caches.size() == 1);
+    auto const& memory = caches[0].load.tiers[static_cast<std::size_t>(StorageTier::Memory)];
+    REQUIRE(memory.has_value());
+    CHECK(Unwrap(memory).itemCount == 900);
+    CHECK(caches[0].load.hits == 4000);
 }

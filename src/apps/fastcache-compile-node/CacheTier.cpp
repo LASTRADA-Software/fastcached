@@ -202,6 +202,52 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
     return tier;
 }
 
+Distributed::NodeCacheCapacity CacheCapacityOf(CacheTier const* tier)
+{
+    Distributed::NodeCacheCapacity out {};
+    if (tier == nullptr)
+        return out;
+
+    auto const tiers = tier->SnapshotTiers();
+    for (auto const& row: StorageTierTable)
+    {
+        auto const index = static_cast<std::size_t>(row.tier);
+        // Bound to a reference before it is tested, rather than subscripted again
+        // after it: `bugprone-unchecked-optional-access` can follow the guard only
+        // on the same expression, and with `WarningsAsErrors` a second subscript is
+        // a build failure rather than a note.
+        auto const& stats = tiers[index];
+        if (stats.has_value())
+            out.tierBytesLimit[index] = static_cast<std::uint64_t>(stats->bytesLimit);
+    }
+    return out;
+}
+
+Distributed::NodeCacheLoad CacheLoadOf(CacheTier const* tier, IMetricsSink const& metrics)
+{
+    Distributed::NodeCacheLoad out {};
+    if (tier == nullptr)
+        // Absent, not zero, and all the way down: a node with no cache must not
+        // report an empty one, which is what a leader would draw as a member whose
+        // cache is doing nothing.
+        return out;
+
+    auto const tiers = tier->SnapshotTiers();
+    for (auto const& row: StorageTierTable)
+    {
+        auto const index = static_cast<std::size_t>(row.tier);
+        auto const& stats = tiers[index];
+        if (!stats.has_value())
+            continue;
+        out.tiers[index] = Distributed::CacheTierUsage { .itemCount = static_cast<std::uint64_t>(stats->itemCount),
+                                                         .bytesUsed = static_cast<std::uint64_t>(stats->bytesUsed),
+                                                         .evictions = stats->evictions };
+    }
+    out.hits = metrics.Read(IMetricsSink::Counter::NodeCacheHits);
+    out.misses = metrics.Read(IMetricsSink::Counter::NodeCacheMisses);
+    return out;
+}
+
 std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
     NodeIoLoop& io,
     NodeConfig const& cfg,

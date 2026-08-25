@@ -608,11 +608,22 @@ constexpr int ExitOk = 0;
     // entries report themselves busy together and the scheduler stops picking any
     // of them. The pool behaves as one because the number it reports describes
     // the machine rather than the entry.
+    //
+    // The capacity they announce is the machine facts PLUS what the cache tier
+    // actually became, and the second half is read off the tier rather than off
+    // the configuration that asked for it. `--listen-cache` may have been taken and
+    // `--cache-memory 0` may have turned the memory half off, so a node announcing
+    // the budget it was configured with would have the leader reporting a cache
+    // that is not there. It cannot be folded into `capacity` above either: that one
+    // is what `slots` was derived from, and the tier does not exist at that point.
+    auto advertised = capacity;
+    advertised.cache = Node::CacheCapacityOf(cacheTier.get());
+
     std::vector<Cc::WorkerRegistrar> registrars;
     registrars.reserve(toolchains.size());
     for (auto const& [fingerprint, compiler]: toolchains)
         registrars.emplace_back(
-            fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, Distributed::CapacityToWire(capacity));
+            fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, Distributed::CapacityToWire(advertised));
 
     // One sampler for the whole loop, not one per heartbeat. CPU utilization is a
     // difference between two readings, so a sampler constructed per iteration would
@@ -655,11 +666,18 @@ constexpr int ExitOk = 0;
                 // report several different views of one host and, worse, would cut
                 // the CPU interval into pieces too short to mean anything.
                 auto const sampled = loadSampler->Sample();
+                // The cache is sampled here too, and per ROUND rather than per
+                // registrar for the same reason: a node with two `--toolchain`
+                // flags is two registry entries against one machine and one cache,
+                // so both entries carry the same figures. Summing them across
+                // entries counts that cache twice, which is what
+                // `WorkerRegistry::NodeCaches()` exists to prevent on the other end.
                 auto const load =
                     Distributed::LoadToWire(Distributed::NodeLoad { .inFlight = inFlight,
                                                                     .cpuBusyPermille = sampled.cpuBusyPermille,
                                                                     .availableMemoryBytes = sampled.availableMemoryBytes,
-                                                                    .freeScratchBytes = sampled.freeScratchBytes });
+                                                                    .freeScratchBytes = sampled.freeScratchBytes,
+                                                                    .cache = Node::CacheLoadOf(cacheTier.get(), metrics) });
 
                 for (auto& registrar: registrars)
                 {
