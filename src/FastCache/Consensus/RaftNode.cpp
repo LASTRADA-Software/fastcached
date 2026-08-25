@@ -163,6 +163,59 @@ void RaftNode::NoteLeaderContact(TimePoint now)
     ArmElectionTimer(now);
 }
 
+void RaftNode::NoteFollowerContact(NodeId const& follower, TimePoint now)
+{
+    _followerContact[follower] = now;
+}
+
+bool RaftNode::HasQuorumContact(TimePoint now) const
+{
+    // Itself, but only while it IS a member -- the carve-out `AdvanceCommitIndex`
+    // makes, for the same reason: a leader that has been removed must not count
+    // itself toward a quorum of the set it is no longer in. Erring toward "no
+    // quorum" is also the safe direction here, since it only ever makes this node
+    // readier to let somebody else stand.
+    auto live = IsMember(_config.self) ? std::size_t { 1 } : std::size_t { 0 };
+
+    // Over the peers rather than over the map, so an entry left by a member that
+    // has since been removed cannot be counted.
+    for (auto const& peer: _peers)
+    {
+        // The same window and the same strict `<` as the other branch of
+        // `HasLiveLeader`, which is where that choice is argued.
+        auto const found = _followerContact.find(peer);
+        if (found != _followerContact.end() && now - found->second < _config.electionTimeoutMin)
+            ++live;
+    }
+
+    return live >= Quorum();
+}
+
+bool RaftNode::HasLiveLeader(TimePoint now) const
+{
+    // The window is `electionTimeoutMin` on both branches, and on neither is it
+    // this node's own randomized deadline: "is there a live leader" is a fact
+    // about the cluster, and every node should answer it the same way at the same
+    // instant, which a per-node jittered value does not.
+    //
+    // A leader is one, so it answers from its own quorum. Reading
+    // `_lastLeaderContact` here would consult contact from a *previous* term's
+    // leader, which says nothing about whether this term has one.
+    if (_role == Role::Leader)
+        return HasQuorumContact(now);
+
+    // Asked of `_lastLeaderContact` and **not** of `_electionDeadline`, which is
+    // the shorter spelling and the one this started as. That deadline is re-armed
+    // when this node begins its own pre-vote round, so a node that just started
+    // campaigning answers "yes, recently" for a full timeout and refuses every
+    // peer asking the same question at the same moment. That is the ordinary case
+    // in a cluster whose nodes time out together, and it cost a five-node cluster
+    // some forty election rounds to elect anyone -- slow enough to read as a
+    // livelock, and fast enough to pass wherever the draw sequence happened to
+    // stagger the timeouts.
+    return _lastLeaderContact.has_value() && now - *_lastLeaderContact < _config.electionTimeoutMin;
+}
+
 void RaftNode::ArmElectionTimer(TimePoint now)
 {
     auto const low = static_cast<std::uint64_t>(_config.electionTimeoutMin.count());
@@ -376,6 +429,7 @@ void RaftNode::ApplyCommitted(RaftOutput& output)
         _preVotesGranted.clear();
         _nextIndex.clear();
         _matchIndex.clear();
+        _followerContact.clear();
     }
 }
 
@@ -419,6 +473,7 @@ void RaftNode::AdoptMembers(std::vector<NodeId> members)
     // a quorum it is not part of.
     std::erase_if(_nextIndex, [this](auto const& entry) { return !IsMember(entry.first); });
     std::erase_if(_matchIndex, [this](auto const& entry) { return !IsMember(entry.first); });
+    std::erase_if(_followerContact, [this](auto const& entry) { return !IsMember(entry.first); });
     std::erase_if(_votesGranted, [this](NodeId const& id) { return !IsMember(id); });
     std::erase_if(_preVotesGranted, [this](NodeId const& id) { return !IsMember(id); });
 }
@@ -487,13 +542,15 @@ void RaftNode::StepDown(Term term, TimePoint now, RaftOutput& output)
     _role = Role::Follower;
     _votesGranted.clear();
 
-    // Per-follower progress is a leader's bookkeeping about a term it no longer
-    // leads. Keeping it would let a re-elected node resume from stale guesses
-    // about logs that have moved on since. `_commitIndex` and `_lastApplied` are
-    // deliberately NOT reset: they record what is already committed cluster-wide,
-    // which no change of leadership can un-decide.
+    // Per-follower bookkeeping is a leader's record of a term it no longer leads.
+    // Keeping the progress would let a re-elected node resume from stale guesses
+    // about logs that have moved on since, and keeping the contact would let it
+    // claim a quorum on answers to a term that is over. `_commitIndex` and
+    // `_lastApplied` are deliberately NOT reset: they record what is already
+    // committed cluster-wide, which no change of leadership can un-decide.
     _nextIndex.clear();
     _matchIndex.clear();
+    _followerContact.clear();
 
     if (wasLeader)
         ArmElectionTimer(now);
@@ -586,6 +643,27 @@ void RaftNode::BecomeLeader(TimePoint now, RaftOutput& output)
         _nextIndex[peer] = _log.LastIndex().Advanced(1);
         _matchIndex[peer] = LogIndex::BeforeFirst();
     }
+
+    // Winning an election IS contact from a quorum: those votes were cast just
+    // now. Seeded from the voters rather than from `_peers`, because only the
+    // former actually spoke -- and cleared first, so contact from a leadership
+    // this node has already lost and regained cannot be mistaken for contact with
+    // this one. Without the seed a new leader answers "I have no quorum" until
+    // its first heartbeat comes back, and grants pre-votes for that round trip at
+    // the moment the cluster is least able to afford another election.
+    //
+    // Every voter is stamped with `now` rather than with the instant its own vote
+    // landed, which overstates liveness by however long the election took. That
+    // is deliberate: what is true at this instant is that a majority endorsed
+    // this node for this term, which is a fact about the quorum rather than about
+    // any one vote. Recording arrival times individually would mean making
+    // `_votesGranted` a map to buy back a skew bounded by one round trip -- and
+    // Raft already requires that to be far below `electionTimeoutMin` -- which
+    // the first heartbeat then corrects anyway.
+    _followerContact.clear();
+    for (auto const& voter: _votesGranted)
+        if (voter != _config.self)
+            _followerContact[voter] = now;
 
     // A no-op of this leader's own term, and it is the companion to the §5.4.2
     // guard rather than a nicety. That guard refuses to commit an earlier term's
@@ -839,10 +917,16 @@ void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoin
     reply(AppendResult::Accepted, request.lastIncludedIndex);
 }
 
-void RaftNode::OnInstallSnapshotResponse(InstallSnapshotResponse const& response, TimePoint /*now*/, RaftOutput& output)
+void RaftNode::OnInstallSnapshotResponse(InstallSnapshotResponse const& response, TimePoint now, RaftOutput& output)
 {
     if (_role != Role::Leader || response.term != _currentTerm || !IsMember(response.followerId))
         return;
+
+    // By the rule an AppendEntries response follows, and ahead of the same
+    // branch: a follower being caught up by snapshot answers on this message and
+    // no other, so a leader counting only AppendEntries would lose the quorum it
+    // is repairing.
+    NoteFollowerContact(response.followerId, now);
 
     if (response.result != AppendResult::Accepted)
         return;
@@ -880,26 +964,17 @@ void RaftNode::OnPreVote(PreVoteRequest const& request, TimePoint now, RaftOutpu
     }
 
     // The one condition beyond the log check, and the one that does the work:
-    // this node must not have heard from a leader recently. A cluster with a
-    // healthy leader refuses every pre-vote, so a partitioned node gets no
-    // quorum, never increments its term, and cannot disturb anything when it
-    // returns.
+    // there must not be a live leader. A cluster with a healthy leader refuses
+    // every pre-vote, so a partitioned node gets no quorum, never increments its
+    // term, and cannot disturb anything when it returns.
     //
-    // Asked of `_lastLeaderContact` and **not** of `_electionDeadline`, which is
-    // the shorter spelling and the one this started as. That deadline is re-armed
-    // when this node begins its own pre-vote round, so a node that just started
-    // campaigning answers "yes, recently" for a full timeout and refuses every
-    // peer asking the same question at the same moment. That is the ordinary case
-    // in a cluster whose nodes time out together, and it cost a five-node cluster
-    // some forty election rounds to elect anyone -- slow enough to read as a
-    // livelock, and fast enough to pass wherever the draw sequence happened to
-    // stagger the timeouts.
-    //
-    // The window is `electionTimeoutMin` rather than this node's own randomized
-    // deadline: "is there a live leader" is a fact about the cluster, and every
-    // node should answer it the same way at the same instant, which a per-node
-    // jittered value does not.
-    if (_lastLeaderContact.has_value() && now - *_lastLeaderContact < _config.electionTimeoutMin)
+    // `HasLiveLeader` is where the two roles' evidence for that lives, and the
+    // split is not a refinement: a leader reading the follower's field granted
+    // every challenger it was asked about, because a leader never hears from a
+    // leader. It is also the whole safety argument for refusing here at all --
+    // refusing without checking whether a majority still answers would leave a
+    // partitioned leader vetoing its own replacement forever.
+    if (HasLiveLeader(now))
     {
         reply(VoteDecision::Denied);
         return;
@@ -1084,7 +1159,7 @@ void RaftNode::OnAppendEntries(AppendEntriesRequest const& request, TimePoint no
     ApplyCommitted(output);
 }
 
-void RaftNode::OnAppendEntriesResponse(AppendEntriesResponse const& response, TimePoint /*now*/, RaftOutput& output)
+void RaftNode::OnAppendEntriesResponse(AppendEntriesResponse const& response, TimePoint now, RaftOutput& output)
 {
     // The §5.1 term check in `Receive` has already demoted this node if the
     // responder knew a higher term. What is left matters only to a leader still
@@ -1092,6 +1167,10 @@ void RaftNode::OnAppendEntriesResponse(AppendEntriesResponse const& response, Ti
     // nothing about this one.
     if (_role != Role::Leader || response.term != _currentTerm || !IsMember(response.followerId))
         return;
+
+    // Before the branch below, deliberately: a rejection is still an answer, and
+    // a follower whose log disagrees is a follower that is very much alive.
+    NoteFollowerContact(response.followerId, now);
 
     if (response.result == AppendResult::Rejected)
     {

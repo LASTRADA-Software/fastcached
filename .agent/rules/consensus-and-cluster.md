@@ -294,12 +294,87 @@ Every rule below has already been a bug.
   the same way at the same instant. Both halves are tested: a campaigning node
   still grants, and a node that has just heard from a leader still refuses —
   losing the second while fixing the first would trade a slow election for the
-  disruption pre-vote exists to prevent. The residual, unchanged by this and
-  recorded deliberately: a **leader** never hears from a leader, so its own
-  `_lastLeaderContact` ages out and it grants a challenger's pre-vote — exactly as
-  it did before, since a leader arms no election timer either. Refusing there is
-  CheckQuorum or a leader lease, which `RaftCluster_test` already names as a
-  separate mechanism and which nothing here needs yet.
+  disruption pre-vote exists to prevent. The residual it left — a **leader** never
+  hears from a leader, so its own `_lastLeaderContact` ages out and it granted a
+  challenger's pre-vote, exactly as it did before, since a leader arms no election
+  timer either — is what the next entry closes.
+- **A leader answers pre-vote from its OWN quorum, because a leader never hears
+  from a leader (issue #103).** `OnPreVote` read `_lastLeaderContact`, and
+  `NoteLeaderContact` sets that only where a leader spoke to *this* node — an
+  accepted AppendEntries or InstallSnapshot. A leader executes neither for its own
+  term, so its copy is absent or left over from a term it no longer holds, and past
+  `electionTimeoutMin` an established leader **granted** every challenger it was
+  asked about: the node best placed to refuse was the only one that never did.
+  What makes it bite is not a dead leader — a challenger only campaigns after its
+  own timeout has expired, so in the ordinary case the leader really is gone and
+  granting is correct — but the case where the leader is alive and only *that one
+  follower* lost contact: an asymmetric partition, a saturated link, a paused
+  process. The cluster then re-elects for no reason at all. `HasLiveLeader` is now
+  where the two roles' evidence lives: every other role still asks
+  `_lastLeaderContact`, and a leader asks `HasQuorumContact` — CheckQuorum, decided
+  from responses it already receives rather than from a lease, which would need a
+  clock-drift bound nothing else here assumes. Consequences that are each
+  load-bearing:
+  - **Refusing *without* tracking the quorum would be worse than granting.** A
+    leader that said no unconditionally is a partitioned leader vetoing its own
+    replacement forever, so the two halves are one mechanism and neither ships
+    alone. Both are tested — and the "a leader that has lost its quorum grants"
+    case passes before the fix as well as after. That is not a weak test: it is not
+    a regression test at all, but the guard against over-correcting the other one,
+    and it is the half a later change is most likely to break.
+  - **A rejected response counts as contact, which is why the record is not hung
+    off `AdvanceFollowerProgress`.** That funnel is the obvious place and is
+    reached only by the accepted branch, while a rejection says the follower's
+    *log* disagrees, not that the follower is gone. A leader that counted only
+    accepted responses would lose the quorum it is in the middle of repairing. The
+    same argument puts the call ahead of `OnInstallSnapshotResponse`'s branch too:
+    a follower far enough behind is caught up by snapshot and answers on that
+    message and no other, so counting only AppendEntries loses a quorum during
+    exactly the repair that needs it.
+  - **Winning an election IS contact from a quorum, so `BecomeLeader` seeds the
+    record from the votes** — from the voters, not from `_peers`, because only the
+    voters actually spoke. Without the seed a new leader answers "I have no quorum"
+    until its first heartbeat comes back, and grants pre-votes for that round trip:
+    the moment a cluster is least able to afford another election. It is cleared
+    first, so contact from a leadership this node has already lost and regained
+    cannot pass for contact with this one. Every voter is stamped with the instant
+    the election was *won* rather than the instant its own vote landed, which
+    overstates liveness by the election's duration — deliberately, because what is
+    true at that instant is that a majority endorsed this node for this term, and
+    buying the difference back would mean making `_votesGranted` a map to correct a
+    skew bounded by one round trip that the first heartbeat corrects anyway.
+  - **The window is `electionTimeoutMin` and the comparison is strict, matching the
+    follower side exactly.** "Is there a live leader" is a fact about the cluster,
+    and a leader answering it on a window of its own is how two nodes come to
+    disagree about it at the same instant.
+  - **This is not leader step-down, deliberately.** CheckQuorum elsewhere also
+    *deposes* a leader that has lost its majority. That is a separate mechanism
+    with its own safety argument, and it is not needed for the hole above: an
+    isolated leader's contact ages out, so it grants and blocks nothing.
+    `RaftCluster_test` and `RaftClusterHarness::Leader` still record that nothing
+    here deposes a leader, which is what their assertions actually rest on.
+  - **No cluster case covers it, and why is worth recording rather than
+    apologising for.** `RaftClusterHarness` is this module's oracle, so the first
+    attempt was a one-way link cut — written for exactly this, and then removed,
+    because the case it produced passed against the defect. A challenger's
+    pre-vote only decides anything if the leader's **grant reaches it**, and that
+    grant travels the same path as the heartbeats whose absence made the
+    challenger campaign. A follower that stops hearing the leader therefore also
+    stops receiving its answer — and stops answering it, so the leader loses that
+    follower's contact in the same instant and correctly grants. Losing contact
+    with a follower and losing that follower's responses are **one event**, which
+    is why no persistent topology separates them: not a one-way cut, not a
+    two-sided one, not any number of them. What separates them is transient
+    trouble — a saturated link, a paused process, a partition healing just as the
+    timer expires — and reproducing that needs the grant to win a race against the
+    next heartbeat, which is arithmetic over the step size, the per-message delay
+    and the heartbeat phase. A case resting on that reports a future regression as
+    a flake, which this rulebook already records paying for once. The six
+    `ManualClock` cases on `RaftNode` pin the rule instead, which is where it
+    lives: the node reads no clock of its own, so each of them is exact. It is
+    also the answer to why the defect survived being written down as a residual —
+    the harness that found five other consensus defects could not have found this
+    one.
 - **A round-trip test that omits a message type omits the arm most likely to be
   wrong.** Five of `RaftWire`'s eight encoder arms are near-copies of another —
   PreVote of RequestVote, `InstallSnapshotResponse` of `AppendEntriesResponse` —
@@ -315,10 +390,6 @@ Every rule below has already been a bug.
   kept separate precisely so the exemplars' values can stay distinct.
 ## Open work
 
-- **[#103](https://github.com/LASTRADA-Software/fastcached/issues/103)** — a
-  leader grants a challenger's pre-vote, because a leader never hears from a
-  leader and its `_lastLeaderContact` ages out. This is the residual argued at
-  the end of the pre-vote rule above; closing it is CheckQuorum or a leader lease.
 - **[#97](https://github.com/LASTRADA-Software/fastcached/issues/97)** — a node
   admitted by discovery joins the cluster's *state* but not its *quorum*:
   `RaftNode::ProposeMembership` still takes ids alone, and
