@@ -260,6 +260,19 @@ and what they may assume.
   counter is not unique — `catch_discover_tests` gives every case its own
   process, and the suite runs in parallel.
 
+## Issues and pull requests
+
+Labels here have teeth: a pull request carrying no `type/` label **fails a
+check**, because that label decides which section of the generated release notes
+the change lands in (`.github/release.yml`), and nothing downstream can recover
+it afterwards. CI derives `area/` and `os/` from the changed paths and reads
+`type/` from a conventional-commit title when there is one — a prose title, which
+most of this repository's are, means setting the label by hand.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) carries the taxonomy and the reasoning.
+
+Deferred work is a GitHub issue linked from the matching rulebook file's
+`## Open work` section, never a residual recorded only in prose.
+
 ## Design Patterns & Principles
 
 ### Error handling: `std::expected<T, E>`

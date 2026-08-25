@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Issue triage
+
+# `status/needs-triage` marks an issue nobody has typed or assigned an area to
+# yet. Nothing else in this repository sets it, so without this workflow it
+# would be a label that exists and never applies -- which is worse than not
+# having it at all, because an empty query then reads as "nothing is waiting"
+# rather than "nobody is looking".
+#
+# Only on `opened`. Reopening an issue that was already triaged does not make it
+# untriaged again, and re-adding the label there would quietly undo a decision
+# somebody had already made.
+#
+# `issues` is not a fork-sensitive event -- there is no head repository and no
+# code involved -- so the plain trigger suffices and the `pull_request_target`
+# reasoning in pr-labels.yml does not apply here.
+on:
+  issues:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  needs-triage:
+    name: "Mark as needing triage"
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - name: "Apply status/needs-triage"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+        run: gh issue edit "$NUMBER" --repo "$REPO" --add-label status/needs-triage

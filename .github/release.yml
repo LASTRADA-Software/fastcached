@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Categories for GitHub's generated release notes.
+#
+# The release job in build.yml passes `generate_release_notes: true`, so a draft
+# release's body is whatever GitHub renders from the pull requests merged since
+# the previous tag. Without this file that is one flat list; with it, the list is
+# grouped by the `type/` label each pull request carries.
+#
+# Three properties here are load-bearing:
+#
+#   * The `"*"` catch-all is not decoration. A pull request matching no category
+#     is OMITTED from the body entirely -- not sorted to the end, dropped.
+#     `pr-labels.yml` deliberately refuses to guess a type from a prose title, so
+#     a pull request arriving unlabeled is an ordinary state rather than an
+#     error, and without this row those would vanish from the notes. A body that
+#     renders empty is one /publish-release refuses to publish, which is how a
+#     missing row here becomes a release that cannot be cut.
+#
+#   * Order decides, because the first matching category wins. `breaking-change`
+#     is therefore first: a breaking feature belongs under Breaking changes, not
+#     under Features, where a reader skimming for upgrade risk would not look.
+#
+#   * There is deliberately no `exclude:` key. Excluding a label -- `type/chore`
+#     is the tempting one -- drops those pull requests silently, which is the
+#     failure shape .agent/rules/ exists to keep out of this repository. A reader
+#     can skip a section they do not care about; they cannot skip what is absent.
+changelog:
+  categories:
+    - title: "⚠️ Breaking changes"
+      labels: [breaking-change]
+    - title: "Features"
+      labels: [type/feature]
+    - title: "Bug fixes"
+      labels: [type/bug]
+    - title: "Performance"
+      labels: [type/perf]
+    - title: "Documentation"
+      labels: [type/docs]
+    - title: "Internals"
+      labels: [type/refactor, type/test, type/chore]
+    - title: "Other changes"
+      labels: ["*"]

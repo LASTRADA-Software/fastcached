@@ -1,0 +1,154 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Path globs -> `area/` and `os/` labels, applied by pr-labels.yml through
+# actions/labeler.
+#
+# What this file is allowed to decide, and what it is not:
+#
+#   * `area/` and `os/` state WHERE a change landed, which a path answers
+#     exactly. They are derived here.
+#
+#   * `type/` states WHAT the change was for, which a path cannot answer. A bug
+#     fix that also adds a test touches `*_test.cpp` and would pick up
+#     `type/test` beside its real type -- two `type/` labels, which breaks both
+#     the one-type rule in CONTRIBUTING.md and the first-match-wins grouping in
+#     release.yml. No row below names a `type/` label, and none may be added.
+#
+# The `area/` rows mirror the domains in .agent/rules/, so a label points at the
+# rulebook file governing the code it covers. Three depart from that split
+# deliberately: `area/launcher` is separated from `area/compile-cache` because
+# one label over both matches about a third of this repository and so
+# discriminates nothing; `area/net` is separated from `area/protocol` because
+# severing Net/ from Core/ for upstreaming is its own workstream; and
+# `area/core` exists although no rule file governs Core/, because a change to
+# the shared foundation -- the key digest, the one HostPort parser, the error
+# taxonomy -- is a blast-radius signal worth querying for.
+#
+# Globs may overlap, and that is the intended result rather than a defect to
+# tune away: `Protocol/CompileCacheHandler.cpp` genuinely belongs to both
+# `area/protocol` and `area/compile-cache`, and `cmake/Packaging.cmake` to both
+# `area/build` and `area/packaging`. Two true labels beat one arbitrary one.
+#
+# actions/labeler defaults `dot: true`, which is what lets `.github/**` match.
+
+area/launcher:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/apps/fastcache-cc/**'
+          - 'cmake/portable/CompileCache.cmake'
+
+area/compile-cache:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/FastCache/CompileCache/**'
+          - 'src/FastCache/Protocol/CompileCache*'
+          - 'src/apps/compile-cache-testclient/**'
+          - 'scripts/compile-cache-e2e.sh'
+
+area/distributed:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/FastCache/Distributed/**'
+          - 'src/apps/fastcache-compile-node/**'
+          - 'scripts/dist-compile-e2e.*'
+
+area/cluster:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/FastCache/Consensus/**'
+          - 'src/FastCache/Cluster/**'
+          - 'scripts/cluster-e2e.sh'
+
+area/protocol:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/FastCache/Protocol/**'
+          - 'src/FastCache/Auth/**'
+
+area/net:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/FastCache/Net/**'
+          - 'src/FastCache/Async/**'
+          - 'src/FastCache/Server/**'
+
+area/storage:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/FastCache/Cache/**'
+          - 'src/CowTree/**'
+
+area/platform:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/FastCache/Platform/**'
+          - 'src/FastCache/Config/**'
+          - 'src/FastCache/Cli/**'
+          - 'src/apps/fastcached/**'
+
+area/observability:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/FastCache/Metrics/**'
+
+area/packaging:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packaging/**'
+          - 'cmake/Packaging.cmake'
+          - 'cmake/Version.cmake'
+          - 'cmake/MacOS*.cmake'
+
+# Deliberately NOT `**/CMakeLists.txt`. A per-directory CMakeLists.txt is part
+# of whatever area owns that directory -- adding a source file edits one -- so
+# the recursive glob fired on nearly every pull request and made `area/build`
+# mean nothing. Measured on #109, where three such files pulled it in for a
+# change that touched no build system at all. Only the roots of the build itself
+# are listed.
+area/build:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'CMakeLists.txt'
+          - 'CMakePresets.json'
+          - 'cmake/**'
+          - '.github/workflows/**'
+
+area/core:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/FastCache/Core/**'
+
+# The `os/` rows name files that exist only for one host -- its packaging, its
+# service integration, its scripts. They deliberately do NOT name the per-platform
+# reactor and socket implementations (Iocp*, Kqueue*, Epoll*), even though those
+# are the most obviously platform-specific files in the tree.
+#
+# The reason is that they are edited TOGETHER. A cross-platform change to the
+# socket layer touches all three, so those globs handed it `os/windows`,
+# `os/macos` AND `os/linux` at once -- which does not mean "specific to one
+# platform", it means the exact opposite, and it is the state this axis exists to
+# distinguish from. Measured on #109, a portability refactor that collected all
+# three.
+#
+# What that gives up is a genuine one-platform fix to IocpSocket arriving without
+# `os/windows` until somebody adds it. That is the cheap direction to be wrong in:
+# a missing optional label costs one click, while a label that fires on every
+# portability change costs the axis its meaning.
+os/windows:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packaging/windows/**'
+          - '**/*.ps1'
+          - '**/WindowsServiceHost.*'
+
+os/macos:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packaging/macos/**'
+          - 'cmake/MacOS*.cmake'
+          - 'scripts/macos-*'
+
+os/linux:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packaging/linux/**'

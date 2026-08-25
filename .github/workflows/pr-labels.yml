@@ -1,0 +1,168 @@
+# SPDX-License-Identifier: Apache-2.0
+name: PR labels
+
+# Two halves of one rule: apply every label CI can derive, and refuse the pull
+# request when the one label it cannot derive is missing.
+#
+# Why `pull_request_target` and not `pull_request`: a `pull_request` run
+# triggered from a FORK receives a read-only GITHUB_TOKEN, so every step below
+# would succeed at doing nothing the first time an outside contributor opens a
+# pull request -- the silent no-op this repository keeps writing rules against.
+# `pull_request_target` runs in the base repository's context with a writable
+# token.
+#
+# That event carries a documented footgun: it runs the workflow from the BASE
+# branch with secrets available, so checking out and executing the pull
+# request's code would hand a stranger this token. NOTHING HERE CHECKS ANYTHING
+# OUT, and nothing may be added that does. actions/labeler reads its
+# configuration over the API rather than from the workspace, and the remaining
+# steps read a title, a body and a label list. Untrusted text reaches the shell
+# through `env:` only, never interpolated into a script body, so a title
+# containing shell metacharacters is data rather than code.
+#
+# Why this is not a job in build.yml: `check-release-gate` there asserts that
+# every job in that workflow appears in `release.needs`, so a labeling job added
+# to it would make cutting a release depend on pull-request labeling.
+on:
+  pull_request_target:
+    # `edited` catches a title corrected after opening, which is what the type
+    # inference reads. `labeled`/`unlabeled` re-run the gate when a human
+    # supplies the type by hand.
+    #
+    # A label applied with GITHUB_TOKEN does NOT trigger a workflow run. That is
+    # why the gate is a job in THIS workflow rather than a file of its own: run
+    # separately it would stay red after `apply` had already added the very
+    # label it was complaining about, and nothing would ever re-run it.
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled]
+
+# Default to nothing; each job names what it needs.
+permissions: {}
+
+concurrency:
+  group: pr-labels-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    name: "Apply derivable labels"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # area/* and os/* from the changed paths, off .github/labeler.yml.
+      #
+      # `sync-labels: true` removes an area label once a branch stops touching
+      # that tree, so the label keeps stating what is true rather than what was
+      # true at the first push. It only ever touches labels named in the config,
+      # so type/, priority/ and status/ are out of its reach by construction.
+      - name: "Label the areas and platforms from the changed paths"
+        uses: actions/labeler@v5
+        with:
+          sync-labels: true
+
+      # type/* and breaking-change, but only when the title states them.
+      - name: "Infer the type from a conventional-commit title"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          # A human's choice always wins. Re-running on a `labeled` event must
+          # not overwrite a type somebody just corrected by hand.
+          existing="$(gh pr view "$PR" --repo "$REPO" --json labels \
+            --jq '[.labels[].name | select(startswith("type/"))] | join(" ")')"
+          if [[ -n "$existing" ]]; then
+            echo "type already set ($existing) -- leaving it alone"
+            exit 0
+          fi
+
+          # Prefix -> label. A prefix this table does not know applies NOTHING.
+          # That is the point rather than an omission: this repository also
+          # writes scope-only prefixes (`net:`, `node:`, `cluster:`, `cmake:`)
+          # which name an area, not a type, and only about a tenth of its pull
+          # request titles are conventional commits at all. Mapping an unknown
+          # prefix onto a guess is how a refactor gets published under Features,
+          # and a release note that is confidently wrong is worse than one a
+          # human had to fill in. The gate below asks for that human instead.
+          declare -A TYPES=(
+            [feat]=type/feature
+            [fix]=type/bug
+            [perf]=type/perf
+            [docs]=type/docs
+            [test]=type/test
+            [refactor]=type/refactor
+            [chore]=type/chore
+            [ci]=type/chore
+            [build]=type/chore
+          )
+
+          labels=()
+          if [[ "$TITLE" =~ ^([a-z]+)(\([^\)]*\))?(!)?: ]]; then
+            prefix="${BASH_REMATCH[1]}"
+            bang="${BASH_REMATCH[3]}"
+            if [[ -n "${TYPES[$prefix]:-}" ]]; then
+              labels+=("${TYPES[$prefix]}")
+            else
+              echo "title prefix '$prefix' names no type -- leaving the type to a human"
+            fi
+            if [[ -n "$bang" ]]; then
+              labels+=(breaking-change)
+            fi
+          fi
+
+          # Conventional Commits states a breaking change in a footer as well as
+          # with `!`, and a pull request may carry the footer without the mark.
+          if printf '%s' "$BODY" | grep -qE '^BREAKING[ -]CHANGE:'; then
+            labels+=(breaking-change)
+          fi
+
+          if [[ ${#labels[@]} -eq 0 ]]; then
+            echo "nothing derivable from the title -- the gate will ask for a type"
+            exit 0
+          fi
+
+          # Deduplicate: `!` and the footer can both name breaking-change.
+          mapfile -t unique < <(printf '%s\n' "${labels[@]}" | sort -u)
+          echo "applying: ${unique[*]}"
+          gh pr edit "$PR" --repo "$REPO" --add-label "$(IFS=,; printf '%s' "${unique[*]}")"
+
+  gate:
+    name: "Require a type label"
+    needs: apply
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    steps:
+      - name: "Assert exactly one type/ label"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # Read the labels fresh rather than from the event payload: `apply`
+          # may have added one seconds ago, and the payload is a snapshot taken
+          # before this workflow started.
+          mapfile -t found < <(gh pr view "$PR" --repo "$REPO" --json labels \
+            --jq '.labels[].name | select(startswith("type/"))')
+
+          valid="type/bug type/feature type/refactor type/perf type/docs type/test type/chore"
+          case "${#found[@]}" in
+            1)
+              echo "type: ${found[0]}"
+              exit 0
+              ;;
+            0)
+              echo "::error::This pull request carries no type/ label. Add exactly one of: $valid -- it decides which section of the release notes the change lands in (.github/release.yml). CI derives area/ and os/ from the changed paths, but not the type: a path says where a change landed, not what it was for."
+              ;;
+            *)
+              echo "::error::This pull request carries ${#found[@]} type/ labels (${found[*]}); exactly one is allowed. Release notes take the first matching category, so the others would be silently ignored."
+              ;;
+          esac
+          exit 1
