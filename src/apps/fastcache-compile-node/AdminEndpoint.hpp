@@ -6,6 +6,7 @@
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
+#include <FastCache/Server/AdminCredential.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 
 #include <chrono>
@@ -17,6 +18,16 @@
 #include <string>
 #include <string_view>
 #include <thread>
+
+namespace FastCache::Distributed
+{
+struct FleetSources;
+}
+
+namespace FastCache
+{
+class TlsContext;
+}
 
 namespace FastCache::Node
 {
@@ -74,6 +85,42 @@ struct NodeScrapeSources
 [[nodiscard]] AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sources,
                                                                          std::chrono::steady_clock::time_point startedAt);
 
+/// Read the dashboard credential out of the file an operator named.
+///
+/// Fallible and reported rather than warned about, for the reason the endpoint's
+/// own failure is: a credential file that could not be read must not silently
+/// become "no credential", which is the one failure mode that turns a guarded
+/// fleet map into an open one.
+///
+/// The trailing newline every editor adds is trimmed, so a secret typed into a
+/// file works without the operator having to know that.
+/// @param path Where the secret is.
+/// @return The credential, or why it could not be used.
+[[nodiscard]] std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::path const& path);
+
+/// The routes that serve the fleet dashboard.
+///
+/// A free function rather than a lambda in `main()`, for the reason
+/// `MakeNodeSnapshotProvider` is one: `main.cpp` is in no test target, so wiring
+/// assembled there has no coverage at all -- and this has branches worth covering,
+/// since a follower must render a page rather than a redirect and an unauthorised
+/// caller must get a challenge a browser can act on.
+/// @param sources What the fleet is read from; must outlive the returned routes.
+/// @param credential What a caller must present, or a default-constructed one for none.
+/// @param refreshSeconds How often the page reloads itself.
+/// @return `/fleet` and `/fleet.json`.
+[[nodiscard]] std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
+                                                      AdminCredential credential,
+                                                      unsigned refreshSeconds);
+
+/// How often the dashboard reloads itself, in seconds.
+///
+/// A named constant rather than a flag: the endpoint serves one connection at a
+/// time on its owning thread, so the interval is a property of what the surface can
+/// sustain rather than a preference. Ten seconds is slower than a heartbeat, which
+/// is the rate at which anything on the page can actually change.
+inline constexpr unsigned DashboardRefreshSeconds = 10;
+
 /// The worker's `/metrics` and `/healthz` endpoint: listener, server and the
 /// thread that serves them, owned as one thing.
 ///
@@ -111,12 +158,16 @@ class AdminEndpoint
     /// @param snapshot What to report per scrape.
     /// @param logger Where to announce the bound address.
     /// @return The running endpoint, or why it could not be served.
+    /// @param routes Routes beyond `/metrics` and `/healthz`; may be empty.
+    /// @param tls Server TLS context, or nullptr to serve plaintext.
     [[nodiscard]] static std::expected<std::unique_ptr<AdminEndpoint>, std::string> Start(
         std::string_view listenSpec,
         std::string_view defaultHost,
         IMetricsSink& metrics,
         AdminHttpServer::SnapshotProvider snapshot,
-        ILogger& logger);
+        ILogger& logger,
+        std::vector<AdminRoute> routes = {},
+        TlsContext* tls = nullptr);
 
     /// Stop serving and join the thread.
     ~AdminEndpoint();
@@ -149,7 +200,9 @@ class AdminEndpoint
                   IMetricsSink& metrics,
                   AdminHttpServer::SnapshotProvider snapshot,
                   std::string boundEndpoint,
-                  ILogger& logger);
+                  ILogger& logger,
+                  std::vector<AdminRoute> routes,
+                  TlsContext* tls);
 
     std::unique_ptr<BlockingListener> _listener;
     std::unique_ptr<AdminHttpServer> _server;

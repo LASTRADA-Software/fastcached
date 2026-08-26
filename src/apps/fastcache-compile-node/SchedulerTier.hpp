@@ -76,6 +76,16 @@ class SchedulerTier
         _service.AdministerWith(admin);
     }
 
+    /// The scheduler itself, for reporting.
+    ///
+    /// `const`, so a report can read the fleet and cannot change it -- the whole
+    /// mutable surface stays behind the verbs the protocol drives.
+    /// @return The service this tier owns.
+    [[nodiscard]] Distributed::SchedulerService const& Service() const noexcept
+    {
+        return _service;
+    }
+
     /// The address the scheduler surface bound.
     [[nodiscard]] std::string const& BoundEndpoint() const noexcept
     {

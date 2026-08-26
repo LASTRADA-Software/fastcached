@@ -27,10 +27,14 @@
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#if defined(FC_TLS_ENABLED)
+    #include <FastCache/Net/TlsContext.hpp>
+#endif
 #include <FastCache/Platform/CpuAffinity.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/Environment.hpp>
@@ -38,6 +42,7 @@
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
+#include <FastCache/Server/AdminCredential.hpp>
 #include <FastCache/Platform/InheritedListener.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -549,9 +554,78 @@ constexpr int ExitOk = 0;
     // Declared AFTER the cache tier, which is what makes the pointer its lambda
     // captures safe: locals are destroyed in reverse, so this endpoint stops
     // serving -- and joins its thread -- before the tier it reads is gone.
+    //
+    // TLS on the admin surface, when the operator named a certificate and a key.
+    // Named material rather than a boolean, so "TLS requested, nothing to do it
+    // with" is unreachable -- and a node that names neither keeps a plaintext port
+    // behaving exactly as it did before this existed, which is what lets the
+    // dashboard share it without changing the contract for a single scraper.
+    // The owner is declared only where the type is complete: without TLS compiled
+    // in, `TlsContext` is a forward declaration and a `unique_ptr` to one would
+    // instantiate a deleter whose destructor has no definition to link against.
+    // The raw pointer below is what the endpoint takes either way, so the plaintext
+    // build carries a null and no conditional at the call site.
+    TlsContext* adminTls = nullptr;
+#if defined(FC_TLS_ENABLED)
+    std::unique_ptr<TlsContext> ownedAdminTls;
+#endif
+    if (!cfg.tlsCertFile.empty())
+    {
+#if defined(FC_TLS_ENABLED)
+        auto created = TlsContext::Create(cfg.tlsCertFile, cfg.tlsKeyFile);
+        if (!created.has_value())
+        {
+            logger.Logf(LogLevel::Error, "--tls-cert/--tls-key: {}; refusing to start", created.error().ToString());
+            return ExitUsage;
+        }
+        ownedAdminTls = std::move(*created);
+        adminTls = ownedAdminTls.get();
+#else
+        // Fatal rather than a warning, and the daemon answers the same way: a node
+        // that started in the clear after being told to serve TLS is one an
+        // operator believes is encrypted.
+        logger.Log(LogLevel::Error,
+                   "--tls-cert requested but this build has no TLS support "
+                   "(rebuild with -DFASTCACHED_ENABLE_TLS=ON); refusing to start");
+        return ExitUsage;
+#endif
+    }
+
+    // The dashboard's credential, read once at startup. A file that cannot be read
+    // must not become "no credential": that is the one failure that turns a guarded
+    // fleet map into an open one, so it is fatal like everything else here.
+    AdminCredential dashboardCredential;
+    if (!cfg.dashboardTokenFile.empty())
+    {
+        auto read = Node::ReadDashboardToken(cfg.dashboardTokenFile);
+        if (!read.has_value())
+        {
+            logger.Logf(LogLevel::Error, "--dashboard-token-file {}; refusing to start", read.error());
+            return ExitUsage;
+        }
+        dashboardCredential = std::move(*read);
+    }
+
     std::unique_ptr<Node::AdminEndpoint> adminEndpoint;
     if (!cfg.adminListen.empty())
     {
+        // The fleet routes, when the operator asked for them AND this node runs a
+        // scheduler to read. Without one there is no registry to report, so the
+        // routes are not registered at all and `/fleet` is a plain 404 -- a process
+        // with no fleet view offers no fleet route, rather than one that answers
+        // with an empty fleet.
+        std::vector<AdminRoute> fleetRoutes;
+        if (cfg.dashboard && schedulerTier)
+            fleetRoutes = Node::MakeFleetRoutes(
+                Distributed::FleetSources { .scheduler = &schedulerTier->Service(),
+                                            // Legitimately null: a node with no
+                                            // `--node-id` leads itself and has no
+                                            // replicated state for anybody to read.
+                                            .cluster = consensusTier.get(),
+                                            .metrics = &metrics },
+                dashboardCredential,
+                Node::DashboardRefreshSeconds);
+
         auto started = Node::AdminEndpoint::Start(
             cfg.adminListen,
             "127.0.0.1",
@@ -568,7 +642,9 @@ constexpr int ExitOk = 0;
                                                                      .slots = slots,
                                                                      .scratchRoot = jobs.ScratchRoot() },
                                            std::chrono::steady_clock::now()),
-            logger);
+            logger,
+            std::move(fleetRoutes),
+            adminTls);
 
         // Fatal rather than a warning, unlike the daemon's: an operator who asked a
         // *worker* for an endpoint is almost always wiring a probe to it, and a
@@ -581,7 +657,17 @@ constexpr int ExitOk = 0;
         }
 
         adminEndpoint = std::move(*started);
-        logger.Logf(LogLevel::Info, "metrics endpoint on http://{}/metrics (and /healthz)", adminEndpoint->BoundEndpoint());
+        auto const scheme = adminTls != nullptr ? "https" : "http";
+        logger.Logf(LogLevel::Info,
+                    "metrics endpoint on {}://{}/metrics (and /healthz)",
+                    scheme,
+                    adminEndpoint->BoundEndpoint());
+        if (cfg.dashboard && schedulerTier)
+            logger.Logf(LogLevel::Info,
+                        "fleet dashboard on {}://{}/fleet (and /fleet.json){}",
+                        scheme,
+                        adminEndpoint->BoundEndpoint(),
+                        dashboardCredential.Required() ? "" : ", with no credential");
     }
 
     // Both surfaces have bound and adopted, so the loop can start accepting. Doing

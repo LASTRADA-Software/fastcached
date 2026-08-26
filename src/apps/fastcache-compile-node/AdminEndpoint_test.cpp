@@ -5,6 +5,9 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
+#include <FastCache/Core/Clock.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
+#include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -14,10 +17,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <future>
 #include <optional>
 #include <string>
 
+#include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -229,4 +234,131 @@ TEST_CASE("A scrape renders nothing for a cache the node does not have", "[node]
     // And the machine is still there, so this is an absence rather than an empty
     // scrape that would pass the checks above for the wrong reason.
     CHECK(body.contains("fastcache_node_logical_cores 4\n"));
+}
+
+TEST_CASE("A dashboard credential is read from its file, newline and all", "[node][admin][dashboard]")
+{
+    // Every editor adds a trailing newline, and an operator should not have to know
+    // that a secret which looks right is one byte longer than the one they typed.
+    Testing::ScratchDirectory const scratch { "dashboard-token" };
+    auto const path = scratch.Path() / "token";
+
+    {
+        std::ofstream out { path, std::ios::binary };
+        out << "s3cret-token\n";
+    }
+
+    auto const credential = Node::ReadDashboardToken(path);
+    REQUIRE(credential.has_value());
+    CHECK(credential->Required());
+    CHECK(credential->Accepts("Bearer s3cret-token"));
+    CHECK_FALSE(credential->Accepts("Bearer s3cret-token\n"));
+}
+
+TEST_CASE("A credential file that cannot be used is refused rather than ignored", "[node][admin][dashboard]")
+{
+    // The one failure that turns a guarded fleet map into an open one: a token file
+    // that silently becomes "no credential". Both shapes are reported, and both
+    // messages name the path so an operator knows which file to look at.
+    Testing::ScratchDirectory const scratch { "dashboard-token-bad" };
+
+    auto const missing = Node::ReadDashboardToken(scratch.Path() / "absent");
+    REQUIRE_FALSE(missing.has_value());
+    CHECK(missing.error().contains("absent"));
+
+    auto const emptyPath = scratch.Path() / "empty";
+    {
+        std::ofstream out { emptyPath, std::ios::binary };
+        out << "\n";
+    }
+    auto const empty = Node::ReadDashboardToken(emptyPath);
+    REQUIRE_FALSE(empty.has_value());
+    CHECK(empty.error().contains("empty"));
+}
+
+TEST_CASE("The fleet routes answer on their own paths and gate on the credential",
+          "[node][admin][dashboard]")
+{
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    Distributed::SchedulerService scheduler { clock, metrics };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+
+    auto const routes = Node::MakeFleetRoutes(
+        Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
+        AdminCredential { "s3cret" },
+        Node::DashboardRefreshSeconds);
+
+    // Two routes, and the JSON one exists so the page is replaceable and testable
+    // without a browser.
+    REQUIRE(routes.size() == 2);
+    CHECK(routes[0].path == "/fleet");
+    CHECK(routes[1].path == "/fleet.json");
+
+    AdminRequest const anonymous { .path = "/fleet", .query = {}, .authorization = {} };
+    auto const refused = routes[0].handler(anonymous);
+    CHECK(refused.status == "401 Unauthorized");
+    // A 401 with no challenge is one a browser shows as a broken page rather than
+    // prompting for.
+    REQUIRE(refused.extraHeaders.size() == 1);
+    CHECK(refused.extraHeaders[0].contains("Basic"));
+
+    AdminRequest const authorised { .path = "/fleet", .query = {}, .authorization = "Bearer s3cret" };
+    auto const page = routes[0].handler(authorised);
+    CHECK(page.status == "200 OK");
+    CHECK(page.contentType.starts_with("text/html"));
+    CHECK(page.body.starts_with("<!doctype html>"));
+
+    AdminRequest const json { .path = "/fleet.json", .query = {}, .authorization = "Bearer s3cret" };
+    auto const document = routes[1].handler(json);
+    CHECK(document.status == "200 OK");
+    CHECK(document.contentType == "application/json");
+    CHECK(document.body.contains(R"("role":"leader")"));
+}
+
+TEST_CASE("A node that does not lead answers the dashboard with 503 and names the leader",
+          "[node][admin][dashboard]")
+{
+    // `Gate()`'s `NotLeader` in HTTP's vocabulary. A 200 would present a follower's
+    // partial registry as the whole fleet, and a redirect would name a port the
+    // browser cannot use -- which is the defect this project already had once.
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    Distributed::SchedulerService scheduler { clock, metrics };
+    scheduler.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6676");
+
+    auto const routes = Node::MakeFleetRoutes(
+        Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
+        AdminCredential {},
+        Node::DashboardRefreshSeconds);
+
+    AdminRequest const request { .path = "/fleet", .query = {}, .authorization = {} };
+    auto const page = routes[0].handler(request);
+    CHECK(page.status == "503 Service Unavailable");
+    CHECK(page.body.contains("10.0.0.9:6676"));
+    CHECK(page.extraHeaders.empty()); // no Location, no redirect
+
+    AdminRequest const json { .path = "/fleet.json", .query = {}, .authorization = {} };
+    auto const document = routes[1].handler(json);
+    CHECK(document.status == "503 Service Unavailable");
+    CHECK(document.body.contains(R"("role":"follower")"));
+}
+
+TEST_CASE("An endpoint with no credential serves the dashboard to anyone who reaches it",
+          "[node][admin][dashboard]")
+{
+    // What loopback gets, and the reason the startup rules refuse this shape on a
+    // public bind: reaching loopback already means being on the machine.
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    Distributed::SchedulerService scheduler { clock, metrics };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+
+    auto const routes = Node::MakeFleetRoutes(
+        Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
+        AdminCredential {},
+        Node::DashboardRefreshSeconds);
+
+    AdminRequest const anonymous { .path = "/fleet", .query = {}, .authorization = {} };
+    CHECK(routes[0].handler(anonymous).status == "200 OK");
 }

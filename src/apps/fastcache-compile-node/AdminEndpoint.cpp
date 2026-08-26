@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
+
 #include "CacheTier.hpp"
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 
 #include <chrono>
 #include <cstdint>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <utility>
 
@@ -43,13 +47,101 @@ AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sou
     };
 }
 
+std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::path const& path)
+{
+    std::ifstream file { path, std::ios::binary };
+    if (!file)
+        return std::unexpected { std::format("cannot read '{}'", path.string()) };
+
+    std::string secret { std::istreambuf_iterator<char> { file }, std::istreambuf_iterator<char> {} };
+
+    // Trailing whitespace is trimmed because every editor adds a newline, and an
+    // operator should not have to know that a secret which looks right is one byte
+    // longer than the one they typed. Leading whitespace is NOT trimmed: it is not
+    // something an editor adds, and a secret that legitimately begins with a space
+    // would otherwise be silently a different secret.
+    while (!secret.empty() && (secret.back() == '\n' || secret.back() == '\r'))
+        secret.pop_back();
+
+    if (secret.empty())
+        return std::unexpected { std::format("'{}' is empty; a credential file nobody can fail to match is "
+                                             "worse than none, because the surface looks guarded",
+                                             path.string()) };
+
+    return AdminCredential { std::move(secret) };
+}
+
+namespace
+{
+    /// The challenge an unauthorised caller is answered with.
+    ///
+    /// `Basic` is named first because it is the one a browser can prompt for, and
+    /// the page exists to be opened in one. Without a `WWW-Authenticate` header at
+    /// all a browser shows the body and no prompt, which reads as a broken page
+    /// rather than as a credential being required.
+    [[nodiscard]] AdminResponse Unauthorised(std::string_view contentType, std::string body)
+    {
+        return AdminResponse { .status = "401 Unauthorized",
+                               .contentType = contentType,
+                               .body = std::move(body),
+                               .extraHeaders = { R"(WWW-Authenticate: Basic realm="fastcache fleet")" } };
+    }
+} // namespace
+
+std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
+                                        AdminCredential credential,
+                                        unsigned refreshSeconds)
+{
+    // Both routes read the fleet the same way and differ only in how they render
+    // it, so the collection and the gate are written once and the renderer is the
+    // parameter. A second copy of the credential check is the shape of bug that
+    // leaves one of two routes open.
+    auto const answer = [sources, credential](auto&& render, std::string_view contentType, auto&& refuse) {
+        return [sources, credential, render, contentType, refuse](AdminRequest const& request) -> AdminResponse {
+            if (!credential.Accepts(request.authorization))
+                return refuse();
+
+            auto const snapshot = Distributed::CollectFleet(sources);
+            // A follower answers 503 rather than 200: its registry holds whatever
+            // registered against it rather than the fleet, so a 200 would be a
+            // partial picture presented as the whole one. It is `Gate()`'s
+            // `NotLeader` in HTTP's vocabulary -- not me, and here is who.
+            return AdminResponse { .status = Distributed::LeadsTheFleet(snapshot) ? "200 OK" : "503 Service Unavailable",
+                                   .contentType = contentType,
+                                   .body = render(snapshot),
+                                   .extraHeaders = {} };
+        };
+    };
+
+    std::vector<AdminRoute> routes;
+    routes.push_back(AdminRoute {
+        .path = "/fleet",
+        .handler = answer([refreshSeconds](
+                              Distributed::FleetSnapshot const& s) { return Distributed::RenderFleetHtml(s, refreshSeconds); },
+                          "text/html; charset=utf-8",
+                          [] {
+                              return Unauthorised("text/html; charset=utf-8",
+                                                  "<!doctype html><title>fastcache fleet</title>"
+                                                  "<p>This page needs the credential named by "
+                                                  "<code>--dashboard-token-file</code>.</p>");
+                          }) });
+    routes.push_back(AdminRoute {
+        .path = "/fleet.json",
+        .handler = answer([](Distributed::FleetSnapshot const& s) { return Distributed::RenderFleetJson(s); },
+                          "application/json",
+                          [] { return Unauthorised("application/json", R"({"error":"credential required"})"); }) });
+    return routes;
+}
+
 AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
                              IMetricsSink& metrics,
                              AdminHttpServer::SnapshotProvider snapshot,
                              std::string boundEndpoint,
-                             ILogger& logger):
+                             ILogger& logger,
+                             std::vector<AdminRoute> routes,
+                             TlsContext* tls):
     _listener { std::move(listener) },
-    _server { std::make_unique<AdminHttpServer>(*_listener, metrics, std::move(snapshot), logger) },
+    _server { std::make_unique<AdminHttpServer>(*_listener, metrics, std::move(snapshot), logger, std::move(routes), tls) },
     _boundEndpoint { std::move(boundEndpoint) },
     _thread { [server = _server.get()] { SyncRun(server->Run()); } }
 {
@@ -67,7 +159,9 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
                                                                                 std::string_view defaultHost,
                                                                                 IMetricsSink& metrics,
                                                                                 AdminHttpServer::SnapshotProvider snapshot,
-                                                                                ILogger& logger)
+                                                                                ILogger& logger,
+                                                                                std::vector<AdminRoute> routes,
+                                                                                TlsContext* tls)
 {
     auto const endpoint = ParseEndpoint(listenSpec, defaultHost);
     if (!endpoint.has_value())
@@ -91,7 +185,9 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
                                                                 metrics,
                                                                 std::move(snapshot),
                                                                 std::format("{}:{}", endpoint->first, endpoint->second),
-                                                                logger } };
+                                                                logger,
+                                                                std::move(routes),
+                                                                tls } };
 }
 
 } // namespace FastCache::Node

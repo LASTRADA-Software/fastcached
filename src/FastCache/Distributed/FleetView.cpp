@@ -441,7 +441,7 @@ FleetSnapshot CollectFleet(FleetSources const& sources)
         return snapshot;
 
     snapshot.role = sources.scheduler->Role();
-    snapshot.leaderEndpoint = std::string { sources.scheduler->LeaderEndpoint() };
+    snapshot.leaderEndpoint = sources.scheduler->LeaderEndpoint();
     snapshot.nodes = sources.scheduler->Workers().NodeReports();
     snapshot.workers = sources.scheduler->Workers().LiveWorkerReports();
     snapshot.liveLeases = sources.scheduler->LiveLeaseCount();
