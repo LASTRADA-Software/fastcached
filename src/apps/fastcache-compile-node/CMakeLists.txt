@@ -45,6 +45,7 @@ add_executable(fastcache-compile-node
     SchedulerTier.cpp
     LocalCache.cpp
     NodeConfig.cpp
+    NodeToolchains.cpp
     RemoteUpstream.cpp
     FrameEndpoint.cpp
     NodeIoLoop.cpp
@@ -90,6 +91,8 @@ if(FASTCACHED_BUILD_TESTS)
         RemoteUpstream.cpp
         NodeConfig.cpp
         NodeConfig_test.cpp
+        NodeToolchains.cpp
+        NodeToolchains_test.cpp
         FrameEndpoint.cpp
         NodeIoLoop.cpp
         FrameEndpoint_test.cpp

@@ -237,6 +237,24 @@ template <auto Field>
     };
 }
 
+/// An applier for a valueless switch that turns something OFF: sets `Field` to
+/// false.
+///
+/// The counterpart to `SetTrue`, for the flag whose default is on. Spelling the
+/// field positively and clearing it here is what keeps the double negative out of
+/// the config struct — `toolchainDiscovery = false` reads, `noToolchainDiscovery =
+/// true` has to be decoded at every use.
+///
+/// @return The applier, usable as an OptionSpec::apply in a `constexpr` table.
+template <auto Field>
+[[nodiscard]] constexpr auto SetFalse() noexcept
+{
+    return [](auto& result, std::string_view) -> std::expected<void, ConfigError> {
+        TargetOf<Field>(result) = false;
+        return {};
+    };
+}
+
 /// An applier that stores a fixed value in `Field` — how a flag selects what
 /// the process will do instead of its default action.
 /// @return The applier, usable as an OptionSpec::select in a `constexpr` table.

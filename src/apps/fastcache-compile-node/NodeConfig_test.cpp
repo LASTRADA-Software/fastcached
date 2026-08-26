@@ -136,6 +136,9 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.bindAddress = "10.0.0.4";
     cfg.port = 7777;
     cfg.toolchains = { "/usr/bin/g++", "abc123=/usr/bin/clang++" };
+    // Off, because this case gives every field a value differing from its default
+    // so that every emitter fires -- and this one's default is on.
+    cfg.toolchainDiscovery = false;
     cfg.slots = 12;
     cfg.nodeClass = Distributed::NodeClass::Dedicated;
     cfg.reservedCores = 3;
@@ -228,6 +231,48 @@ TEST_CASE("NodeConfig: every toolchain is re-emitted", "[node][service]")
     }
 }
 
+TEST_CASE("NodeConfig: discovery is on unless the operator turns it off", "[node][config]")
+{
+    // On by default, because the whole point of #139 is that installing the package
+    // is the setup. A worker that had to be told to look would be back to a
+    // per-machine list somebody maintains.
+    auto const byDefault = ParseNodeArgv({ "--scheduler=s:1" });
+    REQUIRE(byDefault.has_value());
+    CHECK(byDefault->toolchainDiscovery);
+    CHECK(byDefault->toolchains.empty());
+
+    auto const off = ParseNodeArgv({ "--scheduler=s:1", "--no-toolchain-discovery", "--toolchain=/usr/bin/cc" });
+    REQUIRE(off.has_value());
+    CHECK_FALSE(off->toolchainDiscovery);
+}
+
+TEST_CASE("NodeConfig: a discovery-off registration comes back with it still off", "[node][service]")
+{
+    // It changes what the service DOES at every boot, so losing it in the round
+    // trip would have the worker quietly serving compilers the operator excluded --
+    // and nothing anywhere would say the registration had changed meaning.
+    auto pinned = Installable();
+    pinned.toolchainDiscovery = false;
+    auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", pinned);
+    CHECK(std::ranges::contains(spec.arguments, "--no-toolchain-discovery"));
+
+    // Round-tripped through this project's own parser, which is the rule every
+    // registration follows: whatever reaches a supervisor has to survive it.
+    std::vector<char const*> argv;
+    argv.reserve(spec.arguments.size());
+    for (auto const& argument: spec.arguments)
+        argv.push_back(argument.c_str());
+
+    auto const reparsed = ParseNodeArgv(argv);
+    REQUIRE(reparsed.has_value());
+    CHECK_FALSE(reparsed->toolchainDiscovery);
+
+    // And a default registration does not carry it, so the flag means what it says
+    // rather than appearing in every command line.
+    auto const plain = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", Installable());
+    CHECK_FALSE(std::ranges::contains(plain.arguments, "--no-toolchain-discovery"));
+}
+
 TEST_CASE("NodeConfig: a registration that could not work is refused", "[node][service]")
 {
     // Each of these produces a service that registers cleanly and then cannot do
@@ -239,9 +284,28 @@ TEST_CASE("NodeConfig: a registration that could not work is refused", "[node][s
     noScheduler.scheduler.clear();
     CHECK(NodeServiceRejection(noScheduler).has_value());
 
+    // No toolchain is NOT one of them any more, and that reversal is the point of
+    // #139: registering a service before anybody knows what the machine holds is
+    // exactly what makes installing the package the whole setup. The node answers
+    // the question at boot.
     auto noToolchain = Installable();
     noToolchain.toolchains.clear();
-    CHECK(NodeServiceRejection(noToolchain).has_value());
+    CHECK_FALSE(NodeServiceRejection(noToolchain).has_value());
+
+    // What still cannot work is discovery turned OFF with nothing named -- refused
+    // here, where an operator is watching, rather than at every boot where nobody
+    // is. This is what keeps `--no-toolchain-discovery` from being a null flag.
+    auto noToolchainNoDiscovery = noToolchain;
+    noToolchainNoDiscovery.toolchainDiscovery = false;
+    auto const bothOff = NodeServiceRejection(noToolchainNoDiscovery);
+    REQUIRE(bothOff.has_value());
+    CHECK(Unwrap(bothOff).contains("--no-toolchain-discovery"));
+
+    // Discovery off WITH a toolchain named is a perfectly good registration: it is
+    // how an operator pins a build farm to a curated set.
+    auto pinned = Installable();
+    pinned.toolchainDiscovery = false;
+    CHECK_FALSE(NodeServiceRejection(pinned).has_value());
 
     // The one worth the most: left empty, --advertise defaults to
     // {--bind}:{--port} and --bind defaults to 0.0.0.0, which no client can dial.

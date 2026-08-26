@@ -17,6 +17,7 @@
 #include "NodeConfig.hpp"
 #include "NodeIoLoop.hpp"
 #include "NodeMembership.hpp"
+#include "NodeToolchains.hpp"
 #include "SchedulerTier.hpp"
 #include "WorkerServer.hpp"
 
@@ -65,6 +66,7 @@
 #include <CompileJob.hpp>
 #include <Dispatch.hpp>
 #include <EndpointDial.hpp>
+#include <ToolchainDiscovery.hpp>
 #include <ToolchainHost.hpp>
 #include <ToolchainProbe.hpp>
 #include <WorkerProtocol.hpp>
@@ -143,106 +145,6 @@ void InstallNodeStopHandlers()
 {
     std::signal(SIGINT, &HandleNodeStopSignal);
     std::signal(SIGTERM, &HandleNodeStopSignal);
-}
-
-/// One `--toolchain` entry, resolved.
-struct ToolchainEntry
-{
-    std::string fingerprint; ///< Empty when the node must compute it.
-    std::string compiler;    ///< Path to the compiler.
-};
-
-/// Split a `--toolchain` value into its fingerprint and compiler.
-///
-/// Two accepted shapes, and the bare one is the one operators should use:
-///
-///   `<compiler>`               -- the node computes the fingerprint itself
-///   `<fingerprint>=<compiler>` -- an explicit override
-///
-/// The bare form exists because the fingerprint stopped being something a person
-/// can derive. It used to be the compiler's `--version` line, which an operator
-/// could read off a terminal; it is now a digest over the whole include tree, and
-/// requiring that to be pasted into a config would make every toolchain update a
-/// manual two-step that silently un-registers a worker when someone forgets.
-///
-/// The override is kept because it is the only way to run a worker whose compiler
-/// this process cannot execute -- a cross-compiler, or a wrapper that must not be
-/// spawned at configuration time -- and because pinning a fingerprint by hand is
-/// how an operator forces a fleet to agree while a machine is being repaired.
-///
-/// Split on the FIRST `=`, since a fingerprint is hex and contains none. A
-/// compiler path containing `=` is therefore only reachable through the override
-/// form, which is the documented escape hatch rather than a silent mis-parse.
-/// @param spec The flag's value.
-/// @return The entry, or nullopt when it is empty.
-[[nodiscard]] std::optional<ToolchainEntry> SplitToolchain(std::string_view spec)
-{
-    if (spec.empty())
-        return std::nullopt;
-
-    auto const eq = spec.find('=');
-    if (eq == std::string_view::npos)
-        return ToolchainEntry { .fingerprint = {}, .compiler = std::string { spec } };
-    if (eq == 0 || eq + 1 >= spec.size())
-        return std::nullopt;
-    return ToolchainEntry { .fingerprint = std::string { spec.substr(0, eq) },
-                            .compiler = std::string { spec.substr(eq + 1) } };
-}
-
-/// Resolve every `--toolchain` value to a fingerprint the scheduler can match.
-///
-/// Extracted from `main` rather than inlined, and not only for its length: this
-/// is the one part of startup that runs an external process and can take
-/// seconds, so it is worth being able to read on its own.
-///
-/// @param specs The raw `--toolchain` values.
-/// @param runner Process-spawning seam, for the compiler probes.
-/// @param host The machine's filesystem, registry and environment.
-/// @param logger Startup log.
-/// @return Fingerprint to compiler path, or nullopt when a value is malformed.
-[[nodiscard]] std::optional<std::map<std::string, std::string>> ResolveToolchains(std::vector<std::string> const& specs,
-                                                                                  Cc::IProcessRunner& runner,
-                                                                                  Cc::IToolchainHost& host,
-                                                                                  ILogger& logger)
-{
-    std::map<std::string, std::string> toolchains;
-    for (auto const& spec: specs)
-    {
-        auto const split = SplitToolchain(spec);
-        if (!split.has_value())
-        {
-            logger.Logf(
-                LogLevel::Error, "malformed --toolchain '{}'; expected <compiler> or <fingerprint>=<compiler>", spec);
-            return std::nullopt;
-        }
-
-        auto fingerprint = split->fingerprint;
-        if (fingerprint.empty())
-        {
-            // The same computation the launcher performs, through the same
-            // functions -- which is the point. A worker that derived its identity
-            // differently from its clients would register successfully, heartbeat
-            // happily, and never be matched, with nothing anywhere reporting why.
-            //
-            // Logged at info because it is slow the first time (a full walk of the
-            // include tree, seconds) and instant afterwards, and an operator
-            // watching a worker start deserves to know which of the two is
-            // happening rather than wondering whether it has hung.
-            logger.Logf(LogLevel::Info, "computing the toolchain fingerprint for {}", split->compiler);
-            auto const banner = Cc::CompilerBanner(runner, split->compiler);
-            auto const flavor = Cc::ClassifyCompiler(split->compiler);
-            fingerprint = Cc::CachedToolchainFingerprint(runner, host, split->compiler, banner, Cc::DriverOf(flavor));
-        }
-
-        // Reported unconditionally, including for an explicit override. A
-        // fingerprint mismatch is invisible from both ends -- the scheduler just
-        // says no worker matches -- so the one place the worker's own digest can
-        // be seen is its startup log, next to `fastcache-cc
-        // --print-toolchain-fingerprint` on the client.
-        logger.Logf(LogLevel::Info, "serving {} as {}", split->compiler, fingerprint);
-        toolchains.emplace(std::move(fingerprint), split->compiler);
-    }
-    return toolchains;
 }
 
 /// Adopt a socket-activated listener, when a supervisor handed one over.
@@ -341,10 +243,33 @@ constexpr int ExitOk = 0;
     auto const runner = Cc::MakeProcessRunner();
 
     auto const toolchainHost = Cc::MakeToolchainHost();
-    auto toolchainsOrNone = ResolveToolchains(cfg.toolchains, *runner, *toolchainHost, logger);
+    auto const discovery = cfg.toolchainDiscovery ? Cc::MakeToolchainDiscovery(*toolchainHost, *runner) : nullptr;
+    auto toolchainsOrNone = ResolveToolchains(cfg, discovery.get(), *runner, *toolchainHost, logger);
     if (!toolchainsOrNone.has_value())
         return ExitUsage;
     auto const toolchains = *std::move(toolchainsOrNone);
+
+    // A worker with nothing to serve is refused HERE as well as at the flag check,
+    // because with discovery on the two are different questions: "you named none"
+    // is answerable from the command line, and "this machine has none" is not
+    // answerable until the machine has been asked.
+    //
+    // Left to run, such a worker is the worst shape this system has. Nothing
+    // registers, so the scheduler never hears of it; the heartbeat reports "0 of 0
+    // toolchain(s) registered" and considers that a complete success; and the ready
+    // line says the node is up. A supervisor sees a healthy unit, an operator sees a
+    // green fleet, and every build compiles locally with no error at either end.
+    //
+    // The message names where it looked, because that is the diagnosis: an operator
+    // whose compiler was not found needs the search list, not the verdict.
+    if (toolchains.empty())
+    {
+        logger.Logf(LogLevel::Error,
+                    "no toolchain to serve: found no compiler on this machine. Searched: {}. Name one with "
+                    "--toolchain, or install a compiler where this worker can find it",
+                    SearchedLayouts());
+        return ExitUsage;
+    }
 
     // Computed HERE and advertised, rather than left for the scheduler to derive.
     // Both would use the same `OfferableSlots`, so the numbers would agree -- but
@@ -872,11 +797,14 @@ int main(int argc, char** argv)
         logger.Logf(LogLevel::Error, "--scheduler is required; a worker nothing knows about serves nobody");
         return ExitUsage;
     }
-    if (cfg.toolchains.empty())
+    // Only when the machine will not be asked. With discovery on, "no toolchain" is
+    // not yet a fact -- it is a question the node answers a few lines later, and
+    // refusing here would refuse every worker installed by a package.
+    if (cfg.toolchains.empty() && !cfg.toolchainDiscovery)
     {
         logger.Logf(LogLevel::Error,
-                    "--toolchain is required; a worker with none would register and then refuse every job "
-                    "the scheduler sent it");
+                    "--no-toolchain-discovery was given and no --toolchain: a worker with none would register "
+                    "and then refuse every job the scheduler sent it");
         return ExitUsage;
     }
 

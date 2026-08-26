@@ -73,10 +73,25 @@ struct NodeConfig
     std::string bindAddress { "0.0.0.0" };
     std::uint16_t port { 6676 };
 
-    /// fingerprint=compilerPath, repeatable. A worker with none serves nothing,
-    /// which is deliberate: there is no default compiler, because a default is how
-    /// a job ends up running against something nobody chose.
+    /// fingerprint=compilerPath, repeatable. An OVERRIDE: naming any pins this
+    /// worker to exactly that set, and naming none means "serve what this machine
+    /// has".
+    ///
+    /// There is still no default COMPILER -- a default is how a job ends up running
+    /// against something nobody chose -- and the distinction is the whole of #139:
+    /// "no default" and "no discovery" are different claims. Which compilers a
+    /// machine holds is a fact the node can establish, and it is the half of the
+    /// configuration that has to be redone after every toolchain upgrade.
     std::vector<std::string> toolchains;
+
+    /// Whether a worker given no `--toolchain` surveys the machine for compilers.
+    ///
+    /// On by default, because the whole point is that installing the package is the
+    /// setup. `--no-toolchain-discovery` is for the operator who wants the empty set
+    /// to stay empty, and it is not a null flag: with it set and no `--toolchain`,
+    /// `NodeServiceRejection` still refuses to register a service that provably
+    /// cannot start, which is the guard that used to apply unconditionally.
+    bool toolchainDiscovery { true };
     /// Concurrent compiles, or 0 to size the machine from `nodeClass` and its
     /// hardware. Enforced here as well as advertised, through the one shared
     /// `Distributed::OfferableSlots`: two implementations of that arithmetic is how
