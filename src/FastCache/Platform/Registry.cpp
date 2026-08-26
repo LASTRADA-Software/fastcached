@@ -241,12 +241,18 @@ std::vector<std::string> ListRegistryValueNames(RegistryHive hive, std::string_v
 
 #else
 
-std::optional<std::string> ReadRegistryString(RegistryHive, std::string_view, std::string_view, RegistryView)
+// Named rather than left anonymous even though nothing reads them: this is the
+// contract's other half, and a reader arriving here should see the same signature
+// the header states rather than have to go back for it.
+std::optional<std::string> ReadRegistryString(RegistryHive /*hive*/,
+                                              std::string_view /*subKey*/,
+                                              std::string_view /*valueName*/,
+                                              RegistryView /*view*/)
 {
     return std::nullopt;
 }
 
-std::vector<std::string> ListRegistryValueNames(RegistryHive, std::string_view, RegistryView)
+std::vector<std::string> ListRegistryValueNames(RegistryHive /*hive*/, std::string_view /*subKey*/, RegistryView /*view*/)
 {
     return {};
 }

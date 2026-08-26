@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <string>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 
 namespace
@@ -13,11 +15,11 @@ namespace
 /// A key present on every supported Windows and readable by an unprivileged
 /// process, so the positive cases assert against the real registry rather than
 /// against a fixture this module would have had to write.
-constexpr std::string_view CurrentVersionKey = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+constexpr std::string_view CurrentVersionKey = R"(SOFTWARE\Microsoft\Windows NT\CurrentVersion)";
 
 /// A key nothing has ever installed. Named once so the two absence cases below
 /// cannot drift into testing different things.
-constexpr std::string_view AbsentKey = "SOFTWARE\\fastcached-no-such-key-9f3a";
+constexpr std::string_view AbsentKey = R"(SOFTWARE\fastcached-no-such-key-9f3a)";
 } // namespace
 
 TEST_CASE("A key that does not exist reads as absent rather than empty", "[registry]")
@@ -37,12 +39,12 @@ TEST_CASE("A REG_SZ value comes back verbatim", "[registry]")
     auto const build =
         ReadRegistryString(RegistryHive::LocalMachine, CurrentVersionKey, "CurrentBuildNumber", RegistryView::Native);
     REQUIRE(build.has_value());
-    CHECK_FALSE(build->empty());
+    CHECK_FALSE(FastCache::Testing::Unwrap(build).empty());
 
     // No embedded NUL survived the read. A value stored without a terminator and
     // sized from the reported byte count keeps one, and such a string opens no
     // path and compares equal to nothing -- which is why TrimAtNul exists.
-    CHECK(build->find('\0') == std::string::npos);
+    CHECK(FastCache::Testing::Unwrap(build).find('\0') == std::string::npos);
 }
 
 TEST_CASE("A value of the wrong type is absent rather than reinterpreted", "[registry]")
@@ -87,7 +89,7 @@ TEST_CASE("The 32-bit view resolves to WOW6432Node", "[registry]")
     // every machine anybody will run this on and guaranteed on none of them, which
     // is the property that made the previous version of this case wrong.
     auto const throughPath = ListRegistryValueNames(
-        RegistryHive::LocalMachine, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion", RegistryView::Native);
+        RegistryHive::LocalMachine, R"(SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion)", RegistryView::Native);
     auto const redirected =
         ListRegistryValueNames(RegistryHive::LocalMachine, CurrentVersionKey, RegistryView::ThirtyTwoBit);
 

@@ -132,6 +132,7 @@ set(_fc_cc_sources
     RootReconciler.cpp
     Stats.cpp
     ToolchainFingerprint.cpp
+    ToolchainHost.cpp
     ToolchainProbe.cpp
     ProcessRunner.cpp
     WorkerProtocol.cpp)
@@ -251,6 +252,7 @@ if(FASTCACHED_BUILD_TESTS)
         ProcessRunner_test.cpp
         Stats_test.cpp
         ToolchainFingerprint_test.cpp
+        ToolchainHost_test.cpp
         ToolchainProbe_test.cpp
         WorkerProtocol_test.cpp
         ${_fc_cc_core}
