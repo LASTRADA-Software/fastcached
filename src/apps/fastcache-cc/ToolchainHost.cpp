@@ -45,7 +45,7 @@ namespace
     /// @return True when it carries a directory separator.
     [[nodiscard]] bool LooksLikePath(std::string_view name) noexcept
     {
-        return name.find('/') != std::string_view::npos || name.find('\\') != std::string_view::npos;
+        return name.contains('/') || name.contains('\\');
     }
 
     /// The names of a directory's entries matching a predicate.
