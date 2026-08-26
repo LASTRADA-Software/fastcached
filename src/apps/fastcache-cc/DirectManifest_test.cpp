@@ -23,6 +23,8 @@
 
 using namespace FastCache::Cc;
 using FastCache::Cc::Test::DigestQuarters;
+using FastCache::Cc::Test::RequireNoRetiredGeneration;
+using FastCache::Cc::Test::RetiredGeneration;
 using FastCache::Cc::Test::SplitMix64;
 
 namespace
@@ -1220,9 +1222,28 @@ TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
     // the object key by value and its own key never sees the object-key schema. The
     // reverse is free -- v4 moved this tag alone, to retire the manifests recorded
     // while every relative dependency path was silently dropped, which no change to
-    // the object key was needed for.
+    // the object key was needed for. v5 is the same direction again (issue #111),
+    // retiring the manifests recorded before a drive-relative path under no root
+    // was refused; `objkey` moved with it to keep the two tags from sitting apart,
+    // not because anything forced it.
+    // Computed ONCE and asserted twice, for the reason the matching case in
+    // CacheKey_test.cpp records: the rows below are digests of these exact inputs,
+    // so spelling the call a second time is a place for the two assertions to come
+    // to disagree about what was hashed.
     std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };
-    CHECK(ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51") == "8221eaeac6f3f8e52e523507780ed186");
+    auto const manifestKey = ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51");
+    CHECK(manifestKey == "72ed897f5c3dd9ec9fc2b4607aafdc96");
+
+    // And the generations it has retired stay retired. This is the half the vector
+    // above cannot cover: a v5 manifest is only safe because no launcher carrying
+    // the refusal ever records a defective one, so putting `manifest-v4` back makes
+    // every pre-#104 manifest reachable again and direct mode serves a stale object
+    // under a zero exit code. See RetiredGeneration.
+    constexpr auto Retired = std::to_array<RetiredGeneration>({
+        { .tag = "manifest-v3", .digest = "76b19c2b7caf3e0db4dcc1efcecb76aa" },
+        { .tag = "manifest-v4", .digest = "8221eaeac6f3f8e52e523507780ed186" },
+    });
+    RequireNoRetiredGeneration(manifestKey, Retired);
 
     // The header-state digest is deliberately NOT part of that pair: nothing is
     // stored under it, so it has no stale entries to re-key and its tag stays at

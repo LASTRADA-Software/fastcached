@@ -76,19 +76,23 @@ platforms.
   paths, named a file that is gone. That is worse than a miss, because Ninja records the
   dependency, cannot stat it, rebuilds, hits the same value, and never converges — with a
   successful exit code every time. The dependency path set is therefore part of the key
-  (`objkey-v4`, `KeyInputs::dependencyPaths`), captured on the preprocess run the launcher
+  (`objkey-v5`, `KeyInputs::dependencyPaths`), captured on the preprocess run the launcher
   already makes rather than in a second probe: measured at **+1.5% on a 45 ms preprocess**,
   because the compiler has already opened every one of those files. A move is a different
   key by construction, so the *pre-move* entry survives the move rather than being
   overwritten — which is the property `check_header_move` asserts by moving the header
   back and requiring a HIT. Anchored as `fastcache-cc: HIT`: the launcher prints
   `STALE HIT (...); recompiling` on its way to a MISS, so a bare `grep HIT` is satisfied by
-  exactly the collapse the case exists to reject. `ComputeManifestKey`'s `manifest-v4` tag is
-  bumped in lock-step with `objkey-v4` for a related reason — a manifest stores the object key
+  exactly the collapse the case exists to reject. `ComputeManifestKey`'s `manifest-v*` tag moves
+  in lock-step with `objkey-v*` for a related reason — a manifest stores the object key
   *by value* and its own key never sees the object-key schema, so a manifest written by an
   older launcher keeps resolving to an older object; direct mode is on by default and
   short-circuits before the preprocessed path,
-  so without the second bump the re-key never happens where it matters most.
+  so without the second bump the re-key never happens where it matters most. The coupling is
+  ONE-WAY, though, and both tags currently read `v5`: an `objkey` bump must drag the manifest
+  tag with it, while the reverse is free — and free is the direction `v5` itself moved in
+  (issue #111), the manifest half forced and the object half taken only to keep the two from
+  sitting numerically apart.
   - **Which paths are hashed is the whole subtlety, and the exclusion cuts the opposite
     way from the inclusion.** `KeyDependencySet` normalizes each path through
     `DirectManifest`'s `NormalizePath` **first** — a driver echoes a path as *resolved*, so
@@ -195,7 +199,7 @@ platforms.
       naming a file that is gone, under a zero exit code. Covering it is not available — it
       would mean recording the producing machine's per-drive cwd in the value, which is exactly
       the machine-specific state the key exists to keep out — so the compile is refused
-      instead, the way a module interface unit is, and says so under `FASTCACHE_VERBOSE`. Five
+      instead, the way a module interface unit is, and says so under `FASTCACHE_VERBOSE`. Six
       things about its shape are load-bearing:
       - **It is a ROOT test that begins with an anchor test, and both halves cut opposite
         ways.** Refusing on the anchor alone would take a drive-relative *root* (`C:src\proj`)
@@ -224,11 +228,12 @@ platforms.
         two. Note what #105 did and did not do here: it gave the drop its own NAME, which made
         the fault legible and this fix expressible — naming a drop is not covering it, and on
         its own the path still reached the key filter as a drop.
-      - **No schema tag moves**, and that is what the command-line ask bought. `objkey-v4` and
-        `manifest-v4` stay: nothing about the key's construction, the value's framing or its
-        canonicalization changed, and an affected compile simply stops consulting the cache.
-        Closing this by bumping instead would have re-keyed every entry on every platform for a
-        clang-cl-only exposure.
+      - **No schema tag moved for the refusal itself**, and that is what the command-line ask
+        bought: nothing about the key's construction, the value's framing or its canonicalization
+        changed, and an affected compile simply stops consulting the cache. Closing the *whole*
+        thing by bumping instead would have re-keyed every entry on every platform for a
+        clang-cl-only exposure. A bump was still needed afterwards — for the direct-mode residual
+        below, and not for the refusal. See the `v5` bullet.
       - **The regression test asserts the CONJUNCTION, because the defect was never inside a
         filter.** A table of the shapes a driver can report, each declaring what covers it —
         keyed, guarded, the toolchain stamp, or refused — and there is deliberately no
@@ -236,15 +241,39 @@ platforms.
         kind of row. `ToolchainStamp` is a *claim* about content, true of a toolchain header at
         a fixed address and false of a path nothing can place. Verified by neutering the
         predicate and watching those two rows, and only them, change answer.
-      The residual is now the narrow one, and it is a DIRECT-MODE residual tracked as #111:
-      the authoritative ask runs after `TryDirectMode`, and the command-line ask can only
-      see a path an argument carries — so a drive-relative header that arrived some other
-      way (an `#include "C:foo/x.h"` written out in the source, a fused flag spelling
-      `PathValueFlags()` does not know) keeps direct-hitting a manifest an older launcher
-      recorded, which no tag moved to retire. Reachable only for a build already inside
-      the clang-cl-plus-drive-relative case AND holding a pre-fix manifest, and it
-      self-heals the first time that TU misses direct mode. Closing it is a `manifest-v5`
-      bump, which is the cheap direction of the one-way lock-step above.
+      - **`v5` closes the direct-mode residual the refusal could not reach (issue #111), and
+        both tags move.** The authoritative ask runs after `TryDirectMode`, and the command-line
+        ask can only see a path an *argument* carries — so a drive-relative header arriving some
+        other way (an `#include "C:foo/x.h"` written out in the source, a fused flag spelling
+        `PathValueFlags()` does not know) kept direct-hitting a manifest an older launcher
+        recorded. That manifest was invisible to its own key for exactly the reason the `v4`
+        bullet gives for its generation: the refusal changes neither `canonicalSource` nor the
+        args, so the entry keeps its key and keeps being found, and `ValidateManifest` still
+        validates it because the offending path was dropped from the manifest too and there is
+        nothing left to fail on. Re-keying is the only thing that retires it. Four consequences:
+        - **The bump had to land at or after the refusal, never before it.** A `v5` manifest
+          written by a launcher without the refusal carries the identical defect, and there
+          would be no tag left to retire *that* — the one retirement event would have been spent
+          on the wrong generation. With the refusal underneath, such a compile is never cached
+          at all, so the `v5` population is clean by construction.
+        - **`objkey` moved too, and nothing forced it.** The manifest half is the whole of the
+          fix; the object key's construction, framing and canonicalization are all unmoved. It
+          is taken because the standing argument at the `objkey` tag decides it — two tags
+          sitting numerically apart is a state nobody should have to reason about later — and
+          the cold rebuild it costs is one the manifest bump has already committed every user to
+          paying, so it rides in that invalidation event rather than ever costing a second.
+        - **The issue recommended the opposite and was overruled at the tag, not silently.** It
+          argued for moving `manifest` alone, since re-keying objects invalidates every entry on
+          every platform for a clang-cl-only exposure. That asymmetry is real, but it is an
+          argument about one invalidation event weighed once, while the tags-apart hazard is
+          carried by every later reader and does not expire.
+        - **A golden vector does not pin a bump; a retired-generation table does.** Reverting
+          the tag and re-pasting the vector is one edit two hunks apart and leaves the suite
+          green. `Test::RetiredGeneration` in `KeyDigestTestSupport.hpp` is a row per generation
+          each key space has retired, and the live key must equal none of them, so restoring an
+          old tag reproduces a retired digest and fails whatever the golden says. Rows reach
+          back only to `v3`, because issue #63 moved the digest itself and `v2` and earlier are
+          unreachable by construction rather than by tag.
     - One diagnostic consequence of the drop that used to happen: the launcher's
       `dependency set: 0 of M reported path(s) keyed` line was reachable for a second reason,
       so that fingerprint stopped identifying the #66 short-name mismatch on its own. The two
@@ -859,9 +888,6 @@ without reopening the argument:
 
 ## Open work
 
-- **[#111](https://github.com/LASTRADA-Software/fastcached/issues/111)** — a manifest
-  recorded before #104 can still direct-hit a drive-relative compile, because the
-  authoritative refusal runs after `TryDirectMode`. Closed by a `manifest-v5` bump.
 - **[#64](https://github.com/LASTRADA-Software/fastcached/issues/64)** — a
   relative include-dir argument still reaches the key verbatim through
   `RelativizeArgs`, so two build trees at different depths key apart on the

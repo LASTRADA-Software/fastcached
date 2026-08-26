@@ -234,7 +234,31 @@ std::string ComputeKey(KeyInputs const& inputs)
     // cost of removing the question is a single cold rebuild. The fused-output
     // re-key above, which needed no bump of its own, rides along in the same
     // invalidation event rather than ever costing a second.
-    KeyDigest digest { "objkey-v4" };
+    //
+    // v5 is issue #111, and NOTHING here forced it. The manifest half is what the
+    // issue is about — a manifest recorded before #104's refusal keeps direct-
+    // hitting a drive-relative compile, and only a re-key retires it; see
+    // ComputeManifestKey. This key's construction, the value's framing and its
+    // canonicalization are all unmoved, and the golden vector below moved for the
+    // tag and for nothing else.
+    //
+    // It is taken because the paragraph above is not a remark about v4, it is the
+    // standing rule, and it decides this case the same way: two tags sitting
+    // numerically apart is a state nobody should have to reason about later. A
+    // cache holding v5 manifests that point at v4 objects is correct today under
+    // the one-way lock-step and is one careless edit from not being, and the cost
+    // of removing the question is again a single cold rebuild — one that the
+    // manifest bump has already committed every user to paying, so the object half
+    // rides in that invalidation event rather than ever costing a second.
+    //
+    // Issue #111 recommends the opposite — bump `manifest` alone, on the ground
+    // that re-keying objects invalidates every entry on every platform for a
+    // clang-cl-only exposure — and asks for that recommendation to be followed or
+    // explicitly overruled here rather than silently ignored. It is overruled. The
+    // asymmetry it cites is real but it is an argument about THIS invalidation
+    // event, weighed once; the tags-apart hazard is carried by every reader of
+    // this file afterwards, and unlike a cold rebuild it does not expire.
+    KeyDigest digest { "objkey-v5" };
     digest.Field(inputs.compilerId);
     digest.Field(inputs.preprocessed);
     for (auto const& arg: inputs.relativizedArgs)

@@ -743,7 +743,28 @@ std::string ComputeManifestKey(std::string_view canonicalSource,
     // and a direct hit never reaches RecordManifest, so nothing would ever
     // overwrite one. Edit a dropped header and the stale object is served under a
     // zero exit code, indefinitely. Re-keying is the only thing that retires them.
-    KeyDigest digest { "manifest-v4" };
+    //
+    // v5 is issue #111, and it is the v4 paragraph's argument reaching a second
+    // defect by the same route. Issue #104 refuses to cache a compile carrying a
+    // drive-relative path under no root, and asks twice — Cc::KeyDependencySet of
+    // the paths the compiler actually opened, and Cc::UnkeyableArgument of the
+    // command line. The authoritative ask is the first, and it runs AFTER
+    // TryDirectMode; the second runs early enough but can only isolate a path an
+    // ARGUMENT carries. So a drive-relative header reaching the compiler by some
+    // other route — an `#include "C:foo/x.h"` written out in the translation unit,
+    // a fused flag spelling PathValueFlags() does not know — is invisible to the
+    // early ask, and the late one never runs because direct mode already answered.
+    //
+    // Such a manifest is invisible to the key for the same reason the v4 ones
+    // were: the refusal changes neither `canonicalSource` nor the args, so the
+    // entry keeps its key and keeps being found, and ValidateManifest still
+    // validates it because the offending path was dropped from the manifest too
+    // and there is nothing left to fail on. A stale object under a zero exit code,
+    // through the one door #104 could not close without re-keying. Moving this tag
+    // is what closes it, and it retires exactly the pre-#104 population: a launcher
+    // carrying the refusal never records such a manifest at all, so nothing writes
+    // a v5 entry with the defect in it.
+    KeyDigest digest { "manifest-v5" };
     digest.Field(toolchainStamp);
     digest.Field(canonicalSource);
     for (auto const& arg: relativizedArgs)
