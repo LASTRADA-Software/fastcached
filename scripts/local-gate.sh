@@ -68,6 +68,24 @@ run_preset() {
     local log
     log="$(mktemp)"
 
+    # Configured when it has not been, because `cmake --build --preset` on a
+    # directory that does not exist fails with "<path> is not a directory" -- which
+    # names neither the preset nor the fix, and is what a FRESH CHECKOUT gets from
+    # the one script everybody is told to run before pushing. Only when the cache is
+    # missing: a re-configure here costs over a minute, every run, to do nothing.
+    #
+    # The path is spelled rather than asked for, and it is coupled to
+    # CMakePresets.json's single `binaryDir` of `${sourceDir}/out/build/${presetName}`.
+    # A preset that moved its build directory would configure once too often, which
+    # is the harmless direction.
+    if [[ ! -f "out/build/${preset}/CMakeCache.txt" ]]; then
+        echo "== $preset: configure (no build directory yet)"
+        if ! cmake --preset "$preset" > "$log" 2>&1; then
+            tail -40 "$log"
+            fail "$preset configure (full log: $log)"
+        fi
+    fi
+
     echo "== $preset: build"
     if ! cmake --build --preset "$preset" > "$log" 2>&1; then
         grep -E 'error:|FAILED' "$log" | head -40
