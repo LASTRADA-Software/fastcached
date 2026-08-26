@@ -100,6 +100,15 @@ falling hit ratio mean the working set no longer fits and `--max-memory` (or
 The client side reports independently — `fastcache-cc --show-stats` gives the hit
 rate as each builder sees it, which is what actually determines build times.
 
+If you run a **compile fleet** rather than a lone cache, the leader can show you
+the whole of it on one page: see
+[Looking at the whole fleet](../tools/fastcache-compile-node.md#looking-at-the-whole-fleet).
+That is a view of who is a member, how big each machine is and what its cache
+holds — the thing `/metrics` cannot give you without a Prometheus in front of it,
+because a scrape is one process reporting itself. `/metrics` stays the source of
+truth for anything you alert on; the page is for the question you ask once, while
+something is wrong.
+
 ## A note on client configuration
 
 If hit rates are low, check the client before tuning the server. Cache keys
