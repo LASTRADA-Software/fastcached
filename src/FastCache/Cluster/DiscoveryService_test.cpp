@@ -256,7 +256,7 @@ TEST_CASE("Discovery survives a lost beacon", "[cluster][discovery][service]")
     Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", "secret" };
     Node bob { bus, clock, random, logger, "bob", "10.0.0.2:7000", "prod", "secret" };
 
-    bus.DropNext(AtEndpoint("10.0.0.2:7000"), 1);
+    REQUIRE(bus.DropNext(AtEndpoint("10.0.0.2:7000"), 1) == 1);
 
     REQUIRE(alice.service.SendBeacon());
     CHECK(bob.service.PumpOnce(1ms) == DiscoveryEvent::Nothing); // lost

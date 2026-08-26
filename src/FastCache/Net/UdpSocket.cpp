@@ -222,7 +222,10 @@ namespace
     };
 } // namespace
 
-std::unique_ptr<IDatagramSocket> OpenUdpSocket(std::string_view bindAddress, std::uint16_t port, BroadcastMode broadcast)
+std::unique_ptr<IDatagramSocket> OpenUdpSocket(std::string_view bindAddress,
+                                               std::uint16_t port,
+                                               BroadcastMode broadcast,
+                                               PortSharing sharing)
 {
     // Winsock refuses every call until WSAStartup has run, and there is no
     // diagnostic to distinguish "the stack is not up" from "this address will
@@ -250,8 +253,33 @@ std::unique_ptr<IDatagramSocket> OpenUdpSocket(std::string_view bindAddress, std
         if (handle == Detail::InvalidSocket)
             continue;
 
-        int const reuse = 1;
-        ::setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
+        if (sharing == PortSharing::Shared)
+        {
+            int const reuse = 1;
+            ::setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
+
+            // One intent, two spellings, because SO_REUSEADDR does not mean the
+            // same thing everywhere. On Linux and on Windows it is what lets a
+            // second socket bind an address a first one holds. On BSD and Darwin
+            // it permits that only for a MULTICAST address; a second bind of the
+            // same unicast address needs SO_REUSEPORT, and without it the second
+            // node on a macOS host cannot bind the beacon port at all.
+            //
+            // Set wherever the option exists rather than behind a platform test,
+            // and that is measured rather than assumed: on Ubuntu 24.04, all four
+            // combinations of the two options across two sockets bind
+            // successfully, so a node carrying this still shares a port with an
+            // older node that does not. Undefined on Windows, where SO_REUSEADDR
+            // already says it.
+#if defined(SO_REUSEPORT)
+            ::setsockopt(handle, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
+#endif
+        }
+        // Exclusive asks for nothing, which is every platform's default for a
+        // datagram socket. There is no SO_EXCLUSIVEADDRUSE counterpart to reach
+        // for here the way `Detail::BindAndListen` does: that guards a *named*
+        // port a squatter may already hold shareably, and the sockets that take
+        // this branch ask the kernel to choose one.
 
         if (broadcast == BroadcastMode::On)
         {

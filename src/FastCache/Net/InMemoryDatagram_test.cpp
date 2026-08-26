@@ -63,6 +63,81 @@ TEST_CASE("DatagramBus delivers a unicast to exactly one inbox", "[net][datagram
     CHECK_FALSE(carol->Receive(10ms).has_value());
 }
 
+TEST_CASE("Two sockets sharing one address both hear a broadcast; one hears a unicast", "[net][datagram]")
+{
+    // The asymmetry the whole shared-port defect rests on, and the reason this
+    // double models a shared address at all. A UDP port is shareable -- every
+    // node on a segment binds the beacon port, co-hosted nodes on one machine
+    // included -- and sharing it buys HEARING the broadcast and nothing else.
+    DatagramBus bus;
+    auto first = bus.Open(AtHost("10.0.0.1"));
+    auto second = bus.Open(AtHost("10.0.0.1"));
+    auto sender = bus.Open(AtHost("10.0.0.9"));
+
+    REQUIRE(sender->Send(Bytes("beacon"), DatagramBus::BroadcastAddress()).has_value());
+
+    for (auto* socket: { first.get(), second.get() })
+    {
+        auto const heard = socket->Receive(10ms);
+        REQUIRE(heard.has_value());
+        CHECK(Text(*heard) == "beacon");
+    }
+
+    REQUIRE(sender->Send(Bytes("challenge"), AtHost("10.0.0.1")).has_value());
+
+    // The first to have attached, deterministically: a real kernel's answer
+    // differs between platforms -- Windows 11 hands it to the first-bound socket
+    // and Linux to the last -- so what is asserted is that exactly ONE of them
+    // gets it, which is what every platform agrees on and what the layer above
+    // has to survive.
+    auto const atFirst = first->Receive(10ms);
+    REQUIRE(atFirst.has_value());
+    CHECK(Text(*atFirst) == "challenge");
+    CHECK_FALSE(second->Receive(10ms).has_value());
+}
+
+TEST_CASE("A broadcast to a port passes over a socket on another one", "[net][datagram]")
+{
+    // What `255.255.255.255:P` does. It matters as soon as one node holds sockets
+    // on two ports, which is the shape `AnswerFromOwnAddress` gives it: a beacon
+    // must reach the socket listening for beacons and not the one waiting for the
+    // answer to one, or the node challenges every peer twice per beacon and
+    // rejects the first proof back as a bad key.
+    DatagramBus bus;
+    auto listener = bus.Open(DatagramAddress { .host = "10.0.0.1", .port = 6681 });
+    auto own = bus.Open(DatagramAddress { .host = "10.0.0.1", .port = 40001 });
+
+    REQUIRE(own->Send(Bytes("beacon"), DatagramBus::BroadcastAddressOn(6681)).has_value());
+
+    auto const atListener = listener->Receive(10ms);
+    REQUIRE(atListener.has_value());
+    CHECK(Text(*atListener) == "beacon");
+    CHECK_FALSE(own->Receive(10ms).has_value());
+}
+
+TEST_CASE("Closing one of two sockets on one address leaves the other serving", "[net][datagram]")
+{
+    // Sharing an address is not sharing a socket. A double that gave one address
+    // one inbox would report the survivor closed -- and, worse, would have handed
+    // both nodes the same queue all along.
+    DatagramBus bus;
+    auto first = bus.Open(AtHost("10.0.0.1"));
+    auto second = bus.Open(AtHost("10.0.0.1"));
+    auto sender = bus.Open(AtHost("10.0.0.9"));
+
+    first->Close();
+
+    auto const closed = first->Receive(10ms);
+    REQUIRE_FALSE(closed.has_value());
+    CHECK(closed.error() == DatagramWait::Closed);
+
+    REQUIRE(sender->Send(Bytes("beacon"), DatagramBus::BroadcastAddress()).has_value());
+
+    auto const heard = second->Receive(10ms);
+    REQUIRE(heard.has_value());
+    CHECK(Text(*heard) == "beacon");
+}
+
 TEST_CASE("DatagramBus delivers a broadcast to everyone, sender included", "[net][datagram]")
 {
     // Sender included, because that is what a real broadcast does -- and it is
@@ -95,7 +170,10 @@ TEST_CASE("DatagramBus loses what it is told to lose", "[net][datagram]")
     auto bob = bus.Open(AtHost("10.0.0.2"));
     auto carol = bus.Open(AtHost("10.0.0.3"));
 
-    bus.DropNext(AtHost("10.0.0.2"), 2);
+    // Asserted, not discarded: starving an address nobody holds is a no-op, and
+    // the case below would then be green because the datagram never arrived
+    // rather than because it was dropped.
+    REQUIRE(bus.DropNext(AtHost("10.0.0.2"), 2) == 1);
 
     for (auto const* const text: { "one", "two", "three" })
         REQUIRE(alice->Send(Bytes(text), DatagramBus::BroadcastAddress()).has_value());
@@ -182,6 +260,68 @@ TEST_CASE("A real UDP socket round-trips a datagram", "[net][datagram][smoke]")
     REQUIRE(received.has_value());
     CHECK(Text(*received) == "over the wire");
     CHECK(received->from == sender->BoundAddress());
+}
+
+TEST_CASE("Two real UDP sockets on one port: only one is handed a unicast", "[net][datagram][smoke]")
+{
+    // The kernel behaviour the shared-port fix is premised on, asserted against a
+    // real stack rather than trusted. `PortSharing::Shared` lets both of these
+    // bind -- which is what a segment needs, since every node listens where the
+    // others shout -- and then exactly one of them is handed a unicast. Which one
+    // is not portable: measured, Windows 11 picks the first-bound and Ubuntu
+    // 24.04 the last, so the assertion is the count.
+    //
+    // It is also what proves `PortSharing::Shared` means the same thing on all
+    // three platforms. SO_REUSEADDR alone would fail the second bind on macOS,
+    // and this is the case that would say so.
+    //
+    // Unicast only. The broadcast half is what `SO_REUSEADDR` is *for* and is not
+    // in doubt; asserting it here would mean putting a datagram on the segment
+    // from a unit test, which a CI runner may refuse and a colleague's LAN should
+    // not have to see.
+    //
+    // The port is kernel-chosen and then re-bound, rather than a constant: a
+    // fixed one collides with whatever else is on the machine, and this suite
+    // runs in parallel.
+    auto first = OpenUdpSocket("127.0.0.1", 0, BroadcastMode::Off, PortSharing::Shared);
+    REQUIRE(first != nullptr);
+    auto const shared = first->BoundAddress();
+    REQUIRE(shared.port != 0);
+
+    auto second = OpenUdpSocket("127.0.0.1", shared.port, BroadcastMode::Off, PortSharing::Shared);
+    REQUIRE(second != nullptr);
+    CHECK(second->BoundAddress().port == shared.port);
+
+    auto sender = OpenUdpSocket("127.0.0.1", 0, BroadcastMode::Off);
+    REQUIRE(sender != nullptr);
+    REQUIRE(sender->Send(Bytes("challenge"), shared).has_value());
+
+    // A short wait on the second of the two, because the interesting outcome --
+    // the one that breaks discovery -- is that it never arrives, and that answer
+    // is only ever a timeout.
+    auto const atFirst = first->Receive(2s);
+    auto const atSecond = second->Receive(200ms);
+
+    CHECK(static_cast<int>(atFirst.has_value()) + static_cast<int>(atSecond.has_value()) == 1);
+    if (atFirst.has_value())
+        CHECK(Text(*atFirst) == "challenge");
+    else
+        CHECK(Text(*atSecond) == "challenge");
+}
+
+TEST_CASE("An exclusive UDP socket keeps its address to itself", "[net][datagram][smoke]")
+{
+    // The other half of the contract, and the reason `PortSharing` is a parameter
+    // rather than something every UDP socket gets. Sharing is what a beacon port
+    // needs; a socket whose whole job is that the answer addressed to it arrives
+    // at IT must not share, and nothing would notice if it quietly did -- the
+    // datagrams would simply go to the wrong process now and then.
+    auto held = OpenUdpSocket("127.0.0.1", 0, BroadcastMode::Off, PortSharing::Exclusive);
+    REQUIRE(held != nullptr);
+    auto const bound = held->BoundAddress();
+    REQUIRE(bound.port != 0);
+
+    CHECK(OpenUdpSocket("127.0.0.1", bound.port, BroadcastMode::Off, PortSharing::Exclusive) == nullptr);
 }
 
 TEST_CASE("A real UDP socket reports an address it cannot use", "[net][datagram][smoke]")

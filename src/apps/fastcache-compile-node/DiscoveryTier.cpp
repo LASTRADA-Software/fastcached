@@ -114,7 +114,7 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     // broadcast, so every node has to be listening where the others shout -- an
     // ephemeral local port would send perfectly and hear nothing, which presents as a
     // segment of nodes that each believe they are alone.
-    auto socket = OpenUdpSocket("0.0.0.0", *port, BroadcastMode::On);
+    auto socket = OpenUdpSocket("0.0.0.0", *port, BroadcastMode::On, PortSharing::Shared);
     if (socket == nullptr)
         return std::unexpected { std::format("cannot bind UDP 0.0.0.0:{} for discovery", *port) };
 
