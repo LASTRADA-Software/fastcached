@@ -45,6 +45,12 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
         existing->second.info.slots = OfferableSlots(registration.capacity, registration.slots);
         existing->second.info.capacity = registration.capacity;
         existing->second.info.codecs = registration.codecs;
+        // Refreshed, not kept. This is the path a machine takes when it restarts,
+        // and restarting on a new build is precisely what an upgrade looks like --
+        // a version held over from the first registration would leave the page
+        // reporting the old binary for as long as the process stayed up, which is
+        // the one thing this column must never do.
+        existing->second.info.version = std::string { registration.version };
         // Reset rather than kept, both of them, and for one reason: a re-registering
         // worker has restarted, so whatever it was running is gone and whatever its
         // machine was doing is a reading from before that. Carrying either forward
@@ -61,6 +67,7 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
                      Entry { .info = WorkerInfo { .id = id,
                                                   .fingerprint = std::string { registration.fingerprint },
                                                   .endpoint = std::string { registration.endpoint },
+                                                  .version = std::string { registration.version },
                                                   .slots = OfferableSlots(registration.capacity, registration.slots),
                                                   .inFlight = 0,
                                                   .capacity = registration.capacity,
@@ -318,7 +325,8 @@ std::vector<NodeReport> WorkerRegistry::NodeReports() const
                                                                       .load = entry.info.load,
                                                                       .registeredSlots = entry.info.slots,
                                                                       .fleetJobsInFlight = entry.info.inFlight,
-                                                                      .heartbeatAge = AgeOf(entry.lastSeen, now) },
+                                                                      .heartbeatAge = AgeOf(entry.lastSeen, now),
+                                                                      .version = entry.info.version },
                                                .lastSeen = entry.lastSeen,
                                                .contributorSaysCache = SaysAnything(entry.info.load.cache) });
         if (inserted)
@@ -345,6 +353,11 @@ std::vector<NodeReport> WorkerRegistry::NodeReports() const
             held.report.capacity = entry.info.capacity;
             held.report.load = entry.info.load;
             held.report.heartbeatAge = AgeOf(entry.lastSeen, now);
+            // Machine-wide like the rest of this block: one process serves every
+            // toolchain on a host, so its entries cannot disagree about the version
+            // -- and taking it from the same contributor as everything else keeps
+            // the whole row one entry's account rather than a blend of several.
+            held.report.version = entry.info.version;
             held.lastSeen = entry.lastSeen;
             held.contributorSaysCache = saysCache;
         }

@@ -613,3 +613,75 @@ TEST_CASE("A node cache report carries how stale its figures are", "[distributed
     CHECK(caches[0].heartbeatAge == std::chrono::milliseconds { 250 });
     CHECK(caches[0].load.hits == 10);
 }
+
+TEST_CASE("A machine's software version reaches its report, and a restart refreshes it", "[distributed][registry][version]")
+{
+    ManualClock clock;
+    WorkerRegistry registry { clock };
+
+    (void) registry.Register(WorkerRegistration { .fingerprint = "gcc-14",
+                                                  .endpoint = "10.0.0.1:7100",
+                                                  .version = "1.4.2",
+                                                  .slots = 4,
+                                                  .codecs = {},
+                                                  .capacity = NodeCapacity { .logicalCores = 8 } });
+
+    auto const first = registry.NodeReports();
+    REQUIRE(first.size() == 1);
+    CHECK(first[0].version == "1.4.2");
+
+    // The path a machine takes when it restarts -- and restarting on a new build is
+    // exactly what an upgrade looks like. A version held over from the first
+    // registration would leave the page reporting the old binary for as long as the
+    // process stayed up, which is the one thing this column must never do.
+    (void) registry.Register(WorkerRegistration { .fingerprint = "gcc-14",
+                                                  .endpoint = "10.0.0.1:7100",
+                                                  .version = "1.5.0",
+                                                  .slots = 4,
+                                                  .codecs = {},
+                                                  .capacity = NodeCapacity { .logicalCores = 8 } });
+
+    auto const second = registry.NodeReports();
+    REQUIRE(second.size() == 1);
+    CHECK(second[0].version == "1.5.0");
+}
+
+TEST_CASE("One machine serving two toolchains reports one version", "[distributed][registry][version]")
+{
+    ManualClock clock;
+    WorkerRegistry registry { clock };
+
+    // Two registry entries, one process. They cannot disagree about the version, and
+    // the report is one machine's row -- so this asserts the grain rather than a
+    // blend of the two entries.
+    for (auto const* fingerprint: { "gcc-14", "clang-20" })
+        (void) registry.Register(WorkerRegistration { .fingerprint = fingerprint,
+                                                      .endpoint = "10.0.0.1:7100",
+                                                      .version = "1.4.2",
+                                                      .slots = 4,
+                                                      .codecs = {},
+                                                      .capacity = NodeCapacity { .logicalCores = 8 } });
+
+    auto const reports = registry.NodeReports();
+    REQUIRE(reports.size() == 1);
+    CHECK(reports[0].fingerprints.size() == 2);
+    CHECK(reports[0].version == "1.4.2");
+}
+
+TEST_CASE("A node too old to report a version leaves it empty", "[distributed][registry][version]")
+{
+    ManualClock clock;
+    WorkerRegistry registry { clock };
+
+    (void) registry.Register(WorkerRegistration { .fingerprint = "gcc-14",
+                                                  .endpoint = "10.0.0.1:7100",
+                                                  .slots = 4,
+                                                  .codecs = {},
+                                                  .capacity = NodeCapacity { .logicalCores = 8 } });
+
+    auto const reports = registry.NodeReports();
+    REQUIRE(reports.size() == 1);
+    // Empty is the fact, not a value to be tidied into "unknown" here: what to show
+    // for it is the renderer's decision, and it renders as the page's dash.
+    CHECK(reports[0].version.empty());
+}

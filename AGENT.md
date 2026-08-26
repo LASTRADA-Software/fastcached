@@ -250,6 +250,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   JSON key. Absent renders `null`/`–` at the **cell**, and a tier no member runs
   gets no column.
 - A fleet total is computed over `NodeReports()`, never over registry entries.
+- A node's version is compiled in, rides REGISTER's *nested* capacity record (whose
+  arity is variable) rather than its top level (whose arity is exact), and is
+  refreshed on re-registration — a restart is what an upgrade looks like.
 - A history stores a counter **raw**; a rate is the delta at render, taken only
   between adjacent *present* buckets. A restart is then a gap, not a spike.
 - Sampling runs only while this node **leads**, and no state of the history file

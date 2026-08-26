@@ -286,3 +286,28 @@ fault.
   absolute URL anywhere" fails on the inline sparkline and pushes it out of the
   page for a reason that was never true. Ask instead whether any attribute a
   browser resolves -- `src`, `href`, `@import` -- points off this origin.
+
+- **A node's reported version is compiled in, never configurable.** The column
+  exists to answer *which binary is actually running on that machine*, and it is
+  read during a rolling upgrade -- so a version a node could be **told** to report
+  is one that can be wrong at exactly the moment somebody is relying on it.
+  - **It rides REGISTER's nested capacity record, not its top level.** That
+    message's arity is exact and fixed forever; a sixth field there makes two
+    builds of one fleet unable to speak at all. The nested record is read with the
+    variable-arity split, so compatibility runs both ways: an older node reports
+    nothing and is admitted, and a newer node's extra field is skipped by an older
+    leader.
+  - **It is refreshed on re-registration.** That path *is* a restart, and restarting
+    on a new build is what an upgrade looks like. A version carried over from the
+    first registration would leave the page naming the old binary for as long as the
+    new process stayed up.
+  - **It stays out of `NodeCapacity`.** That struct is a **literal type**, exercised
+    by `constexpr` tests over `OfferableSlots` and the slot ceilings, and one
+    `std::string` in it ends that property for the whole codebase. A version is also
+    not a scheduling input -- nothing weighs it -- which is what `NodeCapacity`
+    holds. It lives beside the other registration strings on `WorkerInfo`.
+  - **A version this build cannot parse is reported, not refused.** It is a string
+    an operator reads rather than one any code branches on, so an unrecognised shape
+    is a peer to report; refusing the registration would take a working machine out
+    of the fleet over a diagnostic field. It reaches an HTML page, so it is escaped
+    like every other value that came off a wire.

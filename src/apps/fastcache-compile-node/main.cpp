@@ -27,6 +27,7 @@
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -628,11 +629,19 @@ constexpr int ExitOk = 0;
     auto advertised = capacity;
     advertised.cache = Node::CacheCapacityOf(cacheTier.get());
 
+    auto advertisedWire = Distributed::CapacityToWire(advertised);
+    // Compiled in, never configurable. The point of the column this feeds is to tell
+    // an operator which binary is actually running on each machine -- most often
+    // part-way through a rolling upgrade -- and a version a node could be *told* to
+    // report is one that can be wrong exactly when somebody is relying on it. It
+    // travels inside the capacity record because that is REGISTER's one extensible
+    // field; the message's own arity is exact and stays that way forever.
+    advertisedWire.version = VersionString;
+
     std::vector<Cc::WorkerRegistrar> registrars;
     registrars.reserve(toolchains.size());
     for (auto const& [fingerprint, compiler]: toolchains)
-        registrars.emplace_back(
-            fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, Distributed::CapacityToWire(advertised));
+        registrars.emplace_back(fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, advertisedWire);
 
     // One sampler for the whole loop, not one per heartbeat. CPU utilization is a
     // difference between two readings, so a sampler constructed per iteration would

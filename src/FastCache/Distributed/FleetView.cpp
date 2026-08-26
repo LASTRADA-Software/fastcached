@@ -240,11 +240,24 @@ namespace
     };
 
     /// What a node row shows, before its per-tier cache columns.
-    constexpr std::array<FleetColumn<NodeReport>, 10> NodeColumns {
+    constexpr std::array<FleetColumn<NodeReport>, 11> NodeColumns {
         FleetColumn<NodeReport> { .name = "endpoint",
                                   .help = "host:port the machine answers on.",
                                   .format = CellFormat::Text,
                                   .project = [](NodeReport const& n) { return FleetCell::Of(n.endpoint); } },
+        FleetColumn<NodeReport> {
+            .name = "version",
+            .help = "Which build of fastcache-compile-node this machine is running. Absent "
+                    "when the node predates the field and cannot report one.",
+            .format = CellFormat::Text,
+            // Absent rather than blank, and the distinction earns its place during
+            // the one activity this column exists for: a rolling upgrade. A node
+            // too old to report a version is exactly the node an operator is
+            // looking for, so it must not render as the emptiest-looking cell in
+            // the table -- it renders as the page's dash, like every other thing
+            // nobody told us.
+            .project =
+                [](NodeReport const& n) { return n.version.empty() ? FleetCell::Nothing() : FleetCell::Of(n.version); } },
         FleetColumn<NodeReport> { .name = "toolchains",
                                   .help = "How many toolchains this one machine serves. Each is a separate registry entry.",
                                   .format = CellFormat::Count,

@@ -1322,6 +1322,19 @@ struct CapacityFields
     /// top-level addition makes two builds unable to speak — and it is a
     /// *registration* fact because a budget does not move while the process runs.
     CacheCapacityFields cache {};
+
+    /// What software this node is running, as `FastCache::VersionString` spells it.
+    ///
+    /// Empty means **did not say**, and on this field that is a fact rather than an
+    /// omission: a node built before this field existed cannot report a version, and
+    /// a fleet mid-upgrade is exactly when somebody is reading this page. Rendering
+    /// it as "unknown" or as a blank would make the one node that is too old to
+    /// answer look like the one node with nothing interesting about it.
+    ///
+    /// A *registration* fact, because a running process does not change version —
+    /// and here rather than at REGISTER's top level for the same arity reason as
+    /// everything else in this record.
+    std::string_view version {};
 };
 
 /// Frame a capacity record as one nested field list.
@@ -1353,7 +1366,8 @@ struct CapacityFields
                                 std::span<std::byte const> { memory },
                                 std::span<std::byte const> { nodeClass },
                                 reserve,
-                                std::span<std::byte const> { cache } });
+                                std::span<std::byte const> { cache },
+                                AsBytes(capacity.version) });
 }
 
 /// Read a capacity record back.
@@ -1415,6 +1429,11 @@ struct CapacityFields
         out.cache = *cache;
     else
         return std::nullopt;
+    // Free-form, and deliberately not validated: a version is a string an operator
+    // reads, not one this code branches on, so a shape it does not recognise is a
+    // peer to report rather than a peer to refuse. A record from a build that
+    // predates the field simply has no fifth index, which `at` answers as empty.
+    out.version = AsStringView(at(5));
     return out;
 }
 

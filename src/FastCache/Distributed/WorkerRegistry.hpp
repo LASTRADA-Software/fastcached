@@ -43,9 +43,22 @@ enum class PickError : std::uint8_t
 /// One registered worker, as the registry sees it.
 struct WorkerInfo
 {
-    std::string id;            ///< Assigned at registration; opaque to the worker.
-    std::string fingerprint;   ///< Toolchain identity, matched byte-for-byte.
-    std::string endpoint;      ///< host:port a client can reach it on.
+    std::string id;          ///< Assigned at registration; opaque to the worker.
+    std::string fingerprint; ///< Toolchain identity, matched byte-for-byte.
+    std::string endpoint;    ///< host:port a client can reach it on.
+    /// What software this node is running, as it stated at registration.
+    ///
+    /// Beside the other registration strings rather than inside `NodeCapacity`,
+    /// and that is not filing: `NodeCapacity` is a **literal type**, exercised by
+    /// `constexpr` tests over `OfferableSlots` and the slot ceilings, and a
+    /// `std::string` in it would quietly end that for the whole codebase. It is
+    /// also not a scheduling input -- nothing weighs it -- which is exactly what
+    /// `NodeCapacity` holds.
+    ///
+    /// Empty means the node did not say, which on this field is a fact rather than
+    /// an omission: a peer built before the field existed cannot report a version,
+    /// and a fleet part-way through an upgrade is when somebody is reading it.
+    std::string version {};
     std::uint32_t slots {};    ///< Concurrent jobs it will accept in general.
     std::uint32_t inFlight {}; ///< Jobs currently outstanding on it.
 
@@ -126,6 +139,9 @@ struct NodeReport
     std::uint32_t fleetJobsInFlight { 0 };
     /// Since the contributing entry was last heard from.
     std::chrono::milliseconds heartbeatAge {};
+    /// What software the machine runs, from the contributing entry. Empty means it
+    /// did not say -- see `WorkerInfo::version`.
+    std::string version {};
 };
 
 /// One node's cache, as `NodeCaches()` reports it.
@@ -158,6 +174,7 @@ struct WorkerRegistration
 {
     std::string_view fingerprint;     ///< Toolchain identity.
     std::string_view endpoint;        ///< host:port clients should use.
+    std::string_view version {};      ///< What software the node runs; empty means it did not say.
     std::uint32_t slots {};           ///< Concurrent job limit it asks for; 0 to derive.
     std::vector<std::uint8_t> codecs; ///< What it can decode.
 

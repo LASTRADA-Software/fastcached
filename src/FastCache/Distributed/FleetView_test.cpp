@@ -668,3 +668,54 @@ TEST_CASE("A follower's page draws no charts at all", "[distributed][fleetview][
     CHECK_FALSE(html.contains("Over time"));
     CHECK(html.contains("10.0.0.9:6676"));
 }
+
+TEST_CASE("Each machine's software version reaches the page and the JSON", "[distributed][fleetview][version]")
+{
+    auto snapshot = LeadingSnapshot();
+    snapshot.nodes.push_back(Machine("10.0.0.3:7100", 16));
+    REQUIRE(snapshot.nodes.size() == 2);
+    snapshot.nodes[0].version = "1.5.0";
+    // The second machine is still on the old build, which is the state this column
+    // exists to make visible: mid-upgrade, and which box is which.
+    snapshot.nodes[1].version = "1.4.2";
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
+    CHECK(html.contains(">version<"));
+    CHECK(html.contains(">1.5.0<"));
+    CHECK(html.contains(">1.4.2<"));
+
+    // One table drives both renderers, so the JSON gets it for free -- and the test
+    // asserts that rather than trusting it.
+    auto const json = RenderFleetJson(snapshot);
+    CHECK(json.contains(R"("version":"1.5.0")"));
+    CHECK(json.contains(R"("version":"1.4.2")"));
+}
+
+TEST_CASE("A machine too old to report a version renders an absence, not a blank", "[distributed][fleetview][version]")
+{
+    auto snapshot = LeadingSnapshot();
+    for (auto& node: snapshot.nodes)
+        node.version.clear();
+
+    // A node that predates the field is exactly the node an operator is hunting for
+    // during a rolling upgrade, so it must not render as the emptiest-looking cell
+    // in the table. It gets the page's dash and the JSON's null, like everything
+    // else nobody told us.
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
+    CHECK(html.contains("&ndash;"));
+    CHECK_FALSE(html.contains("<td></td>"));
+    CHECK(RenderFleetJson(snapshot).contains(R"("version":null)"));
+}
+
+TEST_CASE("A hostile version string is escaped rather than interpolated", "[distributed][fleetview][version]")
+{
+    auto snapshot = LeadingSnapshot();
+    // It came off a wire: whatever a peer sent is what lands here, and the decoder
+    // deliberately does not validate it -- refusing a registration over a
+    // diagnostic field would take a working machine out of the fleet.
+    snapshot.nodes[0].version = R"(<script>alert(1)</script>)";
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
+    CHECK_FALSE(html.contains("<script>alert(1)</script>"));
+    CHECK(html.contains("&lt;script&gt;"));
+}

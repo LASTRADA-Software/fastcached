@@ -804,7 +804,7 @@ What it shows, and why each part is split the way it is:
 |---|---|
 | The readouts | Six figures across the top: compiles dispatched over the selected range (with a sparkline), compiling now, cache hit rate, the share of dispatch decisions refused, leases outstanding, and the **oldest** heartbeat in the fleet. The oldest and not the mean — one machine that stopped answering an hour ago is the fact worth surfacing, and an average over a healthy fleet buries it. |
 | Fleet capacity | One meter over every registered slot, split three ways: compiling, free, and **withheld** by a ceiling. The third is the one to read first — slots a ceiling withdrew are not this fleet being busy, so buying machines does not return them. |
-| Machines | One row **per machine**, not per toolchain: cores, memory, free scratch, class and reserve, cache hit rate, heartbeat age. |
+| Machines | One row **per machine**, not per toolchain: the software version it is running, cores, memory, free scratch, class and reserve, cache hit rate, heartbeat age. |
 | Workers | One row per `(toolchain, endpoint)` registry entry: slots, in flight, available — and *which* limit withdrew the difference. |
 | Why requests were refused | Granted, and refused split four ways, each with what it tells you to do. |
 | Cache tiers | Items, bytes, budget and evictions **per tier**. A tier no member runs has no column at all, and a fleet where nobody runs one says so rather than showing an empty table. |
@@ -829,6 +829,29 @@ Three of those distinctions cost real debugging time when they are collapsed:
 A value nobody reported renders as `–` on the page and `null` in the JSON, never
 as `0` — a zero is a claim, and "this cache holds nothing" is a different fact
 from "this node never told us".
+
+### Which build each machine is running
+
+The `version` column is what a node's own binary reports at registration — the
+same string `fastcache-compile-node --version` prints. It is compiled in and not
+configurable: the column exists to answer *which binary is actually on that box*,
+most often part-way through a rolling upgrade, and a version a node could be
+**told** to report is one that can be wrong exactly when somebody is relying on it.
+
+It rides inside the REGISTER message's nested capacity record rather than as a
+field of its own, because that message's top-level arity is exact and fixed
+forever — a sixth field there would make two builds of a fleet unable to speak at
+all. The nested record is read with the variable-arity split, so compatibility runs
+both ways: a node built before this field registers with a new leader and simply
+reports nothing, and a new node registering with an old leader has the extra field
+skipped.
+
+A node that cannot report one renders as `–`, not as a blank. That node is exactly
+the one an operator is hunting for mid-upgrade, so it must not look like the least
+interesting row in the table. The version is also **refreshed when a machine
+re-registers**, which is the path a restart takes — a value held over from the
+first registration would leave the page reporting the old binary for as long as the
+new process stayed up.
 
 ### The charts, and what they are sampled from
 

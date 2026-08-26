@@ -287,6 +287,14 @@ done
 # over. A page listing registry entries would double-count a node's cores.
 [[ "$json" == *'"toolchains":1'* ]] || fail "/fleet.json did not report the machine's toolchain count"
 
+# The version travelled from the node's own binary, through the REGISTER capacity
+# record, to the leader's report. Asserted end to end because every seam in that
+# path is one where it could silently become empty -- and empty is a legitimate
+# value here, so nothing else would notice.
+[[ "$json" != *'"version":null'* ]] || fail "/fleet.json reported no version for a node that has one"
+[[ "$json" == *'"version":"'* ]] || fail "/fleet.json carried no version field at all"
+[[ "$page" == *'>version<'* ]] || fail "/fleet has no version column"
+
 # ------------------------------------------------------- 6. charts over time
 # Every chart the page references is its own resource. Asked for by name rather
 # than scraped out of the page, so a chart that stopped being served would fail
