@@ -137,19 +137,32 @@ http_get() {
     printf '%s' "$body"
 }
 
+# How long a bounded wait may take, in tenths of a second.
+#
+# 60 seconds, and the number is what it is because of what happens BEFORE the
+# admin surface binds: the node resolves each `--toolchain` first, which walks
+# the compiler's include tree. That is near-instant on a warm developer machine
+# and takes tens of seconds on a cold CI runner with nothing cached -- 10s was
+# enough for the former and not the latter, which is how all three of these
+# fixtures failed on a runner while passing locally. `dist-compile-e2e` next
+# door needs 26 seconds for the same reason.
+#
+# Generous rather than unbounded: a wait nothing can end is a suite timeout
+# naming nothing, which this repository has already paid for once.
+readonly WAIT_TICKS=600
+
 # Block until something answers on a port, or the process behind it dies.
 #
-# Waiting on the listener rather than sleeping a fixed amount: a cold CI runner
-# takes noticeably longer to get there than a warm developer machine, and a fixed
-# sleep is either flaky or slow. Bounded, and it says what it waited for.
+# Waiting on the listener rather than sleeping a fixed amount: a fixed sleep is
+# either flaky or slow. Bounded, and it says what it waited for.
 wait_for_port() {
     local port="$1" pid="$2" what="$3"
-    for _ in $(seq 1 100); do
+    for _ in $(seq 1 "$WAIT_TICKS"); do
         if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then return 0; fi
         if ! kill -0 "$pid" 2>/dev/null; then fail "$what died before it listened on ${port}"; fi
         sleep 0.1
     done
-    fail "timed out after 10s waiting for $what to listen on ${port}"
+    fail "timed out after $((WAIT_TICKS / 10))s waiting for $what to listen on ${port}"
 }
 
 admin_port="$(free_port)"
@@ -231,13 +244,14 @@ json="$(http_get "$admin_port" /fleet.json "Bearer ${TOKEN}")"
 # The node registers with its own scheduler on its heartbeat, so the machine
 # appears once the first REGISTER lands. Bounded, and it says what it waited for.
 registered=""
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "$WAIT_TICKS"); do
     json="$(http_get "$admin_port" /fleet.json "Bearer ${TOKEN}")"
     if [[ "$json" == *"127.0.0.1:${worker_port}"* ]]; then registered="yes"; break; fi
     if ! kill -0 "$node_pid" 2>/dev/null; then fail "the node died before it registered with its own scheduler"; fi
     sleep 0.1
 done
-[[ -n "$registered" ]] || fail "timed out after 10s waiting for the worker to appear in /fleet.json"
+[[ -n "$registered" ]] \
+    || fail "timed out after $((WAIT_TICKS / 10))s waiting for the worker to appear in /fleet.json"
 
 # And it is one MACHINE, whatever it serves: the grain a fleet total is computed
 # over. A page listing registry entries would double-count a node's cores.
