@@ -144,11 +144,14 @@ TEST_CASE("AdminHttp: unknown path returns 404", "[metrics][http]")
     REQUIRE(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
 }
 
-TEST_CASE("AdminHttp: non-GET method returns 405", "[metrics][http]")
+TEST_CASE("AdminHttp: non-GET method returns 405 naming the methods it does serve", "[metrics][http]")
 {
     FastCache::AtomicMetricsSink metrics;
     auto const response = Exchange("POST /metrics HTTP/1.1\r\n\r\n", metrics, {});
     REQUIRE(response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+    // RFC 9110 §15.5.6 makes this a MUST, and it is what separates "wrong verb"
+    // from "wrong path" for whatever is probing this port.
+    CHECK(response.contains("Allow: GET\r\n"));
 }
 
 TEST_CASE("AdminHttp: a request split across reads is consumed to the end", "[metrics][http]")
@@ -186,4 +189,202 @@ TEST_CASE("AdminHttp: a request split across reads is consumed to the end", "[me
 
     // Nothing of the request is left: the server read it to the end before answering.
     CHECK(FastCache::SyncRun(ReadAvailable(pair.server.get())).empty());
+}
+
+namespace
+{
+
+/// Drive one request against a caller-supplied route list.
+///
+/// Separate from `Exchange` rather than a defaulted parameter on it, so every
+/// assertion that a built-in route is unchanged keeps calling the two-argument
+/// form and cannot accidentally start depending on a contributed row.
+/// @param request The raw request bytes.
+/// @param routes What the caller registered.
+/// @return Everything the server wrote back.
+std::string ExchangeWithRoutes(std::string_view request, std::vector<FastCache::AdminRoute> const& routes)
+{
+    FastCache::AtomicMetricsSink metrics;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), request)));
+    pair.client->ShutdownWrite();
+    using namespace std::chrono_literals;
+    auto provider = [] {
+        return FastCache::MetricsSnapshot { .storage = std::nullopt,
+                                            .host = std::nullopt,
+                                            .uptime = FastCache::Uptime { 1s } };
+    };
+    FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider, routes));
+    pair.server->Close();
+    return FastCache::SyncRun(ReadAvailable(pair.client.get()));
+}
+
+} // namespace
+
+TEST_CASE("AdminHttp: a contributed route answers on its own path", "[admin][http][routes]")
+{
+    std::vector<FastCache::AdminRoute> const routes {
+        { .path = "/fleet",
+          .handler =
+              [](FastCache::AdminRequest const&) {
+                  return FastCache::AdminResponse { .status = "200 OK",
+                                                    .contentType = "text/html",
+                                                    .body = "<h1>fleet</h1>" };
+              } },
+    };
+
+    auto const response = ExchangeWithRoutes("GET /fleet HTTP/1.1\r\nHost: x\r\n\r\n", routes);
+    CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK(response.contains("Content-Type: text/html\r\n"));
+    CHECK(response.contains("<h1>fleet</h1>"));
+}
+
+TEST_CASE("AdminHttp: the built-in routes still answer alongside a contributed one", "[admin][http][routes]")
+{
+    // The regression that matters most here: `/metrics` and `/healthz` are what
+    // every existing scraper and probe is pointed at, and a route table that
+    // shadowed or reordered them would be found in production rather than here.
+    std::vector<FastCache::AdminRoute> const routes {
+        { .path = "/fleet", .handler = [](FastCache::AdminRequest const&) { return FastCache::AdminResponse {}; } },
+    };
+
+    CHECK(ExchangeWithRoutes("GET /healthz HTTP/1.1\r\n\r\n", routes).starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK(ExchangeWithRoutes("GET /metrics HTTP/1.1\r\n\r\n", routes).contains("text/plain; version=0.0.4"));
+    CHECK(ExchangeWithRoutes("GET /nope HTTP/1.1\r\n\r\n", routes).starts_with("HTTP/1.1 404 Not Found\r\n"));
+}
+
+TEST_CASE("AdminHttp: a route may refuse, and its extra headers reach the client", "[admin][http][routes]")
+{
+    // A 401 that does not carry `WWW-Authenticate` is one a browser cannot prompt
+    // for, which turns "you need a credential" into "this page is broken".
+    std::vector<FastCache::AdminRoute> const routes {
+        { .path = "/fleet",
+          .handler =
+              [](FastCache::AdminRequest const&) {
+                  return FastCache::AdminResponse { .status = "401 Unauthorized",
+                                                    .contentType = "text/plain",
+                                                    .body = "credential required\n",
+                                                    .extraHeaders = { R"(WWW-Authenticate: Basic realm="fleet")" } };
+              } },
+    };
+
+    auto const response = ExchangeWithRoutes("GET /fleet HTTP/1.1\r\n\r\n", routes);
+    CHECK(response.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+    CHECK(response.contains(R"(WWW-Authenticate: Basic realm="fleet")"));
+    CHECK(response.contains("credential required\n"));
+}
+
+TEST_CASE("AdminHttp: a handler is told the Authorization header, whatever its case", "[admin][http][routes]")
+{
+    // Field names are case-insensitive and real clients disagree about the
+    // spelling. A byte comparison would make the credential work for curl and
+    // not for a proxy, which gets diagnosed as "the token is wrong".
+    auto const echo = [](FastCache::AdminRequest const& request) {
+        return FastCache::AdminResponse { .status = "200 OK",
+                                          .contentType = "text/plain",
+                                          .body = std::string { request.Header(FastCache::AdminHeader::Authorization) } };
+    };
+    std::vector<FastCache::AdminRoute> const routes { { .path = "/echo", .handler = echo } };
+
+    CHECK(
+        ExchangeWithRoutes("GET /echo HTTP/1.1\r\nAuthorization: Bearer s3cret\r\n\r\n", routes).contains("Bearer s3cret"));
+    CHECK(ExchangeWithRoutes("GET /echo HTTP/1.1\r\nauthorization:   Basic QUJD\r\n\r\n", routes).contains("Basic QUJD"));
+
+    // No header at all is an empty view, not a missing one: a handler that reads
+    // it before checking would otherwise be reading uninitialised storage.
+    auto const none = ExchangeWithRoutes("GET /echo HTTP/1.1\r\nHost: x\r\n\r\n", routes);
+    CHECK(none.contains("Content-Length: 0\r\n"));
+}
+
+TEST_CASE("AdminHttp: a query string reaches the handler and does not defeat routing", "[admin][http][routes]")
+{
+    auto const echo = [](FastCache::AdminRequest const& request) {
+        return FastCache::AdminResponse { .status = "200 OK",
+                                          .contentType = "text/plain",
+                                          .body = std::string { request.query } };
+    };
+    std::vector<FastCache::AdminRoute> const routes { { .path = "/echo", .handler = echo } };
+
+    CHECK(ExchangeWithRoutes("GET /echo?tier=disk HTTP/1.1\r\n\r\n", routes).contains("tier=disk"));
+}
+
+TEST_CASE("AdminHttp: every readable header arrives, in either order", "[admin][http][routes]")
+{
+    // The regression this exists for: the walk used to stop at the first header it
+    // recognised. With one readable header that is correct; with two it means
+    // whichever the client happened to send first is the only one that arrives, so
+    // a conditional GET would silently stop revalidating whenever a browser put
+    // `Authorization` above `If-None-Match`.
+    auto const echo = [](FastCache::AdminRequest const& request) {
+        return FastCache::AdminResponse { .status = "200 OK",
+                                          .contentType = "text/plain",
+                                          .body = std::format("[{}][{}]",
+                                                              request.Header(FastCache::AdminHeader::Authorization),
+                                                              request.Header(FastCache::AdminHeader::IfNoneMatch)) };
+    };
+    std::vector<FastCache::AdminRoute> const routes { { .path = "/echo", .handler = echo } };
+
+    CHECK(ExchangeWithRoutes("GET /echo HTTP/1.1\r\nAuthorization: Bearer t\r\nIf-None-Match: \"abc\"\r\n\r\n", routes)
+              .contains("[Bearer t][\"abc\"]"));
+    CHECK(ExchangeWithRoutes("GET /echo HTTP/1.1\r\nif-none-match: \"abc\"\r\nauthorization: Bearer t\r\n\r\n", routes)
+              .contains("[Bearer t][\"abc\"]"));
+}
+
+TEST_CASE("AdminHttp: a 304 carries its validators and no content at all", "[admin][http][routes]")
+{
+    std::vector<FastCache::AdminRoute> const routes {
+        { .path = "/chart.svg",
+          .handler =
+              [](FastCache::AdminRequest const& request) {
+                  if (request.Header(FastCache::AdminHeader::IfNoneMatch) == "\"g-7\"")
+                      return FastCache::AdminResponse { .status = "304 Not Modified",
+                                                        .extraHeaders = { "ETag: \"g-7\"", "Cache-Control: max-age=42" } };
+                  return FastCache::AdminResponse { .status = "200 OK",
+                                                    .contentType = "image/svg+xml",
+                                                    .body = "<svg/>",
+                                                    .extraHeaders = { "ETag: \"g-7\"" } };
+              } },
+    };
+
+    auto const fresh = ExchangeWithRoutes("GET /chart.svg HTTP/1.1\r\n\r\n", routes);
+    CHECK(fresh.starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK(fresh.contains("Content-Type: image/svg+xml\r\n"));
+    CHECK(fresh.ends_with("<svg/>"));
+
+    auto const cached = ExchangeWithRoutes("GET /chart.svg HTTP/1.1\r\nIf-None-Match: \"g-7\"\r\n\r\n", routes);
+    CHECK(cached.starts_with("HTTP/1.1 304 Not Modified\r\n"));
+    // RFC 9110 SS15.4.5 forbids content on a 304, and SS8.6 forbids a Content-Length
+    // that does not match what a 200 would have sent. A client that read one and
+    // then found the connection closed would report a truncated response.
+    CHECK_FALSE(cached.contains("Content-Length:"));
+    CHECK_FALSE(cached.contains("Content-Type:"));
+    // The validators are the whole point of the response: without them the client
+    // has nothing to revalidate against next time.
+    CHECK(cached.contains("ETag: \"g-7\"\r\n"));
+    CHECK(cached.contains("Cache-Control: max-age=42\r\n"));
+    CHECK(cached.ends_with("\r\n\r\n"));
+}
+
+TEST_CASE("AdminHttp: a prefix route answers its tail and never shadows an exact one", "[admin][http][routes]")
+{
+    auto const named = [](std::string_view what) {
+        return [what](FastCache::AdminRequest const& request) {
+            return FastCache::AdminResponse { .status = "200 OK",
+                                              .contentType = "text/plain",
+                                              .body = std::format("{}:{}", what, request.path) };
+        };
+    };
+    // The prefix route is registered *first*, which is what makes this a test of the
+    // table rather than of the caller's vector order.
+    std::vector<FastCache::AdminRoute> const routes {
+        { .path = "/fleet/", .handler = named("prefix"), .match = FastCache::AdminRouteMatch::Prefix },
+        { .path = "/fleet", .handler = named("exact") },
+    };
+
+    CHECK(ExchangeWithRoutes("GET /fleet HTTP/1.1\r\n\r\n", routes).contains("exact:/fleet"));
+    CHECK(ExchangeWithRoutes("GET /fleet/chart/refusals.svg HTTP/1.1\r\n\r\n", routes)
+              .contains("prefix:/fleet/chart/refusals.svg"));
+    // A prefix route is not a catch-all: a path that does not begin with it still
+    // reaches the 404, so a typo is refused rather than quietly served.
+    CHECK(ExchangeWithRoutes("GET /fleetx HTTP/1.1\r\n\r\n", routes).starts_with("HTTP/1.1 404 Not Found\r\n"));
 }

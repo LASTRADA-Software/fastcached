@@ -9,7 +9,9 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -525,4 +527,118 @@ TEST_CASE("A peer that predates the cache record still registers", "[distributed
     REQUIRE(live.size() == 1);
     for (auto const& tier: live[0].capacity.cache.tierBytesLimit)
         CHECK_FALSE(tier.has_value());
+}
+
+TEST_CASE("A node's version rides the capacity record and survives the round trip",
+          "[distributed][scheduler][protocol][version]")
+{
+    // Inside the capacity record rather than at REGISTER's top level, because that
+    // message's arity is exact and fixed forever -- a sixth field there would make
+    // two builds of this fleet unable to speak at all.
+    auto wire = CapacityToWire(NodeCapacity { .logicalCores = 8 });
+    wire.version = "1.4.2-7-gdeadbee";
+
+    auto const encoded = Wire::EncodeCapacity(wire);
+    auto const back = Wire::DecodeCapacity(encoded);
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).version == "1.4.2-7-gdeadbee");
+    // And the rest of the record still reads, which is the half a new trailing
+    // field is most likely to break.
+    CHECK(Unwrap(back).logicalCores == 8);
+}
+
+TEST_CASE("A peer that predates the version field registers rather than being refused",
+          "[distributed][scheduler][protocol][version]")
+{
+    // What an older node's record looks like on the wire: the same five fields, and
+    // no sixth. The nested record is read with the variable-arity split precisely so
+    // this is a node reporting less, not a node speaking a shape we refuse.
+    auto const cores = WireFields::ToBigEndian<std::uint32_t>(12);
+    auto const memory = WireFields::ToBigEndian<std::uint64_t>(1ULL << 34);
+    auto const nodeClass = std::array { static_cast<std::byte>(0) };
+    auto const cache = Wire::EncodeCacheCapacity(Wire::CacheCapacityFields {});
+    auto const older = WireFields::Encode({ std::span<std::byte const> { cores },
+                                            std::span<std::byte const> { memory },
+                                            std::span<std::byte const> { nodeClass },
+                                            std::span<std::byte const> {},
+                                            std::span<std::byte const> { cache } });
+
+    auto const back = Wire::DecodeCapacity(older);
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).logicalCores == 12);
+    // Empty, and that is the fact: this node cannot report a version. Somewhere
+    // downstream it renders as an absence rather than as a blank, so the one machine
+    // too old to answer is the one that stands out during an upgrade.
+    CHECK(Unwrap(back).version.empty());
+}
+
+TEST_CASE("A version this build cannot parse is reported rather than refused", "[distributed][scheduler][protocol][version]")
+{
+    // A version is a string an operator reads, not one this code branches on, so a
+    // shape it does not recognise is a peer to report -- refusing the registration
+    // would take a working machine out of the fleet over a diagnostic field.
+    auto wire = CapacityToWire(NodeCapacity { .logicalCores = 4 });
+    wire.version = "not-a-version-at-all <&\"";
+
+    // **Decoded from a temporary, deliberately.** This is the obvious spelling, and
+    // it was a use-after-free while `CapacityFields::version` was a `string_view`:
+    // the encoded buffer dies at the semicolon and the view outlives it. Linux never
+    // noticed -- nothing reused the block before the read -- and macOS failed, on the
+    // one standard library whose allocator is quick enough. The field owns its bytes
+    // now, and this shape is what proves it stays that way.
+    auto const back = Wire::DecodeCapacity(Wire::EncodeCapacity(wire));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).version == "not-a-version-at-all <&\"");
+}
+
+TEST_CASE("A decoded capacity record outlives the buffer it came from", "[distributed][scheduler][protocol][version]")
+{
+    // The rule stated on its own, rather than inferred from a case that happens to
+    // exercise it: `DecodeCapacity` returns by value and nothing in the name says
+    // "view", so what it returns must not point into the bytes it was handed. The
+    // buffer here is scoped to prove it, and every field is read after it is gone.
+    std::optional<Wire::CapacityFields> decoded;
+    {
+        Wire::CapacityFields wire {};
+        wire.logicalCores = 12;
+        wire.version = "9.9.9-rc1";
+        wire.reservedMemoryBytes = 4096;
+        auto const encoded = Wire::EncodeCapacity(wire);
+        decoded = Wire::DecodeCapacity(encoded);
+    }
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).version == "9.9.9-rc1");
+    CHECK(Unwrap(decoded).logicalCores == 12U);
+    CHECK(Unwrap(decoded).reservedMemoryBytes == 4096U);
+}
+
+TEST_CASE("Memory a node holds back survives the wire", "[distributed][scheduler][protocol][memory]")
+{
+    constexpr NodeCapacity original { .logicalCores = 64,
+                                      .totalMemoryBytes = 34359738368,
+                                      .reservedMemoryBytes = 8589934592,
+                                      .nodeClass = NodeClass::Dedicated };
+
+    auto const back = CapacityFromWire(CapacityToWire(original));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).reservedMemoryBytes == original.reservedMemoryBytes);
+    // It travels because slot derivation can happen at either end: a node normally
+    // sizes itself, but `slots = 0` asks the scheduler to -- and a scheduler
+    // budgeting jobs against RAM the node already spent on its own cache would
+    // over-commit exactly the machines that bothered to report it.
+    CHECK(OfferableSlots(Unwrap(back), 0) == OfferableSlots(original, 0));
+}
+
+TEST_CASE("A peer too old to report held-back memory schedules as it always did",
+          "[distributed][scheduler][protocol][memory]")
+{
+    // Six fields, no seventh -- what an older node's record looks like. It arrives
+    // as zero, which is "holds nothing back", which is the arithmetic every node had
+    // before this field existed.
+    auto wire = CapacityToWire(NodeCapacity { .logicalCores = 64, .totalMemoryBytes = 34359738368 });
+    wire.reservedMemoryBytes = 0;
+
+    auto const back = Wire::DecodeCapacity(Wire::EncodeCapacity(wire));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).reservedMemoryBytes == 0U);
 }

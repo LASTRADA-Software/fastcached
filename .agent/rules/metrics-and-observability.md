@@ -119,3 +119,216 @@ fault.
     naming nothing, which this repository has already paid for once
     (`dist-compile-e2e ***Timeout 900.10 sec`). It destroys the endpoint on another
     thread and fails in 15s saying what it waited for.
+- **A fleet report is served by the leader, and anyone else says so rather than
+  guessing where it is.** A follower's `WorkerRegistry` holds whatever registered
+  against it, not the fleet, which is why `SchedulerService::Gate()` refuses every
+  verb -- reads included -- from a node that does not lead. `/fleet` answers `503`
+  naming the leader and its **scheduler** endpoint: that is `NotLeader` in HTTP's
+  vocabulary, and 200 would present a partial registry as the whole picture.
+  - **It is not a redirect, and it is not a link.** A dashboard address is local
+    configuration on each node and nothing replicates it, so any URL built by the
+    refusing node is a guess. Guessing here is the defect this project has already
+    had once, in its other spelling: a follower redirected clients to the leader's
+    *consensus* port, which speaks nothing a client understands. That is also why
+    a `dashboardEndpoint` on `ClusterMember` was refused rather than added --
+    `Cluster::ClusterState` is versioned and its decoder refuses any other version,
+    so a field costs a `StateVersion` bump that makes every existing on-disk
+    snapshot and log entry undecodable, and a half-upgraded cluster unable to apply
+    each other's entries. That is a consensus-format migration bought for a
+    diagnostic page.
+- **The columns are a table both renderers walk, and the test asserts over the
+  table.** The page and the JSON take one spelling per column -- it is the header
+  cell *and* the key -- so the two cannot drift, and each row carries a projection
+  rather than a value, the shape `TierMetric` already uses against
+  `StorageTierTable`. A hand-written list of `<td>`s is the same defect as a
+  hand-written list of series, and a list of *expected* columns written out beside
+  the table is what goes stale, maintained by whoever forgot the renderer.
+- **Absent is not zero, one level further in than a series: at the cell.** Every
+  `optional` in `NodeLoad`, `NodeCacheLoad` and `NodeCacheCapacity` reaches a cell
+  unflattened -- `null` in JSON, a dash on the page, the spelling `--cluster-status`
+  already uses. `0` is a claim: `cores 0` says a machine has no CPU, and a cache
+  that has served no reads has no hit rate rather than one of 0%. A table cannot
+  omit one cell the way a scrape omits a line, so the granularity of the rule here
+  is the **column**: a tier no member runs contributes no column at all, and a
+  member lacking a tier others have renders an absence in it.
+- **A fleet total is computed per machine, never per registry entry.** The registry
+  keys on `(fingerprint, endpoint)`, so a node with two `--toolchain` flags is two
+  entries carrying one machine's cores -- and a page listing workers would report a
+  fleet twice the size of the one an operator owns. `WorkerRegistry::NodeReports()`
+  is the grain, and it decides once which fields add across siblings: the slot
+  count is the maximum (both were derived from the same cores), the in-flight count
+  is the sum (those are different jobs).
+- **The dashboard's credential is separate from `--requirepass`, and the surface
+  is refused rather than served without one.** `--requirepass` is what a node
+  *presents* to the scheduler and every member of the fleet holds it, so reusing it
+  would let any worker read every other node's fleet map -- wrong direction and
+  wrong grain. It is a file for the reason `--cluster-key-file` is one, and a
+  non-loopback `--admin-listen` with `--dashboard` and no token file is a **startup
+  refusal**: the page lists every member's hostname, endpoint and capacity, and
+  HTTPS does not substitute, because TLS authenticates the server to the browser
+  and says nothing about who the browser is. Loopback needs none -- reaching it
+  already means being on the machine.
+  - **Both `Basic` and `Bearer`, as a table.** Bearer alone would have made the
+    page unopenable in the browser it exists for: there is no browser prompt for
+    it, so a reader would have to paste a token into a URL or a cookie. The 401
+    carries `WWW-Authenticate`, without which a browser shows the body and no
+    prompt -- which reads as a broken page rather than as a credential being
+    required. A scheme that cannot parse its parameter is a refusal, never a
+    fall-through to the next row, or `Basic` with unreadable base64 would be
+    compared verbatim as a bearer token.
+  - **The credential gates the dashboard routes and nothing else.** `/metrics` and
+    `/healthz` stay exactly as open as they were, so turning the dashboard on
+    changes nothing for a scraper or a probe already pointed at that port. TLS is
+    the same story: it is on because material was named or asked for, so a node
+    that does neither keeps a plaintext admin port that behaves as it always did.
+    **Plain HTTP is a supported way to run this**, not a fallback -- on loopback,
+    or behind something that terminates TLS -- which is why nothing anywhere
+    requires a certificate.
+- **TLS is on by naming material or by asking for material to be MADE, never by a
+  bare boolean.** `--tls-self-signed` looks like the boolean that rule forbids and
+  is the same rule kept: what the rule prevents is a configuration that asks for
+  TLS this node cannot then serve, and asking for a generated certificate
+  *produces* the material. The two spellings contradict each other and are refused
+  together, rather than one silently winning and serving an identity nobody chose.
+  - **A generated certificate encrypts; it does not identify.** Nothing signs it,
+    so a client that has not been told its fingerprint out of band cannot tell
+    this node from anything else answering on that address. Two consequences are
+    load-bearing: the credential is still required off loopback, because TLS
+    authenticates the *server* to the browser and says nothing about who the
+    browser is; and the fingerprint is logged at startup, because it is the only
+    thing an operator can compare.
+  - **Its subject names decide whether it is usable at all.** Every modern client
+    ignores the common name, so a certificate whose SAN omits the name an operator
+    types matches nothing however it is labelled -- and a name mismatch is a second
+    browser warning on top of the unknown issuer, much harder to click past than
+    the first. Each name is classified by what it *parses as* rather than by how it
+    is spelled: guessing from a leading digit or a colon gets a host called
+    `10things` and the address `2001:db8::1` wrong in opposite directions.
+  - **The fixture greps `-checkhost`'s output rather than its exit code, and
+    carries a negative control.** `openssl x509 -checkhost` reports its answer in
+    the text and exits 0 either way, so an exit-code check passes for a mismatch.
+    That was found by the control -- a name nobody asked for, asserted NOT to
+    match -- which is why one is there: without it the whole block passed while
+    asserting nothing.
+
+- **A history stores a counter RAW; a rate is the difference taken at render.**
+  Storing the delta at sample time throws away the one thing that distinguishes a
+  restart from a quiet fleet. A counter that returns to zero produces a negative
+  step, and only a raw series can see it -- a stored delta is unsigned and has
+  already turned that step into an enormous spike nobody can explain. Raw, the
+  bucket is a **gap**, which is the truth: the step across a restart is unknowable,
+  not zero and not large.
+  - **A bucket nobody sampled is absent, not zero**, for the reason every cell on
+    the page already is. Zero says the fleet did nothing; absent says nobody was
+    watching, and a leader that has just taken over means the second. The same
+    goes for a rate taken *across* a gap: two readings ten minutes apart with the
+    middle five unobserved would spread the work over minutes nobody saw, so the
+    delta is only ever taken between **adjacent present** buckets.
+  - **A share with a zero denominator delta is absent, not 0%.** A bucket that
+    served no reads has no hit rate. Rendering 0% says the cache missed
+    everything, which is a different and much more alarming claim -- and the one
+    an operator would act on.
+  - **A share folded over a range is taken over that range's whole traffic**, never
+    as the mean of the per-bucket shares. The average weights a bucket that served
+    four reads exactly as heavily as one that served forty thousand, so a single
+    idle bucket at 0% drags a headline figure the chart beside it visibly
+    contradicts.
+- **History is a convenience: no state of its file may keep a node from starting.**
+  Missing, short, wrong version, bad checksum -- every one of them starts empty and
+  logs one line. It is written whole to a temporary and renamed, so a crash
+  mid-write leaves the previous file rather than half of this one. Where it lives
+  follows the directories the node already has (`--cluster-dir`, else
+  `--cache-dir`, else memory only) rather than a flag of its own: a third place to
+  say "put state here" is a third place to point at the wrong disk.
+- **Sampling happens only while this node LEADS.** A follower's registry holds
+  whatever registered against *it*, so a sample taken there records a fraction of
+  the fleet as though it were the whole -- and the chart then shows the fleet
+  shrinking every time leadership moves, which is the opposite of what happened.
+- **A chart served as its own resource cannot see the page's custom properties.**
+  An `<img>`-referenced SVG is a *separate document* and inherits nothing, so each
+  one carries its own palette and its own `prefers-color-scheme` block -- and the
+  theme is therefore part of its URL and part of its cache key. The sparkline is
+  the exception that proves it: inlined into the page, it is part of that document,
+  so it carries no palette and resolves the page's `var()` like anything else.
+  - **The chart URL carries no cache-buster.** A generation in the query would make
+    every closed bucket a new URL, and the conditional GET the whole arrangement
+    exists for would never fire. Stable URL, `ETag` from the sampler's bucket
+    counter (byte-exact and free, unlike a hash of the body), and a `Cache-Control`
+    that runs only to the **end of the bucket being drawn** -- a fixed `max-age`
+    leaves a viewer a whole bucket behind for the rest of it.
+  - **A `304` carries its validators and no content at all.** RFC 9110 §15.4.5
+    forbids content, and §8.6 forbids a `Content-Length` that is not what a `200`
+    would have sent: a client that reads one and then finds the connection closed
+    reports a truncated response rather than a cache hit. Whether a body is allowed
+    is a property of the **status**, checked once in the writer, so a route
+    answering `304` cannot get it wrong by forgetting.
+  - **Every chart route is behind the same credential as the page.** An image URL
+    that answered without one would leak the fleet's whole history while `/fleet`
+    stayed locked. The gate is written once and the renderer is the parameter, so a
+    route added later cannot be one that forgot to check.
+- **An unknown `range` is refused; an unknown `theme` is not.** The asymmetry is the
+  rule: a substituted range puts a reader on a different axis than the one they
+  asked for with nothing on the page saying so, while `auto` renders correctly
+  under either setting and costs them nothing. Refuse where a silent substitution
+  would mislead, default where it cannot.
+- **A stacked area is drawn top band first.** Each band is filled to the baseline
+  and the band below paints over the part that is not its neighbour's. Drawing
+  bottom-up leaves every band overlapping every one above it, and translucent fills
+  then multiply into a colour that belongs to no series -- which is the "four
+  reasons collapse into one" that chart exists to prevent, reintroduced by the
+  renderer.
+- **A gridline's value label goes below its line.** The topmost gridline sits
+  `PadTop` from the edge of the viewBox, so a label placed above *that* one has its
+  ascenders outside it -- clipped silently, and only ever on the line carrying the
+  largest number on the chart.
+- **An `xmlns` is not a fetch.** `http://www.w3.org/2000/svg` is an XML namespace
+  *name*; nothing resolves it. A "this page is self-contained" check written as "no
+  absolute URL anywhere" fails on the inline sparkline and pushes it out of the
+  page for a reason that was never true. Ask instead whether any attribute a
+  browser resolves -- `src`, `href`, `@import` -- points off this origin.
+
+- **A node's reported version is compiled in, never configurable.** The column
+  exists to answer *which binary is actually running on that machine*, and it is
+  read during a rolling upgrade -- so a version a node could be **told** to report
+  is one that can be wrong at exactly the moment somebody is relying on it.
+  - **It rides REGISTER's nested capacity record, not its top level.** That
+    message's arity is exact and fixed forever; a sixth field there makes two
+    builds of one fleet unable to speak at all. The nested record is read with the
+    variable-arity split, so compatibility runs both ways: an older node reports
+    nothing and is admitted, and a newer node's extra field is skipped by an older
+    leader.
+  - **It is refreshed on re-registration.** That path *is* a restart, and restarting
+    on a new build is what an upgrade looks like. A version carried over from the
+    first registration would leave the page naming the old binary for as long as the
+    new process stayed up.
+  - **It stays out of `NodeCapacity`.** That struct is a **literal type**, exercised
+    by `constexpr` tests over `OfferableSlots` and the slot ceilings, and one
+    `std::string` in it ends that property for the whole codebase. A version is also
+    not a scheduling input -- nothing weighs it -- which is what `NodeCapacity`
+    holds. It lives beside the other registration strings on `WorkerInfo`.
+  - **A version this build cannot parse is reported, not refused.** It is a string
+    an operator reads rather than one any code branches on, so an unrecognised shape
+    is a peer to report; refusing the registration would take a working machine out
+    of the fleet over a diagnostic field. It reaches an HTML page, so it is escaped
+    like every other value that came off a wire.
+
+## Open work
+
+- **[#141](https://github.com/LASTRADA-Software/fastcached/issues/141)** —
+  `AppendJsonText` passes every byte from `0x80` up through verbatim, which is
+  right for UTF-8 and produces a non-UTF-8 document for anything else, so one peer
+  registering a non-UTF-8 fingerprint makes `/fleet.json` a response a strict
+  parser may reject for the whole fleet. The fix belongs in `WorkerRegistry`, where
+  the bytes enter: a renderer that sanitises is a second place the value is
+  decided, and `/fleet`, `--cluster-status` and the logs still see the originals.
+- **[#142](https://github.com/LASTRADA-Software/fastcached/issues/142)** —
+  `LeaseTable` exposes `LiveCount()` and `IsInFlight(key)` and no way to walk what
+  is held, so the page can say *seven leases* and not *which*. That is the wrong
+  grain for the moment the tile matters: a lease outstanding for twenty minutes is
+  a worker that died mid-compile, and the count cannot say so.
+- **[#143](https://github.com/LASTRADA-Software/fastcached/issues/143)** —
+  `/fleet` collects and renders a full snapshot per request and the page carries a
+  meta refresh, so tabs left open are steady load on the node that also schedules
+  every compile. Deliberately a *measurement* ticket: a TTL buys latency and pays
+  in staleness on the one page that exists to be current, and the charts already
+  avoid the cost with a validator rather than a lifetime.

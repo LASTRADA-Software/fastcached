@@ -140,12 +140,25 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.nodeClass = Distributed::NodeClass::Dedicated;
     cfg.reservedCores = 3;
     cfg.adminListen = "0.0.0.0:6677";
+    cfg.dashboard = true;
+    cfg.dashboardTokenFile = "dashboard.token";
+    cfg.tlsCertFile = "admin.crt";
+    cfg.tlsKeyFile = "admin.key";
+    // Not alongside the certificate in a real configuration -- they contradict
+    // each other -- but this case exists to give every field a non-default value
+    // so every emitter fires, and it asserts nothing about coherence.
+    cfg.tlsSelfSigned = true;
     cfg.schedulerListen = "0.0.0.0:6678";
     cfg.fleetMembers = { "10.0.0.1:6676", "10.0.0.2:6676" };
     cfg.fleetOpen = true;
-    // Not 256 MiB: that is the default now, and this case exists to give every
-    // field a value differing from its default so every emitter fires.
-    cfg.cacheMemoryBytes = 512 * 1024 * 1024;
+    // Derived from the default rather than written out, because the default is a
+    // fraction of HOST RAM now: any literal here is one that silently equals the
+    // default on some machine, and this case exists precisely to give every field
+    // a value that differs from it.
+    cfg.cacheMemoryBytes = NodeConfig {}.cacheMemoryBytes + 1;
+    // Emitted on whether it was *typed*, not on whether it differs -- so a
+    // fixture that assigns the field has to say so too.
+    cfg.cacheMemoryExplicit = true;
     cfg.cacheDir = "cache";
     cfg.cacheDiskBytes = 40ULL * 1024 * 1024 * 1024;
     cfg.cacheListen = "127.0.0.1:6679";
@@ -424,9 +437,14 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig cfg;
         cfg.schedulerListen = "0.0.0.0:6678";
         cfg.fleetOpen = true;
-        // Not 256 MiB: that is the default now, and this case exists to give every
-        // field a value differing from its default so every emitter fires.
-        cfg.cacheMemoryBytes = 512 * 1024 * 1024;
+        // Derived from the default rather than written out, because the default is a
+        // fraction of HOST RAM now: any literal here is one that silently equals the
+        // default on some machine, and this case exists precisely to give every field
+        // a value that differs from it.
+        cfg.cacheMemoryBytes = NodeConfig {}.cacheMemoryBytes + 1;
+        // Emitted on whether it was *typed*, not on whether it differs -- so a
+        // fixture that assigns the field has to say so too.
+        cfg.cacheMemoryExplicit = true;
         cfg.cacheDir = "cache";
         cfg.cacheListen = "127.0.0.1:6679";
         cfg.upstream = "cache.internal:6674";
@@ -569,6 +587,14 @@ TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node]
     // line that reads correctly.
     NodeConfig cfg;
 
+    // Stated rather than defaulted, and that is the `FakeHost` seam being kept
+    // honest rather than tidiness. The cache budget's default is a share of the RAM
+    // of the machine this test *runs on*, while the memory it is weighed against
+    // comes from the fake — so leaving it default mixes two machines into one sum
+    // and gives an answer that changes with the runner. Sections that are about the
+    // cache say so and override it.
+    cfg.cacheMemoryBytes = 0;
+
     SECTION("a developer's laptop keeps cores for its owner")
     {
         FakeHost const laptop { 8, 32ULL << 30 };
@@ -597,6 +623,25 @@ TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node]
         FakeHost const cramped { 128, 32ULL << 30 };
 
         CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, cramped), cfg.slots) == 32);
+    }
+
+    SECTION("the node's own cache is memory a compile cannot have")
+    {
+        cfg.nodeClass = Distributed::NodeClass::Dedicated;
+        cfg.cacheMemoryBytes = 8ULL << 30;
+        FakeHost const cramped { 128, 32ULL << 30 };
+
+        auto const capacity = NodeCapacityOf(cfg, cramped);
+        // Declared, so the scheduler at the other end reaches the same number.
+        CHECK(capacity.reservedMemoryBytes == (8ULL << 30));
+        // And the machine still reports the RAM it *has*: the dashboard prints this,
+        // and a machine that appeared to shrink by the size of its own cache would be
+        // a different lie.
+        CHECK(capacity.totalMemoryBytes == (32ULL << 30));
+        // 24 rather than 32. The old arithmetic offered a slot per gigabyte of total
+        // RAM while the node held eight of those gigabytes itself -- forty gigabytes
+        // of promises on a thirty-two gigabyte box.
+        CHECK(Distributed::OfferableSlots(capacity, cfg.slots) == 24);
     }
 
     SECTION("a typed reserve of zero is not the same as no reserve")
@@ -637,4 +682,282 @@ TEST_CASE("NodeConfig: the node answers where the launcher looks", "[node][cli]"
 
     // And it is on by default, because a local tier is what the program is for.
     CHECK(NodeConfig {}.cacheMemoryBytes > 0);
+}
+
+TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[node][dashboard][policy]")
+{
+    // Every rule here describes a configuration that would start successfully and
+    // then not work, refused at the one moment an operator is watching. Each
+    // message names the flags, because "invalid" tells them nothing about what to
+    // type instead.
+
+    /// A node whose scheduler and admin surface are both configured, so only the
+    /// dashboard rule under test can fire.
+    auto const servingNode = [] {
+        NodeConfig cfg;
+        cfg.schedulerListen = "0.0.0.0:6678";
+        cfg.fleetOpen = true;
+        cfg.adminListen = "6677"; // a bare port, so loopback
+        cfg.dashboard = true;
+        return cfg;
+    };
+
+    SECTION("a dashboard with no admin surface to serve it on")
+    {
+        auto cfg = servingNode();
+        cfg.adminListen.clear();
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--dashboard"));
+        CHECK(Unwrap(refusal).contains("--admin-listen"));
+    }
+
+    SECTION("a dashboard on a node that never leads a fleet")
+    {
+        // A node running no scheduler has no registry to report, so the page could
+        // only ever say it is not the leader -- which looks like a working
+        // dashboard right up until somebody reads it.
+        auto cfg = servingNode();
+        cfg.schedulerListen.clear();
+        cfg.fleetOpen = false;
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--dashboard"));
+        CHECK(Unwrap(refusal).contains("--listen-scheduler"));
+    }
+
+    SECTION("a credential nothing reads")
+    {
+        // The sibling of the existing --cluster-key-file rule: a secret an operator
+        // went to the trouble of provisioning, read by nobody.
+        auto cfg = servingNode();
+        cfg.dashboard = false;
+        cfg.dashboardTokenFile = "dashboard.token";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--dashboard-token-file"));
+    }
+
+    SECTION("a certificate with no key, and a key with no certificate")
+    {
+        // Without this the node would start and serve the admin surface in the
+        // clear while an operator believed it was encrypted.
+        auto certOnly = servingNode();
+        certOnly.tlsCertFile = "admin.crt";
+        auto const certRefusal = StartupPolicyRejection(certOnly);
+        REQUIRE(certRefusal.has_value());
+        CHECK(Unwrap(certRefusal).contains("--tls-key"));
+
+        auto keyOnly = servingNode();
+        keyOnly.tlsKeyFile = "admin.key";
+        auto const keyRefusal = StartupPolicyRejection(keyOnly);
+        REQUIRE(keyRefusal.has_value());
+        CHECK(Unwrap(keyRefusal).contains("--tls-cert"));
+
+        // Both together is the configuration that works.
+        auto both = servingNode();
+        both.tlsCertFile = "admin.crt";
+        both.tlsKeyFile = "admin.key";
+        CHECK_FALSE(StartupPolicyRejection(both).has_value());
+    }
+
+    SECTION("a generated certificate and a named one contradict each other")
+    {
+        // Silently preferring either would serve an identity the operator did not
+        // choose, which is the whole thing a certificate is for.
+        auto cfg = servingNode();
+        cfg.tlsSelfSigned = true;
+        cfg.tlsCertFile = "admin.crt";
+        cfg.tlsKeyFile = "admin.key";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--tls-self-signed"));
+        CHECK(Unwrap(refusal).contains("--tls-cert"));
+    }
+
+    SECTION("TLS material with no admin surface to terminate it")
+    {
+        // The silent no-op shape again: a certificate nothing serves.
+        auto selfSigned = servingNode();
+        selfSigned.adminListen.clear();
+        selfSigned.dashboard = false;
+        selfSigned.tlsSelfSigned = true;
+        auto const selfSignedRefusal = StartupPolicyRejection(selfSigned);
+        REQUIRE(selfSignedRefusal.has_value());
+        CHECK(Unwrap(selfSignedRefusal).contains("--admin-listen"));
+
+        auto named = servingNode();
+        named.adminListen.clear();
+        named.dashboard = false;
+        named.tlsCertFile = "admin.crt";
+        named.tlsKeyFile = "admin.key";
+        auto const namedRefusal = StartupPolicyRejection(named);
+        REQUIRE(namedRefusal.has_value());
+        CHECK(Unwrap(namedRefusal).contains("--admin-listen"));
+    }
+
+    SECTION("a generated certificate on its own is a working configuration")
+    {
+        // The whole point of the flag: an encrypted admin surface with nothing to
+        // obtain first.
+        auto cfg = servingNode();
+        cfg.tlsSelfSigned = true;
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("a fleet map on a public port with no credential")
+    {
+        // The page lists every member's hostname, endpoint and capacity. An
+        // operator who bound it to the network is publishing that to whoever asks,
+        // and HTTPS does not help: TLS authenticates the SERVER to the browser and
+        // says nothing about who the browser is.
+        auto cfg = servingNode();
+        cfg.adminListen = "0.0.0.0:6677";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--dashboard-token-file"));
+
+        // Naming a credential is what makes that configuration legal.
+        cfg.dashboardTokenFile = "dashboard.token";
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("loopback needs no credential, because reaching it means being on the machine")
+    {
+        // A bare port binds loopback, and the whole default rests on that.
+        auto const cfg = servingNode();
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+
+        // Spelled out, it is the same answer.
+        auto explicitLoopback = servingNode();
+        explicitLoopback.adminListen = "127.0.0.1:6677";
+        CHECK_FALSE(StartupPolicyRejection(explicitLoopback).has_value());
+    }
+}
+
+TEST_CASE("Naming the dashboard flags parses them", "[node][dashboard][cli]")
+{
+    auto const parsed = ParseNodeArgv({ "--scheduler=cache:6675",
+                                        "--toolchain=/usr/bin/g++",
+                                        "--admin-listen=6677",
+                                        "--dashboard",
+                                        "--dashboard-token-file=/etc/fastcached/dashboard.token",
+                                        "--tls-cert=/etc/fastcached/admin.crt",
+                                        "--tls-key=/etc/fastcached/admin.key" });
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->dashboard);
+    CHECK(parsed->dashboardTokenFile == "/etc/fastcached/dashboard.token");
+    CHECK(parsed->tlsCertFile == "/etc/fastcached/admin.crt");
+    CHECK(parsed->tlsKeyFile == "/etc/fastcached/admin.key");
+    CHECK_FALSE(parsed->tlsSelfSigned);
+
+    // The other spelling of asking for TLS, which needs no material to name.
+    auto const generated =
+        ParseNodeArgv({ "--scheduler=cache:6675", "--toolchain=/usr/bin/g++", "--admin-listen=6677", "--tls-self-signed" });
+    REQUIRE(generated.has_value());
+    CHECK(generated->tlsSelfSigned);
+    CHECK(generated->tlsCertFile.empty());
+
+    // Off unless asked for, like every other surface this program serves.
+    auto const bare = ParseNodeArgv({ "--scheduler=cache:6675", "--toolchain=/usr/bin/g++" });
+    REQUIRE(bare.has_value());
+    CHECK_FALSE(bare->dashboard);
+    CHECK(bare->dashboardTokenFile.empty());
+}
+
+TEST_CASE("The in-memory tier defaults to a bounded share of the machine", "[node][config][cache]")
+{
+    auto const budget = NodeConfig {}.cacheMemoryBytes;
+
+    // The same `DefaultMaxMemoryBytes()` the daemon uses, rather than a second
+    // opinion about the same question. Asserted against the function rather than
+    // against a literal, because a literal here is a test that passes for the wrong
+    // reason on whichever machine happens to run it.
+    CHECK(budget == DefaultMaxMemoryBytes());
+
+    // The clamp is what makes a fraction safe in both directions: a small laptop
+    // still gets a cache worth having, and a very large build server does not
+    // quietly take a tenth of its RAM resident for a cache nobody asked for.
+    constexpr std::uint64_t Floor = 512ULL * 1024 * 1024;
+    constexpr std::uint64_t Ceiling = 8ULL * 1024 * 1024 * 1024;
+    CHECK(budget >= Floor);
+    CHECK(budget <= Ceiling);
+}
+
+TEST_CASE("The cache budget can be given as a share of RAM, and zero still turns it off", "[node][config][cache]")
+{
+    // The flag speaks its own default's vocabulary. Without this, "a quarter of RAM,
+    // but half of that" means working the bytes out by hand for every machine.
+    auto const half = ParseNodeArgv({ "--cache-memory=50%" });
+    REQUIRE(half.has_value());
+    CHECK(half->cacheMemoryBytes > 0);
+    auto const quarter = ParseNodeArgv({ "--cache-memory=25%" });
+    REQUIRE(quarter.has_value());
+    // A half is twice a quarter whatever this machine has, give or take the integer
+    // division -- which is the relationship worth asserting, since the absolute
+    // numbers are the runner's.
+    CHECK(half->cacheMemoryBytes >= (quarter->cacheMemoryBytes * 2) - 1);
+
+    auto const bytes = ParseNodeArgv({ "--cache-memory=1g" });
+    REQUIRE(bytes.has_value());
+    CHECK(bytes->cacheMemoryBytes == 1024ULL * 1024 * 1024);
+
+    // **Zero turns the tier off.** It is not "unbounded", which is what zero means
+    // to `InMemoryLruStorage` -- the flag that turns a cache off once turned its
+    // limit off instead, and a percentage default must not have quietly reopened
+    // that: `25%` and `0` have to stay different things.
+    auto const off = ParseNodeArgv({ "--cache-memory=0" });
+    REQUIRE(off.has_value());
+    CHECK(off->cacheMemoryBytes == 0);
+}
+
+TEST_CASE("A cache budget nobody set emits no flag, and a zero one does", "[node][config][cache]")
+{
+    // `--install-service` registers the COMMAND-LINE config, so a field left alone
+    // must emit nothing and be re-derived on the machine the service runs on. That
+    // matters more now the default follows host RAM: baking today's bytes into a
+    // unit would freeze them across a memory upgrade or a VM resize.
+    auto const untouched = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", Installable());
+    CHECK(std::ranges::none_of(untouched.arguments, [](auto const& arg) { return arg.starts_with("--cache-memory"); }));
+
+    auto off = Installable();
+    off.cacheMemoryBytes = 0;
+    off.cacheMemoryExplicit = true;
+    auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", off);
+    // Turning it off is a decision, so it survives into the unit rather than being
+    // read as "unset".
+    CHECK(std::ranges::any_of(spec.arguments, [](auto const& arg) { return arg == "--cache-memory=0"; }));
+
+    // **The one this exists for.** An operator reads the startup line, types that
+    // number back to pin it, and lands on a value equal to the default *on this
+    // machine*. Emitting on "differs from the default" would drop it, and the
+    // service would re-derive from RAM at every start -- so the budget moves under a
+    // VM resize or a memory upgrade, for exactly the operator who pinned it.
+    auto pinned = Installable();
+    pinned.cacheMemoryBytes = NodeConfig {}.cacheMemoryBytes;
+    pinned.cacheMemoryExplicit = true;
+    auto const pinnedSpec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", pinned);
+    CHECK(std::ranges::any_of(pinnedSpec.arguments, [&pinned](auto const& arg) {
+        return arg == std::format("--cache-memory={}", pinned.cacheMemoryBytes);
+    }));
+}
+
+TEST_CASE("Typing the cache budget is what marks it explicit", "[node][config][cache]")
+{
+    // The bit is set by the parse, not by the caller: every path that reaches a
+    // service spec goes through `ParseOptionsInto`, so a flag an operator typed
+    // carries its own provenance rather than depending on somebody remembering to
+    // record it alongside.
+    auto const typed = ParseNodeArgv({ "--cache-memory=1g" });
+    REQUIRE(typed.has_value());
+    CHECK(typed->cacheMemoryExplicit);
+
+    auto const silent = ParseNodeArgv({ "--scheduler=s:1" });
+    REQUIRE(silent.has_value());
+    CHECK_FALSE(silent->cacheMemoryExplicit);
 }

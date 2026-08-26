@@ -183,7 +183,8 @@ Wire::CapacityFields CapacityToWire(NodeCapacity const& capacity)
                                   .reservedCores = capacity.reserveIsExplicit
                                                        ? std::optional<std::uint32_t> { capacity.reservedCores }
                                                        : std::nullopt,
-                                  .cache = CacheCapacityToWire(capacity.cache) };
+                                  .cache = CacheCapacityToWire(capacity.cache),
+                                  .reservedMemoryBytes = capacity.reservedMemoryBytes };
 }
 
 std::optional<NodeCapacity> CapacityFromWire(Wire::CapacityFields const& fields)
@@ -193,6 +194,7 @@ std::optional<NodeCapacity> CapacityFromWire(Wire::CapacityFields const& fields)
         return std::nullopt;
     return NodeCapacity { .logicalCores = fields.logicalCores,
                           .totalMemoryBytes = fields.totalMemoryBytes,
+                          .reservedMemoryBytes = fields.reservedMemoryBytes,
                           .nodeClass = *nodeClass,
                           .reservedCores = fields.reservedCores.value_or(0),
                           .reserveIsExplicit = fields.reservedCores.has_value(),
@@ -233,6 +235,11 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             return _service.Register(caller,
                                      WorkerRegistration { .fingerprint = Wire::AsStringView(fields->fingerprint),
                                                           .endpoint = Wire::AsStringView(fields->endpoint),
+                                                          // Off the nested capacity record because that is the
+                                                          // one extensible carrier REGISTER has -- its top-level
+                                                          // arity is exact and fixed forever -- but kept out of
+                                                          // `NodeCapacity`, which must stay a literal type.
+                                                          .version = fields->capacity.version,
                                                           .slots = fields->slots,
                                                           .codecs = fields->acceptedCodecs,
                                                           .capacity = *capacity });

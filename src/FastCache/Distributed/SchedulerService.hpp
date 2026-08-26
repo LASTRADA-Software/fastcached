@@ -8,8 +8,10 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -179,7 +181,7 @@ class SchedulerService
     /// @return The role last published.
     [[nodiscard]] SchedulerRole Role() const noexcept
     {
-        return _role;
+        return _role.load(std::memory_order_acquire);
     }
 
     /// Admit a worker to the fleet.
@@ -251,6 +253,30 @@ class SchedulerService
                                               std::string_view memberId,
                                               std::string_view raftEndpoint);
 
+    /// Where the leader answers, when one is known.
+    ///
+    /// The scheduler endpoint rather than the consensus one, and that distinction
+    /// is a defect this pairing already closed once: a follower that names the
+    /// leader's Raft port sends a client to a socket which speaks nothing it
+    /// understands. It is the same string `NotLeader` carries in its message, and
+    /// empty for `Undecided` -- an election in progress has nobody to name.
+    /// @return The leader's scheduler endpoint, or empty.
+    [[nodiscard]] std::string LeaderEndpoint() const
+    {
+        std::scoped_lock const guard { _leaderMutex };
+        return _leaderEndpoint;
+    }
+
+    /// Leases outstanding right now.
+    ///
+    /// Narrow on purpose: a reporting caller has no business holding a
+    /// `LeaseTable&`, which is mutable and whose other verbs account for capacity.
+    /// @return The live lease count.
+    [[nodiscard]] std::size_t LiveLeaseCount() const
+    {
+        return _leases.LiveCount();
+    }
+
     /// The registry, for the admin endpoint and for tests.
     [[nodiscard]] WorkerRegistry const& Workers() const noexcept
     {
@@ -290,8 +316,22 @@ class SchedulerService
     IMetricsSink& _metrics;
     WorkerRegistry _workers;
     LeaseTable _leases;
-    SchedulerRole _role { SchedulerRole::Undecided };
-    std::string _leaderEndpoint {};
+
+    /// This node's standing, and where the leader is.
+    ///
+    /// Written by the consensus driver whenever leadership moves, and read by
+    /// every thread that serves a verb -- and now by whichever thread renders a
+    /// fleet report, which is what made the race worth closing rather than
+    /// reasoning about. The role is atomic and the endpoint is behind a mutex
+    /// because one is a byte and the other reallocates.
+    ///
+    /// They are read *separately*, so a report can in principle catch a new role
+    /// beside an old endpoint. That is deliberate rather than overlooked: the same
+    /// interleaving is reachable by a heartbeat landing one instant later, so a
+    /// lock spanning both would buy an atomicity the fleet does not have anyway.
+    std::atomic<SchedulerRole> _role { SchedulerRole::Undecided };
+    mutable std::mutex _leaderMutex;
+    std::string _leaderEndpoint {}; ///< Guarded by `_leaderMutex`.
 
     /// The cluster, when this node runs one. Null is a legitimate state.
     IClusterAdmin* _admin { nullptr };

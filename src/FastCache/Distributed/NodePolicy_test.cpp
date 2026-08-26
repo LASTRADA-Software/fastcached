@@ -262,3 +262,186 @@ TEST_CASE("The lowest of the live ceilings wins", "[distributed][nodepolicy]")
 
     CHECK(AvailableSlots(server, 32, mixed) == 8);
 }
+
+TEST_CASE("Naming the limit that withdrew a machine's slots", "[distributed][nodepolicy][slotlimit]")
+{
+    // The number `AvailableSlots` returns is a `min` of four, and which one it came
+    // from is the only thing an operator can act on: a node offering 2 of 16 sends
+    // them shopping for hardware when somebody is merely *using* the machine.
+    //
+    // Distinct numbers per case, deliberately: a table of near-identical rows makes
+    // "this ceiling reports its neighbour's value" the likely slip, and equal
+    // values would let it through.
+    constexpr NodeCapacity machine { .logicalCores = 32,
+                                     .totalMemoryBytes = 64ULL << 30,
+                                     .nodeClass = NodeClass::Dedicated };
+
+    SECTION("nothing withdraws anything")
+    {
+        constexpr auto ceilings = SlotCeilingsFor(machine, 16, Busy(3));
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::Registered);
+        STATIC_REQUIRE(ceilings.available == 16);
+        STATIC_REQUIRE(ceilings.registered == 16);
+        // Absent is not zero: a machine that reported nothing has no ceilings,
+        // which is a different claim from ceilings of zero.
+        STATIC_REQUIRE(!ceilings.byExternalCpu.has_value());
+        STATIC_REQUIRE(!ceilings.byMemory.has_value());
+        STATIC_REQUIRE(!ceilings.byScratch.has_value());
+    }
+
+    SECTION("somebody else is using the machine")
+    {
+        // 500 permille of 32 cores is 16 busy, less the 2 this fleet runs = 14
+        // external, so 16 registered - 14 = 2.
+        constexpr auto ceilings = SlotCeilingsFor(machine, 16, WithCpu(2, 500));
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::ExternalCpu);
+        STATIC_REQUIRE(ceilings.available == 2);
+        STATIC_REQUIRE(ceilings.byExternalCpu == 2U);
+        STATIC_REQUIRE(!ceilings.byMemory.has_value());
+    }
+
+    SECTION("memory is nearly gone")
+    {
+        // 3 GiB left plus the 1 job running = 4.
+        constexpr auto ceilings = SlotCeilingsFor(machine, 16, WithMemory(1, 3ULL << 30));
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::Memory);
+        STATIC_REQUIRE(ceilings.available == 4);
+        STATIC_REQUIRE(ceilings.byMemory == 4U);
+        STATIC_REQUIRE(!ceilings.byExternalCpu.has_value());
+    }
+
+    SECTION("the scratch filesystem is nearly full")
+    {
+        // 640 MiB at 128 MiB a job is 5, plus the 1 running = 6.
+        constexpr auto ceilings = SlotCeilingsFor(machine, 16, WithScratch(1, 640ULL << 20));
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::Scratch);
+        STATIC_REQUIRE(ceilings.available == 6);
+        STATIC_REQUIRE(ceilings.byScratch == 6U);
+    }
+
+    SECTION("the lowest of several ceilings binds, and each is still reported")
+    {
+        constexpr NodeLoad crowded { .inFlight = 1,
+                                     .cpuBusyPermille = 250,             // 8 busy - 1 ours = 7 external -> 9
+                                     .availableMemoryBytes = 7ULL << 30, // 7 + 1 = 8
+                                     .freeScratchBytes = 384ULL << 20 }; // 3 + 1 = 4
+        constexpr auto ceilings = SlotCeilingsFor(machine, 16, crowded);
+        STATIC_REQUIRE(ceilings.byExternalCpu == 9U);
+        STATIC_REQUIRE(ceilings.byMemory == 8U);
+        STATIC_REQUIRE(ceilings.byScratch == 4U);
+        STATIC_REQUIRE(ceilings.available == 4);
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::Scratch);
+    }
+
+    SECTION("a tie names the earlier limit, so the answer is reproducible")
+    {
+        // Memory and scratch both land on 4. Which one is named must not depend on
+        // how the comparison happened to be written.
+        constexpr NodeLoad tied { .inFlight = 1,
+                                  .cpuBusyPermille = std::nullopt,
+                                  .availableMemoryBytes = 3ULL << 30,
+                                  .freeScratchBytes = 384ULL << 20 };
+        constexpr auto ceilings = SlotCeilingsFor(machine, 16, tied);
+        STATIC_REQUIRE(ceilings.byMemory == 4U);
+        STATIC_REQUIRE(ceilings.byScratch == 4U);
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::Memory);
+    }
+}
+
+TEST_CASE("The unfolded ceilings agree with the number the scheduler uses", "[distributed][nodepolicy][slotlimit]")
+{
+    // The property that says the refactor changed nothing: `AvailableSlots` IS the
+    // minimum `SlotCeilingsFor` arrives at, over every shape of report.
+    constexpr NodeCapacity machine { .logicalCores = 16,
+                                     .totalMemoryBytes = 32ULL << 30,
+                                     .nodeClass = NodeClass::Dedicated };
+
+    constexpr auto agrees = [](NodeCapacity const& capacity, std::uint32_t slots, NodeLoad const& load) {
+        return AvailableSlots(capacity, slots, load) == SlotCeilingsFor(capacity, slots, load).available;
+    };
+
+    STATIC_REQUIRE(agrees(machine, 8, Busy(0)));
+    STATIC_REQUIRE(agrees(machine, 8, Busy(8)));
+    STATIC_REQUIRE(agrees(machine, 8, WithCpu(0, 1000)));
+    STATIC_REQUIRE(agrees(machine, 8, WithCpu(4, 250)));
+    STATIC_REQUIRE(agrees(machine, 8, WithMemory(0, 0)));
+    STATIC_REQUIRE(agrees(machine, 8, WithScratch(2, 1ULL << 30)));
+    STATIC_REQUIRE(agrees(NodeCapacity {}, 1, WithCpu(0, 1000)));
+}
+
+TEST_CASE("Every slot limit has a row naming it and what to do about it", "[distributed][nodepolicy][slotlimit]")
+{
+    // The table drives the report, so a limit added to the enum without a row is a
+    // build failure rather than a dashboard cell naming whichever row sorted first.
+    // Asserted over the table rather than against a list written out beside it.
+    for (auto const& row: SlotLimitTable)
+    {
+        CHECK_FALSE(row.name.empty());
+        CHECK_FALSE(row.remedy.empty());
+        CHECK(TraitsFor(row.limit).name == row.name);
+    }
+    CHECK(TraitsFor(SlotLimit::Scratch).name == "scratch");
+}
+
+TEST_CASE("Slots are budgeted against memory a compile can have, not all of it", "[distributed][policy][memory]")
+{
+    constexpr std::uint64_t Gib = 1ULL << 30;
+
+    // The machine this exists for: more hardware threads than gigabytes, so memory
+    // is the ceiling that binds rather than cores. Before the node declared what its
+    // own cache holds, this offered 32 slots at a gigabyte each *and* held 8 GiB of
+    // cache -- forty gigabytes of promises on a thirty-two gigabyte box.
+    constexpr NodeCapacity greedy {
+        .logicalCores = 64, .totalMemoryBytes = 32 * Gib, .reservedMemoryBytes = 8 * Gib, .nodeClass = NodeClass::Dedicated
+    };
+    CHECK(OfferableSlots(greedy, 0) == 24U);
+
+    // Same machine, no cache tier: nothing is held back, so nothing is subtracted.
+    // This is the arithmetic every node had before the field existed, and it is what
+    // a peer too old to report one still gets.
+    constexpr NodeCapacity lean { .logicalCores = 64, .totalMemoryBytes = 32 * Gib, .nodeClass = NodeClass::Dedicated };
+    CHECK(OfferableSlots(lean, 0) == 32U);
+}
+
+TEST_CASE("A cache budgeted above the machine's RAM floors the slots rather than freeing them",
+          "[distributed][policy][memory]")
+{
+    constexpr std::uint64_t Gib = 1ULL << 30;
+
+    // An operator can type `--cache-memory=64g` on a 16 GiB box. Subtracting to zero
+    // would hand `MemorySlotCeiling` its "did not say" sentinel and remove the memory
+    // ceiling **altogether** -- so the node most obviously short of memory would be
+    // the one offering a slot per core. One, not sixteen.
+    constexpr NodeCapacity impossible {
+        .logicalCores = 16, .totalMemoryBytes = 16 * Gib, .reservedMemoryBytes = 64 * Gib, .nodeClass = NodeClass::Dedicated
+    };
+    CHECK(OfferableSlots(impossible, 0) == 1U);
+
+    // Exactly equal is the same claim: nothing left to compile with.
+    constexpr NodeCapacity exact {
+        .logicalCores = 16, .totalMemoryBytes = 16 * Gib, .reservedMemoryBytes = 16 * Gib, .nodeClass = NodeClass::Dedicated
+    };
+    CHECK(OfferableSlots(exact, 0) == 1U);
+}
+
+TEST_CASE("A machine that did not state its memory is still scheduled on its cores", "[distributed][policy][memory]")
+{
+    // Absent is not zero, and a reserve cannot invent a reading: a node that could
+    // not read its own RAM must be scheduled on what it *did* say, not clamped to
+    // one slot by arithmetic over a number nobody has.
+    constexpr NodeCapacity quiet {
+        .logicalCores = 12, .totalMemoryBytes = 0, .reservedMemoryBytes = 4ULL << 30, .nodeClass = NodeClass::Dedicated
+    };
+    CHECK(OfferableSlots(quiet, 0) == 12U);
+}
+
+TEST_CASE("An explicit slot count is still a ceiling nothing raises or lowers", "[distributed][policy][memory]")
+{
+    constexpr std::uint64_t Gib = 1ULL << 30;
+    // `--slots` is the operator overriding every derivation, and holding memory back
+    // must not quietly start second-guessing it.
+    constexpr NodeCapacity capacity {
+        .logicalCores = 64, .totalMemoryBytes = 32 * Gib, .reservedMemoryBytes = 8 * Gib, .nodeClass = NodeClass::Dedicated
+    };
+    CHECK(OfferableSlots(capacity, 40) == 40U);
+}

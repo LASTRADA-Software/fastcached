@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
@@ -11,18 +12,141 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace FastCache
 {
 
+class TlsContext;
+
+/// One request header this server reads.
+///
+/// A closed set rather than a header map, deliberately: a map would invite routes
+/// that branch on headers this server never bounds or normalises. A table is what
+/// makes the set *extensible without being open* -- the second entry here arrived
+/// as a row, and the parse loop that used to stop at the first match had to be
+/// fixed once and now cannot regress per header.
+enum class AdminHeader : std::uint8_t
+{
+    /// The credential every gated route checks.
+    Authorization = 0,
+    /// What a client already holds, for the conditional GETs the charts serve.
+    IfNoneMatch,
+    Last
+};
+
+/// What one readable header is called on the wire.
+struct AdminHeaderRow
+{
+    AdminHeader header;    ///< The header this row describes.
+    std::string_view name; ///< Its field name, lower-cased for the comparison.
+};
+
+/// Every header this server reads, in enumerator order.
+inline constexpr EnumTable<AdminHeader, AdminHeaderRow> AdminHeaderTable {
+    AdminHeaderRow { .header = AdminHeader::Authorization, .name = "authorization" },
+    AdminHeaderRow { .header = AdminHeader::IfNoneMatch, .name = "if-none-match" },
+};
+static_assert(RowsInEnumeratorOrder(AdminHeaderTable, &AdminHeaderRow::header));
+
+/// One admin request, as far as this server understands one.
+struct AdminRequest
+{
+    /// Path with the query string stripped, so `/metrics?foo=1` routes as `/metrics`.
+    std::string_view path;
+    /// Whatever followed the `?`, empty when there was none.
+    std::string_view query;
+    /// One slot per `AdminHeaderTable` row; empty where the client sent none.
+    EnumTable<AdminHeader, std::string_view> headers {};
+
+    /// One header's value.
+    /// @param which Which header.
+    /// @return Its value, or empty when the client sent none.
+    [[nodiscard]] std::string_view Header(AdminHeader which) const noexcept
+    {
+        return headers[static_cast<std::size_t>(which)];
+    }
+};
+
+/// What a route answered.
+///
+/// The status is part of the *response* rather than a column of the route table,
+/// because one route legitimately answers several: `/fleet` is a page when this
+/// node leads and a 401 when the caller brought no credential. A table column would
+/// have to be a status per route, which is the one thing that is not fixed per route.
+struct AdminResponse
+{
+    /// Status line without the version, e.g. `200 OK`.
+    ///
+    /// A status that carries no content -- `304`, `204` -- suppresses `Content-Type`
+    /// and `Content-Length` on its own, because whether a body is allowed is a
+    /// property of the status rather than something each route must remember.
+    std::string_view status { "200 OK" };
+    /// What `body` is.
+    std::string_view contentType { "text/plain" };
+    /// The body, already rendered. Empty for a status that carries no content.
+    std::string body {};
+    /// Extra header lines, each without its trailing CRLF.
+    ///
+    /// Empty for almost every response. It exists because a 401 that does not carry
+    /// `WWW-Authenticate` is one a browser cannot prompt for, which turns "you need a
+    /// credential" into "this page is broken".
+    std::vector<std::string> extraHeaders {};
+};
+
+/// Renders one route, or refuses it.
+///
+/// A `std::function` supplied by the caller rather than a member function, and that
+/// is a layering decision rather than a style one: the fleet dashboard reads
+/// `Distributed/` and `Cluster/`, and a handler declared here would drag both into
+/// `Server/` for the benefit of one route. The server owns HTTP; what a route means
+/// belongs to whoever registered it.
+using AdminRouteHandler = std::function<AdminResponse(AdminRequest const&)>;
+
+/// How a route's `path` is compared against the request's.
+///
+/// A column and not a special case: the charts are one resource per series, and a
+/// route per series would put the series table's contents in two places. Dispatch
+/// tries the kinds in enumerator order, so an exact route is never shadowed by a
+/// prefix one however the caller happened to order its vector.
+enum class AdminRouteMatch : std::uint8_t
+{
+    /// The whole path, and nothing else.
+    Exact = 0,
+    /// The path begins with `AdminRoute::path`; the handler reads the tail.
+    Prefix,
+    Last
+};
+
+/// One route: the path it answers, how that path is matched, and what answers it.
+///
+/// A table rather than an `if`/`else` ladder, for the reason every other table in
+/// this codebase is one -- a route added by editing a chain of comparisons is a
+/// route somebody adds to the chain and forgets to test, and the ladder this
+/// replaced had already grown a third arm that only differed by a string.
+struct AdminRoute
+{
+    /// The path, matched per `match`.
+    std::string_view path;
+    /// What renders it.
+    AdminRouteHandler handler;
+    /// Whole path or leading path. Exact unless a route says otherwise.
+    AdminRouteMatch match { AdminRouteMatch::Exact };
+};
+
 /// Tiny read-only HTTP/1.1 admin surface, served on a dedicated port so it
 /// never collides with the cache wire protocols (a leading `GET` would
-/// otherwise be misrouted to the memcached text autodetector). Routes:
+/// otherwise be misrouted to the memcached text autodetector). Built-in routes:
 ///   - `GET /metrics` — Prometheus text exposition of the counters + storage
 ///     snapshot (see RenderPrometheus).
 ///   - `GET /healthz` — `200 OK` liveness probe for containers / k8s.
 ///   - anything else — `404`; non-GET — `405`; malformed — `400`.
+/// A caller may register further routes; see `AdminRoute`.
 /// Each connection answers exactly one request, then closes (`Connection:
 /// close`); the request head is bounded so a slow or oversized client cannot
 /// tie the server up. Admission traffic is trivial, so connections are served
@@ -55,10 +179,14 @@ class AdminHttpServer
     /// @param metrics Connection-level counter sink to expose.
     /// @param snapshotProvider Returns a fresh storage snapshot + uptime per scrape.
     /// @param logger Shared logger.
+    /// @param routes Routes beyond `/metrics` and `/healthz`; copied.
+    /// @param tls Server TLS context, or nullptr to serve plaintext.
     AdminHttpServer(IListener& listener,
                     IMetricsSink const& metrics,
                     SnapshotProvider snapshotProvider,
-                    ILogger& logger) noexcept;
+                    ILogger& logger,
+                    std::vector<AdminRoute> routes = {},
+                    TlsContext* tls = nullptr) noexcept;
 
     /// Accept loop; returns when the listener is closed via Shutdown().
     /// @return Task that resolves when the accept loop exits.
@@ -80,6 +208,9 @@ class AdminHttpServer
     IMetricsSink const& _metrics;
     SnapshotProvider _snapshotProvider;
     ILogger& _logger;
+    std::vector<AdminRoute> _routes;
+    /// Server TLS context, or null for plaintext. Not owned.
+    TlsContext* _tls { nullptr };
     std::atomic<bool> _shuttingDown { false };
     /// Number of admin requests currently being served as detached tasks.
     /// Bumped in the accept loop, decremented at the end of each request.
@@ -102,9 +233,11 @@ class AdminHttpServer
 /// @param socket Connected client socket.
 /// @param metrics Counter sink for `/metrics`.
 /// @param snapshotProvider Storage-stats + uptime provider for `/metrics`.
+/// @param routes Caller-registered routes, consulted before the 404.
 /// @return Task that resolves when the response has been written.
 [[nodiscard]] Task<void> ServeAdminHttp(ISocket* socket,
                                         IMetricsSink const* metrics,
-                                        AdminHttpServer::SnapshotProvider snapshotProvider);
+                                        AdminHttpServer::SnapshotProvider snapshotProvider,
+                                        std::span<AdminRoute const> routes = {});
 
 } // namespace FastCache

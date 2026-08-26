@@ -14,6 +14,8 @@
     #include <windows.h>
 #else
     #include <sys/utsname.h>
+
+    #include <unistd.h>
 #endif
 
 namespace FastCache
@@ -84,10 +86,35 @@ namespace
 
     /// Build the facts once.
     /// @return The facts for this machine.
+    /// What this machine calls itself, or empty when it would not say.
+    ///
+    /// Truncation is treated as a failure rather than reported as a shortened
+    /// name: this feeds a certificate's subject names, and half a hostname is a
+    /// name that matches nothing while looking like it should.
+    /// @return The host name, or empty.
+    [[nodiscard]] std::string QueryHostName()
+    {
+        std::array<char, 256> buffer {};
+#if defined(_WIN32)
+        auto size = static_cast<DWORD>(buffer.size());
+        if (GetComputerNameExA(ComputerNameDnsHostname, buffer.data(), &size) == 0)
+            return {};
+#else
+        if (::gethostname(buffer.data(), buffer.size()) != 0)
+            return {};
+        // POSIX does not promise a terminator when the name did not fit, and the
+        // last byte being untouched is how we know it did.
+        if (buffer.back() != '\0')
+            return {};
+#endif
+        return std::string { buffer.data() };
+    }
+
     [[nodiscard]] HostFacts BuildHostFacts()
     {
         auto facts = HostFacts {};
         facts.architecture = std::string { CompiledArchitecture() };
+        facts.hostName = QueryHostName();
 
 #if defined(_WIN32)
         facts.osName = "Windows";

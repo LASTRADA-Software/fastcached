@@ -27,6 +27,8 @@
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Version.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
@@ -549,40 +551,48 @@ constexpr int ExitOk = 0;
     // Declared AFTER the cache tier, which is what makes the pointer its lambda
     // captures safe: locals are destroyed in reverse, so this endpoint stops
     // serving -- and joins its thread -- before the tier it reads is gone.
-    std::unique_ptr<Node::AdminEndpoint> adminEndpoint;
-    if (!cfg.adminListen.empty())
+    // The admin surface: `/metrics`, `/healthz`, and the fleet dashboard when the
+    // operator asked for one. Assembled by a function rather than here, and not
+    // for tidiness -- `main.cpp` is in no test target, so the TLS, credential and
+    // route-selection branches would otherwise have no coverage at all, and this
+    // is the third time that reasoning has moved wiring out of `WorkerBody`.
+    //
+    // Declared AFTER the tiers it reads, which is what makes the pointers safe:
+    // locals are destroyed in reverse, so the surface stops serving -- and joins
+    // its thread -- before the scheduler, the cluster and the cache tier are gone.
+    auto surfaceOrRefusal = Node::StartAdminSurfaceOrExplain(
+        cfg,
+        *host,
+        metrics,
+        // Built by a function rather than spelled as a lambda here, for the reason
+        // above: a node with no cache must report NO cache rather than an empty
+        // one, and that branch has to be reachable from a test.
+        Node::MakeNodeSnapshotProvider(Node::NodeScrapeSources { .host = host.get(),
+                                                                 .busySlots = [&server] { return server.InFlight(); },
+                                                                 .cache = cacheTier.get(),
+                                                                 .slots = slots,
+                                                                 .scratchRoot = jobs.ScratchRoot() },
+                                       std::chrono::steady_clock::now()),
+        // Absent when this node runs no scheduler: there is then no registry to
+        // report, so no fleet route is registered and `/fleet` is a plain 404.
+        schedulerTier ? std::optional { Distributed::FleetSources { .scheduler = &schedulerTier->Service(),
+                                                                    // Legitimately null: a node with no
+                                                                    // `--node-id` leads itself and has no
+                                                                    // replicated state for anybody to read.
+                                                                    .cluster = consensusTier.get(),
+                                                                    .metrics = &metrics } }
+                      : std::nullopt,
+        logger);
+
+    // Fatal rather than a warning, unlike the daemon's: an operator who asked a
+    // *worker* for an endpoint is almost always wiring a probe to it, and a worker
+    // that starts without one looks healthy to everything that would have noticed.
+    if (!surfaceOrRefusal.has_value())
     {
-        auto started = Node::AdminEndpoint::Start(
-            cfg.adminListen,
-            "127.0.0.1",
-            metrics,
-            // Built by a function rather than spelled as a lambda here, and not for
-            // tidiness: `main.cpp` is in no test target, so a snapshot assembled in
-            // it has no coverage -- and this one has a branch worth covering, since
-            // a node with no cache must report NO cache rather than an empty one.
-            // It also kept `WorkerBody` under clang-tidy's cognitive-complexity
-            // limit, which is the symptom that said so.
-            Node::MakeNodeSnapshotProvider(Node::NodeScrapeSources { .host = host.get(),
-                                                                     .busySlots = [&server] { return server.InFlight(); },
-                                                                     .cache = cacheTier.get(),
-                                                                     .slots = slots,
-                                                                     .scratchRoot = jobs.ScratchRoot() },
-                                           std::chrono::steady_clock::now()),
-            logger);
-
-        // Fatal rather than a warning, unlike the daemon's: an operator who asked a
-        // *worker* for an endpoint is almost always wiring a probe to it, and a
-        // worker that starts without one looks healthy to everything that would
-        // have noticed.
-        if (!started.has_value())
-        {
-            logger.Logf(LogLevel::Error, "--admin-listen {}; refusing to start", started.error());
-            return ExitUsage;
-        }
-
-        adminEndpoint = std::move(*started);
-        logger.Logf(LogLevel::Info, "metrics endpoint on http://{}/metrics (and /healthz)", adminEndpoint->BoundEndpoint());
+        logger.Logf(LogLevel::Error, "{}; refusing to start", surfaceOrRefusal.error());
+        return ExitUsage;
     }
+    auto const adminSurface = std::move(*surfaceOrRefusal);
 
     // Both surfaces have bound and adopted, so the loop can start accepting. Doing
     // it here rather than at construction is the ordering `ConsensusTier::Launch`
@@ -619,11 +629,19 @@ constexpr int ExitOk = 0;
     auto advertised = capacity;
     advertised.cache = Node::CacheCapacityOf(cacheTier.get());
 
+    auto advertisedWire = Distributed::CapacityToWire(advertised);
+    // Compiled in, never configurable. The point of the column this feeds is to tell
+    // an operator which binary is actually running on each machine -- most often
+    // part-way through a rolling upgrade -- and a version a node could be *told* to
+    // report is one that can be wrong exactly when somebody is relying on it. It
+    // travels inside the capacity record because that is REGISTER's one extensible
+    // field; the message's own arity is exact and stays that way forever.
+    advertisedWire.version = VersionString;
+
     std::vector<Cc::WorkerRegistrar> registrars;
     registrars.reserve(toolchains.size());
     for (auto const& [fingerprint, compiler]: toolchains)
-        registrars.emplace_back(
-            fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, Distributed::CapacityToWire(advertised));
+        registrars.emplace_back(fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, advertisedWire);
 
     // One sampler for the whole loop, not one per heartbeat. CPU utilization is a
     // difference between two readings, so a sampler constructed per iteration would

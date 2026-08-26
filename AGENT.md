@@ -11,7 +11,7 @@ transport, a manual clock and a scripted reactor.
 ```
 src/FastCache/
   Core/         Error taxonomy, Clock, HostPort, IRandomSource, Logger, BufferPool,
-                Bytes, Endian, Crc32c, MurmurHash3, Sha256/HMAC, StringHash, Owner,
+                Base64, Bytes, Endian, Crc32c, MurmurHash3, Sha256/HMAC, StringHash, Owner,
                 Compression, WireFrame + WireFields (the shared framing), Profiling
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
                 InterruptibleSleepUntil, DeadlineTimer, AsyncQueue (MPSC,
@@ -43,13 +43,15 @@ src/FastCache/
                 MembershipPolicy — who is a member, WHERE they answer, and the
                 settings every member must agree on
   Distributed/  WorkerRegistry, LeaseTable and SchedulerService — the fleet's
-                capacity decisions, all pure with respect to I/O
+                capacity decisions, all pure with respect to I/O; plus FleetView,
+                which renders what the leader can see as a page and as JSON
   Protocol/     IProtocolHandler, ProtocolAutodetect, Framing/ByteReader,
                 MemcachedText, MemcachedMeta, MemcachedBinary, RedisResp,
                 CompileCacheHandler (the 0xFC executor) and CompileCacheWire
                 (header-only and dependency-free, shared verbatim by every
                 binary)
-  Server/       Connection (per-client coroutine), Server, ReactorServerLoop
+  Server/       Connection (per-client coroutine), Server, ReactorServerLoop,
+                AdminHttpServer (its routes are a table) + AdminCredential
   Platform/     IDaemonHost, ISignalSource, DaemonControls, CpuAffinity,
                 HostMemory, HostInfo, ServiceControl (ServiceSpec), Terminal,
                 InheritedListener (systemd socket activation),
@@ -160,6 +162,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   *unbounded*, so the flag that turns a cache off once turned its limit off.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
+- `AvailableSlots` folds four ceilings into one; `SlotCeilingsFor` is the same
+  arithmetic with each named, and a tie names the earlier limit in enumerator order.
+- A heartbeat age is a duration on a report, never a `TimePoint` on `WorkerInfo` —
+  a raw instant invites `steady_clock::now()` and breaks every `ManualClock` test.
 
 **[`.agent/rules/consensus-and-cluster.md`](.agent/rules/consensus-and-cluster.md)**
 — Raft, discovery, membership. Before `Consensus/`, `Cluster/`.
@@ -204,6 +210,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A listening socket claims its address exclusively — `SO_EXCLUSIVEADDRUSE` on
   Windows, where `SO_REUSEADDR` lets a second process take a port already being
   served. Sharing a port is `ReusePort::Yes`, and only that.
+- A struct a decoder returns **by value** must not borrow from the bytes it decoded:
+  `Decode(Encode(x))` is the obvious spelling and is a use-after-free the moment one
+  member becomes a view. A `*View` type borrows and says so; anything else owns.
 - There is exactly one TCP client, `Net/TcpClient`. Do not write a second.
 - A synchronous dial spends a thread the caller does not own — a reactor thread
   dials through `PlatformConnector`, never `BlockingConnector`.
@@ -238,6 +247,36 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A merged snapshot is one tier's answer standing in for all of them:
   `SnapshotTiers()` reports the split, the `tier` label comes from a table, and a
   tier the cache does not have renders no line at all.
+- The fleet page is served by the leader; anyone else answers `503` **naming** the
+  leader, never a redirect and never a link to an address it guessed.
+- Its columns are a table both renderers walk, one spelling serving as header and
+  JSON key. Absent renders `null`/`–` at the **cell**, and a tier no member runs
+  gets no column.
+- A fleet total is computed over `NodeReports()`, never over registry entries.
+- A node's version is compiled in, rides REGISTER's *nested* capacity record (whose
+  arity is variable) rather than its top level (whose arity is exact), and is
+  refreshed on re-registration — a restart is what an upgrade looks like.
+- A history stores a counter **raw**; a rate is the delta at render, taken only
+  between adjacent *present* buckets. A restart is then a gap, not a spike.
+- Sampling runs only while this node **leads**, and no state of the history file
+  may keep a node from starting.
+- A chart served as its own resource inherits nothing from the page, so it carries
+  its own palette and theme is part of its URL — and that URL carries no
+  cache-buster, or the `304` never fires.
+- A `304` carries its validators and no content; whether a body is allowed is a
+  property of the **status**, not a flag each route sets.
+- An unknown `range` is refused, an unknown `theme` is not: refuse where a silent
+  substitution would mislead, default where it cannot.
+- A stacked area is drawn **top band first**, or translucent fills multiply into a
+  colour belonging to no series.
+- The dashboard credential is its own file, never `--requirepass`; a non-loopback
+  bind without one is a startup refusal, and TLS does not substitute for it.
+- Plain HTTP is a supported way to serve the admin surface. TLS is on by naming
+  material or by asking for material to be made (`--tls-self-signed`) — never a
+  bare boolean, and the two spellings are refused together.
+- A generated certificate encrypts but does not identify: its fingerprint is
+  logged because that is all an operator can compare, and its subject names decide
+  whether any client accepts it at all.
 
 **[`.agent/rules/packaging-and-release.md`](.agent/rules/packaging-and-release.md)**
 — packaging, versioning, cutting a release. Before `packaging/`, `cmake/Packaging.cmake`,
@@ -253,6 +292,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
 - Run `scripts/local-gate.sh` before pushing. One configuration is not the gate.
+- Where `clang-debug` will not build, get ASan from GCC (`-fsanitize=address` alone —
+  UBSan breaks the option tables' constexpr checks) and run the **whole** suite: a
+  freed block nothing disturbs reports nothing.
 - Run clang-format and clang-tidy **at the version CI pins**, in a build directory
   of its own; `PATH` resolving to an older binary reports clean in the way that
   means nothing.
@@ -263,6 +305,16 @@ what differs between compilers, standard libraries, hosts and tool versions.
   a configure.
 - A sanitizer that is on in the cache is not one that is on in the build — a tool
   that silently does nothing is worse than one that is visibly off.
+- `clang-format -i` at any version but the pinned one silently reformats code the
+  pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
+  tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the
+  distro only has an older one" is not a reason to use it. An older clang-tidy is
+  worse than a laxer one: it is *silent* about checks that do not exist in it yet.
+- A clang-tidy sweep that cannot prove the tool ran is worth nothing and reads like
+  success — `scripts/tidy-sweep.sh` canaries it first and treats a failure to
+  execute as fatal, never as "no findings".
+- Every `bool` and byte-wide enum in a config struct lives in one run: one between two
+  8-aligned members costs seven bytes, and clang-tidy's padding budget fails the build.
 - A table indexed by an enumerator is `EnumTable<Enum, Row>` + `RowsInEnumeratorOrder`.
   A length anchored on an enumerator by name is a guard that fires only when
   nothing is wrong.

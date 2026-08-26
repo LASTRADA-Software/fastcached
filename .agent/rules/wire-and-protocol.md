@@ -518,3 +518,23 @@ Every rule below has already been a bug.
   - **IOCP cancels timers and not submissions**, because a submission there is a
     completion packet already posted to the kernel and no call takes one back. It
     answers `false` for that case, which is the honest answer under the rule above.
+
+- **A struct returned BY VALUE from a decoder must not borrow from what it decoded.**
+  `DecodeCapacity(EncodeCapacity(x))` is the obvious spelling and was a
+  use-after-free the moment `CapacityFields` grew one `string_view` member: the
+  encoded buffer dies at the semicolon and the view outlives it. Nothing in the type
+  warned anybody -- `RegisterView` says "View" precisely because it borrows, while
+  `CapacityFields` is used for both directions and reads as a value, so a borrowing
+  member turned every existing call site into a trap without a single name changing.
+
+  The decode side of a value-returning record **owns** its bytes. A registration is
+  once per node; the copy is free, and the alternative is a hazard in a header every
+  binary compiles.
+  - **It passed on libstdc++ and failed on libc++**, which is the whole difficulty:
+    the read only misbehaves once something reuses the freed block, and which
+    allocator does that promptly is a property of the platform. A local ASan run
+    reproduces it only if the test *churns the heap* between the decode and the read
+    -- without that, ASan reports nothing and the bug looks absent.
+  - **The regression test decodes from a temporary on purpose**, and a second one
+    scopes the buffer and reads every field after it is gone. A rule this shape
+    cannot be left to a case that happens to exercise it.

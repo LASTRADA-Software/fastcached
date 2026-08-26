@@ -4,6 +4,7 @@
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
+#include <FastCache/Core/HostPort.hpp>
 
 #include <array>
 #include <charconv>
@@ -184,13 +185,21 @@ namespace
     /// @return The size in bytes, or why it is not one.
     [[nodiscard]] std::expected<std::uint64_t, ConfigError> ParseCacheBytes(std::string_view sv)
     {
-        auto const parsed = ParseByteSize(sv, "cache-memory");
+        // Host total passed, so `N%` parses -- which is the vocabulary this flag's
+        // own default is stated in. A default an operator cannot spell is one they
+        // cannot adjust by a little: without this, "a quarter of RAM, but half"
+        // means working out the bytes for every machine by hand.
+        auto const parsed = ParseByteSize(sv, "cache-memory", QueryHostTotalMemoryBytes());
         if (!parsed.has_value())
             return std::unexpected(parsed.error());
         return static_cast<std::uint64_t>(*parsed);
     }
 
-    /// The on-disk tier's byte budget, in the same grammar as `--cache-memory`.
+    /// The on-disk tier's byte budget.
+    ///
+    /// `k`/`m`/`g` as `--cache-memory` takes them, but **not** its `N%`: that share
+    /// is of host RAM, and a disk budget expressed as a fraction of memory would be
+    /// a number with no meaning on any machine whose disk is not its RAM.
     /// @param sv Text to parse.
     /// @return The size in bytes, or why it is not one.
     [[nodiscard]] std::expected<std::uint64_t, ConfigError> ParseCacheDiskBytes(std::string_view sv)
@@ -430,6 +439,43 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "public interface is an operator's decision, not a\n"
                          "default. /healthz is also the liveness probe this\n"
                          "worker otherwise has none of." },
+        { .primary = "--dashboard",
+          .apply = SetTrue<&NodeConfig::dashboard>(),
+          .description = "also serve the fleet dashboard on --admin-listen, at\n"
+                         "/fleet and /fleet.json. Off unless given: the page is a\n"
+                         "map of every member's hostname, endpoint and capacity.\n"
+                         "Answered in full only while this node LEADS; anyone else\n"
+                         "names the leader rather than showing half a fleet." },
+        { .primary = "--dashboard-token-file",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&NodeConfig::dashboardTokenFile, ParsePathValue>(),
+          .description = "credential the dashboard requires, as Basic or Bearer.\n"
+                         "A FILE and not a flag: a command line is readable\n"
+                         "through ps. Its own secret rather than --requirepass,\n"
+                         "which every member of the fleet already holds. Required\n"
+                         "when --admin-listen is not on loopback." },
+        { .primary = "--tls-self-signed",
+          .apply = SetTrue<&NodeConfig::tlsSelfSigned>(),
+          .description = "generate a self-signed certificate at startup and serve\n"
+                         "the admin surface over HTTPS with it, so an internal\n"
+                         "deployment needs no certificate to obtain. Encrypts the\n"
+                         "traffic; it does NOT prove which node answered, so the\n"
+                         "fingerprint is logged for you to compare. Regenerated\n"
+                         "every restart -- name --tls-cert for a stable identity." },
+        { .primary = "--tls-cert",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&NodeConfig::tlsCertFile, ParsePathValue>(),
+          .description = "serve the admin surface over HTTPS with this\n"
+                         "certificate. TLS is on by naming a certificate and a\n"
+                         "key rather than by a flag, so there is no way to ask\n"
+                         "for it without the material to do it." },
+        { .primary = "--tls-key",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&NodeConfig::tlsKeyFile, ParsePathValue>(),
+          .description = "private key for --tls-cert. Both or neither." },
         { .primary = "--listen-scheduler",
           .arity = Arity::Value,
           .operand = "=[<address>:]<port>",
@@ -458,12 +504,14 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "decision -- listing nobody refuses everybody." },
         { .primary = "--cache-memory",
           .arity = Arity::Value,
-          .operand = "=<bytes>",
+          .operand = "=<size>",
           .apply = AssignFrom<&NodeConfig::cacheMemoryBytes, ParseCacheBytes>(),
-          .description = "size of this node's own in-memory cache tier\n"
-                         "(default 256m; 0 turns it off). It exists so a\n"
-                         "local rebuild on a slow or bad network never\n"
-                         "reaches the wire at all." },
+          .explicitBit = &NodeConfig::cacheMemoryExplicit,
+          .description = "size of this node's own in-memory cache tier;\n"
+                         "k/m/g = KiB/MiB/GiB or N% of host RAM. Defaults\n"
+                         "to 25% of RAM within [512m, 8g]; 0 turns it off.\n"
+                         "It exists so a local rebuild on a slow or bad\n"
+                         "network never reaches the wire at all." },
         { .primary = "--cache-disk",
           .arity = Arity::Value,
           .operand = "=<bytes>",
@@ -565,6 +613,12 @@ Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg, IHostFactsSource
 {
     return Distributed::NodeCapacity { .logicalCores = host.LogicalCores(),
                                        .totalMemoryBytes = host.TotalMemoryBytes(),
+                                       // What this node's own cache tier will take,
+                                       // and therefore what a compile cannot have.
+                                       // `cfg.cacheMemoryBytes` is exactly what
+                                       // `CacheTier` builds the memory half with, and
+                                       // zero is both "no tier" and "nothing held".
+                                       .reservedMemoryBytes = cfg.cacheMemoryBytes,
                                        .nodeClass = cfg.nodeClass,
                                        // Absent is not zero, and this is the one line
                                        // where the two are told apart: a reserve the
@@ -620,8 +674,22 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     if (cfg.reservedCores.has_value())
         argv.push_back(std::format("--reserve-cores={}", *cfg.reservedCores));
     emitIfSet("admin-listen", cfg.adminListen, defaults.adminListen);
+    if (cfg.dashboard)
+        argv.emplace_back("--dashboard");
+    // The PATH, never the secret it holds -- the same rule `--requirepass` is
+    // refused outright by, one step less strict because a path is not a credential.
+    emitPathIfSet("dashboard-token-file", cfg.dashboardTokenFile.string());
+    if (cfg.tlsSelfSigned)
+        argv.emplace_back("--tls-self-signed");
+    emitPathIfSet("tls-cert", cfg.tlsCertFile.string());
+    emitPathIfSet("tls-key", cfg.tlsKeyFile.string());
     emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
-    emitIfSet("cache-memory", cfg.cacheMemoryBytes, defaults.cacheMemoryBytes);
+    // On whether they SAID it, not on whether it differs. This default is a share of
+    // host RAM, so the value an operator reads off the startup line and types back to
+    // pin it is the one value `emitIfSet` would drop -- leaving the service to
+    // re-derive from RAM at every start, and the budget to move under a VM resize.
+    if (cfg.cacheMemoryExplicit)
+        argv.emplace_back(std::format("--cache-memory={}", cfg.cacheMemoryBytes));
     emitIfSet("cache-disk", cfg.cacheDiskBytes, defaults.cacheDiskBytes);
     emitIfSet("listen-cache", cfg.cacheListen, defaults.cacheListen);
     emitIfSet("node-id", cfg.nodeId, defaults.nodeId);
@@ -793,6 +861,49 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--cluster-key-file is read by discovery and nothing else, and --discovery is not set. A "
                      "secret an operator went to the trouble of provisioning, being read by nobody, is exactly "
                      "the silent no-op this list exists to refuse." },
+        { .refuses = [](NodeConfig const& c) { return c.dashboard && c.adminListen.empty(); },
+          .message = "--dashboard needs --admin-listen: the dashboard is served on the admin surface, and "
+                     "without one there is no port for it to answer on. It would start, log nothing wrong, "
+                     "and serve the page to nobody." },
+        { .refuses = [](NodeConfig const& c) { return c.dashboard && c.schedulerListen.empty(); },
+          .message = "--dashboard needs --listen-scheduler: a node that runs no scheduler never leads a fleet, "
+                     "so the page could only ever say it is not the leader. The fleet-wide facts live where "
+                     "leadership does." },
+        { .refuses = [](NodeConfig const& c) { return !c.dashboardTokenFile.empty() && !c.dashboard; },
+          .message = "--dashboard-token-file guards the dashboard and nothing else, and --dashboard is not set. "
+                     "A secret an operator provisioned, being read by nobody, is the silent no-op this list "
+                     "exists to refuse." },
+        { .refuses = [](NodeConfig const& c) { return c.tlsSelfSigned && !c.tlsCertFile.empty(); },
+          .message = "--tls-self-signed and --tls-cert contradict each other: one generates a certificate and "
+                     "the other names one. Silently preferring either would serve an identity the operator did "
+                     "not choose, which is the whole thing a certificate is for." },
+        { .refuses =
+              [](NodeConfig const& c) { return (c.tlsSelfSigned || !c.tlsCertFile.empty()) && c.adminListen.empty(); },
+          .message = "--tls-self-signed and --tls-cert serve the admin surface, and --admin-listen is not set. "
+                     "TLS material nothing terminates is the silent no-op this list exists to refuse." },
+        { .refuses = [](NodeConfig const& c) { return c.tlsCertFile.empty() != c.tlsKeyFile.empty(); },
+          .message = "--tls-cert and --tls-key are both or neither: a certificate with no key cannot terminate "
+                     "TLS, and this node would otherwise start and serve the admin surface in the clear while "
+                     "an operator believed it was encrypted." },
+        // The rule that keeps a fleet map off an open port. Loopback needs no
+        // credential -- reaching it already means being on the machine -- but a
+        // bind an operator deliberately exposed does, and HTTPS alone does not
+        // supply it: TLS authenticates the SERVER to the browser and says nothing
+        // about who the browser is.
+        { .refuses =
+              [](NodeConfig const& c) {
+                  if (!c.dashboard || c.adminListen.empty() || !c.dashboardTokenFile.empty())
+                      return false;
+                  // The same default host `AdminEndpoint::Start` binds with, so
+                  // this rule judges the address the endpoint will actually take
+                  // rather than the text an operator typed.
+                  auto const endpoint = ParseEndpoint(c.adminListen, "127.0.0.1");
+                  return endpoint.has_value() && !IsLoopbackHost(endpoint->first);
+              },
+          .message = "--dashboard on a non-loopback --admin-listen needs --dashboard-token-file: the page is a "
+                     "map of every member's hostname, endpoint and capacity, and an operator who bound it to "
+                     "the network is publishing that to whoever asks. A bare port binds loopback and needs no "
+                     "credential." },
     });
 
     for (auto const& rule: Rules)

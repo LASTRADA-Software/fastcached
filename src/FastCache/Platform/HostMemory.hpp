@@ -28,7 +28,8 @@ namespace FastCache
 [[nodiscard]] std::size_t QueryHostTotalMemoryBytes() noexcept;
 
 /// The default in-memory cache budget: a quarter of QueryHostTotalMemoryBytes(),
-/// clamped to [512 MiB, 8 GiB]. Falls back to the floor when the query fails.
+/// rounded down to a whole MiB and clamped to [512 MiB, 8 GiB]. Falls back to the
+/// floor when the query fails.
 ///
 /// A fraction rather than a constant so the default tracks the machine it runs
 /// on: the same build serves an 8 GB laptop and a 96 GB workstation, and a

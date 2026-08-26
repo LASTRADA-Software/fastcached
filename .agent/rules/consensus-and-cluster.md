@@ -525,3 +525,11 @@ Every rule below has already been a bug.
   unicast (measured on Windows 11 and Linux; which one differs between them). Two
   nodes on one host therefore see each other's beacons and silently never finish
   proving the key.
+- **[#144](https://github.com/LASTRADA-Software/fastcached/issues/144)** — a
+  follower answering `/fleet` names the leader but cannot link to it, because
+  where a dashboard is served is local configuration and any URL it built would be
+  a guess. A third recorded endpoint was priced and refused: `StateVersion` is
+  checked on decode, so a field makes every existing snapshot and log entry
+  undecodable. It stays open because the trigger is natural — whenever
+  `ClusterState` next bumps for a reason that carries the migration on its own,
+  this rides along.

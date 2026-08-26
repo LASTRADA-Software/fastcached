@@ -33,6 +33,18 @@ determinism rests on.
   timing seam, or anything a test harness's determinism rests on, build **at least
   one release configuration and one non-clang compiler** locally —
   `cmake --preset gcc-release` and `clang-release` both exist and both run in WSL.
+  - **libc++ does not have every C++23 library feature libstdc++ has, and the
+    failure is a compile error on one platform only.** `std::views::enumerate`
+    compiles under GCC 13's libstdc++ and does not exist in libc++ at all, so
+    `FleetView.cpp` built clean locally and broke the macOS package job -- a
+    configuration whose *first* compile of the change is in CI. This is a different
+    shape from the `uniform_int_distribution` case above: not two implementations
+    disagreeing, but one of them not shipping the header's contents. Before reaching
+    for a C++23 *library* facility that this codebase does not already use
+    somewhere macOS compiles, check that it does -- `grep` for it in non-test code
+    is enough, since the package job builds the library and every app. The
+    workaround is nearly always a C++20 spelling: `std::views::iota` over the
+    index range says what `enumerate` says and is ten years older.
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins.** Both jobs
   run the `$CLANG_TOOLS_VERSION` binary (`.github/workflows/build.yml`), and successive LLVM
   releases do not agree with each other: the style job compares against a *newer formatter*,
@@ -50,6 +62,41 @@ determinism rests on.
   project's WSL image, where 22 sits right beside it as `clang-tidy-22`. So a `clang-debug`
   build reports "clang-tidy clean" in exactly the way that means nothing, and the version it
   used is printed nowhere. Configure a second build directory naming the version, and run that.
+- **When `clang-debug` cannot be built, get the sanitizer from GCC instead.** That
+  preset is the only one that runs ASan, and on a host where it cannot configure at
+  all the tempting conclusion is that no sanitizer coverage is available locally. It
+  is: GCC has ASan too, and a throwaway tree costs one configure.
+
+  ```sh
+  cmake -S . -B out/build/gcc-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+        -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" \
+        -DFASTCACHED_ENABLE_TLS=ON -DPEDANTIC_COMPILER_WERROR=OFF
+  ```
+
+  **ASan only, never `address,undefined`.** UBSan's instrumentation defeats GCC's
+  constant evaluation of the option tables' lambda addresses, so `Options.hpp`'s
+  `TableIsWellFormed` `static_assert` stops compiling -- a build error with nothing
+  to do with the code under test, and an easy reason to abandon the idea.
+
+  A use-after-free reached CI through two jobs while this was thought unavailable.
+  The local run that catches it takes about a minute.
+
+- **A memory bug reports only if something disturbs the freed block, so run the
+  WHOLE suite.** The case that failed in CI passes under ASan on its own: nothing
+  reuses the allocation, so nothing is read across a boundary the interceptors
+  watch, and the test reports success. The same held for a standalone repro --
+  decode, read, nothing in between: clean; sixty allocations inserted between the
+  two: `heap-use-after-free` immediately. A quiet sanitizer run on one test is not
+  evidence that a diagnosis is wrong.
+
+- **After reverting files to reproduce a bug, check that the build SUCCEEDED.**
+  Reverting two files to the parent commit left an unrelated translation unit
+  failing to compile; ninja stopped, and the binary that ran was the *previous* one.
+  It passed, which looked like proof the bug was not real. `ninja: build stopped`
+  scrolls past above a green test run, and a reproduction that did not rebuild is
+  not a reproduction.
+
 - **A sanitizer that is on in the cache is not a sanitizer that is on in the build.**
   `cmake/portable/Sanitizers.cmake` initialised `SANITIZER_COMPILE_OPTIONS` to `""`
   as a normal variable, published the real flags through
@@ -113,6 +160,102 @@ determinism rests on.
   than a rule to argue with. The six bare `return 2`s it left behind became
   `ExitUsage` for the same reason: seven copies of a magic exit code is the
   table-shaped defect this list keeps recording.
+
+- **Never run `clang-format -i` with a version other than the pinned one.** As a
+  *checker* an older binary is worth something; as a *formatter* it rewrites code
+  the pinned version already blessed, and the diff is invisible in review because
+  every line of it is "just formatting". Running `clang-format-18 -i` on
+  `FleetView.cpp` to tidy three added lines reflowed all three column tables --
+  code the change never touched -- and `Check C++ style` rejected 80 lines at
+  clang-format 22, none of them new.
+
+  The repair is not to reformat again but to **restore the untouched region
+  byte-for-byte** from the last commit that passed the style job, then re-insert
+  only the new lines, and prove it: a diff of that region against the good commit
+  must show insertions and *zero* deletions.
+
+  So: run a non-pinned binary as `--dry-run` on the lines **you** added, never with
+  `-i`, and never let it touch a file you are only passing through.
+
+  **"The apt mirror has no `clang-format-22`" is not a reason to format with 18.**
+  LLVM ships the official binaries on PyPI, so the pinned version is one download
+  away on any host with outbound HTTPS and no root:
+
+  ```sh
+  pip download "clang-format==${CLANG_TOOLS_VERSION}.1.0" -d /tmp/cf --no-deps
+  python3 -m zipfile -e /tmp/cf/clang_format-*.whl /tmp/cf22
+  install -m755 /tmp/cf22/clang_format/data/bin/clang-format ~/.local/bin/clang-format-22
+  ```
+
+  With that on `PATH`, `scripts/local-gate.sh` finds it by name and the whole tree
+  can be formatted exactly as `Check C++ style` will judge it -- which is strictly
+  better than hand-matching a style guide and then finding out in CI. Reach for the
+  byte-for-byte restore above only when even this is unavailable.
+
+  **`clang-tidy` ships the same way, and it matters more.** Successive releases add
+  *checks*, so an older binary is not merely a laxer formatter -- it is silent about
+  entire categories. `modernize-use-scoped-lock` and
+  `readability-math-missing-parentheses` do not exist in 18, and 22's
+  `bugprone-unchecked-optional-access` follows a value through a binding that 18's
+  does not, so a file clean under 18 arrived at CI with thirteen findings.
+
+  ```sh
+  pip download "clang-tidy==${CLANG_TOOLS_VERSION}.1.0" -d /tmp/ct --no-deps
+  python3 -m zipfile -e /tmp/ct/clang_tidy-*.whl /tmp/ct22
+  ```
+
+  **Run it in place, or through a wrapper that does.** `clang-tidy` finds its own
+  resource headers *relative to the binary*, so copying just the executable out of
+  the wheel produces `'stddef.h' file not found` -- and every check then reports
+  against a translation unit that did not parse, which looks like a wall of real
+  findings and is nothing of the kind.
+
+  It also needs a **clang** compile database, generated with **module scanning
+  off**. Pointed at a GCC one it inherits flags clang does not know; and a database
+  from a module-scanning generator carries `@…modmap` arguments that do not exist
+  until that target has been built, so the translation unit fails to parse and the
+  file reports nothing at all. Configure a throwaway tree:
+
+  ```sh
+  cmake -S . -B out/build/tidy22 -G Ninja \
+        -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
+        -DFASTCACHED_ENABLE_TLS=ON
+  ```
+
+- **A sweep that cannot prove the tool ran is worth nothing, and reads like
+  success.** Every way of getting clang-tidy wrong above -- an unset execute bit
+  (the wheel does not carry one), a wrapper that cannot exec, a missing resource
+  dir, an unparseable `@modmap` -- produces *silence*, and silence filtered through
+  `grep 'error:'` is indistinguishable from a clean file. This branch shipped to CI
+  twice on sweeps that had reported clean while executing nothing.
+
+  `scripts/tidy-sweep.sh` is that lesson in executable form: it canaries the binary
+  against a real source file first, treats exit codes ≥ 126 as fatal rather than as
+  findings, and refuses to print a clean verdict it did not earn. Use it, and if you
+  write a one-off loop instead, make it fail loudly the same way.
+
+- **A `bool` in the middle of a config struct costs seven bytes, and four of them
+  fail the build.** `clang-analyzer-optin.performance.Padding` permits 24 bytes more
+  padding than an optimal field order would give, and `NodeConfig` is almost entirely
+  `std::string` and `std::filesystem::path` -- so a one-byte member between two of
+  those is padded out to a full eight rather than costing one. Adding `--dashboard`
+  and `--tls-self-signed` beside the settings they configure took the struct to 38
+  bytes against an optimal 6, and the `clang-tidy` job -- the only one that runs the
+  analyzer -- rejected it.
+
+  Keep every `bool` and byte-wide enum in **one run**, which that struct already half
+  did with its trailing flags. Two of the four moved were pre-existing (`logLevel`,
+  `serviceScope`), and that was the point: moving only the two new ones lands on
+  *exactly* 24, which passes and leaves the next contributor's `bool` to break it
+  again. Moving all four lands on 8. A field's position there is a layout constraint,
+  not where it reads most naturally, so the run says so in a comment.
+
+  The check is `BaselinePad - OptimalPad > 24` and both terms are arithmetic over
+  `sizeof`, so it reproduces **without the analyzer**: sum the field sizes, subtract
+  from `sizeof(T)`, and compare against the same sum laid out by descending
+  alignment. Worth knowing because it gives an exact number where re-running CI gives
+  a yes or no -- and because a host without the pinned clang-tidy can still check it.
 
 - **A `static_assert` that anchors a table's length on an enumerator BY NAME is a
   guard that fires only when nothing is wrong.** Casting an enumerator to an index

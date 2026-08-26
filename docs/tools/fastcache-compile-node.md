@@ -175,10 +175,37 @@ B+tree:
 
 | Configuration | What you get |
 |---|---|
-| `--cache-memory=8g` (the default is `256m`) | Memory only. Fast, and gone at restart. |
+| `--cache-memory=8g` (the default is 25% of RAM, within `512m`–`8g`) | Memory only. Fast, and gone at restart. |
 | `--cache-dir=/var/cache/fastcache-node` | Both halves: the memory tier in front of a store that survives a restart. |
 | `--cache-memory=0 --cache-dir=…` | Disk only. |
 | `--cache-memory=0` and no `--cache-dir` | **No tier at all**, which is what a node that only compiles for others wants. |
+
+`--cache-memory` takes bytes (`k`/`m`/`g` = KiB/MiB/GiB, or a bare count with an
+optional `B`) or a share of host RAM (`N%`) — the vocabulary its own default is
+stated in, so "a quarter, but half of that" is `--cache-memory=12%` rather than
+arithmetic you do per machine. **Zero turns the tier off**; it does not mean
+"unbounded", which is what zero means to the store underneath.
+
+Whatever the node logs at startup can be typed straight back to pin it, and pinning
+it that way survives `--install-service`: the flag is written into the unit because
+you *stated* it, not because it differs from the default — otherwise typing the
+machine's current quarter would look identical to saying nothing, and the service
+would go back to re-deriving from RAM at every start.
+
+**The tier's memory is subtracted from what a compile can have.** A node budgets
+one job per gigabyte of RAM, and its own cache is resident memory that is not going
+to yield — so a 64-thread host with 32 GiB used to offer 32 slots *and* hold 8 GiB
+of cache, which is forty gigabytes of promises on a thirty-two gigabyte machine. It
+now offers 24. The figure travels with the registration, so a node that asks the
+scheduler to size it (`--slots 0`) gets the same answer at the other end, and a
+peer too old to report it is sized exactly as it always was.
+
+The default follows the machine because the machines this runs on vary by more
+than an order of magnitude, and one object file is routinely megabytes: a cache
+sized for a laptop is close to useless on a 96 GB workstation, and a flat number
+misses on exactly the rebuild the tier exists to serve. The clamp is what makes a
+fraction safe at both ends — a small laptop still gets a cache worth having, and a
+512 GB build server does not silently take 128 GB resident for one.
 
 `--cache-disk` caps the on-disk half, which is otherwise allowed to grow as
 needed — the same default `--storage-max-disk` has on the daemon. On a build
@@ -763,14 +790,215 @@ curl -s localhost:6675/healthz     # 200 while the worker is answering
 curl -s localhost:6675/metrics     # Prometheus exposition
 ```
 
-It is the same endpoint and the same renderer the daemon serves — a worker has
-no cache, so the cache series are **absent** rather than present and zero, which
-a dashboard would otherwise read as an empty unbounded cache rather than as no
-cache at all.
+It is the same endpoint and the same renderer the daemon serves. A node that
+runs no cache tier at all reports the cache series as **absent** rather than
+present and zero, which a dashboard would otherwise read as an empty unbounded
+cache rather than as no cache at all.
 
 `/healthz` is worth wiring even if you never scrape: without it a supervisor can
 tell that the process is alive but not that it is *answering*, which is the state
 a wedged worker is in. It is what `systemd`'s and Kubernetes' probes want.
+
+## Looking at the whole fleet
+
+`--dashboard` adds four more routes to that same endpoint: `/fleet`, a page;
+`/fleet.json`, the same facts for anything that is not a browser;
+`/fleet/chart/<chart>.svg`, one image per chart; and `/fleet/series.json`, the
+numbers those images are drawn from.
+
+```sh
+fastcache-compile-node --scheduler cache.internal:6674 \
+                       --toolchain /usr/bin/c++ \
+                       --listen-scheduler 6675 --fleet-member 10.0.0.2 \
+                       --admin-listen 6677 \
+                       --dashboard --dashboard-token-file /etc/fastcached/dashboard.token
+curl -s -u ":$(cat /etc/fastcached/dashboard.token)" localhost:6677/fleet.json | jq .
+```
+
+![The fleet dashboard, served by the leader](fleet-dashboard.png)
+
+**The leader answers it, and nobody else can.** A follower's registry holds
+whatever registered against *it* rather than the fleet, which is the same reason
+`--cluster-status` is refused by one. Ask a follower and it replies `503` naming
+the leader and its scheduler endpoint — deliberately not a redirect, and
+deliberately not a link: where the dashboard is served is configuration on that
+node, nothing replicates it, and a URL built by guessing is one your browser
+cannot use.
+
+What it shows, and why each part is split the way it is:
+
+| Section | What it answers |
+|---|---|
+| The readouts | Six figures across the top: compiles dispatched over the selected range (with a sparkline), compiling now, cache hit rate, the share of dispatch decisions refused, leases outstanding, and the **oldest** heartbeat in the fleet. The oldest and not the mean — one machine that stopped answering an hour ago is the fact worth surfacing, and an average over a healthy fleet buries it. |
+| Fleet capacity | One meter over every registered slot, split three ways: compiling, free, and **withheld** by a ceiling. The third is the one to read first — slots a ceiling withdrew are not this fleet being busy, so buying machines does not return them. |
+| Machines | One row **per machine**, not per toolchain: the software version it is running, cores, memory, free scratch, class and reserve, cache hit rate, heartbeat age. |
+| Workers | One row per `(toolchain, endpoint)` registry entry: slots, in flight, available — and *which* limit withdrew the difference. |
+| Why requests were refused | Granted, and refused split four ways, each with what it tells you to do. |
+| Cache tiers | Items, bytes, budget and evictions **per tier**. A tier no member runs has no column at all, and a fleet where nobody runs one says so rather than showing an empty table. |
+| Over time | Four charts over 24 hours or 7 days: compiles dispatched, refusals stacked four ways, offerable capacity against jobs in flight, and cache hit rate per bucket. |
+| Members | Who the cluster has agreed on, and where each answers. A member that has never led shows no scheduler endpoint, because it has not said. |
+
+Three of those distinctions cost real debugging time when they are collapsed:
+
+- **A machine is not a worker.** A node started with two `--toolchain` flags is
+  two registry entries carrying one machine's cores. The Machines table is the
+  grain a fleet total is computed over; summing the Workers table reports a fleet
+  twice the size of the one you own.
+- **`limited-by` is the whole diagnosis.** A node offering 2 of its 16 slots is
+  three different problems: `external-cpu` means somebody is using that machine,
+  `memory` and `scratch` mean it is out of something. Buying hardware fixes
+  exactly one of them.
+- **Do not add the lease refusals together.** `no-worker` is a misconfiguration,
+  `no-capacity` says buy more machines, `withdrawn` says your machines are busy
+  with something else, and `duplicate` says it is already being built. A total
+  hides all four.
+
+A value nobody reported renders as `–` on the page and `null` in the JSON, never
+as `0` — a zero is a claim, and "this cache holds nothing" is a different fact
+from "this node never told us".
+
+### Which build each machine is running
+
+The `version` column is what a node's own binary reports at registration — the
+same string `fastcache-compile-node --version` prints. It is compiled in and not
+configurable: the column exists to answer *which binary is actually on that box*,
+most often part-way through a rolling upgrade, and a version a node could be
+**told** to report is one that can be wrong exactly when somebody is relying on it.
+
+It rides inside the REGISTER message's nested capacity record rather than as a
+field of its own, because that message's top-level arity is exact and fixed
+forever — a sixth field there would make two builds of a fleet unable to speak at
+all. The nested record is read with the variable-arity split, so compatibility runs
+both ways: a node built before this field registers with a new leader and simply
+reports nothing, and a new node registering with an old leader has the extra field
+skipped.
+
+A node that cannot report one renders as `–`, not as a blank. That node is exactly
+the one an operator is hunting for mid-upgrade, so it must not look like the least
+interesting row in the table. The version is also **refreshed when a machine
+re-registers**, which is the path a restart takes — a value held over from the
+first registration would leave the page reporting the old binary for as long as the
+new process stayed up.
+
+### The charts, and what they are sampled from
+
+The leader samples the fleet **once a minute, and only while it leads**. A
+follower's registry holds whatever registered against it, so sampling there would
+record a fraction of the fleet as though it were the whole — and the chart would
+then show the fleet shrinking every time leadership moved. Losing leadership stops
+sampling and leaves a gap.
+
+**A bucket nobody sampled draws a gap, never a zero.** Zero says the fleet did
+nothing; a gap says nobody was watching. The same distinction the tables make at
+the cell, made here at the point. It falls out of storing each counter's *raw*
+cumulative value and taking the difference at render time: a restart returns the
+counter to zero, the difference goes negative, and that bucket is a gap rather
+than an enormous spike.
+
+The cache hit rate is **per bucket and never cumulative** — a running total stops
+moving once it is large, so an afternoon of misses barely bends it. A bucket that
+served no reads has no hit rate at all and is absent, because 0% is the claim that
+the cache missed everything.
+
+Where the history is kept follows the directories the node already has: the
+`--cluster-dir` if there is one, otherwise the `--cache-dir`, otherwise memory
+only — and the page says which. There is no flag for it: a third place to say "put
+state here" is a third place to point at the wrong disk. Any failure to read that
+file — missing, short, wrong version, bad checksum — starts empty and logs one
+line. History is a convenience and must never keep a node from starting.
+
+Each chart is **its own resource** rather than being inlined, so a browser caches
+it:
+
+```sh
+curl -s -u ":$(cat /etc/fastcached/dashboard.token)" \
+     "localhost:6677/fleet/chart/refusals.svg?range=7d" > refusals.svg
+curl -s -u ":$(cat /etc/fastcached/dashboard.token)" \
+     "localhost:6677/fleet/series.json?range=24h" | jq .
+```
+
+`range` is `24h` or `7d`, and an unrecognised one is refused with `400` rather
+than quietly served as the other — a substituted range puts a reader on a
+different axis with nothing on the page saying so. `theme` is `auto` (the
+default), `light` or `dark`, and an unrecognised one *is* silently `auto`, because
+that one renders correctly under either setting and costs a reader nothing.
+
+Each answer carries an `ETag` and a `Cache-Control` that runs only to the end of
+the bucket it drew, so `If-None-Match` gets a `304` until there is something new —
+not a fixed lifetime, which would leave a viewer a whole bucket behind for the
+rest of it.
+
+**The chart routes need the credential too.** An image URL that answered without
+one would leak the fleet's whole history while `/fleet` itself stayed locked.
+Browsers replay Basic on same-origin subresources, so a credential typed once at
+the page covers the images; a Bearer client sets the header per request.
+
+### Getting at it safely
+
+The page is a map of every member's hostname, endpoint and capacity, so:
+
+- **A bare port binds loopback**, as `--admin-listen` always has.
+- **`--dashboard-token-file` is required when it is not on loopback.** The node
+  refuses to start otherwise. A file rather than a flag, because a command line is
+  readable through `ps` — and its own secret rather than `--requirepass`, which
+  every member of the fleet already holds and which points the other way.
+- Present it as `Authorization: Bearer <token>` or as HTTP Basic with any
+  username (`curl -u :$TOKEN`). Basic is there because browsers prompt for it and
+  do not prompt for Bearer.
+
+`/metrics` and `/healthz` are **not** behind the credential, so turning the
+dashboard on changes nothing for a scraper or a probe already pointed at them.
+And `/metrics` stays the source of truth for anything you alert on: the dashboard
+reads the same counters and computes no number of its own.
+
+### Plain HTTP, HTTPS, or HTTPS with nothing to obtain
+
+**HTTP is the default and is a supported way to run this.** The admin surface is
+plaintext unless you ask for TLS, so the example above — loopback, no
+certificate — is a complete configuration. Reaching loopback already means being
+on the machine, which is why it needs no credential either.
+
+There are three ways to run the surface, and they differ only in what you had to
+obtain first:
+
+| | Flags | What you get |
+|---|---|---|
+| Plain HTTP | *(none)* | No encryption. Fine on loopback, or behind something that terminates TLS for you. |
+| HTTPS, generated certificate | `--tls-self-signed` | Encryption with nothing to obtain. Does **not** prove which node answered. |
+| HTTPS, your certificate | `--tls-cert` + `--tls-key` | Encryption, and an identity a client can actually verify. |
+
+```sh
+# An encrypted dashboard on an internal network, with no certificate to obtain:
+fastcache-compile-node ... --admin-listen 0.0.0.0:6677 \
+                       --dashboard --dashboard-token-file /etc/fastcached/dashboard.token \
+                       --tls-self-signed
+```
+
+`--tls-self-signed` generates a P-256 key and a certificate at startup, valid for
+`localhost`, `127.0.0.1`, `::1`, this machine's own hostname, and the address
+`--admin-listen` names when it is a particular interface rather than a wildcard.
+Those names matter: every modern client ignores a certificate's common name, and a
+name mismatch is a second browser warning on top of the unknown issuer — a much
+harder one to click past.
+
+Two things to know before you rely on it:
+
+- **It encrypts; it does not identify.** Nothing signs it, so a client that has
+  not been told its fingerprint out of band cannot tell your node from anything
+  else answering on that address. The node logs the SHA-256 fingerprint at
+  startup for exactly that reason — compare it with what your browser shows. This
+  is also why the credential is still required off loopback: TLS authenticates the
+  *server* to the browser and says nothing about who the browser is.
+- **It is held in memory and regenerated on every restart**, so a browser
+  exception pinned to it has to be granted again. Nothing is written to disk,
+  which means no private key to leak and no permissions to get wrong. If you want
+  a stable identity, name a real certificate.
+
+There is deliberately no `--tls` boolean: TLS is on because you named material or
+asked for material to be made, so "TLS requested, nothing to serve it with" is not
+a state you can reach. `--tls-self-signed` and `--tls-cert` contradict each other
+and the node refuses both together, rather than silently serving an identity you
+did not choose.
 
 What the counters mean is tabulated under
 [Distributed compilation](../getting-started/distributed-compilation.md#confirming-it-works).

@@ -6,6 +6,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
+#include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <cstdint>
@@ -110,6 +111,30 @@ struct NodeConfig
     /// operator's decision, not this program's.
     std::string adminListen;
 
+    /// File holding the credential the dashboard requires, or empty for none.
+    ///
+    /// A FILE and not a flag, for the reason `--cluster-key-file` is one: a command
+    /// line is readable through `ps`. And a credential of its own rather than
+    /// `--requirepass`, which points the other way -- that is the secret this node
+    /// *presents* to the scheduler, held by every member of the fleet, so reusing it
+    /// would let any worker read every other node's fleet map.
+    ///
+    /// Required when the admin surface is not on loopback: a fleet map on a public
+    /// port with no credential is what this flag exists to stop somebody doing by
+    /// accident.
+    std::filesystem::path dashboardTokenFile;
+
+    /// Certificate the admin surface serves TLS with, or empty for plaintext.
+    ///
+    /// Spelled as the daemon spells it, because an operator copies these between
+    /// the two binaries. There is deliberately **no `--tls` boolean**: TLS is on by
+    /// naming a certificate and a key, which removes the state "TLS requested, no
+    /// material" that a boolean makes reachable.
+    std::filesystem::path tlsCertFile;
+
+    /// Private key for `tlsCertFile`. Both or neither.
+    std::filesystem::path tlsKeyFile;
+
     /// Where this node serves the fleet's scheduler verbs, or empty to leave it off.
     ///
     /// Off by default and for the same reason `--admin-listen` is: handing out other
@@ -143,11 +168,22 @@ struct NodeConfig
     /// than pointing at the shared cache is that a rebuild should not reach the wire.
     /// A default of zero would mean nobody got that unless they read this file.
     ///
-    /// 256 MiB rather than a fraction of RAM: this runs on somebody's workstation
-    /// beside their editor and their browser, and the daemon's quarter-of-the-machine
-    /// default is sized for a host whose job is caching. Enough for a few thousand
-    /// objects, small enough that nobody notices it.
-    std::uint64_t cacheMemoryBytes { 256ULL * 1024ULL * 1024ULL };
+    /// **A quarter of host RAM**, clamped to [512 MiB, 8 GiB] -- the same
+    /// `DefaultMaxMemoryBytes()` the daemon uses, rather than a second opinion about
+    /// the same question. This was a flat 256 MiB, chosen on the argument that a node
+    /// shares a workstation with somebody's editor and browser. That argument aged
+    /// badly: the machines this runs on now start at 16 GB, one object file is
+    /// routinely megabytes, and a few hundred of them is the whole cache -- so the
+    /// tier missed on exactly the rebuild it exists to serve, on every machine, and
+    /// only an operator who read this file ever found out.
+    ///
+    /// The clamp is what keeps the old argument's substance: the floor means even a
+    /// small laptop gets a cache worth having, and the ceiling means a 512 GB build
+    /// server does not quietly take 128 GB resident for a cache nobody asked for.
+    /// Memoised in `DefaultMaxMemoryBytes()`, which matters here because this struct
+    /// is default-constructed freely -- including for the `defaults` instance
+    /// `MakeNodeServiceSpec` diffs against.
+    std::uint64_t cacheMemoryBytes { DefaultMaxMemoryBytes() };
 
     /// Bytes the on-disk half may hold. 0 means "grow as needed".
     ///
@@ -189,7 +225,6 @@ struct NodeConfig
 
     std::string token;
     std::string user;
-    LogLevel logLevel { LogLevel::Info };
 
     /// This node's identity in the cluster, or empty to run without consensus.
     ///
@@ -263,11 +298,69 @@ struct NodeConfig
     /// would make installing one silently displace the other.
     std::string serviceName { "FastCacheCompileNode" };
 
+    /// Where a POSIX daemonized run writes its pid, empty for none.
+    std::string pidfile;
+
+    // ---------------------------------------------------------------------------
+    // Every member below is one byte wide, and they are kept in a single run rather
+    // than beside the setting each belongs to.
+    //
+    // This struct is almost entirely `std::string` and `std::filesystem::path`, so a
+    // lone `bool` or byte-wide enum between two of them costs SEVEN bytes of padding
+    // rather than one. Four of them scattered through it -- `dashboard`,
+    // `tlsSelfSigned`, `logLevel`, `serviceScope` -- put the struct 32 bytes over
+    // `clang-analyzer-optin.performance.Padding`'s 24-byte budget and failed the
+    // build, which is why they live here and not where they read most naturally.
+    //
+    // Add the next flag HERE rather than next to what it configures. Its doc comment
+    // is what carries the reader across; the position is a layout constraint.
+
+    /// How chatty the log is.
+    LogLevel logLevel { LogLevel::Info };
+
     /// Which supervisor domain `--install-service` registers into.
     ServiceScope serviceScope { ServiceScope::System };
 
-    /// Where a POSIX daemonized run writes its pid, empty for none.
-    std::string pidfile;
+    /// Whether `--cache-memory` was typed rather than derived.
+    ///
+    /// **Provenance, not value.** `MakeNodeServiceSpec` emits a flag only when it
+    /// differs from the default, which is exactly right for a default that is a
+    /// constant and quietly wrong for one that is a share of host RAM: an operator
+    /// who reads the startup line and types that number back to pin it produces a
+    /// value *equal* to the default on that machine, so the flag is dropped from the
+    /// unit and the service re-derives from RAM on every start. The budget then
+    /// moves under a VM resize or a memory upgrade -- silently, and precisely for the
+    /// operator who took the trouble to pin it.
+    ///
+    /// So what is emitted follows whether they said it, not whether it differs.
+    bool cacheMemoryExplicit { false };
+
+    /// Whether the admin surface also serves the fleet dashboard.
+    ///
+    /// Off unless asked for, like every other surface this program serves. The page
+    /// lists every member's hostname, endpoint and capacity -- a fleet map -- so an
+    /// operator turns it on deliberately rather than acquiring it by naming a port
+    /// they wanted `/metrics` on.
+    ///
+    /// Served on `--admin-listen`, and answered in full only while this node LEADS:
+    /// a follower's registry holds whatever registered against it rather than the
+    /// fleet, so it renders a page naming the leader instead of a partial picture.
+    bool dashboard { false };
+
+    /// Generate a self-signed certificate at startup instead of naming one.
+    ///
+    /// For an internal deployment where obtaining a certificate is the only thing
+    /// between an operator and an encrypted admin surface. It is a boolean where
+    /// `--tls-cert` is a path, and that is not a hole in the "TLS is on by naming
+    /// material" rule but the same rule kept: the point of that rule is that no
+    /// configuration can ask for TLS this node cannot then serve, and asking for
+    /// this one *produces* the material.
+    ///
+    /// **Confidentiality, not identity.** Nothing signs it, so a client that has
+    /// not been told its fingerprint out of band cannot tell this node from
+    /// anything else answering on that address. The credential is still required
+    /// off loopback for exactly that reason.
+    bool tlsSelfSigned { false };
 
     /// Admit every caller to the fleet, rather than only `--fleet-member` hosts.
     ///

@@ -156,7 +156,18 @@ std::size_t DefaultMaxMemoryBytes() noexcept
         auto const total = static_cast<std::uint64_t>(QueryHostTotalMemoryBytes());
         if (total == 0)
             return static_cast<std::size_t>(Floor);
-        return static_cast<std::size_t>(std::clamp(total / HostShareDivisor, Floor, Ceiling));
+
+        // Rounded DOWN to a whole MiB, which is not cosmetics. A quarter of a
+        // machine's RAM lands on an arbitrary byte count, and two things follow from
+        // printing one: `FormatByteSize` is exact by design -- so that what it prints
+        // can be handed straight back as a flag value -- and an exact quarter has no
+        // whole unit, so the line an operator reads at startup to see how big their
+        // cache is becomes `4115271K`, or worse. Rounding down also cannot cross the
+        // share: it only ever asks for less. Both bounds are already MiB-aligned, so
+        // the clamp is untouched by this.
+        constexpr auto Mib = std::uint64_t { 1024 } * 1024;
+        auto const share = (total / HostShareDivisor / Mib) * Mib;
+        return static_cast<std::size_t>(std::clamp(share, Floor, Ceiling));
     }();
 
     return budget;

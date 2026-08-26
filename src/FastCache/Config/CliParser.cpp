@@ -293,7 +293,8 @@ namespace
           .operand = "=<size>",
           .apply = AssignFrom<&Config::maxMemoryBytes, ParseMaxMemory>(),
           .explicitBit = &CliResult::maxMemoryBytesExplicit,
-          .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM (default 64 MiB)" },
+          .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM\n"
+                         "(default 25% of RAM, within 512m-8g)" },
         { .primary = "--log-level",
           .arity = Arity::Value,
           .operand = "=<level>",

@@ -175,8 +175,13 @@ SchedulerService::SchedulerService(IClock& clock, IMetricsSink& metrics) noexcep
 
 void SchedulerService::SetRole(SchedulerRole role, std::string_view leaderEndpoint)
 {
-    _role = role;
-    _leaderEndpoint.assign(leaderEndpoint);
+    {
+        std::scoped_lock const guard { _leaderMutex };
+        _leaderEndpoint.assign(leaderEndpoint);
+    }
+    // Published after the endpoint it describes, so a reader that sees `Leader`
+    // has already been able to see the address that came with it.
+    _role.store(role, std::memory_order_release);
 }
 
 SchedulerReply SchedulerService::Offer(Cluster::Command const& command)
@@ -269,8 +274,8 @@ std::optional<SchedulerReply> SchedulerService::Gate(CallerContext const& caller
     // worker here would put it in a fleet nothing schedules onto -- and the worker
     // would heartbeat happily into it forever. Refusing with the leader's address
     // is what turns that into one redirect.
-    if (_role != SchedulerRole::Leader)
-        return Refuse(Wire::ErrorCode::NotLeader, _leaderEndpoint);
+    if (Role() != SchedulerRole::Leader)
+        return Refuse(Wire::ErrorCode::NotLeader, LeaderEndpoint());
 
     // Then the anti-leeching rule. A non-member is *not* refused the cache -- it
     // reads and writes objects exactly as before -- it is refused the fleet's CPU

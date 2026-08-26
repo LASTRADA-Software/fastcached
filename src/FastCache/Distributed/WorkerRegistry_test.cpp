@@ -491,3 +491,197 @@ TEST_CASE("A sibling that just re-registered does not blank the node's cache", "
     CHECK(Unwrap(memory).itemCount == 900);
     CHECK(caches[0].load.hits == 4000);
 }
+
+TEST_CASE("How long ago a worker was heard from is measured on the injected clock", "[distributed][registry][heartbeat-age]")
+{
+    // The age has to come from the clock the registry was given, not from
+    // `steady_clock::now()`. Handed a raw `TimePoint`, a consumer would reach for
+    // the latter -- right in production and wrong under every one of these cases,
+    // silently, because the two clocks agree about nothing.
+    Fixture fix;
+    auto const id = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
+
+    auto const fresh = fix.registry.LiveWorkerReports();
+    REQUIRE(fresh.size() == 1);
+    CHECK(fresh[0].info.id == id);
+    CHECK(fresh[0].heartbeatAge == std::chrono::milliseconds { 0 });
+
+    fix.clock.Advance(std::chrono::milliseconds { 400 });
+    auto const aged = fix.registry.LiveWorkerReports();
+    REQUIRE(aged.size() == 1);
+    CHECK(aged[0].heartbeatAge == std::chrono::milliseconds { 400 });
+
+    // A heartbeat is what resets it -- that is what the number is reporting.
+    CHECK(fix.registry.Heartbeat(id, Busy(1)));
+    CHECK(fix.registry.LiveWorkerReports()[0].heartbeatAge == std::chrono::milliseconds { 0 });
+}
+
+TEST_CASE("A worker past its timeout is absent rather than very old", "[distributed][registry][heartbeat-age]")
+{
+    // The distinction a dashboard would otherwise get wrong in the dangerous
+    // direction: an expired worker must not appear at all, because a row showing a
+    // large age reads as a machine that is merely slow to report.
+    Fixture fix;
+    (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
+
+    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    CHECK(fix.registry.LiveWorkerReports().empty());
+    CHECK(fix.registry.NodeReports().empty());
+}
+
+TEST_CASE("A clock set backwards reports no age rather than an enormous one", "[distributed][registry][heartbeat-age]")
+{
+    // A `ManualClock` can legitimately go backwards in a test, and an unsigned
+    // duration would then read as several hundred million years.
+    Fixture fix;
+    fix.clock.Advance(std::chrono::milliseconds { 500 });
+    (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
+
+    fix.clock.Advance(std::chrono::milliseconds { -200 });
+    auto const reports = fix.registry.LiveWorkerReports();
+    REQUIRE(reports.size() == 1);
+    CHECK(reports[0].heartbeatAge == std::chrono::milliseconds { 0 });
+}
+
+TEST_CASE("One machine serving two toolchains is one node, and its cores are not doubled",
+          "[distributed][registry][node-report]")
+{
+    // The double count a fleet page exists to avoid. This registry keys on
+    // (fingerprint, endpoint), so a node with two `--toolchain` flags is two
+    // entries carrying ONE machine's cores -- and summing them across
+    // `LiveWorkers()` reports a fleet twice the size of the one an operator owns.
+    //
+    // Deliberately different slot counts and job counts per entry, so a max/sum
+    // transposition fails rather than passing on equal numbers.
+    Fixture fix;
+    auto gcc = Announce(Gcc13, "10.0.0.2:7100", 6);
+    gcc.capacity = NodeCapacity { .logicalCores = 32, .totalMemoryBytes = 64ULL << 30 };
+    auto const gccId = fix.registry.Register(gcc);
+
+    auto clang = Announce(Gcc14, "10.0.0.2:7100", 4);
+    clang.capacity = gcc.capacity;
+    auto const clangId = fix.registry.Register(clang);
+
+    CHECK(fix.registry.LiveWorkers().size() == 2);
+    fix.registry.JobStarted(gccId);
+    fix.registry.JobStarted(gccId);
+    fix.registry.JobStarted(clangId);
+
+    auto const nodes = fix.registry.NodeReports();
+    REQUIRE(nodes.size() == 1);
+    CHECK(nodes[0].endpoint == "10.0.0.2:7100");
+    // 32, not 64: the entries describe one machine.
+    CHECK(nodes[0].capacity.logicalCores == 32);
+    // The maximum, because both were derived from the same cores.
+    CHECK(nodes[0].registeredSlots == 6);
+    // The sum, because those genuinely are three different jobs.
+    CHECK(nodes[0].fleetJobsInFlight == 3);
+    // Both toolchains named, sorted so the column order cannot move between reads.
+    REQUIRE(nodes[0].fingerprints.size() == 2);
+    CHECK(nodes[0].fingerprints[0] == Gcc13);
+    CHECK(nodes[0].fingerprints[1] == Gcc14);
+}
+
+TEST_CASE("Two machines are two node reports", "[distributed][registry][node-report]")
+{
+    // The other direction, so the grouping above cannot pass by collapsing
+    // everything: different endpoints are different machines.
+    Fixture fix;
+    (void) fix.registry.Register(Announce(Gcc13, "10.0.0.2:7100", 4));
+    (void) fix.registry.Register(Announce(Gcc13, "10.0.0.3:7100", 4));
+
+    auto const nodes = fix.registry.NodeReports();
+    REQUIRE(nodes.size() == 2);
+    // Ordered by endpoint, so a snapshot is reproducible.
+    CHECK(nodes[0].endpoint == "10.0.0.2:7100");
+    CHECK(nodes[1].endpoint == "10.0.0.3:7100");
+}
+
+TEST_CASE("A node cache report carries how stale its figures are", "[distributed][registry][cache]")
+{
+    // "This cache is empty" and "this node stopped answering and these are its last
+    // figures" look identical without an age, and lead to opposite conclusions.
+    Fixture fix;
+    auto const id = fix.registry.Register(Announce(Gcc13, "10.0.0.2:7100", 4));
+    NodeLoad load {};
+    load.cache.hits = 10;
+    CHECK(fix.registry.Heartbeat(id, load));
+
+    fix.clock.Advance(std::chrono::milliseconds { 250 });
+    auto const caches = fix.registry.NodeCaches();
+    REQUIRE(caches.size() == 1);
+    CHECK(caches[0].heartbeatAge == std::chrono::milliseconds { 250 });
+    CHECK(caches[0].load.hits == 10);
+}
+
+TEST_CASE("A machine's software version reaches its report, and a restart refreshes it", "[distributed][registry][version]")
+{
+    ManualClock clock;
+    WorkerRegistry registry { clock };
+
+    (void) registry.Register(WorkerRegistration { .fingerprint = "gcc-14",
+                                                  .endpoint = "10.0.0.1:7100",
+                                                  .version = "1.4.2",
+                                                  .slots = 4,
+                                                  .codecs = {},
+                                                  .capacity = NodeCapacity { .logicalCores = 8 } });
+
+    auto const first = registry.NodeReports();
+    REQUIRE(first.size() == 1);
+    CHECK(first[0].version == "1.4.2");
+
+    // The path a machine takes when it restarts -- and restarting on a new build is
+    // exactly what an upgrade looks like. A version held over from the first
+    // registration would leave the page reporting the old binary for as long as the
+    // process stayed up, which is the one thing this column must never do.
+    (void) registry.Register(WorkerRegistration { .fingerprint = "gcc-14",
+                                                  .endpoint = "10.0.0.1:7100",
+                                                  .version = "1.5.0",
+                                                  .slots = 4,
+                                                  .codecs = {},
+                                                  .capacity = NodeCapacity { .logicalCores = 8 } });
+
+    auto const second = registry.NodeReports();
+    REQUIRE(second.size() == 1);
+    CHECK(second[0].version == "1.5.0");
+}
+
+TEST_CASE("One machine serving two toolchains reports one version", "[distributed][registry][version]")
+{
+    ManualClock clock;
+    WorkerRegistry registry { clock };
+
+    // Two registry entries, one process. They cannot disagree about the version, and
+    // the report is one machine's row -- so this asserts the grain rather than a
+    // blend of the two entries.
+    for (auto const* fingerprint: { "gcc-14", "clang-20" })
+        (void) registry.Register(WorkerRegistration { .fingerprint = fingerprint,
+                                                      .endpoint = "10.0.0.1:7100",
+                                                      .version = "1.4.2",
+                                                      .slots = 4,
+                                                      .codecs = {},
+                                                      .capacity = NodeCapacity { .logicalCores = 8 } });
+
+    auto const reports = registry.NodeReports();
+    REQUIRE(reports.size() == 1);
+    CHECK(reports[0].fingerprints.size() == 2);
+    CHECK(reports[0].version == "1.4.2");
+}
+
+TEST_CASE("A node too old to report a version leaves it empty", "[distributed][registry][version]")
+{
+    ManualClock clock;
+    WorkerRegistry registry { clock };
+
+    (void) registry.Register(WorkerRegistration { .fingerprint = "gcc-14",
+                                                  .endpoint = "10.0.0.1:7100",
+                                                  .slots = 4,
+                                                  .codecs = {},
+                                                  .capacity = NodeCapacity { .logicalCores = 8 } });
+
+    auto const reports = registry.NodeReports();
+    REQUIRE(reports.size() == 1);
+    // Empty is the fact, not a value to be tidied into "unknown" here: what to show
+    // for it is the renderer's decision, and it renders as the page's dash.
+    CHECK(reports[0].version.empty());
+}
