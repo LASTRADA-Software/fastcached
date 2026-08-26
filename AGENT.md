@@ -210,6 +210,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A listening socket claims its address exclusively — `SO_EXCLUSIVEADDRUSE` on
   Windows, where `SO_REUSEADDR` lets a second process take a port already being
   served. Sharing a port is `ReusePort::Yes`, and only that.
+- A struct a decoder returns **by value** must not borrow from the bytes it decoded:
+  `Decode(Encode(x))` is the obvious spelling and is a use-after-free the moment one
+  member becomes a view. A `*View` type borrows and says so; anything else owns.
 - There is exactly one TCP client, `Net/TcpClient`. Do not write a second.
 - A synchronous dial spends a thread the caller does not own — a reactor thread
   dials through `PlatformConnector`, never `BlockingConnector`.

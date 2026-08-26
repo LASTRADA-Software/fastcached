@@ -580,9 +580,36 @@ TEST_CASE("A version this build cannot parse is reported rather than refused", "
     auto wire = CapacityToWire(NodeCapacity { .logicalCores = 4 });
     wire.version = "not-a-version-at-all <&\"";
 
+    // **Decoded from a temporary, deliberately.** This is the obvious spelling, and
+    // it was a use-after-free while `CapacityFields::version` was a `string_view`:
+    // the encoded buffer dies at the semicolon and the view outlives it. Linux never
+    // noticed -- nothing reused the block before the read -- and macOS failed, on the
+    // one standard library whose allocator is quick enough. The field owns its bytes
+    // now, and this shape is what proves it stays that way.
     auto const back = Wire::DecodeCapacity(Wire::EncodeCapacity(wire));
     REQUIRE(back.has_value());
     CHECK(Unwrap(back).version == "not-a-version-at-all <&\"");
+}
+
+TEST_CASE("A decoded capacity record outlives the buffer it came from", "[distributed][scheduler][protocol][version]")
+{
+    // The rule stated on its own, rather than inferred from a case that happens to
+    // exercise it: `DecodeCapacity` returns by value and nothing in the name says
+    // "view", so what it returns must not point into the bytes it was handed. The
+    // buffer here is scoped to prove it, and every field is read after it is gone.
+    std::optional<Wire::CapacityFields> decoded;
+    {
+        Wire::CapacityFields wire {};
+        wire.logicalCores = 12;
+        wire.version = "9.9.9-rc1";
+        wire.reservedMemoryBytes = 4096;
+        auto const encoded = Wire::EncodeCapacity(wire);
+        decoded = Wire::DecodeCapacity(encoded);
+    }
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).version == "9.9.9-rc1");
+    CHECK(Unwrap(decoded).logicalCores == 12U);
+    CHECK(Unwrap(decoded).reservedMemoryBytes == 4096U);
 }
 
 TEST_CASE("Memory a node holds back survives the wire", "[distributed][scheduler][protocol][memory]")

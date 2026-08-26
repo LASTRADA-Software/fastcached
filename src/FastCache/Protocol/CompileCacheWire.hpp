@@ -14,6 +14,7 @@
 #include <ranges>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -1334,7 +1335,16 @@ struct CapacityFields
     /// A *registration* fact, because a running process does not change version —
     /// and here rather than at REGISTER's top level for the same arity reason as
     /// everything else in this record.
-    std::string_view version {};
+    ///
+    /// **Owned, not a view, and that is load-bearing.** `DecodeCapacity` returns
+    /// this struct *by value*, so `DecodeCapacity(EncodeCapacity(x))` is the obvious
+    /// spelling — and with a `string_view` here it is a use-after-free the moment
+    /// the temporary dies. Nothing in the name warns anyone: `RegisterView` says
+    /// "View" precisely because it borrows, while this type is used for both
+    /// directions and reads as a value. It cost a macOS-only CI failure to learn
+    /// that, on the one standard library whose allocator reuses the block quickly
+    /// enough to notice. A registration is once per node, so the copy is free.
+    std::string version {};
 
     /// Memory the node holds for itself, and so cannot lend to a compile.
     ///
@@ -1444,7 +1454,7 @@ struct CapacityFields
     // reads, not one this code branches on, so a shape it does not recognise is a
     // peer to report rather than a peer to refuse. A record from a build that
     // predates the field simply has no fifth index, which `at` answers as empty.
-    out.version = AsStringView(at(5));
+    out.version = std::string { AsStringView(at(5)) };
     if (auto const reservedMemory = at(6); !reservedMemory.empty())
     {
         auto const value = WireFields::FromBigEndian<std::uint64_t>(reservedMemory);
