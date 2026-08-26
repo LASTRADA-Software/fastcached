@@ -835,19 +835,60 @@ The page is a map of every member's hostname, endpoint and capacity, so:
 - Present it as `Authorization: Bearer <token>` or as HTTP Basic with any
   username (`curl -u :$TOKEN`). Basic is there because browsers prompt for it and
   do not prompt for Bearer.
-- **`--tls-cert` and `--tls-key` turn the whole admin surface into HTTPS.** Both
-  or neither; there is no `--tls` boolean, so "TLS requested, no certificate" is
-  not a state you can reach. Naming neither leaves the port exactly as it was, so
-  an existing Prometheus scraper keeps working untouched.
-
-TLS gives you confidentiality and tells your browser it reached the right server.
-It says nothing about who the browser is — that is what the credential is for, and
-why one is required rather than suggested on a public bind.
 
 `/metrics` and `/healthz` are **not** behind the credential, so turning the
 dashboard on changes nothing for a scraper or a probe already pointed at them.
 And `/metrics` stays the source of truth for anything you alert on: the dashboard
 reads the same counters and computes no number of its own.
+
+### Plain HTTP, HTTPS, or HTTPS with nothing to obtain
+
+**HTTP is the default and is a supported way to run this.** The admin surface is
+plaintext unless you ask for TLS, so the example above — loopback, no
+certificate — is a complete configuration. Reaching loopback already means being
+on the machine, which is why it needs no credential either.
+
+There are three ways to run the surface, and they differ only in what you had to
+obtain first:
+
+| | Flags | What you get |
+|---|---|---|
+| Plain HTTP | *(none)* | No encryption. Fine on loopback, or behind something that terminates TLS for you. |
+| HTTPS, generated certificate | `--tls-self-signed` | Encryption with nothing to obtain. Does **not** prove which node answered. |
+| HTTPS, your certificate | `--tls-cert` + `--tls-key` | Encryption, and an identity a client can actually verify. |
+
+```sh
+# An encrypted dashboard on an internal network, with no certificate to obtain:
+fastcache-compile-node ... --admin-listen 0.0.0.0:6677 \
+                       --dashboard --dashboard-token-file /etc/fastcached/dashboard.token \
+                       --tls-self-signed
+```
+
+`--tls-self-signed` generates a P-256 key and a certificate at startup, valid for
+`localhost`, `127.0.0.1`, `::1`, this machine's own hostname, and the address
+`--admin-listen` names when it is a particular interface rather than a wildcard.
+Those names matter: every modern client ignores a certificate's common name, and a
+name mismatch is a second browser warning on top of the unknown issuer — a much
+harder one to click past.
+
+Two things to know before you rely on it:
+
+- **It encrypts; it does not identify.** Nothing signs it, so a client that has
+  not been told its fingerprint out of band cannot tell your node from anything
+  else answering on that address. The node logs the SHA-256 fingerprint at
+  startup for exactly that reason — compare it with what your browser shows. This
+  is also why the credential is still required off loopback: TLS authenticates the
+  *server* to the browser and says nothing about who the browser is.
+- **It is held in memory and regenerated on every restart**, so a browser
+  exception pinned to it has to be granted again. Nothing is written to disk,
+  which means no private key to leak and no permissions to get wrong. If you want
+  a stable identity, name a real certificate.
+
+There is deliberately no `--tls` boolean: TLS is on because you named material or
+asked for material to be made, so "TLS requested, nothing to serve it with" is not
+a state you can reach. `--tls-self-signed` and `--tls-cert` contradict each other
+and the node refuses both together, rather than silently serving an identity you
+did not choose.
 
 What the counters mean is tabulated under
 [Distributed compilation](../getting-started/distributed-compilation.md#confirming-it-works).

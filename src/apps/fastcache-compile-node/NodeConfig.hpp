@@ -135,6 +135,21 @@ struct NodeConfig
     /// accident.
     std::string dashboardTokenFile;
 
+    /// Generate a self-signed certificate at startup instead of naming one.
+    ///
+    /// For an internal deployment where obtaining a certificate is the only thing
+    /// between an operator and an encrypted admin surface. It is a boolean where
+    /// `--tls-cert` is a path, and that is not a hole in the "TLS is on by naming
+    /// material" rule but the same rule kept: the point of that rule is that no
+    /// configuration can ask for TLS this node cannot then serve, and asking for
+    /// this one *produces* the material.
+    ///
+    /// **Confidentiality, not identity.** Nothing signs it, so a client that has
+    /// not been told its fingerprint out of band cannot tell this node from
+    /// anything else answering on that address. The credential is still required
+    /// off loopback for exactly that reason.
+    bool tlsSelfSigned { false };
+
     /// Certificate the admin surface serves TLS with, or empty for plaintext.
     ///
     /// Spelled as the daemon spells it, because an operator copies these between

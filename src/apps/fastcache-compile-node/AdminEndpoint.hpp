@@ -246,6 +246,8 @@ struct AdminSurface
 /// scheduler passes nullopt and `/fleet` is then a plain 404: a process with no
 /// fleet view offers no fleet route, rather than one answering with an empty fleet.
 /// @param cfg The parsed configuration.
+/// @param host Where the machine's own facts come from, for a generated
+///        certificate's subject names.
 /// @param metrics The sink `/metrics` renders.
 /// @param snapshot What to report per scrape.
 /// @param fleet What the dashboard reads, or nullopt to serve none.
@@ -254,6 +256,7 @@ struct AdminSurface
 ///         it could not be served.
 [[nodiscard]] std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(
     NodeConfig const& cfg,
+    IHostFactsSource const& host,
     IMetricsSink& metrics,
     AdminHttpServer::SnapshotProvider snapshot,
     std::optional<Distributed::FleetSources> fleet,

@@ -179,5 +179,34 @@ fault.
   - **The credential gates the dashboard routes and nothing else.** `/metrics` and
     `/healthz` stay exactly as open as they were, so turning the dashboard on
     changes nothing for a scraper or a probe already pointed at that port. TLS is
-    the same story: it is on by naming a certificate and a key, so a node that
-    names neither keeps a plaintext admin port that behaves as it always did.
+    the same story: it is on because material was named or asked for, so a node
+    that does neither keeps a plaintext admin port that behaves as it always did.
+    **Plain HTTP is a supported way to run this**, not a fallback -- on loopback,
+    or behind something that terminates TLS -- which is why nothing anywhere
+    requires a certificate.
+- **TLS is on by naming material or by asking for material to be MADE, never by a
+  bare boolean.** `--tls-self-signed` looks like the boolean that rule forbids and
+  is the same rule kept: what the rule prevents is a configuration that asks for
+  TLS this node cannot then serve, and asking for a generated certificate
+  *produces* the material. The two spellings contradict each other and are refused
+  together, rather than one silently winning and serving an identity nobody chose.
+  - **A generated certificate encrypts; it does not identify.** Nothing signs it,
+    so a client that has not been told its fingerprint out of band cannot tell
+    this node from anything else answering on that address. Two consequences are
+    load-bearing: the credential is still required off loopback, because TLS
+    authenticates the *server* to the browser and says nothing about who the
+    browser is; and the fingerprint is logged at startup, because it is the only
+    thing an operator can compare.
+  - **Its subject names decide whether it is usable at all.** Every modern client
+    ignores the common name, so a certificate whose SAN omits the name an operator
+    types matches nothing however it is labelled -- and a name mismatch is a second
+    browser warning on top of the unknown issuer, much harder to click past than
+    the first. Each name is classified by what it *parses as* rather than by how it
+    is spelled: guessing from a leading digit or a colon gets a host called
+    `10things` and the address `2001:db8::1` wrong in opposite directions.
+  - **The fixture greps `-checkhost`'s output rather than its exit code, and
+    carries a negative control.** `openssl x509 -checkhost` reports its answer in
+    the text and exits 0 either way, so an exit-code check passes for a mismatch.
+    That was found by the control -- a name nobody asked for, asserted NOT to
+    match -- which is why one is there: without it the whole block passed while
+    asserting nothing.

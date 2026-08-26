@@ -144,6 +144,10 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.dashboardTokenFile = "dashboard.token";
     cfg.tlsCertFile = "admin.crt";
     cfg.tlsKeyFile = "admin.key";
+    // Not alongside the certificate in a real configuration -- they contradict
+    // each other -- but this case exists to give every field a non-default value
+    // so every emitter fires, and it asserts nothing about coherence.
+    cfg.tlsSelfSigned = true;
     cfg.schedulerListen = "0.0.0.0:6678";
     cfg.fleetMembers = { "10.0.0.1:6676", "10.0.0.2:6676" };
     cfg.fleetOpen = true;
@@ -723,6 +727,51 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
         CHECK_FALSE(StartupPolicyRejection(both).has_value());
     }
 
+    SECTION("a generated certificate and a named one contradict each other")
+    {
+        // Silently preferring either would serve an identity the operator did not
+        // choose, which is the whole thing a certificate is for.
+        auto cfg = servingNode();
+        cfg.tlsSelfSigned = true;
+        cfg.tlsCertFile = "admin.crt";
+        cfg.tlsKeyFile = "admin.key";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--tls-self-signed"));
+        CHECK(Unwrap(refusal).contains("--tls-cert"));
+    }
+
+    SECTION("TLS material with no admin surface to terminate it")
+    {
+        // The silent no-op shape again: a certificate nothing serves.
+        auto selfSigned = servingNode();
+        selfSigned.adminListen.clear();
+        selfSigned.dashboard = false;
+        selfSigned.tlsSelfSigned = true;
+        auto const selfSignedRefusal = StartupPolicyRejection(selfSigned);
+        REQUIRE(selfSignedRefusal.has_value());
+        CHECK(Unwrap(selfSignedRefusal).contains("--admin-listen"));
+
+        auto named = servingNode();
+        named.adminListen.clear();
+        named.dashboard = false;
+        named.tlsCertFile = "admin.crt";
+        named.tlsKeyFile = "admin.key";
+        auto const namedRefusal = StartupPolicyRejection(named);
+        REQUIRE(namedRefusal.has_value());
+        CHECK(Unwrap(namedRefusal).contains("--admin-listen"));
+    }
+
+    SECTION("a generated certificate on its own is a working configuration")
+    {
+        // The whole point of the flag: an encrypted admin surface with nothing to
+        // obtain first.
+        auto cfg = servingNode();
+        cfg.tlsSelfSigned = true;
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+
     SECTION("a fleet map on a public port with no credential")
     {
         // The page lists every member's hostname, endpoint and capacity. An
@@ -768,6 +817,14 @@ TEST_CASE("Naming the dashboard flags parses them", "[node][dashboard][cli]")
     CHECK(parsed->dashboardTokenFile == "/etc/fastcached/dashboard.token");
     CHECK(parsed->tlsCertFile == "/etc/fastcached/admin.crt");
     CHECK(parsed->tlsKeyFile == "/etc/fastcached/admin.key");
+    CHECK_FALSE(parsed->tlsSelfSigned);
+
+    // The other spelling of asking for TLS, which needs no material to name.
+    auto const generated =
+        ParseNodeArgv({ "--scheduler=cache:6675", "--toolchain=/usr/bin/g++", "--admin-listen=6677", "--tls-self-signed" });
+    REQUIRE(generated.has_value());
+    CHECK(generated->tlsSelfSigned);
+    CHECK(generated->tlsCertFile.empty());
 
     // Off unless asked for, like every other surface this program serves.
     auto const bare = ParseNodeArgv({ "--scheduler=cache:6675", "--toolchain=/usr/bin/g++" });

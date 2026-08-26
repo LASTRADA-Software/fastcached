@@ -447,6 +447,14 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "through ps. Its own secret rather than --requirepass,\n"
                          "which every member of the fleet already holds. Required\n"
                          "when --admin-listen is not on loopback." },
+        { .primary = "--tls-self-signed",
+          .apply = SetTrue<&NodeConfig::tlsSelfSigned>(),
+          .description = "generate a self-signed certificate at startup and serve\n"
+                         "the admin surface over HTTPS with it, so an internal\n"
+                         "deployment needs no certificate to obtain. Encrypts the\n"
+                         "traffic; it does NOT prove which node answered, so the\n"
+                         "fingerprint is logged for you to compare. Regenerated\n"
+                         "every restart -- name --tls-cert for a stable identity." },
         { .primary = "--tls-cert",
           .arity = Arity::Value,
           .operand = "=<path>",
@@ -655,6 +663,8 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // The PATH, never the secret it holds -- the same rule `--requirepass` is
     // refused outright by, one step less strict because a path is not a credential.
     emitPathIfSet("dashboard-token-file", cfg.dashboardTokenFile);
+    if (cfg.tlsSelfSigned)
+        argv.emplace_back("--tls-self-signed");
     emitPathIfSet("tls-cert", cfg.tlsCertFile);
     emitPathIfSet("tls-key", cfg.tlsKeyFile);
     emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
@@ -842,6 +852,14 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--dashboard-token-file guards the dashboard and nothing else, and --dashboard is not set. "
                      "A secret an operator provisioned, being read by nobody, is the silent no-op this list "
                      "exists to refuse." },
+        { .refuses = [](NodeConfig const& c) { return c.tlsSelfSigned && !c.tlsCertFile.empty(); },
+          .message = "--tls-self-signed and --tls-cert contradict each other: one generates a certificate and "
+                     "the other names one. Silently preferring either would serve an identity the operator did "
+                     "not choose, which is the whole thing a certificate is for." },
+        { .refuses =
+              [](NodeConfig const& c) { return (c.tlsSelfSigned || !c.tlsCertFile.empty()) && c.adminListen.empty(); },
+          .message = "--tls-self-signed and --tls-cert serve the admin surface, and --admin-listen is not set. "
+                     "TLS material nothing terminates is the silent no-op this list exists to refuse." },
         { .refuses = [](NodeConfig const& c) { return c.tlsCertFile.empty() != c.tlsKeyFile.empty(); },
           .message = "--tls-cert and --tls-key are both or neither: a certificate with no key cannot terminate "
                      "TLS, and this node would otherwise start and serve the admin surface in the clear while "

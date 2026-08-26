@@ -367,9 +367,10 @@ TEST_CASE("An admin surface nobody asked for starts nothing at all", "[node][adm
     // refused by StartupPolicyRejection long before this runs.
     AtomicMetricsSink metrics;
     NullLogger logger;
+    ScrapeHost const scrapeHost;
     NodeConfig cfg;
 
-    auto surface = Node::StartAdminSurfaceOrExplain(cfg, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+    auto surface = Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
     REQUIRE(surface.has_value());
     CHECK(surface->endpoint == nullptr);
 }
@@ -381,13 +382,15 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
     // bad-spelling case already holds.
     AtomicMetricsSink metrics;
     NullLogger logger;
+    ScrapeHost const scrapeHost;
 
     SECTION("a listen spelling that is not an endpoint")
     {
         NodeConfig cfg;
         cfg.adminListen = "not-a-port";
 
-        auto const surface = Node::StartAdminSurfaceOrExplain(cfg, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+        auto const surface =
+            Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
         REQUIRE_FALSE(surface.has_value());
         CHECK(surface.error().contains("--admin-listen"));
         CHECK(surface.error().contains("not-a-port"));
@@ -401,7 +404,8 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
         cfg.adminListen = "0"; // refused before the token is even reached
         cfg.dashboardTokenFile = (scratch.Path() / "absent").string();
 
-        auto const surface = Node::StartAdminSurfaceOrExplain(cfg, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+        auto const surface =
+            Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
         REQUIRE_FALSE(surface.has_value());
     }
 }
@@ -413,6 +417,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
     // offers no fleet route, rather than one answering with an empty fleet.
     AtomicMetricsSink metrics;
     NullLogger logger;
+    ScrapeHost const scrapeHost;
     ManualClock clock;
     Distributed::SchedulerService scheduler { clock, metrics };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
@@ -431,7 +436,8 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
 
     SECTION("with no scheduler, /fleet is not a route")
     {
-        auto surface = Node::StartAdminSurfaceOrExplain(cfg, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+        auto surface =
+            Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
         CHECK(surface->endpoint->BoundEndpoint() == std::format("127.0.0.1:{}", port));
@@ -441,6 +447,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
     {
         auto surface = Node::StartAdminSurfaceOrExplain(
             cfg,
+            scrapeHost,
             metrics,
             WorkerShapedSnapshot(),
             Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
@@ -448,4 +455,61 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
     }
+}
+
+#if defined(FC_TLS_ENABLED)
+TEST_CASE("Asking for a generated certificate gives the surface one to serve", "[node][admin][tls]")
+{
+    // The flag exists so an internal deployment needs nothing to obtain first, so
+    // what this asserts is exactly that: no path named anywhere, and the surface
+    // comes up holding a certificate.
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    ScrapeHost const scrapeHost;
+
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->BoundPort();
+    probe.reset();
+
+    NodeConfig cfg;
+    cfg.adminListen = std::format("127.0.0.1:{}", port);
+    cfg.tlsSelfSigned = true;
+
+    auto surface = Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(surface->endpoint != nullptr);
+    REQUIRE(surface->tls != nullptr);
+
+    // The fingerprint is the only thing that authenticates a certificate nothing
+    // signed, so it has to be reportable -- an operator compares it with what
+    // their browser shows.
+    CHECK(surface->tls->CertificateFingerprint().size() == 64);
+}
+#endif
+
+TEST_CASE("A surface with no TLS asked for holds no context at all", "[node][admin][tls]")
+{
+    // The half that keeps every existing deployment unchanged: naming no material
+    // and asking for none leaves the admin port exactly as plaintext as it was.
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    ScrapeHost const scrapeHost;
+
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->BoundPort();
+    probe.reset();
+
+    NodeConfig cfg;
+    cfg.adminListen = std::format("127.0.0.1:{}", port);
+
+    auto surface = Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(surface->endpoint != nullptr);
+#if defined(FC_TLS_ENABLED)
+    CHECK(surface->tls == nullptr);
+#endif
 }

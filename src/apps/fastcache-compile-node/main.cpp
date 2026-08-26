@@ -561,6 +561,7 @@ constexpr int ExitOk = 0;
     // its thread -- before the scheduler, the cluster and the cache tier are gone.
     auto surfaceOrRefusal = Node::StartAdminSurfaceOrExplain(
         cfg,
+        *host,
         metrics,
         // Built by a function rather than spelled as a lambda here, for the reason
         // above: a node with no cache must report NO cache rather than an empty

@@ -252,6 +252,12 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A fleet total is computed over `NodeReports()`, never over registry entries.
 - The dashboard credential is its own file, never `--requirepass`; a non-loopback
   bind without one is a startup refusal, and TLS does not substitute for it.
+- Plain HTTP is a supported way to serve the admin surface. TLS is on by naming
+  material or by asking for material to be made (`--tls-self-signed`) — never a
+  bare boolean, and the two spellings are refused together.
+- A generated certificate encrypts but does not identify: its fingerprint is
+  logged because that is all an operator can compare, and its subject names decide
+  whether any client accepts it at all.
 
 **[`.agent/rules/packaging-and-release.md`](.agent/rules/packaging-and-release.md)**
 — packaging, versioning, cutting a release. Before `packaging/`, `cmake/Packaging.cmake`,

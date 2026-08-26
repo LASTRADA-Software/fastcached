@@ -35,6 +35,15 @@ struct HostFacts
     /// compared for equality, never parsed.
     std::string osVersion;
 
+    /// This machine's network name, e.g. "buildnode-3". Empty when it would not say.
+    ///
+    /// Reported rather than resolved: it is whatever the host calls itself, which
+    /// may be a bare label or a fully-qualified name and is not guaranteed to
+    /// resolve anywhere. That is exactly what makes it useful for a certificate's
+    /// subject names -- it is the name an operator types -- and exactly why nothing
+    /// here treats it as an address.
+    std::string hostName;
+
     /// CPU architecture, e.g. "x86_64", "aarch64".
     ///
     /// Taken from the **compiler**, not from the OS. A scheduler matches a worker

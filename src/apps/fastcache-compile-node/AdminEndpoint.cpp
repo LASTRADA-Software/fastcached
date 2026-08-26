@@ -9,13 +9,17 @@
 #endif
 #include <FastCache/Distributed/FleetView.hpp>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <format>
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <ranges>
 #include <utility>
+#include <vector>
 
 namespace FastCache::Node
 {
@@ -75,6 +79,41 @@ std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::
 
 namespace
 {
+#if defined(FC_TLS_ENABLED)
+    /// Names a generated certificate should be valid for.
+    ///
+    /// Every modern client ignores a certificate's common name, so this list is
+    /// what decides whether a browser warns once or twice: an unknown issuer is one
+    /// warning an operator can accept, and a name mismatch on top of it is a second
+    /// one that is much harder to click past.
+    ///
+    /// Loopback always, because that is where the surface binds by default; the
+    /// machine's own network name, because that is what an operator types to reach
+    /// another node; and the admin bind address when it names a particular
+    /// interface rather than every one of them -- a wildcard is not a name anybody
+    /// can dial, so putting it in a certificate would say nothing.
+    /// @param cfg The parsed configuration.
+    /// @param host Where the machine's own facts come from.
+    /// @return The subject names, loopback first.
+    [[nodiscard]] std::vector<std::string> SelfSignedSubjectNames(NodeConfig const& cfg, IHostFactsSource const& host)
+    {
+        std::vector<std::string> names { "localhost", "127.0.0.1", "::1" };
+
+        if (auto const& hostName = host.Facts().hostName; !hostName.empty())
+            names.push_back(hostName);
+
+        if (auto const endpoint = ParseEndpoint(cfg.adminListen, "127.0.0.1"); endpoint.has_value())
+        {
+            constexpr std::array<std::string_view, 3> Wildcards { "0.0.0.0", "::", "[::]" };
+            auto const& bindHost = endpoint->first;
+            if (!std::ranges::contains(Wildcards, bindHost) && !std::ranges::contains(names, bindHost))
+                names.push_back(bindHost);
+        }
+
+        return names;
+    }
+#endif
+
     /// The challenge an unauthorised caller is answered with.
     ///
     /// `Basic` is named first because it is the one a browser can prompt for, and
@@ -137,6 +176,7 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
 }
 
 std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig const& cfg,
+                                                                    [[maybe_unused]] IHostFactsSource const& host,
                                                                     IMetricsSink& metrics,
                                                                     AdminHttpServer::SnapshotProvider snapshot,
                                                                     std::optional<Distributed::FleetSources> fleet,
@@ -151,21 +191,25 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
     if (cfg.adminListen.empty())
         return surface;
 
-    // TLS is on by naming a certificate and a key rather than by a boolean, so
-    // "TLS requested, nothing to do it with" is not a state that exists.
-    if (!cfg.tlsCertFile.empty())
+    // TLS is on by naming material or by asking for material to be made, never by
+    // a bare boolean: neither spelling can reach a state where TLS was requested
+    // and this node has nothing to serve it with.
+    if (cfg.tlsSelfSigned || !cfg.tlsCertFile.empty())
     {
 #if defined(FC_TLS_ENABLED)
-        auto created = TlsContext::Create(cfg.tlsCertFile, cfg.tlsKeyFile);
+        auto created = cfg.tlsSelfSigned ? TlsContext::CreateSelfSigned(SelfSignedSubjectNames(cfg, host))
+                                         : TlsContext::Create(cfg.tlsCertFile, cfg.tlsKeyFile);
         if (!created.has_value())
-            return std::unexpected { std::format("--tls-cert/--tls-key: {}", created.error().ToString()) };
+            return std::unexpected { std::format(
+                "{}: {}", cfg.tlsSelfSigned ? "--tls-self-signed" : "--tls-cert/--tls-key", created.error().ToString()) };
         surface.tls = std::move(*created);
 #else
         // Refused rather than warned about, and the daemon answers the same way: a
         // node that started in the clear after being told to serve TLS is one an
         // operator believes is encrypted.
-        return std::unexpected { std::string { "--tls-cert requested but this build has no TLS support "
-                                               "(rebuild with -DFASTCACHED_ENABLE_TLS=ON)" } };
+        return std::unexpected { std::format("{} requested but this build has no TLS support "
+                                             "(rebuild with -DFASTCACHED_ENABLE_TLS=ON)",
+                                             cfg.tlsSelfSigned ? "--tls-self-signed" : "--tls-cert") };
 #endif
     }
 
@@ -209,6 +253,17 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
         surface.tls ? "https" : "http";
 #else
         "http";
+#endif
+#if defined(FC_TLS_ENABLED)
+    // Printed because with a generated certificate this is the ONLY thing that
+    // authenticates the node: nothing signs it, so an operator compares what is
+    // logged here against what their browser shows and knows they reached the
+    // machine rather than something in between.
+    if (surface.tls && cfg.tlsSelfSigned)
+        logger.Logf(LogLevel::Info,
+                    "admin TLS uses a self-signed certificate generated at startup; SHA-256 fingerprint {} "
+                    "(it changes on every restart)",
+                    surface.tls->CertificateFingerprint());
 #endif
     logger.Logf(
         LogLevel::Info, "metrics endpoint on {}://{}/metrics (and /healthz)", scheme, surface.endpoint->BoundEndpoint());

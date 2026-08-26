@@ -329,6 +329,25 @@ else()
             RUN_SERIAL TRUE
             TIMEOUT 120
         )
+
+        # And the spelling that needs no certificate to exist first. Separate from
+        # the case above rather than folded into it: the generated certificate has
+        # its own properties to assert -- that it is valid for the names an
+        # operator types, that it is NOT valid for others, and that the fingerprint
+        # the node logged is the one on the wire -- and a fixture asserting two
+        # different things reports which one broke by not saying.
+        add_test(
+            NAME "fleet-dashboard-self-signed-e2e"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/fleet-dashboard-e2e.sh"
+                --node "$<TARGET_FILE:fastcache-compile-node>"
+                --tls-self-signed
+        )
+        set_tests_properties("fleet-dashboard-self-signed-e2e" PROPERTIES
+            LABELS "smoke"
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE
+            TIMEOUT 120
+        )
     endif()
 endif()
 

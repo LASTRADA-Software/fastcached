@@ -37,11 +37,13 @@ set -uo pipefail
 node=""
 tls_cert=""
 tls_key=""
+tls_self_signed=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --node) node="$2"; shift 2 ;;
         --tls-cert) tls_cert="$2"; shift 2 ;;
         --tls-key) tls_key="$2"; shift 2 ;;
+        --tls-self-signed) tls_self_signed="yes"; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -53,8 +55,13 @@ readonly SKIP=77
 # that speaks TLS. `/dev/tcp` cannot, so this half -- and only this half -- depends
 # on curl and skips without it rather than silently testing the plaintext path
 # under a name that says otherwise.
-if [[ -n "$tls_cert" ]]; then
-    [[ -r "$tls_cert" && -r "$tls_key" ]] || { echo "TLS material unreadable; skipping"; exit "$SKIP"; }
+# `tls` is set for either spelling -- a named certificate or a generated one --
+# because everything downstream only cares whether the port speaks TLS.
+tls=""
+[[ -n "$tls_cert" || -n "$tls_self_signed" ]] && tls="yes"
+if [[ -n "$tls" ]]; then
+    [[ -z "$tls_cert" || ( -r "$tls_cert" && -r "$tls_key" ) ]] \
+        || { echo "TLS material unreadable; skipping"; exit "$SKIP"; }
     command -v curl >/dev/null 2>&1 || { echo "curl not found and TLS was asked for; skipping"; exit "$SKIP"; }
 fi
 
@@ -106,7 +113,7 @@ http_get() {
     # because the checked-in fixture certificate is self-signed for 'localhost'
     # and what this asserts is that the handshake happens and the routes answer
     # behind it, not that a test fixture chains to a public root.
-    if [[ -n "$tls_cert" ]]; then
+    if [[ -n "$tls" ]]; then
         local args=(-sk -i -m 10)
         [[ -n "$auth" ]] && args+=(-H "Authorization: ${auth}")
         curl "${args[@]}" "https://127.0.0.1:${port}${path}"
@@ -158,6 +165,7 @@ toolchain="$(command -v c++ || command -v g++ || command -v cc)"
 
 tls_args=()
 [[ -n "$tls_cert" ]] && tls_args=(--tls-cert "$tls_cert" --tls-key "$tls_key")
+[[ -n "$tls_self_signed" ]] && tls_args=(--tls-self-signed)
 
 "$node" \
     --scheduler "127.0.0.1:${sched_port}" \
@@ -239,12 +247,60 @@ done
 missing="$(http_get "$admin_port" /nope "Bearer ${TOKEN}")"
 [[ "$missing" == HTTP/1.1\ 404* ]] || fail "an unknown path no longer answers 404"
 
-if [[ -n "$tls_cert" ]]; then
+if [[ -n "$tls" ]]; then
     # And that the handshake is real rather than the port merely answering: a
     # plaintext request to a TLS port must fail, not be served.
     plaintext_code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${admin_port}/healthz" || true)"
     [[ "$plaintext_code" != "200" ]] || fail "a plaintext request to the TLS admin port was served"
-    echo "PASS: fleet dashboard served over HTTPS, credential enforced, /metrics unchanged"
+
+    if [[ -n "$tls_self_signed" ]]; then
+        # A generated certificate has to be valid for the NAME an operator types,
+        # not merely exist: an unknown issuer is one browser warning they can
+        # accept, and a name mismatch on top of it is a second, much harder one.
+        #
+        # Asked with `openssl x509 -checkhost` rather than by reading curl's exit
+        # code, because that code is not a stable way to tell "untrusted issuer"
+        # from "wrong name" -- measured here, a mismatch surfaced as a timeout
+        # rather than as the documented 51, which would have made this assertion
+        # quietly vacuous.
+        if command -v openssl >/dev/null 2>&1; then
+            pem="${workdir}/served.pem"
+            echo | openssl s_client -connect "127.0.0.1:${admin_port}" 2>/dev/null \
+                 | openssl x509 -outform PEM > "$pem" 2>/dev/null
+            [[ -s "$pem" ]] || fail "could not read the certificate the node is serving"
+
+            # `-checkhost` reports its answer in the OUTPUT and exits 0 either
+            # way, which is why this greps rather than testing the exit code --
+            # the negative control below is what caught that, and without it this
+            # whole block would have passed while asserting nothing.
+            checks_name() {
+                openssl x509 -in "$pem" -noout "$1" "$2" 2>/dev/null | grep -q "does match"
+            }
+
+            checks_name -checkhost localhost \
+                || fail "the generated certificate is not valid for the name 'localhost'"
+            checks_name -checkip 127.0.0.1 \
+                || fail "the generated certificate is not valid for 127.0.0.1"
+            # The negative control, so the two above cannot pass by matching
+            # everything -- a certificate valid for any name is not a certificate.
+            if checks_name -checkhost elsewhere.invalid; then
+                fail "the generated certificate matches a name nobody asked for"
+            fi
+
+            # And the fingerprint the node logged is the one on the wire -- the
+            # only thing that authenticates a certificate nothing signed.
+            logged="$(grep -oE 'fingerprint [0-9a-f]{64}' "${workdir}/node.log" | awk '{print $2}' | head -1)"
+            [[ -n "$logged" ]] || fail "the node did not report the generated certificate's fingerprint"
+            wire="$(openssl x509 -in "$pem" -noout -fingerprint -sha256 2>/dev/null \
+                    | sed 's/.*=//' | tr -d ':' | tr 'A-F' 'a-f')"
+            [[ "$wire" == "$logged" ]] \
+                || fail "the logged fingerprint (${logged}) is not the one served (${wire})"
+        fi
+
+        echo "PASS: fleet dashboard served over HTTPS from a generated certificate"
+    else
+        echo "PASS: fleet dashboard served over HTTPS, credential enforced, /metrics unchanged"
+    fi
 else
     echo "PASS: fleet dashboard served, credential enforced, /metrics unchanged"
 fi
