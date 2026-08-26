@@ -35,15 +35,28 @@
 set -uo pipefail
 
 node=""
+tls_cert=""
+tls_key=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --node) node="$2"; shift 2 ;;
+        --tls-cert) tls_cert="$2"; shift 2 ;;
+        --tls-key) tls_key="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
 readonly SKIP=77
 [[ -n "$node" && -x "$node" ]] || { echo "fastcache-compile-node not found: '$node'; skipping"; exit "$SKIP"; }
+
+# When a certificate is named this run is the HTTPS one, and it needs a client
+# that speaks TLS. `/dev/tcp` cannot, so this half -- and only this half -- depends
+# on curl and skips without it rather than silently testing the plaintext path
+# under a name that says otherwise.
+if [[ -n "$tls_cert" ]]; then
+    [[ -r "$tls_cert" && -r "$tls_key" ]] || { echo "TLS material unreadable; skipping"; exit "$SKIP"; }
+    command -v curl >/dev/null 2>&1 || { echo "curl not found and TLS was asked for; skipping"; exit "$SKIP"; }
+fi
 
 workdir="$(mktemp -d)"
 node_pid=""
@@ -88,6 +101,18 @@ free_port() {
 # @param 3 optional Authorization header value
 http_get() {
     local port="$1" path="$2" auth="${3:-}" line="" body=""
+
+    # Over TLS `/dev/tcp` cannot help, so the HTTPS run goes through curl. `-k`
+    # because the checked-in fixture certificate is self-signed for 'localhost'
+    # and what this asserts is that the handshake happens and the routes answer
+    # behind it, not that a test fixture chains to a public root.
+    if [[ -n "$tls_cert" ]]; then
+        local args=(-sk -i -m 10)
+        [[ -n "$auth" ]] && args+=(-H "Authorization: ${auth}")
+        curl "${args[@]}" "https://127.0.0.1:${port}${path}"
+        return 0
+    fi
+
     exec 3<>"/dev/tcp/127.0.0.1/${port}" || return 1
     {
         printf 'GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\n' "$path"
@@ -131,6 +156,9 @@ printf '%s\n' "$TOKEN" > "${workdir}/token"
 toolchain="$(command -v c++ || command -v g++ || command -v cc)"
 [[ -n "$toolchain" ]] || { echo "no C++ driver on PATH; skipping"; exit "$SKIP"; }
 
+tls_args=()
+[[ -n "$tls_cert" ]] && tls_args=(--tls-cert "$tls_cert" --tls-key "$tls_key")
+
 "$node" \
     --scheduler "127.0.0.1:${sched_port}" \
     --toolchain "$toolchain" \
@@ -142,6 +170,7 @@ toolchain="$(command -v c++ || command -v g++ || command -v cc)"
     --dashboard \
     --dashboard-token-file "${workdir}/token" \
     --listen-cache "" \
+    "${tls_args[@]}" \
     > "${workdir}/node.log" 2>&1 &
 node_pid=$!
 
@@ -210,4 +239,12 @@ done
 missing="$(http_get "$admin_port" /nope "Bearer ${TOKEN}")"
 [[ "$missing" == HTTP/1.1\ 404* ]] || fail "an unknown path no longer answers 404"
 
-echo "PASS: fleet dashboard served, credential enforced, /metrics unchanged"
+if [[ -n "$tls_cert" ]]; then
+    # And that the handshake is real rather than the port merely answering: a
+    # plaintext request to a TLS port must fail, not be served.
+    plaintext_code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${admin_port}/healthz" || true)"
+    [[ "$plaintext_code" != "200" ]] || fail "a plaintext request to the TLS admin port was served"
+    echo "PASS: fleet dashboard served over HTTPS, credential enforced, /metrics unchanged"
+else
+    echo "PASS: fleet dashboard served, credential enforced, /metrics unchanged"
+fi

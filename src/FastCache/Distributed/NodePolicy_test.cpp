@@ -322,9 +322,9 @@ TEST_CASE("Naming the limit that withdrew a machine's slots", "[distributed][nod
     SECTION("the lowest of several ceilings binds, and each is still reported")
     {
         constexpr NodeLoad crowded { .inFlight = 1,
-                                     .cpuBusyPermille = 250,          // 8 busy - 1 ours = 7 external -> 9
-                                     .availableMemoryBytes = 7ULL << 30,  // 7 + 1 = 8
-                                     .freeScratchBytes = 384ULL << 20 };  // 3 + 1 = 4
+                                     .cpuBusyPermille = 250,             // 8 busy - 1 ours = 7 external -> 9
+                                     .availableMemoryBytes = 7ULL << 30, // 7 + 1 = 8
+                                     .freeScratchBytes = 384ULL << 20 }; // 3 + 1 = 4
         constexpr auto ceilings = SlotCeilingsFor(machine, 16, crowded);
         STATIC_REQUIRE(ceilings.byExternalCpu == 9U);
         STATIC_REQUIRE(ceilings.byMemory == 8U);

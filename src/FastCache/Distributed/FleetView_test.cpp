@@ -26,7 +26,10 @@ namespace
 class FakeCluster final: public IClusterAdmin
 {
   public:
-    explicit FakeCluster(Cluster::ClusterState state): _state { std::move(state) } {}
+    explicit FakeCluster(Cluster::ClusterState state):
+        _state { std::move(state) }
+    {
+    }
 
     [[nodiscard]] Cluster::ClusterState ClusterState() const override
     {
@@ -78,12 +81,10 @@ TEST_CASE("Every fleet column reaches both the page and the JSON", "[distributed
     // would be maintained by the same person who forgot the renderer. This is the
     // same rule `MetricsCatalog`'s test follows, one axis over.
     auto snapshot = LeadingSnapshot();
-    snapshot.cluster = Cluster::ClusterState {
-        .members = { Cluster::ClusterMember { .id = "n1",
-                                              .raftEndpoint = "10.0.0.2:6675",
-                                              .schedulerEndpoint = "10.0.0.2:6676" } },
-        .settings = {}
-    };
+    snapshot.cluster =
+        Cluster::ClusterState { .members = { Cluster::ClusterMember {
+                                    .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = "10.0.0.2:6676" } },
+                                .settings = {} };
     snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
                                                              .fingerprint = "gcc-13-abcdef",
                                                              .endpoint = "10.0.0.2:7100",
@@ -105,8 +106,16 @@ TEST_CASE("Every fleet column reaches both the page and the JSON", "[distributed
         CHECK(html.contains(std::string { ">" } + name + "</th>"));
         CHECK(json.contains(std::string { "\"" } + name + "\":"));
     }
-    for (auto const& name: { "endpoint", "toolchains", "cores", "memory", "class", "cpu-busy",
-                             "memory-available", "scratch-free", "cache-hit-rate", "heartbeat-age" })
+    for (auto const& name: { "endpoint",
+                             "toolchains",
+                             "cores",
+                             "memory",
+                             "class",
+                             "cpu-busy",
+                             "memory-available",
+                             "scratch-free",
+                             "cache-hit-rate",
+                             "heartbeat-age" })
     {
         INFO("node column " << name);
         CHECK(html.contains(std::string { ">" } + name + "</th>"));
@@ -133,7 +142,7 @@ TEST_CASE("A number nobody reported renders as an absence, never as a zero", "[d
     // is standing empty, which are claims, while absent says nobody asked or nobody
     // answered. A dashboard is the consumer most likely to flatten them.
     auto snapshot = LeadingSnapshot();
-    snapshot.nodes[0].capacity.logicalCores = 0;   // "did not say" in NodeCapacity
+    snapshot.nodes[0].capacity.logicalCores = 0; // "did not say" in NodeCapacity
     snapshot.nodes[0].capacity.totalMemoryBytes = 0;
     snapshot.nodes[0].load = Busy(1); // no CPU, no memory, no scratch reading
 
@@ -300,8 +309,7 @@ TEST_CASE("An election in progress names nobody rather than guessing", "[distrib
     CHECK(RenderFleetJson(snapshot).contains(R"("leader":null)"));
 }
 
-TEST_CASE("A node running no cluster reports no members rather than an empty cluster",
-          "[distributed][fleetview]")
+TEST_CASE("A node running no cluster reports no members rather than an empty cluster", "[distributed][fleetview]")
 {
     // Absent and empty are different claims: a node started without `--node-id`
     // leads itself and has no replicated state for anybody to read.
@@ -373,8 +381,7 @@ TEST_CASE("Each lease outcome carries its own number", "[distributed][fleetview]
     CHECK(RenderFleetHtml(snapshot, 0).contains("Do not add these together"));
 }
 
-TEST_CASE("Collecting a fleet reads the registry per machine and the counters as they stand",
-          "[distributed][fleetview]")
+TEST_CASE("Collecting a fleet reads the registry per machine and the counters as they stand", "[distributed][fleetview]")
 {
     ManualClock clock;
     AtomicMetricsSink metrics;
@@ -382,21 +389,17 @@ TEST_CASE("Collecting a fleet reads the registry per machine and the counters as
     scheduler.SetRole(SchedulerRole::Leader, {});
 
     CallerContext const member { .membership = Membership::Member, .peerId = "peer" };
-    auto announce = WorkerRegistration { .fingerprint = "gcc-13-abcdef",
-                                         .endpoint = "10.0.0.2:7100",
-                                         .slots = 4,
-                                         .codecs = {} };
+    auto announce =
+        WorkerRegistration { .fingerprint = "gcc-13-abcdef", .endpoint = "10.0.0.2:7100", .slots = 4, .codecs = {} };
     CHECK(scheduler.Register(member, announce).status == CompileCacheWire::Status::Ok);
     announce.fingerprint = "clang-20-aaaa";
     CHECK(scheduler.Register(member, announce).status == CompileCacheWire::Status::Ok);
 
     Cluster::ClusterState state;
-    state.members.push_back(
-        Cluster::ClusterMember { .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = {} });
+    state.members.push_back(Cluster::ClusterMember { .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = {} });
     FakeCluster cluster { state };
 
-    auto const snapshot =
-        CollectFleet(FleetSources { .scheduler = &scheduler, .cluster = &cluster, .metrics = &metrics });
+    auto const snapshot = CollectFleet(FleetSources { .scheduler = &scheduler, .cluster = &cluster, .metrics = &metrics });
 
     CHECK(LeadsTheFleet(snapshot));
     // Two registry entries, one machine -- the grain that keeps a fleet total honest.
@@ -417,8 +420,7 @@ TEST_CASE("Collecting a fleet without a cluster is a snapshot, not a crash", "[d
     AtomicMetricsSink metrics;
     SchedulerService scheduler { clock, metrics };
 
-    auto const snapshot =
-        CollectFleet(FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics });
+    auto const snapshot = CollectFleet(FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics });
     CHECK_FALSE(snapshot.cluster.has_value());
     CHECK(snapshot.nodes.empty());
 }

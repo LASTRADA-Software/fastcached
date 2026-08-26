@@ -308,6 +308,28 @@ else()
         RUN_SERIAL TRUE
         TIMEOUT 120
     )
+
+    # The same fixture over HTTPS, registered only where TLS is compiled in --
+    # the shape `tls-smoke` already takes, and for the same reason: a test that
+    # could never pass in the default build is dead configuration rather than
+    # coverage. It additionally proves the handshake is REAL, by checking that a
+    # plaintext request to the TLS port is not served: a port that merely answers
+    # would otherwise pass every assertion above it.
+    if(FASTCACHED_ENABLE_TLS)
+        add_test(
+            NAME "fleet-dashboard-tls-e2e"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/fleet-dashboard-e2e.sh"
+                --node "$<TARGET_FILE:fastcache-compile-node>"
+                --tls-cert "${CMAKE_SOURCE_DIR}/testdata/tls/server.crt"
+                --tls-key "${CMAKE_SOURCE_DIR}/testdata/tls/server.key"
+        )
+        set_tests_properties("fleet-dashboard-tls-e2e" PROPERTIES
+            LABELS "smoke"
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE
+            TIMEOUT 120
+        )
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

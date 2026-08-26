@@ -41,11 +41,11 @@ TEST_CASE("A browser's Basic credential is accepted whatever username it sends",
     // ignored -- demanding a matching one would be a second secret nobody was given.
     AdminCredential const guarded { "s3cret-token" };
 
-    CHECK(guarded.Accepts("Basic OnMzY3JldC10b2tlbg=="));          // ":s3cret-token"
-    CHECK(guarded.Accepts("Basic YWRtaW46czNjcmV0LXRva2Vu"));      // "admin:s3cret-token"
-    CHECK(guarded.Accepts("basic YWRtaW46czNjcmV0LXRva2Vu"));      // case-insensitive
-    CHECK_FALSE(guarded.Accepts("Basic YWRtaW46d3Jvbmc="));        // "admin:wrong"
-    CHECK_FALSE(guarded.Accepts("Basic YWRtaW4="));                // "admin", no colon
+    CHECK(guarded.Accepts("Basic OnMzY3JldC10b2tlbg=="));     // ":s3cret-token"
+    CHECK(guarded.Accepts("Basic YWRtaW46czNjcmV0LXRva2Vu")); // "admin:s3cret-token"
+    CHECK(guarded.Accepts("basic YWRtaW46czNjcmV0LXRva2Vu")); // case-insensitive
+    CHECK_FALSE(guarded.Accepts("Basic YWRtaW46d3Jvbmc="));   // "admin:wrong"
+    CHECK_FALSE(guarded.Accepts("Basic YWRtaW4="));           // "admin", no colon
 }
 
 TEST_CASE("A malformed credential is refused rather than retried as another scheme", "[admin][credential]")

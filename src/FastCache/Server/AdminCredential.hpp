@@ -50,7 +50,10 @@ class AdminCredential
 
     /// Require @p secret.
     /// @param secret The shared secret; must not be empty.
-    explicit AdminCredential(std::string secret) noexcept: _secret { std::move(secret) } {}
+    explicit AdminCredential(std::string secret) noexcept:
+        _secret { std::move(secret) }
+    {
+    }
 
     /// Whether a credential is configured at all.
     /// @return True when one must be presented.

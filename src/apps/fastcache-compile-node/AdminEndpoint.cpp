@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
-
 #include "CacheTier.hpp"
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#if defined(FC_TLS_ENABLED)
+    #include <FastCache/Net/TlsContext.hpp>
+#endif
 #include <FastCache/Distributed/FleetView.hpp>
 
 #include <chrono>
@@ -89,7 +91,7 @@ namespace
 } // namespace
 
 std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
-                                        AdminCredential credential,
+                                        AdminCredential const& credential,
                                         unsigned refreshSeconds)
 {
     // Both routes read the fleet the same way and differ only in how they render
@@ -114,23 +116,110 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
     };
 
     std::vector<AdminRoute> routes;
-    routes.push_back(AdminRoute {
-        .path = "/fleet",
-        .handler = answer([refreshSeconds](
-                              Distributed::FleetSnapshot const& s) { return Distributed::RenderFleetHtml(s, refreshSeconds); },
-                          "text/html; charset=utf-8",
-                          [] {
-                              return Unauthorised("text/html; charset=utf-8",
-                                                  "<!doctype html><title>fastcache fleet</title>"
-                                                  "<p>This page needs the credential named by "
-                                                  "<code>--dashboard-token-file</code>.</p>");
-                          }) });
+    routes.push_back(AdminRoute { .path = "/fleet",
+                                  .handler = answer(
+                                      [refreshSeconds](Distributed::FleetSnapshot const& s) {
+                                          return Distributed::RenderFleetHtml(s, refreshSeconds);
+                                      },
+                                      "text/html; charset=utf-8",
+                                      [] {
+                                          return Unauthorised("text/html; charset=utf-8",
+                                                              "<!doctype html><title>fastcache fleet</title>"
+                                                              "<p>This page needs the credential named by "
+                                                              "<code>--dashboard-token-file</code>.</p>");
+                                      }) });
     routes.push_back(AdminRoute {
         .path = "/fleet.json",
         .handler = answer([](Distributed::FleetSnapshot const& s) { return Distributed::RenderFleetJson(s); },
                           "application/json",
                           [] { return Unauthorised("application/json", R"({"error":"credential required"})"); }) });
     return routes;
+}
+
+std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig const& cfg,
+                                                                    IMetricsSink& metrics,
+                                                                    AdminHttpServer::SnapshotProvider snapshot,
+                                                                    std::optional<Distributed::FleetSources> fleet,
+                                                                    ILogger& logger)
+{
+    AdminSurface surface;
+
+    // Off unless asked for, like every other surface this program serves. Nothing
+    // else here runs, so a node with no `--admin-listen` also reads no certificate
+    // and no token -- the flags that would be a silent no-op are refused by
+    // `StartupPolicyRejection` long before this.
+    if (cfg.adminListen.empty())
+        return surface;
+
+    // TLS is on by naming a certificate and a key rather than by a boolean, so
+    // "TLS requested, nothing to do it with" is not a state that exists.
+    if (!cfg.tlsCertFile.empty())
+    {
+#if defined(FC_TLS_ENABLED)
+        auto created = TlsContext::Create(cfg.tlsCertFile, cfg.tlsKeyFile);
+        if (!created.has_value())
+            return std::unexpected { std::format("--tls-cert/--tls-key: {}", created.error().ToString()) };
+        surface.tls = std::move(*created);
+#else
+        // Refused rather than warned about, and the daemon answers the same way: a
+        // node that started in the clear after being told to serve TLS is one an
+        // operator believes is encrypted.
+        return std::unexpected { std::string { "--tls-cert requested but this build has no TLS support "
+                                               "(rebuild with -DFASTCACHED_ENABLE_TLS=ON)" } };
+#endif
+    }
+
+    // Read once at startup. A file that cannot be read must not become "no
+    // credential": that is the single failure that turns a guarded fleet map into
+    // an open one.
+    AdminCredential credential;
+    if (!cfg.dashboardTokenFile.empty())
+    {
+        auto read = ReadDashboardToken(cfg.dashboardTokenFile);
+        if (!read.has_value())
+            return std::unexpected { std::format("--dashboard-token-file {}", read.error()) };
+        credential = std::move(*read);
+    }
+
+    // Contributed only when the operator asked AND there is a fleet to read. A
+    // node with no scheduler passes nullopt, and `/fleet` is then a plain 404
+    // rather than a route answering with an empty fleet.
+    std::vector<AdminRoute> routes;
+    if (cfg.dashboard && fleet.has_value())
+        routes = MakeFleetRoutes(*fleet, credential, DashboardRefreshSeconds);
+
+    auto started = AdminEndpoint::Start(cfg.adminListen,
+                                        "127.0.0.1",
+                                        metrics,
+                                        std::move(snapshot),
+                                        logger,
+                                        std::move(routes),
+#if defined(FC_TLS_ENABLED)
+                                        surface.tls.get());
+#else
+                                        nullptr);
+#endif
+    if (!started.has_value())
+        return std::unexpected { std::format("--admin-listen {}", started.error()) };
+
+    surface.endpoint = std::move(*started);
+
+    auto const* const scheme =
+#if defined(FC_TLS_ENABLED)
+        surface.tls ? "https" : "http";
+#else
+        "http";
+#endif
+    logger.Logf(
+        LogLevel::Info, "metrics endpoint on {}://{}/metrics (and /healthz)", scheme, surface.endpoint->BoundEndpoint());
+    if (cfg.dashboard && fleet.has_value())
+        logger.Logf(LogLevel::Info,
+                    "fleet dashboard on {}://{}/fleet (and /fleet.json){}",
+                    scheme,
+                    surface.endpoint->BoundEndpoint(),
+                    credential.Required() ? "" : ", with no credential");
+
+    return surface;
 }
 
 AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,

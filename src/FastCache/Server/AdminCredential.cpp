@@ -31,27 +31,24 @@ std::array<AdminAuthScheme, 2> const& AdminAuthSchemes() noexcept
 {
     static std::array<AdminAuthScheme, 2> const schemes {
         AdminAuthScheme { .name = "Basic",
-                          .extract =
-                              [](std::string_view parameter) -> std::optional<std::string> {
-                                  auto decoded = Base64Decode(parameter);
-                                  if (!decoded.has_value())
-                                      return std::nullopt;
-                                  // `user:secret`, and the username half is ignored:
-                                  // the token file holds one secret, so demanding a
-                                  // matching username would be a second secret
-                                  // nobody was given. A value with no colon at all
-                                  // is malformed for this scheme rather than a
-                                  // secret with an empty username.
-                                  auto const colon = decoded->find(':');
-                                  if (colon == std::string::npos)
-                                      return std::nullopt;
-                                  return decoded->substr(colon + 1);
-                              } },
-        AdminAuthScheme { .name = "Bearer",
-                          .extract =
-                              [](std::string_view parameter) -> std::optional<std::string> {
-                                  return std::string { parameter };
-                              } },
+                          .extract = [](std::string_view parameter) -> std::optional<std::string> {
+                              auto decoded = Base64Decode(parameter);
+                              if (!decoded.has_value())
+                                  return std::nullopt;
+                              // `user:secret`, and the username half is ignored:
+                              // the token file holds one secret, so demanding a
+                              // matching username would be a second secret
+                              // nobody was given. A value with no colon at all
+                              // is malformed for this scheme rather than a
+                              // secret with an empty username.
+                              auto const colon = decoded->find(':');
+                              if (colon == std::string::npos)
+                                  return std::nullopt;
+                              return decoded->substr(colon + 1);
+                          } },
+        AdminAuthScheme {
+            .name = "Bearer",
+            .extract = [](std::string_view parameter) -> std::optional<std::string> { return std::string { parameter }; } },
     };
     return schemes;
 }

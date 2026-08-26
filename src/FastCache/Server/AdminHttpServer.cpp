@@ -147,8 +147,8 @@ namespace
             if (lineEnd == std::string::npos || lineEnd == cursor)
                 break;
             std::string_view const field { buffer.data() + cursor, lineEnd - cursor };
-            if (auto const colon = field.find(':'); colon != std::string_view::npos
-                && EqualsIgnoringCase(field.substr(0, colon), AuthorizationField))
+            if (auto const colon = field.find(':');
+                colon != std::string_view::npos && EqualsIgnoringCase(field.substr(0, colon), AuthorizationField))
             {
                 authorization = std::string { TrimFieldValue(field.substr(colon + 1)) };
                 break;
@@ -163,7 +163,10 @@ namespace
                                 .ok = true };
     }
 
-    Task<bool> WriteResponse(ISocket* socket, AdminResponse const& response)
+    /// By value, not by reference: this is a coroutine, so a reference parameter
+    /// is one whose referent may be gone by the time the first `co_await`
+    /// resumes -- the hazard `ServeAdminHttp`'s own signature already avoids.
+    Task<bool> WriteResponse(ISocket* socket, AdminResponse response)
     {
         auto head = std::format("HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
                                 response.status,
@@ -222,8 +225,7 @@ Task<void> ServeAdminHttp(ISocket* socket,
     {
         auto const body = RenderPrometheus(*metrics, snapshotProvider());
         (void) co_await WriteResponse(
-            socket,
-            AdminResponse { .status = "200 OK", .contentType = "text/plain; version=0.0.4", .body = body });
+            socket, AdminResponse { .status = "200 OK", .contentType = "text/plain; version=0.0.4", .body = body });
         co_return;
     }
     if (path == "/healthz")

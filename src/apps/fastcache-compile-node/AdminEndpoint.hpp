@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "NodeConfig.hpp"
+
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
@@ -19,15 +22,17 @@
 #include <string_view>
 #include <thread>
 
-namespace FastCache::Distributed
-{
-struct FleetSources;
-}
-
+// Under TLS the surface below OWNS a context, so the complete type is needed for
+// its deleter; without it the class is only ever a pointer that is always null,
+// and the forward declaration keeps this header free of OpenSSL either way.
+#if defined(FC_TLS_ENABLED)
+    #include <FastCache/Net/TlsContext.hpp>
+#else
 namespace FastCache
 {
 class TlsContext;
 }
+#endif
 
 namespace FastCache::Node
 {
@@ -110,7 +115,7 @@ struct NodeScrapeSources
 /// @param refreshSeconds How often the page reloads itself.
 /// @return `/fleet` and `/fleet.json`.
 [[nodiscard]] std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
-                                                      AdminCredential credential,
+                                                      AdminCredential const& credential,
                                                       unsigned refreshSeconds);
 
 /// How often the dashboard reloads itself, in seconds.
@@ -209,5 +214,49 @@ class AdminEndpoint
     std::string _boundEndpoint;
     std::jthread _thread;
 };
+
+/// The admin surface and everything it borrows, owned as one thing.
+///
+/// The TLS context is declared **before** the endpoint so it is destroyed
+/// **after** it: every accepted socket holds that context for as long as it lives,
+/// and the endpoint's destructor is what drains them. Two locals in `WorkerBody`
+/// would express that ordering as a comment somebody has to keep believing; here
+/// it is the member order, which is the same reason `CacheTier` and
+/// `SchedulerTier` are each one object rather than five locals.
+struct AdminSurface
+{
+#if defined(FC_TLS_ENABLED)
+    /// Server TLS context when a certificate was named, else null.
+    std::unique_ptr<TlsContext> tls;
+#endif
+    /// The running endpoint. Null when the operator asked for no admin surface.
+    std::unique_ptr<AdminEndpoint> endpoint;
+};
+
+/// Build the whole admin surface from the configuration, or explain the refusal.
+///
+/// The sibling of `StartCacheTierOrExplain`, and a function for the same two
+/// reasons: it reads three flags that can each refuse for a different reason, and
+/// `main.cpp` is in no test target -- so assembled there, none of the TLS, token
+/// and route-selection branches would have any coverage at all. It also keeps
+/// `WorkerBody` under clang-tidy's cognitive-complexity limit, which is the
+/// symptom that says a decision has spread too far.
+///
+/// Fleet routes are contributed only when `fleet` is present. A node with no
+/// scheduler passes nullopt and `/fleet` is then a plain 404: a process with no
+/// fleet view offers no fleet route, rather than one answering with an empty fleet.
+/// @param cfg The parsed configuration.
+/// @param metrics The sink `/metrics` renders.
+/// @param snapshot What to report per scrape.
+/// @param fleet What the dashboard reads, or nullopt to serve none.
+/// @param logger Where to announce the bound address.
+/// @return The surface (whose endpoint is null when none was asked for), or why
+///         it could not be served.
+[[nodiscard]] std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(
+    NodeConfig const& cfg,
+    IMetricsSink& metrics,
+    AdminHttpServer::SnapshotProvider snapshot,
+    std::optional<Distributed::FleetSources> fleet,
+    ILogger& logger);
 
 } // namespace FastCache::Node

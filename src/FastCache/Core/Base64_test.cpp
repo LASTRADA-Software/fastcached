@@ -40,12 +40,12 @@ TEST_CASE("Base64 refuses what it does not understand rather than skipping it", 
     // wrong here for a specific reason: this decodes a credential, and a decoder
     // that quietly ignores what it cannot read maps two different inputs onto one
     // secret.
-    CHECK_FALSE(Base64Decode("Zm9v!").has_value());   // outside the alphabet
-    CHECK_FALSE(Base64Decode("Zm9").has_value());     // not a multiple of four
-    CHECK_FALSE(Base64Decode("Zm9vYg=").has_value()); // ditto, with padding
-    CHECK_FALSE(Base64Decode("Z===").has_value());    // padding where a symbol belongs
+    CHECK_FALSE(Base64Decode("Zm9v!").has_value());    // outside the alphabet
+    CHECK_FALSE(Base64Decode("Zm9").has_value());      // not a multiple of four
+    CHECK_FALSE(Base64Decode("Zm9vYg=").has_value());  // ditto, with padding
+    CHECK_FALSE(Base64Decode("Z===").has_value());     // padding where a symbol belongs
     CHECK_FALSE(Base64Decode("Zg==Zg==").has_value()); // padding in the middle
-    CHECK_FALSE(Base64Decode("Zm 9v").has_value());   // whitespace is not ignored
+    CHECK_FALSE(Base64Decode("Zm 9v").has_value());    // whitespace is not ignored
 
     // The URL-safe alphabet is a different encoding, and accepting both would mean
     // two spellings of one credential.

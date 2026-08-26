@@ -492,8 +492,7 @@ TEST_CASE("A sibling that just re-registered does not blank the node's cache", "
     CHECK(caches[0].load.hits == 4000);
 }
 
-TEST_CASE("How long ago a worker was heard from is measured on the injected clock",
-          "[distributed][registry][heartbeat-age]")
+TEST_CASE("How long ago a worker was heard from is measured on the injected clock", "[distributed][registry][heartbeat-age]")
 {
     // The age has to come from the clock the registry was given, not from
     // `steady_clock::now()`. Handed a raw `TimePoint`, a consumer would reach for

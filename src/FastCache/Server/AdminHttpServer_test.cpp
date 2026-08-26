@@ -222,9 +222,12 @@ TEST_CASE("AdminHttp: a contributed route answers on its own path", "[admin][htt
 {
     std::vector<FastCache::AdminRoute> const routes {
         { .path = "/fleet",
-          .handler = [](FastCache::AdminRequest const&) {
-              return FastCache::AdminResponse { .status = "200 OK", .contentType = "text/html", .body = "<h1>fleet</h1>" };
-          } },
+          .handler =
+              [](FastCache::AdminRequest const&) {
+                  return FastCache::AdminResponse { .status = "200 OK",
+                                                    .contentType = "text/html",
+                                                    .body = "<h1>fleet</h1>" };
+              } },
     };
 
     auto const response = ExchangeWithRoutes("GET /fleet HTTP/1.1\r\nHost: x\r\n\r\n", routes);
@@ -239,8 +242,7 @@ TEST_CASE("AdminHttp: the built-in routes still answer alongside a contributed o
     // every existing scraper and probe is pointed at, and a route table that
     // shadowed or reordered them would be found in production rather than here.
     std::vector<FastCache::AdminRoute> const routes {
-        { .path = "/fleet",
-          .handler = [](FastCache::AdminRequest const&) { return FastCache::AdminResponse {}; } },
+        { .path = "/fleet", .handler = [](FastCache::AdminRequest const&) { return FastCache::AdminResponse {}; } },
     };
 
     CHECK(ExchangeWithRoutes("GET /healthz HTTP/1.1\r\n\r\n", routes).starts_with("HTTP/1.1 200 OK\r\n"));
@@ -253,12 +255,14 @@ TEST_CASE("AdminHttp: a route may refuse, and its extra headers reach the client
     // A 401 that does not carry `WWW-Authenticate` is one a browser cannot prompt
     // for, which turns "you need a credential" into "this page is broken".
     std::vector<FastCache::AdminRoute> const routes {
-        { .path = "/fleet", .handler = [](FastCache::AdminRequest const&) {
-             return FastCache::AdminResponse { .status = "401 Unauthorized",
-                                               .contentType = "text/plain",
-                                               .body = "credential required\n",
-                                               .extraHeaders = { R"(WWW-Authenticate: Basic realm="fleet")" } };
-         } },
+        { .path = "/fleet",
+          .handler =
+              [](FastCache::AdminRequest const&) {
+                  return FastCache::AdminResponse { .status = "401 Unauthorized",
+                                                    .contentType = "text/plain",
+                                                    .body = "credential required\n",
+                                                    .extraHeaders = { R"(WWW-Authenticate: Basic realm="fleet")" } };
+              } },
     };
 
     auto const response = ExchangeWithRoutes("GET /fleet HTTP/1.1\r\n\r\n", routes);
@@ -279,8 +283,8 @@ TEST_CASE("AdminHttp: a handler is told the Authorization header, whatever its c
     };
     std::vector<FastCache::AdminRoute> const routes { { .path = "/echo", .handler = echo } };
 
-    CHECK(ExchangeWithRoutes("GET /echo HTTP/1.1\r\nAuthorization: Bearer s3cret\r\n\r\n", routes)
-              .contains("Bearer s3cret"));
+    CHECK(
+        ExchangeWithRoutes("GET /echo HTTP/1.1\r\nAuthorization: Bearer s3cret\r\n\r\n", routes).contains("Bearer s3cret"));
     CHECK(ExchangeWithRoutes("GET /echo HTTP/1.1\r\nauthorization:   Basic QUJD\r\n\r\n", routes).contains("Basic QUJD"));
 
     // No header at all is an empty view, not a missing one: a handler that reads

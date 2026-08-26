@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
 
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
+#include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
-#include <FastCache/Core/Clock.hpp>
-#include <FastCache/Distributed/FleetView.hpp>
-#include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -276,18 +276,17 @@ TEST_CASE("A credential file that cannot be used is refused rather than ignored"
     CHECK(empty.error().contains("empty"));
 }
 
-TEST_CASE("The fleet routes answer on their own paths and gate on the credential",
-          "[node][admin][dashboard]")
+TEST_CASE("The fleet routes answer on their own paths and gate on the credential", "[node][admin][dashboard]")
 {
     ManualClock clock;
     AtomicMetricsSink metrics;
     Distributed::SchedulerService scheduler { clock, metrics };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
 
-    auto const routes = Node::MakeFleetRoutes(
-        Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
-        AdminCredential { "s3cret" },
-        Node::DashboardRefreshSeconds);
+    auto const routes =
+        Node::MakeFleetRoutes(Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
+                              AdminCredential { "s3cret" },
+                              Node::DashboardRefreshSeconds);
 
     // Two routes, and the JSON one exists so the page is replaceable and testable
     // without a browser.
@@ -316,8 +315,7 @@ TEST_CASE("The fleet routes answer on their own paths and gate on the credential
     CHECK(document.body.contains(R"("role":"leader")"));
 }
 
-TEST_CASE("A node that does not lead answers the dashboard with 503 and names the leader",
-          "[node][admin][dashboard]")
+TEST_CASE("A node that does not lead answers the dashboard with 503 and names the leader", "[node][admin][dashboard]")
 {
     // `Gate()`'s `NotLeader` in HTTP's vocabulary. A 200 would present a follower's
     // partial registry as the whole fleet, and a redirect would name a port the
@@ -327,10 +325,10 @@ TEST_CASE("A node that does not lead answers the dashboard with 503 and names th
     Distributed::SchedulerService scheduler { clock, metrics };
     scheduler.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6676");
 
-    auto const routes = Node::MakeFleetRoutes(
-        Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
-        AdminCredential {},
-        Node::DashboardRefreshSeconds);
+    auto const routes =
+        Node::MakeFleetRoutes(Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
+                              AdminCredential {},
+                              Node::DashboardRefreshSeconds);
 
     AdminRequest const request { .path = "/fleet", .query = {}, .authorization = {} };
     auto const page = routes[0].handler(request);
@@ -344,8 +342,7 @@ TEST_CASE("A node that does not lead answers the dashboard with 503 and names th
     CHECK(document.body.contains(R"("role":"follower")"));
 }
 
-TEST_CASE("An endpoint with no credential serves the dashboard to anyone who reaches it",
-          "[node][admin][dashboard]")
+TEST_CASE("An endpoint with no credential serves the dashboard to anyone who reaches it", "[node][admin][dashboard]")
 {
     // What loopback gets, and the reason the startup rules refuse this shape on a
     // public bind: reaching loopback already means being on the machine.
@@ -354,11 +351,101 @@ TEST_CASE("An endpoint with no credential serves the dashboard to anyone who rea
     Distributed::SchedulerService scheduler { clock, metrics };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
 
-    auto const routes = Node::MakeFleetRoutes(
-        Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
-        AdminCredential {},
-        Node::DashboardRefreshSeconds);
+    auto const routes =
+        Node::MakeFleetRoutes(Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
+                              AdminCredential {},
+                              Node::DashboardRefreshSeconds);
 
     AdminRequest const anonymous { .path = "/fleet", .query = {}, .authorization = {} };
     CHECK(routes[0].handler(anonymous).status == "200 OK");
+}
+
+TEST_CASE("An admin surface nobody asked for starts nothing at all", "[node][admin][dashboard]")
+{
+    // No `--admin-listen` means no listener, and therefore no certificate read and
+    // no token read either. The flags that would then be a silent no-op are
+    // refused by StartupPolicyRejection long before this runs.
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    NodeConfig cfg;
+
+    auto surface = Node::StartAdminSurfaceOrExplain(cfg, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+    REQUIRE(surface.has_value());
+    CHECK(surface->endpoint == nullptr);
+}
+
+TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashboard]")
+{
+    // "invalid" tells an operator nothing about what to type instead, so each
+    // refusal names the flag it came from -- the standard the endpoint's own
+    // bad-spelling case already holds.
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+
+    SECTION("a listen spelling that is not an endpoint")
+    {
+        NodeConfig cfg;
+        cfg.adminListen = "not-a-port";
+
+        auto const surface = Node::StartAdminSurfaceOrExplain(cfg, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+        REQUIRE_FALSE(surface.has_value());
+        CHECK(surface.error().contains("--admin-listen"));
+        CHECK(surface.error().contains("not-a-port"));
+    }
+
+    SECTION("a credential file that cannot be read")
+    {
+        // The failure that must never degrade to "no credential".
+        Testing::ScratchDirectory const scratch { "admin-surface-token" };
+        NodeConfig cfg;
+        cfg.adminListen = "0"; // refused before the token is even reached
+        cfg.dashboardTokenFile = (scratch.Path() / "absent").string();
+
+        auto const surface = Node::StartAdminSurfaceOrExplain(cfg, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+        REQUIRE_FALSE(surface.has_value());
+    }
+}
+
+TEST_CASE("An admin surface serves the fleet only when there is a fleet to read", "[node][admin][dashboard]")
+{
+    // A node with no scheduler has no registry to report, so no fleet route is
+    // registered and `/fleet` stays a plain 404: a process with no fleet view
+    // offers no fleet route, rather than one answering with an empty fleet.
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    ManualClock clock;
+    Distributed::SchedulerService scheduler { clock, metrics };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+
+    // Bind a probe, take its port, release it: `Start` refuses port 0, and a fixed
+    // port is one more way to collide with whatever else a runner is doing.
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->BoundPort();
+    probe.reset();
+
+    NodeConfig cfg;
+    cfg.adminListen = std::format("127.0.0.1:{}", port);
+    cfg.dashboard = true;
+
+    SECTION("with no scheduler, /fleet is not a route")
+    {
+        auto surface = Node::StartAdminSurfaceOrExplain(cfg, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+        REQUIRE(surface.has_value());
+        REQUIRE(surface->endpoint != nullptr);
+        CHECK(surface->endpoint->BoundEndpoint() == std::format("127.0.0.1:{}", port));
+    }
+
+    SECTION("with a scheduler, the surface starts and serves it")
+    {
+        auto surface = Node::StartAdminSurfaceOrExplain(
+            cfg,
+            metrics,
+            WorkerShapedSnapshot(),
+            Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
+            logger);
+        REQUIRE(surface.has_value());
+        REQUIRE(surface->endpoint != nullptr);
+    }
 }

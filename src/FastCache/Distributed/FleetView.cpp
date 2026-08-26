@@ -79,10 +79,10 @@ namespace
     template <typename Subject>
     struct FleetColumn
     {
-        std::string_view name;   ///< JSON key AND header cell: one spelling, so the two cannot disagree.
-        std::string_view help;   ///< The header's tooltip; a reader's, so not in the JSON.
-        CellFormat format;       ///< How the page renders it.
-        FleetCell (*project)(Subject const&); ///< What to read.
+        std::string_view name;                   ///< JSON key AND header cell: one spelling, so the two cannot disagree.
+        std::string_view help;                   ///< The header's tooltip; a reader's, so not in the JSON.
+        CellFormat format { CellFormat::Count }; ///< How the page renders it.
+        FleetCell (*project)(Subject const&);    ///< What to read.
     };
 
     // ---------------------------------------------------------------- helpers
@@ -100,12 +100,24 @@ namespace
         {
             switch (ch)
             {
-                case '&': out += "&amp;"; break;
-                case '<': out += "&lt;"; break;
-                case '>': out += "&gt;"; break;
-                case '"': out += "&quot;"; break;
-                case '\'': out += "&#39;"; break;
-                default: out += ch; break;
+                case '&':
+                    out += "&amp;";
+                    break;
+                case '<':
+                    out += "&lt;";
+                    break;
+                case '>':
+                    out += "&gt;";
+                    break;
+                case '"':
+                    out += "&quot;";
+                    break;
+                case '\'':
+                    out += "&#39;";
+                    break;
+                default:
+                    out += ch;
+                    break;
             }
         }
         return out;
@@ -118,11 +130,21 @@ namespace
         {
             switch (ch)
             {
-                case '"': out += "\\\""; break;
-                case '\\': out += "\\\\"; break;
-                case '\n': out += "\\n"; break;
-                case '\r': out += "\\r"; break;
-                case '\t': out += "\\t"; break;
+                case '"':
+                    out += "\\\"";
+                    break;
+                case '\\':
+                    out += "\\\\";
+                    break;
+                case '\n':
+                    out += "\\n";
+                    break;
+                case '\r':
+                    out += "\\r";
+                    break;
+                case '\t':
+                    out += "\\t";
+                    break;
                 default:
                     if (static_cast<unsigned char>(ch) < 0x20)
                         out += std::format("\\u{:04x}", static_cast<unsigned>(static_cast<unsigned char>(ch)));
@@ -171,11 +193,15 @@ namespace
             return EscapeHtml(cell.text);
         switch (format)
         {
-            case CellFormat::Bytes: return HumanBytes(cell.number);
-            case CellFormat::Permille: return std::format("{:.1f}%", static_cast<double>(cell.number) / 10.0);
-            case CellFormat::Millis: return HumanMillis(cell.number);
+            case CellFormat::Bytes:
+                return HumanBytes(cell.number);
+            case CellFormat::Permille:
+                return std::format("{:.1f}%", static_cast<double>(cell.number) / 10.0);
+            case CellFormat::Millis:
+                return HumanMillis(cell.number);
             case CellFormat::Count:
-            case CellFormat::Text: break;
+            case CellFormat::Text:
+                break;
         }
         return std::format("{}", cell.number);
     }
@@ -185,9 +211,15 @@ namespace
     {
         switch (cell.kind)
         {
-            case FleetCell::Kind::Absent: out += "null"; break;
-            case FleetCell::Kind::Number: out += std::format("{}", cell.number); break;
-            case FleetCell::Kind::Text: AppendJsonString(out, cell.text); break;
+            case FleetCell::Kind::Absent:
+                out += "null";
+                break;
+            case FleetCell::Kind::Number:
+                out += std::format("{}", cell.number);
+                break;
+            case FleetCell::Kind::Text:
+                AppendJsonString(out, cell.text);
+                break;
         }
     }
 
@@ -227,9 +259,10 @@ namespace
             // Absent, not an empty string presented as a fact: a member that has
             // never led has not said, which is the normal state rather than a
             // fault.
-            .project = [](Cluster::ClusterMember const& m) {
-                return m.schedulerEndpoint.empty() ? FleetCell::Nothing() : FleetCell::Of(m.schedulerEndpoint);
-            } },
+            .project =
+                [](Cluster::ClusterMember const& m) {
+                    return m.schedulerEndpoint.empty() ? FleetCell::Nothing() : FleetCell::Of(m.schedulerEndpoint);
+                } },
     };
 
     /// What a node row shows, before its per-tier cache columns.
@@ -238,56 +271,52 @@ namespace
                                   .help = "host:port the machine answers on.",
                                   .format = CellFormat::Text,
                                   .project = [](NodeReport const& n) { return FleetCell::Of(n.endpoint); } },
-        FleetColumn<NodeReport> {
-            .name = "toolchains",
-            .help = "How many toolchains this one machine serves. Each is a separate registry entry.",
-            .format = CellFormat::Count,
-            .project = [](NodeReport const& n) { return FleetCell::Of(n.fingerprints.size()); } },
-        FleetColumn<NodeReport> {
-            .name = "cores",
-            .help = "Hardware threads. Absent when the machine could not read its own.",
-            .format = CellFormat::Count,
-            // Zero means "did not say" in `NodeCapacity`, and rendering it as 0
-            // would claim a machine with no CPU.
-            .project = [](NodeReport const& n) {
-                return n.capacity.logicalCores == 0 ? FleetCell::Nothing() : FleetCell::Of(n.capacity.logicalCores);
-            } },
+        FleetColumn<NodeReport> { .name = "toolchains",
+                                  .help = "How many toolchains this one machine serves. Each is a separate registry entry.",
+                                  .format = CellFormat::Count,
+                                  .project = [](NodeReport const& n) { return FleetCell::Of(n.fingerprints.size()); } },
+        FleetColumn<NodeReport> { .name = "cores",
+                                  .help = "Hardware threads. Absent when the machine could not read its own.",
+                                  .format = CellFormat::Count,
+                                  // Zero means "did not say" in `NodeCapacity`, and rendering it as 0
+                                  // would claim a machine with no CPU.
+                                  .project =
+                                      [](NodeReport const& n) {
+                                          return n.capacity.logicalCores == 0 ? FleetCell::Nothing()
+                                                                              : FleetCell::Of(n.capacity.logicalCores);
+                                      } },
         FleetColumn<NodeReport> { .name = "memory",
                                   .help = "Physical memory. Absent when the machine did not say.",
                                   .format = CellFormat::Bytes,
-                                  .project = [](NodeReport const& n) {
-                                      return n.capacity.totalMemoryBytes == 0
-                                                 ? FleetCell::Nothing()
-                                                 : FleetCell::Of(n.capacity.totalMemoryBytes);
-                                  } },
+                                  .project =
+                                      [](NodeReport const& n) {
+                                          return n.capacity.totalMemoryBytes == 0
+                                                     ? FleetCell::Nothing()
+                                                     : FleetCell::Of(n.capacity.totalMemoryBytes);
+                                      } },
         FleetColumn<NodeReport> {
             .name = "class",
             .help = "How hard this machine may be driven, and how many cores are held back for whoever uses it.",
             .format = CellFormat::Text,
-            .project = [](NodeReport const& n) {
-                auto const& traits = TraitsFor(n.capacity.nodeClass);
-                auto const reserve =
-                    n.capacity.reserveIsExplicit ? n.capacity.reservedCores : traits.reservedCores;
-                return FleetCell::Of(std::format("{} (reserve {})", traits.name, reserve));
-            } },
+            .project =
+                [](NodeReport const& n) {
+                    auto const& traits = TraitsFor(n.capacity.nodeClass);
+                    auto const reserve = n.capacity.reserveIsExplicit ? n.capacity.reservedCores : traits.reservedCores;
+                    return FleetCell::Of(std::format("{} (reserve {})", traits.name, reserve));
+                } },
         FleetColumn<NodeReport> { .name = "cpu-busy",
                                   .help = "Host-wide CPU in use, this fleet's work included. Absent when unread.",
                                   .format = CellFormat::Permille,
-                                  .project = [](NodeReport const& n) {
-                                      return FleetCell::Maybe(n.load.cpuBusyPermille);
-                                  } },
-        FleetColumn<NodeReport> { .name = "memory-available",
-                                  .help = "Memory a new compile could get. Absent when unread.",
-                                  .format = CellFormat::Bytes,
-                                  .project = [](NodeReport const& n) {
-                                      return FleetCell::Maybe(n.load.availableMemoryBytes);
-                                  } },
+                                  .project = [](NodeReport const& n) { return FleetCell::Maybe(n.load.cpuBusyPermille); } },
+        FleetColumn<NodeReport> {
+            .name = "memory-available",
+            .help = "Memory a new compile could get. Absent when unread.",
+            .format = CellFormat::Bytes,
+            .project = [](NodeReport const& n) { return FleetCell::Maybe(n.load.availableMemoryBytes); } },
         FleetColumn<NodeReport> { .name = "scratch-free",
                                   .help = "Room where compiles run. The limit that most often reaches zero.",
                                   .format = CellFormat::Bytes,
-                                  .project = [](NodeReport const& n) {
-                                      return FleetCell::Maybe(n.load.freeScratchBytes);
-                                  } },
+                                  .project = [](NodeReport const& n) { return FleetCell::Maybe(n.load.freeScratchBytes); } },
         FleetColumn<NodeReport> { .name = "cache-hit-rate",
                                   .help = "Reads this node's cache served. Absent when it has served none.",
                                   .format = CellFormat::Permille,
@@ -309,11 +338,10 @@ namespace
                                     .help = "The id this leader assigned at registration.",
                                     .format = CellFormat::Text,
                                     .project = [](WorkerReport const& w) { return FleetCell::Of(w.info.id); } },
-        FleetColumn<WorkerReport> {
-            .name = "toolchain",
-            .help = "Matched byte-for-byte. A job never crosses fingerprints.",
-            .format = CellFormat::Text,
-            .project = [](WorkerReport const& w) { return FleetCell::Of(w.info.fingerprint); } },
+        FleetColumn<WorkerReport> { .name = "toolchain",
+                                    .help = "Matched byte-for-byte. A job never crosses fingerprints.",
+                                    .format = CellFormat::Text,
+                                    .project = [](WorkerReport const& w) { return FleetCell::Of(w.info.fingerprint); } },
         FleetColumn<WorkerReport> { .name = "endpoint",
                                     .help = "host:port a client is sent to.",
                                     .format = CellFormat::Text,
@@ -330,23 +358,25 @@ namespace
             .name = "available",
             .help = "Compiles it may take right now. Below the registered count when something withdrew capacity.",
             .format = CellFormat::Count,
-            .project = [](WorkerReport const& w) {
-                return FleetCell::Of(AvailableSlots(w.info.capacity, w.info.slots, w.info.load));
-            } },
+            .project =
+                [](WorkerReport const& w) {
+                    return FleetCell::Of(AvailableSlots(w.info.capacity, w.info.slots, w.info.load));
+                } },
+        FleetColumn<WorkerReport> { .name = "limited-by",
+                                    .help = "Which ceiling withdrew the difference: the three have opposite fixes.",
+                                    .format = CellFormat::Text,
+                                    .project =
+                                        [](WorkerReport const& w) {
+                                            auto const ceilings =
+                                                SlotCeilingsFor(w.info.capacity, w.info.slots, w.info.load);
+                                            return FleetCell::Of(std::string { TraitsFor(ceilings.binding).name });
+                                        } },
         FleetColumn<WorkerReport> {
-            .name = "limited-by",
-            .help = "Which ceiling withdrew the difference: the three have opposite fixes.",
-            .format = CellFormat::Text,
-            .project = [](WorkerReport const& w) {
-                auto const ceilings = SlotCeilingsFor(w.info.capacity, w.info.slots, w.info.load);
-                return FleetCell::Of(std::string { TraitsFor(ceilings.binding).name });
-            } },
-        FleetColumn<WorkerReport> { .name = "heartbeat-age",
-                                    .help = "Since this entry last reported. A worker unheard-from is dropped.",
-                                    .format = CellFormat::Millis,
-                                    .project = [](WorkerReport const& w) {
-                                        return FleetCell::Of(static_cast<std::uint64_t>(w.heartbeatAge.count()));
-                                    } },
+            .name = "heartbeat-age",
+            .help = "Since this entry last reported. A worker unheard-from is dropped.",
+            .format = CellFormat::Millis,
+            .project =
+                [](WorkerReport const& w) { return FleetCell::Of(static_cast<std::uint64_t>(w.heartbeatAge.count())); } },
     };
 
     /// The per-tier cache columns, rendered once per tier a member actually runs.
@@ -358,7 +388,7 @@ namespace
     {
         std::string_view suffix;
         std::string_view help;
-        CellFormat format;
+        CellFormat format { CellFormat::Count };
         FleetCell (*project)(NodeReport const&, StorageTier);
     };
 
@@ -366,17 +396,19 @@ namespace
         TierColumn { .suffix = "items",
                      .help = "Entries this tier holds.",
                      .format = CellFormat::Count,
-                     .project = [](NodeReport const& n, StorageTier tier) {
-                         auto const& usage = n.load.cache.tiers[static_cast<std::size_t>(tier)];
-                         return usage.has_value() ? FleetCell::Of(usage->itemCount) : FleetCell::Nothing();
-                     } },
+                     .project =
+                         [](NodeReport const& n, StorageTier tier) {
+                             auto const& usage = n.load.cache.tiers[static_cast<std::size_t>(tier)];
+                             return usage.has_value() ? FleetCell::Of(usage->itemCount) : FleetCell::Nothing();
+                         } },
         TierColumn { .suffix = "bytes",
                      .help = "Bytes this tier holds.",
                      .format = CellFormat::Bytes,
-                     .project = [](NodeReport const& n, StorageTier tier) {
-                         auto const& usage = n.load.cache.tiers[static_cast<std::size_t>(tier)];
-                         return usage.has_value() ? FleetCell::Of(usage->bytesUsed) : FleetCell::Nothing();
-                     } },
+                     .project =
+                         [](NodeReport const& n, StorageTier tier) {
+                             auto const& usage = n.load.cache.tiers[static_cast<std::size_t>(tier)];
+                             return usage.has_value() ? FleetCell::Of(usage->bytesUsed) : FleetCell::Nothing();
+                         } },
         TierColumn { .suffix = "budget",
                      .help = "What this tier may hold. Absent means no such tier; unbounded means no ceiling.",
                      .format = CellFormat::Bytes,
@@ -384,19 +416,21 @@ namespace
                      // "this node runs no tier of that kind", zero is "a tier with
                      // no ceiling". A dashboard that flattened them would render
                      // both as the same thing.
-                     .project = [](NodeReport const& n, StorageTier tier) {
-                         auto const& limit = n.capacity.cache.tierBytesLimit[static_cast<std::size_t>(tier)];
-                         if (!limit.has_value())
-                             return FleetCell::Nothing();
-                         return *limit == 0 ? FleetCell::Of(std::string { "unbounded" }) : FleetCell::Of(*limit);
-                     } },
+                     .project =
+                         [](NodeReport const& n, StorageTier tier) {
+                             auto const& limit = n.capacity.cache.tierBytesLimit[static_cast<std::size_t>(tier)];
+                             if (!limit.has_value())
+                                 return FleetCell::Nothing();
+                             return *limit == 0 ? FleetCell::Of(std::string { "unbounded" }) : FleetCell::Of(*limit);
+                         } },
         TierColumn { .suffix = "evictions",
                      .help = "Entries this tier dropped to stay within its budget.",
                      .format = CellFormat::Count,
-                     .project = [](NodeReport const& n, StorageTier tier) {
-                         auto const& usage = n.load.cache.tiers[static_cast<std::size_t>(tier)];
-                         return usage.has_value() ? FleetCell::Of(usage->evictions) : FleetCell::Nothing();
-                     } },
+                     .project =
+                         [](NodeReport const& n, StorageTier tier) {
+                             auto const& usage = n.load.cache.tiers[static_cast<std::size_t>(tier)];
+                             return usage.has_value() ? FleetCell::Of(usage->evictions) : FleetCell::Nothing();
+                         } },
     };
 
     /// The name a tier column carries, e.g. `memory-items`.
@@ -419,10 +453,14 @@ namespace
     {
         switch (role)
         {
-            case SchedulerRole::Leader: return "leader";
-            case SchedulerRole::Follower: return "follower";
-            case SchedulerRole::Undecided: return "undecided";
-            case SchedulerRole::Last: break;
+            case SchedulerRole::Leader:
+                return "leader";
+            case SchedulerRole::Follower:
+                return "follower";
+            case SchedulerRole::Undecided:
+                return "undecided";
+            case SchedulerRole::Last:
+                break;
         }
         return "undecided";
     }
@@ -513,7 +551,7 @@ namespace
             for (auto const& column: columns)
             {
                 auto const cell = column.project(subject);
-                auto const absent = cell.kind == FleetCell::Kind::Absent ? R"( class="absent")" : "";
+                auto const* const absent = cell.kind == FleetCell::Kind::Absent ? R"( class="absent")" : "";
                 out += std::format("<td{}>{}</td>", absent, CellAsText(cell, column.format));
             }
             out += "</tr>";
@@ -599,10 +637,9 @@ std::string RenderFleetJson(FleetSnapshot const& snapshot)
             out += ',';
         AppendJsonString(out, row.key);
         out += ':';
-        out += std::format("{}",
-                           static_cast<std::size_t>(index) < snapshot.leases.size()
-                               ? snapshot.leases[static_cast<std::size_t>(index)]
-                               : 0);
+        out += std::format(
+            "{}",
+            static_cast<std::size_t>(index) < snapshot.leases.size() ? snapshot.leases[static_cast<std::size_t>(index)] : 0);
     }
     out += '}';
 
@@ -736,7 +773,7 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, unsigned refreshSecon
                 for (auto const& column: TierColumns)
                 {
                     auto const cell = column.project(node, tier.tier);
-                    auto const absent = cell.kind == FleetCell::Kind::Absent ? R"( class="absent")" : "";
+                    auto const* const absent = cell.kind == FleetCell::Kind::Absent ? R"( class="absent")" : "";
                     out += std::format("<td{}>{}</td>", absent, CellAsText(cell, column.format));
                 }
             }
@@ -755,13 +792,10 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, unsigned refreshSecon
            "</th></tr></thead><tbody>";
     for (auto const& [index, row]: std::views::enumerate(LeaseOutcomeTable))
     {
-        auto const value = static_cast<std::size_t>(index) < snapshot.leases.size()
-                               ? snapshot.leases[static_cast<std::size_t>(index)]
-                               : 0;
-        out += std::format("<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-                           EscapeHtml(row.label),
-                           value,
-                           EscapeHtml(row.meaning));
+        auto const value =
+            static_cast<std::size_t>(index) < snapshot.leases.size() ? snapshot.leases[static_cast<std::size_t>(index)] : 0;
+        out +=
+            std::format("<tr><td>{}</td><td>{}</td><td>{}</td></tr>", EscapeHtml(row.label), value, EscapeHtml(row.meaning));
     }
     out += "</tbody></table>";
     out += std::format(R"(<p class="note">{}</p></div>)", EscapeHtml(LeaseNote));

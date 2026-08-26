@@ -310,17 +310,17 @@ std::vector<NodeReport> WorkerRegistry::NodeReports() const
         if (!IsLive(entry, now))
             continue;
 
-        auto const [slot, inserted] = byEndpoint.try_emplace(
-            entry.info.endpoint,
-            Candidate { .report = NodeReport { .endpoint = entry.info.endpoint,
-                                               .fingerprints = { entry.info.fingerprint },
-                                               .capacity = entry.info.capacity,
-                                               .load = entry.info.load,
-                                               .registeredSlots = entry.info.slots,
-                                               .fleetJobsInFlight = entry.info.inFlight,
-                                               .heartbeatAge = AgeOf(entry.lastSeen, now) },
-                        .lastSeen = entry.lastSeen,
-                        .contributorSaysCache = SaysAnything(entry.info.load.cache) });
+        auto const [slot, inserted] =
+            byEndpoint.try_emplace(entry.info.endpoint,
+                                   Candidate { .report = NodeReport { .endpoint = entry.info.endpoint,
+                                                                      .fingerprints = { entry.info.fingerprint },
+                                                                      .capacity = entry.info.capacity,
+                                                                      .load = entry.info.load,
+                                                                      .registeredSlots = entry.info.slots,
+                                                                      .fleetJobsInFlight = entry.info.inFlight,
+                                                                      .heartbeatAge = AgeOf(entry.lastSeen, now) },
+                                               .lastSeen = entry.lastSeen,
+                                               .contributorSaysCache = SaysAnything(entry.info.load.cache) });
         if (inserted)
             continue;
 
@@ -339,8 +339,7 @@ std::vector<NodeReport> WorkerRegistry::NodeReports() const
         // that has not, and among those the most recently heard from wins. The
         // order `_workers` happens to iterate in decides nothing.
         auto const saysCache = SaysAnything(entry.info.load.cache);
-        auto const better =
-            saysCache != held.contributorSaysCache ? saysCache : entry.lastSeen > held.lastSeen;
+        auto const better = saysCache != held.contributorSaysCache ? saysCache : entry.lastSeen > held.lastSeen;
         if (better)
         {
             held.report.capacity = entry.info.capacity;
