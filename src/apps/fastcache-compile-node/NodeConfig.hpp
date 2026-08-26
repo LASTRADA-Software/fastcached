@@ -110,18 +110,6 @@ struct NodeConfig
     /// operator's decision, not this program's.
     std::string adminListen;
 
-    /// Whether the admin surface also serves the fleet dashboard.
-    ///
-    /// Off unless asked for, like every other surface this program serves. The page
-    /// lists every member's hostname, endpoint and capacity -- a fleet map -- so an
-    /// operator turns it on deliberately rather than acquiring it by naming a port
-    /// they wanted `/metrics` on.
-    ///
-    /// Served on `--admin-listen`, and answered in full only while this node LEADS:
-    /// a follower's registry holds whatever registered against it rather than the
-    /// fleet, so it renders a page naming the leader instead of a partial picture.
-    bool dashboard { false };
-
     /// File holding the credential the dashboard requires, or empty for none.
     ///
     /// A FILE and not a flag, for the reason `--cluster-key-file` is one: a command
@@ -134,21 +122,6 @@ struct NodeConfig
     /// port with no credential is what this flag exists to stop somebody doing by
     /// accident.
     std::filesystem::path dashboardTokenFile;
-
-    /// Generate a self-signed certificate at startup instead of naming one.
-    ///
-    /// For an internal deployment where obtaining a certificate is the only thing
-    /// between an operator and an encrypted admin surface. It is a boolean where
-    /// `--tls-cert` is a path, and that is not a hole in the "TLS is on by naming
-    /// material" rule but the same rule kept: the point of that rule is that no
-    /// configuration can ask for TLS this node cannot then serve, and asking for
-    /// this one *produces* the material.
-    ///
-    /// **Confidentiality, not identity.** Nothing signs it, so a client that has
-    /// not been told its fingerprint out of band cannot tell this node from
-    /// anything else answering on that address. The credential is still required
-    /// off loopback for exactly that reason.
-    bool tlsSelfSigned { false };
 
     /// Certificate the admin surface serves TLS with, or empty for plaintext.
     ///
@@ -240,7 +213,6 @@ struct NodeConfig
 
     std::string token;
     std::string user;
-    LogLevel logLevel { LogLevel::Info };
 
     /// This node's identity in the cluster, or empty to run without consensus.
     ///
@@ -314,11 +286,55 @@ struct NodeConfig
     /// would make installing one silently displace the other.
     std::string serviceName { "FastCacheCompileNode" };
 
+    /// Where a POSIX daemonized run writes its pid, empty for none.
+    std::string pidfile;
+
+    // ---------------------------------------------------------------------------
+    // Every member below is one byte wide, and they are kept in a single run rather
+    // than beside the setting each belongs to.
+    //
+    // This struct is almost entirely `std::string` and `std::filesystem::path`, so a
+    // lone `bool` or byte-wide enum between two of them costs SEVEN bytes of padding
+    // rather than one. Four of them scattered through it -- `dashboard`,
+    // `tlsSelfSigned`, `logLevel`, `serviceScope` -- put the struct 32 bytes over
+    // `clang-analyzer-optin.performance.Padding`'s 24-byte budget and failed the
+    // build, which is why they live here and not where they read most naturally.
+    //
+    // Add the next flag HERE rather than next to what it configures. Its doc comment
+    // is what carries the reader across; the position is a layout constraint.
+
+    /// How chatty the log is.
+    LogLevel logLevel { LogLevel::Info };
+
     /// Which supervisor domain `--install-service` registers into.
     ServiceScope serviceScope { ServiceScope::System };
 
-    /// Where a POSIX daemonized run writes its pid, empty for none.
-    std::string pidfile;
+    /// Whether the admin surface also serves the fleet dashboard.
+    ///
+    /// Off unless asked for, like every other surface this program serves. The page
+    /// lists every member's hostname, endpoint and capacity -- a fleet map -- so an
+    /// operator turns it on deliberately rather than acquiring it by naming a port
+    /// they wanted `/metrics` on.
+    ///
+    /// Served on `--admin-listen`, and answered in full only while this node LEADS:
+    /// a follower's registry holds whatever registered against it rather than the
+    /// fleet, so it renders a page naming the leader instead of a partial picture.
+    bool dashboard { false };
+
+    /// Generate a self-signed certificate at startup instead of naming one.
+    ///
+    /// For an internal deployment where obtaining a certificate is the only thing
+    /// between an operator and an encrypted admin surface. It is a boolean where
+    /// `--tls-cert` is a path, and that is not a hole in the "TLS is on by naming
+    /// material" rule but the same rule kept: the point of that rule is that no
+    /// configuration can ask for TLS this node cannot then serve, and asking for
+    /// this one *produces* the material.
+    ///
+    /// **Confidentiality, not identity.** Nothing signs it, so a client that has
+    /// not been told its fingerprint out of band cannot tell this node from
+    /// anything else answering on that address. The credential is still required
+    /// off loopback for exactly that reason.
+    bool tlsSelfSigned { false };
 
     /// Admit every caller to the fleet, rather than only `--fleet-member` hosts.
     ///

@@ -283,6 +283,8 @@ what differs between compilers, standard libraries, hosts and tool versions.
   a configure.
 - A sanitizer that is on in the cache is not one that is on in the build — a tool
   that silently does nothing is worse than one that is visibly off.
+- Every `bool` and byte-wide enum in a config struct lives in one run: one between two
+  8-aligned members costs seven bytes, and clang-tidy's padding budget fails the build.
 - A table indexed by an enumerator is `EnumTable<Enum, Row>` + `RowsInEnumeratorOrder`.
   A length anchored on an enumerator by name is a guard that fires only when
   nothing is wrong.

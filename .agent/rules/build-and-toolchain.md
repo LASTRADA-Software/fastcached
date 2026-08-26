@@ -126,6 +126,28 @@ determinism rests on.
   `ExitUsage` for the same reason: seven copies of a magic exit code is the
   table-shaped defect this list keeps recording.
 
+- **A `bool` in the middle of a config struct costs seven bytes, and four of them
+  fail the build.** `clang-analyzer-optin.performance.Padding` permits 24 bytes more
+  padding than an optimal field order would give, and `NodeConfig` is almost entirely
+  `std::string` and `std::filesystem::path` -- so a one-byte member between two of
+  those is padded out to a full eight rather than costing one. Adding `--dashboard`
+  and `--tls-self-signed` beside the settings they configure took the struct to 38
+  bytes against an optimal 6, and the `clang-tidy` job -- the only one that runs the
+  analyzer -- rejected it.
+
+  Keep every `bool` and byte-wide enum in **one run**, which that struct already half
+  did with its trailing flags. Two of the four moved were pre-existing (`logLevel`,
+  `serviceScope`), and that was the point: moving only the two new ones lands on
+  *exactly* 24, which passes and leaves the next contributor's `bool` to break it
+  again. Moving all four lands on 8. A field's position there is a layout constraint,
+  not where it reads most naturally, so the run says so in a comment.
+
+  The check is `BaselinePad - OptimalPad > 24` and both terms are arithmetic over
+  `sizeof`, so it reproduces **without the analyzer**: sum the field sizes, subtract
+  from `sizeof(T)`, and compare against the same sum laid out by descending
+  alignment. Worth knowing because it gives an exact number where re-running CI gives
+  a yes or no -- and because a host without the pinned clang-tidy can still check it.
+
 - **A `static_assert` that anchors a table's length on an enumerator BY NAME is a
   guard that fires only when nothing is wrong.** Casting an enumerator to an index
   is safe exactly while the table holds one row per enumerator in enumerator order,
