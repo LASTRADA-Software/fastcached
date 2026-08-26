@@ -191,6 +191,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A cluster that has elected is not one that has formed. Until every member
   attaches, pre-vote refuses nothing and any stall re-elects — assert leadership
   stability only after formation, and log the term or nothing explains it.
+- A leader and a follower stamp the same link half a round trip apart, so a shared
+  window never bought a shared answer. A non-leader decides a pre-vote from its own
+  `_knownLeader` and election deadline, never from a timestamp.
 
 **[`.agent/rules/wire-and-protocol.md`](.agent/rules/wire-and-protocol.md)** —
 framing, the auth gate, sockets, dialling and coroutine lifetime. Before
