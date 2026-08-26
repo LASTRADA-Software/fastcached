@@ -427,3 +427,82 @@ TEST_CASE("Collecting a fleet without a cluster is a snapshot, not a crash", "[d
     CHECK_FALSE(snapshot.cluster.has_value());
     CHECK(snapshot.nodes.empty());
 }
+
+TEST_CASE("Fleet capacity is summed per machine and splits busy from withheld", "[distributed][fleetview]")
+{
+    FleetSnapshot snapshot;
+    snapshot.role = SchedulerRole::Leader;
+    // Two machines, and one of them has a ceiling below what it registered: a
+    // host whose CPU is doing somebody else's work.
+    auto busy = Machine("10.0.0.1:7100", 16);
+    busy.registeredSlots = 16;
+    busy.fleetJobsInFlight = 4;
+    busy.load.inFlight = 4;
+    busy.load.cpuBusyPermille = 900; // most of the machine is not ours
+    snapshot.nodes.push_back(busy);
+
+    auto idle = Machine("10.0.0.2:7100", 8);
+    idle.registeredSlots = 8;
+    idle.fleetJobsInFlight = 0;
+    idle.load = NodeLoad {};
+    snapshot.nodes.push_back(idle);
+
+    auto const totals = TotalsFor(snapshot);
+
+    CHECK(totals.registered == 24);
+    CHECK(totals.inFlight == 4);
+    // The whole point of the split: what is not running is not therefore
+    // available, and the difference is what an operator has to act on.
+    CHECK(totals.inFlight + totals.free + totals.withheld == totals.registered);
+    CHECK(totals.withheld > 0);
+}
+
+TEST_CASE("Fleet capacity saturates rather than wrapping", "[distributed][fleetview]")
+{
+    // The three parts come off a heartbeat a machine may have sent at different
+    // moments, so a ceiling can legitimately exceed what is left after in-flight
+    // work. These are unsigned: wrapping would draw a bar four billion slots wide.
+    FleetSnapshot snapshot;
+    snapshot.role = SchedulerRole::Leader;
+    auto node = Machine("10.0.0.1:7100", 64);
+    node.registeredSlots = 1;
+    node.fleetJobsInFlight = 8;
+    node.load = NodeLoad {};
+    node.load.inFlight = 8;
+    snapshot.nodes.push_back(node);
+
+    auto const totals = TotalsFor(snapshot);
+    CHECK(totals.withheld == 0);
+}
+
+TEST_CASE("A fleet with no machines has no capacity to draw", "[distributed][fleetview]")
+{
+    FleetSnapshot snapshot;
+    snapshot.role = SchedulerRole::Leader;
+
+    auto const totals = TotalsFor(snapshot);
+    CHECK(totals.registered == 0);
+    CHECK(totals.inFlight == 0);
+    CHECK(totals.free == 0);
+    CHECK(totals.withheld == 0);
+
+    // And the page says so rather than rendering an empty meter.
+    auto const html = RenderFleetHtml(snapshot, 0);
+    CHECK(html.contains("No machine has registered"));
+}
+
+TEST_CASE("The page dresses a stale heartbeat differently from a fresh one", "[distributed][fleetview]")
+{
+    auto snapshot = LeadingSnapshot();
+    REQUIRE(!snapshot.nodes.empty());
+    snapshot.nodes[0].heartbeatAge = std::chrono::milliseconds { 250 };
+
+    auto const fresh = RenderFleetHtml(snapshot, 0);
+    CHECK(fresh.contains("pill--ok"));
+
+    snapshot.nodes[0].heartbeatAge = std::chrono::minutes { 5 };
+    auto const stale = RenderFleetHtml(snapshot, 0);
+    // Everything on that row is as old as this number, which is the reason the
+    // column exists at all -- so the row has to look different.
+    CHECK(stale.contains("pill--warn"));
+}

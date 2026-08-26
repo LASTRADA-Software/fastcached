@@ -800,11 +800,12 @@ What it shows, and why each part is split the way it is:
 
 | Section | What it answers |
 |---|---|
-| Members | Who the cluster has agreed on, and where each answers. A member that has never led shows no scheduler endpoint, because it has not said. |
+| Fleet capacity | One meter over every registered slot, split three ways: compiling, free, and **withheld** by a ceiling. The third is the one to read first — slots a ceiling withdrew are not this fleet being busy, so buying machines does not return them. |
 | Machines | One row **per machine**, not per toolchain: cores, memory, free scratch, class and reserve, cache hit rate, heartbeat age. |
-| Caches | Items, bytes, budget and evictions **per tier**. A tier no member runs has no column at all. |
 | Workers | One row per `(toolchain, endpoint)` registry entry: slots, in flight, available — and *which* limit withdrew the difference. |
-| Leases | Granted, and refused split four ways. |
+| Why requests were refused | Granted, and refused split four ways, each with what it tells you to do. |
+| Cache tiers | Items, bytes, budget and evictions **per tier**. A tier no member runs has no column at all, and a fleet where nobody runs one says so rather than showing an empty table. |
+| Members | Who the cluster has agreed on, and where each answers. A member that has never led shows no scheduler endpoint, because it has not said. |
 
 Three of those distinctions cost real debugging time when they are collapsed:
 

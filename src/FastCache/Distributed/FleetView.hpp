@@ -128,6 +128,31 @@ struct FleetSources
 /// one machine's numbers.
 /// @param sources What to read.
 /// @return The snapshot.
+/// The fleet's capacity, split the way an operator has to act on it.
+///
+/// Three numbers rather than one, because they have three different fixes. Slots
+/// this fleet is using say buy more machines; slots a ceiling withdrew say the
+/// machines are busy with somebody else's work or out of scratch, and buying more
+/// would not have helped. Collapsing them into "utilisation" is what hides which
+/// of those a fleet is suffering from -- the same reason `LeaseOutcomeTable` keeps
+/// its five rows apart.
+struct FleetTotals
+{
+    std::uint32_t registered { 0 }; ///< Slots the machines registered with.
+    std::uint32_t inFlight { 0 };   ///< This fleet's compiles running right now.
+    std::uint32_t free { 0 };       ///< Slots a compile could start on right now.
+    std::uint32_t withheld { 0 };   ///< Registered, but behind a ceiling: not ours to use.
+};
+
+/// Sum the capacity split across machines.
+///
+/// Over `NodeReports()` and never over worker entries: a machine serving two
+/// toolchains is two registry entries carrying one machine's cores, so summing
+/// there reports a fleet twice the size of the one you own.
+/// @param snapshot The gathered fleet.
+/// @return The split, saturating rather than wrapping if a ceiling exceeds what was registered.
+[[nodiscard]] FleetTotals TotalsFor(FleetSnapshot const& snapshot) noexcept;
+
 [[nodiscard]] FleetSnapshot CollectFleet(FleetSources const& sources);
 
 /// Render a fleet snapshot as JSON.
