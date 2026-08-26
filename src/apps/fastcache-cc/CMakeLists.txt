@@ -131,6 +131,7 @@ set(_fc_cc_sources
     ReplayGuard.cpp
     RootReconciler.cpp
     Stats.cpp
+    ToolchainDiscovery.cpp
     ToolchainFingerprint.cpp
     ToolchainHost.cpp
     ToolchainProbe.cpp
@@ -251,6 +252,7 @@ if(FASTCACHED_BUILD_TESTS)
         RootReconciler_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp
+        ToolchainDiscovery_test.cpp
         ToolchainFingerprint_test.cpp
         ToolchainHost_test.cpp
         ToolchainProbe_test.cpp

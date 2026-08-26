@@ -28,6 +28,7 @@ set(_fc_node_shared
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/EndpointDial.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ProcessRunner.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/Stats.cpp"
+    "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainDiscovery.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainFingerprint.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainHost.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainProbe.cpp"
