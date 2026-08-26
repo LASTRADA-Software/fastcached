@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -121,6 +122,12 @@ class ScratchDirectory
     /// and a fixture that silently fails to create a parent produces a test that
     /// passes by finding nothing.
     ///
+    /// **Throws on failure**, which is the point rather than an afterthought. A
+    /// fixture that silently fails to create what a case is about to look for
+    /// produces a test that passes by finding nothing -- and a `Write` that
+    /// discarded its `error_code` would be that fixture. Catch2 reports the throw
+    /// as a failure of the case that made it, which is where it belongs.
+    ///
     /// @param relative Path relative to this directory.
     /// @param contents What to write; an empty string still creates the file.
     /// @return The path written, so a case can name it in an assertion.
@@ -129,8 +136,17 @@ class ScratchDirectory
         auto const target = *this / relative;
         auto error = std::error_code {};
         std::filesystem::create_directories(target.parent_path(), error);
+        if (error)
+            throw std::runtime_error { std::format(
+                "scratch: cannot create {}: {}", target.parent_path().string(), error.message()) };
+
         std::ofstream out { target, std::ios::binary };
         out << contents;
+        // Flushed and checked here rather than left to the destructor, whose failure
+        // nothing observes.
+        out.close();
+        if (!out)
+            throw std::runtime_error { std::format("scratch: cannot write {}", target.string()) };
         return target;
     }
 

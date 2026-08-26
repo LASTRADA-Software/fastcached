@@ -35,6 +35,13 @@ namespace FastCache::Cc
 /// Discovery is best-effort by construction -- a machine simply does not have most
 /// of these layouts -- so an error channel would carry "this host is not a Mac" on
 /// every call and mean nothing.
+///
+/// **Implementations must tolerate concurrent calls.** The compile node
+/// fingerprints several toolchains at once and every one of them asks this seam
+/// about the machine, so the same object is reached from up to four threads. Both
+/// implementations already are: the real one holds nothing across a call, and the
+/// scripted one is written before any case reads it. Stated here because the
+/// requirement is otherwise invisible at the point somebody writes a third.
 class IToolchainHost
 {
   public:
@@ -141,6 +148,8 @@ class IToolchainHost
 /// copy of any of the three.
 ///
 /// @return A host answering for the machine this process runs on.
+[[nodiscard]] std::unique_ptr<IToolchainHost> MakeToolchainHost();
+
 /// Join a directory and a relative path into ONE spelling.
 ///
 /// Not `std::filesystem::path::operator/`, and the difference is the whole reason
@@ -162,7 +171,5 @@ class IToolchainHost
 /// @param relative What to hang under it; empty yields the directory alone.
 /// @return The joined path, `/`-separated throughout.
 [[nodiscard]] std::string JoinPath(std::string_view directory, std::string_view relative);
-
-[[nodiscard]] std::unique_ptr<IToolchainHost> MakeToolchainHost();
 
 } // namespace FastCache::Cc

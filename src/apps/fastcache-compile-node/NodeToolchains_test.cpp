@@ -2,6 +2,7 @@
 #include "NodeToolchains.hpp"
 
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Platform/EnvironmentTestUtils.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -10,9 +11,11 @@
 #include <ranges>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <ToolchainHostTestUtils.hpp>
+#include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -22,6 +25,37 @@ using FastCache::Testing::Unwrap;
 
 namespace
 {
+/// The variable `StateDirectory()` resolves the fingerprint cache from.
+///
+/// The same `#if` `StateDirectory` itself carries: these are genuinely different
+/// variables per platform rather than one spelled two ways.
+#if defined(_WIN32)
+constexpr char const* StateVariable = "LOCALAPPDATA";
+#else
+constexpr char const* StateVariable = "XDG_STATE_HOME";
+#endif
+
+/// A private fingerprint cache, for the duration of one case.
+///
+/// `ResolveToolchains` fingerprints through `CachedToolchainFingerprint`, which
+/// READS AND WRITES a cache under the user's state directory. Without this, these
+/// cases scribble in the developer's real one -- and worse, take a different path
+/// depending on whether it already holds an entry for `/usr/bin/gcc`, which is a
+/// test whose result depends on what the machine did yesterday.
+class ScopedStateDir
+{
+  public:
+    ScopedStateDir():
+        _dir { "fc-node-tc" },
+        _env { StateVariable, _dir.Path().string() }
+    {
+    }
+
+  private:
+    FastCache::Testing::ScratchDirectory _dir;
+    FastCache::Testing::ScopedEnv _env;
+};
+
 /// A discovery that reports whatever a case wrote down.
 ///
 /// The reason `IToolchainDiscovery` is an interface rather than a call to the
@@ -80,6 +114,22 @@ class SpawnScript final: public Cc::IProcessRunner
         return *this;
     }
 
+    /// Make @p compiler report @p banner rather than one naming itself.
+    ///
+    /// Two compilers CAN report the same version line: `clang` and `clang++` do,
+    /// because clang's banner does not echo its own argv[0] the way a GNU driver's
+    /// does. Verified: both print `Ubuntu clang version 20.1.2 (...)`, while `gcc`,
+    /// `g++`, `cc` and `c++` each name themselves.
+    ///
+    /// @param compiler The path.
+    /// @param banner What it should say.
+    /// @return This runner, for chaining.
+    SpawnScript& Banner(std::string compiler, std::string banner)
+    {
+        _banners.emplace_back(std::move(compiler), std::move(banner));
+        return *this;
+    }
+
     Cc::CompileRun RunCaptureCombined(std::span<std::string const> argv) override
     {
         if (!argv.empty() && std::ranges::contains(_unspawnable, argv.front()))
@@ -95,6 +145,9 @@ class SpawnScript final: public Cc::IProcessRunner
         auto const named = argv.empty() ? std::string {} : argv.front();
         if (std::ranges::contains(_speechless, named))
             return Cc::CompileRun { .exitCode = 2, .out = {}, .err = {} };
+        for (auto const& [compiler, banner]: _banners)
+            if (compiler == named)
+                return Cc::CompileRun { .exitCode = 0, .out = banner + "\n", .err = {} };
         return Cc::CompileRun { .exitCode = 0, .out = "fake 1.0 (" + named + ")\n", .err = {} };
     }
 
@@ -106,6 +159,7 @@ class SpawnScript final: public Cc::IProcessRunner
   private:
     std::vector<std::string> _unspawnable;
     std::vector<std::string> _speechless;
+    std::vector<std::pair<std::string, std::string>> _banners;
 };
 
 /// A `cl.exe` in the layout every Visual Studio since 2017 installs.
@@ -170,6 +224,7 @@ TEST_CASE("NodeToolchains: a discovered compiler is not re-parsed as an override
     FixedDiscovery discovery { { Candidate("/opt/gcc=13/bin/gcc") } };
     SpawnScript runner;
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
@@ -188,6 +243,7 @@ TEST_CASE("NodeToolchains: a discovered path that would abort the operator parse
     FixedDiscovery discovery { { Candidate("/opt/=weird/bin/gcc"), Candidate("/opt/trailing=") } };
     SpawnScript runner;
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
@@ -207,6 +263,7 @@ TEST_CASE("NodeToolchains: a discovered compiler that cannot be spawned is dropp
     SpawnScript runner;
     runner.Unspawnable("/usr/bin/broken-cc");
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
@@ -231,6 +288,7 @@ TEST_CASE("NodeToolchains: an operator-named compiler is never spawn-probed", "[
     SpawnScript runner;
     runner.Unspawnable("/opt/cross/bin/aarch64-none-elf-gcc");
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
@@ -250,6 +308,7 @@ TEST_CASE("NodeToolchains: the operator's list wins whole", "[node][toolchains]"
     FixedDiscovery discovery { { Candidate("/usr/bin/gcc"), Candidate("/usr/bin/clang") } };
     SpawnScript runner;
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
@@ -267,6 +326,7 @@ TEST_CASE("NodeToolchains: discovery turned off with nothing named is refused", 
     NodeConfig const cfg = Startable();
     SpawnScript runner;
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     CHECK_FALSE(ResolveToolchains(cfg, nullptr, runner, host, logger).has_value());
@@ -286,6 +346,7 @@ TEST_CASE("NodeToolchains: a machine with no compiler resolves to nothing", "[no
     FixedDiscovery discovery { {} };
     SpawnScript runner;
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, logger).has_value());
@@ -309,6 +370,7 @@ TEST_CASE("NodeToolchains: every discovered compiler that cannot run leaves noth
     SpawnScript runner;
     runner.Unspawnable("/usr/bin/gcc").Unspawnable("/usr/bin/g++");
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, logger).has_value());
@@ -321,6 +383,7 @@ TEST_CASE("NodeToolchains: a malformed --toolchain is refused, naming the value"
     FixedDiscovery discovery { {} };
     SpawnScript runner;
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, logger).has_value());
@@ -342,6 +405,7 @@ TEST_CASE("NodeToolchains: many toolchains are all identified, and reported in o
     FixedDiscovery discovery { candidates };
     SpawnScript runner;
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
@@ -419,6 +483,7 @@ TEST_CASE("NodeToolchains: an identity that names no compiler is refused, not re
     // A service's view of the machine: the compiler is right there, and nothing says
     // where its headers are -- no layout, no `INCLUDE`.
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, logger).has_value());
@@ -443,6 +508,7 @@ TEST_CASE("NodeToolchains: an unaskable compiler with a locatable include tree i
     runner.Speechless(std::string { MsvcCompiler });
     ScriptedToolchainHost host;
     DescribeMsvcLayout(host);
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
@@ -462,6 +528,7 @@ TEST_CASE("NodeToolchains: an operator's pinned identity is never second-guessed
     SpawnScript runner;
     runner.Speechless(std::string { MsvcCompiler });
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     auto const resolved = ResolveToolchains(cfg, nullptr, runner, host, logger);
@@ -481,10 +548,64 @@ TEST_CASE("NodeToolchains: a driver that answers is kept whatever its roots", "[
     FixedDiscovery discovery { { Candidate("/usr/bin/gcc") } };
     SpawnScript runner;
     ScriptedToolchainHost host;
+    ScopedStateDir const state;
     CapturingLogger logger;
 
     auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
     REQUIRE(resolved.has_value());
     CHECK(Unwrap(resolved).size() == 1);
     CHECK_FALSE(Logged(logger, "refusing"));
+}
+
+TEST_CASE("NodeToolchains: two names for one toolchain are served once, and said so", "[node][toolchains]")
+{
+    // `clang` and `clang++` reach the SAME fingerprint. Clang's banner does not
+    // echo its own argv[0] the way a GNU driver's does -- both print
+    // `Ubuntu clang version 20.1.2 (...)` -- and both classify as `Flavor::Clang`,
+    // whose include probe forces `-x c++`, so the roots match too. The map keeps
+    // the first, which is right: the worker really does serve one toolchain.
+    //
+    // What was wrong was the LOG. It said "serving" for each in turn, naming a
+    // binding the worker does not have, in the one place an operator looks to find
+    // out why a fingerprint is not matching.
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Candidate("/usr/bin/clang"), Candidate("/usr/bin/clang++") } };
+    SpawnScript runner;
+    runner.Banner("/usr/bin/clang", "Ubuntu clang version 20.1.2").Banner("/usr/bin/clang++", "Ubuntu clang version 20.1.2");
+    ScopedStateDir const state;
+    ScriptedToolchainHost host;
+    CapturingLogger logger;
+
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    REQUIRE(resolved.has_value());
+    REQUIRE(Unwrap(resolved).size() == 1);
+
+    // One "serving" line, not two, and the second is reported as what it is.
+    auto const records = logger.Snapshot();
+    auto const serving =
+        std::ranges::count_if(records, [](CapturingLogger::Record const& r) { return r.message.starts_with("serving "); });
+    CHECK(serving == 1);
+    CHECK(Logged(logger, "is the same toolchain as"));
+
+    // And the count an operator reads is the count of what is served.
+    CHECK(Logged(logger, "discovered 1 toolchain(s)"));
+}
+
+TEST_CASE("NodeToolchains: two distinct compilers stay two", "[node][toolchains]")
+{
+    // The other side, and why the collision above is not simply deduplicated away
+    // at discovery: `gcc` and `g++` DO name themselves in their banners, so they
+    // are two toolchains a client can ask for separately, and a worker that offered
+    // only one would silently never match the other.
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Candidate("/usr/bin/gcc"), Candidate("/usr/bin/g++") } };
+    SpawnScript runner;
+    ScopedStateDir const state;
+    ScriptedToolchainHost host;
+    CapturingLogger logger;
+
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    REQUIRE(resolved.has_value());
+    CHECK(Unwrap(resolved).size() == 2);
+    CHECK_FALSE(Logged(logger, "is the same toolchain as"));
 }

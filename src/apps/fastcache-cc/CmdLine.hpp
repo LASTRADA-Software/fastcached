@@ -396,6 +396,8 @@ struct ParsedCommand
 ///
 /// @param compiler argv[0] as invoked.
 /// @return The matching flavor, or `Flavor::Unknown`.
+[[nodiscard]] Flavor ClassifyCompiler(std::string_view compiler);
+
 /// A compiler's basename, lowered and stripped of `.exe`.
 ///
 /// Here rather than beside its callers because THREE questions are answered from
@@ -408,8 +410,6 @@ struct ParsedCommand
 /// @param compiler argv[0] as invoked, bare name or path.
 /// @return Its normalized basename.
 [[nodiscard]] std::string NormalizedCompilerName(std::string_view compiler);
-
-[[nodiscard]] Flavor ClassifyCompiler(std::string_view compiler);
 
 [[nodiscard]] DriverSpec const& DriverOf(Flavor flavor);
 

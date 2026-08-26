@@ -252,15 +252,28 @@ std::optional<std::map<std::string, std::string>> ResolveToolchains(NodeConfig c
 
         auto const& fingerprint = identity.fingerprint;
 
-        // Reported unconditionally, including for an explicit override, and IN
-        // TABLE ORDER however the work was scheduled. A fingerprint mismatch is
-        // invisible from both ends -- the scheduler just says no worker matches --
-        // so the one place a worker's own digest can be seen is this log, next to
-        // `fastcache-cc --print-toolchain-fingerprint` on the client. A log whose
-        // order depended on which thread finished first would be a poor place to
-        // compare two machines.
-        logger.Logf(LogLevel::Info, "serving {} as {}", entry.compiler, fingerprint);
-        toolchains.emplace(fingerprint, entry.compiler);
+        // The log follows the MAP rather than the loop, because the map is what the
+        // worker will actually serve and the two do not always agree. Two compilers
+        // can reach one fingerprint -- `clang` and `clang++` do, since clang's banner
+        // does not name its own argv[0] the way a GNU driver's does, and the include
+        // probe forces `-x c++` for both -- and `emplace` keeps the first. Saying
+        // "serving" for the second was a line naming a binding this worker does not
+        // have, in the one log an operator reads to find out why the scheduler is not
+        // matching them.
+        //
+        // Reported for an explicit override too, and IN TABLE ORDER however the work
+        // was scheduled: a fingerprint mismatch is invisible from both ends, so this
+        // log is where two machines' digests get compared, and one ordered by which
+        // thread finished first would be a poor place to do it.
+        auto const [existing, inserted] = toolchains.emplace(fingerprint, entry.compiler);
+        if (inserted)
+            logger.Logf(LogLevel::Info, "serving {} as {}", entry.compiler, fingerprint);
+        else
+            logger.Logf(LogLevel::Info,
+                        "{} is the same toolchain as {} ({}); serving it once",
+                        entry.compiler,
+                        existing->second,
+                        fingerprint);
     }
 
     // Refused HERE, and the refusal is the point of the function rather than an
@@ -302,6 +315,7 @@ std::optional<std::map<std::string, std::string>> ResolveToolchains(NodeConfig c
         logger.Logf(LogLevel::Info,
                     "discovered {} toolchain(s) on this machine; pass --toolchain to serve a narrower set",
                     toolchains.size());
+
     return toolchains;
 }
 
