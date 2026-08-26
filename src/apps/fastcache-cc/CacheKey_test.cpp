@@ -18,6 +18,8 @@
 
 using namespace FastCache::Cc;
 using FastCache::Cc::Test::DigestQuarters;
+using FastCache::Cc::Test::RequireNoRetiredGeneration;
+using FastCache::Cc::Test::RetiredGeneration;
 using FastCache::Cc::Test::SplitMix64;
 
 namespace
@@ -405,7 +407,14 @@ TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliber
     //      DirectManifest.cpp, in lock-step -- a manifest stores the object key
     //      by value and its own key never sees the object-key schema, so direct
     //      mode would keep resolving to entries written under the old rules;
-    //   2. only then update this vector.
+    //   2. add the tag you are leaving to `Retired` below. Its digest is what the
+    //      NEW construction yields for these inputs under the OLD tag -- which is
+    //      NOT, in general, the vector you are about to replace. The two coincide
+    //      only when a bump changes nothing but the tag, as v4 -> v5 did; pasting
+    //      the outgoing vector after a construction change records a digest this
+    //      build can no longer produce, and the row then forbids nothing while
+    //      `RequireNoRetiredGeneration` still reports the table as populated;
+    //   3. only then update this vector.
     // Updating the vector alone leaves old entries matching new keys and being
     // served under rules they were not written by, which is the silent mis-serve
     // the tag exists to prevent -- it presents as a hit-rate collapse, not a miss.
@@ -414,7 +423,23 @@ TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliber
                              .relativizedArgs = { "-c", "-O2", "<SRCROOT>/src/main.cpp" },
                              .dependencyPaths = { "<SRCROOT>/inc/a.hpp", "<SRCROOT>/inc/b.hpp" } };
 
-    CHECK(ComputeKey(inputs) == "a38a64d1e6e4c72f555c7e97ba26bd16");
+    // Computed ONCE and asserted twice. Both assertions have to be about the same
+    // key or the second says nothing: the rows below are digests of these exact
+    // `inputs`, so a second `ComputeKey(...)` call is a place for the two to come
+    // to disagree about what was hashed, and the retirement check would go vacuous
+    // in the one edit it exists to catch.
+    auto const key = ComputeKey(inputs);
+    CHECK(key == "b89cce126e819bbb6868c7a6065e01cb");
+
+    // What the vector alone cannot say: that the tag has not been put BACK. See
+    // RetiredGeneration -- reverting the tag and re-pasting the vector is one edit
+    // two hunks apart and leaves the suite green, so each generation this key space
+    // has retired is required to stay unreachable in its own right.
+    constexpr auto Retired = std::to_array<RetiredGeneration>({
+        { .tag = "objkey-v3", .digest = "65a330c5e6541bf33b2682d642717669" },
+        { .tag = "objkey-v4", .digest = "a38a64d1e6e4c72f555c7e97ba26bd16" },
+    });
+    RequireNoRetiredGeneration(key, Retired);
 }
 
 TEST_CASE("Field contents cannot be shifted across a field boundary")
