@@ -262,6 +262,53 @@ rules, none of them the obvious one:
   rather than a null pointer, so "this node has no shared cache" is a decision
   somebody made rather than a pointer nobody set.
 
+Four more about what the tier IS and who gets to see it:
+
+- **`--cache-memory 0` means no in-memory tier, and zero is how
+  `InMemoryLruStorage` spells UNBOUNDED.** `EvictToFit` returns immediately on a
+  zero budget, so for as long as the flag existed the one number an operator could
+  switch the cache off with was the number that removed its limit — a node told to
+  hold nothing held everything, growing until the machine ran out of memory, with
+  the cache appearing to work better and better on the way. Both halves off (no
+  `--cache-dir` either) means no tier at all, said out loud rather than left to
+  produce a cache port answering out of nothing.
+- **A store that will not open is always fatal; a port that will not bind is fatal
+  only when the operator typed the address.** The two leave `CacheTier` through one
+  `std::string`, so `StartCacheTierOrExplain` opens the store itself rather than
+  letting `Start` do it — otherwise a bad `--cache-dir` on a node using the DEFAULT
+  cache port is logged as a warning and stepped over, and the error names
+  `--listen-cache` while pointing at a directory.
+- **The tier lives behind a single-shard `ShardedStorage`, and that wrapper is the
+  lock rather than any kind of sharding.** The tier is mutated on the reactor thread
+  while the heartbeat thread and the `/metrics` scrape read its statistics, and
+  `Snapshot()` on these backends writes a `mutable` member. It is the same reason
+  the daemon's `useShardingWrapper` includes `metricsEnabled`. A node's `--cache-dir`
+  also takes no inter-process lock (#135) and does its I/O on the shared reactor
+  thread (#136); both are stated where an operator meets them.
+- **A cache is per NODE, and the registry is keyed per (fingerprint, endpoint).** A
+  node with two `--toolchain` flags is two entries against one machine —
+  deliberately — and both heartbeat the SAME cache figures, so summing a cache field
+  across `LiveWorkers()` counts one node's objects once per toolchain it serves.
+  `WorkerRegistry::NodeCaches()` is the deduped view, and it does not pick
+  arbitrarily between siblings: `Register` clears a worker's load, so an entry that
+  just re-registered holds nothing while its sibling holds last round's figures. One
+  that has reported a cache wins over one that has not, most recently seen breaking
+  the tie — otherwise a node reads as having no cache for one heartbeat interval,
+  intermittently, depending on an `unordered_map`'s iteration order.
+
+The cache facts themselves ride **nested**, inside the capacity and load records
+rather than beside them, for the reason those records are nested inside REGISTER
+and HEARTBEAT: `SplitFields` is exact by design, so a fact added at any fixed-arity
+level makes two builds of a fleet unable to speak at all. Tiers travel
+**positionally**, because `CompileCacheWire.hpp` is compiled into `fastcache-cc`
+and cannot see `StorageTier` — which makes that enum's ORDER a wire contract, and
+makes `CacheCapacityToWire`/`FromWire` the only pair that knows index 1 is the disk
+tier. A transposition between them decodes perfectly and reports a node's RAM
+budget as its disk budget, so both round trips give every tier a distinct value.
+None of it is scheduling input: `AvailableSlots` does not read it and must not
+start to, because how full a node's cache is says nothing about whether it can take
+another compile.
+
 `NoExpiry` is `TimePoint::max()` and **not** a default-constructed `TimePoint`: the
 storage tests `entry.expiry <= now`, so zero means "expired before any clock reading"
 rather than "no deadline" — every write landed and was unreadable, a cache that

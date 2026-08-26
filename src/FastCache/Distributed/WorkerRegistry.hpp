@@ -68,6 +68,22 @@ struct WorkerInfo
     std::vector<std::uint8_t> codecs;
 };
 
+/// One node's cache, as `NodeCaches()` reports it.
+///
+/// A machine rather than a registry entry, which is the whole reason this type
+/// exists: a node with two `--toolchain` flags is two entries carrying one
+/// cache's figures, so a consumer reading them off `LiveWorkers()` would count
+/// that cache once per toolchain.
+struct NodeCacheReport
+{
+    /// host:port the node answers on — the key an operator means by "node".
+    std::string endpoint;
+    /// What it was configured to hold, as stated at registration.
+    NodeCacheCapacity capacity {};
+    /// What it holds now, as of its last heartbeat.
+    NodeCacheLoad load {};
+};
+
 /// What a worker announces about itself.
 ///
 /// A struct rather than four positional parameters: two of them are strings that
@@ -192,6 +208,29 @@ class WorkerRegistry
     /// Every live worker, for `/metrics` and diagnostics.
     /// @return A snapshot; expired workers are excluded.
     [[nodiscard]] std::vector<WorkerInfo> LiveWorkers() const;
+
+    /// Every live NODE's cache, one entry per machine.
+    ///
+    /// `LiveWorkers()` lists registry entries, and this registry keys on
+    /// `(fingerprint, endpoint)` — so a node started with two `--toolchain` flags
+    /// is two entries describing one machine, deliberately. A cache is per node,
+    /// not per toolchain, and both entries heartbeat the *same* cache figures, so
+    /// anything summing a cache field across `LiveWorkers()` counts one node's
+    /// objects and bytes once per toolchain it serves.
+    ///
+    /// This is the deduped view, and it exists so that fact lives in one place
+    /// rather than in every consumer's memory. Grouping is by endpoint, which is
+    /// what an operator means by "node": the entries share it precisely because
+    /// they are one machine.
+    ///
+    /// The entries of one node do not always agree, which is why only one of them
+    /// contributes and which one is a real choice: `Register` clears a worker's
+    /// load, so a sibling that has just re-registered holds nothing while the
+    /// other still holds last round's figures. An entry that has reported a cache
+    /// wins over one that has not, and among those the most recently heard from.
+    /// @return One entry per live endpoint, ordered by endpoint so a snapshot is
+    ///         reproducible — the property `LiveWorkers()` sorts for.
+    [[nodiscard]] std::vector<NodeCacheReport> NodeCaches() const;
 
   private:
     struct Entry

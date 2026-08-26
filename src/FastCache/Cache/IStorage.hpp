@@ -2,9 +2,12 @@
 #pragma once
 
 #include <FastCache/Cache/CacheEntry.hpp>
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -13,6 +16,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace FastCache
@@ -78,6 +82,108 @@ struct StorageStats
     /// by it.
     std::uint64_t writeErrors { 0 };
 };
+
+/// One cache's statistics, kept apart by the tier holding them.
+///
+/// An entry is absent when the cache has no such tier at all, which is a
+/// different fact from a tier holding nothing — see `IStorage::SnapshotTiers`.
+using TieredStorageStats = EnumTable<StorageTier, std::optional<StorageStats>>;
+
+/// The size-typed fields of `StorageStats`, as member pointers.
+///
+/// A table so that summing several snapshots is one loop rather than one `+=`
+/// per field. `ShardedStorage` wrote that addition out by hand across
+/// twenty-three lines, and a hand-written list of every field is the shape where
+/// a field added later is silently left out — `writeErrors` already had been,
+/// and only failed to matter because the decorator that populates it wraps the
+/// sharded backend rather than each shard.
+inline constexpr std::array StorageStatsSizeFields {
+    &StorageStats::itemCount,
+    &StorageStats::bytesUsed,
+    &StorageStats::bytesLimit,
+};
+
+/// The counter fields of `StorageStats`, as member pointers.
+///
+/// Separate from the size fields only because the two groups have different
+/// types; both are summed the same way.
+inline constexpr std::array StorageStatsCounterFields {
+    &StorageStats::evictions,    &StorageStats::cmdGet,    &StorageStats::cmdSet,           &StorageStats::cmdTouch,
+    &StorageStats::cmdFlush,     &StorageStats::getHits,   &StorageStats::getMisses,        &StorageStats::deleteHits,
+    &StorageStats::deleteMisses, &StorageStats::incrHits,  &StorageStats::incrMisses,       &StorageStats::decrHits,
+    &StorageStats::decrMisses,   &StorageStats::touchHits, &StorageStats::touchMisses,      &StorageStats::casHits,
+    &StorageStats::casMisses,    &StorageStats::casBadval, &StorageStats::evictedUnfetched, &StorageStats::expiredUnfetched,
+    &StorageStats::writeErrors,
+};
+
+/// The width of the member @p field names.
+///
+/// Taken from the member's own type rather than assumed, so the guard below
+/// stays true whatever a field happens to be declared as.
+/// @param field Any pointer-to-member.
+/// @return `sizeof` the member's type.
+template <typename Member, typename Class>
+consteval std::size_t MemberSize(Member Class::* /*field*/) noexcept
+{
+    return sizeof(Member);
+}
+
+// The guard the tables exist to make possible, and the thing whose absence let
+// `writeErrors` be added to the struct and to nothing else. Two halves, and the
+// runtime duplicate check in `StorageTier_test` is the third: this one catches a
+// field that reaches no table, and that one catches a table that names one field
+// twice while dropping its neighbour.
+//
+// The first assert is what makes the second sound. It fails on a platform whose
+// `std::size_t` is narrower than its `std::uint64_t` -- a 32-bit build -- because
+// `StorageStats` then carries alignment padding and its size stops being the sum
+// of its fields. That is a real signal rather than a nuisance: the check has to
+// be replaced with one that accounts for the padding, never deleted.
+static_assert(std::has_unique_object_representations_v<StorageStats>,
+              "StorageStats must have no padding for the field-table completeness check below to hold");
+static_assert(sizeof(StorageStats)
+                  == (StorageStatsSizeFields.size() * MemberSize(StorageStatsSizeFields.front()))
+                         + (StorageStatsCounterFields.size() * MemberSize(StorageStatsCounterFields.front())),
+              "every field of StorageStats must appear in exactly one of the field tables above; a field that "
+              "reaches neither is silently left out of every sum");
+
+/// Add every field of @p addend into @p total.
+/// @param total Accumulator, modified in place.
+/// @param addend What to fold in.
+constexpr void AddInto(StorageStats& total, StorageStats const& addend) noexcept
+{
+    for (auto const field: StorageStatsSizeFields)
+        total.*field += addend.*field;
+    for (auto const field: StorageStatsCounterFields)
+        total.*field += addend.*field;
+}
+
+/// Fold one tiered snapshot into another, tier by tier.
+///
+/// A tier the addend does not have leaves the accumulator's entry untouched —
+/// **including leaving it absent**, which is what keeps "this cache has no disk
+/// tier" from becoming "this cache has a disk tier holding nothing" the moment a
+/// second snapshot is merged in.
+/// @param total Accumulator, modified in place.
+/// @param addend What to fold in.
+constexpr void AddInto(TieredStorageStats& total, TieredStorageStats const& addend) noexcept
+{
+    for (auto const& tierRow: StorageTierTable)
+    {
+        auto const index = static_cast<std::size_t>(tierRow.tier);
+        // Both bound to references before they are tested, rather than subscripted
+        // again after. `bugprone-unchecked-optional-access` can follow a guard only
+        // on the same expression, and a second `total[index]` is a fresh one it has
+        // no guard for -- which with `WarningsAsErrors` is a build failure.
+        auto const& from = addend[index];
+        if (!from.has_value())
+            continue;
+        auto& into = total[index];
+        if (!into.has_value())
+            into = StorageStats {};
+        AddInto(*into, *from);
+    }
+}
 
 /// Storage backend abstraction. The cache engine routes every command
 /// through these primitives. Implementations are responsible for honouring
@@ -393,6 +499,40 @@ class IStorage
 
     /// @return Current storage statistics.
     [[nodiscard]] virtual StorageStats Snapshot() const noexcept = 0;
+
+    /// The same statistics, kept apart by the tier that holds them.
+    ///
+    /// `Snapshot()` answers "what does this cache hold", which a composite backend
+    /// can only answer by choosing: `LayeredStorage` reports its canonical lower
+    /// tier's item count, bytes and budget, so the in-memory half above it leaves no
+    /// trace at all. That is the right merge for a `stats` command and the wrong one
+    /// for an operator asking whether a node's RAM tier is doing anything.
+    ///
+    /// **Absent is not zero**, which is why every entry is optional: a memory-only
+    /// cache has no disk tier, and a disk tier holding zero bytes is a different
+    /// claim that a dashboard renders as "empty" rather than as "there isn't one".
+    ///
+    /// The default describes a backend that is one in-memory tier — true of
+    /// `InMemoryLruStorage` and of every in-memory test double. A backend that keeps
+    /// its bytes anywhere else, or that composes several, **must override this**;
+    /// the ones in this tree do.
+    ///
+    /// **These are each tier's own numbers, and nothing here is meant to be summed
+    /// across tiers.** A composite's tiers overlap, in both directions.
+    /// `LayeredStorage` mirrors into L1 every entry it reads out of L2, so adding
+    /// the two item counts counts the mirrored entries twice; and L2 is consulted
+    /// only when L1 missed, so adding the two hit counts turns a hundred reads
+    /// served entirely from cache into a hundred and sixty requests at 62%. Both
+    /// tiers' figures are true, and they answer "is the mirror doing anything" and
+    /// "how full is the store" rather than "what does this cache hold" -- which is
+    /// what `Snapshot()` is for, and what a consumer wanting a total must call.
+    /// @return One entry per tier this backend has, indexed by `StorageTier`.
+    [[nodiscard]] virtual TieredStorageStats SnapshotTiers() const noexcept
+    {
+        TieredStorageStats tiers {};
+        tiers[static_cast<std::size_t>(StorageTier::Memory)] = Snapshot();
+        return tiers;
+    }
 
     /// Whether this backend's `Get` is safe to call concurrently under a
     /// *shared* (reader) lock — i.e. a read performs no structural mutation of

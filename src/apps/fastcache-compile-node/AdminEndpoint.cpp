@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
+#include "CacheTier.hpp"
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/HostPort.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <format>
+#include <optional>
 #include <utility>
 
 namespace FastCache::Node
 {
+
+AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sources,
+                                                           std::chrono::steady_clock::time_point startedAt)
+{
+    return [sources = std::move(sources), startedAt] {
+        auto const disk = sources.host->SpaceOn(sources.scratchRoot);
+        return MetricsSnapshot {
+            // The node's own cache, when it has one. It usually does --
+            // `--listen-cache` is on by default and a local tier is what this
+            // program is FOR -- and this scrape reported `std::nullopt` regardless,
+            // so a node holding a quarter of a gigabyte of objects and one holding
+            // none produced the same bytes. Null only when the operator turned
+            // every half of the tier off, and then absent IS the truth.
+            .storage = sources.cache != nullptr ? std::optional { sources.cache->Snapshot() } : std::nullopt,
+            // And the halves that merged view cannot show apart: with `--cache-dir`
+            // the composite reports the on-disk store alone, so the in-memory tier
+            // an operator sized with `--cache-memory` would otherwise be invisible.
+            .storageTiers = sources.cache != nullptr ? sources.cache->SnapshotTiers() : TieredStorageStats {},
+            .host = HostCapacity { .logicalCores = sources.host->LogicalCores(),
+                                   .configuredSlots = sources.slots,
+                                   .totalMemoryBytes = sources.host->TotalMemoryBytes(),
+                                   .diskCapacityBytes = static_cast<std::uint64_t>(disk.capacityBytes),
+                                   .diskFreeBytes = static_cast<std::uint64_t>(disk.freeBytes),
+                                   .busySlots = sources.busySlots() },
+            .uptime =
+                Uptime { std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startedAt) },
+        };
+    };
+}
 
 AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
                              IMetricsSink& metrics,

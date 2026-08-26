@@ -3,8 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <format>
+#include <optional>
 #include <string>
+#include <type_traits>
 
 namespace FastCache::Distributed
 {
@@ -72,6 +75,102 @@ std::vector<std::byte> SchedulerProtocol::Answer(std::span<std::byte const> fram
     return Wire::EncodeErrorReply(reply.error, reply.message);
 }
 
+namespace
+{
+    /// Turn a per-tier domain table into the wire's positional list.
+    ///
+    /// The wire carries tiers by POSITION, because `CompileCacheWire.hpp` is
+    /// compiled into `fastcache-cc` and cannot see `StorageTier`. This function
+    /// and its inverse are the only two places that know the two orders are the
+    /// same one, which is why they sit together — a transposition here is
+    /// invisible to every compiler and to both ends of the wire.
+    /// @param table One entry per tier, in enumerator order.
+    /// @param project Turns one domain entry into its wire form.
+    /// @return The same entries, positionally.
+    template <typename Wired, typename Domain, typename Project>
+    [[nodiscard]] Wire::PerTier<Wired> TiersToWire(Domain const& table, Project project)
+    {
+        Wire::PerTier<Wired> out;
+        out.reserve(table.size());
+        for (auto const& row: StorageTierTable)
+        {
+            auto const& entry = table[static_cast<std::size_t>(row.tier)];
+            out.push_back(entry.has_value() ? std::optional { project(*entry) } : std::nullopt);
+        }
+        return out;
+    }
+
+    /// Read the wire's positional list back into a per-tier domain table.
+    ///
+    /// A position this build has no tier for is dropped rather than refused: it
+    /// comes from a peer that knows a tier this one does not, and a cache figure
+    /// is reported, never acted on, so there is nothing to fail closed about. A
+    /// position the peer did not send stays absent, which is "no such tier".
+    /// @param tiers The wire's list.
+    /// @param project Turns one wire entry into its domain form.
+    /// @return One entry per tier this build knows.
+    template <typename Table, typename Wired, typename Project>
+    [[nodiscard]] Table TiersFromWire(Wired const& tiers, Project project)
+    {
+        Table out {};
+        for (auto const& row: StorageTierTable)
+        {
+            auto const index = static_cast<std::size_t>(row.tier);
+            if (index >= tiers.size())
+                continue;
+            // Bound to a reference before it is tested, rather than subscripted
+            // twice in one condition. The two spellings mean the same thing and
+            // `bugprone-unchecked-optional-access` can only follow the first: a
+            // second `tiers[index]` is a fresh expression it has no guard for, and
+            // with `WarningsAsErrors` that is a build failure rather than a note.
+            auto const& wired = tiers[index];
+            if (wired.has_value())
+                out[index] = project(*wired);
+        }
+        return out;
+    }
+} // namespace
+
+NodeCacheCapacity CacheCapacityFromWire(Wire::CacheCapacityFields const& fields)
+{
+    return NodeCacheCapacity { .tierBytesLimit = TiersFromWire<EnumTable<StorageTier, std::optional<std::uint64_t>>>(
+                                   fields.tiers, [](Wire::CacheTierBudget const& budget) { return budget.bytesLimit; }) };
+}
+
+Wire::CacheCapacityFields CacheCapacityToWire(NodeCacheCapacity const& cache)
+{
+    return Wire::CacheCapacityFields { .tiers =
+                                           TiersToWire<Wire::CacheTierBudget>(cache.tierBytesLimit, [](std::uint64_t limit) {
+                                               return Wire::CacheTierBudget { .bytesLimit = limit };
+                                           }) };
+}
+
+NodeCacheLoad CacheLoadFromWire(Wire::CacheLoadFields const& fields)
+{
+    return NodeCacheLoad { .tiers = TiersFromWire<EnumTable<StorageTier, std::optional<CacheTierUsage>>>(
+                               fields.tiers,
+                               [](Wire::CacheTierUsage const& usage) {
+                                   return CacheTierUsage { .itemCount = usage.itemCount,
+                                                           .bytesUsed = usage.bytesUsed,
+                                                           .evictions = usage.evictions };
+                               }),
+                           .hits = fields.hits,
+                           .misses = fields.misses };
+}
+
+Wire::CacheLoadFields CacheLoadToWire(NodeCacheLoad const& cache)
+{
+    return Wire::CacheLoadFields { .tiers = TiersToWire<Wire::CacheTierUsage>(
+                                       cache.tiers,
+                                       [](CacheTierUsage const& usage) {
+                                           return Wire::CacheTierUsage { .itemCount = usage.itemCount,
+                                                                         .bytesUsed = usage.bytesUsed,
+                                                                         .evictions = usage.evictions };
+                                       }),
+                                   .hits = cache.hits,
+                                   .misses = cache.misses };
+}
+
 Wire::CapacityFields CapacityToWire(NodeCapacity const& capacity)
 {
     return Wire::CapacityFields { .logicalCores = capacity.logicalCores,
@@ -83,7 +182,8 @@ Wire::CapacityFields CapacityToWire(NodeCapacity const& capacity)
                                   // cannot tell a deliberate zero from silence.
                                   .reservedCores = capacity.reserveIsExplicit
                                                        ? std::optional<std::uint32_t> { capacity.reservedCores }
-                                                       : std::nullopt };
+                                                       : std::nullopt,
+                                  .cache = CacheCapacityToWire(capacity.cache) };
 }
 
 std::optional<NodeCapacity> CapacityFromWire(Wire::CapacityFields const& fields)
@@ -95,14 +195,16 @@ std::optional<NodeCapacity> CapacityFromWire(Wire::CapacityFields const& fields)
                           .totalMemoryBytes = fields.totalMemoryBytes,
                           .nodeClass = *nodeClass,
                           .reservedCores = fields.reservedCores.value_or(0),
-                          .reserveIsExplicit = fields.reservedCores.has_value() };
+                          .reserveIsExplicit = fields.reservedCores.has_value(),
+                          .cache = CacheCapacityFromWire(fields.cache) };
 }
 
 Wire::LoadFields LoadToWire(NodeLoad const& load)
 {
     return Wire::LoadFields { .cpuBusyPermille = load.cpuBusyPermille,
                               .availableMemoryBytes = load.availableMemoryBytes,
-                              .freeScratchBytes = load.freeScratchBytes };
+                              .freeScratchBytes = load.freeScratchBytes,
+                              .cache = CacheLoadToWire(load.cache) };
 }
 
 NodeLoad LoadFromWire(Wire::LoadFields const& fields, std::uint32_t inFlight)
@@ -110,7 +212,8 @@ NodeLoad LoadFromWire(Wire::LoadFields const& fields, std::uint32_t inFlight)
     return NodeLoad { .inFlight = inFlight,
                       .cpuBusyPermille = fields.cpuBusyPermille,
                       .availableMemoryBytes = fields.availableMemoryBytes,
-                      .freeScratchBytes = fields.freeScratchBytes };
+                      .freeScratchBytes = fields.freeScratchBytes,
+                      .cache = CacheLoadFromWire(fields.cache) };
 }
 
 SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> payload, CallerContext const& caller)

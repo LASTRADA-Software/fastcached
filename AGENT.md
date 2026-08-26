@@ -156,6 +156,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   included.
 - Duplicate suppression is asked **before** capacity, or a busy fleet reports
   `NoCapacity` for a key it is already building.
+- `--cache-memory 0` means no tier. Zero is how `InMemoryLruStorage` spells
+  *unbounded*, so the flag that turns a cache off once turned its limit off.
+- A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
+  a cache field across `LiveWorkers()` counts one machine once per toolchain.
 
 **[`.agent/rules/consensus-and-cluster.md`](.agent/rules/consensus-and-cluster.md)**
 — Raft, discovery, membership. Before `Consensus/`, `Cluster/`.
@@ -193,7 +197,8 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - `Net/` must not depend on `Core/`. `Async/` travels with it, plus three named
   dependency-free leaf headers; `ctest -R net-boundary` enforces the table.
 - `CompileCacheWire.hpp` must stay header-only and dependency-free — the launcher
-  does not link `FastCache`.
+  does not link `FastCache`. It therefore carries cache tiers **positionally**,
+  which makes `StorageTier`'s enumerator order a wire contract.
 - SIGPIPE is suppressed per socket, never process-wide: an ignored disposition is
   inherited across exec.
 - A listening socket claims its address exclusively — `SO_EXCLUSIVEADDRUSE` on
@@ -228,6 +233,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - Absent is not zero: a process with no cache reports no cache, and *names* the
   field to do it.
 - A duration is a `_sum`/`_count` pair, never a gauge.
+- A merged snapshot is one tier's answer standing in for all of them:
+  `SnapshotTiers()` reports the split, the `tier` label comes from a table, and a
+  tier the cache does not have renders no line at all.
 
 **[`.agent/rules/packaging-and-release.md`](.agent/rules/packaging-and-release.md)**
 — packaging, versioning, cutting a release. Before `packaging/`, `cmake/Packaging.cmake`,
@@ -265,6 +273,8 @@ and what they may assume.
 - Tests allocate their ports per run rather than fixing them.
 - `Unwrap(x)` after `REQUIRE(x.has_value())` for `std::optional`; a bare `*x` is a
   build failure.
+- A Catch2 case name may not begin with `-`. CTest passes it as an argument, so
+  `--help ...` printed usage and reported a pass for a case that never ran.
 - A scratch directory comes from `src/tests/ScratchPath.hpp`. A per-process
   counter is not unique — `catch_discover_tests` gives every case its own
   process, and the suite runs in parallel.
@@ -453,8 +463,9 @@ Catch2 tests live next to the implementation files, so `Foo.cpp` has a `Foo_test
 
 Not every test is a Catch2 case: script-driven tests are registered in
 `src/tests/CMakeLists.txt`, the `smoke`-labelled ones reporting a missing
-prerequisite as skipped. `ctest -R repository-hygiene` and `ctest -R net-boundary`
-need no daemon, socket or compiler and run in the default set.
+prerequisite as skipped. `ctest -R repository-hygiene`, `ctest -R net-boundary` and
+`ctest -R test-name-hygiene` need no daemon, socket or compiler and run in the
+default set.
 
 The rules that have each already cost a debugging session — bounded waits, where a
 script-driven test must be registered, per-run port allocation, and the shared

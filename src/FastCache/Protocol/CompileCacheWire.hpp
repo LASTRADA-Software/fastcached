@@ -1065,6 +1065,234 @@ using CodecList = std::vector<std::uint8_t>;
     return IdentityCodec;
 }
 
+/// Cache facts that travel one field per tier, positionally.
+///
+/// **Position is the tier**, because this header is compiled into
+/// `fastcache-cc`, which does not link `FastCache` and therefore cannot see
+/// `FastCache::StorageTier` — the same reason `nodeClassRaw` is a byte here and
+/// an enumerator one layer up. Index 0 is the first tier that enum names, index
+/// 1 the second, and so on; the mapping is done in
+/// `Distributed/SchedulerProtocol.cpp`, which can see both.
+///
+/// That makes the enum's ORDER a wire contract: enumerators are appended, never
+/// reordered, or a build reads a peer's disk tier as its memory tier and nothing
+/// anywhere reports a fault. `StorageTier`'s own header says so.
+///
+/// An entry is absent when the sender has no such tier at all, which is a
+/// different fact from a tier holding nothing — a dashboard draws a zero as
+/// "empty" and an absence as "there isn't one". A list SHORTER than this build
+/// expects leaves the remaining tiers absent, which is exactly right for a peer
+/// that predates them.
+template <typename T>
+using PerTier = std::vector<std::optional<T>>;
+
+/// What one cache tier is, stable for the life of the sending process.
+///
+/// Split from `CacheTierUsage` below exactly as `CapacityFields` is split from
+/// `LoadFields`, and for the same reason: a budget captured per heartbeat is a
+/// number the receiver would keep re-reading for nothing, and a usage figure
+/// captured at registration is one it would keep believing.
+struct CacheTierBudget
+{
+    /// Bytes this tier may hold. 0 means unbounded, which is a real
+    /// configuration and not an absence — the tier's presence is carried by the
+    /// optional around this struct.
+    std::uint64_t bytesLimit { 0 };
+};
+
+/// A node's cache as it is configured, travelling inside REGISTER.
+struct CacheCapacityFields
+{
+    PerTier<CacheTierBudget> tiers; ///< One entry per tier; absent means "no such tier".
+};
+
+/// Frame a cache-capacity record as one nested field list.
+///
+/// Nested inside the capacity record rather than added to REGISTER, for the
+/// reason `EncodeCapacity` is nested inside REGISTER: `SplitFields` is exact by
+/// design, so a fact added at any fixed-arity level makes two builds of a fleet
+/// unable to speak at all.
+/// @param cache The facts to encode.
+/// @return The nested record's bytes.
+[[nodiscard]] inline std::vector<std::byte> EncodeCacheCapacity(CacheCapacityFields const& cache)
+{
+    // The per-tier list is itself one field, so a later cache-wide fact that is
+    // not per-tier can be the record's second field without moving the tiers.
+    std::vector<std::vector<std::byte>> owned;
+    std::vector<std::span<std::byte const>> tierFields;
+    owned.reserve(cache.tiers.size());
+    tierFields.reserve(cache.tiers.size());
+    for (auto const& tier: cache.tiers)
+    {
+        owned.push_back(tier.has_value() ? WireFields::Encode({ std::span<std::byte const> {
+                                               WireFields::ToBigEndian<std::uint64_t>(tier->bytesLimit) } })
+                                         : std::vector<std::byte> {});
+        tierFields.emplace_back(owned.back());
+    }
+    auto const tiers = WireFields::Encode(WireFields::FieldList { tierFields });
+    return WireFields::Encode({ std::span<std::byte const> { tiers } });
+}
+
+/// Read a cache-capacity record back.
+/// @param field The nested record's bytes.
+/// @return The facts, or nullopt when the record is malformed.
+[[nodiscard]] inline std::optional<CacheCapacityFields> DecodeCacheCapacity(std::span<std::byte const> field)
+{
+    // An absent record is not a malformed one: a peer that predates this field,
+    // or one with no cache at all, is answered rather than refused.
+    if (field.empty())
+        return CacheCapacityFields {};
+
+    auto const parts = WireFields::SplitAll(field);
+    if (!parts.has_value())
+        return std::nullopt;
+    if (parts->empty() || parts->front().empty())
+        return CacheCapacityFields {};
+
+    auto const tiers = WireFields::SplitAll(parts->front());
+    if (!tiers.has_value())
+        return std::nullopt;
+
+    CacheCapacityFields out {};
+    out.tiers.reserve(tiers->size());
+    for (auto const& tier: *tiers)
+    {
+        if (tier.empty())
+        {
+            out.tiers.emplace_back();
+            continue;
+        }
+        auto const values = WireFields::SplitAll(tier);
+        if (!values.has_value() || values->empty())
+            return std::nullopt;
+        auto const limit = WireFields::FromBigEndian<std::uint64_t>(values->front());
+        if (!limit.has_value())
+            return std::nullopt;
+        out.tiers.emplace_back(CacheTierBudget { .bytesLimit = *limit });
+    }
+    return out;
+}
+
+/// What one cache tier holds right now.
+struct CacheTierUsage
+{
+    std::uint64_t itemCount { 0 }; ///< Live entries.
+    std::uint64_t bytesUsed { 0 }; ///< Bytes held.
+    std::uint64_t evictions { 0 }; ///< Entries dropped to stay within the budget.
+};
+
+/// A node's cache as it stands right now, travelling inside HEARTBEAT.
+struct CacheLoadFields
+{
+    PerTier<CacheTierUsage> tiers; ///< One entry per tier; absent means "no such tier".
+
+    /// Reads the node's cache served, and reads it could not.
+    ///
+    /// Node-wide rather than per tier, and deliberately: a lower tier is
+    /// consulted only when the one above it missed, so per-tier figures do not
+    /// add up to the node's and a consumer summing them would report a cache
+    /// serving every read at well under 100%.
+    ///
+    /// Optional because absent is not zero here too: a node that cannot say is
+    /// not a node with no hits.
+    std::optional<std::uint64_t> hits;
+    std::optional<std::uint64_t> misses; ///< @see hits.
+};
+
+/// Frame a cache-load record as one nested field list.
+/// @param cache What the cache holds.
+/// @return The nested record's bytes.
+[[nodiscard]] inline std::vector<std::byte> EncodeCacheLoad(CacheLoadFields const& cache)
+{
+    std::vector<std::vector<std::byte>> owned;
+    std::vector<std::span<std::byte const>> tierFields;
+    owned.reserve(cache.tiers.size());
+    tierFields.reserve(cache.tiers.size());
+    for (auto const& tier: cache.tiers)
+    {
+        owned.push_back(tier.has_value()
+                            ? WireFields::Encode(
+                                  { std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(tier->itemCount) },
+                                    std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(tier->bytesUsed) },
+                                    std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(tier->evictions) } })
+                            : std::vector<std::byte> {});
+        tierFields.emplace_back(owned.back());
+    }
+    auto const tiers = WireFields::Encode(WireFields::FieldList { tierFields });
+    auto const hits = WireFields::ToBigEndian<std::uint64_t>(cache.hits.value_or(0));
+    auto const misses = WireFields::ToBigEndian<std::uint64_t>(cache.misses.value_or(0));
+    return WireFields::Encode(
+        { std::span<std::byte const> { tiers },
+          cache.hits.has_value() ? std::span<std::byte const> { hits } : std::span<std::byte const> {},
+          cache.misses.has_value() ? std::span<std::byte const> { misses } : std::span<std::byte const> {} });
+}
+
+/// Read a cache-load record back.
+/// @param field The nested record's bytes.
+/// @return The facts, or nullopt when the record is malformed.
+[[nodiscard]] inline std::optional<CacheLoadFields> DecodeCacheLoad(std::span<std::byte const> field)
+{
+    if (field.empty())
+        return CacheLoadFields {};
+
+    auto const parts = WireFields::SplitAll(field);
+    if (!parts.has_value())
+        return std::nullopt;
+    auto const at = [&](std::size_t index) {
+        return index < parts->size() ? (*parts)[index] : std::span<std::byte const> {};
+    };
+
+    CacheLoadFields out {};
+    if (auto const packed = at(0); !packed.empty())
+    {
+        auto const tiers = WireFields::SplitAll(packed);
+        if (!tiers.has_value())
+            return std::nullopt;
+        out.tiers.reserve(tiers->size());
+        for (auto const& tier: *tiers)
+        {
+            if (tier.empty())
+            {
+                out.tiers.emplace_back();
+                continue;
+            }
+            auto const values = WireFields::SplitAll(tier);
+            // Three fields expected and fewer tolerated, exactly as the records
+            // above tolerate a short peer: what is absent stays at zero.
+            if (!values.has_value())
+                return std::nullopt;
+            CacheTierUsage usage {};
+            constexpr std::array Members { &CacheTierUsage::itemCount,
+                                           &CacheTierUsage::bytesUsed,
+                                           &CacheTierUsage::evictions };
+            for (std::size_t index = 0; index < Members.size() && index < values->size(); ++index)
+            {
+                auto const& raw = (*values)[index];
+                if (raw.empty())
+                    continue;
+                auto const value = WireFields::FromBigEndian<std::uint64_t>(raw);
+                if (!value.has_value())
+                    return std::nullopt;
+                usage.*Members[index] = *value;
+            }
+            out.tiers.emplace_back(usage);
+        }
+    }
+    if (auto const hits = at(1); !hits.empty())
+    {
+        out.hits = WireFields::FromBigEndian<std::uint64_t>(hits);
+        if (!out.hits.has_value())
+            return std::nullopt;
+    }
+    if (auto const misses = at(2); !misses.empty())
+    {
+        out.misses = WireFields::FromBigEndian<std::uint64_t>(misses);
+        if (!out.misses.has_value())
+            return std::nullopt;
+    }
+    return out;
+}
+
 /// A worker announcing itself to the scheduler.
 /// A worker's static hardware facts, as they travel inside REGISTER.
 ///
@@ -1085,6 +1313,15 @@ struct CapacityFields
     /// "the operator said to reserve nothing". A machine that merely failed to
     /// mention a reserve would otherwise be driven to its last core.
     std::optional<std::uint32_t> reservedCores {};
+
+    /// The node's cache, as it was configured.
+    ///
+    /// Every member of this fleet is a cache, and the leader could say nothing at
+    /// all about any of them. It rides here rather than as a REGISTER field for
+    /// the reason the whole record is nested — `SplitFields` is exact, so a
+    /// top-level addition makes two builds unable to speak — and it is a
+    /// *registration* fact because a budget does not move while the process runs.
+    CacheCapacityFields cache {};
 };
 
 /// Frame a capacity record as one nested field list.
@@ -1111,10 +1348,12 @@ struct CapacityFields
     auto const reserveBytes = WireFields::ToBigEndian<std::uint32_t>(capacity.reservedCores.value_or(0));
     auto const reserve =
         capacity.reservedCores.has_value() ? std::span<std::byte const> { reserveBytes } : std::span<std::byte const> {};
+    auto const cache = EncodeCacheCapacity(capacity.cache);
     return WireFields::Encode({ std::span<std::byte const> { cores },
                                 std::span<std::byte const> { memory },
                                 std::span<std::byte const> { nodeClass },
-                                reserve });
+                                reserve,
+                                std::span<std::byte const> { cache } });
 }
 
 /// Read a capacity record back.
@@ -1172,6 +1411,10 @@ struct CapacityFields
         // to catch: it puts a dereference in the path for no gain.
         out.reservedCores = value;
     }
+    if (auto const cache = DecodeCacheCapacity(at(4)); cache.has_value())
+        out.cache = *cache;
+    else
+        return std::nullopt;
     return out;
 }
 
@@ -1304,6 +1547,19 @@ struct LoadFields
     std::optional<std::uint32_t> cpuBusyPermille;      ///< Host-wide CPU busy, 0..1000.
     std::optional<std::uint64_t> availableMemoryBytes; ///< Memory a new job could get.
     std::optional<std::uint64_t> freeScratchBytes;     ///< Room where jobs are compiled.
+
+    /// What the node's cache holds right now.
+    ///
+    /// A heartbeat fact rather than a registration one, and the split is the same
+    /// `NodeCapacity`/`NodeLoad` draw: item count, bytes and evictions move while
+    /// the process runs, so a copy taken at registration is a number the scheduler
+    /// would keep believing long after it stopped being true.
+    ///
+    /// **It is per NODE, not per registry entry.** A worker with two `--toolchain`
+    /// flags registers twice against one machine and both entries heartbeat these
+    /// same numbers, so anything summing them across entries counts one cache
+    /// twice. `WorkerRegistry::NodeCaches()` is what dedupes.
+    CacheLoadFields cache {};
 };
 
 /// Frame a live-load record as one nested field list.
@@ -1320,10 +1576,12 @@ struct LoadFields
     auto const cpu = WireFields::ToBigEndian<std::uint32_t>(load.cpuBusyPermille.value_or(0));
     auto const memory = WireFields::ToBigEndian<std::uint64_t>(load.availableMemoryBytes.value_or(0));
     auto const scratch = WireFields::ToBigEndian<std::uint64_t>(load.freeScratchBytes.value_or(0));
+    auto const cache = EncodeCacheLoad(load.cache);
     return WireFields::Encode(
         { load.cpuBusyPermille.has_value() ? std::span<std::byte const> { cpu } : std::span<std::byte const> {},
           load.availableMemoryBytes.has_value() ? std::span<std::byte const> { memory } : std::span<std::byte const> {},
-          load.freeScratchBytes.has_value() ? std::span<std::byte const> { scratch } : std::span<std::byte const> {} });
+          load.freeScratchBytes.has_value() ? std::span<std::byte const> { scratch } : std::span<std::byte const> {},
+          std::span<std::byte const> { cache } });
 }
 
 /// Read a live-load record back.
@@ -1365,6 +1623,10 @@ struct LoadFields
         if (!out.freeScratchBytes.has_value())
             return std::nullopt;
     }
+    if (auto const cache = DecodeCacheLoad(at(3)); cache.has_value())
+        out.cache = *cache;
+    else
+        return std::nullopt;
     return out;
 }
 

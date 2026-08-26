@@ -190,6 +190,17 @@ namespace
         return static_cast<std::uint64_t>(*parsed);
     }
 
+    /// The on-disk tier's byte budget, in the same grammar as `--cache-memory`.
+    /// @param sv Text to parse.
+    /// @return The size in bytes, or why it is not one.
+    [[nodiscard]] std::expected<std::uint64_t, ConfigError> ParseCacheDiskBytes(std::string_view sv)
+    {
+        auto const parsed = ParseByteSize(sv, "cache-disk");
+        if (!parsed.has_value())
+            return std::unexpected(parsed.error());
+        return static_cast<std::uint64_t>(*parsed);
+    }
+
     /// A filesystem path, taken as written.
     /// @param sv Text to parse.
     /// @return The path.
@@ -453,13 +464,23 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "(default 256m; 0 turns it off). It exists so a\n"
                          "local rebuild on a slow or bad network never\n"
                          "reaches the wire at all." },
+        { .primary = "--cache-disk",
+          .arity = Arity::Value,
+          .operand = "=<bytes>",
+          .apply = AssignFrom<&NodeConfig::cacheDiskBytes, ParseCacheDiskBytes>(),
+          .description = "cap this node's on-disk cache tier at this size\n"
+                         "(default 0, meaning grow as needed). Only means\n"
+                         "anything with --cache-dir: without a path there is\n"
+                         "no disk tier for a budget to bound." },
         { .primary = "--cache-dir",
           .arity = Arity::Value,
           .operand = "=<path>",
           .apply = AssignFrom<&NodeConfig::cacheDir, ParsePathValue>(),
           .description = "back the local cache tier with disk at this path.\n"
                          "Memory-only otherwise: a disk tier is a resource an\n"
-                         "operator should have to name." },
+                         "operator should have to name. ONE node per path:\n"
+                         "the store takes no inter-process lock, so two\n"
+                         "nodes sharing it corrupt it." },
         { .primary = "--listen-cache",
           .arity = Arity::Value,
           .operand = "=[<address>:]<port>",
@@ -601,6 +622,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitIfSet("admin-listen", cfg.adminListen, defaults.adminListen);
     emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
     emitIfSet("cache-memory", cfg.cacheMemoryBytes, defaults.cacheMemoryBytes);
+    emitIfSet("cache-disk", cfg.cacheDiskBytes, defaults.cacheDiskBytes);
     emitIfSet("listen-cache", cfg.cacheListen, defaults.cacheListen);
     emitIfSet("node-id", cfg.nodeId, defaults.nodeId);
     emitIfSet("listen-raft", cfg.raftListen, defaults.raftListen);

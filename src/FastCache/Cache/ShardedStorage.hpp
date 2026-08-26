@@ -132,6 +132,17 @@ class ShardedStorage final: public IStorage
     std::size_t PurgeExpired(TimePoint now) override;
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
 
+    /// Every shard's tiers, summed tier by tier.
+    ///
+    /// Taken under each shard's exclusive lock, exactly as `Snapshot()` is and for
+    /// the same reason: an inner backend's own snapshot writes its `mutable _stats`,
+    /// so a shared lock would race a concurrent reader. That lock is also what makes
+    /// this callable at all from a thread that does not own the storage -- which is
+    /// why the daemon wraps a metrics-enabled backend here and why the compile
+    /// node's cache tier does the same.
+    /// @return The per-tier sums; a tier no shard has stays absent.
+    [[nodiscard]] TieredStorageStats SnapshotTiers() const noexcept override;
+
     /// @return Number of shards owned by this storage.
     [[nodiscard]] std::size_t ShardCount() const noexcept
     {

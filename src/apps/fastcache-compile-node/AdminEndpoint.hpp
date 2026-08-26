@@ -5,9 +5,14 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Platform/HostInfo.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 
+#include <chrono>
+#include <cstddef>
 #include <expected>
+#include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -15,6 +20,59 @@
 
 namespace FastCache::Node
 {
+
+class CacheTier;
+
+/// What a node's `/metrics` scrape reads, gathered in one place.
+///
+/// Pointers rather than references because one of them is legitimately absent —
+/// a node whose every cache half was turned off has no tier — and because the
+/// bundle then has an obvious "nothing configured" spelling for a test.
+///
+/// Every one of these must outlive the endpoint built from it. In `WorkerBody`
+/// they all do: each is declared before the endpoint and therefore destroyed
+/// after it.
+struct NodeScrapeSources
+{
+    /// Where the machine's own numbers come from. Never null.
+    ///
+    /// The same source the advertised capacity came from, so a scrape and a
+    /// registration cannot disagree about the machine they describe.
+    IHostFactsSource const* host {};
+    /// How many compiles are running right now.
+    ///
+    /// A callable rather than a `WorkerServer const*`, and the reason is testing
+    /// rather than generality: a real `WorkerServer` needs a bound listener, a
+    /// protocol, a membership oracle, a sink and a logger, so a snapshot that
+    /// demanded one could only be exercised by standing a server up. It is also a
+    /// gauge sampled per scrape, which is exactly what a callable is.
+    std::function<std::size_t()> busySlots;
+    /// The node's cache, or **null** when it runs none.
+    CacheTier const* cache {};
+    /// Concurrent compiles this node advertises.
+    std::size_t slots {};
+    /// The filesystem whose free space is reported.
+    std::filesystem::path scratchRoot;
+};
+
+/// Build the provider that answers each `/metrics` scrape.
+///
+/// A function rather than a lambda in `main()`, for the reason `AdminEndpoint`
+/// itself is a class rather than three locals: `main.cpp` is in no test target, so
+/// a snapshot assembled there has no coverage at all — and this one has a branch
+/// worth covering, since a node without a cache must report **no** cache rather
+/// than an empty one. It also keeps `WorkerBody` under clang-tidy's
+/// cognitive-complexity limit, which is the symptom that said the decision had
+/// spread too far.
+///
+/// Everything it reports is sampled per scrape rather than captured once: the disk
+/// fills, the busy count moves, and the cache grows, so a value frozen at startup
+/// is worse than no value because it looks current.
+/// @param sources What to read; must outlive the returned provider.
+/// @param startedAt When the process began, for the uptime gauge.
+/// @return A provider suitable for `AdminEndpoint::Start`.
+[[nodiscard]] AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sources,
+                                                                         std::chrono::steady_clock::time_point startedAt);
 
 /// The worker's `/metrics` and `/healthz` endpoint: listener, server and the
 /// thread that serves them, owned as one thing.

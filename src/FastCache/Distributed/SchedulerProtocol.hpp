@@ -34,6 +34,39 @@ namespace FastCache::Distributed
 /// @return The facts, or nullopt when the class byte is not one of ours.
 [[nodiscard]] std::optional<NodeCapacity> CapacityFromWire(CompileCacheWire::CapacityFields const& fields);
 
+/// Render a node's cache budget in the vocabulary the wire uses.
+///
+/// Paired with `CacheCapacityFromWire` for the reason every other pair here is,
+/// and with one extra hazard of its own: the wire carries tiers **positionally**,
+/// because `CompileCacheWire.hpp` is compiled into `fastcache-cc` and cannot see
+/// `StorageTier`. So these two functions are the only place that knows position
+/// *k* means the *k*-th enumerator, and a transposition between them is invisible
+/// to every compiler and to both ends of the wire — which is why
+/// `SchedulerProtocol_test` round-trips them with a distinct value per tier.
+/// @param cache What the node's cache is configured to hold.
+/// @return The same facts, as raw wire values.
+[[nodiscard]] CompileCacheWire::CacheCapacityFields CacheCapacityToWire(NodeCacheCapacity const& cache);
+
+/// Read a cache-budget record back into the scheduler's vocabulary.
+///
+/// Cannot fail. A tier position this build does not know comes from a peer that
+/// knows one it does not, and is dropped rather than refused: unlike a node
+/// class, a cache figure is reported and never acted on, so there is no decision
+/// to get silently wrong.
+/// @param fields The raw values as received.
+/// @return The facts.
+[[nodiscard]] NodeCacheCapacity CacheCapacityFromWire(CompileCacheWire::CacheCapacityFields const& fields);
+
+/// Render what a node's cache holds in the vocabulary the wire uses.
+/// @param cache What the cache holds right now.
+/// @return The same facts, as raw wire values.
+[[nodiscard]] CompileCacheWire::CacheLoadFields CacheLoadToWire(NodeCacheLoad const& cache);
+
+/// Read a cache-usage record back into the scheduler's vocabulary.
+/// @param fields The raw values as received.
+/// @return The facts.
+[[nodiscard]] NodeCacheLoad CacheLoadFromWire(CompileCacheWire::CacheLoadFields const& fields);
+
 /// Render a node's live load in the vocabulary the wire uses.
 ///
 /// Paired with `LoadFromWire` for the reason `CapacityToWire` is paired with

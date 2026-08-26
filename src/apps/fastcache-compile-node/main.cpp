@@ -53,6 +53,7 @@
 #include <format>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -435,66 +436,11 @@ constexpr int ExitOk = 0;
 
     Node::WorkerServer server { listenerRef, protocol, slots, membership.Oracle(), metrics, logger };
 
-    // The admin endpoint, when the operator asked for one. Off by default and on
-    // loopback for a bare port: a scrape surface reachable from the network is a
-    // decision, not a default.
-    //
-    // The same `AdminHttpServer` the daemon runs, over the same renderer. A second
-    // implementation for a process with no cache is what `MetricsSnapshot::storage`
-    // being optional exists to avoid -- and it brings `/healthz`, which this worker
-    // has never had: a supervisor could tell that the process was alive and not
-    // that it was answering.
-    std::unique_ptr<Node::AdminEndpoint> adminEndpoint;
-    if (!cfg.adminListen.empty())
-    {
-        auto started = Node::AdminEndpoint::Start(
-            cfg.adminListen,
-            "127.0.0.1",
-            metrics,
-            [startedAt = std::chrono::steady_clock::now(),
-             &server,
-             slots,
-             host = host.get(),
-             scratchRoot = jobs.ScratchRoot()] {
-                // Sampled per scrape rather than captured once: the disk fills and
-                // the busy count moves, and a value frozen at startup is worse than
-                // no value because it looks current.
-                // Through the same facts source the capacity above came from, so a
-                // scrape and a registration cannot disagree about the machine they
-                // describe. `host` outlives this lambda: it is declared before the
-                // endpoint and destroyed after it.
-                auto const disk = host->SpaceOn(scratchRoot);
-
-                // No storage: a worker has no cache, and reporting a
-                // default-constructed one would state an empty unbounded cache as a
-                // fact rather than as an absence.
-                return MetricsSnapshot {
-                    .storage = std::nullopt,
-                    .host = HostCapacity { .logicalCores = host->LogicalCores(),
-                                           .configuredSlots = slots,
-                                           .totalMemoryBytes = host->TotalMemoryBytes(),
-                                           .diskCapacityBytes = static_cast<std::uint64_t>(disk.capacityBytes),
-                                           .diskFreeBytes = static_cast<std::uint64_t>(disk.freeBytes),
-                                           .busySlots = server.InFlight() },
-                    .uptime = Uptime { std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()
-                                                                                        - startedAt) },
-                };
-            },
-            logger);
-
-        // Fatal rather than a warning, unlike the daemon's: an operator who asked a
-        // *worker* for an endpoint is almost always wiring a probe to it, and a
-        // worker that starts without one looks healthy to everything that would
-        // have noticed.
-        if (!started.has_value())
-        {
-            logger.Logf(LogLevel::Error, "--admin-listen {}; refusing to start", started.error());
-            return ExitUsage;
-        }
-
-        adminEndpoint = std::move(*started);
-        logger.Logf(LogLevel::Info, "metrics endpoint on http://{}/metrics (and /healthz)", adminEndpoint->BoundEndpoint());
-    }
+    // The admin endpoint used to be built here, and moving it down is the fix
+    // rather than tidying. Its snapshot lambda has to report the node's cache, and
+    // the cache tier is started further down -- so a lambda captured at this point
+    // could only ever say `.storage = std::nullopt`, which is exactly what it said,
+    // comment and all, for as long as this program has had a cache.
 
     // The fleet scheduler, when this node is the one running it. Off unless asked
     // for: handing out other machines' CPU time is an operator's decision, not
@@ -579,13 +525,64 @@ constexpr int ExitOk = 0;
     auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(nodeIo, cfg, membership.Oracle(), cacheClock, metrics, logger);
     if (!cacheTierOrRefusal.has_value())
     {
-        logger.Logf(LogLevel::Error, "--listen-cache {}; refusing to start", cacheTierOrRefusal.error());
+        // No flag prefix here, unlike its neighbours: this tier can fail over two
+        // different flags -- the directory and the port -- and only
+        // `StartCacheTierOrExplain` knows which, so it names it.
+        logger.Logf(LogLevel::Error, "{}; refusing to start", cacheTierOrRefusal.error());
         return ExitUsage;
     }
     // May legitimately be null: `StartCacheTierOrExplain` treats an emptied
     // `--listen-cache`, and a DEFAULT address that was already taken, as reasons to
     // carry on without a tier rather than as failures. Both have been logged.
     auto const cacheTier = std::move(*cacheTierOrRefusal);
+
+    // The admin endpoint, when the operator asked for one. Off by default and on
+    // loopback for a bare port: a scrape surface reachable from the network is a
+    // decision, not a default.
+    //
+    // The same `AdminHttpServer` the daemon runs, over the same renderer. A second
+    // implementation for a process with no cache is what `MetricsSnapshot::storage`
+    // being optional exists to avoid -- and it brings `/healthz`, which this worker
+    // has never had: a supervisor could tell that the process was alive and not
+    // that it was answering.
+    //
+    // Declared AFTER the cache tier, which is what makes the pointer its lambda
+    // captures safe: locals are destroyed in reverse, so this endpoint stops
+    // serving -- and joins its thread -- before the tier it reads is gone.
+    std::unique_ptr<Node::AdminEndpoint> adminEndpoint;
+    if (!cfg.adminListen.empty())
+    {
+        auto started = Node::AdminEndpoint::Start(
+            cfg.adminListen,
+            "127.0.0.1",
+            metrics,
+            // Built by a function rather than spelled as a lambda here, and not for
+            // tidiness: `main.cpp` is in no test target, so a snapshot assembled in
+            // it has no coverage -- and this one has a branch worth covering, since
+            // a node with no cache must report NO cache rather than an empty one.
+            // It also kept `WorkerBody` under clang-tidy's cognitive-complexity
+            // limit, which is the symptom that said so.
+            Node::MakeNodeSnapshotProvider(Node::NodeScrapeSources { .host = host.get(),
+                                                                     .busySlots = [&server] { return server.InFlight(); },
+                                                                     .cache = cacheTier.get(),
+                                                                     .slots = slots,
+                                                                     .scratchRoot = jobs.ScratchRoot() },
+                                           std::chrono::steady_clock::now()),
+            logger);
+
+        // Fatal rather than a warning, unlike the daemon's: an operator who asked a
+        // *worker* for an endpoint is almost always wiring a probe to it, and a
+        // worker that starts without one looks healthy to everything that would
+        // have noticed.
+        if (!started.has_value())
+        {
+            logger.Logf(LogLevel::Error, "--admin-listen {}; refusing to start", started.error());
+            return ExitUsage;
+        }
+
+        adminEndpoint = std::move(*started);
+        logger.Logf(LogLevel::Info, "metrics endpoint on http://{}/metrics (and /healthz)", adminEndpoint->BoundEndpoint());
+    }
 
     // Both surfaces have bound and adopted, so the loop can start accepting. Doing
     // it here rather than at construction is the ordering `ConsensusTier::Launch`
@@ -611,11 +608,22 @@ constexpr int ExitOk = 0;
     // entries report themselves busy together and the scheduler stops picking any
     // of them. The pool behaves as one because the number it reports describes
     // the machine rather than the entry.
+    //
+    // The capacity they announce is the machine facts PLUS what the cache tier
+    // actually became, and the second half is read off the tier rather than off
+    // the configuration that asked for it. `--listen-cache` may have been taken and
+    // `--cache-memory 0` may have turned the memory half off, so a node announcing
+    // the budget it was configured with would have the leader reporting a cache
+    // that is not there. It cannot be folded into `capacity` above either: that one
+    // is what `slots` was derived from, and the tier does not exist at that point.
+    auto advertised = capacity;
+    advertised.cache = Node::CacheCapacityOf(cacheTier.get());
+
     std::vector<Cc::WorkerRegistrar> registrars;
     registrars.reserve(toolchains.size());
     for (auto const& [fingerprint, compiler]: toolchains)
         registrars.emplace_back(
-            fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, Distributed::CapacityToWire(capacity));
+            fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, Distributed::CapacityToWire(advertised));
 
     // One sampler for the whole loop, not one per heartbeat. CPU utilization is a
     // difference between two readings, so a sampler constructed per iteration would
@@ -658,11 +666,18 @@ constexpr int ExitOk = 0;
                 // report several different views of one host and, worse, would cut
                 // the CPU interval into pieces too short to mean anything.
                 auto const sampled = loadSampler->Sample();
+                // The cache is sampled here too, and per ROUND rather than per
+                // registrar for the same reason: a node with two `--toolchain`
+                // flags is two registry entries against one machine and one cache,
+                // so both entries carry the same figures. Summing them across
+                // entries counts that cache twice, which is what
+                // `WorkerRegistry::NodeCaches()` exists to prevent on the other end.
                 auto const load =
                     Distributed::LoadToWire(Distributed::NodeLoad { .inFlight = inFlight,
                                                                     .cpuBusyPermille = sampled.cpuBusyPermille,
                                                                     .availableMemoryBytes = sampled.availableMemoryBytes,
-                                                                    .freeScratchBytes = sampled.freeScratchBytes });
+                                                                    .freeScratchBytes = sampled.freeScratchBytes,
+                                                                    .cache = Node::CacheLoadOf(cacheTier.get(), metrics) });
 
                 for (auto& registrar: registrars)
                 {

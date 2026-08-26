@@ -12,6 +12,31 @@ spins on a condition a regression never satisfies hangs instead of failing, and 
 defect — this repository has already paid for that once
 (`dist-compile-e2e ***Timeout 900.10 sec`).
 
+## A case name is an ARGUMENT, so it may not begin with `-`
+
+`catch_discover_tests` registers each case as
+`add_test(NAME <case> COMMAND <exe> <case>)`. The name therefore reaches Catch2 on
+its command line, and Catch2 parses arguments before it parses test specs — so a
+leading dash is read as an option. The two halves fail differently and the quiet
+one is worse:
+
+- **A recognised flag.** `TEST_CASE("--help wins over whatever follows it")` made
+  the runner print its usage and exit 0, so CTest recorded a **pass for a case that
+  had never run**. It had been doing that since the day it was written, which is
+  the shape this whole file is about: nothing fails, and the thing somebody was
+  told is covered is not. `TEST_CASE("--help works with and without a
+  sub-command")` in the test client was the same case, one target over.
+- **An unrecognised one.** `TEST_CASE("--cache-dir gives the node an on-disk
+  tier")` made Catch2 print `Unrecognised token` and exit non-zero, so CTest
+  reported a failure the case did not have — and it passed when run by hand. That
+  is how the first half was found.
+
+`ctest -R test-name-hygiene` scans for the pattern and refuses a third. It scans
+rather than listing the two known names, for the reason every other table here
+does: a list of what is wrong today is maintained by the same person who
+introduces the next one. Put the flag anywhere but first — "Naming `--cache-dir`
+gives the node an on-disk tier" reads no worse and runs.
+
 ## The shared helpers: `Unwrap` and `ScratchPath`
 
 `src/tests/` holds the helpers every test target shares -- `Unwrap.hpp` and

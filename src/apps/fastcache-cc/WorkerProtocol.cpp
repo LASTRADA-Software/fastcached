@@ -205,7 +205,10 @@ WorkerRegistrar::WorkerRegistrar(std::string fingerprint,
     _endpoint { std::move(endpoint) },
     _slots { slots },
     _acceptedCodecs { std::move(acceptedCodecs) },
-    _capacity { capacity }
+    // Moved rather than copied, like every other member here. It became worth
+    // saying when `CapacityFields` grew the node's cache record: it was a handful
+    // of scalars and is now a struct holding a vector, so a copy allocates.
+    _capacity { std::move(capacity) }
 {
 }
 

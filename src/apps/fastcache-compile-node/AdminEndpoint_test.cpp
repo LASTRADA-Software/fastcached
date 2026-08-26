@@ -10,14 +10,20 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
 #include <format>
 #include <future>
 #include <optional>
 #include <string>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Node;
 using namespace std::chrono_literals;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -135,4 +141,92 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
     auto again = BlockingListener::Bind("127.0.0.1", port);
     REQUIRE(again);
     CHECK(again->IsBound());
+}
+
+namespace
+{
+/// A machine a test can describe, standing in for the one it runs on.
+///
+/// A second, smaller copy of `NodeConfig_test`'s `FakeHost`: that one lives in its
+/// file's anonymous namespace and reports no disk at all, which is precisely what
+/// this case needs to see. Two copies rather than a shared header, and worth
+/// lifting if a third appears.
+class ScrapeHost final: public IHostFactsSource
+{
+  public:
+    [[nodiscard]] HostFacts const& Facts() const override
+    {
+        return _facts;
+    }
+    [[nodiscard]] std::uint32_t LogicalCores() const override
+    {
+        return 4;
+    }
+    [[nodiscard]] std::uint64_t TotalMemoryBytes() const override
+    {
+        return 8ULL << 30;
+    }
+    [[nodiscard]] DiskSpace SpaceOn(std::filesystem::path const& /*path*/) const override
+    {
+        return DiskSpace { .capacityBytes = 1000, .freeBytes = 400 };
+    }
+
+  private:
+    HostFacts _facts;
+};
+} // namespace
+
+TEST_CASE("A node with no cache tier reports no cache", "[node][admin][cache]")
+{
+    // The branch this factory exists to have covered. While it lived in `main.cpp`
+    // as a lambda it had no coverage at all -- that file is in no test target --
+    // and it spent its whole life returning `std::nullopt` under a comment saying a
+    // worker has no cache, which stopped being true when the node grew one.
+    //
+    // Absent here is the truth rather than a placeholder: a node whose every cache
+    // half was turned off has none, and a default-constructed `StorageStats` would
+    // state an empty unbounded cache as a fact.
+    ScrapeHost host;
+    auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
+                                                                       .busySlots = [] { return std::size_t { 2 }; },
+                                                                       .cache = nullptr,
+                                                                       .slots = 4,
+                                                                       .scratchRoot = std::filesystem::path { "." } },
+                                                   std::chrono::steady_clock::now());
+
+    auto const snapshot = provider();
+    CHECK_FALSE(snapshot.storage.has_value());
+    for (auto const& tier: snapshot.storageTiers)
+        CHECK_FALSE(tier.has_value());
+
+    // What it reports regardless: the machine, which does not depend on a cache.
+    REQUIRE(snapshot.host.has_value());
+    CHECK(Unwrap(snapshot.host).logicalCores == 4);
+    CHECK(Unwrap(snapshot.host).configuredSlots == 4);
+    CHECK(Unwrap(snapshot.host).diskFreeBytes == 400);
+    // Sampled per scrape, not captured once -- the busy count moves.
+    CHECK(Unwrap(snapshot.host).busySlots == 2);
+}
+
+TEST_CASE("A scrape renders nothing for a cache the node does not have", "[node][admin][cache]")
+{
+    // End to end through the renderer, because the absence has to survive it too: a
+    // `fastcached_items 0` line says the cache is empty, which is a different claim
+    // from a node that has none, and a dashboard reads the first as a fact.
+    ScrapeHost host;
+    AtomicMetricsSink metrics;
+    auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
+                                                                       .busySlots = [] { return std::size_t { 0 }; },
+                                                                       .cache = nullptr,
+                                                                       .slots = 4,
+                                                                       .scratchRoot = std::filesystem::path { "." } },
+                                                   std::chrono::steady_clock::now());
+
+    auto const body = RenderPrometheus(metrics, provider());
+    CHECK_FALSE(body.contains("fastcached_items"));
+    CHECK_FALSE(body.contains("fastcached_bytes_limit"));
+    CHECK_FALSE(body.contains("fastcached_tier_"));
+    // And the machine is still there, so this is an absence rather than an empty
+    // scrape that would pass the checks above for the wrong reason.
+    CHECK(body.contains("fastcache_node_logical_cores 4\n"));
 }

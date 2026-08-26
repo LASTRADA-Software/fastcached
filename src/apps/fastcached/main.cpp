@@ -733,6 +733,13 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
                 [&engine, &steadyClock, adminStartedAt] {
                     return FastCache::MetricsSnapshot {
                         .storage = engine.Snapshot(),
+                        // What the merged view above had to leave out. With
+                        // `--storage` the backend is an in-memory tier over a CoW
+                        // tree, and `LayeredStorage::Snapshot()` reports the
+                        // tree's item count, bytes and budget alone -- so the RAM
+                        // tier an operator sized with `--memory` has never
+                        // appeared on this scrape at all.
+                        .storageTiers = engine.SnapshotTiers(),
                         // Absent, and said out loud rather than left to the default:
                         // this is a cache, not a compile node, and cores it does not
                         // schedule against are noise on its scrape. Naming the field

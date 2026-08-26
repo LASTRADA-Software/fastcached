@@ -232,4 +232,9 @@ StorageStats WriteErrorReportingStorage::Snapshot() const noexcept
     return stats;
 }
 
+TieredStorageStats WriteErrorReportingStorage::SnapshotTiers() const noexcept
+{
+    return _inner.SnapshotTiers();
+}
+
 } // namespace FastCache

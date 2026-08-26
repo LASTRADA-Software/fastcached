@@ -557,6 +557,17 @@ class CacheEngine
         return _storage.Snapshot();
     }
 
+    /// The same statistics, kept apart by the tier holding them.
+    ///
+    /// What `Snapshot()` above cannot say for a `--storage` daemon: its backend is
+    /// an in-memory tier over a CoW tree, and the merged view reports the tree's
+    /// item count, bytes and budget alone. See `IStorage::SnapshotTiers`.
+    /// @return One entry per tier the backend has.
+    [[nodiscard]] TieredStorageStats SnapshotTiers() const noexcept
+    {
+        return _storage.SnapshotTiers();
+    }
+
     [[nodiscard]] IClock& Clock() noexcept
     {
         return _clock;

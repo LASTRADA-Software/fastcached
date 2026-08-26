@@ -1256,6 +1256,13 @@ StorageStats CowTreeStorage::Snapshot() const noexcept
     return _stats;
 }
 
+TieredStorageStats CowTreeStorage::SnapshotTiers() const noexcept
+{
+    TieredStorageStats tiers {};
+    tiers[static_cast<std::size_t>(StorageTier::Disk)] = Snapshot();
+    return tiers;
+}
+
 void CowTreeStorage::Resize(std::size_t newMaxBytes)
 {
     _options.maxBytes = newMaxBytes;

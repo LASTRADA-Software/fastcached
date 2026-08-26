@@ -257,6 +257,11 @@ StorageStats NotifyingStorage::Snapshot() const noexcept
     return _inner.Snapshot();
 }
 
+TieredStorageStats NotifyingStorage::SnapshotTiers() const noexcept
+{
+    return _inner.SnapshotTiers();
+}
+
 bool NotifyingStorage::SupportsSharedRead() const noexcept
 {
     return _inner.SupportsSharedRead();

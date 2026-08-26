@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/IStorage.hpp>
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
@@ -7,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <format>
 #include <optional>
 #include <string>
@@ -169,4 +171,86 @@ TEST_CASE("A compile node reports its size, and a cache daemon does not", "[metr
         metrics, MetricsSnapshot { .storage = StorageStats {}, .host = std::nullopt, .uptime = Uptime { 1s } });
     CHECK_FALSE(withoutHost.contains("fastcache_node_logical_cores"));
     CHECK_FALSE(withoutHost.contains("fastcache_node_slots_busy"));
+}
+
+TEST_CASE("A tiered cache renders one labelled sample per tier", "[metrics][prometheus][storage-tier]")
+{
+    // The numbers `MetricsSnapshot::storage` cannot carry. `LayeredStorage`
+    // reports its canonical lower tier's item count, bytes and budget with the
+    // composite's hit/miss patched over them, so a node's whole in-memory tier is
+    // missing from a scrape that reads only that field.
+    AtomicMetricsSink metrics;
+
+    TieredStorageStats tiers {};
+    tiers[static_cast<std::size_t>(StorageTier::Memory)] =
+        StorageStats { .itemCount = 11, .bytesUsed = 2048, .bytesLimit = 4096, .evictions = 7 };
+    tiers[static_cast<std::size_t>(StorageTier::Disk)] =
+        StorageStats { .itemCount = 900, .bytesUsed = 1'000'000, .bytesLimit = 0, .evictions = 1 };
+
+    auto const body = RenderPrometheus(
+        metrics,
+        MetricsSnapshot { .storage = std::nullopt, .storageTiers = tiers, .host = std::nullopt, .uptime = Uptime { 1s } });
+
+    SECTION("each tier's own numbers, under its own label")
+    {
+        // Every value distinct, so a row rendering its neighbour's field cannot
+        // pass -- the slip a table of near-identical rows invites.
+        CHECK(body.contains("fastcached_tier_items{tier=\"memory\"} 11\n"));
+        CHECK(body.contains("fastcached_tier_items{tier=\"disk\"} 900\n"));
+        CHECK(body.contains("fastcached_tier_bytes_used{tier=\"memory\"} 2048\n"));
+        CHECK(body.contains("fastcached_tier_bytes_used{tier=\"disk\"} 1000000\n"));
+        CHECK(body.contains("fastcached_tier_bytes_limit{tier=\"memory\"} 4096\n"));
+        CHECK(body.contains("fastcached_tier_bytes_limit{tier=\"disk\"} 0\n"));
+        CHECK(body.contains("fastcached_tier_evictions_total{tier=\"memory\"} 7\n"));
+        CHECK(body.contains("fastcached_tier_evictions_total{tier=\"disk\"} 1\n"));
+    }
+    SECTION("HELP and TYPE appear once per series, not once per label")
+    {
+        // Repeating them per label value is what a scraper rejects, and it takes
+        // the whole body with it rather than the one series.
+        for (auto const& name: { "fastcached_tier_items",
+                                 "fastcached_tier_bytes_used",
+                                 "fastcached_tier_bytes_limit",
+                                 "fastcached_tier_evictions_total" })
+        {
+            INFO("series " << name);
+            auto count = 0;
+            for (auto pos = body.find(std::format("# TYPE {} ", name)); pos != std::string::npos;
+                 pos = body.find(std::format("# TYPE {} ", name), pos + 1))
+                ++count;
+            CHECK(count == 1);
+        }
+    }
+}
+
+TEST_CASE("A memory-only cache renders no disk tier at all", "[metrics][prometheus][storage-tier]")
+{
+    // Absent is not zero, one level below the rule `MetricsSnapshot::storage`
+    // already follows: `fastcached_tier_items{tier="disk"} 0` says a disk tier is
+    // standing empty, and a node configured without one has no such tier to be
+    // empty. A dashboard cannot tell those apart from a zero.
+    AtomicMetricsSink metrics;
+
+    TieredStorageStats tiers {};
+    tiers[static_cast<std::size_t>(StorageTier::Memory)] = StorageStats { .itemCount = 4 };
+
+    auto const body = RenderPrometheus(
+        metrics,
+        MetricsSnapshot { .storage = std::nullopt, .storageTiers = tiers, .host = std::nullopt, .uptime = Uptime { 1s } });
+
+    CHECK(body.contains("fastcached_tier_items{tier=\"memory\"} 4\n"));
+    CHECK_FALSE(body.contains("tier=\"disk\""));
+}
+
+TEST_CASE("A process with no cache renders no tier series", "[metrics][prometheus][storage-tier]")
+{
+    // The default `MetricsSnapshot` leaves every tier absent, so a worker that
+    // never started a cache tier emits no `fastcached_tier_*` line -- not even a
+    // `# HELP` with nothing under it, which a scraper accepts and a dashboard
+    // draws as a series that has stopped reporting.
+    AtomicMetricsSink metrics;
+    auto const body = RenderPrometheus(
+        metrics, MetricsSnapshot { .storage = std::nullopt, .host = std::nullopt, .uptime = Uptime { 1s } });
+
+    CHECK_FALSE(body.contains("fastcached_tier_"));
 }

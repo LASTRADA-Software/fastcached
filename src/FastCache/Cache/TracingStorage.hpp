@@ -129,6 +129,7 @@ class TracingStorage final: public IStorage
     std::size_t PurgeExpired(TimePoint now) override;
     void Resize(std::size_t newMaxBytes) override;
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
+    [[nodiscard]] TieredStorageStats SnapshotTiers() const noexcept override;
 
   private:
     IStorage& _inner;

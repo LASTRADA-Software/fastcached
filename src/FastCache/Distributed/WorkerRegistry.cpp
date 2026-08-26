@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <format>
+#include <map>
 #include <ranges>
 #include <utility>
 
@@ -235,6 +236,76 @@ std::vector<WorkerInfo> WorkerRegistry::LiveWorkers() const
     // Sorted so a snapshot is reproducible: this feeds diagnostics and tests, and
     // an unordered_map's iteration order is neither stable nor meaningful.
     std::ranges::sort(out, [](auto const& a, auto const& b) { return a.id < b.id; });
+    return out;
+}
+
+namespace
+{
+    /// Whether this entry's heartbeat has actually said anything about a cache.
+    ///
+    /// The tie-break `NodeCaches()` needs, and it is not cosmetic. `Register`
+    /// resets `info.load` to `{}`, because a re-registering worker has restarted
+    /// and whatever it last reported is a reading from before that. So a node's
+    /// two entries do NOT always agree: one may have just re-registered -- its
+    /// heartbeat refused, its load cleared -- while its sibling still holds
+    /// figures from the last round. Picking arbitrarily between them reports that
+    /// node as having no cache for one heartbeat interval, which is
+    /// indistinguishable from a node that has none.
+    /// @param cache The entry's reported cache.
+    /// @return True when it carries at least one fact.
+    [[nodiscard]] bool SaysAnything(NodeCacheLoad const& cache) noexcept
+    {
+        return cache.hits.has_value() || cache.misses.has_value()
+               || std::ranges::any_of(cache.tiers, [](auto const& tier) { return tier.has_value(); });
+    }
+} // namespace
+
+std::vector<NodeCacheReport> WorkerRegistry::NodeCaches() const
+{
+    std::scoped_lock const guard { _mutex };
+    auto const now = _clock.Now();
+
+    // Keyed on endpoint, because that is what the entries of one machine share --
+    // this registry keys workers on (fingerprint, endpoint), so a node with two
+    // `--toolchain` flags is two entries reporting one cache.
+    struct Candidate
+    {
+        NodeCacheReport report;
+        TimePoint lastSeen {};
+    };
+    std::map<std::string, Candidate> byEndpoint;
+    for (auto const& [id, entry]: _workers)
+    {
+        if (!IsLive(entry, now))
+            continue;
+
+        Candidate candidate { .report = NodeCacheReport { .endpoint = entry.info.endpoint,
+                                                          .capacity = entry.info.capacity.cache,
+                                                          .load = entry.info.load.cache },
+                              .lastSeen = entry.lastSeen };
+        auto const [slot, inserted] = byEndpoint.try_emplace(entry.info.endpoint, candidate);
+        if (inserted)
+            continue;
+
+        // Only ONE entry contributes -- adding them is the double count this whole
+        // function exists to prevent -- so which one is a real choice. An entry
+        // that has reported a cache beats one that has not, and among those the
+        // most recently heard from wins. The order `_workers` happens to iterate
+        // in decides nothing.
+        auto const& incumbent = slot->second;
+        auto const better = SaysAnything(candidate.report.load) != SaysAnything(incumbent.report.load)
+                                ? SaysAnything(candidate.report.load)
+                                : candidate.lastSeen > incumbent.lastSeen;
+        if (better)
+            slot->second = std::move(candidate);
+    }
+
+    std::vector<NodeCacheReport> out;
+    out.reserve(byEndpoint.size());
+    // `std::map` rather than an unordered one, so the order is the endpoints'
+    // and a snapshot is reproducible -- the property `LiveWorkers()` sorts for.
+    for (auto& [endpoint, candidate]: byEndpoint)
+        out.push_back(std::move(candidate.report));
     return out;
 }
 

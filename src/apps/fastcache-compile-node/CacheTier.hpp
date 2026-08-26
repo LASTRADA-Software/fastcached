@@ -8,8 +8,10 @@
 #include "Responders.hpp"
 
 #include <FastCache/Cache/IStorage.hpp>
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <expected>
@@ -46,7 +48,15 @@ class CacheTier
     /// the same departure `AdminEndpoint::Start` documents and for the same reason:
     /// this fails in ways belonging to two taxonomies and the caller's response is
     /// identical either way.
+    /// The storage arrives already built, rather than being assembled in here, and
+    /// that is what keeps two unequal failures apart. A store that will not open is
+    /// always fatal; a port that will not bind is fatal only when the operator typed
+    /// the address. Both reduce to a diagnostic string, so building the store inside
+    /// this function would leave `StartCacheTierOrExplain` unable to tell which it
+    /// was holding — and a bad `--cache-dir` on a node using the default cache port
+    /// would be logged as a warning and stepped over.
     /// @param cfg The parsed configuration.
+    /// @param storage Where this tier keeps objects; already opened.
     /// @param membership Decides who may read this tier; must outlive it.
     /// @param clock Time source for the tier's expiry; must outlive the tier.
     /// @param metrics Where hits, misses and upstream outcomes are counted.
@@ -55,6 +65,7 @@ class CacheTier
     [[nodiscard]] static std::expected<std::unique_ptr<CacheTier>, std::string> Start(
         NodeIoLoop& io,
         NodeConfig const& cfg,
+        std::unique_ptr<IStorage> storage,
         Distributed::IMembershipOracle const& membership,
         IClock& clock,
         IMetricsSink& metrics,
@@ -71,6 +82,29 @@ class CacheTier
     [[nodiscard]] std::string const& BoundEndpoint() const noexcept
     {
         return _endpoint->BoundEndpoint();
+    }
+
+    /// What this node's cache holds, as one figure.
+    ///
+    /// Safe from any thread, which is the whole reason the storage below is behind
+    /// a `ShardedStorage`: the tier is mutated on the reactor thread while the
+    /// heartbeat thread and the `/metrics` scrape read it.
+    /// @return The cache's own statistics.
+    [[nodiscard]] StorageStats Snapshot() const noexcept
+    {
+        return _storage->Snapshot();
+    }
+
+    /// The same, kept apart by the tier holding each number.
+    ///
+    /// What `Snapshot()` cannot say when both halves are configured: the composite
+    /// reports the on-disk store's item count, bytes and budget, so the in-memory
+    /// half above it leaves no trace. See `IStorage::SnapshotTiers` for why these
+    /// are per-tier answers rather than a total waiting to be summed.
+    /// @return One entry per tier this node configured.
+    [[nodiscard]] TieredStorageStats SnapshotTiers() const noexcept
+    {
+        return _storage->SnapshotTiers();
     }
 
   private:
@@ -90,6 +124,32 @@ class CacheTier
     CacheResponder _responder;
     std::unique_ptr<FrameEndpoint> _endpoint;
 };
+
+/// What @p tier is configured to hold, in the vocabulary the fleet speaks.
+///
+/// Read off the tier that was actually built rather than off the configuration
+/// that asked for it, and the difference is the point: `--listen-cache` may have
+/// been taken, `--cache-memory 0` may have turned the memory half off, and a
+/// node that announced a budget it does not have would have the leader reporting
+/// a cache that is not there.
+///
+/// A registration fact, because a budget does not move while the process runs.
+/// @param tier The node's cache, or null when it has none.
+/// @return The per-tier budgets; every tier absent when @p tier is null.
+[[nodiscard]] Distributed::NodeCacheCapacity CacheCapacityOf(CacheTier const* tier);
+
+/// What @p tier holds right now, in the vocabulary the fleet speaks.
+///
+/// A heartbeat fact. The hit/miss split comes from the sink rather than from the
+/// storage, and deliberately: `LocalCache` counts a hit when it serves from this
+/// node's tier and a miss when it has to reach the shared cache, which is the
+/// question an operator is asking. The storage's own `getHits` counts something
+/// narrower -- reads of one tier -- and a lower tier is only consulted when the
+/// one above it missed, so those do not add up to the node's.
+/// @param tier The node's cache, or null when it has none.
+/// @param metrics Where `LocalCache` counted its hits and misses.
+/// @return What the cache holds; every tier absent when @p tier is null.
+[[nodiscard]] Distributed::NodeCacheLoad CacheLoadOf(CacheTier const* tier, IMetricsSink const& metrics);
 
 /// Start the node's cache tier, or explain why the node must not start at all.
 ///

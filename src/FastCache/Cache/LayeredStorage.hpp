@@ -155,6 +155,15 @@ class LayeredStorage final: public IStorage
     std::size_t PurgeExpired(TimePoint now) override;
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
 
+    /// Both tiers' statistics, unmerged.
+    ///
+    /// What `Snapshot()` above cannot answer: it reports L2's item count, bytes and
+    /// budget with this composite's own hit/miss patched over them, so L1 leaves no
+    /// trace beyond its share of the eviction total. An operator asking whether a
+    /// node's RAM tier is populated has no other way to find out.
+    /// @return L1's entry and L2's, each at the tier that store reports itself as.
+    [[nodiscard]] TieredStorageStats SnapshotTiers() const noexcept override;
+
     /// Reconfigure the L1 byte budget. L2's budget is its own concern
     /// (typically unbounded for disk-backed tiers).
     /// @param newL1MaxBytes New L1 byte budget.

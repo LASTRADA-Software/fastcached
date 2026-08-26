@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 
 #include <algorithm>
@@ -97,6 +98,58 @@ static_assert(RowsInEnumeratorOrder(NodeClassTable, &NodeClassTraits::nodeClass)
     return NodeClassTable[raw].nodeClass;
 }
 
+/// A node's cache budget, as it announces it at registration.
+///
+/// Every member of this fleet is a cache, and until this record existed the
+/// leader — the one node that talks to every other — could say nothing at all
+/// about any of them: not how many objects a member holds, not how close to its
+/// budget it is, not whether it has a disk tier.
+///
+/// Split from `NodeCacheLoad` exactly as `NodeCapacity` is split from `NodeLoad`,
+/// and the boundary is the same one: a budget is fixed for the process's life, so
+/// re-reading it on every heartbeat would be a number nobody chose to resend.
+///
+/// **Not scheduling input.** `AvailableSlots` does not consult any of this and
+/// must not start to: a node's cache says nothing about whether it can take
+/// another compile. It is here to be reported.
+struct NodeCacheCapacity
+{
+    /// Bytes each tier may hold, or absent when the node has no such tier.
+    ///
+    /// Absent is not zero, and here the two are opposite claims: absent means the
+    /// node runs no tier of that kind, while zero is a tier configured with no
+    /// ceiling. A dashboard renders the second as "unbounded" and would render a
+    /// flattened first as the same thing.
+    EnumTable<StorageTier, std::optional<std::uint64_t>> tierBytesLimit {};
+};
+
+/// What one of a node's cache tiers holds.
+struct CacheTierUsage
+{
+    std::uint64_t itemCount { 0 }; ///< Live entries.
+    std::uint64_t bytesUsed { 0 }; ///< Bytes held.
+    std::uint64_t evictions { 0 }; ///< Entries dropped to stay within the budget.
+};
+
+/// What a node's cache holds right now, as it reports on each heartbeat.
+///
+/// The dynamic counterpart of `NodeCacheCapacity`, for the reason `NodeLoad` is
+/// the dynamic counterpart of `NodeCapacity`.
+struct NodeCacheLoad
+{
+    /// What each tier holds, or absent when the node has no such tier.
+    EnumTable<StorageTier, std::optional<CacheTierUsage>> tiers {};
+
+    /// Reads the node's cache served, and reads it could not.
+    ///
+    /// Node-wide rather than per tier, deliberately: a lower tier is consulted
+    /// only when the one above it missed, so per-tier hit counts do not sum to the
+    /// node's and a consumer adding them reports a cache serving every read at
+    /// well under 100%.
+    std::optional<std::uint64_t> hits;
+    std::optional<std::uint64_t> misses; ///< @see hits.
+};
+
 /// What a machine is, as far as scheduling onto it is concerned.
 ///
 /// Deliberately not `Platform::HostFacts`: that describes what a machine *is* — its
@@ -124,6 +177,13 @@ struct NodeCapacity
     std::uint32_t reservedCores { 0 };
     /// Whether `reservedCores` was set explicitly, or should follow the class.
     bool reserveIsExplicit { false };
+
+    /// What this node's cache is configured to hold.
+    ///
+    /// Here rather than in `NodeLoad` because a budget does not move, and here
+    /// rather than nowhere because the leader is the one node with a view of
+    /// every member and had no view of any member's cache at all.
+    NodeCacheCapacity cache {};
 };
 
 /// Memory a single translation unit is budgeted at, for slot derivation.
@@ -233,6 +293,13 @@ struct NodeLoad
     std::optional<std::uint32_t> cpuBusyPermille;      ///< Host-wide CPU busy, 0..1000.
     std::optional<std::uint64_t> availableMemoryBytes; ///< Memory a new job could get.
     std::optional<std::uint64_t> freeScratchBytes;     ///< Room where jobs are compiled.
+
+    /// What this node's cache holds right now.
+    ///
+    /// Reported for an operator rather than weighed by a scheduler:
+    /// `AvailableSlots` below does not read it, and must not start to. How full
+    /// a node's cache is says nothing about whether it can take another compile.
+    NodeCacheLoad cache {};
 };
 
 namespace Detail
