@@ -25,13 +25,19 @@ Wants=network-online.target
 [Service]
 Type=simple
 
-# The scheduler address and the toolchains are SITE-SPECIFIC and have no
+# The scheduler address and the advertised endpoint are SITE-SPECIFIC and have no
 # defensible default, so they come from a file an operator writes rather than
-# from this unit. A worker with no scheduler serves nobody and a worker with no
-# toolchain can run nothing, so starting without them is a configuration error
-# and the binary refuses -- loudly, at start, which is the right time to find
-# out. The `-` prefix keeps the missing file from being a *unit* error, so the
-# failure reported is the real one.
+# from this unit. A worker nothing knows about serves nobody, so starting without
+# them is a configuration error and the binary refuses -- loudly, at start, which
+# is the right time to find out. The `-` prefix keeps the missing file from being
+# a *unit* error, so the failure reported is the real one.
+#
+# The TOOLCHAINS are not in that file any more. "No default compiler" and "no
+# discovery" turned out to be different claims: a default is how a job ends up
+# running against something nobody chose, while which compilers a machine holds is
+# a fact this worker can establish for itself. It surveys the machine at startup
+# and serves what it finds; `--toolchain` narrows that, and
+# `--no-toolchain-discovery` turns it off.
 EnvironmentFile=-/etc/fastcached/compile-node.env
 ExecStart=/usr/bin/fastcache-compile-node $FASTCACHE_NODE_ARGS
 

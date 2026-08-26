@@ -156,6 +156,48 @@
                   Impersonate="no"
                   Return="ignore" />
 
+    <!-- The COMPILE WORKER, which this MSI previously installed as a binary and
+         never registered: the node refused to install without a toolchain named,
+         and an installer cannot know what a machine holds.
+
+         It can now. The worker surveys the machine at startup and serves what it
+         finds, so the per-machine half of the configuration is gone and the MSI
+         has a registration it can actually write.
+
+         What is left is genuinely site-specific and the installer still cannot
+         guess it: WHERE the scheduler is, and WHAT ADDRESS clients should use to
+         reach this worker. Neither has a defensible default. The advertise flag in
+         particular falls back to 0.0.0.0, which no client can dial, and such a
+         worker registers, heartbeats, is leased out and is never reached, with no
+         error at either end. So they are installer properties, and with neither
+         set nothing is registered at all:
+
+             msiexec /i fastcached.msi ^
+                 FASTCACHE_NODE_SCHEDULER=build-cache.internal:6675 ^
+                 FASTCACHE_NODE_ADVERTISE=worker-01.internal:6676
+
+         NOTE, as at the top of this file: XML forbids a double hyphen inside a
+         comment, so flag names are written without their leading dashes here.
+
+         Secure="yes" so the values survive the elevation to the deferred action's
+         own session, exactly as FASTCACHED_START_SERVICE does. -->
+    <Property Id="FASTCACHE_NODE_SCHEDULER" Secure="yes" />
+    <Property Id="FASTCACHE_NODE_ADVERTISE" Secure="yes" />
+
+    <CustomAction Id="FastCacheNodeInstallService"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --install-service --scheduler=[FASTCACHE_NODE_SCHEDULER] --advertise=[FASTCACHE_NODE_ADVERTISE]"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <CustomAction Id="FastCacheNodeUninstallService"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --uninstall-service"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
     <InstallExecuteSequence>
       <!-- Seed before registering, so the service finds its configuration the
            first time it starts. Both run after the files are on disk
@@ -172,9 +214,29 @@
       <Custom Action="FastCachedStartService" After="FastCachedInstallService"
               Condition="NOT REMOVE AND FASTCACHED_START_SERVICE = &quot;1&quot;" />
 
+      <!-- The worker, registered only when the installer was told both of the two
+           things it cannot guess. Conditioned on BOTH rather than either: a
+           registration with a scheduler and no advertised endpoint bakes in
+           0.0.0.0, and that worker is leased out and never reached, which is the
+           worst shape this system has because it looks healthy from both ends.
+
+           A property that was not passed formats as the empty string, so the
+           condition tests for a non-empty value rather than for the property's
+           existence. -->
+      <Custom Action="FastCacheNodeInstallService" After="FastCachedStartService"
+              Condition="NOT REMOVE AND FASTCACHE_NODE_SCHEDULER AND FASTCACHE_NODE_ADVERTISE" />
+
       <!-- Deregister before the files are removed: the action needs
            fastcached.exe to still exist. -->
       <Custom Action="FastCachedUninstallService" Before="RemoveFiles"
+              Condition="REMOVE~=&quot;ALL&quot;" />
+
+      <!-- Unconditional on the way out, unlike the install: an uninstall merely
+           names a registration to remove, and refusing to remove one because the
+           properties were not passed a second time is how a stale registration
+           becomes permanent. Return="ignore" already covers the case where there
+           was none. -->
+      <Custom Action="FastCacheNodeUninstallService" Before="FastCachedUninstallService"
               Condition="REMOVE~=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 
