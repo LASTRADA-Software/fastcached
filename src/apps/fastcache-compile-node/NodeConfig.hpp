@@ -6,6 +6,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
+#include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <cstdint>
@@ -167,11 +168,22 @@ struct NodeConfig
     /// than pointing at the shared cache is that a rebuild should not reach the wire.
     /// A default of zero would mean nobody got that unless they read this file.
     ///
-    /// 256 MiB rather than a fraction of RAM: this runs on somebody's workstation
-    /// beside their editor and their browser, and the daemon's quarter-of-the-machine
-    /// default is sized for a host whose job is caching. Enough for a few thousand
-    /// objects, small enough that nobody notices it.
-    std::uint64_t cacheMemoryBytes { 256ULL * 1024ULL * 1024ULL };
+    /// **A quarter of host RAM**, clamped to [512 MiB, 8 GiB] -- the same
+    /// `DefaultMaxMemoryBytes()` the daemon uses, rather than a second opinion about
+    /// the same question. This was a flat 256 MiB, chosen on the argument that a node
+    /// shares a workstation with somebody's editor and browser. That argument aged
+    /// badly: the machines this runs on now start at 16 GB, one object file is
+    /// routinely megabytes, and a few hundred of them is the whole cache -- so the
+    /// tier missed on exactly the rebuild it exists to serve, on every machine, and
+    /// only an operator who read this file ever found out.
+    ///
+    /// The clamp is what keeps the old argument's substance: the floor means even a
+    /// small laptop gets a cache worth having, and the ceiling means a 512 GB build
+    /// server does not quietly take 128 GB resident for a cache nobody asked for.
+    /// Memoised in `DefaultMaxMemoryBytes()`, which matters here because this struct
+    /// is default-constructed freely -- including for the `defaults` instance
+    /// `MakeNodeServiceSpec` diffs against.
+    std::uint64_t cacheMemoryBytes { DefaultMaxMemoryBytes() };
 
     /// Bytes the on-disk half may hold. 0 means "grow as needed".
     ///

@@ -175,10 +175,23 @@ B+tree:
 
 | Configuration | What you get |
 |---|---|
-| `--cache-memory=8g` (the default is `256m`) | Memory only. Fast, and gone at restart. |
+| `--cache-memory=8g` (the default is 25% of RAM, within `512m`–`8g`) | Memory only. Fast, and gone at restart. |
 | `--cache-dir=/var/cache/fastcache-node` | Both halves: the memory tier in front of a store that survives a restart. |
 | `--cache-memory=0 --cache-dir=…` | Disk only. |
 | `--cache-memory=0` and no `--cache-dir` | **No tier at all**, which is what a node that only compiles for others wants. |
+
+`--cache-memory` takes bytes (`k`/`m`/`g` = KiB/MiB/GiB) or a share of host RAM
+(`N%`) — the vocabulary its own default is stated in, so "a quarter, but half of
+that" is `--cache-memory=12%` rather than arithmetic you do per machine. **Zero
+turns the tier off**; it does not mean "unbounded", which is what zero means to
+the store underneath.
+
+The default follows the machine because the machines this runs on vary by more
+than an order of magnitude, and one object file is routinely megabytes: a cache
+sized for a laptop is close to useless on a 96 GB workstation, and a flat number
+misses on exactly the rebuild the tier exists to serve. The clamp is what makes a
+fraction safe at both ends — a small laptop still gets a cache worth having, and a
+512 GB build server does not silently take 128 GB resident for one.
 
 `--cache-disk` caps the on-disk half, which is otherwise allowed to grow as
 needed — the same default `--storage-max-disk` has on the daemon. On a build

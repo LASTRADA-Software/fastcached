@@ -151,9 +151,11 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.schedulerListen = "0.0.0.0:6678";
     cfg.fleetMembers = { "10.0.0.1:6676", "10.0.0.2:6676" };
     cfg.fleetOpen = true;
-    // Not 256 MiB: that is the default now, and this case exists to give every
-    // field a value differing from its default so every emitter fires.
-    cfg.cacheMemoryBytes = 512 * 1024 * 1024;
+    // Derived from the default rather than written out, because the default is a
+    // fraction of HOST RAM now: any literal here is one that silently equals the
+    // default on some machine, and this case exists precisely to give every field
+    // a value that differs from it.
+    cfg.cacheMemoryBytes = NodeConfig {}.cacheMemoryBytes + 1;
     cfg.cacheDir = "cache";
     cfg.cacheDiskBytes = 40ULL * 1024 * 1024 * 1024;
     cfg.cacheListen = "127.0.0.1:6679";
@@ -432,9 +434,11 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig cfg;
         cfg.schedulerListen = "0.0.0.0:6678";
         cfg.fleetOpen = true;
-        // Not 256 MiB: that is the default now, and this case exists to give every
-        // field a value differing from its default so every emitter fires.
-        cfg.cacheMemoryBytes = 512 * 1024 * 1024;
+        // Derived from the default rather than written out, because the default is a
+        // fraction of HOST RAM now: any literal here is one that silently equals the
+        // default on some machine, and this case exists precisely to give every field
+        // a value that differs from it.
+        cfg.cacheMemoryBytes = NodeConfig {}.cacheMemoryBytes + 1;
         cfg.cacheDir = "cache";
         cfg.cacheListen = "127.0.0.1:6679";
         cfg.upstream = "cache.internal:6674";
@@ -831,4 +835,67 @@ TEST_CASE("Naming the dashboard flags parses them", "[node][dashboard][cli]")
     REQUIRE(bare.has_value());
     CHECK_FALSE(bare->dashboard);
     CHECK(bare->dashboardTokenFile.empty());
+}
+
+TEST_CASE("The in-memory tier defaults to a bounded share of the machine", "[node][config][cache]")
+{
+    auto const budget = NodeConfig {}.cacheMemoryBytes;
+
+    // The same `DefaultMaxMemoryBytes()` the daemon uses, rather than a second
+    // opinion about the same question. Asserted against the function rather than
+    // against a literal, because a literal here is a test that passes for the wrong
+    // reason on whichever machine happens to run it.
+    CHECK(budget == DefaultMaxMemoryBytes());
+
+    // The clamp is what makes a fraction safe in both directions: a small laptop
+    // still gets a cache worth having, and a very large build server does not
+    // quietly take a tenth of its RAM resident for a cache nobody asked for.
+    constexpr std::uint64_t Floor = 512ULL * 1024 * 1024;
+    constexpr std::uint64_t Ceiling = 8ULL * 1024 * 1024 * 1024;
+    CHECK(budget >= Floor);
+    CHECK(budget <= Ceiling);
+}
+
+TEST_CASE("The cache budget can be given as a share of RAM, and zero still turns it off", "[node][config][cache]")
+{
+    // The flag speaks its own default's vocabulary. Without this, "a quarter of RAM,
+    // but half of that" means working the bytes out by hand for every machine.
+    auto const half = ParseNodeArgv({ "--cache-memory=50%" });
+    REQUIRE(half.has_value());
+    CHECK(half->cacheMemoryBytes > 0);
+    auto const quarter = ParseNodeArgv({ "--cache-memory=25%" });
+    REQUIRE(quarter.has_value());
+    // A half is twice a quarter whatever this machine has, give or take the integer
+    // division -- which is the relationship worth asserting, since the absolute
+    // numbers are the runner's.
+    CHECK(half->cacheMemoryBytes >= (quarter->cacheMemoryBytes * 2) - 1);
+
+    auto const bytes = ParseNodeArgv({ "--cache-memory=1g" });
+    REQUIRE(bytes.has_value());
+    CHECK(bytes->cacheMemoryBytes == 1024ULL * 1024 * 1024);
+
+    // **Zero turns the tier off.** It is not "unbounded", which is what zero means
+    // to `InMemoryLruStorage` -- the flag that turns a cache off once turned its
+    // limit off instead, and a percentage default must not have quietly reopened
+    // that: `25%` and `0` have to stay different things.
+    auto const off = ParseNodeArgv({ "--cache-memory=0" });
+    REQUIRE(off.has_value());
+    CHECK(off->cacheMemoryBytes == 0);
+}
+
+TEST_CASE("A cache budget nobody set emits no flag, and a zero one does", "[node][config][cache]")
+{
+    // `--install-service` registers the COMMAND-LINE config, so a field left alone
+    // must emit nothing and be re-derived on the machine the service runs on. That
+    // matters more now the default follows host RAM: baking today's bytes into a
+    // unit would freeze them across a memory upgrade or a VM resize.
+    auto const untouched = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", Installable());
+    CHECK(std::ranges::none_of(untouched.arguments, [](auto const& arg) { return arg.starts_with("--cache-memory"); }));
+
+    auto off = Installable();
+    off.cacheMemoryBytes = 0;
+    auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", off);
+    // Turning it off is a decision, and one that differs from the default on every
+    // machine -- so it survives into the unit rather than being read as "unset".
+    CHECK(std::ranges::any_of(spec.arguments, [](auto const& arg) { return arg == "--cache-memory=0"; }));
 }

@@ -185,7 +185,11 @@ namespace
     /// @return The size in bytes, or why it is not one.
     [[nodiscard]] std::expected<std::uint64_t, ConfigError> ParseCacheBytes(std::string_view sv)
     {
-        auto const parsed = ParseByteSize(sv, "cache-memory");
+        // Host total passed, so `N%` parses -- which is the vocabulary this flag's
+        // own default is stated in. A default an operator cannot spell is one they
+        // cannot adjust by a little: without this, "a quarter of RAM, but half"
+        // means working out the bytes for every machine by hand.
+        auto const parsed = ParseByteSize(sv, "cache-memory", QueryHostTotalMemoryBytes());
         if (!parsed.has_value())
             return std::unexpected(parsed.error());
         return static_cast<std::uint64_t>(*parsed);
@@ -496,12 +500,13 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "decision -- listing nobody refuses everybody." },
         { .primary = "--cache-memory",
           .arity = Arity::Value,
-          .operand = "=<bytes>",
+          .operand = "=<size>",
           .apply = AssignFrom<&NodeConfig::cacheMemoryBytes, ParseCacheBytes>(),
-          .description = "size of this node's own in-memory cache tier\n"
-                         "(default 256m; 0 turns it off). It exists so a\n"
-                         "local rebuild on a slow or bad network never\n"
-                         "reaches the wire at all." },
+          .description = "size of this node's own in-memory cache tier;\n"
+                         "k/m/g = KiB/MiB/GiB or N% of host RAM. Defaults\n"
+                         "to 25% of RAM within [512m, 8g]; 0 turns it off.\n"
+                         "It exists so a local rebuild on a slow or bad\n"
+                         "network never reaches the wire at all." },
         { .primary = "--cache-disk",
           .arity = Arity::Value,
           .operand = "=<bytes>",
