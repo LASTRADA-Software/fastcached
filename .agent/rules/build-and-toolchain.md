@@ -175,10 +175,30 @@ determinism rests on.
   against a translation unit that did not parse, which looks like a wall of real
   findings and is nothing of the kind.
 
-  It also needs a **clang** compile database. Pointed at a GCC one it inherits
-  flags clang does not know, and the mismatch is not always as loud as it should be;
-  configure a throwaway tree with `-DCMAKE_CXX_COMPILER=clang++
-  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` and point `-p` at that.
+  It also needs a **clang** compile database, generated with **module scanning
+  off**. Pointed at a GCC one it inherits flags clang does not know; and a database
+  from a module-scanning generator carries `@…modmap` arguments that do not exist
+  until that target has been built, so the translation unit fails to parse and the
+  file reports nothing at all. Configure a throwaway tree:
+
+  ```sh
+  cmake -S . -B out/build/tidy22 -G Ninja \
+        -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
+        -DFASTCACHED_ENABLE_TLS=ON
+  ```
+
+- **A sweep that cannot prove the tool ran is worth nothing, and reads like
+  success.** Every way of getting clang-tidy wrong above -- an unset execute bit
+  (the wheel does not carry one), a wrapper that cannot exec, a missing resource
+  dir, an unparseable `@modmap` -- produces *silence*, and silence filtered through
+  `grep 'error:'` is indistinguishable from a clean file. This branch shipped to CI
+  twice on sweeps that had reported clean while executing nothing.
+
+  `scripts/tidy-sweep.sh` is that lesson in executable form: it canaries the binary
+  against a real source file first, treats exit codes ≥ 126 as fatal rather than as
+  findings, and refuses to print a clean verdict it did not earn. Use it, and if you
+  write a one-off loop instead, make it fail loudly the same way.
 
 - **A `bool` in the middle of a config struct costs seven bytes, and four of them
   fail the build.** `clang-analyzer-optin.performance.Padding` permits 24 bytes more

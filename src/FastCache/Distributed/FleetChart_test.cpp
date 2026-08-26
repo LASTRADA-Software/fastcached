@@ -5,12 +5,16 @@
 
 #include <chrono>
 #include <cstdint>
+#include <format>
 #include <ranges>
 #include <string>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Distributed;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -91,7 +95,7 @@ TEST_CASE("A rate is the delta between adjacent buckets, per minute", "[distribu
     // and emphatically not the cumulative 100.
     CHECK_FALSE(values[0].has_value());
     REQUIRE(values[1].has_value());
-    CHECK(*values[1] == 6.0); // 30 compiles over five minutes.
+    CHECK(Unwrap(values[1]) == 6.0); // 30 compiles over five minutes.
 }
 
 TEST_CASE("A counter that goes backwards is a restart, and renders as a gap", "[distributed][fleetchart]")
@@ -107,7 +111,7 @@ TEST_CASE("A counter that goes backwards is a restart, and renders as a gap", "[
     // sample time would have recorded a negative as an enormous unsigned spike.
     CHECK_FALSE(values[1].has_value());
     REQUIRE(values[2].has_value());
-    CHECK(*values[2] == 6.0);
+    CHECK(Unwrap(values[2]) == 6.0);
 }
 
 TEST_CASE("A rate is never taken across a gap", "[distributed][fleetchart]")
@@ -130,7 +134,7 @@ TEST_CASE("A gauge is the bucket's own reading, with no bucket before it needed"
 
     auto const values = ValuesFor(SeriesByKey("in-flight"), buckets, DaySeconds);
     REQUIRE(values[0].has_value());
-    CHECK(*values[0] == 7.0);
+    CHECK(Unwrap(values[0]) == 7.0);
 }
 
 TEST_CASE("A share with no reads in the bucket is absent, not zero", "[distributed][fleetchart]")
@@ -146,7 +150,7 @@ TEST_CASE("A share with no reads in the bucket is absent, not zero", "[distribut
     // missed everything, which is a different and much more alarming statement.
     CHECK_FALSE(values[1].has_value());
     REQUIRE(values[2].has_value());
-    CHECK(*values[2] == 75.0); // 3 hits of 4 reads.
+    CHECK(Unwrap(values[2]) == 75.0); // 3 hits of 4 reads.
 }
 
 TEST_CASE("The newest known value is what a KPI tile shows", "[distributed][fleetchart]")
@@ -161,7 +165,7 @@ TEST_CASE("The newest known value is what a KPI tile shows", "[distributed][flee
     // The tile reads back past the trailing gap rather than reporting nothing: the
     // newest *known* value is what an operator is asking for.
     REQUIRE(latest.has_value());
-    CHECK(*latest == 9.0);
+    CHECK(Unwrap(latest) == 9.0);
 
     CHECK_FALSE(LatestOf(SeriesByKey("in-flight"), { Gap(0), Gap(300'000) }, DaySeconds).has_value());
 }
@@ -173,9 +177,9 @@ TEST_CASE("An all-absent series draws nothing at all", "[distributed][fleetchart
     auto const svg = RenderChartSvg(ChartByKey("dispatched"), buckets, FleetRange::Day, FleetTheme::Light);
     // Gridlines and axis labels still render -- the chart's frame is not a claim
     // about the data -- but no path and no dot, because nothing was observed.
-    CHECK(svg.find("<path d=\"\"") == std::string::npos);
-    CHECK(svg.find("<circle") == std::string::npos);
-    CHECK(svg.find("M") == std::string::npos);
+    CHECK_FALSE(svg.contains("<path d=\"\""));
+    CHECK_FALSE(svg.contains("<circle"));
+    CHECK_FALSE(svg.contains('M'));
     CHECK(svg.starts_with("<svg "));
     CHECK(svg.ends_with("</svg>"));
 }
@@ -198,11 +202,11 @@ TEST_CASE("A chart is a document a browser may load as an image", "[distributed]
         // Served as its own resource and loaded through <img>, so a script would not
         // run anyway -- but nothing here has any business emitting one, and a chart
         // that started to would be worth failing over rather than discovering later.
-        CHECK(svg.find("<script") == std::string::npos);
-        CHECK(svg.find("<path") != std::string::npos);
+        CHECK_FALSE(svg.contains("<script"));
+        CHECK(svg.contains("<path"));
         // Auto ships both palettes and lets the viewer's own setting choose, because
         // an <img>-referenced document inherits nothing from the page around it.
-        CHECK(svg.find("prefers-color-scheme:dark") != std::string::npos);
+        CHECK(svg.contains("prefers-color-scheme:dark"));
     }
 }
 
@@ -211,11 +215,11 @@ TEST_CASE("A fixed theme carries one palette and no media query", "[distributed]
     std::vector<FleetBucket> const buckets { At(0, { { FleetMetric::DispatchGranted, 1 } }) };
 
     auto const dark = RenderChartSvg(ChartByKey("dispatched"), buckets, FleetRange::Day, FleetTheme::Dark);
-    CHECK(dark.find("prefers-color-scheme") == std::string::npos);
-    CHECK(dark.find("--surface:#151A21") != std::string::npos);
+    CHECK_FALSE(dark.contains("prefers-color-scheme"));
+    CHECK(dark.contains("--surface:#151A21"));
 
     auto const light = RenderChartSvg(ChartByKey("dispatched"), buckets, FleetRange::Day, FleetTheme::Light);
-    CHECK(light.find("--surface:#FFFFFF") != std::string::npos);
+    CHECK(light.contains("--surface:#FFFFFF"));
 }
 
 TEST_CASE("A hostile unit is escaped rather than interpolated", "[distributed][fleetchart]")
@@ -232,8 +236,8 @@ TEST_CASE("A hostile unit is escaped rather than interpolated", "[distributed][f
     hostile.unit = "\"><script>alert(1)</script>";
 
     auto const svg = RenderChartSvg(hostile, buckets, FleetRange::Day, FleetTheme::Light);
-    CHECK(svg.find("<script") == std::string::npos);
-    CHECK(svg.find("&lt;script&gt;") != std::string::npos);
+    CHECK_FALSE(svg.contains("<script"));
+    CHECK(svg.contains("&lt;script&gt;"));
 }
 
 TEST_CASE("The series JSON carries every key the table names", "[distributed][fleetchart]")
@@ -249,12 +253,12 @@ TEST_CASE("The series JSON carries every key the table names", "[distributed][fl
     for (auto const& series: FleetSeriesTable)
     {
         INFO("series " << series.key);
-        CHECK(json.find(std::string { "\"" } + std::string { series.key } + "\":[") != std::string::npos);
+        CHECK(json.contains(std::format(R"("{}":[)", series.key)));
     }
-    CHECK(json.find("\"range\":\"24h\"") != std::string::npos);
-    CHECK(json.find("\"bucketSeconds\":300") != std::string::npos);
+    CHECK(json.contains("\"range\":\"24h\""));
+    CHECK(json.contains("\"bucketSeconds\":300"));
     // Absent is null and never 0, so a consumer cannot average a gap into the rest.
-    CHECK(json.find("[null,1") != std::string::npos);
+    CHECK(json.contains("[null,1"));
 }
 
 TEST_CASE("The sparkline inherits the page's palette rather than carrying one", "[distributed][fleetchart]")
@@ -268,11 +272,11 @@ TEST_CASE("The sparkline inherits the page's palette rather than carrying one", 
     auto const spark = RenderSparklineSvg(buckets);
     // Inlined into the page, so it is part of that document: no <style>, no palette,
     // and a var() the tile around it resolves.
-    CHECK(spark.find("<style>") == std::string::npos);
-    CHECK(spark.find("var(--accent)") != std::string::npos);
-    CHECK(spark.find("<path") != std::string::npos);
+    CHECK_FALSE(spark.contains("<style>"));
+    CHECK(spark.contains("var(--accent)"));
+    CHECK(spark.contains("<path"));
 
-    CHECK(RenderSparklineSvg({ Gap(0), Gap(300'000) }).find("<path") == std::string::npos);
+    CHECK_FALSE(RenderSparklineSvg({ Gap(0), Gap(300'000) }).contains("<path"));
 }
 
 TEST_CASE("A range with nothing in it folds to nothing, and does not walk backwards", "[distributed][fleetchart]")
@@ -311,7 +315,7 @@ TEST_CASE("A range's share is taken over its whole traffic, not averaged per buc
     // 99 of 100 reads hit. The mean of the per-bucket shares would be 49.5%, which
     // weights one read exactly as heavily as ninety-nine and reports a headline the
     // chart beside it visibly contradicts.
-    CHECK(*share == 99.0);
+    CHECK(Unwrap(share) == 99.0);
 }
 
 TEST_CASE("A rate folds to the total it accounts for", "[distributed][fleetchart]")
