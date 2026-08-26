@@ -325,11 +325,107 @@ namespace Detail
     }
 } // namespace Detail
 
-/// Slots this worker may be given **right now**.
+/// Which of the four ceilings decided `AvailableSlots`.
 ///
-/// `OfferableSlots` answers what a machine is worth in general; this answers what it
-/// can take at this moment, and the difference is everything a heartbeat carries.
-/// Three limits, each of which lowers the count and none of which raises it:
+/// `Registered` is zero, and that is the safety property rather than an ordering
+/// convenience: a breakdown nobody filled in reads as "nothing withdrew anything",
+/// which is the claim that sends an operator looking at the fleet rather than at
+/// one machine.
+enum class SlotLimit : std::uint8_t
+{
+    /// Nothing withdrew anything; the machine offers what it registered with.
+    Registered = 0,
+    /// Somebody else is using this machine.
+    ExternalCpu,
+    /// What is left of its memory.
+    Memory,
+    /// What is left of its scratch filesystem.
+    Scratch,
+    Last, ///< Not a limit, and has no row: `SlotLimitTable`'s length.
+};
+
+/// One row per limit: what it is called, and what an operator does about it.
+///
+/// The remedy is a column rather than prose somewhere else because the three
+/// reasons have *opposite* fixes -- buy a machine, free memory, free a disk -- and
+/// a dashboard that named the limit without naming the fix would send an operator
+/// shopping for hardware they already own. That is the same argument `PickError`'s
+/// three-way split makes one layer up.
+struct SlotLimitTraits
+{
+    SlotLimit limit;         ///< The limit this row describes.
+    std::string_view name;   ///< Spelling a report uses.
+    std::string_view remedy; ///< What an operator does about it.
+};
+
+/// Every limit, in enumerator order.
+inline constexpr EnumTable<SlotLimit, SlotLimitTraits> SlotLimitTable { {
+    { .limit = SlotLimit::Registered,
+      .name = "registered",
+      .remedy = "nothing is holding this machine back; it offers what it registered with." },
+    { .limit = SlotLimit::ExternalCpu,
+      .name = "external-cpu",
+      .remedy = "somebody else is using this machine. Its own work is not the fleet's." },
+    { .limit = SlotLimit::Memory,
+      .name = "memory",
+      .remedy = "memory is nearly gone. A compile is budgeted at 1 GiB." },
+    { .limit = SlotLimit::Scratch,
+      .name = "scratch",
+      .remedy = "the scratch filesystem is nearly full. A compile is budgeted at 128 MiB." },
+} };
+
+// A limit added to the enum without a row is a build failure rather than a report
+// that names whichever row happened to sort first.
+static_assert(RowsInEnumeratorOrder(SlotLimitTable, &SlotLimitTraits::limit),
+              "SlotLimitTable must hold one row per SlotLimit, in enumerator order");
+
+/// The traits for a limit.
+/// @param limit The limit.
+/// @return Its row.
+[[nodiscard]] constexpr SlotLimitTraits const& TraitsFor(SlotLimit limit) noexcept
+{
+    return SlotLimitTable[static_cast<std::size_t>(limit)];
+}
+
+/// The ceilings behind `AvailableSlots`, unfolded.
+///
+/// That function returns a `min` of four numbers, and folding them loses the only
+/// thing an operator wants to know: a node offering 2 of its 16 slots is a
+/// different problem depending on whether somebody is *using* the machine, its
+/// memory is gone, or its scratch disk has filled -- and the fix differs in each
+/// case. Summing or collapsing them hides all three, exactly as summing the lease
+/// refusals hides the difference between an empty fleet and a busy one.
+///
+/// The three dynamic ceilings are `optional` for the reason `NodeLoad`'s fields
+/// are: **absent is not zero**. A machine that could not read its own CPU has no
+/// CPU ceiling, which is a different claim from a ceiling of zero -- one says
+/// "scheduled on its other properties", the other says "take no work at all".
+struct SlotCeilings
+{
+    /// What `OfferableSlots` gave this worker at registration.
+    std::uint32_t registered { 0 };
+    /// What is left after the CPU somebody else is using, or absent when the
+    /// machine did not report its CPU.
+    std::optional<std::uint32_t> byExternalCpu {};
+    /// What its remaining memory supports, or absent when it did not say.
+    std::optional<std::uint32_t> byMemory {};
+    /// What its remaining scratch space supports, or absent when it did not say.
+    std::optional<std::uint32_t> byScratch {};
+    /// The minimum of whichever applied; what `AvailableSlots` returns.
+    std::uint32_t available { 0 };
+    /// Which ceiling produced `available`.
+    ///
+    /// On a tie this names the **first** limit in enumerator order that reached
+    /// `available`, and enumerator order is the order the ceilings are applied in.
+    /// Stating it makes the answer reproducible rather than dependent on how the
+    /// comparison happened to be written.
+    SlotLimit binding { SlotLimit::Registered };
+};
+
+/// Every ceiling that applies to this worker right now, and which one binds.
+///
+/// The whole of `AvailableSlots`' arithmetic, spelled apart instead of folded. The
+/// three limits are the ones a heartbeat carries:
 ///
 ///   - **Somebody else is using the machine.** Host CPU busy, less what this fleet
 ///     is running here, is capacity that belongs to whoever is using it.
@@ -337,20 +433,22 @@ namespace Detail
 ///   - **The scratch filesystem is nearly full.** Likewise, and it is the limit that
 ///     most often reaches zero on a long-lived build host.
 ///
-/// It may legitimately return **zero**, unlike `OfferableSlots`. A registered worker
-/// must always be worth picking *eventually*, which is why that one has a floor; a
-/// worker whose disk is full right now must be worth picking *never, until that
-/// changes*, and a floor here would keep handing it jobs it cannot run.
-///
+/// **`capacity.cache` is not read, and must not start to be**: how full a node's
+/// cache is says nothing about whether it can take another compile.
 /// @param capacity What the machine is.
 /// @param registeredSlots What `OfferableSlots` gave it at registration.
 /// @param load What it is doing now.
-/// @return Concurrent jobs it may hold right now; may be zero.
-[[nodiscard]] constexpr std::uint32_t AvailableSlots(NodeCapacity const& capacity,
+/// @return Each ceiling, the resulting count, and which limit produced it.
+[[nodiscard]] constexpr SlotCeilings SlotCeilingsFor(NodeCapacity const& capacity,
                                                      std::uint32_t registeredSlots,
                                                      NodeLoad const& load) noexcept
 {
-    auto ceiling = registeredSlots;
+    SlotCeilings result { .registered = registeredSlots,
+                          .byExternalCpu = std::nullopt,
+                          .byMemory = std::nullopt,
+                          .byScratch = std::nullopt,
+                          .available = registeredSlots,
+                          .binding = SlotLimit::Registered };
 
     if (load.cpuBusyPermille.has_value())
     {
@@ -368,16 +466,57 @@ namespace Detail
         // reporting why.
         auto const external =
             busyCores <= std::uint64_t { load.inFlight } ? 0U : static_cast<std::uint32_t>(busyCores) - load.inFlight;
-        ceiling = external >= ceiling ? 0U : ceiling - external;
+        result.byExternalCpu = external >= registeredSlots ? 0U : registeredSlots - external;
+        result.available = *result.byExternalCpu;
+        if (*result.byExternalCpu < registeredSlots)
+            result.binding = SlotLimit::ExternalCpu;
     }
 
     if (load.availableMemoryBytes.has_value())
-        ceiling = std::min(ceiling, Detail::CeilingFrom(load.inFlight, *load.availableMemoryBytes, MemoryBudgetPerJobBytes));
+    {
+        result.byMemory = Detail::CeilingFrom(load.inFlight, *load.availableMemoryBytes, MemoryBudgetPerJobBytes);
+        if (*result.byMemory < result.available)
+        {
+            result.available = *result.byMemory;
+            result.binding = SlotLimit::Memory;
+        }
+    }
 
     if (load.freeScratchBytes.has_value())
-        ceiling = std::min(ceiling, Detail::CeilingFrom(load.inFlight, *load.freeScratchBytes, ScratchBudgetPerJobBytes));
+    {
+        result.byScratch = Detail::CeilingFrom(load.inFlight, *load.freeScratchBytes, ScratchBudgetPerJobBytes);
+        if (*result.byScratch < result.available)
+        {
+            result.available = *result.byScratch;
+            result.binding = SlotLimit::Scratch;
+        }
+    }
 
-    return ceiling;
+    return result;
+}
+
+/// Slots this worker may be given **right now**.
+///
+/// `OfferableSlots` answers what a machine is worth in general; this answers what it
+/// can take at this moment, and the difference is everything a heartbeat carries.
+/// Three limits, each of which lowers the count and none of which raises it --
+/// `SlotCeilingsFor` above is the same arithmetic with each of them named, and this
+/// is the number it arrives at.
+///
+/// It may legitimately return **zero**, unlike `OfferableSlots`. A registered worker
+/// must always be worth picking *eventually*, which is why that one has a floor; a
+/// worker whose disk is full right now must be worth picking *never, until that
+/// changes*, and a floor here would keep handing it jobs it cannot run.
+///
+/// @param capacity What the machine is.
+/// @param registeredSlots What `OfferableSlots` gave it at registration.
+/// @param load What it is doing now.
+/// @return Concurrent jobs it may hold right now; may be zero.
+[[nodiscard]] constexpr std::uint32_t AvailableSlots(NodeCapacity const& capacity,
+                                                     std::uint32_t registeredSlots,
+                                                     NodeLoad const& load) noexcept
+{
+    return SlotCeilingsFor(capacity, registeredSlots, load).available;
 }
 
 } // namespace FastCache::Distributed
