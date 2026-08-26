@@ -210,3 +210,79 @@ fault.
     That was found by the control -- a name nobody asked for, asserted NOT to
     match -- which is why one is there: without it the whole block passed while
     asserting nothing.
+
+- **A history stores a counter RAW; a rate is the difference taken at render.**
+  Storing the delta at sample time throws away the one thing that distinguishes a
+  restart from a quiet fleet. A counter that returns to zero produces a negative
+  step, and only a raw series can see it -- a stored delta is unsigned and has
+  already turned that step into an enormous spike nobody can explain. Raw, the
+  bucket is a **gap**, which is the truth: the step across a restart is unknowable,
+  not zero and not large.
+  - **A bucket nobody sampled is absent, not zero**, for the reason every cell on
+    the page already is. Zero says the fleet did nothing; absent says nobody was
+    watching, and a leader that has just taken over means the second. The same
+    goes for a rate taken *across* a gap: two readings ten minutes apart with the
+    middle five unobserved would spread the work over minutes nobody saw, so the
+    delta is only ever taken between **adjacent present** buckets.
+  - **A share with a zero denominator delta is absent, not 0%.** A bucket that
+    served no reads has no hit rate. Rendering 0% says the cache missed
+    everything, which is a different and much more alarming claim -- and the one
+    an operator would act on.
+  - **A share folded over a range is taken over that range's whole traffic**, never
+    as the mean of the per-bucket shares. The average weights a bucket that served
+    four reads exactly as heavily as one that served forty thousand, so a single
+    idle bucket at 0% drags a headline figure the chart beside it visibly
+    contradicts.
+- **History is a convenience: no state of its file may keep a node from starting.**
+  Missing, short, wrong version, bad checksum -- every one of them starts empty and
+  logs one line. It is written whole to a temporary and renamed, so a crash
+  mid-write leaves the previous file rather than half of this one. Where it lives
+  follows the directories the node already has (`--cluster-dir`, else
+  `--cache-dir`, else memory only) rather than a flag of its own: a third place to
+  say "put state here" is a third place to point at the wrong disk.
+- **Sampling happens only while this node LEADS.** A follower's registry holds
+  whatever registered against *it*, so a sample taken there records a fraction of
+  the fleet as though it were the whole -- and the chart then shows the fleet
+  shrinking every time leadership moves, which is the opposite of what happened.
+- **A chart served as its own resource cannot see the page's custom properties.**
+  An `<img>`-referenced SVG is a *separate document* and inherits nothing, so each
+  one carries its own palette and its own `prefers-color-scheme` block -- and the
+  theme is therefore part of its URL and part of its cache key. The sparkline is
+  the exception that proves it: inlined into the page, it is part of that document,
+  so it carries no palette and resolves the page's `var()` like anything else.
+  - **The chart URL carries no cache-buster.** A generation in the query would make
+    every closed bucket a new URL, and the conditional GET the whole arrangement
+    exists for would never fire. Stable URL, `ETag` from the sampler's bucket
+    counter (byte-exact and free, unlike a hash of the body), and a `Cache-Control`
+    that runs only to the **end of the bucket being drawn** -- a fixed `max-age`
+    leaves a viewer a whole bucket behind for the rest of it.
+  - **A `304` carries its validators and no content at all.** RFC 9110 §15.4.5
+    forbids content, and §8.6 forbids a `Content-Length` that is not what a `200`
+    would have sent: a client that reads one and then finds the connection closed
+    reports a truncated response rather than a cache hit. Whether a body is allowed
+    is a property of the **status**, checked once in the writer, so a route
+    answering `304` cannot get it wrong by forgetting.
+  - **Every chart route is behind the same credential as the page.** An image URL
+    that answered without one would leak the fleet's whole history while `/fleet`
+    stayed locked. The gate is written once and the renderer is the parameter, so a
+    route added later cannot be one that forgot to check.
+- **An unknown `range` is refused; an unknown `theme` is not.** The asymmetry is the
+  rule: a substituted range puts a reader on a different axis than the one they
+  asked for with nothing on the page saying so, while `auto` renders correctly
+  under either setting and costs them nothing. Refuse where a silent substitution
+  would mislead, default where it cannot.
+- **A stacked area is drawn top band first.** Each band is filled to the baseline
+  and the band below paints over the part that is not its neighbour's. Drawing
+  bottom-up leaves every band overlapping every one above it, and translucent fills
+  then multiply into a colour that belongs to no series -- which is the "four
+  reasons collapse into one" that chart exists to prevent, reintroduced by the
+  renderer.
+- **A gridline's value label goes below its line.** The topmost gridline sits
+  `PadTop` from the edge of the viewBox, so a label placed above *that* one has its
+  ascenders outside it -- clipped silently, and only ever on the line carrying the
+  largest number on the chart.
+- **An `xmlns` is not a fetch.** `http://www.w3.org/2000/svg` is an XML namespace
+  *name*; nothing resolves it. A "this page is self-contained" check written as "no
+  absolute URL anywhere" fails on the inline sparkline and pushes it out of the
+  page for a reason that was never true. Ask instead whether any attribute a
+  browser resolves -- `src`, `href`, `@import` -- points off this origin.

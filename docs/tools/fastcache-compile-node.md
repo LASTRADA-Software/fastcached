@@ -774,8 +774,10 @@ a wedged worker is in. It is what `systemd`'s and Kubernetes' probes want.
 
 ## Looking at the whole fleet
 
-`--dashboard` adds two more routes to that same endpoint: `/fleet`, a page, and
-`/fleet.json`, the same facts for anything that is not a browser.
+`--dashboard` adds four more routes to that same endpoint: `/fleet`, a page;
+`/fleet.json`, the same facts for anything that is not a browser;
+`/fleet/chart/<chart>.svg`, one image per chart; and `/fleet/series.json`, the
+numbers those images are drawn from.
 
 ```sh
 fastcache-compile-node --scheduler cache.internal:6674 \
@@ -800,11 +802,13 @@ What it shows, and why each part is split the way it is:
 
 | Section | What it answers |
 |---|---|
+| The readouts | Six figures across the top: compiles dispatched over the selected range (with a sparkline), compiling now, cache hit rate, the share of dispatch decisions refused, leases outstanding, and the **oldest** heartbeat in the fleet. The oldest and not the mean — one machine that stopped answering an hour ago is the fact worth surfacing, and an average over a healthy fleet buries it. |
 | Fleet capacity | One meter over every registered slot, split three ways: compiling, free, and **withheld** by a ceiling. The third is the one to read first — slots a ceiling withdrew are not this fleet being busy, so buying machines does not return them. |
 | Machines | One row **per machine**, not per toolchain: cores, memory, free scratch, class and reserve, cache hit rate, heartbeat age. |
 | Workers | One row per `(toolchain, endpoint)` registry entry: slots, in flight, available — and *which* limit withdrew the difference. |
 | Why requests were refused | Granted, and refused split four ways, each with what it tells you to do. |
 | Cache tiers | Items, bytes, budget and evictions **per tier**. A tier no member runs has no column at all, and a fleet where nobody runs one says so rather than showing an empty table. |
+| Over time | Four charts over 24 hours or 7 days: compiles dispatched, refusals stacked four ways, offerable capacity against jobs in flight, and cache hit rate per bucket. |
 | Members | Who the cluster has agreed on, and where each answers. A member that has never led shows no scheduler endpoint, because it has not said. |
 
 Three of those distinctions cost real debugging time when they are collapsed:
@@ -825,6 +829,59 @@ Three of those distinctions cost real debugging time when they are collapsed:
 A value nobody reported renders as `–` on the page and `null` in the JSON, never
 as `0` — a zero is a claim, and "this cache holds nothing" is a different fact
 from "this node never told us".
+
+### The charts, and what they are sampled from
+
+The leader samples the fleet **once a minute, and only while it leads**. A
+follower's registry holds whatever registered against it, so sampling there would
+record a fraction of the fleet as though it were the whole — and the chart would
+then show the fleet shrinking every time leadership moved. Losing leadership stops
+sampling and leaves a gap.
+
+**A bucket nobody sampled draws a gap, never a zero.** Zero says the fleet did
+nothing; a gap says nobody was watching. The same distinction the tables make at
+the cell, made here at the point. It falls out of storing each counter's *raw*
+cumulative value and taking the difference at render time: a restart returns the
+counter to zero, the difference goes negative, and that bucket is a gap rather
+than an enormous spike.
+
+The cache hit rate is **per bucket and never cumulative** — a running total stops
+moving once it is large, so an afternoon of misses barely bends it. A bucket that
+served no reads has no hit rate at all and is absent, because 0% is the claim that
+the cache missed everything.
+
+Where the history is kept follows the directories the node already has: the
+`--cluster-dir` if there is one, otherwise the `--cache-dir`, otherwise memory
+only — and the page says which. There is no flag for it: a third place to say "put
+state here" is a third place to point at the wrong disk. Any failure to read that
+file — missing, short, wrong version, bad checksum — starts empty and logs one
+line. History is a convenience and must never keep a node from starting.
+
+Each chart is **its own resource** rather than being inlined, so a browser caches
+it:
+
+```sh
+curl -s -u ":$(cat /etc/fastcached/dashboard.token)" \
+     "localhost:6677/fleet/chart/refusals.svg?range=7d" > refusals.svg
+curl -s -u ":$(cat /etc/fastcached/dashboard.token)" \
+     "localhost:6677/fleet/series.json?range=24h" | jq .
+```
+
+`range` is `24h` or `7d`, and an unrecognised one is refused with `400` rather
+than quietly served as the other — a substituted range puts a reader on a
+different axis with nothing on the page saying so. `theme` is `auto` (the
+default), `light` or `dark`, and an unrecognised one *is* silently `auto`, because
+that one renders correctly under either setting and costs a reader nothing.
+
+Each answer carries an `ETag` and a `Cache-Control` that runs only to the end of
+the bucket it drew, so `If-None-Match` gets a `304` until there is something new —
+not a fixed lifetime, which would leave a viewer a whole bucket behind for the
+rest of it.
+
+**The chart routes need the credential too.** An image URL that answered without
+one would leak the fleet's whole history while `/fleet` itself stayed locked.
+Browsers replay Basic on same-origin subresources, so a credential typed once at
+the page covers the images; a Bearer client sets the header per request.
 
 ### Getting at it safely
 

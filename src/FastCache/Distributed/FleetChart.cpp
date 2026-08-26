@@ -200,9 +200,13 @@ namespace
                                y,
                                HairlineVar);
             if (step > 0)
+                // Below its line, not above it. The topmost gridline sits `PadTop`
+                // from the edge, and a label placed above that one has its ascenders
+                // outside the viewBox -- clipped, silently, and only for the line
+                // carrying the largest number on the chart.
                 out += std::format(
                     R"(<text x="4" y="{:.1f}" font-size="9" fill="{}" font-family="ui-monospace,monospace">{:.0f}{}</text>)",
-                    y - 3.0,
+                    y + 9.0,
                     FaintVar,
                     value,
                     EscapeMarkup(unit));
@@ -437,29 +441,41 @@ std::string RenderChartSvg(FleetChartRow const& chart,
 
     if (chart.shape == FleetChartShape::Stacked)
     {
-        // Bottom-up in table order, each band drawn over the running total below it.
+        // Every band's cumulative top, computed bottom-up in table order.
+        std::vector<FleetSeriesValues> tops;
+        tops.reserve(chart.count);
         FleetSeriesValues running(buckets.size(), 0.0);
         for (auto const offset: std::views::iota(std::size_t { 0 }, chart.count))
         {
-            auto const& row = FleetSeriesTable[chart.first + offset];
             FleetSeriesValues top(buckets.size(), std::nullopt);
             for (auto const index: std::views::iota(std::size_t { 0 }, buckets.size()))
             {
-                if (!series[offset][index].has_value())
+                auto const& here = series[offset][index];
+                if (!here.has_value())
                     continue;
-                running[index] = running[index].value_or(0.0) + *series[offset][index];
+                running[index] = running[index].value_or(0.0) + *here;
                 top[index] = running[index];
             }
-            auto const band = RunsPath(top, max, true);
+            tops.push_back(std::move(top));
+        }
+
+        // Drawn **top band first**, each filled all the way down to the baseline, so
+        // the band below paints over the part that is not its neighbour's. Drawing
+        // bottom-up instead leaves every band overlapping every one above it, and
+        // translucent fills then multiply into a colour that belongs to no series --
+        // exactly the "four reasons collapse into one" this chart exists to prevent,
+        // reintroduced by the renderer.
+        for (auto const offset: std::views::iota(std::size_t { 0 }, chart.count) | std::views::reverse)
+        {
+            auto const& row = FleetSeriesTable[chart.first + offset];
+            auto const band = RunsPath(tops[offset], max, true);
             // An element with an empty `d` is not nothing: it is a shape a renderer
             // still has to consider, and it makes "this series was never observed"
             // indistinguishable from "this series was flat" in the output.
             if (band.empty())
                 continue;
-            out += std::format(R"(<path d="{}" fill="{}" fill-opacity="{}"/>)",
-                               band,
-                               std::format("var(--{})", row.colour),
-                               offset + 1 == chart.count ? "0.45" : "0.8");
+            out +=
+                std::format(R"(<path d="{}" fill="{}" fill-opacity="0.85"/>)", band, std::format("var(--{})", row.colour));
         }
     }
     else
@@ -467,11 +483,18 @@ std::string RenderChartSvg(FleetChartRow const& chart,
         {
             auto const& row = FleetSeriesTable[chart.first + offset];
             auto const colour = std::format("var(--{})", row.colour);
+            // A ceiling is drawn as a ceiling: dashed, and with barely any fill under
+            // it. The gap between the two lines is what this chart is about, and a
+            // reader who cannot tell which line is the limit reads that gap backwards.
+            auto const ceiling = row.stroke == FleetSeriesStroke::Dashed;
             if (auto const area = RunsPath(series[offset], max, true); !area.empty())
-                out += std::format(R"(<path d="{}" fill="{}" fill-opacity="0.14"/>)", area, colour);
+                out += std::format(R"(<path d="{}" fill="{}" fill-opacity="{}"/>)", area, colour, ceiling ? "0.10" : "0.14");
             if (auto const line = RunsPath(series[offset], max, false); !line.empty())
-                out += std::format(
-                    R"(<path d="{}" fill="none" stroke="{}" stroke-width="1.6" stroke-linejoin="round"/>)", line, colour);
+                out += std::format(R"(<path d="{}" fill="none" stroke="{}" stroke-width="1.6" )"
+                                   R"(stroke-linejoin="round"{}/>)",
+                                   line,
+                                   colour,
+                                   ceiling ? R"( stroke-dasharray="4 3")" : "");
         }
 
     out += AxisLabels(buckets);
@@ -547,8 +570,9 @@ std::string RenderSeriesJson(std::vector<FleetBucket> const& buckets, FleetRange
             // `null` and never 0: a consumer that could not tell them apart would
             // average a gap into the rest, which is exactly the mistake the page
             // renders differently.
-            if (values[point].has_value())
-                out += std::format("{:.4g}", *values[point]);
+            auto const& value = values[point];
+            if (value.has_value())
+                out += std::format("{:.4g}", *value);
             else
                 out += "null";
         }

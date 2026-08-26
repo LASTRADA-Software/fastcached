@@ -23,7 +23,7 @@
 #                                           rather than an empty table. That is the
 #                                           end-to-end path from REGISTER through
 #                                           the registry to the rendered document.
-#   5. The page is self-contained         — no script tag and no external URL, so
+#   5. The page is self-contained         — no script tag and nothing fetched, so
 #                                           it renders on the air-gapped network a
 #                                           build fleet usually lives on.
 #
@@ -107,7 +107,7 @@ free_port() {
 # @param 2 path
 # @param 3 optional Authorization header value
 http_get() {
-    local port="$1" path="$2" auth="${3:-}" line="" body=""
+    local port="$1" path="$2" auth="${3:-}" etag="${4:-}" line="" body=""
 
     # Over TLS `/dev/tcp` cannot help, so the HTTPS run goes through curl. `-k`
     # because the checked-in fixture certificate is self-signed for 'localhost'
@@ -116,6 +116,7 @@ http_get() {
     if [[ -n "$tls" ]]; then
         local args=(-sk -i -m 10)
         [[ -n "$auth" ]] && args+=(-H "Authorization: ${auth}")
+        [[ -n "$etag" ]] && args+=(-H "If-None-Match: ${etag}")
         curl "${args[@]}" "https://127.0.0.1:${port}${path}"
         return 0
     fi
@@ -124,6 +125,9 @@ http_get() {
     {
         printf 'GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\n' "$path"
         [[ -n "$auth" ]] && printf 'Authorization: %s\r\n' "$auth"
+        # Second header on purpose: the parse loop used to stop at the first one it
+        # recognised, which stayed correct exactly until there were two.
+        [[ -n "$etag" ]] && printf 'If-None-Match: %s\r\n' "$etag"
         printf 'Connection: close\r\n\r\n'
     } >&3
     while IFS= read -r -t 5 line <&3; do body+="${line}"$'\n'; done
@@ -252,10 +256,16 @@ page="$(http_get "$admin_port" /fleet "Bearer ${TOKEN}")"
 [[ "$page" == *Content-Type:\ text/html* ]] || fail "/fleet did not answer HTML"
 [[ "$page" == *'<!doctype html>'* ]] || fail "/fleet answered HTML without a doctype"
 
-# Self-contained: no script and no external asset, so it renders on an air-gapped
-# network and carries nothing a browser has to fetch.
+# Self-contained: no script, and nothing fetched from another host, so it renders
+# on an air-gapped network. Asked as "no attribute a browser resolves points off
+# this origin" rather than "no absolute URL anywhere": the inline sparkline's
+# `xmlns` is an XML namespace NAME, which looks like a URL and is never fetched --
+# and a check that failed on it would push the sparkline out of the page for a
+# reason that was never true.
 [[ "$page" != *'<script'* ]] || fail "the dashboard carries a script tag"
-[[ "$page" != *'http://'* && "$page" != *'https://'* ]] || fail "the dashboard references an external URL"
+[[ "$page" != *'src="http'* ]] || fail "the dashboard loads something from another host"
+[[ "$page" != *'href="http'* ]] || fail "the dashboard links a stylesheet from another host"
+[[ "$page" != *'@import'* ]] || fail "the dashboard imports a stylesheet"
 
 json="$(http_get "$admin_port" /fleet.json "Bearer ${TOKEN}")"
 [[ "$json" == *Content-Type:\ application/json* ]] || fail "/fleet.json did not answer JSON"
@@ -276,6 +286,60 @@ done
 # And it is one MACHINE, whatever it serves: the grain a fleet total is computed
 # over. A page listing registry entries would double-count a node's cores.
 [[ "$json" == *'"toolchains":1'* ]] || fail "/fleet.json did not report the machine's toolchain count"
+
+# ------------------------------------------------------- 6. charts over time
+# Every chart the page references is its own resource. Asked for by name rather
+# than scraped out of the page, so a chart that stopped being served would fail
+# here rather than quietly become a broken image in a browser.
+for chart in dispatched refusals capacity hit-rate; do
+    # **Unauthenticated first.** An image URL that answered without a credential
+    # would leak the fleet's whole history while /fleet itself stayed locked --
+    # which is the one way this feature could have made the surface less safe.
+    open_chart="$(http_get "$admin_port" "/fleet/chart/${chart}.svg?range=24h")"
+    [[ "$open_chart" == HTTP/1.1\ 401* ]] \
+        || fail "/fleet/chart/${chart}.svg served without a credential: ${open_chart%%$'\n'*}"
+
+    svg="$(http_get "$admin_port" "/fleet/chart/${chart}.svg?range=24h" "Bearer ${TOKEN}")"
+    [[ "$svg" == HTTP/1.1\ 200* ]] || fail "/fleet/chart/${chart}.svg did not answer 200: ${svg%%$'\n'*}"
+    [[ "$svg" == *Content-Type:\ image/svg+xml* ]] || fail "/fleet/chart/${chart}.svg did not answer SVG"
+    [[ "$svg" == *'<svg '* ]] || fail "/fleet/chart/${chart}.svg answered without an SVG root"
+    [[ "$svg" != *'<script'* ]] || fail "/fleet/chart/${chart}.svg carried a script"
+done
+
+# The conditional GET the whole arrangement exists for.
+svg="$(http_get "$admin_port" "/fleet/chart/dispatched.svg?range=24h" "Bearer ${TOKEN}")"
+etag="$(printf '%s' "$svg" | tr -d '\r' | sed -n 's/^ETag: //p' | head -1)"
+[[ -n "$etag" ]] || fail "a chart was served with no ETag, so a browser can never revalidate it"
+[[ "$svg" == *Cache-Control:\ max-age=* ]] || fail "a chart was served with no Cache-Control"
+
+cached="$(http_get "$admin_port" "/fleet/chart/dispatched.svg?range=24h" "Bearer ${TOKEN}" "$etag")"
+[[ "$cached" == HTTP/1.1\ 304* ]] || fail "a chart did not answer 304 to its own ETag: ${cached%%$'\n'*}"
+# RFC 9110 forbids content on a 304, and a Content-Length a client reads before
+# finding the connection closed is reported as a truncated response.
+[[ "$cached" != *Content-Length:* ]] || fail "a 304 carried a Content-Length"
+[[ "$cached" != *'<svg'* ]] || fail "a 304 carried a body"
+[[ "$cached" == *ETag:* ]] || fail "a 304 dropped the validator the client needs next time"
+
+# An unknown range is refused rather than quietly served as a different one.
+bad_range="$(http_get "$admin_port" "/fleet/chart/dispatched.svg?range=30d" "Bearer ${TOKEN}")"
+[[ "$bad_range" == HTTP/1.1\ 400* ]] || fail "an unknown range was not refused: ${bad_range%%$'\n'*}"
+# An unknown chart is a 404, not whichever chart happened to be first in the table.
+bad_chart="$(http_get "$admin_port" "/fleet/chart/nonesuch.svg?range=24h" "Bearer ${TOKEN}")"
+[[ "$bad_chart" == HTTP/1.1\ 404* ]] || fail "an unknown chart was not refused: ${bad_chart%%$'\n'*}"
+
+# And the series behind those charts, so anything on the page can be checked
+# without a browser.
+open_series="$(http_get "$admin_port" "/fleet/series.json?range=24h")"
+[[ "$open_series" == HTTP/1.1\ 401* ]] || fail "/fleet/series.json served without a credential"
+series="$(http_get "$admin_port" "/fleet/series.json?range=24h" "Bearer ${TOKEN}")"
+[[ "$series" == HTTP/1.1\ 200* ]] || fail "/fleet/series.json did not answer 200: ${series%%$'\n'*}"
+[[ "$series" == *Content-Type:\ application/json* ]] || fail "/fleet/series.json did not answer JSON"
+[[ "$series" == *'"range":"24h"'* ]] || fail "/fleet/series.json did not name the range it answered for"
+[[ "$series" == *'"dispatched":['* ]] || fail "/fleet/series.json carried no dispatched series"
+
+# The page points at those resources rather than inlining them.
+[[ "$page" == *'/fleet/chart/dispatched.svg?range=24h'* ]] \
+    || fail "/fleet did not reference the chart resources"
 
 # An unknown path is still a plain 404 rather than anything the dashboard added.
 missing="$(http_get "$admin_port" /nope "Bearer ${TOKEN}")"

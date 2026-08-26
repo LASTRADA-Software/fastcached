@@ -837,12 +837,17 @@ th[title] { text-decoration:underline dotted var(--line); text-underline-offset:
 .range a.on { background:var(--accent); color:#FFF; }
 .range a:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
 .charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(330px,1fr)); gap:1rem; }
-.chart { padding:.85rem 1rem 1rem; display:flex; flex-direction:column; gap:.3rem; }
+.chart { padding:.95rem 1.1rem 1rem; display:flex; flex-direction:column; }
+.chart-head { display:flex; align-items:baseline; justify-content:space-between; gap:.75rem; }
 .chart h3 { margin:0; font:600 12.5px/1.3 ui-sans-serif,system-ui,sans-serif; }
-.chart-cap { margin:0; font-size:11.5px; color:var(--muted); line-height:1.45; }
-.chart-keys { display:flex; flex-wrap:wrap; gap:.1rem .9rem; margin-top:.15rem;
-              font:400 11px/1.6 ui-monospace,monospace; color:var(--muted); }
-.chart img { display:block; width:100%; height:150px; margin-top:.45rem; }
+.chart-now { font:500 12px/1 ui-monospace,monospace; color:var(--muted); white-space:nowrap; }
+.chart-cap { margin:.1rem 0 .55rem; font-size:11.5px; color:var(--muted); line-height:1.45; }
+.chart-keys { display:flex; flex-wrap:wrap; gap:.2rem .9rem; margin-top:.5rem;
+              font-size:11.5px; color:var(--muted); }
+/* `height:auto` and not a fixed height: a viewBox squashed to a panel's width
+   distorts every glyph in it, so the axis labels stop being readable at exactly
+   the width the grid actually gives a chart. */
+.chart img { display:block; width:100%; height:auto; }
 .spark { display:block; width:74px; height:24px; margin-top:.1rem; }
 .spark svg { display:block; width:100%; height:100%; }
 .note a { color:var(--accent); }
@@ -922,6 +927,51 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         return 100.0 * refused / total;
     }
 
+    /// The figure beside a chart's title: what it reads *right now*.
+    ///
+    /// A stacked chart's headline is the sum of its bands, because the question a
+    /// stack answers is how much in total -- while an overlay's is its first series,
+    /// which is the one the panel is named after. Both fall out of `shape`, so a
+    /// fifth chart needs no rule of its own.
+    /// @param chart Which chart.
+    /// @param history What was recorded.
+    /// @return The figure with its unit, or the dash when nothing is known.
+    [[nodiscard]] std::string HeadlineOf(FleetChartRow const& chart, FleetHistoryView const& history)
+    {
+        auto const seconds = BucketSecondsOf(history);
+        auto const newest = [&](std::size_t offset) {
+            return LatestOf(FleetSeriesTable[chart.first + offset], history.buckets, seconds);
+        };
+
+        if (chart.shape == FleetChartShape::Stacked)
+        {
+            // A stack answers "how much in total", so its headline is the total.
+            double sum = 0.0;
+            bool known = false;
+            for (auto const offset: std::views::iota(std::size_t { 0 }, chart.count))
+                if (auto const value = newest(offset); value.has_value())
+                {
+                    sum += *value;
+                    known = true;
+                }
+            return known ? std::format("{:.1f}{} now", sum, chart.nowUnit) : std::string { AbsentText };
+        }
+
+        // An overlay of more than one series is a comparison -- the last series
+        // against the first, which is the ceiling it is measured under. Reporting
+        // only the ceiling would answer a question nobody asked of a panel titled
+        // "X vs. Y".
+        auto const headline = newest(chart.count - 1);
+        if (!headline.has_value())
+            return std::string { AbsentText };
+        if (chart.count == 1)
+            return std::format("{:.1f}{} now", *headline, chart.nowUnit);
+        auto const ceiling = newest(0);
+        if (!ceiling.has_value())
+            return std::format("{:.0f} / {} now", *headline, AbsentText);
+        return std::format("{:.0f} / {:.0f}{} now", *headline, *ceiling, chart.nowUnit);
+    }
+
     /// What one readout on the strip says.
     ///
     /// `value` is already safe to interpolate: every projector below produces either
@@ -941,14 +991,14 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         return decimals == 0 ? std::format("{:.0f}", *value) : std::format("{:.1f}", *value);
     }
 
-    KpiReadout KpiDispatched(FleetSnapshot const&, FleetHistoryView const& history)
+    KpiReadout KpiDispatched(FleetSnapshot const& /*snapshot*/, FleetHistoryView const& history)
     {
         return KpiReadout { .value = FigureOr(FoldedSeries("dispatched", history), 0),
                             .unit = {},
                             .sub = std::format("compiles in the last {}", RangeKeyOf(history)) };
     }
 
-    KpiReadout KpiCompilingNow(FleetSnapshot const& snapshot, FleetHistoryView const&)
+    KpiReadout KpiCompilingNow(FleetSnapshot const& snapshot, FleetHistoryView const& /*history*/)
     {
         auto const totals = TotalsFor(snapshot);
         return KpiReadout { .value = std::to_string(totals.inFlight),
@@ -956,7 +1006,7 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                             .sub = "this fleet's own work" };
     }
 
-    KpiReadout KpiHitRate(FleetSnapshot const&, FleetHistoryView const& history)
+    KpiReadout KpiHitRate(FleetSnapshot const& /*snapshot*/, FleetHistoryView const& history)
     {
         auto const share = FoldedSeries("hit-rate", history);
         return KpiReadout { .value = FigureOr(share, 1),
@@ -964,7 +1014,7 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                             .sub = std::format("over the last {}", RangeKeyOf(history)) };
     }
 
-    KpiReadout KpiRefused(FleetSnapshot const&, FleetHistoryView const& history)
+    KpiReadout KpiRefused(FleetSnapshot const& /*snapshot*/, FleetHistoryView const& history)
     {
         auto const share = RefusedShare(history);
         return KpiReadout { .value = FigureOr(share, 1),
@@ -972,12 +1022,12 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                             .sub = "of dispatch decisions" };
     }
 
-    KpiReadout KpiLeases(FleetSnapshot const& snapshot, FleetHistoryView const&)
+    KpiReadout KpiLeases(FleetSnapshot const& snapshot, FleetHistoryView const& /*history*/)
     {
         return KpiReadout { .value = std::to_string(snapshot.liveLeases), .unit = {}, .sub = "granted, not yet claimed" };
     }
 
-    KpiReadout KpiOldestHeartbeat(FleetSnapshot const& snapshot, FleetHistoryView const&)
+    KpiReadout KpiOldestHeartbeat(FleetSnapshot const& snapshot, FleetHistoryView const& /*history*/)
     {
         if (snapshot.nodes.empty())
             return KpiReadout { .value = std::string { AbsentText }, .unit = {}, .sub = "no machine registered" };
@@ -1015,6 +1065,82 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
     constexpr std::string_view LeaseNote =
         "Do not add these together. An empty fleet, a busy one, machines somebody else is using and an object "
         "already being built are four different problems with four different fixes, and a total hides all of them.";
+    /// Append the whole "Over time" section: the range control, the charts, the note.
+    ///
+    /// Its own function rather than more of `RenderFleetHtml`, and not only for
+    /// length: that function sits right at clang-tidy's cognitive-complexity
+    /// ceiling, which is the tool saying a decision has spread too far. Everything
+    /// here turns on one thing -- which range is in view -- and nothing above it does.
+    /// @param out Where to append.
+    /// @param history What was recorded, and what is being drawn.
+    void AppendOverTime(std::string& out, FleetHistoryView const& history)
+    {
+        auto const rangeKey = RangeKeyOf(history);
+        auto const& rangeRow = FleetRangeTable[static_cast<std::size_t>(history.range)];
+
+        out += R"(<section><div class="sec-head"><h2>Over time</h2><span class="range">)";
+        for (auto const& row: FleetRangeTable)
+            // Links, not buttons: the control is two URLs, so it works with no script,
+            // survives a bookmark and is what the auto-refresh comes back to.
+            out += std::format(R"(<a{} href="?range={}">{}</a>)",
+                               row.range == history.range ? R"( class="on")" : "",
+                               EscapeHtml(row.key),
+                               EscapeHtml(row.label));
+        out += std::format(R"(</span><span class="rule"></span><span class="meta">{} &middot; {}</span></div>)",
+                           EscapeHtml(rangeRow.bucketLabel),
+                           history.durable ? "kept on disk" : "kept in memory only");
+        if (std::ranges::none_of(history.buckets, [](auto const& bucket) { return bucket.present; }))
+            // A frame with nothing in it reads as a broken chart. Absent is not zero
+            // here either: nobody was watching, which is not a fleet that did nothing.
+            out += R"(<div class="panel occ"><p class="note">Nothing has been recorded for this range yet. )"
+                   R"(A node samples the fleet once a minute <strong>while it leads</strong> &mdash; a follower's )"
+                   R"(registry holds only what registered against it, so sampling there would record a fraction )"
+                   R"(as though it were the whole. The first points appear a minute after this node won the )"
+                   R"(election.</p></div>)";
+        else
+        {
+            out += R"(<div class="charts">)";
+            for (auto const& chart: FleetChartTable)
+            {
+                out += std::format(R"(<div class="panel chart"><div class="chart-head"><h3>{}</h3>)"
+                                   R"(<span class="chart-now">{}</span></div><p class="chart-cap">{}</p>)",
+                                   EscapeHtml(chart.title),
+                                   EscapeHtml(HeadlineOf(chart, history)),
+                                   EscapeHtml(chart.caption));
+                // Its own resource, and the URL carries no cache-buster on purpose: a
+                // generation in the query would make every bucket a new URL and the
+                // conditional GET would never fire. Stable URL, `ETag`, `304`.
+                out += std::format(R"(<img src="{}{}.svg?range={}" width="640" height="150" alt="{}">)",
+                                   FleetChartPrefix,
+                                   EscapeHtml(chart.key),
+                                   EscapeHtml(rangeKey),
+                                   EscapeHtml(std::format("{}, {}", chart.title, rangeRow.bucketLabel)));
+                out += R"(<span class="chart-keys">)";
+                for (auto const offset: std::views::iota(std::size_t { 0 }, chart.count))
+                {
+                    auto const& series = FleetSeriesTable[chart.first + offset];
+                    out += std::format(R"(<span><span class="tone tone--{}"></span>{}</span>)",
+                                       EscapeHtml(series.colour),
+                                       EscapeHtml(series.label));
+                }
+                out += "</span></div>";
+            }
+            out += "</div>";
+        }
+        out += std::format(R"(<p class="note"><strong>This history is the leader's.</strong> It is sampled by )"
+                           R"(whichever node currently leads, so a failover moves this page to a machine with a )"
+                           R"(different past. A bucket nobody sampled draws a <em>gap</em>, never a zero &mdash; )"
+                           R"(zero says the fleet did nothing, a gap says nobody was watching. {} The same series )"
+                           R"(are available as JSON at <a href="{}?range={}">{}</a>, and for anything you would )"
+                           R"(alert on, /metrics remains the source of truth.</p></section>)",
+                           history.durable ? "It is written to disk, so it survives a restart."
+                                           : "This node has no --cluster-dir or --cache-dir to write it to, so a restart "
+                                             "starts the history again.",
+                           FleetSeriesPath,
+                           EscapeHtml(rangeKey),
+                           FleetSeriesPath);
+    }
+
 } // namespace
 
 std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView const& history, unsigned refreshSeconds)
@@ -1147,66 +1273,7 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView cons
     }
     out += "</div></section>";
 
-    // ---- over time ----------------------------------------------------------
-    out += R"(<section><div class="sec-head"><h2>Over time</h2><span class="rule"></span><span class="range">)";
-    for (auto const& row: FleetRangeTable)
-        // Links, not buttons: the control is two URLs, so it works with no script,
-        // survives a bookmark and is what the auto-refresh comes back to.
-        out += std::format(R"(<a{} href="?range={}">{}</a>)",
-                           row.range == history.range ? R"( class="on")" : "",
-                           EscapeHtml(row.key),
-                           EscapeHtml(row.label));
-    out += R"(</span></div>)";
-
-    auto const rangeKey = RangeKeyOf(history);
-    auto const& rangeRow = FleetRangeTable[static_cast<std::size_t>(history.range)];
-    if (std::ranges::none_of(history.buckets, [](auto const& bucket) { return bucket.present; }))
-        // A frame with nothing in it reads as a broken chart. Absent is not zero
-        // here either: nobody was watching, which is not a fleet that did nothing.
-        out += R"(<div class="panel occ"><p class="note">Nothing has been recorded for this range yet. )"
-               R"(A node samples the fleet once a minute <strong>while it leads</strong> &mdash; a follower's )"
-               R"(registry holds only what registered against it, so sampling there would record a fraction )"
-               R"(as though it were the whole. The first points appear a minute after this node won the )"
-               R"(election.</p></div>)";
-    else
-    {
-        out += R"(<div class="charts">)";
-        for (auto const& chart: FleetChartTable)
-        {
-            out += std::format(R"(<div class="panel chart"><h3>{}</h3><p class="chart-cap">{}</p>)",
-                               EscapeHtml(chart.title),
-                               EscapeHtml(chart.caption));
-            out += R"(<span class="chart-keys">)";
-            for (auto const offset: std::views::iota(std::size_t { 0 }, chart.count))
-            {
-                auto const& series = FleetSeriesTable[chart.first + offset];
-                out += std::format(R"(<span><span class="tone tone--{}"></span>{}</span>)",
-                                   EscapeHtml(series.colour),
-                                   EscapeHtml(series.label));
-            }
-            out += "</span>";
-            // Its own resource, and the URL carries no cache-buster on purpose: a
-            // generation in the query would make every bucket a new URL and the
-            // conditional GET would never fire. Stable URL, `ETag`, `304`.
-            out += std::format(R"(<img src="{}{}.svg?range={}" width="640" height="150" alt="{}">)",
-                               FleetChartPrefix,
-                               EscapeHtml(chart.key),
-                               EscapeHtml(rangeKey),
-                               EscapeHtml(std::format("{}, {}", chart.title, rangeRow.bucketLabel)));
-            out += "</div>";
-        }
-        out += "</div>";
-    }
-    out += std::format(R"(<p class="note">{} &middot; {} &middot; the same series are available as JSON at )"
-                       R"(<a href="{}?range={}">{}</a>, so anything here can be checked without a browser.</p>)"
-                       R"(</section>)",
-                       EscapeHtml(rangeRow.bucketLabel),
-                       history.durable ? "kept on disk, so it survives a restart"
-                                       : "kept in memory only &mdash; this node has no --cluster-dir or --cache-dir to "
-                                         "write it to, so a restart starts the history again",
-                       FleetSeriesPath,
-                       EscapeHtml(rangeKey),
-                       FleetSeriesPath);
+    AppendOverTime(out, history);
 
     // ---- machines -----------------------------------------------------------
     out += R"(<section><div class="sec-head"><h2>Machines</h2><span class="rule"></span>)"

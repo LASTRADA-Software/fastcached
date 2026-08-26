@@ -137,12 +137,25 @@ determinism rests on.
   The repair is not to reformat again but to **restore the untouched region
   byte-for-byte** from the last commit that passed the style job, then re-insert
   only the new lines, and prove it: a diff of that region against the good commit
-  must show insertions and *zero* deletions. That is the whole check when the
-  pinned binary cannot be installed -- which is the case on a host whose apt
-  mirror has no `clang-format-22`.
+  must show insertions and *zero* deletions.
 
-  So: run the older one as `--dry-run` on the lines **you** added, never with
+  So: run a non-pinned binary as `--dry-run` on the lines **you** added, never with
   `-i`, and never let it touch a file you are only passing through.
+
+  **"The apt mirror has no `clang-format-22`" is not a reason to format with 18.**
+  LLVM ships the official binaries on PyPI, so the pinned version is one download
+  away on any host with outbound HTTPS and no root:
+
+  ```sh
+  pip download "clang-format==${CLANG_TOOLS_VERSION}.1.0" -d /tmp/cf --no-deps
+  python3 -m zipfile -e /tmp/cf/clang_format-*.whl /tmp/cf22
+  install -m755 /tmp/cf22/clang_format/data/bin/clang-format ~/.local/bin/clang-format-22
+  ```
+
+  With that on `PATH`, `scripts/local-gate.sh` finds it by name and the whole tree
+  can be formatted exactly as `Check C++ style` will judge it -- which is strictly
+  better than hand-matching a style guide and then finding out in CI. Reach for the
+  byte-for-byte restore above only when even this is unavailable.
 
 - **A `bool` in the middle of a config struct costs seven bytes, and four of them
   fail the build.** `clang-analyzer-optin.performance.Padding` permits 24 bytes more

@@ -28,6 +28,18 @@ enum class FleetSeriesKind : std::uint8_t
     Share,
 };
 
+/// How a series' line is drawn.
+enum class FleetSeriesStroke : std::uint8_t
+{
+    Solid = 0, ///< An observation.
+    /// A ceiling rather than a reading: what *could* have run, not what did.
+    ///
+    /// Worth a column of its own because colour alone does not carry it. The
+    /// capacity chart's whole point is the gap between two lines, and a reader who
+    /// cannot tell at a glance which of them is the limit reads that gap backwards.
+    Dashed,
+};
+
 /// One line or band on a chart.
 struct FleetSeriesRow
 {
@@ -37,9 +49,10 @@ struct FleetSeriesRow
     /// class name and the SVG into a `var(--...)`. One spelling, because a token
     /// spelled two ways is one that goes stale in whichever place is edited less.
     std::string_view colour;
-    FleetSeriesKind kind;    ///< How to derive it.
-    FleetMetric numerator;   ///< The slot it reads.
-    FleetMetric denominator; ///< The second slot, for `Share`; ignored otherwise.
+    FleetSeriesStroke stroke; ///< Solid reading, or a dashed ceiling.
+    FleetSeriesKind kind;     ///< How to derive it.
+    FleetMetric numerator;    ///< The slot it reads.
+    FleetMetric denominator;  ///< The second slot, for `Share`; ignored otherwise.
 };
 
 /// Which chart a series belongs to, and how that chart is drawn.
@@ -67,9 +80,15 @@ struct FleetChartRow
     std::string_view title;   ///< The panel heading.
     std::string_view caption; ///< The line under it: what the chart is *for*.
     std::string_view unit;    ///< Suffix on the gridline labels, e.g. `%`.
-    FleetChartShape shape;    ///< Line or stacked.
-    std::size_t first;        ///< Index into `FleetSeriesTable` of its first series.
-    std::size_t count;        ///< How many consecutive series it draws.
+    /// Suffix on the headline figure beside the title.
+    ///
+    /// Separate from `unit` because the two answer different questions: the axis
+    /// says how many, the headline says how many *of what, per what*. A rate's axis
+    /// carries no suffix and its headline carries `/min`.
+    std::string_view nowUnit;
+    FleetChartShape shape; ///< Line or stacked.
+    std::size_t first;     ///< Index into `FleetSeriesTable` of its first series.
+    std::size_t count;     ///< How many consecutive series it draws.
 };
 
 /// Every series, grouped so each chart's are consecutive.
@@ -82,48 +101,56 @@ inline constexpr std::array<FleetSeriesRow, 8> FleetSeriesTable {
     FleetSeriesRow { .key = "dispatched",
                      .label = "dispatched",
                      .colour = "accent",
+                     .stroke = FleetSeriesStroke::Solid,
                      .kind = FleetSeriesKind::Rate,
                      .numerator = FleetMetric::DispatchGranted,
                      .denominator = FleetMetric::DispatchGranted },
     FleetSeriesRow { .key = "no-worker",
                      .label = "no worker",
                      .colour = "crit",
+                     .stroke = FleetSeriesStroke::Solid,
                      .kind = FleetSeriesKind::Rate,
                      .numerator = FleetMetric::DispatchNoWorker,
                      .denominator = FleetMetric::DispatchNoWorker },
     FleetSeriesRow { .key = "no-capacity",
                      .label = "no capacity",
                      .colour = "accent",
+                     .stroke = FleetSeriesStroke::Solid,
                      .kind = FleetSeriesKind::Rate,
                      .numerator = FleetMetric::DispatchNoCapacity,
                      .denominator = FleetMetric::DispatchNoCapacity },
     FleetSeriesRow { .key = "withdrawn",
                      .label = "withdrawn",
                      .colour = "warn",
+                     .stroke = FleetSeriesStroke::Solid,
                      .kind = FleetSeriesKind::Rate,
                      .numerator = FleetMetric::DispatchWithdrawn,
                      .denominator = FleetMetric::DispatchWithdrawn },
     FleetSeriesRow { .key = "duplicate",
                      .label = "duplicate",
                      .colour = "inert",
+                     .stroke = FleetSeriesStroke::Solid,
                      .kind = FleetSeriesKind::Rate,
                      .numerator = FleetMetric::DispatchDuplicate,
                      .denominator = FleetMetric::DispatchDuplicate },
     FleetSeriesRow { .key = "offerable",
                      .label = "offerable slots",
-                     .colour = "muted",
+                     .colour = "inert",
+                     .stroke = FleetSeriesStroke::Dashed,
                      .kind = FleetSeriesKind::Level,
                      .numerator = FleetMetric::OfferableSlots,
                      .denominator = FleetMetric::OfferableSlots },
     FleetSeriesRow { .key = "in-flight",
                      .label = "in flight",
                      .colour = "accent",
+                     .stroke = FleetSeriesStroke::Solid,
                      .kind = FleetSeriesKind::Level,
                      .numerator = FleetMetric::JobsInFlight,
                      .denominator = FleetMetric::JobsInFlight },
     FleetSeriesRow { .key = "hit-rate",
                      .label = "hit rate",
                      .colour = "ok",
+                     .stroke = FleetSeriesStroke::Solid,
                      .kind = FleetSeriesKind::Share,
                      .numerator = FleetMetric::CacheHits,
                      .denominator = FleetMetric::CacheMisses },
@@ -136,6 +163,7 @@ inline constexpr EnumTable<FleetChartId, FleetChartRow> FleetChartTable {
                     .title = "Compiles dispatched",
                     .caption = "Is the fleet doing work at all. The shape of a working day.",
                     .unit = "",
+                    .nowUnit = "/min",
                     .shape = FleetChartShape::Line,
                     .first = 0,
                     .count = 1 },
@@ -144,6 +172,7 @@ inline constexpr EnumTable<FleetChartId, FleetChartRow> FleetChartTable {
                     .title = "Refusals, by reason",
                     .caption = "Never one line. Four reasons, four different fixes.",
                     .unit = "",
+                    .nowUnit = "/min",
                     .shape = FleetChartShape::Stacked,
                     .first = 1,
                     .count = 4 },
@@ -152,6 +181,7 @@ inline constexpr EnumTable<FleetChartId, FleetChartRow> FleetChartTable {
                     .title = "Capacity vs. in flight",
                     .caption = "The gap is headroom. When it closes, the fleet is the bottleneck.",
                     .unit = "",
+                    .nowUnit = " slots",
                     .shape = FleetChartShape::Line,
                     .first = 5,
                     .count = 2 },
@@ -160,6 +190,7 @@ inline constexpr EnumTable<FleetChartId, FleetChartRow> FleetChartTable {
                     .title = "Cache hit rate",
                     .caption = "Per bucket, not cumulative — a running total stops moving and hides a regression.",
                     .unit = "%",
+                    .nowUnit = "%",
                     .shape = FleetChartShape::Line,
                     .first = 7,
                     .count = 1 },

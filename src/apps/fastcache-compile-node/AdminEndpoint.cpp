@@ -373,16 +373,16 @@ EnumTable<Distributed::FleetMetric, std::uint64_t> SampleFrom(Distributed::Fleet
 
     // The five dispatch counters keep `LeaseOutcomeTable`'s order rather than being
     // named one by one, so a sixth outcome lands here by being added to that table.
-    static constexpr std::array<Distributed::FleetMetric, 5> DispatchSlots {
+    static constexpr std::array<Distributed::FleetMetric, 5> dispatchSlots {
         Distributed::FleetMetric::DispatchGranted,    Distributed::FleetMetric::DispatchNoWorker,
         Distributed::FleetMetric::DispatchNoCapacity, Distributed::FleetMetric::DispatchWithdrawn,
         Distributed::FleetMetric::DispatchDuplicate,
     };
-    static_assert(DispatchSlots.size() == Distributed::LeaseOutcomeTable.size(),
+    static_assert(dispatchSlots.size() == Distributed::LeaseOutcomeTable.size(),
                   "every lease outcome needs a slot, or a refusal reason silently stops being recorded");
-    for (auto const index: std::views::iota(std::size_t { 0 }, DispatchSlots.size()))
+    for (auto const index: std::views::iota(std::size_t { 0 }, dispatchSlots.size()))
         if (index < snapshot.leases.size())
-            put(DispatchSlots[index], snapshot.leases[index]);
+            put(dispatchSlots[index], snapshot.leases[index]);
 
     // Summed over `NodeReports()`, never over `LiveWorkers()`: a node started with
     // two --toolchain flags is two registry entries carrying one machine's cache,

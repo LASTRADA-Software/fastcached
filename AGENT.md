@@ -250,6 +250,19 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   JSON key. Absent renders `null`/`–` at the **cell**, and a tier no member runs
   gets no column.
 - A fleet total is computed over `NodeReports()`, never over registry entries.
+- A history stores a counter **raw**; a rate is the delta at render, taken only
+  between adjacent *present* buckets. A restart is then a gap, not a spike.
+- Sampling runs only while this node **leads**, and no state of the history file
+  may keep a node from starting.
+- A chart served as its own resource inherits nothing from the page, so it carries
+  its own palette and theme is part of its URL — and that URL carries no
+  cache-buster, or the `304` never fires.
+- A `304` carries its validators and no content; whether a body is allowed is a
+  property of the **status**, not a flag each route sets.
+- An unknown `range` is refused, an unknown `theme` is not: refuse where a silent
+  substitution would mislead, default where it cannot.
+- A stacked area is drawn **top band first**, or translucent fills multiply into a
+  colour belonging to no series.
 - The dashboard credential is its own file, never `--requirepass`; a non-loopback
   bind without one is a startup refusal, and TLS does not substitute for it.
 - Plain HTTP is a supported way to serve the admin surface. TLS is on by naming
@@ -284,7 +297,9 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - A sanitizer that is on in the cache is not one that is on in the build — a tool
   that silently does nothing is worse than one that is visibly off.
 - `clang-format -i` at any version but the pinned one silently reformats code the
-  pinned one already accepted; run an older binary as `--dry-run` only.
+  pinned one already accepted; run an older binary as `--dry-run` only. The pinned
+  build ships on PyPI (`pip download clang-format==<version>`), so "the distro only
+  has an older one" is not a reason to format with it.
 - Every `bool` and byte-wide enum in a config struct lives in one run: one between two
   8-aligned members costs seven bytes, and clang-tidy's padding budget fails the build.
 - A table indexed by an enumerator is `EnumTable<Enum, Row>` + `RowsInEnumeratorOrder`.
