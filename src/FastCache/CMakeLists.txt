@@ -54,6 +54,7 @@ target_sources(FastCache
         Distributed/SchedulerService.cpp
         Distributed/SchedulerProtocol.cpp
         Distributed/FleetHistory.cpp
+        Distributed/FleetChart.cpp
         Distributed/FleetView.cpp
         Core/BufferPool.cpp
         Core/Base64.cpp

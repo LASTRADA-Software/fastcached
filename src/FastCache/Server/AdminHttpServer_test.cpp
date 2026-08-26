@@ -282,7 +282,7 @@ TEST_CASE("AdminHttp: a handler is told the Authorization header, whatever its c
     auto const echo = [](FastCache::AdminRequest const& request) {
         return FastCache::AdminResponse { .status = "200 OK",
                                           .contentType = "text/plain",
-                                          .body = std::string { request.authorization } };
+                                          .body = std::string { request.Header(FastCache::AdminHeader::Authorization) } };
     };
     std::vector<FastCache::AdminRoute> const routes { { .path = "/echo", .handler = echo } };
 
@@ -306,4 +306,85 @@ TEST_CASE("AdminHttp: a query string reaches the handler and does not defeat rou
     std::vector<FastCache::AdminRoute> const routes { { .path = "/echo", .handler = echo } };
 
     CHECK(ExchangeWithRoutes("GET /echo?tier=disk HTTP/1.1\r\n\r\n", routes).contains("tier=disk"));
+}
+
+TEST_CASE("AdminHttp: every readable header arrives, in either order", "[admin][http][routes]")
+{
+    // The regression this exists for: the walk used to stop at the first header it
+    // recognised. With one readable header that is correct; with two it means
+    // whichever the client happened to send first is the only one that arrives, so
+    // a conditional GET would silently stop revalidating whenever a browser put
+    // `Authorization` above `If-None-Match`.
+    auto const echo = [](FastCache::AdminRequest const& request) {
+        return FastCache::AdminResponse { .status = "200 OK",
+                                          .contentType = "text/plain",
+                                          .body = std::format("[{}][{}]",
+                                                              request.Header(FastCache::AdminHeader::Authorization),
+                                                              request.Header(FastCache::AdminHeader::IfNoneMatch)) };
+    };
+    std::vector<FastCache::AdminRoute> const routes { { .path = "/echo", .handler = echo } };
+
+    CHECK(ExchangeWithRoutes("GET /echo HTTP/1.1\r\nAuthorization: Bearer t\r\nIf-None-Match: \"abc\"\r\n\r\n", routes)
+              .contains("[Bearer t][\"abc\"]"));
+    CHECK(ExchangeWithRoutes("GET /echo HTTP/1.1\r\nif-none-match: \"abc\"\r\nauthorization: Bearer t\r\n\r\n", routes)
+              .contains("[Bearer t][\"abc\"]"));
+}
+
+TEST_CASE("AdminHttp: a 304 carries its validators and no content at all", "[admin][http][routes]")
+{
+    std::vector<FastCache::AdminRoute> const routes {
+        { .path = "/chart.svg",
+          .handler =
+              [](FastCache::AdminRequest const& request) {
+                  if (request.Header(FastCache::AdminHeader::IfNoneMatch) == "\"g-7\"")
+                      return FastCache::AdminResponse { .status = "304 Not Modified",
+                                                        .extraHeaders = { "ETag: \"g-7\"", "Cache-Control: max-age=42" } };
+                  return FastCache::AdminResponse { .status = "200 OK",
+                                                    .contentType = "image/svg+xml",
+                                                    .body = "<svg/>",
+                                                    .extraHeaders = { "ETag: \"g-7\"" } };
+              } },
+    };
+
+    auto const fresh = ExchangeWithRoutes("GET /chart.svg HTTP/1.1\r\n\r\n", routes);
+    CHECK(fresh.starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK(fresh.contains("Content-Type: image/svg+xml\r\n"));
+    CHECK(fresh.ends_with("<svg/>"));
+
+    auto const cached = ExchangeWithRoutes("GET /chart.svg HTTP/1.1\r\nIf-None-Match: \"g-7\"\r\n\r\n", routes);
+    CHECK(cached.starts_with("HTTP/1.1 304 Not Modified\r\n"));
+    // RFC 9110 SS15.4.5 forbids content on a 304, and SS8.6 forbids a Content-Length
+    // that does not match what a 200 would have sent. A client that read one and
+    // then found the connection closed would report a truncated response.
+    CHECK_FALSE(cached.contains("Content-Length:"));
+    CHECK_FALSE(cached.contains("Content-Type:"));
+    // The validators are the whole point of the response: without them the client
+    // has nothing to revalidate against next time.
+    CHECK(cached.contains("ETag: \"g-7\"\r\n"));
+    CHECK(cached.contains("Cache-Control: max-age=42\r\n"));
+    CHECK(cached.ends_with("\r\n\r\n"));
+}
+
+TEST_CASE("AdminHttp: a prefix route answers its tail and never shadows an exact one", "[admin][http][routes]")
+{
+    auto const named = [](std::string_view what) {
+        return [what](FastCache::AdminRequest const& request) {
+            return FastCache::AdminResponse { .status = "200 OK",
+                                              .contentType = "text/plain",
+                                              .body = std::format("{}:{}", what, request.path) };
+        };
+    };
+    // The prefix route is registered *first*, which is what makes this a test of the
+    // table rather than of the caller's vector order.
+    std::vector<FastCache::AdminRoute> const routes {
+        { .path = "/fleet/", .handler = named("prefix"), .match = FastCache::AdminRouteMatch::Prefix },
+        { .path = "/fleet", .handler = named("exact") },
+    };
+
+    CHECK(ExchangeWithRoutes("GET /fleet HTTP/1.1\r\n\r\n", routes).contains("exact:/fleet"));
+    CHECK(ExchangeWithRoutes("GET /fleet/chart/refusals.svg HTTP/1.1\r\n\r\n", routes)
+              .contains("prefix:/fleet/chart/refusals.svg"));
+    // A prefix route is not a catch-all: a path that does not begin with it still
+    // reaches the 404, so a typo is refused rather than quietly served.
+    CHECK(ExchangeWithRoutes("GET /fleetx HTTP/1.1\r\n\r\n", routes).starts_with("HTTP/1.1 404 Not Found\r\n"));
 }

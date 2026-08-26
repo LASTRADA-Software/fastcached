@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
@@ -11,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <span>
 #include <string>
@@ -22,24 +24,53 @@ namespace FastCache
 
 class TlsContext;
 
-/// One admin request, as far as this server understands one.
+/// One request header this server reads.
 ///
-/// Deliberately three fields rather than a header map. The admin surface answers
-/// parameterless GETs and one authenticated route, so what a handler can ask about
-/// a request is exactly what some handler already needs -- and a general header map
-/// would invite routes that depend on headers this server does not bound.
+/// A closed set rather than a header map, deliberately: a map would invite routes
+/// that branch on headers this server never bounds or normalises. A table is what
+/// makes the set *extensible without being open* -- the second entry here arrived
+/// as a row, and the parse loop that used to stop at the first match had to be
+/// fixed once and now cannot regress per header.
+enum class AdminHeader : std::uint8_t
+{
+    /// The credential every gated route checks.
+    Authorization = 0,
+    /// What a client already holds, for the conditional GETs the charts serve.
+    IfNoneMatch,
+    Last
+};
+
+/// What one readable header is called on the wire.
+struct AdminHeaderRow
+{
+    AdminHeader header;    ///< The header this row describes.
+    std::string_view name; ///< Its field name, lower-cased for the comparison.
+};
+
+/// Every header this server reads, in enumerator order.
+inline constexpr EnumTable<AdminHeader, AdminHeaderRow> AdminHeaderTable {
+    AdminHeaderRow { .header = AdminHeader::Authorization, .name = "authorization" },
+    AdminHeaderRow { .header = AdminHeader::IfNoneMatch, .name = "if-none-match" },
+};
+static_assert(RowsInEnumeratorOrder(AdminHeaderTable, &AdminHeaderRow::header));
+
+/// One admin request, as far as this server understands one.
 struct AdminRequest
 {
     /// Path with the query string stripped, so `/metrics?foo=1` routes as `/metrics`.
     std::string_view path;
     /// Whatever followed the `?`, empty when there was none.
     std::string_view query;
-    /// The `Authorization` header's value, empty when the client sent none.
-    ///
-    /// The one header this server reads. It is here rather than in a map because a
-    /// credential is the only thing a read-only surface can legitimately branch on,
-    /// and naming it makes every route that ignores it visibly unauthenticated.
-    std::string_view authorization;
+    /// One slot per `AdminHeaderTable` row; empty where the client sent none.
+    EnumTable<AdminHeader, std::string_view> headers {};
+
+    /// One header's value.
+    /// @param which Which header.
+    /// @return Its value, or empty when the client sent none.
+    [[nodiscard]] std::string_view Header(AdminHeader which) const noexcept
+    {
+        return headers[static_cast<std::size_t>(which)];
+    }
 };
 
 /// What a route answered.
@@ -51,11 +82,15 @@ struct AdminRequest
 struct AdminResponse
 {
     /// Status line without the version, e.g. `200 OK`.
+    ///
+    /// A status that carries no content -- `304`, `204` -- suppresses `Content-Type`
+    /// and `Content-Length` on its own, because whether a body is allowed is a
+    /// property of the status rather than something each route must remember.
     std::string_view status { "200 OK" };
     /// What `body` is.
     std::string_view contentType { "text/plain" };
-    /// The body, already rendered.
-    std::string body;
+    /// The body, already rendered. Empty for a status that carries no content.
+    std::string body {};
     /// Extra header lines, each without its trailing CRLF.
     ///
     /// Empty for almost every response. It exists because a 401 that does not carry
@@ -73,7 +108,22 @@ struct AdminResponse
 /// belongs to whoever registered it.
 using AdminRouteHandler = std::function<AdminResponse(AdminRequest const&)>;
 
-/// One route: the path it answers, and what answers it.
+/// How a route's `path` is compared against the request's.
+///
+/// A column and not a special case: the charts are one resource per series, and a
+/// route per series would put the series table's contents in two places. Dispatch
+/// tries the kinds in enumerator order, so an exact route is never shadowed by a
+/// prefix one however the caller happened to order its vector.
+enum class AdminRouteMatch : std::uint8_t
+{
+    /// The whole path, and nothing else.
+    Exact = 0,
+    /// The path begins with `AdminRoute::path`; the handler reads the tail.
+    Prefix,
+    Last
+};
+
+/// One route: the path it answers, how that path is matched, and what answers it.
 ///
 /// A table rather than an `if`/`else` ladder, for the reason every other table in
 /// this codebase is one -- a route added by editing a chain of comparisons is a
@@ -81,10 +131,12 @@ using AdminRouteHandler = std::function<AdminResponse(AdminRequest const&)>;
 /// replaced had already grown a third arm that only differed by a string.
 struct AdminRoute
 {
-    /// Exact match against `AdminRequest::path`.
+    /// The path, matched per `match`.
     std::string_view path;
     /// What renders it.
     AdminRouteHandler handler;
+    /// Whole path or leading path. Exact unless a route says otherwise.
+    AdminRouteMatch match { AdminRouteMatch::Exact };
 };
 
 /// Tiny read-only HTTP/1.1 admin surface, served on a dedicated port so it

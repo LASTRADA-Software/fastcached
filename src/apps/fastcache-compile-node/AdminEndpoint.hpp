@@ -4,6 +4,7 @@
 #include "NodeConfig.hpp"
 
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
@@ -13,11 +14,15 @@
 #include <FastCache/Server/AdminHttpServer.hpp>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -114,9 +119,111 @@ struct NodeScrapeSources
 /// @param credential What a caller must present, or a default-constructed one for none.
 /// @param refreshSeconds How often the page reloads itself.
 /// @return `/fleet` and `/fleet.json`.
+/// The rolling record the fleet routes draw over time, and what it promises.
+///
+/// A bundle rather than two parameters because the two are one fact from a route's
+/// point of view: what to read, and what the page should tell an operator about how
+/// long it will last. `history` is null on a build that keeps none, and the page
+/// then simply has no charts -- which is a legitimate way to run and not a failure.
+struct FleetHistorySource
+{
+    /// Where samples are kept. Null when nothing samples.
+    Distributed::FleetHistory const* history {};
+    /// Whether that record is written to disk and so survives a restart.
+    bool durable { false };
+};
+
 [[nodiscard]] std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
                                                       AdminCredential const& credential,
-                                                      unsigned refreshSeconds);
+                                                      unsigned refreshSeconds,
+                                                      FleetHistorySource history = {});
+
+/// Samples the fleet on a timer, for as long as this node LEADS it.
+///
+/// Only while leading, and that is the whole reason this is a class rather than a
+/// lambda in `main()`: a follower's registry holds whatever registered against it
+/// rather than the fleet, so sampling there would record a fraction as though it
+/// were the whole -- and the resulting chart would show a fleet shrinking every
+/// time leadership moved.
+///
+/// The loop is interruptible. A stop that waits out a full interval makes teardown
+/// look hung, which this repository has already paid for once as a `systemctl stop`
+/// escalating to SIGKILL.
+class FleetSampler
+{
+  public:
+    /// How often the ring is written back, while sampling.
+    ///
+    /// Not every sample: the file is the whole ring, so writing it each minute
+    /// would rewrite 24 hours of buckets to record one. Also written on shutdown.
+    static constexpr auto SaveInterval = std::chrono::minutes { 5 };
+
+    /// Start sampling.
+    /// @param sources What to read; the same bundle the routes collect from.
+    /// @param wall Where a bucket's timestamp comes from.
+    /// @param path Where to keep the history, or empty for memory-only.
+    /// @param logger Shared logger.
+    FleetSampler(Distributed::FleetSources sources, IWallClock const& wall, std::filesystem::path path, ILogger& logger);
+
+    /// Stops the thread and writes the ring out one last time.
+    ~FleetSampler();
+
+    FleetSampler(FleetSampler const&) = delete;
+    FleetSampler& operator=(FleetSampler const&) = delete;
+    FleetSampler(FleetSampler&&) = delete;
+    FleetSampler& operator=(FleetSampler&&) = delete;
+
+    /// What the routes read.
+    [[nodiscard]] Distributed::FleetHistory const& History() const noexcept
+    {
+        return _history;
+    }
+
+    /// Whether the ring is written to disk.
+    [[nodiscard]] bool Durable() const noexcept
+    {
+        return !_path.empty();
+    }
+
+    /// Take one sample now, whatever the timer is doing.
+    ///
+    /// The seam a test drives instead of waiting a minute for the thread: every
+    /// rule about *what* a sample holds is then a case over a scripted registry
+    /// rather than a sleep.
+    /// @return True when a sample was taken; false when this node does not lead.
+    bool SampleOnce();
+
+  private:
+    void Persist();
+
+    Distributed::FleetSources _sources;
+    Distributed::FleetHistory _history;
+    std::filesystem::path _path;
+    ILogger& _logger;
+    std::mutex _wakeMutex;
+    std::condition_variable_any _wake;
+    std::jthread _thread;
+};
+
+/// Turn one fleet snapshot into the nine readings a sample holds.
+///
+/// Separate from the sampler so it is a pure function of a snapshot: which slot
+/// each number lands in is the part worth a unit test, and it needs no thread, no
+/// clock and no registry to check.
+/// @param snapshot What `CollectFleet` returned.
+/// @return The readings, counters cumulative.
+[[nodiscard]] EnumTable<Distributed::FleetMetric, std::uint64_t> SampleFrom(Distributed::FleetSnapshot const& snapshot);
+
+/// Where a node keeps its fleet history.
+///
+/// The cluster directory first, because the history is a leader's record and a
+/// leader is a cluster member; the cache directory next, because a node given one
+/// has somewhere durable already; and otherwise nothing, which means memory-only.
+/// No new flag: a third place to say "put state here" is a third place for an
+/// operator to point at the wrong disk.
+/// @param cfg The parsed configuration.
+/// @return The file path, or empty for memory-only.
+[[nodiscard]] std::filesystem::path FleetHistoryPath(NodeConfig const& cfg);
 
 /// How often the dashboard reloads itself, in seconds.
 ///
@@ -229,6 +336,13 @@ struct AdminSurface
     /// Server TLS context when a certificate was named, else null.
     std::unique_ptr<TlsContext> tls;
 #endif
+    /// The sampler, when this node serves a dashboard over a fleet.
+    ///
+    /// **Declared before `endpoint`, and that ordering is load-bearing**: the routes
+    /// hold a pointer into this history, and members are destroyed in reverse
+    /// declaration order -- so the endpoint (and the thread serving requests
+    /// through those routes) is torn down first.
+    std::unique_ptr<FleetSampler> sampler;
     /// The running endpoint. Null when the operator asked for no admin surface.
     std::unique_ptr<AdminEndpoint> endpoint;
 };

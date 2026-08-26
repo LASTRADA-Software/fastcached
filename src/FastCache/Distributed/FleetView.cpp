@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Distributed/FleetChart.hpp>
+#include <FastCache/Distributed/FleetText.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdint>
 #include <format>
+#include <optional>
 #include <ranges>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace FastCache::Distributed
@@ -103,73 +111,17 @@ namespace
 
     // ---------------------------------------------------------------- helpers
 
+    /// The two escapes live in `FleetText.hpp` so the chart renderer shares them
+    /// rather than carrying a third copy. Named as they were here, so no call site
+    /// moves.
     [[nodiscard]] std::string EscapeHtml(std::string_view text)
     {
-        // Every value on this page came off a wire: a toolchain fingerprint and an
-        // endpoint are whatever a peer sent. `Stats.cpp` has the sibling of this
-        // function in its own anonymous namespace; two small copies are the
-        // accepted shape here rather than a shared header, for the reason the
-        // launcher does not link this library at all.
-        std::string out;
-        out.reserve(text.size());
-        for (auto const ch: text)
-        {
-            switch (ch)
-            {
-                case '&':
-                    out += "&amp;";
-                    break;
-                case '<':
-                    out += "&lt;";
-                    break;
-                case '>':
-                    out += "&gt;";
-                    break;
-                case '"':
-                    out += "&quot;";
-                    break;
-                case '\'':
-                    out += "&#39;";
-                    break;
-                default:
-                    out += ch;
-                    break;
-            }
-        }
-        return out;
+        return EscapeMarkup(text);
     }
 
     void AppendJsonString(std::string& out, std::string_view text)
     {
-        out += '"';
-        for (auto const ch: text)
-        {
-            switch (ch)
-            {
-                case '"':
-                    out += "\\\"";
-                    break;
-                case '\\':
-                    out += "\\\\";
-                    break;
-                case '\n':
-                    out += "\\n";
-                    break;
-                case '\r':
-                    out += "\\r";
-                    break;
-                case '\t':
-                    out += "\\t";
-                    break;
-                default:
-                    if (static_cast<unsigned char>(ch) < 0x20)
-                        out += std::format("\\u{:04x}", static_cast<unsigned>(static_cast<unsigned char>(ch)));
-                    else
-                        out += ch;
-                    break;
-            }
-        }
-        out += '"';
+        AppendJsonText(out, text);
     }
 
     /// Render a byte count the way an operator reads one.
@@ -185,6 +137,13 @@ namespace
         }
         return unit == 0 ? std::format("{} {}", bytes, Units[unit]) : std::format("{:.1f} {}", scaled, Units[unit]);
     }
+
+    /// How the page spells "nobody reported this".
+    ///
+    /// The same dash `--cluster-status` prints, deliberately: an operator reading
+    /// both surfaces should not have to learn that a blank, a zero and a dash are
+    /// the same claim on one and different claims on the other.
+    constexpr std::string_view AbsentText = "&ndash;";
 
     /// Render an age the way an operator reads one.
     [[nodiscard]] std::string HumanMillis(std::uint64_t millis)
@@ -202,9 +161,8 @@ namespace
     /// kept the same so an operator reading both sees one vocabulary.
     [[nodiscard]] std::string CellAsText(FleetCell const& cell, CellFormat format)
     {
-        constexpr std::string_view Absent = "&ndash;";
         if (cell.kind == FleetCell::Kind::Absent)
-            return std::string { Absent };
+            return std::string { AbsentText };
         if (cell.kind == FleetCell::Kind::Text)
             return EscapeHtml(cell.text);
         switch (format)
@@ -870,11 +828,188 @@ th[title] { text-decoration:underline dotted var(--line); text-underline-offset:
 .reason-k { font:500 10.5px/1.3 ui-monospace,monospace; letter-spacing:.07em;
             text-transform:uppercase; color:var(--muted); margin-top:.1rem; }
 .reason-d { font-size:12px; color:var(--muted); margin:.4rem 0 0; line-height:1.45; }
+.range { display:inline-flex; border:1px solid var(--line); border-radius:3px; overflow:hidden;
+         background:var(--surface); }
+.range a { display:block; padding:.25rem .6rem; font:600 10.5px/1.5 ui-monospace,monospace;
+           letter-spacing:.08em; color:var(--muted); text-decoration:none; }
+.range a + a { border-left:1px solid var(--line); }
+.range a:hover { color:var(--ink); background:var(--sunk); }
+.range a.on { background:var(--accent); color:#FFF; }
+.range a:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+.charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(330px,1fr)); gap:1rem; }
+.chart { padding:.85rem 1rem 1rem; display:flex; flex-direction:column; gap:.3rem; }
+.chart h3 { margin:0; font:600 12.5px/1.3 ui-sans-serif,system-ui,sans-serif; }
+.chart-cap { margin:0; font-size:11.5px; color:var(--muted); line-height:1.45; }
+.chart-keys { display:flex; flex-wrap:wrap; gap:.1rem .9rem; margin-top:.15rem;
+              font:400 11px/1.6 ui-monospace,monospace; color:var(--muted); }
+.chart img { display:block; width:100%; height:150px; margin-top:.45rem; }
+.spark { display:block; width:74px; height:24px; margin-top:.1rem; }
+.spark svg { display:block; width:100%; height:100%; }
+.note a { color:var(--accent); }
+/* One class per palette token rather than an inline style: a raw string literal
+   ends at `)"`, which is exactly how `style="background:var(--accent)"` ends. */
+.tone { display:inline-block; width:9px; height:9px; border-radius:2px;
+        transform:translateY(1px); margin-right:.35rem; }
+.tone--accent { background:var(--accent); }
+.tone--ok { background:var(--ok); }
+.tone--warn { background:var(--warn); }
+.tone--crit { background:var(--crit); }
+.tone--inert { background:var(--inert); }
+.tone--muted { background:var(--muted); }
 .follower { padding:1.1rem 1.2rem 1.2rem; border-left:3px solid var(--warn); }
 .leader { font-family:ui-monospace,monospace; font-weight:600; color:var(--accent); }
 footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
          color:var(--faint); font-size:12px; }
 )CSS";
+
+    /// How wide one bucket of the selected range is.
+    [[nodiscard]] std::int64_t BucketSecondsOf(FleetHistoryView const& history) noexcept
+    {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   FleetRangeTable[static_cast<std::size_t>(history.range)].bucket)
+            .count();
+    }
+
+    /// What a URL calls the selected range, e.g. `24h`.
+    [[nodiscard]] std::string_view RangeKeyOf(FleetHistoryView const& history) noexcept
+    {
+        return FleetRangeTable[static_cast<std::size_t>(history.range)].key;
+    }
+
+    /// One series folded over the selected range.
+    /// @param key The series' key.
+    /// @param history What was recorded.
+    /// @return The folded value, or nullopt when the range holds nothing to fold.
+    [[nodiscard]] std::optional<double> FoldedSeries(std::string_view key, FleetHistoryView const& history)
+    {
+        auto const* const series = FleetSeriesFromKey(key);
+        if (series == nullptr)
+            return std::nullopt;
+        return RangeValueOf(*series, history.buckets, BucketSecondsOf(history));
+    }
+
+    /// The share of dispatch decisions that were refusals, over the range.
+    ///
+    /// The four reasons are read off the Refusals chart's own row rather than listed
+    /// again here, so a fifth reason reaches this figure by being added to the series
+    /// table once -- which is the whole reason these are tables.
+    [[nodiscard]] std::optional<double> RefusedShare(FleetHistoryView const& history)
+    {
+        auto const* const granted = FleetSeriesFromKey("dispatched");
+        if (granted == nullptr)
+            return std::nullopt;
+        auto const seconds = BucketSecondsOf(history);
+        auto const grantedTotal = RangeValueOf(*granted, history.buckets, seconds);
+
+        auto const& refusals = FleetChartTable[static_cast<std::size_t>(FleetChartId::Refusals)];
+        double refused = 0.0;
+        bool known = grantedTotal.has_value();
+        for (auto const offset: std::views::iota(std::size_t { 0 }, refusals.count))
+            if (auto const one = RangeValueOf(FleetSeriesTable[refusals.first + offset], history.buckets, seconds);
+                one.has_value())
+            {
+                refused += *one;
+                known = true;
+            }
+        if (!known)
+            return std::nullopt;
+
+        auto const total = refused + grantedTotal.value_or(0.0);
+        // The fleet was asked for nothing at all, so no proportion of it was refused.
+        // Zero would read as "everything went through", which nothing did.
+        if (total <= 0.0)
+            return std::nullopt;
+        return 100.0 * refused / total;
+    }
+
+    /// What one readout on the strip says.
+    ///
+    /// `value` is already safe to interpolate: every projector below produces either
+    /// a number it formatted itself or `AbsentText`, and neither can carry markup.
+    struct KpiReadout
+    {
+        std::string value; ///< The figure, or the dash.
+        std::string unit;  ///< The small suffix beside it; empty for none.
+        std::string sub;   ///< The line under it.
+    };
+
+    /// A figure or the dash, at one decimal place with a unit.
+    [[nodiscard]] std::string FigureOr(std::optional<double> value, int decimals)
+    {
+        if (!value.has_value())
+            return std::string { AbsentText };
+        return decimals == 0 ? std::format("{:.0f}", *value) : std::format("{:.1f}", *value);
+    }
+
+    KpiReadout KpiDispatched(FleetSnapshot const&, FleetHistoryView const& history)
+    {
+        return KpiReadout { .value = FigureOr(FoldedSeries("dispatched", history), 0),
+                            .unit = {},
+                            .sub = std::format("compiles in the last {}", RangeKeyOf(history)) };
+    }
+
+    KpiReadout KpiCompilingNow(FleetSnapshot const& snapshot, FleetHistoryView const&)
+    {
+        auto const totals = TotalsFor(snapshot);
+        return KpiReadout { .value = std::to_string(totals.inFlight),
+                            .unit = std::format("/ {} slots", totals.registered),
+                            .sub = "this fleet's own work" };
+    }
+
+    KpiReadout KpiHitRate(FleetSnapshot const&, FleetHistoryView const& history)
+    {
+        auto const share = FoldedSeries("hit-rate", history);
+        return KpiReadout { .value = FigureOr(share, 1),
+                            .unit = share.has_value() ? "%" : "",
+                            .sub = std::format("over the last {}", RangeKeyOf(history)) };
+    }
+
+    KpiReadout KpiRefused(FleetSnapshot const&, FleetHistoryView const& history)
+    {
+        auto const share = RefusedShare(history);
+        return KpiReadout { .value = FigureOr(share, 1),
+                            .unit = share.has_value() ? "%" : "",
+                            .sub = "of dispatch decisions" };
+    }
+
+    KpiReadout KpiLeases(FleetSnapshot const& snapshot, FleetHistoryView const&)
+    {
+        return KpiReadout { .value = std::to_string(snapshot.liveLeases), .unit = {}, .sub = "granted, not yet claimed" };
+    }
+
+    KpiReadout KpiOldestHeartbeat(FleetSnapshot const& snapshot, FleetHistoryView const&)
+    {
+        if (snapshot.nodes.empty())
+            return KpiReadout { .value = std::string { AbsentText }, .unit = {}, .sub = "no machine registered" };
+        auto const oldest = std::ranges::max(snapshot.nodes, {}, &NodeReport::heartbeatAge).heartbeatAge;
+        // The *oldest*, not the mean: one machine that stopped answering an hour ago
+        // is the fact worth surfacing, and an average over a healthy fleet buries it.
+        return KpiReadout { .value = HumanMillis(static_cast<std::uint64_t>(oldest.count())),
+                            .unit = {},
+                            .sub = std::format("across {} machine(s)", snapshot.nodes.size()) };
+    }
+
+    /// One readout on the strip.
+    ///
+    /// A table rather than six calls: the strip is the part of this page most likely
+    /// to grow a seventh tile, and a tile added as a seventh call is one whose label
+    /// case, absent spelling and order are checked by nothing.
+    struct KpiRow
+    {
+        std::string_view label;                                               ///< What the tile is called.
+        KpiReadout (*project)(FleetSnapshot const&, FleetHistoryView const&); ///< What it reads.
+        bool sparkline;                                                       ///< Whether it carries one.
+    };
+
+    /// The strip, in the order it is read. The mockup's six, in the mockup's order.
+    constexpr std::array<KpiRow, 6> KpiTable {
+        KpiRow { .label = "Dispatched", .project = KpiDispatched, .sparkline = true },
+        KpiRow { .label = "Compiling now", .project = KpiCompilingNow, .sparkline = false },
+        KpiRow { .label = "Cache hit rate", .project = KpiHitRate, .sparkline = false },
+        KpiRow { .label = "Refused", .project = KpiRefused, .sparkline = false },
+        KpiRow { .label = "Leases outstanding", .project = KpiLeases, .sparkline = false },
+        KpiRow { .label = "Oldest heartbeat", .project = KpiOldestHeartbeat, .sparkline = false },
+    };
 
     /// The sentence a split of numbers needs beside it.
     constexpr std::string_view LeaseNote =
@@ -882,7 +1017,7 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         "already being built are four different problems with four different fixes, and a total hides all of them.";
 } // namespace
 
-std::string RenderFleetHtml(FleetSnapshot const& snapshot, unsigned refreshSeconds)
+std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView const& history, unsigned refreshSeconds)
 {
     std::string out;
     out.reserve(16384);
@@ -936,26 +1071,26 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, unsigned refreshSecon
     auto const totals = TotalsFor(snapshot);
 
     // ---- the readouts, before any table ------------------------------------
+    //
+    // Free and withheld are deliberately *not* here: they are the capacity meter's
+    // two segments directly below, and a number repeated a hand's width from the
+    // picture of itself is a number that will one day disagree with it.
     out += R"(<section><div class="kpis">)";
-    auto const kpi =
-        [&out](std::string_view label, std::string const& value, std::string_view unit, std::string const& sub) {
-            out += std::format(R"(<div class="kpi"><span class="kpi-label">{}</span>)"
-                               R"(<span class="kpi-value">{}<small>{}</small></span>)"
-                               R"(<span class="kpi-sub">{}</span></div>)",
-                               EscapeHtml(label),
-                               EscapeHtml(value),
-                               EscapeHtml(unit),
-                               EscapeHtml(sub));
-        };
-    kpi("Compiling now",
-        std::to_string(totals.inFlight),
-        std::format("/ {} slots", totals.registered),
-        "this fleet's own work");
-    kpi("Free now", std::to_string(totals.free), "", "a compile could start");
-    kpi("Withheld", std::to_string(totals.withheld), "", "CPU or scratch, not us");
-    kpi("Leases outstanding", std::to_string(snapshot.liveLeases), "", "granted, not yet claimed");
-    kpi("Machines", std::to_string(snapshot.nodes.size()), "", std::format("{} worker entr(ies)", snapshot.workers.size()));
-    kpi("Registrations", std::to_string(snapshot.registrations), "", "accepted since start");
+    for (auto const& row: KpiTable)
+    {
+        auto const readout = row.project(snapshot, history);
+        out += std::format(R"(<div class="kpi"><span class="kpi-label">{}</span>)"
+                           R"(<span class="kpi-value">{}<small>{}</small></span>)",
+                           EscapeHtml(row.label),
+                           readout.value,
+                           EscapeHtml(readout.unit));
+        // Inlined rather than a seventh request: it is part of the tile's layout at
+        // roughly two hundred bytes, and being inside the page is also what lets it
+        // resolve the page's own custom properties instead of carrying a palette.
+        if (row.sparkline && !history.buckets.empty())
+            out += std::format(R"(<span class="spark">{}</span>)", RenderSparklineSvg(history.buckets));
+        out += std::format(R"(<span class="kpi-sub">{}</span></div>)", EscapeHtml(readout.sub));
+    }
     out += "</div></section>";
 
     // ---- the signature element ---------------------------------------------
@@ -1011,6 +1146,67 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, unsigned refreshSecon
                    R"(not quieter ones.</p>)";
     }
     out += "</div></section>";
+
+    // ---- over time ----------------------------------------------------------
+    out += R"(<section><div class="sec-head"><h2>Over time</h2><span class="rule"></span><span class="range">)";
+    for (auto const& row: FleetRangeTable)
+        // Links, not buttons: the control is two URLs, so it works with no script,
+        // survives a bookmark and is what the auto-refresh comes back to.
+        out += std::format(R"(<a{} href="?range={}">{}</a>)",
+                           row.range == history.range ? R"( class="on")" : "",
+                           EscapeHtml(row.key),
+                           EscapeHtml(row.label));
+    out += R"(</span></div>)";
+
+    auto const rangeKey = RangeKeyOf(history);
+    auto const& rangeRow = FleetRangeTable[static_cast<std::size_t>(history.range)];
+    if (std::ranges::none_of(history.buckets, [](auto const& bucket) { return bucket.present; }))
+        // A frame with nothing in it reads as a broken chart. Absent is not zero
+        // here either: nobody was watching, which is not a fleet that did nothing.
+        out += R"(<div class="panel occ"><p class="note">Nothing has been recorded for this range yet. )"
+               R"(A node samples the fleet once a minute <strong>while it leads</strong> &mdash; a follower's )"
+               R"(registry holds only what registered against it, so sampling there would record a fraction )"
+               R"(as though it were the whole. The first points appear a minute after this node won the )"
+               R"(election.</p></div>)";
+    else
+    {
+        out += R"(<div class="charts">)";
+        for (auto const& chart: FleetChartTable)
+        {
+            out += std::format(R"(<div class="panel chart"><h3>{}</h3><p class="chart-cap">{}</p>)",
+                               EscapeHtml(chart.title),
+                               EscapeHtml(chart.caption));
+            out += R"(<span class="chart-keys">)";
+            for (auto const offset: std::views::iota(std::size_t { 0 }, chart.count))
+            {
+                auto const& series = FleetSeriesTable[chart.first + offset];
+                out += std::format(R"(<span><span class="tone tone--{}"></span>{}</span>)",
+                                   EscapeHtml(series.colour),
+                                   EscapeHtml(series.label));
+            }
+            out += "</span>";
+            // Its own resource, and the URL carries no cache-buster on purpose: a
+            // generation in the query would make every bucket a new URL and the
+            // conditional GET would never fire. Stable URL, `ETag`, `304`.
+            out += std::format(R"(<img src="{}{}.svg?range={}" width="640" height="150" alt="{}">)",
+                               FleetChartPrefix,
+                               EscapeHtml(chart.key),
+                               EscapeHtml(rangeKey),
+                               EscapeHtml(std::format("{}, {}", chart.title, rangeRow.bucketLabel)));
+            out += "</div>";
+        }
+        out += "</div>";
+    }
+    out += std::format(R"(<p class="note">{} &middot; {} &middot; the same series are available as JSON at )"
+                       R"(<a href="{}?range={}">{}</a>, so anything here can be checked without a browser.</p>)"
+                       R"(</section>)",
+                       EscapeHtml(rangeRow.bucketLabel),
+                       history.durable ? "kept on disk, so it survives a restart"
+                                       : "kept in memory only &mdash; this node has no --cluster-dir or --cache-dir to "
+                                         "write it to, so a restart starts the history again",
+                       FleetSeriesPath,
+                       EscapeHtml(rangeKey),
+                       FleetSeriesPath);
 
     // ---- machines -----------------------------------------------------------
     out += R"(<section><div class="sec-head"><h2>Machines</h2><span class="rule"></span>)"

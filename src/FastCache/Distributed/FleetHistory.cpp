@@ -179,6 +179,18 @@ bool FleetHistory::Empty() const noexcept
            && std::ranges::none_of(_hours, [](auto const& b) { return b.present; });
 }
 
+std::chrono::seconds FleetHistory::UntilBucketCloses(FleetRange range) const noexcept
+{
+    auto const width = FleetRangeTable[static_cast<std::size_t>(range)].bucket;
+    auto const widthMillis = std::chrono::milliseconds { width }.count();
+    auto const elapsed = NowMillis() % widthMillis;
+    auto const remaining = std::chrono::milliseconds { widthMillis - elapsed };
+    // Rounded up and floored at a second: a `max-age=0` would make a browser
+    // revalidate every image on every refresh, which is the cost this exists to
+    // avoid rather than a freshness guarantee.
+    return std::max(std::chrono::seconds { 1 }, std::chrono::ceil<std::chrono::seconds>(remaining));
+}
+
 bool FleetHistory::Save(std::filesystem::path const& path) const
 {
     std::string body;

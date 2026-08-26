@@ -3,7 +3,6 @@
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
-#include <FastCache/Distributed/FleetView.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -166,6 +165,17 @@ class FleetHistory
 
     /// Whether anything has been recorded at all.
     [[nodiscard]] bool Empty() const noexcept;
+
+    /// How much longer the newest bucket of a range stays the newest.
+    ///
+    /// What a `Cache-Control: max-age` must be, and the reason it is not a fixed
+    /// sixty seconds: a viewer told to hold a chart for a minute one second before
+    /// its bucket closes then sits a whole bucket behind for the rest of that
+    /// minute, with nothing on the page saying so. Never zero -- a `max-age=0`
+    /// would revalidate on every image on every refresh.
+    /// @param range Which view.
+    /// @return Seconds until this range's newest bucket is superseded.
+    [[nodiscard]] std::chrono::seconds UntilBucketCloses(FleetRange range) const noexcept;
 
     /// Read a saved history back.
     ///

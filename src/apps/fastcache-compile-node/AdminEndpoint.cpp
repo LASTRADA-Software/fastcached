@@ -7,6 +7,7 @@
 #if defined(FC_TLS_ENABLED)
     #include <FastCache/Net/TlsContext.hpp>
 #endif
+#include <FastCache/Distributed/FleetChart.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 
 #include <algorithm>
@@ -136,52 +137,354 @@ namespace
                                .body = std::move(body),
                                .extraHeaders = { R"(WWW-Authenticate: Basic realm="fastcache fleet")" } };
     }
+
+    /// One `name=value` out of a query string.
+    ///
+    /// A parser rather than a dependency: this surface reads two names and would
+    /// otherwise gain a URL library to do it. `&`-separated, first match wins, and
+    /// an absent name is empty -- which every caller here distinguishes from a
+    /// present-but-unrecognised one, because those mean different things.
+    /// @param query Whatever followed the `?`.
+    /// @param name The parameter to find.
+    /// @return Its raw value, or empty when the query does not name it.
+    [[nodiscard]] std::string_view QueryValue(std::string_view query, std::string_view name)
+    {
+        while (!query.empty())
+        {
+            auto const separator = query.find('&');
+            auto const pair = query.substr(0, separator);
+            if (auto const equals = pair.find('='); equals != std::string_view::npos && pair.substr(0, equals) == name)
+                return pair.substr(equals + 1);
+            if (separator == std::string_view::npos)
+                break;
+            query.remove_prefix(separator + 1);
+        }
+        return {};
+    }
+
+    /// A range this surface does not serve.
+    ///
+    /// Refused rather than defaulted, deliberately, and it is the one place these
+    /// routes are stricter than the theme parameter: a range quietly substituted
+    /// puts a reader on a different axis than the one they asked for, with nothing
+    /// on the page saying so. A theme quietly substituted costs them nothing.
+    [[nodiscard]] AdminResponse BadRange(std::string_view contentType, std::string body)
+    {
+        return AdminResponse { .status = "400 Bad Request", .contentType = contentType, .body = std::move(body) };
+    }
+
+    /// A chart tail that names nothing in the table.
+    [[nodiscard]] AdminResponse NoSuchChart()
+    {
+        return AdminResponse { .status = "404 Not Found", .contentType = "text/plain", .body = "no such chart\n" };
+    }
+
+    /// Answer a conditional GET, rendering only when the client's copy is stale.
+    ///
+    /// The `ETag` is the sampler's own bucket counter rather than a hash of the
+    /// body: it moves exactly when a rendered chart would, costs nothing to compute,
+    /// and is byte-exact rather than probabilistic. `Cache-Control` runs only to the
+    /// end of the bucket being drawn, because a fixed max-age would leave a viewer a
+    /// whole bucket behind for the rest of it.
+    /// @param request The request, for its `If-None-Match`.
+    /// @param history Where the generation and the bucket clock come from.
+    /// @param range Which range is being drawn.
+    /// @param identity What distinguishes this resource from the others.
+    /// @param status What a fresh answer's status would be.
+    /// @param contentType What the body is.
+    /// @param render Produces the body; called only when it will be sent.
+    /// @return The rendered answer, or a bodyless `304`.
+    template <typename Render>
+    [[nodiscard]] AdminResponse Conditional(AdminRequest const& request,
+                                            FleetHistorySource const& history,
+                                            Distributed::FleetRange range,
+                                            std::string const& identity,
+                                            std::string_view status,
+                                            std::string_view contentType,
+                                            Render&& render)
+    {
+        if (history.history == nullptr)
+            return AdminResponse { .status = "503 Service Unavailable",
+                                   .contentType = "text/plain",
+                                   .body = "this node keeps no fleet history\n" };
+
+        auto const tag = std::format(R"("{}-{}")", identity, history.history->Generation());
+        auto const maxAge = history.history->UntilBucketCloses(range).count();
+        std::vector<std::string> headers { std::format("ETag: {}", tag),
+                                           std::format("Cache-Control: max-age={}, must-revalidate", maxAge) };
+
+        if (request.Header(AdminHeader::IfNoneMatch) == tag)
+            // Bodyless, and the validators go with it: without them the client has
+            // nothing to revalidate against next time.
+            return AdminResponse { .status = "304 Not Modified", .extraHeaders = std::move(headers) };
+
+        return AdminResponse { .status = status,
+                               .contentType = contentType,
+                               .body = std::forward<Render>(render)(),
+                               .extraHeaders = std::move(headers) };
+    }
 } // namespace
 
 std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
                                         AdminCredential const& credential,
-                                        unsigned refreshSeconds)
+                                        unsigned refreshSeconds,
+                                        FleetHistorySource history)
 {
-    // Both routes read the fleet the same way and differ only in how they render
-    // it, so the collection and the gate are written once and the renderer is the
-    // parameter. A second copy of the credential check is the shape of bug that
-    // leaves one of two routes open.
-    auto const answer = [sources, credential](auto&& render, std::string_view contentType, auto&& refuse) {
-        return [sources, credential, render, contentType, refuse](AdminRequest const& request) -> AdminResponse {
-            if (!credential.Accepts(request.authorization))
+    // Every route reads the fleet the same way and is gated the same way; only what
+    // it renders differs. **The gate is written once and the renderer is the
+    // parameter**, so a route added later cannot be one that forgot to check --
+    // which here would mean the fleet's whole history readable through an image URL
+    // while `/fleet` itself stays locked.
+    auto const gated = [sources, credential](auto refuse, auto render) {
+        return [sources, credential, refuse, render](AdminRequest const& request) -> AdminResponse {
+            if (!credential.Accepts(request.Header(AdminHeader::Authorization)))
                 return refuse();
-
-            auto const snapshot = Distributed::CollectFleet(sources);
-            // A follower answers 503 rather than 200: its registry holds whatever
-            // registered against it rather than the fleet, so a 200 would be a
-            // partial picture presented as the whole one. It is `Gate()`'s
-            // `NotLeader` in HTTP's vocabulary -- not me, and here is who.
-            return AdminResponse { .status = Distributed::LeadsTheFleet(snapshot) ? "200 OK" : "503 Service Unavailable",
-                                   .contentType = contentType,
-                                   .body = render(snapshot),
-                                   .extraHeaders = {} };
+            return render(Distributed::CollectFleet(sources), request);
         };
     };
 
+    // A follower answers 503 rather than 200: its registry holds whatever registered
+    // against it rather than the fleet, so a 200 would be a partial picture
+    // presented as the whole one. It is `Gate()`'s `NotLeader` in HTTP's vocabulary
+    // -- not me, and here is who.
+    auto const statusFor = [](Distributed::FleetSnapshot const& snapshot) {
+        return Distributed::LeadsTheFleet(snapshot) ? "200 OK" : "503 Service Unavailable";
+    };
+
+    /// What the reader asked for, or the default -- never a silent substitution.
+    auto const rangeAsked = [](std::string_view query) -> std::optional<Distributed::FleetRange> {
+        auto const asked = QueryValue(query, "range");
+        if (asked.empty())
+            return Distributed::FleetRange::Day;
+        return Distributed::FleetRangeFromKey(asked);
+    };
+
+    auto const viewFor = [history](Distributed::FleetRange range) {
+        Distributed::FleetHistoryView view { .range = range, .buckets = {}, .durable = history.durable };
+        if (history.history != nullptr)
+            view.buckets = history.history->Buckets(range);
+        return view;
+    };
+
     std::vector<AdminRoute> routes;
-    routes.push_back(AdminRoute { .path = "/fleet",
-                                  .handler = answer(
-                                      [refreshSeconds](Distributed::FleetSnapshot const& s) {
-                                          return Distributed::RenderFleetHtml(s, refreshSeconds);
-                                      },
-                                      "text/html; charset=utf-8",
-                                      [] {
-                                          return Unauthorised("text/html; charset=utf-8",
-                                                              "<!doctype html><title>fastcache fleet</title>"
-                                                              "<p>This page needs the credential named by "
-                                                              "<code>--dashboard-token-file</code>.</p>");
-                                      }) });
+
+    routes.push_back(AdminRoute {
+        .path = "/fleet",
+        .handler = gated(
+            [] {
+                return Unauthorised("text/html; charset=utf-8",
+                                    "<!doctype html><title>fastcache fleet</title>"
+                                    "<p>This page needs the credential named by "
+                                    "<code>--dashboard-token-file</code>.</p>");
+            },
+            [refreshSeconds, statusFor, rangeAsked, viewFor](Distributed::FleetSnapshot const& snapshot,
+                                                             AdminRequest const& request) -> AdminResponse {
+                auto const range = rangeAsked(request.query);
+                if (!range.has_value())
+                    return BadRange("text/html; charset=utf-8",
+                                    "<!doctype html><title>fastcache fleet</title>"
+                                    "<p>Unknown <code>range</code>. Try <code>?range=24h</code> or "
+                                    "<code>?range=7d</code>.</p>");
+                return AdminResponse { .status = statusFor(snapshot),
+                                       .contentType = "text/html; charset=utf-8",
+                                       .body = Distributed::RenderFleetHtml(snapshot, viewFor(*range), refreshSeconds) };
+            }),
+    });
+
     routes.push_back(AdminRoute {
         .path = "/fleet.json",
-        .handler = answer([](Distributed::FleetSnapshot const& s) { return Distributed::RenderFleetJson(s); },
-                          "application/json",
-                          [] { return Unauthorised("application/json", R"({"error":"credential required"})"); }) });
+        .handler = gated([] { return Unauthorised("application/json", R"({"error":"credential required"})"); },
+                         [statusFor](Distributed::FleetSnapshot const& snapshot, AdminRequest const&) {
+                             return AdminResponse { .status = statusFor(snapshot),
+                                                    .contentType = "application/json",
+                                                    .body = Distributed::RenderFleetJson(snapshot) };
+                         }),
+    });
+
+    routes.push_back(AdminRoute {
+        .path = std::string_view { Distributed::FleetSeriesPath },
+        .handler = gated([] { return Unauthorised("application/json", R"({"error":"credential required"})"); },
+                         [history, statusFor, rangeAsked, viewFor](Distributed::FleetSnapshot const& snapshot,
+                                                                   AdminRequest const& request) -> AdminResponse {
+                             auto const range = rangeAsked(request.query);
+                             if (!range.has_value())
+                                 return BadRange("application/json", R"({"error":"unknown range"})");
+                             auto const view = viewFor(*range);
+                             return Conditional(
+                                 request,
+                                 history,
+                                 *range,
+                                 std::format("s-{}", Distributed::FleetRangeTable[static_cast<std::size_t>(*range)].key),
+                                 statusFor(snapshot),
+                                 "application/json",
+                                 [&view, &range] { return Distributed::RenderSeriesJson(view.buckets, *range); });
+                         }),
+    });
+
+    routes.push_back(AdminRoute {
+        .path = std::string_view { Distributed::FleetChartPrefix },
+        .handler = gated([] { return Unauthorised("text/plain", "credential required\n"); },
+                         [history, statusFor, rangeAsked, viewFor](Distributed::FleetSnapshot const& snapshot,
+                                                                   AdminRequest const& request) -> AdminResponse {
+                             constexpr std::string_view Extension = ".svg";
+                             auto tail = request.path.substr(Distributed::FleetChartPrefix.size());
+                             if (!tail.ends_with(Extension))
+                                 return NoSuchChart();
+                             tail.remove_suffix(Extension.size());
+                             auto const chart = Distributed::FleetChartFromKey(tail);
+                             if (!chart.has_value())
+                                 return NoSuchChart();
+
+                             auto const range = rangeAsked(request.query);
+                             if (!range.has_value())
+                                 return BadRange("text/plain", "unknown range\n");
+                             auto const theme = Distributed::FleetThemeFromKey(QueryValue(request.query, "theme"));
+                             auto const& row = Distributed::FleetChartTable[static_cast<std::size_t>(*chart)];
+
+                             auto const view = viewFor(*range);
+                             return Conditional(
+                                 request,
+                                 history,
+                                 *range,
+                                 std::format("{}-{}-{}",
+                                             row.key,
+                                             Distributed::FleetRangeTable[static_cast<std::size_t>(*range)].key,
+                                             Distributed::FleetThemeKey(theme)),
+                                 statusFor(snapshot),
+                                 "image/svg+xml",
+                                 [&row, &view, &range, theme] {
+                                     return Distributed::RenderChartSvg(row, view.buckets, *range, theme);
+                                 });
+                         }),
+        // A prefix route, so one row here covers every chart the table names: a
+        // route per chart would put the chart table's contents in a second place.
+        .match = AdminRouteMatch::Prefix,
+    });
+
     return routes;
+}
+
+EnumTable<Distributed::FleetMetric, std::uint64_t> SampleFrom(Distributed::FleetSnapshot const& snapshot)
+{
+    EnumTable<Distributed::FleetMetric, std::uint64_t> values {};
+    auto const put = [&values](Distributed::FleetMetric metric, std::uint64_t value) {
+        values[static_cast<std::size_t>(metric)] = value;
+    };
+
+    // The five dispatch counters keep `LeaseOutcomeTable`'s order rather than being
+    // named one by one, so a sixth outcome lands here by being added to that table.
+    static constexpr std::array<Distributed::FleetMetric, 5> DispatchSlots {
+        Distributed::FleetMetric::DispatchGranted,    Distributed::FleetMetric::DispatchNoWorker,
+        Distributed::FleetMetric::DispatchNoCapacity, Distributed::FleetMetric::DispatchWithdrawn,
+        Distributed::FleetMetric::DispatchDuplicate,
+    };
+    static_assert(DispatchSlots.size() == Distributed::LeaseOutcomeTable.size(),
+                  "every lease outcome needs a slot, or a refusal reason silently stops being recorded");
+    for (auto const index: std::views::iota(std::size_t { 0 }, DispatchSlots.size()))
+        if (index < snapshot.leases.size())
+            put(DispatchSlots[index], snapshot.leases[index]);
+
+    // Summed over `NodeReports()`, never over `LiveWorkers()`: a node started with
+    // two --toolchain flags is two registry entries carrying one machine's cache,
+    // and summing there counts that cache once per toolchain.
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    for (auto const& node: snapshot.nodes)
+    {
+        hits += node.load.cache.hits.value_or(0);
+        misses += node.load.cache.misses.value_or(0);
+    }
+    put(Distributed::FleetMetric::CacheHits, hits);
+    put(Distributed::FleetMetric::CacheMisses, misses);
+
+    auto const totals = Distributed::TotalsFor(snapshot);
+    put(Distributed::FleetMetric::OfferableSlots, totals.free);
+    put(Distributed::FleetMetric::JobsInFlight, totals.inFlight);
+    return values;
+}
+
+std::filesystem::path FleetHistoryPath(NodeConfig const& cfg)
+{
+    constexpr std::string_view FileName = "fleet-history.bin";
+    if (!cfg.clusterDir.empty())
+        return cfg.clusterDir / FileName;
+    if (!cfg.cacheDir.empty())
+        return cfg.cacheDir / FileName;
+    return {};
+}
+
+FleetSampler::FleetSampler(Distributed::FleetSources sources,
+                           IWallClock const& wall,
+                           std::filesystem::path path,
+                           ILogger& logger):
+    _sources { sources },
+    _history { wall },
+    _path { std::move(path) },
+    _logger { logger }
+{
+    // Every failure to read starts empty and says so once. History is a
+    // convenience, and no state of this file may keep a node from starting.
+    if (!_path.empty())
+    {
+        if (_history.Load(_path))
+            _logger.Logf(LogLevel::Info, "fleet history restored from {}", _path.string());
+        else
+            _logger.Logf(LogLevel::Info, "fleet history starts empty at {}", _path.string());
+    }
+
+    _thread = std::jthread { [this](std::stop_token stop) {
+        auto sinceSave = std::chrono::steady_clock::duration::zero();
+        while (!stop.stop_requested())
+        {
+            SampleOnce();
+            if (sinceSave >= SaveInterval)
+            {
+                Persist();
+                sinceSave = std::chrono::steady_clock::duration::zero();
+            }
+
+            // Interruptible, rather than a sleep this loop would have to wake from
+            // on its own schedule. A stop that had to wait out a full interval makes
+            // teardown look hung, which this repository has already paid for once as
+            // a `systemctl stop` that escalated to SIGKILL.
+            auto guard = std::unique_lock { _wakeMutex };
+            (void) _wake.wait_for(
+                guard, stop, Distributed::FleetHistory::SampleInterval, [&stop] { return stop.stop_requested(); });
+            sinceSave += Distributed::FleetHistory::SampleInterval;
+        }
+    } };
+}
+
+FleetSampler::~FleetSampler()
+{
+    _thread.request_stop();
+    _wake.notify_all();
+    if (_thread.joinable())
+        _thread.join();
+    // One last write, so a clean shutdown does not throw away up to five minutes of
+    // what the page will be asked about the moment the node comes back.
+    Persist();
+}
+
+bool FleetSampler::SampleOnce()
+{
+    auto const snapshot = Distributed::CollectFleet(_sources);
+    // Only while leading. A follower's registry holds whatever registered against
+    // it, so a sample there records a fraction of the fleet as though it were the
+    // whole -- and the chart would then show the fleet shrinking whenever
+    // leadership moved, which is the opposite of what happened.
+    if (!Distributed::LeadsTheFleet(snapshot))
+        return false;
+    _history.Record(SampleFrom(snapshot));
+    return true;
+}
+
+void FleetSampler::Persist()
+{
+    if (_path.empty() || _history.Empty())
+        return;
+    if (!_history.Save(_path))
+        _logger.Logf(LogLevel::Warn, "could not write fleet history to {}", _path.string());
 }
 
 std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig const& cfg,
@@ -243,7 +546,18 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
     // rather than a route answering with an empty fleet.
     std::vector<AdminRoute> routes;
     if (cfg.dashboard && fleet.has_value())
-        routes = MakeFleetRoutes(*fleet, credential, DashboardRefreshSeconds);
+    {
+        // The sampler outlives the routes that read it: `AdminSurface` declares it
+        // before `endpoint`, so the endpoint and its serving thread are torn down
+        // first. See the comment on that member -- the ordering is the contract.
+        static SystemWallClock const wall;
+        surface.sampler = std::make_unique<FleetSampler>(*fleet, wall, FleetHistoryPath(cfg), logger);
+        routes = MakeFleetRoutes(
+            *fleet,
+            credential,
+            DashboardRefreshSeconds,
+            FleetHistorySource { .history = &surface.sampler->History(), .durable = surface.sampler->Durable() });
+    }
 
     auto started = AdminEndpoint::Start(cfg.adminListen,
                                         "127.0.0.1",
@@ -282,7 +596,7 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
         LogLevel::Info, "metrics endpoint on {}://{}/metrics (and /healthz)", scheme, surface.endpoint->BoundEndpoint());
     if (cfg.dashboard && fleet.has_value())
         logger.Logf(LogLevel::Info,
-                    "fleet dashboard on {}://{}/fleet (and /fleet.json){}",
+                    "fleet dashboard on {}://{}/fleet (and /fleet.json, /fleet/series.json, /fleet/chart/*.svg){}",
                     scheme,
                     surface.endpoint->BoundEndpoint(),
                     credential.Required() ? "" : ", with no credential");

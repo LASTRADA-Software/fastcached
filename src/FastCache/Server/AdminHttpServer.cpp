@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <format>
 #include <memory>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -59,7 +60,8 @@ namespace
     {
         std::string method;
         std::string target;
-        std::string authorization;
+        /// One slot per `AdminHeaderTable` row, in its order.
+        EnumTable<AdminHeader, std::string> headers {};
         bool ok { false };
     };
 
@@ -147,31 +149,56 @@ namespace
         auto const sp2 = rest.find(' ');
         auto const target = sp2 == std::string_view::npos ? rest : rest.substr(0, sp2);
 
-        // Walk the remaining field lines for the one header this surface reads.
+        // Walk the remaining field lines for every header this surface reads.
         // Stopping at the blank line rather than scanning the whole buffer keeps a
         // body -- which no admin route has, but which a hostile client may send --
         // from being mistaken for a header.
-        std::string authorization;
-        constexpr std::string_view AuthorizationField = "authorization";
+        //
+        // Every line is offered to every row, and the walk does **not** stop at the
+        // first match. It did, back when there was one readable header, and that is
+        // a shape which stays correct exactly until a second row is added -- at
+        // which point whichever header the client happened to send first is the only
+        // one that arrives, so a chart's `If-None-Match` would vanish whenever the
+        // browser put `Authorization` above it.
+        EnumTable<AdminHeader, std::string> headers {};
         for (auto cursor = eol + 2; cursor < buffer.size();)
         {
             auto const lineEnd = buffer.find("\r\n", cursor);
             if (lineEnd == std::string::npos || lineEnd == cursor)
                 break;
             std::string_view const field { buffer.data() + cursor, lineEnd - cursor };
-            if (auto const colon = field.find(':');
-                colon != std::string_view::npos && EqualsIgnoringCase(field.substr(0, colon), AuthorizationField))
-            {
-                authorization = std::string { TrimFieldValue(field.substr(colon + 1)) };
-                break;
-            }
+            if (auto const colon = field.find(':'); colon != std::string_view::npos)
+                for (auto const& row: AdminHeaderTable)
+                    if (EqualsIgnoringCase(field.substr(0, colon), row.name))
+                    {
+                        headers[static_cast<std::size_t>(row.header)] =
+                            std::string { TrimFieldValue(field.substr(colon + 1)) };
+                        break;
+                    }
             cursor = lineEnd + 2;
         }
 
         co_return RequestHead { .method = std::string { line.substr(0, sp1) },
                                 .target = std::string { target },
-                                .authorization = std::move(authorization),
+                                .headers = std::move(headers),
                                 .ok = true };
+    }
+
+    /// Statuses whose responses carry no content at all.
+    ///
+    /// A property of the status rather than a flag on the response, so a route that
+    /// answers `304` cannot get it wrong by forgetting to set one. RFC 9110 SS15.4.5
+    /// forbids content on a `304`, and SS8.6 forbids a `Content-Length` that does not
+    /// equal what a `200` would have sent -- a client that read one and then found the
+    /// connection closed would report a truncated response rather than a cache hit.
+    constexpr std::array<std::string_view, 2> BodylessStatuses { "204 No Content", "304 Not Modified" };
+
+    /// Whether a status forbids a body.
+    /// @param status The status line without its version.
+    /// @return True when neither content nor its headers may be written.
+    [[nodiscard]] bool CarriesNoContent(std::string_view status) noexcept
+    {
+        return std::ranges::any_of(BodylessStatuses, [status](auto const& known) noexcept { return known == status; });
     }
 
     /// By value, not by reference: this is a coroutine, so a reference parameter
@@ -179,15 +206,18 @@ namespace
     /// resumes -- the hazard `ServeAdminHttp`'s own signature already avoids.
     Task<bool> WriteResponse(ISocket* socket, AdminResponse response)
     {
-        auto head = std::format("HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-                                response.status,
-                                response.contentType,
-                                response.body.size());
+        auto const bodyless = CarriesNoContent(response.status);
+        auto head = std::format("HTTP/1.1 {}\r\n", response.status);
+        if (!bodyless)
+            head += std::format("Content-Type: {}\r\nContent-Length: {}\r\n", response.contentType, response.body.size());
+        head += "Connection: close\r\n";
         for (auto const& extra: response.extraHeaders)
             head += std::format("{}\r\n", extra);
         head += "\r\n";
         if (!co_await WriteAll(socket, head))
             co_return false;
+        if (bodyless)
+            co_return true;
         co_return co_await WriteAll(socket, response.body);
     }
 
@@ -253,14 +283,27 @@ Task<void> ServeAdminHttp(ISocket* socket,
         co_return;
     }
 
-    AdminRequest const routeRequest { .path = path, .query = query, .authorization = request.authorization };
-    for (auto const& route: routes)
+    AdminRequest routeRequest { .path = path, .query = query };
+    for (auto const& row: AdminHeaderTable)
     {
-        if (route.path != path || !route.handler)
-            continue;
-        (void) co_await WriteResponse(socket, route.handler(routeRequest));
-        co_return;
+        auto const slot = static_cast<std::size_t>(row.header);
+        routeRequest.headers[slot] = request.headers[slot];
     }
+
+    // Kinds in enumerator order, so `Exact` is tried against every route before
+    // `Prefix` is tried against any: which route answers a path is then a property
+    // of the table rather than of the order a caller happened to build its vector in.
+    for (auto const kind: std::views::iota(std::size_t { 0 }, EnumeratorCount<AdminRouteMatch>))
+        for (auto const& route: routes)
+        {
+            if (static_cast<std::size_t>(route.match) != kind || !route.handler)
+                continue;
+            auto const hit = route.match == AdminRouteMatch::Exact ? route.path == path : path.starts_with(route.path);
+            if (!hit)
+                continue;
+            (void) co_await WriteResponse(socket, route.handler(routeRequest));
+            co_return;
+        }
 
     (void) co_await WriteResponse(socket, PlainRefusal("404 Not Found", "not found\n"));
     co_return;

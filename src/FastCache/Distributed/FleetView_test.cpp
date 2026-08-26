@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Distributed/FleetChart.hpp>
+#include <FastCache/Distributed/FleetText.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/NodeLoadTestUtils.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <format>
 #include <optional>
+#include <ranges>
 #include <string>
+#include <string_view>
 
 #include <tests/Unwrap.hpp>
 
@@ -75,6 +82,15 @@ class FakeCluster final: public IClusterAdmin
 constexpr auto MemoryIndex = static_cast<std::size_t>(StorageTier::Memory);
 constexpr auto DiskIndex = static_cast<std::size_t>(StorageTier::Disk);
 
+/// A history nobody has sampled yet, for a case that is not about the charts.
+///
+/// Empty rather than fabricated: most cases here are about the snapshot, and a
+/// literal series in each would be four lines of noise proving nothing.
+[[nodiscard]] FleetHistoryView NoHistory()
+{
+    return FleetHistoryView {};
+}
+
 } // namespace
 
 TEST_CASE("Every fleet column reaches both the page and the JSON", "[distributed][fleetview]")
@@ -98,7 +114,7 @@ TEST_CASE("Every fleet column reaches both the page and the JSON", "[distributed
                                                              .codecs = {} },
                                         .heartbeatAge = std::chrono::milliseconds { 30 } } };
 
-    auto const html = RenderFleetHtml(snapshot, 10);
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
     auto const json = RenderFleetJson(snapshot);
 
     // Column names are one spelling serving both consumers, so a header and a key
@@ -149,7 +165,7 @@ TEST_CASE("A number nobody reported renders as an absence, never as a zero", "[d
     snapshot.nodes[0].capacity.totalMemoryBytes = 0;
     snapshot.nodes[0].load = Busy(1); // no CPU, no memory, no scratch reading
 
-    auto const html = RenderFleetHtml(snapshot, 0);
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
     auto const json = RenderFleetJson(snapshot);
 
     CHECK(json.contains(R"("cores":null)"));
@@ -189,7 +205,7 @@ TEST_CASE("A tier no member runs contributes no column at all", "[distributed][f
     snapshot.tiersPresent[MemoryIndex] = true;
     snapshot.tiersPresent[DiskIndex] = false;
 
-    auto const html = RenderFleetHtml(snapshot, 0);
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
     auto const json = RenderFleetJson(snapshot);
 
     CHECK(html.contains("memory-items"));
@@ -211,7 +227,7 @@ TEST_CASE("An absent tier budget and an unbounded one are different claims", "[d
     snapshot.nodes[0].load.cache.tiers[MemoryIndex] = CacheTierUsage {};
 
     CHECK(RenderFleetJson(snapshot).contains(R"("memory-budget":"unbounded")"));
-    CHECK(RenderFleetHtml(snapshot, 0).contains("unbounded"));
+    CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("unbounded"));
 
     snapshot.nodes[0].capacity.cache.tierBytesLimit[MemoryIndex] = std::nullopt;
     snapshot.nodes[0].load.cache.tiers[MemoryIndex] = std::nullopt;
@@ -286,7 +302,7 @@ TEST_CASE("A follower answers with a page naming the leader, and never a redirec
     snapshot.role = SchedulerRole::Follower;
     snapshot.leaderEndpoint = "10.0.0.9:6676";
 
-    auto const html = RenderFleetHtml(snapshot, 10);
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
     CHECK(html.starts_with("<!doctype html>"));
     CHECK(html.contains("10.0.0.9:6676"));
     CHECK(html.contains("follower"));
@@ -307,7 +323,7 @@ TEST_CASE("An election in progress names nobody rather than guessing", "[distrib
     FleetSnapshot snapshot;
     snapshot.role = SchedulerRole::Undecided;
 
-    auto const html = RenderFleetHtml(snapshot, 0);
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
     CHECK(html.contains("election"));
     CHECK(RenderFleetJson(snapshot).contains(R"("leader":null)"));
 }
@@ -319,7 +335,7 @@ TEST_CASE("A node running no cluster reports no members rather than an empty clu
     auto snapshot = LeadingSnapshot();
     CHECK_FALSE(snapshot.cluster.has_value());
     CHECK(RenderFleetJson(snapshot).contains(R"("members":null)"));
-    CHECK(RenderFleetHtml(snapshot, 0).contains("runs no cluster"));
+    CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("runs no cluster"));
 
     snapshot.cluster = Cluster::ClusterState {};
     CHECK(RenderFleetJson(snapshot).contains(R"("members":[])"));
@@ -340,7 +356,7 @@ TEST_CASE("A hostile fingerprint cannot escape the page or the document", "[dist
                                                              .codecs = {} },
                                         .heartbeatAge = std::chrono::milliseconds { 0 } } };
 
-    auto const html = RenderFleetHtml(snapshot, 0);
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
     CHECK_FALSE(html.contains("<script>alert(1)</script>"));
     CHECK(html.contains("&lt;script&gt;"));
     CHECK(html.contains("&quot;"));
@@ -355,7 +371,7 @@ TEST_CASE("The page carries no script and refreshes itself without one", "[distr
     // and a page that fetched one would not render on the air-gapped network a
     // build fleet usually lives on. A meta refresh is a poll interval with no
     // JavaScript at all.
-    auto const html = RenderFleetHtml(LeadingSnapshot(), 10);
+    auto const html = RenderFleetHtml(LeadingSnapshot(), NoHistory(), 10);
     CHECK(html.starts_with("<!doctype html>"));
     CHECK_FALSE(html.contains("<script"));
     CHECK_FALSE(html.contains("http://"));
@@ -363,7 +379,7 @@ TEST_CASE("The page carries no script and refreshes itself without one", "[distr
     CHECK(html.contains(R"(<meta http-equiv="refresh" content="10">)"));
 
     // Zero means the operator asked for no refresh, and then there is no tag.
-    CHECK_FALSE(RenderFleetHtml(LeadingSnapshot(), 0).contains("http-equiv=\"refresh\""));
+    CHECK_FALSE(RenderFleetHtml(LeadingSnapshot(), NoHistory(), 0).contains("http-equiv=\"refresh\""));
 }
 
 TEST_CASE("Each lease outcome carries its own number", "[distributed][fleetview]")
@@ -381,7 +397,7 @@ TEST_CASE("Each lease outcome carries its own number", "[distributed][fleetview]
     CHECK(json.contains(R"("withdrawn":3)"));
     CHECK(json.contains(R"("duplicate":2)"));
     // And the page says out loud that they must not be added together.
-    CHECK(RenderFleetHtml(snapshot, 0).contains("Do not add these together"));
+    CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("Do not add these together"));
 }
 
 TEST_CASE("Collecting a fleet reads the registry per machine and the counters as they stand", "[distributed][fleetview]")
@@ -487,7 +503,7 @@ TEST_CASE("A fleet with no machines has no capacity to draw", "[distributed][fle
     CHECK(totals.withheld == 0);
 
     // And the page says so rather than rendering an empty meter.
-    auto const html = RenderFleetHtml(snapshot, 0);
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
     CHECK(html.contains("No machine has registered"));
 }
 
@@ -497,12 +513,158 @@ TEST_CASE("The page dresses a stale heartbeat differently from a fresh one", "[d
     REQUIRE(!snapshot.nodes.empty());
     snapshot.nodes[0].heartbeatAge = std::chrono::milliseconds { 250 };
 
-    auto const fresh = RenderFleetHtml(snapshot, 0);
+    auto const fresh = RenderFleetHtml(snapshot, NoHistory(), 0);
     CHECK(fresh.contains("pill--ok"));
 
     snapshot.nodes[0].heartbeatAge = std::chrono::minutes { 5 };
-    auto const stale = RenderFleetHtml(snapshot, 0);
+    auto const stale = RenderFleetHtml(snapshot, NoHistory(), 0);
     // Everything on that row is as old as this number, which is the reason the
     // column exists at all -- so the row has to look different.
     CHECK(stale.contains("pill--warn"));
+}
+
+namespace
+{
+
+/// A day of buckets carrying a rising counter, so every chart has something to draw.
+[[nodiscard]] FleetHistoryView SomeHistory(FleetRange range = FleetRange::Day, bool durable = true)
+{
+    FleetHistoryView view { .range = range, .buckets = {}, .durable = durable };
+    for (auto const index: std::views::iota(0, 8))
+    {
+        FleetBucket bucket {};
+        bucket.startMillis = index * 300'000;
+        bucket.present = true;
+        auto const set = [&bucket](FleetMetric metric, std::uint64_t value) {
+            bucket.values[static_cast<std::size_t>(metric)] = value;
+        };
+        set(FleetMetric::DispatchGranted, static_cast<std::uint64_t>(index) * 30);
+        set(FleetMetric::DispatchNoCapacity, static_cast<std::uint64_t>(index) * 2);
+        set(FleetMetric::CacheHits, static_cast<std::uint64_t>(index) * 9);
+        set(FleetMetric::CacheMisses, static_cast<std::uint64_t>(index));
+        set(FleetMetric::OfferableSlots, 16);
+        set(FleetMetric::JobsInFlight, static_cast<std::uint64_t>(index) % 4);
+        view.buckets.push_back(bucket);
+    }
+    return view;
+}
+
+} // namespace
+
+TEST_CASE("The readouts are the strip's table, in its order", "[distributed][fleetview][kpi]")
+{
+    auto const html = RenderFleetHtml(LeadingSnapshot(), SomeHistory(), 0);
+
+    // The mockup's six, and the order is what a reader's eye follows -- so it is
+    // asserted rather than left to whichever order the rows happened to be typed in.
+    constexpr std::array<std::string_view, 6> Expected { "Dispatched", "Compiling now",      "Cache hit rate",
+                                                         "Refused",    "Leases outstanding", "Oldest heartbeat" };
+    std::size_t cursor = 0;
+    for (auto const& label: Expected)
+    {
+        auto const at = html.find(label, cursor);
+        INFO("label " << label);
+        REQUIRE(at != std::string::npos);
+        cursor = at;
+    }
+
+    // Free and withheld are the capacity meter's own two segments directly below.
+    // A number repeated a hand's width from the picture of itself is a number that
+    // will one day disagree with it.
+    CHECK_FALSE(html.contains(">Free now<"));
+    CHECK_FALSE(html.contains(">Withheld<"));
+}
+
+TEST_CASE("A tile whose range holds nothing shows a dash rather than a zero", "[distributed][fleetview][kpi]")
+{
+    auto const html = RenderFleetHtml(LeadingSnapshot(), NoHistory(), 0);
+
+    // Absent is not zero, at the tile as everywhere else on this page: "0 compiles
+    // dispatched" is a claim about a fleet, and nobody was watching.
+    CHECK(html.contains("&ndash;"));
+    CHECK(html.contains("Nothing has been recorded for this range yet"));
+    // No frames with nothing in them: a chart panel drawn over no data reads as a
+    // broken chart rather than as an honest absence.
+    CHECK_FALSE(html.contains("/fleet/chart/"));
+}
+
+TEST_CASE("The range control offers every range and marks the one in view", "[distributed][fleetview][charts]")
+{
+    auto const day = RenderFleetHtml(LeadingSnapshot(), SomeHistory(FleetRange::Day), 0);
+    auto const week = RenderFleetHtml(LeadingSnapshot(), SomeHistory(FleetRange::Week), 0);
+
+    for (auto const& row: FleetRangeTable)
+    {
+        INFO("range " << row.key);
+        CHECK(day.contains(std::format(R"(href="?range={}")", row.key)));
+        CHECK(week.contains(std::format(R"(href="?range={}")", row.key)));
+    }
+    // Links, not buttons: the control is two URLs, so it survives a bookmark and is
+    // what the page's own auto-refresh comes back to.
+    CHECK_FALSE(day.contains("<button"));
+    CHECK(day.contains(R"(<a class="on" href="?range=24h")"));
+    CHECK(week.contains(R"(<a class="on" href="?range=7d")"));
+}
+
+TEST_CASE("Every chart the table names becomes a panel and its own image", "[distributed][fleetview][charts]")
+{
+    auto const html = RenderFleetHtml(LeadingSnapshot(), SomeHistory(FleetRange::Week), 0);
+
+    for (auto const& chart: FleetChartTable)
+    {
+        INFO("chart " << chart.key);
+        CHECK(html.contains(EscapeMarkup(chart.title)));
+        CHECK(html.contains(EscapeMarkup(chart.caption)));
+        // Its own resource, and the URL carries no cache-buster: a generation in the
+        // query would make every bucket a new URL and the conditional GET this whole
+        // arrangement exists for would never fire.
+        auto const src = std::format(R"(src="/fleet/chart/{}.svg?range=7d")", chart.key);
+        CHECK(html.contains(src));
+        CHECK_FALSE(html.contains(src.substr(0, src.size() - 1) + "&"));
+
+        for (auto const offset: std::views::iota(std::size_t { 0 }, chart.count))
+        {
+            auto const& series = FleetSeriesTable[chart.first + offset];
+            INFO("series " << series.key);
+            CHECK(html.contains(EscapeMarkup(series.label)));
+            // A class per palette token, never an inline style: `style="…var(--x)"`
+            // ends in the two characters that terminate a raw string literal.
+            CHECK(html.contains(std::format(R"(class="tone tone--{}")", series.colour)));
+        }
+    }
+}
+
+TEST_CASE("The page says whether the history it draws will survive a restart", "[distributed][fleetview][charts]")
+{
+    CHECK(RenderFleetHtml(LeadingSnapshot(), SomeHistory(FleetRange::Day, true), 0).contains("survives a restart"));
+    // A node with nowhere to write it is a legitimate way to run, and the promise it
+    // makes is different -- so the page says so rather than letting an operator find
+    // out at the next restart.
+    CHECK(RenderFleetHtml(LeadingSnapshot(), SomeHistory(FleetRange::Day, false), 0).contains("kept in memory only"));
+}
+
+TEST_CASE("The dispatched tile carries its sparkline inline", "[distributed][fleetview][charts]")
+{
+    auto const html = RenderFleetHtml(LeadingSnapshot(), SomeHistory(), 0);
+
+    // Inline rather than a seventh request: it is part of the tile's layout at
+    // roughly two hundred bytes, and being inside the page is also what lets it
+    // resolve the page's own custom properties instead of carrying a palette.
+    CHECK(html.contains(R"(<span class="spark"><svg )"));
+    CHECK(html.contains("var(--accent)"));
+    CHECK_FALSE(RenderFleetHtml(LeadingSnapshot(), NoHistory(), 0).contains(R"(<span class="spark">)"));
+}
+
+TEST_CASE("A follower's page draws no charts at all", "[distributed][fleetview][charts]")
+{
+    auto snapshot = LeadingSnapshot();
+    snapshot.role = SchedulerRole::Follower;
+    snapshot.leaderEndpoint = "10.0.0.9:6676";
+
+    // A follower samples nothing, so it has nothing to draw -- and a chart there
+    // would be a fraction of the fleet presented as the whole of it.
+    auto const html = RenderFleetHtml(snapshot, SomeHistory(), 0);
+    CHECK_FALSE(html.contains("/fleet/chart/"));
+    CHECK_FALSE(html.contains("Over time"));
+    CHECK(html.contains("10.0.0.9:6676"));
 }

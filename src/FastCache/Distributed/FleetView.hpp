@@ -4,6 +4,7 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -164,15 +165,52 @@ struct FleetTotals
 /// @return A JSON document.
 [[nodiscard]] std::string RenderFleetJson(FleetSnapshot const& snapshot);
 
+/// What the page draws over time, gathered before rendering.
+///
+/// Pure data, like `FleetSnapshot` and for the same reason: every rendering rule
+/// below is then a unit test over a literal rather than over a sampler, a timer and
+/// a sleep.
+struct FleetHistoryView
+{
+    /// Which range the reader asked for.
+    FleetRange range { FleetRange::Day };
+    /// That range's buckets, oldest first, gaps included.
+    ///
+    /// Empty when this node keeps no history at all -- a node that has just started
+    /// leading, or one whose `Load` found nothing. The page says which, because a
+    /// fleet that did nothing and a fleet nobody was watching are different facts.
+    std::vector<FleetBucket> buckets {};
+    /// Whether the history survives a restart, for the note under the charts.
+    ///
+    /// A node with neither `--cluster-dir` nor `--cache-dir` has nowhere to put the
+    /// file and keeps its history in memory only. That is a legitimate way to run,
+    /// and it is not the same promise as a durable one -- so the page says so
+    /// rather than letting an operator find out at the next restart.
+    bool durable { false };
+};
+
 /// Render a fleet snapshot as one self-contained HTML page.
 ///
 /// No script, no external asset, no bundled framework: the stylesheet is embedded
 /// and every value is escaped. A value nobody reported renders as a dash, which is
 /// the spelling `--cluster-status` already uses for "has not said".
+///
+/// The charts are the one thing this page does **not** inline: each is referenced
+/// at its own URL so a browser can revalidate it with `If-None-Match` and be told
+/// `304` for as long as the bucket it drew is still open.
 /// @param snapshot What to render.
+/// @param history What to draw over time.
 /// @param refreshSeconds How often the page reloads itself; 0 to not.
 /// @return A complete HTML document.
-[[nodiscard]] std::string RenderFleetHtml(FleetSnapshot const& snapshot, unsigned refreshSeconds);
+[[nodiscard]] std::string RenderFleetHtml(FleetSnapshot const& snapshot,
+                                          FleetHistoryView const& history,
+                                          unsigned refreshSeconds);
+
+/// Where a chart's SVG is served, relative to the admin root.
+inline constexpr std::string_view FleetChartPrefix = "/fleet/chart/";
+
+/// Where the whole series set is served as JSON.
+inline constexpr std::string_view FleetSeriesPath = "/fleet/series.json";
 
 /// Whether this snapshot can answer for the whole fleet.
 ///

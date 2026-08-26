@@ -3,6 +3,7 @@
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/FleetChart.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -19,8 +20,11 @@
 #include <format>
 #include <fstream>
 #include <future>
+#include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
@@ -288,13 +292,25 @@ TEST_CASE("The fleet routes answer on their own paths and gate on the credential
                               AdminCredential { "s3cret" },
                               Node::DashboardRefreshSeconds);
 
-    // Two routes, and the JSON one exists so the page is replaceable and testable
-    // without a browser.
-    REQUIRE(routes.size() == 2);
+    // Four routes: the page, the JSON that makes it replaceable and testable
+    // without a browser, the series behind the charts, and the charts themselves.
+    REQUIRE(routes.size() == 4);
     CHECK(routes[0].path == "/fleet");
     CHECK(routes[1].path == "/fleet.json");
+    CHECK(routes[2].path == "/fleet/series.json");
+    CHECK(routes[3].path == "/fleet/chart/");
+    CHECK(routes[3].match == AdminRouteMatch::Prefix);
 
-    AdminRequest const anonymous { .path = "/fleet", .query = {}, .authorization = {} };
+    // Every one of them is gated. The chart routes are the ones worth asserting
+    // about by name: an image URL that answered without a credential would leak the
+    // fleet's whole history while `/fleet` itself stayed locked.
+    for (auto const& route: routes)
+    {
+        INFO("route " << route.path);
+        CHECK(route.handler(AdminRequest { .path = route.path, .query = {} }).status == "401 Unauthorized");
+    }
+
+    AdminRequest const anonymous { .path = "/fleet", .query = {} };
     auto const refused = routes[0].handler(anonymous);
     CHECK(refused.status == "401 Unauthorized");
     // A 401 with no challenge is one a browser shows as a broken page rather than
@@ -302,13 +318,13 @@ TEST_CASE("The fleet routes answer on their own paths and gate on the credential
     REQUIRE(refused.extraHeaders.size() == 1);
     CHECK(refused.extraHeaders[0].contains("Basic"));
 
-    AdminRequest const authorised { .path = "/fleet", .query = {}, .authorization = "Bearer s3cret" };
+    AdminRequest const authorised { .path = "/fleet", .query = {}, .headers = { "Bearer s3cret" } };
     auto const page = routes[0].handler(authorised);
     CHECK(page.status == "200 OK");
     CHECK(page.contentType.starts_with("text/html"));
     CHECK(page.body.starts_with("<!doctype html>"));
 
-    AdminRequest const json { .path = "/fleet.json", .query = {}, .authorization = "Bearer s3cret" };
+    AdminRequest const json { .path = "/fleet.json", .query = {}, .headers = { "Bearer s3cret" } };
     auto const document = routes[1].handler(json);
     CHECK(document.status == "200 OK");
     CHECK(document.contentType == "application/json");
@@ -330,13 +346,13 @@ TEST_CASE("A node that does not lead answers the dashboard with 503 and names th
                               AdminCredential {},
                               Node::DashboardRefreshSeconds);
 
-    AdminRequest const request { .path = "/fleet", .query = {}, .authorization = {} };
+    AdminRequest const request { .path = "/fleet", .query = {} };
     auto const page = routes[0].handler(request);
     CHECK(page.status == "503 Service Unavailable");
     CHECK(page.body.contains("10.0.0.9:6676"));
     CHECK(page.extraHeaders.empty()); // no Location, no redirect
 
-    AdminRequest const json { .path = "/fleet.json", .query = {}, .authorization = {} };
+    AdminRequest const json { .path = "/fleet.json", .query = {} };
     auto const document = routes[1].handler(json);
     CHECK(document.status == "503 Service Unavailable");
     CHECK(document.body.contains(R"("role":"follower")"));
@@ -356,7 +372,7 @@ TEST_CASE("An endpoint with no credential serves the dashboard to anyone who rea
                               AdminCredential {},
                               Node::DashboardRefreshSeconds);
 
-    AdminRequest const anonymous { .path = "/fleet", .query = {}, .authorization = {} };
+    AdminRequest const anonymous { .path = "/fleet", .query = {} };
     CHECK(routes[0].handler(anonymous).status == "200 OK");
 }
 
@@ -512,4 +528,252 @@ TEST_CASE("A surface with no TLS asked for holds no context at all", "[node][adm
 #if defined(FC_TLS_ENABLED)
     CHECK(surface->tls == nullptr);
 #endif
+}
+
+TEST_CASE("A sample records what the fleet is, in the slots the table names", "[node][admin][fleethistory]")
+{
+    Distributed::FleetSnapshot snapshot;
+    snapshot.role = Distributed::SchedulerRole::Leader;
+    snapshot.leases = { 11, 2, 3, 4, 5 };
+    // Two machines, each of which registered against two toolchains. The cache
+    // figures come off NodeReports() and so are counted once per machine.
+    snapshot.nodes.resize(2);
+    snapshot.nodes[0].endpoint = "a:1";
+    snapshot.nodes[0].registeredSlots = 8;
+    snapshot.nodes[0].fleetJobsInFlight = 3;
+    snapshot.nodes[1].endpoint = "b:1";
+    snapshot.nodes[1].registeredSlots = 4;
+    snapshot.nodes[1].fleetJobsInFlight = 1;
+    snapshot.nodes[0].load.cache.hits = 70;
+    snapshot.nodes[0].load.cache.misses = 30;
+    snapshot.nodes[1].load.cache.hits = 5;
+    // Node b reports no miss count. Absent is not zero for a *tier*, but a sum over
+    // machines has to choose, and choosing zero is what keeps the fleet total from
+    // vanishing because one machine was quiet about half of it.
+    auto const values = SampleFrom(snapshot);
+    auto const slot = [&values](Distributed::FleetMetric metric) {
+        return values[static_cast<std::size_t>(metric)];
+    };
+
+    CHECK(slot(Distributed::FleetMetric::DispatchGranted) == 11);
+    CHECK(slot(Distributed::FleetMetric::DispatchNoWorker) == 2);
+    CHECK(slot(Distributed::FleetMetric::DispatchDuplicate) == 5);
+    CHECK(slot(Distributed::FleetMetric::CacheHits) == 75);
+    CHECK(slot(Distributed::FleetMetric::CacheMisses) == 30);
+    CHECK(slot(Distributed::FleetMetric::JobsInFlight) == 4);
+}
+
+TEST_CASE("The sampler records only while this node leads", "[node][admin][fleethistory]")
+{
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    SystemWallClock const wall;
+    Distributed::SchedulerService scheduler { clock, metrics };
+    Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
+
+    FleetSampler sampler { sources, wall, {}, logger };
+
+    scheduler.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6676");
+    // A follower's registry holds whatever registered against *it*, so a sample
+    // here would record a fraction of the fleet as though it were the whole -- and
+    // the chart would show the fleet shrinking every time leadership moved.
+    CHECK_FALSE(sampler.SampleOnce());
+    CHECK(sampler.History().Empty());
+
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    CHECK(sampler.SampleOnce());
+    CHECK_FALSE(sampler.History().Empty());
+
+    // No path, so nothing durable is promised -- and the page says so rather than
+    // letting an operator find out at the next restart.
+    CHECK_FALSE(sampler.Durable());
+}
+
+TEST_CASE("A sampler with a path writes its history and reads it back", "[node][admin][fleethistory]")
+{
+    Testing::ScratchDirectory const scratch { "fleet-sampler-durable" };
+    auto const file = scratch.Path() / "history.bin";
+
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    SystemWallClock const wall;
+    Distributed::SchedulerService scheduler { clock, metrics };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
+
+    {
+        FleetSampler sampler { sources, wall, file, logger };
+        CHECK(sampler.Durable());
+        REQUIRE(sampler.SampleOnce());
+        // Written by the destructor, so a clean shutdown does not throw away what
+        // the page will be asked about the moment the node comes back.
+    }
+    REQUIRE(std::filesystem::exists(file));
+
+    FleetSampler restored { sources, wall, file, logger };
+    CHECK_FALSE(restored.History().Empty());
+}
+
+TEST_CASE("The history path follows the directories a node already has", "[node][admin][fleethistory]")
+{
+    NodeConfig cfg;
+    // No new flag: a third place to say "put state here" is a third place for an
+    // operator to point at the wrong disk.
+    CHECK(FleetHistoryPath(cfg).empty());
+
+    cfg.cacheDir = "/var/lib/fastcache";
+    CHECK(FleetHistoryPath(cfg) == std::filesystem::path { "/var/lib/fastcache" } / "fleet-history.bin");
+
+    // The cluster directory wins: the history is a leader's record, and a leader is
+    // a cluster member.
+    cfg.clusterDir = "/var/lib/fastcache-cluster";
+    CHECK(FleetHistoryPath(cfg) == std::filesystem::path { "/var/lib/fastcache-cluster" } / "fleet-history.bin");
+}
+
+namespace
+{
+
+/// The four fleet routes over a leading scheduler and a sampler that has sampled.
+struct ChartFixture
+{
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    SystemWallClock wall;
+    Distributed::SchedulerService scheduler { clock, metrics };
+    std::unique_ptr<FleetSampler> sampler;
+    std::vector<AdminRoute> routes;
+
+    ChartFixture()
+    {
+        scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+        Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
+        sampler = std::make_unique<FleetSampler>(sources, wall, std::filesystem::path {}, logger);
+        REQUIRE(sampler->SampleOnce());
+        routes = MakeFleetRoutes(sources,
+                                 AdminCredential {},
+                                 DashboardRefreshSeconds,
+                                 FleetHistorySource { .history = &sampler->History(), .durable = false });
+    }
+
+    [[nodiscard]] AdminResponse Get(std::string_view path, std::string_view query = {}, std::string_view etag = {}) const
+    {
+        AdminRequest request { .path = path, .query = query };
+        request.headers[static_cast<std::size_t>(AdminHeader::IfNoneMatch)] = etag;
+        for (auto const& route: routes)
+        {
+            auto const hit = route.match == AdminRouteMatch::Exact ? route.path == path : path.starts_with(route.path);
+            if (hit)
+                return route.handler(request);
+        }
+        FAIL("no route for " << path);
+        return {};
+    }
+
+    [[nodiscard]] static std::string_view HeaderValue(AdminResponse const& response, std::string_view name)
+    {
+        for (auto const& line: response.extraHeaders)
+            if (std::string_view { line }.starts_with(name))
+                return std::string_view { line }.substr(name.size());
+        return {};
+    }
+};
+
+} // namespace
+
+TEST_CASE("A chart is served as its own SVG resource, per chart the table names", "[node][admin][chart]")
+{
+    ChartFixture const fixture;
+
+    for (auto const& chart: Distributed::FleetChartTable)
+    {
+        INFO("chart " << chart.key);
+        auto const response = fixture.Get(std::format("/fleet/chart/{}.svg", chart.key), "range=24h");
+        CHECK(response.status == "200 OK");
+        CHECK(response.contentType == "image/svg+xml");
+        CHECK(response.body.starts_with("<svg "));
+    }
+
+    // One prefix route covers the whole table, so a tail that names nothing is a
+    // 404 rather than whichever chart happened to be first.
+    CHECK(fixture.Get("/fleet/chart/nonesuch.svg").status == "404 Not Found");
+    CHECK(fixture.Get("/fleet/chart/dispatched.png").status == "404 Not Found");
+}
+
+TEST_CASE("A chart revalidates with If-None-Match and is told 304", "[node][admin][chart]")
+{
+    ChartFixture const fixture;
+
+    auto const fresh = fixture.Get("/fleet/chart/dispatched.svg", "range=24h");
+    REQUIRE(fresh.status == "200 OK");
+    auto const tag = std::string { ChartFixture::HeaderValue(fresh, "ETag: ") };
+    REQUIRE(!tag.empty());
+    // Not a fixed max-age: a viewer told to hold a chart for a minute one second
+    // before its bucket closes sits a whole bucket behind for the rest of it.
+    CHECK(ChartFixture::HeaderValue(fresh, "Cache-Control: ").starts_with("max-age="));
+
+    auto const cached = fixture.Get("/fleet/chart/dispatched.svg", "range=24h", tag);
+    CHECK(cached.status == "304 Not Modified");
+    CHECK(cached.body.empty());
+    // The validators travel with the 304: without them the client has nothing to
+    // revalidate against next time.
+    CHECK(ChartFixture::HeaderValue(cached, "ETag: ") == tag);
+
+    // The identity is part of the tag, so one chart's cached copy never satisfies
+    // another's request -- nor the same chart at a different range or theme.
+    CHECK(fixture.Get("/fleet/chart/refusals.svg", "range=24h", tag).status == "200 OK");
+    CHECK(fixture.Get("/fleet/chart/dispatched.svg", "range=7d", tag).status == "200 OK");
+    CHECK(fixture.Get("/fleet/chart/dispatched.svg", "range=24h&theme=dark", tag).status == "200 OK");
+}
+
+TEST_CASE("An unknown range is refused rather than quietly served as another", "[node][admin][chart]")
+{
+    ChartFixture const fixture;
+
+    // A theme has a safe default; a range does not. A range quietly substituted
+    // puts a reader on a different axis than the one they asked for.
+    CHECK(fixture.Get("/fleet", "range=30d").status == "400 Bad Request");
+    CHECK(fixture.Get("/fleet/series.json", "range=30d").status == "400 Bad Request");
+    CHECK(fixture.Get("/fleet/chart/dispatched.svg", "range=30d").status == "400 Bad Request");
+
+    CHECK(fixture.Get("/fleet/chart/dispatched.svg", "theme=solarized").status == "200 OK");
+}
+
+TEST_CASE("The series behind the charts are served as JSON", "[node][admin][chart]")
+{
+    ChartFixture const fixture;
+
+    auto const response = fixture.Get("/fleet/series.json", "range=7d");
+    CHECK(response.status == "200 OK");
+    CHECK(response.contentType == "application/json");
+    CHECK(response.body.contains(R"("range":"7d")"));
+    for (auto const& series: Distributed::FleetSeriesTable)
+    {
+        INFO("series " << series.key);
+        CHECK(response.body.contains(std::format(R"("{}":[)", series.key)));
+    }
+}
+
+TEST_CASE("The page carries the range control and one image per chart", "[node][admin][chart]")
+{
+    ChartFixture const fixture;
+
+    auto const page = fixture.Get("/fleet", "range=7d");
+    REQUIRE(page.status == "200 OK");
+    for (auto const& range: Distributed::FleetRangeTable)
+        CHECK(page.body.contains(std::format(R"(href="?range={}")", range.key)));
+    for (auto const& chart: Distributed::FleetChartTable)
+        CHECK(page.body.contains(std::format(R"(src="/fleet/chart/{}.svg?range=7d")", chart.key)));
+
+    // Still no script and nothing fetched from another host: the charts are
+    // same-origin images and the stylesheet is embedded, which is what lets this
+    // page work on the air-gapped network a build fleet usually lives on. The one
+    // absolute URL in the document is the inline sparkline's `xmlns`, which is an
+    // XML namespace name rather than something a browser goes and asks for.
+    CHECK_FALSE(page.body.contains("<script"));
+    CHECK_FALSE(page.body.contains(R"(src="http)"));
+    CHECK_FALSE(page.body.contains(R"(href="http)"));
+    CHECK_FALSE(page.body.contains("@import"));
 }
