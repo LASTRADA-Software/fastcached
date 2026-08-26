@@ -40,6 +40,27 @@ enum class InlineCredential : std::uint8_t
     Present, ///< A credential was typed alongside `--install-service`.
 };
 
+/// Which identity the Windows SCM logs a service on as.
+///
+/// The Windows counterpart of `ServiceSpec::serviceAccount`, and separate from it
+/// because the two supervisors take different *kinds* of answer: launchd wants an
+/// account name that must already exist, while the SCM derives a per-service
+/// identity from the service's own name and needs no account created at all. One
+/// string field could not mean both, and a spec has to answer both supervisors.
+enum class WindowsLogonAccount : std::uint8_t
+{
+    /// `lpServiceStartName = nullptr`: the SCM default, **LocalSystem** -- the
+    /// most privileged identity on the machine. Correct only for a service that
+    /// genuinely needs it.
+    LocalSystem,
+
+    /// `NT SERVICE\<serviceName>`: a virtual account the SCM creates on demand for
+    /// a `SERVICE_WIN32_OWN_PROCESS` service. It has a per-service SID, no
+    /// password, no group membership and no machine credentials on the network --
+    /// the Windows answer to "this process should not have the whole machine".
+    VirtualAccount,
+};
+
 /// A service to register, described independently of which binary runs it.
 ///
 /// This is the seam that lets one implementation of "install this as a service"
@@ -98,16 +119,24 @@ struct ServiceSpec
     /// different one.
     std::string serviceAccount;
 
-    /// Directories `serviceAccount` must own before the job first runs.
+    /// Paths `serviceAccount` must own before the job first runs.
     ///
-    /// Only ever directories the operator actually named. Handing over a
-    /// **parent** gives away a directory nobody asked about: `--storage=/var/db/fc`
-    /// would reassign `/var/db`, shared with other system services, to an
-    /// unprivileged cache account -- silently, under a message saying the service
-    /// had been installed. The daemon drops to `serviceAccount`, so a directory
-    /// root created for it has to change hands or the first write fails with
-    /// EACCES, which launchd surfaces only as a job that exits over and over.
-    std::vector<std::filesystem::path> ownedDirectories;
+    /// Only ever paths the operator actually named. Handing over a **parent**
+    /// gives away a directory nobody asked about: `--storage=/var/db/fc` would
+    /// reassign `/var/db`, shared with other system services, to an unprivileged
+    /// cache account -- silently, under a message saying the service had been
+    /// installed. The daemon drops to `serviceAccount`, so a directory root
+    /// created for it has to change hands or the first write fails with EACCES,
+    /// which launchd surfaces only as a job that exits over and over.
+    ///
+    /// Usually a directory, which the handover creates when it is absent -- but
+    /// never a path that `Core/PathKind`'s `PathNamesAFile` says is a file, and
+    /// never over something already there. `storage_path` may name one CoW file,
+    /// and a `create_directories` over `cache.cow` would put a directory where the
+    /// daemon wants a file. Hence `ownedPaths` rather than `ownedDirectories`:
+    /// `chown` and a DACL apply to a file just as well, so only the *create* has
+    /// to care, and it is refused in the handover rather than in each producer.
+    std::vector<std::filesystem::path> ownedPaths;
 
     /// Whether a secret was typed on the installing command line.
     InlineCredential inlineCredential { InlineCredential::Absent };
@@ -118,6 +147,33 @@ struct ServiceSpec
     /// instead. It is not a hint that the combination is safe -- see
     /// `InlineCredentialRejection`.
     std::string configPath;
+
+    /// The application name this service's *files* are looked up under -- its
+    /// machine-wide configuration and its per-user cache -- or **empty** when the
+    /// service keeps neither.
+    ///
+    /// Empty is a real answer, not a missing one, and `WithScopeDefaults` turns on
+    /// it: a service named here is file-configured, so the installer may fill in a
+    /// `--config` or `--storage` the operator left unset. One that names nothing
+    /// is configured entirely from argv, and must be given neither.
+    ///
+    /// `fastcache-compile-node` is the second kind. Its parser rejects both flags,
+    /// so a registration carrying either produced a job that refused its own
+    /// command line at every start -- reported installed, dead at every boot,
+    /// which is exactly the shape this file refuses at install time. The name was
+    /// hardcoded to the daemon's before, so every spec got the daemon's defaults.
+    std::string applicationName;
+
+    /// Which identity the Windows SCM should log this service on as.
+    ///
+    /// Defaults to `LocalSystem` because that is what the SCM does when told
+    /// nothing, so the default states the platform's behaviour rather than this
+    /// project's preference. **Both** of this project's services override it:
+    /// neither has any use for unrestricted access to the machine.
+    ///
+    /// `serviceAccount` does not answer this: it holds a POSIX account name that
+    /// must already exist, which is not a thing the SCM takes.
+    WindowsLogonAccount windowsLogon { WindowsLogonAccount::LocalSystem };
 };
 
 /// Resolve the absolute path of the running executable.
@@ -271,6 +327,70 @@ struct ServiceSpec
 [[nodiscard]] std::string BuildLaunchdPlist(ServiceSpec const& spec,
                                             ServiceScope scope,
                                             std::filesystem::path const& logDirectory);
+
+/// The account name to hand `CreateService` as `lpServiceStartName`.
+///
+/// Pure and platform-independent so it is asserted everywhere rather than only on
+/// a Windows runner -- the same reason BuildLaunchdPlist is. The alternative was a
+/// derivation visible only inside `#if defined(_WIN32)`, and this file has already
+/// paid for that once.
+///
+/// @param spec Service to name; `serviceName` is what a virtual account derives
+///        from, so the two cannot disagree.
+/// @return `NT SERVICE\<serviceName>` for a virtual account; `nullopt` for
+///         LocalSystem, which is spelled by passing no name at all.
+[[nodiscard]] std::optional<std::string> WindowsLogonName(ServiceSpec const& spec);
+
+/// Where a launchd job writes its stdout/stderr.
+///
+/// System scope gets a directory of its **own**, named by the job's label,
+/// because `InstallService` hands that directory to the account the job runs as
+/// -- and a machine may run more than one of this project's services system-wide.
+/// While it was one shared directory each install chowned the other's to its own
+/// account, so registering the compile worker reassigned the daemon's and a
+/// package reinstall reassigned it back.
+///
+/// User scope keeps the flat directory: nothing is chowned there and the files
+/// inside are already named by the label, so two agents cannot collide. Giving it
+/// a subdirectory would move a path an operator already has open in `tail -f` and
+/// buy nothing.
+///
+/// Declared here rather than kept private to the launchd implementation for the
+/// reason WithScopeDefaults below is: it decides a path that ends up in a plist
+/// and in a chown, so it has to be assertable on every platform.
+///
+/// @param label The job's launchd label, from LaunchdLabel.
+/// @param scope Which domain the job belongs to.
+/// @param home The invoking user's home directory; used only for User scope.
+/// @return Directory the job's `.out.log` and `.err.log` live in.
+[[nodiscard]] std::filesystem::path DefaultLogDirectory(std::string_view label,
+                                                        ServiceScope scope,
+                                                        std::filesystem::path const& home);
+
+/// Fill in the per-scope path arguments the operator left unset.
+///
+/// Pure, and declared here rather than kept private to the launchd
+/// implementation, for the reason BuildLaunchdPlist is: it decides what goes into
+/// a registration, so it has to be assertable on every platform. While it was
+/// private to the `__APPLE__` block no test could reach it, and it spent that
+/// time handing every service the *daemon's* defaults -- including one whose
+/// parser rejects them.
+///
+/// Decides nothing about the environment: `home` and `packagedConfig` are probed
+/// by the composition root and passed in, so the policy is testable against
+/// values that need not exist.
+///
+/// @param spec Service as described from the command line.
+/// @param scope Domain being installed into.
+/// @param home The invoking user's home directory.
+/// @param packagedConfig The machine-wide config file, empty when it is absent,
+///        unreadable or untrusted.
+/// @return @p spec with the storage and config arguments filled in where this
+///         service has such files at all -- see `ServiceSpec::applicationName`.
+[[nodiscard]] ServiceSpec WithScopeDefaults(ServiceSpec spec,
+                                            ServiceScope scope,
+                                            std::filesystem::path const& home,
+                                            std::filesystem::path const& packagedConfig);
 
 /// Outcome of a service-control operation.
 struct ServiceControlResult

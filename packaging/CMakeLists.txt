@@ -198,6 +198,15 @@ elseif(FASTCACHED_PACKAGE_ROOT_PREFIX AND APPLE)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/macos/seed-config.sh.inc"
         FASTCACHED_MACOS_SEED_CONFIG)
 
+    # The other shared fragment, on the same terms: creating a hidden account is
+    # thirty lines of dscl whose every subtlety was a failure first (a colliding
+    # gid, a record dscl had written but getpwnam could not yet see), and there are
+    # two accounts to create from two different components. Copying it per account
+    # is precisely the differ-only-by-a-constant duplication this project refuses.
+    # Substituted into whichever scripts declare @FASTCACHED_MACOS_CREATE_ACCOUNT@.
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/macos/create-account.sh.inc"
+        FASTCACHED_MACOS_CREATE_ACCOUNT)
+
     foreach(_script IN LISTS FASTCACHED_MACOS_SCRIPTS)
         set(_out "${CMAKE_CURRENT_BINARY_DIR}/macos/${_script}")
         configure_file("${CMAKE_CURRENT_SOURCE_DIR}/macos/${_script}.sh.in" "${_out}" @ONLY)

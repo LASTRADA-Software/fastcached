@@ -11,7 +11,37 @@
 set -u
 
 PREFIX="/@FASTCACHED_MACOS_PREFIX@"
+NODE_ACCOUNT="@FASTCACHED_MACOS_NODE_ACCOUNT@"
 @FASTCACHED_MACOS_SEED_CONFIG@
+
+@FASTCACHED_MACOS_CREATE_ACCOUNT@
+
+# The compile worker's account, created here in the RUNTIME component rather than
+# beside the daemon's in postinstall-launchdaemon.sh.in. Three reasons, and the
+# first is the one that matters:
+#
+#   * fastcache-compile-node is Runtime payload, and which launchd choice the
+#     operator picked for *fastcached* says nothing about whether they will run a
+#     worker. Creating it from the LaunchDaemon component would leave anyone who
+#     took the default (the per-user agent) unable to install a system-scope
+#     worker at all -- which is the bug this closes, moved rather than fixed.
+#   * It mirrors Linux, where fastcache-compile-node.sysusers is likewise a
+#     Runtime asset applied unconditionally by the deb/rpm scriptlets.
+#   * The account is inert until something registers a job as it: shell
+#     /usr/bin/false, no home, IsHidden.
+#
+# The installer does NOT register the worker itself -- it has no scheduler address
+# or toolchain list to register one WITH, and NodeServiceRejection refuses a
+# registration missing either. This makes the operator's own
+# `fastcache-compile-node --install-service --service-scope=system` work; without
+# the account that command is refused, and without the refusal it would register a
+# launchd job running as ROOT that compiles input from the network (issue #87).
+# Guarded on the binary, not on a build flag: FASTCACHED_BUILD_NODE is OFF in
+# somebody's fork sooner or later, and an account for a worker that was never
+# shipped is a system account nobody can explain.
+if [ -x "${PREFIX}/bin/fastcache-compile-node" ]; then
+    fastcached_create_account "$NODE_ACCOUNT" "fastcache compile node"
+fi
 
 # State directory for the system LaunchDaemon. Created here rather than shipped
 # as an empty payload directory so its ownership is set by the component that
@@ -31,7 +61,11 @@ mkdir -p "${PREFIX}/var" "${PREFIX}/var/log" || true
 # the user with no fastcache-cc at all. The uninstaller has the mirror of this
 # guard; this is the half that went missing.
 mkdir -p /usr/local/bin || true
-for tool in fastcached fastcache-cc; do
+for tool in @FASTCACHED_MACOS_LINKED_TOOLS@; do
+    # A tool this build did not produce gets no link. `ln -sfn` is perfectly
+    # happy to create a dangling one, and the shell would then find a name on
+    # PATH that cannot be executed -- worse than the name simply not being there.
+    [ -e "${PREFIX}/bin/${tool}" ] || continue
     link="/usr/local/bin/${tool}"
     if [ -e "$link" ] || [ -L "$link" ]; then
         if [ ! -L "$link" ] || [ "$(readlink "$link")" != "${PREFIX}/bin/${tool}" ]; then

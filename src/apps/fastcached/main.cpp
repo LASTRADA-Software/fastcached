@@ -27,6 +27,7 @@
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/PathKind.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -57,6 +58,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -153,12 +155,12 @@ void InstallStopHandlers()
 /// - User-specified non-zero: honored verbatim.
 /// - Auto (0) for in-memory: fan out (`AutoShardCount`).
 /// - Auto (0) for persistent: fan out **by default** so disk writes
-///   parallelise, EXCEPT for paths that name a single file — an existing
-///   regular file, or a not-yet-existing path with a file extension (e.g.
-///   `cache.cow`) — which stay single-file for backward compatibility (the
-///   path is used as one file, never `mkdir`-ed over). An existing directory
-///   or a not-yet-existing extension-less path (a cache directory) fans out
-///   into `shard-NN.cow` files.
+///   parallelise, EXCEPT for paths that name a single file
+///   (`FastCache::PathNamesAFile`), which stay single-file for backward
+///   compatibility — the path is used as one file, never `mkdir`-ed over. The
+///   install-time handover asks the same predicate before it creates anything, so
+///   what the first start opens and what `--install-service` may create at that
+///   path cannot drift apart.
 [[nodiscard]] std::size_t ResolvePhysicalShards(std::size_t requested,
                                                 bool usingPersistent,
                                                 std::filesystem::path const& storagePath) noexcept
@@ -167,14 +169,7 @@ void InstallStopHandlers()
         return requested;
     if (!usingPersistent)
         return AutoShardCount();
-    std::error_code ec;
-    if (std::filesystem::is_directory(storagePath, ec))
-        return AutoShardCount(); // existing directory of shards
-    if (std::filesystem::exists(storagePath, ec))
-        return 1; // existing regular file — keep single-file (compat)
-    if (storagePath.has_extension())
-        return 1;            // a new file-looking path (e.g. cache.cow) — single file
-    return AutoShardCount(); // a new cache directory — fan out
+    return FastCache::PathNamesAFile(storagePath) ? 1 : AutoShardCount();
 }
 
 /// Translate the user-facing StorageDurability into the page-store enum.
@@ -224,6 +219,81 @@ struct StorageBackendBundle
 {
     std::unique_ptr<FastCache::IStorage> backend;
 };
+
+/// Advice to append to a storage failure when this process cannot write there.
+///
+/// The daemon no longer runs as the platform's most privileged account, so a
+/// storage directory it cannot write is now something an ordinary, correct
+/// install can hit: the operator set `storage_path` after the service was
+/// registered, so nothing ever handed that directory over. Under a supervisor the
+/// only symptom is a job that exits at every start, and the errno text alone says
+/// nothing about which account was refused or how to grant it.
+///
+/// Gated on an actual write attempt rather than on the error text, because the
+/// three call sites that need this most report a *string* from the storage layer
+/// rather than an `error_code`, and because parsing a localized "permission
+/// denied" is not something to build advice on. What the probe establishes is
+/// exactly what the message then claims -- that this process cannot create a file
+/// there -- so a full disk gets a true statement rather than a wrong diagnosis.
+///
+/// Windows only: this is where the identity changed. The POSIX services already
+/// ran unprivileged and their packaging hands their directories over, and naming
+/// an account here would have to guess between the macOS `_fastcached` and the
+/// Linux `fastcached` -- and would be wrong for a foreground run under either.
+///
+/// And on Windows only when this process IS that service. The probe proves that
+/// *this* process cannot write, which says nothing about who the service runs as:
+/// an administrator running the daemon in a console would otherwise be handed a
+/// diagnosis naming an identity that is not running their process, and an `icacls`
+/// line granting an account that may not be registered at all. `--daemon` is
+/// precisely the "started by the SCM" signal, because it is what the registration
+/// bakes into the service's command line.
+///
+/// @param effective The merged configuration -- its storage location, whether this
+///        process was started as the service, and the service's own name, which is
+///        what the SCM derives its virtual account from (`Config{}.serviceName`
+///        would name the wrong account for an install made with `--service-name`).
+/// @return A sentence naming the remedy, or an empty string.
+[[nodiscard]] std::string StorageAccessHint([[maybe_unused]] FastCache::Config const& effective)
+{
+#if defined(_WIN32)
+    if (!effective.daemon)
+        return {};
+
+    std::filesystem::path const storagePath { effective.storagePath };
+
+    // The directory itself when it exists, else the parent that would have to
+    // hold it -- a path that could not be created is a permission problem one
+    // level up.
+    std::error_code ec;
+    auto const directory = std::filesystem::is_directory(storagePath, ec) ? storagePath : storagePath.parent_path();
+    if (directory.empty())
+        return {};
+
+    auto const probe = directory / ".fastcached-access-probe";
+    {
+        std::ofstream out { probe };
+        if (out)
+        {
+            out.close();
+            std::filesystem::remove(probe, ec);
+            return {};
+        }
+    }
+    std::filesystem::remove(probe, ec);
+
+    return std::format("\nThis process cannot create files in {}. The service runs as the virtual account "
+                       "NT SERVICE\\{}, which has no rights of its own to a directory an administrator made. "
+                       "Grant it from an elevated prompt:\n"
+                       "    icacls \"{}\" /grant \"NT SERVICE\\{}\":(OI)(CI)F",
+                       directory.string(),
+                       effective.serviceName,
+                       directory.string(),
+                       effective.serviceName);
+#else
+    return {};
+#endif
+}
 
 /// Open a CowTreeStorage at `path` and wrap it in a LayeredStorage(L1
 /// InMemoryLruStorage, L2 CowTreeStorage). The L1 cache owns the
@@ -276,7 +346,8 @@ struct StorageBackendBundle
     {
         auto layered = BuildLayeredShard(effective.storagePath, effective, perShardBytes, perShardDiskBytes);
         if (!layered.has_value())
-            return std::unexpected(std::format("failed to open storage '{}': {}", effective.storagePath, layered.error()));
+            return std::unexpected(std::format(
+                "failed to open storage '{}': {}{}", effective.storagePath, layered.error(), StorageAccessHint(effective)));
         inners.push_back(std::move(*layered));
         return inners;
     }
@@ -285,15 +356,18 @@ struct StorageBackendBundle
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     if (ec)
-        return std::unexpected(
-            std::format("failed to create storage directory '{}': {}", effective.storagePath, ec.message()));
+        return std::unexpected(std::format("failed to create storage directory '{}': {}{}",
+                                           effective.storagePath,
+                                           ec.message(),
+                                           StorageAccessHint(effective)));
 
     for (std::size_t i = 0; i < physicalShards; ++i)
     {
         auto const path = dir / std::format("shard-{:02d}.cow", i);
         auto layered = BuildLayeredShard(path, effective, perShardBytes, perShardDiskBytes);
         if (!layered.has_value())
-            return std::unexpected(std::format("failed to open shard '{}': {}", path.string(), layered.error()));
+            return std::unexpected(std::format(
+                "failed to open shard '{}': {}{}", path.string(), layered.error(), StorageAccessHint(effective)));
         inners.push_back(std::move(*layered));
     }
     return inners;
@@ -343,7 +417,8 @@ struct StorageBackendBundle
 
     auto layered = BuildLayeredShard(effective.storagePath, effective, perShardBytes, perShardDiskBytes);
     if (!layered.has_value())
-        return std::unexpected(std::format("failed to open storage '{}': {}", effective.storagePath, layered.error()));
+        return std::unexpected(std::format(
+            "failed to open storage '{}': {}{}", effective.storagePath, layered.error(), StorageAccessHint(effective)));
     bundle.backend = std::move(*layered);
     return bundle;
 }
@@ -933,7 +1008,33 @@ int main(int argc, char const* const* argv)
         // Turned into a ServiceSpec here because that is the seam the platform
         // registration speaks: `fastcache-compile-node` builds its own from its
         // own configuration type rather than reaching for the daemon's.
-        auto const spec = FastCache::MakeDaemonServiceSpec(FastCache::CurrentExecutablePath(), parsed->config);
+        auto spec = FastCache::MakeDaemonServiceSpec(FastCache::CurrentExecutablePath(), parsed->config);
+
+        // ...and here, deliberately, the MERGED one -- for a purpose the rule
+        // above does not cover. Nothing from `effective` is registered: this adds
+        // a path to hand over, never a flag to bake in, so the hazard that rule
+        // exists for (a path in ProgramArguments outranking the very file it came
+        // from, forever) cannot arise.
+        //
+        // It is needed because the daemon no longer runs as the machine's most
+        // privileged account. `storage_path` is read from YAML at every start, so
+        // the registration cannot see it -- and an upgrade that changed the
+        // service's identity without handing over the cache directory LocalSystem
+        // had created would leave the daemon unable to open its own storage, at
+        // every start, on precisely the installs that bothered to configure
+        // persistence.
+        //
+        // Only what is actually configured. A daemon with no `storage_path` is
+        // memory-only and needs no directory at all, so granting a speculative
+        // default would create one nothing ever uses.
+        //
+        // Whether the path may be CREATED is not decided here. `storage_path` is
+        // allowed to name one CoW file, and the handover is what would `mkdir` over
+        // it -- so the handover is where that is refused, once, for every producer
+        // of an owned path rather than for this one.
+        if (!effective.storagePath.empty()
+            && !std::ranges::contains(spec.ownedPaths, std::filesystem::path { effective.storagePath }))
+            spec.ownedPaths.emplace_back(effective.storagePath);
         auto const result = parsed->outcome == FastCache::CliOutcome::InstallService
                                 ? FastCache::InstallService(spec, parsed->serviceScope)
                                 : FastCache::UninstallService(spec, parsed->serviceScope);

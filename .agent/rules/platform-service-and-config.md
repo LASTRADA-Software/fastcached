@@ -24,20 +24,108 @@ readable and silently ignored. Every rule below has already been one of them.
     hook that hands control to `WindowsServiceHost`) and launchd needs its absence,
     since like systemd it supervises the process it started and reaps a job that
     forks as "exited".
-  - **`serviceAccount` and `ownedDirectories` replaced a constant and a reach into
-    `cfg.storagePath`.** Which account a service runs as, and which directories it
-    must own before its first write, are properties of the *service*. The rule they
-    carry is unchanged and still the point: only directories the operator actually
-    named, never a parent -- `--storage=/var/db/fc` must not hand `/var/db`, shared
-    with other system services, to an unprivileged cache account.
+  - **`serviceAccount` and `ownedPaths` replaced a constant and a reach into
+    `cfg.storagePath`.** Which account a service runs as, and which paths it must
+    own before its first write, are properties of the *service*. The rule they
+    carry is unchanged and still the point: only paths the operator actually named,
+    never a parent -- `--storage=/var/db/fc` must not hand `/var/db`, shared with
+    other system services, to an unprivileged cache account.
   - **An empty `serviceAccount` means root, so a worker names one.** A system-scope
     launchd job with no `UserName` runs as root, and `fastcache-compile-node`
     compiles input that arrived over the network. Naming `fastcache-node` -- the
     account the Linux unit already uses -- puts the existing "that account does not
-    exist" guard in the way, so a macOS system-scope install **refuses** until the
-    package creates it rather than silently succeeding with root privileges
-    (issue #87). It is deliberately not the daemon's `_fastcached`: one account
-    would let a compromised compile rewrite every cached object.
+    exist" guard in the way, so a macOS system-scope install refuses rather than
+    silently succeeding with root privileges. It is deliberately not the daemon's
+    `_fastcached`: one account would let a compromised compile rewrite every cached
+    object. **The package creates it** (issue #87), from the *Runtime* component and
+    not the LaunchDaemon one -- which launchd choice an operator made for
+    `fastcached` says nothing about whether they will run a worker, and the
+    installer's default is the per-user agent. One spelling reaches the binary, the
+    packaging and the Linux unit; `ctest -R service-accounts` fails on every
+    platform when they drift, because the failure itself is macOS-only and silent.
+  - **An empty `applicationName` means "configured entirely from argv", and
+    `WithScopeDefaults` must then bake in nothing.** It used to look the machine-wide
+    config up under `DaemonApplicationName` unconditionally, so *every* spec got the
+    *daemon's* defaults: a worker registration was handed `--config=` (system) or
+    `--storage=` (user), and `NodeOptions()` has neither flag. That is the
+    supervisor-must-survive-its-own-parser rule below, produced by the installer
+    itself -- the job registered, reported success, and answered `unrecognised
+    argument` at every boot. On a packaged macOS system it was worse than that: the
+    daemon's config is `0640 root:_fastcached`, so `ServiceAccountReadDenial`
+    refused the worker install for a reason that had nothing to do with the worker.
+    `WithScopeDefaults` was private to the `__APPLE__` block for all of this, which
+    is exactly why no test saw it; it is declared in the header now, like
+    `BuildLaunchdPlist`, and asserted on every platform.
+  - **`ownedPaths` is not just the daemon's `--storage`.** A worker given
+    `--cache-dir` or `--cluster-dir` gets directories root created for an account
+    that is not root, so they must change hands too -- and only those, never a
+    parent.
+  - **An owned path is created only when it is absent AND is not a file, and is
+    otherwise handed over as whatever it already is.** The field is `ownedPaths`
+    and not `ownedDirectories` because `storage_path` is allowed to name ONE CoW
+    file -- `ResolvePhysicalShards` keeps a path with a file extension single-file
+    for backward compatibility. Both handovers used to `create_directories` over
+    their entries unconditionally, and that failed in both directions on the same
+    value: `--storage=D:\fc\cache.cow` on a fresh install produced a *directory* of
+    that name, which the very next start read as a shard directory and silently
+    fanned out into; and once the file existed, the create *failed*, so the
+    chown/grant was skipped on exactly the upgrade the handover is there for.
+    `Core/PathKind`'s `PathNamesAFile` is the one answer to "is this a file", and
+    `ResolvePhysicalShards` asks it too, so the shard count and what the installer
+    may create cannot drift apart. A `chown` and an `SE_FILE_OBJECT` DACL apply to
+    a file just as well as to a directory, so only the *create* has to care --
+    which is why the refusal lives in the **handover** and not in each producer of
+    an owned path. `MakeDaemonServiceSpec` and `main.cpp`'s install branch are two
+    such producers of the very same value, and gating one of them was the first,
+    wrong, shape of this fix.
+  - **`serviceAccount` does not answer the SCM, so `windowsLogon` does.** The two
+    supervisors take different *kinds* of answer: launchd wants an account name that
+    must already exist, while the SCM derives a per-service identity from the
+    service's own name. `CreateService` passed `nullptr` for `lpServiceStartName`,
+    which is **LocalSystem** -- so on Windows `fastcache-compile-node` registered
+    itself with the whole machine while the macOS spec was carefully naming an
+    unprivileged account for the same binary. It names
+    `WindowsLogonAccount::VirtualAccount` now: `NT SERVICE\<serviceName>`, created by
+    the SCM itself, no account to make and no password to keep. **Both** services name
+    one; neither has any use for the local Administrators group. The daemon can still
+    read what it needs, because the `%ProgramData%\fastcached` access list grants
+    `BUILTIN\Users` read and execute and a virtual account is an Authenticated User --
+    and what it can no longer do is WRITE there, which is the point: a service that
+    cannot rewrite its own configuration cannot be made to load a different one.
+  - **The daemon's storage is granted from the MERGED config, and that is not the
+    `--install-service` rule below being broken.** `storage_path` is read from YAML at
+    every start, so a registration built from the command line cannot see it -- and the
+    daemon no longer runs as an account that can write wherever it likes. `main.cpp`'s
+    install branch therefore adds `effective.storagePath` to `ownedPaths`.
+    Nothing from the merged config is *registered*: this contributes a path to hand
+    over, never a flag to bake in, so the hazard that rule exists for -- a path in
+    `ProgramArguments` outranking the very file it came from, forever -- cannot arise.
+    Only what is configured, never a speculative default: a daemon with no
+    `storage_path` is memory-only and needs no directory at all. Whether that path may
+    be *created* is not decided here but in the handover (see `ownedPaths` above),
+    because `MakeDaemonServiceSpec` contributes the same value from the command-line
+    config and gating one producer leaves the other open. An
+    operator who adds one *after* installing gets a permission failure naming the
+    account and the `icacls` line, because at that point nothing has handed the
+    directory over -- and the message must not tell them to re-run
+    `--install-service`, which returns on `ERROR_SERVICE_EXISTS` *before* the grant
+    loop and would repair nothing. The startup hint is gated on an actual write probe
+    rather than on the error text, because three of the four storage failures report a
+    string from the storage layer rather than an `error_code`, and because a localized
+    "permission denied" is not something to build advice on. It is also gated on
+    `--daemon`: the probe proves only that *this* process cannot write, so a foreground
+    run by an administrator would otherwise be handed a diagnosis naming an identity
+    that is not running it, and an `icacls` line for an account that may not be
+    registered at all.
+  - **A virtual account cannot write what an administrator created, so the install
+    grants it.** LocalSystem never noticed, which is why nothing on the Windows path
+    had ever needed the equivalent of the launchd `chown`. Two things about the
+    grant: `NT SERVICE\<name>` does not resolve until the service exists, so it runs
+    **after** `CreateService` (before it, `SetEntriesInAcl` fails with
+    `ERROR_NONE_MAPPED`); and the entry is *added* to the existing list rather than
+    replacing it, or the directory becomes one only the service can repair. A grant
+    that fails is reported and the registration kept -- an operator can fix an ACL,
+    but not a registration that was rolled back.
   - **`BuildServiceArgv` stays hand-written per binary.** An `OptionSpec` says how
     to *parse* a flag and carries no way to read a value back out, so "emit every
     field that differs from its default" cannot be written once generically. Each

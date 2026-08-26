@@ -39,6 +39,7 @@ target_sources(FastCache
         Consensus/RaftPeerServer.cpp
         Consensus/RaftPeerTransport.cpp
         Core/Crc32c.cpp
+        Core/PathKind.cpp
         Core/Sha256.cpp
         Cluster/ClusterState.cpp
         Cluster/ClusterStateMachine.cpp

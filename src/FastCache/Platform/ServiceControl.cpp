@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/DefaultConfigPath.hpp>
+#include <FastCache/Core/PathKind.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
@@ -10,6 +11,7 @@
 #include <concepts>
 #include <filesystem>
 #include <format>
+#include <memory>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -17,6 +19,7 @@
 #include <vector>
 
 #if defined(_WIN32)
+    #include <aclapi.h>
     #include <windows.h>
 #elif defined(__APPLE__)
     #include <sys/stat.h>
@@ -346,9 +349,29 @@ ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, Config c
                          .displayName = "fastcached",
                          .description = "fastcached — fast cache daemon",
                          .serviceAccount = std::string { DaemonServiceAccount },
-                         .ownedDirectories = std::move(owned),
+                         .ownedPaths = std::move(owned),
                          .inlineCredential = cfg.requirePass.empty() ? InlineCredential::Absent : InlineCredential::Present,
-                         .configPath = cfg.configPath };
+                         .configPath = cfg.configPath,
+                         // The daemon IS the file-configured service: it probes a
+                         // machine-wide fastcached.yaml at every start and keeps a
+                         // per-user cache under this name. WithScopeDefaults may
+                         // therefore fill in a --config or --storage the operator
+                         // left unset; a service naming nothing gets neither.
+                         .applicationName = std::string { DaemonApplicationName },
+                         // Named rather than left to the SCM's default, which is
+                         // LocalSystem: unrestricted access to every local resource
+                         // and a member of the local Administrators group. A cache
+                         // daemon listening on a socket has no use for any of it.
+                         //
+                         // The account costs nothing to create because the SCM
+                         // derives it from the service name and manages it itself,
+                         // and it can already read what it needs: the
+                         // %ProgramData%\fastcached access list grants BUILTIN\Users
+                         // read and execute, and a virtual account is an
+                         // Authenticated User. What it cannot do is WRITE there,
+                         // which is the point -- a service that cannot rewrite its
+                         // own configuration cannot be made to load a different one.
+                         .windowsLogon = WindowsLogonAccount::VirtualAccount };
 }
 
 std::optional<std::string> InlineCredentialRejection(ServiceSpec const& spec)
@@ -661,6 +684,134 @@ std::string BuildLaunchdPlist(ServiceSpec const& spec, ServiceScope scope, std::
     return out;
 }
 
+namespace
+{
+    /// Whether @p spec already carries an argument introduced by @p flag.
+    ///
+    /// "The operator set this" is exactly "BuildServiceArgv emitted it", because
+    /// that function emits a flag only for a field differing from its default --
+    /// so asking the argument list is asking the same question the Config test
+    /// used to, one layer further along.
+    /// @param spec Service being registered.
+    /// @param flag Flag prefix including its `=`, e.g. `--config=`.
+    /// @return True when the flag is already present.
+    [[nodiscard]] bool HasArgument(ServiceSpec const& spec, std::string_view flag)
+    {
+        return std::ranges::any_of(spec.arguments, [flag](std::string const& arg) { return arg.starts_with(flag); });
+    }
+} // namespace
+
+namespace
+{
+/// Root of the macOS package payload, e.g. `/opt/fastcached`.
+///
+/// Handed down from FASTCACHED_MACOS_PREFIX by src/FastCache/CMakeLists.txt
+/// so the daemon's idea of its own install tree cannot drift from the one
+/// the installer actually lays down. The fallback matters for builds that
+/// compile this file outside the package configuration (a plain
+/// `cmake --install --prefix /usr/local`, or the test binary on a
+/// non-Apple CI toolchain), where no prefix has been chosen.
+#if defined(FC_MACOS_PREFIX)
+    constexpr std::string_view MacOsPrefix = FC_MACOS_PREFIX;
+#else
+    constexpr std::string_view MacOsPrefix = "/opt/fastcached";
+#endif
+
+} // namespace
+
+std::optional<std::string> WindowsLogonName(ServiceSpec const& spec)
+{
+    // The SCM derives the virtual account from the service name itself and creates
+    // it on demand, so this is a spelling rather than a lookup -- and it is why a
+    // virtual account needs no password and no installer step. It only resolves
+    // AFTER CreateService has run; nothing may ACL against it before then.
+    if (spec.windowsLogon == WindowsLogonAccount::VirtualAccount)
+        return std::format("NT SERVICE\\{}", spec.serviceName);
+
+    // LocalSystem is spelled by naming nobody. Returning "LocalSystem" would also
+    // work, but nullopt keeps the one caller passing the literal nullptr the API
+    // documents rather than a string that has to be right.
+    return std::nullopt;
+}
+
+std::filesystem::path DefaultLogDirectory(std::string_view label, ServiceScope scope, std::filesystem::path const& home)
+{
+    if (scope == ServiceScope::User)
+        return home / "Library/Logs/fastcached";
+    return std::filesystem::path { MacOsPrefix } / "var/log" / label;
+}
+
+ServiceSpec WithScopeDefaults(ServiceSpec spec,
+                              ServiceScope scope,
+                              std::filesystem::path const& home,
+                              std::filesystem::path const& packagedConfig)
+{
+    // A service that names no application keeps no files, and must be given no
+    // flags about them. This is the whole gate, and it is checked before either
+    // default rather than inside them, because both defaults exist only because
+    // the daemon has a config file and a cache to default.
+    //
+    // `fastcache-compile-node` is that service: it is configured entirely from
+    // argv and its parser rejects both `--storage=` and `--config=`. Appending
+    // either registered a job that refused its own command line at every start --
+    // reported installed, and dead at every boot. That is the failure this
+    // codebase refuses at install time, produced BY the installer.
+    if (spec.applicationName.empty())
+        return spec;
+
+    // A LaunchAgent that kept the in-memory default would lose the whole cache
+    // on every logout, which for a compile cache is most of the value. launchd
+    // expands neither `~` nor `$HOME` in ProgramArguments, so the concrete path
+    // has to be resolved here, at install time, by the process that knows it.
+    //
+    // The default is applied only when the caller named **no** config file. A
+    // CLI value baked into ProgramArguments outranks YAML in Merge, so
+    // injecting one alongside `--config` would override the `storage_path` in
+    // that very file for the life of the registration -- the operator edits it,
+    // kickstarts the job, and nothing changes, with no error anywhere. Whoever
+    // passes a config file owns the storage path in it.
+    //
+    // System scope gets no storage default at all: its config file is always
+    // the package's `<prefix>/etc/fastcached.yaml`, so there is nothing to
+    // default.
+    if (scope == ServiceScope::User && !HasArgument(spec, "--storage=") && !HasArgument(spec, "--config="))
+    {
+        // One appended component, not three. `home / "Library/Caches" / app /
+        // "cache"` renders with the platform's separator between each, so the
+        // value this bakes into a registration would stop being the one the
+        // previous release baked in -- and this is a live path an existing agent
+        // is already pointed at. Identical output is worth more than the tidier
+        // spelling.
+        auto const storage = home / std::format("Library/Caches/{}/cache", spec.applicationName);
+        spec.arguments.push_back(std::format("--storage={}", storage.string()));
+        spec.ownedPaths.emplace_back(storage);
+    }
+
+    // The daemon would find this file on its own -- it is the machine-wide
+    // candidate its startup lookup probes -- so registering it is a choice,
+    // not a necessity, and it is made for two reasons. ServiceAccountReadDenial
+    // validates `configPath`, so leaving it empty would demote "the
+    // _fastcached account cannot read the config" from an install-time error
+    // to a silent fall-through to built-in defaults. And a system job whose
+    // HOME resolves somewhere real would otherwise prefer a per-user file
+    // over the machine-wide one, which is backwards for a daemon.
+    //
+    // System scope only: that file describes the machine-wide daemon (its
+    // cache lives under the package prefix, writable by the service account
+    // alone), so handing it to a per-user agent would point the agent at a
+    // directory it cannot write.
+    //
+    // An empty packagedConfig means it is not actually there, so a
+    // build-from-source install does not point launchd at a missing path.
+    if (scope == ServiceScope::System && !HasArgument(spec, "--config=") && !packagedConfig.empty())
+    {
+        spec.arguments.push_back(std::format("--config={}", packagedConfig.string()));
+        spec.configPath = packagedConfig.string();
+    }
+
+    return spec;
+}
+
 #if defined(_WIN32)
 
 namespace
@@ -672,6 +823,104 @@ namespace
     [[nodiscard]] std::string ElevationHint(std::string_view action)
     {
         return std::format("access denied {}; run from an elevated (Administrator) prompt", action);
+    }
+
+    /// Frees a `LocalAlloc`ed block, so the ACL paths below cannot leak one on an
+    /// early return. There are two such blocks per call and four ways out.
+    struct LocalDeleter
+    {
+        /// @param block Block to release; null is a no-op, as LocalFree allows.
+        void operator()(void* block) const noexcept
+        {
+            (void) ::LocalFree(block);
+        }
+    };
+    using LocalPtr = std::unique_ptr<void, LocalDeleter>;
+
+    /// Give @p account full control of @p target, creating it as a directory if
+    /// absent.
+    ///
+    /// The Windows counterpart of the `chown` the launchd path does, and needed for
+    /// the same reason: a service that no longer runs as the machine's most
+    /// privileged identity cannot write a directory the installer created as an
+    /// administrator. LocalSystem never noticed because LocalSystem can write
+    /// anywhere.
+    ///
+    /// Created only when it is absent AND meant to be a directory; whatever is
+    /// already there is granted as-is. `SE_FILE_OBJECT` covers a file and a
+    /// directory alike, so the grant itself does not care -- the *create* does.
+    /// A `ServiceSpec::ownedPaths` entry may be one CoW file (`storage_path` is
+    /// allowed to name `cache.cow`), and an unconditional `create_directories`
+    /// failed in both directions on it: on a fresh install it made a DIRECTORY the
+    /// daemon then read as a directory of shards, and once the file existed it
+    /// failed and skipped the grant -- on exactly the upgrade this exists for.
+    ///
+    /// The entry is ADDED to the existing list rather than replacing it, so an
+    /// administrator keeps the access they had -- a replaced list is how a
+    /// directory becomes one only the service can repair.
+    ///
+    /// @param target Path to grant access to; created as a directory when absent
+    ///        and not named as a file.
+    /// @param account Trustee name, e.g. `NT SERVICE\FastCacheCompileNode`. It
+    ///        resolves only once the service exists, so call this after
+    ///        CreateService.
+    /// @return An explanatory message on failure, else nullopt.
+    [[nodiscard]] std::optional<std::string> GrantPathAccess(std::filesystem::path const& target, std::string const& account)
+    {
+        std::error_code ec;
+        if (!std::filesystem::exists(target, ec))
+        {
+            if (PathNamesAFile(target))
+                return std::format("{} does not exist yet and names a file, so it was not created; grant "
+                                   "'{}' access to the directory that will hold it once it is there",
+                                   target.string(),
+                                   account);
+            std::filesystem::create_directories(target, ec);
+        }
+        if (!std::filesystem::exists(target, ec))
+            return std::format("could not create {}: {}", target.string(), ec.message());
+
+        auto path = target.string();
+
+        PACL current = nullptr;
+        PSECURITY_DESCRIPTOR rawDescriptor = nullptr;
+        if (auto const rc = ::GetNamedSecurityInfoA(path.c_str(),
+                                                    SE_FILE_OBJECT,
+                                                    DACL_SECURITY_INFORMATION,
+                                                    nullptr,
+                                                    nullptr,
+                                                    &current,
+                                                    nullptr,
+                                                    &rawDescriptor);
+            rc != ERROR_SUCCESS)
+            return std::format("could not read the access list of {} (error {})", path, rc);
+        LocalPtr const descriptor { rawDescriptor };
+
+        // A copy: EXPLICIT_ACCESS takes a mutable pointer, and the API is ANSI here
+        // to match the rest of this file's SCM calls.
+        auto trustee = account;
+
+        EXPLICIT_ACCESS_A entry {};
+        entry.grfAccessPermissions = GENERIC_ALL;
+        entry.grfAccessMode = GRANT_ACCESS;
+        // Inherited by what the service later creates inside, or the grant covers
+        // the directory and nothing the service puts in it.
+        entry.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        entry.Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+        entry.Trustee.TrusteeType = TRUSTEE_IS_USER;
+        entry.Trustee.ptstrName = trustee.data();
+
+        PACL rawUpdated = nullptr;
+        if (auto const rc = ::SetEntriesInAclA(1, &entry, current, &rawUpdated); rc != ERROR_SUCCESS)
+            return std::format("could not grant '{}' access to {} (error {})", account, path, rc);
+        LocalPtr const updated { rawUpdated };
+
+        if (auto const rc = ::SetNamedSecurityInfoA(
+                path.data(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, rawUpdated, nullptr);
+            rc != ERROR_SUCCESS)
+            return std::format("could not apply the access list of {} (error {})", path, rc);
+
+        return std::nullopt;
     }
 } // namespace
 
@@ -685,6 +934,7 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scop
         return { .exitCode = 1, .message = "could not determine the fastcached executable path" };
 
     auto const commandLine = BuildServiceCommandLine(spec);
+    auto const logonName = WindowsLogonName(spec);
 
     SC_HANDLE const manager = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (manager == nullptr)
@@ -706,7 +956,14 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scop
                                              nullptr,
                                              nullptr,
                                              nullptr,
-                                             nullptr,
+                                             // lpServiceStartName. Naming nobody is
+                                             // LocalSystem -- the whole machine --
+                                             // which fastcache-compile-node must
+                                             // not have: it compiles input that
+                                             // arrived over the network.
+                                             logonName ? logonName->c_str() : nullptr,
+                                             // No password. A virtual account has
+                                             // none, and LocalSystem takes none.
                                              nullptr);
     if (service == nullptr)
     {
@@ -728,6 +985,27 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scop
 
     CloseServiceHandle(service);
     CloseServiceHandle(manager);
+
+    // Only now: `NT SERVICE\<name>` does not resolve until the service exists, so
+    // a grant attempted before CreateService fails to translate the trustee.
+    //
+    // Reported rather than fatal, and the registration is left in place. A service
+    // that is registered and cannot write one directory is recoverable by an
+    // operator with `icacls`; one that was rolled back because of it leaves them
+    // nothing to repair. This mirrors the launchd path, where a chown that fails
+    // is `(void)`-discarded -- except that this says so.
+    std::string warnings;
+    if (logonName)
+        for (auto const& owned: spec.ownedPaths)
+            if (auto const denial = GrantPathAccess(owned, *logonName))
+                warnings += std::format("\nwarning: {}", *denial);
+
+    if (!warnings.empty())
+        return { .exitCode = 0,
+                 .message = std::format("installed service '{}' (auto-start); start it now with: sc start {}{}",
+                                        spec.serviceName,
+                                        spec.serviceName,
+                                        warnings) };
 
     return { .exitCode = 0,
              .message = std::format("installed service '{}' (auto-start); start it now with: sc start {}",
@@ -789,105 +1067,6 @@ namespace
         if (auto const* const pw = ::getpwuid(::getuid()); pw != nullptr && pw->pw_dir != nullptr)
             return std::filesystem::path { pw->pw_dir };
         return {};
-    }
-
-    /// Root of the macOS package payload, e.g. `/opt/fastcached`.
-    ///
-    /// Handed down from FASTCACHED_MACOS_PREFIX by src/FastCache/CMakeLists.txt
-    /// so the daemon's idea of its own install tree cannot drift from the one
-    /// the installer actually lays down. The fallback matters for builds that
-    /// compile this file outside the package configuration (a plain
-    /// `cmake --install --prefix /usr/local`, or the test binary on a
-    /// non-Apple CI toolchain), where no prefix has been chosen.
-    #if defined(FC_MACOS_PREFIX)
-    constexpr std::string_view MacOsPrefix = FC_MACOS_PREFIX;
-    #else
-    constexpr std::string_view MacOsPrefix = "/opt/fastcached";
-    #endif
-
-    /// Where a job in @p scope writes its stdout/stderr.
-    [[nodiscard]] std::filesystem::path DefaultLogDirectory(ServiceScope scope, std::filesystem::path const& home)
-    {
-        if (scope == ServiceScope::User)
-            return home / "Library/Logs/fastcached";
-        return std::filesystem::path { MacOsPrefix } / "var/log";
-    }
-
-    /// Apply the scope's per-user path defaults to @p cfg.
-    ///
-    /// A LaunchAgent that kept the in-memory default would lose the whole cache
-    /// on every logout, which for a compile cache is most of the value. launchd
-    /// expands neither `~` nor `$HOME` in ProgramArguments, so the concrete path
-    /// has to be resolved here, at install time, by the process that knows it.
-    ///
-    /// The default is applied only when the caller named **no** config file. A
-    /// CLI value baked into ProgramArguments outranks YAML in Merge, so
-    /// injecting one alongside `--config` would override the `storage_path` in
-    /// that very file for the life of the registration — the operator edits it,
-    /// kickstarts the job, and nothing changes, with no error anywhere. Whoever
-    /// passes a config file owns the storage path in it.
-    ///
-    /// System scope gets no storage default at all: its config file is always
-    /// the package's `<prefix>/etc/fastcached.yaml`, so there is nothing to
-    /// default.
-    ///
-    /// Whether @p spec already carries an argument introduced by @p flag.
-    ///
-    /// "The operator set this" is exactly "BuildServiceArgv emitted it", because
-    /// that function emits a flag only for a field differing from its default --
-    /// so asking the argument list is asking the same question the Config test
-    /// used to, one layer further along.
-    /// @param spec Service being registered.
-    /// @param flag Flag prefix including its `=`, e.g. `--config=`.
-    /// @return True when the flag is already present.
-    [[nodiscard]] bool HasArgument(ServiceSpec const& spec, std::string_view flag)
-    {
-        return std::ranges::any_of(spec.arguments, [flag](std::string const& arg) { return arg.starts_with(flag); });
-    }
-
-    /// @param spec Service as described from the command line.
-    /// @param scope Domain being installed into.
-    /// @param home The invoking user's home directory.
-    /// @param packagedConfig The machine-wide config file, empty when it is
-    ///        absent or unreadable. Resolved by the caller for the same reason
-    ///        @p home is: this function decides, the composition root probes.
-    /// @return @p spec with the storage and config arguments filled in when the
-    ///         caller left them unset.
-    [[nodiscard]] ServiceSpec WithScopeDefaults(ServiceSpec spec,
-                                                ServiceScope scope,
-                                                std::filesystem::path const& home,
-                                                std::filesystem::path const& packagedConfig)
-    {
-        if (scope == ServiceScope::User && !HasArgument(spec, "--storage=") && !HasArgument(spec, "--config="))
-        {
-            auto const storage = home / "Library/Caches/fastcached/cache";
-            spec.arguments.push_back(std::format("--storage={}", storage.string()));
-            spec.ownedDirectories.emplace_back(storage);
-        }
-
-        // The daemon would find this file on its own — it is the machine-wide
-        // candidate its startup lookup probes — so registering it is a choice,
-        // not a necessity, and it is made for two reasons. ServiceAccountReadDenial
-        // below validates `configPath`, so leaving it empty would demote "the
-        // _fastcached account cannot read the config" from an install-time error
-        // to a silent fall-through to built-in defaults. And a system job whose
-        // HOME resolves somewhere real would otherwise prefer a per-user file
-        // over the machine-wide one, which is backwards for a daemon.
-        //
-        // System scope only: that file describes the machine-wide daemon (its
-        // cache lives under the package prefix, writable by the service account
-        // alone), so handing it to a per-user agent would point the agent at a
-        // directory it cannot write.
-        //
-        // An empty packagedConfig means it is not actually there, so a
-        // build-from-source install does not point launchd at a missing path.
-        if (scope == ServiceScope::System && !HasArgument(spec, "--config=") && !packagedConfig.empty())
-        {
-            spec.arguments.push_back(std::format("--config={}", packagedConfig.string()));
-            spec.configPath = packagedConfig.string();
-        }
-
-        return spec;
     }
 
     /// Whether a launchctl invocation's own diagnostics reach the terminal.
@@ -1179,8 +1358,17 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     // at every start. Failing the same way in both places keeps the two from
     // disagreeing about which configs count.
     SystemConfigPathProbe const probe;
+    //
+    // Looked up under the SPEC's application name, not the daemon's. Hardcoding
+    // the daemon's meant a worker registration was handed the daemon's config
+    // file -- a file it cannot parse, and, once the package tightens that file to
+    // 0640 root:_fastcached, one the worker's own account cannot even read, so the
+    // install was refused for a reason that had nothing to do with the worker.
+    // A service that names no application looks nothing up.
     auto const packagedConfig = [&] {
-        auto const path = SystemConfigPath(probe, DaemonApplicationName);
+        if (spec.applicationName.empty())
+            return std::filesystem::path {};
+        auto const path = SystemConfigPath(probe, spec.applicationName);
         return path.has_value() && probe.IsReadableFile(*path) && probe.IsTrustedSystemLocation(*path)
                    ? *path
                    : std::filesystem::path {};
@@ -1189,7 +1377,7 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     auto const effective = WithScopeDefaults(spec, scope, home, packagedConfig);
     auto const label = LaunchdLabel(effective);
     auto const plistPath = LaunchdPlistPath(effective, scope, home);
-    auto const logDirectory = DefaultLogDirectory(scope, home);
+    auto const logDirectory = DefaultLogDirectory(label, scope, home);
 
     if (scope == ServiceScope::System && !effective.configPath.empty())
         if (auto const denial = ServiceAccountReadDenial(effective.serviceAccount, effective.configPath))
@@ -1214,16 +1402,25 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     // reassigned /var/db, shared with other system services, to an unprivileged
     // cache account, and `--storage=/tmp/cache` reassigned /private/tmp — both
     // silently, under a message that said the service had been installed.
+    //
+    // Created only when it is absent AND meant to be a directory; whatever is
+    // already there is chowned as-is. An `ownedPaths` entry may be one CoW file
+    // (`storage_path` is allowed to name `cache.cow`), and an unconditional
+    // `create_directories` failed in both directions on it: on a fresh install it
+    // made a DIRECTORY the daemon then read as a directory of shards, and once the
+    // file existed it failed and skipped the chown — on exactly the upgrade this
+    // handover is here for.
     if (scope == ServiceScope::System && !effective.serviceAccount.empty())
         if (auto const* const pw = ::getpwnam(effective.serviceAccount.c_str()); pw != nullptr)
         {
             std::vector<std::filesystem::path> owned { logDirectory };
-            for (auto const& directory: effective.ownedDirectories)
+            for (auto const& target: effective.ownedPaths)
             {
                 std::error_code ownedEc;
-                std::filesystem::create_directories(directory, ownedEc);
-                if (!ownedEc)
-                    owned.emplace_back(directory);
+                if (!std::filesystem::exists(target, ownedEc) && !PathNamesAFile(target))
+                    std::filesystem::create_directories(target, ownedEc);
+                if (std::filesystem::exists(target, ownedEc))
+                    owned.emplace_back(target);
             }
             for (auto const& path: owned)
                 (void) ::chown(path.c_str(), pw->pw_uid, pw->pw_gid);

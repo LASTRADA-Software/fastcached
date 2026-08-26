@@ -15,6 +15,10 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
+using FastCache::Testing::Unwrap;
+
 namespace
 {
 /// The `ServiceSpec` the daemon would register for @p cfg.
@@ -195,6 +199,134 @@ TEST_CASE("ServiceControl: the launchd label is reverse-DNS and lowercased", "[p
 
     cfg.serviceName = "FastCachedSmoke";
     REQUIRE(FastCache::LaunchdLabel(SpecFor("fastcached", cfg)) == "software.lastrada.fastcachedsmoke");
+}
+
+TEST_CASE("ServiceControl: the SCM logon identity is named, not implied", "[platform][service][scm]")
+{
+    // Naming nobody is LocalSystem: unrestricted access to every local resource and
+    // a member of the local Administrators group. Neither of this project's services
+    // has any use for that, so neither leaves it to the default.
+    FastCache::Config const cfg {};
+    auto const daemon = SpecFor("fastcached", cfg);
+    REQUIRE(daemon.windowsLogon == FastCache::WindowsLogonAccount::VirtualAccount);
+    REQUIRE(Unwrap(FastCache::WindowsLogonName(daemon)) == "NT SERVICE\\FastCached");
+
+    // A virtual account is derived from the service name by the SCM itself, so the
+    // spelling has to match the name exactly or the service logs on as nobody.
+    FastCache::ServiceSpec worker {};
+    worker.serviceName = "FastCacheCompileNode";
+    worker.windowsLogon = FastCache::WindowsLogonAccount::VirtualAccount;
+
+    auto const name = FastCache::WindowsLogonName(worker);
+    REQUIRE(name.has_value());
+    REQUIRE(Unwrap(name) == "NT SERVICE\\FastCacheCompileNode");
+
+    // It follows --service-name, because that is what the SCM derives it from: a
+    // fixed string here would name an identity a renamed service does not have.
+    worker.serviceName = "FastCacheCompileNodeSmoke";
+    REQUIRE(Unwrap(FastCache::WindowsLogonName(worker)) == "NT SERVICE\\FastCacheCompileNodeSmoke");
+}
+
+TEST_CASE("ServiceControl: a system job's log directory is its own", "[platform][service][launchd]")
+{
+    // InstallService hands this directory to the account the job runs as, and a
+    // machine may run both fastcached and fastcache-compile-node system-wide.
+    // One shared directory meant each install chowned the other's to itself:
+    // registering the worker took the daemon's, and a package reinstall took it
+    // back.
+    auto const daemon = FastCache::DefaultLogDirectory("software.lastrada.fastcached", ServiceScope::System, "/Users/jo");
+    auto const worker =
+        FastCache::DefaultLogDirectory("software.lastrada.fastcachecompilenode", ServiceScope::System, "/Users/jo");
+
+    REQUIRE(daemon != worker);
+    REQUIRE(daemon.filename() == "software.lastrada.fastcached");
+    // A machine-wide job must not reach into anybody's home directory.
+    REQUIRE(!daemon.string().contains("/Users/jo"));
+
+    // A per-user agent is not chowned and its files are already label-named, so
+    // it keeps the flat directory an operator may have open in `tail -f`.
+    auto const agent = FastCache::DefaultLogDirectory("software.lastrada.fastcached", ServiceScope::User, "/Users/jo");
+    REQUIRE(agent == std::filesystem::path { "/Users/jo" } / "Library/Logs/fastcached");
+}
+
+TEST_CASE("ServiceControl: scope defaults are filled in for a file-configured service", "[platform][service][launchd]")
+{
+    FastCache::Config const cfg {};
+    auto const spec = SpecFor("fastcached", cfg);
+    REQUIRE(!spec.applicationName.empty());
+
+    SECTION("a user agent gets a cache under the invoking account's home")
+    {
+        // Kept in-memory it would lose the whole cache at every logout, which for
+        // a compile cache is most of the value -- and launchd expands neither `~`
+        // nor `$HOME` in ProgramArguments, so the concrete path has to be resolved
+        // at install time.
+        auto const filled = WithScopeDefaults(spec, ServiceScope::User, "/Users/jo", {});
+
+        // The tail is spelled out -- `fastcached` in it is the applicationName,
+        // which is the point -- while the separator between home and it is left
+        // to the platform, because this case runs everywhere and only macOS
+        // renders it with a slash.
+        auto const expected = std::filesystem::path { "/Users/jo" } / "Library/Caches/fastcached/cache";
+        REQUIRE(std::ranges::contains(filled.arguments, std::format("--storage={}", expected.string())));
+        REQUIRE(std::ranges::contains(filled.ownedPaths, expected));
+    }
+
+    SECTION("a config the operator named is never overridden by a storage default")
+    {
+        // A CLI value outranks YAML in Merge, so injecting --storage alongside
+        // --config would pin the cache location and make every later storage_path
+        // edit a silent no-op.
+        FastCache::Config named {};
+        named.configPath = "/etc/fastcached/fastcached.yaml";
+        auto const filled = WithScopeDefaults(SpecFor("fastcached", named), ServiceScope::User, "/Users/jo", {});
+
+        REQUIRE(std::ranges::none_of(filled.arguments, [](std::string const& a) { return a.starts_with("--storage="); }));
+    }
+
+    SECTION("a system daemon is pointed at the packaged config")
+    {
+        auto const filled =
+            WithScopeDefaults(spec, ServiceScope::System, "/Users/jo", "/opt/fastcached/etc/fastcached.yaml");
+
+        REQUIRE(std::ranges::contains(filled.arguments, "--config=/opt/fastcached/etc/fastcached.yaml"));
+        // ServiceAccountReadDenial validates this, so leaving it empty would
+        // demote an install-time error to a silent fall-through to defaults.
+        REQUIRE(filled.configPath == "/opt/fastcached/etc/fastcached.yaml");
+    }
+
+    SECTION("an absent packaged config points launchd at nothing")
+    {
+        auto const filled = WithScopeDefaults(spec, ServiceScope::System, "/Users/jo", {});
+
+        REQUIRE(std::ranges::none_of(filled.arguments, [](std::string const& a) { return a.starts_with("--config="); }));
+    }
+}
+
+TEST_CASE("ServiceControl: a service that keeps no files is given no path flags", "[platform][service][launchd]")
+{
+    // The registration has to survive the registered binary's OWN parser.
+    // `fastcache-compile-node` is configured entirely from argv and accepts
+    // neither flag, so a default baked in here produced a job that answered its
+    // own command line with "unrecognised argument" at every start -- registered,
+    // reported installed, and dead at every boot. The application name was
+    // hardcoded to the daemon's, so every spec got the daemon's defaults.
+    //
+    // Asserted against a bare spec rather than the worker's, because this file
+    // must not depend on an app target: what is being pinned is the rule, and
+    // NodeConfig_test.cpp pins that the worker actually claims it.
+    FastCache::ServiceSpec argvOnly {};
+    argvOnly.serviceName = "ArgvOnly";
+    argvOnly.applicationName = {};
+
+    for (auto const scope: { ServiceScope::User, ServiceScope::System })
+    {
+        auto const filled = WithScopeDefaults(argvOnly, scope, "/Users/jo", "/opt/fastcached/etc/fastcached.yaml");
+
+        CHECK(filled.arguments.empty());
+        CHECK(filled.configPath.empty());
+        CHECK(filled.ownedPaths.empty());
+    }
 }
 
 TEST_CASE("ServiceControl: the plist path follows the scope", "[platform][service][launchd]")

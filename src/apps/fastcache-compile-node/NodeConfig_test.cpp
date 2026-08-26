@@ -281,6 +281,117 @@ TEST_CASE("NodeConfig: a system-scope job names an unprivileged account", "[node
     // compromised compile rewrite every cached object.
     auto const daemonSpec = MakeDaemonServiceSpec(std::filesystem::path { "fastcached" }, Config {});
     CHECK(spec.serviceAccount != daemonSpec.serviceAccount);
+
+    // The same decision for the other supervisor. Told nothing, the Windows SCM
+    // logs a service on as LocalSystem, which is the machine -- so the worker names
+    // a virtual account there for exactly the reason it names an account here.
+    CHECK(spec.windowsLogon == WindowsLogonAccount::VirtualAccount);
+    CHECK(Unwrap(WindowsLogonName(spec)) == "NT SERVICE\\FastCacheCompileNode");
+}
+
+TEST_CASE("NodeConfig: the worker's launchd label is what the packaging removes", "[node][service]")
+{
+    // FASTCACHED_MACOS_NODE_LABEL in the top-level CMakeLists.txt is substituted
+    // into fastcached-uninstall.sh.in, which boots the job out and deletes its
+    // plist. It has to be this string, because the uninstaller also removes the
+    // binary that would otherwise answer for itself -- so a label that drifted
+    // would leave a job bootstrapped against a deleted executable, with nothing
+    // on disk left able to reach it.
+    //
+    // Compared against the PACKAGING's value, compiled in by this target's
+    // CMakeLists, rather than a literal repeated here. A literal would be a third
+    // copy that agrees with the derivation and drifts from the package in
+    // silence, which is the failure this assertion exists to prevent -- the
+    // derivation itself (LaunchdLabelPrefix + the lowercased service name) is
+    // already covered by ServiceControl_test.cpp.
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable());
+
+    CHECK(LaunchdLabel(spec) == std::string_view { FASTCACHED_MACOS_NODE_LABEL });
+}
+
+TEST_CASE("NodeConfig: the worker's registration survives its own parser", "[node][service]")
+{
+    // Every flag baked into a registration is re-read by this binary at the next
+    // start, so one it cannot parse is a service that registers cleanly and then
+    // fails forever. The worker takes NO config file and NO storage directory --
+    // NodeOptions() has neither flag -- and the installer used to fill both in
+    // from the daemon's defaults, because the application name was hardcoded.
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable());
+    CHECK(spec.applicationName.empty());
+
+    // The assertion that matters is not "the field is empty" but what the field
+    // makes the installer do, so drive the installer's own function -- on every
+    // platform, which is the half that was missing while it lived inside the
+    // macOS block.
+    for (auto const scope: { ServiceScope::User, ServiceScope::System })
+    {
+        auto const filled = WithScopeDefaults(spec,
+                                              scope,
+                                              std::filesystem::path { "/Users/jo" },
+                                              std::filesystem::path { "/opt/fastcached/etc/fastcached.yaml" });
+
+        // Every argument must be one this binary's own parser accepts.
+        for (auto const& argument: filled.arguments)
+        {
+            auto const flag = argument.substr(0, argument.find('='));
+            INFO("registered flag: " << argument);
+            CHECK(std::ranges::any_of(
+                NodeOptions(), [&flag](auto const& option) { return option.primary == flag || option.alias == flag; }));
+        }
+    }
+}
+
+TEST_CASE("NodeConfig: consensus state may not default to a relative path in a service", "[node][service]")
+{
+    // `fastcache-cluster/<node-id>` is a fine default for a worker an operator
+    // started in a directory they chose. A service has no such directory: the SCM
+    // starts it in C:\Windows\System32 and launchd in /, both writable only by the
+    // privileges this worker is deliberately not given. So the job would register,
+    // report success, and fail to open its own consensus state at every start --
+    // which is the shape refused here rather than at the next boot.
+    auto cfg = Installable();
+    cfg.raftListen = "0.0.0.0:6680";
+    cfg.nodeId = "n1";
+
+    REQUIRE(NodeServiceRejection(cfg).has_value());
+    CHECK(Unwrap(NodeServiceRejection(cfg)).contains("--cluster-dir"));
+
+    // Named, and it is accepted.
+    cfg.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    CHECK(!NodeServiceRejection(cfg).has_value());
+
+    // A worker running no consensus is unaffected: the flag it would need is one
+    // it has no use for.
+    auto plain = Installable();
+    plain.clusterDir.clear();
+    CHECK(!NodeServiceRejection(plain).has_value());
+}
+
+TEST_CASE("NodeConfig: a system-scope job owns the directories it was given", "[node][service]")
+{
+    // A system-scope worker runs as an unprivileged account and root created these
+    // directories, so without the handover its first write fails with EACCES --
+    // which launchd surfaces only as a job that exits over and over. The daemon
+    // has always handed over its --storage for exactly this reason.
+    auto cfg = Installable();
+    cfg.cacheDir = std::filesystem::path { "/var/cache/fastcache-node" };
+    cfg.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
+
+    CHECK(std::ranges::contains(spec.ownedPaths, cfg.cacheDir));
+    CHECK(std::ranges::contains(spec.ownedPaths, cfg.clusterDir));
+
+    // Only what the operator named, never a parent: handing over /var/cache would
+    // reassign a directory shared with other services to an unprivileged compile
+    // account, silently, under a message saying the service had been installed.
+    CHECK(std::ranges::none_of(spec.ownedPaths, [](std::filesystem::path const& owned) {
+        return owned == std::filesystem::path { "/var/cache" } || owned == std::filesystem::path { "/var/lib" };
+    }));
+
+    // A worker given neither hands over nothing, rather than a path nobody asked
+    // for -- the mirror of the rule above.
+    CHECK(MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable()).ownedPaths.empty());
 }
 
 TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[node][scheduler][policy]")

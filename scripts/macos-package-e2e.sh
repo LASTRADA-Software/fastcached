@@ -25,9 +25,17 @@
 #                           welcome and read-me panes shipped once, while the
 #                           .txt license looked fine and disguised it.
 #   4. Service runs       — the selected launchd job is registered and serving.
+#   4b. Worker installs   — the compile worker's account exists whichever launchd
+#                           choice was made, and a system-scope worker
+#                           registration is accepted, names that unprivileged
+#                           account, and carries only flags the worker's own
+#                           parser accepts. Refused outright before #87.
 #   5. Config survives    — an edit made after install is still there after a
 #                           reinstall of the same package.
-#   6. Uninstall is total — no files, no job, no PATH entry, no receipts.
+#   6. Uninstall is total — no files, no job, no PATH entry, no receipts, and
+#                           neither account. Including the worker job from 4b,
+#                           which the package never installed but whose binary it
+#                           is about to delete.
 #
 # --scope selects which launchd choice the installer is driven with:
 #
@@ -78,6 +86,15 @@ readonly PREFIX="/opt/fastcached"
 readonly LABEL="software.lastrada.fastcached"
 readonly PATHS_D="/etc/paths.d/fastcached"
 
+# The compile worker's identity, spelled out rather than read from the build tree:
+# this script is handed a .pkg and nothing else, so every expected value here is a
+# literal on purpose -- an assertion that derived its expectation the same way the
+# code under test does would agree with it whatever either said. The matching
+# derivations are pinned cross-platform by `ctest -R service-accounts` and by
+# NodeConfig_test.cpp.
+readonly NODE_ACCOUNT="fastcache-node"
+readonly NODE_LABEL="software.lastrada.fastcachecompilenode"
+
 workdir="$(mktemp -d)"
 cleanup() {
     sudo "${PREFIX}/bin/fastcached-uninstall" >/dev/null 2>&1 || true
@@ -108,6 +125,7 @@ payload="$(cd "${workdir}/expanded" && find . -path '*/Payload/*' -type f | sed 
 
 for expected in opt/fastcached/bin/fastcached \
                 opt/fastcached/bin/fastcache-cc \
+                opt/fastcached/bin/fastcache-compile-node \
                 opt/fastcached/bin/fastcached-uninstall \
                 opt/fastcached/etc/fastcached.yaml.default \
                 etc/paths.d/fastcached; do
@@ -201,10 +219,18 @@ echo "== installing (scope: ${scope})"
 install_log="$(sudo installer -pkg "$pkg" -applyChoiceChangesXML "$choices" -target / 2>&1)" \
     || fail "installer failed: $install_log"
 
-[[ -x "${PREFIX}/bin/fastcached" ]]           || fail "no ${PREFIX}/bin/fastcached"
-[[ -x "${PREFIX}/bin/fastcache-cc" ]]         || fail "no ${PREFIX}/bin/fastcache-cc"
-[[ -x "${PREFIX}/bin/fastcached-uninstall" ]] || fail "no uninstaller"
-[[ -f "${PREFIX}/etc/fastcached.yaml" ]]      || fail "postinstall did not seed fastcached.yaml"
+[[ -x "${PREFIX}/bin/fastcached" ]]             || fail "no ${PREFIX}/bin/fastcached"
+[[ -x "${PREFIX}/bin/fastcache-cc" ]]           || fail "no ${PREFIX}/bin/fastcache-cc"
+[[ -x "${PREFIX}/bin/fastcache-compile-node" ]] || fail "no ${PREFIX}/bin/fastcache-compile-node"
+[[ -x "${PREFIX}/bin/fastcached-uninstall" ]]   || fail "no uninstaller"
+[[ -f "${PREFIX}/etc/fastcached.yaml" ]]        || fail "postinstall did not seed fastcached.yaml"
+
+# The worker's account comes from the RUNTIME component, so it must exist
+# whichever launchd choice was made for fastcached -- including the per-user
+# agent, which is the installer's default and has nothing to do with the worker.
+# Asserted before the scope split below for exactly that reason (issue #87).
+dscl . -read "/Users/${NODE_ACCOUNT}" >/dev/null 2>&1 \
+    || fail "postinstall did not create the ${NODE_ACCOUNT} worker account"
 
 grep -qx "${PREFIX}/bin" "$PATHS_D" || fail "$PATHS_D does not name ${PREFIX}/bin"
 
@@ -217,9 +243,12 @@ pkgutil --pkgs | grep -q "^${LABEL}\." \
     || fail "no package receipt starts with ${LABEL}; the uninstaller would never find them"
 
 # The symlinks are what make the tools reachable in a shell that is already
-# open, and in fish, which never reads /etc/paths.d.
-[[ -L /usr/local/bin/fastcached ]]   || fail "no /usr/local/bin/fastcached symlink"
-[[ -L /usr/local/bin/fastcache-cc ]] || fail "no /usr/local/bin/fastcache-cc symlink"
+# open, and in fish, which never reads /etc/paths.d. Every tool, including the
+# worker: /etc/paths.d takes effect only for LOGIN shells, so without a link the
+# command an operator is told to run is not on PATH where they will run it.
+for tool in fastcached fastcache-cc fastcache-compile-node; do
+    [[ -L "/usr/local/bin/${tool}" ]] || fail "no /usr/local/bin/${tool} symlink"
+done
 
 # --- 4. the selected launchd job must be registered and serving -------------
 echo "== checking the launchd registration"
@@ -324,6 +353,57 @@ else
     fi
 fi
 
+# --- 4b. a system-scope worker registration must be possible ---------------
+# The package registers no worker of its own -- it has no scheduler address or
+# toolchain list to register one WITH, and NodeServiceRejection refuses a
+# registration missing either. What it provides is the account, and this is the
+# assertion that the account is actually usable for what it exists for.
+#
+# Run in both scopes, because the account comes from the Runtime component: an
+# operator who took the installer's default (the per-user agent for fastcached)
+# must still be able to install a system-wide worker.
+#
+# Before #87 this refused with "the 'fastcache-node' service account does not
+# exist", which is the correct behaviour given no account -- a system launchd job
+# naming no UserName runs as ROOT, and this process compiles input that arrived
+# over the network. So the assertion is on the refusal being GONE, and on the
+# registration naming the unprivileged account rather than defaulting to root.
+echo "== checking a system-scope worker registration"
+node_plist="/Library/LaunchDaemons/${NODE_LABEL}.plist"
+
+# Captured, not discarded: the refusal this used to produce is a precise sentence
+# naming the account, and swallowing it would turn a diagnosis into "exit 1".
+if ! node_log="$(sudo "${PREFIX}/bin/fastcache-compile-node" --install-service --service-scope=system \
+        --scheduler=127.0.0.1:6675 \
+        --advertise=127.0.0.1:6676 \
+        --toolchain=/usr/bin/cc 2>&1)"; then
+    fail "worker --install-service --service-scope=system was refused: ${node_log}"
+fi
+
+[[ -f "$node_plist" ]] || fail "worker install reported success but wrote no ${node_plist}"
+
+# The whole point of the account. A plist with no UserName is a job that runs as
+# root, and launchd would accept that silently.
+grep -q "<string>${NODE_ACCOUNT}</string>" "$node_plist" \
+    || fail "the worker plist does not name ${NODE_ACCOUNT}; a system job with no UserName runs as root"
+
+# Every flag in ProgramArguments is re-read by the worker at the next start, so
+# one its own parser rejects is a job that registers and then fails forever. The
+# installer used to bake in the DAEMON's --config and --storage for any service,
+# and the worker accepts neither -- so this is the assertion that the
+# registration survives its own parser, at the level where it actually matters.
+for rejected in --config --storage; do
+    ! grep -q -- "$rejected" "$node_plist" \
+        || fail "the worker plist carries ${rejected}, which fastcache-compile-node does not accept"
+done
+
+# Deliberately LEFT REGISTERED. Step 6 then exercises the uninstaller against a
+# worker the package never installed, which is the only case there is: the
+# uninstaller removes ${PREFIX}, so a job it walked past would be left
+# bootstrapped against a deleted executable, with nothing on disk able to reach
+# it afterwards.
+echo "   worker registered as ${NODE_ACCOUNT}"
+
 # --- 5. an operator edit must survive a reinstall --------------------------
 echo "== reinstalling over an edited config"
 readonly MARKER="# fastcached-e2e-marker"
@@ -337,6 +417,16 @@ reinstall_log="$(sudo installer -pkg "$pkg" -applyChoiceChangesXML "$choices" -t
 sudo grep -qF "$MARKER" "${PREFIX}/etc/fastcached.yaml" \
     || fail "reinstall overwrote the operator's fastcached.yaml"
 
+# And it must not have taken the worker's log directory with it. Every
+# system-scope job has one of its own, owned by the account that job runs as; a
+# `chown -R` over the whole of ${PREFIX}/var during the daemon's postinstall
+# would quietly hand the worker's to _fastcached, leaving it unable to write its
+# own logs with nothing reporting why.
+node_log_owner="$(stat -f %Su "${PREFIX}/var/log/${NODE_LABEL}" 2>/dev/null || true)"
+if [[ "$node_log_owner" != "$NODE_ACCOUNT" ]]; then
+    fail "after the reinstall ${PREFIX}/var/log/${NODE_LABEL} is owned by '${node_log_owner:-<absent>}', expected ${NODE_ACCOUNT}"
+fi
+
 # --- 6. uninstall must leave nothing ---------------------------------------
 echo "== uninstalling"
 uninstall_log="$(sudo "${PREFIX}/bin/fastcached-uninstall" 2>&1)" \
@@ -344,15 +434,26 @@ uninstall_log="$(sudo "${PREFIX}/bin/fastcached-uninstall" 2>&1)" \
 
 [[ ! -e "$PREFIX" ]]  || fail "$PREFIX still present"
 [[ ! -e "$PATHS_D" ]] || fail "$PATHS_D still present"
-[[ ! -e /usr/local/bin/fastcached ]]   || fail "/usr/local/bin/fastcached symlink left behind"
-[[ ! -e /usr/local/bin/fastcache-cc ]] || fail "/usr/local/bin/fastcache-cc symlink left behind"
+for tool in fastcached fastcache-cc fastcache-compile-node; do
+    [[ ! -e "/usr/local/bin/${tool}" ]] || fail "/usr/local/bin/${tool} symlink left behind"
+done
 ! registered_agent_domain >/dev/null || fail "user agent still registered in $(registered_agent_domain)"
 ! sudo launchctl print "system/${LABEL}" >/dev/null 2>&1 || fail "system daemon still registered"
 [[ ! -e "/Library/LaunchDaemons/${LABEL}.plist" ]] || fail "system plist left behind"
 [[ -z "$(pkgutil --pkgs | grep "^${LABEL}" || true)" ]] || fail "package receipts left behind"
 
+# The worker job registered in step 4b, which the package itself never installs.
+# The uninstaller has to know about it anyway: it deletes ${PREFIX}, so anything
+# it leaves bootstrapped now points at an executable that is gone.
+! sudo launchctl print "system/${NODE_LABEL}" >/dev/null 2>&1 || fail "worker job still registered"
+[[ ! -e "/Library/LaunchDaemons/${NODE_LABEL}.plist" ]] || fail "worker plist left behind"
+
 # A stale service account is what makes a reinstall pick a *different* uid next
-# time, silently orphaning the state directory it used to own.
-! dscl . -read /Users/_fastcached >/dev/null 2>&1 || fail "_fastcached account left behind"
+# time, silently orphaning the state directory it used to own. Both accounts:
+# the worker's is created by a different component than the daemon's, so a
+# removal that covered only one would leave no trace anybody would look for.
+for account in _fastcached "$NODE_ACCOUNT"; do
+    ! dscl . -read "/Users/${account}" >/dev/null 2>&1 || fail "${account} account left behind"
+done
 
 echo "macOS package E2E: all assertions held"

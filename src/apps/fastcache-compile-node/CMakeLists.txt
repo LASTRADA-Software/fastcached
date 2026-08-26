@@ -99,6 +99,14 @@ if(FASTCACHED_BUILD_TESTS)
         "${CMAKE_SOURCE_DIR}/src"
         "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc")
     target_link_libraries(fastcache-compile-node-tests PRIVATE FastCache Catch2::Catch2)
+    # The launchd label the macOS uninstaller boots this worker's job out by,
+    # handed to the test so it compares the packaging's value against the one the
+    # binary derives -- rather than against a literal of its own, which would
+    # agree with the code and drift from the package in silence. The uninstaller
+    # deletes the executable that would otherwise answer for itself, so a label
+    # that drifted leaves a job registered with nothing left able to remove it.
+    target_compile_definitions(fastcache-compile-node-tests PRIVATE
+        FASTCACHED_MACOS_NODE_LABEL="${FASTCACHED_MACOS_NODE_LABEL}")
     if(WIN32)
         target_link_libraries(fastcache-compile-node-tests PRIVATE ws2_32)
     endif()

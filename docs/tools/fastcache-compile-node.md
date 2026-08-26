@@ -593,21 +593,48 @@ things are therefore refused at install time rather than at the next boot:
 
 `--requirepass` is refused too, for the reason it is on the daemon: a supervisor
 records launch arguments where every local account can read them, and for a
-worker that token is what the scheduler authenticates it *by*. Put it in a
-config file the service account can read, or set it with a supervisor override.
+worker that token is what the scheduler authenticates it *by*.
+
+Where it goes instead is a supervisor override, not a config file — this worker
+reads no configuration file at all. On Linux that is `FASTCACHE_NODE_ARGS` in
+`/etc/fastcached/compile-node.env`, which systemd reads and the worker never
+sees on a world-readable command line. macOS and Windows have no equivalent
+today, so a worker that needs a token is run there in the foreground rather than
+registered as a service.
 
 **macOS scope.** `--service-scope=user` registers a LaunchAgent that runs as
-you, which is the per-developer case and works today. `--service-scope=system`
-registers a LaunchDaemon that must run as the unprivileged `fastcache-node`
-account — the same one the Linux unit uses — and **is refused until that account
-exists**, because a system job with no account named runs as *root*, and this
-process compiles input that arrived over the network. Creating it is packaging
-work that has not landed ([#87](https://github.com/LASTRADA-Software/fastcached/issues/87)).
+you, which is the per-developer case. `--service-scope=system` registers a
+LaunchDaemon that runs as the unprivileged `fastcache-node` account — the same
+one the Linux unit uses — because a system job with no account named runs as
+*root*, and this process compiles input that arrived over the network.
+
+The `.pkg` creates that account, from its **Runtime** component, so it is there
+whichever launchd choice you made for `fastcached` itself. Installing from a
+tarball or a source build does not create it, and the registration is then
+refused with a message saying so rather than registering a job launchd would
+accept and never spawn.
+
+Neither scope bakes a `--config` or `--storage` into the registration: this
+worker takes neither flag, and a registration carrying one is a job that answers
+its own command line with `unrecognised argument` at every start. Everything the
+worker needs is on the `--install-service` command line itself.
 
 **Windows** registers an SCM service (auto-start, left stopped; `sc start
 FastCacheCompileNode`). The default service name is `FastCacheCompileNode`, not
 the daemon's `FastCached`, so a machine can run both without one install
 displacing the other.
+
+It logs on as the **virtual account** `NT SERVICE\FastCacheCompileNode`, for the
+reason the macOS job runs as `fastcache-node`: told no account, the SCM would use
+LocalSystem, and a process that compiles input arriving over the network should
+not have the machine. The SCM derives that account from the service name and
+creates it itself — there is nothing to create and no password to keep.
+
+Because it is no longer LocalSystem, a `--cache-dir` or `--cluster-dir` you name
+is granted to that account at install time; the grant is reported if it fails and
+the registration is kept, so you can repair it with `icacls` rather than being
+left with nothing. If you rename the service with `--service-name`, the account
+follows the new name.
 
 Remove a registration with `--uninstall-service` (and the same
 `--service-scope`, on macOS: which domain a job lives in is decided at install
@@ -830,11 +857,3 @@ For anything beyond a trusted build network, put mTLS in front of every port.
     differ by the clock alone. The POSIX fixture asserts strict byte-identity and
     should — GCC and clang embed nothing path-dependent without `-g`. If your
     build compares object bytes across machines, compare sections.
-
-## Not yet done
-
-- The macOS package does not create the `fastcache-node` account, so
-  `--install-service --service-scope=system` refuses there
-  ([#87](https://github.com/LASTRADA-Software/fastcached/issues/87)).
-  `--service-scope=user` works, and is the right answer on a developer machine
-  anyway.

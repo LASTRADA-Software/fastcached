@@ -659,7 +659,18 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     for (auto const& toolchain: cfg.toolchains)
         argv.push_back(std::format("--toolchain={}", toolchain));
 
+    // Directories root will create for an account that is not root. Without the
+    // handover the worker's first write fails with EACCES, which launchd surfaces
+    // only as a job that exits over and over -- the same reason the daemon hands
+    // over its --storage.
+    //
+    // Only what the operator actually named, never a parent: `--cache-dir=/var/db/fc`
+    // must not reassign /var/db, shared with other system services, to an
+    // unprivileged compile account.
     std::vector<std::filesystem::path> owned;
+    for (auto const& directory: { cfg.cacheDir, cfg.clusterDir })
+        if (!directory.empty())
+            owned.emplace_back(directory);
 
     return ServiceSpec { .serviceName = cfg.serviceName,
                          .exePath = exePath,
@@ -678,9 +689,26 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          // `--service-scope=user` works today and is the per-developer
                          // case anyway: a user agent runs as the invoking account.
                          .serviceAccount = "fastcache-node",
-                         .ownedDirectories = std::move(owned),
+                         .ownedPaths = std::move(owned),
                          .inlineCredential = cfg.token.empty() ? InlineCredential::Absent : InlineCredential::Present,
-                         .configPath = {} };
+                         .configPath = {},
+                         // Empty, and load-bearing: this worker is configured
+                         // entirely from argv and NodeOptions() has neither
+                         // `--config` nor `--storage`. Naming an application here
+                         // would invite WithScopeDefaults to bake one in, and the
+                         // registration would then be a job that answers its own
+                         // command line with "unrecognised argument" at every
+                         // start -- reported installed, dead at every boot.
+                         .applicationName = {},
+                         // The Windows half of the same decision `serviceAccount`
+                         // makes for launchd. Told nothing, the SCM logs a service
+                         // on as LocalSystem -- the whole machine -- and this one
+                         // compiles input that arrived over the network. A virtual
+                         // account gives it a per-service SID, no group membership
+                         // and no machine credentials on the network, and the SCM
+                         // creates it from the service name with no account for the
+                         // installer to make and no password to keep.
+                         .windowsLogon = WindowsLogonAccount::VirtualAccount };
 }
 
 std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
@@ -703,6 +731,12 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
           .message = "--advertise is required to install a service: without it the registration bakes in "
                      "{--bind}:{--port}, and the default 0.0.0.0 is not an address a client can dial. Such a worker "
                      "registers, heartbeats, is leased out, and is never reached -- with no error at either end." },
+        { .refuses = [](NodeConfig const& c) { return !c.raftListen.empty() && c.clusterDir.empty(); },
+          .message = "--listen-raft needs --cluster-dir to install a service: consensus state otherwise lands in "
+                     "`fastcache-cluster/<node-id>` relative to the working directory, and a service does not "
+                     "inherit the installing shell's. It resolves under C:\\Windows\\System32 for the SCM and under "
+                     "/ for launchd -- writable only by the very privileges a worker is deliberately not given, so "
+                     "the job registers and then fails to open its own state at every start." },
     });
 
     for (auto const& rule: Rules)

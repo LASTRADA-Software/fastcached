@@ -1330,6 +1330,104 @@ jobs:
           for ($i = 0; $i -lt 30 -and (Get-Service FastCached).Status -ne 'Running'; $i++) { Start-Sleep 1 }
           if ((Get-Service FastCached).Status -ne 'Running') { throw 'service did not start' }
 
+          # The identity it logs on as. Told nothing, CreateService uses LocalSystem
+          # -- unrestricted access to every local resource, and a member of the local
+          # Administrators group. A cache daemon listening on a socket needs none of
+          # it. Asserted here because this is a SHIPPED service whose identity
+          # changed: if the virtual account cannot log on, the service simply never
+          # starts, and the check above would be the only thing that noticed.
+          $svc = Get-CimInstance Win32_Service -Filter "Name='FastCached'"
+          if ($svc.StartName -ne 'NT SERVICE\FastCached') {
+            Show-InstallLog
+            throw "daemon runs as '$($svc.StartName)', expected NT SERVICE\FastCached"
+          }
+
+          # Running is not serving. The virtual account has to be able to read the
+          # config it was seeded and bind its port, and only an actual round trip
+          # says so -- a job can reach Running and then fail its first request.
+          $reply = ''
+          for ($i = 0; $i -lt 30 -and -not $reply; $i++) {
+            try {
+              $c = New-Object Net.Sockets.TcpClient('127.0.0.1', 6674)
+              $st = $c.GetStream()
+              $w = New-Object IO.StreamWriter($st); $w.NewLine = "`r`n"; $w.AutoFlush = $true
+              $w.WriteLine('set k 0 0 5'); $w.WriteLine('hello'); $w.WriteLine('get k')
+              $r = New-Object IO.StreamReader($st)
+              $c.ReceiveTimeout = 5000
+              $reply = $r.ReadLine() + '|' + $r.ReadLine() + '|' + $r.ReadLine()
+              $c.Close()
+            } catch { Start-Sleep 1 }
+          }
+          if ($reply -notmatch 'STORED' -or $reply -notmatch 'hello') {
+            Show-InstallLog
+            throw "daemon did not serve on 6674 under its virtual account: '$reply'"
+          }
+          Write-Host "daemon serving as $($svc.StartName)"
+
+      # The compile worker registers itself; the MSI never does. What is asserted
+      # here is the identity it registers UNDER: told nothing, CreateService logs a
+      # service on as LocalSystem -- the whole machine -- and this process compiles
+      # input that arrived over the network. The macOS half of the same decision is
+      # the fastcache-node account (issue #87); on Windows it is a virtual account,
+      # which the SCM derives from the service name and creates itself.
+      #
+      # Run against the built binary rather than the MSI payload because the MSI
+      # deliberately registers no worker: it has no scheduler address or toolchain
+      # list to register one with.
+      - name: "Verify the compile worker does not register as LocalSystem"
+        shell: pwsh
+        working-directory: out/build/cl-release
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $node = Resolve-Path 'target/fastcache-compile-node.exe'
+          $cacheDir = Join-Path $env:RUNNER_TEMP 'fastcache-node-cache'
+          $toolchain = (Get-Command cl.exe).Source
+
+          & $node --install-service `
+              --scheduler=127.0.0.1:6675 `
+              --advertise=127.0.0.1:6676 `
+              --cache-dir="$cacheDir" `
+              --toolchain="$toolchain"
+          if ($LASTEXITCODE -ne 0) { throw "worker --install-service failed with $LASTEXITCODE" }
+
+          try {
+            $svc = Get-CimInstance Win32_Service -Filter "Name='FastCacheCompileNode'"
+            if (-not $svc) { throw 'FastCacheCompileNode was not registered' }
+
+            # The assertion this step exists for.
+            if ($svc.StartName -ne 'NT SERVICE\FastCacheCompileNode') {
+              throw "worker runs as '$($svc.StartName)', expected NT SERVICE\FastCacheCompileNode"
+            }
+
+            # A virtual account cannot write a directory an administrator created,
+            # which LocalSystem never noticed. The install grants it explicitly, and
+            # the trustee only resolves once the service exists -- so this also pins
+            # that the grant happens after CreateService and not before.
+            $granted = (Get-Acl $cacheDir).Access | Where-Object {
+              $_.IdentityReference.Value -eq 'NT SERVICE\FastCacheCompileNode' -and $_.AccessControlType -eq 'Allow'
+            }
+            if (-not $granted) { throw "$cacheDir carries no ACE for the worker's virtual account" }
+
+            # And it must actually run under that identity. A registration that
+            # cannot start is the failure this project refuses at install time, so
+            # it must not be introduced by the installer either. The heartbeat
+            # retries in a background thread, so an unreachable scheduler does not
+            # stop the service.
+            Start-Service FastCacheCompileNode
+            for ($i = 0; $i -lt 30 -and (Get-Service FastCacheCompileNode).Status -ne 'Running'; $i++) { Start-Sleep 1 }
+            if ((Get-Service FastCacheCompileNode).Status -ne 'Running') {
+              throw "worker did not start under its virtual account: $((Get-Service FastCacheCompileNode).Status)"
+            }
+            Stop-Service FastCacheCompileNode -Force
+          }
+          finally {
+            & $node --uninstall-service
+          }
+
+          if (Get-Service -Name FastCacheCompileNode -ErrorAction SilentlyContinue) {
+            throw 'FastCacheCompileNode survived --uninstall-service'
+          }
+
       # The configuration half of the same promise, which nothing asserted
       # before: the .deb/.rpm conffile and the .pkg postinstall are both checked
       # end to end below and on macOS, while the MSI's seeding action is
@@ -1406,6 +1504,18 @@ jobs:
 
           if (-not (Select-String -Path $cfg -Pattern ([regex]::Escape($marker)) -Quiet)) {
             throw 'the reinstall overwrote the operator edit'
+          }
+
+          # The upgrade path for the service identity. A reinstall re-registers the
+          # daemon, so this is where a change to what it logs on as would strand an
+          # existing installation -- registered, and unable to start.
+          for ($i = 0; $i -lt 30 -and (Get-Service FastCached).Status -ne 'Running'; $i++) { Start-Sleep 1 }
+          if ((Get-Service FastCached).Status -ne 'Running') {
+            throw 'the daemon did not come back up after a reinstall'
+          }
+          $svc = Get-CimInstance Win32_Service -Filter "Name='FastCached'"
+          if ($svc.StartName -ne 'NT SERVICE\FastCached') {
+            throw "after reinstall the daemon runs as '$($svc.StartName)'"
           }
 
       - name: "Uninstall and verify the service is gone"
