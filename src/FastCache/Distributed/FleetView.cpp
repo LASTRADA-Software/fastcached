@@ -258,20 +258,16 @@ namespace
 
     /// What a member row shows.
     constexpr std::array<FleetColumn<Cluster::ClusterMember>, 3> MemberColumns {
-        FleetColumn<Cluster::ClusterMember> { .name = "id",
-                                              .help = "The member's stable identity: what consensus counts.",
-                                              .format = CellFormat::Text,
-                                              .project =
-                                                  [](Cluster::ClusterMember const& m) {
-                                                      return FleetCell::Of(m.id);
-                                                  } },
-        FleetColumn<Cluster::ClusterMember> { .name = "raft-endpoint",
-                                              .help = "Where its consensus port answers. Always present.",
-                                              .format = CellFormat::Text,
-                                              .project =
-                                                  [](Cluster::ClusterMember const& m) {
-                                                      return FleetCell::Of(m.raftEndpoint);
-                                                  } },
+        FleetColumn<Cluster::ClusterMember> {
+            .name = "id",
+            .help = "The member's stable identity: what consensus counts.",
+            .format = CellFormat::Text,
+            .project = [](Cluster::ClusterMember const& m) { return FleetCell::Of(m.id); } },
+        FleetColumn<Cluster::ClusterMember> {
+            .name = "raft-endpoint",
+            .help = "Where its consensus port answers. Always present.",
+            .format = CellFormat::Text,
+            .project = [](Cluster::ClusterMember const& m) { return FleetCell::Of(m.raftEndpoint); } },
         FleetColumn<Cluster::ClusterMember> {
             .name = "scheduler-endpoint",
             .help = "Where clients reach the fleet while this member leads. Absent until it has led.",
@@ -290,17 +286,11 @@ namespace
         FleetColumn<NodeReport> { .name = "endpoint",
                                   .help = "host:port the machine answers on.",
                                   .format = CellFormat::Text,
-                                  .project =
-                                      [](NodeReport const& n) {
-                                          return FleetCell::Of(n.endpoint);
-                                      } },
+                                  .project = [](NodeReport const& n) { return FleetCell::Of(n.endpoint); } },
         FleetColumn<NodeReport> { .name = "toolchains",
                                   .help = "How many toolchains this one machine serves. Each is a separate registry entry.",
                                   .format = CellFormat::Count,
-                                  .project =
-                                      [](NodeReport const& n) {
-                                          return FleetCell::Of(n.fingerprints.size());
-                                      } },
+                                  .project = [](NodeReport const& n) { return FleetCell::Of(n.fingerprints.size()); } },
         FleetColumn<NodeReport> { .name = "cores",
                                   .help = "Hardware threads. Absent when the machine could not read its own.",
                                   .format = CellFormat::Count,
@@ -333,42 +323,30 @@ namespace
         FleetColumn<NodeReport> { .name = "cpu-busy",
                                   .help = "Host-wide CPU in use, this fleet's work included. Absent when unread.",
                                   .format = CellFormat::Permille,
-                                  .project =
-                                      [](NodeReport const& n) {
-                                          return FleetCell::Maybe(n.load.cpuBusyPermille);
-                                      } },
-        FleetColumn<NodeReport> { .name = "memory-available",
-                                  .help = "Memory a new compile could get. Absent when unread.",
-                                  .format = CellFormat::Bytes,
-                                  .project =
-                                      [](NodeReport const& n) {
-                                          return FleetCell::Maybe(n.load.availableMemoryBytes);
-                                      } },
+                                  .project = [](NodeReport const& n) { return FleetCell::Maybe(n.load.cpuBusyPermille); } },
+        FleetColumn<NodeReport> {
+            .name = "memory-available",
+            .help = "Memory a new compile could get. Absent when unread.",
+            .format = CellFormat::Bytes,
+            .project = [](NodeReport const& n) { return FleetCell::Maybe(n.load.availableMemoryBytes); } },
         FleetColumn<NodeReport> { .name = "scratch-free",
                                   .help = "Room where compiles run. The limit that most often reaches zero.",
                                   .format = CellFormat::Bytes,
-                                  .project =
-                                      [](NodeReport const& n) {
-                                          return FleetCell::Maybe(n.load.freeScratchBytes);
-                                      } },
+                                  .project = [](NodeReport const& n) { return FleetCell::Maybe(n.load.freeScratchBytes); } },
         FleetColumn<NodeReport> { .name = "cache-hit-rate",
                                   .help = "Reads this node's cache served. Absent when it has served none.",
                                   .format = CellFormat::Permille,
-                                  .project =
-                                      [](NodeReport const& n) {
-                                          return HitRateOf(n.load.cache);
-                                      } },
-        FleetColumn<NodeReport> { .name = "heartbeat-age",
-                                  .help = "Since this machine last reported. Everything on its row is that old.",
-                                  .format = CellFormat::Millis,
-                                  .decor = CellDecor::Freshness,
-                                  // The column that tells "this cache is empty" from "this node stopped
-                                  // answering an hour ago and these are its last figures" -- which look
-                                  // identical without it, and lead to opposite conclusions.
-                                  .project =
-                                      [](NodeReport const& n) {
-                                          return FleetCell::Of(static_cast<std::uint64_t>(n.heartbeatAge.count()));
-                                      } },
+                                  .project = [](NodeReport const& n) { return HitRateOf(n.load.cache); } },
+        FleetColumn<NodeReport> {
+            .name = "heartbeat-age",
+            .help = "Since this machine last reported. Everything on its row is that old.",
+            .format = CellFormat::Millis,
+            .decor = CellDecor::Freshness,
+            // The column that tells "this cache is empty" from "this node stopped
+            // answering an hour ago and these are its last figures" -- which look
+            // identical without it, and lead to opposite conclusions.
+            .project =
+                [](NodeReport const& n) { return FleetCell::Of(static_cast<std::uint64_t>(n.heartbeatAge.count())); } },
     };
 
     /// What a worker row shows.
@@ -376,38 +354,23 @@ namespace
         FleetColumn<WorkerReport> { .name = "id",
                                     .help = "The id this leader assigned at registration.",
                                     .format = CellFormat::Text,
-                                    .project =
-                                        [](WorkerReport const& w) {
-                                            return FleetCell::Of(w.info.id);
-                                        } },
+                                    .project = [](WorkerReport const& w) { return FleetCell::Of(w.info.id); } },
         FleetColumn<WorkerReport> { .name = "toolchain",
                                     .help = "Matched byte-for-byte. A job never crosses fingerprints.",
                                     .format = CellFormat::Text,
-                                    .project =
-                                        [](WorkerReport const& w) {
-                                            return FleetCell::Of(w.info.fingerprint);
-                                        } },
+                                    .project = [](WorkerReport const& w) { return FleetCell::Of(w.info.fingerprint); } },
         FleetColumn<WorkerReport> { .name = "endpoint",
                                     .help = "host:port a client is sent to.",
                                     .format = CellFormat::Text,
-                                    .project =
-                                        [](WorkerReport const& w) {
-                                            return FleetCell::Of(w.info.endpoint);
-                                        } },
+                                    .project = [](WorkerReport const& w) { return FleetCell::Of(w.info.endpoint); } },
         FleetColumn<WorkerReport> { .name = "slots",
                                     .help = "Concurrent compiles it registered with.",
                                     .format = CellFormat::Count,
-                                    .project =
-                                        [](WorkerReport const& w) {
-                                            return FleetCell::Of(w.info.slots);
-                                        } },
+                                    .project = [](WorkerReport const& w) { return FleetCell::Of(w.info.slots); } },
         FleetColumn<WorkerReport> { .name = "in-flight",
                                     .help = "This fleet's compiles running on it right now.",
                                     .format = CellFormat::Count,
-                                    .project =
-                                        [](WorkerReport const& w) {
-                                            return FleetCell::Of(w.info.inFlight);
-                                        } },
+                                    .project = [](WorkerReport const& w) { return FleetCell::Of(w.info.inFlight); } },
         FleetColumn<WorkerReport> {
             .name = "available",
             .help = "Compiles it may take right now. Below the registered count when something withdrew capacity.",
@@ -426,14 +389,13 @@ namespace
                                                 SlotCeilingsFor(w.info.capacity, w.info.slots, w.info.load);
                                             return FleetCell::Of(std::string { TraitsFor(ceilings.binding).name });
                                         } },
-        FleetColumn<WorkerReport> { .name = "heartbeat-age",
-                                    .help = "Since this entry last reported. A worker unheard-from is dropped.",
-                                    .format = CellFormat::Millis,
-                                    .decor = CellDecor::Freshness,
-                                    .project =
-                                        [](WorkerReport const& w) {
-                                            return FleetCell::Of(static_cast<std::uint64_t>(w.heartbeatAge.count()));
-                                        } },
+        FleetColumn<WorkerReport> {
+            .name = "heartbeat-age",
+            .help = "Since this entry last reported. A worker unheard-from is dropped.",
+            .format = CellFormat::Millis,
+            .decor = CellDecor::Freshness,
+            .project =
+                [](WorkerReport const& w) { return FleetCell::Of(static_cast<std::uint64_t>(w.heartbeatAge.count())); } },
     };
 
     /// The per-tier cache columns, rendered once per tier a member actually runs.

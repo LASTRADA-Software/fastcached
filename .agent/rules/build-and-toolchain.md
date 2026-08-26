@@ -126,6 +126,24 @@ determinism rests on.
   `ExitUsage` for the same reason: seven copies of a magic exit code is the
   table-shaped defect this list keeps recording.
 
+- **Never run `clang-format -i` with a version other than the pinned one.** As a
+  *checker* an older binary is worth something; as a *formatter* it rewrites code
+  the pinned version already blessed, and the diff is invisible in review because
+  every line of it is "just formatting". Running `clang-format-18 -i` on
+  `FleetView.cpp` to tidy three added lines reflowed all three column tables --
+  code the change never touched -- and `Check C++ style` rejected 80 lines at
+  clang-format 22, none of them new.
+
+  The repair is not to reformat again but to **restore the untouched region
+  byte-for-byte** from the last commit that passed the style job, then re-insert
+  only the new lines, and prove it: a diff of that region against the good commit
+  must show insertions and *zero* deletions. That is the whole check when the
+  pinned binary cannot be installed -- which is the case on a host whose apt
+  mirror has no `clang-format-22`.
+
+  So: run the older one as `--dry-run` on the lines **you** added, never with
+  `-i`, and never let it touch a file you are only passing through.
+
 - **A `bool` in the middle of a config struct costs seven bytes, and four of them
   fail the build.** `clang-analyzer-optin.performance.Padding` permits 24 bytes more
   padding than an optimal field order would give, and `NodeConfig` is almost entirely

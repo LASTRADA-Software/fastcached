@@ -283,6 +283,8 @@ what differs between compilers, standard libraries, hosts and tool versions.
   a configure.
 - A sanitizer that is on in the cache is not one that is on in the build — a tool
   that silently does nothing is worse than one that is visibly off.
+- `clang-format -i` at any version but the pinned one silently reformats code the
+  pinned one already accepted; run an older binary as `--dry-run` only.
 - Every `bool` and byte-wide enum in a config struct lives in one run: one between two
   8-aligned members costs seven bytes, and clang-tidy's padding budget fails the build.
 - A table indexed by an enumerator is `EnumTable<Enum, Row>` + `RowsInEnumeratorOrder`.
