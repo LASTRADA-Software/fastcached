@@ -448,6 +448,19 @@ namespace
         });
     }
 
+    /// The count for one `LeaseOutcomeTable` row, or zero when the snapshot is short.
+    ///
+    /// A snapshot collected without a metrics sink carries no counts at all, and
+    /// both renderers walk the table regardless -- so the bounds check belongs in
+    /// one place rather than being spelled the same way twice and drifting.
+    /// @param snapshot What to read.
+    /// @param index The row's position in `LeaseOutcomeTable`.
+    /// @return The count, or zero.
+    [[nodiscard]] std::uint64_t CountAt(FleetSnapshot const& snapshot, std::size_t index) noexcept
+    {
+        return index < snapshot.leases.size() ? snapshot.leases[index] : 0;
+    }
+
     /// How the page and the JSON both name a role.
     [[nodiscard]] std::string_view RoleName(SchedulerRole role) noexcept
     {
@@ -631,15 +644,13 @@ std::string RenderFleetJson(FleetSnapshot const& snapshot)
     out += ',';
     AppendJsonString(out, "leases");
     out += ":{";
-    for (auto const& [index, row]: std::views::enumerate(LeaseOutcomeTable))
+    for (auto const index: std::views::iota(std::size_t { 0 }, LeaseOutcomeTable.size()))
     {
         if (index != 0)
             out += ',';
-        AppendJsonString(out, row.key);
+        AppendJsonString(out, LeaseOutcomeTable[index].key);
         out += ':';
-        out += std::format(
-            "{}",
-            static_cast<std::size_t>(index) < snapshot.leases.size() ? snapshot.leases[static_cast<std::size_t>(index)] : 0);
+        out += std::format("{}", CountAt(snapshot, index));
     }
     out += '}';
 
@@ -790,12 +801,13 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, unsigned refreshSecon
 
     out += "<h2>Leases</h2><div class=\"wrap\"><table><thead><tr><th>outcome</th><th>count</th><th>what it means"
            "</th></tr></thead><tbody>";
-    for (auto const& [index, row]: std::views::enumerate(LeaseOutcomeTable))
+    for (auto const index: std::views::iota(std::size_t { 0 }, LeaseOutcomeTable.size()))
     {
-        auto const value =
-            static_cast<std::size_t>(index) < snapshot.leases.size() ? snapshot.leases[static_cast<std::size_t>(index)] : 0;
-        out +=
-            std::format("<tr><td>{}</td><td>{}</td><td>{}</td></tr>", EscapeHtml(row.label), value, EscapeHtml(row.meaning));
+        auto const& row = LeaseOutcomeTable[index];
+        out += std::format("<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                           EscapeHtml(row.label),
+                           CountAt(snapshot, index),
+                           EscapeHtml(row.meaning));
     }
     out += "</tbody></table>";
     out += std::format(R"(<p class="note">{}</p></div>)", EscapeHtml(LeaseNote));

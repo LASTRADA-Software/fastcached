@@ -33,6 +33,18 @@ determinism rests on.
   timing seam, or anything a test harness's determinism rests on, build **at least
   one release configuration and one non-clang compiler** locally —
   `cmake --preset gcc-release` and `clang-release` both exist and both run in WSL.
+  - **libc++ does not have every C++23 library feature libstdc++ has, and the
+    failure is a compile error on one platform only.** `std::views::enumerate`
+    compiles under GCC 13's libstdc++ and does not exist in libc++ at all, so
+    `FleetView.cpp` built clean locally and broke the macOS package job -- a
+    configuration whose *first* compile of the change is in CI. This is a different
+    shape from the `uniform_int_distribution` case above: not two implementations
+    disagreeing, but one of them not shipping the header's contents. Before reaching
+    for a C++23 *library* facility that this codebase does not already use
+    somewhere macOS compiles, check that it does -- `grep` for it in non-test code
+    is enough, since the package job builds the library and every app. The
+    workaround is nearly always a C++20 spelling: `std::views::iota` over the
+    index range says what `enumerate` says and is ten years older.
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins.** Both jobs
   run the `$CLANG_TOOLS_VERSION` binary (`.github/workflows/build.yml`), and successive LLVM
   releases do not agree with each other: the style job compares against a *newer formatter*,
