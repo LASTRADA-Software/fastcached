@@ -296,6 +296,23 @@ struct NodeConfig
     /// every other machine.
     std::string discoveryAddress;
 
+    /// Port this node's peers unicast their challenges and proofs to; 0 lets the
+    /// kernel choose.
+    ///
+    /// **Not the beacon port, and it cannot be.** A beacon is a broadcast, so
+    /// every node on the segment binds the same port -- co-hosted nodes on one
+    /// machine included -- and only one of the sockets sharing a port is handed a
+    /// unicast. A node that answered there would be answering for its whole
+    /// machine, which is why two nodes on one host never finished proving the key.
+    ///
+    /// Kernel-chosen by default, because that always works and needs nobody to
+    /// pick a number. It exists for one deployment where that is not enough: a
+    /// host firewall scoped to the beacon port alone passes beacons and drops
+    /// every challenge and proof, which presents as peers that are seen and never
+    /// admitted. Pinning this is what such a site opens instead -- one port per
+    /// node on the machine, since two nodes cannot share it.
+    std::uint16_t discoveryReplyPort { 0 };
+
     /// File holding the cluster's pre-shared key.
     ///
     /// A path rather than the key itself, and that is a security decision rather

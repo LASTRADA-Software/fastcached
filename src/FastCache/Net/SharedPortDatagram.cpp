@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Net/SharedPortDatagram.hpp>
+#include <FastCache/Net/UdpSocket.hpp>
 
 #include <algorithm>
 #include <array>
@@ -138,6 +139,18 @@ std::unique_ptr<IDatagramSocket> AnswerFromOwnAddress(std::unique_ptr<IDatagramS
         return nullptr;
 
     return std::make_unique<SharedPortDatagramSocket>(std::move(shared), std::move(own));
+}
+
+std::unique_ptr<IDatagramSocket> OpenSharedPortUdpSocket(std::string_view bindAddress,
+                                                         std::uint16_t sharedPort,
+                                                         std::uint16_t ownPort)
+{
+    // The listener sends nothing, so it needs no broadcast capability; the
+    // private socket sends everything, so it carries it. That reads backwards
+    // until it is taken literally -- hearing a broadcast needs no permission,
+    // sending one does -- which is exactly why it is spelled once, here.
+    return AnswerFromOwnAddress(OpenUdpSocket(bindAddress, sharedPort, BroadcastMode::Off, PortSharing::Shared),
+                                OpenUdpSocket(bindAddress, ownPort, BroadcastMode::On, PortSharing::Exclusive));
 }
 
 } // namespace FastCache

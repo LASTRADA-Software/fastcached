@@ -119,7 +119,13 @@ class DiscoveryTier
     /// @return False when the socket has closed and the loop should end.
     bool Step(std::chrono::milliseconds timeout);
 
-    /// Where this node's discovery socket bound, as text for a log line.
+    /// Where a peer's challenge or proof reaches this node, as text for a log line.
+    ///
+    /// **Not the beacon port.** A node listens for beacons where every other node
+    /// on the segment does and answers from an address of its own, because only
+    /// one socket on a shared port is handed a unicast -- see
+    /// `Net/SharedPortDatagram`. This is that own address, which is what the
+    /// socket reports and what a peer replies to.
     ///
     /// The join lives above the socket for the reason `Cc::DialEndpoint` exists
     /// -- see `DatagramAddress`. Out of line so that reason does not make

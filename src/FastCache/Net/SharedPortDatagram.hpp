@@ -3,7 +3,9 @@
 
 #include <FastCache/Net/IDatagramSocket.hpp>
 
+#include <cstdint>
 #include <memory>
+#include <string_view>
 
 namespace FastCache
 {
@@ -51,5 +53,28 @@ namespace FastCache
 ///         is how `OpenUdpSocket` reports a bind it could not make.
 [[nodiscard]] std::unique_ptr<IDatagramSocket> AnswerFromOwnAddress(std::unique_ptr<IDatagramSocket> shared,
                                                                     std::unique_ptr<IDatagramSocket> own);
+
+/// Open the two UDP sockets `AnswerFromOwnAddress` pairs, over the real stack.
+///
+/// One place, because which socket gets which option is the whole fix and every
+/// one of the four is easy to put on the wrong half. Transposing the two ports
+/// yields a node answering where the segment shouts; moving `BroadcastMode::On`
+/// to the listener yields one that is reachable and never announces itself. A
+/// caller that passes two ports cannot make either mistake, and a caller that
+/// spelled the four options out could make both and still pass a test suite.
+///
+/// | socket   | binds                    | sharing   | broadcast |
+/// |----------|--------------------------|-----------|-----------|
+/// | listener | @p sharedPort            | Shared    | Off       |
+/// | own      | @p ownPort               | Exclusive | On        |
+/// @param bindAddress Address to bind both, e.g. `0.0.0.0`.
+/// @param sharedPort The well-known port the segment broadcasts to.
+/// @param ownPort The port to be answered on; 0 lets the kernel choose, which is
+///        what a node wants unless something outside it needs to predict the
+///        number.
+/// @return The pair as one socket, or nullptr when either could not be bound.
+[[nodiscard]] std::unique_ptr<IDatagramSocket> OpenSharedPortUdpSocket(std::string_view bindAddress,
+                                                                       std::uint16_t sharedPort,
+                                                                       std::uint16_t ownPort);
 
 } // namespace FastCache

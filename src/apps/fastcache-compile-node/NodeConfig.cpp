@@ -432,6 +432,16 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "here; off unless given. Needs --node-id and\n"
                          "--cluster-key-file. Without it a cluster is exactly\n"
                          "the --raft-peer list an operator typed." },
+        { .primary = "--discovery-reply-port",
+          .arity = Arity::Value,
+          .operand = "=<n>",
+          .apply = AssignFrom<&NodeConfig::discoveryReplyPort, ParseNodePort>(),
+          .description = "port peers unicast their discovery challenges and\n"
+                         "proofs to; kernel-chosen unless given. NOT the\n"
+                         "--discovery port: that one is shared by every node on\n"
+                         "the segment, and only one socket sharing a port is\n"
+                         "handed a unicast. Pin it where a host firewall opens\n"
+                         "named ports only -- one per node on the machine." },
         { .primary = "--cluster-key-file",
           .arity = Arity::Value,
           .operand = "=<path>",
@@ -707,6 +717,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitPathIfSet("cluster-dir", cfg.clusterDir.string());
     emitIfSet("cluster-id", cfg.clusterId, defaults.clusterId);
     emitIfSet("discovery", cfg.discoveryAddress, defaults.discoveryAddress);
+    emitIfSet("discovery-reply-port", cfg.discoveryReplyPort, defaults.discoveryReplyPort);
     emitPathIfSet("cluster-key-file", cfg.clusterKeyFile.string());
     // Repeatable, so one token per peer rather than one joined value -- for the
     // reason the toolchains are: a service that came back knowing fewer members than
@@ -881,6 +892,22 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--discovery needs --cluster-key-file: a beacon is unauthenticated by construction, so the "
                      "key is the only thing separating a peer from anything else on the segment. With none, no "
                      "peer can ever be admitted and this node would announce itself forever to no effect." },
+        { .refuses = [](NodeConfig const& c) { return c.discoveryReplyPort != 0 && c.discoveryAddress.empty(); },
+          .message = "--discovery-reply-port is where discovery is ANSWERED, and --discovery is not set. A port "
+                     "pinned for a service that is off is a port nothing will ever bind, so this is a typo or a "
+                     "half-finished configuration rather than an instruction." },
+        { .refuses =
+              [](NodeConfig const& c) {
+                  if (c.discoveryReplyPort == 0)
+                      return false;
+                  auto const beacon = SplitHostPort(c.discoveryAddress);
+                  return beacon.has_value() && ParseTcpPort(beacon->second) == c.discoveryReplyPort;
+              },
+          .message = "--discovery-reply-port names the --discovery port, and they are the two halves this node "
+                     "keeps APART. It listens on the beacon port, which every node on the segment shares, and "
+                     "answers somewhere only it holds -- because just one of the sockets sharing a port is handed "
+                     "a unicast. Pointing both at one port is the configuration that made two nodes on a host see "
+                     "each other and never finish proving the key. Pick another, or leave it unset." },
         { .refuses = [](NodeConfig const& c) { return !c.clusterKeyFile.empty() && c.discoveryAddress.empty(); },
           .message = "--cluster-key-file is read by discovery and nothing else, and --discovery is not set. A "
                      "secret an operator went to the trouble of provisioning, being read by nobody, is exactly "

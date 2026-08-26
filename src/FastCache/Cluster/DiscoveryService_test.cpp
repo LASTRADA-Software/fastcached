@@ -5,11 +5,13 @@
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/InMemoryDatagram.hpp>
+#include <FastCache/Net/SharedPortDatagram.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -62,7 +64,22 @@ namespace
 /// setup than on the property being asserted.
 struct Node
 {
-    Node(DatagramBus& bus,
+    /// Over a socket and a beacon address somebody else chose.
+    ///
+    /// The door the co-hosted cases take, because what they vary is precisely
+    /// the socket: two nodes on one machine listen on the SAME beacon address
+    /// and must still be answerable apart.
+    /// @param ownSocket Where this node's datagrams come from and go.
+    /// @param beaconAddress Where it announces itself.
+    /// @param clock Time source.
+    /// @param random Where nonces come from.
+    /// @param logger Where joins and rejections are reported.
+    /// @param id This node's identity.
+    /// @param endpoint Where it answers Raft peer traffic.
+    /// @param cluster Which fleet it belongs to.
+    /// @param key The cluster key it holds.
+    Node(std::unique_ptr<IDatagramSocket> ownSocket,
+         DatagramAddress beaconAddress,
          IClock& clock,
          IRandomSource& random,
          ILogger& logger,
@@ -70,7 +87,7 @@ struct Node
          std::string endpoint,
          std::string cluster,
          std::string const& key):
-        socket { bus.Open(AtEndpoint(endpoint)) },
+        socket { std::move(ownSocket) },
         directory { clock, cluster, id },
         service { *socket,
                   clock,
@@ -79,9 +96,41 @@ struct Node
                   DiscoveryConfig { .clusterId = std::move(cluster),
                                     .nodeId = std::move(id),
                                     .raftEndpoint = std::move(endpoint),
-                                    .beaconAddress = DatagramBus::BroadcastAddress(),
+                                    .beaconAddress = std::move(beaconAddress),
                                     .presharedKey = Key(key) },
                   logger }
+    {
+    }
+
+    /// One node per address, which is what most of these cases want.
+    /// @param bus The segment.
+    /// @param clock Time source.
+    /// @param random Where nonces come from.
+    /// @param logger Where joins and rejections are reported.
+    /// @param id This node's identity.
+    /// @param endpoint Where it answers Raft peer traffic, and where it listens.
+    /// @param cluster Which fleet it belongs to.
+    /// @param key The cluster key it holds.
+    Node(DatagramBus& bus,
+         IClock& clock,
+         IRandomSource& random,
+         ILogger& logger,
+         std::string id,
+         std::string endpoint,
+         std::string cluster,
+         std::string const& key):
+        // Copied rather than moved into the delegation: `AtEndpoint(endpoint)`
+        // is evaluated in the same argument list, and the order of the two is
+        // unspecified.
+        Node(bus.Open(AtEndpoint(endpoint)),
+             DatagramBus::BroadcastAddress(),
+             clock,
+             random,
+             logger,
+             id,
+             endpoint,
+             cluster,
+             key)
     {
     }
 
@@ -89,6 +138,25 @@ struct Node
     PeerDirectory directory;
     DiscoveryService service;
 };
+
+/// The port every node on a segment listens for beacons on.
+constexpr std::uint16_t BeaconPort = 6681;
+
+/// A socket for a node co-hosted with others, listening where they all do.
+///
+/// Two halves, and that is the point: the shared one hears the broadcast every
+/// node on the segment is listening for, and the private one is what this node
+/// sends from -- so the address a peer replies to names this node rather than
+/// the machine it happens to share. See `Net/SharedPortDatagram`.
+/// @param bus The segment.
+/// @param host The machine; co-hosted nodes pass the same one.
+/// @param ownPort The port only this node holds.
+/// @return The pair, as one socket.
+[[nodiscard]] std::unique_ptr<IDatagramSocket> CoHostedSocket(DatagramBus& bus, std::string_view host, std::uint16_t ownPort)
+{
+    return AnswerFromOwnAddress(bus.Open(DatagramAddress { .host = std::string { host }, .port = BeaconPort }),
+                                bus.Open(DatagramAddress { .host = std::string { host }, .port = ownPort }));
+}
 
 /// Drain everything waiting for @p node, so a test can settle the segment.
 /// @param node Whose inbox to drain.
@@ -101,6 +169,58 @@ std::size_t Drain(Node& node)
     return handled;
 }
 } // namespace
+
+TEST_CASE("Two nodes on one host share a beacon port and still prove the key", "[cluster][discovery][service]")
+{
+    // The configuration the whole shared-port shape exists for, and the one that
+    // used to fail in silence. A beacon is a broadcast, so every node on a
+    // segment binds the SAME port -- including two nodes that happen to be on one
+    // machine. Sharing that port is what lets both hear a beacon; it is also what
+    // makes a unicast to it arrive at only one of them, and the challenge and the
+    // proof are both unicast.
+    //
+    // Before this, a node answered from the port it shared, so the address a peer
+    // replied to named the MACHINE. Every challenge and every proof went to
+    // whichever co-hosted node the kernel picked, each one arriving somewhere
+    // that had not asked for it, and the pair sat there seen-but-unproved
+    // forever with nothing logged.
+    DatagramBus bus;
+    ManualClock clock;
+    ScriptedRandomSource random { { 1, 2, 3, 4, 5, 6, 7, 8 } };
+    NullLogger logger;
+
+    auto const beacon = DatagramBus::BroadcastAddressOn(BeaconPort);
+
+    Node first {
+        CoHostedSocket(bus, "10.0.0.1", 40001), beacon, clock, random, logger, "first", "10.0.0.1:7000", "prod", "secret"
+    };
+    Node second {
+        CoHostedSocket(bus, "10.0.0.1", 40002), beacon, clock, random, logger, "second", "10.0.0.1:7001", "prod", "secret"
+    };
+
+    REQUIRE(first.service.SendBeacon());
+    REQUIRE(second.service.SendBeacon());
+
+    // Settled by draining both sides in turn rather than by a scripted sequence
+    // of steps: a challenge one side issues is an answer the other has to see, so
+    // each needs a turn after the other has had one. Four rounds is well over the
+    // three legs a handshake takes.
+    for (auto round = 0; round < 4; ++round)
+    {
+        Drain(first);
+        Drain(second);
+    }
+
+    auto const atFirst = first.directory.AuthenticatedPeers();
+    REQUIRE(atFirst.size() == 1);
+    CHECK(atFirst.front().nodeId == "second");
+    CHECK(atFirst.front().raftEndpoint == "10.0.0.1:7001");
+
+    auto const atSecond = second.directory.AuthenticatedPeers();
+    REQUIRE(atSecond.size() == 1);
+    CHECK(atSecond.front().nodeId == "first");
+    CHECK(atSecond.front().raftEndpoint == "10.0.0.1:7000");
+}
 
 TEST_CASE("Two nodes discover each other and prove the key", "[cluster][discovery][service]")
 {

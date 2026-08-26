@@ -177,6 +177,7 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.clusterDir = "cluster";
     cfg.clusterId = "fleet-a";
     cfg.discoveryAddress = "255.255.255.255:6681";
+    cfg.discoveryReplyPort = 6682;
     cfg.clusterKeyFile = "cluster.key";
     cfg.logLevel = LogLevel::Debug;
     cfg.pidfile = "worker.pid";
@@ -641,6 +642,60 @@ TEST_CASE("NodeConfig: a reserve of zero parses, unlike a slot count of zero", "
     CHECK(Unwrap(none->reservedCores) == 0U);
 
     CHECK_FALSE(ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--slots=0" }).has_value());
+}
+
+TEST_CASE("NodeConfig: the discovery reply port is pinned by name and needs discovery", "[node][cli]")
+{
+    // Where a node is ANSWERED, which is never where it listens: every node on
+    // the segment binds the beacon port, and only one socket sharing a port is
+    // handed a unicast. Kernel-chosen by default -- the value nobody has to pick
+    // -- and pinned only where a host firewall opens named ports and would
+    // otherwise drop every challenge and proof.
+    auto const base = std::vector<char const*> { "--scheduler=s:1",
+                                                 "--toolchain=/usr/bin/cc",
+                                                 "--node-id=n1",
+                                                 "--cluster-key-file=cluster.key",
+                                                 "--discovery=255.255.255.255:6681" };
+
+    auto const unset = ParseNodeArgv(base);
+    REQUIRE(unset.has_value());
+    CHECK(unset->discoveryReplyPort == 0);
+
+    auto const withPort = [&base](char const* flag) {
+        auto args = base;
+        args.push_back(flag);
+        return ParseNodeArgv(args);
+    };
+
+    auto const parsed = withPort("--discovery-reply-port=6682");
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->discoveryReplyPort == 6682);
+
+    // Zero is not an answer here, unlike --reserve-cores: it is what the default
+    // already is, so typing it means the operator got the flag wrong.
+    CHECK_FALSE(withPort("--discovery-reply-port=0").has_value());
+
+    // And pinning where nothing answers is a half-finished configuration rather
+    // than an instruction, so it is refused at startup rather than ignored -- a
+    // port reserved for a service that is off is a port nothing will ever bind.
+    //
+    // Dereferenced directly rather than through `Unwrap`: that helper is for
+    // `std::optional`, which clang-tidy cannot see a REQUIRE guard through, and
+    // `std::expected` does not go through it.
+    CHECK_FALSE(StartupPolicyRejection(*parsed).has_value());
+
+    auto orphaned = *parsed;
+    orphaned.discoveryAddress.clear();
+    CHECK(StartupPolicyRejection(orphaned).has_value());
+
+    // Pointing both halves at one port is the configuration the whole fix exists
+    // to prevent, so it is refused by name rather than left to fail at bind with
+    // a message that reads as somebody else holding the port.
+    auto collided = *parsed;
+    collided.discoveryReplyPort = 6681;
+    auto const refusal = StartupPolicyRejection(collided);
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).contains("--discovery-reply-port"));
 }
 
 TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node][capacity]")

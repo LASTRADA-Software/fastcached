@@ -2,7 +2,7 @@
 #include "DiscoveryTier.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Net/UdpSocket.hpp>
+#include <FastCache/Net/SharedPortDatagram.hpp>
 
 #include <cstdio>
 #include <format>
@@ -110,13 +110,31 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     if (!key.has_value())
         return std::unexpected { key.error() };
 
-    // Bound on the SAME port the beacons go to, and on the wildcard. A beacon is a
-    // broadcast, so every node has to be listening where the others shout -- an
-    // ephemeral local port would send perfectly and hear nothing, which presents as a
-    // segment of nodes that each believe they are alone.
-    auto socket = OpenUdpSocket("0.0.0.0", *port, BroadcastMode::On, PortSharing::Shared);
+    // Two sockets, and which does what is the whole of issue #126.
+    //
+    // A node LISTENS on the beacon port, on the wildcard, shared -- a beacon is a
+    // broadcast, so every node has to be where the others shout, and an ephemeral
+    // listening port would send perfectly and hear nothing. It ANSWERS somewhere
+    // only it holds, because sharing a port buys hearing a broadcast and nothing
+    // else: only one of the sockets sharing a port is handed a unicast, and both
+    // the challenge and the proof are unicast to wherever the last datagram came
+    // from. A node that answered on the shared port would be answering for its
+    // machine, which is why two nodes on one host never finished proving the key.
+    //
+    // Which socket takes which option is `OpenSharedPortUdpSocket`'s to know, not
+    // this function's: there are four of them, each easy to put on the wrong half,
+    // and every wrong pairing still starts and still passes a test suite.
+    auto socket = OpenSharedPortUdpSocket("0.0.0.0", *port, cfg.discoveryReplyPort);
     if (socket == nullptr)
-        return std::unexpected { std::format("cannot bind UDP 0.0.0.0:{} for discovery", *port) };
+        return std::unexpected { std::format("cannot bind UDP 0.0.0.0:{} for discovery{}",
+                                             *port,
+                                             cfg.discoveryReplyPort != 0
+                                                 ? std::format(" or 0.0.0.0:{} to answer it on", cfg.discoveryReplyPort)
+                                                 : std::string {}) };
+
+    // The port the operator configured, which is NOT the one the pair reports:
+    // that is where this node is answered. Both go in the startup line.
+    auto const listeningOn = FormatHostPort("0.0.0.0", *port);
 
     auto config = Cluster::DiscoveryConfig { .clusterId = cfg.clusterId,
                                              .nodeId = cfg.nodeId,
@@ -133,8 +151,16 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
             ;
     } };
 
-    logger.Logf(
-        LogLevel::Info, "discovery on {} for cluster {}, announcing {}", tier->BoundEndpoint(), cfg.clusterId, raftEndpoint);
+    // Both addresses, because they answer different operator questions: the first
+    // is the port that was configured and the one beacons are shouted to, and the
+    // second is where this node's peers unicast their challenges and proofs --
+    // which is what a host firewall has to let in, and is not the beacon port.
+    logger.Logf(LogLevel::Info,
+                "discovery listening on {}, answering from {}, for cluster {}, announcing {}",
+                listeningOn,
+                tier->BoundEndpoint(),
+                cfg.clusterId,
+                raftEndpoint);
     return tier;
 }
 
