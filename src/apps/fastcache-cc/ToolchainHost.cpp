@@ -3,6 +3,7 @@
 
 #include <FastCache/Platform/Environment.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -161,11 +162,6 @@ namespace
             return ReadRegistryString(hive, subKey, valueName, view);
         }
 
-        std::vector<std::string> RegistryValueNames(RegistryHive hive, std::string_view subKey, RegistryView view) override
-        {
-            return ListRegistryValueNames(hive, subKey, view);
-        }
-
         std::optional<std::string> Environment(std::string_view name) override
         {
             return ReadEnvironmentVariable(name);
@@ -221,6 +217,21 @@ namespace
         }
     };
 } // namespace
+
+std::string JoinPath(std::string_view directory, std::string_view relative)
+{
+    while (!directory.empty() && (directory.back() == '/' || directory.back() == '\\'))
+        directory.remove_suffix(1);
+
+    std::string joined { directory };
+    if (!relative.empty())
+    {
+        joined += '/';
+        joined += relative;
+    }
+    std::ranges::replace(joined, '\\', '/');
+    return joined;
+}
 
 std::unique_ptr<IToolchainHost> MakeToolchainHost()
 {

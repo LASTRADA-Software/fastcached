@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -88,6 +89,22 @@ enum class Grammar : std::uint8_t
 [[nodiscard]] constexpr char AsciiLower(char c) noexcept
 {
     return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+/// A copy of @p text with every ASCII letter folded down.
+///
+/// The whole-string form of the byte-level one above, here rather than re-spelled
+/// per caller: there were five copies of this three-line `ranges::transform`, each
+/// carrying its own note about `std::tolower` being locale-sensitive, and a rule
+/// written down five times is a rule four of them can drift from.
+///
+/// @param text What to fold.
+/// @return The folded copy.
+[[nodiscard]] inline std::string AsciiLower(std::string_view text)
+{
+    std::string folded { text };
+    std::ranges::transform(folded, folded.begin(), [](char c) { return AsciiLower(c); });
+    return folded;
 }
 
 /// True when `layout` describes a Windows build tree.

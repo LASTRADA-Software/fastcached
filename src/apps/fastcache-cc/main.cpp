@@ -824,10 +824,22 @@ struct SourceProbe
 {
     auto const banner = CompilerId(compiler);
     auto const flavor = Cc::ClassifyCompiler(compiler);
-    auto const fingerprint = Cc::CachedToolchainFingerprint(
+    auto const identity = Cc::CachedToolchainFingerprint(
         ProcessRunner(), ToolchainHost(), compiler, banner, Cc::DriverOf(flavor), /*forceRefresh=*/true);
 
-    std::cout << fingerprint << '\n';
+    std::cout << identity.fingerprint << '\n';
+
+    // Said out loud, on stderr so it cannot corrupt a digest somebody is piping.
+    // This command exists to answer "why did no worker match", and a degenerate
+    // identity is the one answer the digest itself cannot give: it is a well-formed
+    // hex string that every install of this compiler would also print. Without this
+    // line an operator compares two identical-looking values and concludes the two
+    // machines agree.
+    if (identity.degenerate)
+        std::cerr << "warning: " << compiler
+                  << " could not be asked its version and no include roots were found, so this "
+                     "fingerprint says nothing about which compiler it is -- every install of it "
+                     "digests the same\n";
     return 0;
 }
 
@@ -1313,7 +1325,8 @@ void RecordManifest(Config const& cfg,
     // several seconds the first time a machine sees a toolchain, and a build that
     // never dispatches must not pay that at all.
     auto const fingerprint = Cc::CachedToolchainFingerprint(
-        ProcessRunner(), ToolchainHost(), cmd.compiler, toolchainStamp, Cc::DriverOf(cmd.flavor));
+                                 ProcessRunner(), ToolchainHost(), cmd.compiler, toolchainStamp, Cc::DriverOf(cmd.flavor))
+                                 .fingerprint;
 
     auto const dialer = Cc::MakeTcpDialer(cfg.connectTimeout, cfg.ioTimeout);
     auto const outcome = Cc::Dispatch(*dialer,

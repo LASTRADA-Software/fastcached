@@ -82,32 +82,27 @@ namespace FastCache::Cc
 /// a worker and its clients permanently out of agreement, with no error anywhere,
 /// just a scheduler that never finds a match.
 ///
-/// Falls back to the compiler's basename when it cannot be run or says nothing.
-/// A weak identity beats an empty one: an empty banner would make every
-/// unrunnable compiler look like every other.
+/// Falls back to `NormalizedCompilerName` (in `CmdLine.hpp`) when the compiler
+/// cannot be run or says nothing. A weak identity beats an empty one: an empty
+/// banner would make every unrunnable compiler look like every other. Where that
+/// fallback is ALSO the whole identity, `ToolchainIdentity::degenerate` says so.
 ///
 /// @param runner Process-spawning seam.
 /// @param compiler The compiler to ask.
 /// @return The banner line, or the basename.
 [[nodiscard]] std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler);
 
-/// What `CompilerBanner` falls back to when a compiler cannot be asked.
+/// Whether a name is made only of digits and dots, with at least one digit.
 ///
-/// The basename, lowercased and stripped of `.exe`, exactly as `ClassifyCompiler`
-/// normalizes -- so "which driver is this" and "what do we call it" cannot
-/// disagree about `CL.EXE`.
+/// One predicate for two questions that must answer alike: which subdirectory of a
+/// Windows SDK's `Include` is a kit version (`10.0.26100.0` yes, `KitsRoot10` and
+/// the GUID-named values no), and which suffix on a compiler name is a version
+/// (`gcc-13` yes, `gcc-ar` no). A second spelling is a second set of rules for what
+/// counts as a version.
 ///
-/// Exposed so a CALLER can tell a real banner from the fallback, which is the only
-/// way to notice a **degenerate identity**: a fingerprint over the fallback name
-/// AND no include roots carries no information about which compiler it is, and
-/// two different toolchains then digest the same. `ToolchainProbe`'s own
-/// "weaker but still correct" argument for a banner-only fingerprint has a
-/// precondition nobody wrote down -- that the banner is a real version string --
-/// and this is what lets a caller check it.
-///
-/// @param compiler The compiler as invoked, bare name or path.
-/// @return Its normalized basename.
-[[nodiscard]] std::string NormalizedCompilerName(std::string_view compiler);
+/// @param name The candidate.
+/// @return True when it could be a version.
+[[nodiscard]] bool LooksLikeVersion(std::string_view name) noexcept;
 
 /// The VC half of an MSVC toolchain's include roots, from its own install layout.
 ///
@@ -138,14 +133,13 @@ namespace FastCache::Cc
 /// version, located through the registry rather than through the compiler: nothing
 /// about a `cl.exe` says which SDK it will be used with.
 ///
-/// The kit version comes from BOTH the value names under `Installed Roots` and the
-/// subdirectories of `Include`, because neither is reliable alone. Some machines
-/// record each installed kit as a version-named value; the one this was written on
-/// records `KitsRoot10` and two hundred GUIDs and nothing else, so a registry-only
-/// lookup finds no version at all. A directory-only lookup, conversely, cannot tell
-/// an installed kit from a leftover directory an uninstall did not remove. Both
-/// sources are unioned and then filtered to versions whose `Include` directory
-/// actually exists.
+/// The kit ROOT comes from the registry -- nothing else knows where it is -- and the
+/// kit VERSION from the subdirectories of `<root>/Include`. Not from the value names
+/// under `Installed Roots`: only a version with an `Include` directory is usable, so
+/// the listing is already the complete set of answers and a registry name could add
+/// none. (Telling an installed kit from a directory an uninstall left behind is a
+/// real question the registry could answer, but it needs its names treated as
+/// authoritative rather than unioned in, and that changes which kit is chosen.)
 ///
 /// **The HIGHEST installed kit is chosen, not the one the build selected**, and the
 /// imprecision is deliberate rather than overlooked. A build pins its kit through
@@ -209,6 +203,31 @@ namespace FastCache::Cc
                                                 std::string const& compiler,
                                                 std::span<std::string const> roots);
 
+/// A toolchain fingerprint, and whether it says anything about WHICH compiler it is.
+struct ToolchainIdentity
+{
+    std::string fingerprint; ///< The digest a client must match. Never empty.
+
+    /// True when the digest carries no information about which compiler this is.
+    ///
+    /// Reported HERE because this is the only place both halves are known, and
+    /// reconstructing it outside meant guessing which branch `CompilerBanner` took
+    /// and deriving the include roots a second time. The condition: the driver has
+    /// a way to find its include roots, that way found none, AND the banner is
+    /// itself the fallback name. All three, because each alone is ordinary --
+    /// `IncludeDiscovery::None` has no roots by construction, a real version banner
+    /// is an identity whatever its roots, and a fallback banner over a located
+    /// include tree is exactly the MSVC case that works.
+    ///
+    /// Together they are not a weak identity but no identity:
+    /// `KeyDigest("toolchain-v1").Field("cl")` is a value this repository could
+    /// print with no compiler installed, and every MSVC toolset in existence
+    /// produces it. The "weaker but still correct" argument above for a
+    /// banner-only fingerprint has an unstated precondition -- that the banner is a
+    /// real version string -- and this is that precondition, checked.
+    bool degenerate { false };
+};
+
 /// A toolchain fingerprint, computed once per machine and remembered.
 ///
 /// The full walk costs about 2 seconds over 288 MB on an ordinary Xcode
@@ -228,12 +247,13 @@ namespace FastCache::Cc
 /// @param banner Its version line, already obtained by the caller.
 /// @param spec The driver's table row.
 /// @param forceRefresh Skip the cached value and rewrite it.
-/// @return The fingerprint; never empty (it degrades to a banner-only digest).
-[[nodiscard]] std::string CachedToolchainFingerprint(IProcessRunner& runner,
-                                                     IToolchainHost& host,
-                                                     std::string const& compiler,
-                                                     std::string_view banner,
-                                                     DriverSpec const& spec,
-                                                     bool forceRefresh = false);
+/// @return The fingerprint and whether it means anything; the digest is never
+///         empty (it degrades to a banner-only one).
+[[nodiscard]] ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
+                                                           IToolchainHost& host,
+                                                           std::string const& compiler,
+                                                           std::string_view banner,
+                                                           DriverSpec const& spec,
+                                                           bool forceRefresh = false);
 
 } // namespace FastCache::Cc

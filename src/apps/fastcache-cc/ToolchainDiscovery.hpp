@@ -18,15 +18,15 @@ namespace FastCache::Cc
 struct ToolchainCandidate
 {
     /// Where it lives, as an absolute path.
-    std::string compiler;
-
-    /// Which driver family it is, from `ClassifyCompiler` and nowhere else.
     ///
-    /// Discovery adds CANDIDATES; it must never add a second way to decide what a
-    /// compiler is. A worker that derived its flavour -- and through it its
-    /// fingerprint -- differently from its clients would register successfully,
+    /// A PATH and a provenance, and deliberately nothing else. Discovery adds
+    /// CANDIDATES; it must never add a second way to decide what a compiler IS.
+    /// Carrying a flavour here would be exactly that -- a second answer, computed at
+    /// survey time, for a question `ClassifyCompiler` answers at fingerprint time
+    /// from the path alone. A worker that derived its flavour, and through it its
+    /// fingerprint, differently from its clients would register successfully,
     /// heartbeat happily, and never be matched, with nothing anywhere reporting why.
-    Flavor flavor { Flavor::Unknown };
+    std::string compiler;
 
     /// The layout row that found it, for the startup log.
     ///

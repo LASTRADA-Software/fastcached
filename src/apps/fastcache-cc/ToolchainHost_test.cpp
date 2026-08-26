@@ -27,61 +27,6 @@ namespace
 /// case runs against, so its own semantics have to be right or those cases assert
 /// against a fiction; the real host is what production uses, so the two must agree
 /// about what "a directory", "an executable" and "a listing" mean.
-class ScratchTree
-{
-  public:
-    explicit ScratchTree(std::string_view name):
-        // The unique parent is KEPT, not just used and forgotten: the destructor
-        // removes it rather than the root, or every case leaves an empty directory
-        // behind in the system temp for good. Same reasoning, and the same shape,
-        // as the helper in ToolchainProbe_test.cpp.
-        _base { FastCache::Testing::UniqueScratchPath("fc-tch") },
-        _root { _base / std::filesystem::path { std::string { name } } }
-    {
-        std::error_code ec;
-        std::filesystem::create_directories(_root, ec);
-    }
-
-    ~ScratchTree()
-    {
-        std::error_code ec;
-        std::filesystem::remove_all(_base, ec);
-    }
-
-    ScratchTree(ScratchTree const&) = delete;
-    ScratchTree& operator=(ScratchTree const&) = delete;
-    ScratchTree(ScratchTree&&) = delete;
-    ScratchTree& operator=(ScratchTree&&) = delete;
-
-    /// @return The tree's root.
-    [[nodiscard]] std::filesystem::path const& Root() const noexcept
-    {
-        return _root;
-    }
-
-    /// Write a file, creating the directories above it.
-    ///
-    /// Non-const because it changes the tree this object stands for -- which is
-    /// also what keeps the returned path from having to be `[[nodiscard]]`, since
-    /// most callers want the write and not the name.
-    ///
-    /// @param relative Path under the root.
-    /// @param contents What to write.
-    /// @return The absolute path written.
-    std::filesystem::path Write(std::string_view relative, std::string_view contents)
-    {
-        auto const path = _root / std::filesystem::path { relative };
-        std::error_code ec;
-        std::filesystem::create_directories(path.parent_path(), ec);
-        std::ofstream out { path, std::ios::binary };
-        out << contents;
-        return path;
-    }
-
-  private:
-    std::filesystem::path _base;
-    std::filesystem::path _root;
-};
 } // namespace
 
 TEST_CASE("The scripted host creates every directory above a file", "[toolchain-host]")
@@ -161,20 +106,6 @@ TEST_CASE("A scripted registry answers per hive and per view", "[toolchain-host]
         host.RegistryString(RegistryHive::CurrentUser, R"(SOFTWARE\LLVM\LLVM)", "", RegistryView::ThirtyTwoBit).has_value());
 }
 
-TEST_CASE("A scripted registry key lists the value names under it", "[toolchain-host]")
-{
-    // The shape `Installed Roots` has: the installed kits ARE the value names.
-    ScriptedToolchainHost host;
-    constexpr std::string_view roots = R"(SOFTWARE\Microsoft\Windows Kits\Installed Roots)";
-    host.AddRegistryValue(RegistryHive::LocalMachine, roots, "KitsRoot10", "C:/Kits/10/", RegistryView::ThirtyTwoBit);
-    host.AddRegistryValue(RegistryHive::LocalMachine, roots, "10.0.26100.0", "1", RegistryView::ThirtyTwoBit);
-    host.AddRegistryValue(RegistryHive::LocalMachine, R"(SOFTWARE\Other)", "Ignored", "x", RegistryView::ThirtyTwoBit);
-
-    auto names = host.RegistryValueNames(RegistryHive::LocalMachine, roots, RegistryView::ThirtyTwoBit);
-    std::ranges::sort(names);
-    CHECK(names == std::vector<std::string> { "10.0.26100.0", "KitsRoot10" });
-}
-
 TEST_CASE("A scripted search path resolves a bare name and passes a path through", "[toolchain-host]")
 {
     ScriptedToolchainHost host;
@@ -231,33 +162,33 @@ TEST_CASE("An extensionless wrapper does not shadow the real executable", "[tool
 
 TEST_CASE("The real host tells a directory from a file and lists each", "[toolchain-host]")
 {
-    ScratchTree tree { "listing" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tch-listing" };
     tree.Write("bin/marker.txt", "hello");
     tree.Write("include/header.h", "#pragma once\n");
 
     auto const host = MakeToolchainHost();
-    auto const root = tree.Root().string();
+    auto const root = tree.Path().string();
 
     CHECK(host->DirectoryExists(root));
-    CHECK_FALSE(host->DirectoryExists((tree.Root() / "bin" / "marker.txt").string()));
-    CHECK_FALSE(host->DirectoryExists((tree.Root() / "absent").string()));
+    CHECK_FALSE(host->DirectoryExists((tree.Path() / "bin" / "marker.txt").string()));
+    CHECK_FALSE(host->DirectoryExists((tree.Path() / "absent").string()));
 
     auto directories = host->ListDirectories(root);
     std::ranges::sort(directories);
     CHECK(directories == std::vector<std::string> { "bin", "include" });
 
     CHECK(host->ListFiles(root).empty());
-    CHECK(host->ListFiles((tree.Root() / "bin").string()) == std::vector<std::string> { "marker.txt" });
+    CHECK(host->ListFiles((tree.Path() / "bin").string()) == std::vector<std::string> { "marker.txt" });
 
     // A directory that is not there lists nothing rather than failing: discovery
     // is best-effort by construction and most layouts are absent on most machines.
-    CHECK(host->ListDirectories((tree.Root() / "absent").string()).empty());
-    CHECK(host->ListFiles((tree.Root() / "absent").string()).empty());
+    CHECK(host->ListDirectories((tree.Path() / "absent").string()).empty());
+    CHECK(host->ListFiles((tree.Path() / "absent").string()).empty());
 }
 
 TEST_CASE("The real host reads a text file whole and reports an absent one", "[toolchain-host]")
 {
-    ScratchTree tree { "read" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tch-read" };
     // A trailing newline is what `Microsoft.VCToolsVersion.default.txt` actually
     // carries, and it comes back rather than being trimmed here -- trimming is the
     // caller's decision, and a reader that did it silently would make a file whose
@@ -265,23 +196,23 @@ TEST_CASE("The real host reads a text file whole and reports an absent one", "[t
     tree.Write("version.txt", "14.51.36231\r\n");
 
     auto const host = MakeToolchainHost();
-    auto const contents = host->ReadTextFile((tree.Root() / "version.txt").string());
+    auto const contents = host->ReadTextFile((tree.Path() / "version.txt").string());
     REQUIRE(contents.has_value());
     CHECK(FastCache::Testing::Unwrap(contents) == "14.51.36231\r\n");
 
-    CHECK_FALSE(host->ReadTextFile((tree.Root() / "absent.txt").string()).has_value());
+    CHECK_FALSE(host->ReadTextFile((tree.Path() / "absent.txt").string()).has_value());
 
     // A DIRECTORY is absent, not empty. `ifstream` opens one perfectly happily on
     // Linux and only the read fails, so a plain `if (!in)` guard lets it through
     // and yields "" -- "a version file that says nothing" rather than "there is no
     // version file", which are different answers to a caller deciding whether a
     // layout is present at all.
-    CHECK_FALSE(host->ReadTextFile(tree.Root().string()).has_value());
+    CHECK_FALSE(host->ReadTextFile(tree.Path().string()).has_value());
 }
 
 TEST_CASE("The real host resolves this process's own executable on PATH", "[toolchain-host]")
 {
-    ScratchTree tree { "search" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tch-search" };
 #if defined(_WIN32)
     auto const executable = tree.Write("bin/fc-probe.exe", "not really a program");
     constexpr std::string_view bareName = "fc-probe";
@@ -302,7 +233,7 @@ TEST_CASE("The real host resolves this process's own executable on PATH", "[tool
 
     // The variable is restored afterwards rather than removed, which matters in a
     // binary whose other cases spawn compilers.
-    FastCache::Testing::ScopedEnv const path { "PATH", (tree.Root() / "bin").string() };
+    FastCache::Testing::ScopedEnv const path { "PATH", (tree.Path() / "bin").string() };
 
     auto const resolved = host->ResolveOnSearchPath(bareName);
     REQUIRE(resolved.has_value());
@@ -322,15 +253,11 @@ TEST_CASE("The real host reaches the same registry the platform leaf does", "[to
                                             R"(SOFTWARE\Microsoft\Windows NT\CurrentVersion)",
                                             "CurrentBuildNumber",
                                             RegistryView::Native);
-    auto const names = host->RegistryValueNames(
-        RegistryHive::LocalMachine, R"(SOFTWARE\Microsoft\Windows NT\CurrentVersion)", RegistryView::Native);
 
 #if defined(_WIN32)
     CHECK(value.has_value());
-    CHECK_FALSE(names.empty());
 #else
     CHECK_FALSE(value.has_value());
-    CHECK(names.empty());
 #endif
 
     CHECK_FALSE(host->RegistryString(RegistryHive::LocalMachine, R"(SOFTWARE\fastcached-absent)", "x", RegistryView::Native)

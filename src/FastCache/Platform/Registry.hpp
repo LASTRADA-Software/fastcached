@@ -5,7 +5,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace FastCache
 {
@@ -66,22 +65,5 @@ enum class RegistryView : std::uint8_t
                                                             std::string_view subKey,
                                                             std::string_view valueName,
                                                             RegistryView view);
-
-/// List the value names directly under a registry key.
-///
-/// Needed because one key this locates a toolchain through is a *set*: the
-/// Windows SDK records each installed kit as a value under `Installed Roots`,
-/// so "which SDK versions are here" cannot be answered by reading a value whose
-/// name is already known.
-///
-/// The key's default value has an empty name and is reported as such rather than
-/// skipped, so a caller counting entries sees what is really there.
-///
-/// @param hive Which root to start from.
-/// @param subKey Key path beneath it, backslash-separated, no leading separator.
-/// @param view Which of a 64-bit host's two views to read.
-/// @return The value names in the order the registry enumerated them; empty when
-///         the key is absent, has no values, or the host has no registry.
-[[nodiscard]] std::vector<std::string> ListRegistryValueNames(RegistryHive hive, std::string_view subKey, RegistryView view);
 
 } // namespace FastCache

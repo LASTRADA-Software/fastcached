@@ -131,7 +131,6 @@ set(_fc_cc_sources
     ReplayGuard.cpp
     RootReconciler.cpp
     Stats.cpp
-    ToolchainDiscovery.cpp
     ToolchainFingerprint.cpp
     ToolchainHost.cpp
     ToolchainProbe.cpp
@@ -252,6 +251,12 @@ if(FASTCACHED_BUILD_TESTS)
         RootReconciler_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp
+        # Discovery is the compile NODE's, not the launcher's -- `fastcache-cc`
+        # never surveys a machine, it is handed a compiler. The source is listed
+        # here for its tests and in `_fc_node_shared` for its one real consumer,
+        # rather than in `_fc_cc_sources`, so the shipped launcher does not carry a
+        # layout table and a vswhere parser it cannot reach.
+        ToolchainDiscovery.cpp
         ToolchainDiscovery_test.cpp
         ToolchainFingerprint_test.cpp
         ToolchainHost_test.cpp

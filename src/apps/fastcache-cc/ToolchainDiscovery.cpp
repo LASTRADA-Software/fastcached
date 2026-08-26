@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ToolchainDiscovery.hpp"
+#include "ToolchainProbe.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 
@@ -92,16 +93,10 @@ namespace
     /// for UTF-8 would hand those APIs bytes they misread, which is worse than the
     /// ACP round trip everything else already does. A non-ASCII install path is a
     /// tree-wide question rather than a `vswhere` one.
-    constexpr std::array<std::string_view, 3> VsWhereArguments { "-products", "*", "-prerelease" };
-
-    /// How `vswhere` is asked to print: one bare value per line, no adornment.
-    constexpr std::string_view VsWhereFormat = "value";
-
-    /// The flag introducing the property below.
-    constexpr std::string_view VsWherePropertyFlag = "-property";
-
-    /// The property `vswhere` is asked for.
-    constexpr std::string_view VsWhereProperty = "installationPath";
+    /// The trailing four ask for one bare installation path per line, unadorned,
+    /// which is what `ParseVsWhereInstallations` is written against.
+    constexpr std::array<std::string_view, 7> VsWhereArguments { "-products", "*",         "-prerelease",     "-format",
+                                                                 "value",     "-property", "installationPath" };
 
     /// Where `vswhere.exe` always is.
     ///
@@ -274,42 +269,6 @@ namespace
         return key;
     }
 
-    /// Join a directory and a relative path with a single forward slash.
-    ///
-    /// Forward, and by hand rather than through `std::filesystem::path`, because the
-    /// separator `operator/` inserts is a property of the HOST rather than of the
-    /// path -- so a Windows layout probed from a test running on Linux would be
-    /// joined with the wrong one. Windows accepts either.
-    ///
-    /// EVERY separator is collapsed, not only the one appended, so one location has
-    /// one spelling however it was reached. A root arrives spelled however its
-    /// source spells it -- the registry writes `C:\Program Files\LLVM`, an
-    /// environment variable writes `C:\Program Files`, a table row writes
-    /// `C:/msys64` -- so the same `clang.exe` found through two rows came back as
-    /// two different strings and was reported twice. `WorkerRegistry` keys on
-    /// `(fingerprint, endpoint)`, so that is one machine registering under two
-    /// near-identical identities: exactly the double-counting the duplicate check
-    /// exists to prevent, and invisible to a scripted host that normalizes on the
-    /// way in.
-    ///
-    /// @param directory The prefix; a trailing separator is tolerated.
-    /// @param relative What to hang under it.
-    /// @return The joined path, `/`-separated throughout.
-    [[nodiscard]] std::string JoinPath(std::string_view directory, std::string_view relative)
-    {
-        while (!directory.empty() && (directory.back() == '/' || directory.back() == '\\'))
-            directory.remove_suffix(1);
-
-        std::string joined { directory };
-        if (!relative.empty())
-        {
-            joined += '/';
-            joined += relative;
-        }
-        std::ranges::replace(joined, '\\', '/');
-        return joined;
-    }
-
     /// The root directories a layout row names on this machine.
     ///
     /// @param layout The row.
@@ -355,14 +314,10 @@ namespace
                     return {};
 
                 std::vector<std::string> argv;
-                argv.reserve(VsWhereArguments.size() + 4);
+                argv.reserve(VsWhereArguments.size() + 1);
                 argv.push_back(vswhere);
                 for (auto const& argument: VsWhereArguments)
                     argv.emplace_back(argument);
-                argv.emplace_back("-format");
-                argv.emplace_back(VsWhereFormat);
-                argv.emplace_back(VsWherePropertyFlag);
-                argv.emplace_back(VsWhereProperty);
 
                 // Combined, because `vswhere` writes its own diagnostics to stderr
                 // and a run that reports nothing useful there is indistinguishable
@@ -445,12 +400,15 @@ namespace
         // and every Linux machine -- an unguarded row costs six failed process
         // creations at every single start, forever, to learn something the search
         // path already said.
-        if (!host.ResolveOnSearchPath(XcrunName).has_value())
+        auto const xcrun = host.ResolveOnSearchPath(XcrunName);
+        if (!xcrun.has_value())
             return;
 
         for (auto const& binary: layout.binaries)
         {
-            std::array<std::string, 3> const argv { "xcrun", "--find", std::string { binary } };
+            // The RESOLVED path, not the bare name again: resolving it and then
+            // spawning something else is two questions with one answer between them.
+            std::array<std::string, 3> const argv { *xcrun, "--find", std::string { binary } };
             auto const run = runner.RunCaptureCombined(argv);
             if (run.exitCode != 0)
                 continue;
@@ -513,9 +471,7 @@ bool MatchesCompilerName(std::string_view name, std::string_view stem, NameMatch
     // as a compiler registers a toolchain that fails every job it is sent.
     if (!name.starts_with(stem) || name.size() <= stem.size() + 1 || name[stem.size()] != '-')
         return false;
-    auto const suffix = name.substr(stem.size() + 1);
-    return std::ranges::all_of(suffix, [](char c) { return (c >= '0' && c <= '9') || c == '.'; })
-           && std::ranges::any_of(suffix, [](char c) { return c >= '0' && c <= '9'; });
+    return LooksLikeVersion(name.substr(stem.size() + 1));
 }
 
 std::vector<ToolchainCandidate> DiscoverToolchainCandidates(IToolchainHost& host, IProcessRunner& runner)
@@ -523,18 +479,13 @@ std::vector<ToolchainCandidate> DiscoverToolchainCandidates(IToolchainHost& host
     std::vector<ToolchainCandidate> candidates;
 
     std::set<std::string> seen;
-    auto remember = [&seen](std::string const& compiler) {
-        return seen.insert(PathIdentity(compiler)).second;
-    };
-
     for (auto const& layout: ToolchainLayouts())
     {
         auto record = [&](std::string compiler) {
-            if (!remember(compiler))
+            if (!seen.insert(PathIdentity(compiler)).second)
                 return;
-            auto const flavor = ClassifyCompiler(compiler);
-            candidates.push_back(ToolchainCandidate {
-                .compiler = std::move(compiler), .flavor = flavor, .layout = std::string { layout.name } });
+            candidates.push_back(
+                ToolchainCandidate { .compiler = std::move(compiler), .layout = std::string { layout.name } });
         };
 
         if (layout.root == LayoutRoot::Xcrun)
@@ -553,8 +504,16 @@ std::vector<ToolchainCandidate> DiscoverToolchainCandidates(IToolchainHost& host
                 // Listed once and matched against every wanted name, rather than
                 // probed name by name: a bindir holds hundreds of entries and the
                 // version-suffixed rule cannot be expressed as a path to test for.
-                auto const entries = host.ListFiles(directory);
-                std::set<std::string> const present { entries.begin(), entries.end() };
+                auto entries = host.ListFiles(directory);
+
+                // SORTED rather than copied into a set. The only question asked of
+                // this is whether a sibling name is present, and `/usr/bin` holds
+                // several thousand entries -- a set would copy every one of them and
+                // allocate a node each, per bindir, to answer it.
+                std::ranges::sort(entries);
+                auto const present = [&entries](std::string_view name) {
+                    return std::ranges::binary_search(entries, name);
+                };
 
                 for (auto const& entry: entries)
                 {
@@ -568,7 +527,7 @@ std::vector<ToolchainCandidate> DiscoverToolchainCandidates(IToolchainHost& host
                     // Registering the wrapper would hand the fleet a toolchain that
                     // cannot be spawned.
                     if (!entry.ends_with(WindowsExecutableSuffix)
-                        && present.contains(entry + std::string { WindowsExecutableSuffix }))
+                        && present(entry + std::string { WindowsExecutableSuffix }))
                         continue;
 
                     auto entryName = std::string_view { entry };

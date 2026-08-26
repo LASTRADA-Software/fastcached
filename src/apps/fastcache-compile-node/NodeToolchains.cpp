@@ -51,23 +51,6 @@ namespace
     /// deployment `--node-class=workstation` exists for.
     constexpr std::size_t MaxFingerprintThreads = 4;
 
-    /// One toolchain's computed identity, and whether it means anything.
-    struct Identity
-    {
-        std::string fingerprint; ///< The digest a client must match.
-        /// True when the digest carries no information about WHICH compiler this is.
-        ///
-        /// A banner that is itself the fallback name, over an empty include tree, is
-        /// not a weak identity but no identity: `KeyDigest("toolchain-v1").Field("cl")`
-        /// is a value this repository could print with no compiler installed, and
-        /// every MSVC toolset in existence produces it. `ToolchainProbe.hpp` permits
-        /// a banner-only fingerprint and argues it can "only cause two
-        /// genuinely-identical toolchains to be treated as identical, never two
-        /// different ones" -- and that argument has an unstated precondition, that the
-        /// banner is a real version string. This is that precondition, checked.
-        bool degenerate { false };
-    };
-
     /// Compute every entry's identity, several at a time.
     ///
     /// **The INJECTED runner is what every worker uses**, rather than one made per
@@ -88,12 +71,12 @@ namespace
     /// @param host The machine's filesystem, registry and environment.
     /// @param logger Startup log.
     /// @return One identity per entry, in the same order.
-    [[nodiscard]] std::vector<Identity> FingerprintAll(std::vector<ToolchainEntry> const& entries,
-                                                       Cc::IProcessRunner& runner,
-                                                       Cc::IToolchainHost& host,
-                                                       ILogger& logger)
+    [[nodiscard]] std::vector<Cc::ToolchainIdentity> FingerprintAll(std::vector<ToolchainEntry> const& entries,
+                                                                    Cc::IProcessRunner& runner,
+                                                                    Cc::IToolchainHost& host,
+                                                                    ILogger& logger)
     {
-        std::vector<Identity> fingerprints(entries.size());
+        std::vector<Cc::ToolchainIdentity> fingerprints(entries.size());
         std::atomic<std::size_t> next { 0 };
 
         auto identify = [&] {
@@ -105,7 +88,7 @@ namespace
                     // An operator pinned it by hand, which is the documented way to
                     // give a worker an identity this process could not compute.
                     // Second-guessing it here would refuse the escape hatch.
-                    fingerprints[index] = Identity { .fingerprint = entry.fingerprint, .degenerate = false };
+                    fingerprints[index] = Cc::ToolchainIdentity { .fingerprint = entry.fingerprint, .degenerate = false };
                     continue;
                 }
 
@@ -121,17 +104,8 @@ namespace
                 logger.Logf(LogLevel::Info, "computing the toolchain fingerprint for {}", entry.compiler);
                 auto const banner = Cc::CompilerBanner(runner, entry.compiler);
                 auto const flavor = Cc::ClassifyCompiler(entry.compiler);
-                auto const& driver = Cc::DriverOf(flavor);
-                fingerprints[index].fingerprint =
-                    Cc::CachedToolchainFingerprint(runner, host, entry.compiler, banner, driver);
-
-                // The roots are re-derived only when the banner turned out to be the
-                // FALLBACK, which is the cheap half of the test and the one that
-                // gates it. A driver that answered `--version` has a real identity
-                // whatever its roots, and re-deriving for it would spawn the verbose
-                // probe a second time on every GNU toolchain.
-                if (banner == Cc::NormalizedCompilerName(entry.compiler))
-                    fingerprints[index].degenerate = Cc::DiscoverIncludePaths(runner, host, entry.compiler, driver).empty();
+                fingerprints[index] =
+                    Cc::CachedToolchainFingerprint(runner, host, entry.compiler, banner, Cc::DriverOf(flavor));
             }
         };
 
@@ -144,9 +118,15 @@ namespace
             return fingerprints;
         }
 
+        // Bounded by the COMPUTED count, not by `workers.capacity()`. `reserve`
+        // promises only `capacity() >= n`, so reading the bound back out of the
+        // vector makes the thread count an allocator detail -- and the number it
+        // would then not be bounded by is the one `MaxFingerprintThreads` documents
+        // as "polite on the machine a developer is sitting at".
+        auto const threads = std::min(entries.size(), MaxFingerprintThreads);
         std::vector<std::jthread> workers;
-        workers.reserve(std::min(entries.size(), MaxFingerprintThreads));
-        for ([[maybe_unused]] auto const worker: std::views::iota(std::size_t { 0 }, workers.capacity()))
+        workers.reserve(threads);
+        for ([[maybe_unused]] auto const worker: std::views::iota(std::size_t { 0 }, threads))
             workers.emplace_back(identify);
 
         // Cleared EXPLICITLY, and it is not tidiness. `jthread` joins when it is
@@ -190,12 +170,14 @@ std::optional<std::map<std::string, std::string>> ResolveToolchains(NodeConfig c
                                                                     Cc::IToolchainHost& host,
                                                                     ILogger& logger)
 {
-    std::vector<ToolchainEntry> entries;
-    bool discovered = false;
+    // One fact, stated once. The set is the machine's when the operator named none
+    // and there is something to ask -- which is also what decides whether the count
+    // at the end is worth saying out loud.
+    bool const discovered = cfg.toolchains.empty() && discovery != nullptr;
 
-    if (cfg.toolchains.empty() && discovery != nullptr)
+    std::vector<ToolchainEntry> entries;
+    if (discovered)
     {
-        discovered = true;
         for (auto const& candidate: discovery->Discover())
         {
             // Refused HERE rather than at the first job. A compiler that is present
@@ -279,6 +261,38 @@ std::optional<std::map<std::string, std::string>> ResolveToolchains(NodeConfig c
         // compare two machines.
         logger.Logf(LogLevel::Info, "serving {} as {}", entry.compiler, fingerprint);
         toolchains.emplace(fingerprint, entry.compiler);
+    }
+
+    // Refused HERE, and the refusal is the point of the function rather than an
+    // afterthought its caller performs. Left to run, a worker with nothing to serve
+    // is the worst shape this system has: nothing registers, so the scheduler never
+    // hears of it; the heartbeat reports "0 of 0 toolchain(s) registered" and calls
+    // that a complete success; and the ready line says the node is up. A supervisor
+    // sees a healthy unit, an operator sees a green fleet, and every build compiles
+    // locally with no error at either end.
+    //
+    // The message names where it looked ONLY when there was a search. A worker that
+    // was told which compilers to serve, and had every one of them rejected, must
+    // not be handed a list of places it never looked -- that reads as "your compiler
+    // is not installed" when the answer is "the one you named was refused, a line
+    // above". The search list is derived from the layout table rather than written
+    // out, so a layout added to the table necessarily appears in it.
+    if (toolchains.empty())
+    {
+        if (discovered)
+            logger.Logf(LogLevel::Error,
+                        "no toolchain to serve: found no compiler on this machine. Searched: {}. Name one with "
+                        "--toolchain, or install a compiler where this worker can find it",
+                        SearchedLayouts());
+        else if (!cfg.toolchains.empty())
+            logger.Logf(LogLevel::Error,
+                        "no toolchain to serve: every compiler named with --toolchain was refused, for the reason "
+                        "given above each");
+        else
+            logger.Logf(LogLevel::Error,
+                        "no toolchain to serve: --no-toolchain-discovery was given and no --toolchain, so this "
+                        "worker was told to serve nothing");
+        return std::nullopt;
     }
 
     // Said out loud when the machine answered, because the set is then something

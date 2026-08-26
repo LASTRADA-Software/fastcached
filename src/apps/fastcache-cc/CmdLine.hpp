@@ -396,6 +396,19 @@ struct ParsedCommand
 ///
 /// @param compiler argv[0] as invoked.
 /// @return The matching flavor, or `Flavor::Unknown`.
+/// A compiler's basename, lowered and stripped of `.exe`.
+///
+/// Here rather than beside its callers because THREE questions are answered from
+/// it and they must not disagree: which driver this is (`ClassifyCompiler`),
+/// whether it compiles everything as C++, and -- when a driver answers no
+/// `--version` -- what to call it in a fingerprint. `CL.EXE`, `cl` and
+/// `C:/.../cl.exe` are one compiler, and a second spelling of "what do we call it"
+/// is a second chance for a launcher and a worker to part company silently.
+///
+/// @param compiler argv[0] as invoked, bare name or path.
+/// @return Its normalized basename.
+[[nodiscard]] std::string NormalizedCompilerName(std::string_view compiler);
+
 [[nodiscard]] Flavor ClassifyCompiler(std::string_view compiler);
 
 [[nodiscard]] DriverSpec const& DriverOf(Flavor flavor);

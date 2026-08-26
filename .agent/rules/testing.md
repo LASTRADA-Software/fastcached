@@ -160,3 +160,9 @@ replaces all four. It is POSIX-only for now: the properties are
 platform-independent and the fixture is not, so a Windows counterpart would be a
 translation rather than new coverage.
 
+## Open work
+
+- **[#147](https://github.com/LASTRADA-Software/fastcached/issues/147)** — two
+  scratch-directory helpers still shadow `Testing::ScratchDirectory`, in
+  `PathResolve_test.cpp` and `Stats_test.cpp`. Both correct today; the shape is what
+  has been copied wrong before.

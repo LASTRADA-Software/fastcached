@@ -29,7 +29,6 @@ TEST_CASE("A key that does not exist reads as absent rather than empty", "[regis
     CHECK_FALSE(ReadRegistryString(RegistryHive::LocalMachine, AbsentKey, "Anything", RegistryView::Native).has_value());
     CHECK_FALSE(
         ReadRegistryString(RegistryHive::CurrentUser, AbsentKey, "Anything", RegistryView::ThirtyTwoBit).has_value());
-    CHECK(ListRegistryValueNames(RegistryHive::LocalMachine, AbsentKey, RegistryView::Native).empty());
 }
 
 #if defined(_WIN32)
@@ -49,54 +48,41 @@ TEST_CASE("A REG_SZ value comes back verbatim", "[registry]")
 
 TEST_CASE("A value of the wrong type is absent rather than reinterpreted", "[registry]")
 {
-    // Proven to be a rejection rather than an absence: the same key's value
-    // listing names it, so the read below saw it and turned it down for its type.
-    // `InstallDate` is REG_DWORD on every Windows since Vista.
-    auto const names = ListRegistryValueNames(RegistryHive::LocalMachine, CurrentVersionKey, RegistryView::Native);
-    REQUIRE(std::ranges::contains(names, std::string { "InstallDate" }));
+    // Proven to be a rejection rather than an absence: a REG_SZ under the SAME key
+    // reads fine, so the key opened and the value below was seen and turned down
+    // for its type. `InstallDate` is REG_DWORD on every Windows since Vista.
+    REQUIRE(ReadRegistryString(RegistryHive::LocalMachine, CurrentVersionKey, "CurrentBuildNumber", RegistryView::Native)
+                .has_value());
 
     CHECK_FALSE(
         ReadRegistryString(RegistryHive::LocalMachine, CurrentVersionKey, "InstallDate", RegistryView::Native).has_value());
 }
 
-TEST_CASE("Value names are enumerated to the end of the key", "[registry]")
-{
-    auto const names = ListRegistryValueNames(RegistryHive::LocalMachine, CurrentVersionKey, RegistryView::Native);
-
-    // More than a handful, and containing an entry whose name is longer than the
-    // first one enumerated -- which is the case that used to stop the loop early,
-    // because RegEnumValue writes the used length back over the buffer size.
-    CHECK(names.size() > 4);
-    CHECK(std::ranges::contains(names, std::string { "CurrentBuildNumber" }));
-    CHECK(std::ranges::none_of(names, [](std::string const& name) { return name.find('\0') != std::string::npos; }));
-}
-
 TEST_CASE("The 32-bit view resolves to WOW6432Node", "[registry]")
 {
-    // Asserted as the redirection IDENTITY -- `SOFTWARE\X` read in the 32-bit view
-    // is `SOFTWARE\WOW6432Node\X` read natively -- rather than by comparing the two
-    // views of one path against each other. `Windows NT\CurrentVersion` is a
-    // *redirected* key, so those are two independent keys: the WOW6432Node copy is
-    // written at install and not kept in step by servicing, and an upgraded machine
-    // legitimately has a stale `CurrentBuildNumber` there. A test asserting they
-    // match would fail on such a host while this function was behaving correctly.
+    // `ProgramFilesDir` is the value the redirection exists FOR: the native copy
+    // says `C:\Program Files` and the 32-bit one `C:\Program Files (x86)`. That is
+    // what makes this case catch a dropped `KEY_WOW64_32KEY` -- with the flag
+    // missing, the left-hand read falls through to the native copy and the two
+    // stop matching.
     //
-    // Both sides here name the same underlying key, so the case can never be flaky
-    // -- and it still catches a dropped `KEY_WOW64_32KEY`, because the redirected
-    // copy holds a genuinely different set of values (33 against 25 on the machine
-    // this was written on), so the two listings diverge as soon as the flag stops
-    // reaching the open. The inequality is deliberately NOT asserted: it is true on
-    // every machine anybody will run this on and guaranteed on none of them, which
-    // is the property that made the previous version of this case wrong.
-    auto const throughPath = ListRegistryValueNames(
-        RegistryHive::LocalMachine, R"(SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion)", RegistryView::Native);
-    auto const redirected =
-        ListRegistryValueNames(RegistryHive::LocalMachine, CurrentVersionKey, RegistryView::ThirtyTwoBit);
+    // The IDENTITY is what is asserted, not the inequality. That the two copies
+    // differ is true on every machine anybody will run this on and guaranteed on
+    // none of them; that the 32-bit VIEW of a key and the NATIVE read of its
+    // `WOW6432Node` twin name the same storage is the API's own contract.
+    constexpr std::string_view windowsKey = R"(SOFTWARE\Microsoft\Windows\CurrentVersion)";
+    constexpr std::string_view redirectedKey = R"(SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion)";
 
-    // Required non-empty so the comparison cannot pass by both sides being empty,
+    auto const throughView =
+        ReadRegistryString(RegistryHive::LocalMachine, windowsKey, "ProgramFilesDir", RegistryView::ThirtyTwoBit);
+    auto const throughPath =
+        ReadRegistryString(RegistryHive::LocalMachine, redirectedKey, "ProgramFilesDir", RegistryView::Native);
+
+    // Required present so the comparison cannot pass by both sides being absent,
     // which is what an assertion nobody notices looks like.
-    REQUIRE_FALSE(throughPath.empty());
-    CHECK(redirected == throughPath);
+    REQUIRE(throughView.has_value());
+    REQUIRE(throughPath.has_value());
+    CHECK(FastCache::Testing::Unwrap(throughView) == FastCache::Testing::Unwrap(throughPath));
 }
 
 #else
@@ -110,7 +96,6 @@ TEST_CASE("A host with no registry answers nothing, on every hive and view", "[r
     CHECK_FALSE(
         ReadRegistryString(RegistryHive::CurrentUser, CurrentVersionKey, "CurrentBuildNumber", RegistryView::ThirtyTwoBit)
             .has_value());
-    CHECK(ListRegistryValueNames(RegistryHive::LocalMachine, CurrentVersionKey, RegistryView::Native).empty());
 }
 
 #endif

@@ -113,47 +113,6 @@ namespace
         return expanded;
     }
 
-    /// The registry's own ceiling on a value name, in characters.
-    ///
-    /// It is what bounds the grow-and-retry below: `RegEnumValue` does not report
-    /// the size a name needed when it refuses one, so the only way to find out is
-    /// to ask again with more room -- and a loop that grows until the API is happy,
-    /// with nothing saying when to stop, is a loop that never does.
-    constexpr DWORD MaxValueNameChars = 16'383;
-
-    /// The value name at @p index, whatever its length.
-    ///
-    /// Split out because the retry is the whole point. `RegQueryInfoKeyA` reports
-    /// the longest name it saw at the moment it was asked, and a longer one created
-    /// between that call and this one comes back as `ERROR_MORE_DATA` -- which the
-    /// obvious loop reads as "no more values" and stops at. For the Windows SDK's
-    /// `Installed Roots`, whose values ARE the installed kits, that is a toolchain
-    /// this machine has and discovery never sees, with nothing anywhere saying so.
-    ///
-    /// @param key The open key.
-    /// @param index Enumeration index.
-    /// @param lengthHint The longest name `RegQueryInfoKeyA` sampled, excluding
-    ///        the terminator.
-    /// @return The name, or `std::nullopt` at the end of the enumeration (and for
-    ///         a name the registry's own ceiling says cannot exist).
-    [[nodiscard]] std::optional<std::string> ValueNameAt(HKEY key, DWORD index, DWORD lengthHint)
-    {
-        for (DWORD capacity = lengthHint + 1; capacity <= MaxValueNameChars + 1; capacity *= 2)
-        {
-            std::string name(capacity, '\0');
-            DWORD used = capacity;
-            auto const status = ::RegEnumValueA(key, index, name.data(), &used, nullptr, nullptr, nullptr, nullptr);
-            if (status == ERROR_SUCCESS)
-            {
-                name.resize(used);
-                return name;
-            }
-            if (status != ERROR_MORE_DATA)
-                return std::nullopt;
-        }
-        return std::nullopt;
-    }
-
     /// Drop everything from the first embedded NUL onwards.
     ///
     /// `RegQueryValueEx` reports the stored byte count, and whether that count
@@ -211,34 +170,6 @@ std::optional<std::string> ReadRegistryString(RegistryHive hive,
     return trimmed;
 }
 
-std::vector<std::string> ListRegistryValueNames(RegistryHive hive, std::string_view subKey, RegistryView view)
-{
-    RegKey const key { hive, subKey, view };
-    if (!key.Valid())
-        return {};
-
-    DWORD count = 0;
-    DWORD longestName = 0;
-    if (::RegQueryInfoKeyA(
-            key.Get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &count, &longestName, nullptr, nullptr, nullptr)
-        != ERROR_SUCCESS)
-        return {};
-
-    // `count` sizes the vector and does NOT bound the loop. It is a sample taken
-    // before the enumeration began, and a value added while it runs makes the real
-    // end one entry further on; only ERROR_NO_MORE_ITEMS says where that is.
-    std::vector<std::string> names;
-    names.reserve(count);
-    for (DWORD const index: std::views::iota(DWORD { 0 }))
-    {
-        auto name = ValueNameAt(key.Get(), index, longestName);
-        if (!name.has_value())
-            break;
-        names.push_back(*std::move(name));
-    }
-    return names;
-}
-
 #else
 
 // Named rather than left anonymous even though nothing reads them: this is the
@@ -250,11 +181,6 @@ std::optional<std::string> ReadRegistryString(RegistryHive /*hive*/,
                                               RegistryView /*view*/)
 {
     return std::nullopt;
-}
-
-std::vector<std::string> ListRegistryValueNames(RegistryHive /*hive*/, std::string_view /*subKey*/, RegistryView /*view*/)
-{
-    return {};
 }
 
 #endif

@@ -135,9 +135,7 @@ void DescribeMsvcLayout(ScriptedToolchainHost& host)
 /// @return A candidate a discovery can report.
 [[nodiscard]] Cc::ToolchainCandidate Candidate(std::string compiler, std::string layout = "usr")
 {
-    return Cc::ToolchainCandidate { .compiler = std::move(compiler),
-                                    .flavor = Cc::Flavor::Gcc,
-                                    .layout = std::move(layout) };
+    return Cc::ToolchainCandidate { .compiler = std::move(compiler), .layout = std::move(layout) };
 }
 
 /// @return A config a worker could start from, with no toolchain named.
@@ -262,16 +260,20 @@ TEST_CASE("NodeToolchains: the operator's list wins whole", "[node][toolchains]"
     CHECK(discovery.Calls() == 0);
 }
 
-TEST_CASE("NodeToolchains: discovery turned off is a null discovery, not an empty one", "[node][toolchains]")
+TEST_CASE("NodeToolchains: discovery turned off with nothing named is refused", "[node][toolchains]")
 {
+    // The one shape that provably cannot work, and the reason
+    // `--no-toolchain-discovery` is not a null flag.
     NodeConfig const cfg = Startable();
     SpawnScript runner;
     ScriptedToolchainHost host;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, nullptr, runner, host, logger);
-    REQUIRE(resolved.has_value());
-    CHECK(Unwrap(resolved).empty());
+    CHECK_FALSE(ResolveToolchains(cfg, nullptr, runner, host, logger).has_value());
+    CHECK(Logged(logger, "told to serve nothing"));
+
+    // And it does NOT recite the search list: nothing was searched.
+    CHECK_FALSE(Logged(logger, "Searched:"));
 }
 
 TEST_CASE("NodeToolchains: a machine with no compiler resolves to nothing", "[node][toolchains]")
@@ -286,9 +288,16 @@ TEST_CASE("NodeToolchains: a machine with no compiler resolves to nothing", "[no
     ScriptedToolchainHost host;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
-    REQUIRE(resolved.has_value());
-    CHECK(Unwrap(resolved).empty());
+    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, logger).has_value());
+
+    // The search list is what an operator whose compiler was not found actually
+    // needs -- the verdict alone says nothing about where to install one.
+    CHECK(Logged(logger, "Searched:"));
+    for (auto const& layout: Cc::ToolchainLayouts())
+    {
+        INFO("layout: " << layout.name);
+        CHECK(Logged(logger, layout.name));
+    }
 }
 
 TEST_CASE("NodeToolchains: every discovered compiler that cannot run leaves nothing", "[node][toolchains]")
@@ -302,9 +311,7 @@ TEST_CASE("NodeToolchains: every discovered compiler that cannot run leaves noth
     ScriptedToolchainHost host;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
-    REQUIRE(resolved.has_value());
-    CHECK(Unwrap(resolved).empty());
+    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, logger).has_value());
 }
 
 TEST_CASE("NodeToolchains: a malformed --toolchain is refused, naming the value", "[node][toolchains]")
@@ -404,8 +411,8 @@ TEST_CASE("NodeToolchains: an identity that names no compiler is refused, not re
     // directions are silent from both ends, which is the failure the fingerprint
     // exists to prevent rather than to cause.
     NodeConfig const cfg = Startable();
-    FixedDiscovery discovery { { Cc::ToolchainCandidate {
-        .compiler = std::string { MsvcCompiler }, .flavor = Cc::Flavor::Cl, .layout = "visual-studio" } } };
+    FixedDiscovery discovery { { Cc::ToolchainCandidate { .compiler = std::string { MsvcCompiler },
+                                                          .layout = "visual-studio" } } };
     SpawnScript runner;
     runner.Speechless(std::string { MsvcCompiler });
 
@@ -414,9 +421,7 @@ TEST_CASE("NodeToolchains: an identity that names no compiler is refused, not re
     ScriptedToolchainHost host;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
-    REQUIRE(resolved.has_value());
-    CHECK(Unwrap(resolved).empty());
+    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, logger).has_value());
 
     // Named, and pointed at the way out. An operator who genuinely wants this
     // toolchain served can pin an identity by hand, which is the one mechanism that
@@ -432,8 +437,8 @@ TEST_CASE("NodeToolchains: an unaskable compiler with a locatable include tree i
     // banner alone would refuse every MSVC toolchain in the fleet. It is the include
     // tree that carries the identity there.
     NodeConfig const cfg = Startable();
-    FixedDiscovery discovery { { Cc::ToolchainCandidate {
-        .compiler = std::string { MsvcCompiler }, .flavor = Cc::Flavor::Cl, .layout = "visual-studio" } } };
+    FixedDiscovery discovery { { Cc::ToolchainCandidate { .compiler = std::string { MsvcCompiler },
+                                                          .layout = "visual-studio" } } };
     SpawnScript runner;
     runner.Speechless(std::string { MsvcCompiler });
     ScriptedToolchainHost host;

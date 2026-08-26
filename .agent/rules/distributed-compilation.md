@@ -607,6 +607,18 @@ the seam.
 
 ## Open work
 
+- **[#148](https://github.com/LASTRADA-Software/fastcached/issues/148)** — every
+  discovered compiler is spawned twice at startup with the same argv, once to learn
+  it can be spawned and once for its banner, and the first is in a serial loop in
+  front of the pool built to hide exactly that. `CompilerBanner` knows both facts
+  and reports neither, so two callers reconstruct what it discarded.
+- **[#146](https://github.com/LASTRADA-Software/fastcached/issues/146)** — the MSVC
+  bindir a layout row searches is chosen by `#if` on the architecture this binary was
+  COMPILED for, so an x64 build on an ARM64 Windows host never offers that machine's
+  native toolset. Moving the fact onto `IToolchainHost` costs the row its
+  `constexpr` span, and it is only fully correct once a fingerprint can tell one
+  toolset's target variants apart -- which today it cannot, since they share an
+  include tree and a fallback banner and therefore digest identically.
 - **[#145](https://github.com/LASTRADA-Software/fastcached/issues/145)** — `clang-cl`
   still takes its include roots from `INCLUDE`, so a launcher in a developer prompt
   and a worker running as a service compute different fingerprints and never match.

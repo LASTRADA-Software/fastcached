@@ -192,7 +192,6 @@ TEST_CASE("A Visual Studio install is found through vswhere", "[toolchain-discov
     // register one machine several times under one identity.
     CHECK(std::ranges::none_of(paths, [&](std::string const& p) { return p.contains(otherBin); }));
 
-    CHECK(candidates.front().flavor == Flavor::Cl);
     CHECK(candidates.front().layout == "visual-studio");
 }
 
@@ -229,10 +228,13 @@ TEST_CASE("An LLVM install is found through the registry", "[toolchain-discovery
     // whatever the bindir holds.
     CHECK_FALSE(Found(candidates, "C:/Program Files/LLVM/bin/lld-link.exe"));
 
+    // What a candidate IS gets decided later, by `ClassifyCompiler`, from this path
+    // and nothing discovery recorded -- so the useful thing to assert here is that
+    // the path is the one that classifier will be given.
     auto const clangCl =
         std::ranges::find_if(candidates, [](ToolchainCandidate const& c) { return c.compiler.contains("clang-cl"); });
     REQUIRE(clangCl != candidates.end());
-    CHECK(clangCl->flavor == Flavor::ClangCl);
+    CHECK(ClassifyCompiler(clangCl->compiler) == Flavor::ClangCl);
 }
 
 TEST_CASE("One install reported by two rows is one candidate", "[toolchain-discovery]")
@@ -388,7 +390,6 @@ TEST_CASE("Xcode's active toolchain is found through xcrun", "[toolchain-discove
     REQUIRE(candidates.size() == 1);
     CHECK(candidates.front().compiler
           == "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++");
-    CHECK(candidates.front().flavor == Flavor::Clang);
     CHECK(candidates.front().layout == "xcode");
 }
 
@@ -427,5 +428,4 @@ TEST_CASE("The discovery seam reports what the table found", "[toolchain-discove
 
     REQUIRE(candidates.size() == 1);
     CHECK(candidates.front().compiler == "/usr/bin/g++");
-    CHECK(candidates.front().flavor == Flavor::Gcc);
 }

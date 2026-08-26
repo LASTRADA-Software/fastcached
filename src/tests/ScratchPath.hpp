@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -111,6 +112,26 @@ class ScratchDirectory
     [[nodiscard]] std::filesystem::path operator/(std::string_view relative) const
     {
         return _path / std::filesystem::path { relative };
+    }
+
+    /// Create a file inside this directory, parent directories and all.
+    ///
+    /// Here rather than in each test file that wants a tree to walk: the copies
+    /// this replaced each re-derived the same "make the parents, then open" pair,
+    /// and a fixture that silently fails to create a parent produces a test that
+    /// passes by finding nothing.
+    ///
+    /// @param relative Path relative to this directory.
+    /// @param contents What to write; an empty string still creates the file.
+    /// @return The path written, so a case can name it in an assertion.
+    std::filesystem::path Write(std::string_view relative, std::string_view contents = {})
+    {
+        auto const target = *this / relative;
+        auto error = std::error_code {};
+        std::filesystem::create_directories(target.parent_path(), error);
+        std::ofstream out { target, std::ios::binary };
+        out << contents;
+        return target;
     }
 
   private:

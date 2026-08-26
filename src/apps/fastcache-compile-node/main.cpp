@@ -68,7 +68,6 @@
 #include <EndpointDial.hpp>
 #include <ToolchainDiscovery.hpp>
 #include <ToolchainHost.hpp>
-#include <ToolchainProbe.hpp>
 #include <WorkerProtocol.hpp>
 
 namespace
@@ -248,28 +247,6 @@ constexpr int ExitOk = 0;
     if (!toolchainsOrNone.has_value())
         return ExitUsage;
     auto const toolchains = *std::move(toolchainsOrNone);
-
-    // A worker with nothing to serve is refused HERE as well as at the flag check,
-    // because with discovery on the two are different questions: "you named none"
-    // is answerable from the command line, and "this machine has none" is not
-    // answerable until the machine has been asked.
-    //
-    // Left to run, such a worker is the worst shape this system has. Nothing
-    // registers, so the scheduler never hears of it; the heartbeat reports "0 of 0
-    // toolchain(s) registered" and considers that a complete success; and the ready
-    // line says the node is up. A supervisor sees a healthy unit, an operator sees a
-    // green fleet, and every build compiles locally with no error at either end.
-    //
-    // The message names where it looked, because that is the diagnosis: an operator
-    // whose compiler was not found needs the search list, not the verdict.
-    if (toolchains.empty())
-    {
-        logger.Logf(LogLevel::Error,
-                    "no toolchain to serve: found no compiler on this machine. Searched: {}. Name one with "
-                    "--toolchain, or install a compiler where this worker can find it",
-                    SearchedLayouts());
-        return ExitUsage;
-    }
 
     // Computed HERE and advertised, rather than left for the scheduler to derive.
     // Both would use the same `OfferableSlots`, so the numbers would agree -- but

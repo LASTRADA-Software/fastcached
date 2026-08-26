@@ -110,19 +110,6 @@ class IToolchainHost
                                                                     std::string_view valueName,
                                                                     RegistryView view) = 0;
 
-    /// List the value names directly under a registry key.
-    ///
-    /// Needed because one key discovery reads is a *set*: the Windows SDK records
-    /// each installed kit as a value under `Installed Roots`.
-    ///
-    /// @param hive Which root to start from.
-    /// @param subKey Key path beneath it, backslash-separated.
-    /// @param view Which of a 64-bit host's two registry views to read.
-    /// @return The value names; empty when the key is absent (always, off Windows).
-    [[nodiscard]] virtual std::vector<std::string> RegistryValueNames(RegistryHive hive,
-                                                                      std::string_view subKey,
-                                                                      RegistryView view) = 0;
-
     /// Read a variable from the process environment.
     /// @param name Variable name.
     /// @return Its value, or `std::nullopt` when unset.
@@ -154,6 +141,28 @@ class IToolchainHost
 /// copy of any of the three.
 ///
 /// @return A host answering for the machine this process runs on.
+/// Join a directory and a relative path into ONE spelling.
+///
+/// Not `std::filesystem::path::operator/`, and the difference is the whole reason
+/// this exists: the separator that inserts is a property of the HOST rather than
+/// of the path, so a Windows layout described by a test running on Linux would be
+/// joined with the wrong one. Windows accepts either.
+///
+/// Every separator in the result is collapsed to `/`, including ones that arrived
+/// inside @p directory. A root reaches a caller spelled however its source spells
+/// it -- the registry writes `C:\\Program Files\\LLVM`, an environment variable
+/// writes `C:\\Program Files`, a table row writes `C:/msys64` -- so the same
+/// location reached two ways came back as two strings. `WorkerRegistry` keys on
+/// `(fingerprint, endpoint)`, so that is one machine registering under two
+/// near-identical identities, and a scripted host cannot catch it because it
+/// normalizes on the way in.
+///
+/// @param directory The prefix; a trailing separator is tolerated, which is what
+///        `KitsRoot10` actually contains.
+/// @param relative What to hang under it; empty yields the directory alone.
+/// @return The joined path, `/`-separated throughout.
+[[nodiscard]] std::string JoinPath(std::string_view directory, std::string_view relative);
+
 [[nodiscard]] std::unique_ptr<IToolchainHost> MakeToolchainHost();
 
 } // namespace FastCache::Cc

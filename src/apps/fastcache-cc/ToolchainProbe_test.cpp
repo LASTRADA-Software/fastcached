@@ -43,54 +43,6 @@ End of search list.
 # 1 "/dev/null"
 )";
 
-/// A scratch directory tree that removes itself.
-class ScratchTree
-{
-  public:
-    explicit ScratchTree(std::string_view name):
-        // A unique PARENT with the caller's name hung under it, rather than the name
-        // alone. The name is what a reader recognises and one of them is itself a
-        // nested path, so it stays exactly as written; what changes is that it can no
-        // longer be the whole story. `temp / "<fixed>"` is the same directory in every
-        // concurrent test process -- see `tests/ScratchPath.hpp` for the five times
-        // that has been paid for.
-        _base { FastCache::Testing::UniqueScratchPath("fc-tcp") },
-        _root { _base / std::filesystem::path { std::string { name } } }
-    {
-        std::error_code ec;
-        std::filesystem::create_directories(_root, ec);
-    }
-    ~ScratchTree()
-    {
-        // The BASE, not the root: the root may be nested inside it.
-        std::error_code ec;
-        std::filesystem::remove_all(_base, ec);
-    }
-    ScratchTree(ScratchTree const&) = delete;
-    ScratchTree& operator=(ScratchTree const&) = delete;
-    ScratchTree(ScratchTree&&) = delete;
-    ScratchTree& operator=(ScratchTree&&) = delete;
-
-    /// Write `content` to `relative`, creating parent directories.
-    void Write(std::string_view relative, std::string_view content) const
-    {
-        auto const path = _root / std::filesystem::path { std::string { relative } };
-        std::error_code ec;
-        std::filesystem::create_directories(path.parent_path(), ec);
-        std::ofstream out { path, std::ios::binary };
-        out.write(content.data(), static_cast<std::streamsize>(content.size()));
-    }
-
-    [[nodiscard]] std::string Root() const
-    {
-        return _root.string();
-    }
-
-  private:
-    std::filesystem::path _base;
-    std::filesystem::path _root;
-};
-
 [[nodiscard]] bool HasPath(std::vector<ToolchainFile> const& files, std::string_view relative)
 {
     return std::ranges::any_of(files, [&](ToolchainFile const& f) { return f.relativePath == relative; });
@@ -218,11 +170,11 @@ TEST_CASE("An unset INCLUDE yields no paths", "[toolchain-probe]")
 
 TEST_CASE("Probing records every file relative to its own root", "[toolchain-probe]")
 {
-    ScratchTree const tree { "relative" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-relative" };
     tree.Write("a/x.hpp", "content-x");
     tree.Write("a/nested/y.hpp", "content-y");
 
-    std::vector<std::string> const roots { tree.Root() + "/a" };
+    std::vector<std::string> const roots { (tree / "a").string() };
     auto const files = ProbeToolchainFiles(roots);
 
     REQUIRE(files.size() == 2);
@@ -235,16 +187,21 @@ TEST_CASE("The same tree at two prefixes fingerprints identically", "[toolchain-
     // The whole reason paths are relative. Two machines with the same toolchain
     // at different install prefixes must agree, or distribution is disabled
     // between exactly the machines it exists to connect.
-    ScratchTree const one { "prefix-one" };
-    ScratchTree const two { "prefix-two-deeper/and/deeper" };
-    for (auto const* tree: { &one, &two })
-    {
-        tree->Write("inc/vector", "template <class T> struct vector {};");
-        tree->Write("inc/detail/config.h", "#define CONFIG 1");
-    }
+    FastCache::Testing::ScratchDirectory one { "fc-tcp-prefix-one" };
+    FastCache::Testing::ScratchDirectory two { "fc-tcp-prefix-two" };
 
-    std::vector<std::string> const rootsOne { one.Root() + "/inc" };
-    std::vector<std::string> const rootsTwo { two.Root() + "/inc" };
+    // The second root sits DELIBERATELY deeper. A prefix that differed only in its
+    // last component would still pass if the code folded absolute paths on a
+    // machine whose temp directory names happened to be the same length.
+    constexpr std::string_view deeper = "and/deeper/still";
+
+    one.Write("inc/vector", "template <class T> struct vector {};");
+    one.Write("inc/detail/config.h", "#define CONFIG 1");
+    two.Write(std::string { deeper } + "/inc/vector", "template <class T> struct vector {};");
+    two.Write(std::string { deeper } + "/inc/detail/config.h", "#define CONFIG 1");
+
+    std::vector<std::string> const rootsOne { (one / "inc").string() };
+    std::vector<std::string> const rootsTwo { (two / (std::string { deeper } + "/inc")).string() };
 
     auto const first = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(rootsOne));
     auto const second = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(rootsTwo));
@@ -254,9 +211,9 @@ TEST_CASE("The same tree at two prefixes fingerprints identically", "[toolchain-
 
 TEST_CASE("One changed header changes the fingerprint", "[toolchain-probe]")
 {
-    ScratchTree const tree { "changed" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-changed" };
     tree.Write("inc/a.hpp", "original");
-    std::vector<std::string> const roots { tree.Root() + "/inc" };
+    std::vector<std::string> const roots { (tree / "inc").string() };
     auto const before = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(roots));
 
     tree.Write("inc/a.hpp", "edited!");
@@ -270,10 +227,10 @@ TEST_CASE("A missing search root is skipped, not fatal", "[toolchain-probe]")
     // Drivers list paths they WOULD search; `/usr/local/include` is routinely
     // absent. Failing on one would make the fingerprint unavailable on a
     // perfectly ordinary machine.
-    ScratchTree const tree { "missing-root" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-missing-root" };
     tree.Write("inc/a.hpp", "x");
 
-    std::vector<std::string> const roots { tree.Root() + "/does-not-exist", tree.Root() + "/inc" };
+    std::vector<std::string> const roots { (tree / "does-not-exist").string(), (tree / "inc").string() };
     auto const files = ProbeToolchainFiles(roots);
 
     REQUIRE(files.size() == 1);
@@ -683,11 +640,11 @@ TEST_CASE("A stamp follows a search root's modification time", "[toolchain-probe
     // the two readings are identical and the test fails for a reason that has
     // nothing to do with the stamp. Setting it states the property directly:
     // whatever the filesystem reports for this root is folded into the stamp.
-    ScratchTree const tree { "stamp-root" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-stamp-root" };
     tree.Write("inc/a.hpp", "x");
     tree.Write("cc", "#!/bin/sh\n");
-    auto const compiler = tree.Root() + "/cc";
-    auto const includeDir = std::filesystem::path { tree.Root() } / "inc";
+    auto const compiler = (tree / "cc").string();
+    auto const includeDir = std::filesystem::path { tree.Path().string() } / "inc";
     std::vector<std::string> const roots { includeDir.string() };
 
     std::error_code ec;
@@ -709,9 +666,9 @@ TEST_CASE("A stamp changes when the compiler binary changes size", "[toolchain-p
     // Size as well as mtime, because a toolchain restored from an archive can
     // carry its original timestamps -- an upgrade that moves no clock but
     // certainly moves the bytes.
-    ScratchTree const tree { "stamp-size" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-stamp-size" };
     tree.Write("cc", "#!/bin/sh\n");
-    auto const compiler = tree.Root() + "/cc";
+    auto const compiler = (tree / "cc").string();
     auto const before = ComputeToolchainStamp("cc 1.0", compiler, {});
 
     tree.Write("cc", "#!/bin/sh\nexec real-cc \"$@\"\n");
@@ -727,10 +684,10 @@ TEST_CASE("A stamp changes when the compiler binary changes size", "[toolchain-p
 
 TEST_CASE("A stamp changes when the banner changes", "[toolchain-probe]")
 {
-    ScratchTree const tree { "stamp-banner" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-stamp-banner" };
     tree.Write("cc", "#!/bin/sh\n");
     std::vector<std::string> const roots {};
-    auto const compiler = tree.Root() + "/cc";
+    auto const compiler = (tree / "cc").string();
 
     CHECK(ComputeToolchainStamp("cc 1.0", compiler, roots) != ComputeToolchainStamp("cc 2.0", compiler, roots));
 }
@@ -798,19 +755,19 @@ class CountingRunner final: public IProcessRunner
 
 TEST_CASE("A cached fingerprint is reused rather than rewalked", "[toolchain-probe]")
 {
-    ScratchTree const tree { "cache-hit" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-cache-hit" };
     tree.Write("inc/a.hpp", "content");
     tree.Write("cc", "#!/bin/sh\n");
-    auto const compiler = tree.Root() + "/cc";
-    auto const root = (std::filesystem::path { tree.Root() } / "inc").string();
+    auto const compiler = (tree / "cc").string();
+    auto const root = (std::filesystem::path { tree.Path().string() } / "inc").string();
 
-    ScratchTree const state { "cache-hit-state" };
-    FastCache::Testing::ScopedEnv const env { StateVariable, state.Root() };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-cache-hit-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
 
     CountingRunner runner { VerboseNaming(root) };
     ScriptedToolchainHost host;
-    auto const first = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang));
-    auto const second = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    auto const first = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
+    auto const second = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
 
     CHECK(!first.empty());
     CHECK(first == second);
@@ -828,21 +785,21 @@ TEST_CASE("A compiler invoked by bare name still caches its fingerprint", "[tool
     // translation unit. Resolving the name for the stamp and the cache file also
     // gives the two spellings of one compiler ONE cache entry rather than two whose
     // contents are identical and each of which the other misses.
-    ScratchTree const tree { "cache-bare" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-cache-bare" };
     tree.Write("inc/a.hpp", "content");
     tree.Write("cc", "#!/bin/sh\n");
-    auto const compiler = tree.Root() + "/cc";
-    auto const root = (std::filesystem::path { tree.Root() } / "inc").string();
+    auto const compiler = (tree / "cc").string();
+    auto const root = (std::filesystem::path { tree.Path().string() } / "inc").string();
 
-    ScratchTree const state { "cache-bare-state" };
-    FastCache::Testing::ScopedEnv const env { StateVariable, state.Root() };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-cache-bare-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
 
     // The scripted host is what turns `cc` into that path, exactly as a real PATH
     // lookup would; the real filesystem underneath is what the stamp then stats.
     CountingRunner runner { VerboseNaming(root) };
     ScriptedToolchainHost host;
     host.AddExecutable(compiler);
-    host.SetSearchPath({ tree.Root() });
+    host.SetSearchPath({ tree.Path().string() });
 
     // The full path is spelled the way the search-path lookup returns it. Two
     // SEPARATOR spellings of one location still key apart, here and in production
@@ -851,8 +808,9 @@ TEST_CASE("A compiler invoked by bare name still caches its fingerprint", "[tool
     // would leave this case unable to say which of the two effects it had caught.
     auto const fullPath = ScriptedToolchainHost::Normalize(compiler);
 
-    auto const viaBareName = CachedToolchainFingerprint(runner, host, "cc", "cc 1.0", DriverOf(Flavor::Clang));
-    auto const viaFullPath = CachedToolchainFingerprint(runner, host, fullPath, "cc 1.0", DriverOf(Flavor::Clang));
+    auto const viaBareName = CachedToolchainFingerprint(runner, host, "cc", "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
+    auto const viaFullPath =
+        CachedToolchainFingerprint(runner, host, fullPath, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
 
     CHECK_FALSE(viaBareName.empty());
     CHECK(viaBareName == viaFullPath);
@@ -862,7 +820,7 @@ TEST_CASE("A compiler invoked by bare name still caches its fingerprint", "[tool
     // path used to key different entries that each missed the other.
     std::error_code ec;
     std::size_t entries = 0;
-    auto const cacheDirectory = std::filesystem::path { state.Root() } / "fastcache-cc" / "toolchains";
+    auto const cacheDirectory = std::filesystem::path { state.Path().string() } / "fastcache-cc" / "toolchains";
     for (auto const& entry: std::filesystem::directory_iterator { cacheDirectory, ec })
         if (entry.path().extension() == ".fingerprint")
             ++entries;
@@ -872,18 +830,18 @@ TEST_CASE("A compiler invoked by bare name still caches its fingerprint", "[tool
 
 TEST_CASE("A changed toolchain invalidates the cached fingerprint", "[toolchain-probe]")
 {
-    ScratchTree const tree { "cache-invalidate" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-cache-invalidate" };
     tree.Write("inc/a.hpp", "original");
     tree.Write("cc", "#!/bin/sh\n");
-    auto const compiler = tree.Root() + "/cc";
-    auto const includeDir = std::filesystem::path { tree.Root() } / "inc";
+    auto const compiler = (tree / "cc").string();
+    auto const includeDir = std::filesystem::path { tree.Path().string() } / "inc";
 
-    ScratchTree const state { "cache-invalidate-state" };
-    FastCache::Testing::ScopedEnv const env { StateVariable, state.Root() };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-cache-invalidate-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
 
     CountingRunner runner { VerboseNaming(includeDir.string()) };
     ScriptedToolchainHost host;
-    auto const before = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    auto const before = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
 
     // Change the content AND move the directory clock, which is what a toolchain
     // upgrade does. Content alone would not restamp -- that is the documented
@@ -895,7 +853,7 @@ TEST_CASE("A changed toolchain invalidates the cached fingerprint", "[toolchain-
     std::filesystem::last_write_time(includeDir, original + std::chrono::hours { 1 }, ec);
     REQUIRE(!ec);
 
-    auto const after = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    auto const after = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
     CHECK(before != after);
 }
 
@@ -904,24 +862,25 @@ TEST_CASE("A forced refresh ignores a cached value", "[toolchain-probe]")
     // What --print-toolchain-fingerprint relies on: it exists to answer "why did
     // no worker match", and a cached answer cannot tell a genuine difference from
     // a stale entry.
-    ScratchTree const tree { "cache-force" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-cache-force" };
     tree.Write("inc/a.hpp", "original");
     tree.Write("cc", "#!/bin/sh\n");
-    auto const compiler = tree.Root() + "/cc";
-    auto const root = (std::filesystem::path { tree.Root() } / "inc").string();
+    auto const compiler = (tree / "cc").string();
+    auto const root = (std::filesystem::path { tree.Path().string() } / "inc").string();
 
-    ScratchTree const state { "cache-force-state" };
-    FastCache::Testing::ScopedEnv const env { StateVariable, state.Root() };
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-cache-force-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
 
     CountingRunner runner { VerboseNaming(root) };
     ScriptedToolchainHost host;
-    auto const before = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    auto const before = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
 
     // Content changed, clock untouched: the stamp cannot see this, so an
     // unforced call would return the stale value.
     tree.Write("inc/a.hpp", "edited in place");
-    auto const stale = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang));
-    auto const forced = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang), true);
+    auto const stale = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
+    auto const forced =
+        CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang), true).fingerprint;
 
     CHECK(stale == before);
     CHECK(forced != before);
@@ -931,16 +890,16 @@ TEST_CASE("No state directory still yields a fingerprint", "[toolchain-probe]")
 {
     // A machine with nowhere to persist must still be able to dispatch. Caching
     // is an optimization; the fingerprint is not.
-    ScratchTree const tree { "cache-nowhere" };
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-cache-nowhere" };
     tree.Write("inc/a.hpp", "content");
     tree.Write("cc", "#!/bin/sh\n");
-    auto const compiler = tree.Root() + "/cc";
-    auto const root = (std::filesystem::path { tree.Root() } / "inc").string();
+    auto const compiler = (tree / "cc").string();
+    auto const root = (std::filesystem::path { tree.Path().string() } / "inc").string();
 
     FastCache::Testing::ScopedEnv const env { StateVariable, "" };
     CountingRunner runner { VerboseNaming(root) };
     ScriptedToolchainHost host;
-    CHECK(!CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).empty());
+    CHECK(!CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint.empty());
 }
 
 // --- the compiler banner ------------------------------------------------------

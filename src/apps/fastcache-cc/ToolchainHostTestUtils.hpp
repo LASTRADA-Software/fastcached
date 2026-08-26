@@ -159,18 +159,6 @@ class ScriptedToolchainHost final: public IToolchainHost
         return found->second;
     }
 
-    std::vector<std::string> RegistryValueNames(RegistryHive hive, std::string_view subKey, RegistryView view) override
-    {
-        std::vector<std::string> names;
-        for (auto const& [entry, data]: _registry)
-        {
-            auto const& [entryHive, entryKey, entryValue, entryView] = entry;
-            if (entryHive == hive && entryView == view && entryKey == NormalizeRegistryKey(subKey))
-                names.push_back(entryValue);
-        }
-        return names;
-    }
-
     std::optional<std::string> Environment(std::string_view name) override
     {
         auto const found = _environment.find(std::string { name });

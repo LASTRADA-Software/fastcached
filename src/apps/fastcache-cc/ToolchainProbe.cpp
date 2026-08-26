@@ -261,33 +261,6 @@ namespace
     /// directory matches nothing while looking entirely reasonable.
     constexpr std::string_view VisualStudioSharedInclude = "VC/Auxiliary/VS/include";
 
-    /// A copy of @p text with every ASCII letter folded down.
-    ///
-    /// Through `PathCanon::AsciiLower` rather than `std::tolower`, which is
-    /// locale-sensitive: under a Turkish locale it maps `I` to a dotless glyph, so
-    /// a directory named `MSVC` would stop matching on exactly the machines nobody
-    /// tests on.
-    /// @param text What to fold.
-    /// @return The folded copy.
-    [[nodiscard]] std::string AsciiLowered(std::string_view text)
-    {
-        std::string folded { text };
-        std::ranges::transform(folded, folded.begin(), [](char c) { return PathCanon::AsciiLower(c); });
-        return folded;
-    }
-
-    /// Whether a name is made only of digits and dots, with at least one digit.
-    ///
-    /// What separates `10.0.26100.0` from `KitsRoot10` and from the GUID-named
-    /// values that make up most of `Installed Roots` on a real machine.
-    /// @param name The candidate.
-    /// @return True when it could be a version.
-    [[nodiscard]] bool LooksLikeVersion(std::string_view name) noexcept
-    {
-        return !name.empty() && std::ranges::any_of(name, [](char c) { return c >= '0' && c <= '9'; })
-               && std::ranges::all_of(name, [](char c) { return (c >= '0' && c <= '9') || c == '.'; });
-    }
-
     /// Order two dotted versions by their numeric components.
     ///
     /// Numerically rather than lexicographically, because the SDK's own numbering
@@ -317,24 +290,6 @@ namespace
                 return leftPart < rightPart;
         }
         return false;
-    }
-
-    /// Join a directory and a relative path with a single forward slash.
-    ///
-    /// Forward, and by hand rather than through `std::filesystem::path`, because
-    /// the separator `operator/` inserts is a property of the HOST rather than of
-    /// the path -- so a Windows layout described by a test running on Linux would
-    /// be joined with the wrong one. Windows accepts either.
-    ///
-    /// @param directory The prefix; a trailing separator is tolerated, which is
-    ///        what `KitsRoot10` actually contains.
-    /// @param relative What to hang under it.
-    /// @return The joined path.
-    [[nodiscard]] std::string JoinPath(std::string_view directory, std::string_view relative)
-    {
-        while (!directory.empty() && (directory.back() == '/' || directory.back() == '\\'))
-            directory.remove_suffix(1);
-        return std::string { directory } + '/' + std::string { relative };
     }
 
     /// Append @p relative to @p root when the directory is really there.
@@ -521,14 +476,10 @@ std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
     return NormalizedCompilerName(compiler);
 }
 
-std::string NormalizedCompilerName(std::string_view compiler)
+bool LooksLikeVersion(std::string_view name) noexcept
 {
-    auto const slash = compiler.find_last_of("/\\");
-    std::string base { slash == std::string_view::npos ? compiler : compiler.substr(slash + 1) };
-    std::ranges::transform(base, base.begin(), [](char c) { return PathCanon::AsciiLower(c); });
-    if (base.ends_with(".exe"))
-        base.resize(base.size() - 4);
-    return base;
+    return !name.empty() && std::ranges::any_of(name, [](char c) { return c >= '0' && c <= '9'; })
+           && std::ranges::all_of(name, [](char c) { return (c >= '0' && c <= '9') || c == '.'; });
 }
 
 std::vector<std::string> MsvcToolsetIncludeRoots(IToolchainHost& host, std::string const& compiler)
@@ -550,7 +501,7 @@ std::vector<std::string> MsvcToolsetIncludeRoots(IToolchainHost& host, std::stri
         auto const parent = directory.parent_path();
         if (parent.empty() || parent == directory)
             break;
-        if (AsciiLowered(parent.parent_path().filename().string()) == MsvcToolsetParent)
+        if (PathCanon::AsciiLower(parent.parent_path().filename().string()) == MsvcToolsetParent)
         {
             toolset = parent;
             break;
@@ -595,16 +546,26 @@ std::vector<std::string> WindowsKitIncludeRoots(IToolchainHost& host)
 
     auto const includeRoot = JoinPath(*kitsRoot, "Include");
 
-    // Both sources, because neither answers alone -- see the header.
-    std::vector<std::string> candidates = host.ListDirectories(includeRoot);
-    for (auto const view: { RegistryView::ThirtyTwoBit, RegistryView::Native })
-        for (auto& name: host.RegistryValueNames(RegistryHive::LocalMachine, InstalledRootsKey, view))
-            candidates.push_back(std::move(name));
-
+    // The DIRECTORIES are the source, and the registry's value names are
+    // deliberately not consulted -- which is a correction, not a shortcut.
+    //
+    // They were, on the reasoning that some machines record each kit as a
+    // version-named value while others (this one included) record `KitsRoot10` and
+    // two hundred GUIDs. But a candidate only survives if `<Include>/<version>`
+    // exists as a directory, and `ListDirectories` already returns every such
+    // directory -- so a registry-sourced name could never contribute one the listing
+    // had not. It was two `RegQueryInfoKey` sweeps of ~200 value names each, per
+    // translation unit on the launcher's dispatch path, that could not change the
+    // answer.
+    //
+    // What the registry WOULD be good for is the opposite question -- telling an
+    // installed kit from a directory an uninstall left behind -- and that would mean
+    // treating its names as authoritative when it lists any, not unioning them in.
+    // That changes which kit is chosen on such a machine, and therefore the
+    // fingerprint, so it is not a change to make in passing.
     std::string best;
-    for (auto const& candidate: candidates)
-        if (LooksLikeVersion(candidate) && (best.empty() || VersionLess(best, candidate))
-            && host.DirectoryExists(JoinPath(includeRoot, candidate)))
+    for (auto const& candidate: host.ListDirectories(includeRoot))
+        if (LooksLikeVersion(candidate) && (best.empty() || VersionLess(best, candidate)))
             best = candidate;
     if (best.empty())
         return {};
@@ -705,14 +666,20 @@ std::string ComputeToolchainStamp(std::string_view banner, std::string const& co
     return digest.ToHex();
 }
 
-std::string CachedToolchainFingerprint(IProcessRunner& runner,
-                                       IToolchainHost& host,
-                                       std::string const& compiler,
-                                       std::string_view banner,
-                                       DriverSpec const& spec,
-                                       bool forceRefresh)
+ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
+                                             IToolchainHost& host,
+                                             std::string const& compiler,
+                                             std::string_view banner,
+                                             DriverSpec const& spec,
+                                             bool forceRefresh)
 {
     auto const roots = DiscoverIncludePaths(runner, host, compiler, spec);
+
+    // Decided here, where the banner and the roots are both in hand, rather than
+    // left for a caller to reconstruct -- see `ToolchainIdentity::degenerate` for
+    // why all three conditions are needed and what the value means without them.
+    auto const degenerate =
+        spec.includeDiscovery != IncludeDiscovery::None && roots.empty() && banner == NormalizedCompilerName(compiler);
 
     // Resolved for the STAMP and the CACHE FILE, which is what makes the cache work
     // at all for a compiler invoked by bare name. `ComputeToolchainStamp` stats the
@@ -734,7 +701,7 @@ std::string CachedToolchainFingerprint(IProcessRunner& runner,
     {
         auto const [cachedStamp, cachedFingerprint] = ReadCache(cachePath);
         if (!cachedStamp.empty() && cachedStamp == stamp)
-            return cachedFingerprint;
+            return ToolchainIdentity { .fingerprint = cachedFingerprint, .degenerate = degenerate };
     }
 
     // The expensive part, reached only on a miss or a forced refresh.
@@ -743,7 +710,7 @@ std::string CachedToolchainFingerprint(IProcessRunner& runner,
     if (!stamp.empty() && !cachePath.empty())
         WriteCacheAtomically(cachePath, stamp, fingerprint);
 
-    return fingerprint;
+    return ToolchainIdentity { .fingerprint = fingerprint, .degenerate = degenerate };
 }
 
 } // namespace FastCache::Cc

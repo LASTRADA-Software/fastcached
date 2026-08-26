@@ -79,9 +79,16 @@ struct ToolchainEntry
 /// operator-NAMED toolchain is not probed: the `<fingerprint>=<compiler>` override
 /// exists precisely for a compiler this process cannot execute.
 ///
-/// **An empty result is a caller's decision, not an error here.** Nothing is
-/// malformed about a machine with no compiler; it simply cannot serve, and the
-/// caller has the vocabulary to say so.
+/// **A worker with nothing to serve is refused here**, not reported as an empty set
+/// for the caller to judge. Left to run it is the worst shape this system has:
+/// nothing registers, the heartbeat calls "0 of 0 toolchain(s)" a success, and the
+/// ready line says the node is up -- a healthy unit, a green fleet, and every build
+/// compiling locally with no error at either end. Refusing is also what makes the
+/// message testable, and there are three of them because there are three ways to
+/// arrive: the machine was searched and holds nothing, every named compiler was
+/// rejected, or nothing was named and nothing was to be searched. The first names
+/// where it looked; the others must NOT, because reciting places nobody looked in
+/// reads as "your compiler is not installed".
 ///
 /// @param cfg What the operator asked for.
 /// @param discovery Where the machine's own compilers come from; null when
@@ -89,8 +96,8 @@ struct ToolchainEntry
 /// @param runner Process-spawning seam, for the compiler probes.
 /// @param host The machine's filesystem, registry and environment.
 /// @param logger Startup log.
-/// @return Fingerprint to compiler path, or nullopt when a `--toolchain` value is
-///         malformed.
+/// @return Fingerprint to compiler path -- never empty -- or nullopt when a
+///         `--toolchain` value is malformed or there is nothing to serve.
 [[nodiscard]] std::optional<std::map<std::string, std::string>> ResolveToolchains(NodeConfig const& cfg,
                                                                                   Cc::IToolchainDiscovery* discovery,
                                                                                   Cc::IProcessRunner& runner,

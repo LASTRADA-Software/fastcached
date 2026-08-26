@@ -14,21 +14,6 @@ namespace FastCache::Cc
 namespace
 {
 
-    /// Lower-case an ASCII string copy (for case-insensitive suffix/basename match).
-    ///
-    /// Folds through PathCanon's byte rule rather than std::tolower, which is
-    /// locale-dependent: what this decides is which argument is the source file
-    /// and which driver is in use, both of which reach the cache key. Under a
-    /// Turkish locale `std::tolower('I')` is not `i`, so a `.I` suffix or a
-    /// compiler basename carrying an `I` folds differently there — the function
-    /// was named for a guarantee it did not provide.
-    [[nodiscard]] std::string AsciiLower(std::string_view s)
-    {
-        std::string out { s };
-        std::ranges::transform(out, out.begin(), [](char c) { return PathCanon::AsciiLower(c); });
-        return out;
-    }
-
     /// The last path component of `path` (after the final `/` or `\`).
     [[nodiscard]] std::string_view Basename(std::string_view path)
     {
@@ -429,9 +414,7 @@ namespace
     /// @return The matching flavor, or Unknown.
     [[nodiscard]] Flavor ClassifyCompilerImpl(std::string_view compiler)
     {
-        std::string base = AsciiLower(Basename(compiler));
-        if (base.ends_with(".exe"))
-            base.resize(base.size() - 4);
+        std::string const base = NormalizedCompilerName(compiler);
 
         // The match is consumed through a view rather than bound to a named
         // iterator. An iterator variable cannot be spelled portably here:
@@ -462,9 +445,7 @@ namespace
     /// @return True for a `++` driver.
     [[nodiscard]] bool CompilesEverythingAsCxx(std::string_view compiler)
     {
-        std::string base = AsciiLower(Basename(compiler));
-        if (base.ends_with(".exe"))
-            base.resize(base.size() - 4);
+        std::string const base = NormalizedCompilerName(compiler);
 
         for (NamePattern const& pattern: NamePatterns)
         {
@@ -688,6 +669,14 @@ std::string_view ObjectOutputPrefixFor(DriverFamily family)
     return fallback.empty() ? std::string_view { "-o" } : fallback;
 }
 
+std::string NormalizedCompilerName(std::string_view compiler)
+{
+    std::string base = PathCanon::AsciiLower(Basename(compiler));
+    if (base.ends_with(".exe"))
+        base.resize(base.size() - 4);
+    return base;
+}
+
 Flavor ClassifyCompiler(std::string_view compiler)
 {
     return ClassifyCompilerImpl(compiler);
@@ -720,7 +709,7 @@ std::optional<SourceLanguage> LanguageOfSource(std::string_view path)
     if (std::ranges::contains(AmbiguousSourceExtensions, extension))
         return std::nullopt;
 
-    auto const folded = AsciiLower(extension);
+    auto const folded = PathCanon::AsciiLower(extension);
     for (auto const& [spelling, language]: SourceExtensions)
         if (folded == spelling)
             return language;
@@ -833,7 +822,7 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
         }
 
         // A bare argument ending in a source suffix is the translation unit.
-        if (!IsOption(a, driver) && IsSourceSuffix(AsciiLower(a)))
+        if (!IsOption(a, driver) && IsSourceSuffix(PathCanon::AsciiLower(a)))
         {
             // First source wins; a second source means a multi-TU line we do
             // not cache (leave parsedOk false).
