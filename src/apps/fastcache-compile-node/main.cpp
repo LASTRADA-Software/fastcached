@@ -65,6 +65,7 @@
 #include <CompileJob.hpp>
 #include <Dispatch.hpp>
 #include <EndpointDial.hpp>
+#include <ToolchainHost.hpp>
 #include <ToolchainProbe.hpp>
 #include <WorkerProtocol.hpp>
 
@@ -196,10 +197,12 @@ struct ToolchainEntry
 ///
 /// @param specs The raw `--toolchain` values.
 /// @param runner Process-spawning seam, for the compiler probes.
+/// @param host The machine's filesystem, registry and environment.
 /// @param logger Startup log.
 /// @return Fingerprint to compiler path, or nullopt when a value is malformed.
 [[nodiscard]] std::optional<std::map<std::string, std::string>> ResolveToolchains(std::vector<std::string> const& specs,
                                                                                   Cc::IProcessRunner& runner,
+                                                                                  Cc::IToolchainHost& host,
                                                                                   ILogger& logger)
 {
     std::map<std::string, std::string> toolchains;
@@ -228,7 +231,7 @@ struct ToolchainEntry
             logger.Logf(LogLevel::Info, "computing the toolchain fingerprint for {}", split->compiler);
             auto const banner = Cc::CompilerBanner(runner, split->compiler);
             auto const flavor = Cc::ClassifyCompiler(split->compiler);
-            fingerprint = Cc::CachedToolchainFingerprint(runner, split->compiler, banner, Cc::DriverOf(flavor));
+            fingerprint = Cc::CachedToolchainFingerprint(runner, host, split->compiler, banner, Cc::DriverOf(flavor));
         }
 
         // Reported unconditionally, including for an explicit override. A
@@ -337,7 +340,8 @@ constexpr int ExitOk = 0;
 
     auto const runner = Cc::MakeProcessRunner();
 
-    auto toolchainsOrNone = ResolveToolchains(cfg.toolchains, *runner, logger);
+    auto const toolchainHost = Cc::MakeToolchainHost();
+    auto toolchainsOrNone = ResolveToolchains(cfg.toolchains, *runner, *toolchainHost, logger);
     if (!toolchainsOrNone.has_value())
         return ExitUsage;
     auto const toolchains = *std::move(toolchainsOrNone);

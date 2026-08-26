@@ -241,7 +241,11 @@ namespace
           .preprocessDropFlags = MsvcDrop,
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false,
-          .includeDiscovery = IncludeDiscovery::MsvcEnvironment,
+          // Layout rather than environment, because a Windows SERVICE inherits no
+          // `INCLUDE` -- and `cl` has no `--version`, so a worker started that way
+          // fingerprinted as a digest of the string `cl`, identically on every
+          // MSVC toolset. See the enumerator for the whole of it.
+          .includeDiscovery = IncludeDiscovery::MsvcLayout,
           .includeProbeFlags = {} },
         { .flavor = Flavor::ClangCl,
           .family = DriverFamily::Msvc,

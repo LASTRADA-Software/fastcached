@@ -70,6 +70,35 @@ enum class IncludeDiscovery : std::uint8_t
     /// Read the `INCLUDE` environment variable, which is where an MSVC toolchain
     /// puts its search list and the only place `cl` reads it from.
     MsvcEnvironment = 2,
+    /// Derive an MSVC toolchain's search list from the machine's INSTALL LAYOUT --
+    /// the compiler's own path for the VC headers, the registry for the Windows
+    /// SDK's -- falling back to `INCLUDE` when the layout cannot be determined.
+    ///
+    /// This exists because `INCLUDE` is set per shell by `vcvarsall`, and a
+    /// **Windows service does not inherit it**. `MsvcEnvironment` therefore
+    /// returns nothing under the SCM, `ProbeToolchainFiles` walks nothing, and --
+    /// since `cl` has no `--version` and falls back to its normalized basename --
+    /// an MSVC worker started as a service fingerprints as a digest of the string
+    /// `cl` and nothing else. That is the SAME digest on every MSVC toolset in
+    /// existence: the false match `ToolchainFingerprint.hpp` exists to prevent,
+    /// and the one that yields a silently wrong object rather than a stale path a
+    /// replay guard can probe.
+    ///
+    /// The layout is tried FIRST and the environment only as a fallback, which is
+    /// the whole of why this is not merely "read INCLUDE, then guess". Preferring
+    /// `INCLUDE` where it is set would make a developer prompt and a service
+    /// disagree the moment the two root sets differ by one directory -- and a
+    /// fingerprint disagreement is invisible from both ends, presenting only as a
+    /// scheduler that never matches. Layout-first means both derive the same roots
+    /// wherever the layout is derivable at all.
+    ///
+    /// `Flavor::ClangCl` deliberately does NOT use this. Its banner is a genuine
+    /// version string, so a service run degrades it to a banner-only fingerprint
+    /// rather than collapsing every version onto one digest; and locating the VC
+    /// headers for a driver that does not live inside the VC layout needs
+    /// `vswhere`, which is a process spawn on the launcher's per-translation-unit
+    /// hot path. See https://github.com/LASTRADA-Software/fastcached/issues/145.
+    MsvcLayout = 3,
 };
 
 /// True when two family sets overlap.

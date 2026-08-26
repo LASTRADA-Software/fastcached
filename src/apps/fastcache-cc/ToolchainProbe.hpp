@@ -4,6 +4,7 @@
 #include "CmdLine.hpp"
 #include "IProcessRunner.hpp"
 #include "ToolchainFingerprint.hpp"
+#include "ToolchainHost.hpp"
 
 #include <span>
 #include <string>
@@ -90,6 +91,62 @@ namespace FastCache::Cc
 /// @return The banner line, or the basename.
 [[nodiscard]] std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler);
 
+/// The VC half of an MSVC toolchain's include roots, from its own install layout.
+///
+/// Derived from the COMPILER'S PATH rather than from anything ambient, which is
+/// what lets a service -- with no `INCLUDE` and no developer prompt -- reach the
+/// same answer a build system does. A bare name is resolved on the search path
+/// first, so `cl` and `C:\...\cl.exe` land on one set of roots.
+///
+/// The toolset root is found by walking up from the compiler until an ancestor's
+/// PARENT is named `MSVC`, which is the `VC\Tools\MSVC\<version>` layout every
+/// Visual Studio since 2017 uses. Counting a fixed number of levels would break on
+/// a cross-targeting `bin\Hostx64\arm64` the moment somebody used one.
+///
+/// The roots and their order mirror what `vcvarsall` puts in `INCLUDE` --
+/// `<toolset>\include`, `<toolset>\atlmfc\include`, `<vs>\VC\Auxiliary\VS\include`
+/// -- so the two mechanisms agree on a machine where both can answer. A root that
+/// is not present is skipped rather than emitted: `ProbeToolchainFiles` would skip
+/// it anyway, and listing it would only make the roots harder to read in a log.
+///
+/// @param host The machine's filesystem and search path.
+/// @param compiler The compiler being identified, bare name or path.
+/// @return Its VC include roots; empty when the layout cannot be determined.
+[[nodiscard]] std::vector<std::string> MsvcToolsetIncludeRoots(IToolchainHost& host, std::string const& compiler);
+
+/// The Windows SDK half of an MSVC toolchain's include roots.
+///
+/// Separate from the VC half because it is a separate install with a separate
+/// version, located through the registry rather than through the compiler: nothing
+/// about a `cl.exe` says which SDK it will be used with.
+///
+/// The kit version comes from BOTH the value names under `Installed Roots` and the
+/// subdirectories of `Include`, because neither is reliable alone. Some machines
+/// record each installed kit as a version-named value; the one this was written on
+/// records `KitsRoot10` and two hundred GUIDs and nothing else, so a registry-only
+/// lookup finds no version at all. A directory-only lookup, conversely, cannot tell
+/// an installed kit from a leftover directory an uninstall did not remove. Both
+/// sources are unioned and then filtered to versions whose `Include` directory
+/// actually exists.
+///
+/// **The HIGHEST installed kit is chosen, not the one the build selected**, and the
+/// imprecision is deliberate rather than overlooked. A build pins its kit through
+/// `INCLUDE`, `vcvarsall <version>` or `WindowsTargetPlatformVersion`, none of which
+/// a service can see -- so honouring it would put the launcher and the worker back
+/// on different answers, which is the failure `MsvcLayout` exists to close. Picking
+/// the highest is a rule both ends reach identically from the machine alone.
+///
+/// What that gives up is bounded, and bounded by the shape of a dispatched compile:
+/// a worker compiles text that is ALREADY PREPROCESSED, so no SDK header is opened
+/// on the far side and the kit a machine pinned cannot change the object that comes
+/// back. Two machines pinned to different kits therefore look interchangeable here
+/// and genuinely are, for this purpose.
+///
+/// @param host The machine's filesystem and registry.
+/// @return The SDK include roots for the highest installed kit; empty when no kit
+///         is installed, and always empty off Windows.
+[[nodiscard]] std::vector<std::string> WindowsKitIncludeRoots(IToolchainHost& host);
+
 /// Ask a driver where it searches for system headers.
 ///
 /// Dispatches on `spec.includeDiscovery` with no `default:`, so a mechanism added
@@ -102,10 +159,12 @@ namespace FastCache::Cc
 /// toolchains to be treated as identical, never two different ones.
 ///
 /// @param runner Process-spawning seam.
+/// @param host The machine's filesystem, registry and environment.
 /// @param compiler The compiler to interrogate.
 /// @param spec The driver's table row.
 /// @return Search paths in the driver's own order; empty when undiscoverable.
 [[nodiscard]] std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
+                                                            IToolchainHost& host,
                                                             std::string const& compiler,
                                                             DriverSpec const& spec);
 
@@ -146,12 +205,14 @@ namespace FastCache::Cc
 /// short-lived processes that must never deadlock a build.
 ///
 /// @param runner Process-spawning seam.
+/// @param host The machine's filesystem, registry and environment.
 /// @param compiler Path to the compiler.
 /// @param banner Its version line, already obtained by the caller.
 /// @param spec The driver's table row.
 /// @param forceRefresh Skip the cached value and rewrite it.
 /// @return The fingerprint; never empty (it degrades to a banner-only digest).
 [[nodiscard]] std::string CachedToolchainFingerprint(IProcessRunner& runner,
+                                                     IToolchainHost& host,
                                                      std::string const& compiler,
                                                      std::string_view banner,
                                                      DriverSpec const& spec,

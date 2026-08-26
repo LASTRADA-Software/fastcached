@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "ToolchainHostTestUtils.hpp"
 #include "ToolchainProbe.hpp"
 
 #include <FastCache/Platform/EnvironmentTestUtils.hpp>
@@ -16,6 +17,7 @@
 
 using namespace FastCache;
 using namespace FastCache::Cc;
+using namespace FastCache::Cc::Testing;
 
 namespace
 {
@@ -341,8 +343,9 @@ TEST_CASE("A GNU driver is asked verbosely, and its stderr is what is read", "[t
     // its /showIncludes notes between streams.
     ScriptedRunner runner { CompileRun {
         .exitCode = 0, .out = "should not be read", .err = std::string { AppleClangVerbose } } };
+    ScriptedToolchainHost host;
 
-    auto const paths = DiscoverIncludePaths(runner, "/usr/bin/c++", SpecFor(Flavor::Clang));
+    auto const paths = DiscoverIncludePaths(runner, host, "/usr/bin/c++", SpecFor(Flavor::Clang));
 
     REQUIRE(paths.size() == 4);
     CHECK(paths[0].contains("c++/v1"));
@@ -358,13 +361,15 @@ TEST_CASE("A non-zero exit does not discard a printed search list", "[toolchain-
     // non-zero for reasons that leave it valid. Gating on the exit code would
     // silently drop the include tree on exactly those toolchains.
     ScriptedRunner runner { CompileRun { .exitCode = 1, .out = {}, .err = std::string { AppleClangVerbose } } };
-    CHECK(DiscoverIncludePaths(runner, "cc", SpecFor(Flavor::Clang)).size() == 4);
+    ScriptedToolchainHost host;
+    CHECK(DiscoverIncludePaths(runner, host, "cc", SpecFor(Flavor::Clang)).size() == 4);
 }
 
 TEST_CASE("An unknown driver is not interrogated at all", "[toolchain-probe]")
 {
     ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = std::string { AppleClangVerbose } } };
-    CHECK(DiscoverIncludePaths(runner, "mystery", SpecFor(Flavor::Unknown)).empty());
+    ScriptedToolchainHost host;
+    CHECK(DiscoverIncludePaths(runner, host, "mystery", SpecFor(Flavor::Unknown)).empty());
     CHECK(runner.Calls() == 0);
 }
 
@@ -373,8 +378,300 @@ TEST_CASE("An MSVC driver is not spawned to discover its paths", "[toolchain-pro
     // cl has no such switch; its list comes from the environment. Spawning it
     // would cost a process per launcher invocation and return nothing.
     ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
-    (void) DiscoverIncludePaths(runner, "cl.exe", SpecFor(Flavor::Cl));
+    ScriptedToolchainHost host;
+    (void) DiscoverIncludePaths(runner, host, "cl.exe", SpecFor(Flavor::Cl));
     CHECK(runner.Calls() == 0);
+}
+
+// --- the MSVC install layout -------------------------------------------------
+//
+// Every case here runs on EVERY platform, against a scripted machine. That is the
+// whole reason the host is a seam: a Visual Studio install and a Windows SDK
+// cannot exist on the Linux and macOS runners that make up most of this project's
+// CI, so a layout tested only where it can be installed is a layout tested in one
+// job out of six.
+
+namespace
+{
+/// A scripted machine carrying one Visual Studio install and one Windows SDK,
+/// laid out exactly as a real one is.
+///
+/// Described in place rather than returned, because `IToolchainHost` deletes its
+/// copy and move constructors on purpose -- a seam is held by reference, never
+/// passed around by value.
+///
+/// Written once and reused, so a case that changes the shape says which part it
+/// changed rather than restating the whole machine. The version numbers are the
+/// ones from the machine this was written on -- real values, because the parsing
+/// they exercise (a four-component SDK version, a three-component toolset) is
+/// where the interesting failures are.
+///
+/// @param host The scripted machine to describe.
+void DescribeWindowsMachine(ScriptedToolchainHost& host)
+{
+    constexpr std::string_view vs = "C:/Program Files/Microsoft Visual Studio/18/Community";
+    constexpr std::string_view toolset = "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231";
+    constexpr std::string_view kits = "C:/Program Files (x86)/Windows Kits/10";
+
+    host.AddExecutable(std::string { toolset } + "/bin/Hostx64/x64/cl.exe");
+    host.AddDirectory(std::string { toolset } + "/include");
+    host.AddDirectory(std::string { toolset } + "/atlmfc/include");
+    host.AddDirectory(std::string { vs } + "/VC/Auxiliary/VS/include");
+    host.AddFile(std::string { vs } + "/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt", "14.51.36231\n");
+
+    // The trailing separator is what `KitsRoot10` really contains.
+    host.AddRegistryValue(RegistryHive::LocalMachine,
+                          R"(SOFTWARE\Microsoft\Windows Kits\Installed Roots)",
+                          "KitsRoot10",
+                          std::string { kits } + "/",
+                          RegistryView::ThirtyTwoBit);
+    for (auto const& subdirectory: { "ucrt", "um", "shared", "winrt", "cppwinrt" })
+        host.AddDirectory(std::string { kits } + "/Include/10.0.26100.0/" + subdirectory);
+    host.AddDirectory(std::string { kits } + "/Include/10.0.22621.0/ucrt");
+
+    host.SetSearchPath({ std::string { toolset } + "/bin/Hostx64/x64" });
+}
+} // namespace
+
+TEST_CASE("An MSVC toolchain's roots come from its own install layout", "[toolchain-probe]")
+{
+    ScriptedToolchainHost host;
+    DescribeWindowsMachine(host);
+
+    auto const roots = MsvcToolsetIncludeRoots(host,
+                                               "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/"
+                                               "MSVC/14.51.36231/bin/Hostx64/x64/cl.exe");
+
+    // The same three directories, in the same order, that `vcvarsall` puts at the
+    // front of `INCLUDE` -- checked against a real developer prompt.
+    CHECK(roots
+          == std::vector<std::string> {
+              "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/include",
+              "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/atlmfc/include",
+              "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Auxiliary/VS/include",
+          });
+}
+
+TEST_CASE("A bare cl and its absolute path derive the same roots", "[toolchain-probe]")
+{
+    // The rule the whole mechanism turns on. A build system invokes `cl` while a
+    // worker is configured with the full path; if those derived different roots
+    // they would derive different fingerprints, and a fingerprint disagreement is
+    // invisible from both ends -- the scheduler simply never matches.
+    ScriptedToolchainHost host;
+    DescribeWindowsMachine(host);
+
+    auto const bare = MsvcToolsetIncludeRoots(host, "cl");
+    auto const absolute = MsvcToolsetIncludeRoots(host,
+                                                  "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/"
+                                                  "MSVC/14.51.36231/bin/Hostx64/x64/cl.exe");
+
+    CHECK_FALSE(bare.empty());
+    CHECK(bare == absolute);
+}
+
+TEST_CASE("A cross-targeting toolset is found at its own depth", "[toolchain-probe]")
+{
+    // `bin/Hostx64/arm64` is the same depth as `x64` today and nothing promises it
+    // stays that way, which is why the walk looks for the `MSVC/<version>` pair
+    // rather than counting levels.
+    ScriptedToolchainHost host;
+    DescribeWindowsMachine(host);
+    constexpr std::string_view toolset = "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231";
+    host.AddExecutable(std::string { toolset } + "/bin/Hostx64/arm64/cl.exe");
+
+    auto const roots = MsvcToolsetIncludeRoots(host, std::string { toolset } + "/bin/Hostx64/arm64/cl.exe");
+    REQUIRE_FALSE(roots.empty());
+    CHECK(roots.front() == std::string { toolset } + "/include");
+}
+
+TEST_CASE("A directory absent from the layout is not offered as a root", "[toolchain-probe]")
+{
+    // A toolchain without ATL/MFC installed is ordinary. `ProbeToolchainFiles`
+    // would skip the root anyway; emitting it only makes the list harder to read
+    // beside an operator's own INCLUDE when a fingerprint disagrees.
+    ScriptedToolchainHost host;
+    constexpr std::string_view toolset = "C:/VS/VC/Tools/MSVC/14.0.0";
+    host.AddExecutable(std::string { toolset } + "/bin/Hostx64/x64/cl.exe");
+    host.AddDirectory(std::string { toolset } + "/include");
+
+    CHECK(MsvcToolsetIncludeRoots(host, std::string { toolset } + "/bin/Hostx64/x64/cl.exe")
+          == std::vector<std::string> { std::string { toolset } + "/include" });
+}
+
+TEST_CASE("A compiler outside any MSVC layout derives no roots", "[toolchain-probe]")
+{
+    ScriptedToolchainHost host;
+    host.AddExecutable("C:/wrappers/cl.exe");
+    host.AddDirectory("C:/wrappers/include");
+
+    CHECK(MsvcToolsetIncludeRoots(host, "C:/wrappers/cl.exe").empty());
+    CHECK(MsvcToolsetIncludeRoots(host, "C:/not/installed/cl.exe").empty());
+}
+
+TEST_CASE("The Windows SDK's roots come from the registry and the newest kit", "[toolchain-probe]")
+{
+    ScriptedToolchainHost host;
+    DescribeWindowsMachine(host);
+
+    CHECK(WindowsKitIncludeRoots(host)
+          == std::vector<std::string> {
+              "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/ucrt",
+              "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um",
+              "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/shared",
+              "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/winrt",
+              "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/cppwinrt",
+          });
+}
+
+TEST_CASE("SDK versions are ordered numerically, not as text", "[toolchain-probe]")
+{
+    // `10.0.9` sorts ABOVE `10.0.22621.0` as text, so a string compare picks a kit
+    // years out of date and fingerprints headers the compiler will never open.
+    ScriptedToolchainHost host;
+    host.AddRegistryValue(RegistryHive::LocalMachine,
+                          R"(SOFTWARE\Microsoft\Windows Kits\Installed Roots)",
+                          "KitsRoot10",
+                          "C:/Kits/10/",
+                          RegistryView::ThirtyTwoBit);
+    host.AddDirectory("C:/Kits/10/Include/10.0.9/ucrt");
+    host.AddDirectory("C:/Kits/10/Include/10.0.22621.0/ucrt");
+
+    CHECK(WindowsKitIncludeRoots(host) == std::vector<std::string> { "C:/Kits/10/Include/10.0.22621.0/ucrt" });
+}
+
+TEST_CASE("A kit named only in the registry still counts", "[toolchain-probe]")
+{
+    // Some machines record each installed kit as a version-named value under
+    // `Installed Roots`; the one this was written on records `KitsRoot10` and two
+    // hundred GUIDs and nothing else. Both sources are read because neither
+    // answers everywhere -- and the GUIDs must not be mistaken for versions.
+    ScriptedToolchainHost host;
+    constexpr std::string_view roots = R"(SOFTWARE\Microsoft\Windows Kits\Installed Roots)";
+    host.AddRegistryValue(RegistryHive::LocalMachine, roots, "KitsRoot10", "C:/Kits/10/", RegistryView::ThirtyTwoBit);
+    host.AddRegistryValue(RegistryHive::LocalMachine, roots, "10.0.26100.0", "1", RegistryView::ThirtyTwoBit);
+    host.AddRegistryValue(
+        RegistryHive::LocalMachine, roots, "{EC4535F2-0CE9-1B42-8E73-B32BCDE21496}", "1", RegistryView::ThirtyTwoBit);
+    host.AddDirectory("C:/Kits/10/Include/10.0.26100.0/um");
+
+    CHECK(WindowsKitIncludeRoots(host) == std::vector<std::string> { "C:/Kits/10/Include/10.0.26100.0/um" });
+}
+
+TEST_CASE("A registry version with no headers on disk is not chosen", "[toolchain-probe]")
+{
+    // An uninstall that left the value behind, or a kit installed without its
+    // headers. Choosing it would fingerprint nothing at all while reporting that
+    // the layout was found.
+    ScriptedToolchainHost host;
+    constexpr std::string_view roots = R"(SOFTWARE\Microsoft\Windows Kits\Installed Roots)";
+    host.AddRegistryValue(RegistryHive::LocalMachine, roots, "KitsRoot10", "C:/Kits/10/", RegistryView::ThirtyTwoBit);
+    host.AddRegistryValue(RegistryHive::LocalMachine, roots, "99.0.0.0", "1", RegistryView::ThirtyTwoBit);
+    host.AddDirectory("C:/Kits/10/Include/10.0.26100.0/um");
+
+    CHECK(WindowsKitIncludeRoots(host) == std::vector<std::string> { "C:/Kits/10/Include/10.0.26100.0/um" });
+}
+
+TEST_CASE("An SDK recorded only in the native view is still found", "[toolchain-probe]")
+{
+    // `Installed Roots` is written by a 32-bit installer and normally lands in
+    // WOW6432Node, but a native-only record must not make the kit invisible.
+    ScriptedToolchainHost host;
+    host.AddRegistryValue(RegistryHive::LocalMachine,
+                          R"(SOFTWARE\Microsoft\Windows Kits\Installed Roots)",
+                          "KitsRoot10",
+                          "C:/Kits/10/",
+                          RegistryView::Native);
+    host.AddDirectory("C:/Kits/10/Include/10.0.26100.0/ucrt");
+
+    CHECK(WindowsKitIncludeRoots(host) == std::vector<std::string> { "C:/Kits/10/Include/10.0.26100.0/ucrt" });
+}
+
+TEST_CASE("A machine with no SDK registered reports no kit", "[toolchain-probe]")
+{
+    ScriptedToolchainHost host;
+    CHECK(WindowsKitIncludeRoots(host).empty());
+}
+
+TEST_CASE("An MSVC service and a developer prompt derive the same roots", "[toolchain-probe]")
+{
+    // The defect this whole mechanism exists for. A Windows service inherits no
+    // `INCLUDE`; `cl` has no `--version`, so its banner falls back to the
+    // normalized basename -- and a worker started as a service therefore
+    // fingerprinted as a digest of the string `cl`, IDENTICALLY on every MSVC
+    // toolset in existence. Two nodes on different toolsets were interchangeable
+    // to the scheduler, which is the false match the fingerprint exists to prevent
+    // and the one that yields a silently wrong object.
+    ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
+
+    ScriptedToolchainHost service;
+    DescribeWindowsMachine(service);
+    ScriptedToolchainHost developerPrompt;
+    DescribeWindowsMachine(developerPrompt);
+    developerPrompt.SetEnvironment("INCLUDE", "C:/somewhere/else;C:/and/another");
+
+    auto const underService = DiscoverIncludePaths(runner, service, "cl", SpecFor(Flavor::Cl));
+    auto const underPrompt = DiscoverIncludePaths(runner, developerPrompt, "cl", SpecFor(Flavor::Cl));
+
+    CHECK_FALSE(underService.empty());
+    CHECK(underService == underPrompt);
+
+    // And the layout, not the variable, is what answered -- the ordering that
+    // keeps the two ends agreeing wherever the layout is derivable at all.
+    CHECK(std::ranges::find(underPrompt, "C:/somewhere/else") == underPrompt.end());
+}
+
+TEST_CASE("INCLUDE is the fallback when no toolset layout can be determined", "[toolchain-probe]")
+{
+    // A wrapper named cl.exe outside any VC layout -- ON A MACHINE THAT HAS AN SDK,
+    // which is the whole point of the case. `WindowsKitIncludeRoots` answers from
+    // the registry alone and knows nothing about which compiler is being
+    // identified, so gating the fallback on the MERGED roots would leave such a
+    // compiler with SDK roots only: no VC headers in its identity, and two
+    // different wrapped toolsets digesting identically. That is the false match the
+    // whole mechanism exists to prevent, reached by the fix for it.
+    ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
+    ScriptedToolchainHost host;
+    DescribeWindowsMachine(host);
+    host.AddExecutable("C:/wrappers/cl.exe");
+    host.SetEnvironment("INCLUDE", "C:/legacy/include;C:/legacy/atl");
+
+    REQUIRE_FALSE(WindowsKitIncludeRoots(host).empty());
+    CHECK(DiscoverIncludePaths(runner, host, "C:/wrappers/cl.exe", SpecFor(Flavor::Cl))
+          == std::vector<std::string> { "C:/legacy/include", "C:/legacy/atl" });
+    CHECK(runner.Calls() == 0);
+}
+
+TEST_CASE("A toolset with no SDK keeps its VC roots rather than falling back", "[toolchain-probe]")
+{
+    // The other half of the gate. A partial layout answer is kept, because both
+    // ends of a dispatch run this code and so reach the same partial answer --
+    // whereas topping it up from a variable only one of them has is how the two
+    // stop agreeing.
+    ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
+    ScriptedToolchainHost host;
+    constexpr std::string_view toolset = "C:/VS/VC/Tools/MSVC/14.0.0";
+    host.AddExecutable(std::string { toolset } + "/bin/Hostx64/x64/cl.exe");
+    host.AddDirectory(std::string { toolset } + "/include");
+    host.SetEnvironment("INCLUDE", "C:/should/not/be/used");
+
+    CHECK(DiscoverIncludePaths(runner, host, std::string { toolset } + "/bin/Hostx64/x64/cl.exe", SpecFor(Flavor::Cl))
+          == std::vector<std::string> { std::string { toolset } + "/include" });
+}
+
+TEST_CASE("clang-cl still reads INCLUDE", "[toolchain-probe]")
+{
+    // Deliberately unchanged: clang-cl's banner is a genuine version string, so a
+    // service run degrades it to a banner-only fingerprint rather than collapsing
+    // every version onto one digest -- and locating the VC headers for a driver
+    // that lives outside the VC layout needs vswhere, a process spawn on the
+    // launcher's per-translation-unit hot path. Issue #145 carries the rest.
+    ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
+    ScriptedToolchainHost host;
+    DescribeWindowsMachine(host);
+    host.SetEnvironment("INCLUDE", "C:/from/the/prompt");
+
+    CHECK(DiscoverIncludePaths(runner, host, "clang-cl.exe", SpecFor(Flavor::ClangCl))
+          == std::vector<std::string> { "C:/from/the/prompt" });
 }
 
 // --- the validity stamp ------------------------------------------------------
@@ -511,8 +808,9 @@ TEST_CASE("A cached fingerprint is reused rather than rewalked", "[toolchain-pro
     FastCache::Testing::ScopedEnv const env { StateVariable, state.Root() };
 
     CountingRunner runner { VerboseNaming(root) };
-    auto const first = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang));
-    auto const second = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    ScriptedToolchainHost host;
+    auto const first = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    auto const second = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang));
 
     CHECK(!first.empty());
     CHECK(first == second);
@@ -520,6 +818,56 @@ TEST_CASE("A cached fingerprint is reused rather than rewalked", "[toolchain-pro
     // what the stamp is computed FROM, so it cannot be cached behind the stamp.
     // What the cache saves is the walk, which is the 288 MB part.
     CHECK(runner.Calls() == 2);
+}
+
+TEST_CASE("A compiler invoked by bare name still caches its fingerprint", "[toolchain-probe]")
+{
+    // The stamp stats the compiler binary, and a BARE name cannot be stat'd from an
+    // arbitrary working directory -- so it produced no stamp, nothing was ever
+    // cached, and the multi-second include-tree walk ran again for every single
+    // translation unit. Resolving the name for the stamp and the cache file also
+    // gives the two spellings of one compiler ONE cache entry rather than two whose
+    // contents are identical and each of which the other misses.
+    ScratchTree const tree { "cache-bare" };
+    tree.Write("inc/a.hpp", "content");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = tree.Root() + "/cc";
+    auto const root = (std::filesystem::path { tree.Root() } / "inc").string();
+
+    ScratchTree const state { "cache-bare-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Root() };
+
+    // The scripted host is what turns `cc` into that path, exactly as a real PATH
+    // lookup would; the real filesystem underneath is what the stamp then stats.
+    CountingRunner runner { VerboseNaming(root) };
+    ScriptedToolchainHost host;
+    host.AddExecutable(compiler);
+    host.SetSearchPath({ tree.Root() });
+
+    // The full path is spelled the way the search-path lookup returns it. Two
+    // SEPARATOR spellings of one location still key apart, here and in production
+    // -- `ResolveOnSearchPath` hands a path back verbatim -- and that is a separate,
+    // pre-existing concern that `IPathResolver` exists for (issue #66). Mixing it in
+    // would leave this case unable to say which of the two effects it had caught.
+    auto const fullPath = ScriptedToolchainHost::Normalize(compiler);
+
+    auto const viaBareName = CachedToolchainFingerprint(runner, host, "cc", "cc 1.0", DriverOf(Flavor::Clang));
+    auto const viaFullPath = CachedToolchainFingerprint(runner, host, fullPath, "cc 1.0", DriverOf(Flavor::Clang));
+
+    CHECK_FALSE(viaBareName.empty());
+    CHECK(viaBareName == viaFullPath);
+
+    // ONE cache file for both spellings, not two -- the half of this that a
+    // matching fingerprint alone would not have caught, since `cc` and its absolute
+    // path used to key different entries that each missed the other.
+    std::error_code ec;
+    std::size_t entries = 0;
+    auto const cacheDirectory = std::filesystem::path { state.Root() } / "fastcache-cc" / "toolchains";
+    for (auto const& entry: std::filesystem::directory_iterator { cacheDirectory, ec })
+        if (entry.path().extension() == ".fingerprint")
+            ++entries;
+    REQUIRE_FALSE(ec);
+    CHECK(entries == 1);
 }
 
 TEST_CASE("A changed toolchain invalidates the cached fingerprint", "[toolchain-probe]")
@@ -534,7 +882,8 @@ TEST_CASE("A changed toolchain invalidates the cached fingerprint", "[toolchain-
     FastCache::Testing::ScopedEnv const env { StateVariable, state.Root() };
 
     CountingRunner runner { VerboseNaming(includeDir.string()) };
-    auto const before = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    ScriptedToolchainHost host;
+    auto const before = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang));
 
     // Change the content AND move the directory clock, which is what a toolchain
     // upgrade does. Content alone would not restamp -- that is the documented
@@ -546,7 +895,7 @@ TEST_CASE("A changed toolchain invalidates the cached fingerprint", "[toolchain-
     std::filesystem::last_write_time(includeDir, original + std::chrono::hours { 1 }, ec);
     REQUIRE(!ec);
 
-    auto const after = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    auto const after = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang));
     CHECK(before != after);
 }
 
@@ -565,13 +914,14 @@ TEST_CASE("A forced refresh ignores a cached value", "[toolchain-probe]")
     FastCache::Testing::ScopedEnv const env { StateVariable, state.Root() };
 
     CountingRunner runner { VerboseNaming(root) };
-    auto const before = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    ScriptedToolchainHost host;
+    auto const before = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang));
 
     // Content changed, clock untouched: the stamp cannot see this, so an
     // unforced call would return the stale value.
     tree.Write("inc/a.hpp", "edited in place");
-    auto const stale = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang));
-    auto const forced = CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang), true);
+    auto const stale = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang));
+    auto const forced = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang), true);
 
     CHECK(stale == before);
     CHECK(forced != before);
@@ -589,7 +939,8 @@ TEST_CASE("No state directory still yields a fingerprint", "[toolchain-probe]")
 
     FastCache::Testing::ScopedEnv const env { StateVariable, "" };
     CountingRunner runner { VerboseNaming(root) };
-    CHECK(!CachedToolchainFingerprint(runner, compiler, "cc 1.0", DriverOf(Flavor::Clang)).empty());
+    ScriptedToolchainHost host;
+    CHECK(!CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).empty());
 }
 
 // --- the compiler banner ------------------------------------------------------

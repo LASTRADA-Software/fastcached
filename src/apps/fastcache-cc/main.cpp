@@ -47,6 +47,7 @@
 #include "ReplayGuard.hpp"
 #include "RootReconciler.hpp"
 #include "Stats.hpp"
+#include "ToolchainHost.hpp"
 #include "ToolchainProbe.hpp"
 
 #include <FastCache/CompileCache/CompileValue.hpp>
@@ -476,6 +477,16 @@ void NoteIfCredentialIgnored(Cc::CacheOutcome const& outcome)
     return *runner;
 }
 
+/// The machine's filesystem, registry and environment, as the toolchain probe
+/// reaches them. Created once, alongside the process runner and for the same
+/// reason: this file is the composition root, so the seams are constructed here
+/// and everything below takes them as parameters.
+[[nodiscard]] Cc::IToolchainHost& ToolchainHost()
+{
+    static std::unique_ptr<Cc::IToolchainHost> const host = Cc::MakeToolchainHost();
+    return *host;
+}
+
 using Cc::CompileRun;
 
 /// Run `argv` with stdout and stderr captured separately.
@@ -813,8 +824,8 @@ struct SourceProbe
 {
     auto const banner = CompilerId(compiler);
     auto const flavor = Cc::ClassifyCompiler(compiler);
-    auto const fingerprint =
-        Cc::CachedToolchainFingerprint(ProcessRunner(), compiler, banner, Cc::DriverOf(flavor), /*forceRefresh=*/true);
+    auto const fingerprint = Cc::CachedToolchainFingerprint(
+        ProcessRunner(), ToolchainHost(), compiler, banner, Cc::DriverOf(flavor), /*forceRefresh=*/true);
 
     std::cout << fingerprint << '\n';
     return 0;
@@ -1301,8 +1312,8 @@ void RecordManifest(Config const& cfg,
     // dispatch-configured path only: it is a cache read in the steady state, but
     // several seconds the first time a machine sees a toolchain, and a build that
     // never dispatches must not pay that at all.
-    auto const fingerprint =
-        Cc::CachedToolchainFingerprint(ProcessRunner(), cmd.compiler, toolchainStamp, Cc::DriverOf(cmd.flavor));
+    auto const fingerprint = Cc::CachedToolchainFingerprint(
+        ProcessRunner(), ToolchainHost(), cmd.compiler, toolchainStamp, Cc::DriverOf(cmd.flavor));
 
     auto const dialer = Cc::MakeTcpDialer(cfg.connectTimeout, cfg.ioTimeout);
     auto const outcome = Cc::Dispatch(*dialer,
