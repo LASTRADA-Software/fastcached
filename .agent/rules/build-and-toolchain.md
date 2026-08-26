@@ -157,6 +157,29 @@ determinism rests on.
   better than hand-matching a style guide and then finding out in CI. Reach for the
   byte-for-byte restore above only when even this is unavailable.
 
+  **`clang-tidy` ships the same way, and it matters more.** Successive releases add
+  *checks*, so an older binary is not merely a laxer formatter -- it is silent about
+  entire categories. `modernize-use-scoped-lock` and
+  `readability-math-missing-parentheses` do not exist in 18, and 22's
+  `bugprone-unchecked-optional-access` follows a value through a binding that 18's
+  does not, so a file clean under 18 arrived at CI with thirteen findings.
+
+  ```sh
+  pip download "clang-tidy==${CLANG_TOOLS_VERSION}.1.0" -d /tmp/ct --no-deps
+  python3 -m zipfile -e /tmp/ct/clang_tidy-*.whl /tmp/ct22
+  ```
+
+  **Run it in place, or through a wrapper that does.** `clang-tidy` finds its own
+  resource headers *relative to the binary*, so copying just the executable out of
+  the wheel produces `'stddef.h' file not found` -- and every check then reports
+  against a translation unit that did not parse, which looks like a wall of real
+  findings and is nothing of the kind.
+
+  It also needs a **clang** compile database. Pointed at a GCC one it inherits
+  flags clang does not know, and the mismatch is not always as loud as it should be;
+  configure a throwaway tree with `-DCMAKE_CXX_COMPILER=clang++
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` and point `-p` at that.
+
 - **A `bool` in the middle of a config struct costs seven bytes, and four of them
   fail the build.** `clang-analyzer-optin.performance.Padding` permits 24 bytes more
   padding than an optimal field order would give, and `NodeConfig` is almost entirely

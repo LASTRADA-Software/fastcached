@@ -120,7 +120,7 @@ std::int64_t FleetHistory::NowMillis() const noexcept
 void FleetHistory::Record(EnumTable<FleetMetric, std::uint64_t> const& values)
 {
     auto const now = NowMillis();
-    auto const guard = std::lock_guard { _mutex };
+    auto const guard = std::scoped_lock { _mutex };
 
     // Both rings take every sample. The hour ring keeps the last reading of each
     // hour, which for a cumulative counter is exactly what makes the difference
@@ -137,7 +137,7 @@ std::vector<FleetBucket> FleetHistory::Buckets(FleetRange range) const
     auto const width = WidthMillisFor(range);
     auto const now = NowMillis();
 
-    auto const guard = std::lock_guard { _mutex };
+    auto const guard = std::scoped_lock { _mutex };
 
     // The Day view folds five 1-minute slots per point; the Week view reads its own
     // ring one for one. One writer, one base resolution, and the fold lives here
@@ -168,13 +168,13 @@ std::vector<FleetBucket> FleetHistory::Buckets(FleetRange range) const
 
 std::uint64_t FleetHistory::Generation() const noexcept
 {
-    auto const guard = std::lock_guard { _mutex };
+    auto const guard = std::scoped_lock { _mutex };
     return _generation;
 }
 
 bool FleetHistory::Empty() const noexcept
 {
-    auto const guard = std::lock_guard { _mutex };
+    auto const guard = std::scoped_lock { _mutex };
     return std::ranges::none_of(_minutes, [](auto const& b) { return b.present; })
            && std::ranges::none_of(_hours, [](auto const& b) { return b.present; });
 }
@@ -195,7 +195,7 @@ bool FleetHistory::Save(std::filesystem::path const& path) const
 {
     std::string body;
     {
-        auto const guard = std::lock_guard { _mutex };
+        auto const guard = std::scoped_lock { _mutex };
         AppendU64(body, _generation);
         for (auto const* ring: { &_minutes, &_hours })
         {
@@ -252,7 +252,7 @@ bool FleetHistory::Load(std::filesystem::path const& path)
     buffer << in.rdbuf();
     auto const raw = buffer.str();
 
-    constexpr std::size_t HeaderSize = FileMagic.size() + 1 + sizeof(std::uint64_t) * 2;
+    constexpr std::size_t HeaderSize = FileMagic.size() + 1 + (sizeof(std::uint64_t) * 2);
     if (raw.size() < HeaderSize)
         return false;
     if (!std::equal(FileMagic.begin(), FileMagic.end(), raw.begin()))
@@ -309,7 +309,7 @@ bool FleetHistory::Load(std::filesystem::path const& path)
     if (rings[0].size() != MinuteSlots || rings[1].size() != HourSlots)
         return false;
 
-    auto const guard = std::lock_guard { _mutex };
+    auto const guard = std::scoped_lock { _mutex };
     _minutes = std::move(rings[0]);
     _hours = std::move(rings[1]);
     // Restored, not reset: a generation that started again from zero would let a

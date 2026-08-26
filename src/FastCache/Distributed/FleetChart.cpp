@@ -122,7 +122,7 @@ namespace
         if (max <= 0.0)
             return ChartHeight - PadBottom;
         auto const usable = ChartHeight - PadTop - PadBottom;
-        return PadTop + usable * (1.0 - std::min(value / max, 1.0));
+        return PadTop + (usable * (1.0 - std::min(value / max, 1.0)));
     }
 
     /// Round a maximum up to something a gridline label can say plainly.
@@ -152,28 +152,30 @@ namespace
         std::size_t index = 0;
         while (index < values.size())
         {
-            if (!values[index].has_value())
+            auto const& first = values[index];
+            if (!first.has_value())
             {
                 ++index;
                 continue;
             }
             auto const runStart = index;
+            auto const firstOfRun = *first;
             std::string path;
-            while (index < values.size() && values[index].has_value())
+            while (index < values.size())
             {
-                path += std::format("{}{:.2f} {:.2f}",
-                                    index == runStart ? "M" : "L",
-                                    XAt(index, values.size()),
-                                    ScaleY(*values[index], max));
+                auto const& reading = values[index];
+                if (!reading.has_value())
+                    break;
+                path += std::format(
+                    "{}{:.2f} {:.2f}", index == runStart ? "M" : "L", XAt(index, values.size()), ScaleY(*reading, max));
                 ++index;
             }
             if (index - runStart < 2 && !close)
             {
                 // A single known point has no line to draw, so it gets a dot -- a
                 // run of one is still a reading and dropping it would under-report.
-                out += std::format(R"(<circle cx="{:.2f}" cy="{:.2f}" r="1.6"/>)",
-                                   XAt(runStart, values.size()),
-                                   ScaleY(*values[runStart], max));
+                out += std::format(
+                    R"(<circle cx="{:.2f}" cy="{:.2f}" r="1.6"/>)", XAt(runStart, values.size()), ScaleY(firstOfRun, max));
                 continue;
             }
             if (close)
@@ -523,14 +525,15 @@ std::string RenderSparklineSvg(std::vector<FleetBucket> const& buckets)
     bool open = false;
     for (auto const index: std::views::iota(std::size_t { 0 }, values.size()))
     {
-        if (!values[index].has_value())
+        auto const& reading = values[index];
+        if (!reading.has_value())
         {
             open = false;
             continue;
         }
         auto const x =
             SparkWidth * static_cast<double>(index) / static_cast<double>(std::max<std::size_t>(1, values.size() - 1));
-        auto const y = max > 0.0 ? (SparkHeight - 2.0) * (1.0 - *values[index] / max) + 1.0 : SparkHeight - 1.0;
+        auto const y = max > 0.0 ? ((SparkHeight - 2.0) * (1.0 - (*reading / max))) + 1.0 : SparkHeight - 1.0;
         path += std::format("{}{:.1f} {:.1f}", open ? "L" : "M", x, y);
         open = true;
     }

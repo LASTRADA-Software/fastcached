@@ -297,9 +297,10 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - A sanitizer that is on in the cache is not one that is on in the build — a tool
   that silently does nothing is worse than one that is visibly off.
 - `clang-format -i` at any version but the pinned one silently reformats code the
-  pinned one already accepted; run an older binary as `--dry-run` only. The pinned
-  build ships on PyPI (`pip download clang-format==<version>`), so "the distro only
-  has an older one" is not a reason to format with it.
+  pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
+  tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the
+  distro only has an older one" is not a reason to use it. An older clang-tidy is
+  worse than a laxer one: it is *silent* about checks that do not exist in it yet.
 - Every `bool` and byte-wide enum in a config struct lives in one run: one between two
   8-aligned members costs seven bytes, and clang-tidy's padding budget fails the build.
 - A table indexed by an enumerator is `EnumTable<Enum, Row>` + `RowsInEnumeratorOrder`.
