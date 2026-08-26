@@ -133,7 +133,7 @@ struct NodeConfig
     /// Required when the admin surface is not on loopback: a fleet map on a public
     /// port with no credential is what this flag exists to stop somebody doing by
     /// accident.
-    std::string dashboardTokenFile;
+    std::filesystem::path dashboardTokenFile;
 
     /// Generate a self-signed certificate at startup instead of naming one.
     ///
@@ -156,10 +156,10 @@ struct NodeConfig
     /// the two binaries. There is deliberately **no `--tls` boolean**: TLS is on by
     /// naming a certificate and a key, which removes the state "TLS requested, no
     /// material" that a boolean makes reachable.
-    std::string tlsCertFile;
+    std::filesystem::path tlsCertFile;
 
     /// Private key for `tlsCertFile`. Both or neither.
-    std::string tlsKeyFile;
+    std::filesystem::path tlsKeyFile;
 
     /// Where this node serves the fleet's scheduler verbs, or empty to leave it off.
     ///

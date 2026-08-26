@@ -40,11 +40,23 @@ namespace
     /// Parsed HTTP request head. `ok` is false when no complete line arrived
     /// within the byte cap or the line was malformed.
     ///
-    /// Holds the head it parsed, because `AdminRequest` is all `string_view`: the
-    /// views point into `head`, so the two travel together or neither is valid.
+    /// Owns each field as its own `std::string` rather than keeping the raw head
+    /// and viewing into it. That is not redundancy: an earlier version held the
+    /// buffer here and `std::move`d it into this struct *in the same aggregate
+    /// initializer* that read `string_view`s over it -- and aggregate
+    /// initialization is evaluated left to right, so the move happened first and
+    /// every view was already dangling.
+    ///
+    /// It worked on libstdc++ and returned empty strings on libc++, for a reason
+    /// worth keeping: whether the move invalidates the views depends entirely on
+    /// whether the buffer was heap-allocated. libc++'s small-string capacity is 22
+    /// bytes and `GET /nope HTTP/1.1\r\n\r\n` is exactly 22, so that request was
+    /// copied inline and its views broke, while a 26-byte POST heap-allocated and
+    /// survived. libstdc++'s capacity is 15, so both allocated and neither broke.
+    /// A bug that is invisible on one standard library and depends on request
+    /// length on the other is not one to leave to a careful reader.
     struct RequestHead
     {
-        std::string head;
         std::string method;
         std::string target;
         std::string authorization;
@@ -156,8 +168,7 @@ namespace
             cursor = lineEnd + 2;
         }
 
-        co_return RequestHead { .head = std::move(buffer),
-                                .method = std::string { line.substr(0, sp1) },
+        co_return RequestHead { .method = std::string { line.substr(0, sp1) },
                                 .target = std::string { target },
                                 .authorization = std::move(authorization),
                                 .ok = true };

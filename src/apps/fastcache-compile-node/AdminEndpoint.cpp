@@ -207,7 +207,11 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
     {
 #if defined(FC_TLS_ENABLED)
         auto created = cfg.tlsSelfSigned ? TlsContext::CreateSelfSigned(SelfSignedSubjectNames(cfg, host))
-                                         : TlsContext::Create(cfg.tlsCertFile, cfg.tlsKeyFile);
+                                         // `.string()` because `TlsContext::Create` takes
+                                         // `string_view`, and a `std::filesystem::path` only
+                                         // converts to one implicitly where `string_type` IS
+                                         // `std::string` -- which is POSIX and not Windows.
+                                         : TlsContext::Create(cfg.tlsCertFile.string(), cfg.tlsKeyFile.string());
         if (!created.has_value())
             return std::unexpected { std::format(
                 "{}: {}", cfg.tlsSelfSigned ? "--tls-self-signed" : "--tls-cert/--tls-key", created.error().ToString()) };

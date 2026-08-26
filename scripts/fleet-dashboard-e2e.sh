@@ -176,6 +176,14 @@ printf '%s\n' "$TOKEN" > "${workdir}/token"
 toolchain="$(command -v c++ || command -v g++ || command -v cc)"
 [[ -n "$toolchain" ]] || { echo "no C++ driver on PATH; skipping"; exit "$SKIP"; }
 
+# The flags that turn TLS on, or none of them.
+#
+# Expanded below as `${tls_args[@]+"${tls_args[@]}"}` rather than plainly, which
+# looks redundant and is not: under `set -u`, bash 3.2 treats expanding an EMPTY
+# array as an unbound variable and aborts. That is the bash macOS still ships, so
+# the plaintext run -- the only one whose array is empty -- died on the runner
+# while both TLS runs passed. bash 4.4 made the plain form safe, which is why no
+# Linux job ever saw it.
 tls_args=()
 [[ -n "$tls_cert" ]] && tls_args=(--tls-cert "$tls_cert" --tls-key "$tls_key")
 [[ -n "$tls_self_signed" ]] && tls_args=(--tls-self-signed)
@@ -191,7 +199,7 @@ tls_args=()
     --dashboard \
     --dashboard-token-file "${workdir}/token" \
     --listen-cache "" \
-    "${tls_args[@]}" \
+    ${tls_args[@]+"${tls_args[@]}"} \
     > "${workdir}/node.log" 2>&1 &
 node_pid=$!
 
