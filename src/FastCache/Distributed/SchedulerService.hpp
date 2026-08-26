@@ -251,6 +251,29 @@ class SchedulerService
                                               std::string_view memberId,
                                               std::string_view raftEndpoint);
 
+    /// Where the leader answers, when one is known.
+    ///
+    /// The scheduler endpoint rather than the consensus one, and that distinction
+    /// is a defect this pairing already closed once: a follower that names the
+    /// leader's Raft port sends a client to a socket which speaks nothing it
+    /// understands. It is the same string `NotLeader` carries in its message, and
+    /// empty for `Undecided` -- an election in progress has nobody to name.
+    /// @return The leader's scheduler endpoint, or empty.
+    [[nodiscard]] std::string_view LeaderEndpoint() const noexcept
+    {
+        return _leaderEndpoint;
+    }
+
+    /// Leases outstanding right now.
+    ///
+    /// Narrow on purpose: a reporting caller has no business holding a
+    /// `LeaseTable&`, which is mutable and whose other verbs account for capacity.
+    /// @return The live lease count.
+    [[nodiscard]] std::size_t LiveLeaseCount() const
+    {
+        return _leases.LiveCount();
+    }
+
     /// The registry, for the admin endpoint and for tests.
     [[nodiscard]] WorkerRegistry const& Workers() const noexcept
     {
