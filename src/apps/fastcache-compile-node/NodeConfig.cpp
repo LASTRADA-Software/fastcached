@@ -662,11 +662,11 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
         argv.emplace_back("--dashboard");
     // The PATH, never the secret it holds -- the same rule `--requirepass` is
     // refused outright by, one step less strict because a path is not a credential.
-    emitPathIfSet("dashboard-token-file", cfg.dashboardTokenFile);
+    emitPathIfSet("dashboard-token-file", cfg.dashboardTokenFile.string());
     if (cfg.tlsSelfSigned)
         argv.emplace_back("--tls-self-signed");
-    emitPathIfSet("tls-cert", cfg.tlsCertFile);
-    emitPathIfSet("tls-key", cfg.tlsKeyFile);
+    emitPathIfSet("tls-cert", cfg.tlsCertFile.string());
+    emitPathIfSet("tls-key", cfg.tlsKeyFile.string());
     emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
     emitIfSet("cache-memory", cfg.cacheMemoryBytes, defaults.cacheMemoryBytes);
     emitIfSet("cache-disk", cfg.cacheDiskBytes, defaults.cacheDiskBytes);
