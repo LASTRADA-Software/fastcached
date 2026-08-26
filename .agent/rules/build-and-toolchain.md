@@ -62,6 +62,41 @@ determinism rests on.
   project's WSL image, where 22 sits right beside it as `clang-tidy-22`. So a `clang-debug`
   build reports "clang-tidy clean" in exactly the way that means nothing, and the version it
   used is printed nowhere. Configure a second build directory naming the version, and run that.
+- **When `clang-debug` cannot be built, get the sanitizer from GCC instead.** That
+  preset is the only one that runs ASan, and on a host where it cannot configure at
+  all the tempting conclusion is that no sanitizer coverage is available locally. It
+  is: GCC has ASan too, and a throwaway tree costs one configure.
+
+  ```sh
+  cmake -S . -B out/build/gcc-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+        -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" \
+        -DFASTCACHED_ENABLE_TLS=ON -DPEDANTIC_COMPILER_WERROR=OFF
+  ```
+
+  **ASan only, never `address,undefined`.** UBSan's instrumentation defeats GCC's
+  constant evaluation of the option tables' lambda addresses, so `Options.hpp`'s
+  `TableIsWellFormed` `static_assert` stops compiling -- a build error with nothing
+  to do with the code under test, and an easy reason to abandon the idea.
+
+  A use-after-free reached CI through two jobs while this was thought unavailable.
+  The local run that catches it takes about a minute.
+
+- **A memory bug reports only if something disturbs the freed block, so run the
+  WHOLE suite.** The case that failed in CI passes under ASan on its own: nothing
+  reuses the allocation, so nothing is read across a boundary the interceptors
+  watch, and the test reports success. The same held for a standalone repro --
+  decode, read, nothing in between: clean; sixty allocations inserted between the
+  two: `heap-use-after-free` immediately. A quiet sanitizer run on one test is not
+  evidence that a diagnosis is wrong.
+
+- **After reverting files to reproduce a bug, check that the build SUCCEEDED.**
+  Reverting two files to the parent commit left an unrelated translation unit
+  failing to compile; ninja stopped, and the binary that ran was the *previous* one.
+  It passed, which looked like proof the bug was not real. `ninja: build stopped`
+  scrolls past above a green test run, and a reproduction that did not rebuild is
+  not a reproduction.
+
 - **A sanitizer that is on in the cache is not a sanitizer that is on in the build.**
   `cmake/portable/Sanitizers.cmake` initialised `SANITIZER_COMPILE_OPTIONS` to `""`
   as a normal variable, published the real flags through

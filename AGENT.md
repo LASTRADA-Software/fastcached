@@ -292,6 +292,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
 - Run `scripts/local-gate.sh` before pushing. One configuration is not the gate.
+- Where `clang-debug` will not build, get ASan from GCC (`-fsanitize=address` alone —
+  UBSan breaks the option tables' constexpr checks) and run the **whole** suite: a
+  freed block nothing disturbs reports nothing.
 - Run clang-format and clang-tidy **at the version CI pins**, in a build directory
   of its own; `PATH` resolving to an older binary reports clean in the way that
   means nothing.
