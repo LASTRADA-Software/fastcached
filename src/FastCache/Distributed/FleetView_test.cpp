@@ -11,9 +11,12 @@
 #include <optional>
 #include <string>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Distributed;
 using namespace FastCache::Distributed::Testing;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -36,7 +39,7 @@ class FakeCluster final: public IClusterAdmin
         return _state;
     }
 
-    [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const&) override
+    [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& /*command*/) override
     {
         return {};
     }
@@ -407,7 +410,7 @@ TEST_CASE("Collecting a fleet reads the registry per machine and the counters as
     REQUIRE(snapshot.nodes.size() == 1);
     CHECK(snapshot.nodes[0].endpoint == "10.0.0.2:7100");
     REQUIRE(snapshot.cluster.has_value());
-    CHECK(snapshot.cluster->members.size() == 1);
+    CHECK(Unwrap(snapshot.cluster).members.size() == 1);
     // Read off the sink rather than recomputed here: /metrics stays the source of
     // truth for anything alertable.
     REQUIRE(snapshot.leases.size() == LeaseOutcomeTable.size());
