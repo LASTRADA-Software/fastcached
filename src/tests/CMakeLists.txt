@@ -275,6 +275,42 @@ set_tests_properties("compile-cache-daemon-staging" PROPERTIES
 # worker's output can never be byte-identical to a local build's. Every section
 # carrying code or data is, and the fixture's own comparison is what says so --
 # which is why that comparison has a self-test of its own below.
+# ---------------------------------------------------------------------------
+# fleet-dashboard-e2e: the leader's dashboard, over a real socket.
+#
+# Registered HERE rather than beside the node for the reason `dist-compile-e2e`
+# is: `src/apps` walks its app table in order, so a test registered beside one
+# binary cannot name another, and a `$<TARGET_FILE:>` guard on a target
+# configured later does not fail -- it silently skips the test forever.
+#
+# What it covers that the unit tests cannot: that the route rows reach the accept
+# loop over a real bound port, that `/metrics` on that same port is byte-for-byte
+# unaffected by the credential (the assertion protecting every existing scraper),
+# and that a node registering with its own scheduler reaches the rendered page.
+if(NOT TARGET fastcache-compile-node)
+    message(STATUS "fleet-dashboard-e2e: compile node not built — skipping")
+elseif(WIN32)
+    # POSIX-only for now, the way `cluster-e2e` records for itself: the fixture is
+    # `/dev/tcp` and bash, and a PowerShell twin is a translation rather than new
+    # coverage.
+    message(STATUS "fleet-dashboard-e2e: POSIX-only fixture — skipping on Windows")
+else()
+    add_test(
+        NAME "fleet-dashboard-e2e"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/fleet-dashboard-e2e.sh"
+            --node "$<TARGET_FILE:fastcache-compile-node>"
+    )
+    # Starts a real node with three listeners, so it must not race the other
+    # server-starting smoke tests for ports.
+    set_tests_properties("fleet-dashboard-e2e" PROPERTIES
+        LABELS "smoke"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 120
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cc)
     message(STATUS "dist-compile-e2e: daemon, compile node or launcher not built — skipping")
 else()

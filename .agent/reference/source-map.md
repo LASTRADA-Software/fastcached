@@ -103,6 +103,12 @@ src/FastCache/
                 ManualClock unit test rather than a sleep. Named Distributed
                 and not Dispatch because RedisResp.cpp already has a Dispatch()
                 that collides under unqualified lookup inside namespace FastCache.
+                FleetView renders what the leader can see -- members, machines,
+                workers, per-tier caches and the lease split -- as one page and as
+                JSON, off column tables both renderers walk. Pure with respect to
+                I/O for the reason the two above it are: collecting reads the
+                scheduler, rendering reads only the snapshot, so every "absent is
+                not zero" rule is a unit test over a literal.
   Protocol/     IProtocolHandler, ProtocolAutodetect,
                 Framing/ByteReader (line and length-prefixed), MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
@@ -113,7 +119,11 @@ src/FastCache/
                 status/error tables and their encoders, shared verbatim by the
                 daemon, fastcache-cc and the test client)
   Server/       Connection (per-client coroutine), Server,
-                ReactorServerLoop (the server driver)
+                ReactorServerLoop (the server driver), AdminHttpServer (the
+                read-only HTTP surface; its routes are a table a caller
+                contributes rows to, so the fleet page can be served without
+                Server/ ever learning about Distributed/) and AdminCredential
+                (the Basic/Bearer scheme table, over ConstantTimeEquals)
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
                 ISignalSource, DaemonControls (process-wide stop/reload flags),
                 CpuAffinity, HostMemory, HostInfo (what a machine IS: OS, version,

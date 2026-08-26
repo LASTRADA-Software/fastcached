@@ -484,3 +484,33 @@ waits for the worker's **own** readiness line rather than `systemctl is-active`:
 `Type=simple` is reported active the moment systemd forks, while the worker still
 has seconds of include-tree walking to do.
 
+**A dashboard route is a verb, and gets the same leadership answer as the rest of
+the surface.** `/fleet` and `/fleet.json` are not registered at all on a node with
+no `--listen-scheduler`, so they are a plain 404 rather than a route answering with
+an empty fleet -- a process with no fleet view offers no fleet route. Where one
+exists, a node that does not lead answers `503` naming the leader, which is
+`Gate()`'s `NotLeader` rendered in HTTP. The reasoning, and why it is never a
+redirect, is in
+[`metrics-and-observability.md`](metrics-and-observability.md).
+
+**The ceilings behind `AvailableSlots` are reported, not just the minimum.** That
+function folds four numbers into one and the fold loses the only part an operator
+can act on: a node offering 2 of its 16 slots is a different problem depending on
+whether somebody is *using* the machine, its memory is gone, or its scratch disk
+has filled, and the three have opposite fixes. `SlotCeilingsFor` is the same
+arithmetic with each ceiling named and `AvailableSlots` is one line over it, so
+there is one author for the subtraction. Two properties travel with it: the
+ceilings are `optional`, so a machine that could not read its CPU has *no* CPU
+ceiling rather than one of zero; and a tie names the earlier limit in enumerator
+order, which is application order -- left unstated it would depend on how the
+comparison happened to be written and change under somebody tidying it.
+
+**A heartbeat age is a duration on a report, never a `TimePoint` on `WorkerInfo`.**
+`WorkerInfo` is what `Pick` returns and what a lease is built from, and an age
+frozen inside a lease stops meaning anything the moment it is stored. Worse,
+handed a raw `TimePoint` the obvious thing for a consumer to do is subtract
+`steady_clock::now()` -- right in production, wrong under every `ManualClock` test,
+and silent, because the two clocks agree about nothing. Subtracting inside the
+registry means the answer comes from the clock it was injected with; it clamps at
+zero, because a manual clock can legitimately be set backwards and an unsigned
+duration would otherwise read as several hundred million years.

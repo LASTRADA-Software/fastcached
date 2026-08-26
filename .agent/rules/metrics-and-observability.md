@@ -119,3 +119,65 @@ fault.
     naming nothing, which this repository has already paid for once
     (`dist-compile-e2e ***Timeout 900.10 sec`). It destroys the endpoint on another
     thread and fails in 15s saying what it waited for.
+- **A fleet report is served by the leader, and anyone else says so rather than
+  guessing where it is.** A follower's `WorkerRegistry` holds whatever registered
+  against it, not the fleet, which is why `SchedulerService::Gate()` refuses every
+  verb -- reads included -- from a node that does not lead. `/fleet` answers `503`
+  naming the leader and its **scheduler** endpoint: that is `NotLeader` in HTTP's
+  vocabulary, and 200 would present a partial registry as the whole picture.
+  - **It is not a redirect, and it is not a link.** A dashboard address is local
+    configuration on each node and nothing replicates it, so any URL built by the
+    refusing node is a guess. Guessing here is the defect this project has already
+    had once, in its other spelling: a follower redirected clients to the leader's
+    *consensus* port, which speaks nothing a client understands. That is also why
+    a `dashboardEndpoint` on `ClusterMember` was refused rather than added --
+    `Cluster::ClusterState` is versioned and its decoder refuses any other version,
+    so a field costs a `StateVersion` bump that makes every existing on-disk
+    snapshot and log entry undecodable, and a half-upgraded cluster unable to apply
+    each other's entries. That is a consensus-format migration bought for a
+    diagnostic page.
+- **The columns are a table both renderers walk, and the test asserts over the
+  table.** The page and the JSON take one spelling per column -- it is the header
+  cell *and* the key -- so the two cannot drift, and each row carries a projection
+  rather than a value, the shape `TierMetric` already uses against
+  `StorageTierTable`. A hand-written list of `<td>`s is the same defect as a
+  hand-written list of series, and a list of *expected* columns written out beside
+  the table is what goes stale, maintained by whoever forgot the renderer.
+- **Absent is not zero, one level further in than a series: at the cell.** Every
+  `optional` in `NodeLoad`, `NodeCacheLoad` and `NodeCacheCapacity` reaches a cell
+  unflattened -- `null` in JSON, a dash on the page, the spelling `--cluster-status`
+  already uses. `0` is a claim: `cores 0` says a machine has no CPU, and a cache
+  that has served no reads has no hit rate rather than one of 0%. A table cannot
+  omit one cell the way a scrape omits a line, so the granularity of the rule here
+  is the **column**: a tier no member runs contributes no column at all, and a
+  member lacking a tier others have renders an absence in it.
+- **A fleet total is computed per machine, never per registry entry.** The registry
+  keys on `(fingerprint, endpoint)`, so a node with two `--toolchain` flags is two
+  entries carrying one machine's cores -- and a page listing workers would report a
+  fleet twice the size of the one an operator owns. `WorkerRegistry::NodeReports()`
+  is the grain, and it decides once which fields add across siblings: the slot
+  count is the maximum (both were derived from the same cores), the in-flight count
+  is the sum (those are different jobs).
+- **The dashboard's credential is separate from `--requirepass`, and the surface
+  is refused rather than served without one.** `--requirepass` is what a node
+  *presents* to the scheduler and every member of the fleet holds it, so reusing it
+  would let any worker read every other node's fleet map -- wrong direction and
+  wrong grain. It is a file for the reason `--cluster-key-file` is one, and a
+  non-loopback `--admin-listen` with `--dashboard` and no token file is a **startup
+  refusal**: the page lists every member's hostname, endpoint and capacity, and
+  HTTPS does not substitute, because TLS authenticates the server to the browser
+  and says nothing about who the browser is. Loopback needs none -- reaching it
+  already means being on the machine.
+  - **Both `Basic` and `Bearer`, as a table.** Bearer alone would have made the
+    page unopenable in the browser it exists for: there is no browser prompt for
+    it, so a reader would have to paste a token into a URL or a cookie. The 401
+    carries `WWW-Authenticate`, without which a browser shows the body and no
+    prompt -- which reads as a broken page rather than as a credential being
+    required. A scheme that cannot parse its parameter is a refusal, never a
+    fall-through to the next row, or `Basic` with unreadable base64 would be
+    compared verbatim as a bearer token.
+  - **The credential gates the dashboard routes and nothing else.** `/metrics` and
+    `/healthz` stay exactly as open as they were, so turning the dashboard on
+    changes nothing for a scraper or a probe already pointed at that port. TLS is
+    the same story: it is on by naming a certificate and a key, so a node that
+    names neither keeps a plaintext admin port that behaves as it always did.

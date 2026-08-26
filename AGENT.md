@@ -11,7 +11,7 @@ transport, a manual clock and a scripted reactor.
 ```
 src/FastCache/
   Core/         Error taxonomy, Clock, HostPort, IRandomSource, Logger, BufferPool,
-                Bytes, Endian, Crc32c, MurmurHash3, Sha256/HMAC, StringHash, Owner,
+                Base64, Bytes, Endian, Crc32c, MurmurHash3, Sha256/HMAC, StringHash, Owner,
                 Compression, WireFrame + WireFields (the shared framing), Profiling
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
                 InterruptibleSleepUntil, DeadlineTimer, AsyncQueue (MPSC,
@@ -43,13 +43,15 @@ src/FastCache/
                 MembershipPolicy — who is a member, WHERE they answer, and the
                 settings every member must agree on
   Distributed/  WorkerRegistry, LeaseTable and SchedulerService — the fleet's
-                capacity decisions, all pure with respect to I/O
+                capacity decisions, all pure with respect to I/O; plus FleetView,
+                which renders what the leader can see as a page and as JSON
   Protocol/     IProtocolHandler, ProtocolAutodetect, Framing/ByteReader,
                 MemcachedText, MemcachedMeta, MemcachedBinary, RedisResp,
                 CompileCacheHandler (the 0xFC executor) and CompileCacheWire
                 (header-only and dependency-free, shared verbatim by every
                 binary)
-  Server/       Connection (per-client coroutine), Server, ReactorServerLoop
+  Server/       Connection (per-client coroutine), Server, ReactorServerLoop,
+                AdminHttpServer (its routes are a table) + AdminCredential
   Platform/     IDaemonHost, ISignalSource, DaemonControls, CpuAffinity,
                 HostMemory, HostInfo, ServiceControl (ServiceSpec), Terminal,
                 InheritedListener (systemd socket activation),
@@ -160,6 +162,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   *unbounded*, so the flag that turns a cache off once turned its limit off.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
+- `AvailableSlots` folds four ceilings into one; `SlotCeilingsFor` is the same
+  arithmetic with each named, and a tie names the earlier limit in enumerator order.
+- A heartbeat age is a duration on a report, never a `TimePoint` on `WorkerInfo` —
+  a raw instant invites `steady_clock::now()` and breaks every `ManualClock` test.
 
 **[`.agent/rules/consensus-and-cluster.md`](.agent/rules/consensus-and-cluster.md)**
 — Raft, discovery, membership. Before `Consensus/`, `Cluster/`.
@@ -238,6 +244,14 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A merged snapshot is one tier's answer standing in for all of them:
   `SnapshotTiers()` reports the split, the `tier` label comes from a table, and a
   tier the cache does not have renders no line at all.
+- The fleet page is served by the leader; anyone else answers `503` **naming** the
+  leader, never a redirect and never a link to an address it guessed.
+- Its columns are a table both renderers walk, one spelling serving as header and
+  JSON key. Absent renders `null`/`–` at the **cell**, and a tier no member runs
+  gets no column.
+- A fleet total is computed over `NodeReports()`, never over registry entries.
+- The dashboard credential is its own file, never `--requirepass`; a non-loopback
+  bind without one is a startup refusal, and TLS does not substitute for it.
 
 **[`.agent/rules/packaging-and-release.md`](.agent/rules/packaging-and-release.md)**
 — packaging, versioning, cutting a release. Before `packaging/`, `cmake/Packaging.cmake`,

@@ -763,14 +763,91 @@ curl -s localhost:6675/healthz     # 200 while the worker is answering
 curl -s localhost:6675/metrics     # Prometheus exposition
 ```
 
-It is the same endpoint and the same renderer the daemon serves — a worker has
-no cache, so the cache series are **absent** rather than present and zero, which
-a dashboard would otherwise read as an empty unbounded cache rather than as no
-cache at all.
+It is the same endpoint and the same renderer the daemon serves. A node that
+runs no cache tier at all reports the cache series as **absent** rather than
+present and zero, which a dashboard would otherwise read as an empty unbounded
+cache rather than as no cache at all.
 
 `/healthz` is worth wiring even if you never scrape: without it a supervisor can
 tell that the process is alive but not that it is *answering*, which is the state
 a wedged worker is in. It is what `systemd`'s and Kubernetes' probes want.
+
+## Looking at the whole fleet
+
+`--dashboard` adds two more routes to that same endpoint: `/fleet`, a page, and
+`/fleet.json`, the same facts for anything that is not a browser.
+
+```sh
+fastcache-compile-node --scheduler cache.internal:6674 \
+                       --toolchain /usr/bin/c++ \
+                       --listen-scheduler 6675 --fleet-member 10.0.0.2 \
+                       --admin-listen 6677 \
+                       --dashboard --dashboard-token-file /etc/fastcached/dashboard.token
+curl -s -u ":$(cat /etc/fastcached/dashboard.token)" localhost:6677/fleet.json | jq .
+```
+
+**The leader answers it, and nobody else can.** A follower's registry holds
+whatever registered against *it* rather than the fleet, which is the same reason
+`--cluster-status` is refused by one. Ask a follower and it replies `503` naming
+the leader and its scheduler endpoint — deliberately not a redirect, and
+deliberately not a link: where the dashboard is served is configuration on that
+node, nothing replicates it, and a URL built by guessing is one your browser
+cannot use.
+
+What it shows, and why each part is split the way it is:
+
+| Section | What it answers |
+|---|---|
+| Members | Who the cluster has agreed on, and where each answers. A member that has never led shows no scheduler endpoint, because it has not said. |
+| Machines | One row **per machine**, not per toolchain: cores, memory, free scratch, class and reserve, cache hit rate, heartbeat age. |
+| Caches | Items, bytes, budget and evictions **per tier**. A tier no member runs has no column at all. |
+| Workers | One row per `(toolchain, endpoint)` registry entry: slots, in flight, available — and *which* limit withdrew the difference. |
+| Leases | Granted, and refused split four ways. |
+
+Three of those distinctions cost real debugging time when they are collapsed:
+
+- **A machine is not a worker.** A node started with two `--toolchain` flags is
+  two registry entries carrying one machine's cores. The Machines table is the
+  grain a fleet total is computed over; summing the Workers table reports a fleet
+  twice the size of the one you own.
+- **`limited-by` is the whole diagnosis.** A node offering 2 of its 16 slots is
+  three different problems: `external-cpu` means somebody is using that machine,
+  `memory` and `scratch` mean it is out of something. Buying hardware fixes
+  exactly one of them.
+- **Do not add the lease refusals together.** `no-worker` is a misconfiguration,
+  `no-capacity` says buy more machines, `withdrawn` says your machines are busy
+  with something else, and `duplicate` says it is already being built. A total
+  hides all four.
+
+A value nobody reported renders as `–` on the page and `null` in the JSON, never
+as `0` — a zero is a claim, and "this cache holds nothing" is a different fact
+from "this node never told us".
+
+### Getting at it safely
+
+The page is a map of every member's hostname, endpoint and capacity, so:
+
+- **A bare port binds loopback**, as `--admin-listen` always has.
+- **`--dashboard-token-file` is required when it is not on loopback.** The node
+  refuses to start otherwise. A file rather than a flag, because a command line is
+  readable through `ps` — and its own secret rather than `--requirepass`, which
+  every member of the fleet already holds and which points the other way.
+- Present it as `Authorization: Bearer <token>` or as HTTP Basic with any
+  username (`curl -u :$TOKEN`). Basic is there because browsers prompt for it and
+  do not prompt for Bearer.
+- **`--tls-cert` and `--tls-key` turn the whole admin surface into HTTPS.** Both
+  or neither; there is no `--tls` boolean, so "TLS requested, no certificate" is
+  not a state you can reach. Naming neither leaves the port exactly as it was, so
+  an existing Prometheus scraper keeps working untouched.
+
+TLS gives you confidentiality and tells your browser it reached the right server.
+It says nothing about who the browser is — that is what the credential is for, and
+why one is required rather than suggested on a public bind.
+
+`/metrics` and `/healthz` are **not** behind the credential, so turning the
+dashboard on changes nothing for a scraper or a probe already pointed at them.
+And `/metrics` stays the source of truth for anything you alert on: the dashboard
+reads the same counters and computes no number of its own.
 
 What the counters mean is tabulated under
 [Distributed compilation](../getting-started/distributed-compilation.md#confirming-it-works).
