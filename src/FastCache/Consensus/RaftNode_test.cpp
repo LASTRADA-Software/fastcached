@@ -1347,10 +1347,10 @@ TEST_CASE("A node that has just heard from a leader refuses a pre-vote", "[conse
 
 TEST_CASE("A leader that still hears from a quorum refuses a pre-vote", "[consensus][raft][prevote]")
 {
-    // The hole the follower-side check leaves. `_lastLeaderContact` is set only
-    // where a leader spoke to this node, and a leader never hears from a leader --
-    // so it ages out on the one node best placed to refuse, and the node whose own
-    // quorum proves the cluster is healthy was the only one that granted.
+    // The hole the follower-side check leaves. That check answers from evidence a
+    // leader never gets -- a leader never hears from a leader -- so it ages out on
+    // the one node best placed to refuse, and the node whose own quorum proves the
+    // cluster is healthy was the only one that granted.
     //
     // A leader answers from that quorum instead: CheckQuorum, decided from the
     // responses it already receives rather than from a clock it must trust.
@@ -1514,6 +1514,141 @@ TEST_CASE("A leader refuses a pre-vote before its first heartbeat is answered", 
     auto const replies = MessagesOfType<PreVoteResponse>(answer);
     REQUIRE(replies.size() == 1);
     CHECK(replies[0].decision == VoteDecision::Denied);
+}
+
+TEST_CASE("A follower refuses a pre-vote while it still names a leader", "[consensus][raft][prevote]")
+{
+    // Issue #117, reopened. The window a follower answered on was
+    // `electionTimeoutMin`, while the timeout it actually campaigns on is its own
+    // randomized draw from [min, max] -- so between the two there is a band in
+    // which a node tells a challenger "there is no live leader" about a leader it
+    // is still following and has not given up on. That answer is incoherent with
+    // its own behaviour, and in a three-node cluster it is decisive: the
+    // challenger needs one grant, so this one is a quorum with its own vote and
+    // the real leader's refusal buys nothing.
+    ScriptedRandomSource random { { 250 } };
+    auto node = MakeNode(ThreeNodes("n3"), random);
+
+    (void) node.Receive(AppendEntriesRequest { .term = Term { .value = 1 },
+                                               .leaderId = "n1",
+                                               .prevLogIndex = LogIndex::BeforeFirst(),
+                                               .prevLogTerm = Term::None(),
+                                               .entries = {},
+                                               .leaderCommit = LogIndex::BeforeFirst() },
+                        At(0));
+    REQUIRE(node.KnownLeader() == std::optional<NodeId> { "n1" });
+
+    // Past `electionTimeoutMin` (150) and short of this node's own deadline (250):
+    // it has not given up on n1 and would not campaign for another 50ms.
+    auto const output = node.Receive(PreVoteRequest { .term = Term { .value = 2 },
+                                                      .candidateId = "n2",
+                                                      .lastLogIndex = LogIndex::BeforeFirst(),
+                                                      .lastLogTerm = Term::None() },
+                                     At(200));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(output);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Denied);
+}
+
+TEST_CASE("A leader and its follower answer one pre-vote the same way", "[consensus][raft][prevote]")
+{
+    // The two halves of `HasLiveLeader` are asked about the SAME leader, and used
+    // to be able to disagree at one instant -- which is the defect, because the
+    // grant is what counts.
+    //
+    // A leader stamps contact when a RESPONSE arrives and a follower stamps it
+    // when the REQUEST arrives, so on one link the leader's stamp is always the
+    // later of the two by half a round trip. Comparing both against the same
+    // window therefore leaves a band, half a round trip wide, in which the leader
+    // still counts that follower toward its quorum while the follower has already
+    // written the leader off.
+    ScriptedRandomSource leaderRandom { { 0 } };
+    auto leader = MakeNode(ThreeNodes("n1"), leaderRandom);
+
+    (void) leader.Tick(At(ElectionMin.count()));
+    (void) leader.Receive(
+        PreVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+        At(ElectionMin.count()));
+    (void) leader.Receive(
+        RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+        At(ElectionMin.count()));
+    REQUIRE(leader.CurrentRole() == Role::Leader);
+
+    // n3 answers at +10, which is the only contact this leader has with it and so
+    // is what its quorum rests on -- n2 is about to go quiet.
+    (void) leader.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
+                                                  .result = AppendResult::Accepted,
+                                                  .matchIndex = LogIndex { .value = 1 },
+                                                  .followerId = "n3" },
+                          At(ElectionMin.count() + 10));
+
+    // n3's own view of that same exchange: it saw the request at +5, five
+    // milliseconds before the leader saw the answer.
+    ScriptedRandomSource followerRandom { { 250 } };
+    auto follower = MakeNode(ThreeNodes("n3"), followerRandom);
+    (void) follower.Receive(AppendEntriesRequest { .term = Term { .value = 1 },
+                                                   .leaderId = "n1",
+                                                   .prevLogIndex = LogIndex::BeforeFirst(),
+                                                   .prevLogTerm = Term::None(),
+                                                   .entries = {},
+                                                   .leaderCommit = LogIndex::BeforeFirst() },
+                            At(ElectionMin.count() + 5));
+    REQUIRE(follower.KnownLeader() == std::optional<NodeId> { "n1" });
+
+    // One question, one instant, both nodes -- and the instant is chosen INSIDE the
+    // band, because the band is the whole defect. The follower's stamp ages out at
+    // 155 + 150 = 305 and the leader's at 160 + 150 = 310, so [305, 310) is exactly
+    // where the two used to disagree: five milliseconds wide because that is the
+    // half round trip between them. 309 is a point in it, and the narrowness is the
+    // measurement rather than a tolerance -- widen the simulated RTT and the band
+    // widens with it.
+    auto const ask = At((2 * ElectionMin.count()) + 9);
+    auto const answerOf = [&ask](RaftNode& node) {
+        auto const output = node.Receive(PreVoteRequest { .term = Term { .value = 2 },
+                                                          .candidateId = "n2",
+                                                          .lastLogIndex = LogIndex { .value = 1 },
+                                                          .lastLogTerm = Term { .value = 1 } },
+                                         ask);
+        auto const replies = MessagesOfType<PreVoteResponse>(output);
+        REQUIRE(replies.size() == 1);
+        return replies[0].decision;
+    };
+
+    // The leader still counts n3, so it refuses; n3 must not be undercutting it.
+    CHECK(answerOf(leader) == VoteDecision::Denied);
+    CHECK(answerOf(follower) == VoteDecision::Denied);
+}
+
+TEST_CASE("A follower that has given up on its leader still grants a pre-vote", "[consensus][raft][prevote]")
+{
+    // The other half of the rule, and the half a later change is most likely to
+    // break: refusing while a leader is merely *named* would make a node that has
+    // genuinely lost its leader veto every replacement, which is the livelock the
+    // pre-vote round exists to avoid. This passes before the fix as well as after
+    // -- it is a guard against over-correcting the case above, not a regression
+    // test.
+    ScriptedRandomSource random { { 250 } };
+    auto node = MakeNode(ThreeNodes("n3"), random);
+
+    (void) node.Receive(AppendEntriesRequest { .term = Term { .value = 1 },
+                                               .leaderId = "n1",
+                                               .prevLogIndex = LogIndex::BeforeFirst(),
+                                               .prevLogTerm = Term::None(),
+                                               .entries = {},
+                                               .leaderCommit = LogIndex::BeforeFirst() },
+                        At(0));
+
+    // Past its own deadline: it has given up, and would be campaigning itself.
+    auto const output = node.Receive(PreVoteRequest { .term = Term { .value = 2 },
+                                                      .candidateId = "n2",
+                                                      .lastLogIndex = LogIndex::BeforeFirst(),
+                                                      .lastLogTerm = Term::None() },
+                                     At(260));
+
+    auto const replies = MessagesOfType<PreVoteResponse>(output);
+    REQUIRE(replies.size() == 1);
+    CHECK(replies[0].decision == VoteDecision::Granted);
 }
 
 TEST_CASE("A node with no cluster never stands for election", "[consensus][raft][membership]")

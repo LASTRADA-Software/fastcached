@@ -148,7 +148,11 @@ TimePoint RaftNode::NextDeadline() const noexcept
 
 void RaftNode::NoteLeaderContact(TimePoint now)
 {
-    _lastLeaderContact = now;
+    // Arming the timer IS the record now: since issue #117 a node answers a
+    // pre-vote from the deadline it would campaign on, so pushing that deadline
+    // out is what "a leader spoke to me" means. It kept a separate timestamp
+    // beside it until nothing read one. Why this stayed a function of its own
+    // rather than becoming `ArmElectionTimer` at the call sites is in the header.
     ArmElectionTimer(now);
 }
 
@@ -170,8 +174,12 @@ bool RaftNode::HasQuorumContact(TimePoint now) const
     // has since been removed cannot be counted.
     for (auto const& peer: _peers)
     {
-        // The same window and the same strict `<` as the other branch of
-        // `HasLiveLeader`, which is where that choice is argued.
+        // `electionTimeoutMin` because that is the soonest any peer could start
+        // campaigning, so it is the shortest silence that could mean this leader
+        // is about to be challenged. It deliberately no longer matches the other
+        // branch of `HasLiveLeader`, which stopped comparing durations at all:
+        // trying to make the two agree by sharing a window is what issue #117
+        // was, since the two sides stamp contact half a round trip apart.
         auto const found = _followerContact.find(peer);
         if (found != _followerContact.end() && now - found->second < _config.electionTimeoutMin)
             ++live;
@@ -182,27 +190,61 @@ bool RaftNode::HasQuorumContact(TimePoint now) const
 
 bool RaftNode::HasLiveLeader(TimePoint now) const
 {
-    // The window is `electionTimeoutMin` on both branches, and on neither is it
-    // this node's own randomized deadline: "is there a live leader" is a fact
-    // about the cluster, and every node should answer it the same way at the same
-    // instant, which a per-node jittered value does not.
+    // Two roles, two kinds of evidence, and the split is not a refinement: a
+    // leader never hears from a leader, so the evidence every other role reads is
+    // permanently stale on the one node whose own quorum proves the cluster is
+    // healthy (issue #103).
     //
-    // A leader is one, so it answers from its own quorum. Reading
-    // `_lastLeaderContact` here would consult contact from a *previous* term's
-    // leader, which says nothing about whether this term has one.
+    // What this comment used to claim -- that both branches share one window, so
+    // every node answers the same way at the same instant -- was the thing that
+    // turned out to be false, and issue #117 is what it cost. Sharing a *window*
+    // is not sharing an *answer* when the two sides measure from different
+    // instants; see the branch below.
     if (_role == Role::Leader)
         return HasQuorumContact(now);
 
-    // Asked of `_lastLeaderContact` and **not** of `_electionDeadline`, which is
-    // the shorter spelling and the one this started as. That deadline is re-armed
-    // when this node begins its own pre-vote round, so a node that just started
-    // campaigning answers "yes, recently" for a full timeout and refuses every
-    // peer asking the same question at the same moment. That is the ordinary case
-    // in a cluster whose nodes time out together, and it cost a five-node cluster
-    // some forty election rounds to elect anyone -- slow enough to read as a
-    // livelock, and fast enough to pass wherever the draw sequence happened to
-    // stagger the timeouts.
-    return _lastLeaderContact.has_value() && now - *_lastLeaderContact < _config.electionTimeoutMin;
+    // Every other role answers from its OWN belief -- does it still name a leader,
+    // and has it yet given up on one -- rather than from a timestamp compared
+    // against a shared window (issue #117).
+    //
+    // The window was `electionTimeoutMin` on both branches, on the reasoning that
+    // "is there a live leader" is a fact about the cluster and every node should
+    // answer it the same way at the same instant. The window matched; the
+    // **reference instants never did**. A leader stamps contact when a RESPONSE
+    // arrives and a follower stamps it when the REQUEST arrives, so on one link
+    // the leader's stamp is always the later of the two by half a round trip --
+    // leaving a band, half a round trip wide, in which a leader still counts a
+    // follower toward its quorum while that follower has already told a challenger
+    // there is nobody in charge. In a three-node cluster that is decisive rather
+    // than marginal: the challenger needs one grant, so the follower's grant is a
+    // quorum with the challenger's own vote and the leader's refusal buys nothing.
+    //
+    // `_electionDeadline` is the deadline this node would actually campaign on, so
+    // a node now authorizes a challenger exactly when it has given up on its own
+    // leader -- the moment it would stand itself. That is coherence with its own
+    // behaviour rather than agreement with the leader's clock, which is the part
+    // that cannot be had: the two sides measure one link from opposite ends, and
+    // no shared constant reconciles that.
+    //
+    // **It costs failover time, and the trade is deliberate.** A follower used to
+    // grant after a flat `electionTimeoutMin`; it now grants after its own draw
+    // from [min, max]. So a genuinely dead leader is replaced once the SECOND
+    // smallest draw among the peers expires rather than after a flat minimum --
+    // in a three-node cluster with draws of 160 and 300, no election can complete
+    // before the 300, and the challenger spends a pre-vote round finding that out.
+    // Bounded by `electionTimeoutMax`, which is the bound the design already
+    // accepts for a single election round, and paid to stop a HEALTHY cluster
+    // re-electing: an unnecessary election costs a term and a leaderless window
+    // too, and happens far more often than a leader actually dies.
+    //
+    // The conjunct is what keeps this from being the version issue #103 replaced.
+    // That one read `_electionDeadline` ALONE, and the deadline is re-armed when
+    // this node begins its own pre-vote round -- so a node that had just started
+    // campaigning answered "yes, recently" for a full timeout and refused every
+    // peer timing out alongside it, which cost a five-node cluster some forty
+    // election rounds to elect anybody. `StartPreVote` also clears `_knownLeader`,
+    // so a campaigning node now answers "no" and that livelock stays fixed.
+    return _knownLeader.has_value() && now < _electionDeadline;
 }
 
 void RaftNode::ArmElectionTimer(TimePoint now)
