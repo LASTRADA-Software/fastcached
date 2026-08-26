@@ -6,6 +6,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <ranges>
 #include <span>
 #include <string>
 #include <vector>
@@ -65,6 +67,19 @@ class SpawnScript final: public Cc::IProcessRunner
         return *this;
     }
 
+    /// Let @p compiler run but say nothing, the way `cl` answers `--version`.
+    ///
+    /// This is what drives `CompilerBanner` onto its FALLBACK, and that fallback is
+    /// half of what makes an identity degenerate.
+    ///
+    /// @param compiler The path with no version banner.
+    /// @return This runner, for chaining.
+    SpawnScript& Speechless(std::string compiler)
+    {
+        _speechless.push_back(std::move(compiler));
+        return *this;
+    }
+
     Cc::CompileRun RunCaptureCombined(std::span<std::string const> argv) override
     {
         if (!argv.empty() && std::ranges::contains(_unspawnable, argv.front()))
@@ -78,6 +93,8 @@ class SpawnScript final: public Cc::IProcessRunner
         // for genuinely identical toolchains and would quietly hide whether a case
         // resolved one entry or two.
         auto const named = argv.empty() ? std::string {} : argv.front();
+        if (std::ranges::contains(_speechless, named))
+            return Cc::CompileRun { .exitCode = 2, .out = {}, .err = {} };
         return Cc::CompileRun { .exitCode = 0, .out = "fake 1.0 (" + named + ")\n", .err = {} };
     }
 
@@ -88,7 +105,30 @@ class SpawnScript final: public Cc::IProcessRunner
 
   private:
     std::vector<std::string> _unspawnable;
+    std::vector<std::string> _speechless;
 };
+
+/// A `cl.exe` in the layout every Visual Studio since 2017 installs.
+constexpr std::string_view MsvcCompiler =
+    "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/bin/Hostx64/x64/cl.exe";
+
+/// Give @p host the VC layout that compiler sits in.
+///
+/// Only the directories `MsvcToolsetIncludeRoots` emits, because that is the whole
+/// question here: whether ANY include root was found, never what is inside one.
+///
+/// @param host The scripted machine, configured in place (`IToolchainHost` is
+///             neither copyable nor movable).
+void DescribeMsvcLayout(ScriptedToolchainHost& host)
+{
+    constexpr std::string_view vs = "C:/Program Files/Microsoft Visual Studio/18/Community";
+    constexpr std::string_view toolset = "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231";
+
+    host.AddExecutable(std::string { MsvcCompiler });
+    host.AddDirectory(std::string { toolset } + "/include");
+    host.AddDirectory(std::string { toolset } + "/atlmfc/include");
+    host.AddDirectory(std::string { vs } + "/VC/Auxiliary/VS/include");
+}
 
 /// @param compiler Where it lives.
 /// @param layout Which row found it.
@@ -280,6 +320,48 @@ TEST_CASE("NodeToolchains: a malformed --toolchain is refused, naming the value"
     CHECK(Logged(logger, "malformed --toolchain"));
 }
 
+TEST_CASE("NodeToolchains: many toolchains are all identified, and reported in order", "[node][toolchains]")
+{
+    // Fingerprinting runs on a small pool, because a cold walk is seconds per
+    // toolchain and a surveyed machine routinely holds several -- sequentially that
+    // is a node sitting silent for half a minute before it reaches its scheduler.
+    // Two things must survive the concurrency: every entry gets ITS OWN answer, and
+    // the log does not depend on which thread finished first.
+    NodeConfig const cfg = Startable();
+    std::vector<Cc::ToolchainCandidate> candidates;
+    for (auto const index: std::views::iota(0, 9))
+        candidates.push_back(Candidate("/usr/bin/cc-" + std::to_string(index)));
+
+    FixedDiscovery discovery { candidates };
+    SpawnScript runner;
+    ScriptedToolchainHost host;
+    CapturingLogger logger;
+
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    REQUIRE(resolved.has_value());
+
+    // Nine distinct compilers, nine distinct identities: a shared result slot or a
+    // shared runner would show up here as a fingerprint attributed to the wrong
+    // compiler, which is the failure that matches nothing and says nothing.
+    CHECK(Unwrap(resolved).size() == candidates.size());
+    for (auto const& candidate: candidates)
+    {
+        INFO("compiler: " << candidate.compiler);
+        CHECK(
+            std::ranges::any_of(Unwrap(resolved), [&](auto const& served) { return served.second == candidate.compiler; }));
+    }
+
+    // And the "serving" lines come out in table order however the work was
+    // scheduled -- this log is where two machines' digests get compared.
+    std::vector<std::string> served;
+    for (auto const& record: logger.Snapshot())
+        if (record.message.starts_with("serving "))
+            served.push_back(record.message);
+    REQUIRE(served.size() == candidates.size());
+    for (auto const index: std::views::iota(std::size_t { 0 }, candidates.size()))
+        CHECK(served[index].contains(candidates[index].compiler));
+}
+
 TEST_CASE("NodeToolchains: the operator grammar splits on the first equals", "[node][toolchains]")
 {
     auto const bare = SplitToolchain("/usr/bin/g++");
@@ -309,4 +391,95 @@ TEST_CASE("NodeToolchains: the search list comes off the layout table", "[node][
         INFO("layout: " << layout.name);
         CHECK(searched.contains(layout.name));
     }
+}
+
+TEST_CASE("NodeToolchains: an identity that names no compiler is refused, not registered", "[node][toolchains]")
+{
+    // Issue #140. A compiler that cannot be asked its version AND whose include tree
+    // could not be located fingerprints as a digest over its own basename -- a value
+    // this process could print with nothing installed at all, and one that EVERY
+    // MSVC toolset on earth produces. Registering it is worse than registering
+    // nothing: the worker comes up healthy, heartbeats happily, and is then matched
+    // by clients on a completely different toolchain, or by none at all. Both
+    // directions are silent from both ends, which is the failure the fingerprint
+    // exists to prevent rather than to cause.
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Cc::ToolchainCandidate {
+        .compiler = std::string { MsvcCompiler }, .flavor = Cc::Flavor::Cl, .layout = "visual-studio" } } };
+    SpawnScript runner;
+    runner.Speechless(std::string { MsvcCompiler });
+
+    // A service's view of the machine: the compiler is right there, and nothing says
+    // where its headers are -- no layout, no `INCLUDE`.
+    ScriptedToolchainHost host;
+    CapturingLogger logger;
+
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    REQUIRE(resolved.has_value());
+    CHECK(Unwrap(resolved).empty());
+
+    // Named, and pointed at the way out. An operator who genuinely wants this
+    // toolchain served can pin an identity by hand, which is the one mechanism that
+    // makes a compiler this process cannot interrogate usable at all.
+    CHECK(Logged(logger, std::string { MsvcCompiler }));
+    CHECK(Logged(logger, "--toolchain="));
+}
+
+TEST_CASE("NodeToolchains: an unaskable compiler with a locatable include tree is served", "[node][toolchains]")
+{
+    // The other side of the same rule, and what keeps it from being a regression.
+    // `cl` answers no `--version` on ANY machine, so a check that refused on the
+    // banner alone would refuse every MSVC toolchain in the fleet. It is the include
+    // tree that carries the identity there.
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Cc::ToolchainCandidate {
+        .compiler = std::string { MsvcCompiler }, .flavor = Cc::Flavor::Cl, .layout = "visual-studio" } } };
+    SpawnScript runner;
+    runner.Speechless(std::string { MsvcCompiler });
+    ScriptedToolchainHost host;
+    DescribeMsvcLayout(host);
+    CapturingLogger logger;
+
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    REQUIRE(resolved.has_value());
+    REQUIRE(Unwrap(resolved).size() == 1);
+    CHECK(Unwrap(resolved).begin()->second == MsvcCompiler);
+}
+
+TEST_CASE("NodeToolchains: an operator's pinned identity is never second-guessed", "[node][toolchains]")
+{
+    // The check asks how a fingerprint was COMPUTED, so it has no business judging
+    // one that was not. `<fingerprint>=<compiler>` is the documented escape hatch
+    // for precisely the compiler this process cannot interrogate -- refusing it here
+    // would close the one door deliberately left open.
+    auto cfg = Startable();
+    cfg.toolchains = { "deadbeef=" + std::string { MsvcCompiler } };
+    SpawnScript runner;
+    runner.Speechless(std::string { MsvcCompiler });
+    ScriptedToolchainHost host;
+    CapturingLogger logger;
+
+    auto const resolved = ResolveToolchains(cfg, nullptr, runner, host, logger);
+    REQUIRE(resolved.has_value());
+    REQUIRE(Unwrap(resolved).size() == 1);
+    CHECK(Unwrap(resolved).begin()->first == "deadbeef");
+}
+
+TEST_CASE("NodeToolchains: a driver that answers is kept whatever its roots", "[node][toolchains]")
+{
+    // A real banner IS an identity: two GCC installs of different versions differ in
+    // it, which is the property `ToolchainProbe` leans on when a walk finds nothing.
+    // Only the fallback carries no information, so only the fallback is checked --
+    // and re-deriving roots for a toolchain that answered would spawn the verbose
+    // probe a second time for nothing.
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Candidate("/usr/bin/gcc") } };
+    SpawnScript runner;
+    ScriptedToolchainHost host;
+    CapturingLogger logger;
+
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    REQUIRE(resolved.has_value());
+    CHECK(Unwrap(resolved).size() == 1);
+    CHECK_FALSE(Logged(logger, "refusing"));
 }

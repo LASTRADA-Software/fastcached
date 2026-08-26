@@ -91,6 +91,24 @@ namespace FastCache::Cc
 /// @return The banner line, or the basename.
 [[nodiscard]] std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler);
 
+/// What `CompilerBanner` falls back to when a compiler cannot be asked.
+///
+/// The basename, lowercased and stripped of `.exe`, exactly as `ClassifyCompiler`
+/// normalizes -- so "which driver is this" and "what do we call it" cannot
+/// disagree about `CL.EXE`.
+///
+/// Exposed so a CALLER can tell a real banner from the fallback, which is the only
+/// way to notice a **degenerate identity**: a fingerprint over the fallback name
+/// AND no include roots carries no information about which compiler it is, and
+/// two different toolchains then digest the same. `ToolchainProbe`'s own
+/// "weaker but still correct" argument for a banner-only fingerprint has a
+/// precondition nobody wrote down -- that the banner is a real version string --
+/// and this is what lets a caller check it.
+///
+/// @param compiler The compiler as invoked, bare name or path.
+/// @return Its normalized basename.
+[[nodiscard]] std::string NormalizedCompilerName(std::string_view compiler);
+
 /// The VC half of an MSVC toolchain's include roots, from its own install layout.
 ///
 /// Derived from the COMPILER'S PATH rather than from anything ambient, which is

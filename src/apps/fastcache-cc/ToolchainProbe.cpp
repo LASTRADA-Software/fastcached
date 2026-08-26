@@ -518,8 +518,13 @@ std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
     //
     // Lowercased and de-suffixed exactly as `ClassifyCompiler` does, so "which
     // driver is this" and "what do we call it" cannot disagree about `CL.EXE`.
+    return NormalizedCompilerName(compiler);
+}
+
+std::string NormalizedCompilerName(std::string_view compiler)
+{
     auto const slash = compiler.find_last_of("/\\");
-    auto base = slash == std::string::npos ? compiler : compiler.substr(slash + 1);
+    std::string base { slash == std::string_view::npos ? compiler : compiler.substr(slash + 1) };
     std::ranges::transform(base, base.begin(), [](char c) { return PathCanon::AsciiLower(c); });
     if (base.ends_with(".exe"))
         base.resize(base.size() - 4);
