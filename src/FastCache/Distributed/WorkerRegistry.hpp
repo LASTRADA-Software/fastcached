@@ -68,6 +68,66 @@ struct WorkerInfo
     std::vector<std::uint8_t> codecs;
 };
 
+/// One live worker, as a diagnostic rather than as a scheduling input.
+///
+/// `WorkerInfo` deliberately carries no timestamp: it is what `Pick` returns and
+/// what a lease is built from, and an age frozen inside a lease is a number that
+/// stops meaning anything the moment it is stored. An age is a property of an
+/// *observation*, so it lives on the report of one.
+///
+/// The age is a duration rather than the `TimePoint` it came from, and that is the
+/// injected clock defending itself: handed a `TimePoint`, the obvious thing for a
+/// consumer to do is subtract `steady_clock::now()` from it -- which is right in
+/// production and wrong under every `ManualClock` test, silently, because the two
+/// clocks agree about nothing. Subtracting inside the registry means the answer
+/// comes from the clock the registry was given.
+struct WorkerReport
+{
+    WorkerInfo info;                           ///< What the worker said about itself.
+    std::chrono::milliseconds heartbeatAge {}; ///< Since it registered or last heartbeat.
+};
+
+/// One live MACHINE, grouped as an operator means "node".
+///
+/// This registry keys on `(fingerprint, endpoint)`, so a node started with two
+/// `--toolchain` flags is two entries describing **one machine** -- deliberately,
+/// because a lease is per toolchain. Both entries then carry that machine's cores,
+/// its memory, its CPU reading and its cache, so anything summing those across
+/// `LiveWorkers()` counts one machine once per toolchain it serves: a two-toolchain
+/// node doubles the fleet's core count, and a fleet page is exactly the consumer
+/// that would.
+///
+/// Which fields add across sibling entries and which do not is the decision this
+/// type exists to make once, rather than in every consumer's memory:
+///
+///   - **`capacity`, `load` and `cache` do not add.** They describe the machine,
+///     and are taken from a single contributing entry, chosen by the rule below.
+///   - **`registeredSlots` is the maximum**, not the sum: the siblings describe one
+///     machine's offer, and `OfferableSlots` derived each from the same cores.
+///   - **`fleetJobsInFlight` is the sum**: those are genuinely different jobs, one
+///     count per toolchain, running side by side on the one machine.
+struct NodeReport
+{
+    /// host:port the node answers on — the key an operator means by "node".
+    std::string endpoint;
+    /// Every toolchain this machine serves, sorted so a snapshot is reproducible.
+    std::vector<std::string> fingerprints;
+    /// What the machine is, from the contributing entry.
+    NodeCapacity capacity {};
+    /// What it is doing, from the contributing entry.
+    ///
+    /// Its machine-wide fields — CPU, memory, scratch, cache — are what this grain
+    /// is for. Its `inFlight` is the contributing *entry's* job count; the machine's
+    /// is `fleetJobsInFlight` below.
+    NodeLoad load {};
+    /// The largest slot count any of this machine's entries registered with.
+    std::uint32_t registeredSlots { 0 };
+    /// This fleet's jobs running on the machine, summed across its entries.
+    std::uint32_t fleetJobsInFlight { 0 };
+    /// Since the contributing entry was last heard from.
+    std::chrono::milliseconds heartbeatAge {};
+};
+
 /// One node's cache, as `NodeCaches()` reports it.
 ///
 /// A machine rather than a registry entry, which is the whole reason this type
@@ -82,6 +142,12 @@ struct NodeCacheReport
     NodeCacheCapacity capacity {};
     /// What it holds now, as of its last heartbeat.
     NodeCacheLoad load {};
+    /// Since the contributing entry was last heard from.
+    ///
+    /// So a consumer can tell "this cache is empty" from "this node stopped
+    /// answering an hour ago and these are its last figures" -- which look
+    /// identical without it, and lead to opposite conclusions.
+    std::chrono::milliseconds heartbeatAge {};
 };
 
 /// What a worker announces about itself.
@@ -209,6 +275,21 @@ class WorkerRegistry
     /// @return A snapshot; expired workers are excluded.
     [[nodiscard]] std::vector<WorkerInfo> LiveWorkers() const;
 
+    /// Every live worker, with how long ago each was heard from.
+    ///
+    /// The diagnostic counterpart of `LiveWorkers()`, kept apart from it because an
+    /// age has no business on the value `Pick` hands to a lease.
+    /// @return A snapshot ordered by worker id; expired workers are excluded.
+    [[nodiscard]] std::vector<WorkerReport> LiveWorkerReports() const;
+
+    /// Every live NODE, one entry per machine.
+    ///
+    /// The deduped view of the whole registry, and the one a fleet-wide total must
+    /// be computed over: see `NodeReport` for which fields add across a machine's
+    /// sibling entries and which do not.
+    /// @return One entry per live endpoint, ordered by endpoint.
+    [[nodiscard]] std::vector<NodeReport> NodeReports() const;
+
     /// Every live NODE's cache, one entry per machine.
     ///
     /// `LiveWorkers()` lists registry entries, and this registry keys on
@@ -241,6 +322,16 @@ class WorkerRegistry
 
     /// Whether `entry` has been heard from recently enough to dispatch to.
     [[nodiscard]] bool IsLive(Entry const& entry, TimePoint now) const noexcept;
+
+    /// How long ago an entry was last heard from, clamped at zero.
+    ///
+    /// Static, because it reads no member: the clock has already been asked, once,
+    /// by the caller holding the lock. Asking it per entry would let one snapshot
+    /// report ages measured against different instants.
+    /// @param lastSeen When the entry last registered or heartbeat.
+    /// @param now The instant the whole snapshot is measured against.
+    /// @return The age; never negative, even under a clock set backwards.
+    [[nodiscard]] static std::chrono::milliseconds AgeOf(TimePoint lastSeen, TimePoint now) noexcept;
 
     IClock& _clock;
     std::chrono::milliseconds _heartbeatTimeout;

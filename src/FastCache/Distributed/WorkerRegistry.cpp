@@ -239,11 +239,29 @@ std::vector<WorkerInfo> WorkerRegistry::LiveWorkers() const
     return out;
 }
 
+std::vector<WorkerReport> WorkerRegistry::LiveWorkerReports() const
+{
+    std::scoped_lock const guard { _mutex };
+    auto const now = _clock.Now();
+
+    std::vector<WorkerReport> out;
+    out.reserve(_workers.size());
+    for (auto const& [id, entry]: _workers)
+        if (IsLive(entry, now))
+            out.push_back(WorkerReport { .info = entry.info, .heartbeatAge = AgeOf(entry.lastSeen, now) });
+
+    // Sorted for the reason `LiveWorkers()` sorts: an unordered_map's iteration
+    // order is neither stable nor meaningful, and this feeds a page an operator
+    // reads twice in a row.
+    std::ranges::sort(out, [](auto const& a, auto const& b) { return a.info.id < b.info.id; });
+    return out;
+}
+
 namespace
 {
     /// Whether this entry's heartbeat has actually said anything about a cache.
     ///
-    /// The tie-break `NodeCaches()` needs, and it is not cosmetic. `Register`
+    /// The tie-break the grouping needs, and it is not cosmetic. `Register`
     /// resets `info.load` to `{}`, because a re-registering worker has restarted
     /// and whatever it last reported is a reading from before that. So a node's
     /// two entries do NOT always agree: one may have just re-registered -- its
@@ -260,52 +278,109 @@ namespace
     }
 } // namespace
 
-std::vector<NodeCacheReport> WorkerRegistry::NodeCaches() const
+std::chrono::milliseconds WorkerRegistry::AgeOf(TimePoint lastSeen, TimePoint now) noexcept
+{
+    // Clamped at zero rather than allowed to go negative, for the reason `IsLive`
+    // is written the way it is: a `ManualClock` can legitimately be set backwards
+    // in a test, and an unsigned duration would then report an age of several
+    // hundred million years rather than "just now".
+    if (now <= lastSeen)
+        return std::chrono::milliseconds { 0 };
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSeen);
+}
+
+std::vector<NodeReport> WorkerRegistry::NodeReports() const
 {
     std::scoped_lock const guard { _mutex };
     auto const now = _clock.Now();
 
     // Keyed on endpoint, because that is what the entries of one machine share --
     // this registry keys workers on (fingerprint, endpoint), so a node with two
-    // `--toolchain` flags is two entries reporting one cache.
+    // `--toolchain` flags is two entries describing one machine.
     struct Candidate
     {
-        NodeCacheReport report;
+        NodeReport report;
         TimePoint lastSeen {};
+        bool contributorSaysCache { false };
     };
     std::map<std::string, Candidate> byEndpoint;
+
     for (auto const& [id, entry]: _workers)
     {
         if (!IsLive(entry, now))
             continue;
 
-        Candidate candidate { .report = NodeCacheReport { .endpoint = entry.info.endpoint,
-                                                          .capacity = entry.info.capacity.cache,
-                                                          .load = entry.info.load.cache },
-                              .lastSeen = entry.lastSeen };
-        auto const [slot, inserted] = byEndpoint.try_emplace(entry.info.endpoint, candidate);
+        auto const [slot, inserted] = byEndpoint.try_emplace(
+            entry.info.endpoint,
+            Candidate { .report = NodeReport { .endpoint = entry.info.endpoint,
+                                               .fingerprints = { entry.info.fingerprint },
+                                               .capacity = entry.info.capacity,
+                                               .load = entry.info.load,
+                                               .registeredSlots = entry.info.slots,
+                                               .fleetJobsInFlight = entry.info.inFlight,
+                                               .heartbeatAge = AgeOf(entry.lastSeen, now) },
+                        .lastSeen = entry.lastSeen,
+                        .contributorSaysCache = SaysAnything(entry.info.load.cache) });
         if (inserted)
             continue;
 
-        // Only ONE entry contributes -- adding them is the double count this whole
-        // function exists to prevent -- so which one is a real choice. An entry
-        // that has reported a cache beats one that has not, and among those the
-        // most recently heard from wins. The order `_workers` happens to iterate
-        // in decides nothing.
-        auto const& incumbent = slot->second;
-        auto const better = SaysAnything(candidate.report.load) != SaysAnything(incumbent.report.load)
-                                ? SaysAnything(candidate.report.load)
-                                : candidate.lastSeen > incumbent.lastSeen;
+        auto& held = slot->second;
+
+        // The fields that ADD across a machine's sibling entries. These are the
+        // only two: everything else describes the machine and would be counted
+        // once per toolchain by a sum.
+        held.report.fingerprints.push_back(entry.info.fingerprint);
+        held.report.registeredSlots = std::max(held.report.registeredSlots, entry.info.slots);
+        held.report.fleetJobsInFlight += entry.info.inFlight;
+
+        // And the machine-wide half, where only ONE entry contributes -- adding
+        // them is the double count this whole function exists to prevent -- so
+        // which one is a real choice. An entry that has reported a cache beats one
+        // that has not, and among those the most recently heard from wins. The
+        // order `_workers` happens to iterate in decides nothing.
+        auto const saysCache = SaysAnything(entry.info.load.cache);
+        auto const better =
+            saysCache != held.contributorSaysCache ? saysCache : entry.lastSeen > held.lastSeen;
         if (better)
-            slot->second = std::move(candidate);
+        {
+            held.report.capacity = entry.info.capacity;
+            held.report.load = entry.info.load;
+            held.report.heartbeatAge = AgeOf(entry.lastSeen, now);
+            held.lastSeen = entry.lastSeen;
+            held.contributorSaysCache = saysCache;
+        }
     }
 
-    std::vector<NodeCacheReport> out;
+    std::vector<NodeReport> out;
     out.reserve(byEndpoint.size());
     // `std::map` rather than an unordered one, so the order is the endpoints'
     // and a snapshot is reproducible -- the property `LiveWorkers()` sorts for.
     for (auto& [endpoint, candidate]: byEndpoint)
+    {
+        // Sorted for the same reason the outer order is: a node's toolchains come
+        // out of an unordered_map, and a snapshot whose column order moved between
+        // scrapes would read as the fleet changing.
+        std::ranges::sort(candidate.report.fingerprints);
         out.push_back(std::move(candidate.report));
+    }
+    return out;
+}
+
+std::vector<NodeCacheReport> WorkerRegistry::NodeCaches() const
+{
+    // A projection of `NodeReports()` rather than a second traversal, so the rule
+    // that decides which of a machine's sibling entries contributes has ONE
+    // definition. Two copies of it drift, and the symptom -- a node reporting no
+    // cache for one heartbeat interval, intermittently -- is the one this rule was
+    // written to prevent in the first place.
+    auto const nodes = NodeReports();
+    std::vector<NodeCacheReport> out;
+    out.reserve(nodes.size());
+    for (auto const& node: nodes)
+        out.push_back(NodeCacheReport { .endpoint = node.endpoint,
+                                        .capacity = node.capacity.cache,
+                                        .load = node.load.cache,
+                                        .heartbeatAge = node.heartbeatAge });
     return out;
 }
 
