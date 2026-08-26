@@ -144,11 +144,14 @@ TEST_CASE("AdminHttp: unknown path returns 404", "[metrics][http]")
     REQUIRE(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
 }
 
-TEST_CASE("AdminHttp: non-GET method returns 405", "[metrics][http]")
+TEST_CASE("AdminHttp: non-GET method returns 405 naming the methods it does serve", "[metrics][http]")
 {
     FastCache::AtomicMetricsSink metrics;
     auto const response = Exchange("POST /metrics HTTP/1.1\r\n\r\n", metrics, {});
     REQUIRE(response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+    // RFC 9110 §15.5.6 makes this a MUST, and it is what separates "wrong verb"
+    // from "wrong path" for whatever is probing this port.
+    CHECK(response.contains("Allow: GET\r\n"));
 }
 
 TEST_CASE("AdminHttp: a request split across reads is consumed to the end", "[metrics][http]")

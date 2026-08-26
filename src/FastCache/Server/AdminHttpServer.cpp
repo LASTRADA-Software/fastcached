@@ -222,7 +222,15 @@ Task<void> ServeAdminHttp(ISocket* socket,
     }
     if (request.method != "GET")
     {
-        (void) co_await WriteResponse(socket, PlainRefusal("405 Method Not Allowed", "method not allowed\n"));
+        // RFC 9110 §15.5.6 makes `Allow` a MUST on a 405, and it is not ceremony:
+        // without it a client is told the request was wrong and not which half of
+        // it, so a probe pointed at the right path with the wrong verb reads
+        // identically to one pointed at a path this server does not serve.
+        (void) co_await WriteResponse(socket,
+                                      AdminResponse { .status = "405 Method Not Allowed",
+                                                      .contentType = "text/plain",
+                                                      .body = "method not allowed\n",
+                                                      .extraHeaders = { "Allow: GET" } });
         co_return;
     }
 
