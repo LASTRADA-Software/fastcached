@@ -430,25 +430,83 @@ echo "cluster E2E: a follower redirects to an endpoint that answers"
 
 # --- 3. a setting reaches every member ---------------------------------------
 
-answer="$(cluster "$leader_endpoint" --cluster-set=upstream=cache.example:6674)"
-[[ "$answer" == *"accepted"* ]] || fail "the leader refused a legitimate setting: ${answer}"
+# Submit a setting to whoever leads NOW, rather than to whoever led when section 1
+# ran.
+#
+# `$leader_endpoint` was pinned there, and leadership may legitimately move before
+# this section finishes -- a slow enough runner blows any election timeout. Pinned,
+# BOTH halves of the old assertion were wrong: the submission went to a node that
+# answers "ask somebody else", and the poll below then waited out its full 20s to
+# report that a setting the leader accepted never appeared in its own state -- a
+# sentence about replication, produced by an election. That is the message issue
+# #117's second occurrence actually carried.
+#
+# Retried on ANY answer that is not the one the caller is asserting, rather than on
+# a recognised "not the leader" refusal: that refusal has two spellings, one for
+# "somebody else leads" and one for "an election is in progress", and a fixture
+# that matched them would stop retrying the day either sentence is reworded --
+# silently, and back to failing the way this section used to.
+# @param 1 the `--cluster-set` argument to submit
+# @param 2 the substring an answer carries when the submission worked
+# @param 3 what to report when it never does
+submit_setting() {
+    local answer
+    answer="$(cluster "$leader_endpoint" --cluster-set="$1")"
+    if [[ "$answer" != *"$2"* ]]; then
+        find_leader
+        answer="$(cluster "$leader_endpoint" --cluster-set="$1")"
+    fi
+    [[ "$answer" == *"$2"* ]] || fail "$3 (asked ${leader_endpoint}): ${answer}"
+}
 
-# Replication is asynchronous, so this is a bounded wait rather than an immediate
-# assertion -- and bounded rather than unbounded, so a cluster that never
-# replicates fails saying so instead of timing out the suite.
+# The one submission this section makes, named once so the poll below re-offers
+# the same setting rather than a second one that drifted from it.
+set_upstream() {
+    submit_setting "upstream=cache.example:6674" "accepted" \
+        "the leader refused a legitimate setting"
+}
+
+set_upstream
+
+# Replication is asynchronous, so the setting becomes visible a moment after it is
+# accepted. Bounded rather than unbounded, so a cluster that never replicates
+# fails saying so instead of timing out the suite -- and re-submitted rather than
+# only waited on.
+#
+# Re-deriving the leader would not be enough on its own. A proposal accepted by a
+# leader that is then deposed may legitimately never commit -- Raft promises
+# nothing about an uncommitted entry across a term change -- so polling forever
+# for it asserts something the algorithm does not offer. The honest property is
+# that a setting a client SUCCESSFULLY sets becomes visible, and a client gets
+# that by asking again. Which is what any real operator tool would do, so it is
+# also the behaviour worth having under test.
 settled=0
 for _ in $(seq 1 100); do
     answer="$(cluster "$leader_endpoint" --cluster-status)"
-    [[ "$answer" == *"cache.example:6674"* ]] && { settled=1; break; }
+    if [[ "$answer" == *"cache.example:6674"* ]]; then
+        settled=1
+        break
+    fi
+
+    # Not visible yet. Either replication is still in flight -- ordinary, wait --
+    # or this node no longer leads, in which case the setting may have died with
+    # its term and has to be offered to whoever leads now.
+    if [[ "$answer" != *"known settings:"* ]]; then
+        find_leader
+        set_upstream
+    fi
     sleep 0.2
 done
-[[ "$settled" -eq 1 ]] || fail "a setting the leader accepted never appeared in its own state"
+[[ "$settled" -eq 1 ]] || fail "a setting accepted by the leader never became visible on it"
 echo "cluster E2E: a setting replicates"
 
 # A setting nobody has heard of is refused where the operator is watching, rather
 # than replicated to every node and quietly doing nothing.
-answer="$(cluster "$leader_endpoint" --cluster-set=upsteam=typo)"
-[[ "$answer" == *"upsteam"* ]] || fail "a typo'd setting was not refused by name: ${answer}"
+#
+# Against whoever leads NOW for the same reason: a follower refuses this with "ask
+# somebody else" and never names the typo, so an election here would fail it on a
+# point it does not test.
+submit_setting "upsteam=typo" "upsteam" "a typo'd setting was not refused by name"
 echo "cluster E2E: an unknown setting is refused by name"
 
 # --- 4. a machine joins the running cluster ----------------------------------
