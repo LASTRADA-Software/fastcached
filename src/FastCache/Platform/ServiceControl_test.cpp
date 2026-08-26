@@ -269,7 +269,7 @@ TEST_CASE("ServiceControl: scope defaults are filled in for a file-configured se
         // renders it with a slash.
         auto const expected = std::filesystem::path { "/Users/jo" } / "Library/Caches/fastcached/cache";
         REQUIRE(std::ranges::contains(filled.arguments, std::format("--storage={}", expected.string())));
-        REQUIRE(std::ranges::contains(filled.ownedDirectories, expected));
+        REQUIRE(std::ranges::contains(filled.ownedPaths, expected));
     }
 
     SECTION("a config the operator named is never overridden by a storage default")
@@ -325,7 +325,7 @@ TEST_CASE("ServiceControl: a service that keeps no files is given no path flags"
 
         CHECK(filled.arguments.empty());
         CHECK(filled.configPath.empty());
-        CHECK(filled.ownedDirectories.empty());
+        CHECK(filled.ownedPaths.empty());
     }
 }
 

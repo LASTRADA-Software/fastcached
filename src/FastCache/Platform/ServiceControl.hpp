@@ -119,16 +119,24 @@ struct ServiceSpec
     /// different one.
     std::string serviceAccount;
 
-    /// Directories `serviceAccount` must own before the job first runs.
+    /// Paths `serviceAccount` must own before the job first runs.
     ///
-    /// Only ever directories the operator actually named. Handing over a
-    /// **parent** gives away a directory nobody asked about: `--storage=/var/db/fc`
-    /// would reassign `/var/db`, shared with other system services, to an
-    /// unprivileged cache account -- silently, under a message saying the service
-    /// had been installed. The daemon drops to `serviceAccount`, so a directory
-    /// root created for it has to change hands or the first write fails with
-    /// EACCES, which launchd surfaces only as a job that exits over and over.
-    std::vector<std::filesystem::path> ownedDirectories;
+    /// Only ever paths the operator actually named. Handing over a **parent**
+    /// gives away a directory nobody asked about: `--storage=/var/db/fc` would
+    /// reassign `/var/db`, shared with other system services, to an unprivileged
+    /// cache account -- silently, under a message saying the service had been
+    /// installed. The daemon drops to `serviceAccount`, so a directory root
+    /// created for it has to change hands or the first write fails with EACCES,
+    /// which launchd surfaces only as a job that exits over and over.
+    ///
+    /// Usually a directory, which the handover creates when it is absent -- but
+    /// never a path that `Core/PathKind`'s `PathNamesAFile` says is a file, and
+    /// never over something already there. `storage_path` may name one CoW file,
+    /// and a `create_directories` over `cache.cow` would put a directory where the
+    /// daemon wants a file. Hence `ownedPaths` rather than `ownedDirectories`:
+    /// `chown` and a DACL apply to a file just as well, so only the *create* has
+    /// to care, and it is refused in the handover rather than in each producer.
+    std::vector<std::filesystem::path> ownedPaths;
 
     /// Whether a secret was typed on the installing command line.
     InlineCredential inlineCredential { InlineCredential::Absent };

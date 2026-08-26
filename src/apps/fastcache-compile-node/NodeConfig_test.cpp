@@ -379,19 +379,19 @@ TEST_CASE("NodeConfig: a system-scope job owns the directories it was given", "[
 
     auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
 
-    CHECK(std::ranges::contains(spec.ownedDirectories, cfg.cacheDir));
-    CHECK(std::ranges::contains(spec.ownedDirectories, cfg.clusterDir));
+    CHECK(std::ranges::contains(spec.ownedPaths, cfg.cacheDir));
+    CHECK(std::ranges::contains(spec.ownedPaths, cfg.clusterDir));
 
     // Only what the operator named, never a parent: handing over /var/cache would
     // reassign a directory shared with other services to an unprivileged compile
     // account, silently, under a message saying the service had been installed.
-    CHECK(std::ranges::none_of(spec.ownedDirectories, [](std::filesystem::path const& owned) {
+    CHECK(std::ranges::none_of(spec.ownedPaths, [](std::filesystem::path const& owned) {
         return owned == std::filesystem::path { "/var/cache" } || owned == std::filesystem::path { "/var/lib" };
     }));
 
     // A worker given neither hands over nothing, rather than a path nobody asked
     // for -- the mirror of the rule above.
-    CHECK(MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable()).ownedDirectories.empty());
+    CHECK(MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable()).ownedPaths.empty());
 }
 
 TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[node][scheduler][policy]")

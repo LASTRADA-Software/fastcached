@@ -208,6 +208,15 @@ loading a different one.
 hands over whatever `storage_path` is configured at the time it runs, so seeding
 the config first and installing second needs nothing extra.
 
+One exception: a `storage_path` that names a **single cache file** — an existing
+file, or a path with a file extension such as `D:\fastcached\cache.cow` — is only
+created by the installer if it is already there. Creating `cache.cow` as a
+*directory* would make the very next start treat it as a directory of shards and
+fan out inside it, so the installer refuses and says so. An upgrade therefore needs
+nothing extra (the file exists, and is handed over); a first install against a
+not-yet-created cache file prints that refusal as a `warning:` on the install line
+and needs the `icacls` command below, run against the directory that will hold it.
+
 If you add or move `storage_path` afterwards, grant it from an elevated prompt:
 
 ```powershell
@@ -221,7 +230,10 @@ service, so `icacls` is the less disruptive of the two.
 
 A daemon that cannot open its storage says so at startup and prints this command
 with your own paths and service name filled in; without `storage_path` it is
-memory-only and needs no directory at all.
+memory-only and needs no directory at all. The advice appears only when the
+daemon is *running as the service* (`--daemon`) — a foreground run is not the
+virtual account, so naming it there would send you after an identity that is not
+the one being refused.
 
 Renaming the service with `--service-name` renames the account with it, since the
 SCM derives one from the other.

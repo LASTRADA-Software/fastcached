@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/DefaultConfigPath.hpp>
+#include <FastCache/Core/PathKind.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
@@ -348,7 +349,7 @@ ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, Config c
                          .displayName = "fastcached",
                          .description = "fastcached — fast cache daemon",
                          .serviceAccount = std::string { DaemonServiceAccount },
-                         .ownedDirectories = std::move(owned),
+                         .ownedPaths = std::move(owned),
                          .inlineCredential = cfg.requirePass.empty() ? InlineCredential::Absent : InlineCredential::Present,
                          .configPath = cfg.configPath,
                          // The daemon IS the file-configured service: it probes a
@@ -783,7 +784,7 @@ ServiceSpec WithScopeDefaults(ServiceSpec spec,
         // spelling.
         auto const storage = home / std::format("Library/Caches/{}/cache", spec.applicationName);
         spec.arguments.push_back(std::format("--storage={}", storage.string()));
-        spec.ownedDirectories.emplace_back(storage);
+        spec.ownedPaths.emplace_back(storage);
     }
 
     // The daemon would find this file on its own -- it is the machine-wide
@@ -836,7 +837,8 @@ namespace
     };
     using LocalPtr = std::unique_ptr<void, LocalDeleter>;
 
-    /// Give @p account full control of @p directory, creating it if absent.
+    /// Give @p account full control of @p target, creating it as a directory if
+    /// absent.
     ///
     /// The Windows counterpart of the `chown` the launchd path does, and needed for
     /// the same reason: a service that no longer runs as the machine's most
@@ -844,24 +846,41 @@ namespace
     /// administrator. LocalSystem never noticed because LocalSystem can write
     /// anywhere.
     ///
+    /// Created only when it is absent AND meant to be a directory; whatever is
+    /// already there is granted as-is. `SE_FILE_OBJECT` covers a file and a
+    /// directory alike, so the grant itself does not care -- the *create* does.
+    /// A `ServiceSpec::ownedPaths` entry may be one CoW file (`storage_path` is
+    /// allowed to name `cache.cow`), and an unconditional `create_directories`
+    /// failed in both directions on it: on a fresh install it made a DIRECTORY the
+    /// daemon then read as a directory of shards, and once the file existed it
+    /// failed and skipped the grant -- on exactly the upgrade this exists for.
+    ///
     /// The entry is ADDED to the existing list rather than replacing it, so an
     /// administrator keeps the access they had -- a replaced list is how a
     /// directory becomes one only the service can repair.
     ///
-    /// @param directory Directory to create and grant access to.
+    /// @param target Path to grant access to; created as a directory when absent
+    ///        and not named as a file.
     /// @param account Trustee name, e.g. `NT SERVICE\FastCacheCompileNode`. It
     ///        resolves only once the service exists, so call this after
     ///        CreateService.
     /// @return An explanatory message on failure, else nullopt.
-    [[nodiscard]] std::optional<std::string> GrantDirectoryAccess(std::filesystem::path const& directory,
-                                                                  std::string const& account)
+    [[nodiscard]] std::optional<std::string> GrantPathAccess(std::filesystem::path const& target, std::string const& account)
     {
         std::error_code ec;
-        std::filesystem::create_directories(directory, ec);
-        if (ec && !std::filesystem::is_directory(directory))
-            return std::format("could not create {}: {}", directory.string(), ec.message());
+        if (!std::filesystem::exists(target, ec))
+        {
+            if (PathNamesAFile(target))
+                return std::format("{} does not exist yet and names a file, so it was not created; grant "
+                                   "'{}' access to the directory that will hold it once it is there",
+                                   target.string(),
+                                   account);
+            std::filesystem::create_directories(target, ec);
+        }
+        if (!std::filesystem::exists(target, ec))
+            return std::format("could not create {}: {}", target.string(), ec.message());
 
-        auto path = directory.string();
+        auto path = target.string();
 
         PACL current = nullptr;
         PSECURITY_DESCRIPTOR rawDescriptor = nullptr;
@@ -977,8 +996,8 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scop
     // is `(void)`-discarded -- except that this says so.
     std::string warnings;
     if (logonName)
-        for (auto const& owned: spec.ownedDirectories)
-            if (auto const denial = GrantDirectoryAccess(owned, *logonName))
+        for (auto const& owned: spec.ownedPaths)
+            if (auto const denial = GrantPathAccess(owned, *logonName))
                 warnings += std::format("\nwarning: {}", *denial);
 
     if (!warnings.empty())
@@ -1383,16 +1402,25 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     // reassigned /var/db, shared with other system services, to an unprivileged
     // cache account, and `--storage=/tmp/cache` reassigned /private/tmp — both
     // silently, under a message that said the service had been installed.
+    //
+    // Created only when it is absent AND meant to be a directory; whatever is
+    // already there is chowned as-is. An `ownedPaths` entry may be one CoW file
+    // (`storage_path` is allowed to name `cache.cow`), and an unconditional
+    // `create_directories` failed in both directions on it: on a fresh install it
+    // made a DIRECTORY the daemon then read as a directory of shards, and once the
+    // file existed it failed and skipped the chown — on exactly the upgrade this
+    // handover is here for.
     if (scope == ServiceScope::System && !effective.serviceAccount.empty())
         if (auto const* const pw = ::getpwnam(effective.serviceAccount.c_str()); pw != nullptr)
         {
             std::vector<std::filesystem::path> owned { logDirectory };
-            for (auto const& directory: effective.ownedDirectories)
+            for (auto const& target: effective.ownedPaths)
             {
                 std::error_code ownedEc;
-                std::filesystem::create_directories(directory, ownedEc);
-                if (!ownedEc)
-                    owned.emplace_back(directory);
+                if (!std::filesystem::exists(target, ownedEc) && !PathNamesAFile(target))
+                    std::filesystem::create_directories(target, ownedEc);
+                if (std::filesystem::exists(target, ownedEc))
+                    owned.emplace_back(target);
             }
             for (auto const& path: owned)
                 (void) ::chown(path.c_str(), pw->pw_uid, pw->pw_gid);

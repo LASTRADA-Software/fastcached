@@ -689,7 +689,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          // `--service-scope=user` works today and is the per-developer
                          // case anyway: a user agent runs as the invoking account.
                          .serviceAccount = "fastcache-node",
-                         .ownedDirectories = std::move(owned),
+                         .ownedPaths = std::move(owned),
                          .inlineCredential = cfg.token.empty() ? InlineCredential::Absent : InlineCredential::Present,
                          .configPath = {},
                          // Empty, and load-bearing: this worker is configured
