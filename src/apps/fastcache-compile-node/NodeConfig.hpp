@@ -110,6 +110,42 @@ struct NodeConfig
     /// operator's decision, not this program's.
     std::string adminListen;
 
+    /// Whether the admin surface also serves the fleet dashboard.
+    ///
+    /// Off unless asked for, like every other surface this program serves. The page
+    /// lists every member's hostname, endpoint and capacity -- a fleet map -- so an
+    /// operator turns it on deliberately rather than acquiring it by naming a port
+    /// they wanted `/metrics` on.
+    ///
+    /// Served on `--admin-listen`, and answered in full only while this node LEADS:
+    /// a follower's registry holds whatever registered against it rather than the
+    /// fleet, so it renders a page naming the leader instead of a partial picture.
+    bool dashboard { false };
+
+    /// File holding the credential the dashboard requires, or empty for none.
+    ///
+    /// A FILE and not a flag, for the reason `--cluster-key-file` is one: a command
+    /// line is readable through `ps`. And a credential of its own rather than
+    /// `--requirepass`, which points the other way -- that is the secret this node
+    /// *presents* to the scheduler, held by every member of the fleet, so reusing it
+    /// would let any worker read every other node's fleet map.
+    ///
+    /// Required when the admin surface is not on loopback: a fleet map on a public
+    /// port with no credential is what this flag exists to stop somebody doing by
+    /// accident.
+    std::string dashboardTokenFile;
+
+    /// Certificate the admin surface serves TLS with, or empty for plaintext.
+    ///
+    /// Spelled as the daemon spells it, because an operator copies these between
+    /// the two binaries. There is deliberately **no `--tls` boolean**: TLS is on by
+    /// naming a certificate and a key, which removes the state "TLS requested, no
+    /// material" that a boolean makes reachable.
+    std::string tlsCertFile;
+
+    /// Private key for `tlsCertFile`. Both or neither.
+    std::string tlsKeyFile;
+
     /// Where this node serves the fleet's scheduler verbs, or empty to leave it off.
     ///
     /// Off by default and for the same reason `--admin-listen` is: handing out other

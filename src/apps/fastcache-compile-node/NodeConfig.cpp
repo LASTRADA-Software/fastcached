@@ -4,6 +4,7 @@
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
+#include <FastCache/Core/HostPort.hpp>
 
 #include <array>
 #include <charconv>
@@ -430,6 +431,35 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "public interface is an operator's decision, not a\n"
                          "default. /healthz is also the liveness probe this\n"
                          "worker otherwise has none of." },
+        { .primary = "--dashboard",
+          .apply = SetTrue<&NodeConfig::dashboard>(),
+          .description = "also serve the fleet dashboard on --admin-listen, at\n"
+                         "/fleet and /fleet.json. Off unless given: the page is a\n"
+                         "map of every member's hostname, endpoint and capacity.\n"
+                         "Answered in full only while this node LEADS; anyone else\n"
+                         "names the leader rather than showing half a fleet." },
+        { .primary = "--dashboard-token-file",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&NodeConfig::dashboardTokenFile, ParsePathValue>(),
+          .description = "credential the dashboard requires, as Basic or Bearer.\n"
+                         "A FILE and not a flag: a command line is readable\n"
+                         "through ps. Its own secret rather than --requirepass,\n"
+                         "which every member of the fleet already holds. Required\n"
+                         "when --admin-listen is not on loopback." },
+        { .primary = "--tls-cert",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&NodeConfig::tlsCertFile, ParsePathValue>(),
+          .description = "serve the admin surface over HTTPS with this\n"
+                         "certificate. TLS is on by naming a certificate and a\n"
+                         "key rather than by a flag, so there is no way to ask\n"
+                         "for it without the material to do it." },
+        { .primary = "--tls-key",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&NodeConfig::tlsKeyFile, ParsePathValue>(),
+          .description = "private key for --tls-cert. Both or neither." },
         { .primary = "--listen-scheduler",
           .arity = Arity::Value,
           .operand = "=[<address>:]<port>",
@@ -620,6 +650,13 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     if (cfg.reservedCores.has_value())
         argv.push_back(std::format("--reserve-cores={}", *cfg.reservedCores));
     emitIfSet("admin-listen", cfg.adminListen, defaults.adminListen);
+    if (cfg.dashboard)
+        argv.emplace_back("--dashboard");
+    // The PATH, never the secret it holds -- the same rule `--requirepass` is
+    // refused outright by, one step less strict because a path is not a credential.
+    emitPathIfSet("dashboard-token-file", cfg.dashboardTokenFile);
+    emitPathIfSet("tls-cert", cfg.tlsCertFile);
+    emitPathIfSet("tls-key", cfg.tlsKeyFile);
     emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
     emitIfSet("cache-memory", cfg.cacheMemoryBytes, defaults.cacheMemoryBytes);
     emitIfSet("cache-disk", cfg.cacheDiskBytes, defaults.cacheDiskBytes);
@@ -793,6 +830,41 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--cluster-key-file is read by discovery and nothing else, and --discovery is not set. A "
                      "secret an operator went to the trouble of provisioning, being read by nobody, is exactly "
                      "the silent no-op this list exists to refuse." },
+        { .refuses = [](NodeConfig const& c) { return c.dashboard && c.adminListen.empty(); },
+          .message = "--dashboard needs --admin-listen: the dashboard is served on the admin surface, and "
+                     "without one there is no port for it to answer on. It would start, log nothing wrong, "
+                     "and serve the page to nobody." },
+        { .refuses = [](NodeConfig const& c) { return c.dashboard && c.schedulerListen.empty(); },
+          .message = "--dashboard needs --listen-scheduler: a node that runs no scheduler never leads a fleet, "
+                     "so the page could only ever say it is not the leader. The fleet-wide facts live where "
+                     "leadership does." },
+        { .refuses = [](NodeConfig const& c) { return !c.dashboardTokenFile.empty() && !c.dashboard; },
+          .message = "--dashboard-token-file guards the dashboard and nothing else, and --dashboard is not set. "
+                     "A secret an operator provisioned, being read by nobody, is the silent no-op this list "
+                     "exists to refuse." },
+        { .refuses = [](NodeConfig const& c) { return c.tlsCertFile.empty() != c.tlsKeyFile.empty(); },
+          .message = "--tls-cert and --tls-key are both or neither: a certificate with no key cannot terminate "
+                     "TLS, and this node would otherwise start and serve the admin surface in the clear while "
+                     "an operator believed it was encrypted." },
+        // The rule that keeps a fleet map off an open port. Loopback needs no
+        // credential -- reaching it already means being on the machine -- but a
+        // bind an operator deliberately exposed does, and HTTPS alone does not
+        // supply it: TLS authenticates the SERVER to the browser and says nothing
+        // about who the browser is.
+        { .refuses =
+              [](NodeConfig const& c) {
+                  if (!c.dashboard || c.adminListen.empty() || !c.dashboardTokenFile.empty())
+                      return false;
+                  // The same default host `AdminEndpoint::Start` binds with, so
+                  // this rule judges the address the endpoint will actually take
+                  // rather than the text an operator typed.
+                  auto const endpoint = ParseEndpoint(c.adminListen, "127.0.0.1");
+                  return endpoint.has_value() && !IsLoopbackHost(endpoint->first);
+              },
+          .message = "--dashboard on a non-loopback --admin-listen needs --dashboard-token-file: the page is a "
+                     "map of every member's hostname, endpoint and capacity, and an operator who bound it to "
+                     "the network is publishing that to whoever asks. A bare port binds loopback and needs no "
+                     "credential." },
     });
 
     for (auto const& rule: Rules)

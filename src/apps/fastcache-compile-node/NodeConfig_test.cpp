@@ -140,6 +140,10 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.nodeClass = Distributed::NodeClass::Dedicated;
     cfg.reservedCores = 3;
     cfg.adminListen = "0.0.0.0:6677";
+    cfg.dashboard = true;
+    cfg.dashboardTokenFile = "dashboard.token";
+    cfg.tlsCertFile = "admin.crt";
+    cfg.tlsKeyFile = "admin.key";
     cfg.schedulerListen = "0.0.0.0:6678";
     cfg.fleetMembers = { "10.0.0.1:6676", "10.0.0.2:6676" };
     cfg.fleetOpen = true;
@@ -637,4 +641,137 @@ TEST_CASE("NodeConfig: the node answers where the launcher looks", "[node][cli]"
 
     // And it is on by default, because a local tier is what the program is for.
     CHECK(NodeConfig {}.cacheMemoryBytes > 0);
+}
+
+TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[node][dashboard][policy]")
+{
+    // Every rule here describes a configuration that would start successfully and
+    // then not work, refused at the one moment an operator is watching. Each
+    // message names the flags, because "invalid" tells them nothing about what to
+    // type instead.
+
+    /// A node whose scheduler and admin surface are both configured, so only the
+    /// dashboard rule under test can fire.
+    auto const servingNode = [] {
+        NodeConfig cfg;
+        cfg.schedulerListen = "0.0.0.0:6678";
+        cfg.fleetOpen = true;
+        cfg.adminListen = "6677"; // a bare port, so loopback
+        cfg.dashboard = true;
+        return cfg;
+    };
+
+    SECTION("a dashboard with no admin surface to serve it on")
+    {
+        auto cfg = servingNode();
+        cfg.adminListen.clear();
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--dashboard"));
+        CHECK(Unwrap(refusal).contains("--admin-listen"));
+    }
+
+    SECTION("a dashboard on a node that never leads a fleet")
+    {
+        // A node running no scheduler has no registry to report, so the page could
+        // only ever say it is not the leader -- which looks like a working
+        // dashboard right up until somebody reads it.
+        auto cfg = servingNode();
+        cfg.schedulerListen.clear();
+        cfg.fleetOpen = false;
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--dashboard"));
+        CHECK(Unwrap(refusal).contains("--listen-scheduler"));
+    }
+
+    SECTION("a credential nothing reads")
+    {
+        // The sibling of the existing --cluster-key-file rule: a secret an operator
+        // went to the trouble of provisioning, read by nobody.
+        auto cfg = servingNode();
+        cfg.dashboard = false;
+        cfg.dashboardTokenFile = "dashboard.token";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--dashboard-token-file"));
+    }
+
+    SECTION("a certificate with no key, and a key with no certificate")
+    {
+        // Without this the node would start and serve the admin surface in the
+        // clear while an operator believed it was encrypted.
+        auto certOnly = servingNode();
+        certOnly.tlsCertFile = "admin.crt";
+        auto const certRefusal = StartupPolicyRejection(certOnly);
+        REQUIRE(certRefusal.has_value());
+        CHECK(Unwrap(certRefusal).contains("--tls-key"));
+
+        auto keyOnly = servingNode();
+        keyOnly.tlsKeyFile = "admin.key";
+        auto const keyRefusal = StartupPolicyRejection(keyOnly);
+        REQUIRE(keyRefusal.has_value());
+        CHECK(Unwrap(keyRefusal).contains("--tls-cert"));
+
+        // Both together is the configuration that works.
+        auto both = servingNode();
+        both.tlsCertFile = "admin.crt";
+        both.tlsKeyFile = "admin.key";
+        CHECK_FALSE(StartupPolicyRejection(both).has_value());
+    }
+
+    SECTION("a fleet map on a public port with no credential")
+    {
+        // The page lists every member's hostname, endpoint and capacity. An
+        // operator who bound it to the network is publishing that to whoever asks,
+        // and HTTPS does not help: TLS authenticates the SERVER to the browser and
+        // says nothing about who the browser is.
+        auto cfg = servingNode();
+        cfg.adminListen = "0.0.0.0:6677";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--dashboard-token-file"));
+
+        // Naming a credential is what makes that configuration legal.
+        cfg.dashboardTokenFile = "dashboard.token";
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("loopback needs no credential, because reaching it means being on the machine")
+    {
+        // A bare port binds loopback, and the whole default rests on that.
+        auto const cfg = servingNode();
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+
+        // Spelled out, it is the same answer.
+        auto explicitLoopback = servingNode();
+        explicitLoopback.adminListen = "127.0.0.1:6677";
+        CHECK_FALSE(StartupPolicyRejection(explicitLoopback).has_value());
+    }
+}
+
+TEST_CASE("Naming the dashboard flags parses them", "[node][dashboard][cli]")
+{
+    auto const parsed = ParseNodeArgv({ "--scheduler=cache:6675",
+                                        "--toolchain=/usr/bin/g++",
+                                        "--admin-listen=6677",
+                                        "--dashboard",
+                                        "--dashboard-token-file=/etc/fastcached/dashboard.token",
+                                        "--tls-cert=/etc/fastcached/admin.crt",
+                                        "--tls-key=/etc/fastcached/admin.key" });
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->dashboard);
+    CHECK(parsed->dashboardTokenFile == "/etc/fastcached/dashboard.token");
+    CHECK(parsed->tlsCertFile == "/etc/fastcached/admin.crt");
+    CHECK(parsed->tlsKeyFile == "/etc/fastcached/admin.key");
+
+    // Off unless asked for, like every other surface this program serves.
+    auto const bare = ParseNodeArgv({ "--scheduler=cache:6675", "--toolchain=/usr/bin/g++" });
+    REQUIRE(bare.has_value());
+    CHECK_FALSE(bare->dashboard);
+    CHECK(bare->dashboardTokenFile.empty());
 }

@@ -55,6 +55,8 @@ target_sources(FastCache
         Distributed/SchedulerProtocol.cpp
         Distributed/FleetView.cpp
         Core/BufferPool.cpp
+        Core/Base64.cpp
+        Server/AdminCredential.cpp
         Metrics/PrometheusFormatter.cpp
         Net/BlockingConnector.cpp
         Net/BlockingSocket.cpp
