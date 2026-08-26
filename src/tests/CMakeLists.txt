@@ -306,7 +306,7 @@ else()
         LABELS "smoke"
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE
-        TIMEOUT 300
+        TIMEOUT 600
     )
 
     # The same fixture over HTTPS, registered only where TLS is compiled in --
@@ -327,7 +327,7 @@ else()
             LABELS "smoke"
             SKIP_RETURN_CODE 77
             RUN_SERIAL TRUE
-            TIMEOUT 300
+            TIMEOUT 600
         )
 
         # And the spelling that needs no certificate to exist first. Separate from
@@ -346,7 +346,7 @@ else()
             LABELS "smoke"
             SKIP_RETURN_CODE 77
             RUN_SERIAL TRUE
-            TIMEOUT 300
+            TIMEOUT 600
         )
     endif()
 endif()

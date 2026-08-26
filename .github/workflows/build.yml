@@ -882,7 +882,13 @@ jobs:
           # real work. Polling is-active therefore answers "has it started",
           # which is not the question; the first version of this step asked it
           # and read an empty journal.
-          for _ in $(seq 1 90); do
+          #
+          # 240 rather than 90: that walk is thousands of cold stat and read
+          # calls, and on a contended runner it outran 90s here while the
+          # service sat "active (running)" on 894ms of CPU -- blocked on I/O,
+          # not computing. `scripts/fleet-dashboard-e2e.sh` measured the same
+          # cost directly and carries the numbers.
+          for _ in $(seq 1 240); do
             sudo journalctl -u fastcache-compile-node --no-pager > /tmp/node-log.txt 2>/dev/null || true
             grep -q 'compile node ready' /tmp/node-log.txt && break
             sleep 1

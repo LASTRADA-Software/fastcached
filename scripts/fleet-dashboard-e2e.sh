@@ -139,17 +139,29 @@ http_get() {
 
 # How long a bounded wait may take, in tenths of a second.
 #
-# 60 seconds, and the number is what it is because of what happens BEFORE the
+# 240 seconds, and the number is what it is because of what happens BEFORE the
 # admin surface binds: the node resolves each `--toolchain` first, which walks
-# the compiler's include tree. That is near-instant on a warm developer machine
-# and takes tens of seconds on a cold CI runner with nothing cached -- 10s was
-# enough for the former and not the latter, which is how all three of these
-# fixtures failed on a runner while passing locally. `dist-compile-e2e` next
-# door needs 26 seconds for the same reason.
+# the compiler's include tree. That is thousands of cold stat and read calls,
+# near-instant on a warm developer machine and minutes on a contended CI runner
+# whose page cache holds none of it.
+#
+# The cost is paid ONCE per runner, and the three fixtures below measured it
+# exactly. Run back to back against the same node and the same `/usr/bin/c++`:
+#
+#     fleet-dashboard-e2e              timed out at  60s
+#     fleet-dashboard-tls-e2e          passed in    5.08s
+#     fleet-dashboard-self-signed-e2e  passed in    1.27s
+#
+# Nothing differs between them but page-cache warmth, so whichever runs first
+# pays for all three -- and 10s, then 60s, were each enough on a quiet runner
+# and not on a busy one. `EpollSocket::WriteVectored` took 26s in that same run,
+# which is what "busy" looked like.
 #
 # Generous rather than unbounded: a wait nothing can end is a suite timeout
-# naming nothing, which this repository has already paid for once.
-readonly WAIT_TICKS=600
+# naming nothing, which this repository has already paid for once. This one
+# named the port, the elapsed time and the node's own last log line, and that is
+# what made two runner failures diagnosable from the output alone.
+readonly WAIT_TICKS=2400
 
 # Block until something answers on a port, or the process behind it dies.
 #
