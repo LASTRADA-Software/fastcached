@@ -786,6 +786,8 @@ fastcache-compile-node --scheduler cache.internal:6674 \
 curl -s -u ":$(cat /etc/fastcached/dashboard.token)" localhost:6677/fleet.json | jq .
 ```
 
+![The fleet dashboard, served by the leader](fleet-dashboard.png)
+
 **The leader answers it, and nobody else can.** A follower's registry holds
 whatever registered against *it* rather than the fleet, which is the same reason
 `--cluster-status` is refused by one. Ask a follower and it replies `503` naming
