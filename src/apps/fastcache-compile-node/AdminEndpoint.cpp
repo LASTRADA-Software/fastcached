@@ -15,9 +15,9 @@
 #include <cstdint>
 #include <format>
 #include <fstream>
-#include <iterator>
 #include <optional>
 #include <ranges>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -59,7 +59,16 @@ std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::
     if (!file)
         return std::unexpected { std::format("cannot read '{}'", path.string()) };
 
-    std::string secret { std::istreambuf_iterator<char> { file }, std::istreambuf_iterator<char> {} };
+    // Via the stream buffer rather than `std::istreambuf_iterator`, which is the
+    // workaround this codebase has already had to reach for twice (see
+    // `Cc::ReadBytes` and `DefaultConfigPath_test`'s `ReadFile`): GCC at -O3
+    // inlines the iterator far enough to see a path where the buffer pointer
+    // could be null and rejects it under `-Werror=null-dereference`, which for an
+    // `ifstream` it never is. Inserting a `streambuf*` handles null by setting
+    // failbit, so there is nothing left for it to complain about.
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    auto secret = std::move(buffer).str();
 
     // Trailing whitespace is trimmed because every editor adds a newline, and an
     // operator should not have to know that a secret which looks right is one byte
