@@ -187,3 +187,116 @@ TEST_CASE("AdminHttp: a request split across reads is consumed to the end", "[me
     // Nothing of the request is left: the server read it to the end before answering.
     CHECK(FastCache::SyncRun(ReadAvailable(pair.server.get())).empty());
 }
+
+namespace
+{
+
+/// Drive one request against a caller-supplied route list.
+///
+/// Separate from `Exchange` rather than a defaulted parameter on it, so every
+/// assertion that a built-in route is unchanged keeps calling the two-argument
+/// form and cannot accidentally start depending on a contributed row.
+/// @param request The raw request bytes.
+/// @param routes What the caller registered.
+/// @return Everything the server wrote back.
+std::string ExchangeWithRoutes(std::string_view request, std::vector<FastCache::AdminRoute> const& routes)
+{
+    FastCache::AtomicMetricsSink metrics;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), request)));
+    pair.client->ShutdownWrite();
+    using namespace std::chrono_literals;
+    auto provider = [] {
+        return FastCache::MetricsSnapshot { .storage = std::nullopt,
+                                            .host = std::nullopt,
+                                            .uptime = FastCache::Uptime { 1s } };
+    };
+    FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider, routes));
+    pair.server->Close();
+    return FastCache::SyncRun(ReadAvailable(pair.client.get()));
+}
+
+} // namespace
+
+TEST_CASE("AdminHttp: a contributed route answers on its own path", "[admin][http][routes]")
+{
+    std::vector<FastCache::AdminRoute> const routes {
+        { .path = "/fleet",
+          .handler = [](FastCache::AdminRequest const&) {
+              return FastCache::AdminResponse { .status = "200 OK", .contentType = "text/html", .body = "<h1>fleet</h1>" };
+          } },
+    };
+
+    auto const response = ExchangeWithRoutes("GET /fleet HTTP/1.1\r\nHost: x\r\n\r\n", routes);
+    CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK(response.contains("Content-Type: text/html\r\n"));
+    CHECK(response.contains("<h1>fleet</h1>"));
+}
+
+TEST_CASE("AdminHttp: the built-in routes still answer alongside a contributed one", "[admin][http][routes]")
+{
+    // The regression that matters most here: `/metrics` and `/healthz` are what
+    // every existing scraper and probe is pointed at, and a route table that
+    // shadowed or reordered them would be found in production rather than here.
+    std::vector<FastCache::AdminRoute> const routes {
+        { .path = "/fleet",
+          .handler = [](FastCache::AdminRequest const&) { return FastCache::AdminResponse {}; } },
+    };
+
+    CHECK(ExchangeWithRoutes("GET /healthz HTTP/1.1\r\n\r\n", routes).starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK(ExchangeWithRoutes("GET /metrics HTTP/1.1\r\n\r\n", routes).contains("text/plain; version=0.0.4"));
+    CHECK(ExchangeWithRoutes("GET /nope HTTP/1.1\r\n\r\n", routes).starts_with("HTTP/1.1 404 Not Found\r\n"));
+}
+
+TEST_CASE("AdminHttp: a route may refuse, and its extra headers reach the client", "[admin][http][routes]")
+{
+    // A 401 that does not carry `WWW-Authenticate` is one a browser cannot prompt
+    // for, which turns "you need a credential" into "this page is broken".
+    std::vector<FastCache::AdminRoute> const routes {
+        { .path = "/fleet", .handler = [](FastCache::AdminRequest const&) {
+             return FastCache::AdminResponse { .status = "401 Unauthorized",
+                                               .contentType = "text/plain",
+                                               .body = "credential required\n",
+                                               .extraHeaders = { R"(WWW-Authenticate: Basic realm="fleet")" } };
+         } },
+    };
+
+    auto const response = ExchangeWithRoutes("GET /fleet HTTP/1.1\r\n\r\n", routes);
+    CHECK(response.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+    CHECK(response.contains(R"(WWW-Authenticate: Basic realm="fleet")"));
+    CHECK(response.contains("credential required\n"));
+}
+
+TEST_CASE("AdminHttp: a handler is told the Authorization header, whatever its case", "[admin][http][routes]")
+{
+    // Field names are case-insensitive and real clients disagree about the
+    // spelling. A byte comparison would make the credential work for curl and
+    // not for a proxy, which gets diagnosed as "the token is wrong".
+    auto const echo = [](FastCache::AdminRequest const& request) {
+        return FastCache::AdminResponse { .status = "200 OK",
+                                          .contentType = "text/plain",
+                                          .body = std::string { request.authorization } };
+    };
+    std::vector<FastCache::AdminRoute> const routes { { .path = "/echo", .handler = echo } };
+
+    CHECK(ExchangeWithRoutes("GET /echo HTTP/1.1\r\nAuthorization: Bearer s3cret\r\n\r\n", routes)
+              .contains("Bearer s3cret"));
+    CHECK(ExchangeWithRoutes("GET /echo HTTP/1.1\r\nauthorization:   Basic QUJD\r\n\r\n", routes).contains("Basic QUJD"));
+
+    // No header at all is an empty view, not a missing one: a handler that reads
+    // it before checking would otherwise be reading uninitialised storage.
+    auto const none = ExchangeWithRoutes("GET /echo HTTP/1.1\r\nHost: x\r\n\r\n", routes);
+    CHECK(none.contains("Content-Length: 0\r\n"));
+}
+
+TEST_CASE("AdminHttp: a query string reaches the handler and does not defeat routing", "[admin][http][routes]")
+{
+    auto const echo = [](FastCache::AdminRequest const& request) {
+        return FastCache::AdminResponse { .status = "200 OK",
+                                          .contentType = "text/plain",
+                                          .body = std::string { request.query } };
+    };
+    std::vector<FastCache::AdminRoute> const routes { { .path = "/echo", .handler = echo } };
+
+    CHECK(ExchangeWithRoutes("GET /echo?tier=disk HTTP/1.1\r\n\r\n", routes).contains("tier=disk"));
+}
