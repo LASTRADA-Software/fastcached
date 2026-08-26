@@ -156,6 +156,9 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     // default on some machine, and this case exists precisely to give every field
     // a value that differs from it.
     cfg.cacheMemoryBytes = NodeConfig {}.cacheMemoryBytes + 1;
+    // Emitted on whether it was *typed*, not on whether it differs -- so a
+    // fixture that assigns the field has to say so too.
+    cfg.cacheMemoryExplicit = true;
     cfg.cacheDir = "cache";
     cfg.cacheDiskBytes = 40ULL * 1024 * 1024 * 1024;
     cfg.cacheListen = "127.0.0.1:6679";
@@ -439,6 +442,9 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // default on some machine, and this case exists precisely to give every field
         // a value that differs from it.
         cfg.cacheMemoryBytes = NodeConfig {}.cacheMemoryBytes + 1;
+        // Emitted on whether it was *typed*, not on whether it differs -- so a
+        // fixture that assigns the field has to say so too.
+        cfg.cacheMemoryExplicit = true;
         cfg.cacheDir = "cache";
         cfg.cacheListen = "127.0.0.1:6679";
         cfg.upstream = "cache.internal:6674";
@@ -581,6 +587,14 @@ TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node]
     // line that reads correctly.
     NodeConfig cfg;
 
+    // Stated rather than defaulted, and that is the `FakeHost` seam being kept
+    // honest rather than tidiness. The cache budget's default is a share of the RAM
+    // of the machine this test *runs on*, while the memory it is weighed against
+    // comes from the fake — so leaving it default mixes two machines into one sum
+    // and gives an answer that changes with the runner. Sections that are about the
+    // cache say so and override it.
+    cfg.cacheMemoryBytes = 0;
+
     SECTION("a developer's laptop keeps cores for its owner")
     {
         FakeHost const laptop { 8, 32ULL << 30 };
@@ -609,6 +623,25 @@ TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node]
         FakeHost const cramped { 128, 32ULL << 30 };
 
         CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, cramped), cfg.slots) == 32);
+    }
+
+    SECTION("the node's own cache is memory a compile cannot have")
+    {
+        cfg.nodeClass = Distributed::NodeClass::Dedicated;
+        cfg.cacheMemoryBytes = 8ULL << 30;
+        FakeHost const cramped { 128, 32ULL << 30 };
+
+        auto const capacity = NodeCapacityOf(cfg, cramped);
+        // Declared, so the scheduler at the other end reaches the same number.
+        CHECK(capacity.reservedMemoryBytes == (8ULL << 30));
+        // And the machine still reports the RAM it *has*: the dashboard prints this,
+        // and a machine that appeared to shrink by the size of its own cache would be
+        // a different lie.
+        CHECK(capacity.totalMemoryBytes == (32ULL << 30));
+        // 24 rather than 32. The old arithmetic offered a slot per gigabyte of total
+        // RAM while the node held eight of those gigabytes itself -- forty gigabytes
+        // of promises on a thirty-two gigabyte box.
+        CHECK(Distributed::OfferableSlots(capacity, cfg.slots) == 24);
     }
 
     SECTION("a typed reserve of zero is not the same as no reserve")
@@ -894,8 +927,37 @@ TEST_CASE("A cache budget nobody set emits no flag, and a zero one does", "[node
 
     auto off = Installable();
     off.cacheMemoryBytes = 0;
+    off.cacheMemoryExplicit = true;
     auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", off);
-    // Turning it off is a decision, and one that differs from the default on every
-    // machine -- so it survives into the unit rather than being read as "unset".
+    // Turning it off is a decision, so it survives into the unit rather than being
+    // read as "unset".
     CHECK(std::ranges::any_of(spec.arguments, [](auto const& arg) { return arg == "--cache-memory=0"; }));
+
+    // **The one this exists for.** An operator reads the startup line, types that
+    // number back to pin it, and lands on a value equal to the default *on this
+    // machine*. Emitting on "differs from the default" would drop it, and the
+    // service would re-derive from RAM at every start -- so the budget moves under a
+    // VM resize or a memory upgrade, for exactly the operator who pinned it.
+    auto pinned = Installable();
+    pinned.cacheMemoryBytes = NodeConfig {}.cacheMemoryBytes;
+    pinned.cacheMemoryExplicit = true;
+    auto const pinnedSpec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", pinned);
+    CHECK(std::ranges::any_of(pinnedSpec.arguments, [&pinned](auto const& arg) {
+        return arg == std::format("--cache-memory={}", pinned.cacheMemoryBytes);
+    }));
+}
+
+TEST_CASE("Typing the cache budget is what marks it explicit", "[node][config][cache]")
+{
+    // The bit is set by the parse, not by the caller: every path that reaches a
+    // service spec goes through `ParseOptionsInto`, so a flag an operator typed
+    // carries its own provenance rather than depending on somebody remembering to
+    // record it alongside.
+    auto const typed = ParseNodeArgv({ "--cache-memory=1g" });
+    REQUIRE(typed.has_value());
+    CHECK(typed->cacheMemoryExplicit);
+
+    auto const silent = ParseNodeArgv({ "--scheduler=s:1" });
+    REQUIRE(silent.has_value());
+    CHECK_FALSE(silent->cacheMemoryExplicit);
 }

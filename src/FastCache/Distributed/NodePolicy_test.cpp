@@ -382,3 +382,66 @@ TEST_CASE("Every slot limit has a row naming it and what to do about it", "[dist
     }
     CHECK(TraitsFor(SlotLimit::Scratch).name == "scratch");
 }
+
+TEST_CASE("Slots are budgeted against memory a compile can have, not all of it", "[distributed][policy][memory]")
+{
+    constexpr std::uint64_t Gib = 1ULL << 30;
+
+    // The machine this exists for: more hardware threads than gigabytes, so memory
+    // is the ceiling that binds rather than cores. Before the node declared what its
+    // own cache holds, this offered 32 slots at a gigabyte each *and* held 8 GiB of
+    // cache -- forty gigabytes of promises on a thirty-two gigabyte box.
+    constexpr NodeCapacity greedy {
+        .logicalCores = 64, .totalMemoryBytes = 32 * Gib, .reservedMemoryBytes = 8 * Gib, .nodeClass = NodeClass::Dedicated
+    };
+    CHECK(OfferableSlots(greedy, 0) == 24U);
+
+    // Same machine, no cache tier: nothing is held back, so nothing is subtracted.
+    // This is the arithmetic every node had before the field existed, and it is what
+    // a peer too old to report one still gets.
+    constexpr NodeCapacity lean { .logicalCores = 64, .totalMemoryBytes = 32 * Gib, .nodeClass = NodeClass::Dedicated };
+    CHECK(OfferableSlots(lean, 0) == 32U);
+}
+
+TEST_CASE("A cache budgeted above the machine's RAM floors the slots rather than freeing them",
+          "[distributed][policy][memory]")
+{
+    constexpr std::uint64_t Gib = 1ULL << 30;
+
+    // An operator can type `--cache-memory=64g` on a 16 GiB box. Subtracting to zero
+    // would hand `MemorySlotCeiling` its "did not say" sentinel and remove the memory
+    // ceiling **altogether** -- so the node most obviously short of memory would be
+    // the one offering a slot per core. One, not sixteen.
+    constexpr NodeCapacity impossible {
+        .logicalCores = 16, .totalMemoryBytes = 16 * Gib, .reservedMemoryBytes = 64 * Gib, .nodeClass = NodeClass::Dedicated
+    };
+    CHECK(OfferableSlots(impossible, 0) == 1U);
+
+    // Exactly equal is the same claim: nothing left to compile with.
+    constexpr NodeCapacity exact {
+        .logicalCores = 16, .totalMemoryBytes = 16 * Gib, .reservedMemoryBytes = 16 * Gib, .nodeClass = NodeClass::Dedicated
+    };
+    CHECK(OfferableSlots(exact, 0) == 1U);
+}
+
+TEST_CASE("A machine that did not state its memory is still scheduled on its cores", "[distributed][policy][memory]")
+{
+    // Absent is not zero, and a reserve cannot invent a reading: a node that could
+    // not read its own RAM must be scheduled on what it *did* say, not clamped to
+    // one slot by arithmetic over a number nobody has.
+    constexpr NodeCapacity quiet {
+        .logicalCores = 12, .totalMemoryBytes = 0, .reservedMemoryBytes = 4ULL << 30, .nodeClass = NodeClass::Dedicated
+    };
+    CHECK(OfferableSlots(quiet, 0) == 12U);
+}
+
+TEST_CASE("An explicit slot count is still a ceiling nothing raises or lowers", "[distributed][policy][memory]")
+{
+    constexpr std::uint64_t Gib = 1ULL << 30;
+    // `--slots` is the operator overriding every derivation, and holding memory back
+    // must not quietly start second-guessing it.
+    constexpr NodeCapacity capacity {
+        .logicalCores = 64, .totalMemoryBytes = 32 * Gib, .reservedMemoryBytes = 8 * Gib, .nodeClass = NodeClass::Dedicated
+    };
+    CHECK(OfferableSlots(capacity, 40) == 40U);
+}

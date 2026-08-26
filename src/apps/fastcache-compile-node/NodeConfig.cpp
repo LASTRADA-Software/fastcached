@@ -195,7 +195,11 @@ namespace
         return static_cast<std::uint64_t>(*parsed);
     }
 
-    /// The on-disk tier's byte budget, in the same grammar as `--cache-memory`.
+    /// The on-disk tier's byte budget.
+    ///
+    /// `k`/`m`/`g` as `--cache-memory` takes them, but **not** its `N%`: that share
+    /// is of host RAM, and a disk budget expressed as a fraction of memory would be
+    /// a number with no meaning on any machine whose disk is not its RAM.
     /// @param sv Text to parse.
     /// @return The size in bytes, or why it is not one.
     [[nodiscard]] std::expected<std::uint64_t, ConfigError> ParseCacheDiskBytes(std::string_view sv)
@@ -502,6 +506,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::Value,
           .operand = "=<size>",
           .apply = AssignFrom<&NodeConfig::cacheMemoryBytes, ParseCacheBytes>(),
+          .explicitBit = &NodeConfig::cacheMemoryExplicit,
           .description = "size of this node's own in-memory cache tier;\n"
                          "k/m/g = KiB/MiB/GiB or N% of host RAM. Defaults\n"
                          "to 25% of RAM within [512m, 8g]; 0 turns it off.\n"
@@ -608,6 +613,12 @@ Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg, IHostFactsSource
 {
     return Distributed::NodeCapacity { .logicalCores = host.LogicalCores(),
                                        .totalMemoryBytes = host.TotalMemoryBytes(),
+                                       // What this node's own cache tier will take,
+                                       // and therefore what a compile cannot have.
+                                       // `cfg.cacheMemoryBytes` is exactly what
+                                       // `CacheTier` builds the memory half with, and
+                                       // zero is both "no tier" and "nothing held".
+                                       .reservedMemoryBytes = cfg.cacheMemoryBytes,
                                        .nodeClass = cfg.nodeClass,
                                        // Absent is not zero, and this is the one line
                                        // where the two are told apart: a reserve the
@@ -673,7 +684,12 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitPathIfSet("tls-cert", cfg.tlsCertFile.string());
     emitPathIfSet("tls-key", cfg.tlsKeyFile.string());
     emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
-    emitIfSet("cache-memory", cfg.cacheMemoryBytes, defaults.cacheMemoryBytes);
+    // On whether they SAID it, not on whether it differs. This default is a share of
+    // host RAM, so the value an operator reads off the startup line and types back to
+    // pin it is the one value `emitIfSet` would drop -- leaving the service to
+    // re-derive from RAM at every start, and the budget to move under a VM resize.
+    if (cfg.cacheMemoryExplicit)
+        argv.emplace_back(std::format("--cache-memory={}", cfg.cacheMemoryBytes));
     emitIfSet("cache-disk", cfg.cacheDiskBytes, defaults.cacheDiskBytes);
     emitIfSet("listen-cache", cfg.cacheListen, defaults.cacheListen);
     emitIfSet("node-id", cfg.nodeId, defaults.nodeId);

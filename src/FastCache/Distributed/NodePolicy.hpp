@@ -170,6 +170,16 @@ struct NodeCapacity
     std::uint32_t logicalCores { 0 };
     /// Physical memory, in bytes. Zero means "did not say".
     std::uint64_t totalMemoryBytes { 0 };
+    /// Memory this node holds for itself, and so cannot lend to a compile.
+    ///
+    /// Its own cache tier is the whole of it today. Separate from
+    /// `totalMemoryBytes` rather than subtracted from it, because that field is what
+    /// the machine *has* -- the dashboard reports it, and a machine that appeared to
+    /// shrink by the size of its own cache would be a different lie.
+    ///
+    /// Zero when the node runs no cache, and zero from a peer too old to report one,
+    /// which is the same arithmetic this had before the field existed.
+    std::uint64_t reservedMemoryBytes { 0 };
     /// How hard this machine may be driven.
     NodeClass nodeClass { NodeClass::Workstation };
     /// Cores held back from the fleet. Defaults to the class's reserve; an
@@ -255,8 +265,27 @@ inline constexpr std::uint64_t MemoryBudgetPerJobBytes = 1ULL << 30;
         return advertisedSlots;
 
     auto ceiling = capacity.logicalCores == 0 ? 1U : capacity.logicalCores;
-    if (auto const byMemory = MemorySlotCeiling(capacity.totalMemoryBytes); byMemory.has_value())
-        ceiling = std::min(ceiling, *byMemory);
+
+    // Against the memory a compile can actually have, which is not all of it: the
+    // node's own cache tier is resident and is not going to yield. Budgeting jobs
+    // against total RAM was near enough while that tier was a couple of hundred
+    // megabytes and stopped being so when it became a share of the machine -- a
+    // 64-thread host with 32 GiB was offering 32 slots at a gigabyte each *and*
+    // holding 8 GiB of cache, which is forty gigabytes of promises on a
+    // thirty-two gigabyte box.
+    //
+    // Floored at one byte rather than allowed to reach zero: zero is
+    // `MemorySlotCeiling`'s spelling of "did not say", so a node whose cache is
+    // budgeted above its RAM would lose the memory ceiling altogether -- the exact
+    // opposite of what it has just told us.
+    if (capacity.totalMemoryBytes != 0)
+    {
+        auto const forJobs = capacity.reservedMemoryBytes >= capacity.totalMemoryBytes
+                                 ? std::uint64_t { 1 }
+                                 : capacity.totalMemoryBytes - capacity.reservedMemoryBytes;
+        if (auto const byMemory = MemorySlotCeiling(forJobs); byMemory.has_value())
+            ceiling = std::min(ceiling, *byMemory);
+    }
     auto const reserve = capacity.reserveIsExplicit ? capacity.reservedCores : TraitsFor(capacity.nodeClass).reservedCores;
 
     // Saturating rather than wrapping: a two-core workstation reserving two cores

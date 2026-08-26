@@ -180,11 +180,25 @@ B+tree:
 | `--cache-memory=0 --cache-dir=…` | Disk only. |
 | `--cache-memory=0` and no `--cache-dir` | **No tier at all**, which is what a node that only compiles for others wants. |
 
-`--cache-memory` takes bytes (`k`/`m`/`g` = KiB/MiB/GiB) or a share of host RAM
-(`N%`) — the vocabulary its own default is stated in, so "a quarter, but half of
-that" is `--cache-memory=12%` rather than arithmetic you do per machine. **Zero
-turns the tier off**; it does not mean "unbounded", which is what zero means to
-the store underneath.
+`--cache-memory` takes bytes (`k`/`m`/`g` = KiB/MiB/GiB, or a bare count with an
+optional `B`) or a share of host RAM (`N%`) — the vocabulary its own default is
+stated in, so "a quarter, but half of that" is `--cache-memory=12%` rather than
+arithmetic you do per machine. **Zero turns the tier off**; it does not mean
+"unbounded", which is what zero means to the store underneath.
+
+Whatever the node logs at startup can be typed straight back to pin it, and pinning
+it that way survives `--install-service`: the flag is written into the unit because
+you *stated* it, not because it differs from the default — otherwise typing the
+machine's current quarter would look identical to saying nothing, and the service
+would go back to re-deriving from RAM at every start.
+
+**The tier's memory is subtracted from what a compile can have.** A node budgets
+one job per gigabyte of RAM, and its own cache is resident memory that is not going
+to yield — so a 64-thread host with 32 GiB used to offer 32 slots *and* hold 8 GiB
+of cache, which is forty gigabytes of promises on a thirty-two gigabyte machine. It
+now offers 24. The figure travels with the registration, so a node that asks the
+scheduler to size it (`--slots 0`) gets the same answer at the other end, and a
+peer too old to report it is sized exactly as it always was.
 
 The default follows the machine because the machines this runs on vary by more
 than an order of magnitude, and one object file is routinely megabytes: a cache

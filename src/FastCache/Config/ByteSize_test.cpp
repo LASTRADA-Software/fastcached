@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <string>
@@ -134,4 +135,34 @@ TEST_CASE("FormatByteSize: non-clean values fall back to bytes", "[config][bytes
     REQUIRE(FastCache::FormatByteSize(1) == "1B");
     REQUIRE(FastCache::FormatByteSize(1025) == "1025B");
     REQUIRE(FastCache::FormatByteSize((1024 * 1024) + 1) == "1048577B");
+}
+
+TEST_CASE("Everything FormatByteSize prints, ParseByteSize accepts", "[config][bytesize]")
+{
+    // The two are each other's inverse or they are not worth having. Startup logs
+    // print a budget with `FormatByteSize` precisely so an operator can pin it by
+    // typing it back, and `4096B` was refused: `B` was the one suffix the formatter
+    // emitted and the parser did not know. A percentage budget lands on a
+    // non-KiB-aligned byte count almost every time, so that fallback is the common
+    // case rather than the odd one.
+    constexpr std::array<std::size_t, 8> Values {
+        0, 1, 1023, 4096, 1685615001, 4213178368, 512ULL * 1024 * 1024, 8ULL * 1024 * 1024 * 1024
+    };
+    for (auto const value: Values)
+    {
+        auto const text = FastCache::FormatByteSize(value);
+        INFO(value << " formats as " << text);
+        auto const back = FastCache::ParseByteSize(text, "x");
+        REQUIRE(back.has_value());
+        CHECK(*back == value);
+    }
+}
+
+TEST_CASE("ParseByteSize: a B suffix is plain bytes", "[config][bytesize]")
+{
+    CHECK(FastCache::ParseByteSize("4096B", "x").value() == 4096U);
+    CHECK(FastCache::ParseByteSize("4096b", "x").value() == 4096U);
+    // And it is not a multiplier anybody can confuse with the others.
+    CHECK(FastCache::ParseByteSize("1B", "x").value() == 1U);
+    CHECK(FastCache::ParseByteSize("1K", "x").value() == 1024U);
 }

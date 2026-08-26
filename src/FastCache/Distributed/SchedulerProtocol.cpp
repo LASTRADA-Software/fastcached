@@ -183,7 +183,8 @@ Wire::CapacityFields CapacityToWire(NodeCapacity const& capacity)
                                   .reservedCores = capacity.reserveIsExplicit
                                                        ? std::optional<std::uint32_t> { capacity.reservedCores }
                                                        : std::nullopt,
-                                  .cache = CacheCapacityToWire(capacity.cache) };
+                                  .cache = CacheCapacityToWire(capacity.cache),
+                                  .reservedMemoryBytes = capacity.reservedMemoryBytes };
 }
 
 std::optional<NodeCapacity> CapacityFromWire(Wire::CapacityFields const& fields)
@@ -193,6 +194,7 @@ std::optional<NodeCapacity> CapacityFromWire(Wire::CapacityFields const& fields)
         return std::nullopt;
     return NodeCapacity { .logicalCores = fields.logicalCores,
                           .totalMemoryBytes = fields.totalMemoryBytes,
+                          .reservedMemoryBytes = fields.reservedMemoryBytes,
                           .nodeClass = *nodeClass,
                           .reservedCores = fields.reservedCores.value_or(0),
                           .reserveIsExplicit = fields.reservedCores.has_value(),

@@ -43,7 +43,10 @@ namespace FastCache
 /// integer multiple is chosen; otherwise the raw byte count with a `B`
 /// suffix is returned. Examples: `8G`, `64M`, `4096B`, `0B`.
 ///
-/// 1024-based units, mirroring `ParseByteSize`.
+/// 1024-based units, mirroring `ParseByteSize` -- and mirroring it closely enough
+/// that **everything this produces, `ParseByteSize` accepts**, `B` included. That
+/// is what makes it safe to print a budget an operator is meant to be able to hand
+/// straight back on a command line, which is what the startup logs do.
 ///
 /// @param bytes Byte count to format.
 /// @return Short human-readable string (e.g. `"30M"`, `"4096B"`).

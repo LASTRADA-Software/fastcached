@@ -584,3 +584,34 @@ TEST_CASE("A version this build cannot parse is reported rather than refused", "
     REQUIRE(back.has_value());
     CHECK(Unwrap(back).version == "not-a-version-at-all <&\"");
 }
+
+TEST_CASE("Memory a node holds back survives the wire", "[distributed][scheduler][protocol][memory]")
+{
+    constexpr NodeCapacity original { .logicalCores = 64,
+                                      .totalMemoryBytes = 34359738368,
+                                      .reservedMemoryBytes = 8589934592,
+                                      .nodeClass = NodeClass::Dedicated };
+
+    auto const back = CapacityFromWire(CapacityToWire(original));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).reservedMemoryBytes == original.reservedMemoryBytes);
+    // It travels because slot derivation can happen at either end: a node normally
+    // sizes itself, but `slots = 0` asks the scheduler to -- and a scheduler
+    // budgeting jobs against RAM the node already spent on its own cache would
+    // over-commit exactly the machines that bothered to report it.
+    CHECK(OfferableSlots(Unwrap(back), 0) == OfferableSlots(original, 0));
+}
+
+TEST_CASE("A peer too old to report held-back memory schedules as it always did",
+          "[distributed][scheduler][protocol][memory]")
+{
+    // Six fields, no seventh -- what an older node's record looks like. It arrives
+    // as zero, which is "holds nothing back", which is the arithmetic every node had
+    // before this field existed.
+    auto wire = CapacityToWire(NodeCapacity { .logicalCores = 64, .totalMemoryBytes = 34359738368 });
+    wire.reservedMemoryBytes = 0;
+
+    auto const back = Wire::DecodeCapacity(Wire::EncodeCapacity(wire));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).reservedMemoryBytes == 0U);
+}

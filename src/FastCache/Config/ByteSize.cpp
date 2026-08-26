@@ -34,6 +34,14 @@ namespace
     {
         switch (c)
         {
+            // Plain bytes. `FormatByteSize` falls back to this suffix for any value
+            // that is not a whole KiB, and without it here that output is not
+            // something this parser accepts -- so `--cache-memory=$(what the log
+            // printed)` fails for exactly the values `N%` makes reachable. The two
+            // functions are each other's inverse or they are not worth having.
+            case 'b':
+            case 'B':
+                return 1ULL;
             case 'k':
             case 'K':
                 return 1024ULL;

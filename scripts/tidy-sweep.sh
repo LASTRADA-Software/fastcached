@@ -57,13 +57,18 @@ case "$probe" in
         fatal "$TIDY is not parsing: ${probe}" ;;
 esac
 
-# Committed changes AND files not yet added. The second half is not a nicety: a
-# brand-new source file is untracked until `git add`, so a list built from
-# `git diff` alone skips exactly the code that has never been checked by anything
-# -- and reports a confident count while doing it.
+# Committed changes, everything different from HEAD, and files not yet added.
+#
+# The last two are not a nicety, and the middle one is easy to get wrong: a new
+# source file is untracked until `git add` and then *staged*, at which point it is
+# invisible to both `git diff` (worktree against index -- no difference) and
+# `git ls-files --others` (no longer "other"). `git diff HEAD` is what sees it,
+# because it compares against the commit rather than the index. Get this wrong and
+# the sweep skips exactly the code nothing has ever checked, and prints a confident
+# file count while doing it.
 status=0
 mapfile -t files < <({ git diff --name-only "${BASE}...HEAD" -- '*.cpp'
-                       git diff --name-only -- '*.cpp'
+                       git diff --name-only HEAD -- '*.cpp'
                        git ls-files --others --exclude-standard -- '*.cpp'; } | sort -u)
 [[ "${#files[@]}" -gt 0 ]] || { echo "TIDY SWEEP: nothing changed against ${BASE}"; exit 0; }
 

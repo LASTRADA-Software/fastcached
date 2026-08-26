@@ -321,6 +321,20 @@ struct NodeConfig
     /// Which supervisor domain `--install-service` registers into.
     ServiceScope serviceScope { ServiceScope::System };
 
+    /// Whether `--cache-memory` was typed rather than derived.
+    ///
+    /// **Provenance, not value.** `MakeNodeServiceSpec` emits a flag only when it
+    /// differs from the default, which is exactly right for a default that is a
+    /// constant and quietly wrong for one that is a share of host RAM: an operator
+    /// who reads the startup line and types that number back to pin it produces a
+    /// value *equal* to the default on that machine, so the flag is dropped from the
+    /// unit and the service re-derives from RAM on every start. The budget then
+    /// moves under a VM resize or a memory upgrade -- silently, and precisely for the
+    /// operator who took the trouble to pin it.
+    ///
+    /// So what is emitted follows whether they said it, not whether it differs.
+    bool cacheMemoryExplicit { false };
+
     /// Whether the admin surface also serves the fleet dashboard.
     ///
     /// Off unless asked for, like every other surface this program serves. The page

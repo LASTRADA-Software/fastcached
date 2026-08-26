@@ -1335,6 +1335,15 @@ struct CapacityFields
     /// and here rather than at REGISTER's top level for the same arity reason as
     /// everything else in this record.
     std::string_view version {};
+
+    /// Memory the node holds for itself, and so cannot lend to a compile.
+    ///
+    /// Travels because slot derivation may happen at either end: a node normally
+    /// sizes itself and sends the answer, but `slots = 0` asks the scheduler to do
+    /// it -- and a scheduler budgeting jobs against RAM the node has already spent
+    /// on its own cache would over-commit exactly the machines that report it.
+    /// Zero from a peer too old to say, which is the arithmetic this had before.
+    std::uint64_t reservedMemoryBytes { 0 };
 };
 
 /// Frame a capacity record as one nested field list.
@@ -1362,12 +1371,14 @@ struct CapacityFields
     auto const reserve =
         capacity.reservedCores.has_value() ? std::span<std::byte const> { reserveBytes } : std::span<std::byte const> {};
     auto const cache = EncodeCacheCapacity(capacity.cache);
+    auto const reservedMemory = WireFields::ToBigEndian<std::uint64_t>(capacity.reservedMemoryBytes);
     return WireFields::Encode({ std::span<std::byte const> { cores },
                                 std::span<std::byte const> { memory },
                                 std::span<std::byte const> { nodeClass },
                                 reserve,
                                 std::span<std::byte const> { cache },
-                                AsBytes(capacity.version) });
+                                AsBytes(capacity.version),
+                                std::span<std::byte const> { reservedMemory } });
 }
 
 /// Read a capacity record back.
@@ -1434,6 +1445,13 @@ struct CapacityFields
     // peer to report rather than a peer to refuse. A record from a build that
     // predates the field simply has no fifth index, which `at` answers as empty.
     out.version = AsStringView(at(5));
+    if (auto const reservedMemory = at(6); !reservedMemory.empty())
+    {
+        auto const value = WireFields::FromBigEndian<std::uint64_t>(reservedMemory);
+        if (!value.has_value())
+            return std::nullopt;
+        out.reservedMemoryBytes = *value;
+    }
     return out;
 }
 
