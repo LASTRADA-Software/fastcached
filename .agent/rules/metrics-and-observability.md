@@ -311,3 +311,24 @@ fault.
     is a peer to report; refusing the registration would take a working machine out
     of the fleet over a diagnostic field. It reaches an HTML page, so it is escaped
     like every other value that came off a wire.
+
+## Open work
+
+- **[#141](https://github.com/LASTRADA-Software/fastcached/issues/141)** —
+  `AppendJsonText` passes every byte from `0x80` up through verbatim, which is
+  right for UTF-8 and produces a non-UTF-8 document for anything else, so one peer
+  registering a non-UTF-8 fingerprint makes `/fleet.json` a response a strict
+  parser may reject for the whole fleet. The fix belongs in `WorkerRegistry`, where
+  the bytes enter: a renderer that sanitises is a second place the value is
+  decided, and `/fleet`, `--cluster-status` and the logs still see the originals.
+- **[#142](https://github.com/LASTRADA-Software/fastcached/issues/142)** —
+  `LeaseTable` exposes `LiveCount()` and `IsInFlight(key)` and no way to walk what
+  is held, so the page can say *seven leases* and not *which*. That is the wrong
+  grain for the moment the tile matters: a lease outstanding for twenty minutes is
+  a worker that died mid-compile, and the count cannot say so.
+- **[#143](https://github.com/LASTRADA-Software/fastcached/issues/143)** —
+  `/fleet` collects and renders a full snapshot per request and the page carries a
+  meta refresh, so tabs left open are steady load on the node that also schedules
+  every compile. Deliberately a *measurement* ticket: a TTL buys latency and pays
+  in staleness on the one page that exists to be current, and the charts already
+  avoid the cost with a validator rather than a lifetime.
