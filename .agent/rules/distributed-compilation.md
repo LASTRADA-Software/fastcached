@@ -600,11 +600,10 @@ caught in review:
   fleet view then has to render. Separators are collapsed on every host, case only on
   Windows; a scripted host cannot catch it, because it normalizes on the way in.
 - **A fingerprint that names no compiler is refused, not registered**
-  ([#140](https://github.com/LASTRADA-Software/fastcached/issues/140)). A driver that
-  answers no `--version` falls back to a digest of its own basename, and discovery of
-  its include tree is best-effort by construction; a toolchain that hits both at once
-  digests to a value this repository could print with nothing installed, and that
-  every MSVC toolset in existence produces. `ToolchainProbe.hpp` permits a
+  ([#140](https://github.com/LASTRADA-Software/fastcached/issues/140)). A driver this
+  build cannot ask for a version falls back to a digest of its own basename, and
+  discovery of its include tree is best-effort by construction; a toolchain that hits
+  both at once digests to a value this repository could print with nothing installed. `ToolchainProbe.hpp` permits a
   banner-only fingerprint on the argument that it "can only cause two
   genuinely-identical toolchains to be treated as identical" — true, with an unstated
   precondition that the banner is a real version string. Check the precondition where
@@ -616,10 +615,15 @@ caught in review:
   every `cc` build.
 
 **Only the native MSVC target variant is offered, and only what the filesystem
-confirms.** Every target variant of one toolset — x64, x86, arm64 — shares an include
-tree and, because `cl` has no `--version`, a banner of the normalized basename, so
-all of them fingerprint identically: offering them all registers one machine several
-times under one identity. Two neighbouring rules for the same reason: `vswhere` is
+confirms.** This was once forced: every target variant of one toolset — x64, x86,
+arm64 — shares an include tree, and they shared a banner too, so all of them
+fingerprinted identically and offering them all registered one machine several times
+under ONE identity. That is retired
+([#195](https://github.com/LASTRADA-Software/fastcached/issues/195)) — the banner names
+the target now, so they are distinct toolchains, and until then a fleet would happily
+dispatch an x86 compile to an x64 worker. Offering them is therefore a capability
+nobody has asked for rather than a duplicate; the restriction stands as scope, and
+`ToolchainDiscovery_test` pins it so the day it changes it is a decision. Two neighbouring rules for the same reason: `vswhere` is
 asked without `-requires`, because filtering on `...VC.Tools.x86.x64` is a false
 negative on exactly the ARM64-only host the arm64 bin path exists for — an install
 with no C++ toolset simply has nothing beneath its `versionRoot`; and nothing is
@@ -639,9 +643,8 @@ means different things to them:
 
 - **`cl` owns the VC toolset it lives inside**, so `MsvcToolsetIncludeRoots` walks up
   from the driver to `VC\Tools\MSVC\<version>`. It keeps an `INCLUDE` fallback
-  because it must: `cl` answers no `--version`, so a wrapper outside that layout would
-  be left with a digest of the string `cl`, which every MSVC toolset in existence
-  produces.
+  because it must: a banner cannot see a patched header, so a wrapper outside that
+  layout would be left with an identity carrying no toolchain content at all.
 - **`clang-cl` owns only its resource directory** —
   `<prefix>/lib/clang/<version>/include` — and it is **asked** for it
   (`-print-resource-dir`) rather than having it derived. That is correctness, not
@@ -684,6 +687,14 @@ the seam.
 
 ## Open work
 
+- **[#201](https://github.com/LASTRADA-Software/fastcached/issues/201)** — a node
+  offers only the NATIVE MSVC target variant, on a reason that no longer holds: the
+  variants shared a banner and so a fingerprint, and
+  [#195](https://github.com/LASTRADA-Software/fastcached/issues/195) gave the banner the
+  target it names. They are distinct toolchains now, so offering the cross-target
+  drivers is a capability rather than a duplicate -- but it multiplies one machine into
+  six registrations, and capacity is per NODE, so it is not a one-line change to the
+  layout table.
 - **[#175](https://github.com/LASTRADA-Software/fastcached/issues/175)** — a disk
   tier's in-memory key index is RAM nothing accounts for. `--cache-disk` and
   `tierBytesLimit[Disk]` both denominate bytes on the filesystem, while

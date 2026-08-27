@@ -43,16 +43,30 @@ End of search list.
 # 1 "/dev/null"
 )";
 
-/// Real `cl --version` combined output, which is a REFUSAL that still names the
-/// compiler.
+/// Real bare-`cl` combined output, on two MSVC toolsets, exactly as a pipe
+/// carries it.
 ///
-/// Captured rather than invented, and the distinction is the whole point of this
-/// fixture. `RunCaptureCombined` merges both streams into `out` and leaves `err`
-/// empty, so scripting `cl` with an empty `out` models a driver that prints
-/// NOTHING -- and the premise every MSVC identity rests on, that `cl` tells us
-/// nothing, would then be asserted by the fixture rather than tested. `cl` in fact
-/// prints its version line first and only then complains, so the banner IS in the
-/// buffer; what discards it is the exit code, which is what the test below pins.
+/// Captured rather than invented, down to the CRLF, because three separate things
+/// under test are properties of the real bytes and not of a plausible-looking
+/// string: that the banner is the FIRST line even though `cl` writes it to stderr
+/// and the usage text to stdout; that the two toolsets differ in it; and that it
+/// ends with a carriage return a key input must not carry.
+constexpr std::string_view ClBareBanner1451 = "Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36252 for x64\r\n"
+                                              "Copyright (C) Microsoft Corporation.  All rights reserved.\r\n"
+                                              "\r\n"
+                                              "usage: cl [ option... ] filename... [ /link linkoption... ]\r\n";
+
+constexpr std::string_view ClBareBanner1444 = "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for x64\r\n"
+                                              "Copyright (C) Microsoft Corporation.  All rights reserved.\r\n"
+                                              "\r\n"
+                                              "usage: cl [ option... ] filename... [ /link linkoption... ]\r\n";
+
+/// Real `cl --version` combined output: a REFUSAL that still names the compiler.
+///
+/// Kept because it is the shape of the defect. `RunCaptureCombined` merges both
+/// streams into `out`, so the banner IS in the buffer -- what discarded it was the
+/// exit code, and the launcher no longer asks `cl` this way at all. The test below
+/// pins that it does not.
 constexpr std::string_view ClVersionRefusal =
     R"(Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35207 for x64
 Copyright (C) Microsoft Corporation.  All rights reserved.
@@ -627,12 +641,13 @@ TEST_CASE("An empty 32-bit KitsRoot10 still reaches the native view", "[toolchai
 TEST_CASE("An MSVC service and a developer prompt derive the same roots", "[toolchain-probe]")
 {
     // The defect this whole mechanism exists for. A Windows service inherits no
-    // `INCLUDE`; `cl` has no `--version`, so its banner falls back to the
-    // normalized basename -- and a worker started as a service therefore
-    // fingerprinted as a digest of the string `cl`, IDENTICALLY on every MSVC
-    // toolset in existence. Two nodes on different toolsets were interchangeable
-    // to the scheduler, which is the false match the fingerprint exists to prevent
-    // and the one that yields a silently wrong object.
+    // `INCLUDE`, so a worker started as a service walked no include tree and
+    // fingerprinted on its banner alone -- which, before issue #195, was the string
+    // `cl` on every MSVC toolset in existence. Two nodes on different toolsets were
+    // interchangeable to the scheduler, which is the false match the fingerprint
+    // exists to prevent and the one that yields a silently wrong object. The banner
+    // names the toolset now; the roots are still what make the digest sensitive to
+    // a patched header, which no banner is.
     ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
 
     ScriptedToolchainHost service;
@@ -1151,22 +1166,94 @@ TEST_CASE("No state directory still yields a fingerprint", "[toolchain-probe]")
 
 // --- the compiler banner ------------------------------------------------------
 
+TEST_CASE("One command answers both questions asked of a compiler", "[toolchain-probe]")
+{
+    // `CompilerBanner` asks what a compiler IS and `NodeToolchains`' `CanSpawn` asks
+    // whether it STARTS, and they must ask identically -- otherwise a node judges
+    // spawnability from an invocation it then never uses. They diverged once, with
+    // `--version` written out in `CanSpawn` while the banner probe learned that `cl`
+    // answers only when asked bare, so this pins the shared builder rather than
+    // leaving it implied by two call sites.
+    CHECK(VersionProbeCommand("cl") == std::vector<std::string> { "cl" });
+    CHECK(VersionProbeCommand(R"(C:\MSVC\CL.EXE)") == std::vector<std::string> { R"(C:\MSVC\CL.EXE)" });
+    CHECK(VersionProbeCommand("clang-cl") == std::vector<std::string> { "clang-cl", "--version" });
+    CHECK(VersionProbeCommand("/usr/bin/g++") == std::vector<std::string> { "/usr/bin/g++", "--version" });
+    CHECK(VersionProbeCommand("mystery-cc") == std::vector<std::string> { "mystery-cc", "--version" });
+}
+
+TEST_CASE("MSVC is asked for its version the one way it answers", "[toolchain-probe]")
+{
+    // `cl` is spawned BARE. It has no `--version`, and the exit-code gate below is
+    // deliberate, so asking it that way put every MSVC compiler on the fallback and
+    // gave them all one identity: the string `cl`. That string is the cache key's
+    // compiler identity, so a 14.51 object was replayed for a 14.44 compile under a
+    // zero exit code (issue #195).
+    //
+    // The ARGV is asserted, not only the result, because the result alone cannot
+    // tell "asked correctly" from "asked wrongly and the fixture answered anyway".
+    // A row that grew a flag would put MSVC back on the fallback in silence.
+    ScriptedRunner msvc { CompileRun { .exitCode = 0, .out = std::string { ClBareBanner1451 }, .err = {} } };
+    CHECK(CompilerBanner(msvc, "cl") == "Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36252 for x64");
+    CHECK(msvc.LastArgv() == std::vector<std::string> { "cl" });
+
+    // Every other driver keeps `--version`, clang-cl included -- it is clang's own
+    // option rather than a GNU-family one, and clang-cl exits 0 from it.
+    for (auto const* compiler: { "clang-cl", "g++", "/usr/bin/clang", "some-unknown-driver" })
+    {
+        ScriptedRunner other { CompileRun { .exitCode = 0, .out = "v 1.0\n", .err = {} } };
+        CHECK(CompilerBanner(other, compiler) == "v 1.0");
+        CHECK(other.LastArgv() == std::vector<std::string> { compiler, "--version" });
+    }
+}
+
+TEST_CASE("Two MSVC toolsets do not share one identity", "[toolchain-probe]")
+{
+    // The regression, stated as the thing that went wrong: both of these used to be
+    // the string `cl`, so `ComputeManifestKey` and `ComputeKey` could not tell 14.44
+    // from 14.51 and a direct-mode hit crossed between them -- silently, because
+    // `ValidateManifest` compares this same value and was comparing "cl" with "cl".
+    ScriptedRunner newer { CompileRun { .exitCode = 0, .out = std::string { ClBareBanner1451 }, .err = {} } };
+    ScriptedRunner older { CompileRun { .exitCode = 0, .out = std::string { ClBareBanner1444 }, .err = {} } };
+
+    auto const a = CompilerBanner(newer, "cl");
+    auto const b = CompilerBanner(older, "cl");
+
+    CHECK(a != b);
+    // Neither is the fallback. A test that only checked they differ would still
+    // pass with one of them left on the normalized name.
+    CHECK(a != "cl");
+    CHECK(b != "cl");
+    // The target architecture rides along, which is what separates the x86 and x64
+    // `cl.exe` of ONE toolset: they share their include roots exactly, so nothing
+    // else in a fingerprint or in a direct-mode key can tell those two apart.
+    CHECK(a.contains("x64"));
+}
+
+TEST_CASE("A banner carries no line ending", "[toolchain-probe]")
+{
+    // Measured: `cl` ends its banner with CRLF, `clang-cl` with LF. This value is a
+    // cache key input and a fingerprint input, so a surviving `\r` would put a byte
+    // describing the HOST's line-ending convention into the identity of the
+    // COMPILER -- separating two things that are the same, and nothing else.
+    ScriptedRunner crlf { CompileRun { .exitCode = 0, .out = "some-cc 1.2.3\r\nmore\r\n", .err = {} } };
+    ScriptedRunner lf { CompileRun { .exitCode = 0, .out = "some-cc 1.2.3\nmore\n", .err = {} } };
+    CHECK(CompilerBanner(crlf, "some-cc") == "some-cc 1.2.3");
+    CHECK(CompilerBanner(lf, "some-cc") == "some-cc 1.2.3");
+}
+
 TEST_CASE("A banner falls back to a normalized name, not the spelling", "[toolchain-probe]")
 {
-    // Only MSVC reaches the fallback -- `cl` has no `--version` -- so this branch
-    // decides every MSVC fingerprint. Returning the basename AS SPELLED made the
-    // digest depend on how the compiler was named rather than on which compiler it
-    // is: a worker configured with `C:\path\cl.exe` and a build invoking bare `cl`
-    // computed different fingerprints, and the scheduler matched neither to the
-    // other -- "no worker matches this toolchain", on a fleet where both ends were
-    // pointed at the same compiler.
-    // The refusal carries `cl`'s real version line, in `out`, where a combined
-    // capture puts it -- so this asserts the fallback is taken DESPITE a usable
-    // banner sitting in the buffer, rather than for want of one. That is the
-    // behaviour, and it is the reason relaxing the exit-code gate would be a
-    // change of policy rather than a tidy-up: it would re-key every MSVC
-    // fingerprint in a fleet, and a localized version line differs between two
-    // machines holding the same toolset.
+    // The fallback is now reached only by a driver that cannot be run at all, or
+    // answers nothing: the table gives every driver a probe it exits ZERO from.
+    // Scripted here with `cl`'s real `--version` refusal, which is what used to
+    // reach it and is still a faithful "ran, failed, and said something".
+    //
+    // Returning the basename AS SPELLED made the digest depend on how the compiler
+    // was named rather than on which compiler it is: a worker configured with
+    // `C:\path\cl.exe` and a build invoking bare `cl` computed different
+    // fingerprints, and the scheduler matched neither to the other -- "no worker
+    // matches this toolchain", on a fleet where both ends were pointed at the same
+    // compiler.
     ScriptedRunner refuses { CompileRun { .exitCode = 2, .out = std::string { ClVersionRefusal }, .err = {} } };
 
     auto const bare = CompilerBanner(refuses, "cl");

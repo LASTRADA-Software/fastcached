@@ -101,10 +101,12 @@ class SpawnScript final: public Cc::IProcessRunner
         return *this;
     }
 
-    /// Let @p compiler run but say nothing, the way `cl` answers `--version`.
+    /// Let @p compiler run but say nothing, and fail while doing it.
     ///
     /// This is what drives `CompilerBanner` onto its FALLBACK, and that fallback is
-    /// half of what makes an identity degenerate.
+    /// half of what makes an identity degenerate. A stub, a wrapper script, or a
+    /// driver whose version probe this build does not know -- no longer `cl`, which
+    /// is asked bare and answers (issue #195).
     ///
     /// @param compiler The path with no version banner.
     /// @return This runner, for chaining.
@@ -134,7 +136,7 @@ class SpawnScript final: public Cc::IProcessRunner
     {
         if (!argv.empty() && std::ranges::contains(_unspawnable, argv.front()))
             // -1 is the ONE answer meaning "could not spawn". A compiler that ran
-            // and rejected `--version` -- which `cl` does -- has run.
+            // and then failed has run, and takes the other branch.
             return Cc::CompileRun { .exitCode = -1, .out = {}, .err = {} };
 
         // The banner names the compiler, so two distinct compilers get two distinct
@@ -498,9 +500,9 @@ TEST_CASE("NodeToolchains: an identity that names no compiler is refused, not re
 TEST_CASE("NodeToolchains: an unaskable compiler with a locatable include tree is served", "[node][toolchains]")
 {
     // The other side of the same rule, and what keeps it from being a regression.
-    // `cl` answers no `--version` on ANY machine, so a check that refused on the
-    // banner alone would refuse every MSVC toolchain in the fleet. It is the include
-    // tree that carries the identity there.
+    // A driver this build cannot interrogate is not thereby unusable: where the
+    // include tree WAS located, that tree carries the identity, and refusing on the
+    // banner alone would drop a toolchain the fleet can serve perfectly well.
     NodeConfig const cfg = Startable();
     FixedDiscovery discovery { { Cc::ToolchainCandidate { .compiler = std::string { MsvcCompiler },
                                                           .layout = "visual-studio" } } };

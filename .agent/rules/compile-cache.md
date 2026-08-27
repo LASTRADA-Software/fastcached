@@ -103,6 +103,21 @@ same on both — the same defect with no MSVC anywhere near it.
   the compile's own command line is not needed. Appending it would override the
   build, and compiling for a target the build did not ask for is a wrong object
   rather than a failed one.
+- **`cl` has no target to ask for, so its BANNER has to carry one — which is why it
+  must be a real banner**
+  ([#195](https://github.com/LASTRADA-Software/fastcached/issues/195)).
+  `TargetDiscovery::None` is right about MSVC: which code generator runs is decided
+  by which `cl.exe` is invoked, and no command line restates it. So the whole of an
+  MSVC identity is the banner — in `CacheCompilerId` *and* in
+  `CachedToolchainFingerprint`, the one compiler where the two still say the same
+  thing. It was the constant `cl` on every MSVC ever installed, because `cl` answers
+  `--version` by printing its banner and *then* exiting 2, and the banner requires a
+  zero exit. Bare `cl` prints the same line and exits 0, so asking it that way
+  (`DriverSpec::versionFlags`, MSVC's row **empty**) is what makes
+  `Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36252 for x64` the identity
+  — version *and* target, out of a driver that can be asked for neither. The x86 and
+  x64 `cl.exe` of one toolset share an include tree exactly, so until then they were
+  one toolchain to the key, to the fingerprint, and to the scheduler alike.
 - **One flag closes both halves.** The cc1 triple EMBEDS the compatibility version:
   `--target=x86_64-pc-windows-msvc19.11.0` produces an object byte-identical to
   `-fms-compatibility-version=19.11`. It therefore also closes the case where a
@@ -215,6 +230,25 @@ same on both — the same defect with no MSVC anywhere near it.
     them would be machine-specific. The set is sorted and deduplicated because
     `/showIncludes` repeats a header once per inclusion site and emission order is a
     property of the driver.
+    - **The compiler identity that "covers" them is a string a compiler had to say, so
+      every driver is asked the one way it answers**
+      ([#195](https://github.com/LASTRADA-Software/fastcached/issues/195)). Dropping 476
+      of 635 headers rests entirely on the clause above, and the identity doing the
+      covering is `CompilerBanner` — `main.cpp`'s `toolchainStamp`, which is what
+      `ComputeKey`, `ComputeManifestKey` and `ValidateManifest` all fold in. `cl` has no
+      `--version`: asked for one it prints its banner, then errors, then exits 2, and the
+      banner requires a **zero exit** so a driver that cannot answer falls back to its
+      normalized basename rather than fingerprinting on an error message. So every MSVC
+      compiler ever installed identified as the string `cl` — and an MSVC key covered
+      neither the toolchain headers (dropped) nor the compiler (a constant). Measured: a
+      TU compiled under 14.51 was STORED, and the identical compile under 14.44 HIT the
+      same key and received an object embedding `_MSC_FULL_VER` 195136252, which 14.44
+      cannot produce. Zero exit code, no diagnostic. The gate is right; the probe was
+      wrong, and how to ask is now `DriverSpec::versionFlags` — MSVC's row **empty**,
+      because bare `cl` prints the same banner and exits 0. The banner names the target
+      too ("... for x64"), which is the only thing separating the x86 and x64 `cl.exe` of
+      one toolset: those two share an include tree exactly, so a fingerprint could not
+      tell them apart either and a fleet dispatched between them.
     - **A relative path is classified by what it resolves to, never by its spelling** —
       which is why `KeyDependencySet` takes a working directory at all, threaded from
       `RunCached` through `CompileWorkingDirectory()`, the one place `main.cpp` answers
@@ -984,7 +1018,7 @@ without reopening the argument:
   the key is not a security boundary: anyone who can STORE can already write a
   wrong object under a correct key. Closing it needs a keyed hash *and* a trust
   model for STORE.
-- Two machines whose compilers print the same `--version` banner from different
+- Two machines whose compilers print the same version banner from different
   install prefixes share a key and can replay each other's toolchain paths.
   Hashing those paths would give up cross-machine sharing wholesale;
   `Cc::MissingReplayedDependency` is the backstop instead.
@@ -1000,6 +1034,14 @@ without reopening the argument:
   under the fingerprint's stamp is unsound: that stamp does not cover the MSVC
   install the answer depends on, so a stale value would be a wrong hit rather than
   a miss.
+- **[#200](https://github.com/LASTRADA-Software/fastcached/issues/200)** — `cl`
+  localizes its banner, and since [#195](https://github.com/LASTRADA-Software/fastcached/issues/195)
+  that banner is the compiler's identity, so two machines holding one toolset under
+  different Visual Studio language packs share nothing and match nothing. Correct but
+  needlessly conservative. The fix is `VSLANG=1033` on the PROBE alone, which needs
+  per-spawn environment on `IProcessRunner` -- setting it process-wide would change the
+  language of the diagnostics the operator sees. Not token extraction: no rule over
+  "the version-looking word and the last one" survives a locale nobody has read.
 - **[#64](https://github.com/LASTRADA-Software/fastcached/issues/64)** — a
   relative include-dir argument still reaches the key verbatim through
   `RelativizeArgs`, so two build trees at different depths key apart on the

@@ -186,10 +186,13 @@ TEST_CASE("A Visual Studio install is found through vswhere", "[toolchain-discov
     CHECK(paths[0] == std::string { vs } + "/VC/Tools/MSVC/14.51.36231/" + std::string { nativeBin } + "/cl.exe");
     CHECK(paths[1] == std::string { vs } + "/VC/Tools/MSVC/14.44.35207/" + std::string { nativeBin } + "/cl.exe");
 
-    // And ONLY the native target. Every target variant of one toolset shares an
-    // include tree and, because `cl` has no `--version`, a banner of the normalized
-    // basename -- so they all fingerprint identically, and offering them all would
-    // register one machine several times under one identity.
+    // And ONLY the native target. This was once forced: every target variant of one
+    // toolset shares an include tree, and they shared a banner too, so offering them
+    // all registered one machine several times under ONE identity. Issue #195 gave
+    // the banner the target it names ("... for x64"), so they are now distinct
+    // toolchains -- and offering them is a capability nobody has asked for rather
+    // than a duplicate, tracked as its own issue. Pinned here so the day that
+    // changes it is a decision.
     CHECK(std::ranges::none_of(paths, [&](std::string const& p) { return p.contains(otherBin); }));
 
     CHECK(candidates.front().layout == "visual-studio");

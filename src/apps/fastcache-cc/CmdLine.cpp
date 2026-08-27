@@ -230,6 +230,18 @@ namespace
     /// fail. Here only the presence of the product name matters.
     constexpr std::string_view ClangBannerMarker = "clang version";
 
+    /// Asks a driver that HAS a version option to state its version.
+    ///
+    /// Every driver but `cl` accepts this and exits 0, `clang-cl` included — it is
+    /// clang's own option, not a GNU-family one, so this is not `GnuVersion`.
+    /// MSVC's row is empty; see `DriverSpec::versionFlags`.
+    ///
+    /// No input path is appended, unlike `MsvcTargetProbe` and `GnuIncludeProbe`:
+    /// those ask a driver a question ABOUT a compile and need something to pretend
+    /// to compile, while this one asks who the driver is. Giving `cl` a `NUL` to go
+    /// with an empty flag list would be handing it a source file.
+    constexpr std::array<std::string_view, 1> VersionProbe { "--version" };
+
     constexpr std::array<DriverSpec, 5> Drivers { {
         { .flavor = Flavor::Unknown,
           .family = DriverFamily::None,
@@ -242,7 +254,11 @@ namespace
           .includeDiscovery = IncludeDiscovery::None,
           .targetDiscovery = TargetDiscovery::None,
           .includeProbeFlags = {},
-          .targetProbeFlags = {} },
+          .targetProbeFlags = {},
+          // `--version` even here. An unrecognised driver is not cached, so this
+          // value reaches nothing but a diagnostic -- and asking the one option
+          // almost every tool answers beats asking nothing.
+          .versionFlags = VersionProbe },
         { .flavor = Flavor::Cl,
           .family = DriverFamily::Msvc,
           .preprocessFlags = MsvcPreprocess,
@@ -252,16 +268,20 @@ namespace
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false,
           // Layout rather than environment, because a Windows SERVICE inherits no
-          // `INCLUDE` -- and `cl` has no `--version`, so a worker started that way
-          // fingerprinted as a digest of the string `cl`, identically on every
-          // MSVC toolset. See the enumerator for the whole of it.
+          // `INCLUDE`, and a worker started that way would otherwise carry no
+          // toolchain content in its fingerprint at all. See the enumerator.
           .includeDiscovery = IncludeDiscovery::MsvcLayout,
           // Nothing to ask and nothing to state: `cl` has no `-###` and no
           // `--target`. Which code generator runs is decided by WHICH `cl.exe` is
           // invoked, and a launcher cannot restate that on a command line.
           .targetDiscovery = TargetDiscovery::None,
           .includeProbeFlags = {},
-          .targetProbeFlags = {} },
+          .targetProbeFlags = {},
+          // EMPTY, and that is the probe: `cl` prints its banner on every
+          // invocation, so it needs no option to be asked -- and it has none, so
+          // asking `--version` made it exit 2 and identify as the string `cl` on
+          // every MSVC toolset alike. See `DriverSpec::versionFlags`.
+          .versionFlags = {} },
         { .flavor = Flavor::ClangCl,
           .family = DriverFamily::Msvc,
           .preprocessFlags = MsvcPreprocess,
@@ -282,7 +302,8 @@ namespace
           // Stated on the dispatch line instead of digested into an identity.
           .targetDiscovery = TargetDiscovery::ClangDriverLine,
           .includeProbeFlags = {},
-          .targetProbeFlags = MsvcTargetProbe },
+          .targetProbeFlags = MsvcTargetProbe,
+          .versionFlags = VersionProbe },
         { .flavor = Flavor::Gcc,
           .family = DriverFamily::Gnu,
           .preprocessFlags = GnuPreprocess,
@@ -301,7 +322,8 @@ namespace
           // translation unit keys the same on both.
           .targetDiscovery = TargetDiscovery::GnuTargetLine,
           .includeProbeFlags = GnuIncludeProbe,
-          .targetProbeFlags = GnuTargetProbe },
+          .targetProbeFlags = GnuTargetProbe,
+          .versionFlags = VersionProbe },
         { .flavor = Flavor::Clang,
           .family = DriverFamily::Gnu,
           .preprocessFlags = GnuPreprocess,
@@ -313,7 +335,8 @@ namespace
           .includeDiscovery = IncludeDiscovery::GnuVerbose,
           .targetDiscovery = TargetDiscovery::ClangDriverLine,
           .includeProbeFlags = GnuIncludeProbe,
-          .targetProbeFlags = GnuTargetProbe },
+          .targetProbeFlags = GnuTargetProbe,
+          .versionFlags = VersionProbe },
     } };
 
     // --- path-valued flags --------------------------------------------------

@@ -145,6 +145,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - `/` introduces an option only on a Windows layout; on POSIX it starts a path.
 - Only machine-independent dependency paths are hashed, and a path is classified
   by what it *resolves to*, never by its spelling.
+- The toolchain headers the key drops are covered by the compiler's *banner*, so every
+  driver is asked for one the way it answers. `cl` has no `--version`; bare `cl` is its
+  probe, and until it was asked that way every MSVC toolset keyed as the string `cl`.
 - A root and the paths a driver emits are reconciled on both sides, or neither.
 - Bump `manifest-v*` whenever `objkey-v*` moves. The reverse is not required.
 - A compile that writes a second artefact (a module BMI, a PCH) is refused, not cached.

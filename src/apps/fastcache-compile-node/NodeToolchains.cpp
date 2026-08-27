@@ -2,7 +2,6 @@
 #include "NodeToolchains.hpp"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstddef>
 #include <ranges>
@@ -30,15 +29,20 @@ namespace
     /// at configuration time.
     ///
     /// `exitCode == -1` is the one answer that means "could not spawn"; a compiler that
-    /// ran and rejected `--version` (which `cl` does) has run, and that is the question.
+    /// ran and then failed has run, and that is the question.
+    ///
+    /// The argv is `Cc::VersionProbeCommand`'s and not a second spelling of it, because
+    /// the very next thing asked of this compiler is its banner, through the same
+    /// command. Two spellings would have this judge spawnability from an invocation it
+    /// then never uses -- and they diverged once already, when `--version` was hard-coded
+    /// here while the banner probe learned that `cl` answers only when asked bare.
     ///
     /// @param runner Process-spawning seam.
     /// @param compiler The candidate.
     /// @return True when the process started.
     [[nodiscard]] bool CanSpawn(Cc::IProcessRunner& runner, std::string const& compiler)
     {
-        std::array<std::string, 2> const probe { compiler, "--version" };
-        return runner.RunCaptureCombined(probe).exitCode != -1;
+        return runner.RunCaptureCombined(Cc::VersionProbeCommand(compiler)).exitCode != -1;
     }
 
     /// How many toolchains are fingerprinted at once.
