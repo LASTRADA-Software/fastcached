@@ -108,27 +108,14 @@ that starting the daemon and reconfiguring is enough, and any other outcome —
 `connect failed`, a version mismatch, no daemon at all — falls back to `sccache`
 naming the address it tried; `-DUSE_COMPILER_CACHE=OFF` disables both.
 
-!!! warning "The `sccache` fallback is not equivalent, and the configure says so"
+The fallback is not equivalent, and the configure says so: selecting sccache
+under MSVC or clang-cl emits a `CMake Warning` naming the hazard below, because a
+build opted into it in silence is one whose symptom arrives hours later and
+somewhere else. `-DUSE_COMPILER_CACHE=OFF` opts out of caching entirely, and
+`ctest -R compile-cache-caveat` pins both the warning and the silence for the
+launchers that have no hazard.
 
-    **Under MSVC and clang-cl**, sccache replays a cache hit's `/showIncludes`
-    stream with the **absolute** paths spelled by the build that *stored* it,
-    while the text it hashes to find that hit carries none — it preprocesses with
-    `/EP`, which emits no line markers. Two checkouts sharing one sccache cache
-    therefore record dependencies pointing into each other, after which editing a
-    header in the checkout you are building rebuilds nothing: the build stays
-    green and the objects are stale. Measured on this project, a second worktree
-    recorded 1097 dependency edges into the first and none into itself.
-
-    It bites an *incremental* build across two checkouts sharing one cache. A
-    clean build has no dependency graph to corrupt, and checkouts that all sit at
-    the same absolute path replay paths that are correct — CI is normally both.
-    **GCC and Clang are unaffected**: their preprocessed output carries the paths,
-    so two checkouts never share an entry to begin with.
-
-    `fastcache-cc` does not have this failure mode: it rewrites a hit's paths into
-    the consuming checkout before replaying them, and refuses a hit whose replayed
-    dependency is not there. Selecting sccache therefore emits a `CMake Warning`
-    naming the hazard; `-DUSE_COMPILER_CACHE=OFF` opts out of caching entirely.
+--8<-- "sccache-backend-caveat.md"
 
 The probe carries its own ten-second cap, which is what bounds a remote address
 that drops packets rather than refusing them: `FASTCACHE_TIMEOUT_MS` bounds each

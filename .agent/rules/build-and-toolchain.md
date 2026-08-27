@@ -399,6 +399,33 @@ PDB is a second artefact no hit can reproduce).
   that sccache warns, and that the launchers without a hazard stay silent. A warning
   that fired for every launcher would be one nobody reads.
 
+- **The same hazard has a second audience, and that warning cannot reach it.**
+  Pointing sccache at a fastcached daemon — `SCCACHE_MEMCACHED` / `SCCACHE_REDIS`,
+  which `README.md` pitches, the docs repeat and this project's own `--help` prints
+  — is *definitionally* **one cache shared by every checkout and every machine
+  pointed at it**, the maximal form of the entry above. Those users have their own
+  build system and never configure `CompileCache.cmake`, so the `message(WARNING)`
+  it emits never happens to them.
+
+  Measured here in two compiles per compiler, which is all it takes: with sccache
+  0.14.0 and MSVC 14.51 a second directory took a **cache hit from the first**, and
+  its `/showIncludes` named the *first* directory's header; under g++ 14 the same
+  two compiles were **0 hits and 2 misses**. `README.md` had asserted the opposite
+  — that sccache's entries are "not portable between checkouts at different paths"
+  — which is true of GCC and Clang and **false of the exact compilers that are
+  exposed**, so the one caveat that was there read as reassurance. Silence would
+  have been better than that sentence.
+
+  `docs/snippets/sccache-backend-caveat.md` is the one wording; the MkDocs pages
+  include it, and `README.md` and `--help` restate it because neither can include
+  anything. `ctest -R sccache-backend-caveat` fails any file naming either variable
+  without, within 40 lines of it, the three facts a reader is otherwise right to
+  skip past: **which compilers**, **the mechanism** (`/showIncludes`, `/EP`), and
+  **the remedy** (`fastcache-cc`). Wording is free; those three are not. Prose
+  drifts exactly the way an include graph drifts — nothing fails, nothing warns,
+  and the next page pitching it is written by someone who never saw the caveat on
+  the other four.
+
 ## Code coverage
 
 `cmake --preset clang-coverage`, build, then `--target coverage`. That target runs the
