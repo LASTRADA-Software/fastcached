@@ -203,6 +203,43 @@ set_tests_properties("service-accounts" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# A non-ASCII argument, from the command line into main(). Runs each executable
+# that has an option table with an unrecognised flag spelled with U+00FC, and
+# requires the diagnostic to echo those exact UTF-8 bytes back.
+#
+# It is the only proof there CAN be of the fix for issue #155, because the defect
+# is in what the OS hands a process: Windows transcodes argv through the process's
+# active code page, so nothing inside a process can observe what was lost. A Catch2
+# case can assert the code page a test binary ended up with (and
+# Platform/NarrowText_test.cpp does); only running a real executable says what an
+# argument BECAME on the way in. Verified to distinguish the two states -- against a
+# binary built without the manifest the same argument arrives as `67 72 FC 6E` and
+# this fails.
+#
+# Registered here rather than beside one binary because it names four, per
+# .agent/rules/testing.md. Each row is guarded on its target existing: the test
+# client and the launcher are gated by their own options in src/apps.
+#
+# Not labelled "smoke": each run is one process that rejects an argument and exits
+# before binding anything, needing no daemon, no socket and no compiler -- so it
+# belongs in the default `ctest` set and must survive `ctest -LE smoke`.
+foreach(_utf8ArgvTarget IN ITEMS fastcached fastcache-cc fastcache-compile-node compile-cache-testclient)
+    if(TARGET ${_utf8ArgvTarget})
+        add_test(
+            NAME "utf8-argv-${_utf8ArgvTarget}"
+            COMMAND ${CMAKE_COMMAND}
+                "-DEXE=$<TARGET_FILE:${_utf8ArgvTarget}>"
+                "-DNAME=${_utf8ArgvTarget}"
+                -P "${CMAKE_SOURCE_DIR}/scripts/check-utf8-argv.cmake"
+        )
+        set_tests_properties("utf8-argv-${_utf8ArgvTarget}" PROPERTIES
+            LABELS "hygiene"
+            TIMEOUT 60
+        )
+    endif()
+endforeach()
+
+# ---------------------------------------------------------------------------
 # Compiler-cache auto-install fallback. Configures the tiny fixture project in
 # compile-cache-fixture/ once per way the fetch can be declined, and requires
 # each one to end in a status message and a clean fall-through.

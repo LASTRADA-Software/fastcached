@@ -4,7 +4,9 @@
 #include "PathResolve.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
+#include <FastCache/Platform/NarrowText.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -68,9 +70,24 @@ class RootReconciler
     /// @param sourceRoot The source root as the build system spelled it.
     /// @param buildTree  The build tree as the build system spelled it.
     /// @param resolver   The path-identity seam.
-    RootReconciler(std::string_view sourceRoot, std::string_view buildTree, IPathResolver& resolver);
+    /// @param policy     How this host reads narrow text a TOOL wrote. Defaulted to
+    ///                   "bytes are bytes", which is POSIX and is what every caller
+    ///                   that is not handling a compiler's own output wants.
+    RootReconciler(std::string_view sourceRoot,
+                   std::string_view buildTree,
+                   IPathResolver& resolver,
+                   NarrowTextPolicy policy = {});
 
     /// Reconcile one path naming a FILE — an include note, a depfile entry.
+    ///
+    /// Also where a path a tool emitted becomes TEXT, because this is the funnel
+    /// every one of them passes through (`All` and `Region` both come here) and
+    /// because nothing downstream can do it: the launcher's own paths arrive as
+    /// UTF-8 through `argv` while a compiler writes its output in a code page of
+    /// its own, and a `std::filesystem::path` built from the second on a host that
+    /// reads narrow bytes as UTF-8 does not mis-name a file, it THROWS. A path this
+    /// process cannot read as text is returned verbatim and untranslated, and
+    /// counted -- see `UnreadablePaths()`.
     /// @param path The path as the compiler spelled it.
     /// @return The same location in this build's spelling, or `path` unchanged.
     [[nodiscard]] std::string Path(std::string_view path);
@@ -151,6 +168,22 @@ class RootReconciler
         return _asGiven;
     }
 
+    /// How many paths this reconciler could not read as text.
+    ///
+    /// Not a drop and not a diagnostic: a path whose bytes this process cannot read
+    /// is keyed by nothing, resolved by nothing and stat'ed by nothing, so a header
+    /// moved inside it replays a stored object under a zero exit code -- the same
+    /// hazard `PathDisposition::DriveRelative` exists for, reached by a different
+    /// road. The caller declines to cache the compile; see main.cpp.
+    ///
+    /// Counted per reconciled OCCURRENCE rather than per distinct path, because the
+    /// only question asked of it is whether it is zero.
+    /// @return The count since construction.
+    [[nodiscard]] std::size_t UnreadablePaths() const noexcept
+    {
+        return _unreadablePaths;
+    }
+
   private:
     /// How much of a path the resolver should be asked about.
     enum class Depth : std::uint8_t
@@ -168,6 +201,8 @@ class RootReconciler
     IPathResolver& _resolver;
     PathCanon::Layout _asGiven;
     PathCanon::Layout _resolved;
+    NarrowTextPolicy _policy;
+    std::size_t _unreadablePaths { 0 };
 };
 
 } // namespace FastCache::Cc

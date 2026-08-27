@@ -217,6 +217,10 @@ std::optional<std::map<std::string, std::string>> ResolveToolchains(NodeConfig c
                     LogLevel::Error, "malformed --toolchain '{}'; expected <compiler> or <fingerprint>=<compiler>", spec);
                 return std::nullopt;
             }
+
+            // Whether the PINNED half is text is asked by `ParseToolchain`, in the
+            // option table, so that `--install-service` cannot bake in a fingerprint
+            // no scheduler will accept: this function is not reached on that path.
             entries.push_back(*std::move(split));
         }
 

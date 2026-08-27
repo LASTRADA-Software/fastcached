@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  SPDX-License-Identifier: Apache-2.0
+
+  The process code page every executable in this tree declares. Embedded into
+  each one by cmake/Utf8CodePage.cmake, which carries the reasoning; the short
+  version is that Windows transcodes every narrow string crossing an OS boundary
+  through this code page, and the fleet's wire format requires UTF-8 of the
+  values an operator types (issue #155).
+
+  Honoured from Windows 10 1903 / Server 2022 onwards. An older host ignores the
+  setting silently, which is why FastCache::NarrowTextIsUtf8() exists to say so.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings xmlns:ws2019="http://schemas.microsoft.com/SMI/2019/WindowsSettings">
+      <ws2019:activeCodePage>UTF-8</ws2019:activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

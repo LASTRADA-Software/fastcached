@@ -1009,6 +1009,53 @@ same on both — the same defect with no MSVC anywhere near it.
   verified by re-neutering it, since a regression test for a fatal signal that
   cannot be seen to fail is worth nothing).
 
+## A path a compiler wrote is not this process's text
+
+- **`RootReconciler::Path` is where a tool-emitted path becomes text, because it is
+  the funnel every one of them already passes through** (`All` and `Region` both
+  come here) and because nothing downstream can do it. The launcher's roots come
+  from `argv`, which on a Windows host declaring the UTF-8 code page is UTF-8, while
+  `cl.exe` writes `/showIncludes` in the CONSOLE OUTPUT code page — `C3 BC` for
+  U+00FC under CP 65001, `81` under CP 850, measured. Untranslated, such a path
+  prefix-matches no root, so a project header classifies as toolchain content:
+  dropped from the key, stat'ed by nothing, and a header edited inside it serves the
+  stored object under a zero exit code.
+
+- **Two candidate encodings, in this order and no other**: UTF-8 if the bytes are
+  UTF-8 (clang and gcc always, `cl` under a UTF-8 console), else the one code page
+  the host names. Never a ladder — a single-byte page decodes nearly everything, and
+  Windows even maps CP-1252's five unassigned bytes to the matching C1 controls, so
+  trying pages until one "works" produces a path naming a file that does not exist
+  rather than a refusal.
+
+- **The DECODED form is what comes back, not merely what the decision is made on.**
+  Returning the raw bytes for a path the reconciler translates no further was tried
+  and is wrong twice: the key and the manifest prefix-match against roots that are
+  UTF-8, and `Region`'s result goes into a value SHARED between machines which the
+  daemon canonicalizes against those same roots. One encoding in a stored value is
+  the rule #141 settled for the wire.
+
+- **What cannot be read is counted, and the compile is not cached.** Same hazard as
+  `PathDisposition::DriveRelative` and the same answer, asked in all three places
+  the count can rise: the key path, the manifest record, and again after the stored
+  regions are built — `Region` walks a wider set of path spans than the dependency
+  list, so the earlier ask cannot have covered them. The refusal names the recovery
+  (`chcp 65001`).
+
+- **Whether bytes must be text at all is a property of the HOST**, carried as
+  `NarrowTextPolicy` and injected rather than probed — so `PortableForm` stays pure
+  and both hosts' behaviour is testable on either. On POSIX nothing is transcoded
+  and a legacy filename is a perfectly good filename; refusing one there would break
+  a build that works today.
+
+- **A launcher never fails a build the compiler would have completed**, and
+  `std::filesystem::path`'s narrow constructor throws on a UTF-8-code-page host for
+  bytes that are not. Every construction from foreign text goes through
+  `Platform::PathFromNarrowText`; `MissingReplayedDependency` is the one that
+  matters most, because its bytes arrive over the NETWORK — there, unreadable counts
+  as *missing*, which discards the hit and recompiles rather than serving one it
+  could not check.
+
 ## Accepted trade-offs
 
 These are argued in place above and are **not** open work — do not "fix" one
@@ -1025,6 +1072,13 @@ without reopening the argument:
 - The 64 MiB floor in `SessionContext` means a cap below it cannot be exercised
   end-to-end without a genuinely large fixture, so the e2e drives the client
   ceiling and `TcpClient_test` pins the socket half.
+- A stored stream region mixes encodings when the compiler's is not UTF-8: the
+  path spans are decoded, the text around them is the tool's own bytes. Replayed
+  on a hit to a console that is not UTF-8, a non-ASCII path therefore renders
+  differently than the uncached compile printed it. Accepted, because the
+  alternative is the one that cannot work: an entry storing the producer's code
+  page is an entry no other machine can canonicalize, which is the whole of what
+  this cache is for. `chcp 65001` makes the two identical.
 
 ## Open work
 

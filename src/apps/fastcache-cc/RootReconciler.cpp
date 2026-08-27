@@ -2,6 +2,7 @@
 #include "RootReconciler.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -33,17 +34,67 @@ std::string WithoutTrailingSeparator(std::string root)
     return root;
 }
 
-RootReconciler::RootReconciler(std::string_view sourceRoot, std::string_view buildTree, IPathResolver& resolver):
+RootReconciler::RootReconciler(std::string_view sourceRoot,
+                               std::string_view buildTree,
+                               IPathResolver& resolver,
+                               NarrowTextPolicy policy):
     _resolver { resolver },
     _asGiven { .sourceRoot = WithoutTrailingSeparator(std::string { sourceRoot }),
                .buildTree = WithoutTrailingSeparator(std::string { buildTree }) },
     _resolved { .sourceRoot = resolver.ResolveDirectory(_asGiven.sourceRoot),
-                .buildTree = resolver.ResolveDirectory(_asGiven.buildTree) }
+                .buildTree = resolver.ResolveDirectory(_asGiven.buildTree) },
+    _policy { policy }
 {
 }
 
 std::string RootReconciler::Path(std::string_view path)
 {
+    // The roots this translates against came from `argv`, which on a host that
+    // declares the UTF-8 code page is UTF-8; `path` came from a compiler, which
+    // does not. Reading it as text first is what keeps the two comparable -- and
+    // what keeps `Translate` from handing bytes no decoder accepts to
+    // `std::filesystem::path`, which on such a host throws rather than mis-names.
+    //
+    // Skipped entirely where narrow bytes are not decoded at all: on POSIX a
+    // legacy filename is a perfectly good filename, and refusing it here would
+    // break a build that works.
+    std::optional<std::string> decoded;
+    if (_policy.pathsAreUtf8)
+    {
+        decoded = Utf8FromNarrowText(path, _policy.toolCodePage);
+        if (!decoded.has_value())
+        {
+            // Verbatim and UNTRANSLATED: resolving it would be the throw this exists
+            // to avoid, and inventing a spelling for a path this process cannot read
+            // would put a guess into a cache key. The count is what the caller acts
+            // on.
+            ++_unreadablePaths;
+            return std::string { path };
+        }
+        // The DECODED form is what comes back, not merely what the decision is made
+        // on, and returning the raw bytes for a path this translates no further was
+        // tried and is wrong. Both consumers need the text:
+        //
+        // - the key and the manifest prefix-match it against roots that came from
+        //   `argv` and are UTF-8, so legacy bytes match neither and a project header
+        //   silently keys as toolchain content -- the very defect this decode is
+        //   here to close;
+        // - `Region` hands its result to a value SHARED between machines, and the
+        //   daemon canonicalizes it against those same roots. A span left in the
+        //   producer's code page is one no consumer can canonicalize, and a
+        //   consumer whose legacy page differs reads it as different characters
+        //   entirely. One encoding in a stored value is the same rule #141 settled
+        //   for the wire.
+        //
+        // The class's "a path under neither root keeps its exact bytes" property is
+        // about its SPELLING -- that this does not rewrite where a path points --
+        // and it is unchanged. Only the encoding of a non-ASCII one moves, and only
+        // on a host that transcodes at all.
+        //
+        // Outlives the call below, so the view is safe -- and rebinding rather than
+        // branching keeps one translation path for both hosts.
+        path = *decoded;
+    }
     return Translate(path, Depth::LeafAsSpelled);
 }
 

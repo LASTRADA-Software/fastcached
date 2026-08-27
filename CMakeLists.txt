@@ -341,6 +341,7 @@ include(PedanticCompiler)
 include(Sanitizers)
 include(Coverage)
 include(ClangTidy)
+include(Utf8CodePage)
 
 # ----------------------------------------------------------------------------
 # Test wiring is enabled early so all subdirectories (CowTree, FastCache,
@@ -439,6 +440,15 @@ include(Packaging)
 if(FASTCACHED_BUILD_TESTS)
     add_subdirectory(src/tests)
 endif()
+
+# ----------------------------------------------------------------------------
+# The UTF-8 process code page every Windows executable declares. Here rather than
+# in each add_executable() site, and here rather than earlier, for the reason the
+# coverage block below states: it walks the build system as it stands, so a target
+# defined after this call is a binary that keeps the host's legacy code page.
+# cmake/Utf8CodePage.cmake carries why the code page is what gets declared.
+
+fastcached_declare_utf8_code_page()
 
 # ----------------------------------------------------------------------------
 # The `coverage` / `coverage-clean` targets, when ENABLE_COVERAGE is on. Last in

@@ -33,6 +33,7 @@ struct TestConfig
     std::uint16_t port { 11 };
     bool verbose { false };
     std::string name;
+    std::string advertised;
     std::vector<std::string> listeners;
 };
 
@@ -86,6 +87,12 @@ constexpr auto TestOptions = std::to_array<OptionSpec<TestResult>>({
       .operand = "=<host>",
       .apply = AppendFrom<&TestConfig::listeners, ParseText>(),
       .description = "extra listener; repeatable" },
+    // A flag whose value other machines will read, so it has to be text.
+    { .primary = "--advertise",
+      .arity = Arity::Value,
+      .operand = "=<host>",
+      .apply = AssignFrom<&TestConfig::advertised, ParseUtf8Text>(),
+      .description = "what to tell other machines" },
     // An action flag that both stores a value and selects an outcome, and whose
     // target is the result itself rather than the nested config.
     { .primary = "--install",
@@ -249,6 +256,57 @@ TEST_CASE("every row is documented and spelled once", "[cli][options]")
         INFO("row: " << outer.primary);
         CHECK(duplicates == 1);
     }
+}
+
+TEST_CASE("a value other machines will read is accepted as text, in any script", "[cli][options]")
+{
+    // The rule is about ENCODING and not about ASCII. #141 narrowed nothing else,
+    // and a fleet whose members may only name themselves in ASCII would be a second
+    // restriction nobody announced.
+    auto const ascii = Parse({ "--advertise=build-3.example:6676" });
+    REQUIRE(ascii.has_value());
+    CHECK(ascii->config.advertised == "build-3.example:6676");
+
+    auto const multiByte = Parse({ "--advertise=gr\xC3\xBC"
+                                   "n:6676" });
+    REQUIRE(multiByte.has_value());
+    CHECK(multiByte->config.advertised
+          == "gr\xC3\xBC"
+             "n:6676");
+}
+
+TEST_CASE("a value other machines will read is refused when it is not text", "[cli][options]")
+{
+    // Refused where a person typed it. Accepted here it reaches
+    // `SchedulerService::Register`, is refused there on every heartbeat forever, and
+    // the operator's only recovery is to rename the thing (issue #155).
+    auto const legacy = Parse({ "--advertise=gr\xFC"
+                                "n:6676" });
+    REQUIRE_FALSE(legacy.has_value());
+
+    // The FLAG, which the value parser cannot know: it is a free function shared by
+    // every row that uses it, so `ApplyOneOption` stamps the row's own spelling.
+    CHECK(legacy.error().field == "--advertise");
+    CHECK(legacy.error().source == "argv");
+
+    // And WHICH byte. "not valid UTF-8" about a string the console has already
+    // re-rendered tells nobody which character was the problem.
+    CHECK(legacy.error().context.contains("0xFC"));
+    CHECK(legacy.error().context.contains("offset 2"));
+
+    // Strict in the sense RFC 3629 is, because Core/Utf8.hpp is: a form that only
+    // LOOKS like UTF-8 is not text either, and the far end would refuse it too.
+    CHECK_FALSE(Parse({ "--advertise=\xED\xA0\x80" }).has_value()); // lone surrogate
+    CHECK_FALSE(Parse({ "--advertise=\xC0\x80" }).has_value());     // overlong NUL
+}
+
+TEST_CASE("a value parser with its own field to name keeps it", "[cli][options]")
+{
+    // The stamp fills an EMPTY field only. `ParseTestPort` names `port` deliberately
+    // -- a parser with something more specific to say must go on saying it.
+    auto const bad = Parse({ "--port=nope" });
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().field == "port");
 }
 
 TEST_CASE("a longer flag is not claimed by a shorter one", "[cli][options]")

@@ -48,6 +48,7 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/TcpClient.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/ThreadedAddressResolver.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/NarrowText.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Registry.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
 

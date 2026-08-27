@@ -42,6 +42,7 @@
 #include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/InheritedListener.hpp>
+#include <FastCache/Platform/NarrowText.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -721,7 +722,24 @@ int main(int argc, char** argv)
     auto const flow = ParseOptionsInto(NodeOptions(), argvSpan.subspan(1), cfg);
     if (!flow.has_value())
     {
-        std::cerr << "fastcache-compile-node: " << flow.error().context << '\n';
+        // The FIELD as well as the reason. Without it an unrecognised argument reads
+        // as `unrecognised argument` and names nothing at all -- the daemon and the
+        // test client have always printed both, and this is the binary whose flags
+        // an operator is most likely to be typing by hand.
+        std::cerr << "fastcache-compile-node: " << flow.error().field << ": " << flow.error().context << '\n';
+
+        // Said only where it explains something. A non-ASCII argument does not reach
+        // a Windows process as UTF-8 unless its active code page is UTF-8, which
+        // every executable here asks for by manifest -- so this line appears only on
+        // a host too old to honour that, where it is the whole answer and no other
+        // surface would ever give it (issue #155).
+        //
+        // The optional is tested rather than `NarrowTextIsUtf8()`, which implies but
+        // does not state that there is a code page to print: an inference a reader
+        // has to make is one clang-tidy makes differently.
+        if (auto const codePage = ActiveCodePage(); codePage.has_value() && *codePage != Utf8CodePage)
+            std::cerr << "fastcache-compile-node: this host's active code page is " << *codePage
+                      << ", not UTF-8, so a non-ASCII argument does not reach this process as the bytes you typed\n";
         return ExitUsage;
     }
 
