@@ -138,6 +138,44 @@ namespace
         return unit == 0 ? std::format("{} {}", bytes, Units[unit]) : std::format("{:.1f} {}", scaled, Units[unit]);
     }
 
+    /// The chip class per slot limit, in enumerator order.
+    ///
+    /// A table rather than the `if` ladder this used to be, and the ladder is why:
+    /// it named `scratch` and `registered` and let everything else fall through to
+    /// the CPU class, so a MEMORY-bound worker was dressed as "somebody else is
+    /// using this machine" -- pointing an operator at the wrong remedy, which is
+    /// the one thing `SlotLimitTraits::remedy` exists to get right. `EnumTable`
+    /// takes its extent from the enum, so a fifth limit fails the build here
+    /// instead of quietly inheriting a colour.
+    constexpr EnumTable<SlotLimit, std::string_view> LimitChipClass {
+        "chip--registered", "chip--cpu", "chip--memory", "chip--scratch"
+    };
+
+    // `EnumTable` fixes the extent, but aggregate initialization value-initializes
+    // a row nobody wrote -- so an appended enumerator would silently get an EMPTY
+    // class rather than a build error. This is the guard `RowsInEnumeratorOrder`
+    // provides for tables whose rows name their own enumerator; these are bare
+    // values, so the check is that none of them is missing.
+    static_assert(std::ranges::none_of(LimitChipClass, [](std::string_view chipClass) { return chipClass.empty(); }),
+                  "every SlotLimit needs a chip class");
+
+    /// The chip class for a limit named the way `SlotLimitTable` spells it.
+    ///
+    /// Resolved through that table rather than by matching strings here, so the
+    /// two cannot drift: the cell carries the limit's NAME, and its name is what
+    /// the table already owns.
+    ///
+    /// @param limitName The cell's text.
+    /// @return The chip class; `Registered`'s when nothing matches, which is the
+    ///         reading that claims least.
+    [[nodiscard]] std::string_view ChipClassFor(std::string_view limitName)
+    {
+        for (auto const& row: SlotLimitTable)
+            if (row.name == limitName)
+                return LimitChipClass[static_cast<std::size_t>(row.limit)];
+        return LimitChipClass[static_cast<std::size_t>(SlotLimit::Registered)];
+    }
+
     /// How the page spells "nobody reported this".
     ///
     /// The same dash `--cluster-status` prints, deliberately: an operator reading
@@ -602,17 +640,8 @@ namespace
         {
             case CellDecor::Plain:
                 break;
-            case CellDecor::Limit: {
-                // The class is derived from the value rather than mapped in a
-                // second table: `SlotLimitTable` already names these, and a
-                // lookup here would be a second place to update when it grows.
-                char const* modifier = "chip--cpu";
-                if (cell.text == "scratch")
-                    modifier = "chip--scratch";
-                else if (cell.text == "registered")
-                    modifier = "chip--registered";
-                return std::format(R"(<span class="chip {}">{}</span>)", modifier, text);
-            }
+            case CellDecor::Limit:
+                return std::format(R"(<span class="chip {}">{}</span>)", ChipClassFor(cell.text), text);
             case CellDecor::Freshness: {
                 // Amber past the point where a reader should stop trusting the
                 // rest of the row. Everything on it is as old as this number.
@@ -841,6 +870,7 @@ th[title] { text-decoration:underline dotted var(--line); text-underline-offset:
 .chip { display:inline-block; font-size:10.5px; font-weight:500; padding:.12rem .4rem; border-radius:2px;
         background:var(--sunk); color:var(--muted); border:1px solid var(--hairline); }
 .chip--cpu { background:var(--warn-soft); color:var(--warn); }
+.chip--memory { background:var(--accent-soft); color:var(--accent); }
 .chip--scratch { background:var(--crit-soft); color:var(--crit); }
 .chip--registered { background:var(--ok-soft); color:var(--ok); }
 .bar { display:inline-flex; align-items:center; gap:.45rem; }
@@ -1139,7 +1169,15 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                 out += std::format(R"(<div class="panel chart"><div class="chart-head"><h3>{}</h3>)"
                                    R"(<span class="chart-now">{}</span></div><p class="chart-cap">{}</p>)",
                                    EscapeHtml(chart.title),
-                                   EscapeHtml(HeadlineOf(chart, history)),
+                                   // NOT escaped, and the same reasoning
+                                   // `KpiReadout` already carries: this yields
+                                   // either a number it formatted itself or
+                                   // `AbsentText`, which IS markup -- the entity
+                                   // for the dash. Escaping turned its `&` into
+                                   // `&amp;`, so a chart with nothing to report
+                                   // rendered the literal text `&ndash;`. Every
+                                   // other absent path interpolates it raw.
+                                   HeadlineOf(chart, history),
                                    EscapeHtml(chart.caption));
                 // Its own resource, and the URL carries no cache-buster on purpose: a
                 // generation in the query would make every bucket a new URL and the
@@ -1285,7 +1323,7 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView cons
                            R"(<span class="legend-item"><span class="swatch swatch--free"></span>)"
                            R"(<b>{}</b> <span>free &mdash; a compile could start now</span></span>)"
                            R"(<span class="legend-item"><span class="swatch swatch--held"></span>)"
-                           R"(<b>{}</b> <span>withheld &mdash; CPU or scratch, not us</span></span></div>)",
+                           R"(<b>{}</b> <span>withheld &mdash; CPU, memory or scratch, not us</span></span></div>)",
                            totals.inFlight,
                            totals.free,
                            totals.withheld);

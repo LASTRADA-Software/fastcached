@@ -484,6 +484,66 @@ TEST_CASE("Fleet capacity is summed per machine and splits busy from withheld", 
     CHECK(totals.inFlight + totals.free + totals.withheld == totals.registered);
 }
 
+TEST_CASE("A memory-bound worker is not dressed as a busy one", "[distributed][fleetview]")
+{
+    // `SlotLimitTable` has four rows and the chip mapping handled two, defaulting
+    // the rest to the CPU class -- so a machine held back by MEMORY was coloured
+    // "somebody else is using this machine". The remedies are opposite (free
+    // memory against buy a machine), which is the whole reason the table carries a
+    // remedy per limit rather than one sentence for all of them.
+    //
+    // The chip is on the WORKER table, not the node table, and the assertion is on
+    // the rendered element rather than on the class name -- the stylesheet names
+    // every class unconditionally, so `contains("chip--memory")` is true whatever
+    // the mapping does. This case was written that way first and passed against the
+    // unfixed ladder.
+    auto snapshot = LeadingSnapshot();
+    auto load = NodeLoad {};
+    load.inFlight = 0;
+    load.availableMemoryBytes = 1ULL << 30; // one job's budget: a ceiling of 1
+
+    snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
+                                                             .fingerprint = "gcc-13-abcdef",
+                                                             .endpoint = "10.0.0.2:7100",
+                                                             .slots = 8,
+                                                             .inFlight = 0,
+                                                             .capacity = snapshot.nodes[0].capacity,
+                                                             .load = load,
+                                                             .codecs = {} },
+                                        .heartbeatAge = std::chrono::milliseconds { 30 } } };
+
+    REQUIRE(SlotCeilingsFor(snapshot.workers[0].info.capacity, snapshot.workers[0].info.slots, snapshot.workers[0].info.load)
+                .binding
+            == SlotLimit::Memory);
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
+    CHECK(html.contains(R"(<span class="chip chip--memory">memory</span>)"));
+    CHECK_FALSE(html.contains(R"(<span class="chip chip--cpu">memory</span>)"));
+}
+
+TEST_CASE("A chart with nothing to report renders a dash, not its markup", "[distributed][fleetview]")
+{
+    // `AbsentText` IS markup -- the entity for an en dash -- and every path that
+    // shows it interpolates it raw. The chart headline was escaped instead, so its
+    // `&` became `&amp;` and the panel displayed the literal text `&ndash;`. A
+    // fleet reporting no cache figures leaves the hit-rate series absent in every
+    // bucket while others are present, so this is the ordinary state of that panel
+    // rather than an exotic one -- and NOT the same as an empty history, which the
+    // page short-circuits before it renders a chart at all.
+    FleetHistoryView history;
+    history.buckets = { FleetBucket { .startMillis = 0, .sampleMillis = 0, .values = {}, .present = true },
+                        FleetBucket { .startMillis = 300'000, .sampleMillis = 300'000, .values = {}, .present = true } };
+
+    auto const snapshot = LeadingSnapshot();
+    auto const html = RenderFleetHtml(snapshot, history, 0);
+
+    // The charts really did render -- otherwise this asserts nothing.
+    REQUIRE(html.contains("chart-now"));
+    // The dash reaches the page as an entity, never as the text of one.
+    CHECK(html.contains("&ndash;"));
+    CHECK_FALSE(html.contains("&amp;ndash;"));
+}
+
 TEST_CASE("A machine running everything it can offers nothing", "[distributed][fleetview]")
 {
     // The sharpest form of the same defect, and the one an operator sees first: a
