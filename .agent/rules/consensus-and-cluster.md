@@ -596,6 +596,19 @@ Every rule below has already been a bug.
     the only thing to supply — while the identical attempt over `AppendEntries` was
     refused. A guard a second entry point does not apply is not a guard.
 
+    **The same path was missing the role change too**, and for the same reason: a
+    candidate that hears from a leader of its own term has lost the election, and
+    `OnAppendEntries` demotes it while `OnInstallSnapshot` — which publishes
+    `_knownLeader`, clears the tally and arms the election timer from the very same
+    message — did not. It was survivable while `HasLiveLeader` read a timestamp, and
+    stopped being survivable the moment a non-leader started answering pre-votes from
+    `_knownLeader`: a node left a candidate there denies the pre-votes a candidate is
+    documented to always grant, which is #103's livelock on one entry point. **Both
+    halves of what a message means have to be applied wherever that message is
+    handled** — the two handlers for "a leader spoke" are `OnAppendEntries` and
+    `OnInstallSnapshot`, and a rule stated in only one of them is a rule the cluster
+    does not have.
+
 ## Open work
 
 - **[#144](https://github.com/LASTRADA-Software/fastcached/issues/144)** — a

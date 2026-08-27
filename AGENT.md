@@ -194,6 +194,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A leader and a follower stamp the same link half a round trip apart, so a shared
   window never bought a shared answer. A non-leader decides a pre-vote from its own
   `_knownLeader` and election deadline, never from a timestamp.
+- "A leader spoke" arrives at two handlers, and every rule about it belongs in
+  both: `OnInstallSnapshot` is `OnAppendEntries` speaking, membership guard and
+  candidate demotion included.
 
 **[`.agent/rules/wire-and-protocol.md`](.agent/rules/wire-and-protocol.md)** —
 framing, the auth gate, sockets, dialling and coroutine lifetime. Before

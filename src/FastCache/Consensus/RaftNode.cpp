@@ -955,6 +955,14 @@ void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoin
     // A snapshot is a leader speaking, so it counts as hearing from one: without
     // arming the timer here a follower being caught up would stand for election
     // in the middle of it.
+    //
+    // And a candidate that hears from a leader of its own term has lost, exactly
+    // as on the AppendEntries path -- the asymmetry between the two entry points
+    // was the bug, not the rule. Left a candidate, this node campaigns against the
+    // leader that is catching it up, and denies its peers the pre-votes a
+    // candidate always grants, because `HasLiveLeader` answers from
+    // `_knownLeader` and this path had just published one.
+    _role = Role::Follower;
     _knownLeader = request.leaderId;
     _votesGranted.clear();
     NoteLeaderContact(now);
