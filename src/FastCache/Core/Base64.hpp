@@ -15,8 +15,9 @@ namespace FastCache
 /// forty lines of table lookup is not a trade this codebase makes.
 ///
 /// **Refuses rather than repairs.** A byte outside the alphabet, a length that is
-/// not a multiple of four, or padding in the middle of the input all return
-/// nullopt instead of being skipped. Skipping them is the traditional shape of this
+/// not a multiple of four, padding in the middle of the input, or a padded final
+/// group whose spare bits are not zero all return nullopt instead of being
+/// skipped. Skipping them is the traditional shape of this
 /// function and it is wrong here for a specific reason: this decodes a credential,
 /// and a decoder that quietly ignores what it does not understand turns two
 /// different inputs into one secret.
