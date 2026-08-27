@@ -18,7 +18,18 @@ namespace FastCache::Cc
 /// has its line markers normalized by the compiler's own preprocessor).
 struct KeyInputs
 {
-    std::string compilerId;                   ///< Stable compiler identity (name + version banner).
+    /// Stable compiler identity: its version banner, and the target it generates
+    /// for when the driver can be asked (see `CacheCompilerId`).
+    ///
+    /// The target half is not decoration. A banner alone identifies the DRIVER, and
+    /// a driver's code generation is not a function of the driver alone: clang-cl
+    /// derives `-fms-compatibility-version` from whatever MSVC it can find beside
+    /// it, and clang's Microsoft C++ ABI gates version-specific code generation on
+    /// that. Two machines running one `clang-cl.exe` beside two MSVC installs print
+    /// the same banner, preprocess to the same text -- measured byte-identical even
+    /// for a TU including `<cstdio>`, because `_MSC_VER` need not survive into the
+    /// output -- and would otherwise share an entry while needing different objects.
+    std::string compilerId;
     std::string preprocessed;                 ///< Preprocessor output for the TU.
     std::vector<std::string> relativizedArgs; ///< Compile args with checkout-rooted paths relativized.
 
@@ -56,6 +67,45 @@ struct KeyInputs
 /// @param inputs The machine-independent key inputs.
 /// @return A 32-hex-char key string.
 [[nodiscard]] std::string ComputeKey(KeyInputs const& inputs);
+
+/// Build the compiler identity a cache key is keyed on.
+///
+/// Two facts joined with a newline, which is a framing rather than a decoration:
+/// concatenating them bare would let `("ab", "c")` and `("a", "bc")` digest alike.
+/// A banner is one line by construction (`CompilerBanner` takes the first) and a
+/// triple is letters, digits, dots, underscores and dashes, so neither half can
+/// contain the separator and the pair is recoverable from the result.
+///
+/// An empty @p targetTriple yields the banner UNCHANGED, not a banner with an
+/// empty field appended. That is what keeps every driver with no target to state
+/// -- `cl`, `gcc`, an unknown driver -- keyed exactly as it was, so their existing
+/// cache entries stay reachable and only the drivers that gained an identity are
+/// re-keyed.
+///
+/// This is deliberately NOT what the toolchain fingerprint is built on. A
+/// fingerprint decides which WORKER may serve a client, and folding the target into
+/// it would split a developer-prompt launcher from a service-run worker again --
+/// the mismatch #145 removed, reintroduced for a fact the dispatch line now states
+/// outright. A key decides which OBJECT may be served, and there the same fact is
+/// load-bearing. One string served both questions; it cannot.
+///
+/// The triple is folded VERBATIM, including the version its environment field
+/// carries, and that is a deliberate over-specification rather than an oversight.
+/// Clang's Microsoft ABI gates on major.minor (19.12, 19.33), so two MSVC builds
+/// differing only in patch generate identically and now key apart -- a lost match
+/// on every Visual Studio point release. Truncating would recover those, and is not
+/// done, because the same field means something else on another platform: on Apple
+/// targets it is the DEPLOYMENT TARGET (`arm64-apple-macosx15.0.0`), which does
+/// change code generation, so one rule cannot serve both and a per-platform rule
+/// would be guessing at which components matter for a triple this code has never
+/// seen. Over-specifying costs a recompile; under-specifying serves an object built
+/// by a different code generator, and only one of those is recoverable.
+///
+/// @param banner The compiler's own version line.
+/// @param targetTriple The target it generates for, or empty when it has none to
+///        state.
+/// @return The identity to key on.
+[[nodiscard]] std::string CacheCompilerId(std::string_view banner, std::string_view targetTriple);
 
 /// Rewrite every argument whose path lies under `sourceRoot` or `buildTree` to
 /// a checkout-independent token form (via PathCanon), leaving other arguments

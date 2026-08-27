@@ -6,6 +6,7 @@
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 
+#include <format>
 #include <optional>
 #include <span>
 #include <string>
@@ -163,6 +164,13 @@ std::optional<std::string> UnkeyableArgument(std::span<std::string const> args, 
             return std::string { arg };
     }
     return std::nullopt;
+}
+
+std::string CacheCompilerId(std::string_view banner, std::string_view targetTriple)
+{
+    if (targetTriple.empty())
+        return std::string { banner };
+    return std::format("{}\n{}", banner, targetTriple);
 }
 
 std::string ComputeKey(KeyInputs const& inputs)

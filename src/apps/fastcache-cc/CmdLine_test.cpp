@@ -453,7 +453,7 @@ TEST_CASE("RemoteCompileArgs keeps the flags that change generated code")
     auto const cmd = ParseCommand(argv);
     REQUIRE(cmd.parsedOk);
 
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE(parsed.has_value());
     auto const remote = Unwrap(parsed);
     for (auto const* kept: { "-std=c++23", "-O2", "-g", "-Wall", "-fPIC" })
@@ -461,6 +461,158 @@ TEST_CASE("RemoteCompileArgs keeps the flags that change generated code")
         INFO("flag " << kept);
         CHECK(std::ranges::find(remote, kept) != remote.end());
     }
+}
+
+TEST_CASE("cc and c++ are classified by what the driver says, not by what it is called")
+{
+    // `cc` and `c++` name a policy, not a product. On macOS `/usr/bin/c++` is Apple
+    // clang and is CMake's default C++ compiler, so the spelling a build system uses
+    // most is the one that says least -- and by name it landed in the gcc row, which
+    // is now the row deciding how a target is found and whether it can be stated.
+    CHECK(ClassifyCompiler("c++") == Flavor::Gcc);
+    CHECK(ClassifyCompilerFromBanner(Flavor::Gcc, "Apple clang version 17.0.0 (clang-1700.0.13.3)") == Flavor::Clang);
+    CHECK(ClassifyCompilerFromBanner(Flavor::Gcc, "Ubuntu clang version 20.1.2 (0ubuntu1~24.04.3)") == Flavor::Clang);
+
+    // A real GCC keeps its row.
+    CHECK(ClassifyCompilerFromBanner(Flavor::Gcc, "g++ (Ubuntu 14.2.0-4ubuntu2~24.04.1) 14.2.0") == Flavor::Gcc);
+}
+
+TEST_CASE("An unrecognised banner leaves the name-based guess standing")
+{
+    // The correction runs in ONE direction, on positive evidence only. Seeing
+    // `clang version` is proof; not seeing it is not proof of the opposite, because
+    // a driver that could not be RUN falls back to its own basename. Demoting on
+    // absence would put a real clang++ whose --version failed into the gcc row --
+    // unversioned target, no pin, on a driver whose name said exactly what it was.
+    CHECK(ClassifyCompilerFromBanner(Flavor::Clang, "clang++") == Flavor::Clang);
+    CHECK(ClassifyCompilerFromBanner(Flavor::Gcc, "cc") == Flavor::Gcc);
+
+    // GCC has no marker as reliable as clang's -- vanilla prints `(GCC)`, Ubuntu
+    // prints `(Ubuntu 14.2.0-...)` -- so nothing here tries to prove it.
+    CHECK(ClassifyCompilerFromBanner(Flavor::Clang, "g++ (GCC) 14.2.0") == Flavor::Clang);
+}
+
+TEST_CASE("A banner cannot reclassify clang-cl, because it does not distinguish it")
+{
+    // `clang-cl --version` prints `clang version ...`, byte for byte what plain
+    // clang prints. The NAME is the only thing separating the two drivers, so a
+    // banner test here would collapse clang-cl into clang and take its `/`-spelled
+    // command line, its `/EP` preprocess and its MSVC-preprocessed-input flags with
+    // it.
+    CHECK(ClassifyCompilerFromBanner(Flavor::ClangCl, "clang version 22.1.3") == Flavor::ClangCl);
+    CHECK(ClassifyCompilerFromBanner(Flavor::Cl, "clang version 22.1.3") == Flavor::Cl);
+    CHECK(ClassifyCompilerFromBanner(Flavor::Unknown, "clang version 22.1.3") == Flavor::Unknown);
+}
+
+TEST_CASE("The gcc and clang rows differ in nothing but how a target is discovered")
+{
+    // What makes correcting the flavour AFTER the command line was parsed safe: the
+    // parse read this row, and every column it read is the same in both. Only the
+    // target columns may move. If this ever fails, the correction in main.cpp has to
+    // move above ParseCommand instead of beside the banner.
+    auto const& gcc = DriverOf(Flavor::Gcc);
+    auto const& clang = DriverOf(Flavor::Clang);
+
+    CHECK(gcc.family == clang.family);
+    CHECK(gcc.preprocessFlags.data() == clang.preprocessFlags.data());
+    CHECK(gcc.dispatchPreprocessFlags.data() == clang.dispatchPreprocessFlags.data());
+    CHECK(gcc.preprocessedInput.data() == clang.preprocessedInput.data());
+    CHECK(gcc.preprocessDropFlags.data() == clang.preprocessDropFlags.data());
+    CHECK(gcc.dependencyProbeFlags.data() == clang.dependencyProbeFlags.data());
+    CHECK(gcc.usesDepfile == clang.usesDepfile);
+    CHECK(gcc.includeDiscovery == clang.includeDiscovery);
+    CHECK(gcc.includeProbeFlags.data() == clang.includeProbeFlags.data());
+    CHECK(gcc.targetProbeFlags.data() == clang.targetProbeFlags.data());
+
+    // The one column that is allowed to differ, and does.
+    CHECK(gcc.targetDiscovery != clang.targetDiscovery);
+}
+
+TEST_CASE("gcc is identified but never pinned, because it has no --target")
+{
+    // Discovering and stating are separate questions. gcc's target belongs in the
+    // cache key -- one g++ version string covers x86_64 and aarch64 alike -- and
+    // must never reach a dispatched command line, where the driver would reject the
+    // flag and fail the compile outright.
+    CHECK(TargetPinPrefixFor(TargetDiscovery::GnuTargetLine).empty());
+    CHECK(TargetPinPrefixFor(TargetDiscovery::ClangDriverLine) == "--target=");
+    CHECK(TargetPinPrefixFor(TargetDiscovery::None).empty());
+
+    std::vector<std::string> const argv { "g++", "-c", "-O2", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, "x86_64-linux-gnu");
+
+    REQUIRE(parsed.has_value());
+    CHECK(std::ranges::none_of(*parsed, [](std::string const& a) { return a.starts_with("--target"); }));
+}
+
+TEST_CASE("RemoteCompileArgs states the client's target so the worker cannot pick its own")
+{
+    std::vector<std::string> const argv { "clang-cl", "/c", "/O2", "a.cpp", "/Foa.obj" };
+    auto const cmd = ParseCommand(argv);
+
+    auto const parsed = RemoteCompileArgs(cmd, argv, "x86_64-pc-windows-msvc19.51.36252");
+
+    REQUIRE(parsed.has_value());
+    // FIRST, before anything the build said for itself. What it states is the
+    // DEFAULT the client's own driver would have used, so a build's own
+    // `--target=` or `-m32` comes later on the line and still wins -- which is
+    // exactly what happens when the same line is compiled locally.
+    REQUIRE_FALSE(parsed->empty());
+    CHECK(parsed->front() == "--target=x86_64-pc-windows-msvc19.51.36252");
+
+    // Fused, not two arguments: clang-cl rejects `--target x` and accepts
+    // `--target=x`, so one spelling covers both drivers.
+    CHECK(std::ranges::count_if(*parsed, [](std::string const& a) { return a.starts_with("--target"); }) == 1);
+}
+
+TEST_CASE("RemoteCompileArgs states nothing when there is no target to state")
+{
+    // `cl` has no `--target`: which code generator runs is decided by WHICH cl.exe
+    // is invoked. A caller handing it a triple anyway must not put one on the line,
+    // because the driver would refuse the argument and the whole compile with it.
+    std::vector<std::string> const argv { "cl", "/c", "a.cpp", "/Foa.obj" };
+    auto const cmd = ParseCommand(argv);
+
+    auto const parsed = RemoteCompileArgs(cmd, argv, "x86_64-pc-windows-msvc19.51.36252");
+
+    REQUIRE(parsed.has_value());
+    CHECK(std::ranges::none_of(*parsed, [](std::string const& a) { return a.starts_with("--target"); }));
+}
+
+TEST_CASE("An empty triple leaves the dispatched line exactly as it was")
+{
+    // The probe fails open, so empty is an answer this receives in practice: a
+    // driver that would not say, or one with nothing to say. It must cost nothing.
+    std::vector<std::string> const argv { "clang-cl", "/c", "/O2", "a.cpp", "/Foa.obj" };
+    auto const cmd = ParseCommand(argv);
+
+    auto const pinned = RemoteCompileArgs(cmd, argv, "x86_64-pc-windows-msvc19.33.0");
+    auto const bare = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+
+    REQUIRE(pinned.has_value());
+    REQUIRE(bare.has_value());
+    REQUIRE(pinned->size() == bare->size() + 1);
+    CHECK(std::ranges::equal(std::next(pinned->begin()), pinned->end(), bare->begin(), bare->end()));
+}
+
+TEST_CASE("A build that names its own target still wins over the stated default")
+{
+    // The pin goes first precisely so this holds. Overriding a target the build
+    // asked for would be a wrong object rather than a failed one, and the two are
+    // not comparable: one fails the link, the other is cached and shipped.
+    std::vector<std::string> const argv { "clang-cl", "/c", "--target=aarch64-pc-windows-msvc", "a.cpp", "/Foa.obj" };
+    auto const cmd = ParseCommand(argv);
+
+    auto const parsed = RemoteCompileArgs(cmd, argv, "x86_64-pc-windows-msvc19.51.36252");
+
+    REQUIRE(parsed.has_value());
+    auto const stated = std::ranges::find(*parsed, "--target=x86_64-pc-windows-msvc19.51.36252");
+    auto const built = std::ranges::find(*parsed, "--target=aarch64-pc-windows-msvc");
+    REQUIRE(stated != parsed->end());
+    REQUIRE(built != parsed->end());
+    // The driver takes the last one, so the build's must come after ours.
+    CHECK(stated < built);
 }
 
 TEST_CASE("RemoteCompileArgs drops the source, the output and the compile marker")
@@ -471,7 +623,7 @@ TEST_CASE("RemoteCompileArgs drops the source, the output and the compile marker
     auto const cmd = ParseCommand(argv);
     REQUIRE(cmd.parsedOk);
 
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE(parsed.has_value());
     auto const remote = Unwrap(parsed);
     CHECK(std::ranges::find(remote, "a.cpp") == remote.end());
@@ -490,7 +642,7 @@ TEST_CASE("RemoteCompileArgs drops include directories in both spellings")
     auto const cmd = ParseCommand(argv);
     REQUIRE(cmd.parsedOk);
 
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE(parsed.has_value());
     auto const remote = Unwrap(parsed);
     for (auto const* gone: { "-Iinc", "-I", "other" })
@@ -511,7 +663,7 @@ TEST_CASE("RemoteCompileArgs refuses a command line it cannot fully account for"
     // compile, which is the only one of the three that is not a defect.
     auto const refuses = [](std::vector<std::string> const& argv) {
         auto const cmd = ParseCommand(argv);
-        return !RemoteCompileArgs(cmd, argv).has_value();
+        return !RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {}).has_value();
     };
 
     CHECK(refuses({ "g++", "-isystem", "/opt/sdk/include", "-c", "a.cpp", "-o", "a.o" }));
@@ -540,7 +692,7 @@ TEST_CASE("RemoteCompileArgs drops a separated flag together with its value")
     auto const cmd = ParseCommand(argv);
     REQUIRE(cmd.parsedOk);
 
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE(parsed.has_value());
     auto const remote = Unwrap(parsed);
     CHECK(std::ranges::find(remote, "dep.d") == remote.end());
@@ -558,7 +710,7 @@ TEST_CASE("RemoteCompileArgs leaves nothing that names a path")
                                           "-MT",     "target",   "-O2", "-c",          "a.cpp" };
     auto const cmd = ParseCommand(argv);
 
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE(parsed.has_value());
     auto const remote = Unwrap(parsed);
     for (auto const& arg: remote)
@@ -576,7 +728,7 @@ TEST_CASE("RemoteCompileArgs drops the MSVC spellings too")
     auto const cmd = ParseCommand(argv);
     REQUIRE(cmd.parsedOk);
 
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE(parsed.has_value());
     auto const remote = Unwrap(parsed);
     CHECK(std::ranges::find(remote, "/std:c++20") != remote.end());
@@ -633,7 +785,7 @@ TEST_CASE("A remote compile is told its input is already preprocessed")
     // object, where before it failed and was retried locally.
     std::vector<std::string> const argv { "g++", "-O2", "-c", "a.cpp", "-o", "a.o" };
     auto const cmd = ParseCommand(argv);
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE(parsed.has_value());
     auto const remote = Unwrap(parsed);
 
@@ -649,7 +801,7 @@ TEST_CASE("A C source is told the C preprocessed language, not the C++ one")
     // overload resolution, name mangling and what even parses.
     std::vector<std::string> const argv { "gcc", "-O2", "-c", "a.c", "-o", "a.o" };
     auto const cmd = ParseCommand(argv);
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE(parsed.has_value());
     auto const remote = Unwrap(parsed);
 
@@ -668,7 +820,7 @@ TEST_CASE("An MSVC remote compile is told its language too, in MSVC's own spelli
     // object with C++ mangling under the C key where it is.
     std::vector<std::string> const argv { "cl", "/O2", "/c", "a.cpp", "/Foa.obj" };
     auto const cmd = ParseCommand(argv);
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE(parsed.has_value());
     auto const remote = Unwrap(parsed);
 
@@ -683,7 +835,7 @@ TEST_CASE("An MSVC C translation unit is told /TC")
 {
     std::vector<std::string> const argv { "cl", "/O2", "/c", "a.c", "/Foa.obj" };
     auto const cmd = ParseCommand(argv);
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE(parsed.has_value());
     auto const remote = Unwrap(parsed);
 
@@ -698,14 +850,14 @@ TEST_CASE("A language the driver has no spelling for is refused, and says so")
     // job comes back compiled as something else.
     std::vector<std::string> const argv { "cl", "/c", "a.m", "/Foa.obj" };
     auto const cmd = ParseCommand(argv);
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE_FALSE(parsed.has_value());
     CHECK(parsed.error().contains("Objective-C"));
 
     // The same source IS dispatchable to a GNU driver.
     std::vector<std::string> const gnu { "clang", "-c", "a.m", "-o", "a.o" };
     auto const gnuCmd = ParseCommand(gnu);
-    auto const gnuParsed = RemoteCompileArgs(gnuCmd, gnu);
+    auto const gnuParsed = RemoteCompileArgs(gnuCmd, gnu, /*targetTriple=*/ {});
     REQUIRE(gnuParsed.has_value());
     CHECK(Unwrap(gnuParsed).back() == "objective-c-cpp-output");
 }
@@ -716,7 +868,7 @@ TEST_CASE("An extension whose language depends on the driver is never guessed at
     // answer the question and a guess would hand a worker the wrong language.
     std::vector<std::string> const argv { "g++", "-c", "a.C", "-o", "a.o" };
     auto const cmd = ParseCommand(argv);
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE_FALSE(parsed.has_value());
     CHECK(parsed.error().contains("a.C"));
 }
@@ -786,7 +938,7 @@ TEST_CASE("A `++` driver compiles .c as C++, and the worker is told so")
     // object rather than a failed one, stored under the key for everybody.
     std::vector<std::string> const argv { "g++", "-c", "a.c", "-o", "a.o" };
     auto const cmd = ParseCommand(argv);
-    auto const parsed = RemoteCompileArgs(cmd, argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     REQUIRE(parsed.has_value());
     CHECK(Unwrap(parsed).back() == "c++-cpp-output");
 
@@ -794,7 +946,7 @@ TEST_CASE("A `++` driver compiles .c as C++, and the worker is told so")
     // column: `gcc` and `g++` are one Flavor and disagree about this.
     std::vector<std::string> const c { "gcc", "-c", "a.c", "-o", "a.o" };
     auto const cCmd = ParseCommand(c);
-    auto const cParsed = RemoteCompileArgs(cCmd, c);
+    auto const cParsed = RemoteCompileArgs(cCmd, c, /*targetTriple=*/ {});
     REQUIRE(cParsed.has_value());
     CHECK(Unwrap(cParsed).back() == "cpp-output");
 
@@ -804,7 +956,7 @@ TEST_CASE("A `++` driver compiles .c as C++, and the worker is told so")
     {
         std::vector<std::string> const each { spelling, "-c", "a.c", "-o", "a.o" };
         auto const eachCmd = ParseCommand(each);
-        auto const eachParsed = RemoteCompileArgs(eachCmd, each);
+        auto const eachParsed = RemoteCompileArgs(eachCmd, each, /*targetTriple=*/ {});
         INFO("driver: " << spelling);
         REQUIRE(eachParsed.has_value());
         CHECK(Unwrap(eachParsed).back() == "c++-cpp-output");
@@ -823,7 +975,7 @@ TEST_CASE("A command line that names the language itself is not dispatched")
                              std::vector<std::string> { "clang", "-c", "-xc++", "a.c", "-o", "a.o" } })
     {
         auto const cmd = ParseCommand(argv);
-        auto const parsed = RemoteCompileArgs(cmd, argv);
+        auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
         INFO("driver: " << argv.front());
         REQUIRE_FALSE(parsed.has_value());
         CHECK(parsed.error().contains("names the input language itself"));
@@ -834,7 +986,7 @@ TEST_CASE("A command line that names the language itself is not dispatched")
     // has no such file.
     std::vector<std::string> const named { "cl", "/c", "/Tcother.c", "/Foa.obj", "a.c" };
     auto const namedCmd = ParseCommand(named);
-    CHECK_FALSE(RemoteCompileArgs(namedCmd, named).has_value());
+    CHECK_FALSE(RemoteCompileArgs(namedCmd, named, /*targetTriple=*/ {}).has_value());
 }
 
 TEST_CASE("A module interface unit is never dispatched, whatever the driver")
@@ -846,7 +998,7 @@ TEST_CASE("A module interface unit is never dispatched, whatever the driver")
     {
         std::vector<std::string> const argv { "clang++", "-c", source, "-o", "m.o" };
         auto const cmd = ParseCommand(argv);
-        auto const parsed = RemoteCompileArgs(cmd, argv);
+        auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
         REQUIRE_FALSE(parsed.has_value());
         CHECK(parsed.error().contains("BMI"));
     }

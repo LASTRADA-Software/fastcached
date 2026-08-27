@@ -13,6 +13,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -662,4 +663,68 @@ TEST_CASE("UnkeyableArgument is inert under a POSIX layout")
     FastCache::PathCanon::Layout const posix { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
     std::vector<std::string> const args { "-IC:foo", "C:foo/u.cpp", "/usr/include/x.h", "-I/Infra/inc" };
     CHECK(UnkeyableArgument(std::span<std::string const> { args }, posix) == std::nullopt);
+}
+
+// --- the compiler identity a key is built on --------------------------------
+
+TEST_CASE("A driver with no target to state keys exactly as it always did")
+{
+    // `cl`, `gcc` and an unknown driver cannot be asked what they generate for, so
+    // they state nothing -- and an empty answer must leave the identity BYTE
+    // IDENTICAL rather than appending an empty field. Every cache entry those
+    // drivers have ever written stays reachable; only the drivers that gained an
+    // identity are re-keyed.
+    CHECK(CacheCompilerId("g++ (GCC) 14.2.0", /*targetTriple=*/ {}) == "g++ (GCC) 14.2.0");
+    CHECK(CacheCompilerId("cl", /*targetTriple=*/ {}) == "cl");
+}
+
+TEST_CASE("Two MSVC installs beside one clang-cl are two compiler identities")
+{
+    // The defect this closes. One `clang-cl.exe` prints one banner, so the banner
+    // alone cannot tell the two apart -- while clang derives
+    // `-fms-compatibility-version` from whichever MSVC it found and gates
+    // version-specific code generation on it.
+    constexpr std::string_view Banner = "clang version 22.1.3";
+
+    auto const developerPrompt = CacheCompilerId(Banner, "x86_64-pc-windows-msvc19.51.36252");
+    auto const service = CacheCompilerId(Banner, "x86_64-pc-windows-msvc19.33.0");
+
+    CHECK(developerPrompt != service);
+    // And neither is the bare banner, or they would collide with entries written
+    // before either had an identity.
+    CHECK(developerPrompt != std::string { Banner });
+    CHECK(service != std::string { Banner });
+}
+
+TEST_CASE("The banner and the target are framed, not concatenated")
+{
+    // Bare concatenation is not a framing: ("ab", "c") and ("a", "bc") would produce
+    // one string and therefore one key, so a banner that gained a character where a
+    // triple lost one would key alike. The separator is a newline because neither
+    // half can contain one -- a banner is a single line by construction and a triple
+    // is letters, digits, dots, underscores and dashes.
+    CHECK(CacheCompilerId("ab", "c-c") != CacheCompilerId("a", "bc-c"));
+    CHECK(CacheCompilerId("clang", "x86_64-pc-linux-gnu") != CacheCompilerId("clangx86_64-pc-linux-gnu", {}));
+}
+
+TEST_CASE("The target reaches the object key, so two code generators do not share an entry")
+{
+    // Everything else held equal: the same driver, the same preprocessed text, the
+    // same arguments and the same dependency set. Measured, and this is why the
+    // preprocessed text cannot be relied on to carry the difference: two
+    // compatibility versions preprocess a TU including <cstdio> to BYTE-IDENTICAL
+    // output, because `_MSC_VER` need not survive into it.
+    auto keyFor = [](std::string_view triple) {
+        return ComputeKey(KeyInputs { .compilerId = CacheCompilerId("clang version 22.1.3", triple),
+                                      .preprocessed = "int f(){return 1;}",
+                                      .relativizedArgs = { "/O2", "/std:c++17" },
+                                      .dependencyPaths = { "<root>/a.hpp" } });
+    };
+
+    CHECK(keyFor("x86_64-pc-windows-msvc19.51.36252") != keyFor("x86_64-pc-windows-msvc19.33.0"));
+    // A cross-architecture pair is the same hazard reached the other way: one clang
+    // version string, two object formats.
+    CHECK(keyFor("x86_64-pc-linux-gnu") != keyFor("aarch64-pc-linux-gnu"));
+    // And the same target still keys the same, or nothing would ever hit.
+    CHECK(keyFor("x86_64-pc-linux-gnu") == keyFor("x86_64-pc-linux-gnu"));
 }

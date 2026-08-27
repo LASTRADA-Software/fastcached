@@ -199,6 +199,30 @@ namespace
 #endif
     }
 
+    /// Build a probe invocation: the compiler, its table row's flags, an empty input.
+    ///
+    /// Shared by the two probes that ask a driver a question over a file that is not
+    /// really there, because the five lines were otherwise identical but for which
+    /// span they read -- and a copy that drifts is how one probe silently stops
+    /// appending an input the other still does.
+    ///
+    /// The input is appended here rather than carried in the table for the reason the
+    /// table's own columns give: "empty and always exists" has no portable spelling.
+    ///
+    /// @param compiler The driver to run.
+    /// @param flags Its probe flags.
+    /// @return The full argv, input included.
+    [[nodiscard]] std::vector<std::string> ProbeArgv(std::string const& compiler, std::span<std::string_view const> flags)
+    {
+        std::vector<std::string> argv;
+        argv.reserve(flags.size() + 2);
+        argv.emplace_back(compiler);
+        for (auto const& flag: flags)
+            argv.emplace_back(flag);
+        argv.emplace_back(NullInputPath());
+        return argv;
+    }
+
     /// This process's id, for a temp filename no concurrent writer will reuse.
     ///
     /// A `#if` for the same reason `NullInputPath` is one: the OSes genuinely
@@ -275,6 +299,121 @@ namespace
     /// also what tells a real answer from a driver that did not understand the
     /// question.
     constexpr std::string_view ClangResourceIncludeSubdirectory = "include";
+
+    /// What marks a driver-printed line as the FRONTEND invocation.
+    constexpr std::string_view FrontendMarker = "-cc1";
+
+    /// The frontend option whose value is the target triple.
+    constexpr std::string_view TripleOption = "-triple";
+
+    /// The header a GNU driver prints its own target on.
+    constexpr std::string_view TargetHeaderPrefix = "Target:";
+
+    /// The first line of @p text that @p extract gets an answer out of.
+    ///
+    /// Shared by the two target readers rather than written out twice, and the
+    /// trailing carriage return is why it earns its keep: a capture taken on Windows,
+    /// or piped through a tool that rewrote the line endings, carries one, and
+    /// stripping it is the step whose omission fails SILENTLY -- the shape check
+    /// rejects an otherwise perfect answer and the probe reports nothing at all.
+    ///
+    /// By value rather than by forwarding reference, and that is a correctness choice
+    /// rather than a style one: @p extract is invoked once per LINE, so forwarding it
+    /// would move from it on the first iteration and leave every later call reading a
+    /// moved-from object. The standard algorithms take a callable by value for the
+    /// same reason.
+    ///
+    /// @param text The driver output to walk.
+    /// @param extract Called per line; returns the answer, or empty to keep looking.
+    /// @return The first non-empty answer, or empty when no line had one.
+    template <typename Extract>
+    [[nodiscard]] std::string FirstLineAnswering(std::string_view text, Extract extract)
+    {
+        for (std::size_t pos = 0; pos <= text.size();)
+        {
+            auto const newline = text.find('\n', pos);
+            auto line = text.substr(pos, newline == std::string_view::npos ? std::string_view::npos : newline - pos);
+            pos = newline == std::string_view::npos ? text.size() + 1 : newline + 1;
+
+            if (!line.empty() && line.back() == '\r')
+                line.remove_suffix(1);
+
+            if (auto answer = extract(line); !answer.empty())
+                return answer;
+        }
+        return {};
+    }
+
+    /// The longest triple worth believing.
+    ///
+    /// A real one runs to about thirty characters (`x86_64-pc-windows-msvc19.51.36252`).
+    /// The ceiling is what stops a mis-parse from folding an entire command line into
+    /// a cache key.
+    constexpr std::size_t MaxTargetTripleLength = 128;
+
+    /// Split one driver-printed command line into its arguments, honouring quotes.
+    ///
+    /// clang quotes every token it prints, so a Windows path arrives as
+    /// `"C:\Program Files\...\clang-cl.exe"` -- ONE argument containing a space.
+    /// Splitting on whitespace alone would break it in two and shift every token after
+    /// it, and the triple is read POSITIONALLY (the argument following `-triple`). A
+    /// shift therefore does not fail loudly: it returns a neighbouring token that looks
+    /// like an answer.
+    ///
+    /// Backslashes are left as they are rather than unescaped. Nothing here needs the
+    /// original path back, and a triple has no backslash to unescape.
+    ///
+    /// @param line One line of driver output.
+    /// @return Its arguments, quotes stripped, as views into @p line.
+    [[nodiscard]] std::vector<std::string_view> SplitDriverLine(std::string_view line)
+    {
+        std::vector<std::string_view> tokens;
+        for (std::size_t pos = 0; pos < line.size();)
+        {
+            if (line[pos] == ' ' || line[pos] == '\t')
+            {
+                ++pos;
+                continue;
+            }
+            if (line[pos] == '"')
+            {
+                auto const start = pos + 1;
+                auto const close = line.find('"', start);
+                tokens.push_back(
+                    line.substr(start, close == std::string_view::npos ? std::string_view::npos : close - start));
+                pos = close == std::string_view::npos ? line.size() : close + 1;
+                continue;
+            }
+            auto const end = line.find_first_of(" \t", pos);
+            tokens.push_back(line.substr(pos, end == std::string_view::npos ? std::string_view::npos : end - pos));
+            pos = end == std::string_view::npos ? line.size() : end;
+        }
+        return tokens;
+    }
+
+    /// Whether a token could be a target triple.
+    ///
+    /// Validated rather than trusted, because this value becomes BOTH a cache key
+    /// input and a command-line argument. A mis-parse that returned a path would split
+    /// the fleet's keys by install location and hand a worker an argument its own
+    /// filter has to refuse -- one silent, one loud, neither of them the answer. A
+    /// triple is letters, digits, dots, underscores and dashes, with at least one dash
+    /// separating its components -- and it never LEADS with one, which is the check
+    /// that carries the weight here. `-triple` is read positionally, so a driver line
+    /// carrying the option with no value leaves the next FLAG in the value's place,
+    /// and `-emit-obj` satisfies every other rule on this list. The result would be a
+    /// cache key and a `--target=` argument built out of somebody else's option.
+    ///
+    /// @param token The candidate.
+    /// @return True when it is shaped like a triple.
+    [[nodiscard]] bool LooksLikeTargetTriple(std::string_view token) noexcept
+    {
+        return !token.empty() && !token.starts_with('-') && token.size() <= MaxTargetTripleLength && token.contains('-')
+               && std::ranges::all_of(token, [](char c) {
+                      return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.'
+                             || c == '_' || c == '-';
+                  });
+    }
 
     /// Where the shared VS headers live, relative to the Visual Studio root.
     ///
@@ -638,6 +777,86 @@ std::vector<std::string> ClangResourceIncludeRoots(IProcessRunner& runner, ITool
     return roots;
 }
 
+std::string ParseDriverTargetTriple(std::string_view driverOutput)
+{
+    // No frontend line, or one naming nothing this can trust, yields empty -- the
+    // safe answer, because it leaves the key spelled as it is today and the dispatch
+    // line unpinned. See the header for the one direction in which that is not
+    // enough.
+    return FirstLineAnswering(driverOutput, [](std::string_view line) -> std::string {
+        // ONLY the frontend line is read, and that is the point of the marker rather
+        // than a tidy-up. The `Target:` header near the top of this same output names
+        // a triple too -- `x86_64-pc-windows-msvc` -- but names it WITHOUT the version
+        // suffix that carries `-fms-compatibility-version`. A reader that took
+        // whichever triple came first would pin the architecture, drop the code
+        // generation contract, and look entirely correct doing it.
+        //
+        // A substring test before tokenizing, so the banner lines above the frontend
+        // invocation are skipped without being split apart. It is a FILTER and not the
+        // decision: `-cc1` can appear inside a path, so the exact token match below is
+        // still what decides.
+        if (!line.contains(FrontendMarker))
+            return {};
+
+        auto const tokens = SplitDriverLine(line);
+        if (!std::ranges::contains(tokens, FrontendMarker))
+            return {};
+
+        auto const option = std::ranges::find(tokens, TripleOption);
+        if (option == tokens.end() || std::next(option) == tokens.end())
+            return {};
+
+        auto const value = *std::next(option);
+        return LooksLikeTargetTriple(value) ? std::string { value } : std::string {};
+    });
+}
+
+std::string ParseDriverTargetHeader(std::string_view driverOutput)
+{
+    return FirstLineAnswering(driverOutput, [](std::string_view line) -> std::string {
+        auto const trimmed = Trim(line);
+        if (!trimmed.starts_with(TargetHeaderPrefix))
+            return {};
+
+        // Validated by the same rule the frontend reader uses, and for the same
+        // reason: this value becomes a cache key input, so a header naming a path --
+        // which a `Configured with:` line is full of -- must not be taken for an
+        // answer.
+        auto const value = Trim(trimmed.substr(TargetHeaderPrefix.size()));
+        return LooksLikeTargetTriple(value) ? std::string { value } : std::string {};
+    });
+}
+
+std::string DiscoverTargetTriple(IProcessRunner& runner, std::string const& compiler, DriverSpec const& spec)
+{
+    // No `default:`, so a mechanism added to the table fails to compile here rather
+    // than silently returning nothing -- which would present as a cache key that had
+    // quietly stopped covering the target.
+    switch (spec.targetDiscovery)
+    {
+        case TargetDiscovery::None:
+            return {};
+
+        case TargetDiscovery::ClangDriverLine: {
+            auto const run = runner.RunCaptureSplit(ProbeArgv(compiler, spec.targetProbeFlags));
+            // Read from STDERR, which is where `-###` prints all of it; stdout stays
+            // empty. The exit code is deliberately not consulted, for the reason the
+            // include probe gives: the frontend line is printed before anything that
+            // could fail, and parsing is what decides whether the output is usable.
+            return ParseDriverTargetTriple(run.err);
+        }
+
+        case TargetDiscovery::GnuTargetLine: {
+            // The same spawn and the same stream as above; only which line is
+            // authoritative differs, and that is the table's answer rather than this
+            // function's. GCC writes its header to stderr exactly as clang does.
+            auto const run = runner.RunCaptureSplit(ProbeArgv(compiler, spec.targetProbeFlags));
+            return ParseDriverTargetHeader(run.err);
+        }
+    }
+    return {};
+}
+
 std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
                                               IToolchainHost& host,
                                               std::string const& compiler,
@@ -652,14 +871,7 @@ std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
             return {};
 
         case IncludeDiscovery::GnuVerbose: {
-            std::vector<std::string> argv;
-            argv.reserve(spec.includeProbeFlags.size() + 2);
-            argv.emplace_back(compiler);
-            for (auto const& flag: spec.includeProbeFlags)
-                argv.emplace_back(flag);
-            argv.emplace_back(NullInputPath());
-
-            auto const run = runner.RunCaptureSplit(argv);
+            auto const run = runner.RunCaptureSplit(ProbeArgv(compiler, spec.includeProbeFlags));
             // The exit code is deliberately NOT checked. The list is printed
             // before anything that could fail, and a driver can exit non-zero for
             // reasons that leave it perfectly valid -- a missing SDK component, a
