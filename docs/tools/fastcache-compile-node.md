@@ -405,7 +405,7 @@ not a degraded fleet, it is the one thing the architecture says only one node ma
 do. So a fleet gives each node an identity and tells it who its peers are:
 
 ```sh
-fastcache-compile-node     --node-id=n1 --listen-raft=6680     --raft-peer=n1=10.0.0.1:6680     --raft-peer=n2=10.0.0.2:6680     --raft-peer=n3=10.0.0.3:6680     --listen-scheduler=6675 --advertise=10.0.0.1:6676     --toolchain=/usr/bin/g++
+fastcache-compile-node     --node-id=n1 --listen-raft=6680     --raft-peer=n1=10.0.0.1:6680     --raft-peer=n2=10.0.0.2:6680     --raft-peer=n3=10.0.0.3:6680     --listen-scheduler=6675 --fleet-open     --advertise=10.0.0.1:6676     --toolchain=/usr/bin/g++
 ```
 
 Each peer is an **identity and an address in one token**, because they are one
@@ -593,7 +593,7 @@ fastcache-compile-node \
     --discovery=255.255.255.255:6681 \
     --cluster-key-file=/etc/fastcached/cluster.key \
     --cluster-id=build-farm \
-    --listen-scheduler=6675 --toolchain=/usr/bin/g++
+    --listen-scheduler=6675 --fleet-open --toolchain=/usr/bin/g++
 ```
 
 Every node still names **itself** in `--raft-peer`, because that is the address its
