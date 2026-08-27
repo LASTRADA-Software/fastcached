@@ -283,8 +283,21 @@ Four more about what the tier IS and who gets to see it:
   while the heartbeat thread and the `/metrics` scrape read its statistics, and
   `Snapshot()` on these backends writes a `mutable` member. It is the same reason
   the daemon's `useShardingWrapper` includes `metricsEnabled`. A node's `--cache-dir`
-  also takes no inter-process lock (#135) and does its I/O on the shared reactor
-  thread (#136); both are stated where an operator meets them.
+  still does its I/O on the shared reactor thread (#136), which is stated where an
+  operator meets it.
+- **A store file belongs to exactly one open store, and the store enforces that
+  rather than documenting it.** `FilePageStore::Open` claims the file — POSIX
+  `flock(LOCK_EX | LOCK_NB)`, and on Windows the `FILE_SHARE_READ` share mode it
+  already passed — and a second opener gets `StorageErrorCode::InUse`, which is a
+  distinct code because the remedy is another process or another path, not a
+  repair. Before this, two nodes on one `--cache-dir` (or two daemons on one
+  `--storage`) silently lost half their writes on POSIX: 400 committed puts,
+  200 readable, no error anywhere. It must stay `flock` and never `fcntl` — an
+  fcntl lock is per PROCESS, so a second store inside one process would take it
+  again and report success. Nothing is written to the file, so a store stays
+  byte-compatible with builds that predate the claim; and a filesystem that
+  cannot lock opens anyway and *says so*, because refusing there would break a
+  working deployment over something that is not contention.
 - **A cache is per NODE, and the registry is keyed per (fingerprint, endpoint).** A
   node with two `--toolchain` flags is two entries against one machine —
   deliberately — and both heartbeat the SAME cache figures, so summing a cache field

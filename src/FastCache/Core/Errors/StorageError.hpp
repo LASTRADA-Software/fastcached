@@ -38,38 +38,35 @@ enum class StorageErrorCode : std::uint8_t
     /// message text.
     ///
     /// Appended rather than slotted in beside `Corrupt` so that no existing
-    /// enumerator's value moves: `StorageError::ToString` renders the code as a
-    /// number, and an operator alerting on one would otherwise silently start
-    /// matching a different condition after an upgrade.
+    /// enumerator's value moves. `StorageError::ToString` names the code rather
+    /// than numbering it, so a fresh log line no longer carries an ordinal at
+    /// all — but one written by an older build does, and an operator alerting on
+    /// that number would otherwise silently start matching a different condition
+    /// after an upgrade.
     UnsupportedFormatVersion,
+
+    /// Another process holds this store open.
+    ///
+    /// Deliberately not `IoError`: the file is intact and the remedy is the
+    /// other process or a different path, never a repair. An operator sent to
+    /// inspect a healthy store is most of what made the silent version of this
+    /// bug expensive.
+    ///
+    /// Appended for the same reason as the enumerator above, and the reason
+    /// survives even though `ToString` now names the code rather than
+    /// numbering it: a log line written by an OLDER build still carries an
+    /// ordinal, so moving an existing enumerator would retroactively change
+    /// what those lines appear to say.
+    InUse,
 };
 
-/// Structured storage error.
-struct StorageError
-{
-    StorageErrorCode code = StorageErrorCode::IoError;
-
-    /// Native OS error code if applicable. Zero otherwise.
-    int systemCode = 0;
-
-    std::string context;
-
-    [[nodiscard]] std::string ToString() const
-    {
-        return std::format("StorageError(code={} system={} context={})", static_cast<unsigned>(code), systemCode, context);
-    }
-};
-
-/// Build a `StorageError` carrying only a code (no system code or context).
-/// Centralizes the full field initialization in one place so call sites stay
-/// terse without tripping `-Wmissing-designated-field-initializers`.
+/// Stable name for a StorageErrorCode, suitable for diagnostic logging.
+///
+/// Declared above `StorageError` so `ToString()` can name the code rather than
+/// print its ordinal: an operator reading `code=7` learns nothing, and the
+/// number is not even stable — it shifts whenever an enumerator is inserted.
 /// @param code The storage error category.
-/// @return A `StorageError` with `code` set and the remaining fields defaulted.
-[[nodiscard]] inline StorageError MakeStorageError(StorageErrorCode code) noexcept
-{
-    return StorageError { .code = code, .systemCode = 0, .context = {} };
-}
-
+/// @return Static string view; never empty.
 [[nodiscard]] constexpr std::string_view ToStringView(StorageErrorCode code) noexcept
 {
     switch (code)
@@ -90,6 +87,8 @@ struct StorageError
             return "Corrupt";
         case StorageErrorCode::IoError:
             return "IoError";
+        case StorageErrorCode::InUse:
+            return "InUse";
         case StorageErrorCode::ReadOnly:
             return "ReadOnly";
         case StorageErrorCode::InvalidArgument:
@@ -104,6 +103,32 @@ struct StorageError
             return "UnsupportedFormatVersion";
     }
     return "Unknown";
+}
+
+/// Structured storage error.
+struct StorageError
+{
+    StorageErrorCode code = StorageErrorCode::IoError;
+
+    /// Native OS error code if applicable. Zero otherwise.
+    int systemCode = 0;
+
+    std::string context;
+
+    [[nodiscard]] std::string ToString() const
+    {
+        return std::format("StorageError(code={} system={} context={})", ToStringView(code), systemCode, context);
+    }
+};
+
+/// Build a `StorageError` carrying only a code (no system code or context).
+/// Centralizes the full field initialization in one place so call sites stay
+/// terse without tripping `-Wmissing-designated-field-initializers`.
+/// @param code The storage error category.
+/// @return A `StorageError` with `code` set and the remaining fields defaulted.
+[[nodiscard]] inline StorageError MakeStorageError(StorageErrorCode code) noexcept
+{
+    return StorageError { .code = code, .systemCode = 0, .context = {} };
 }
 
 } // namespace FastCache

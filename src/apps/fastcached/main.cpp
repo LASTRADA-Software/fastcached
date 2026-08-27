@@ -296,14 +296,56 @@ struct StorageBackendBundle
 #endif
 }
 
+/// What an operator is told when a store will not open, whichever shape of
+/// storage produced it.
+///
+/// One function because the three call sites below differ only in the noun --
+/// the whole store, or one shard of it -- and a message assembled separately at
+/// each is a message that drifts at two of them.
+///
+/// It also picks the remedy. `StorageAccessHint` has to *probe* for its answer,
+/// because a permission problem arrives as an unhelpfully generic failure,
+/// whereas `InUse` needs no probe at all: the code IS the diagnosis, and it is
+/// the one open failure whose cause is another process rather than anything
+/// about the file or the directory. So an operator whose real problem is the
+/// other daemon is never handed an `icacls` command instead.
+/// @param what      What the path names to an operator: "storage" or "shard".
+/// @param path      The path that would not open.
+/// @param effective The merged configuration.
+/// @param error     What `CowTreeStorage::Open` reported.
+/// @return The sentence to fail with.
+[[nodiscard]] std::string StorageOpenFailure(std::string_view what,
+                                             std::string_view path,
+                                             FastCache::Config const& effective,
+                                             FastCache::StorageError const& error)
+{
+    auto const remedy = error.code == FastCache::StorageErrorCode::InUse
+                            ? std::string { "\nAnother process already has this store open. A storage path belongs "
+                                            "to one daemon: stop the other one, or give this daemon a path of its own." }
+                            : StorageAccessHint(effective);
+    return std::format("failed to open {} '{}': {}{}", what, path, error.ToString(), remedy);
+}
+
 /// Open a CowTreeStorage at `path` and wrap it in a LayeredStorage(L1
 /// InMemoryLruStorage, L2 CowTreeStorage). The L1 cache owns the
 /// per-shard memory budget; the disk tier is unbounded for now.
-[[nodiscard]] std::expected<std::unique_ptr<FastCache::LayeredStorage>, std::string> BuildLayeredShard(
+///
+/// Fails with the `StorageError` rather than a rendered string, so the CODE
+/// survives to the caller that composes the operator's message. Flattened here,
+/// "another process has this store open" would be one more opaque open failure
+/// by the time anybody could act on it.
+/// @param path              Where this shard's B+tree lives.
+/// @param effective         The merged configuration.
+/// @param perShardBytes     RAM budget for this shard's L1.
+/// @param perShardDiskBytes On-disk budget for this shard's L2; 0 is unbounded.
+/// @param logger            Where an unenforceable exclusive claim is reported.
+/// @return The layered shard, or why its store would not open.
+[[nodiscard]] std::expected<std::unique_ptr<FastCache::LayeredStorage>, FastCache::StorageError> BuildLayeredShard(
     std::filesystem::path const& path,
     FastCache::Config const& effective,
     std::size_t perShardBytes,
-    std::size_t perShardDiskBytes)
+    std::size_t perShardDiskBytes,
+    FastCache::ILogger& logger)
 {
     FastCache::CowTreeStorage::Options opts;
     opts.path = path;
@@ -318,7 +360,15 @@ struct StorageBackendBundle
     opts.compressionMinBytes = effective.compressionMinBytes;
     auto opened = FastCache::CowTreeStorage::Open(opts);
     if (!opened.has_value())
-        return std::unexpected(opened.error().ToString());
+        return std::unexpected(opened.error());
+
+    // Read before the store disappears into the LayeredStorage, and said out
+    // loud rather than assumed: a guard that silently does nothing reads
+    // exactly like one that works.
+    if ((*opened)->StoreLockState() == CowTree::FilePageStore::LockState::Unavailable)
+        logger.Logf(FastCache::LogLevel::Warn,
+                    "{} is on a filesystem that cannot lock; nothing stops a second daemon opening it",
+                    path.string());
     auto l1 = MakeL1(effective, perShardBytes);
     return std::make_unique<FastCache::LayeredStorage>(std::move(l1), std::move(*opened));
 }
@@ -357,7 +407,8 @@ struct StorageBackendBundle
     bool usingPersistent,
     std::size_t physicalShards,
     std::size_t perShardBytes,
-    std::size_t perShardDiskBytes)
+    std::size_t perShardDiskBytes,
+    FastCache::ILogger& logger)
 {
     std::vector<std::unique_ptr<FastCache::IStorage>> inners;
     inners.reserve(physicalShards);
@@ -371,10 +422,9 @@ struct StorageBackendBundle
 
     if (physicalShards == 1)
     {
-        auto layered = BuildLayeredShard(effective.storagePath, effective, perShardBytes, perShardDiskBytes);
+        auto layered = BuildLayeredShard(effective.storagePath, effective, perShardBytes, perShardDiskBytes, logger);
         if (!layered.has_value())
-            return std::unexpected(std::format(
-                "failed to open storage '{}': {}{}", effective.storagePath, layered.error(), StorageAccessHint(effective)));
+            return std::unexpected(StorageOpenFailure("storage", effective.storagePath, effective, layered.error()));
         inners.push_back(std::move(*layered));
         return inners;
     }
@@ -390,10 +440,9 @@ struct StorageBackendBundle
 
     for (auto const& path: StorageShardPaths(effective.storagePath, physicalShards))
     {
-        auto layered = BuildLayeredShard(path, effective, perShardBytes, perShardDiskBytes);
+        auto layered = BuildLayeredShard(path, effective, perShardBytes, perShardDiskBytes, logger);
         if (!layered.has_value())
-            return std::unexpected(std::format(
-                "failed to open shard '{}': {}{}", path.string(), layered.error(), StorageAccessHint(effective)));
+            return std::unexpected(StorageOpenFailure("shard", path.string(), effective, layered.error()));
         inners.push_back(std::move(*layered));
     }
     return inners;
@@ -416,7 +465,8 @@ struct StorageBackendBundle
 [[nodiscard]] std::expected<StorageBackendBundle, std::string> BuildStorageBackend(FastCache::Config const& effective,
                                                                                    bool usingPersistent,
                                                                                    bool useShardingWrapper,
-                                                                                   std::size_t physicalShards)
+                                                                                   std::size_t physicalShards,
+                                                                                   FastCache::ILogger& logger)
 {
     auto const perShardBytes = physicalShards > 0 ? effective.maxMemoryBytes / physicalShards : effective.maxMemoryBytes;
     // Split the on-disk budget the same way as the RAM budget. 0 stays 0
@@ -427,7 +477,8 @@ struct StorageBackendBundle
 
     if (useShardingWrapper)
     {
-        auto inners = BuildShardedInners(effective, usingPersistent, physicalShards, perShardBytes, perShardDiskBytes);
+        auto inners =
+            BuildShardedInners(effective, usingPersistent, physicalShards, perShardBytes, perShardDiskBytes, logger);
         if (!inners.has_value())
             return std::unexpected(std::move(inners.error()));
         bundle.backend = std::make_unique<FastCache::ShardedStorage>(std::move(*inners));
@@ -441,10 +492,9 @@ struct StorageBackendBundle
         return bundle;
     }
 
-    auto layered = BuildLayeredShard(effective.storagePath, effective, perShardBytes, perShardDiskBytes);
+    auto layered = BuildLayeredShard(effective.storagePath, effective, perShardBytes, perShardDiskBytes, logger);
     if (!layered.has_value())
-        return std::unexpected(std::format(
-            "failed to open storage '{}': {}{}", effective.storagePath, layered.error(), StorageAccessHint(effective)));
+        return std::unexpected(StorageOpenFailure("storage", effective.storagePath, effective, layered.error()));
     bundle.backend = std::move(*layered);
     return bundle;
 }
@@ -637,7 +687,7 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
     FastCache::RedisMutationObserver mutationObserver { &watches, &keyspaceNotifier };
     FastCache::ReclaimLog reclaimLog { &mutationObserver, &metrics };
 
-    auto bundle = BuildStorageBackend(effective, usingPersistent, useShardingWrapper, physicalShards);
+    auto bundle = BuildStorageBackend(effective, usingPersistent, useShardingWrapper, physicalShards, logger);
     if (!bundle.has_value())
     {
         logger.Logf(FastCache::LogLevel::Fatal, "{}", bundle.error());

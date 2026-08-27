@@ -168,6 +168,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   arithmetic with each named, and a tie names the earlier limit in enumerator order.
 - A heartbeat age is a duration on a report, never a `TimePoint` on `WorkerInfo` —
   a raw instant invites `steady_clock::now()` and breaks every `ManualClock` test.
+- A CoW store file is claimed exclusively at `Open` and a second opener is refused
+  by name (`InUse`), never left to interleave meta-page writes. `flock`, never
+  `fcntl` — an fcntl lock is per process and a second store inside one would take
+  it again and succeed.
 
 **[`.agent/rules/consensus-and-cluster.md`](.agent/rules/consensus-and-cluster.md)**
 — Raft, discovery, membership. Before `Consensus/`, `Cluster/`.

@@ -177,6 +177,10 @@ class CowTreeStorage final: public IStorage
 
     /// Open or create the storage. Replays existing entries into the
     /// in-memory LRU mirror.
+    ///
+    /// The backing file is claimed exclusively for the life of the returned
+    /// object, so a second process on one path is refused with
+    /// StorageErrorCode::InUse rather than left to corrupt it.
     [[nodiscard]] static std::expected<std::unique_ptr<CowTreeStorage>, StorageError> Open(Options options);
 
     /// Convert the store at `options.path` to the record layout this build
@@ -326,6 +330,18 @@ class CowTreeStorage final: public IStorage
 
     /// Reconfigure the byte budget at runtime. Evicts as needed.
     void Resize(std::size_t newMaxBytes) override;
+
+    /// Whether the backing file is held under an exclusive inter-process claim.
+    ///
+    /// `std::nullopt` when this storage was opened over a caller-supplied page
+    /// store, which need not be a file at all — absent is not zero, and a test
+    /// driving an `InMemoryPageStore` has no claim to report rather than a
+    /// missing one. Deliberately NOT on `IStorage`: it is a `FilePageStore`
+    /// fact, and putting it on the interface would oblige every decorator
+    /// (`LayeredStorage`, `ShardedStorage`, `TracingStorage`, ...) to forward
+    /// it, which is how a decorator quietly answers for a tier it is not.
+    /// @return The claim's state, or nullopt when there is no file behind this.
+    [[nodiscard]] std::optional<CowTree::FilePageStore::LockState> StoreLockState() const noexcept;
 
   private:
     explicit CowTreeStorage(Options options) noexcept;
@@ -550,6 +566,11 @@ class CowTreeStorage final: public IStorage
     /// The active page store — points at `_ownedStore` or a borrowed store.
     CowTree::IPageStore* _store { nullptr };
     std::unique_ptr<CowTree::CowTree> _tree;
+
+    /// What the `FilePageStore` reported about its claim, recorded by `Open`
+    /// alone. Empty on the borrowing and injected-store paths, where there is
+    /// no file and so nothing to have claimed.
+    std::optional<CowTree::FilePageStore::LockState> _storeLockState;
 
     struct LruNode
     {
