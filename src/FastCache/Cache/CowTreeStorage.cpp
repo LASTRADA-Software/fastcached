@@ -1349,6 +1349,33 @@ void CowTreeStorage::EraseNode(Iterator it)
     _lru.erase(it);
 }
 
+void CowTreeStorage::ReclaimDeadRecord(std::string_view key, CacheEntry const& entry, TimePoint now)
+{
+    // Recorded BEFORE the erase, not after. `key` is a caller's view at every
+    // site today, but the erase drops the LRU node that owns the only other
+    // copy of that string -- so recording first is what keeps the ordering from
+    // being a precondition a future caller has to know about.
+    if (entry.expiry <= now)
+        RecordReclaim(_reclaim, MutationKind::Expire, key);
+    // Ignored, as on the delete path: the record is already unreachable to
+    // every caller, so a failure to erase it costs disk space and nothing else.
+    // Reporting an I/O error out of a verb whose answer is "that key is not
+    // here" would turn a miss into a failure.
+    std::ignore = EraseEntry(key);
+    EraseFromLru(key);
+}
+
+bool CowTreeStorage::AcceptLiveRecord(std::string_view key, std::optional<LoadedEntry> const& loaded, TimePoint now)
+{
+    if (!loaded.has_value())
+        return false; // Nothing on disk; nothing to reclaim either.
+    auto const& entry = loaded->entry;
+    if (entry.expiry > now && entry.generation >= _liveGeneration)
+        return true;
+    ReclaimDeadRecord(key, entry, now);
+    return false;
+}
+
 void CowTreeStorage::EvictToFit()
 {
     FC_ZONE_SCOPED_N("CowTreeStorage::EvictToFit");
@@ -1441,7 +1468,14 @@ std::expected<CasToken, StorageError> CowTreeStorage::UpdateRecordMetadata(std::
         return std::unexpected(parsed.error());
     auto& entry = parsed->entry;
     if (entry.expiry <= now || entry.generation < _liveGeneration)
+    {
+        // Reached through `Touch` and `MarkStale`, both of which write -- so
+        // unlike `Get` and `Peek` this one may reclaim, and `AcceptLiveRecord`
+        // is not usable here only because the record was read raw rather than
+        // through `LoadEntry`.
+        ReclaimDeadRecord(key, entry, now);
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
+    }
 
     // Re-encode ONLY the leaf record. The value bytes are never decompressed,
     // re-read, or re-compressed — the record's existing codec + original length
@@ -1587,7 +1621,12 @@ std::expected<CasToken, StorageError> CowTreeStorage::Add(
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
-    if (loaded->has_value() && (*loaded)->entry.expiry > now && (*loaded)->entry.generation >= _liveGeneration)
+    // The same question the verbs below ask, acted on the other way round --
+    // and it is what reclaims a lapsed record here rather than letting the Set
+    // silently overwrite it. `NotifyingStorage` drains reclaims before it emits
+    // a verb's own event, so a subscriber sees `expired k` and then `set k`,
+    // which is the order the in-memory tier already produces for this sequence.
+    if (AcceptLiveRecord(key, *loaded, now))
         return std::unexpected(MakeError(StorageErrorCode::KeyExists));
     return Set(key, std::move(value), flags, expiry);
 }
@@ -1598,7 +1637,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Replace(
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
-    if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
+    if (!AcceptLiveRecord(key, *loaded, now))
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     return Set(key, std::move(value), flags, expiry);
 }
@@ -1611,7 +1650,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Append(std::string_view ke
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
-    if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
+    if (!AcceptLiveRecord(key, *loaded, now))
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     auto& entry = (*loaded)->entry;
     if (expected != 0 && entry.cas != expected)
@@ -1643,7 +1682,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Prepend(std::string_view k
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
-    if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
+    if (!AcceptLiveRecord(key, *loaded, now))
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     auto& entry = (*loaded)->entry;
     if (expected != 0 && entry.cas != expected)
@@ -1680,7 +1719,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::CompareAndSwap(std::string
         ++_stats.casMisses;
         return std::unexpected(loaded.error());
     }
-    if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
+    if (!AcceptLiveRecord(key, *loaded, now))
     {
         ++_stats.casMisses;
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
@@ -1713,7 +1752,7 @@ std::expected<IStorage::IncrResult, StorageError> CowTreeStorage::IncrementOrIni
     // semantics (binary `initial`/`expiration`, meta `J`/`N`) and re-issues
     // a Set on KeyNotFound. Auto-vivifying here with current=0 would ignore
     // those flags and silently bypass the binary "do not create" sentinel.
-    if (!loaded->has_value() || (*loaded)->entry.expiry <= now || (*loaded)->entry.generation < _liveGeneration)
+    if (!AcceptLiveRecord(key, *loaded, now))
     {
         if (decrement)
             ++_stats.decrMisses;
@@ -1777,18 +1816,12 @@ std::expected<void, StorageError> CowTreeStorage::Delete(std::string_view key, T
     auto const& entry = (*loaded)->entry;
     if (entry.expiry <= now || entry.generation < _liveGeneration)
     {
-        // The on-disk record is stale (expired or older than the
-        // current flush generation); still clean it up so a subsequent
-        // restart doesn't replay the dead bytes. Caller's view is the
+        // The on-disk record is stale (expired or older than the current flush
+        // generation); still clean it up so a subsequent restart doesn't replay
+        // the dead bytes, and report the expiry so the same client sequence
+        // does not produce different events per backend. Caller's view is the
         // same as if the key was absent — KeyNotFound.
-        std::ignore = EraseEntry(key);
-        EraseFromLru(key);
-        // A lapsed TTL noticed here is a reclaim like any other: the in-memory
-        // tier reports one from its own delete path, and the same client
-        // sequence must not produce different events per backend. A stale
-        // generation is excluded, as everywhere else — FLUSHDB already fired.
-        if (entry.expiry <= now)
-            RecordReclaim(_reclaim, MutationKind::Expire, key);
+        ReclaimDeadRecord(key, entry, now);
         ++_stats.deleteMisses;
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     }

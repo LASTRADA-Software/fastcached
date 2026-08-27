@@ -380,6 +380,46 @@ class CowTreeStorage final: public IStorage
     /// Erase the entry from the tree.
     [[nodiscard]] std::expected<void, StorageError> EraseEntry(std::string_view key);
 
+    /// Reclaim a record a write path has just found dead, and report it.
+    ///
+    /// The disk tier's answer to what `InMemoryLruStorage::FindAlive` does for
+    /// the in-memory one. Every write verb here loads the record, finds its TTL
+    /// lapsed or its generation stale, and reports a miss -- and used to leave
+    /// the record exactly where it was. Two things followed, and both were
+    /// visible to a client: the dead bytes stayed on disk until a sweep or a
+    /// `DELETE` reached them, and the same client sequence produced a different
+    /// event stream depending on `--storage`, because the in-memory tier
+    /// reclaims and reports from every lookup.
+    ///
+    /// Only a write path may call this. A read (`Get`, `Peek`) may hold nothing
+    /// but a shared lock, and opening a write transaction there would break
+    /// CowTree's single-writer contract -- which is why those two still leave a
+    /// dead record for the sweep, and why the asymmetry is now one of timing
+    /// rather than of whether it happens at all.
+    ///
+    /// A stale generation is reclaimed silently: FLUSHDB fired its own event,
+    /// and naming the key `expired` on top of that reports a TTL that never
+    /// passed.
+    /// @param key   The record's key. Must not alias the LRU node's own string.
+    /// @param entry The record as loaded, already known to be dead.
+    /// @param now   Current clock value; decides lapsed from merely flushed.
+    void ReclaimDeadRecord(std::string_view key, CacheEntry const& entry, TimePoint now);
+
+    /// Decide a write path's existence check, reclaiming whatever it finds dead.
+    ///
+    /// The one spelling of "is there a record here I may act on?" for every
+    /// verb that loads before it writes, so the reclaim above cannot be
+    /// remembered at four sites and forgotten at a fifth. `Add` asks the same
+    /// question and acts on the opposite answer.
+    /// @param key    The record's key.
+    /// @param loaded What `LoadEntry` returned for it.
+    /// @param now    Current clock value.
+    /// @return True when `loaded` holds a record this verb may operate on.
+    ///         False when there is none -- absent, TTL lapsed, or voided by a
+    ///         flush -- in which case a dead record has already been erased,
+    ///         and reported when its TTL was what killed it.
+    [[nodiscard]] bool AcceptLiveRecord(std::string_view key, std::optional<LoadedEntry> const& loaded, TimePoint now);
+
     /// Apply a metadata-only mutation (TTL / stale / lastAccess) to the stored
     /// record for `key`, rewriting ONLY the leaf record and REUSING any existing
     /// overflow chain in place — no chain materialisation and no chain rewrite,
