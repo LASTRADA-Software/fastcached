@@ -603,6 +603,27 @@ TEST_CASE("A machine with no SDK registered reports no kit", "[toolchain-probe]"
     CHECK(WindowsKitIncludeRoots(host).empty());
 }
 
+TEST_CASE("An empty 32-bit KitsRoot10 still reaches the native view", "[toolchain-probe]")
+{
+    // Present and EMPTY is a third answer, and the fallback has to treat it as
+    // absent. `ReadRegistryString` returns a zero-length value as an empty string
+    // rather than as `nullopt` -- which is what a partial or rolled-back SDK
+    // uninstall leaves in `WOW6432Node` -- so a fallback gated on `has_value()`
+    // alone never read the native view, and the machine's `cl` lost the whole SDK
+    // half of its identity while the VC half kept `MsvcLayout` off its `INCLUDE`
+    // fallback too. It then fingerprinted differently from an identically
+    // toolchained peer, with no diagnostic at either end.
+    ScriptedToolchainHost host;
+    constexpr std::string_view roots = R"(SOFTWARE\Microsoft\Windows Kits\Installed Roots)";
+    constexpr std::string_view kits = "C:/Program Files (x86)/Windows Kits/10";
+
+    host.AddRegistryValue(RegistryHive::LocalMachine, roots, "KitsRoot10", "", RegistryView::ThirtyTwoBit);
+    host.AddRegistryValue(RegistryHive::LocalMachine, roots, "KitsRoot10", std::string { kits } + "/", RegistryView::Native);
+    host.AddDirectory(std::string { kits } + "/Include/10.0.26100.0/ucrt");
+
+    CHECK(WindowsKitIncludeRoots(host) == std::vector<std::string> { std::string { kits } + "/Include/10.0.26100.0/ucrt" });
+}
+
 TEST_CASE("An MSVC service and a developer prompt derive the same roots", "[toolchain-probe]")
 {
     // The defect this whole mechanism exists for. A Windows service inherits no

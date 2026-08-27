@@ -562,7 +562,13 @@ std::vector<std::string> WindowsKitIncludeRoots(IToolchainHost& host)
     // machine has that discovery never sees.
     auto kitsRoot =
         host.RegistryString(RegistryHive::LocalMachine, InstalledRootsKey, KitsRootValue, RegistryView::ThirtyTwoBit);
-    if (!kitsRoot.has_value())
+
+    // Present-and-EMPTY counts as absent for that fallback, which is the third
+    // answer `RegistryString` can give and the easy one to miss: a zero-length
+    // value comes back as an empty string rather than as `nullopt`. Testing only
+    // `has_value()` skipped the native read on a machine whose 32-bit value had
+    // been emptied, and dropped the SDK half of its identity in silence.
+    if (!kitsRoot.has_value() || kitsRoot->empty())
         kitsRoot = host.RegistryString(RegistryHive::LocalMachine, InstalledRootsKey, KitsRootValue, RegistryView::Native);
     if (!kitsRoot.has_value() || kitsRoot->empty())
         return {};
