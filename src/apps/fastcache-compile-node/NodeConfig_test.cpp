@@ -2,6 +2,7 @@
 #include "LauncherCli.hpp"
 #include "NodeConfig.hpp"
 
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
@@ -9,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <format>
@@ -50,6 +53,28 @@ namespace
     if (!flow.has_value())
         return std::unexpected(flow.error());
     return cfg;
+}
+
+/// What `CacheCapacityOf` reports for a node that built no cache tier.
+///
+/// A named constant rather than a bare `{}` at the call sites, because it is the
+/// argument that carries the meaning: this node runs no cache, so it holds nothing
+/// back from a compile.
+constexpr Distributed::NodeCacheCapacity NoCacheTier {};
+
+/// What `CacheCapacityOf` reports for a node whose only tier is @p tier, holding
+/// @p bytes.
+///
+/// One helper over the tier rather than one per tier: the cases differ by which
+/// enumerator they name, and that is the fact each is asserting.
+/// @param tier Which tier the node built.
+/// @param bytes That tier's budget.
+/// @return The cache record such a node announces.
+[[nodiscard]] Distributed::NodeCacheCapacity CacheTierOf(StorageTier tier, std::uint64_t bytes)
+{
+    Distributed::NodeCacheCapacity cache;
+    cache.tierBytesLimit[static_cast<std::size_t>(tier)] = bytes;
+    return cache;
 }
 
 /// A machine a test can describe, standing in for the one it runs on.
@@ -796,18 +821,10 @@ TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node]
     // line that reads correctly.
     NodeConfig cfg;
 
-    // Stated rather than defaulted, and that is the `FakeHost` seam being kept
-    // honest rather than tidiness. The cache budget's default is a share of the RAM
-    // of the machine this test *runs on*, while the memory it is weighed against
-    // comes from the fake — so leaving it default mixes two machines into one sum
-    // and gives an answer that changes with the runner. Sections that are about the
-    // cache say so and override it.
-    cfg.cacheMemoryBytes = 0;
-
     SECTION("a developer's laptop keeps cores for its owner")
     {
         FakeHost const laptop { 8, 32ULL << 30 };
-        auto const capacity = NodeCapacityOf(cfg, laptop);
+        auto const capacity = NodeCapacityOf(cfg, laptop, NoCacheTier);
 
         CHECK(capacity.logicalCores == 8);
         CHECK(capacity.totalMemoryBytes == (32ULL << 30));
@@ -823,7 +840,7 @@ TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node]
         cfg.nodeClass = Distributed::NodeClass::Dedicated;
         FakeHost const server { 128, 512ULL << 30 };
 
-        CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, server), cfg.slots) == 128);
+        CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, server, NoCacheTier), cfg.slots) == 128);
     }
 
     SECTION("a machine whose cores outrun its memory is sized by the memory")
@@ -831,18 +848,22 @@ TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node]
         cfg.nodeClass = Distributed::NodeClass::Dedicated;
         FakeHost const cramped { 128, 32ULL << 30 };
 
-        CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, cramped), cfg.slots) == 32);
+        CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, cramped, NoCacheTier), cfg.slots) == 32);
     }
 
     SECTION("the node's own cache is memory a compile cannot have")
     {
         cfg.nodeClass = Distributed::NodeClass::Dedicated;
-        cfg.cacheMemoryBytes = 8ULL << 30;
         FakeHost const cramped { 128, 32ULL << 30 };
+        auto const memoryTier = CacheTierOf(StorageTier::Memory, 8ULL << 30);
 
-        auto const capacity = NodeCapacityOf(cfg, cramped);
+        auto const capacity = NodeCapacityOf(cfg, cramped, memoryTier);
         // Declared, so the scheduler at the other end reaches the same number.
         CHECK(capacity.reservedMemoryBytes == (8ULL << 30));
+        // And it is the SAME record the leader renders the member's cache from, not
+        // a second opinion about it: the reservation is that budget rather than a
+        // number derived alongside it.
+        CHECK(capacity.cache.tierBytesLimit == memoryTier.tierBytesLimit);
         // And the machine still reports the RAM it *has*: the dashboard prints this,
         // and a machine that appeared to shrink by the size of its own cache would be
         // a different lie.
@@ -853,17 +874,67 @@ TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node]
         CHECK(Distributed::OfferableSlots(capacity, cfg.slots) == 24);
     }
 
+    SECTION("a node that built no cache tier holds nothing back for one")
+    {
+        // The pairing no case used to make, and the whole of #167: a cache budget
+        // that was asked for, and a tier that was never built. `--listen-cache=`
+        // reaches it, and so does a DEFAULT cache port `fastcached` already holds on
+        // the same machine -- neither of which touches `cacheMemoryBytes`, whose
+        // default is a quarter of RAM. Sized from the flag, this node reserved eight
+        // gigabytes for nothing and offered the fleet 24 slots instead of 32:
+        // under-utilisation rather than breakage, and therefore silent forever.
+        cfg.nodeClass = Distributed::NodeClass::Dedicated;
+        // Set and then deliberately ignored: this line IS the regression guard, and
+        // it is the only section here that touches the flag at all.
+        cfg.cacheMemoryBytes = 8ULL << 30;
+        FakeHost const cramped { 128, 32ULL << 30 };
+
+        auto const capacity = NodeCapacityOf(cfg, cramped, NoCacheTier);
+        CHECK(capacity.reservedMemoryBytes == 0);
+        CHECK(Distributed::OfferableSlots(capacity, cfg.slots) == 32);
+    }
+
+    SECTION("a disk-only cache is disk, and takes no memory from a compile")
+    {
+        // `--cache-memory 0 --cache-dir <path>` is a real deployment, and the tier
+        // it builds is resident nowhere -- which `StorageTierTable` now says rather
+        // than each reader assuming. Summing every tier's budget into the memory
+        // reservation would cost this node ten of its slots for a cache on disk.
+        cfg.nodeClass = Distributed::NodeClass::Dedicated;
+        FakeHost const cramped { 128, 32ULL << 30 };
+
+        auto const capacity = NodeCapacityOf(cfg, cramped, CacheTierOf(StorageTier::Disk, 10ULL << 30));
+        CHECK(capacity.reservedMemoryBytes == 0);
+        CHECK(Distributed::OfferableSlots(capacity, cfg.slots) == 32);
+    }
+
+    SECTION("a resident tier with no ceiling is reserved as the whole machine")
+    {
+        // Zero is this vocabulary's UNBOUNDED, not its "nothing" -- the same two
+        // meanings of that number `--cache-memory 0` already has a rule about. Read
+        // as "reserve nothing", it would be the exact inverse of what the tier just
+        // said: the node would offer every slot while its cache grew without a
+        // ceiling. Reserved as the whole machine, `OfferableSlots`'s own floor
+        // applies and the memory decides rather than the 128 cores.
+        cfg.nodeClass = Distributed::NodeClass::Dedicated;
+        FakeHost const cramped { 128, 32ULL << 30 };
+
+        auto const capacity = NodeCapacityOf(cfg, cramped, CacheTierOf(StorageTier::Memory, 0));
+        CHECK(capacity.reservedMemoryBytes == (32ULL << 30));
+        CHECK(Distributed::OfferableSlots(capacity, cfg.slots) == 1);
+    }
+
     SECTION("a typed reserve of zero is not the same as no reserve")
     {
         FakeHost const laptop { 8, 32ULL << 30 };
 
         cfg.reservedCores = 0;
-        auto const explicitNone = NodeCapacityOf(cfg, laptop);
+        auto const explicitNone = NodeCapacityOf(cfg, laptop, NoCacheTier);
         CHECK(explicitNone.reserveIsExplicit);
         CHECK(Distributed::OfferableSlots(explicitNone, cfg.slots) == 8);
 
         cfg.reservedCores = 4;
-        CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, laptop), cfg.slots) == 4);
+        CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, laptop, NoCacheTier), cfg.slots) == 4);
     }
 
     SECTION("an explicit slot count overrides every derivation")
@@ -871,7 +942,10 @@ TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node]
         cfg.slots = 20;
         FakeHost const laptop { 8, 32ULL << 30 };
 
-        CHECK(Distributed::OfferableSlots(NodeCapacityOf(cfg, laptop), cfg.slots) == 20);
+        // With a cache tier big enough that every derivation would have clamped
+        // below 20, so this passes only because the typed number wins outright.
+        auto const capacity = NodeCapacityOf(cfg, laptop, CacheTierOf(StorageTier::Memory, 8ULL << 30));
+        CHECK(Distributed::OfferableSlots(capacity, cfg.slots) == 20);
     }
 }
 

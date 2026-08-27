@@ -262,8 +262,32 @@ rules, none of them the obvious one:
   rather than a null pointer, so "this node has no shared cache" is a decision
   somebody made rather than a pointer nobody set.
 
-Four more about what the tier IS and who gets to see it:
+Six more about what the tier IS and who gets to see it:
 
+- **What a node holds back from compiles is what its tier BUILT, never what a flag
+  asked for.** `--cache-memory` is a request, and three things grant it and one
+  denies it: `--listen-cache=` builds no tier at all, `--cache-memory 0` builds no
+  memory half, and a DEFAULT `--listen-cache` already held — by the `fastcached` on
+  the same machine, which is where that port points — is a warning the node carries
+  on past. None of the three touches `cacheMemoryBytes`, whose default is a quarter
+  of RAM, so `NodeCapacityOf` reading the flag reserved 8 GiB on a 32 GiB box that
+  cached nothing and offered the fleet 24 slots instead of 32. Under-utilisation
+  rather than breakage, and therefore silent forever: nothing anywhere reports a
+  reservation for a tier that does not exist. `NodeCapacityOf` takes the
+  `NodeCacheCapacity` that `CacheCapacityOf` read off the tier, which is why
+  `WorkerBody` derives capacity and `slots` BELOW the tier startup rather than above
+  it — and why the record the leader renders and the number the worker enforces are
+  now one call rather than a patched copy.
+- **Which tiers cost the machine RAM is a column of `StorageTierTable`, not a check
+  for `StorageTier::Memory`.** The taxonomy is open — the enum's own comment
+  foreshadows a tier on a peer and a tier on a second filesystem — and enumerators
+  are appended, so a resident tier added later would land past any hand-written
+  check and be reserved as nothing. That direction over-commits the machine, which
+  is the swapping-and-OOM failure `MemoryBudgetPerJobBytes` exists to prevent. And
+  the reservation is total over the vocabulary: **absent** is a tier this node does
+  not run, while **present and zero** is a tier with no ceiling, so a resident one
+  is reserved as the whole machine rather than as nothing — the same two meanings of
+  zero the bullet below already records.
 - **`--cache-memory 0` means no in-memory tier, and zero is how
   `InMemoryLruStorage` spells UNBOUNDED.** `EvictToFit` returns immediately on a
   zero budget, so for as long as the flag existed the one number an operator could
@@ -655,6 +679,14 @@ the seam.
 
 ## Open work
 
+- **[#175](https://github.com/LASTRADA-Software/fastcached/issues/175)** — a disk
+  tier's in-memory key index is RAM nothing accounts for. `--cache-disk` and
+  `tierBytesLimit[Disk]` both denominate bytes on the filesystem, while
+  `CowTreeStorage` keeps every live key resident, so a `--cache-memory 0
+  --cache-dir …` node reserves nothing and offers the whole machine. Marking the
+  disk tier resident is NOT the fix — its budget is disk, so summing it into a
+  memory total is wrong by the ratio between the two rather than by the index's
+  size. The fix needs a figure that does not exist yet.
 - **[#148](https://github.com/LASTRADA-Software/fastcached/issues/148)** — every
   discovered compiler is spawned twice at startup with the same argv, once to learn
   it can be spawned and once for its banner, and the first is in a serial loop in

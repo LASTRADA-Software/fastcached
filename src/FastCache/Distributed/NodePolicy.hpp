@@ -179,6 +179,13 @@ struct NodeCapacity
     ///
     /// Zero when the node runs no cache, and zero from a peer too old to report one,
     /// which is the same arithmetic this had before the field existed.
+    ///
+    /// **Not guaranteed to agree with `cache`**, and deliberately not: the two are
+    /// independent fields of the registration record, so a peer too old to send one,
+    /// or an implementation that is not this one, may report a reservation this
+    /// build would have derived differently. Consume it as what the sender claims to
+    /// hold back. What a node running THIS build puts here is derived from `cache` --
+    /// see `Node::NodeCapacityOf`, which is where that rule is stated and tested.
     std::uint64_t reservedMemoryBytes { 0 };
     /// How hard this machine may be driven.
     NodeClass nodeClass { NodeClass::Workstation };
@@ -188,7 +195,7 @@ struct NodeCapacity
     /// Whether `reservedCores` was set explicitly, or should follow the class.
     bool reserveIsExplicit { false };
 
-    /// What this node's cache is configured to hold.
+    /// What this node's cache tiers actually hold -- not what was asked for.
     ///
     /// Here rather than in `NodeLoad` because a budget does not move, and here
     /// rather than nowhere because the leader is the one node with a view of

@@ -460,10 +460,31 @@ struct NodeConfig
 /// The machine arrives through `IHostFactsSource` rather than through
 /// `OnlineCpuCount()` and friends, so a two-core laptop and a 128-thread server are
 /// both assertable from one test run.
+///
+/// **The cache arrives as what the tier BECAME, never as the flag that asked for
+/// one** -- the rule this function exists to hold, and the one it got wrong. The
+/// memory a node holds back from compiles is the memory its tier actually holds, and
+/// `cacheMemoryBytes` is only ever the request: `--listen-cache=` builds no tier at
+/// all, `--cache-memory 0` builds no memory half, and a DEFAULT cache port already
+/// held by a `fastcached` on the same machine is a warning the node carries on past.
+/// None of the three is visible in the flag, so sizing from it reserved a quarter of
+/// RAM for a tier that was never built and offered the fleet fewer slots than the
+/// machine has -- silently, since nothing reports a reservation for a tier that does
+/// not exist (#167).
+///
+/// Hence a **required** parameter rather than a defaulted convenience: a caller that
+/// could omit it is a caller that can quietly go back to guessing. It must also be
+/// obtained AFTER the tier has been started, which no signature can enforce --
+/// `CacheCapacityOf(nullptr)` and "not built yet" are the same record. `WorkerBody`
+/// is the one caller and derives both together, below the tier.
 /// @param cfg The parsed configuration.
 /// @param host What the machine says about itself.
+/// @param cache What this node's cache tiers hold, from `CacheCapacityOf`; a
+///        default-constructed record is a node with no tier.
 /// @return The capacity to advertise, and to size this worker's own limit by.
-[[nodiscard]] Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg, IHostFactsSource const& host);
+[[nodiscard]] Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg,
+                                                       IHostFactsSource const& host,
+                                                       Distributed::NodeCacheCapacity const& cache);
 
 /// Every accepted option, one row each.
 ///

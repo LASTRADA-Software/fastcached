@@ -10,13 +10,16 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <format>
 #include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include <tests/ScratchPath.hpp>
@@ -41,7 +44,7 @@ struct Fixture
 {
     ManualClock clock;
     AtomicMetricsSink metrics;
-    NullLogger logger;
+    CapturingLogger logger;
     Distributed::ClusterMembership membership { { "127.0.0.1:7000" } };
     NodeIoLoop io;
 
@@ -73,11 +76,26 @@ struct Fixture
     }
 };
 
+/// Whether any captured line contains @p needle.
+/// @param logger Where the tier reported.
+/// @param needle Text to look for.
+/// @return True when some line contains it.
+[[nodiscard]] bool Logged(CapturingLogger const& logger, std::string_view needle)
+{
+    auto const records = logger.Snapshot();
+    return std::ranges::any_of(records, [needle](CapturingLogger::Record const& r) { return r.message.contains(needle); });
+}
+
 /// One tier's entry, or nullopt when the cache has no such tier.
-/// @param tiers What `SnapshotTiers()` returned.
+///
+/// A template over the table, because the two this file reads -- `SnapshotTiers()`'s
+/// statistics and `CacheCapacityOf`'s budgets -- are both an `EnumTable` keyed by
+/// tier, and two helpers with one body is two things to keep in step.
+/// @param tiers Any per-tier table.
 /// @param tier Which tier to read.
 /// @return That tier's entry.
-[[nodiscard]] std::optional<StorageStats> const& At(TieredStorageStats const& tiers, StorageTier tier)
+template <typename Table>
+[[nodiscard]] auto const& At(Table const& tiers, StorageTier tier)
 {
     return tiers[static_cast<std::size_t>(tier)];
 }
@@ -100,6 +118,55 @@ TEST_CASE("A node told to hold nothing serves no cache tier", "[node][cache-tier
     CHECK(*started == nullptr);
 }
 
+TEST_CASE("A node with no cache port serves no cache tier", "[node][cache-tier]")
+{
+    // `--listen-cache=` is the documented way to turn the local cache off, and it
+    // turns it off WITHOUT touching `--cache-memory` -- whose default is a share of
+    // host RAM, so it is left non-zero here rather than relying on the runner's.
+    // That pairing, a budget asked for and no tier built, is what made sizing the
+    // machine's reservation from the flag reserve a quarter of RAM for nothing
+    // (#167).
+    Fixture fixture;
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheListen.clear();
+    cfg.cacheMemoryBytes = 8ULL * 1024 * 1024 * 1024;
+
+    auto started = fixture.Start(cfg);
+    REQUIRE(started.has_value());
+    auto const tier = std::move(*started);
+    REQUIRE(tier == nullptr);
+
+    // Absent, not zero, and all the way down: this is the record `NodeCapacityOf`
+    // derives the reservation from, so a memory tier reported here for a tier that
+    // was never built is memory the fleet would never get back.
+    auto const budget = CacheCapacityOf(tier.get());
+    CHECK_FALSE(At(budget.tierBytesLimit, StorageTier::Memory).has_value());
+    CHECK_FALSE(At(budget.tierBytesLimit, StorageTier::Disk).has_value());
+
+    // And it says so. This was the one route to "no cache tier" that logged
+    // nothing at all, so an operator had no line anywhere telling them this node
+    // was not caching.
+    CHECK(Logged(fixture.logger, "serving no local cache tier"));
+}
+
+TEST_CASE("A cache budget with no port to serve it is called out", "[node][cache-tier]")
+{
+    // `--cache-memory` and `--cache-dir` do nothing at all without a port, and a
+    // flag silently doing nothing is the shape this codebase keeps a list about.
+    // Named only when the operator actually set one -- a default nobody typed is
+    // not something to warn them about.
+    Testing::ScratchDirectory const scratch { "node-cache-no-port" };
+    Fixture fixture;
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheListen.clear();
+    cfg.cacheDir = scratch.Path();
+
+    auto const started = fixture.Start(cfg);
+    REQUIRE(started.has_value());
+    CHECK(*started == nullptr);
+    CHECK(Logged(fixture.logger, "--cache-memory/--cache-dir have no effect"));
+}
+
 TEST_CASE("A memory-only node reports its budget and no disk tier", "[node][cache-tier]")
 {
     Fixture fixture;
@@ -117,6 +184,15 @@ TEST_CASE("A memory-only node reports its budget and no disk tier", "[node][cach
     // Absent rather than a disk tier holding nothing: an operator who did not ask
     // for `--cache-dir` has no disk tier to be empty.
     CHECK_FALSE(At(tiers, StorageTier::Disk).has_value());
+
+    // And the announced record says the same, because that is the one
+    // `NodeCapacityOf` subtracts from this machine's RAM (#167). Asserted here
+    // rather than in a case of its own: `CacheCapacityOf` is a projection of the
+    // snapshot above, and this file's fixture costs a process and a port probe.
+    auto const budget = CacheCapacityOf(tier.get());
+    REQUIRE(At(budget.tierBytesLimit, StorageTier::Memory).has_value());
+    CHECK(Unwrap(At(budget.tierBytesLimit, StorageTier::Memory)) == cfg.cacheMemoryBytes);
+    CHECK_FALSE(At(budget.tierBytesLimit, StorageTier::Disk).has_value());
 }
 
 // The name may not START with `--`: `catch_discover_tests` passes it to the
