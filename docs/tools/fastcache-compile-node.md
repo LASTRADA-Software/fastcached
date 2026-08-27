@@ -104,6 +104,33 @@ build that mysteriously falls back to local compiles on every machine but one.
 It defaults to `--bind` and `--port`, which is correct only when those already
 name an address other machines can reach.
 
+## Anything the fleet reads has to be text
+
+A value that leaves this machine has to be valid UTF-8, because every other
+member reads it back: `/fleet.json` is JSON, the fleet page is HTML, and a chart
+is SVG. The flags that carry one are `--advertise`, `--bind`, `--node-id`,
+`--raft-peer`, `--cluster-id`, `--cluster-admit`, `--cluster-set`, and the
+`<fingerprint>` half of `--toolchain=<fingerprint>=<compiler>`. A worker refuses
+to start rather than registering a value the scheduler would then reject on every
+heartbeat.
+
+Non-ASCII is fine — the rule is about the encoding, not about the alphabet. What
+is refused is a byte sequence that is not UTF-8 at all, and on Windows that used
+to be what a non-ASCII argument *became* on the way into the process. Every
+binary here now declares UTF-8 as its code page, which Windows honours from
+Windows 10 1903 and Windows Server 2022 onwards.
+
+On an older Windows the declaration is ignored, and `chcp` does **not** help:
+that sets the console's code page, while arguments are transcoded through the
+system's *ANSI* one. A refused start says which code page this host is on. Either
+keep those values ASCII, or turn on the system-wide *Beta: Use Unicode UTF-8 for
+worldwide language support* setting, which is what makes `GetACP()` answer 65001
+on such a host.
+
+Paths are deliberately not covered by the rule — `--cache-dir` and the compiler
+half of `--toolchain` name files on this machine and nowhere else, so whatever
+this host calls a filename is accepted.
+
 ## Toolchains
 
 **A worker surveys this machine at startup and serves what it finds.** Nothing has

@@ -349,6 +349,42 @@ readable and silently ignored. Every rule below has already been one of them.
   `CliOptions()` and requires each non-excluded flag to be emitted — the
   exclusions, `--requirepass` above all, are listed with their reasons) and the
   launcher's `FASTCACHE_*` oracle list in `LauncherCli_test`.
+
+- **Which flags carry text OTHER MACHINES will read is a column of the table.**
+  `ParseUtf8Text` rather than `ParseText`, and the rows in it are the ones whose
+  value leaves the machine: `--advertise` and `--bind` become the endpoint clients
+  dial, `--node-id` and `--raft-peer` a member's identity and the address its peers
+  open a socket to, `--cluster-id` rides every discovery beacon, and
+  `--cluster-admit`/`--cluster-set` commit their operand through consensus — where
+  an entry is applied *after* it is committed, with nobody left to refuse it, so the
+  CLI is the last place a person can be told. Since #141 the scheduler refuses a
+  registration whose fields are not valid UTF-8, and a value that gets past the CLI
+  is refused there on every heartbeat, forever, with the operator's only recovery
+  being to rename the thing.
+
+  Three rows are deliberately OUT of the column, and each omission is load-bearing:
+
+  - **`--cluster-forget`.** Its operand *is* the offending id. A check covering it
+    would make a member admitted by an older peer impossible to remove, and it would
+    count towards quorum forever — the trap
+    [#159](https://github.com/LASTRADA-Software/fastcached/issues/159) records.
+  - **Every path-valued flag.** On a host that transcodes nothing a legacy filename
+    is a perfectly good filename; refusing one would break a working node over a
+    rule about a field it is not.
+  - **The compiler half of `--toolchain=<fingerprint>=<compiler>`.** Only the
+    fingerprint travels, so `ParseToolchain` checks what is before the first `=` and
+    nothing after it. Asked by the PARSE rather than where the halves are used,
+    which is the difference between a refusal and a trap: `--install-service`
+    returns before a toolchain is ever resolved, bakes the command line into a
+    registration, and replays it at every boot with nobody watching.
+
+- **A value parser does not know which flag it was reached through, so it must not
+  name one.** It is a free function shared by every row that uses it, and a
+  hand-written field is one that drifts when a flag is renamed. `ApplyOneOption`
+  stamps the row's own `primary` into an error whose `field` the parser left empty;
+  a parser with something more specific to say — the node's log-level parser, its
+  cluster appliers — keeps saying it. Without the stamp a refusal names nothing,
+  which is what the node's own report used to do for an unrecognised argument.
 ## The daemon host, and what a machine IS
 
 - **A daemon host wraps the body, so what must reach a terminal has to happen
@@ -383,13 +419,3 @@ readable and silently ignored. Every rule below has already been one of them.
   legitimate *absence* (no scheduler surface, no admin surface), so the predicate is
   "parses when given" rather than "parses", and `ParseEndpoint`'s default host
   differs per flag.
-
-- **[#155](https://github.com/LASTRADA-Software/fastcached/issues/155)** — `argv`
-  on Windows carries the ANSI code page, and nothing in this tree converts it to
-  UTF-8. It did not matter while every string a peer sent was passed through
-  unexamined; #141 made a node's fingerprint, endpoint and version have to be
-  UTF-8, so a non-ASCII value an operator typed on a Windows console is now
-  refused by the scheduler for a reason invisible from where it was typed. The
-  seam belongs in `Platform/Environment`, which is already the one place the
-  environment is read — but `fastcache-cc` does not link `FastCache`, so what
-  that seam may depend on is part of the question.

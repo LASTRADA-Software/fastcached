@@ -1483,3 +1483,151 @@ TEST_CASE("Typing the cache budget is what marks it explicit", "[node][config][c
     REQUIRE(silent.has_value());
     CHECK_FALSE(silent->cacheMemoryExplicit);
 }
+
+TEST_CASE("A flag whose value other machines read refuses one that is not text", "[node][config][utf8]")
+{
+    // Which flags carry text the fleet reads is a COLUMN of the option table, and
+    // this pins the column rather than the parser -- `Cli/Options_test.cpp` covers
+    // what `ParseUtf8Text` does. Every one of these ends up in a peer's
+    // `ClusterState` or in a registration: `--advertise` and `--bind` become the
+    // endpoint clients dial, `--node-id` and `--raft-peer` a member's identity and
+    // the address its peers dial it at.
+    //
+    // Accepted here, such a value is refused by `SchedulerService::Register` on
+    // every heartbeat forever, and the operator's only recovery is to rename the
+    // thing -- on Windows, for a byte that was never going to survive `argv` in the
+    // first place (issue #155).
+    // A row per flag rather than one value for all four, because `--raft-peer` also
+    // has a GRAMMAR (`<id>=<host>:<port>`, #168) and a bare `grün` is refused by
+    // that instead -- which would pass this case for a reason that has nothing to do
+    // with encoding, and would keep passing the day the encoding check was removed.
+    // Each row is therefore the same token twice, differing only in how the umlaut
+    // is spelled.
+    struct Row
+    {
+        char const* flag;   ///< The flag under test.
+        char const* latin1; ///< Its value carrying a lone 0xFC -- not UTF-8.
+        char const* utf8;   ///< The same value, spelled in UTF-8.
+    };
+
+    constexpr std::array<Row, 4> Rows { {
+        { .flag = "--advertise",
+          .latin1 = "gr\xFC"
+                    "n",
+          .utf8 = "gr\xC3\xBC"
+                  "n" },
+        { .flag = "--bind",
+          .latin1 = "gr\xFC"
+                    "n",
+          .utf8 = "gr\xC3\xBC"
+                  "n" },
+        { .flag = "--node-id",
+          .latin1 = "gr\xFC"
+                    "n",
+          .utf8 = "gr\xC3\xBC"
+                  "n" },
+        { .flag = "--raft-peer",
+          .latin1 = "gr\xFC"
+                    "n=h:1234",
+          .utf8 = "gr\xC3\xBC"
+                  "n=h:1234" },
+    } };
+
+    for (auto const& row: Rows)
+    {
+        INFO("flag: " << row.flag);
+        auto const refused = ParseNodeArgv({ row.flag, row.latin1 });
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().field == row.flag);
+
+        // The same value in UTF-8 is accepted: the rule is about encoding, not about
+        // ASCII, and a fleet whose members may only name themselves in ASCII would
+        // be a second restriction nobody announced.
+        CHECK(ParseNodeArgv({ row.flag, row.utf8 }).has_value());
+    }
+}
+
+TEST_CASE("A pinned toolchain fingerprint is in the column; the compiler is not", "[node][config][utf8]")
+{
+    // A fingerprint is what a scheduler matches a client's request against byte for
+    // byte, and since #141 a registration carrying one that is not valid UTF-8 is
+    // refused -- on every heartbeat, forever. Decided by the PARSE rather than where
+    // the two halves are used, so `--install-service` cannot bake such a value into
+    // a registration that then fails at every boot with nobody watching: it returns
+    // before a toolchain is ever resolved.
+    auto const refused = ParseNodeArgv({ "--toolchain=gr\xFC"
+                                         "n=/usr/bin/g++" });
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().field == "--toolchain");
+
+    // The bare form pins nothing, so there is nothing to refuse: the node computes
+    // the fingerprint itself, in hex, which cannot fail this.
+    CHECK(ParseNodeArgv({ "--toolchain=/usr/bin/g++" }).has_value());
+
+    // And a pinned fingerprint spelled in UTF-8 is accepted, umlaut and all.
+    CHECK(ParseNodeArgv({ "--toolchain=gr\xC3\xBC"
+                          "n=/usr/bin/g++" })
+              .has_value());
+}
+
+TEST_CASE("A cluster change an operator commits is in the column; forgetting is not", "[node][config][utf8]")
+{
+    // `--cluster-admit` and `--cluster-set` COMMIT their operand through consensus:
+    // it lands in every peer's ClusterState and is rendered into /fleet.json. A
+    // consensus entry is applied after it is committed, with nobody left to refuse
+    // it, so the CLI is the last place a person can be told.
+    auto const admit = ParseNodeArgv({ "--cluster-admit=gr\xFC"
+                                       "n=host:6677" });
+    REQUIRE_FALSE(admit.has_value());
+    CHECK(admit.error().field == "--cluster-admit");
+
+    auto const set = ParseNodeArgv({ "--cluster-set=name=gr\xFC"
+                                     "n" });
+    REQUIRE_FALSE(set.has_value());
+    CHECK(set.error().field == "--cluster-set");
+
+    // `--cluster-forget` is deliberately NOT in the column, and this pins the
+    // omission rather than tolerating it. Its operand IS the offending id, so a
+    // check covering it would make a member admitted by an older peer impossible to
+    // remove -- and it would count towards quorum forever (issue #159).
+    auto const forget = ParseNodeArgv({ "--cluster-forget=gr\xFC"
+                                        "n" });
+    REQUIRE(forget.has_value());
+    CHECK(forget->cluster.key
+          == "gr\xFC"
+             "n");
+}
+
+TEST_CASE("A path-valued flag is deliberately not in that column", "[node][config][utf8]")
+{
+    // On a host that transcodes nothing, a legacy filename is a perfectly good
+    // filename. Refusing `--cache-dir` for the reason `--advertise` is refused would
+    // break a working node over a rule about a field it is not.
+    //
+    // POSIX only, and not because Windows behaves differently here -- because the
+    // case cannot arise there. The OS holds a command line as UTF-16 and hands this
+    // process the UTF-8 form of it (the declared code page), so `argv` on Windows is
+    // always valid UTF-8 and there is no legacy spelling for this flag to receive.
+#if !defined(_WIN32)
+    auto const parsed = ParseNodeArgv({ "--cache-dir=/var/cache/gr\xFC"
+                                        "n" });
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->cacheDir
+          == "/var/cache/gr\xFC"
+             "n");
+
+    // The COMPILER half of a pinned `--toolchain` is a path too, and is asked
+    // nothing for the same reason -- only the fingerprint before the first `=`
+    // travels.
+    CHECK(ParseNodeArgv({ "--toolchain=deadbeef=/opt/gr\xFC"
+                          "n/bin/g++" })
+              .has_value());
+#endif
+
+    // Everywhere: a non-ASCII path is a path, not a fleet-visible identity, and
+    // nothing here narrows it.
+    auto const utf8 = ParseNodeArgv({ "--cache-dir=/var/cache/gr\xC3\xBC"
+                                      "n" });
+    REQUIRE(utf8.has_value());
+    CHECK_FALSE(utf8->cacheDir.empty());
+}

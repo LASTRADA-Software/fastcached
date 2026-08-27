@@ -2,6 +2,8 @@
 #include "DirectManifest.hpp"
 #include "ReplayGuard.hpp"
 
+#include <FastCache/Platform/NarrowText.hpp>
+
 #include <array>
 #include <filesystem>
 #include <optional>
@@ -122,12 +124,28 @@ std::optional<std::string> MissingReplayedDependency(std::span<TextRegion const>
 {
     for (auto& path: ReplayedDependencyPaths(localizedRegions, layout))
     {
+        // Read as text FIRST, and the `error_code` overload below is no help with
+        // it: this path came out of a STORED value, so its bytes were written by
+        // whichever machine produced that entry -- and on a host that reads narrow
+        // bytes as UTF-8 the `path` CONSTRUCTOR throws for bytes that are not,
+        // before any error_code is consulted. This is the one input here that
+        // arrives over the network, so it is also the one a remote entry could use
+        // to take a build down.
+        //
+        // Unreadable counts as MISSING, which discards the hit and recompiles. That
+        // is the honest answer as much as the safe one: a dependency this host
+        // cannot even name is one it cannot check, and serving a hit it could not
+        // check is what this guard exists to prevent.
+        auto const dependency = PathFromNarrowText(path);
+        if (!dependency.has_value())
+            return std::move(path);
+
         std::error_code ec;
         // operator/ replaces the left operand when the right is absolute, so this
         // one expression covers both kinds. The error_code overload is not optional:
         // the throwing one would abort a launcher whose whole contract is that a
         // cache problem never breaks a build.
-        if (!std::filesystem::exists(workingDirectory / std::filesystem::path { path }, ec) && !ec)
+        if (!std::filesystem::exists(workingDirectory / *dependency, ec) && !ec)
             return std::move(path);
     }
     return std::nullopt;

@@ -54,6 +54,7 @@
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Net/TcpClient.hpp>
 #include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/NarrowText.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -1123,6 +1124,17 @@ void RecordManifest(Config const& cfg,
     // function's own inputs costs a hash lookup per path.
     reconciler.All(includes);
 
+    // Asked here as well as on the key path, because a manifest is the direct-mode
+    // half of the same promise: an entry naming a path this host could not read is
+    // revalidated against nothing, so a header edited inside it direct-hits forever.
+    // The key path declines the whole compile for this; here there is nothing to
+    // decline but the record itself.
+    if (reconciler.UnreadablePaths() != 0)
+    {
+        NoteNoManifest("a reported dependency path is not text this host can read");
+        return;
+    }
+
     // The manifest points at the object's ordinary key rather than causing a second
     // copy to be stored: L1 keeps values uncompressed, so duplicating objects would
     // double RAM pressure (27 GB -> 54 GB measured) where compression cannot help.
@@ -1421,7 +1433,10 @@ void RecordManifest(Config const& cfg,
     // them; nothing downstream needs to know they exist. Taken FROM the reconciler
     // rather than built beside it, so the two cannot come to disagree about a
     // trailing separator or anything else the constructor normalizes.
-    Cc::RootReconciler reconciler { cfg.srcRoot, cfg.buildTree, PathResolver() };
+    // The host's narrow-text policy goes in here and nowhere else, because this is
+    // the one object every path a compiler emitted passes through. It is read from
+    // the platform at exactly this call site so everything it reaches stays pure.
+    Cc::RootReconciler reconciler { cfg.srcRoot, cfg.buildTree, PathResolver(), FastCache::HostNarrowTextPolicy() };
     PathCanon::Layout const& layout = reconciler.Layout();
 
     // Asked before ANYTHING else the cache does, direct mode included, and that
@@ -1610,6 +1625,23 @@ void RecordManifest(Config const& cfg,
             return std::nullopt;
         }
 
+        // The same hazard reached by a different road, and it has to be its own ask
+        // because `PortableForm` cannot see it: whether bytes are text is a property
+        // of the HOST, and that function is pure. A path the reconciler could not
+        // read went through untranslated, so it prefix-matches no root, keys as
+        // toolchain and is stat'ed by nothing -- a moved header inside it would
+        // replay a stored object under a zero exit code.
+        //
+        // Reachable only on Windows, and there only when a tool wrote a path in
+        // neither UTF-8 nor the console output code page. The recovery is the
+        // console: `chcp 65001` makes `cl` emit UTF-8 and this stops firing.
+        if (reconciler.UnreadablePaths() != 0)
+        {
+            Decline("a reported dependency path is not text this host can read; not caching "
+                    "(neither keyed nor guarded) -- try a UTF-8 console code page");
+            return std::nullopt;
+        }
+
         // Non-const so the preprocessed text can be MOVED out below rather than
         // copied. It was const, and `std::move` on a const member is a silent copy
         // -- of several megabytes, on the hot path of a parallel build, while the
@@ -1772,6 +1804,19 @@ void RecordManifest(Config const& cfg,
         value.textRegions.push_back(
             { .grammar = PathCanon::Grammar::GccDepfile,
               .bytes = reconciler.Region(*depText, PathCanon::Grammar::GccDepfile, Cc::ParseDepFileTargets(*depText)) });
+
+    // Asked AGAIN, after the regions above, and not only on the key path. Those
+    // calls run the reconciler over every path span the grammars find in the
+    // captured streams -- a wider set than the dependency list, and one the earlier
+    // ask therefore cannot have covered. A span this host could not read went into
+    // these regions untranslated, so the value would carry a spelling no consumer
+    // can canonicalize, localize or check.
+    if (reconciler.UnreadablePaths() != 0)
+    {
+        Note("a captured region names a path that is not text this host can read; not caching "
+             "-- try a UTF-8 console code page");
+        return code;
+    }
 
     auto const encoded = EncodeCompileValue(value);
     if (!Cc::IsStorableSize(encoded.size(), cfg.maxStoreBytes))

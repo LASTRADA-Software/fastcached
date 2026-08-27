@@ -1299,3 +1299,27 @@ TEST_CASE("HashFileContents separates equal-length contents and reports unreadab
 
     std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("NormalizePath answers for a spelling this host cannot read, instead of throwing")
+{
+    // A launcher's one promise is that it never fails a build the compiler would
+    // have completed, and `std::filesystem::path`'s narrow constructor THROWS on a
+    // host that decodes narrow bytes as UTF-8 when the bytes are not -- which is
+    // every Windows executable in this tree since it began declaring the UTF-8 code
+    // page. `/showIncludes` under a legacy console produces exactly such bytes.
+    //
+    // Where that case is DECIDED is `RootReconciler::Path`, which reads a tool's
+    // path as text first and counts what it could not, so main.cpp can decline the
+    // compile. This is the guard that keeps the road there from ending in
+    // std::terminate -- including for a path out of a manifest an older launcher
+    // stored, which no reconciler ever sees.
+    CHECK_NOTHROW(NormalizePath("/x/src/gr\xFC"
+                                "n/a.h"));
+    CHECK(NormalizePath("/x/src/gr\xFC"
+                        "n/a.h")
+          == "/x/src/gr\xFC"
+             "n/a.h");
+
+    // Still normalizes everything it can read, which is every path a build has.
+    CHECK(NormalizePath("/x/src/./inc/../a.h") == std::filesystem::path { "/x/src/a.h" }.make_preferred().string());
+}

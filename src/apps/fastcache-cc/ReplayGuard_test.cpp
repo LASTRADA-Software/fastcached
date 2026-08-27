@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -307,4 +308,32 @@ TEST_CASE("A relative dependency resolves against the supplied working directory
 TEST_CASE("A value with no regions at all asserts nothing", "[replay-guard]")
 {
     CHECK_FALSE(MissingReplayedDependency({}, PosixLayout(), std::filesystem::temp_directory_path()).has_value());
+}
+
+TEST_CASE("A replayed dependency this host cannot read discards the hit rather than the build", "[replay-guard]")
+{
+    // The one input on this path that arrives over the NETWORK: these bytes were
+    // written by whichever machine produced the entry, so a legacy spelling from a
+    // POSIX producer -- or from a launcher built before the UTF-8 code page -- lands
+    // on a consumer that reads narrow bytes as UTF-8 and cannot decode them. There
+    // the `std::filesystem::path` CONSTRUCTOR throws, ahead of every `error_code`
+    // this function carefully takes, and an uncaught throw out of a cache lookup
+    // fails a build the compiler would have completed.
+    //
+    // Reported as missing, which discards the hit and recompiles: a dependency this
+    // host cannot name is one it cannot check, and an unchecked hit is what this
+    // guard exists to refuse.
+    ScopedTree const tree { "fc-replayguard-unreadable" };
+    (void) tree.Write("src/hdr.hpp");
+    PathCanon::Layout const layout { .sourceRoot = (tree.root / "src").string(),
+                                     .buildTree = (tree.root / "build").string() };
+
+    constexpr auto legacyName = "src/gr\xFC"
+                                "n.hpp";
+    auto const regions = Value("", "", std::string { "build/a.o: " } + legacyName + "\n");
+
+    std::optional<std::string> missing;
+    CHECK_NOTHROW(missing = MissingReplayedDependency(regions, layout, tree.root));
+    REQUIRE(missing.has_value());
+    CHECK(missing == legacyName);
 }

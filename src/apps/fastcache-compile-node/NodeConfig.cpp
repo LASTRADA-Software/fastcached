@@ -144,6 +144,24 @@ namespace
             auto& request = TargetOf<&NodeConfig::cluster>(result);
             request.action = Action;
 
+            if constexpr (Action == ClusterAction::Admit || Action == ClusterAction::Set)
+            {
+                // These two COMMIT their operand through consensus: an admitted
+                // member's id and endpoint land in every peer's `ClusterState` and
+                // are rendered into `/fleet.json`, and a setting is agreed by the
+                // whole cluster and survives every restart. A consensus entry is
+                // applied after it is committed, with nobody left to refuse it, so
+                // this is the last place a person can be told.
+                //
+                // `Forget` is deliberately NOT here, and that omission is the trap
+                // issue #159 records: its operand IS the offending id, so a check
+                // covering it would make a bad member -- one admitted by an older
+                // peer -- impossible to remove, and it would count towards quorum
+                // forever.
+                if (auto const text = ParseUtf8Text(value); !text.has_value())
+                    return std::unexpected(text.error());
+            }
+
             if constexpr (Action == ClusterAction::Set)
             {
                 auto assignment = ParseSettingAssignment(value);
@@ -178,6 +196,36 @@ namespace
 
             return {};
         };
+    }
+
+    /// A `--toolchain` value, with the half that TRAVELS checked for being text.
+    ///
+    /// Split on the first `=`, as `SplitToolchain` does and for the same reason: a
+    /// fingerprint is hex and contains none, so a compiler path holding one is only
+    /// reachable through the override form. Restated here rather than shared,
+    /// because sharing it would mean this file depending on the toolchain module it
+    /// configures -- and what is restated is one `find`, while the rule that
+    /// matters (what counts as text, and what the operator is told) stays in
+    /// `ParseUtf8Text`.
+    ///
+    /// Only the fingerprint. The compiler beside it is a path on this machine, and
+    /// on a host that transcodes nothing a legacy filename is a perfectly good
+    /// filename -- refusing it would break a working node over a rule about a field
+    /// it is not.
+    ///
+    /// Asked HERE rather than where the two halves are used, so it is decided by the
+    /// parse: `--install-service` returns before a toolchain is ever resolved, and a
+    /// registration that bakes in a fingerprint no scheduler will accept is one that
+    /// fails at every boot with nobody watching.
+    ///
+    /// @param sv The flag's value.
+    /// @return `sv` verbatim, or why its pinned half is not text.
+    [[nodiscard]] std::expected<std::string, ConfigError> ParseToolchain(std::string_view sv)
+    {
+        if (auto const eq = sv.find('='); eq != std::string_view::npos)
+            if (auto const pinned = ParseUtf8Text(sv.substr(0, eq)); !pinned.has_value())
+                return std::unexpected(pinned.error());
+        return std::string { sv };
     }
 
     /// A byte count for the local cache tier, accepting the k/m/g suffixes the
@@ -231,6 +279,16 @@ namespace
     /// @return The member, or why the token is not one.
     [[nodiscard]] std::expected<Cluster::ClusterMember, ConfigError> ParseRaftPeer(std::string_view sv)
     {
+        // Text FIRST, and over the whole token, because both halves of it are
+        // published: the id is a member's identity in `ClusterState` and the address
+        // is what every peer is told to dial. A value that is not valid UTF-8 is
+        // refused by `SchedulerService::Register` on every heartbeat forever, with
+        // the operator's only recovery being to rename the thing -- so it is refused
+        // here, where they typed it and the flag can be named (issue #155). See
+        // `ParseUtf8Text`, and `NodeOptions()` for the other rows in this column.
+        if (auto const text = ParseUtf8Text(sv); !text.has_value())
+            return std::unexpected(text.error());
+
         auto member = Cluster::ParseMemberSpec(sv);
         if (!member.has_value())
             return std::unexpected(
@@ -362,7 +420,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { .primary = "--advertise",
           .arity = Arity::Value,
           .operand = "=<host:port>",
-          .apply = AssignFrom<&NodeConfig::advertise, ParseText>(),
+          .apply = AssignFrom<&NodeConfig::advertise, ParseUtf8Text>(),
           .description = "host:port CLIENTS should use to reach this worker.\n"
                          "Defaults to --bind and --port, which is wrong behind NAT\n"
                          "or on a multi-homed host: the scheduler hands this string\n"
@@ -372,7 +430,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { .primary = "--bind",
           .arity = Arity::Value,
           .operand = "=<address>",
-          .apply = AssignFrom<&NodeConfig::bindAddress, ParseText>(),
+          .apply = AssignFrom<&NodeConfig::bindAddress, ParseUtf8Text>(),
           .description = "address to listen on (default 0.0.0.0)" },
         { .primary = "--port",
           .arity = Arity::Value,
@@ -382,7 +440,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { .primary = "--toolchain",
           .arity = Arity::Value,
           .operand = "=<compiler>|<fingerprint>=<compiler>",
-          .apply = AppendFrom<&NodeConfig::toolchains, ParseText>(),
+          .apply = AppendFrom<&NodeConfig::toolchains, ParseToolchain>(),
           .description = "a toolchain this worker serves; repeatable. An OVERRIDE:\n"
                          "naming any pins this worker to exactly that set, and\n"
                          "naming none means serve whatever this machine has.\n"
@@ -427,7 +485,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { .primary = "--node-id",
           .arity = Arity::Value,
           .operand = "=<id>",
-          .apply = AssignFrom<&NodeConfig::nodeId, ParseText>(),
+          .apply = AssignFrom<&NodeConfig::nodeId, ParseUtf8Text>(),
           .description = "this node's identity in the cluster. Giving it turns\n"
                          "consensus ON; without it this node leads alone,\n"
                          "which is right for one machine and is the default." },
@@ -499,7 +557,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { .primary = "--cluster-id",
           .arity = Arity::Value,
           .operand = "=<name>",
-          .apply = AssignFrom<&NodeConfig::clusterId, ParseText>(),
+          .apply = AssignFrom<&NodeConfig::clusterId, ParseUtf8Text>(),
           .description = "which fleet this node belongs to. Plain text in every\n"
                          "beacon and NOT a credential: what it buys is that two\n"
                          "unrelated fleets on one segment ignore each other." },

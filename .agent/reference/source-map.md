@@ -145,7 +145,10 @@ src/FastCache/
                 close-on-exec and the shutdown timeouts, which are parameters
                 rather than the caller's job),
                 Environment (the one place the process environment is read),
-                FileTrust (could only an administrator have put a file here?)
+                FileTrust (could only an administrator have put a file here?),
+                NarrowText (what code page this process transcodes narrow text
+                through, whether a path built from bytes decodes as UTF-8, and
+                the two total conversions for text something ELSE wrote)
   Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader,
                 EnvExpand ($VAR/${VAR} in path settings), DefaultConfigPath
                 (per-platform config lookup + --seed-config, behind IConfigPathProbe)
@@ -179,8 +182,9 @@ src/apps/
                             — to one, memoized per directory),
                             so main.cpp's flow logic is platform-free. Compiles
                             in `Cli/UsageDoc.cpp`, the four `Net/` rows that are
-                            its TCP client, plus `Platform/Environment.cpp`
-                            and `Platform/Terminal.cpp` (see `_fc_cc_core`), so
+                            its TCP client, plus `Platform/Environment.cpp`,
+                            `Platform/NarrowText.cpp` and `Platform/Terminal.cpp`
+                            (see `_fc_cc_core`), so
                             its help renders and colorizes exactly like the
                             daemon's without linking the library. `Cli/Options`
                             is header-only, so including it costs no build row.
