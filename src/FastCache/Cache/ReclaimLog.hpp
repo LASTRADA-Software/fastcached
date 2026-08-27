@@ -44,7 +44,7 @@ class ReclaimLog final: public IReclaimLog
     explicit ReclaimLog(IStorageMutationObserver* observer, std::size_t capacity = DefaultCapacity) noexcept;
 
     void Record(MutationKind kind, std::string_view key) noexcept override;
-    void Drain(std::vector<ReclaimedKey>& out) override;
+    void Drain(std::vector<ReclaimedKey>& out) noexcept override;
     [[nodiscard]] bool HasPending() const noexcept override;
     [[nodiscard]] bool IsRecording() const noexcept override;
 

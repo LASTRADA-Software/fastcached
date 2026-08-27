@@ -345,7 +345,7 @@ void LayeredStorage::ExpiriesOnlyLog::Record(MutationKind kind, std::string_view
         _inner->Record(kind, key);
 }
 
-void LayeredStorage::ExpiriesOnlyLog::Drain(std::vector<ReclaimedKey>& out)
+void LayeredStorage::ExpiriesOnlyLog::Drain(std::vector<ReclaimedKey>& out) noexcept
 {
     // Nothing is ever buffered here: Record forwards or discards. Draining the
     // filter would otherwise look like a way to reach the real log's contents.

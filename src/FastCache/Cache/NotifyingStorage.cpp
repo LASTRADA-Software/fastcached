@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cache/IReclaimLog.hpp>
 #include <FastCache/Cache/NotifyingStorage.hpp>
 
 #include <utility>
+#include <vector>
 
 namespace FastCache
 {
@@ -12,7 +14,7 @@ NotifyingStorage::NotifyingStorage(IStorage& inner, IStorageMutationObserver* ob
 {
 }
 
-void NotifyingStorage::Notify(MutationKind kind, std::string_view key) const noexcept
+void NotifyingStorage::Emit(MutationKind kind, std::string_view key) const noexcept
 {
     if (_observer == nullptr)
         return;
@@ -24,18 +26,40 @@ void NotifyingStorage::Notify(MutationKind kind, std::string_view key) const noe
     _observer->OnMutation(kind, key);
 }
 
+void NotifyingStorage::Notify(MutationKind kind, std::string_view key) const noexcept
+{
+    // Whatever the call reclaimed goes out FIRST, because it happened first and
+    // because the two can name the same key: an `ADD k` on a lapsed TTL
+    // reclaims k inside the lookup and then re-creates it. Reported the other
+    // way round a subscriber sees `set k` followed by `expired k` and concludes
+    // a live key is gone.
+    FlushReclaimed();
+    Emit(kind, key);
+}
+
+void NotifyingStorage::FlushReclaimed() const noexcept
+{
+    if (_reclaim == nullptr || !_reclaim->HasPending())
+        return;
+    // Thread-local, not a member and not a fresh local. A member would be a
+    // race -- with `--threads` several reactors call into this decorator at
+    // once -- and a fresh local would hand the log a zero-capacity buffer to
+    // regrow under the tier's lock on every drain, which on a cache at its byte
+    // budget is once per write. Drain swaps, so both sides keep their storage.
+    thread_local std::vector<ReclaimedKey> reclaimed;
+    _reclaim->Drain(reclaimed);
+    // Emit, not Notify: Notify drains first, and this IS the drain.
+    for (auto const& entry: reclaimed)
+        Emit(entry.kind, entry.key);
+}
+
 std::expected<GetResult, StorageError> NotifyingStorage::Get(std::string_view key, TimePoint now)
 {
-    // Get may trigger lazy TTL expiry inside the inner storage. The
-    // inner storage does NOT know about MutationKind::Expire; the
-    // decorator infers it from the result shape: if a Peek would have
-    // shown the key present but Get reports it absent, the expiry was
-    // consumed by this call. We don't have a cheap way to tell from
-    // the outside, so we do not synthesise Expire events from Get — it
-    // would require a Peek-before-Get that doubles the read cost. The
-    // PurgeExpired path below covers eager expiry, and the
-    // protocol-handler layer fires Expire from a separate path. (See
-    // KeyspaceEvents::Expired notes in KeyspaceNotifier.hpp.)
+    ReclaimDrain const drain { *this };
+    // A Get can consume a lapsed TTL: on the strict-LRU path the lookup erases
+    // the entry it finds dead. The tier records that in the reclaim log while
+    // it still has the key in hand, and the guard above fires the Expire when
+    // this returns — no Peek-before-Get, and no guessing from the result shape.
     return _inner.Get(key, now);
 }
 
@@ -44,6 +68,7 @@ std::expected<CasToken, StorageError> NotifyingStorage::Set(std::string_view key
                                                             std::uint32_t flags,
                                                             TimePoint expiry)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.Set(key, std::move(value), flags, expiry);
     if (result.has_value())
         Notify(MutationKind::Set, key);
@@ -53,6 +78,7 @@ std::expected<CasToken, StorageError> NotifyingStorage::Set(std::string_view key
 std::expected<CasToken, StorageError> NotifyingStorage::Add(
     std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.Add(key, std::move(value), flags, expiry, now);
     if (result.has_value())
         Notify(MutationKind::Set, key);
@@ -62,6 +88,7 @@ std::expected<CasToken, StorageError> NotifyingStorage::Add(
 std::expected<CasToken, StorageError> NotifyingStorage::Replace(
     std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.Replace(key, std::move(value), flags, expiry, now);
     if (result.has_value())
         Notify(MutationKind::Set, key);
@@ -73,6 +100,7 @@ std::expected<CasToken, StorageError> NotifyingStorage::Append(std::string_view 
                                                                CasToken expected,
                                                                TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.Append(key, suffix, expected, now);
     if (result.has_value())
         Notify(MutationKind::Append, key);
@@ -84,6 +112,7 @@ std::expected<CasToken, StorageError> NotifyingStorage::Prepend(std::string_view
                                                                 CasToken expected,
                                                                 TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.Prepend(key, prefix, expected, now);
     if (result.has_value())
         Notify(MutationKind::Prepend, key);
@@ -97,6 +126,7 @@ std::expected<CasToken, StorageError> NotifyingStorage::CompareAndSwap(std::stri
                                                                        TimePoint expiry,
                                                                        TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.CompareAndSwap(key, expected, std::move(value), flags, expiry, now);
     if (result.has_value())
         Notify(MutationKind::Cas, key);
@@ -108,6 +138,7 @@ std::expected<IStorage::IncrResult, StorageError> NotifyingStorage::IncrementOrI
                                                                                           bool decrement,
                                                                                           TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.IncrementOrInitialize(key, magnitude, decrement, now);
     if (result.has_value())
         Notify(MutationKind::Incr, key);
@@ -116,6 +147,7 @@ std::expected<IStorage::IncrResult, StorageError> NotifyingStorage::IncrementOrI
 
 std::expected<void, StorageError> NotifyingStorage::Delete(std::string_view key, TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.Delete(key, now);
     if (result.has_value())
         Notify(MutationKind::Delete, key);
@@ -124,6 +156,7 @@ std::expected<void, StorageError> NotifyingStorage::Delete(std::string_view key,
 
 std::expected<CasToken, StorageError> NotifyingStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.Touch(key, newExpiry, now);
     if (result.has_value())
         Notify(MutationKind::Touch, key);
@@ -132,15 +165,18 @@ std::expected<CasToken, StorageError> NotifyingStorage::Touch(std::string_view k
 
 std::expected<GetResult, StorageError> NotifyingStorage::Peek(std::string_view key, TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     return _inner.Peek(key, now);
 }
 
 std::expected<std::optional<TimePoint>, StorageError> NotifyingStorage::PeekExpiry(std::string_view key, TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     return _inner.PeekExpiry(key, now);
 }
 std::expected<bool, StorageError> NotifyingStorage::Prefetch(std::string_view key, TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     return _inner.Prefetch(key, now);
 }
 
@@ -148,6 +184,7 @@ std::expected<CasToken, StorageError> NotifyingStorage::MarkStale(std::string_vi
                                                                   std::optional<TimePoint> newExpiry,
                                                                   TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.MarkStale(key, newExpiry, now);
     if (result.has_value())
         Notify(MutationKind::MarkStale, key);
@@ -158,6 +195,7 @@ std::expected<GetResult, StorageError> NotifyingStorage::GetAndTouch(std::string
                                                                      TimePoint newExpiry,
                                                                      TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.GetAndTouch(key, newExpiry, now);
     if (result.has_value())
         Notify(MutationKind::Touch, key);
@@ -166,6 +204,7 @@ std::expected<GetResult, StorageError> NotifyingStorage::GetAndTouch(std::string
 
 std::expected<void, StorageError> NotifyingStorage::CompareAndDelete(std::string_view key, CasToken expected, TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.CompareAndDelete(key, expected, now);
     if (result.has_value())
         Notify(MutationKind::Delete, key);
@@ -174,6 +213,7 @@ std::expected<void, StorageError> NotifyingStorage::CompareAndDelete(std::string
 
 std::expected<bool, StorageError> NotifyingStorage::ClearExpiry(std::string_view key, TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     auto result = _inner.ClearExpiry(key, now);
     // Only fire Persist when a TTL was actually cleared (result == true).
     // ClearExpiry returns false when the entry existed but had no TTL —
@@ -188,6 +228,7 @@ std::expected<CasToken, StorageError> NotifyingStorage::Update(
     std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
     TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     // Track the inner outcome by sniffing the callback's UpdateAction.
     // We wrap the callback so we can observe what the Update will do
     // without forcing the inner storage to expose its decision —
@@ -228,6 +269,7 @@ std::expected<CasToken, StorageError> NotifyingStorage::Update(
 
 void NotifyingStorage::FlushWithGeneration(TimePoint effectiveAt)
 {
+    ReclaimDrain const drain { *this };
     _inner.FlushWithGeneration(effectiveAt);
     // FlushDb is a whole-database event; the key is empty per the
     // observer contract. WATCH semantics: every WATCH'd key must be
@@ -237,23 +279,26 @@ void NotifyingStorage::FlushWithGeneration(TimePoint effectiveAt)
 
 std::size_t NotifyingStorage::PurgeExpired(TimePoint now)
 {
-    // The inner storage does not give us the list of expired keys, so
-    // we cannot fire a per-key Expire event from here. The hook is
-    // present in the kind enum for a future storage that DOES surface
-    // the victim list (e.g. a write-through tier with a TTL log).
-    // For now, PurgeExpired is opaque at this layer; lazy expiry
-    // observable from Get/Peek is also not fired (same limitation).
-    // The TODO.md gap (KeyspaceEvents::Expired) is acknowledged.
+    ReclaimDrain const drain { *this };
+    // The count this returns is still opaque — it says how many, not which —
+    // but the tier no longer has to answer that question through the return
+    // value. It names each key in the reclaim log as it sweeps, and the guard
+    // above turns those into Expire events when this returns.
     return _inner.PurgeExpired(now);
 }
 
 void NotifyingStorage::SetReclaimLog(IReclaimLog* log)
 {
+    // Kept AND forwarded. This decorator is the drain end of the very log the
+    // tiers below record into, so one call wires both halves of the chain and
+    // there is no way to connect one without the other.
+    _reclaim = log;
     _inner.SetReclaimLog(log);
 }
 
 void NotifyingStorage::Resize(std::size_t newMaxBytes)
 {
+    ReclaimDrain const drain { *this };
     _inner.Resize(newMaxBytes);
 }
 
@@ -274,6 +319,7 @@ bool NotifyingStorage::SupportsSharedRead() const noexcept
 
 void NotifyingStorage::PromoteOnRead(std::string_view key, TimePoint now)
 {
+    ReclaimDrain const drain { *this };
     _inner.PromoteOnRead(key, now);
 }
 

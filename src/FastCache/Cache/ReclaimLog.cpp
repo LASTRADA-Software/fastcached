@@ -65,7 +65,7 @@ void ReclaimLog::Record(MutationKind kind, std::string_view key) noexcept
     _pendingCount.store(_pending.size(), std::memory_order_relaxed);
 }
 
-void ReclaimLog::Drain(std::vector<ReclaimedKey>& out)
+void ReclaimLog::Drain(std::vector<ReclaimedKey>& out) noexcept
 {
     std::scoped_lock const lock { _mu };
     out.clear();

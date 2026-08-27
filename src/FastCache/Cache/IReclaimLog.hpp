@@ -60,9 +60,16 @@ class IReclaimLog
     ///
     /// `out` is emptied first, so a caller may reuse one buffer across calls;
     /// its storage is handed to the log to refill, which keeps a steady-state
-    /// drain allocation-free.
+    /// drain allocation-free **provided the caller does reuse it**. Handing in
+    /// a fresh vector each time gives the log a zero-capacity buffer to regrow
+    /// under the tier's lock on the next reclaim — on a cache sitting at its
+    /// byte budget, that is once per write.
+    ///
+    /// `noexcept` because the drain runs from a scope guard's destructor, which
+    /// can itself run while an exception is propagating. `Record` is `noexcept`
+    /// for the same reason and takes the same lock.
     /// @param out Receives the pending entries.
-    virtual void Drain(std::vector<ReclaimedKey>& out) = 0;
+    virtual void Drain(std::vector<ReclaimedKey>& out) noexcept = 0;
 
     /// Lock-free probe: is there anything to `Drain`? Lets the drain site skip
     /// taking the log's lock on the overwhelmingly common empty call.

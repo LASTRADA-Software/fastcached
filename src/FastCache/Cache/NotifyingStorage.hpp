@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cache/CacheEntry.hpp>
+#include <FastCache/Cache/IReclaimLog.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Cache/IStorageMutationObserver.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
@@ -131,9 +132,11 @@ class NotifyingStorage final: public IStorage
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;
 
-    /// Forward to the inner storage, which is where the tiers that reclaim
-    /// live. This decorator is the other end of the same log — it drains what
-    /// they record — but it reclaims nothing itself.
+    /// Keep `log` **and** forward it to the inner storage.
+    ///
+    /// This decorator reclaims nothing itself; it is the drain end of the very
+    /// log the tiers below record into. Wiring both halves from one call is
+    /// what makes it impossible to connect one without the other.
     /// @param log Sink for reclaimed keys, or nullptr to stop reporting.
     void SetReclaimLog(IReclaimLog* log) override;
     void Resize(std::size_t newMaxBytes) override;
@@ -144,14 +147,70 @@ class NotifyingStorage final: public IStorage
 
   private:
     /// Fire `kind`/`key` on the observer, gated by the lock-free
-    /// `HasObservers` probe. Called from every mutating override after
-    /// the inner storage has committed.
+    /// `HasObservers` probe. The raw emit, with no drain of its own — the
+    /// drain itself uses this, which is what keeps the two from recursing.
+    /// @param kind Mutation kind.
+    /// @param key  Affected key (empty for FlushDb).
+    void Emit(MutationKind kind, std::string_view key) const noexcept;
+
+    /// Report `kind`/`key`, preceded by anything the same call reclaimed.
+    /// Called from every mutating override after the inner storage has
+    /// committed.
     /// @param kind Mutation kind.
     /// @param key  Affected key (empty for FlushDb).
     void Notify(MutationKind kind, std::string_view key) const noexcept;
 
+    /// Drain whatever the tiers reclaimed during the call that is returning,
+    /// and fire one `Expire`/`Evict` per key.
+    ///
+    /// This is the half of the reclaim path that runs **outside** every storage
+    /// lock — see `IReclaimLog`. The tiers only appended; publishing happens
+    /// here, where taking the observer's locks is safe.
+    void FlushReclaimed() const noexcept;
+
+    /// Fires the tiers' reclaim events when the enclosing storage call returns.
+    ///
+    /// A guard rather than a line before each `return`, because a reclaim is
+    /// not tied to the call *succeeding*, nor to it notifying anything. A
+    /// `Delete` of a key whose TTL has passed reclaims it and then reports
+    /// KeyNotFound; a `Get` on the strict-LRU path reclaims and notifies
+    /// nothing at all. Anchoring the drain to scope exit is what makes those
+    /// cases impossible to leave out, and it covers every early return.
+    ///
+    /// It is the backstop, not the usual path: `Notify` drains before emitting,
+    /// so a call that reports something has already flushed by the time this
+    /// runs and finds nothing left. That ordering matters — a reclaim and the
+    /// call that caused it can name the SAME key, as `ADD k` on a lapsed TTL
+    /// does, and emitting `set k` before `expired k` tells a subscriber a live
+    /// key is gone.
+    class ReclaimDrain
+    {
+      public:
+        /// @param owner The decorator whose log to drain on scope exit.
+        explicit ReclaimDrain(NotifyingStorage const& owner) noexcept:
+            _owner { &owner }
+        {
+        }
+
+        ReclaimDrain(ReclaimDrain const&) = delete;
+        ReclaimDrain(ReclaimDrain&&) = delete;
+        ReclaimDrain& operator=(ReclaimDrain const&) = delete;
+        ReclaimDrain& operator=(ReclaimDrain&&) = delete;
+
+        ~ReclaimDrain()
+        {
+            _owner->FlushReclaimed();
+        }
+
+      private:
+        NotifyingStorage const* _owner;
+    };
+
     IStorage& _inner;
     IStorageMutationObserver* _observer;
+    /// The drain end of the log the tiers below record into. Null until
+    /// `SetReclaimLog` wires it, which is every existing construction site.
+    IReclaimLog* _reclaim { nullptr };
 };
 
 } // namespace FastCache

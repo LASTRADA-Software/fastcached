@@ -243,7 +243,7 @@ class LayeredStorage final: public IStorage
         }
 
         void Record(MutationKind kind, std::string_view key) noexcept override;
-        void Drain(std::vector<ReclaimedKey>& out) override;
+        void Drain(std::vector<ReclaimedKey>& out) noexcept override;
         [[nodiscard]] bool HasPending() const noexcept override;
         [[nodiscard]] bool IsRecording() const noexcept override;
 
