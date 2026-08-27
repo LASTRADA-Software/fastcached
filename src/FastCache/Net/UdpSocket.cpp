@@ -222,7 +222,10 @@ namespace
     };
 } // namespace
 
-std::unique_ptr<IDatagramSocket> OpenUdpSocket(std::string_view bindAddress, std::uint16_t port, BroadcastMode broadcast)
+std::unique_ptr<IDatagramSocket> OpenUdpSocket(std::string_view bindAddress,
+                                               std::uint16_t port,
+                                               BroadcastMode broadcast,
+                                               PortSharing sharing)
 {
     // Winsock refuses every call until WSAStartup has run, and there is no
     // diagnostic to distinguish "the stack is not up" from "this address will
@@ -250,8 +253,56 @@ std::unique_ptr<IDatagramSocket> OpenUdpSocket(std::string_view bindAddress, std
         if (handle == Detail::InvalidSocket)
             continue;
 
-        int const reuse = 1;
-        ::setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
+        if (sharing == PortSharing::Shared)
+        {
+            int const reuse = 1;
+            ::setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
+
+            // One intent, two spellings, because SO_REUSEADDR does not mean the
+            // same thing everywhere. On Linux and on Windows it is what lets a
+            // second socket bind an address a first one holds. On BSD and Darwin
+            // it permits that only for a MULTICAST address; a second bind of the
+            // same unicast address needs SO_REUSEPORT, and without it the second
+            // node on a macOS host cannot bind the beacon port at all.
+            //
+            // Set wherever the option exists rather than behind a platform test,
+            // and that is measured rather than assumed: on Ubuntu 24.04, all four
+            // combinations of the two options across two sockets bind
+            // successfully, so a node carrying this still shares a port with an
+            // older node that does not. Undefined on Windows, where SO_REUSEADDR
+            // already says it.
+#if defined(SO_REUSEPORT)
+            ::setsockopt(handle, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
+#endif
+        }
+        // Exclusive is the default on POSIX and has to be asked for on Windows,
+        // which is the same asymmetry `Detail::BindAndListen` records for the
+        // stream side: there, SO_REUSEADDR on a *later* bind takes an address a
+        // live socket already holds, and SO_EXCLUSIVEADDRUSE is the documented
+        // way to refuse that.
+        //
+        // It is not hypothetical here just because most of these sockets ask the
+        // kernel to choose a port. `--discovery-reply-port` binds a NAMED one
+        // through this branch, and a socket answering discovery is precisely the
+        // one whose datagrams must not be handed to a second process: that is
+        // issue #126 again, arrived at from the other side.
+        //
+        // So it fails the candidate rather than being ignored the way
+        // TCP_NODELAY is. A `setsockopt` carrying a security property is not
+        // best-effort -- the rule this repository already paid for once.
+#if defined(_WIN32)
+        if (sharing == PortSharing::Exclusive)
+        {
+            int const exclusive = 1;
+            if (::setsockopt(
+                    handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<char const*>(&exclusive), sizeof(exclusive))
+                != 0)
+            {
+                Detail::CloseNativeSocket(handle);
+                continue;
+            }
+        }
+#endif
 
         if (broadcast == BroadcastMode::On)
         {

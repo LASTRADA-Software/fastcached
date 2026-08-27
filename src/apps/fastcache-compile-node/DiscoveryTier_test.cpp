@@ -6,17 +6,21 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <ranges>
 #include <string>
 #include <vector>
 
+#include <tests/CoHostedDatagram.hpp>
 #include <tests/ScratchPath.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
 using namespace std::chrono_literals;
+using FastCache::Testing::CoHostedDatagramSocket;
+using FastCache::Testing::TestBeaconPort;
 
 namespace
 {
@@ -33,13 +37,16 @@ namespace
 /// What one node announces about itself.
 /// @param nodeId Its identity.
 /// @param key The cluster key it holds.
+/// @param beaconAddress Where this node announces itself.
 /// @return The configuration.
-[[nodiscard]] Cluster::DiscoveryConfig ConfigFor(std::string const& nodeId, std::vector<std::byte> key)
+[[nodiscard]] Cluster::DiscoveryConfig ConfigFor(std::string const& nodeId,
+                                                 std::vector<std::byte> key,
+                                                 DatagramAddress beaconAddress)
 {
     return Cluster::DiscoveryConfig { .clusterId = "fleet",
                                       .nodeId = nodeId,
                                       .raftEndpoint = nodeId + ".local:6675",
-                                      .beaconAddress = DatagramBus::BroadcastAddress(),
+                                      .beaconAddress = std::move(beaconAddress),
                                       .presharedKey = std::move(key),
                                       .beaconInterval = 15s,
                                       .challengeLifetime = 30s };
@@ -55,13 +62,30 @@ struct Peer
     std::vector<Cluster::DesiredMember> seen;
     std::unique_ptr<DiscoveryTier> tier;
 
+    /// One node per machine, which is the ordinary deployment.
     /// @param bus The segment.
     /// @param nodeId This node's identity.
     /// @param key The cluster key it holds.
     Peer(DatagramBus& bus, std::string const& nodeId, std::vector<std::byte> key):
+        Peer(bus.Open(DatagramAddress { .host = nodeId, .port = TestBeaconPort }),
+             DatagramBus::BroadcastAddress(),
+             nodeId,
+             std::move(key))
+    {
+    }
+
+    /// Over a socket and a beacon address somebody else chose.
+    /// @param socket Where this node's datagrams come from and go.
+    /// @param beaconAddress Where it announces itself.
+    /// @param nodeId This node's identity.
+    /// @param key The cluster key it holds.
+    Peer(std::unique_ptr<IDatagramSocket> socket,
+         DatagramAddress beaconAddress,
+         std::string const& nodeId,
+         std::vector<std::byte> key):
         tier { DiscoveryTier::Over(
-            bus.Open(DatagramAddress { .host = nodeId, .port = 6677 }),
-            ConfigFor(nodeId, std::move(key)),
+            std::move(socket),
+            ConfigFor(nodeId, std::move(key), std::move(beaconAddress)),
             [this](std::span<Cluster::DesiredMember const> peers) { seen.assign(peers.begin(), peers.end()); },
             logger) }
     {
@@ -139,6 +163,48 @@ TEST_CASE("A node holding the wrong key is never admitted", "[node][discovery]")
     CHECK(honest.seen.empty());
 }
 
+TEST_CASE("Two nodes on one host find and prove each other", "[node][discovery]")
+{
+    // Issue #126, at the tier that owns the sockets. Both nodes listen on the one
+    // beacon port -- they have to, a beacon being a broadcast -- so both hear each
+    // other. What used to fail is everything after that: a unicast to a shared
+    // port reaches only one of the sockets on it, and the challenge and the proof
+    // are both unicast to wherever the last datagram came from, so each landed on
+    // whichever co-hosted node the kernel picked. Nothing logged; the pair simply
+    // stayed seen-and-unproved.
+    //
+    // Driven step by step rather than by a settle loop, because each step here is
+    // one leg of the handshake and a failure should name the leg.
+    DatagramBus bus;
+    auto const beacon = DatagramBus::BroadcastAddressOn(TestBeaconPort);
+
+    Peer first { CoHostedDatagramSocket(bus, "host", 40001), beacon, "n1", TestKey() };
+    Peer second { CoHostedDatagramSocket(bus, "host", 40002), beacon, "n2", TestKey() };
+
+    // Each announces itself, then reads the other's beacon and challenges it, then
+    // answers the challenge it was given, then checks the proof it was sent. The
+    // extra rounds are slack: a shared-port socket looks at one of its halves and
+    // waits on the other, so a datagram can need one more step to be reached.
+    for (auto round = 0; round < 8; ++round)
+    {
+        CHECK(first.tier->Step(Step));
+        CHECK(second.tier->Step(Step));
+    }
+
+    REQUIRE(first.tier->AuthenticatedCount() == 1);
+    REQUIRE(second.tier->AuthenticatedCount() == 1);
+
+    // And each learned where the OTHER answers Raft, not where it does -- the
+    // failure a co-hosted pair would show if the two ever crossed.
+    REQUIRE(first.seen.size() == 1);
+    CHECK(first.seen.front().id == "n2");
+    CHECK(first.seen.front().raftEndpoint == "n2.local:6675");
+
+    REQUIRE(second.seen.size() == 1);
+    CHECK(second.seen.front().id == "n1");
+    CHECK(second.seen.front().raftEndpoint == "n1.local:6675");
+}
+
 TEST_CASE("Two fleets on one segment ignore each other", "[node][discovery]")
 {
     // A cluster id is routing rather than authentication, and this is what it buys:
@@ -148,10 +214,10 @@ TEST_CASE("Two fleets on one segment ignore each other", "[node][discovery]")
     Peer ours { bus, "n1", TestKey() };
 
     NullLogger otherLogger;
-    auto otherConfig = ConfigFor("n2", TestKey());
+    auto otherConfig = ConfigFor("n2", TestKey(), DatagramBus::BroadcastAddress());
     otherConfig.clusterId = "somebody-elses";
     auto const theirs = DiscoveryTier::Over(
-        bus.Open(DatagramAddress { .host = "n2", .port = 6677 }), std::move(otherConfig), {}, otherLogger);
+        bus.Open(DatagramAddress { .host = "n2", .port = TestBeaconPort }), std::move(otherConfig), {}, otherLogger);
 
     for (auto round = 0; round < 6; ++round)
     {

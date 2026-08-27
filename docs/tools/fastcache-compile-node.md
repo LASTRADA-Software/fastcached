@@ -592,6 +592,31 @@ so treating it as a credential would be the mistake. What it buys is that two
 unrelated fleets on one segment ignore each other, which holds even when somebody
 shares a key across fleets — which they should not.
 
+**A node listens on the `--discovery` port and answers somewhere else.** Every node
+on the segment binds that port — a beacon is a broadcast, so they have to — and only
+one of the sockets sharing a port is handed a *unicast*. Since the challenge and the
+proof are both unicast, a node answering there would be answering for its whole
+machine, which is why two nodes on one host used to see each other and never finish
+proving the key. Each one therefore also holds a port of its own, and that is where
+its peers reach it.
+
+Two consequences worth knowing before you deploy it:
+
+- **A firewall rule scoped to `udp/6681` alone is no longer enough.** It passes the
+  beacons and drops every challenge and proof, and the symptom is peers that are
+  discovered and never admitted. A rule scoped to the *program* covers it. Where a
+  site must name the port, `--discovery-reply-port=6682` pins it — one port per node
+  on the machine, since two nodes cannot share one, and naming the `--discovery`
+  port there is refused rather than left to fail at bind.
+- **The startup line reports both**, which is what to check:
+
+  ```
+  discovery listening on 0.0.0.0:6681, answering from 0.0.0.0:52341, for cluster build-farm, announcing 10.0.0.1:6680
+  ```
+
+Running several nodes on one machine works, and each needs its own `--node-id`,
+`--listen-raft` and — if you pin them — `--discovery-reply-port`.
+
 **Discovery never changes membership by itself.** It answers who proved the key and
 where they answer; the *leader* proposes, and only the leader, because admitting a
 node is a Raft decision. Every node on the segment sees the same peers and all but

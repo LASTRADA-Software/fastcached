@@ -42,6 +42,35 @@ Every rule below has already been a bug.
     they answer; a caller proposes. Admitting a node is a Raft decision only a
     leader may make, and a layer that proposed directly would have every node on
     the segment proposing the same change at once.
+- **A node listens where the segment shouts and answers from an address of its
+  own. Sharing a port buys hearing a broadcast and nothing else.** Every node binds
+  the beacon port on the wildcard, shared, because a beacon is a broadcast and a
+  node listening anywhere else would send perfectly and hear nothing. But two
+  sockets on one UDP port both receive a broadcast and only **one** receives a
+  unicast -- measured, Windows 11 hands it to the first-bound socket and Linux to
+  the last -- and the challenge and the proof are both unicast to `received->from`.
+  A node that answered out of the shared socket would be answering for its
+  *machine*, so two nodes on one host saw each other's beacons and silently never
+  finished proving the key (#126). It holds two sockets now: the shared listener,
+  which never sends, and a private one, which sends everything and receives the
+  answers. `Net/SharedPortDatagram` pairs them, so `DiscoveryService` still holds
+  one socket -- which datagram left from where is a question about sockets, not
+  about what a datagram means.
+  - **Which socket takes which of the four options is `OpenSharedPortUdpSocket`'s
+    to know, not a caller's.** Transposing the two ports yields a node answering
+    where the segment shouts; putting the broadcast capability on the listener
+    yields one that is reachable and never announces itself. Every wrong pairing
+    still starts, and still passes a suite that only drives the in-memory bus.
+  - **`PortSharing::Shared` sets `SO_REUSEPORT` too, and that is one intent in two
+    spellings.** `SO_REUSEADDR` permits a duplicate bind on Linux and Windows; on
+    BSD and Darwin it permits one only for a *multicast* address, so without this
+    the second node on a macOS host cannot bind the beacon port at all.
+  - **Answering happens on a kernel-chosen port, so a firewall scoped to the beacon
+    port alone is no longer enough.** It passes the beacons and drops every
+    challenge and proof, which presents as peers seen and never admitted --
+    the same silence, moved. `--discovery-reply-port` pins it, one port per node on
+    a machine, and naming the beacon port there is refused rather than left to fail
+    at bind.
 - **A cluster id is routing, not authentication, and saying so keeps it honest.**
   It is plain text in every beacon, so treating it as a credential would be the
   mistake. What it buys is that two unrelated fleets on one segment ignore each
@@ -519,12 +548,6 @@ Every rule below has already been a bug.
 
 ## Open work
 
-- **[#126](https://github.com/LASTRADA-Software/fastcached/issues/126)** — the
-  beacon is a broadcast but the challenge and the proof are unicast to
-  `received->from`, and only one of two sockets sharing a UDP port receives a
-  unicast (measured on Windows 11 and Linux; which one differs between them). Two
-  nodes on one host therefore see each other's beacons and silently never finish
-  proving the key.
 - **[#144](https://github.com/LASTRADA-Software/fastcached/issues/144)** — a
   follower answering `/fleet` names the leader but cannot link to it, because
   where a dashboard is served is local configuration and any URL it built would be

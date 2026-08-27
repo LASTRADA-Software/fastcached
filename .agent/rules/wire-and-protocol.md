@@ -294,13 +294,15 @@ Every rule below has already been a bug.
     `OpenUdpSocket` binds the wildcard on the *shared* beacon port so every node
     on the segment hears the broadcast, and claiming that port exclusively would
     let the first process on a host lock every other one out of hearing beacons
-    at all. What sharing it does **not** already buy is two nodes on one host
-    completing the handshake: measured on Windows 11 and on Linux, two
-    `SO_REUSEADDR` sockets on one port both receive a broadcast and only one
-    receives a unicast -- and the challenge and the proof are both unicast to
-    `received->from` (`DiscoveryService.cpp`). Co-hosted nodes therefore see each
-    other's beacons and silently never finish proving the key. That is a defect
-    in discovery, not in the bind option, and it is not this change's to fix.
+    at all. What sharing it does **not** buy is two nodes on one host completing
+    the handshake: measured on Windows 11 and on Linux, two sockets on one port
+    both receive a broadcast and only one receives a unicast -- and the challenge
+    and the proof are both unicast to `received->from` (`DiscoveryService.cpp`).
+    That was a defect in discovery rather than in the bind option, and #126 fixed
+    it where it lived: a node now **listens** on the shared port and **answers**
+    from one only it holds, so sharing is asked for per socket
+    (`PortSharing`) rather than being every UDP socket's default. See
+    `.agent/rules/consensus-and-cluster.md`.
 
 - **A platform socket error is classified in one place.** `Detail::TranslateError`
   in `BlockingSocket.cpp` mapped ten conditions onto `NetErrorCode`;

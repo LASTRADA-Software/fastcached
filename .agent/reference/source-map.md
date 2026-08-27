@@ -82,7 +82,12 @@ src/FastCache/
                 verification vector to check against the way MurmurHash3 has
                 SMHasher's, so that harness is the closest available oracle.
   Cluster/      DiscoveryService + DiscoveryWire (the LAN beacon and its PSK
-                challenge), PeerDirectory (who proved the key, and where),
+                challenge, driven over the socket pair Net/SharedPortDatagram
+                gives a node: it listens where the segment shouts, on a port every
+                node shares, and answers from one only it holds, because just one
+                of the sockets sharing a port is handed a unicast and the
+                challenge and the proof are both unicast),
+                PeerDirectory (who proved the key, and where),
                 ClusterState + ClusterStateMachine — the cluster's replicated
                 configuration: who is a member, WHERE they answer, and the settings
                 every member must agree on — and MembershipPolicy, the pure decision

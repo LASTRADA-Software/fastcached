@@ -47,6 +47,7 @@ target_sources(FastCache
         Cluster/MembershipPolicy.cpp
         Cluster/PeerDirectory.cpp
         Net/InMemoryDatagram.cpp
+        Net/SharedPortDatagram.cpp
         Net/UdpSocket.cpp
         Core/Logger.cpp
         Distributed/LeaseTable.cpp

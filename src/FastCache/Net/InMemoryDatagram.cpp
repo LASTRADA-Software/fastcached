@@ -1,10 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Net/InMemoryDatagram.hpp>
 
+#include <algorithm>
+#include <ranges>
 #include <utility>
 
 namespace FastCache
 {
+
+namespace
+{
+    /// Whether an inbox is one a socket bound to @p endpoint holds.
+    ///
+    /// One predicate rather than the same comparison written at both call sites,
+    /// which want different halves of the same answer: `DropNext` starves every
+    /// match and `Deliver` hands a unicast to the first.
+    /// @param endpoint The address being matched.
+    /// @return The predicate; it refers to @p endpoint, which must outlive it.
+    [[nodiscard]] auto HeldAt(DatagramAddress const& endpoint)
+    {
+        return [&endpoint](auto const& inbox) {
+            return inbox.endpoint == endpoint;
+        };
+    }
+} // namespace
 
 /// One endpoint on a `DatagramBus`.
 class InMemoryDatagramSocket final: public IDatagramSocket
@@ -12,17 +31,21 @@ class InMemoryDatagramSocket final: public IDatagramSocket
   public:
     /// Attach to @p bus at @p endpoint.
     /// @param bus The segment.
-    /// @param endpoint This socket's address.
+    /// @param endpoint This socket's address; other sockets may hold it too.
     InMemoryDatagramSocket(DatagramBus& bus, DatagramAddress endpoint):
         _bus { bus },
-        _endpoint { std::move(endpoint) }
+        _endpoint { std::move(endpoint) },
+        // Held rather than looked up per call. An address no longer names one
+        // inbox, so there is nothing to look one up BY -- and the reference is
+        // sound for as long as this socket lives, because `std::map` keeps its
+        // values put and only this socket's destructor erases its entry.
+        _attachment { _bus.Attach(_endpoint) }
     {
-        _bus.Attach(_endpoint);
     }
 
     ~InMemoryDatagramSocket() override
     {
-        _bus.Detach(_endpoint);
+        _bus.Detach(_attachment.id);
     }
 
     InMemoryDatagramSocket(InMemoryDatagramSocket const&) = delete;
@@ -40,7 +63,7 @@ class InMemoryDatagramSocket final: public IDatagramSocket
     {
         std::unique_lock lock { _bus._mutex };
 
-        auto& inbox = _bus._inboxes[_endpoint];
+        auto& inbox = _attachment.inbox;
         auto const ready = [&inbox] {
             return inbox.closed || !inbox.queue.empty();
         };
@@ -63,7 +86,7 @@ class InMemoryDatagramSocket final: public IDatagramSocket
     {
         {
             std::scoped_lock const lock { _bus._mutex };
-            _bus._inboxes[_endpoint].closed = true;
+            _attachment.inbox.closed = true;
         }
         _bus._arrived.notify_all();
     }
@@ -75,7 +98,15 @@ class InMemoryDatagramSocket final: public IDatagramSocket
 
   private:
     DatagramBus& _bus;
+
+    /// This socket's own copy of what its inbox records, deliberately.
+    ///
+    /// Reading it back out of the bus would be reading bus state without the bus
+    /// lock -- sound, since nothing ever writes it after `Attach`, but sound for a
+    /// reason a reader has to reconstruct. An address is three words.
     DatagramAddress _endpoint;
+
+    DatagramBus::Attachment _attachment;
 };
 
 std::unique_ptr<IDatagramSocket> DatagramBus::Open(DatagramAddress endpoint)
@@ -83,22 +114,29 @@ std::unique_ptr<IDatagramSocket> DatagramBus::Open(DatagramAddress endpoint)
     return std::make_unique<InMemoryDatagramSocket>(*this, std::move(endpoint));
 }
 
-void DatagramBus::Attach(DatagramAddress const& endpoint)
+DatagramBus::Attachment DatagramBus::Attach(DatagramAddress endpoint)
 {
     std::scoped_lock const lock { _mutex };
-    _inboxes[endpoint];
+    auto const id = _nextId++;
+    return Attachment { .id = id, .inbox = _inboxes.emplace(id, Inbox { .endpoint = std::move(endpoint) }).first->second };
 }
 
-void DatagramBus::Detach(DatagramAddress const& endpoint)
+void DatagramBus::Detach(std::size_t id)
 {
     std::scoped_lock const lock { _mutex };
-    _inboxes.erase(endpoint);
+    _inboxes.erase(id);
 }
 
-void DatagramBus::DropNext(DatagramAddress const& endpoint, std::size_t count)
+std::size_t DatagramBus::DropNext(DatagramAddress const& endpoint, std::size_t count)
 {
     std::scoped_lock const lock { _mutex };
-    _inboxes[endpoint].dropsRemaining += count;
+    std::size_t starved = 0;
+    for (auto& inbox: _inboxes | std::views::values | std::views::filter(HeldAt(endpoint)))
+    {
+        inbox.dropsRemaining += count;
+        ++starved;
+    }
+    return starved;
 }
 
 std::size_t DatagramBus::SendCount() const
@@ -126,14 +164,28 @@ void DatagramBus::Deliver(std::span<std::byte const> payload, DatagramAddress co
             inbox.queue.push_back(ReceivedDatagram { .payload = { payload.begin(), payload.end() }, .from = from });
         };
 
-        if (to == BroadcastAddress())
-            for (auto& [address, inbox]: _inboxes)
+        if (to.host == BroadcastAddress().host)
+        {
+            // Port zero is every inbox; any other port is the sockets bound to
+            // it, which is what a broadcast to `255.255.255.255:P` reaches.
+            auto const hears = [&to](Inbox const& inbox) {
+                return to.port == 0 || inbox.endpoint.port == to.port;
+            };
+            for (auto& inbox: _inboxes | std::views::values | std::views::filter(hears))
                 deliverTo(inbox);
-        else if (auto found = _inboxes.find(to); found != _inboxes.end())
-            deliverTo(found->second);
-        // A datagram to an endpoint nobody holds is silently discarded, which is
-        // what UDP does. Reporting it would give the layer above a delivery
-        // signal the real network cannot provide.
+        }
+        else
+        {
+            // Exactly one, and the first to have attached -- see this function's
+            // declaration for why one, and why that one.
+            //
+            // A datagram to an endpoint nobody holds is silently discarded, which
+            // is what UDP does. Reporting it would give the layer above a
+            // delivery signal the real network cannot provide.
+            auto held = _inboxes | std::views::values;
+            if (auto const found = std::ranges::find_if(held, HeldAt(to)); found != std::ranges::end(held))
+                deliverTo(*found);
+        }
     }
     _arrived.notify_all();
 }

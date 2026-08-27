@@ -24,7 +24,8 @@ src/FastCache/
                 IAsyncAddressResolver + ThreadedAddressResolver,
                 TcpClient (the ONE TCP client), SocketAddress, BlockingSocket,
                 the reactor sockets, TLS, InMemoryTransport, HealthProbe,
-                IAdmissionControl
+                IAdmissionControl, IDatagramSocket + UdpSocket/InMemoryDatagram
+                and SharedPortDatagram (listen shared, answer private)
   Cli/          UsageDoc (usage text as data) and Options (the one parse loop).
                 Dependency-free by design, so fastcache-cc compiles it in rather
                 than linking the library
