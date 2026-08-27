@@ -105,3 +105,25 @@ TEST_CASE("SleepFor: computes the deadline relative to the reactor's clock", "[r
     reactor.Run();
     REQUIRE(fired);
 }
+
+TEST_CASE("NextWakeStep: the polling rule, decided without a reactor", "[reactor][sleep]")
+{
+    // The arithmetic three separate bounded waits used to each carry a copy of.
+    // Pure, so the rule itself is checked here rather than inferred from a
+    // coroutine's timing in three different tests.
+    constexpr auto Start = FastCache::TimePoint {};
+    constexpr auto Deadline = Start + 1s;
+
+    // An ordinary step is one bound from now, and never past the deadline.
+    STATIC_REQUIRE(FastCache::NextWakeStep(Start, Deadline, 50ms) == Start + 50ms);
+    STATIC_REQUIRE(FastCache::NextWakeStep(Start + 980ms, Deadline, 50ms) == Deadline);
+
+    // A non-positive bound means "do not poll", not "spin": a zero-length step
+    // resolves as already-ready and would busy-loop the reactor thread, so the
+    // wait goes straight through to the deadline instead.
+    STATIC_REQUIRE(FastCache::NextWakeStep(Start, Deadline, FastCache::Duration::zero()) == Deadline);
+    STATIC_REQUIRE(FastCache::NextWakeStep(Start, Deadline, -50ms) == Deadline);
+
+    // A bound longer than what is left does not overshoot either.
+    STATIC_REQUIRE(FastCache::NextWakeStep(Start, Deadline, 10s) == Deadline);
+}

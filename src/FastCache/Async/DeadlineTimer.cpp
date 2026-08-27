@@ -4,7 +4,6 @@
 #include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Async/Task.hpp>
 
-#include <algorithm>
 #include <utility>
 
 namespace FastCache
@@ -80,10 +79,7 @@ namespace
                 expired = true;
                 break;
             }
-            // A non-positive bound means "do not poll", not "spin" -- the rule
-            // `InterruptibleSleepUntil` states, kept identical here.
-            auto const step = pollInterval > Duration::zero() ? std::min(deadline, now + pollInterval) : deadline;
-            co_await SleepUntil { .reactor = reactor, .deadline = step };
+            co_await SleepUntil { .reactor = reactor, .deadline = NextWakeStep(now, deadline, pollInterval) };
         }
 
         // Cleared on the ONE exit path, before the callback runs: the callback is
