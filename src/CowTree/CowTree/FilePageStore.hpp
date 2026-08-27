@@ -31,6 +31,14 @@ namespace CowTree
 /// for portable, position-independent I/O without needing `lseek` state.
 /// `SyncData` and `WriteMeta` issue `fsync` / `FlushFileBuffers` according
 /// to the configured durability mode.
+///
+/// **A store file belongs to exactly one open store.** `Open` claims it
+/// exclusively and holds the claim until the store is destroyed, so a second
+/// opener is refused with CowTreeError::InUse rather than allowed to interleave
+/// its meta-page writes with the first one's. Nothing about the claim is written
+/// to the file: it is kernel state on the open file description (POSIX `flock`)
+/// or on the handle (the Windows share mode), so a file written by a build that
+/// takes it is byte-identical to one written by a build that does not.
 class FilePageStore final: public IPageStore
 {
   public:
@@ -41,6 +49,39 @@ class FilePageStore final: public IPageStore
         Batched, ///< Buffer writes; fsync at SyncData() boundaries only.
         None,    ///< Never call fsync. OS page cache only. Fastest.
     };
+
+    /// Whether this store holds its file exclusively.
+    enum class LockState : std::uint8_t
+    {
+        Held,        ///< Claimed. A second opener is refused.
+        Unavailable, ///< This filesystem cannot lock; the store opened unguarded.
+    };
+
+    /// What a failure to claim the file means.
+    enum class LockFailure : std::uint8_t
+    {
+        Contended,   ///< Somebody else holds it. Refuse: CowTreeError::InUse.
+        Unsupported, ///< The filesystem cannot lock. Open anyway, unguarded.
+        Fatal,       ///< Unrelated failure. Refuse: CowTreeError::IoError.
+    };
+
+    /// Classify the system error a failed claim produced.
+    ///
+    /// The two platforms feed this from different calls, which is a consequence
+    /// of where each one enforces exclusivity: POSIX passes `errno` from
+    /// `flock`, taken after the file is already open, so anything it does not
+    /// recognise means *this filesystem cannot lock* and the store opens
+    /// unguarded. Windows passes `GetLastError()` from `CreateFileW` itself —
+    /// the share mode is the claim, so there is no separate call to fail and no
+    /// `Unsupported` case at all; anything unrecognised there is a genuine open
+    /// failure.
+    ///
+    /// Public so the decision table can be asserted directly. The `Unsupported`
+    /// arm cannot be provoked on any filesystem the tests run on, which is
+    /// exactly what makes it worth pinning down.
+    /// @param systemError POSIX `errno`, or Windows `GetLastError()`.
+    /// @return What the caller should do about it.
+    [[nodiscard]] static LockFailure ClassifyLockFailure(int systemError) noexcept;
 
     /// Construction options.
     struct Options
@@ -56,12 +97,18 @@ class FilePageStore final: public IPageStore
         Durability durability { Durability::Batched };
     };
 
-    /// Open or create the backing file. Existing files are inspected:
-    /// the page size is taken from whichever meta page validates; new
-    /// files are initialised with two blank meta pages of the requested
-    /// size.
+    /// Open or create the backing file, claiming it exclusively. Existing
+    /// files are inspected: the page size is taken from whichever meta page
+    /// validates; new files are initialised with two blank meta pages of the
+    /// requested size.
+    ///
+    /// The claim is taken before any of that, because writing the blank meta
+    /// pages of a "new" file is itself the write that would destroy a store a
+    /// second process is already using.
     /// @param options Open parameters.
-    /// @return Owning FilePageStore on success.
+    /// @return Owning FilePageStore on success; CowTreeError::InUse when
+    ///         another open store holds the file, CowTreeError::IoError on any
+    ///         other failure to open it.
     [[nodiscard]] static auto Open(Options options) -> std::expected<std::unique_ptr<FilePageStore>, CowTreeError>;
 
     FilePageStore(FilePageStore const&) = delete;
@@ -95,6 +142,14 @@ class FilePageStore final: public IPageStore
     /// @return Current durability mode.
     [[nodiscard]] Durability DurabilityMode() const noexcept;
 
+    /// Whether this store actually holds its file exclusively.
+    ///
+    /// `Unavailable` is not a failure — the store is open and usable — but it
+    /// says the guard against a second opener is not in force, which a caller
+    /// should tell its operator rather than keep to itself.
+    /// @return Held, unless the filesystem could not lock.
+    [[nodiscard]] LockState StoreLockState() const noexcept;
+
     /// @return The total number of data pages currently allocated in
     ///         the file (live pages + free-list entries).
     [[nodiscard]] std::size_t TotalDataPages() const noexcept;
@@ -111,6 +166,18 @@ class FilePageStore final: public IPageStore
 
   private:
     explicit FilePageStore(Options options) noexcept;
+
+#if !defined(_WIN32)
+    /// Claim the already-open file for this store, setting `_lockState`.
+    ///
+    /// POSIX only, and declared conditionally rather than left as an empty
+    /// Windows body: there the share mode passed to `CreateFileW` *is* the
+    /// claim, so a second function would be one nothing ever calls.
+    /// @return Empty once the outcome is recorded — including the
+    ///         `Unsupported` outcome, which opens unguarded rather than
+    ///         failing; CowTreeError::InUse or ::IoError otherwise.
+    [[nodiscard]] auto TakeExclusiveLock() -> std::expected<void, CowTreeError>;
+#endif
 
     /// Compute the file offset of a data page.
     [[nodiscard]] std::uint64_t DataPageOffset(PageId id) const noexcept;
@@ -182,6 +249,17 @@ class FilePageStore final: public IPageStore
     /// flush can never destroy the last durable meta. Initialised on
     /// Bootstrap/Recover and advanced by `FlushBatchLocked`.
     MetaSlot _lastDurableSlot { MetaSlot::A };
+
+    /// Whether the file is actually claimed. Both platforms can downgrade it,
+    /// and neither takes the claim's word for it: POSIX reads what `flock`
+    /// reported, and Windows re-opens the file it just claimed to check that
+    /// the share mode was honoured rather than merely accepted.
+    ///
+    /// Declared against `_lastDurableSlot` rather than beside the handle it
+    /// describes because both are byte-wide: a lone byte between two 8-aligned
+    /// members costs seven, and `clang-analyzer-optin.performance.Padding` is
+    /// enforced here.
+    LockState _lockState { LockState::Held };
 
     /// Flush the accumulated Batched writes after this many commits.
     static constexpr std::size_t BatchedFlushInterval = 64;

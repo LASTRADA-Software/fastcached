@@ -11,6 +11,14 @@
 #include <CowTree/CowTree.hpp>
 #include <CowTree/FilePageStore.hpp>
 
+// The lock-classifier case below asserts over the platform's own error
+// constants: `errno` values on POSIX, `GetLastError()` values on Windows.
+#if defined(_WIN32)
+    #include <windows.h>
+#else
+    #include <cerrno>
+#endif
+
 namespace
 {
 
@@ -335,4 +343,134 @@ TEST_CASE("Durability=Batched: commits flushed before a crash survive it", "[fil
     auto tail = r.Get(B("k79"));
     REQUIRE(tail.has_value());
     REQUIRE_FALSE(tail->has_value());
+}
+
+// ============================================================================
+// Exclusive claim on the backing file
+//
+// A second store on one path used to be silent data loss on POSIX: both opened,
+// both wrote meta pages, and whichever committed last decided what the other
+// one's transactions had never happened. Windows refused it, but as a generic
+// open failure that named no cause.
+//
+// These run in ONE process on purpose. `flock` is per open file description
+// and a Windows share mode is per handle, so a second `Open` from here meets
+// exactly the kernel enforcement a second process would -- and unlike a second
+// process, it runs on every platform in CI.
+// ============================================================================
+
+TEST_CASE("A second store on one path is refused as InUse", "[filestore][lock]")
+{
+    TempFile tmp;
+    CowTree::FilePageStore::Options opts;
+    opts.path = tmp.path;
+
+    auto first = CowTree::FilePageStore::Open(opts);
+    REQUIRE(first.has_value());
+    REQUIRE((*first)->StoreLockState() == CowTree::FilePageStore::LockState::Held);
+
+    auto second = CowTree::FilePageStore::Open(opts);
+    REQUIRE_FALSE(second.has_value());
+    REQUIRE(second.error() == CowTree::CowTreeError::InUse);
+}
+
+TEST_CASE("A store refused as InUse leaves the first one writable", "[filestore][lock]")
+{
+    TempFile tmp;
+    CowTree::FilePageStore::Options opts;
+    opts.path = tmp.path;
+
+    auto first = CowTree::FilePageStore::Open(opts);
+    REQUIRE(first.has_value());
+    CowTree::CowTree tree { **first };
+    REQUIRE(tree.Open().has_value());
+
+    // The refusal must touch nothing: a guard that costs the incumbent its
+    // store would be worse than the corruption it prevents.
+    REQUIRE_FALSE(CowTree::FilePageStore::Open(opts).has_value());
+
+    auto txn = tree.BeginWrite();
+    REQUIRE(txn.Put(B("survivor"), B("yes")).has_value());
+    REQUIRE(txn.Commit().has_value());
+
+    auto reader = tree.BeginRead();
+    auto got = reader.Get(B("survivor"));
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    REQUIRE(Decode((*got).value_or(std::vector<std::byte> {})) == "yes");
+}
+
+TEST_CASE("Closing a store releases the file for the next one", "[filestore][lock]")
+{
+    TempFile tmp;
+    CowTree::FilePageStore::Options opts;
+    opts.path = tmp.path;
+
+    {
+        auto first = CowTree::FilePageStore::Open(opts);
+        REQUIRE(first.has_value());
+    }
+
+    // Every restart depends on this, so it is asserted rather than assumed:
+    // the claim is released by the close in the destructor, not held to the
+    // end of the process.
+    auto second = CowTree::FilePageStore::Open(opts);
+    REQUIRE(second.has_value());
+}
+
+TEST_CASE("A crashed store releases the file", "[filestore][lock][crash]")
+{
+    TempFile tmp;
+    CowTree::FilePageStore::Options opts;
+    opts.path = tmp.path;
+
+    auto crashed = CowTree::FilePageStore::Open(opts);
+    REQUIRE(crashed.has_value());
+    (*crashed)->SimulateCrashForTest();
+
+    // What the kernel does for a process that dies: the descriptor goes, and
+    // the claim goes with it. A recovering daemon must not have to clear
+    // anything by hand -- that is the failure mode a lock FILE would have.
+    auto next = CowTree::FilePageStore::Open(opts);
+    REQUIRE(next.has_value());
+}
+
+TEST_CASE("ClassifyLockFailure maps this platform's lock errors", "[filestore][lock]")
+{
+    using LockFailure = CowTree::FilePageStore::LockFailure;
+
+    struct Row
+    {
+        int systemError;
+        LockFailure expected;
+        char const* what;
+    };
+
+    // Asserted as a table because the arms differ per platform and the one
+    // that matters most cannot be provoked: no filesystem CI runs on reports
+    // "cannot lock", so `Unsupported` would otherwise be reasoning nobody ever
+    // checks.
+#if defined(_WIN32)
+    auto const rows = std::vector<Row> {
+        { ERROR_SHARING_VIOLATION, LockFailure::Contended, "another handle holds the file" },
+        { ERROR_LOCK_VIOLATION, LockFailure::Contended, "a byte-range lock refuses us" },
+        { ERROR_FILE_NOT_FOUND, LockFailure::Fatal, "the open itself failed" },
+        { ERROR_ACCESS_DENIED, LockFailure::Fatal, "no rights to the file" },
+    };
+#else
+    auto const rows = std::vector<Row> {
+        { EWOULDBLOCK, LockFailure::Contended, "another descriptor holds the file" },
+        { EAGAIN, LockFailure::Contended, "the same condition under its other spelling" },
+        { EBADF, LockFailure::Fatal, "our own bug, not the filesystem's limit" },
+        { ENOLCK, LockFailure::Unsupported, "the kernel has no lock to give" },
+        { EINVAL, LockFailure::Unsupported, "this descriptor cannot be flocked" },
+        { EOPNOTSUPP, LockFailure::Unsupported, "the filesystem does not implement it" },
+    };
+#endif
+
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        CHECK(CowTree::FilePageStore::ClassifyLockFailure(row.systemError) == row.expected);
+    }
 }

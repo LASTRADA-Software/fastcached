@@ -25,6 +25,7 @@ enum class CowTreeError : std::uint8_t
     OutOfRange,    ///< Page id, slot index, or value-size argument out of range.
     NotOpen,       ///< Operation requires Open() to have been called first.
     AlreadyOpen,   ///< Open() called twice.
+    InUse,         ///< Another open file description holds this store exclusively.
     InvalidArg,    ///< Caller passed a malformed argument (e.g. wrong page-size buffer).
     ValueTooLarge, ///< Single key+value pair does not fit in a page.
     InjectedFault, ///< Test-only: a failure was injected by the page-store fault harness.
@@ -54,6 +55,8 @@ enum class CowTreeError : std::uint8_t
             return "NotOpen";
         case CowTreeError::AlreadyOpen:
             return "AlreadyOpen";
+        case CowTreeError::InUse:
+            return "InUse";
         case CowTreeError::InvalidArg:
             return "InvalidArg";
         case CowTreeError::ValueTooLarge:

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cerrno>
 #include <cstddef>
@@ -20,6 +21,7 @@
 #if defined(_WIN32)
     #include <windows.h>
 #else
+    #include <sys/file.h>
     #include <sys/stat.h>
     #include <sys/types.h>
 
@@ -39,7 +41,54 @@ namespace
         return size >= MinPageSize && size <= MaxPageSize && (size & (size - 1)) == 0;
     }
 
+    /// One system error, and what it means for the exclusive claim.
+    struct LockErrorRow
+    {
+        int systemError;
+        FilePageStore::LockFailure failure;
+    };
+
+#if defined(_WIN32)
+    /// `CreateFileW` refuses a second writer because of the share mode the
+    /// first one passed; both spellings of that refusal reach us here.
+    constexpr std::array LockErrorRows {
+        LockErrorRow { ERROR_SHARING_VIOLATION, FilePageStore::LockFailure::Contended },
+        LockErrorRow { ERROR_LOCK_VIOLATION, FilePageStore::LockFailure::Contended },
+    };
+
+    /// The call that failed is the open itself, so anything not named above is
+    /// a genuine open failure — there is no separate claim that could have been
+    /// unsupported.
+    constexpr auto UnnamedLockError = FilePageStore::LockFailure::Fatal;
+#else
+    /// EWOULDBLOCK and EAGAIN are one value on Linux and permitted to differ by
+    /// POSIX; the duplicate row costs a comparison and keeps the table honest
+    /// on a platform where they split. EBADF is our own bug rather than
+    /// anything about the file.
+    constexpr std::array LockErrorRows {
+        LockErrorRow { EWOULDBLOCK, FilePageStore::LockFailure::Contended },
+        LockErrorRow { EAGAIN, FilePageStore::LockFailure::Contended },
+        LockErrorRow { EBADF, FilePageStore::LockFailure::Fatal },
+    };
+
+    /// The file is already open by the time `flock` runs, so an unrecognised
+    /// errno means the claim could not be made rather than that the file could
+    /// not be reached. ENOLCK, EOPNOTSUPP and EINVAL all arrive here and there
+    /// is no closed list of them — kernels and network filesystems disagree
+    /// about which they report — so this is the default rather than a fourth
+    /// row somebody has to keep current.
+    constexpr auto UnnamedLockError = FilePageStore::LockFailure::Unsupported;
+#endif
+
 } // namespace
+
+auto FilePageStore::ClassifyLockFailure(int systemError) noexcept -> LockFailure
+{
+    // `auto`, never `auto const*`: a std::array iterator is a raw pointer on
+    // libstdc++ and libc++ and a class type on MSVC.
+    auto const row = std::ranges::find(LockErrorRows, systemError, &LockErrorRow::systemError);
+    return row != LockErrorRows.end() ? row->failure : UnnamedLockError;
+}
 
 FilePageStore::FilePageStore(Options options) noexcept:
     _options { std::move(options) },
@@ -57,6 +106,10 @@ FilePageStore::~FilePageStore()
         std::scoped_lock const lock { _ioMutex };
         std::ignore = FlushBatchLocked();
     }
+    // The close below is what releases the exclusive claim, and there is
+    // deliberately no explicit unlock before it: an unlock is a second thing
+    // that can be ordered wrongly, and putting one ahead of the flush above
+    // would let the next opener in while this store is still writing.
 #if defined(_WIN32)
     if (_handle != nullptr)
     {
@@ -83,17 +136,48 @@ auto FilePageStore::Open(Options options) -> std::expected<std::unique_ptr<FileP
 
 #if defined(_WIN32)
     auto const path = store->_options.path.native();
+    // FILE_SHARE_READ and no FILE_SHARE_WRITE IS the exclusive claim: a second
+    // writer cannot obtain a handle at all, so there is no separate lock call
+    // and no window in which we hold a writable handle we have not claimed.
     auto* handle = ::CreateFileW(
         path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE)
-        return std::unexpected(CowTreeError::IoError);
+    {
+        auto const failure = ClassifyLockFailure(static_cast<int>(::GetLastError()));
+        return std::unexpected(failure == LockFailure::Contended ? CowTreeError::InUse : CowTreeError::IoError);
+    }
     store->_handle = handle;
+
+    // Prove the share mode is enforced rather than assuming it. A share mode is
+    // honoured by the filesystem driver, and some network redirectors and
+    // user-mode filesystems accept one and ignore it; on those the claim above
+    // is decoration, and a second daemon would open the same store and
+    // interleave its meta-page writes with no diagnostic at all.
+    //
+    // Asking for a second handle answers the question exactly, because it asks
+    // the question: if THIS process can reopen the file it just claimed, so can
+    // another one. `OPEN_EXISTING` so the probe can only ever observe, and the
+    // handle is dropped immediately — nothing is ever written through it.
+    auto* const probe = ::CreateFileW(
+        path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (probe != INVALID_HANDLE_VALUE)
+    {
+        ::CloseHandle(probe);
+        store->_lockState = LockState::Unavailable;
+    }
 #else
     auto const flags = O_RDWR | O_CREAT;
     auto const fd = ::open(store->_options.path.c_str(), flags, 0644);
     if (fd < 0)
         return std::unexpected(CowTreeError::IoError);
     store->_fd = fd;
+
+    // Before bootstrap or recovery, either of which writes meta pages: a "new"
+    // file is only new because nobody has claimed it yet, and blanking its two
+    // meta pages is precisely the write that would destroy a store somebody
+    // else is already using.
+    if (auto const claimed = store->TakeExclusiveLock(); !claimed.has_value())
+        return std::unexpected(claimed.error());
 #endif
 
     if (!existed)
@@ -110,6 +194,42 @@ auto FilePageStore::Open(Options options) -> std::expected<std::unique_ptr<FileP
     store->_readBuffer.resize(store->_pageSize);
     return store;
 }
+
+#if !defined(_WIN32)
+auto FilePageStore::TakeExclusiveLock() -> std::expected<void, CowTreeError>
+{
+    // flock rather than fcntl: an fcntl lock is per PROCESS, so a second store
+    // in the same process would take it again and report success — which is
+    // both a real way to corrupt the file and the reason the guard would be
+    // untestable without spawning processes. flock is per open file
+    // DESCRIPTION, so it refuses a second `open` of the same path even from
+    // here, survives a fork (both halves then share the one claim, which is
+    // what a daemon that forks before opening wants), and is released by
+    // `close` — including the close the kernel does for a process that dies.
+    while (::flock(_fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        if (errno == EINTR)
+            continue;
+        switch (ClassifyLockFailure(errno))
+        {
+            case LockFailure::Contended:
+                return std::unexpected(CowTreeError::InUse);
+            case LockFailure::Fatal:
+                return std::unexpected(CowTreeError::IoError);
+            case LockFailure::Unsupported:
+                // Not a failure to open. This filesystem cannot lock, so the
+                // store opens with no guard against a second one — refusing
+                // instead would stop a deployment that works today for a
+                // reason that has nothing to do with contention. The caller
+                // reads `StoreLockState()` and says so.
+                _lockState = LockState::Unavailable;
+                return {};
+        }
+    }
+    _lockState = LockState::Held;
+    return {};
+}
+#endif
 
 auto FilePageStore::BootstrapNewFile() -> std::expected<void, CowTreeError>
 {
@@ -530,6 +650,11 @@ std::size_t FilePageStore::PageCount() const noexcept
 FilePageStore::Durability FilePageStore::DurabilityMode() const noexcept
 {
     return _options.durability;
+}
+
+FilePageStore::LockState FilePageStore::StoreLockState() const noexcept
+{
+    return _lockState;
 }
 
 std::size_t FilePageStore::TotalDataPages() const noexcept
