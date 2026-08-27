@@ -240,7 +240,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // the command line -- an install included -- rather than here. What survives is
     // the message that names the text they typed, which a row of static prose
     // cannot, and the answer for a `NodeConfig` no argv produced (#168).
-    auto const endpoint = ParseEndpoint(cfg.raftListen, "0.0.0.0");
+    auto const endpoint = ParseEndpoint(cfg.raftListen, RaftListenDefaultHost);
     if (!endpoint.has_value())
         return std::unexpected { std::format("--listen-raft={} names no usable port", cfg.raftListen) };
 

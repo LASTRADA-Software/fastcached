@@ -224,11 +224,9 @@ namespace
     /// accepting different token sets for one concept -- with only one of them being
     /// what the transport actually dials.
     ///
-    /// Here rather than in the tier that consumes it, and that is the fix for #168:
-    /// a refusal inside `ConsensusTier::Start` is one `--install-service` returns
-    /// long before reaching, so a registration carrying a malformed peer was written
-    /// happily and then failed at every boot, into a log nobody reads. The parser is
-    /// the one place on every path, and the only one that can name the token.
+    /// Here rather than in the tier that consumes it, because the parser is the one
+    /// place on every path and the only one that can name the offending token --
+    /// see `NodeConfig::raftPeers` for what that cost while it was not (#168).
     /// @param sv Text to parse.
     /// @return The member, or why the token is not one.
     [[nodiscard]] std::expected<Cluster::ClusterMember, ConfigError> ParseRaftPeer(std::string_view sv)
@@ -998,7 +996,9 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // below judges the address `AdminEndpoint` will actually take rather than
         // the text an operator typed.
         { .refuses =
-              [](NodeConfig const& c) { return !c.nodeId.empty() && !ParseEndpoint(c.raftListen, "0.0.0.0").has_value(); },
+              [](NodeConfig const& c) {
+                  return !c.nodeId.empty() && !ParseEndpoint(c.raftListen, RaftListenDefaultHost).has_value();
+              },
           .message = "--node-id needs a usable --listen-raft: consensus is what --node-id turns on, and that port "
                      "is where every peer dials this node. Without one nothing binds, no vote could arrive, and "
                      "the node refuses to start rather than join a cluster that cannot see it." },

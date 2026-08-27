@@ -589,6 +589,7 @@ TEST_CASE("NodeConfig: a --raft-peer that names no member is refused where it wa
     // verbs alike. It used to be checked inside `ConsensusTier::Start`, which the
     // install path returns long before reaching: a registration carrying
     // `--raft-peer=garbage` was written happily and then died at every boot (#168).
+    //
     // Every way a token can fail to name a member, through the one grammar.
     for (auto const* const token: {
              "garbage",          // neither half

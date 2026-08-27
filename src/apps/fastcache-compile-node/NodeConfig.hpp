@@ -536,6 +536,15 @@ struct NodeConfig
 /// @return An explanatory message when the install must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg);
 
+/// What a bare `--listen-raft` binds.
+///
+/// The wildcard, like `--listen-scheduler` and unlike `--listen-cache`: peers are on
+/// other machines by definition, so a loopback default would be one that silently
+/// cannot work. Named because two places have to agree on it -- the policy row that
+/// refuses an unusable `--listen-raft` and the tier that binds it -- and a default
+/// they disagreed about is a row accepting what the tier then refuses.
+inline constexpr std::string_view RaftListenDefaultHost = "0.0.0.0";
+
 /// Why a `--node-id` that names no `--raft-peer` cannot work.
 ///
 /// A named constant rather than prose written into the policy row it fills, because

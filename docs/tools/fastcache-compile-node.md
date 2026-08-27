@@ -464,7 +464,7 @@ Each is decided by the command line alone, so each is refused at startup **and**
 `--install-service`, where you are watching, rather than at every boot into a log
 nobody reads:
 
-| | Why |
+| What has to hold | Why |
 |---|---|
 | every `--raft-peer` is `<id>=<host>:<port>` | A token that names no member is refused by the parser, which is the only place that can tell you *which* token. `--cluster-admit` takes the same one. |
 | one of them is this node | The address its peers dial is the half only it knows — whether it bootstraps a cluster or joins one with `--raft-join`. |
